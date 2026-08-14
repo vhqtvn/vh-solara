@@ -439,22 +439,30 @@ export async function split(page: Page, id: string, dir: "right" | "down"): Prom
   return r ?? null;
 }
 
-/** Wait until every pane overlay's geometry transition has finished (no active
- *  CSS animations on any `.dv-render-overlay`). Pane-overlay geometry is
- *  FLIP-animated via a transient `transition: transform` (layoutAnimation.ts —
- *  the GPU-composited rewrite of the old left/top/width/height transition), so a
- *  DOM rect read immediately after a layout op can observe the MID-animation
- *  position. Tests that assert real DOM geometry right after an op must call
- *  this first. Model-level reads (groupBox → group.api.boundingBox) are NOT
- *  affected (they read the Dockview model, not the animated DOM). */
+/** Wait until every pane's geometry animation has finished: no active CSS
+ *  animations on any `.dv-render-overlay` / `.pane` AND no residual inline
+ *  FLIP styles (the deferred-reflow PIN / transform / transition that
+ *  layoutAnimation.ts sets). The inline-style poll is load-bearing: during
+ *  the FLIP's hold-until-stable phase a pane carries `transition: none` (no
+ *  running animation!) while still pinned/transformed — an animations-only
+ *  poll false-passes in that window and would read stale geometry. Model
+ *  reads (groupBox → group.api.boundingBox) are NOT affected (they read the
+ *  Dockview model, not the animated DOM). */
 export async function waitForLayoutSettled(page: Page, timeoutMs = 5000): Promise<void> {
   await expect
     .poll(
       () =>
         page.evaluate(() => {
           let n = 0;
-          for (const el of document.querySelectorAll(".dv-render-overlay")) {
+          for (const el of document.querySelectorAll(
+            ".dv-render-overlay, .dv-render-overlay .pane",
+          )) {
             n += el.getAnimations().length;
+          }
+          for (const el of document.querySelectorAll<HTMLElement>(".dv-render-overlay .pane")) {
+            if (el.style.width || el.style.height || el.style.transform || el.style.transition) {
+              n++;
+            }
           }
           return n;
         }),

@@ -50,18 +50,23 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* DEFERRED-REFLOW FLIP (layoutAnimation.ts): the morph transform targets
+   * THIS child, and the FLIP math (translate(dx,dy) scale(sx,sy) with
+   * origin at the box top-left) must land exactly on the old/new rects.
+   * The `.dv-render-overlay { transform-origin: 0 0 }` rule below does NOT
+   * apply to this child, so it needs its own. Harmless at rest (no
+   * transform outside the transient morph). */
+  transform-origin: 0 0;
 }
 
 /* FLIP layout animation target. layoutAnimation.ts applies a single
- * GPU-composited `transform` per pane (translate+scale) to animate layout-to-
- * layout transitions, REPLACING the old `transition: left/top/width/height`
+ * GPU-composited `transform` per pane to animate layout-to-layout
+ * transitions, REPLACING the old `transition: left/top/width/height`
  * approach that triggered LAYOUT on every animation frame (the operator's
- * multi-phase jank diagnosis). `transform-origin: 0 0` (top-left) is REQUIRED so
- * the FLIP math — translate(dx,dy) scale(sx,sy), where dx/dy are left/top deltas
- * and sx/sy are width/height ratios — reproduces the old rect EXACTLY (with the
- * default 50%/50% origin the scaled box's corners would not land on the old
- * rect). It is harmless otherwise: the overlay's only transform is the FLIP,
- * applied transiently during the ~0.15s play.
+ * multi-phase jank diagnosis). The transform lives on the `.pane` CHILD
+ * (deferred-reflow / pinned-content technique — see layoutAnimation.ts);
+ * `transform-origin: 0 0` on the overlay rule below is kept for
+ * belt-and-suspenders (the overlay itself is no longer transformed).
  *
  * The `.dv-geometry-dragging` class is STILL toggled by DockviewHost on this
  * root during continuous sash/floating drags; layoutAnimation.ts reads it to
@@ -78,6 +83,22 @@
  * is needed; this block is intentionally transform-only. */
 .dv-render-overlay {
   transform-origin: 0 0;
+}
+
+/* DEFERRED-REFLOW FLIP (deliberate, reversible override — restore
+ * `contain: layout paint` to undo). Upstream dockview-core pins
+ * `.dv-render-overlay { contain: layout paint; }`; `contain: paint` CLIPS
+ * descendants to the overlay bounds, which would visibly CUT OFF the pinned
+ * old-size `.pane` during a shrink morph (layoutAnimation.ts deliberately
+ * keeps it extending outside the overlay — translated + scaled — until the
+ * settle). Our panes are full-bleed iframes that exactly fill their box, so
+ * paint containment's clipping is only ever visible during our deliberate
+ * morph; `layout` isolation is kept. AGENTS.md's Firefox/WebRender guidance
+ * also notes contain:paint on large surfaces HURT GPU perf — removing it is
+ * unlikely to regress. Loaded AFTER dockview.css (index.tsx import order) so
+ * this same-specificity rule wins. */
+.dv-render-overlay {
+  contain: layout;
 }
 
 /* native sashes (drag-rearrange = resize). Make them visible + grabbable. */

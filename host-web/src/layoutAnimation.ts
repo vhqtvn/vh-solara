@@ -1,64 +1,125 @@
 import type { DockviewApi } from "dockview-core";
 
 /**
- * FLIP animation for Dockview pane layout transitions.
+ * FLIP layout animation for Dockview pane transitions — DEFERRED-REFLOW
+ * (pinned-content) variant.
  *
- * REPLACES the laggy `transition: left/top/width/height` approach that used to
- * live in dockviewOverrides.css. That approach animated LAYOUT properties, which
- * triggers a browser layout pass on EVERY animation frame. The operator's
- * measured diagnosis: a discrete layout op (split/swap/orientation-flip) read as
- * a multi-phase janky effect — the root resized first, then panes translated
- * (lagging), then panes scaled — because each animated property reflows
- * independently and the browser interleaves the reflow bursts Dockview emits.
+ * WHY DEFERRED REFLOW: the previous FLIP (dcd6547) animated the
+ * `.dv-render-overlay` with `transform: translate() scale()`. The transform
+ * was GPU-composited and smooth — but Dockview commits the overlay's new
+ * `width/height` IMMEDIATELY, which resizes the cross-origin IFRAME at the
+ * jump → the SPA's chat view re-wraps + re-anchors scroll on its main thread
+ * MID-ANIMATION → visible "tail lag in chat view". A host-side transform can
+ * visually scale the pane, but it cannot hide in-iframe main-thread jank.
  *
- * FLIP (First-Last-Invert-Play) animates the transition with a SINGLE
- * GPU-composited `transform` per pane. `transform` (like `opacity`) is composited
- * on the GPU and does NOT trigger layout, so the whole move+resize runs as one
- * smooth combined motion with zero per-frame layout cost.
+ * THE FIX: during the animation keep the pane CONTENT element at its OLD
+ * pixel size (PINNED) and let a transform on that child visually scale it
+ * into the new rect. The iframe does not resize until the animation ends —
+ * the GPU scales the already-rendered OLD bitmap (zero iframe main-thread
+ * work); the actual reflow happens ONCE, AFTER the motion settles.
  *
- * Technique (per pane element, the `.dv-render-overlay` Dockview positions):
- *   1. FIRST  — the pane's pre-change rect is stored in `lastRects`.
- *   2. LAST   — `onDidLayoutChange` fires after Dockview wrote the new inline
- *               left/top/width/height; read the new rect.
- *   3. INVERT — apply `translate(dx,dy) scale(sx,sy)` (transform-origin: 0 0,
- *               set in dockviewOverrides.css) so the pane APPEARS to still be at
- *               its old rect, then force ONE reflow to commit that state.
- *   4. PLAY   — set `transition: transform <dur> ease-out` + `transform: ""`
- *               (identity); the pane animates from the inverted (old) state to
- *               its natural (new) state via a single composited transform.
+ * WHY THE TRANSFORM MOVED FROM THE OVERLAY TO THE CHILD (the math): with
+ * transform-on-OVERLAY, the child's visual size = childLayout × overlayScale.
+ * For the child's visual size to equal its OLD size at animation start
+ * (overlayScale = oldW/newW), childLayout must equal the NEW size — i.e. the
+ * child must have ALREADY reflowed. Contradiction. Deferred reflow therefore
+ * requires the transform on the CHILD (the pinned `.pane` element), while the
+ * overlay jumps to its new geometry immediately.
  *
- * TARGET ELEMENT: `.dv-render-overlay` (OverlayRenderContainer's positioned child
- * for renderer:'always' panels) — the SAME element the old CSS transition
- * targeted, and the ANCESTOR of each pane's `<iframe>` (never the iframe itself;
- * see AGENTS.md GPU rules). Each overlay holds one `.pane[data-pane-id]`.
+ * Sequence per panel (W1,H1 = old size; W2,H2 = new size):
+ *   1. PIN    — `.pane` (the panel content root inside the overlay; carries
+ *               data-pane-id, contains .pane-body → iframe) gets inline
+ *               `width: W1px; height: H1px`. The overlay jumps to W2×H2
+ *               (Dockview), the child stays W1×H1 → the iframe box is
+ *               UNCHANGED → no reflow, no scroll re-anchor. The pin equals
+ *               the size the iframe already has, so writing it is a no-op
+ *               for layout — done BEFORE any layout read, the iframe never
+ *               lays out at an intermediate size.
+ *   2. INVERT — `transform: translate(V.left−new.left, V.top−new.top)
+ *               scale(V.w/W1, V.h/H1)` on the pinned child
+ *               (transform-origin: 0 0), where V is the child's CURRENT
+ *               VISUAL rect (its settled old rect on a fresh op; its
+ *               mid-flight interpolated rect on a retarget). The pane
+ *               appears exactly where it just was — no visual jump.
+ *   3. COMMIT — one forced reflow (offsetWidth) so the inverted state is the
+ *               transition's start value.
+ *   4. PLAY   — `transition: transform <dur> ease-out` +
+ *               `transform: translate(0,0) scale(W2/W1, H2/H1)`. The old-size
+ *               content visually moves AND scales into the new rect in one
+ *               GPU-composited transform; the iframe bitmap is untouched.
+ *   5. SETTLE — on transitionend: remove the pin (width/height) AND the
+ *               transform + transition. The child refills the overlay at
+ *               W2×H2 → the iframe resizes NOW → ONE reflow + scroll-anchor
+ *               AFTER the motion. There is a one-frame content settle
+ *               (old-wrapping-scaled → new-wrapping) — accepted tradeoff.
  *
- * GPU SAFETY (AGENTS.md Firefox/WebRender rules): `transform` + `opacity` are
- * the only composited properties and are ALLOWED. This module uses `transform`
- * only. It does NOT touch mask-image / backdrop-filter / contain:paint (BANNED).
+ * TIMING GUARANTEE (what makes the pin work): Dockview writes each overlay's
+ * inline left/top/width/height from `requestAnimationFrame` callbacks
+ * (OverlayRenderContainer.attach → resize()), and buffers
+ * `onDidLayoutChange` through an AsapEvent (a queueMicrotask callback). A
+ * microtask handler would read PRE-commit geometry. This module defers its
+ * handling to a rAF queued AFTER the event: dockview's geometry rAFs for the
+ * op were queued first (synchronously inside the op) and run earlier in the
+ * same frame, so the handler reads COMMITTED geometry. The pin is still a
+ * style write in that same rAF — before the frame's style/layout/paint — so
+ * the iframe never lays out at the intermediate (un-pinned) new size. The
+ * same choreography re-seeds the install-time baseline one frame after mount
+ * (a synchronous read would capture the un-positioned overlays, which fill
+ * the whole container).
+ *
+ * STABILITY CHOREOGRAPHY (hold-until-stable): a single user op can commit
+ * SEVERAL geometry states across several frames — a swap docks a panel into
+ * a neighbor's group (a TRANSIENT rect that can be far off-window — observed
+ * x≈1920px on a 1280px viewport) before the final redistribution lands, and
+ * dockview rAF-chains mean the final rect can commit 2-3 frames after the
+ * last layout event. Animating toward a transient would dart the pane out
+ * and back. So the handler runs on EVERY frame while a morph is pending
+ * (the "chase") and per pane:
+ *   - target unchanged & mid-flight  → leave the running transition alone;
+ *   - rect CHANGED vs the previous frame → CANCEL + re-INVERT from the
+ *     current visual rect and HOLD (transition: none — frozen at the old
+ *     visual, zero perceptible motion);
+ *   - rect STABLE two consecutive frames AND displaced from the visual rect
+ *     → COMMIT the invert + PLAY to the stable rect;
+ *   - already in place → clear any stray pin.
+ * The visible effect: the pane rests at its OLD visual position for ~1-2
+ * frames (imperceptible), then performs ONE smooth morph to the final rect —
+ * transients are never chased. Mid-flight retargets restart from the CURRENT
+ * visual rect (continuous position, no snap-back).
+ *
+ * TARGET ELEMENT: the `.pane[data-pane-id]` CHILD of each `.dv-render-overlay`
+ * (never the `<iframe>` itself — see AGENTS.md GPU rules; an ancestor
+ * wrapper transform is also fine, but a DESCENDANT wrapper is what defers
+ * the reflow). The overlay itself is never touched by the FLIP.
+ *
+ * CSS DEPENDENCIES (dockviewOverrides.css):
+ *   - `.dv-render-overlay { contain: layout; }` — upstream dockview-core pins
+ *     `contain: layout paint`; `paint` CLIPS descendants to the overlay
+ *     bounds, which would cut off the pinned old-size child during a shrink
+ *     morph (it deliberately extends outside the overlay until settle). The
+ *     override drops `paint`, keeps `layout` isolation. (AGENTS.md WebRender
+ *     guidance: contain:paint on large surfaces HURT GPU perf anyway.)
+ *   - `.dv-render-overlay > .pane { transform-origin: 0 0; }` — required so
+ *     the INVERT/PLAY math lands exactly on the old/new rects (the overlay's
+ *     own `transform-origin: 0 0` rule does NOT apply to the child).
+ *
+ * GPU SAFETY (AGENTS.md Firefox/WebRender rules): `transform` + `opacity`
+ * are the only composited properties used (transform only). No mask-image /
+ * backdrop-filter / contain:paint (BANNED). Width/height are written BEFORE
+ * the play and cleared AFTER the transition — never animated.
  *
  * SKIP CASES (no animation, just record the baseline):
- *   - CONTINUOUS geometry drags (sash resize / floating drag): the drag itself is
- *     the motion; FLIP-ing its bursts would be wrong. Detected via the
- *     `.dv-geometry-dragging` class DockviewHost toggles on the container. The
- *     baseline is refreshed once on drag-end (pointerup) so the next DISCRETE op
- *     animates from the post-drag position (see `onDragEnd`).
- *   - prefers-reduced-motion: an abrupt jump is the reduced-motion-correct
- *     behavior; no animation is synthesized.
- *   - New panels (first appearance): no stored FIRST rect → no animation.
+ *   - CONTINUOUS geometry drags (sash resize / floating drag): detected via
+ *     the `.dv-geometry-dragging` class DockviewHost toggles on the container.
+ *     Baseline refreshed once on drag-end (pointerup) so the next DISCRETE op
+ *     animates from the post-drag position.
+ *   - prefers-reduced-motion: abrupt jump; no animation, no pin.
+ *   - New panels (first appearance): no recorded rect → no animation.
  *   - Trivial moves (< 1px) / zero-size (trayed/off-screen) overlays.
  *
- * MULTI-STEP OPS: Dockview emits several `onDidLayoutChange` bursts during one
- * user op (a swap writes an intermediate state then the final redistribution; an
- * orientation flip writes a retarget burst then the transposed layout ~200ms
- * later). Each burst is handled as its own FLIP from the previous baseline, so a
- * multi-step op reads as one continuous motion (the in-flight transform is
- * cancelled + restarted from the last SETTLED rect on each burst — never from a
- * mid-animation position, because the rect read clears any in-flight transform
- * first).
- *
  * TUNABLE: FLIP_DURATION_MS is the on-device dial-in default. Larger (~0.2s)
- * reads smoother; smaller (~0.1s) is snappier. ease-out keeps the start fast so
- * the pane feels responsive.
+ * reads smoother; smaller (~0.1s) is snappier. ease-out keeps the start fast
+ * so the pane feels responsive.
  */
 export function installFlipAnimation(
   api: DockviewApi,
@@ -73,6 +134,10 @@ export function installFlipAnimation(
   const FALLBACK_SLACK_MS = 60;
   // Relative scale change below which we treat the size as unchanged.
   const MIN_SCALE_DELTA = 0.01;
+  // Hard cap on the hold-until-stable chase (frames). A pathological
+  // geometry thrash degenerates into "no animation" rather than an endless
+  // chase; the fallback timer clears held styles well before this anyway.
+  const MAX_CHASE_FRAMES = 24;
 
   interface Rect {
     left: number;
@@ -80,187 +145,301 @@ export function installFlipAnimation(
     width: number;
     height: number;
   }
+  /** One panel's positioned pair: the overlay Dockview sizes + our content
+   *  root inside it (carries data-pane-id; contains .pane-body → iframe). */
+  interface PanePair {
+    overlay: HTMLElement;
+    pane: HTMLElement;
+  }
 
-  // LAST/FIRST baseline: each panel id → its last SETTLED (natural) rect.
+  // Natural (overlay) rect each panel showed on the PREVIOUS handled frame.
+  // Doubles as the "panel is known" marker (new panels animate nothing on
+  // their first recorded frame) and drives removed-panel cleanup.
   const lastRects = new Map<string, Rect>();
-  // Overlays with an in-flight FLIP transition (cleared on transitionend /
-  // fallback / next cycle). Used so uninstall + the fallback can clean up.
+  // In-flight content pins: pane element → the pixel size its content bitmap
+  // currently renders at. Active from PIN until SETTLE (survives the whole
+  // hold-until-stable chase — the iframe never reflows mid-sequence).
+  const pins = new Map<HTMLElement, { w: number; h: number }>();
+  // Pane elements with an in-flight FLIP transition (cleared on
+  // transitionend / fallback).
   const inFlight = new Set<HTMLElement>();
+  // Pane elements INVERTED but not yet playing (waiting for geometry to
+  // stabilize). Cleared when they play, or by the fallback.
+  const held = new Set<HTMLElement>();
+  // The natural-coords rect each in-flight pane is animating TOWARD. A new
+  // frame whose rect ≈ target means "already flying there — leave alone".
+  const targets = new Map<HTMLElement, Rect>();
   // True while a continuous geometry drag is in progress (class present). The
   // baseline is refreshed once when it ends.
   let draggingActive = false;
   let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+  // The pending rAF (event handling, install re-seed, or chase frame).
+  let rafHandle: number | undefined;
+  // Chase budget: frames remaining of the current hold-until-stable run.
+  let chaseFramesLeft = 0;
 
   const prefersReducedMotion = (): boolean =>
     typeof window !== "undefined" &&
     typeof window.matchMedia === "function" &&
     window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  /** Enumerate the current panels' positioned overlay elements.
-   *  One `.dv-render-overlay` per renderer:'always' panel; the panel id is read
-   *  from its `.pane[data-pane-id]` child (set by IframeRenderer). Only overlays
+  /** Enumerate the current panels' positioned elements. One
+   *  `.dv-render-overlay` per renderer:'always' panel, whose `.pane[data-
+   *  pane-id]` child (set by IframeRenderer) identifies the panel. Only pairs
    *  whose pane id is still a live panel are returned (stale/trayed overlays
    *  whose panel was disposed are dropped). */
-  function currentOverlays(): Map<string, HTMLElement> {
-    const out = new Map<string, HTMLElement>();
+  function currentPanes(): Map<string, PanePair> {
+    const out = new Map<string, PanePair>();
     const live = new Set<string>();
     for (const p of api.panels) live.add(p.id);
     const overlays =
       container.querySelectorAll<HTMLElement>(".dv-render-overlay");
-    for (const el of overlays) {
-      const pane = el.querySelector<HTMLElement>(".pane[data-pane-id]");
+    for (const overlay of overlays) {
+      const pane = overlay.querySelector<HTMLElement>(".pane[data-pane-id]");
       const id = pane?.dataset.paneId;
-      if (id && live.has(id)) out.set(id, el);
+      if (id && pane && live.has(id)) out.set(id, { overlay, pane });
     }
     return out;
   }
 
-  /** Read the natural (untransformed) rects of all current overlays after
-   *  cancelling any in-flight FLIP. Temporarily sets `transition: none` +
-   *  `transform: ""` on every overlay, forces ONE reflow (so a partial transform
-   *  never pollutes the read), reads all rects, then RESTORES transition to ""
-   *  (transform is already "" and committed, so there is nothing left to animate
-   *  and no residual `transition: none` lingers on non-animating panes). Returns
-   *  panel id → natural rect. */
-  function readNaturalRects(overlays: Map<string, HTMLElement>): Map<string, Rect> {
-    inFlight.clear();
-    for (const [, el] of overlays) {
-      el.style.transition = "none";
-      el.style.transform = "";
-    }
-    // Single reflow commits the cleared transforms so getBoundingClientRect is
-    // not affected by a still-active inverted transform from a prior FLIP.
-    void container.offsetWidth;
-    const rects = new Map<string, Rect>();
-    for (const [id, el] of overlays) {
-      const r = el.getBoundingClientRect();
-      rects.set(id, { left: r.left, top: r.top, width: r.width, height: r.height });
-    }
-    // Restore transition: transform is "" and committed above, so clearing the
-    // transient `transition: none` cannot trigger an animation (no pending
-    // property change). This keeps non-animating overlays' inline styles clean.
-    for (const [, el] of overlays) {
-      el.style.transition = "";
-    }
-    return rects;
+  function readRect(el: HTMLElement): Rect {
+    const r = el.getBoundingClientRect();
+    return { left: r.left, top: r.top, width: r.width, height: r.height };
   }
 
-  function clearStyles(el: HTMLElement): void {
-    el.style.transition = "";
-    el.style.transform = "";
+  /** Within-threshold equality of two rects (trivial move / stable frame). */
+  function rectEq(a: Rect, b: Rect): boolean {
+    return (
+      Math.abs(a.left - b.left) < MIN_DELTA_PX &&
+      Math.abs(a.top - b.top) < MIN_DELTA_PX &&
+      Math.abs(a.width - b.width) < MIN_DELTA_PX &&
+      Math.abs(a.height - b.height) < MIN_DELTA_PX
+    );
   }
 
-  /** Refresh the baseline (FIRST rects) without animating. Used at install time,
-   *  under prefers-reduced-motion, and once on drag-end so the next discrete op
-   *  animates from the post-drag position. */
+  /** SETTLE-clear: remove every inline style the FLIP put on a pane child —
+   *  pin (width/height), transform, transition. This is the moment the
+   *  deferred reflow fires: the child refills its overlay and the iframe
+   *  takes the new size, once, after the motion. All four properties are
+   *  cleared in one synchronous task with `transition` also removed, so the
+   *  clear itself never animates. */
+  function clearPaneStyles(pane: HTMLElement): void {
+    pane.style.width = "";
+    pane.style.height = "";
+    pane.style.transform = "";
+    pane.style.transition = "";
+  }
+
+  /** Full settle of one pane (transitionend / fallback / in-place path). */
+  function settlePane(pane: HTMLElement): void {
+    clearPaneStyles(pane);
+    inFlight.delete(pane);
+    held.delete(pane);
+    pins.delete(pane);
+    targets.delete(pane);
+  }
+
+  /** HARD-cancel any in-flight FLIP state on a pane so a subsequent write
+   *  never animates: disable the transition, drop pin + transform. Caller
+   *  must force one reflow before re-enabling transitions. */
+  function hardCancelPane(pane: HTMLElement): void {
+    pane.style.transition = "none";
+    pane.style.width = "";
+    pane.style.height = "";
+    pane.style.transform = "";
+    inFlight.delete(pane);
+    held.delete(pane);
+    pins.delete(pane);
+    targets.delete(pane);
+  }
+
+  /** Refresh the baseline (FIRST rects) without animating. Used at install
+   *  time, under prefers-reduced-motion, and once on drag-end so the next
+   *  discrete op animates from the post-drag position. Also hard-cancels any
+   *  stale in-flight pin (defensive; normally already settled). */
   function refreshBaseline(): void {
-    const overlays = currentOverlays();
-    const rects = readNaturalRects(overlays);
-    inFlight.clear();
+    chaseFramesLeft = 0;
+    const panes = currentPanes();
+    for (const [, { pane }] of panes) hardCancelPane(pane);
+    // One reflow commits the cancel; then restore transition to "" (there is
+    // no pending property change, so nothing animates and no residual
+    // `transition: none` lingers).
+    void container.offsetWidth;
+    for (const [, { pane }] of panes) pane.style.transition = "";
     lastRects.clear();
-    for (const [id, r] of rects) lastRects.set(id, r);
+    for (const [id, { overlay }] of panes) lastRects.set(id, readRect(overlay));
   }
 
   /** Fallback clear: a transitionend can be missed (element hidden mid-anim,
-   *  tab backgrounded). Guarantee no residual transform lingers past the play
-   *  duration + slack. Each animating cycle reschedules this. */
+   *  tab backgrounded) and a held pane's geometry may never stabilize.
+   *  Guarantee no residual pin/transform/transition lingers past the play
+   *  duration + slack. Each animating/held cycle reschedules this. */
   function scheduleFallback(): void {
     if (fallbackTimer !== undefined) clearTimeout(fallbackTimer);
     fallbackTimer = setTimeout(() => {
       fallbackTimer = undefined;
-      for (const el of inFlight) clearStyles(el);
+      for (const pane of inFlight) settlePane(pane);
+      for (const pane of held) settlePane(pane);
       inFlight.clear();
+      held.clear();
+      targets.clear();
+      pins.clear();
+      chaseFramesLeft = 0;
     }, FLIP_DURATION_MS + FALLBACK_SLACK_MS);
   }
 
-  function onLayoutChange(): void {
+  /** Queue the next chase frame (the hold-until-stable loop) while any pane
+   *  is still in flight or held, within the frame budget. */
+  function scheduleChase(): void {
+    if (chaseFramesLeft <= 0) return;
+    if (inFlight.size === 0 && held.size === 0) return;
+    if (rafHandle !== undefined) return;
+    rafHandle = requestAnimationFrame(() => {
+      rafHandle = undefined;
+      handleLayoutChange();
+    });
+  }
+
+  function handleLayoutChange(): void {
     // CONTINUOUS drag: skip entirely (no reflow per pointermove frame). Flag so
     // the drag-end pointerup refreshes the baseline once.
     if (container.classList.contains("dv-geometry-dragging")) {
       draggingActive = true;
       return;
     }
-    // Reduced motion: jump is correct; just keep the baseline current.
+    // Reduced motion: jump is correct; no animation, NO PIN (the content
+    // jumps directly to the new size). Just keep the baseline current.
     if (prefersReducedMotion()) {
       refreshBaseline();
       return;
     }
 
-    const overlays = currentOverlays();
-    if (overlays.size === 0) return;
+    const panes = currentPanes();
+    if (panes.size === 0) return;
 
-    // FIRST read: natural rects (in-flight FLIPs cancelled + cleared above).
-    const newRects = readNaturalRects(overlays);
-    const seen = new Set<string>(newRects.keys());
+    // ---- PIN (before any layout read of the new geometry) ----------------
+    // For every KNOWN pane, ensure a pin exists at the size its iframe
+    // already renders at: an active pin (mid-chase), or the natural size
+    // recorded on the previous handled frame (= the pane's last COMPUTED
+    // layout — reading it from the map, NOT from offsetWidth, so this phase
+    // forces no layout and the new overlay geometry cannot reach the iframe
+    // before the pin lands). The pin write is a layout no-op (same size);
+    // every subsequent layout this frame computes the iframe at that size.
+    for (const [id, { pane }] of panes) {
+      if (pins.has(pane)) continue;
+      const prev = lastRects.get(id);
+      // New panel (first recorded appearance) or zero-size (trayed /
+      // off-screen): no old bitmap worth keeping — animate nothing.
+      if (!prev || prev.width <= 0 || prev.height <= 0) continue;
+      pins.set(pane, { w: prev.width, h: prev.height });
+      pane.style.width = `${prev.width}px`;
+      pane.style.height = `${prev.height}px`;
+    }
 
-    // INVERT: for each pane that moved/resized vs its LAST settled rect, apply
-    // the inverse transform so it appears at its old rect.
-    const toPlay: HTMLElement[] = [];
-    for (const [id, el] of overlays) {
-      const oldRect = lastRects.get(id);
-      const newRect = newRects.get(id);
-      if (!oldRect || !newRect) continue;
-      // Skip zero-size (trayed / off-screen / not-yet-laid-out) overlays.
-      if (
-        oldRect.width <= 0 ||
-        oldRect.height <= 0 ||
-        newRect.width <= 0 ||
-        newRect.height <= 0
-      ) {
+    // ---- LAST read (committed overlay geometry this frame) ---------------
+    // Overlays carry no FLIP styles (only their .pane children ever do), so
+    // their rects are always natural — no cancelling needed to read them.
+    const newRects = new Map<string, Rect>();
+    for (const [id, { overlay }] of panes) newRects.set(id, readRect(overlay));
+    const seen = new Set(newRects.keys());
+
+    let playedOrHeld = false;
+
+    for (const [id, { pane }] of panes) {
+      const pin = pins.get(pane);
+      const newRect = newRects.get(id)!;
+      if (!pin) continue; // new panel this frame — record only (below)
+
+      const target = targets.get(pane);
+      if (target && rectEq(target, newRect)) {
+        // Already flying toward exactly this rect — leave the transition
+        // alone (re-handling would restart it every frame and freeze).
         continue;
       }
-      const dx = oldRect.left - newRect.left;
-      const dy = oldRect.top - newRect.top;
-      const sx = oldRect.width / newRect.width;
-      const sy = oldRect.height / newRect.height;
-      const moved = Math.abs(dx) >= MIN_DELTA_PX || Math.abs(dy) >= MIN_DELTA_PX;
-      const scaled =
-        Math.abs(sx - 1) >= MIN_SCALE_DELTA || Math.abs(sy - 1) >= MIN_SCALE_DELTA;
-      if (moved || scaled) {
-        // transform-origin: 0 0 (set in dockviewOverrides.css) makes this exact:
-        // top-left → (oldLeft, oldTop), size → (oldW, oldH).
-        el.style.transform = `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`;
-        toPlay.push(el);
+
+      // Zero-size destination (trayed / collapsed): settle now — the pane
+      // follows its overlay down; nothing to morph.
+      if (newRect.width <= 0 || newRect.height <= 0) {
+        settlePane(pane);
+        continue;
       }
+
+      const prevRect = lastRects.get(id);
+      const stable = prevRect !== undefined && rectEq(prevRect, newRect);
+
+      // Current VISUAL rect — the FLIP always starts exactly from what the
+      // user currently sees (settled old rect, or the mid-flight
+      // interpolated rect on a retarget: continuous position, no snap-back).
+      const visual = readRect(pane);
+
+      if (stable && rectEq(visual, newRect)) {
+        // In place, geometry stable: any pin we hold is superfluous.
+        if (!inFlight.has(pane)) settlePane(pane);
+        continue;
+      }
+
+      // INVERT (style-only) — the pane visually stays exactly where it is:
+      // translate the pin box (at the new overlay top-left) so its top-left
+      // lands on the visual rect's top-left, and scale it to the visual
+      // rect's size (identity for a settled pane: visual == pin box).
+      const dx = visual.left - newRect.left;
+      const dy = visual.top - newRect.top;
+      const sx0 = visual.width / pin.w;
+      const sy0 = visual.height / pin.h;
+      pane.style.transition = "none";
+      pane.style.transform = `translate(${dx}px, ${dy}px) scale(${sx0}, ${sy0})`;
+      void pane.offsetWidth; // commit cancel + invert before any play
+
+      if (stable) {
+        // The invert is already committed by the reflow above — PLAY to the
+        // stable natural rect: identity translate + end-scale.
+        const sx = newRect.width / pin.w;
+        const sy = newRect.height / pin.h;
+        pane.style.transition = `transform ${FLIP_DURATION_MS}ms ${FLIP_TIMING}`;
+        pane.style.transform = `translate(0px, 0px) scale(${sx}, ${sy})`;
+        held.delete(pane);
+        inFlight.add(pane);
+        targets.set(pane, newRect);
+      } else {
+        // Geometry still moving frame-to-frame (transient states of a
+        // multi-step op — e.g. a swap's off-window intermediate): HOLD at
+        // the current visual (transition: none). Play only once stable.
+        inFlight.delete(pane);
+        held.add(pane);
+        targets.delete(pane);
+      }
+      playedOrHeld = true;
     }
 
-    if (toPlay.length > 0) {
-      // ONE reflow commits all inverted transforms as the current value, so the
-      // transition in PLAY runs FROM the inverted state.
-      void container.offsetWidth;
-      // PLAY: animate each to identity (natural new rect) via one composited
-      // transform. The transition + transform="" are set in the same frame.
-      for (const el of toPlay) {
-        el.style.transition = `transform ${FLIP_DURATION_MS}ms ${FLIP_TIMING}`;
-        el.style.transform = "";
-        inFlight.add(el);
-      }
-      scheduleFallback();
-    }
-
-    // Record the new natural rects as the next FIRST baseline.
+    // ---- bookkeeping -------------------------------------------------------
+    // lastRects := this frame's natural rects (the stability reference for
+    // the next frame); forget panes whose panels are gone.
     for (const [id, r] of newRects) lastRects.set(id, r);
     for (const id of [...lastRects.keys()]) if (!seen.has(id)) lastRects.delete(id);
+
+    if (playedOrHeld) scheduleFallback();
+    if (chaseFramesLeft > 0) chaseFramesLeft--;
+    scheduleChase();
   }
 
-  // transitionend (bubbles from .dv-render-overlay to container): clear the
-  // inline transition + transform the moment the FLIP completes so no residual
-  // transform remains on the pane. Only the FLIP's own transform transition is
-  // cleared (propertyName filter + inFlight membership guard).
+  // transitionend (bubbles from the .pane child through its overlay to the
+  // container): SETTLE — clear the pin + transform + transition the moment
+  // the FLIP completes, so the deferred reflow fires exactly once, after the
+  // motion. Only the FLIP's own transform transition is cleared
+  // (propertyName filter + inFlight membership guard).
   function onTransitionEnd(ev: TransitionEvent): void {
     if (ev.propertyName !== "transform") return;
     const el = ev.target;
     if (!(el instanceof HTMLElement)) return;
     if (!inFlight.has(el)) return;
-    clearStyles(el);
-    inFlight.delete(el);
+    settlePane(el);
   }
 
   // Drag-end: a continuous geometry drag just released. Refresh the baseline so
-  // the next DISCRETE op animates from the post-drag position (without this, the
-  // baseline would still hold the pre-drag rects and the next op's FLIP would
-  // fly the panes in from their old pre-drag spots). Window-capture so it fires
-  // before Dockview's own drag-release flush.
+  // the next DISCRETE op animates from the post-drag position (without this,
+  // the baseline would still hold the pre-drag rects and the next op's FLIP
+  // would fly the panes in from their old pre-drag spots). Window-capture so
+  // it fires before Dockview's own drag-release flush.
   function onDragEnd(): void {
     if (!draggingActive) return;
     draggingActive = false;
@@ -271,19 +450,55 @@ export function installFlipAnimation(
   window.addEventListener("pointerup", onDragEnd, true);
   window.addEventListener("pointercancel", onDragEnd, true);
 
+  // Deferred, per-frame handling (see TIMING GUARANTEE above): dockview
+  // commits overlay geometry in rAFs queued synchronously inside the layout
+  // op; this handler's rAF is queued later (from the AsapEvent microtask),
+  // so it runs AFTER them in the same frame and reads the COMMITTED new
+  // geometry — while still writing the pin before the frame's layout/paint
+  // (the iframe never lays out at the un-pinned new size). Sets up the
+  // hold-until-stable chase budget for multi-frame geometry commits.
+  function onLayoutChange(): void {
+    if (rafHandle === undefined) {
+      rafHandle = requestAnimationFrame(() => {
+        rafHandle = undefined;
+        handleLayoutChange();
+      });
+    }
+    chaseFramesLeft = MAX_CHASE_FRAMES;
+  }
+
   const layoutDisp = api.onDidLayoutChange(onLayoutChange);
 
-  // Seed the baseline so the FIRST user-driven layout change has a valid FIRST.
+  // Seed the baseline so the FIRST user-driven layout change has a valid
+  // FIRST. The synchronous read runs before dockview's rAF-positioned
+  // geometry commit (overlays still fill the whole container), so re-seed
+  // one frame later when the real per-overlay geometry has committed.
   refreshBaseline();
+  rafHandle = requestAnimationFrame(() => {
+    rafHandle = undefined;
+    refreshBaseline();
+  });
 
   return () => {
     layoutDisp.dispose();
+    if (rafHandle !== undefined) cancelAnimationFrame(rafHandle);
     container.removeEventListener("transitionend", onTransitionEnd);
     window.removeEventListener("pointerup", onDragEnd, true);
     window.removeEventListener("pointercancel", onDragEnd, true);
     if (fallbackTimer !== undefined) clearTimeout(fallbackTimer);
-    for (const el of inFlight) clearStyles(el);
+    // Hard-cancel (never animate) any still-in-flight/held pane + drop
+    // stale pins, then restore transition (hardCancelPane leaves
+    // `transition: none`).
+    const active = new Set<HTMLElement>([...inFlight, ...held]);
+    for (const pane of active) {
+      hardCancelPane(pane);
+      pane.style.transition = "";
+    }
     inFlight.clear();
+    held.clear();
+    targets.clear();
+    pins.clear();
     lastRects.clear();
+    chaseFramesLeft = 0;
   };
 }
