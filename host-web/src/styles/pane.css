@@ -17,8 +17,22 @@
  * / large shadows (AGENTS.md Firefox/WebRender GPU gotchas).
  */
 
+/* SETTLE BLANK-FRAME GUARD (FLIP layoutAnimation.ts, Cause A): when the
+ * FLIP settle unpins the pane, the iframe resizes W1→W2 and engines can
+ * paint a BLANK frame (frequently WHITE) inside a resizing iframe before
+ * the embedded document repaints. The whole pane chain — .pane, .pane-body,
+ * and the <iframe> element itself — therefore paints the dark theme surface
+ * (--bg), so any blank frame is dark-on-dark (nearly invisible). The IFRAME
+ * element's own background is the load-bearing one: it is what shows in the
+ * blank window before the embedded document paints. `color-scheme: dark` on
+ * the chain additionally steers engines that derive the blank/initial canvas
+ * color from the element's color-scheme away from a white default. (Already
+ * inherited from :root — declared here explicitly so the pane subtree is
+ * self-describing.) */
+
 .pane {
-  background: var(--bg);
+  background-color: var(--bg);
+  color-scheme: dark;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -109,12 +123,18 @@
   flex: 1 1 auto;
   position: relative;
   min-height: 0;
-  background: var(--bg);
+  background-color: var(--bg);
+  color-scheme: dark;
 }
 .pane-iframe {
   width: 100%;
   height: 100%;
   border: 0;
   display: block;
-  background: var(--bg);
+  /* SETTLE BLANK-FRAME GUARD — the load-bearing one (see the block comment
+   * at the top of this file): the iframe element's own background is what a
+   * resizing engine paints in the blank window before the embedded document
+   * repaints at the new size. Keep it dark and opaque. */
+  background-color: var(--bg);
+  color-scheme: dark;
 }

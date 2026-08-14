@@ -34,7 +34,11 @@ import type { DockviewApi } from "dockview-core";
  *               UNCHANGED → no reflow, no scroll re-anchor. The pin equals
  *               the size the iframe already has, so writing it is a no-op
  *               for layout — done BEFORE any layout read, the iframe never
- *               lays out at an intermediate size.
+ *               lays out at an intermediate size. The pin lands IN THE
+ *               onDidLayoutChange MICROTASK ITSELF (before any rAF — see
+ *               TIMING GUARANTEE), so no rAF-scheduling/ordering slip can
+ *               ever paint the committed overlay geometry with an UN-PINNED
+ *               child (the residual single-flash hardening).
  *   2. INVERT — `transform: translate(V.left−new.left, V.top−new.top)
  *               scale(V.w/W1, V.h/H1)` on the pinned child
  *               (transform-origin: 0 0), where V is the child's CURRENT
@@ -48,24 +52,39 @@ import type { DockviewApi } from "dockview-core";
  *               content visually moves AND scales into the new rect in one
  *               GPU-composited transform; the iframe bitmap is untouched.
  *   5. SETTLE — on transitionend: remove the pin (width/height) AND the
- *               transform + transition. The child refills the overlay at
- *               W2×H2 → the iframe resizes NOW → ONE reflow + scroll-anchor
- *               AFTER the motion. There is a one-frame content settle
- *               (old-wrapping-scaled → new-wrapping) — accepted tradeoff.
+ *               transform + transition — all four in ONE synchronous block,
+ *               so the un-pin and the transform-clear commit in the same
+ *               style recalc (never a half-settled paint). The child refills
+ *               the overlay at W2×H2 → the iframe resizes NOW → ONE reflow +
+ *               scroll-anchor AFTER the motion. There is a one-frame content
+ *               settle (old-wrapping-scaled → new-wrapping; engines may
+ *               paint a BLANK frame inside the resizing iframe before the
+ *               embedded document repaints — pane.css paints the whole pane
+ *               chain dark so any blank frame is dark-on-dark) — accepted
+ *               tradeoff.
  *
  * TIMING GUARANTEE (what makes the pin work): Dockview writes each overlay's
  * inline left/top/width/height from `requestAnimationFrame` callbacks
  * (OverlayRenderContainer.attach → resize()), and buffers
  * `onDidLayoutChange` through an AsapEvent (a queueMicrotask callback). A
- * microtask handler would read PRE-commit geometry. This module defers its
- * handling to a rAF queued AFTER the event: dockview's geometry rAFs for the
- * op were queued first (synchronously inside the op) and run earlier in the
- * same frame, so the handler reads COMMITTED geometry. The pin is still a
- * style write in that same rAF — before the frame's style/layout/paint — so
- * the iframe never lays out at the intermediate (un-pinned) new size. The
- * same choreography re-seeds the install-time baseline one frame after mount
- * (a synchronous read would capture the un-positioned overlays, which fill
- * the whole container).
+ * microtask handler would read PRE-commit geometry. This module therefore
+ * does TWO things in that microtask:
+ *   1. EARLY PIN — synchronously pin every known pane at its CURRENT size
+ *      (the last recorded rect, = the size the iframe already renders at).
+ *      At microtask time no new geometry has been committed, so the pin is a
+ *      VISUAL NO-OP (the child already fills that size) — yet it guarantees
+ *      the iframe can never lay out at the NEW size before the handler's
+ *      pin, regardless of rAF scheduling/registration order across engines
+ *      (if our handler rAF ever ran BEFORE dockview's geometry rAFs, or a
+ *      frame painted between them, the child is already pinned — the one
+ *      un-pinned-flash window is closed).
+ *   2. defer the real handling to a rAF queued AFTER the event: dockview's
+ *      geometry rAFs for the op were queued first (synchronously inside the
+ *      op) and run earlier in the same frame, so the handler reads COMMITTED
+ *      geometry while still writing styles before the frame's style/layout/
+ *      paint. The same choreography re-seeds the install-time baseline one
+ *      frame after mount (a synchronous read would capture the un-positioned
+ *      overlays, which fill the whole container).
  *
  * STABILITY CHOREOGRAPHY (hold-until-stable): a single user op can commit
  * SEVERAL geometry states across several frames — a swap docks a panel into
@@ -300,11 +319,48 @@ export function installFlipAnimation(
     });
   }
 
+  /** PIN phase: for every KNOWN pane, ensure a pin exists at the size its
+   *  iframe already renders at: an active pin (mid-chase), or the natural
+   *  size recorded on the previous handled frame (= the pane's last COMPUTED
+   *  layout — reading it from the map, NOT from offsetWidth, so this phase
+   *  forces no layout and pending overlay geometry cannot reach the iframe
+   *  before the pin lands). The pin write is a layout no-op (same size);
+   *  every subsequent layout this frame computes the iframe at that size.
+   *  Called from BOTH the onDidLayoutChange microtask (the EARLY pin —
+   *  before any rAF, closing the un-pinned-paint window) and the top of
+   *  handleLayoutChange (covers panes that gained a lastRect since, e.g. a
+   *  drag ended between the microtask and the rAF). */
+  function ensurePins(panes: Map<string, PanePair>): void {
+    for (const [id, { pane }] of panes) {
+      if (pins.has(pane)) continue;
+      const prev = lastRects.get(id);
+      // New panel (first recorded appearance) or zero-size (trayed /
+      // off-screen): no old bitmap worth keeping — animate nothing.
+      if (!prev || prev.width <= 0 || prev.height <= 0) continue;
+      pins.set(pane, { w: prev.width, h: prev.height });
+      pane.style.width = `${prev.width}px`;
+      pane.style.height = `${prev.height}px`;
+    }
+  }
+
   function handleLayoutChange(): void {
     // CONTINUOUS drag: skip entirely (no reflow per pointermove frame). Flag so
     // the drag-end pointerup refreshes the baseline once.
     if (container.classList.contains("dv-geometry-dragging")) {
       draggingActive = true;
+      // EARLY-PIN cleanup: a pin may have landed in the microtask window
+      // before the drag class appeared. Panes merely PINNED (not yet
+      // inverted/playing) must not ride the drag at their old size — release
+      // them here. In-flight/held panes keep their state (a drag starting
+      // mid-morph was always left to transitionend/fallback; the drag-end
+      // refreshBaseline then hard-cancels any remainder, as before).
+      for (const [pane] of pins) {
+        if (!inFlight.has(pane) && !held.has(pane)) {
+          pane.style.width = "";
+          pane.style.height = "";
+          pins.delete(pane);
+        }
+      }
       return;
     }
     // Reduced motion: jump is correct; no animation, NO PIN (the content
@@ -318,23 +374,10 @@ export function installFlipAnimation(
     if (panes.size === 0) return;
 
     // ---- PIN (before any layout read of the new geometry) ----------------
-    // For every KNOWN pane, ensure a pin exists at the size its iframe
-    // already renders at: an active pin (mid-chase), or the natural size
-    // recorded on the previous handled frame (= the pane's last COMPUTED
-    // layout — reading it from the map, NOT from offsetWidth, so this phase
-    // forces no layout and the new overlay geometry cannot reach the iframe
-    // before the pin lands). The pin write is a layout no-op (same size);
-    // every subsequent layout this frame computes the iframe at that size.
-    for (const [id, { pane }] of panes) {
-      if (pins.has(pane)) continue;
-      const prev = lastRects.get(id);
-      // New panel (first recorded appearance) or zero-size (trayed /
-      // off-screen): no old bitmap worth keeping — animate nothing.
-      if (!prev || prev.width <= 0 || prev.height <= 0) continue;
-      pins.set(pane, { w: prev.width, h: prev.height });
-      pane.style.width = `${prev.width}px`;
-      pane.style.height = `${prev.height}px`;
-    }
+    // Usually a no-op: the EARLY pin (microtask) already pinned every known
+    // pane. Still needed for panes whose pin was skipped in the microtask
+    // (drag ended / rect first recorded between microtask and rAF).
+    ensurePins(panes);
 
     // ---- LAST read (committed overlay geometry this frame) ---------------
     // Overlays carry no FLIP styles (only their .pane children ever do), so
@@ -458,6 +501,22 @@ export function installFlipAnimation(
   // (the iframe never lays out at the un-pinned new size). Sets up the
   // hold-until-stable chase budget for multi-frame geometry commits.
   function onLayoutChange(): void {
+    // EARLY PIN — synchronously in THIS microtask, BEFORE any rAF (see
+    // TIMING GUARANTEE step 1). At microtask time the overlay still has OLD
+    // geometry, so pinning the child at its current (old) size is a visual
+    // no-op — it already fills — yet it guarantees the iframe never lays out
+    // at the new size before the handler's pin, regardless of rAF
+    // scheduling/order. Skip cases must NOT pin (they jump instead): a
+    // continuous drag resizes per pointermove, and reduced-motion jumps
+    // directly. (If the skip state appears only LATER — a drag starts before
+    // the rAF runs — handleLayoutChange's drag branch releases the early
+    // pin, and refreshBaseline hard-cancels any pin it finds.)
+    if (
+      !container.classList.contains("dv-geometry-dragging") &&
+      !prefersReducedMotion()
+    ) {
+      ensurePins(currentPanes());
+    }
     if (rafHandle === undefined) {
       rafHandle = requestAnimationFrame(() => {
         rafHandle = undefined;

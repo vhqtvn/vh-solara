@@ -31,6 +31,18 @@ import * as H from "./util";
  *      iframe, never the iframe itself) does NOT reload the iframe. This is
  *      the architecture-A / renderer:'always' invariant; a transform that
  *      triggered a reload would fail the mission's STOP condition.
+ *   6. EARLY PIN — the pin (inline width/height on the `.pane`) is present
+ *      at the FIRST post-op observation — one microtask after the op, BEFORE
+ *      any rAF/geometry commit/paint (dockview buffers onDidLayoutChange
+ *      through AsapEvent = queueMicrotask; the handler pins in that same
+ *      microtask). This closes the un-pinned-paint window (the residual
+ *      single-flash hardening): no rAF-ordering slip can ever lay the iframe
+ *      out at the new size before the pin.
+ *   7. DARK BACKGROUNDS — `.pane`, `.pane-body`, and the iframe element
+ *      compute a DARK opaque background-color (the settle blank-frame guard:
+ *      engines can paint a blank — often white — frame inside a resizing
+ *      iframe before the embedded document repaints; dark-on-dark makes it
+ *      nearly invisible).
  *
  * Chromium only (the interaction spec's convention; Firefox/WebKit survival is
  * covered by survival.spec.ts). Serial with the rest of the suite
@@ -268,6 +280,116 @@ test.describe("FLIP layout animation (deferred reflow)", () => {
     ).toBeLessThanOrEqual(1);
   });
 
+  test("EARLY-PIN: the pin is present at the FIRST post-op observation (microtask, pre-rAF) and the iframe never takes the new size before settle", async ({ page }) => {
+    const ids = await H.panes(page);
+    const a = ids[0];
+
+    // Deterministic geometry (mirror the DEFERRED-REFLOW test): close every
+    // pane but `a` so a right-split MUST halve its overlay.
+    for (const id of ids.slice(1)) await H.closePane(page, id);
+    await H.waitForLayoutSettled(page);
+    await assertNoResidual(page);
+    await expect.poll(async () => H.panes(page)).toEqual([a]);
+
+    const r = await page.evaluate(async (a) => {
+      const pane = document.querySelector<HTMLElement>(`.pane[data-pane-id="${a}"]`)!;
+      const overlay = pane.closest<HTMLElement>(".dv-render-overlay")!;
+      const iframe = pane.querySelector<HTMLIFrameElement>("iframe")!;
+      const pre = {
+        paneW: pane.offsetWidth,
+        paneH: pane.offsetHeight,
+        iframeW: iframe.offsetWidth,
+        iframeH: iframe.offsetHeight,
+        overlayW: overlay.getBoundingClientRect().width,
+      };
+      const h = (window as unknown as { __host?: { split(i: string, d: "right" | "down"): string | null } }).__host;
+      const created = h ? h.split(a, "right") : null;
+
+      // FIRST observation — exactly ONE microtask yield. Dockview buffers
+      // onDidLayoutChange through AsapEvent (a queueMicrotask enqueued
+      // synchronously inside the op, verified in dockview-core dist), so
+      // this continuation runs AFTER the handler's microtask: the EARLY PIN
+      // must already be set. Still pre-rAF / pre-paint — no geometry commit
+      // has happened (asserted below via the unchanged overlay width).
+      await Promise.resolve();
+      const first = {
+        pinW: pane.style.width,
+        pinH: pane.style.height,
+        iframeW: iframe.offsetWidth,
+        iframeH: iframe.offsetHeight,
+        overlayW: overlay.getBoundingClientRect().width,
+      };
+
+      // Two rAFs: dockview commits the overlay geometry and the FLIP handler
+      // runs its choreography (invert / hold-until-stable / play).
+      await new Promise<void>((res) => requestAnimationFrame(() => requestAnimationFrame(() => res())));
+      const committed = {
+        overlayW: overlay.getBoundingClientRect().width,
+        pinW: pane.style.width,
+        iframeW: iframe.offsetWidth,
+        iframeH: iframe.offsetHeight,
+      };
+
+      // Sample the pre-settle window: while the pin is present the iframe
+      // must keep the OLD size (the deferred reflow has not fired).
+      const during: Array<{ pinned: boolean; iframeW: number; iframeH: number }> = [];
+      const t0 = performance.now();
+      while (performance.now() - t0 < 120) {
+        during.push({
+          pinned: pane.style.width !== "",
+          iframeW: iframe.offsetWidth,
+          iframeH: iframe.offsetHeight,
+        });
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((res) => setTimeout(res, 12));
+      }
+      return { pre, created, first, committed, during };
+    }, a);
+
+    expect(r.created, "split created a new pane").toBeTruthy();
+    expect(r.pre.overlayW, "precondition: lone pane spans most of the grid").toBeGreaterThan(200);
+
+    // CRUX 1 — EARLY PIN: present at the very first post-op observation
+    // (microtask time — BEFORE any rAF, geometry commit, or paint), at
+    // exactly the OLD pixel size.
+    expect(r.first.pinW, "pin width set at first observation (microtask, pre-rAF)").toMatch(/px$/);
+    expect(r.first.pinH, "pin height set at first observation (microtask, pre-rAF)").toMatch(/px$/);
+    expect(Math.abs(parseFloat(r.first.pinW) - r.pre.paneW), "early pin width == old pane width").toBeLessThanOrEqual(1);
+    expect(Math.abs(parseFloat(r.first.pinH) - r.pre.paneH), "early pin height == old pane height").toBeLessThanOrEqual(1);
+    // The observation was genuinely pre-commit: the overlay was still at the
+    // OLD geometry, and the iframe had not resized.
+    expect(Math.abs(r.first.overlayW - r.pre.overlayW), "first observation: overlay still OLD (pre-commit)").toBeLessThanOrEqual(1);
+    expect(Math.abs(r.first.iframeW - r.pre.iframeW), "first observation: iframe still OLD").toBeLessThanOrEqual(1);
+    expect(Math.abs(r.first.iframeH - r.pre.iframeH), "first observation: iframe still OLD (height)").toBeLessThanOrEqual(1);
+
+    // CRUX 2 — geometry committed UNDER the pin: the overlay took the NEW
+    // (~halved) size while the pane stayed pinned and the iframe stayed OLD.
+    expect(r.committed.overlayW, "overlay committed the new (halved) geometry").toBeLessThan(r.pre.overlayW * 0.75);
+    expect(r.committed.pinW, "pin still present after the geometry commit").not.toBe("");
+    expect(Math.abs(r.committed.iframeW - r.pre.iframeW), "iframe still OLD after commit (never the new size before settle)").toBeLessThanOrEqual(1);
+    expect(Math.abs(r.committed.iframeH - r.pre.iframeH), "iframe still OLD after commit (height)").toBeLessThanOrEqual(1);
+
+    // CRUX 3 — pre-settle samples: every PINNED sample keeps the OLD iframe
+    // size (a perfect every-frame assertion is impossible from Playwright;
+    // the first-observation + committed + pinned-sample chain brackets the
+    // whole window).
+    const pinnedSamples = r.during.filter((s) => s.pinned);
+    expect(pinnedSamples.length, "samples with the pin present in the pre-settle window").toBeGreaterThan(0);
+    for (const s of pinnedSamples) {
+      expect(Math.abs(s.iframeW - r.pre.iframeW), "pinned: iframe width == old width").toBeLessThanOrEqual(1);
+      expect(Math.abs(s.iframeH - r.pre.iframeH), "pinned: iframe height == old height").toBeLessThanOrEqual(1);
+    }
+
+    // After settle: pin released, iframe == the NEW overlay size (the ONE
+    // deferred reflow landed exactly once, after the motion).
+    await H.waitForLayoutSettled(page);
+    await assertNoResidual(page);
+    const g = await paneGeometry(page, a);
+    expect(g.inline.width, "no residual pin width after settle").toBe("");
+    expect(g.inline.transform, "no residual transform after settle").toBe("");
+    expect(Math.abs(g.iframe.w - g.overlay.w), "settled iframe == new overlay width").toBeLessThanOrEqual(1);
+  });
+
   test("CLEANUP: after a discrete split + settle, no residual width/height/transform/transition on panes or overlays", async ({ page }) => {
     const ids = await H.panes(page);
     const a = ids[0];
@@ -353,5 +475,59 @@ test.describe("FLIP layout animation (deferred reflow)", () => {
 
     await H.assertSurvived(page, a, ba, "swap pane A across animated swap");
     await H.assertSurvived(page, b, bb, "swap pane B across animated swap");
+  });
+
+  test("DARK-BACKGROUNDS: .pane, .pane-body, and the iframe element compute a dark opaque background-color (settle blank-frame guard)", async ({ page }) => {
+    // SETTLE BLANK-FRAME GUARD (Cause A): when the FLIP settle unpins a pane
+    // the iframe resizes W1→W2; engines can paint a BLANK (often white)
+    // frame inside a resizing iframe before the embedded document repaints.
+    // The pane chain must therefore compute a DARK, OPAQUE background — the
+    // iframe element's own background is the load-bearing one.
+    const bg = await page.evaluate(() => {
+      const pane = document.querySelector<HTMLElement>(".dv-render-overlay .pane")!;
+      const body = pane.querySelector<HTMLElement>(".pane-body")!;
+      const iframe = pane.querySelector<HTMLIFrameElement>("iframe")!;
+      const paneCs = getComputedStyle(pane);
+      const bodyCs = getComputedStyle(body);
+      const iframeCs = getComputedStyle(iframe);
+      return {
+        pane: paneCs.backgroundColor,
+        body: bodyCs.backgroundColor,
+        iframe: iframeCs.backgroundColor,
+        // getPropertyValue (not the typed property) — colorScheme is not on
+        // older TS lib.dom CSSStyleDeclaration interfaces.
+        paneScheme: paneCs.getPropertyValue("color-scheme"),
+        iframeScheme: iframeCs.getPropertyValue("color-scheme"),
+      };
+    });
+
+    /** Parse a computed rgb()/rgba() color into channels. */
+    const parse = (value: string, label: string) => {
+      const m = /rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)(?:[,\s/]+([\d.]+))?\s*\)/.exec(value);
+      expect(m, `${label}: computed background-color parses (got "${value}")`).not.toBeNull();
+      return {
+        r: Number(m![1]),
+        g: Number(m![2]),
+        b: Number(m![3]),
+        a: m![4] === undefined ? 1 : Number(m![4]),
+      };
+    };
+
+    for (const [label, value] of Object.entries({ pane: bg.pane, "pane-body": bg.body, iframe: bg.iframe })) {
+      const c = parse(value, label);
+      // Opaque — a transparent background would let a blank resize frame
+      // show through to whatever sits behind the pane.
+      expect(c.a, `${label}: background is opaque`).toBeGreaterThanOrEqual(0.99);
+      // DARK — every channel well below mid-gray. The theme surface is
+      // --bg #0d1117 = rgb(13,17,23); a UA default white flash is
+      // rgb(255,255,255). 96 cleanly separates them.
+      expect(Math.max(c.r, c.g, c.b), `${label}: background is dark (not white/transparent)`).toBeLessThan(96);
+    }
+
+    // color-scheme: dark on the pane chain (steers engines that derive the
+    // blank/initial canvas color from the element's color-scheme away from a
+    // white default; also inherited from :root — asserted computed).
+    expect(bg.paneScheme.trim(), "pane color-scheme is dark").toContain("dark");
+    expect(bg.iframeScheme.trim(), "iframe color-scheme is dark").toContain("dark");
   });
 });
