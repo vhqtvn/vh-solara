@@ -13,6 +13,7 @@ import {
 } from "../dockview/store";
 import { next } from "../attentionNext";
 import { AddServer } from "./AddServer";
+import { Settings } from "./Settings";
 import s from "./Tabstrip.module.css";
 
 /**
@@ -89,6 +90,9 @@ export function Tabstrip() {
         +
       </button>
       <AddServer />
+      {/* Settings gear (host-chrome popover: reload + auto-rotate toggle).
+          Sits after AddServer in the right cluster; see Settings.tsx. */}
+      <Settings />
       {/* P3 NEXT hero button (moved from the deleted bottom statusbar). The
           attention-loop trigger: visible only when the active workspace has a
           needs-you pane (needsYouCount() > 0), pulses to draw the eye, and on

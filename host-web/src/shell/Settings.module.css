@@ -1,0 +1,126 @@
+/* Settings popover (tabstrip gear). Mirrors AddServer.module.css's visual
+ * language (tokens, sizes, popover chrome) so the two tabstrip popovers read
+ * as siblings. GPU-cheap only: plain bg/border/shadow — no mask-image,
+ * backdrop-filter, or contain:paint (AGENTS.md Firefox/WebRender rules). */
+.wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+/* Icon-only gear trigger (26px square — same footprint as the ws-add "+").
+ * aria-label carries the name; no text to crowd the tab row at any width. */
+.trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.triggerIcon {
+  font-size: 14px;
+  line-height: 1;
+}
+.trigger:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+/* Anchored dropdown — same geometry as the AddServer popover (absolute,
+ * top:30px right:0 under the 36px tabstrip, z-50 above the workspace grid).
+ * The tabstrip keeps overflow:visible precisely so this can drop down. */
+.popover {
+  position: absolute;
+  top: 30px;
+  right: 0;
+  z-index: 50;
+  width: 280px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.heading {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--fg);
+}
+.menu {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+/* One menu entry: full-width text button (label + one-line description),
+ * left-aligned so the description reads as a caption, not a button caption.
+ * Native <button> semantics give free Enter/Space activation + focus. */
+.item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.3;
+  text-align: left;
+  cursor: pointer;
+}
+.item:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.itemText {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.itemLabel {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.itemDesc {
+  font-size: 10px;
+  color: var(--fg-dim);
+  line-height: 1.35;
+}
+/* Checkbox affordance for toggle items (menuitemcheckbox). A bordered square
+ * with a ✓ when on — same accent treatment as the AddServer outcome line. */
+.itemCheck {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--accent);
+  font-size: 11px;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+.itemCheckMark {
+  font-size: 11px;
+  font-weight: 700;
+}

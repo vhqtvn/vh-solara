@@ -127,6 +127,20 @@
   align-items: center;
   gap: 6px;
   min-width: 0;
+  /* Click-to-prefill affordance: the row fills the form above with its
+   * {url,label}. Plain bg/border hover only (GPU-cheap). Padding + negative
+   * margin keep the row's visual footprint identical to the old plain row. */
+  padding: 3px 4px;
+  margin: -3px -4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.catalogRow:hover {
+  background: var(--bg-soft);
+}
+.catalogRow:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 .catalogLabel {
   font-size: 12px;

@@ -89,6 +89,20 @@ export function AddServer() {
     }
   };
 
+  // Catalog row click → prefill the form with that row's {url,label} (the
+  // operator's minimum: "at least it must auto fill the url"). Clears any
+  // error/outcome so the form reads clean, then focuses + select-all's the
+  // URL input for quick editing (change a port/path and re-add).
+  let urlInputEl: HTMLInputElement | undefined;
+  const prefill = (srv: { url: string; label: string }) => {
+    setUrl(srv.url);
+    setLabel(srv.label);
+    setError("");
+    setOutcome(null);
+    urlInputEl?.focus();
+    urlInputEl?.select();
+  };
+
   return (
     <div class={s.wrap}>
       <button
@@ -109,6 +123,7 @@ export function AddServer() {
             <label class={s.field}>
               <span class={s.fieldLabel}>Server URL</span>
               <input
+                ref={urlInputEl}
                 class={s.input}
                 type="text"
                 placeholder="https://srv.example.com"
@@ -157,7 +172,30 @@ export function AddServer() {
             <div class={s.catalog} data-testid="server-catalog">
               <For each={runtimeServers()}>
                 {(srv) => (
-                  <div class={s.catalogRow}>
+                  <div
+                    class={s.catalogRow}
+                    // Click-to-prefill: the row is a button-like affordance
+                    // (pointer + keyboard) that fills the form above with this
+                    // server's {url,label}. The nested × stops propagation so
+                    // removing never prefills.
+                    role="button"
+                    tabindex="0"
+                    data-testid="server-row"
+                    data-url={srv.url}
+                    aria-label={`Use ${srv.label}`}
+                    title={`Fill the form with ${srv.label}`}
+                    onClick={() => prefill(srv)}
+                    onKeyDown={(e) => {
+                      // Only activate when the ROW itself is focused — the
+                      // nested × button handles its own Enter/Space (its click
+                      // stops propagation below).
+                      if (e.target !== e.currentTarget) return;
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        prefill(srv);
+                      }
+                    }}
+                  >
                     <span class={s.catalogLabel} title={srv.url}>
                       {srv.label}
                     </span>
@@ -169,7 +207,12 @@ export function AddServer() {
                       aria-label={`Remove ${srv.label}`}
                       data-testid="remove-server"
                       data-url={srv.url}
-                      onClick={() => remove(srv.url)}
+                      // stopPropagation so a remove tap does NOT also prefill
+                      // the form from the row it lives in.
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        remove(srv.url);
+                      }}
                     >
                       ✕
                     </button>
