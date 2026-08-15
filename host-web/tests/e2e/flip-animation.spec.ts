@@ -43,6 +43,11 @@ import * as H from "./util";
  *      engines can paint a blank — often white — frame inside a resizing
  *      iframe before the embedded document repaints; dark-on-dark makes it
  *      nearly invisible).
+ *   8. BASELINE-FRESHNESS — a SILENT container resize (viewport/URL-bar —
+ *      dockview commits overlay geometry without firing onDidLayoutChange)
+ *      must not arm a stale baseline: the next layout EVENT (route change /
+ *      activation) animates NOTHING and panes never grow back to the
+ *      pre-resize size (the on-device "random weird animation" regression).
  *
  * Chromium only (the interaction spec's convention; Firefox/WebKit survival is
  * covered by survival.spec.ts). Serial with the rest of the suite
@@ -475,6 +480,115 @@ test.describe("FLIP layout animation (deferred reflow)", () => {
 
     await H.assertSurvived(page, a, ba, "swap pane A across animated swap");
     await H.assertSurvived(page, b, bb, "swap pane B across animated swap");
+  });
+
+  test("BASELINE-FRESHNESS: a silent container resize (viewport/URL-bar shrink) followed by a layout EVENT (route change) animates nothing — panes never grow back to the stale pre-resize size", async ({ page }) => {
+    // ROOT-CAUSE REGRESSION (the "random weird animation" report): Dockview
+    // commits container-driven overlay resizes (window resize, mobile
+    // URL-bar collapse/expand, keyboard shrink) WITHOUT firing
+    // onDidLayoutChange — only the pixel geometry changes, not the gridview
+    // model. The FLIP baseline (lastRects, updated only inside the handler)
+    // therefore goes STALE. The next layout EVENT (panel activation and
+    // add/remove both fire it — upstream BaseGrid wires
+    // Event.any(onDidAdd, onDidRemove, onDidActiveChange) into the buffered
+    // onDidLayoutChange; a route change or a tap inside a pane is enough)
+    // would early-pin panes at the pre-resize size: the pane child AND its
+    // iframe visibly resize UP to the stale size (a real iframe reflow),
+    // then morph back down — the reported bogus animation. "Random" because
+    // it needs a silent persistent resize since the last genuine layout
+    // event (URL-bar state change), which the operator cannot see.
+    //
+    // The fix: a ResizeObserver on the container marks the baseline suspect
+    // and re-seeds it after dockview's overlay-rewrite rAFs commit; while
+    // suspect, no pin is taken and no animation runs off the stale baseline.
+    // This test reproduces the exact on-device sequence headlessly.
+    await H.waitForLayoutSettled(page);
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await H.waitForLayoutSettled(page);
+    await assertNoResidual(page);
+
+    // The TALL pane (its height tracks the viewport; the wide pane's width
+    // does not change on a height-only shrink).
+    const pre = await page.evaluate(() => {
+      const panes = [...document.querySelectorAll<HTMLElement>(".dv-render-overlay .pane")];
+      const tall = panes.sort((a, b) => b.offsetHeight - a.offsetHeight)[0];
+      const ov = tall.closest<HTMLElement>(".dv-render-overlay")!;
+      const iframe = tall.querySelector<HTMLIFrameElement>("iframe")!;
+      return {
+        id: tall.dataset.paneId!,
+        overlayH: ov.getBoundingClientRect().height,
+        iframeH: iframe.offsetHeight,
+      };
+    });
+    expect(pre.overlayH, "precondition: tall pane occupies real height").toBeGreaterThan(300);
+
+    // SILENT resize: shrink the viewport 60px (the URL-bar-expand analog).
+    // Wait PAST the ~150ms commit propagation so the overlays hold the NEW
+    // size while (pre-fix) lastRects still records the OLD one.
+    await page.setViewportSize({ width: 1280, height: 660 });
+    await page.waitForTimeout(400);
+
+    // The resize itself was committed WITHOUT any FLIP involvement: the
+    // iframe already sits at the NEW (smaller) height, with no residual
+    // styles from any animation.
+    const postResize = await page.evaluate((id) => {
+      const pane = document.querySelector<HTMLElement>(`.pane[data-pane-id="${id}"]`)!;
+      const ov = pane.closest<HTMLElement>(".dv-render-overlay")!;
+      const iframe = pane.querySelector<HTMLIFrameElement>("iframe")!;
+      return { overlayH: ov.getBoundingClientRect().height, iframeH: iframe.offsetHeight };
+    }, pre.id);
+    expect(
+      postResize.overlayH,
+      "viewport shrink committed: overlay height dropped ~60px",
+    ).toBeLessThan(pre.overlayH - 30);
+    expect(
+      Math.abs(postResize.iframeH - postResize.overlayH),
+      "post-resize: iframe already at the NEW natural height (no pin held)",
+    ).toBeLessThanOrEqual(2);
+    await assertNoResidual(page);
+
+    // Now the reported operator action on the stale-baseline window: a
+    // route change (selectTarget round-trip — fires the buffered
+    // onDidLayoutChange via panel activation). Sample in-browser through
+    // the whole window: NO transition may start, and the tall pane's
+    // iframe must NEVER grow back toward the stale (pre-resize) height.
+    const sampling = page.evaluate(async () => {
+      let max = 0;
+      let maxIframeH: number | null = null;
+      const deadline = performance.now() + 400;
+      while (performance.now() < deadline) {
+        let n = 0;
+        for (const el of document.querySelectorAll(".dv-render-overlay, .dv-render-overlay .pane")) {
+          n += el.getAnimations().length;
+        }
+        if (n > max) max = n;
+        const panes = [...document.querySelectorAll<HTMLElement>(".dv-render-overlay .pane")];
+        const tall = panes.sort((a, b) => b.offsetHeight - a.offsetHeight)[0];
+        if (tall) {
+          const h = tall.querySelector("iframe")!.offsetHeight;
+          if (maxIframeH === null || h > maxIframeH) maxIframeH = h;
+        }
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      return { max, maxIframeH };
+    });
+    await H.selectTarget(page, pre.id, "/repo/x", "sess-1");
+    const anim = await sampling;
+
+    expect(anim.max, "no FLIP transition after route change on a resized baseline").toBe(0);
+    expect(
+      anim.maxIframeH!,
+      "iframe never grew back toward the stale pre-resize height",
+    ).toBeLessThanOrEqual(postResize.iframeH + 1);
+
+    // Final state: clean, still at the post-resize geometry.
+    await assertNoResidual(page);
+    const end = await paneGeometry(page, pre.id);
+    expect(
+      Math.abs(end.iframe.h - postResize.overlayH),
+      "settled iframe stays at the post-resize height",
+    ).toBeLessThanOrEqual(2);
   });
 
   test("DARK-BACKGROUNDS: .pane, .pane-body, and the iframe element compute a dark opaque background-color (settle blank-frame guard)", async ({ page }) => {

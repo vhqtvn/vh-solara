@@ -136,6 +136,33 @@ import type { DockviewApi } from "dockview-core";
  *   - New panels (first appearance): no recorded rect → no animation.
  *   - Trivial moves (< 1px) / zero-size (trayed/off-screen) overlays.
  *
+ * BASELINE-FRESHNESS (viewport resizes — the "random weird animation" fix):
+ *   Dockview commits container-driven overlay resizes (window resize, mobile
+ *   URL-bar collapse/expand, keyboard root-shrink) WITHOUT firing
+ *   onDidLayoutChange — the gridview MODEL does not change, only pixel
+ *   geometry. `lastRects` (updated only inside the handler) would go STALE;
+ *   the next layout EVENT would then early-pin panes at the pre-resize size
+ *   (pane child AND iframe visibly resize UP — a real iframe reflow — then
+ *   morph back down). Note that layout events fire for far more than
+ *   geometry: upstream BaseGrid wires Event.any(onDidAdd, onDidRemove,
+ *   onDidActiveChange) into the buffered onDidLayoutChange, so a mere
+ *   CROSS-GROUP panel activation (any tap that focuses a pane, a route
+ *   change) is enough to detonate a stale baseline. A ResizeObserver on the
+ *   container therefore marks the baseline suspect (`resizeDirty`) and
+ *   re-seeds it after dockview's overlay-rewrite rAFs have committed
+ *   (2 chained rAFs — dockview's RO fires first, its geometry rAFs land on
+ *   the next frame). While dirty: the microtask takes NO early pin, and the
+ *   handler re-seeds + returns — never animate off a suspect baseline.
+ *   Hard-cancelling a mid-flight op on resize is accepted: a system-driven
+ *   viewport change is abrupt by nature (jump, no morph).
+ *
+ * REMOVED-PANEL GHOSTS: a panel closed mid-flight is absent from
+ *   currentPanes() (overlay already detached/disposed), so no per-pane path
+ *   settles it — it would ride inFlight/held until the ~210ms fallback and
+ *   keep the chase loop reading rects for a dead pane every frame. The
+ *   handler settles any pinned/inverted/playing pane whose panel is gone the
+ *   moment it first misses the enumeration.
+ *
  * TUNABLE: FLIP_DURATION_MS is the on-device dial-in default. Larger (~0.2s)
  * reads smoother; smaller (~0.1s) is snappier. ease-out keeps the start fast
  * so the pane feels responsive.
@@ -151,8 +178,6 @@ export function installFlipAnimation(
   const MIN_DELTA_PX = 1;
   // Slack over FLIP_DURATION_MS for the transitionend-missed fallback clear.
   const FALLBACK_SLACK_MS = 60;
-  // Relative scale change below which we treat the size as unchanged.
-  const MIN_SCALE_DELTA = 0.01;
   // Hard cap on the hold-until-stable chase (frames). A pathological
   // geometry thrash degenerates into "no animation" rather than an endless
   // chase; the fallback timer clears held styles well before this anyway.
@@ -196,6 +221,12 @@ export function installFlipAnimation(
   let rafHandle: number | undefined;
   // Chase budget: frames remaining of the current hold-until-stable run.
   let chaseFramesLeft = 0;
+  // BASELINE-FRESHNESS: the container resized since the last handled frame
+  // (dockview commits viewport-driven overlay geometry WITHOUT firing
+  // onDidLayoutChange) — lastRects is suspect until re-seeded.
+  let resizeDirty = false;
+  // Pending rAF handles of the resize re-seed chain (2 chained frames).
+  const resizeRafs: number[] = [];
 
   const prefersReducedMotion = (): boolean =>
     typeof window !== "undefined" &&
@@ -272,13 +303,29 @@ export function installFlipAnimation(
     targets.delete(pane);
   }
 
+  /** REMOVED-PANEL cleanup: settle every tracked pane whose element is NOT in
+   *  the live enumeration — its panel was closed/disposed mid-flight, so no
+   *  per-pane path will ever settle it (it would ride until the ~210ms
+   *  fallback and keep the chase reading rects for a dead pane). */
+  function settleGhosts(live: Set<HTMLElement>): void {
+    const tracked = [...inFlight, ...held, ...pins.keys()];
+    for (const pane of tracked) if (!live.has(pane)) settlePane(pane);
+  }
+
   /** Refresh the baseline (FIRST rects) without animating. Used at install
-   *  time, under prefers-reduced-motion, and once on drag-end so the next
-   *  discrete op animates from the post-drag position. Also hard-cancels any
-   *  stale in-flight pin (defensive; normally already settled). */
+   *  time, under prefers-reduced-motion, once on drag-end (so the next
+   *  discrete op animates from the post-drag position), and after a
+   *  container resize (BASELINE-FRESHNESS — dockview commits viewport-driven
+   *  overlay geometry without firing onDidLayoutChange). Also hard-cancels
+   *  any in-flight pin (a system-driven resize jumps; no morph) and settles
+   *  removed-panel ghosts. */
   function refreshBaseline(): void {
+    resizeDirty = false;
     chaseFramesLeft = 0;
     const panes = currentPanes();
+    const live = new Set<HTMLElement>();
+    for (const [, { pane }] of panes) live.add(pane);
+    settleGhosts(live);
     for (const [, { pane }] of panes) hardCancelPane(pane);
     // One reflow commits the cancel; then restore transition to "" (there is
     // no pending property change, so nothing animates and no residual
@@ -344,6 +391,16 @@ export function installFlipAnimation(
   }
 
   function handleLayoutChange(): void {
+    // BASELINE-FRESHNESS: the container resized since the last handled frame
+    // (dockview commits viewport-driven overlay resizes — window/URL-bar/
+    // keyboard — without firing onDidLayoutChange). Never pin / invert off a
+    // suspect baseline: re-seed it (which also hard-cancels any in-flight op
+    // — a system-driven viewport change jumps, no morph) and return. The next
+    // event animates from the FRESH baseline.
+    if (resizeDirty) {
+      refreshBaseline();
+      return;
+    }
     // CONTINUOUS drag: skip entirely (no reflow per pointermove frame). Flag so
     // the drag-end pointerup refreshes the baseline once.
     if (container.classList.contains("dv-geometry-dragging")) {
@@ -371,6 +428,14 @@ export function installFlipAnimation(
     }
 
     const panes = currentPanes();
+
+    // REMOVED-PANEL GHOSTS: settle tracked panes whose panel is gone (their
+    // per-pane paths below never run for them — the chase would burn frames
+    // on dead rects until the ~210ms fallback).
+    const live = new Set<HTMLElement>();
+    for (const [, { pane }] of panes) live.add(pane);
+    settleGhosts(live);
+
     if (panes.size === 0) return;
 
     // ---- PIN (before any layout read of the new geometry) ----------------
@@ -507,11 +572,14 @@ export function installFlipAnimation(
     // no-op — it already fills — yet it guarantees the iframe never lays out
     // at the new size before the handler's pin, regardless of rAF
     // scheduling/order. Skip cases must NOT pin (they jump instead): a
-    // continuous drag resizes per pointermove, and reduced-motion jumps
-    // directly. (If the skip state appears only LATER — a drag starts before
-    // the rAF runs — handleLayoutChange's drag branch releases the early
-    // pin, and refreshBaseline hard-cancels any pin it finds.)
+    // continuous drag resizes per pointermove, reduced-motion jumps
+    // directly, and a pending baseline re-seed (BASELINE-FRESHNESS — the
+    // container resized) must not pin at the STALE pre-resize size. (If the
+    // skip state appears only LATER — a drag starts before the rAF runs —
+    // handleLayoutChange's drag branch releases the early pin, and
+    // refreshBaseline hard-cancels any pin it finds.)
     if (
+      !resizeDirty &&
       !container.classList.contains("dv-geometry-dragging") &&
       !prefersReducedMotion()
     ) {
@@ -528,6 +596,33 @@ export function installFlipAnimation(
 
   const layoutDisp = api.onDidLayoutChange(onLayoutChange);
 
+  // BASELINE-FRESHNESS: dockview commits container-driven overlay resizes
+  // (window/URL-bar/keyboard) WITHOUT firing onDidLayoutChange — lastRects
+  // would go stale and the next layout EVENT (a mere panel activation or
+  // route change fires it) would pin panes at the pre-resize size and morph
+  // them: the reported "random weird animation". Watch the container; on
+  // resize, mark the baseline suspect and re-seed it after dockview's
+  // overlay-rewrite rAFs have committed. Dockview's own RO on the same
+  // element was registered first (mount-time), so its callback runs first;
+  // its geometry writes are rAF-chained — 2 chained rAFs from OUR callback
+  // land safely past them. While dirty, no early pin is taken and the
+  // handler re-seeds + returns (never animate off a suspect baseline).
+  const resizeObserver = new ResizeObserver(() => {
+    resizeDirty = true;
+    if (resizeRafs.length > 0) return; // a re-seed chain is already pending
+    resizeRafs.push(
+      requestAnimationFrame(() => {
+        resizeRafs.push(
+          requestAnimationFrame(() => {
+            resizeRafs.length = 0; // chain complete — a new one may start
+            refreshBaseline();
+          }),
+        );
+      }),
+    );
+  });
+  resizeObserver.observe(container);
+
   // Seed the baseline so the FIRST user-driven layout change has a valid
   // FIRST. The synchronous read runs before dockview's rAF-positioned
   // geometry commit (overlays still fill the whole container), so re-seed
@@ -540,6 +635,9 @@ export function installFlipAnimation(
 
   return () => {
     layoutDisp.dispose();
+    resizeObserver.disconnect();
+    for (const h of resizeRafs) cancelAnimationFrame(h);
+    resizeRafs.length = 0;
     if (rafHandle !== undefined) cancelAnimationFrame(rafHandle);
     container.removeEventListener("transitionend", onTransitionEnd);
     window.removeEventListener("pointerup", onDragEnd, true);
