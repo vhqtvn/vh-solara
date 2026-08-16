@@ -173,7 +173,7 @@ test.describe("layout persistence", () => {
     const ws2 = await H.addWorkspace(page);
     expect(ws2, "ws2 created").toBeTruthy();
     await expect.poll(async () => H.activeWorkspace(page)).toBe(ws2);
-    const ws2Url = serverUrl("ws-persist");
+    const ws2Url = H.serverUrl("ws-persist");
     const ws2Pane = await H.addServer(page, ws2Url, "ws-persist");
     expect(ws2Pane, "server pane opened in ws2").toBeTruthy();
     const ws2PanesBefore = await H.panes(page);
@@ -214,11 +214,4 @@ test.describe("layout persistence", () => {
     }
   });
 });
-
-/** Build a mock-content server url (matches server-mgmt's helper). */
-function serverUrl(server: string): string {
-  const MOCK_ORIGIN = "http://127.0.0.1:5174";
-  const q = new URLSearchParams({ server, view: "chat" });
-  return `${MOCK_ORIGIN}/?${q.toString()}`;
-}
 

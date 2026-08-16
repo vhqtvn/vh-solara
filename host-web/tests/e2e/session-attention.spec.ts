@@ -31,7 +31,6 @@ import * as H from "./util";
 // spec adds the complementary guarantee: a status message is survival-SAFE.
 // =============================================================================
 
-const MOCK_ORIGIN = "http://127.0.0.1:5174"; // mock content origin (:5174)
 // A wrong origin used to prove the status branch's constraint-#3 origin check.
 // NOT the seeded panes' configured origin (:5174), so a status from here must be
 // rejected even though its source binds to a known pane.
@@ -53,7 +52,7 @@ test.describe("P1 session-attention", () => {
 
     const r = await H.probeStatus(page, {
       sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: {
         type: "status",
         dir: "/proj",
@@ -85,7 +84,7 @@ test.describe("P1 session-attention", () => {
     // status reuses it verbatim.) The host never stores an arbitrary string.
     const malformed = await H.probeStatus(page, {
       sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "", title: "", attention: "bogus", activity: "also-bogus" },
     });
     expect(malformed.accepted, "out-of-vocabulary status rejected").toBe(false);
@@ -102,7 +101,7 @@ test.describe("P1 session-attention", () => {
     // liveness). needs_permission → a visible "!" badge + needs-you count.
     await H.probeStatus(page, {
       sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "/proj", session: "s1", title: "Baseline", attention: "needs_permission", activity: "running" },
     });
     const baseline = await H.status(page, pane);
@@ -158,7 +157,7 @@ test.describe("P1 session-attention", () => {
 
     await H.probeStatus(page, {
       sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "s1", title: "T", attention: "needs_permission", activity: "running" },
     });
 
@@ -176,7 +175,7 @@ test.describe("P1 session-attention", () => {
 
     await H.probeStatus(page, {
       sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "s1", title: "", attention: "needs_permission", activity: "running" },
     });
 
@@ -191,7 +190,7 @@ test.describe("P1 session-attention", () => {
     const huge = "x".repeat(5000);
     await H.probeStatus(page, {
       sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "s1", title: huge, attention: "none", activity: "idle" },
     });
     const st = await H.status(page, pane);

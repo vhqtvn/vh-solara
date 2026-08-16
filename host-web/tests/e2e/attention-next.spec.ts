@@ -29,8 +29,6 @@ import * as H from "./util";
 // unchanged).
 // =============================================================================
 
-const MOCK_ORIGIN = "http://127.0.0.1:5174"; // mock content origin (:5174)
-
 test.describe("P3 attention loop + NEXT hero button", () => {
   test.beforeEach(async ({ page }) => {
     await H.loadHost(page);
@@ -53,12 +51,12 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     // a needs permission (running), b needs reply (idle).
     await H.probeStatus(page, {
       sourcePaneId: a,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "a", title: "A", attention: "needs_permission", activity: "running" },
     });
     await H.probeStatus(page, {
       sourcePaneId: b,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "b", title: "B", attention: "needs_reply", activity: "idle" },
     });
 
@@ -80,7 +78,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
 
     await H.probeStatus(page, {
       sourcePaneId: needy,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "a", title: "A", attention: "needs_permission", activity: "idle" },
     });
     // Focus the OTHER pane first so the needy one is not already focused.
@@ -109,13 +107,13 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     // must still win because attention rank dominates the tiebreak.
     await H.probeStatus(page, {
       sourcePaneId: reply,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "r", title: "R", attention: "needs_reply", activity: "idle" },
     });
     await page.waitForTimeout(15);
     await H.probeStatus(page, {
       sourcePaneId: perm,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "p", title: "P", attention: "needs_permission", activity: "idle" },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(2);
@@ -132,13 +130,13 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     // Both needs_reply; older latched first via a real delay between probes.
     await H.probeStatus(page, {
       sourcePaneId: older,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "o", title: "O", attention: "needs_reply", activity: "idle" },
     });
     await page.waitForTimeout(20);
     await H.probeStatus(page, {
       sourcePaneId: newer,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "n", title: "N", attention: "needs_reply", activity: "idle" },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(2);
@@ -164,7 +162,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
 
     await H.probeStatus(page, {
       sourcePaneId: needy,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "a", title: "A", attention: "needs_permission", activity: "idle" },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);
@@ -209,7 +207,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     // Make the ws2 pane HIGH-priority needy (needs_permission).
     await H.probeStatus(page, {
       sourcePaneId: ws2Pane!,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "w2", title: "W2", attention: "needs_permission", activity: "idle" },
     });
 
@@ -221,7 +219,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     const ws1Pane = ws1Panes[0];
     await H.probeStatus(page, {
       sourcePaneId: ws1Pane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "w1", title: "W1", attention: "needs_reply", activity: "idle" },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);
@@ -254,7 +252,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await expect.poll(async () => H.focused(page)).toBe(focusedPane);
     await H.probeStatus(page, {
       sourcePaneId: needyPane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "n", title: "N", attention: "needs_permission", activity: "idle" },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);
@@ -294,7 +292,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.focusPane(page, focusedPane);
     await H.probeStatus(page, {
       sourcePaneId: needyPane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "n", title: "N", attention: "needs_permission", activity: "idle" },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);
@@ -335,7 +333,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await expect.poll(async () => H.focused(page)).toBe(pane);
     await H.probeStatus(page, {
       sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "s", title: "S", attention: "needs_permission", activity: "idle" },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);
@@ -394,7 +392,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     // GLOBAL (source-bound), so it lands regardless of the active workspace.
     await H.probeStatus(page, {
       sourcePaneId: ws2Needy!,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "w2", title: "W2", attention: "needs_permission", activity: "idle" },
     });
 
@@ -410,7 +408,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     const ws1Pane = ws1Panes[0];
     await H.probeStatus(page, {
       sourcePaneId: ws1Pane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "w1", title: "W1", attention: "needs_reply", activity: "idle" },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);
@@ -482,7 +480,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     // Make the ws2 pane HIGH-priority needy (needs_permission). Status is GLOBAL.
     await H.probeStatus(page, {
       sourcePaneId: ws2Pane!,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "w2", title: "W2", attention: "needs_permission", activity: "idle" },
     });
 
@@ -496,7 +494,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await expect.poll(async () => H.focused(page)).toBe(ws1Focused);
     await H.probeStatus(page, {
       sourcePaneId: ws1Focused,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "w1", title: "W1", attention: "needs_reply", activity: "idle" },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);

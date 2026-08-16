@@ -15,10 +15,6 @@ import * as H from "./util";
  * calls loadHost in beforeEach for a fresh page + the seeded default workspace.
  */
 
-// The mock content page origin. Status probes are source-bound to a real pane's
-// contentWindow, so the origin must match the pane's configured origin.
-const MOCK_ORIGIN = "http://127.0.0.1:5174";
-
 const REPO_ROOT = path.resolve(process.cwd(), "..");
 const VISION_DIR = path.join(REPO_ROOT, "tmp/host-web-playwright/vision/i3");
 
@@ -161,7 +157,7 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     const pane0 = ids[0];
     await H.probeStatus(page, {
       sourcePaneId: pane0,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: {
         type: "status",
         dir: "/proj",

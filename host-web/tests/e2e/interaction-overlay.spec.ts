@@ -44,7 +44,6 @@ test.beforeAll(() => {
   fs.mkdirSync(VISION_DIR, { recursive: true });
 });
 
-const MOCK_ORIGIN = "http://127.0.0.1:5174"; // mock content origin (:5174)
 const WRONG_ORIGIN = "http://127.0.0.1:9999";
 
 test.describe("layout overlay interaction model", () => {
@@ -61,7 +60,7 @@ test.describe("layout overlay interaction model", () => {
 
     const r = await H.probePaneMessage(page, {
       sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "host-gesture", gesture: "layout-overlay-request" },
     });
     expect(r.accepted, "valid host-gesture accepted").toBe(true);
@@ -83,7 +82,7 @@ test.describe("layout overlay interaction model", () => {
     const pane = ids[0];
     const r = await H.probePaneMessage(page, {
       sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       // A poison paneId + dir must cause rejection — the host accepts ONLY
       // {type, gesture}. The host never trusts a sender-claimed id (and here it
       // rejects the whole message before any action).
@@ -99,7 +98,7 @@ test.describe("layout overlay interaction model", () => {
     const pane = ids[0];
     const r = await H.probePaneMessage(page, {
       sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "host-gesture", gesture: "something-else" },
     });
     expect(r.accepted, "bad gesture rejected").toBe(false);
@@ -112,7 +111,7 @@ test.describe("layout overlay interaction model", () => {
     const pane = ids[0];
     const r = await H.probePaneMessage(page, {
       sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "host-gesture-typo", gesture: "layout-overlay-request" },
     });
     expect(r.accepted, "bad type rejected").toBe(false);
@@ -124,7 +123,7 @@ test.describe("layout overlay interaction model", () => {
     // router treats it as an unknown source (rejected:unknown-source).
     const r = await H.probePaneMessage(page, {
       sourcePaneId: "nonexistent-pane",
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "host-gesture", gesture: "layout-overlay-request" },
     });
     expect(r.accepted, "unknown source rejected").toBe(false);
@@ -155,7 +154,7 @@ test.describe("layout overlay interaction model", () => {
     // source-binding for the clean payload.)
     await H.probePaneMessage(page, {
       sourcePaneId: source,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "host-gesture", gesture: "layout-overlay-request" },
     });
     await expect.poll(async () => H.overlaySource(page)).toBe(source);
@@ -370,7 +369,7 @@ test.describe("layout overlay interaction model", () => {
     // appears, then open the overlay + assert NEXT is still present + clickable.
     await H.probeStatus(page, {
       sourcePaneId: ids[1],
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "/p", session: "s1", title: "T", attention: "needs_permission", activity: "running" },
     });
     await expect.poll(async () => H.needsYou(page), { timeout: 8000 }).toBe(1);
@@ -419,7 +418,7 @@ test.describe("layout overlay interaction model", () => {
     // the SPA's hostGesture.ts uses).
     const r = await H.probePaneMessage(page, {
       sourcePaneId: target,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "host-gesture", gesture: "pane-activate" },
     });
     expect(r.accepted, "pane-activate accepted").toBe(true);
@@ -449,7 +448,7 @@ test.describe("layout overlay interaction model", () => {
     // First activate from the active pane — accepted, no thrash.
     const r1 = await H.probePaneMessage(page, {
       sourcePaneId: target,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "host-gesture", gesture: "pane-activate" },
     });
     expect(r1.accepted, "activate on active pane accepted").toBe(true);
@@ -458,7 +457,7 @@ test.describe("layout overlay interaction model", () => {
     // Second activate from the same pane — still accepted, focus unchanged.
     const r2 = await H.probePaneMessage(page, {
       sourcePaneId: target,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "host-gesture", gesture: "pane-activate" },
     });
     expect(r2.accepted, "repeat activate accepted").toBe(true);
@@ -477,7 +476,7 @@ test.describe("layout overlay interaction model", () => {
     // overlay's source).
     await H.probePaneMessage(page, {
       sourcePaneId: activator,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "host-gesture", gesture: "pane-activate" },
     });
     await expect.poll(async () => H.overlaySource(page)).toBeNull();
@@ -494,7 +493,7 @@ test.describe("layout overlay interaction model", () => {
     // Activate the SAME pane the overlay is open for → no-op on the overlay.
     await H.probePaneMessage(page, {
       sourcePaneId: overlayPane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "host-gesture", gesture: "pane-activate" },
     });
     await expect.poll(async () => H.overlaySource(page)).toBe(overlayPane);
@@ -507,7 +506,7 @@ test.describe("layout overlay interaction model", () => {
     await H.focusPane(page, ids[0]);
     const r = await H.probePaneMessage(page, {
       sourcePaneId: target,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       // A poison paneId must cause rejection — the host accepts ONLY
       // {type, gesture}. The host never trusts a sender-claimed id.
       payload: { type: "host-gesture", gesture: "pane-activate", paneId: "evil" },

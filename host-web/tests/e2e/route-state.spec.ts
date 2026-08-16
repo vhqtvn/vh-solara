@@ -32,8 +32,6 @@ import * as H from "./util";
 // Runs on Chromium + Firefox + WebKit (playwright.config.ts projects).
 // =============================================================================
 
-const MOCK_ORIGIN = "http://127.0.0.1:5174"; // mock content origin (:5174)
-
 // ---- Fork 2: route survives reload ----------------------------------------
 
 test("route change is captured + restored on reload (deep-link in iframe src)", async ({
@@ -48,7 +46,7 @@ test("route change is captured + restored on reload (deep-link in iframe src)", 
   const route = "?dir=/test-project&session=42";
   const r = await H.probePaneMessage(page, {
     sourcePaneId: pane,
-    origin: MOCK_ORIGIN,
+    origin: H.MOCK_ORIGIN,
     payload: { type: "route", route },
   });
   expect(r.accepted, "route message accepted (source-bound)").toBe(true);
@@ -115,7 +113,7 @@ test("two tabs at / stay independent (per-tab URL hash, not shared localStorage)
     const aPane = (await H.panes(pageA))[0];
     await H.probePaneMessage(pageA, {
       sourcePaneId: aPane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "route", route: "?dir=/tab-A" },
     });
     await H.waitForHashContent(pageA, "dir=/tab-A");
@@ -127,7 +125,7 @@ test("two tabs at / stay independent (per-tab URL hash, not shared localStorage)
     const bPane = (await H.panes(pageB))[0];
     await H.probePaneMessage(pageB, {
       sourcePaneId: bPane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "route", route: "?dir=/tab-B" },
     });
     await H.waitForHashContent(pageB, "dir=/tab-B");
@@ -137,7 +135,7 @@ test("two tabs at / stay independent (per-tab URL hash, not shared localStorage)
     // localStorage now holds dir=/tab-A2 (A just wrote it).
     await H.probePaneMessage(pageA, {
       sourcePaneId: aPane,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "route", route: "?dir=/tab-A2" },
     });
     await H.waitForHashContent(pageA, "dir=/tab-A2");
@@ -188,7 +186,7 @@ test("route change does NOT reload the iframe (identity preserved)", async ({
   // updateParameters (survival-safe — no src change, no renderer update).
   await H.probePaneMessage(page, {
     sourcePaneId: pane,
-    origin: MOCK_ORIGIN,
+    origin: H.MOCK_ORIGIN,
     payload: { type: "route", route: "?dir=/survival-test&session=7" },
   });
 

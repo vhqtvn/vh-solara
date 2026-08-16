@@ -16,14 +16,6 @@ import * as H from "./util";
 // Runs on Chromium AND Firefox (see playwright.config.ts projects).
 // =============================================================================
 
-// The mock content page origin (served on :5174). Used to add a heartbeating
-// server pane in the workspace-switch crux so its identity can be tracked.
-const MOCK_ORIGIN = "http://127.0.0.1:5174";
-function serverUrl(server: string): string {
-  const q = new URLSearchParams({ server, view: "chat" });
-  return `${MOCK_ORIGIN}/?${q.toString()}`;
-}
-
 test.describe("iframe-survival regression gate", () => {
   test.beforeEach(async ({ page }) => {
     await H.loadHost(page);
@@ -165,7 +157,7 @@ test.describe("iframe-survival regression gate", () => {
     expect(await H.panes(page), "ws2 is empty initially").toEqual([]);
 
     // Add server B in workspace 2. It opens a pane + heartbeats.
-    const bUrl = serverUrl("ws-switch-b");
+    const bUrl = H.serverUrl("ws-switch-b");
     const b = await H.addServer(page, bUrl, "ws-switch-b");
     expect(b, "server B pane opened in ws2").toBeTruthy();
     const beforeB = await H.waitForReady(page, b!);

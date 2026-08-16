@@ -17,8 +17,6 @@ import * as H from "./util";
 // overlay; their detailed coverage lives in i3.spec.ts + interaction-overlay.
 // spec.ts. The top tabstrip is the WORKSPACE tabstrip (ws-tab/ws-add present).
 
-const MOCK_ORIGIN = "http://127.0.0.1:5174"; // mock content origin (:5174)
-
 test.describe("host shell UI wiring", () => {
   test.beforeEach(async ({ page }) => {
     await H.loadHost(page);
@@ -58,7 +56,7 @@ test.describe("host shell UI wiring", () => {
     await expect.poll(async () => H.focused(page)).toBe(other);
     await H.probeStatus(page, {
       sourcePaneId: needy,
-      origin: MOCK_ORIGIN,
+      origin: H.MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "a", title: "A", attention: "needs_permission", activity: "idle" },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);

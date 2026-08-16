@@ -38,8 +38,6 @@ test.beforeAll(() => {
   fs.mkdirSync(VISION_DIR, { recursive: true });
 });
 
-const MOCK_ORIGIN = "http://127.0.0.1:5174";
-
 test.describe("i3 host-shell Phase 1", () => {
   test.beforeEach(async ({ page }) => {
     await H.loadHost(page);
