@@ -150,6 +150,7 @@ is **no pytest** anywhere in this repo.
    prove the shell works when `window.__host` is absent. No Go, no fixtureserver.
    Runner (survival + shell; Chromium + Firefox + WebKit): `npm --prefix host-web run test:e2e`.
    Runner (production-build proof; Chromium + Firefox): `npm --prefix host-web run test:e2e:preview`.
+   Docker route (survival + shell, all three engines; no host Node/browsers needed — host needs only docker, and host-web/node_modules is auto-installed in-container if missing): operator `make test-host-web-docker` (scoped: `make test-host-web-docker ARGS='--project=webkit'`), agent `vh-agent-harness exec make test-host-web-docker`. Image pin: `PLAYWRIGHT_IMAGE` in the Makefile, coupled to the host-web `@playwright/test` pin. See [`docs/ai/docker-test-routes.md`](../docs/ai/docker-test-routes.md).
 
 8. **host-web real-embedding e2e** — `host-web/tests/real-embed-e2e/real-embed.spec.ts`
    (Playwright). The FIRST host-web lane to embed the REAL production `web/` SPA
@@ -191,6 +192,8 @@ vh-agent-harness exec npm --prefix web run typecheck
 vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && npm --prefix web run test:e2e'
 # host-web e2e (iframe survival + shell; self-bootstrapped vite dev servers):
 vh-agent-harness exec npm --prefix host-web run test:e2e
+# host-web e2e via docker (no host Node/browsers needed; full three-engine lane 7):
+vh-agent-harness exec make test-host-web-docker
 # host-web production-build shell proof (vite preview):
 vh-agent-harness exec npm --prefix host-web run test:e2e:preview
 # host-web real-embedding e2e (LANE 8: real web/ SPA + real local-server; NOT PR-blocking; full pipeline builds web→materializes→builds go→runs Playwright):

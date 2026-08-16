@@ -5,7 +5,7 @@
 # (copy) BOTH staged bundles into pkg/web/dist + pkg/web/host-dist right before
 # `go build`, so one binary carries both SPAs (`/` → host, `/app` → single-server).
 
-.PHONY: web web-materialize host-web host-web-materialize embed-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-preview test-host-web-real-embed verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed clean-host-web-embed
+.PHONY: web web-materialize host-web host-web-materialize embed-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-docker test-host-web-preview test-host-web-real-embed verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed clean-host-web-embed
 
 web: ## Build the SolidJS single-server SPA into web/dist-build (gitignored, NOT pkg/web/dist)
 	cd web && npm ci && npm run build
@@ -74,6 +74,22 @@ test-host-web-preview: ## Run host-web production-build shell proof (vite previe
 
 test-host-web-real-embed: ## Run host-web real-embedding e2e (real web/ SPA + real local-server, cross-origin host embed; LANE 8, nightly-grade, NOT PR-blocking). Full pipeline: builds web SPA, materializes into pkg/web/dist, builds the Go binary, runs Playwright. Needs go + Node >= 24 + Playwright browsers.
 	bash host-web/scripts/real-embed-run.sh
+
+# Docker-backed test routes (Phase 1: lane 7 only). See docs/ai/docker-test-routes.md.
+# Official Playwright image, pinned to the exact @playwright/test version in
+# host-web/package.json (browsers ship inside the image; PLAYWRIGHT_BROWSERS_PATH
+# is preset). Host prerequisites: docker + repo checkout. Nothing else.
+PLAYWRIGHT_IMAGE ?= mcr.microsoft.com/playwright:v1.60.0-noble
+# Run as the invoking uid/gid with a writable HOME so artifacts under tmp/ and
+# host-web/node_modules/.vite stay user-owned (never root-owned).
+PW_DOCKER = docker run --rm --init --user "$$(id -u):$$(id -g)" -e HOME=/tmp/pw-home -v "$$(pwd)":/repo -w /repo $(PLAYWRIGHT_IMAGE)
+
+test-host-web-docker: ## Run host-web Playwright e2e (LANE 7, all three engines) inside the pinned Playwright image — no host Node/browsers needed. Scope via ARGS, e.g. make test-host-web-docker ARGS='--project=webkit'. Installs host-web/node_modules in-container first if missing (fresh clone: works with docker only).
+	@if [ ! -d host-web/node_modules ]; then \
+		echo ">> host-web/node_modules missing — running npm ci inside $(PLAYWRIGHT_IMAGE)"; \
+		$(PW_DOCKER) bash -c 'mkdir -p "$$HOME" && cd host-web && npm ci'; \
+	fi
+	$(PW_DOCKER) bash -c 'mkdir -p "$$HOME" && cd host-web && npx playwright test $(ARGS)'
 
 fmt: ## Format all Go source (mirrors CI's gofmt scope)
 	gofmt -w pkg cmd main.go
