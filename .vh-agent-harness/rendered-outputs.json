@@ -50,6 +50,20 @@
       "overlay_pack": "resolve-first-pilot",
       "source_relative_path": "skills/resolve-first/references/runbook.md",
       "rendered_digest": "sha256:7eb5b91026d4e3d48846324d46f209144b3b91b510b30dfd6305bd66a36370fe"
+    },
+    {
+      "destination_path": ".opencode/skills/review-blocker-fix/SKILL.md",
+      "producer_kind": "overlay_skill",
+      "overlay_pack": "release",
+      "source_relative_path": "skills/review-blocker-fix/SKILL.md",
+      "rendered_digest": "sha256:6f8e1763328332588161c512f41806198acc10225839f0d3ce332c38ecb00969"
+    },
+    {
+      "destination_path": ".opencode/skills/web-e2e-surgery/SKILL.md",
+      "producer_kind": "overlay_skill",
+      "overlay_pack": "release",
+      "source_relative_path": "skills/web-e2e-surgery/SKILL.md",
+      "rendered_digest": "sha256:b3f74a645cd9ea5ba8ce2dcf31eaf17c310c9f39c7e26199d7e4b6aae0a0b6d5"
     }
   ]
 }
