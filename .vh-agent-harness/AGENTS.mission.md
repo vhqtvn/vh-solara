@@ -212,6 +212,33 @@ For any substantial boundary change, also update the relevant docs.
   [`docs/guides/managed-projects.md`](../docs/guides/managed-projects.md). Building the embedded
   view app itself: [`docs/guides/custom-views.md`](../docs/guides/custom-views.md).
 
+## Coordinator and build-session lifecycle discipline (harness)
+
+Advisory OWN-LOCAL protocol (2026-08-16 harness-waste briefs, Slice S1). Full
+checklist: [`docs/ai/coordinator-lifecycle.md`](../docs/ai/coordinator-lifecycle.md).
+
+- Rotate coordinator hub sessions at **task/slice boundaries** (primary
+  trigger). Turn/token thresholds (~80 turns, context-pressure warnings) are
+  backstops that force rotation only at the nearest coherent boundary — never
+  mid-slice.
+- Start a fresh session explicitly (`/session-start <alias>` + task contract)
+  before the first concrete dispatch of a new slice. Manual choreography
+  today; do not emulate automatic bootstrap with auto-spawn loops.
+- Keep `/checkpoint-save` for durable progress and `/handoff-save` for
+  receiver-targeted transfer (do not retire or duplicate it). Every handoff
+  names its receiver and carries each load-bearing premise as the explicit
+  4-tuple `(value, source, re_derivation_command, observed_at)`.
+- Dispatch discipline (2026-08-10 storm mitigation): stable logical dispatch
+  identity, sequential dispatch (never parallel identical `task` emissions),
+  inspect existing children before at most ONE manual retry, never auto-spawn
+  on ambiguous failure.
+- Route pure bookkeeping (DEFER-card curation, backlog edits, checkpoint
+  scribe work) to the existing `docs-steward` specialist — routing policy
+  only; no new agent, no authority widening.
+- Zero review-authority change: the incumbent review panel stays the sole
+  gate; any future change requires the shadow-measurement program in
+  [`docs/ai/review-shadow-measurement-contract.md`](../docs/ai/review-shadow-measurement-contract.md).
+
 ## Not applicable
 
 vh-solara is a host-run Go binary + embedded SPA — **not** container-first, and it
