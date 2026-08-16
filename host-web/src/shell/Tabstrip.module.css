@@ -194,21 +194,12 @@
   line-height: 1;
   flex: 0 0 auto;
 }
+/* Shared 26px icon button (Popover.module.css .iconTrigger — the same base
+ * the Settings gear composes; finding 6 deduplicated the copies) + this
+ * button's glyph size and the tabstrip flex behavior. */
 .plus {
-  width: 26px;
-  height: 26px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-  color: var(--fg-dim);
+  composes: iconTrigger from "./Popover.module.css";
   font-size: 16px;
-  line-height: 1;
-  cursor: pointer;
-  flex: 0 0 auto;
-}
-.plus:hover {
-  border-color: var(--accent);
-  color: var(--accent);
 }
 .trayBadge {
   font-size: 11px;

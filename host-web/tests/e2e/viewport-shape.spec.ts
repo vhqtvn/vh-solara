@@ -48,25 +48,6 @@ const WIDE = { width: 1024, height: 640 }; // w/h=1.6 → wide
 const TALL = { width: 400, height: 800 }; // h/w=2.0 → tall
 const SQUARE = { width: 600, height: 600 }; // 1.0 → square
 
-/** Reduce the seeded grid to exactly TWO side-by-side panes (HORIZONTAL) for
- *  deterministic geometry + clean vision screenshots, regardless of how many
- *  panes the mock fleet seeds (the seed count is not part of this feature's
- *  contract). Closes every seeded pane except the first, then splits it right.
- *  The keeper's iframe survives the closes (removePanel on the others does not
- *  touch its mounted iframe). Returns [keeper, newPane]. */
-async function twoPanes(
-  page: Page,
-): Promise<[string, string]> {
-  const seeded = await H.panes(page);
-  const keeper = seeded[0];
-  for (const id of seeded.slice(1)) await H.closePane(page, id);
-  await H.waitForReady(page, keeper);
-  const other = await H.split(page, keeper, "right");
-  expect(other, "split created a second pane").toBeTruthy();
-  await H.waitForReady(page, other!);
-  return [keeper, other!];
-}
-
 /** Reduce the seeded grid to exactly ONE pane (for the 1-pane no-op test).
  *  Closes every seeded pane except the first; the keeper survives. */
 async function onePane(page: Page): Promise<string> {
@@ -82,10 +63,13 @@ test.describe("viewport-shape auto-transpose (i3 Phase 2)", () => {
     // The serial suite shares a localStorage context. A prior test may have
     // auto-transposed the layout and the debounced save flushed it; without a
     // reset, this test's loadHost would cold-restore a VERTICAL layout. Clear
-    // the persisted layout (forces the fresh HORIZONTAL seed) before loading.
-    // Clearing also removes the toggle key → default ON.
-    await page.goto("/");
-    await page.evaluate(() => localStorage.clear());
+    // the persisted state BEFORE the single app boot (addInitScript runs on
+    // the loadHost navigation, before any app script — forces the fresh
+    // HORIZONTAL seed) instead of the old goto('/') + clear + loadHost
+    // double-boot, which discarded one full app boot per test and raced its
+    // debounced layout save. Clearing also removes the toggle key → default
+    // ON.
+    await page.addInitScript(() => localStorage.clear());
     await H.loadHost(page);
     // Ensure a known wide baseline for every test (the project default is wide,
     // but be explicit so a shape assertion is never ambiguous).
@@ -95,7 +79,7 @@ test.describe("viewport-shape auto-transpose (i3 Phase 2)", () => {
   test("portrait flip preserves BOTH pane identities [SURVIVAL CRUX]", async ({ page }) => {
     // Build a clean 2-pane side-by-side (HORIZONTAL) layout for unambiguous
     // geometry + clean vision screenshots (the mock fleet seeds more than 2).
-    const [a, b] = await twoPanes(page);
+    const [a, b] = await H.twoPanes(page);
     expect(await H.gridPaneCount(page), "exactly 2 grid panes").toBe(2);
 
     // Baseline: wide → HORIZONTAL (side-by-side). Capture survival identities

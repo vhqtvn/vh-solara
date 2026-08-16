@@ -1,0 +1,64 @@
+/* Shared popover chrome for the host shell's anchored dropdowns (the
+ * tabstrip's AddServer + Settings popovers). Co-located with popover.ts —
+ * the behavior primitive owns its visual counterpart.
+ *
+ * Consumers `composes:` these classes from their own modules and add ONLY
+ * non-conflicting properties (width, per-consumer spacing/glyph sizes), so
+ * there is never a cross-file source-order hazard: the shared rules and the
+ * consumer rules never write the same property.
+ *
+ * GPU-cheap only: plain bg/border/shadow — no mask-image, backdrop-filter,
+ * or contain:paint (AGENTS.md Firefox/WebRender rules). */
+
+/* Anchored dropdown under the 36px tabstrip. Width is deliberately NOT set —
+ * each consumer sizes its own popover (320px form vs 280px menu). */
+.popover {
+  position: absolute;
+  top: 30px;
+  right: 0;
+  z-index: 50;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+/* Popover heading. */
+.heading {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--fg);
+}
+
+/* 26px square icon button (the tabstrip's gear / "+" family). font-size is
+ * deliberately NOT set — each icon picks its own glyph size (⚙ 14px, + 16px).
+ * aria-label carries the accessible name at the call site. */
+.iconTrigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.iconTrigger:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.iconTrigger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

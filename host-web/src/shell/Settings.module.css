@@ -1,60 +1,31 @@
-/* Settings popover (tabstrip gear). Mirrors AddServer.module.css's visual
- * language (tokens, sizes, popover chrome) so the two tabstrip popovers read
- * as siblings. GPU-cheap only: plain bg/border/shadow — no mask-image,
+/* Settings popover (tabstrip gear). The popover chrome (positioning/z-index/
+ * border/padding/gap/shadow), heading, and icon-trigger base all come from
+ * the SHARED Popover.module.css via composes — the same primitive AddServer
+ * uses, so the two tabstrip popovers cannot drift apart again (finding 6).
+ * This module contributes ONLY what is specific: the menu item styles and
+ * the 280px width. GPU-cheap only: plain bg/border/shadow — no mask-image,
  * backdrop-filter, or contain:paint (AGENTS.md Firefox/WebRender rules). */
 .wrap {
   position: relative;
   flex: 0 0 auto;
 }
-/* Icon-only gear trigger (26px square — same footprint as the ws-add "+").
- * aria-label carries the name; no text to crowd the tab row at any width. */
+/* Icon-only gear trigger: shared 26px icon button + this icon's glyph size. */
 .trigger {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
-  padding: 0;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-  color: var(--fg-dim);
-  font-size: 14px;
-  line-height: 1;
-  cursor: pointer;
-  -webkit-user-select: none;
-  user-select: none;
+  composes: iconTrigger from "./Popover.module.css";
 }
 .triggerIcon {
   font-size: 14px;
   line-height: 1;
 }
-.trigger:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-/* Anchored dropdown — same geometry as the AddServer popover (absolute,
- * top:30px right:0 under the 36px tabstrip, z-50 above the workspace grid).
- * The tabstrip keeps overflow:visible precisely so this can drop down. */
+/* Anchored dropdown — shared chrome + this menu's width (280px vs the
+ * AddServer form's 320px). The tabstrip keeps overflow:visible precisely so
+ * this can drop down. */
 .popover {
-  position: absolute;
-  top: 30px;
-  right: 0;
-  z-index: 50;
+  composes: popover from "./Popover.module.css";
   width: 280px;
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
 }
 .heading {
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--fg);
+  composes: heading from "./Popover.module.css";
 }
 .menu {
   display: flex;

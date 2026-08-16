@@ -1,5 +1,6 @@
-import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
-import { autoTransposeEnabled, setAutoTranspose } from "../viewportShape";
+import { For, Show } from "solid-js";
+import { autoTransposeOn, setAutoTranspose } from "../viewportShape";
+import { TABSTRIP_POPOVER_GROUP, usePopoverSurface } from "./popover";
 import s from "./Settings.module.css";
 
 /**
@@ -7,23 +8,27 @@ import s from "./Settings.module.css";
  * surface (the statusbar and per-pane headers are both gone, so after a
  * deploy the operator had no way to reload short of summoning a keyboard).
  *
- * Mirrors the AddServer popover's structure/positioning (anchored dropdown
- * top-right of the tabstrip trigger, z-50) and adds the close affordances
- * AddServer never had: click-outside (document pointerdown) + Escape.
+ * OPEN/CLOSE goes through the shared surface stack (popover.ts), the SAME
+ * primitive AddServer uses: Escape closes (topmost-only — with the layout
+ * overlay also open, one Escape dismisses only the topmost surface), a
+ * pointerdown outside the wrap closes, and the tabstrip group keeps this
+ * popover mutually exclusive with AddServer. The listeners live only while
+ * a surface is open — no shell-lifetime document handlers.
  * Note the click-outside limit: pointerdown on a CROSS-ORIGIN IFRAME never
  * reaches this document, so tapping a pane does not close the popover —
- * Escape + any host-chrome tap do. Same limitation class as every other
- * popover here; acceptable for a settings menu.
+ * Escape + any host-chrome tap do.
  *
  * EXTENSIBLE BY DESIGN: the menu items are a plain typed array below. Adding
  * a future setting = appending one entry (action or toggle); no rendering
- * changes. Items are host-chrome ONLY (no iframe lifecycle impact) and all
- * GPU-cheap CSS (plain bg/border — no mask-image/backdrop-filter/contain).
+ * changes. A persisted toggle stays live automatically when its `isOn` reads
+ * a storage-synced reactive accessor (see viewportShape.autoTransposeOn).
+ * Items are host-chrome ONLY (no iframe lifecycle impact) and all GPU-cheap
+ * CSS (plain bg/border — no mask-image/backdrop-filter/contain).
  *
- * Production-capable: reads/writes the toggle through viewportShape's
- * exported localStorage helpers (NOT the DEV bridge). The auto-rotate item
- * applies LIVE because viewportShape.applyTranspose re-reads the key on
- * EVERY evaluation — no reload, no listener needed.
+ * Production-capable: the toggle reads/writes viewportShape's localStorage
+ * helpers (NOT the DEV bridge). The auto-rotate item applies LIVE because
+ * viewportShape.applyTranspose re-reads the key on EVERY evaluation — no
+ * reload needed.
  */
 
 /** A one-shot menu entry (runs an action when activated). */
@@ -49,50 +54,20 @@ interface ToggleItem {
 type MenuItem = ActionItem | ToggleItem;
 
 export function Settings() {
-  const [open, setOpen] = createSignal(false);
-  // Auto-rotate UI state. Synced FROM localStorage on every open (so an
-  // external write — DEV bridge, another tab — is reflected), written back
-  // through setAutoTranspose on toggle. The signal exists only to make the
-  // checkbox reactive; localStorage remains the source of truth.
-  const [autoRotate, setAutoRotate] = createSignal(autoTransposeEnabled());
-
   let wrapEl: HTMLDivElement | undefined;
 
-  const openPopover = () => {
-    setAutoRotate(autoTransposeEnabled()); // reflect current persisted state
-    setOpen(true);
-  };
-
-  const closePopover = () => setOpen(false);
-
-  const togglePopover = () => {
-    if (open()) closePopover();
-    else openPopover();
-  };
-
-  // Click-outside + Escape close (onMount → listeners live for the shell's
-  // lifetime; they early-return while the popover is closed — same pattern
-  // as LayoutOverlay's Esc handling). pointerdown (not click) so the close
-  // wins the race against whatever the outside tap activates.
-  onMount(() => {
-    const onPointerDown = (ev: PointerEvent): void => {
-      if (!open()) return;
-      const t = ev.target as Node | null;
-      if (t && wrapEl?.contains(t)) return; // trigger + popover are inside
-      closePopover();
-    };
-    const onKeyDown = (ev: KeyboardEvent): void => {
-      if (open() && ev.key === "Escape") closePopover();
-    };
-    document.addEventListener("pointerdown", onPointerDown);
-    window.addEventListener("keydown", onKeyDown);
-    onCleanup(() => {
-      document.removeEventListener("pointerdown", onPointerDown);
-      window.removeEventListener("keydown", onKeyDown);
-    });
+  const surface = usePopoverSurface({
+    id: "settings",
+    group: TABSTRIP_POPOVER_GROUP,
+    anchor: () => wrapEl,
   });
 
   // The menu. Append entries here; the <For> below renders both kinds.
+  // The auto-rotate toggle's isOn reads autoTransposeOn — a REACTIVE mirror
+  // of the persisted key that tracks every writer (same-document writes via
+  // setAutoTranspose — including the DEV bridge — and cross-document writes
+  // via the storage event), so the checkmark can never go stale while the
+  // popover is open (finding 7).
   const items: MenuItem[] = [
     {
       kind: "action",
@@ -106,11 +81,8 @@ export function Settings() {
       testid: "settings-autorotate",
       label: "Auto-rotate layout",
       description: "Flip split orientation when the viewport rotates.",
-      isOn: () => autoRotate(),
-      set: (v) => {
-        setAutoTranspose(v);
-        setAutoRotate(v);
-      },
+      isOn: () => autoTransposeOn(),
+      set: (v) => setAutoTranspose(v),
     },
   ];
 
@@ -132,13 +104,13 @@ export function Settings() {
         title="Settings"
         aria-label="Settings"
         aria-haspopup="menu"
-        aria-expanded={open() ? "true" : "false"}
+        aria-expanded={surface.open() ? "true" : "false"}
         data-testid="settings-btn"
-        onClick={() => togglePopover()}
+        onClick={() => surface.togglePopover()}
       >
         <span class={s.triggerIcon} aria-hidden="true">⚙</span>
       </button>
-      <Show when={open()}>
+      <Show when={surface.open()}>
         <div class={s.popover} role="menu" data-testid="settings-popover" aria-label="Settings">
           <div class={s.heading}>Settings</div>
           <div class={s.menu} role="presentation">

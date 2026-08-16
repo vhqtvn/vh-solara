@@ -1,5 +1,6 @@
 import { Orientation } from "dockview-core";
 import type { DockviewApi } from "dockview-core";
+import { createSignal } from "solid-js";
 import { activeWorkspaceId, workspaceApiFor } from "./dockview/store";
 
 // =============================================================================
@@ -86,10 +87,42 @@ export function autoTransposeEnabled(): boolean {
   return v == null ? true : v.toLowerCase() !== "off";
 }
 
-/** Set the toggle. Persists immediately. */
+// ---- reactive mirror (the Settings toggle's live state) ----------------------
+//
+// localStorage stays the source of truth (applyTranspose keeps reading the key
+// on every evaluation), but UI surfaces need a signal that tracks EVERY writer
+// of the key, not just their own clicks:
+//  - same-document writes (setAutoTranspose below — including the DEV bridge's
+//    setEnabled and any future programmatic writer) update the signal directly;
+//  - cross-document writes (a second browser tab on this origin) arrive via
+//    the `storage` event, which fires only in NON-writer documents — so the
+//    listener re-reads and refreshes the signal there.
+// This mirrors the inner SPA's persistedSignal pattern (web/src/lib/store.ts),
+// adapted to this module's plain "on"/"off" key format (no versioned envelope,
+// so stored values and the DEV bridge semantics are unchanged).
+const [autoTransposeState, setAutoTransposeState] = createSignal(autoTransposeEnabled());
+
+if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+  window.addEventListener("storage", (ev: StorageEvent) => {
+    if (ev.key !== AUTOTRANSPOSE_STORAGE_KEY) return;
+    // Re-read through the same parse path: by the time the event fires here,
+    // this document's localStorage already holds the other document's write.
+    setAutoTransposeState(autoTransposeEnabled());
+  });
+}
+
+/** Reactive view of the auto-transpose toggle (tracks same-document AND
+ *  cross-document writers — never stale while a UI surface reads it). */
+export function autoTransposeOn(): boolean {
+  return autoTransposeState();
+}
+
+/** Set the toggle. Persists immediately and refreshes the reactive mirror. */
 export function setAutoTranspose(on: boolean): void {
-  if (typeof localStorage === "undefined") return;
-  localStorage.setItem(AUTOTRANSPOSE_STORAGE_KEY, on ? "on" : "off");
+  if (typeof localStorage !== "undefined") {
+    localStorage.setItem(AUTOTRANSPOSE_STORAGE_KEY, on ? "on" : "off");
+  }
+  setAutoTransposeState(on);
 }
 
 // ---- dockview access (the survival-safe transpose path) --------------------

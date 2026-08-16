@@ -1,6 +1,7 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { hostOps, overlaySourcePaneId, panes } from "../dockview/store";
 import type { OverlaySplitDir } from "../dockview/types";
+import { registerSurface, releaseSurface } from "./popover";
 import s from "./LayoutOverlay.module.css";
 
 /**
@@ -31,9 +32,11 @@ import s from "./LayoutOverlay.module.css";
  * moved from the deleted statusbar) and Add Server stay clickable while the
  * overlay is open. There is no full-screen capture layer.
  *
- * DISMISS: Esc, the Close-overlay button (✕, distinct from Close-pane), an
- * outside-the-card click within `<main>`, a workspace switch (App.tsx clears the
- * signal), or source-pane removal (the effect below). A split/swap is a terminal
+ * DISMISS: Esc (routed through the shared surface stack — topmost-only, so
+ * an open tabstrip popover is dismissed by its own later Escape), the
+ * Close-overlay button (✕, distinct from Close-pane), an outside-the-card
+ * click within `<main>`, a workspace switch (App.tsx clears the signal), or
+ * source-pane removal (the effect below). A split/swap is a terminal
  * overlay action (auto-closes). IDEMPOTENT: a second valid request while open
  * re-anchors to the new source (the signal swaps; no stacking). The mode resets
  * to Split whenever the overlay (re)opens, so a stale Swap selection never
@@ -126,15 +129,21 @@ export function LayoutOverlay(props: { mainEl: () => HTMLElement | null }) {
     if (!stillPresent) hostOps()?.closeLayoutOverlay?.();
   });
 
-  // Esc → close (only while open).
-  onMount(() => {
-    const onKey = (ev: KeyboardEvent): void => {
-      if (ev.key === "Escape" && source() !== null) {
-        hostOps()?.closeLayoutOverlay?.();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    onCleanup(() => window.removeEventListener("keydown", onKey));
+  // Esc → close (topmost-only): the overlay registers on the shared surface
+  // stack (popover.ts) while open, so ONE Escape dismisses only the TOPMOST
+  // surface — with a tabstrip popover also open, the first Escape closes this
+  // overlay and leaves the popover for the next press (the app-like
+  // back-navigation principle from f7bba45). No private window keydown
+  // listener here: that was the double-dismiss bug (one Escape fired every
+  // surface's own listener). No anchor: the overlay owns its outside-dismiss
+  // (<main> capture layer below), so the stack's pointerdown pass skips it.
+  createEffect(() => {
+    if (source() === null) return;
+    registerSurface({
+      id: "layout-overlay",
+      close: () => hostOps()?.closeLayoutOverlay?.(),
+    });
+    onCleanup(() => releaseSurface("layout-overlay"));
   });
 
   // Position the card over the source pane's box, recomputed on open + on

@@ -17,13 +17,19 @@ import * as H from "./util";
 //
 // Part 2 — AddServer catalog click-to-prefill: clicking a catalog row fills
 // the url+label inputs (focus + select-all on the URL); the × remove button
-// must NOT prefill (stopPropagation).
+// must NOT prefill (siblings — no propagation path).
+//
+// Part 3 — the shared surface stack (host-web/src/shell/popover.ts): the
+// tabstrip popovers are mutually exclusive (AddServer-then-gear must not
+// leave both forms open), and Escape dismisses only the TOPMOST surface (the
+// app-like back-navigation principle from f7bba45 — one Escape, one surface,
+// even with the layout overlay also open).
 //
 // Vision screenshots land under tmp/host-web-playwright/vision/settings/
 // (gitignored). Serial suite (config: workers 1); each test clears persisted
-// state in beforeEach so the auto-transpose key starts ABSENT (default ON)
-// and no prior layout leaks in — same defensive pattern as
-// viewport-shape.spec.ts.
+// state via addInitScript BEFORE the single app boot, so the auto-transpose
+// key starts ABSENT (default ON) and no prior layout leaks in — no discarded
+// first boot.
 // =============================================================================
 
 const REPO_ROOT = path.resolve(process.cwd(), "..");
@@ -38,50 +44,22 @@ test.beforeAll(() => {
 const WIDE = { width: 1024, height: 640 };
 const TALL = { width: 400, height: 800 };
 
-// The mock content page origin (:5174) — same as server-mgmt.spec.ts.
-const MOCK_ORIGIN = "http://127.0.0.1:5174";
-function serverUrl(server: string): string {
-  const q = new URLSearchParams({ server, view: "chat" });
-  return `${MOCK_ORIGIN}/?${q.toString()}`;
-}
-
 /** Open the settings popover and wait for it to be visible. */
 async function openSettings(page: Page): Promise<void> {
   await page.locator('[data-testid="settings-btn"]').click();
   await expect(page.locator('[data-testid="settings-popover"]')).toBeVisible();
 }
 
-/** Open the add-server popover and return locators for its inputs. */
-async function openAddServer(page: Page): Promise<void> {
-  await page.locator('[data-testid="add-server-btn"]').click();
-  await expect(page.locator('[data-testid="add-server-popover"]')).toBeVisible();
-}
-
-async function fillAndSubmit(page: Page, url: string, label: string): Promise<void> {
-  await page.locator('[data-testid="add-server-url"]').fill(url);
-  await page.locator('[data-testid="add-server-label"]').fill(label);
-  await page.locator('[data-testid="add-server-submit"]').click();
-}
-
-/** Reduce the seeded grid to exactly TWO side-by-side panes (HORIZONTAL) —
- *  same helper as viewport-shape.spec.ts. Returns [keeper, newPane]. */
-async function twoPanes(page: Page): Promise<[string, string]> {
-  const seeded = await H.panes(page);
-  const keeper = seeded[0];
-  for (const id of seeded.slice(1)) await H.closePane(page, id);
-  await H.waitForReady(page, keeper);
-  const other = await H.split(page, keeper, "right");
-  expect(other, "split created a second pane").toBeTruthy();
-  await H.waitForReady(page, other!);
-  return [keeper, other!];
-}
-
 test.describe("settings popover", () => {
   test.beforeEach(async ({ page }) => {
-    // Clear persisted state so the auto-transpose key starts ABSENT (toggle
-    // default ON) and no prior test's saved layout leaks in.
-    await page.goto("/");
-    await page.evaluate(() => localStorage.clear());
+    // Clear persisted state BEFORE the app boots: addInitScript runs on the
+    // (single) loadHost navigation, before any app script, so the
+    // auto-transpose key starts ABSENT (toggle default ON) and no prior
+    // test's saved layout leaks in. This replaces the old goto('/') +
+    // localStorage.clear() + loadHost double-boot — one full app boot
+    // (mock iframe fleet included) used to be discarded per test purely to
+    // clear storage, racing the first boot's debounced layout save.
+    await page.addInitScript(() => localStorage.clear());
     await H.loadHost(page);
   });
 
@@ -111,6 +89,64 @@ test.describe("settings popover", () => {
     await page.locator('[data-testid="add-server-btn"]').click();
     await expect(page.locator('[data-testid="settings-popover"]')).toBeHidden();
     await expect(page.locator('[data-testid="add-server-popover"]')).toBeVisible();
+  });
+
+  test("AddServer-then-gear: the gear closes AddServer — never both forms at once", async ({ page }) => {
+    // The ordering the old suite never exercised: AddServer FIRST, then the
+    // gear. AddServer used to have NO outside-click/Escape dismissal, so
+    // both popovers stayed open and Settings covered ~246px of the AddServer
+    // form (its controls still tabbable underneath). The shared surface
+    // stack's tabstrip group makes them mutually exclusive.
+    const addBtn = page.locator('[data-testid="add-server-btn"]');
+    await H.openAddServer(page);
+    await expect(addBtn).toHaveAttribute("aria-expanded", "true");
+
+    await page.locator('[data-testid="settings-btn"]').click();
+
+    // Exactly one tabstrip popover: Settings open, AddServer GONE (the form
+    // unmounts with <Show>, so no control stays visible or tabbable).
+    await expect(page.locator('[data-testid="settings-popover"]')).toBeVisible();
+    await expect(page.locator('[data-testid="settings-popover"]')).toHaveCount(1);
+    await expect(page.locator('[data-testid="add-server-popover"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="add-server-url"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="add-server-label"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="server-catalog"]')).toHaveCount(0);
+    await expect(addBtn).toHaveAttribute("aria-expanded", "false");
+    await expect(page.locator('[data-testid="settings-btn"]')).toHaveAttribute("aria-expanded", "true");
+  });
+
+  test("Escape dismisses only the TOPMOST surface (app-like back navigation)", async ({ page }) => {
+    const pane = (await H.panes(page))[0];
+
+    // Settings open, then the layout overlay on top of it. Both surfaces
+    // coexist (the overlay's capture layer covers only <main>, so the
+    // tabstrip gear stays clickable) — the exact reachable state where one
+    // Escape used to close BOTH.
+    await openSettings(page);
+    await H.openLayoutOverlay(page, pane);
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
+    await expect(page.locator('[data-testid="settings-popover"]')).toBeVisible();
+
+    // ONE Escape → only the topmost (the overlay, opened last) closes.
+    await page.keyboard.press("Escape");
+    await expect.poll(async () => H.overlaySource(page)).toBeNull();
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="settings-popover"]')).toBeVisible();
+
+    // The next Escape dismisses the next surface (Settings) — LIFO unwind.
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="settings-popover"]')).toHaveCount(0);
+
+    // Reverse open order → reverse dismissal: overlay first, then Settings
+    // (the gear is reachable while the overlay is open) makes Settings the
+    // topmost, so the FIRST Escape takes Settings and spares the overlay.
+    await H.openLayoutOverlay(page, pane);
+    await openSettings(page);
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="settings-popover"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toHaveCount(0);
   });
 
   test("Reload page item reloads the document", async ({ page }) => {
@@ -164,10 +200,37 @@ test.describe("settings popover", () => {
     await expect(item).toHaveAttribute("aria-checked", "true");
   });
 
+  test("auto-rotate checkmark tracks EXTERNAL writers live (never stale while open)", async ({ page }) => {
+    const KEY = H.AUTOTRANSPOSE_STORAGE_KEY;
+    const item = page.locator('[data-testid="settings-autorotate"]');
+
+    await openSettings(page);
+    await expect(item).toHaveAttribute("aria-checked", "true");
+
+    // Same-document external writer — the DEV bridge (__hostViewport.setEnabled
+    // routes through setAutoTranspose, which now refreshes the reactive
+    // mirror). The old hand-synced signal re-read storage only on OPEN, so
+    // this write left a stale checkmark until close/reopen.
+    await H.setViewportEnabled(page, false);
+    await expect(item).toHaveAttribute("aria-checked", "false");
+    expect(await page.evaluate((k) => localStorage.getItem(k), KEY)).toBe("off");
+
+    // Cross-document writer — a second tab on this origin. The storage event
+    // the reactive mirror listens for fires only in NON-writer documents, so
+    // a same-document write alone cannot prove the listener; dispatch it
+    // synthetically around a REAL localStorage write (the same precedent as
+    // dispatchResize).
+    await page.evaluate((k) => {
+      localStorage.setItem(k, "on");
+      window.dispatchEvent(new StorageEvent("storage", { key: k }));
+    }, KEY);
+    await expect(item).toHaveAttribute("aria-checked", "true");
+  });
+
   test("auto-rotate applies LIVE: UI toggle gates the resize flip (no reload)", async ({ page }) => {
     // Known wide baseline with exactly two side-by-side panes.
     await page.setViewportSize(WIDE);
-    const [a, b] = await twoPanes(page);
+    const [a, b] = await H.twoPanes(page);
     expect(await H.gridPaneCount(page), "exactly 2 grid panes").toBe(2);
     await H.waitForSideBySide(page, a, b);
     expect(await H.viewportOrientation(page), "wide baseline = HORIZONTAL").toBe("HORIZONTAL");
@@ -219,12 +282,12 @@ test.describe("add-server catalog click-to-prefill", () => {
     page: Page,
   ): Promise<[{ url: string; label: string }, { url: string; label: string }]> {
     const base = (await H.panes(page)).length;
-    const one = { url: serverUrl("prefill-one"), label: "prefill-one" };
-    const two = { url: serverUrl("prefill-two"), label: "prefill-two" };
-    await openAddServer(page);
-    await fillAndSubmit(page, one.url, one.label);
+    const one = { url: H.serverUrl("prefill-one"), label: "prefill-one" };
+    const two = { url: H.serverUrl("prefill-two"), label: "prefill-two" };
+    await H.openAddServer(page);
+    await H.fillAndSubmit(page, one.url, one.label);
     await expect.poll(async () => (await H.panes(page)).length).toBe(base + 1);
-    await fillAndSubmit(page, two.url, two.label);
+    await H.fillAndSubmit(page, two.url, two.label);
     await expect.poll(async () => (await H.panes(page)).length).toBe(base + 2);
     // Both rows are in the catalog.
     await expect(page.locator(`[data-testid="server-row"][data-url="${one.url}"]`)).toHaveCount(1);
@@ -265,6 +328,26 @@ test.describe("add-server catalog click-to-prefill", () => {
       path: path.join(VISION_DIR, "03-addserver-prefilled.png"),
       fullPage: true,
     });
+  });
+
+  test("bottom-edge click on a catalog row prefills THAT row (no hit-box overlap)", async ({ page }) => {
+    const [one, two] = await seedTwoServers(page);
+
+    // The old rows' -3px negative margins overlapped the next row's border
+    // box by 2px (the later row won hit-testing): a click 1px above the
+    // bottom of row `one` — visually inside its highlight — prefilled row
+    // `two`. Rows now have strictly non-overlapping boxes: the bottom edge
+    // belongs to its own row.
+    const row = page.locator(`[data-testid="server-row"][data-url="${one.url}"]`);
+    const box = await row.boundingBox();
+    expect(box, "row has a bounding box").toBeTruthy();
+    await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height - 1);
+
+    await expect(page.locator('[data-testid="add-server-url"]')).toHaveValue(one.url);
+    await expect(page.locator('[data-testid="add-server-label"]')).toHaveValue(one.label);
+    // Explicitly NOT the row below.
+    await expect(page.locator('[data-testid="add-server-url"]')).not.toHaveValue(two.url);
+    await expect(page.locator('[data-testid="add-server-label"]')).not.toHaveValue(two.label);
   });
 
   test("removing via × does not prefill the form", async ({ page }) => {

@@ -2,6 +2,7 @@ import { For, Show, createSignal } from "solid-js";
 import { hostOps, panes, focusedId } from "../dockview/store";
 import { runtimeServers } from "../state/serverList";
 import type { AddServerOutcome } from "../dockview/types";
+import { TABSTRIP_POPOVER_GROUP, usePopoverSurface } from "./popover";
 import s from "./AddServer.module.css";
 
 /**
@@ -19,6 +20,18 @@ import s from "./AddServer.module.css";
  *    handling) and shows an outcome line ("Already open" / "Opened" / "Added
  *    and opened") that STAYS VISIBLE so the operator can tell what happened.
  *
+ * OPEN/CLOSE goes through the shared surface stack (popover.ts): Escape closes
+ * (topmost-only), a pointerdown outside the wrap closes, and the tabstrip
+ * group keeps this popover mutually exclusive with Settings — exactly one
+ * tabstrip popover open at a time (finding 1).
+ *
+ * CATALOG ROWS are two SIBLING real buttons (finding 3): the pick button
+ * (label + url → click prefills the form) and the ✕ remove button. They are
+ * NOT nested — a button's descendants are presentational to ARIA, which
+ * flattened the old row[role=button] > button✕ structure and hid Remove from
+ * screen readers. The pick button's aria-label names both the label AND the
+ * url so the server address is announced.
+ *
  * All actions go through the typed HostOps controller surface (store.hostOps),
  * NOT the DEV-only window.__host bridge, so this works in production builds.
  *
@@ -28,36 +41,29 @@ import s from "./AddServer.module.css";
  * an unsandboxed iframe.src, so this guard is the iframe-src XSS boundary.
  */
 export function AddServer() {
-  const [open, setOpen] = createSignal(false);
+  let wrapEl: HTMLDivElement | undefined;
+
   const [url, setUrl] = createSignal("");
   const [label, setLabel] = createSignal("");
   const [error, setError] = createSignal("");
   const [outcome, setOutcome] = createSignal<AddServerOutcome | null>(null);
 
-  const openPopover = () => {
+  const surface = usePopoverSurface({
+    id: "add-server",
+    group: TABSTRIP_POPOVER_GROUP,
+    anchor: () => wrapEl,
     // OPERATOR POINT #4: "default to prefill current server." Prefill the URL
     // field with the currently-active pane's server URL so the operator can
     // quickly open another window into the same box, or edit for a different
     // server. Label is left empty (the operator names the new window).
-    const activePane = panes().find((p) => p.id === focusedId());
-    setUrl(activePane?.url ?? "");
-    setLabel("");
-    setError("");
-    setOutcome(null);
-    setOpen(true);
-  };
-
-  const closePopover = () => {
-    setOpen(false);
-  };
-
-  const togglePopover = () => {
-    if (open()) {
-      closePopover();
-    } else {
-      openPopover();
-    }
-  };
+    onOpen: () => {
+      const activePane = panes().find((p) => p.id === focusedId());
+      setUrl(activePane?.url ?? "");
+      setLabel("");
+      setError("");
+      setOutcome(null);
+    },
+  });
 
   const submit = (e: Event) => {
     e.preventDefault();
@@ -89,7 +95,7 @@ export function AddServer() {
     }
   };
 
-  // Catalog row click → prefill the form with that row's {url,label} (the
+  // Catalog pick → prefill the form with that row's {url,label} (the
   // operator's minimum: "at least it must auto fill the url"). Clears any
   // error/outcome so the form reads clean, then focuses + select-all's the
   // URL input for quick editing (change a port/path and re-add).
@@ -102,21 +108,36 @@ export function AddServer() {
     urlInputEl?.focus();
     urlInputEl?.select();
   };
+  // Selection guard (finding 5): a click event that ENDS a text-selection
+  // drag over the row (the common-ancestor click rule fires click on mouseup)
+  // must not overwrite the form or clobber the selection. The check is scoped
+  // to selections anchored INSIDE the clicked button, so the select-all that
+  // prefill() itself creates in the URL input never blocks the next pick.
+  // Nearly unreachable now that the rows are user-select:none — kept for UA
+  // quirks / forced selection (e.g. a11y tools).
+  const pick = (e: MouseEvent, srv: { url: string; label: string }) => {
+    const sel = document.getSelection();
+    if (sel && !sel.isCollapsed && e.currentTarget instanceof Node && sel.anchorNode && e.currentTarget.contains(sel.anchorNode)) {
+      return;
+    }
+    prefill(srv);
+  };
 
   return (
-    <div class={s.wrap}>
+    <div class={s.wrap} ref={wrapEl}>
       <button
         type="button"
         class={s.trigger}
         title="Add server"
         aria-label="Add server"
+        aria-expanded={surface.open() ? "true" : "false"}
         data-testid="add-server-btn"
-        onClick={() => togglePopover()}
+        onClick={() => surface.togglePopover()}
       >
         <span class={s.triggerIcon} aria-hidden="true">+</span>
         <span class={s.triggerText}>Add server</span>
       </button>
-      <Show when={open()}>
+      <Show when={surface.open()}>
         <div class={s.popover} data-testid="add-server-popover">
           <div class={s.heading}>Add a server</div>
           <form class={s.form} onSubmit={submit}>
@@ -172,34 +193,26 @@ export function AddServer() {
             <div class={s.catalog} data-testid="server-catalog">
               <For each={runtimeServers()}>
                 {(srv) => (
-                  <div
-                    class={s.catalogRow}
-                    // Click-to-prefill: the row is a button-like affordance
-                    // (pointer + keyboard) that fills the form above with this
-                    // server's {url,label}. The nested × stops propagation so
-                    // removing never prefills.
-                    role="button"
-                    tabindex="0"
-                    data-testid="server-row"
-                    data-url={srv.url}
-                    aria-label={`Use ${srv.label}`}
-                    title={`Fill the form with ${srv.label}`}
-                    onClick={() => prefill(srv)}
-                    onKeyDown={(e) => {
-                      // Only activate when the ROW itself is focused — the
-                      // nested × button handles its own Enter/Space (its click
-                      // stops propagation below).
-                      if (e.target !== e.currentTarget) return;
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        prefill(srv);
-                      }
-                    }}
-                  >
-                    <span class={s.catalogLabel} title={srv.url}>
-                      {srv.label}
-                    </span>
-                    <span class={s.catalogUrl}>{srv.url}</span>
+                  /* A plain flex row (NO role/tabindex — finding 3): the row's
+                   * two affordances are SIBLING real buttons, so neither is an
+                   * interactive-inside-interactive violation and both are
+                   * reliably exposed to assistive tech. data-testid/data-url
+                   * stay on the row (a stable, layout-level marker). */
+                  <div class={s.catalogRow} data-testid="server-row" data-url={srv.url}>
+                    <button
+                      type="button"
+                      class={s.catalogPick}
+                      // The accessible name carries BOTH the label and the url
+                      // (finding 3: the old row aria-label hid the address).
+                      aria-label={`Use ${srv.label} — ${srv.url}`}
+                      title={`Fill the form with ${srv.label}`}
+                      onClick={(e) => pick(e, srv)}
+                    >
+                      <span class={s.catalogLabel} title={srv.url}>
+                        {srv.label}
+                      </span>
+                      <span class={s.catalogUrl}>{srv.url}</span>
+                    </button>
                     <button
                       type="button"
                       class={s.removeBtn}
@@ -207,12 +220,9 @@ export function AddServer() {
                       aria-label={`Remove ${srv.label}`}
                       data-testid="remove-server"
                       data-url={srv.url}
-                      // stopPropagation so a remove tap does NOT also prefill
-                      // the form from the row it lives in.
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        remove(srv.url);
-                      }}
+                      // A sibling (not a descendant) of the pick button: no
+                      // propagation to stop — removing never prefills.
+                      onClick={() => remove(srv.url)}
                     >
                       ✕
                     </button>

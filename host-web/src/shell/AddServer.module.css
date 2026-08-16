@@ -31,25 +31,16 @@
   border-color: var(--accent);
   color: var(--accent);
 }
+/* Shared popover chrome (position/z-index/border/padding/gap/shadow) comes
+ * from Popover.module.css; this module adds ONLY the width (320px form). The
+ * shared and local rules never write the same property, so composes is
+ * order-safe. GPU-cheap only (no mask-image/backdrop-filter/contain). */
 .popover {
-  position: absolute;
-  top: 30px;
-  right: 0;
-  z-index: 50;
+  composes: popover from "./Popover.module.css";
   width: 320px;
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
 }
 .heading {
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--fg);
+  composes: heading from "./Popover.module.css";
 }
 .form {
   display: flex;
@@ -118,27 +109,50 @@
 .catalog {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  /* Row gap small enough that the pick buttons read as one list; the rows'
+   * border boxes are strictly NON-overlapping (finding 2: the old -3px
+   * negative margins overlapped adjacent hit boxes by 2px, so the bottom
+   * sliver of row A hit row B). */
+  gap: 2px;
   border-top: 1px solid var(--border);
   padding-top: 8px;
 }
+/* One catalog row: a plain flex container for two SIBLING buttons (pick +
+ * remove — finding 3). It carries NO hit-testing role of its own; the pick
+ * button is the target. user-select:none matches every other button-like
+ * affordance in this tabstrip (.trigger, tabs, Settings trigger) — the row
+ * text is not selectable, so a drag can't produce a selection for a mouseup
+ * click to clobber (finding 5). */
 .catalogRow {
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
-  /* Click-to-prefill affordance: the row fills the form above with its
-   * {url,label}. Plain bg/border hover only (GPU-cheap). Padding + negative
-   * margin keep the row's visual footprint identical to the old plain row. */
-  padding: 3px 4px;
-  margin: -3px -4px;
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* Click-to-prefill affordance: fills the form above with this server's
+ * {url,label}. A real <button> (native focus/Enter/Space — no role/tabindex/
+ * keydown shim). Spans the row's width minus the ✕; its padding gives the
+ * row real vertical extent so adjacent rows' hit areas never touch. Plain
+ * bg hover only (GPU-cheap). */
+.catalogPick {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+  padding: 4px 6px;
+  border: 0;
   border-radius: 4px;
+  background: transparent;
+  text-align: left;
   cursor: pointer;
 }
-.catalogRow:hover {
+.catalogPick:hover {
   background: var(--bg-soft);
 }
-.catalogRow:focus-visible {
+.catalogPick:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }

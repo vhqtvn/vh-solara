@@ -1193,6 +1193,50 @@ export async function loadHost(page: Page): Promise<string[]> {
   return ids;
 }
 
+// ---- shared UI helpers (mock-origin urls + tabstrip popover flows) -----------
+// Deduplicated from the per-spec copies (settings / server-mgmt /
+// viewport-shape). Pure: no state survives a call — safe for the serial suite.
+
+/** The mock content-page origin (served on :5174 by the e2e webServer). Adding
+ *  a server that points here (with distinct ?server=&view= params) loads a
+ *  real heartbeating iframe, so "connected" stays true and the pane is
+ *  genuinely live — not just a label. */
+export const MOCK_ORIGIN = "http://127.0.0.1:5174";
+
+/** A mock server url with distinct ?server=&view= params (one per `server`). */
+export function serverUrl(server: string): string {
+  const q = new URLSearchParams({ server, view: "chat" });
+  return `${MOCK_ORIGIN}/?${q.toString()}`;
+}
+
+/** Open the add-server popover via the REAL tabstrip trigger. */
+export async function openAddServer(page: Page): Promise<void> {
+  await page.locator('[data-testid="add-server-btn"]').click();
+  await expect(page.locator('[data-testid="add-server-popover"]')).toBeVisible();
+}
+
+/** Fill + submit the add-server form via the REAL UI. */
+export async function fillAndSubmit(page: Page, url: string, label: string): Promise<void> {
+  await page.locator('[data-testid="add-server-url"]').fill(url);
+  await page.locator('[data-testid="add-server-label"]').fill(label);
+  await page.locator('[data-testid="add-server-submit"]').click();
+}
+
+/** Reduce the seeded grid to exactly TWO side-by-side panes (HORIZONTAL) for
+ *  deterministic geometry, regardless of how many panes the mock fleet seeds.
+ *  Closes every seeded pane except the first, then splits it right (the
+ *  keeper's iframe survives the closes). Returns [keeper, newPane]. */
+export async function twoPanes(page: Page): Promise<[string, string]> {
+  const seeded = await panes(page);
+  const keeper = seeded[0];
+  for (const id of seeded.slice(1)) await closePane(page, id);
+  await waitForReady(page, keeper);
+  const other = await split(page, keeper, "right");
+  expect(other, "split created a second pane").toBeTruthy();
+  await waitForReady(page, other!);
+  return [keeper, other!];
+}
+
 // ---- layout-persistence helpers -------------------------------------------
 
 /** Storage key persistence writes (must match src/dockview/layoutPersistence.ts). */

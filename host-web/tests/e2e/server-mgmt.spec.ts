@@ -12,38 +12,13 @@ import * as H from "./util";
 // Drives the REAL UI (the AddServer popover + catalog list) via the typed
 // HostOps controller surface (store.hostOps), NOT the DEV-only window.__host
 // bridge — so the same affordances the preview-build proof exercises are
-// proven here against the dev server.
+// proven here against the dev server. The mock-origin url helpers and the
+// openAddServer/fillAndSubmit UI flows live in ./util (shared, pure).
 //
 // Runs on Chromium AND Firefox (the default lane's project set). Each test gets
 // a fresh browser context → empty localStorage → mock seed (4 panes), so this
 // spec does not pollute the survival/shell/layout gates.
 // =============================================================================
-
-// The mock content page origin (served on :5174). Adding a server that points
-// here (with distinct ?server=&view= params) loads a real heartbeating iframe,
-// so "connected" stays true and the pane is genuinely live — not just a label.
-const MOCK_ORIGIN = "http://127.0.0.1:5174";
-
-function serverUrl(server: string): string {
-  const q = new URLSearchParams({ server, view: "chat" });
-  return `${MOCK_ORIGIN}/?${q.toString()}`;
-}
-
-/** Open the add-server popover and return locators for its inputs. */
-async function openAddServer(page: import("@playwright/test").Page) {
-  await page.locator('[data-testid="add-server-btn"]').click();
-  await expect(page.locator('[data-testid="add-server-popover"]')).toBeVisible();
-}
-
-async function fillAndSubmit(
-  page: import("@playwright/test").Page,
-  url: string,
-  label: string,
-): Promise<void> {
-  await page.locator('[data-testid="add-server-url"]').fill(url);
-  await page.locator('[data-testid="add-server-label"]').fill(label);
-  await page.locator('[data-testid="add-server-submit"]').click();
-}
 
 test.describe("runtime server management", () => {
   test.beforeEach(async ({ page }) => {
@@ -52,11 +27,11 @@ test.describe("runtime server management", () => {
 
   test("add-server opens a pane with the configured url + label", async ({ page }) => {
     const before = (await H.panes(page)).length;
-    const url = serverUrl("custom-add");
+    const url = H.serverUrl("custom-add");
     const label = "custom-add";
 
-    await openAddServer(page);
-    await fillAndSubmit(page, url, label);
+    await H.openAddServer(page);
+    await H.fillAndSubmit(page, url, label);
 
     // A new pane appears.
     await expect.poll(async () => (await H.panes(page)).length).toBe(before + 1);
@@ -81,12 +56,12 @@ test.describe("runtime server management", () => {
     page,
   }) => {
     const baseCount = (await H.panes(page)).length;
-    const url = serverUrl("custom-rm");
+    const url = H.serverUrl("custom-rm");
     const label = "custom-rm";
 
     // Add a server first (so there is a catalog entry + pane to remove).
-    await openAddServer(page);
-    await fillAndSubmit(page, url, label);
+    await H.openAddServer(page);
+    await H.fillAndSubmit(page, url, label);
     await expect.poll(async () => (await H.panes(page)).length).toBe(baseCount + 1);
     await expect(
       page.locator(`[data-testid="remove-server"][data-url="${url}"]`),
@@ -114,12 +89,12 @@ test.describe("runtime server management", () => {
   });
 
   test("server list + layout persist across reload", async ({ page }) => {
-    const url = serverUrl("custom-persist");
+    const url = H.serverUrl("custom-persist");
     const label = "custom-persist";
 
     // Add a server → catalog (synchronous persist) + a new pane.
-    await openAddServer(page);
-    await fillAndSubmit(page, url, label);
+    await H.openAddServer(page);
+    await H.fillAndSubmit(page, url, label);
     const withAdded = (await H.panes(page)).length;
     expect(withAdded, "server was added").toBeGreaterThanOrEqual(5);
 
@@ -148,7 +123,7 @@ test.describe("runtime server management", () => {
 
     // The runtime catalog also restored (the remove affordance keyed by url is
     // present without re-adding the server).
-    await openAddServer(page);
+    await H.openAddServer(page);
     await expect(
       page.locator(`[data-testid="remove-server"][data-url="${url}"]`),
     ).toBeVisible();
@@ -159,8 +134,8 @@ test.describe("runtime server management", () => {
   }) => {
     const before = (await H.panes(page)).length;
 
-    await openAddServer(page);
-    await fillAndSubmit(page, "javascript:alert(document.domain)", "evil");
+    await H.openAddServer(page);
+    await H.fillAndSubmit(page, "javascript:alert(document.domain)", "evil");
 
     // An inline error is shown (the isFleetEntry guard rejected the url).
     await expect(page.locator('[data-testid="add-server-error"]')).toBeVisible();
