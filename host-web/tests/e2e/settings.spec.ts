@@ -8,12 +8,15 @@ import * as H from "./util";
 //
 // Part 1 — the tabstrip SETTINGS gear (host-web/src/shell/Settings.tsx): the
 // host's only settings surface (statusbar + per-pane headers are gone). Menu
-// items: "Reload page" (location.reload — the post-deploy refresh path) and
-// "Auto-rotate layout" (the vh-host:autotranspose localStorage toggle, which
-// had NO UI until now). All assertions drive the REAL UI, not the DEV bridge;
-// the toggle's effect is proven LIVE (a resize flip gated by the UI toggle,
-// no reload), which works because viewportShape.applyTranspose re-reads the
-// key on every evaluation.
+// items: "Layout…" (opens the layout overlay for the FOCUSED pane through the
+// production HostOps path — the host-side no-gesture fallback the statusbar
+// removal in aa244b3 had orphaned; aria-disabled + no-op when no pane is
+// focused), "Reload page" (location.reload — the post-deploy refresh path)
+// and "Auto-rotate layout" (the vh-host:autotranspose localStorage toggle,
+// which had NO UI until now). All assertions drive the REAL UI, not the DEV
+// bridge; the toggle's effect is proven LIVE (a resize flip gated by the UI
+// toggle, no reload), which works because viewportShape.applyTranspose re-reads
+// the key on every evaluation.
 //
 // Part 2 — AddServer catalog click-to-prefill: clicking a catalog row fills
 // the url+label inputs (focus + select-all on the URL); the × remove button
@@ -147,6 +150,82 @@ test.describe("settings popover", () => {
     await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(page.locator('[data-testid="layout-overlay-card"]')).toHaveCount(0);
+  });
+
+  test("Layout… item opens the layout overlay for the focused pane", async ({ page }) => {
+    // Two+ panes; focus the SECOND so the anchor is distinguishable from the
+    // boot default (seed focuses the first pane).
+    const ids = await H.panes(page);
+    expect(ids.length, "seeded fleet present").toBeGreaterThanOrEqual(2);
+    const target = ids[1];
+    await H.focusPane(page, target);
+    await expect.poll(async () => H.focused(page)).toBe(target);
+    // The focused pane's label — the overlay card's "Layout: <label>" identity
+    // must reflect exactly this (labels are pairwise non-substring: distinct
+    // server · view pairs).
+    const params = await H.paneParams(page);
+    const label = params.find((p) => p.id === target)!.label;
+
+    await openSettings(page);
+    const item = page.locator('[data-testid="settings-layout"]');
+    // Renders as an enabled menuitem (a pane IS focused) — FIRST in the menu.
+    await expect(item).toHaveAttribute("role", "menuitem");
+    await expect(item).not.toHaveAttribute("aria-disabled", "true");
+    await expect(item).toHaveText(/Layout…/);
+
+    await item.click();
+
+    // The settings popover CLOSED (surface handoff — the layout overlay is the
+    // next surface; never two popovers at once)…
+    await expect(page.locator('[data-testid="settings-popover"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="settings-btn"]')).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    // …and the overlay opened anchored to the FOCUSED pane.
+    await expect.poll(async () => H.overlaySource(page)).toBe(target);
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toContainText(label);
+    await expect(
+      page.locator(`.pane[data-pane-id="${target}"].is-overlay-source`),
+    ).toHaveCount(1);
+
+    await page.screenshot({
+      path: path.join(VISION_DIR, "04-settings-layout-open.png"),
+      fullPage: true,
+    });
+  });
+
+  test("Layout… is aria-disabled + a no-op when no pane is focused (empty workspace)", async ({ page }) => {
+    // Close every pane → empty workspace → nothing focused.
+    const ids = await H.panes(page);
+    for (const id of ids) {
+      await H.closePane(page, id);
+    }
+    await expect.poll(async () => H.gridPaneCount(page)).toBe(0);
+    expect(await H.focused(page), "no focused pane on empty workspace").toBeNull();
+
+    await openSettings(page);
+    const item = page.locator('[data-testid="settings-layout"]');
+    await expect(item).toHaveAttribute("aria-disabled", "true");
+
+    // Clicking is a FULL no-op: no overlay opens, and the popover STAYS open
+    // (the disabled guard runs before the close-after-run handoff, so the
+    // operator can still pick another entry). force: the item is deliberately
+    // NOT natively disabled (aria-disabled keeps it focusable/discoverable),
+    // but Playwright's actionability check refuses to plain-click an
+    // aria-disabled element — force dispatches the REAL pointer/click sequence
+    // through the actual event path, so the no-op guard in activate() is what
+    // is exercised.
+    await item.click({ force: true });
+    await expect(page.locator('[data-testid="settings-popover"]')).toBeVisible();
+    expect(await H.overlaySource(page), "overlay not opened").toBeNull();
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toHaveCount(0);
+
+    await page.screenshot({
+      path: path.join(VISION_DIR, "05-settings-layout-disabled.png"),
+      fullPage: true,
+    });
   });
 
   test("Reload page item reloads the document", async ({ page }) => {

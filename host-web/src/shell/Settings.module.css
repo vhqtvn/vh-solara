@@ -95,3 +95,20 @@
   font-size: 11px;
   font-weight: 700;
 }
+/* Disabled action item (e.g. Layout… with NO focused pane): dimmed text, no
+ * hover affordance, default cursor — visibly non-interactive. The class is
+ * ADDED alongside .item (not a composes variant) so the plain cascade carries
+ * the overrides; it is defined after .item/:hover so equal-specificity later
+ * rules win. GPU-cheap (color/cursor only). Focus-visible is intentionally
+ * KEPT: the button stays discoverable by keyboard/screen-reader (aria-disabled
+ * semantics, not the native disabled attr). */
+.itemDisabled,
+.itemDisabled:hover {
+  color: var(--fg-dim);
+  background: transparent;
+  border-color: transparent;
+  cursor: default;
+}
+.itemDisabled .itemLabel {
+  color: var(--fg-dim);
+}
