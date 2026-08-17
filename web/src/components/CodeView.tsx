@@ -3,6 +3,7 @@ import { projectDir } from "../sync";
 import { codeFile, codeLangs, codeRawUrl, codeSearch, codeStatus, codeStyles, codeTree, type CodeEntry, type CodeFile, type CodeHit } from "../code/api";
 import { codeOpenPath, setCodeOpenPath, codeOpenLine, setCodeOpenLine, codeTabs, addCodeTab, closeCodeTab, resolvePicker, setResolvePicker, openResolved } from "../code/state";
 import { bindBackDismiss } from "../lib/backStack";
+import { layoutPx } from "../lib/zoom";
 import { codeStyle, setCodeStyle, codeWrap, setCodeWrap, codeShowIgnored, setCodeShowIgnored, codeFlatten, setCodeFlatten, codeShowSearch, setCodeShowSearch, codeSidebarOpen, setCodeSidebarOpen } from "../prefs";
 import Icon from "./Icon";
 import Select from "./Select";
@@ -437,9 +438,13 @@ export default function CodeView() {
             </div>
           </Show>
         </main>
+        {/* ctxMenu x/y are pointer client coords (viewport px); the
+            fixed-position menu's left/top are zoomed-layout px (UI zoom is
+            CSS `zoom` on :root; see lib/zoom) — convert so it lands at the
+            cursor at any zoom. */}
         <Show when={ctxMenu()}>
           {(m) => (
-            <div class="code-ctx" style={{ left: `${m().x}px`, top: `${m().y}px` }}>
+            <div class="code-ctx" style={{ left: `${layoutPx(m().x)}px`, top: `${layoutPx(m().y)}px` }}>
               <button type="button" onClick={() => { setFocusRoot(m().path); setCtxMenu(null); }}>Focus this folder</button>
               <Show when={focusRoot()}>
                 <button type="button" onClick={() => { setFocusRoot(""); setCtxMenu(null); }}>Clear focus</button>

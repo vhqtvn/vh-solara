@@ -210,4 +210,60 @@ describe("Tooltip", () => {
     await Promise.resolve();
     expect(tipEl()).toBeNull();
   });
+
+  // ---- Zoom unit conversion (fixed left/top are ZOOMED-LAYOUT px) --------
+  // placeTooltip computes in viewport px; the rendered inline left/top must be
+  // that result divided by --ui-zoom. jsdom returns all-zero rects and never
+  // applies CSS zoom, so geometry is stubbed per element and only the CONVERSION
+  // is under test (placement math itself is covered by tooltip.test.ts).
+  // Anchor rect: left=400 top=500 bottom=520 width=100; bubble: 120x28.
+  // → centre 450, clamp bounds [68, 956] on a 1024px viewport → x=450;
+  //   520+6+28+8=562 ≤ 768 → below → y=526. (Viewport guard below keeps the
+  // 1024x768 jsdom default honest if the environment ever changes.)
+  const rectOf = (o: Partial<DOMRect>) =>
+    ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0, ...o }) as DOMRect;
+  const stubTooltipGeometry = (anchor: HTMLElement) =>
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      if (this === anchor) return rectOf({ left: 400, top: 500, bottom: 520, width: 100, right: 500 });
+      if (this.getAttribute?.("role") === "tooltip") return rectOf({ width: 120, height: 28, right: 120 });
+      return rectOf();
+    });
+
+  describe("zoom conversion of fixed left/top", () => {
+    const clearUiZoom = () => document.documentElement.style.removeProperty("--ui-zoom");
+    afterEach(clearUiZoom);
+
+    it("at zoom 1 the inline left/top equal the viewport-px placement", () => {
+      expect([window.innerWidth, window.innerHeight]).toEqual([1024, 768]);
+      vi.useFakeTimers();
+      const { byId } = mountTips([{ id: "a", text: "hello" }]);
+      stubTooltipGeometry(byId("a"));
+      document.documentElement.style.setProperty("--ui-zoom", "1");
+
+      byId("a").focus();
+      vi.advanceTimersByTime(HOVER_DELAY_MS);
+
+      const tip = tipEl();
+      expect(tip).not.toBeNull();
+      expect(parseFloat(tip!.style.left)).toBeCloseTo(450);
+      expect(parseFloat(tip!.style.top)).toBeCloseTo(526);
+    });
+
+    it("at 125% the inline left/top are the viewport-px placement divided by 1.25", () => {
+      vi.useFakeTimers();
+      const { byId } = mountTips([{ id: "a", text: "hello" }]);
+      stubTooltipGeometry(byId("a"));
+      document.documentElement.style.setProperty("--ui-zoom", "1.25");
+
+      byId("a").focus();
+      vi.advanceTimersByTime(HOVER_DELAY_MS);
+
+      const tip = tipEl();
+      expect(tip).not.toBeNull();
+      // 450/1.25 = 360; 526/1.25 = 420.8 — pre-fix this rendered 450/526 and
+      // the bubble visually landed at 562.5/657.5, offset by the zoom factor.
+      expect(parseFloat(tip!.style.left)).toBeCloseTo(360);
+      expect(parseFloat(tip!.style.top)).toBeCloseTo(420.8);
+    });
+  });
 });

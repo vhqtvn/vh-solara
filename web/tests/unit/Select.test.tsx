@@ -265,3 +265,70 @@ describe("Select — mobile sheet (matchMedia reports a mobile viewport)", () =>
     expect(document.activeElement).toBe(trigger());
   });
 });
+
+// ---- Zoom unit conversion (fixed-position style values are layout px) --------
+// popStyle() computes geometry in VIEWPORT px (trigger gBCR + window.inner*),
+// but the portaled popup's inline left/top|bottom/min-width/max-height are
+// interpreted in the popup's own ZOOMED-LAYOUT space (CSS `zoom` on :root —
+// see lib/zoom.ts). jsdom returns all-zero rects and never applies CSS zoom,
+// so the trigger rect is stubbed and only the CONVERSION is under test (the
+// clamp/flip math itself is unchanged and viewport-px throughout).
+// Trigger rect left=400 top=500 bottom=520 width=100 on the 1024x768 jsdom
+// viewport → maxH=min(340,422)=340; below=248 ≥ 220 → no flip; left=400;
+// top=524. At 125%: 400/1.25=320, 524/1.25=419.2, 100/1.25=80, 340/1.25=272.
+const rectOf = (o: Partial<DOMRect>) =>
+  ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0, ...o }) as DOMRect;
+const stubTriggerRect = (trigger: HTMLElement, r: Partial<DOMRect>) =>
+  vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+    return this === trigger ? rectOf(r) : rectOf();
+  });
+const popEl = () => document.querySelector(".vh-select-pop") as HTMLElement | null;
+
+describe("Select — zoom conversion of the fixed popup style", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    document.documentElement.style.removeProperty("--ui-zoom");
+  });
+
+  const openWithRect = async (r: Partial<DOMRect>) => {
+    const { trigger } = setup();
+    stubTriggerRect(trigger(), r);
+    await fireEvent.click(trigger());
+    await waitFor(() => expect(popEl()).not.toBeNull());
+    return popEl()!;
+  };
+
+  it("at zoom 1 the inline style equals the viewport-px geometry", async () => {
+    expect([window.innerWidth, window.innerHeight]).toEqual([1024, 768]);
+    document.documentElement.style.setProperty("--ui-zoom", "1");
+    const pop = await openWithRect({ left: 400, top: 500, bottom: 520, right: 500, width: 100 });
+    expect(parseFloat(pop.style.left)).toBeCloseTo(400);
+    expect(parseFloat(pop.style.top)).toBeCloseTo(524);
+    expect(parseFloat(pop.style.minWidth)).toBeCloseTo(100);
+    expect(parseFloat(pop.style.maxHeight)).toBeCloseTo(340);
+    expect(pop.style.bottom).toBe("");
+  });
+
+  it("at 125% the inline style is the viewport-px geometry divided by 1.25", async () => {
+    document.documentElement.style.setProperty("--ui-zoom", "1.25");
+    const pop = await openWithRect({ left: 400, top: 500, bottom: 520, right: 500, width: 100 });
+    // Pre-fix these rendered 400/524/100/340 layout-px, so the popup visually
+    // landed at 500/655 (…×1.25), offset by the zoom factor.
+    expect(parseFloat(pop.style.left)).toBeCloseTo(320);
+    expect(parseFloat(pop.style.top)).toBeCloseTo(419.2);
+    expect(parseFloat(pop.style.minWidth)).toBeCloseTo(80);
+    expect(parseFloat(pop.style.maxHeight)).toBeCloseTo(272);
+  });
+
+  it("flip-up branch converts bottom too (trigger near the viewport floor)", async () => {
+    document.documentElement.style.setProperty("--ui-zoom", "1.25");
+    // top=700 bottom=720 → below=48 < 220 and top>below → flip up;
+    // bottom=round(768-700+4)=72 → 72/1.25=57.6; left=100 → 80.
+    const pop = await openWithRect({ left: 100, top: 700, bottom: 720, right: 300, width: 200 });
+    expect(pop.style.top).toBe("");
+    expect(parseFloat(pop.style.bottom)).toBeCloseTo(57.6);
+    expect(parseFloat(pop.style.left)).toBeCloseTo(80);
+    expect(parseFloat(pop.style.minWidth)).toBeCloseTo(160);
+  });
+});

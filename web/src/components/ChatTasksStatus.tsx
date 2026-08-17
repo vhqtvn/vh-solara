@@ -10,6 +10,7 @@
 import { createEffect, createMemo, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js";
 import { fetchSubtreeTodos, type SubtreeTodosResp } from "../subtreeTodos";
 import type { CurrentVerb } from "../sync";
+import { layoutPx } from "../lib/zoom";
 import Icon from "./Icon";
 import Spinner from "./Spinner";
 
@@ -81,11 +82,16 @@ export default function ChatTasksStatus(props: {
     e.stopPropagation();
     const el = tasksPopupEl;
     if (!el) return;
-    const r = el.getBoundingClientRect();
-    const sx = e.clientX, sy = e.clientY, sw = r.width, sh = r.height;
+    // Pointer coords arrive in OUTER/viewport px while the width/height styles
+    // below are zoomed-layout px (UI zoom = CSS `zoom` on :root; see
+    // lib/zoom) — convert them, and read the start size via offsetWidth/
+    // offsetHeight (the element's own layout px; getBoundingClientRect would
+    // report visual px under zoom). innerHeight is viewport px too, so the
+    // max-height clamp converts as well.
+    const sx = layoutPx(e.clientX), sy = layoutPx(e.clientY), sw = el.offsetWidth, sh = el.offsetHeight;
     const move = (ev: PointerEvent) => {
-      const w = Math.max(220, Math.min(560, sw + (sx - ev.clientX))); // drag left → wider
-      const h = Math.max(120, Math.min(window.innerHeight * 0.72, sh + (sy - ev.clientY))); // drag up → taller
+      const w = Math.max(220, Math.min(560, sw + (sx - layoutPx(ev.clientX)))); // drag left → wider
+      const h = Math.max(120, Math.min(layoutPx(window.innerHeight) * 0.72, sh + (sy - layoutPx(ev.clientY)))); // drag up → taller
       el.style.width = `${w}px`;
       el.style.height = `${h}px`;
       el.style.maxHeight = `${h}px`;

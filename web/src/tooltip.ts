@@ -22,6 +22,12 @@ export interface Size {
 }
 
 // Place the tooltip bubble relative to its anchor, clamped to the viewport.
+// UNIT CONTRACT: every input and the returned x/y are VIEWPORT px — feed it
+// getBoundingClientRect() geometry and window.innerWidth/innerHeight (all
+// visual px, so every comparison below is unit-consistent). The caller must
+// convert the result to zoomed-layout px (lib/zoom `layoutPx`) before
+// assigning it to the bubble's fixed `left`/`top` styles, which live in the
+// zoomed layout space.
 // `x` is the bubble's horizontal centre (the bubble is rendered with
 // translateX(-50%)), so we clamp the centre such that both edges (centre ±
 // half the measured width) stay `margin` px inside the viewport — this is what

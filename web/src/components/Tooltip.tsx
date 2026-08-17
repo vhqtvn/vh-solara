@@ -1,5 +1,6 @@
 import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { hoverCapable, inspectAt, placeTooltip, type Rectish } from "../tooltip";
+import { layoutPx } from "../lib/zoom";
 import styles from "./Tooltip.module.css";
 
 // DOM-based tooltip (mounted once at the app root). We avoid the native `title`
@@ -174,7 +175,16 @@ export default function Tooltip() {
         role="tooltip"
         style={
           pos()
-            ? { left: `${pos()!.x}px`, top: `${pos()!.y}px` }
+            ? // placeTooltip computes in VIEWPORT px (gBCR of the anchor and
+              // the bubble + window.innerWidth/innerHeight are all visual px),
+              // but `left`/`top` we assign here land in the bubble's own
+              // ZOOMED-LAYOUT space (CSS `zoom` on :root). Convert at this
+              // boundary or the bubble drifts by the zoom factor (zoom>1 lags
+              // toward the top-left; zoom<1 overshoots). Identity at zoom 1.
+              {
+                left: `${layoutPx(pos()!.x)}px`,
+                top: `${layoutPx(pos()!.y)}px`,
+              }
             : { left: "0", top: "0", visibility: "hidden" }
         }
       >

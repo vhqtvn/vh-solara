@@ -1,6 +1,7 @@
 import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import { bindBackDismiss } from "../lib/backStack";
+import { layoutPx } from "../lib/zoom";
 import Icon from "./Icon";
 
 export interface SelectOption {
@@ -205,6 +206,11 @@ export default function Select(props: {
   });
 
   // Fixed position against the trigger; flips up if below would overflow.
+  // All geometry here (gBCR of the trigger + window.innerWidth/innerHeight) is
+  // in VIEWPORT px, but every length assigned below lands in the popup's own
+  // ZOOMED-LAYOUT space (CSS `zoom` on :root — see lib/zoom.ts), so convert
+  // each value at this style boundary or the popup offsets by the zoom factor.
+  // The clamp/flip comparisons stay viewport-px — one unit throughout the math.
   const popStyle = () => {
     const r = rect();
     if (!r) return {};
@@ -214,12 +220,12 @@ export default function Select(props: {
     const left = Math.max(8, Math.min(r.left, window.innerWidth - 8 - r.width));
     const base: Record<string, string> = {
       position: "fixed",
-      left: `${left}px`,
-      "min-width": `${r.width}px`,
-      "max-height": `${maxH}px`,
+      left: `${layoutPx(left)}px`,
+      "min-width": `${layoutPx(r.width)}px`,
+      "max-height": `${layoutPx(maxH)}px`,
     };
-    if (flipUp) base.bottom = `${Math.round(window.innerHeight - r.top + 4)}px`;
-    else base.top = `${Math.round(r.bottom + 4)}px`;
+    if (flipUp) base.bottom = `${layoutPx(Math.round(window.innerHeight - r.top + 4))}px`;
+    else base.top = `${layoutPx(Math.round(r.bottom + 4))}px`;
     return base;
   };
 

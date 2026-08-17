@@ -30,6 +30,7 @@ import {
 import { displayName } from "../projectSettings";
 import { classifyHold } from "../lib/copyHold";
 import { bindBackDismiss } from "../lib/backStack";
+import { layoutPx } from "../lib/zoom";
 import Icon from "./Icon";
 import TextPromptDialog from "./TextPromptDialog";
 import { defaultColorForIndex, labelColorVar } from "./labelPalette";
@@ -97,8 +98,14 @@ export default function SessionContextMenu() {
   const pos = createMemo(() => {
     const t = menuTarget();
     if (!t || t.x == null || t.y == null) return null;
-    const x = Math.min(t.x, window.innerWidth - 240);
-    const y = Math.min(t.y, window.innerHeight - measuredH() - 8);
+    // t.x/t.y are pointer client coords (viewport px); the menu's fixed
+    // left/top and the clamp constants (240, measuredH — offsetHeight, layout
+    // px) live in zoomed-layout px (UI zoom = CSS `zoom` on :root; see
+    // lib/zoom). innerWidth/innerHeight are viewport px too, so convert
+    // everything into layout px before clamping — at zoom ≠ 100% the raw
+    // coords would land the menu offset from the cursor by the zoom factor.
+    const x = Math.min(layoutPx(t.x), layoutPx(window.innerWidth) - 240);
+    const y = Math.min(layoutPx(t.y), layoutPx(window.innerHeight) - measuredH() - 8);
     return { x: Math.max(8, x), y: Math.max(8, y) };
   });
 

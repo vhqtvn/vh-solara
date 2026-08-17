@@ -4,6 +4,7 @@ import { bindCodeFrame, resetCodeFrameReady } from "../code/frame";
 import { codeDockOpen, setCodeDockOpen, codeMobileOverlay, setCodeMobileOverlay, setView, view } from "../ui";
 import { isDesktop } from "../layout";
 import { codeDockSide, setCodeDockSide, codeDockWidth, setCodeDockWidth } from "../prefs";
+import { layoutPx } from "../lib/zoom";
 import Icon from "./Icon";
 
 export type CodeMode = "full" | "dock" | "overlay" | "hidden";
@@ -61,11 +62,15 @@ export default function CodeFrame() {
     const handle = e.currentTarget as HTMLElement;
     handle.setPointerCapture?.(e.pointerId);
     setResizing(true);
-    const startX = e.clientX;
+    const startX = layoutPx(e.clientX);
     const startW = codeDockWidth();
     const move = (ev: PointerEvent) => {
       // Dock on the right grows when dragging left; on the left, the opposite.
-      const dx = codeDockSide() === "right" ? startX - ev.clientX : ev.clientX - startX;
+      // Pointer coords are viewport px while the dock width is zoomed-layout
+      // px (UI zoom = CSS `zoom` on :root; see lib/zoom) — convert so the
+      // delta tracks the cursor at any zoom.
+      const x = layoutPx(ev.clientX);
+      const dx = codeDockSide() === "right" ? startX - x : x - startX;
       setCodeDockWidth(startW + dx);
     };
     const up = (ev: PointerEvent) => {

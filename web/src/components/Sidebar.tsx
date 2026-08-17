@@ -15,6 +15,7 @@ import Icon from "./Icon";
 import { setView } from "../ui";
 import { dismiss } from "../lib/a11y";
 import { bindBackDismiss } from "../lib/backStack";
+import { layoutPx } from "../lib/zoom";
 import { labelColorVar } from "./labelPalette";
 import styles from "./Sidebar.module.css";
 
@@ -128,7 +129,9 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
   };
 
   // Drag the right edge to resize; the sidebar sits at the viewport's left, so
-  // the new width is just the pointer's X. Width is clamped + persisted in layout.
+  // the new width is just the pointer's X — converted from viewport px to
+  // zoomed-layout px (UI zoom is CSS `zoom` on :root; see lib/zoom), since the
+  // width is clamped + persisted in layout px.
   function startResize(e: PointerEvent) {
     e.preventDefault();
     // Capture the pointer on the handle so the drag keeps getting pointermove —
@@ -137,7 +140,7 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
     // "sticks" and only nudges a little.
     const handle = e.currentTarget as HTMLElement;
     handle.setPointerCapture?.(e.pointerId);
-    const move = (ev: PointerEvent) => setSidebarWidth(ev.clientX);
+    const move = (ev: PointerEvent) => setSidebarWidth(layoutPx(ev.clientX));
     const up = () => {
       handle.removeEventListener("pointermove", move);
       handle.removeEventListener("pointerup", up);
