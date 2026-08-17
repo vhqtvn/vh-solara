@@ -34,12 +34,17 @@ result: proven               # proven | skipped | not-demonstrable (the crux out
   verdict MUST be inconclusive, failed, or abandoned.
 - The declaration is a declaration, not a proof: a consistent token does not
   prove the path executed — that needs the repo-specific live verification.
-- Verifier-infeasible: if the verified seam cannot observe the load-bearing
-  outcome (fixture too small, no prior surface, no real scale, no render),
-  declare `result: not-demonstrable` → `verdict: inconclusive`. This blocks a
-  `completed` closeout and routes to defer — never record the infeasibility as
-  silent prose, and never claim `proven` for an outcome the seam could not
-  observe.
+- Verifier-infeasible: when the verified seam cannot observe the load-bearing
+  outcome (the fixture is too small, there is no prior surface, no real scale,
+  or no render available), declare `result: not-demonstrable` (NOT `proven`) →
+  `verdict: inconclusive`. The honest authoring workflow routes such a crux to
+  defer rather than `completed` — an honesty requirement enforced by author +
+  reviewer, NOT a mechanical refusal at the `saveCoordinationTaskCloseout`
+  transition (which parses `rewrite-parity` only, never `behavioral-closure`).
+  `vh-agent-harness doctor` separately audits saved declarations for internal
+  consistency and marks the repo UNHEALTHY on inconsistent ones (FAIL →
+  non-zero exit → blocks release G0c). Never record the infeasibility as silent
+  prose, and never claim `proven` for an outcome the seam could not observe.
 - Outcome vs mechanism: for a user-visible behavior, `proven` must cite an
   OUTCOME observation (the behavior occurred), not a MECHANISM assertion (a
   flag is set, a record exists, a code path ran). Mechanism-without-outcome is
@@ -51,6 +56,55 @@ result: proven               # proven | skipped | not-demonstrable (the crux out
   (`git show <sha>`, `git cat-file`). `git show` succeeds for an orphaned /
   reflog-only commit, so an object-existence verifier cannot distinguish
   "committed and landed" from "committed and reverted/reset".
+- Interaction-reachability (interaction-touching changes): when the
+  load-bearing path is a **user-interaction path** — correctness depends on a
+  real user action reaching the handler in the real runtime, NOT a direct API
+  call that bypasses the event model — the crux MUST carry an
+  **interaction-reachability receipt** in addition to the command receipt
+  above. This is the runtime-blindspot class (e.g. a cross-origin iframe
+  swallows host events; the API test passes; the real user event never
+  arrives). See AGENTS.md → "Behavioral closure" → "Interaction-reachability
+  receipt" for the five governing conditions. The receipt fields live INSIDE
+  the same `behavioral-closure` block (additive to the crux above), using an
+  `interaction_` prefix to avoid collision with the existing `verifier`/
+  `command`/`result` fields:
+
+  ````text
+  # added inside the ```behavioral-closure block when interaction_touching: true
+  interaction_touching: true
+  interaction_action: <real gesture/input — not a programmatic stand-in>
+  interaction_target: <behavior the action is meant to trigger>
+  interaction_environment: <real runtime — NOT a mocked/jsdom/headless stand-in>
+  interaction_verifier: <command that exercises the REAL event path>
+  interaction_outcome: <user-visible outcome a human would see>
+  interaction_tree: <git sha / revision>
+  interaction_evidence: outcome | mechanism
+  ````
+  - An API-call-returned / flag-set / code-path-ran receipt is MECHANISM, not
+    OUTCOME → `interaction_evidence: mechanism` paired with `result: proven`
+    is REJECTED by the gate; downgrade to `result: skipped`, never `proven`,
+    unless the user-visible outcome was actually observed in the real
+    environment (`interaction_evidence: outcome`).
+  - A passing receipt is "structural completeness only," NEVER "reachability
+    proven" — the gate verifies presence/consistency, not that the event
+    reached the handler.
+  - A reviewer (or the advisory `interaction-reachability` skill, when named)
+    may DEFER a shallow/inconsistent/non-falsifiable receipt; this is ADVISORY
+    ONLY — no BLOCK, approval, or unblock authority.
+  - **Enforcement surface:** the `vh-agent-harness doctor` health check (check
+    #14, `behavioral-closure`) scans durable closeout artifacts for the receipt
+    and FAILs when `interaction_touching: true` is declared but the receipt is
+    missing/incomplete, or when `interaction_evidence: mechanism` is paired
+    with `result: proven`. This is structural enforcement, NOT advisory — a
+    doctor FAIL blocks release and flags the repo UNHEALTHY. (The
+    closeout-transition gate `saveCoordinationTaskCloseout` does NOT parse
+    `behavioral-closure`; it enforces only the opt-in `rewrite-parity` Stage-2
+    contract. The behavioral-closure honesty model — including the
+    interaction-reachability receipt — lives entirely in the doctor audit.)
+  - When no verified seam can observe the outcome in the real environment →
+    `result: not-demonstrable` → `verdict: inconclusive` → the doctor check
+    accepts the honest declaration, and the closeout routes to defer rather
+    than `completed`.
 
 ## Rewrite-parity contract (only for explicitly-declared deletion/rewrite slices)
 

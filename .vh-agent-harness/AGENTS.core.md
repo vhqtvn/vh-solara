@@ -221,14 +221,23 @@ outcome).
   declaration, not proof the path executed.
 - The `vh-agent-harness doctor` health check rejects an internally-inconsistent
   declaration (e.g. `verdict: proven` without a proven crux). This is the
-  safety layer acting; it does not gate a verdict it cannot verify.
+  safety layer acting; it does not gate a verdict it cannot verify. When
+  `interaction_touching: true` is declared, doctor additionally rejects a
+  missing/incomplete interaction-reachability receipt or a mechanism-as-proven
+  pairing (see "Interaction-reachability receipt" below).
 - Verifier-infeasible outcome: when the verified seam cannot observe the
   load-bearing outcome (the fixture is too small, there is no prior surface,
   no real scale, or no render available), declare `result: not-demonstrable`
-  (NOT `proven`) → `verdict: inconclusive`. This blocks a `completed` closeout
-  and routes to defer. Never record the infeasibility as silent prose, and
-  never claim `proven` for an outcome the seam could not observe — translate it
-  into the shipped `not-demonstrable` crux state.
+  (NOT `proven`) → `verdict: inconclusive`. The honest authoring workflow
+  routes such a crux to defer rather than `completed` — an honesty requirement
+  enforced by author + reviewer, NOT a mechanical refusal at the
+  `saveCoordinationTaskCloseout` transition (which parses `rewrite-parity`
+  only, never `behavioral-closure`). `vh-agent-harness doctor` separately
+  audits saved declarations for internal consistency and marks the repo
+  UNHEALTHY on inconsistent ones (FAIL → non-zero exit → blocks release G0c).
+  Never record the infeasibility as silent prose, and never claim `proven` for
+  an outcome the seam could not observe — translate it into the shipped
+  `not-demonstrable` crux state.
 - Outcome-observed vs mechanism-asserted: for a behavior whose value is
   user-visible, `proven` must cite an observation of the OUTCOME (the behavior
   occurred), not an assertion of the MECHANISM (a flag is set, a record exists,
@@ -246,6 +255,82 @@ outcome).
   reachability directly, so a defective land-verifier is also caught by the
   better mechanism — but the declared crux command must still be a
   reachability form.)
+
+- **Interaction-reachability receipt (interaction-touching changes):** a
+  behavior change that touches a **user-interaction path** — a codepath whose
+  correctness depends on a real user action actually *reaching* the handler in
+  the real runtime (a focus/click/keypress event dispatched through the real
+  event model, NOT a direct API call that bypasses it) — carries an elevated
+  crux risk: the diff is locally correct and a direct API test passes, yet the
+  behavior is unreachable in the real environment. This is the runtime-blindspot
+  class (e.g. a cross-origin iframe swallows host events; driving the handler
+  API succeeds in a test; the real user event never arrives — invisible to the
+  diff, advisory-only to any reviewer). For such changes the
+  `behavioral-closure` crux MUST carry an **interaction-reachability receipt**
+  in addition to the command receipt above. Five conditions govern this receipt
+  (an honest author satisfies ALL of them; none is waivable):
+  1. **Receipt fields.** The receipt MUST state: the **real user action**
+     performed (the literal gesture/input — not a programmatic stand-in); the
+     **target behavior** the action is meant to trigger; the **actual
+     environment** it ran in (the real runtime/browser/device — NOT a mocked,
+     jsdom, or headless stand-in that elides the event model); the **verifier
+     command** plus its **observed outcome**; a **tree/revision binding**; and
+     the **observed USER-VISIBLE outcome** (what a human would see — not "the
+     function returned").
+  2. **Mechanism-asserting receipts are `skipped`.** A receipt whose evidence
+     is that an API call returned, a flag/state was set, or a code path ran is
+     MECHANISM evidence, not OUTCOME evidence. It MUST be classified
+     `result: skipped`, NEVER `proven`, unless the user-visible outcome was
+     actually observed in the real environment. (This sharpens the
+     outcome-vs-mechanism rule above for interactions: "I called `setActive()`
+     and it returned" is mechanism; "focus moved to the intended pane after the
+     real click" is outcome.)
+  3. **Label honesty — structural completeness only.** A crux/receipt that
+     passes the consistency check is "structural completeness only," NEVER
+     "reachability proven." The gate verifies the receipt is present and
+     internally consistent; it does NOT — and cannot — verify that the user
+     event reached the handler in the real runtime. State the pass as
+     "structurally complete," never as proof of reachability.
+  4. **Advisory falsification surface.** A reviewer (or the
+     `interaction-reachability` advisory skill, when named in the task
+     contract) inspects the receipt for **shallow, inconsistent, or
+     non-falsifiable** claims — e.g. a receipt citing a mocked environment where
+     the event model is absent, or an outcome indistinguishable from the
+     API-call mechanism. This inspection is **ADVISORY ONLY**: it INFORMS the
+     author/reviewer and may issue a DEFER; it has NO BLOCK, approval, or
+     unblock authority of its own (a runtime-only concern cannot ground a
+     diff-verifiable BLOCK).
+  5. **Honest infeasibility.** When no verified seam can observe the
+     user-visible outcome in the real environment (no real browser/runtime
+     fixture, the event model cannot be exercised, or the outcome is not
+     observable), the result MUST be `not-demonstrable` (→ `verdict:
+     inconclusive`), NEVER a reachability `proven`. The honest authoring
+     workflow routes such a crux to defer rather than `completed` — the same
+     honesty requirement as the verifier-infeasible rule above (author +
+     reviewer, NOT a mechanical refusal at the `saveCoordinationTaskCloseout`
+     transition). Never record the infeasibility as silent prose, and never
+     claim `proven` for an outcome the seam could not observe.
+
+  This receipt dimension is ADDITIVE: it adds a new requirement for a new class
+  of change (interaction-touching); it does NOT weaken existing crux receipts or
+  remove existing gate semantics. The receipt is presence-/consistency-verified
+  by the gate, not truth-verified — the SAME honesty ceiling every crux receipt
+  already carries (author + reviewer, not the gate).
+
+  **Author-declared predicate + receipt fields (enforcement shape):** the
+  interaction-touching predicate is AUTHOR-DECLARED via
+  `interaction_touching: true` inside the `behavioral-closure` block (the gate
+  does NOT diff-infer interaction-touching). When declared, the receipt MUST
+  carry six fields using an `interaction_` prefix (to avoid collision with the
+  existing `verifier`/`command`/`result` crux fields): `interaction_action`
+  (real user gesture), `interaction_target` (target behavior),
+  `interaction_environment` (real runtime), `interaction_verifier` (verifier
+  command on the real event path), `interaction_tree` (tree binding),
+  `interaction_outcome` (observed user-visible outcome) — plus
+  `interaction_evidence: outcome | mechanism` for the condition-2 downgrade
+  (mechanism-asserting evidence paired with `result: proven` is rejected;
+  downgrade to `skipped`). The `vh-agent-harness doctor` check #14 enforces
+  this structurally — it is NOT advisory.
 
 - **Provable-invariant crux:** when the crux is a provable concurrency or
   state-machine invariant, the `formal-verification` skill authors an

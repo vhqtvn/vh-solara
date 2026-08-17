@@ -51,7 +51,10 @@ converge on correctness without blocking edits:
    the promotion Definition of Ready is met (concrete area + file scope +
    validation plan + clear slice + provenance). The promoter runs the
    `check-defer-triggers.mjs` predicate checker as a review aid (promoter-use-
-   only; never a commit hook; never blocking).
+   only; never a commit hook; never blocking). Read-only roles
+   (`researcher`, `worker-read-only`) run it via the contained
+   `vh-agent-harness defer-triggers` wrapper (strict sandbox, no args); `build`
+   and interactive operator use may run the bare `node …` form directly.
 
 The **promoter** curates candidates, batch-promotes a cycle's consolidated
 status transitions (normalize + archive), and runs the narrow
