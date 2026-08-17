@@ -4,6 +4,7 @@
 // bottom): the signal is the single source of truth, so setters just set it and
 // there's no boot list to keep in sync in index.tsx.
 import { createRenderEffect, createRoot } from "solid-js";
+import { isEmbedded } from "./embedded";
 import { persistedSignal, boolMigrate } from "./lib/store";
 
 // Live message streaming: when on (default), in-flight assistant text renders
@@ -76,7 +77,7 @@ export function applyScale() {
   // meta path (the real virtual-viewport zoom); standalone desktop already uses
   // zoom. Without this, ui-scale was a no-op for mobile-embedded users (the
   // "ui scaling no longer works" report once the host shell became default).
-  const embedded = typeof window !== "undefined" && window.parent !== window;
+  const embedded = isEmbedded();
   // ui-zoom always drives the viewport meta's initial/min/max-scale — the
   // mechanism that actually scales on mobile (and webviews that honor it).
   setViewportScale(scale);

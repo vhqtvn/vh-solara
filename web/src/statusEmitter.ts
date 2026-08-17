@@ -23,6 +23,7 @@
 // This is ADDITIVE: it does not change the physical topology, the heartbeat, or
 // the Q1-C liveness indicator. Survival is unchanged.
 
+import { isEmbedded } from "./embedded";
 import { state } from "./sync/store";
 import { rootOf, sessionWorking } from "./sync/selectors";
 
@@ -118,7 +119,7 @@ function deriveActivity(session: string): Activity {
 export function startStatusEmitter(): (() => void) | undefined {
   if (typeof window === "undefined") return;
   // Constraint #1 (mirror heartbeat): embed gate. Send nothing standalone.
-  if (window.parent === window) return;
+  if (!isEmbedded()) return;
 
   // Q2-A (mirror heartbeat): host origin captured from the inbound handshake
   // MessageEvent.origin — never a literal '*' and never build-time config.

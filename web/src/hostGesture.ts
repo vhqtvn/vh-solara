@@ -124,11 +124,13 @@ export interface HostGestureMessage {
  * module). Wire alongside startHeartbeat()/startStatusEmitter()/
  * startSelectListener() in index.tsx.
  */
+import { isEmbedded } from "./embedded";
+
 export function startHostGesture(): (() => void) | undefined {
   if (typeof window === "undefined") return;
   // Constraint #1 (mirror heartbeat): embed gate. Do nothing standalone — the
   // common single-server case has no host to receive the gesture.
-  if (window.parent === window) return;
+  if (!isEmbedded()) return;
 
   // Q2-A (mirror heartbeat): host origin captured from the inbound handshake
   // MessageEvent.origin — never a literal '*' and never build-time config.

@@ -42,10 +42,12 @@ function allowlistRoute(): string {
  * a reload re-runs this module → fresh mountTs + a fresh nonce from the new
  * handshake). No-op when not embedded (constraint #1).
  */
+import { isEmbedded } from "./embedded";
+
 export function startHeartbeat(): number | undefined {
   if (typeof window === "undefined") return;
   // Constraint #1: embed gate. Send nothing when standalone.
-  if (window.parent === window) return;
+  if (!isEmbedded()) return;
 
   // Identity captured ONCE per document load. NEVER reassigned.
   // mountTs = the document's navigation start (stable per load, changes on

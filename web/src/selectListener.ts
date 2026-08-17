@@ -30,6 +30,7 @@
 // origin to target without sharing the handshake listener, which is unnecessary
 // here since the source-guard is the load-bearing inbound binding).
 
+import { isEmbedded } from "./embedded";
 import { projectDir } from "./sync/store";
 import { setSelectedId, switchProject } from "./sync/actions";
 
@@ -90,7 +91,7 @@ export function startSelectListener(): (() => void) | undefined {
   if (typeof window === "undefined") return;
   // Constraint #1 (mirror heartbeat): embed gate. Do nothing standalone — the
   // common single-server case has no host to drive a select.
-  if (window.parent === window) return;
+  if (!isEmbedded()) return;
 
   const onMessage = (ev: MessageEvent): void => {
     // F1 (mirror heartbeat): inbound source-guard, BEFORE any state mutation.
