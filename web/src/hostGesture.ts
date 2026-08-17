@@ -72,6 +72,8 @@
 // is COMBINED with the handshake listener so this module adds exactly ONE
 // message listener total (handshake + host-mode on the same handler).
 
+import { isEmbedded } from "./embedded";
+
 const DOUBLE_CTRL_WINDOW_MS = 450;
 // 3-finger-tap: all three fingers down + lifted within this window of the
 // FIRST down (total first-down → last-up elapsed). Robust on real touch (counts
@@ -124,8 +126,6 @@ export interface HostGestureMessage {
  * module). Wire alongside startHeartbeat()/startStatusEmitter()/
  * startSelectListener() in index.tsx.
  */
-import { isEmbedded } from "./embedded";
-
 export function startHostGesture(): (() => void) | undefined {
   if (typeof window === "undefined") return;
   // Constraint #1 (mirror heartbeat): embed gate. Do nothing standalone — the

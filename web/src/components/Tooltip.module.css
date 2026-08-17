@@ -1,7 +1,9 @@
-/* DOM tooltip (replaces native title; data-tip driven). Portaled to <body> as
-   fixed-position. `.tooltip` is kept :global because e2e (tooltip.spec,
+/* DOM tooltip (replaces native title; data-tip driven). Mounted once at the
+   app root (App tree, NOT portaled to <body>) as fixed-position — the bubble
+   is an ordinary child of the <Tooltip /> node rendered near the end of App.
+   `.tooltip` is kept :global because e2e (tooltip.spec,
    features2.spec) queries the literal `.tooltip` class selector; the module CSS
-   still applies to the portaled element regardless. `.above` is sole-owned by
+   still applies to that root-mounted element regardless. `.above` is sole-owned by
    Tooltip (no other component uses it as a class) and is NOT queried by e2e, so
    it is scoped locally and applied via `classList={{ [styles.above]: ... }}`.
    `tip-in` keyframes is sole-owned and lives here (local); the `animation`

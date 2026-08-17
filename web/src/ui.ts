@@ -3,6 +3,7 @@
 import { createRoot, createSignal } from "solid-js";
 import { bindBackDismiss, pushBackSurface, releaseBackSurface, type BackSurface } from "./lib/backStack";
 import { loadVersioned, saveVersioned } from "./lib/store";
+import { isEmbedded } from "./embedded";
 
 // Built-in views plus consumer-registered embedded views, keyed "view:<id>".
 export type BuiltinView = "chat" | "changes" | "notes" | "preferences" | "code";
@@ -61,8 +62,38 @@ export const [paletteOpen, setPaletteOpen] = createSignal(false);
 // (it lives in App → .view-primary, a sibling of the sidebar switcher trigger).
 export const [projSwitcherOpen, setProjSwitcherOpen] = createSignal(false);
 // Terminal: a bottom dock that can expand to full-screen (always full on mobile).
-export const [termOpen, setTermOpen] = createSignal(false);
-export const [termFull, setTermFull] = createSignal(false);
+//
+// S1b embedded default: when this SPA runs inside the host shell's iframe
+// (isEmbedded()), the dock's DEFAULT presentation on its first open in a
+// session is overlay-full (.full in TerminalDock.css) — opening a terminal
+// never permanently consumes pane vertical space. Standalone keeps the
+// bottom-dock default. The default is applied at first OPEN, not by
+// initializing the signal true: bindBackDismiss(termFull, …) below would
+// otherwise push a back-history token at every embedded load — before any
+// terminal is open — swallowing the first back press (pinned in
+// termEmbeddedDefault.test.ts). Any explicit setTermFull (the Dock/Full-screen
+// toggle, or a back-dismissal of the overlay) records the session's choice,
+// which then wins over the default for the rest of the session — matching the
+// signal's existing session-scoped (deliberately non-persisted) lifetime. No
+// persistence is added.
+const [termOpen, setTermOpenCore] = createSignal(false);
+const [termFull, setTermFullCore] = createSignal(false);
+export { termOpen, termFull };
+// True once a terminal presentation exists for this session — either the
+// embedded default was applied (first open) or the user toggled explicitly.
+let termPresentationSet = false;
+export function setTermOpen(v: boolean | ((prev: boolean) => boolean)) {
+  const open = typeof v === "function" ? v(termOpen()) : v;
+  if (open && !termPresentationSet) {
+    termPresentationSet = true;
+    if (isEmbedded()) setTermFullCore(true);
+  }
+  setTermOpenCore(open);
+}
+export function setTermFull(v: boolean | ((prev: boolean) => boolean)) {
+  termPresentationSet = true;
+  setTermFullCore(typeof v === "function" ? v(termFull()) : v);
+}
 // Toggleable on-screen key bar (esc/tab/ctrl/arrows). Persisted; default on.
 const [termKeys, setTermKeysSig] = createSignal<boolean>(
   loadVersioned<boolean>("vh.term.keys.v1", 1, true, (o) => o !== false && o !== 0 && o !== "0"),

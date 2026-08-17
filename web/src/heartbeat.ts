@@ -12,6 +12,8 @@
 // Q2-A: replies go to the host origin captured from the inbound handshake
 // MessageEvent.origin (never a literal '*' and never a build-time config).
 
+import { isEmbedded } from "./embedded";
+
 const HEARTBEAT_MS = 250; // ≈4 Hz, matching the mock stand-in (docs §6).
 
 /**
@@ -42,8 +44,6 @@ function allowlistRoute(): string {
  * a reload re-runs this module → fresh mountTs + a fresh nonce from the new
  * handshake). No-op when not embedded (constraint #1).
  */
-import { isEmbedded } from "./embedded";
-
 export function startHeartbeat(): number | undefined {
   if (typeof window === "undefined") return;
   // Constraint #1: embed gate. Send nothing when standalone.
