@@ -22,6 +22,14 @@
 /* flex:1 so the title absorbs width changes between tabs and the seg + right-side
    controls stay anchored — switching Chat/Changes/Notes no longer shifts them. */
 .main-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+/* --- height-tier defense (S2a; signal source: web/src/shapeTier.ts) --------
+   e. Header slim, TINY only: the ~46px header eats ~12% of a 320px-tall pane.
+   Halve the row's vertical padding (buttons, icons, and title stay — nothing
+   is removed, only the breathing room shrinks). */
+[data-h-tier="tiny"] .main-head {
+  padding: max(4px, env(safe-area-inset-top)) max(10px, env(safe-area-inset-right)) 4px max(10px, env(safe-area-inset-left));
+  gap: 6px;
+}
 .nav-toggle {
   /* Visible on desktop (collapse/expand) and mobile (slide-over). */
   display: inline-flex;

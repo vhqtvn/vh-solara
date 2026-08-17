@@ -36,6 +36,7 @@ import ProtocolConfirm from "./components/ProtocolConfirm";
 import Icon from "./components/Icon";
 import { menuTriggers } from "./sessionMenu";
 import { isDesktop, sidebarCollapsed, sidebarWidth, toggleSidebar } from "./layout";
+import { installShapeTier } from "./shapeTier";
 import { draft, selectedId, state } from "./sync";
 import { startDiagCapture } from "./sync/diaglog";
 import { refreshViews, views } from "./views";
@@ -73,6 +74,8 @@ export default function App() {
   );
   // Path selection captured when the Code button is pressed (see its handlers).
   let codeBtnTarget: string | null = null;
+  // App root (`.app`) — the height-tier signal observes it (shapeTier.ts).
+  let appEl: HTMLDivElement | undefined;
 
   // View tabs for the header switcher (built-ins + any embedded views). Icons
   // are best-effort (the icon style shows them with a tooltip).
@@ -141,6 +144,9 @@ export default function App() {
     // Wire the hidden diagnostic-log capture (default-off ring buffer). No-op
     // capture until the operator enables it from the server-admin menu.
     startDiagCapture();
+    // Height-tier signal (short-pane defenses): ResizeObserver on `.app`,
+    // publishes data-h-tier. Kill-switch: vh.prefs.shapeTier.v1 = "off".
+    if (appEl) onCleanup(installShapeTier(appEl));
   });
   onCleanup(() => {
     document.removeEventListener("keydown", onGlobalKey);
@@ -248,7 +254,7 @@ export default function App() {
   const toggleNav = () => (isDesktop() ? toggleSidebar() : setNavOpen((v) => !v));
 
   return (
-    <div class="app" classList={{ "sidebar-collapsed": sidebarCollapsed() }}>
+    <div class="app" classList={{ "sidebar-collapsed": sidebarCollapsed() }} ref={appEl}>
       <Sidebar open={navOpen()} onClose={() => setNavOpen(false)} />
       <main class="main">
         <header class="main-head">

@@ -8,6 +8,43 @@
   display: flex; align-items: center; gap: 10px;
   width: 100%; max-width: var(--chat-width, 860px); margin: 0 auto; padding: 6px 14px 8px;
 }
+
+/* --- height-tier defenses (S2a; signal source: web/src/shapeTier.ts) ---------
+   `[data-h-tier]` lives on `.app` (short <= 520 visual px, tiny <= 400). */
+
+/* b. Compress the status row above the composer (~50% padding). */
+[data-h-tier="short"] .chat-status,
+[data-h-tier="tiny"] .chat-status { padding: 3px 14px 4px; }
+/* Under tiny, hide the purely informational Working pill (aria-live status, no
+   interaction — its base rule lives in 80-professional-pass.css). The Tasks
+   pill stays: it is interactive. */
+[data-h-tier="tiny"] .chat-status .working { display: none; }
+
+/* c. Cap the autosizing textarea. The JS autosize (ChatView) writes an inline
+   `height` up to 200px, but CSS max-height caps the USED height regardless of
+   the height source, the base rule's overflow-y:auto (80-professional-pass.css)
+   makes the excess scroll, and the inset:0 highlight mirror follows the capped
+   field with its scrollTop synced (onScroll) — the same coexistence the
+   existing 200px cap already relies on. Focus mode keeps max-height:none: its
+   `.composer.focus .composer-text` selector out-specifies these. */
+/* TUNABLE: short-tier composer cap (visual px). */
+[data-h-tier="short"] .composer-text { max-height: 110px; }
+/* TUNABLE: tiny-tier composer cap (visual px). */
+[data-h-tier="tiny"] .composer-text { max-height: 80px; }
+/* The draft min-height (104px, 40-chat-stream.css) would BEAT the tiny cap —
+   min-height wins over max-height in CSS — so restore the base min-height
+   under the tiers or the cap never binds in the draft view. */
+[data-h-tier="short"] .chat.draft .composer-text,
+[data-h-tier="tiny"] .chat.draft .composer-text { min-height: 44px; }
+
+/* d. Discourage composer-bar wrap: wrapping costs a second row of vertical
+   budget. Under the tiers keep the bar a single row with horizontal scroll.
+   Children stop shrinking so the row genuinely scrolls (with default
+   flex-shrink the selects would crush to min-content instead). */
+[data-h-tier="short"] .composer-bar,
+[data-h-tier="tiny"] .composer-bar { flex-wrap: nowrap; overflow-x: auto; }
+[data-h-tier="short"] .composer-bar > *,
+[data-h-tier="tiny"] .composer-bar > * { flex-shrink: 0; }
 .tasks-bar { position: relative; margin-left: auto; text-align: right; }
 .tasks-pill {
   display: inline-flex; align-items: center; gap: 6px;
