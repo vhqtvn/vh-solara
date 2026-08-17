@@ -7,6 +7,7 @@ import {
   installLayoutSaver,
 } from "./layoutPersistence";
 import { installFlipAnimation } from "../layoutAnimation";
+import { normalizeWorkspaceOrientation } from "../viewportShape";
 import type { HostOps } from "./types";
 import {
   activeWorkspaceId,
@@ -106,6 +107,18 @@ export function DockviewHost(props: { workspaceId: string }) {
       // empty-workspace affordance prompts Add Server.
     }
 
+    // ---- STARTUP ORIENTATION NORMALIZATION (viewportShape, one-shot) -------
+    // A restored/seeded layout whose orientation mismatches the viewport SHAPE
+    // (horizontal split on a portrait device) is flipped NOW — once per mount,
+    // right after the cold restore — instead of staying wrong until the first
+    // resize. Ordered BEFORE installLayoutSaver (the system-driven flip does
+    // not itself schedule a save — persistence semantics stay "user mutations
+    // only") and BEFORE the FLIP install below (so the FLIP's initial baseline
+    // seeds from POST-normalization geometry — no morph on first paint).
+    // Toggle-gated (vh-host:autotranspose) + idempotent; a background host
+    // (visibility:hidden — the layout box persists) normalizes the same way.
+    normalizeWorkspaceOrientation(api);
+
     // Hook the debounced save AFTER cold init so the initial seed/restore does
     // not itself trigger a save — only subsequent user mutations persist.
     installLayoutSaver(api);
@@ -116,21 +129,24 @@ export function DockviewHost(props: { workspaceId: string }) {
       controller.syncAll();
     }
 
-    // ---- resize-smoothing drag toggle ---------------------------------------
-    // The pane-overlay geometry transition (dockviewOverrides.css) smooths
-    // DISCRETE layout ops (split/swap/orientation-flip) but must NOT apply
-    // during CONTINUOUS geometry drags — a 0.12s transition retargeted on every
-    // pointermove frame makes a sash resize / floating-window drag feel laggy
-    // and rubber-banded. Dockview core exposes no public sash-drag-start event
-    // (only the internal Splitview onDidSashEnd), so toggle a marker class from
-    // the DOM gesture itself: a CAPTURE-phase pointerdown on any continuous-drag
+    // ---- continuous-drag marker toggle --------------------------------------
+    // The FLIP layout animation (layoutAnimation.ts, installed below) smooths
+    // DISCRETE layout ops (split/swap/orientation-flip) but must NOT run during
+    // CONTINUOUS geometry drags — a morph retargeted on every pointermove
+    // frame makes a sash resize / floating-window drag feel laggy and rubber
+    // banded. Dockview core exposes no public sash-drag-start event (only the
+    // internal Splitview onDidSashEnd), so toggle a marker class from the DOM
+    // gesture itself: a CAPTURE-phase pointerdown on any continuous-drag
     // affordance (.dv-sash, .dv-floating-titlebar, .dv-resize-handle-*) adds
     // `.dv-geometry-dragging` to this host root; window-level pointerup /
     // pointercancel removes it (the same end-signal set Dockview's own sash
     // drag uses, plus pointercancel). Capture phase so an element-level handler
     // that stops propagation cannot hide a drag start from us. Discrete ops
     // (overlay split/swap buttons, drop-based rearrange) never touch these
-    // affordances, so they keep the smoothing transition.
+    // affordances, so they keep the FLIP. (Historical note: this class USED to
+    // gate a pane-overlay geometry CSS transition; the FLIP rewrite replaced
+    // that transition, and the class now gates the FLIP skip instead — see
+    // dockviewOverrides.css.)
     const DRAG_AFFORDANCE_SEL =
       ".dv-sash, .dv-floating-titlebar, [class^='dv-resize-handle-'], [class*=' dv-resize-handle-']";
     onGeometryDragStart = (ev: PointerEvent): void => {
@@ -155,7 +171,8 @@ export function DockviewHost(props: { workspaceId: string }) {
   });
 
   // On becoming active, recompute dimensions (a previously-hidden host may need
-  // a layout() nudge) + re-project the display signals. createEffect tracks
+  // a layout() nudge) + re-project the display signals + re-normalize the
+  // orientation to the CURRENT viewport shape. createEffect tracks
   // activeWorkspaceId(); it fires whenever the active workspace changes.
   createEffect(() => {
     const isActive = activeWorkspaceId() === props.workspaceId;
@@ -168,6 +185,13 @@ export function DockviewHost(props: { workspaceId: string }) {
       const h = container.clientHeight;
       if (w > 0 && h > 0) api.layout(w, h);
       controller?.syncAll();
+      // ACTIVATION normalization (viewportShape): the shape may have changed
+      // while this workspace was INACTIVE (the resize listeners only transpose
+      // the ACTIVE workspace) — flip once per activation event if the restored
+      // orientation now mismatches. The FLIP module is installed by now, so a
+      // flip here animates (desirable — the operator sees the pane morph into
+      // the normalized split). Idempotent + toggle-gated like the mount path.
+      normalizeWorkspaceOrientation(api);
     }
   });
 

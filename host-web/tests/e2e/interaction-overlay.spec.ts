@@ -597,9 +597,9 @@ test.describe("layout overlay interaction model", () => {
     // Geometry: the two panes exchanged RELATIVE ORDER — a (was left) is now
     // RIGHT of b. (Dockview re-proportions sizes on dock+split, so the SIGN of
     // the position difference flips; absolute pixels are not preserved — that is
-    // the intended "swap with neighbor" semantic.) Pane-overlay geometry is
-    // CSS-transitioned (the resize-flash fix), so settle BEFORE reading rects —
-    // mid-transition the panes have not yet crossed.
+    // the intended "swap with neighbor" semantic.) The swap is FLIP-animated
+    // (layoutAnimation.ts: pin + hold-until-stable + morph), so settle BEFORE
+    // reading rects — mid-morph the panes have not yet crossed.
     await H.waitForLayoutSettled(page);
     const ra1 = await rectOf(a);
     const rb1 = await rectOf(b!);

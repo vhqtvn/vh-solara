@@ -228,6 +228,31 @@ test.describe("settings popover", () => {
     });
   });
 
+  test("Layout… flips aria-disabled LIVE while the popover stays open (focusedId → null via pane closes)", async ({ page }) => {
+    // The item's disabled state reads the focusedId() SIGNAL inside the JSX
+    // class/aria-disabled expressions (not a snapshot taken at open), so a
+    // focusedId change while the popover is OPEN must flip the item in place
+    // — no close/reopen. The bridge closePane path drives focusedId to null
+    // the same way a real pane close does (unregisterPane → setFocusedId).
+    await openSettings(page);
+    const item = page.locator('[data-testid="settings-layout"]');
+    await expect(item).not.toHaveAttribute("aria-disabled", "true");
+
+    // Close every pane through the bridge — the popover is NOT surface-managed
+    // by pane lifecycle, so it stays open through the mutation.
+    const ids = await H.panes(page);
+    for (const id of ids) {
+      await H.closePane(page, id);
+    }
+    await expect.poll(async () => H.gridPaneCount(page)).toBe(0);
+    expect(await H.focused(page), "no focused pane after the closes").toBeNull();
+
+    // The STILL-OPEN popover's item is now disabled — auto-waiting assertion,
+    // so a lazy (non-reactive) implementation fails on timeout, not silently.
+    await expect(item).toHaveAttribute("aria-disabled", "true");
+    await expect(page.locator('[data-testid="settings-popover"]')).toBeVisible();
+  });
+
   test("Reload page item reloads the document", async ({ page }) => {
     await openSettings(page);
     // Install the load listener BEFORE the click so the reload cannot race
@@ -447,5 +472,38 @@ test.describe("add-server catalog click-to-prefill", () => {
     await expect(page.locator('[data-testid="add-server-url"]')).toHaveValue(one.url);
     await expect(page.locator('[data-testid="add-server-label"]')).toHaveValue(one.label);
     await expect(page.locator(`[data-testid="server-row"][data-url="${one.url}"]`)).toHaveCount(1);
+  });
+
+  test("keyboard: Enter and Space on a catalog row's pick button both prefill (native <button> activation)", async ({ page }) => {
+    const [one, two] = await seedTwoServers(page);
+
+    // The pick button is the row's first button child (button.catalogPick,
+    // rendered before the ✕ remove button). It is a NATIVE <button> — Enter
+    // and Space both dispatch a synthesized click through the real handler
+    // (no bespoke key handling exists, and none is needed). Assert BOTH keys.
+    const pickOne = page
+      .locator(`[data-testid="server-row"][data-url="${one.url}"]`)
+      .locator("button")
+      .first();
+    const pickTwo = page
+      .locator(`[data-testid="server-row"][data-url="${two.url}"]`)
+      .locator("button")
+      .first();
+    await expect(pickOne).toBeVisible();
+    await expect(pickTwo).toBeVisible();
+
+    // Enter on row one → prefills one.
+    await pickOne.focus();
+    await page.keyboard.press("Enter");
+    await expect(page.locator('[data-testid="add-server-url"]')).toHaveValue(one.url);
+    await expect(page.locator('[data-testid="add-server-label"]')).toHaveValue(one.label);
+
+    // Space on row two → prefills two (also proves Space did not just
+    // re-trigger row one's focused button).
+    await pickTwo.focus();
+    await page.keyboard.press(" ");
+    await expect(page.locator('[data-testid="add-server-url"]')).toHaveValue(two.url);
+    await expect(page.locator('[data-testid="add-server-label"]')).toHaveValue(two.label);
+    await expect(page.locator('[data-testid="add-server-url"]')).not.toHaveValue(one.url);
   });
 });

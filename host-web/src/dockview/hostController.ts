@@ -422,11 +422,15 @@ export class HostController implements HostOps {
    * `api.updateParameters({label})` WITHOUT reloading the iframe (same
    * survival-safe mechanism as updateRoute — IframeRenderer has no update()
    * method → no-op on the component → iframe element + src + renderer:'always'
-   * mount are ALL untouched). Persists via scheduleSave (updateParameters does
-   * NOT fire onDidLayoutChange, so the rename must explicitly schedule a
-   * debounced save). Mirrors the renameWorkspace referential-identity-preserving
-   * pattern (mutate the label field, don't spread-recreate the panel). Refuses
-   * an empty/whitespace label (keeps the current label).
+   * mount are ALL untouched). Persists via scheduleSave — belt-and-suspenders:
+   * updateParameters DOES fire the buffered onDidLayoutChange (dockview wires
+   * Event.any(onDidPanelTitleChange, onDidPanelParametersChange) into it — it
+   * was the detonator in the FLIP baseline-freshness test), so the layout
+   * saver hooked in DockviewHost already schedules a save; the explicit call
+   * only makes it immediate. Mirrors the renameWorkspace
+   * referential-identity-preserving pattern (mutate the label field, don't
+   * spread-recreate the panel). Refuses an empty/whitespace label (keeps the
+   * current label).
    */
   renamePane(paneId: string, label: string): void {
     const panel = this.api.getPanel(paneId);
@@ -435,7 +439,7 @@ export class HostController implements HostOps {
     if (!trimmed) return; // refuse empty rename (keep current label)
     panel.api.updateParameters({ ...(panel.params ?? {}), label: trimmed });
     this.syncPanes(); // rebuild PaneVm with the new label
-    scheduleSave(); // persist (updateParameters does NOT fire onDidLayoutChange)
+    scheduleSave(); // persist now (the layout-event save is debounced anyway)
   }
 
   /**
@@ -1090,23 +1094,38 @@ export class HostController implements HostOps {
       // Read the gridview root orientation ("HORIZONTAL" | "VERTICAL"). The root
       // orientation + tree depth jointly derive every branch's orientation
       // (dockview-core serializeBranchNode alternates orthogonal by depth). Used
-      // by the gate probe + the persistence round-trip e2e. The DockviewApi TS
-      // type doesn't expose `orientation` (it's on the gridview base), but it
-      // exists at runtime — cast through unknown to read/write it.
+      // by the gate probe + the persistence round-trip e2e. The CORRECT path is
+      // the runtime Gridview at `api.component.gridview.orientation` (the
+      // DockviewApi TS type does not expose it; `DockviewApi.orientation` does
+      // not exist and `DockviewComponent.orientation` is getter-only — the old
+      // bridge cast wrote that broken no-op path and silently did nothing).
+      // Same proven, idempotent, survival-safe primitive viewportShape uses.
       rootOrientation: (): "HORIZONTAL" | "VERTICAL" => {
         const c = activeController();
         if (!c) return "HORIZONTAL";
-        const ori = (c.api as unknown as { orientation?: string }).orientation;
-        return (ori ?? "HORIZONTAL") as "HORIZONTAL" | "VERTICAL";
+        const gv = (
+          c.api as unknown as {
+            component?: { gridview?: { orientation?: string } };
+          }
+        ).component?.gridview;
+        return ((gv?.orientation ?? "HORIZONTAL") as "HORIZONTAL" | "VERTICAL");
       },
-      // Flip the gridview root orientation at runtime. gridview.set orientation
-      // calls flipNode(root) which rebuilds the splitview tree. Whether that
-      // reloads iframes is THE Gate 1 question (probed, not assumed).
+      // Flip the gridview root orientation at runtime. The gridview setter
+      // calls flipNode(root) which rebuilds the splitview tree in place
+      // (survival-safe — proven by the viewport-shape gate; iframes keep their
+      // identity) and guards on equality, so setting the current value is a
+      // true no-op.
       setRootOrientation: (o: "HORIZONTAL" | "VERTICAL"): boolean => {
         const c = activeController();
         if (!c) return false;
         try {
-          (c.api as unknown as { orientation: string }).orientation = o;
+          const gv = (
+            c.api as unknown as {
+              component?: { gridview?: { orientation: string } };
+            }
+          ).component?.gridview;
+          if (!gv) return false;
+          gv.orientation = o;
           return true;
         } catch {
           return false;

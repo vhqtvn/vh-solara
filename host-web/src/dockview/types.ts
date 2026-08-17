@@ -297,8 +297,9 @@ export interface HostOps {
    * Rename a pane's LABEL inline (tabs=panes model). Updates the panel params
    * via `api.updateParameters({label})` WITHOUT reloading the iframe (same
    * survival-safe mechanism as updateRoute — the renderer has no update()).
-   * Persists via scheduleSave (updateParameters does NOT fire onDidLayoutChange,
-   * so the rename must explicitly schedule a debounced save). The iframe element
+   * Persists via scheduleSave — belt-and-suspenders: updateParameters DOES
+   * fire the buffered onDidLayoutChange (dockview wires params-change into
+   * it), so the layout saver already schedules a save. The iframe element
    * + src + renderer:'always' mount are ALL untouched. Mirrors the
    * renameWorkspace referential-identity-preserving pattern (mutate the label
    * field, don't spread-recreate the panel). Refuses an empty/whitespace label

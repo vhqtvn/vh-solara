@@ -27,13 +27,25 @@ import { activeWorkspaceId, workspaceApiFor } from "./dockview/store";
 // `api.component.gridview.orientation`. Its setter guards
 // `if (this.root.orientation === orientation) return;` before flipNode, so
 // setting it to the current value is a true no-op (verified empirically + in
-// source: gridview.js). The latent `setRootOrientation` DEV bridge in
-// hostController writes the wrong (no-op) path; it is out of scope here and NOT
-// fixed — this module reaches the gridview directly.
+// source: gridview.js). The `rootOrientation`/`setRootOrientation` DEV bridge
+// in hostController now reads/writes this same gridview path (it used to write
+// the broken `api.orientation` path — fixed).
 //
 // SCOPE. v0 = orientation transpose ONLY. No per-shape layout defaults (tabbed
 // vs grid), no persisted per-shape profiles, no SPA-side changes. The toggle
 // defaults ON; the operator can disable via localStorage.
+//
+// STARTUP NORMALIZATION (v0.1): besides the resize listeners, the orientation
+// is normalized ONCE at each workspace host's mount (right after the cold
+// restore, before the FLIP install) and ONCE on each workspace ACTIVATION — a
+// restored layout whose orientation mismatches the viewport SHAPE (e.g. a
+// horizontal split restored on a portrait device) is flipped immediately
+// instead of staying wrong until the first resize. Per-event only (no
+// continuous re-normalization): the debounced resize listeners own every
+// shape change after that. Same guards as the resize path (toggle, ≥2 grid
+// groups, decisive shape, mismatch) and the same idempotent setter, so a
+// mount/activation normalize immediately followed by a resize evaluation is a
+// harmless no-op repeat.
 // =============================================================================
 
 // ---- tunables (flagged for on-device adjustment) ---------------------------
@@ -142,17 +154,19 @@ function gridviewOf(api: DockviewApi): GridviewLike | null {
   return comp?.gridview ?? null;
 }
 
-/** Number of grid-level GROUPS on the active grid (mirrors
- *  HostController.gridPaneCount). Each grid group with an active panel counts
- *  once; a tabbed multi-panel group still counts once (it is ONE grid child).
- *  Used as the "is there a real split to transpose?" guard: a single pane or a
- *  single tabbed group (count < 2) has no visible split axis → transpose is a
- *  meaningless no-op, so we skip it entirely. */
+/** Number of grid-level GROUPS on the grid — the count of root-splitview
+ *  children (mirrors the transpose guard's semantics: the root orientation
+ *  flip only rearranges the split BETWEEN grid groups). A tabbed
+ *  multi-panel group is ONE grid child and counts ONCE, whether or not it
+ *  currently reports an activePanel. Used as the "is there a real split to
+ *  transpose?" guard: a single pane or a single tabbed group (count < 2)
+ *  has no visible split axis → transpose is a meaningless no-op, so we skip
+ *  it entirely. */
 function gridGroupCount(api: DockviewApi): number {
   let n = 0;
   for (const g of api.groups) {
     if (g.api.location.type === "grid") {
-      n += g.activePanel ? 1 : g.panels.length;
+      n += 1;
     }
   }
   return n;
@@ -173,7 +187,7 @@ let flipCount = 0;
 /** Evaluate the current shape and transpose the ACTIVE workspace if needed.
  *  Pure w.r.t. the toggle: a no-op (returns early, still counts the eval) when
  *  disabled. Idempotent: setting the orientation to its current value is a true
- *  no-op (gridview setter guards on equality; this function ALSO pre-checks so
+ *  no-op (gridview setter guards on equality; the shared core ALSO pre-checks so
  *  flipCount reflects real changes only). Survival-safe: flipNode rebuilds the
  *  split axis in place; no iframe is reparented/moved/removed. */
 function applyTranspose(): void {
@@ -181,19 +195,45 @@ function applyTranspose(): void {
   if (!autoTransposeEnabled()) return;
   const api = workspaceApiFor(activeWorkspaceId());
   if (!api) return;
+  transposeApiIfNeeded(api);
+}
+
+/** Shared transpose core (resize evaluations AND startup normalization): flip
+ *  `api`'s grid root orientation to the current viewport shape when there is a
+ *  real split (≥2 grid groups), the shape is decisive (not square), and the
+ *  orientation mismatches. Returns true iff the orientation actually changed
+ *  (increments flipCount then). Pre-checks make every path idempotent — the
+ *  gridview setter itself also guards on equality, so a repeat call after a
+ *  mount/activation normalize is a true no-op. */
+function transposeApiIfNeeded(api: DockviewApi): boolean {
   // 1 pane / 1 group → no split to transpose. Skip (also avoids a meaningless
   // flipNode on a single root child).
-  if (gridGroupCount(api) < 2) return;
+  if (gridGroupCount(api) < 2) return false;
   const gv = gridviewOf(api);
-  if (!gv) return;
+  if (!gv) return false;
   const shape = classifyShape(window.innerWidth, window.innerHeight);
   const target = targetOrientation(shape);
-  if (target === null) return; // square — ambiguous, leave the layout alone
-  if (gv.orientation === target) return; // already matches — idempotent no-op
+  if (target === null) return false; // square — ambiguous, leave the layout alone
+  if (gv.orientation === target) return false; // already matches — idempotent no-op
   // SURVIVAL-SAFE transpose (proven: Phase 1 Gate 1a). flipNode rebuilds the
   // grid split axis; the keep-mounted iframes keep their identity.
   gv.orientation = target;
   flipCount++;
+  return true;
+}
+
+/** ONE-SHOT startup/activation normalization for a SPECIFIC workspace api
+ *  (NOT the active-workspace resolution of the resize path). Called by each
+ *  DockviewHost at mount — AFTER its cold restore, BEFORE the FLIP install —
+ *  and on every workspace ACTIVATION, so a restored layout whose orientation
+ *  mismatches the viewport shape (horizontal split on a portrait device) is
+ *  corrected immediately instead of staying wrong until the first resize.
+ *  Toggle-gated (vh-host:autotranspose; default ON) and otherwise identical
+ *  to the resize evaluation (same guards, same idempotent setter). Returns
+ *  true iff the orientation was flipped. */
+export function normalizeWorkspaceOrientation(api: DockviewApi): boolean {
+  if (!autoTransposeEnabled()) return false;
+  return transposeApiIfNeeded(api);
 }
 
 /** Resize/orientationchange entry: schedule a debounced evaluation. Rapid

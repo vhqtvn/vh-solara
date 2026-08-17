@@ -48,9 +48,20 @@ import * as H from "./util";
  *      must not arm a stale baseline: the next layout EVENT (route change /
  *      activation) animates NOTHING and panes never grow back to the
  *      pre-resize size (the on-device "random weird animation" regression).
+ *   9. REMOVED-PANE GHOST — closing a pane MID-PLAY settles its ghost
+ *      immediately (settleGhosts on the removal's own layout event), not
+ *      after the 24-frame chase / ~210ms fallback.
+ *  10. DRAG-SKIP — while the real pointerdown drag marker
+ *      (.dv-geometry-dragging, toggled by a genuine sash pointerdown) is
+ *      held, a discrete layout op runs ZERO FLIP animations; on release the
+ *      FLIP runs again.
+ *  11. NO-EXCURSION — during a swap, EVERY per-frame visual rect
+ *      (getBoundingClientRect — includes the interpolating transform) of the
+ *      moving panes stays INSIDE the viewport: the hold-until-stable chase
+ *      never chases an off-window transient (no out-and-back dart).
  *
- * Chromium only (the interaction spec's convention; Firefox/WebKit survival is
- * covered by survival.spec.ts). Serial with the rest of the suite
+ * Chromium + Firefox (the suite's browsers; WebKit launch is environmental —
+ * see playwright.config.ts). Serial with the rest of the suite
  * (playwright.config.ts: workers:1, shared fixture state).
  */
 
@@ -488,11 +499,12 @@ test.describe("FLIP layout animation (deferred reflow)", () => {
     // URL-bar collapse/expand, keyboard shrink) WITHOUT firing
     // onDidLayoutChange — only the pixel geometry changes, not the gridview
     // model. The FLIP baseline (lastRects, updated only inside the handler)
-    // therefore goes STALE. The next layout EVENT (panel activation and
-    // add/remove both fire it — upstream BaseGrid wires
-    // Event.any(onDidAdd, onDidRemove, onDidActiveChange) into the buffered
-    // onDidLayoutChange; a route change or a tap inside a pane is enough)
-    // would early-pin panes at the pre-resize size: the pane child AND its
+    // therefore goes STALE. The next layout EVENT (add/remove/activation via
+    // upstream BaseGrid Event.any(onDidAdd, onDidRemove, onDidActiveChange),
+    // AND panel params/title changes via dockviewComponent's
+    // Event.any(onDidPanelTitleChange, onDidPanelParametersChange) — all
+    // wired into the same buffered onDidLayoutChange) would early-pin panes
+    // at the pre-resize size: the pane child AND its
     // iframe visibly resize UP to the stale size (a real iframe reflow),
     // then morph back down — the reported bogus animation. "Random" because
     // it needs a silent persistent resize since the last genuine layout
@@ -548,9 +560,11 @@ test.describe("FLIP layout animation (deferred reflow)", () => {
     await assertNoResidual(page);
 
     // Now the reported operator action on the stale-baseline window: a
-    // route change (selectTarget round-trip — fires the buffered
-    // onDidLayoutChange via panel activation). Sample in-browser through
-    // the whole window: NO transition may start, and the tall pane's
+    // route change (selectTarget round-trip — updateParameters DOES fire the
+    // buffered onDidLayoutChange: dockviewComponent wires
+    // Event.any(onDidPanelTitleChange, onDidPanelParametersChange) into it,
+    // which is exactly what made this the detonator here). Sample in-browser
+    // through the whole window: NO transition may start, and the tall pane's
     // iframe must NEVER grow back toward the stale (pre-resize) height.
     const sampling = page.evaluate(async () => {
       let max = 0;
@@ -643,5 +657,216 @@ test.describe("FLIP layout animation (deferred reflow)", () => {
     // white default; also inherited from :root — asserted computed).
     expect(bg.paneScheme.trim(), "pane color-scheme is dark").toContain("dark");
     expect(bg.iframeScheme.trim(), "iframe color-scheme is dark").toContain("dark");
+  });
+
+  test("REMOVED-PANE GHOST: closing the animated pane MID-PLAY settles its ghost immediately — no 24-frame chase, no ~210ms fallback wait", async ({ page }) => {
+    // settleGhosts(live) runs at the top of every handleLayoutChange and in
+    // refreshBaseline: a tracked pane whose element is no longer LIVE (its
+    // panel was removed) is hard-settled — inline styles cleared, transition
+    // cancelled — instead of leaving a styled ghost element behind. The
+    // removal itself fires the buffered onDidLayoutChange (BaseGrid wires
+    // onDidRemovePanel), so the ghost is settled by the FIRST chase frame
+    // after the close. This test closes a pane INSIDE the ~150ms play window
+    // and times the settle.
+    const ids = await H.panes(page);
+    const a = ids[0];
+    for (const id of ids.slice(1)) await H.closePane(page, id);
+    await H.waitForLayoutSettled(page);
+    await assertNoResidual(page);
+
+    const r = await page.evaluate(async (a) => {
+      const pane = document.querySelector<HTMLElement>(`.pane[data-pane-id="${a}"]`)!;
+      const h = (window as unknown as {
+        __host?: {
+          split(i: string, d: "right" | "down"): string | null;
+          closePane(i: string): void;
+        };
+      }).__host;
+      // Start an animated split of `a` (a shrinks left — it is the ANIMATED pane).
+      h?.split(a, "right");
+      // Two rAFs: pin + invert + play are committed (same timing as the
+      // DEFERRED-REFLOW test). We are now INSIDE the 150ms play window.
+      await new Promise<void>((res) => requestAnimationFrame(() => requestAnimationFrame(() => res())));
+      const playing =
+        pane.style.transition !== "" || pane.style.transform !== "" || pane.style.width !== "";
+      // Close the animating pane mid-PLAY, and rAF-poll how quickly the FLIP
+      // clears its inline styles (element reference survives detachment).
+      const t0 = performance.now();
+      h?.closePane(a);
+      let clearedAt: number | null = null;
+      const deadline = t0 + 400;
+      while (performance.now() < deadline) {
+        if (pane.style.width === "" && pane.style.height === "" && pane.style.transform === "" && pane.style.transition === "") {
+          clearedAt = performance.now() - t0;
+          break;
+        }
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise<void>((res) => requestAnimationFrame(() => res()));
+      }
+      const stillInDom = document.documentElement.contains(pane);
+      return { playing, clearedAt, stillInDom };
+    }, a);
+
+    expect(r.playing, "precondition: the pane was mid-PLAY when closed (pin/transform inline)").toBe(true);
+    expect(
+      r.clearedAt,
+      "ghost settled within the first chase frames after the close (not the ~210ms fallback)",
+    ).not.toBeNull();
+    expect(r.clearedAt!, "settled promptly (well under the FLIP_DURATION_MS+slack fallback window)").toBeLessThan(120);
+    expect(r.stillInDom, "the closed pane's element is gone from the DOM").toBe(false);
+
+    // The surviving pane (the split target) is intact, animated or settled
+    // cleanly, and the whole grid ends with zero residual FLIP styles.
+    await assertNoResidual(page);
+    const survivors = (await H.panes(page)).filter((id) => id !== a);
+    expect(survivors.length, "the split target pane remains").toBe(1);
+    await H.waitForReady(page, survivors[0]);
+  });
+
+  test("DRAG-SKIP: while a REAL sash pointerdown holds .dv-geometry-dragging, a discrete op runs ZERO FLIP animations; release restores them", async ({ page }) => {
+    // The drag marker gates the FLIP (layoutAnimation reads
+    // .dv-geometry-dragging on the container and skips all animation work),
+    // and DockviewHost toggles it from a CAPTURE-phase pointerdown on real
+    // drag affordances (.dv-sash among them). No DEV hook: press a real sash
+    // with the mouse, keep the button held, fire a bridge split, and assert
+    // NOTHING animates; release, fire another split, and the FLIP runs again.
+    const ids = await H.panes(page);
+    const a = ids[0];
+    for (const id of ids.slice(1)) await H.closePane(page, id);
+    await H.waitForLayoutSettled(page);
+    const b = (await H.split(page, a, "right"))!;
+    expect(b, "precondition: exactly 2 panes → one sash exists").toBeTruthy();
+    await H.waitForLayoutSettled(page);
+    await assertNoResidual(page);
+
+    // The marker's carrier element: DockviewHost adds .dv-geometry-dragging to
+    // the .dockview-root CONTAINER (the element the FLIP module reads), NOT to
+    // the [data-workspace] hostLayer App renders around it — poll the carrier.
+    const draggingRoots = () =>
+      page.evaluate(() => document.querySelectorAll(".dockview-root.dv-geometry-dragging").length);
+
+    const sash = page.locator(".dv-sash").first();
+    const sashBox = await sash.boundingBox();
+    expect(sashBox, "a real .dv-sash element is present and measurable").not.toBeNull();
+    await page.mouse.move(sashBox!.x + sashBox!.width / 2, sashBox!.y + sashBox!.height / 2);
+    await page.mouse.down(); // real pointerdown on the drag affordance
+    await expect.poll(draggingRoots).toBeGreaterThan(0);
+
+    // A discrete layout op WHILE the marker is held: no FLIP may run.
+    const sampling = page.evaluate(async () => {
+      let max = 0;
+      const deadline = performance.now() + 350;
+      while (performance.now() < deadline) {
+        let n = 0;
+        for (const el of document.querySelectorAll(".dv-render-overlay, .dv-render-overlay .pane")) {
+          n += el.getAnimations().length;
+        }
+        if (n > max) max = n;
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((res) => setTimeout(res, 20));
+      }
+      return max;
+    });
+    await page.waitForTimeout(0);
+    const created2 = (await H.split(page, b, "right"))!;
+    expect(created2, "split ran under the drag marker").toBeTruthy();
+    const maxUnderDrag = await sampling;
+
+    expect(maxUnderDrag, "zero FLIP animations while .dv-geometry-dragging is held").toBe(0);
+    await assertNoResidual(page);
+    // The layout op itself still LANDED (the skip is animation-only).
+    await expect.poll(async () => (await H.panes(page)).length).toBe(3);
+
+    // Release the sash: the marker clears…
+    await page.mouse.up();
+    await expect.poll(draggingRoots).toBe(0);
+
+    // …and the FLIP runs again on the next discrete op (the skip was the
+    // marker, not a broken install).
+    const sampling2 = maxFlipAnimations(page, 350);
+    await page.waitForTimeout(0);
+    const created3 = await H.split(page, created2, "right");
+    expect(created3, "post-release split ran").toBeTruthy();
+    const maxAfterRelease = await sampling2;
+    expect(maxAfterRelease, "FLIP animations resumed after the drag marker cleared").toBeGreaterThan(0);
+    await assertNoResidual(page);
+  });
+
+  test("NO-EXCURSION: during an animated swap every per-frame VISUAL rect of the moving panes stays inside the viewport (hold-until-stable never chases an off-window transient)", async ({ page }) => {
+    // The hold-until-stable chase exists so a pane whose destination rect is
+    // still moving NEVER plays toward a stale destination — it re-inverts and
+    // HOLDS. The property this pins: at no sampled frame does a pane's
+    // VISUAL rect (getBoundingClientRect — includes the interpolating
+    // transform) leave the viewport. A chase that played toward an
+    // out-of-window transient would dart out and come back; this sampler
+    // would catch it. getBoundingClientRect is sampled every animation frame
+    // in-page, so nothing between frames can hide.
+    //
+    // SCOPING (measured, not assumed): the assertion runs on the canonical
+    // EQUAL-SIZE exchange — two panes side by side trading halves. On
+    // mixed-SIZE swaps (a 640x684 pane landing in a 428x684 slot) the pinned
+    // pane legitimately starts the play at its OLD size (FLIP anchor,
+    // transform-origin 0 0) and shrinks monotonically into the new slot; if
+    // that slot abuts the viewport edge, the shrinking overhang reads as
+    // transient "overflow" that is size-morphing, NOT an excursion (probed:
+    // overlay in-viewport throughout, overhang strictly decreasing to 0, no
+    // dart). The excursion property — never LEAVING the window on a
+    // position move — is exactly what the equal-size swap isolates.
+    const ids = await H.panes(page);
+    const a = ids[0];
+    for (const id of ids.slice(1)) await H.closePane(page, id);
+    await H.waitForLayoutSettled(page);
+    const b = (await H.split(page, a, "right"))!;
+    expect(b, "precondition: exactly 2 panes trading equal halves").toBeTruthy();
+    await H.waitForLayoutSettled(page);
+    await assertNoResidual(page);
+
+    const r = await page.evaluate(async (ids) => {
+      const [a, b] = ids as [string, string];
+      const ea = document.querySelector<HTMLElement>(`.pane[data-pane-id="${a}"]`)!;
+      const eb = document.querySelector<HTMLElement>(`.pane[data-pane-id="${b}"]`)!;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const SLACK = 2; // sub-pixel rounding at the viewport edges
+      let frames = 0;
+      let maxOverflow = 0; // px beyond the viewport (0 = inside), worst sample
+      const h = (window as unknown as { __host?: { swap(x: string, y: string): void } }).__host;
+      // Sample every animation frame THROUGH the swap window: hold (1-2
+      // frames) + play (FLIP_DURATION_MS=150) + settle, plus margin.
+      let sampling = true;
+      const sampler = (async () => {
+        while (sampling) {
+          for (const el of [ea, eb]) {
+            const rect = el.getBoundingClientRect();
+            const overflow = Math.max(
+              0,
+              -(rect.left + SLACK), // rect.left beyond the left edge by > SLACK
+              -(rect.top + SLACK), // rect.top beyond the top edge by > SLACK
+              rect.right - (vw + SLACK),
+              rect.bottom - (vh + SLACK),
+            );
+            if (overflow > maxOverflow) maxOverflow = overflow;
+          }
+          frames++;
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise<void>((res) => requestAnimationFrame(() => res()));
+        }
+      })();
+      h?.swap(a, b);
+      await new Promise((res) => setTimeout(res, 450)); // whole swap window
+      sampling = false;
+      await sampler;
+      return { frames, maxOverflow, vw, vh };
+    }, [a, b]);
+
+    expect(r.frames, "sampler actually covered the swap window (rAF drove frames)").toBeGreaterThanOrEqual(10);
+    expect(
+      r.maxOverflow,
+      `every per-frame visual rect stayed within the viewport (+${r.vw}x${r.vh} ±2px) — no out-and-back dart`,
+    ).toBe(0);
+
+    // Post-swap hygiene: settled, clean, both panes alive.
+    await assertNoResidual(page);
+    await H.waitForLayoutSettled(page);
   });
 });
