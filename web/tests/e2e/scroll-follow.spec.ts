@@ -23,15 +23,25 @@ import { projectUrl } from "./util";
 // the button is the topmost element at its own center via elementFromPoint —
 // that is the real guard against this class of regression.
 //
-// The demo transcript overflows `.chat-scroll` at a 400x320 viewport
-// (scrollHeight ~1450 vs clientHeight ~70), so we shrink the viewport to make
+// The demo transcript overflows `.chat-scroll` at a 400x600 viewport
+// (scrollHeight ~1450 vs clientHeight ~348), so we shrink the viewport to make
 // the transcript scrollable without touching the Go fixture.
+//
+// Height 600, not the historical 320: since S2a (height-tier responsiveness,
+// web/src/shapeTier.ts) a 400x320 viewport classifies as the `tiny` height
+// tier, whose CSS defenses (hide the `.working` pill, cap the composer at
+// 80px, slim the header/status) break this spec's turn-settle signal
+// (`.working-text` visibility) and perturb the composer-autosize geometry the
+// grow/shrink tests measure. Width 400 (the NARROW-behavior intent) is
+// preserved; 600 is safely normal-tier (short is <=520, hysteresis leaves at
+// >=536). Tests that deliberately exercise a vertical squeeze keep explicit
+// 400x320 sizes (test 8).
 //
 // The e2e suite is serial (workers:1, fullyParallel:false) and shares one
 // mutable fixture backend, so each test reloads the demo session to reset to a
 // known state.
 
-const VP = { width: 400, height: 320 };
+const VP = { width: 400, height: 600 };
 
 // Asserts the element matching `sel` is the topmost painted element at its own
 // center point — i.e. not occluded by another element with a higher z-index.
@@ -535,10 +545,12 @@ test("a content shrink while Live keeps following (no false user-scroll-up)", as
 //
 // Reproduction: load at a TALL viewport (400×600) so .chat-main has room to shrink
 // into, glue to the tail deterministically (scroll to bottom — same pattern as
-// tests 5–7, avoids the detach-prone openDemo click), then SHRINK to 400×320 (the
-// VP the rest of the suite uses; .chat-main drops from ~348px to ~68px — a ~280px
-// shrink that definitely fires the scrollEl RO and moves the bottom edge well past
-// the 24px nearBottom threshold). We assert the GEOMETRY is at the bottom, NOT just
+// tests 5–7, avoids the detach-prone openDemo click), then SHRINK to an explicit
+// 400×320 (NOT VP — since S2a the suite VP is 400×600; the squeeze target stays
+// 320 on purpose: .chat-main drops from ~348px to ~121px (320 is the `tiny`
+// height tier) — a ~230px shrink that definitely fires the scrollEl RO and moves
+// the bottom edge well past the 24px nearBottom threshold). We assert the
+// GEOMETRY is at the bottom, NOT just
 // the Live pill: following is never re-evaluated on a shrink (no scroll event), so
 // the pill stays visible even under the bug — the geometry check is the only thing
 // that catches it. Then we grow back and re-assert to confirm the resize round-trip.
@@ -558,11 +570,15 @@ test("a viewport shrink while Live re-glues to the tail", async ({ page }) => {
   });
   await expectFollowingTail(page);
 
-  // SHRINK the viewport to VP (400×320): .chat-main drops ~280px, so the bottom
-  // edge (scrollHeight - clientHeight) moves DOWN ~280px while scrollTop is
-  // unchanged (no clamp on a shrink → no scroll event → onScrolled never runs).
-  // Simulates the mobile-keyboard-up / console-resize shrink.
-  await page.setViewportSize(VP);
+  // SHRINK the viewport to 400×320 (deliberately explicit — NOT VP; VP is
+  // 400×600 since S2a): .chat-main drops ~230px (348→~121; 320 lands in the
+  // `tiny` height tier, whose defenses compound the shrink), so the bottom
+  // edge (scrollHeight - clientHeight) moves DOWN while scrollTop is
+  // unchanged (no clamp on a shrink → no scroll event → onScrolled never
+  // runs). Simulates the mobile-keyboard-up / console-resize shrink. The
+  // assertions are geometry-only (tier-agnostic), so crossing into the tiny
+  // tier mid-test is fine — this test WANTS the squeeze.
+  await page.setViewportSize({ width: VP.width, height: 320 });
 
   // The fix: the scrollEl ResizeObserver fired and re-pinned to the new bottom
   // while following. This GEOMETRY assertion is what catches the bug — without

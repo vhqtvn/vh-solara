@@ -35,7 +35,14 @@ import { projectUrl } from "./util";
 //   window is not open unless a reconnect coincides. Localizes whether the bug
 //   is size-dependent even without a forced reconnect.
 
-const VP = { width: 400, height: 320 };
+// Height 600, not the historical 320: since S2a (height-tier responsiveness,
+// web/src/shapeTier.ts) 400×320 classifies as the `tiny` height tier, whose
+// CSS defenses hide the `.working` pill — every test below gates its turn on
+// `.working-text` visibility (and the capture observer arms on `.working-text`
+// DOM presence, which is unaffected). Width 400 (narrow intent) is preserved;
+// 600 is safely normal-tier (short is <=520, hysteresis leaves at >=536).
+// Nothing in this spec depends on total page height.
+const VP = { width: 400, height: 600 };
 type Page = import("@playwright/test").Page;
 
 // Final consolidated assistant text the fixture streams (opencode.go:1063).

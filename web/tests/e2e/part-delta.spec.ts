@@ -32,7 +32,13 @@ import { projectUrl } from "./util";
 // The prefix-only DOM window is therefore ~200ms — well above the 20ms sample
 // resolution. No fixture synchronization fallback is needed.
 
-const VP = { width: 400, height: 320 };
+// Height 600, not the historical 320: since S2a (height-tier responsiveness,
+// web/src/shapeTier.ts) 400×320 classifies as the `tiny` height tier, whose
+// CSS defenses hide the `.working` pill — the busy/settled gate below waits on
+// `.working-text` visibility. Width 400 (narrow intent) is preserved; 600 is
+// safely normal-tier (short is <=520). Nothing in this spec depends on total
+// page height (wire records + DOM text sampling).
+const VP = { width: 400, height: 600 };
 type Page = import("@playwright/test").Page;
 
 // The fixture's 4 streamed chunks (opencode.go:1558) and their BYTE offsets.

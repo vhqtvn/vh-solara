@@ -38,7 +38,15 @@ import { projectUrl } from "./util";
 // has a clean activity history and arms reliably — the same path the primary
 // test proves.
 
-const VP = { width: 400, height: 320 };
+// Height 600, not the historical 320: since S2a (height-tier responsiveness,
+// web/src/shapeTier.ts) 400×320 classifies as the `tiny` height tier, whose
+// CSS defenses hide the `.working` pill — breaking waitForTurnSettled's
+// turn-settle signal (`.working-text` visibility) used by tests (3)/(4)/(5).
+// Width 400 (narrow intent) is preserved; 600 is safely normal-tier (short is
+// <=520, hysteresis leaves at >=536). The `other` transcripts built below
+// (3 turns × user+assistant ≈ 600px+) still overflow the ~348px chat client
+// height, so the mid-history anchor/restore assertions stay meaningful.
+const VP = { width: 400, height: 600 };
 
 type Page = import("@playwright/test").Page;
 
@@ -231,7 +239,7 @@ test("opening a session at a mid-history anchor keeps the dot", async ({ page })
   await page.setViewportSize(VP);
   // 1. Build an overflowing transcript in `other`. Each prompt_async turn
   //    appends a user + assistant message; 3 turns comfortably overflow the
-  //    ~70px chat-scroll clientHeight at this 320px viewport. Serial turns
+  //    ~348px chat-scroll clientHeight at this 600px viewport. Serial turns
   //    (settle between each) avoid concurrent simulatePrompt on one session.
   await page.goto(projectUrl("/?session=other"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
@@ -304,7 +312,7 @@ test("opening a session at a mid-history anchor keeps the dot", async ({ page })
 test("scroll-up read position survives a fast (<400ms) session switch (P1-WEB-004)", async ({ page }) => {
   await page.setViewportSize(VP);
   // 1. Build an overflowing transcript in `other` (same seed shape as the guard
-  //    test). 3 turns comfortably overflow the ~70px chat clientHeight at 320px.
+  //    test). 3 turns comfortably overflow the ~348px chat clientHeight at 600px.
   await page.goto(projectUrl("/?session=other"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
   // Clear any stale read anchor left on `other` by earlier serial-suite tests

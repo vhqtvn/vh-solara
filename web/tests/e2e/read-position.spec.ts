@@ -36,7 +36,14 @@ import { projectUrl } from "./util";
 // Serial suite (workers:1, fullyParallel:false, one mutable fixture backend).
 // Each test reloads to reset client state, matching the suite convention.
 
-const VP = { width: 400, height: 320 };
+// Height 600, not the historical 320: since S2a (height-tier responsiveness,
+// web/src/shapeTier.ts) 400×320 classifies as the `tiny` height tier, whose
+// CSS defenses hide the `.working` pill — breaking waitForTurnSettled's
+// turn-settle signal (`.working-text` visibility). Width 400 (narrow intent)
+// is preserved; 600 is safely normal-tier (short is <=520, hysteresis leaves
+// at >=536), and the demo/`other` transcripts still overflow `.chat-scroll`
+// (clientHeight ~348) so all scroll math below stays meaningful.
+const VP = { width: 400, height: 600 };
 
 type Page = import("@playwright/test").Page;
 
@@ -157,7 +164,7 @@ test("mid-stream scroll up surfaces the Latest button through stream completion"
   await page.goto(projectUrl("/?session=demo"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
   // Glue to the tail (following=true). The demo transcript overflows at
-  // 400×320 (scrollHeight ~1450 vs clientHeight ~70), so scrolling up is
+  // 400×600 (scrollHeight ~1450 vs clientHeight ~348), so scrolling up is
   // meaningful. Scroll-to-bottom glue (not a button.click) — the documented
   // deterministic pattern (avoids the detach-prone click path openDemo uses).
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
@@ -233,7 +240,7 @@ test("reload lands on the stored read-anchor [data-mid] row", async ({ page }) =
   await expect(page.locator(".chat-scroll")).toBeVisible({ timeout: 10000 });
 
   // Build an overflowing transcript: 3 prompt_async turns (each appends a user
-  // + assistant message → 6 messages total). At 400×320 the ~70px chat
+  // + assistant message → 6 messages total). At 400×600 the ~348px chat
   // clientHeight is comfortably overflowed. Serial turns (settle between each)
   // avoid concurrent simulatePrompt goroutines interleaving on one session.
   // (Across repeat-each iterations the shared fixture backend accumulates
