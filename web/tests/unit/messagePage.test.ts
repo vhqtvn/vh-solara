@@ -34,6 +34,7 @@ import {
   buildMessages,
   deleteMessagesFromTop,
   prependMessagesIfAbsent,
+  upsertPart,
 } from "../../src/lib/reduce";
 import { state, setState } from "../../src/sync/store";
 import type { MessageInfo, SessionMessages } from "../../src/types";
@@ -194,6 +195,46 @@ describe("deleteMessagesFromTop (pure)", () => {
     const sm = buildMessages([item("a"), item("b")]);
     expect(deleteMessagesFromTop(sm, 1, 5)).toBe(0);
     expect(sm.order).toEqual(["a", "b"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Incident 2026-08-19 symptom (e) — eviction re-opens the placeholder path.
+//
+// After a Load-older cap eviction removes the oldest resident messages, a
+// part-only event for an EVICTED message (compaction burst / warm reconcile
+// re-publish) used to fabricate a placeholder and push it back onto the END of
+// order — an unordered tail row that also corrupted oldestResidentID
+// (history.ts reads sm.order[0]) on the next page merge. The shadow fix keeps
+// the evicted message's parts held in byId only; the next page merge re-brings
+// the message and promotes the shadow to its chronological slot.
+// ---------------------------------------------------------------------------
+describe("post-eviction part.upsert for an evicted message (shadow)", () => {
+  it("(e) does not re-enter order at the tail; a later page merge re-slots it correctly", () => {
+    const sm = buildMessages([item("a", 10), item("b", 20), item("c", 30)]);
+    deleteMessagesFromTop(sm, 1); // cap eviction removes the oldest ("a")
+    expect(sm.order).toEqual(["b", "c"]);
+
+    // A compaction-burst part re-publish for the EVICTED message:
+    upsertPart(sm, { id: "p-a2", sessionID: "s1", messageID: "a", type: "tool", state: "completed" });
+    // Pre-fix: order === ["b","c","a"] — an unordered tail row, and order[0]
+    // bookkeeping (oldestResidentID) would be corrupted on the next merge.
+    expect(sm.order).toEqual(["b", "c"]);
+    // The part is HELD (not dropped) for the next merge.
+    expect(sm.byId["a"].parts["p-a2"]).toBeDefined();
+
+    // The next Load-older page re-brings "a": old evicted messages come back
+    // COMPLETED on pages (terminal copy → upgrade path, part bodies assigned
+    // authoritatively). The shadow is promoted to its chronological slot,
+    // held part + page part both present.
+    const added = prependMessagesIfAbsent(sm, [{
+      info: { id: "a", sessionID: "s1", role: "user", time: { created: 10, completed: 12 } } as MessageInfo,
+      parts: [{ id: "p-a", sessionID: "s1", messageID: "a", type: "text", text: "refetched" }],
+    }]);
+    expect(added).toBe(0); // byId-resident → upgrade/promotion, not an insert
+    expect(sm.order).toEqual(["a", "b", "c"]);
+    expect(sm.byId["a"].parts["p-a2"]).toBeDefined(); // held part survived
+    expect(sm.byId["a"].parts["p-a"].text).toBe("refetched"); // page part merged
   });
 });
 

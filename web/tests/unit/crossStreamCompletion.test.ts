@@ -91,11 +91,19 @@ const treeESes = (): MockEventSource[] =>
 
 let stream: typeof import("../../src/sync/stream") = null as unknown as typeof import("../../src/sync/stream");
 let store: typeof import("../../src/sync/store") = null as unknown as typeof import("../../src/sync/store");
+// Dynamically imported WITH the module reset in setupFresh — the file's
+// stream/store are fresh instances, so statically-imported reconcile /
+// session-stream would operate on the PRE-RESET module graph (a different
+// store) and silently no-op. Same discipline as stream/store above.
+let reconcile: typeof import("../../src/sync/reconcile") = null as unknown as typeof import("../../src/sync/reconcile");
+let sessionStream: typeof import("../../src/sync/session-stream") = null as unknown as typeof import("../../src/sync/session-stream");
 
 async function setupFresh(): Promise<void> {
   vi.resetModules();
   stream = await import("../../src/sync/stream");
   store = await import("../../src/sync/store");
+  reconcile = await import("../../src/sync/reconcile");
+  sessionStream = await import("../../src/sync/session-stream");
   store.setProjectDirRaw("/test");
   store.setSelectedIdRaw("s1");
 }
@@ -229,5 +237,90 @@ describe("Gap #3 — cross-stream completion bridge (activity=idle ⇢ time.comp
     expect(store.state.messages["s1"]?.byId?.["m1"]?.info?.time?.completed).toBeUndefined();
     // activity facet itself DID update (proves the event was handled, not dropped).
     expect(store.state.activity["s1"]).toBe("retry");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Incident 2026-08-19 — the idle bridge vs keyless shadow placeholders.
+//
+// A part-only event for a NON-resident message (compaction burst / warm
+// reconcile re-publish) used to fabricate a placeholder message and push it
+// onto the END of sm.order. activity=idle then stamped time.completed on that
+// BOGUS placeholder (role "assistant", nothing else), which both fabricated a
+// completion AND suppressed the Inv-2 tail-incomplete re-snapshot — the stale
+// rows after the final message stuck until reload.
+//
+// The fix makes such a placeholder a byId-only SHADOW (never in order), so the
+// bridge and Inv-2 only ever see REAL (info-carrying) messages.
+// ---------------------------------------------------------------------------
+describe("idle bridge vs keyless shadows (incident 2026-08-19)", () => {
+  // All session-stream EventSources ever created (CLOSED ones included, so a
+  // force-reconnect is observable as a count increase).
+  const sessionESes = (): MockEventSource[] =>
+    instances.filter((e) => /sessions=[^&]/.test(e.url));
+
+  it("idle stamps NOTHING on a phantom part-only message: render list stays clean, no fabricated completion", async () => {
+    stream.connect();
+    const treeES = treeESes()[0];
+    treeES.simulateOpen();
+
+    // The incident shape: the session's REAL final message (completed
+    // assistant) is resident; a compaction-burst part re-publish arrives for
+    // an out-of-window OLD message (part-only, no message info).
+    store.setState("sessions", "s1", { id: "s1" });
+    store.setState("messages", "s1", buildMessages([
+      { info: { id: "mFinal", sessionID: "s1", role: "assistant", time: { created: 20, completed: 21 } }, parts: [] },
+    ]));
+    reconcile.applyMessageEvent("part.upsert", 1, {
+      id: "pOld", sessionID: "s1", messageID: "mOld", type: "tool", state: "completed",
+    }, false);
+
+    // idle arrives on the TREE stream (Stream 1):
+    treeES.fire("activity", { sessionID: "s1", state: "idle" }, "2");
+
+    const sm = store.state.messages["s1"];
+    // (a) the render list (s.order → ChatView rows) stays clean — the phantom
+    // never became a row after the final message.
+    expect(sm.order).toEqual(["mFinal"]);
+    // (b) the bridge did not fabricate time.completed on the phantom.
+    expect(sm.byId["mOld"].info.time?.completed).toBeUndefined();
+    // (c) the real final message keeps its authoritative completed stamp.
+    expect(sm.byId["mFinal"].info.time?.completed).toBe(21);
+    // (d) activity DID flip (the event was handled, not dropped).
+    expect(store.state.activity["s1"]).toBe("idle");
+  });
+
+  it("a phantom tail no longer SUPPRESSES the Inv-2 tail-incomplete re-snapshot when the real tail is incomplete", async () => {
+    stream.connect();
+    const treeES = treeESes()[0];
+    treeES.simulateOpen();
+
+    // The turn's terminal message.upsert was lost in transit: the real tail is
+    // the USER message, and the turn's streamed parts sit in a phantom
+    // (part-only) message. Pre-fix, the bridge stamped the phantom (role
+    // "assistant") at the tail slot → Inv-2 saw a "completed assistant" → no
+    // recovery → stuck until reload.
+    store.setState("sessions", "s1", { id: "s1" });
+    store.setState("messages", "s1", buildMessages([
+      { info: { id: "mUser", sessionID: "s1", role: "user", time: { created: 10 } }, parts: [] },
+    ]));
+    reconcile.applyMessageEvent("part.upsert", 1, {
+      id: "pTurn", sessionID: "s1", messageID: "mLost", type: "text", text: "streamed answer",
+    }, false);
+
+    // Open the session stream so the Inv-2 force-fetch has a target (s1 is
+    // already the selected id; projectDir is set by setupFresh).
+    sessionStream.openSessionStream("s1");
+    expect(sessionESes()).toHaveLength(1);
+    sessionESes()[0].simulateOpen();
+
+    treeES.fire("activity", { sessionID: "s1", state: "idle" }, "2");
+
+    // The bridge could not stamp (real tail is a user message) → Inv-2 fired:
+    // a fresh-snapshot reconnect was forced (a SECOND session ES was created).
+    expect(sessionESes()).toHaveLength(2);
+    // The phantom still holds the streamed part (held, not dropped) for the
+    // recovery snapshot's merge to pick up.
+    expect(store.state.messages["s1"].byId["mLost"].parts["pTurn"].text).toBe("streamed answer");
   });
 });

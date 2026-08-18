@@ -5,8 +5,17 @@
 import type { MessageInfo, Part, SessionMessages } from "../types";
 
 export function sortMessages(sm: SessionMessages): void {
+  // A keyless entry (no time.created) sorts LAST, mirroring the server's
+  // orderKey semantics (see 0d39634 insertMessageIDOrdered: keyless → +∞).
+  // The old `|| 0` fallback parked a keyless entry at the TOP of the
+  // transcript on the next sort trigger — the "top-jump" face of incident
+  // 2026-08-19. (+∞ comparands are false against any finite value, so every
+  // keyed id sorts before a keyless one; two keyless ids compare NaN → 0,
+  // keeping their relative order under V8's stable sort.)
   sm.order.sort(
-    (a, b) => (sm.byId[a].info.time?.created || 0) - (sm.byId[b].info.time?.created || 0),
+    (a, b) =>
+      (sm.byId[a].info.time?.created ?? Infinity) -
+      (sm.byId[b].info.time?.created ?? Infinity),
   );
 }
 
@@ -14,11 +23,23 @@ export function upsertMessage(sm: SessionMessages, info: MessageInfo): void {
   const existing = sm.byId[info.id];
   if (existing) {
     existing.info = info;
-  } else {
-    sm.byId[info.id] = { id: info.id, info, partOrder: [], parts: {} };
-    sm.order.push(info.id);
-    sortMessages(sm);
+    // KEYLESS→KEYED promotion (FE mirror of 0d39634 setCreatedKey): if the id
+    // was a SHADOW (parts held in byId, never entered order) and the incoming
+    // info carries a creation key, it now has an honest chronological slot —
+    // realize it into order and re-sort. Without a created key there is still
+    // no honest slot, so the shadow stays hidden (never render an unkeyed
+    // row). An id ALREADY in order keeps its slot: time.created is immutable
+    // per id, so a re-sort would be a no-op — skip it (message.updated
+    // refreshes are warm-path).
+    if (!sm.order.includes(info.id) && info.time?.created) {
+      sm.order.push(info.id);
+      sortMessages(sm);
+    }
+    return;
   }
+  sm.byId[info.id] = { id: info.id, info, partOrder: [], parts: {} };
+  sm.order.push(info.id);
+  sortMessages(sm);
 }
 
 export function deleteMessage(sm: SessionMessages, messageID: string): void {
@@ -30,7 +51,26 @@ export function deleteMessage(sm: SessionMessages, messageID: string): void {
 export function upsertPart(sm: SessionMessages, part: Part): void {
   let msg = sm.byId[part.messageID];
   if (!msg) {
-    // A part can arrive before its message.updated; create a placeholder.
+    // A part arrived for a message with NO resident copy. Per the OpenCode
+    // protocol, message.updated precedes its parts on the live tail, so this
+    // shape is dominated by the OUT-OF-WINDOW class: the end-of-turn
+    // compaction burst (docs/ai/wire-protocols/compaction-burst-axis.md, O1)
+    // and the daemon's warm reconcile re-publish parts of older-than-snapshot
+    // messages as part-ONLY events. Such an event carries NO time.created —
+    // there is no honest slot for a row, and message.upsert may never follow.
+    //
+    // So the placeholder is a KEYLESS SHADOW: held in byId ONLY, never pushed
+    // into order — it never renders (every consumer reads through order) and
+    // never occupies the tail slot the idle bridge / Inv-2 inspect. The parts
+    // are held, never dropped; a later message.upsert (upsertMessage
+    // promotion) or snapshot/page merge (prependMessagesIfAbsent) realizes
+    // the shadow at its chronological slot with its parts intact.
+    //
+    // Pre-fix this pushed the id onto the END of order — stale rows rendered
+    // AFTER the final message (incident 2026-08-19), the idle bridge stamped
+    // the phantom tail (suppressing Inv-2 recovery), and the next sort flung
+    // it to the TOP (created treated as 0). Shadow memory is bounded by the
+    // same part data the old code held AND rendered — strictly less exposure.
     msg = {
       id: part.messageID,
       info: { id: part.messageID, sessionID: part.sessionID, role: "assistant" },
@@ -38,7 +78,6 @@ export function upsertPart(sm: SessionMessages, part: Part): void {
       parts: {},
     };
     sm.byId[part.messageID] = msg;
-    sm.order.push(part.messageID);
   }
   if (!msg.parts[part.id]) {
     msg.partOrder.push(part.id);
@@ -90,25 +129,65 @@ export function buildMessages(items: any[]): SessionMessages {
 // once info.time.completed is set — a completed copy is the authoritative final
 // form and can never lose a race against live data. So for an id that is ALREADY
 // resident, if the INCOMING message is completed we UPGRADE the resident entry:
-// replace its info and merge the incoming parts (add missing parts; for parts
-// already present, Object.assign IN PLACE so the stored part KEEPS ITS
-// REFERENCE — replacing the object recreates the chat row and flashes/loses
-// scroll; same rationale as upsertPart). This repairs the "just-finished session
-// re-activated shows a STALE PARTIAL message" bug: a warm Stream-2 snapshot (or
-// cold batch) inlines the now-completed message, but the old insert-if-absent
-// skipped it because its id was already resident (the partial cached while
-// streaming), so the stale partial stayed on screen until a full reload. It also
-// fills a resident message that the activity-idle path stamped time.completed on
-// but that is MISSING parts. A NON-completed incoming copy still takes the
-// insert-if-absent path (this is the live-streaming tail the guard protects) —
-// so the fix does NOT reopen "a stale snapshot clobbers a live mid-stream
-// message."
+// replace its info and merge the incoming parts ORDER-AWARE (mergePartsOrdered
+// with the completed copy authoritative: parts slot in the incoming/server
+// partOrder sequence — recovering, e.g., tool/step parts that streamed before
+// the resident text part to their true position ABOVE it; parts already present
+// keep their object reference and are Object.assign-ed IN PLACE so the chat row
+// does not flash/lose scroll, same rationale as upsertPart). This repairs the
+// "just-finished session re-activated shows a STALE PARTIAL message" bug: a
+// warm Stream-2 snapshot (or cold batch) inlines the now-completed message,
+// but the old insert-if-absent skipped it because its id was already resident
+// (the partial cached while streaming), so the stale partial stayed on screen
+// until a full reload. It also fills a resident message that the activity-idle
+// path stamped time.completed on but that is MISSING parts. A NON-completed
+// incoming copy still takes the insert-if-absent path for a keyed resident
+// (this is the live-streaming tail the guard protects) — so the fix does NOT
+// reopen "a stale snapshot clobbers a live mid-stream message" — with ONE
+// exception: a KEYLESS SHADOW resident (never in order, no info of its own)
+// adopts the incoming info (see prependMessagesIfAbsent).
 //
 // Returns the count of messages actually INSERTED (an in-place upgrade is NOT
 // counted — callers rely on the return meaning "newly inserted older messages"
 // for oldestResident/hasOlder bookkeeping in history.ts). The final sortMessages
 // handles prepend ordering naturally — new ids slot into their creation-time
 // position relative to the existing tail.
+// Part-order-aware merge of an incoming parts array into a resident message.
+// The server serializes parts arrays in me.partOrder (chronological
+// append-on-first-seen) order — see message_window.go / snapshots.go — so the
+// INCOMING array order is authoritative. resident.partOrder is rebuilt to
+// match it: a part present in both KEEPS its resident object (reference
+// identity — chat-row components key on it) and is Object.assign-in-place
+// only when `assignPresent` (the completed/terminal copy is authoritative);
+// otherwise the resident (live) body wins and the incoming copy only fills
+// gaps. Parts held ONLY by the resident (e.g. parts accumulated on a keyless
+// shadow, or parts the page copy lacks) are appended at the end in their
+// existing relative order — absence never deletes (mirrors the server's
+// defensive Option A).
+function mergePartsOrdered(
+  resident: { partOrder: string[]; parts: Record<string, Part> },
+  incomingParts: Part[] | undefined,
+  assignPresent: boolean,
+): void {
+  if (!incomingParts || incomingParts.length === 0) return;
+  const seen = new Set<string>();
+  const next: string[] = [];
+  for (const p of incomingParts) {
+    const held = resident.parts[p.id];
+    if (held) {
+      if (assignPresent) Object.assign(held, p);
+    } else {
+      resident.parts[p.id] = p;
+    }
+    next.push(p.id);
+    seen.add(p.id);
+  }
+  for (const pid of resident.partOrder) {
+    if (!seen.has(pid)) next.push(pid);
+  }
+  resident.partOrder = next;
+}
+
 export function prependMessagesIfAbsent(sm: SessionMessages, items: any[]): number {
   let added = 0;
   let upgraded = false;
@@ -117,21 +196,29 @@ export function prependMessagesIfAbsent(sm: SessionMessages, items: any[]): numb
     if (!info) continue;
     const resident = sm.byId[info.id];
     if (resident) {
-      // Already resident. Upgrade ONLY if the incoming copy is completed
-      // (terminal/immutable — safe against live); otherwise live always wins and
-      // we NEVER touch the existing entry.
+      // Already resident. Two ways a resident entry may be touched:
+      //   1. The incoming copy is COMPLETED (terminal/immutable — safe
+      //      against live): upgrade info + merge parts with the completed
+      //      copy authoritative (assign-in-place). A shadow is also realized
+      //      into order.
+      //   2. The incoming copy is NOT completed but the resident is a KEYLESS
+      //      SHADOW (parts held in byId, never entered order, no info of its
+      //      own to protect): adopting the incoming info — which carries
+      //      time.created, an honest slot — is strictly a repair. Resident
+      //      part BODIES still win (they arrived via the live stream); the
+      //      incoming copy only fills gaps. A KEYED resident (already in
+      //      order) is untouched by a non-completed copy — the live-wins
+      //      guard for the mid-stream tail is preserved exactly.
+      const isShadow = !sm.order.includes(info.id);
       if (info.time?.completed) {
         resident.info = info;
-        for (const p of it.parts || []) {
-          if (!resident.parts[p.id]) {
-            resident.partOrder.push(p.id);
-            resident.parts[p.id] = p;
-          } else {
-            // Merge in place — keep the part's object reference (chat row
-            // identity + scroll), same as upsertPart.
-            Object.assign(resident.parts[p.id], p);
-          }
-        }
+        mergePartsOrdered(resident, it.parts, true);
+        if (isShadow) sm.order.push(info.id);
+        upgraded = true;
+      } else if (isShadow && info.time?.created) {
+        resident.info = info;
+        mergePartsOrdered(resident, it.parts, false);
+        sm.order.push(info.id);
         upgraded = true;
       }
       continue;
@@ -146,9 +233,10 @@ export function prependMessagesIfAbsent(sm: SessionMessages, items: any[]): numb
     sm.order.push(info.id);
     added++;
   }
-  // Re-sort on an insert (prepend ordering) OR an upgrade (a completed copy may
-  // carry a time.created the resident placeholder lacked, changing its slot). A
-  // sort that yields the identical order is a no-op for reactivity.
+  // Re-sort on an insert (prepend ordering) OR an upgrade/promotion (the
+  // incoming copy may carry a time.created the resident shadow lacked,
+  // changing its slot). A sort that yields the identical order is a no-op for
+  // reactivity.
   if (added || upgraded) sortMessages(sm);
   return added;
 }
