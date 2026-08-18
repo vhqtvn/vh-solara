@@ -1,6 +1,7 @@
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import { openFileAt, setPathSelection } from "../code/frame";
 import { looksLikePath } from "../lib/pathlike";
+import { layoutPx } from "../lib/zoom";
 import Icon from "./Icon";
 import styles from "./PathSelectionAction.module.css";
 
@@ -74,7 +75,10 @@ export default function PathSelectionAction() {
         <button
           type="button"
           class={styles["path-sel-action"]}
-          style={{ left: `${b().x}px`, top: `${b().y}px` }}
+          // x/y come from the selection rect (viewport px); this fixed-position
+          // element's left/top resolve in layout px under UI zoom — convert at
+          // this boundary. Matches fc2ef59d.
+          style={{ left: `${layoutPx(b().x)}px`, top: `${layoutPx(b().y)}px` }}
           // Keep the selection alive: a plain mousedown on the button would
           // collapse it before the click fires.
           onMouseDown={(e) => e.preventDefault()}
