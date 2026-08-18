@@ -10,6 +10,7 @@ import {
 } from "../lib/scroll";
 import type { ScrollGeometry } from "../lib/scroll";
 import { createReadCursorStash } from "../lib/readCursorStash";
+import { layoutPx } from "../lib/zoom";
 import { findModel, loadModels, migrateModelPick, models, selectionFor } from "../models";
 import { loadVersioned, saveVersioned } from "../lib/store";
 import { activeAgent, agents, selectAgentForSession, selectedAgent } from "../agents";
@@ -523,7 +524,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // amount of content added/removed above it → the read-mode anchorDelta.
   function anchorContentOffset(el: HTMLElement): number {
     if (!scrollEl) return -1;
-    return el.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top + scrollEl.scrollTop;
+    // The gBCR difference is in viewport px under UI zoom (CSS `zoom` on :root;
+    // see lib/zoom) while scrollTop is zoomed-layout px — convert the
+    // difference once here so the returned content offset (and the
+    // anchorDelta the content RO derives from it) is layout px at any zoom.
+    return layoutPx(el.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top) + scrollEl.scrollTop;
   }
   function pin() {
     if (!scrollEl) return;
@@ -733,7 +738,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // land AT the bottom (system restore = follow intent reset).
         setUserScrolledUp(true);
         const delta = el.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
-        scrollEl.scrollTop += delta;
+        // delta is viewport px under UI zoom (CSS `zoom` on :root; see
+        // lib/zoom) while scrollTop is zoomed-layout px — convert once so the
+        // anchor lands exactly at the viewport top at any zoom (the raw delta
+        // overshoots by the zoom factor above 100%, undershoots below).
+        scrollEl.scrollTop += layoutPx(delta);
         // Record the logical anchor + baseline geometry so the content RO can
         // measure anchorDelta on later hydration/load-more and correct a
         // frozen viewport mechanically (overflow-anchor:auto is assist-only).

@@ -1,5 +1,6 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { tabStyle } from "../prefs";
+import { layoutPx } from "../lib/zoom";
 import Icon from "./Icon";
 import Select from "./Select";
 import styles from "./TabBar.module.css";
@@ -30,7 +31,13 @@ export default function TabBar(props: { items: () => TabItem[]; active: () => st
   // when the item set or the style changes (queueMicrotask: after the DOM paints).
   const measure = () => {
     if (!measureEl) return;
-    setWidths([...measureEl.children].map((c) => (c as HTMLElement).getBoundingClientRect().width));
+    // getBoundingClientRect reports viewport px under UI zoom (CSS `zoom` on
+    // :root; see lib/zoom), while `avail` (clientWidth) and the GAP/MORE_W
+    // constants below are zoomed-layout px — convert each measured width once
+    // at this boundary so the fits() comparison stays unit-consistent at
+    // zoom ≠ 1 (raw widths would over-collapse tabs into the ⋯ menu above
+    // 100% and let the row overflow below).
+    setWidths([...measureEl.children].map((c) => layoutPx((c as HTMLElement).getBoundingClientRect().width)));
   };
   createEffect(() => {
     props.items();
