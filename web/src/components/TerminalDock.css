@@ -50,6 +50,28 @@
 .term-host { flex: 1; min-height: 0; padding: 4px 4px 0 8px; position: relative; }
 .term-host .term-status { position: absolute; top: 6px; right: 8px; z-index: 2; }
 .term-host .xterm { height: 100%; }
+
+/* Cell-snapped pointer indicator: shows which terminal cell a click/touch
+   will hit (the OS cursor is taller than a line, so the target cell is
+   ambiguous). Sized/positioned from JS (TerminalPane → lib/termPointer) in
+   the host's layout space — width/height on fit changes, transform per move.
+   Perf: one tiny element, transform-only movement, pointer-events none, no
+   backdrop-filter / mask-image — WebRender-safe (AGENTS.md GPU rules).
+   z-index 2 is local to .term-host's own stacking context (same tier as
+   .term-status), below the .term-overlay (3) so a dropped connection still
+   reads. */
+.term-host .term-cell-cursor {
+  position: absolute; left: 0; top: 0;
+  box-sizing: border-box;
+  border: 1px solid color-mix(in srgb, var(--accent) 80%, transparent);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  pointer-events: none;
+  z-index: 2;
+  opacity: 0;
+  transition: opacity 120ms;
+}
+.term-host .term-cell-cursor.on { opacity: 1; }
 .term-empty { padding: 16px; color: var(--fg-dim); font-size: 13px; }
 .term-keys { display: flex; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--border); overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .term-keys button {

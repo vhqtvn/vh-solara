@@ -5,6 +5,8 @@ import "@xterm/xterm/css/xterm.css";
 import { projectDir } from "../sync";
 import { termKeys } from "../ui";
 import { monoFontStack } from "../font";
+import { uiZoom } from "../lib/zoom";
+import { pointerToCell, rewriteMouseEvent } from "../lib/termPointer";
 
 // A real terminal: xterm.js over a WebSocket-backed PTY (/vh/term/ws). Input
 // flows through term.onData() so IME/composition resolves to final bytes (the
@@ -16,6 +18,11 @@ const ARROW_FINAL: Record<string, string> = { up: "A", down: "B", right: "C", le
 
 export default function TerminalPane(props: { termId?: string; session?: string; title?: string }) {
   let host!: HTMLDivElement;
+  let cellCursor!: HTMLDivElement;
+  // The .xterm-screen element — the ONE rect every xterm coordinate consumer
+  // (selection, mouse reporting, linkifier) subtracts. Queried once after
+  // term.open(); xterm never replaces it during the terminal's lifetime.
+  let screenEl: HTMLElement | null = null;
   let term: Xterm | undefined;
   let fit: FitAddon | undefined;
   let ws: WebSocket | null = null;
@@ -156,6 +163,7 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host);
+    screenEl = host.querySelector(".xterm-screen");
     // Copy/paste via Ctrl+Shift+C/V. The listener rides `host` in the capture
     // phase so it beats xterm's own keydown handler (on .xterm-helper-textarea);
     // preventDefault + stopImmediatePropagation suppress both the browser
@@ -177,6 +185,104 @@ export default function TerminalPane(props: { termId?: string; session?: string;
       }
     };
     host.addEventListener("keydown", onTermKey, true);
+
+    // UI-zoom pointer seam (terminal cousin of fc2ef59d): xterm.js v6 mixes px
+    // spaces in its own coordinate math — the offset numerator
+    // `clientX - screenRect.left` is visual px (both viewport-space under CSS
+    // zoom), while the cell-size divisor from CharSizeService (OffscreenCanvas
+    // measureText / offsetWidth) is layout px. At zoom ≠ 1 every cell
+    // computation lands off by exactly the zoom factor. Every consumer
+    // subtracts the SAME .xterm-screen rect, so one capture-phase rewrite of
+    // the legacy mouse types xterm registers (mousedown/mousemove/mouseup;
+    // word-select rides event.detail on mousedown) fixes selection anchors,
+    // mouse reporting to apps, and link hits at once: the pointer's offset
+    // within the screen element shrinks by zoom, making xterm's
+    // visual-offset ÷ layout-cell division unit-consistent. Identity at
+    // zoom = 1 (no rewrite). PointerEvents are untouched — hostGesture and
+    // the cell indicator below expect visual px and convert via
+    // lib/termPointer themselves. Drags that leave the terminal are not
+    // rewritten (capture only fires for targets inside); xterm clamps those
+    // out-of-bounds coords to the grid edge, which is the intended behavior.
+    const normalizeForXterm = (e: MouseEvent) => {
+      if (!screenEl) return;
+      rewriteMouseEvent(e, screenEl.getBoundingClientRect(), uiZoom());
+    };
+    for (const t of ["mousedown", "mousemove", "mouseup"] as const) {
+      host.addEventListener(t, normalizeForXterm, true);
+    }
+
+    // Cell indicator: the OS cursor is much taller than a terminal line, so
+    // which cell a click/touch will hit is ambiguous. One tiny overlay
+    // snapped to the cell grid under the pointer, positioned by the SAME
+    // zoom-corrected mapping the seam above feeds xterm (dogfoods the fix).
+    // Hover-follow for mouse/pen (rAF-coalesced), a 600ms flash for touch.
+    // transform-only moves, pointer-events:none, no backdrop-filter/mask —
+    // cheap for the Firefox/WebRender GPU budget (AGENTS.md).
+    let rafId = 0;
+    let flashTimer: number | undefined;
+    let hoverEvt: PointerEvent | null = null;
+    let lastW = 0;
+    let lastH = 0;
+    const hideCursor = () => {
+      hoverEvt = null;
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = 0;
+      }
+      // A touch flash owns the indicator until its timer fires — pointerleave
+      // is dispatched on touch LIFT and must not kill the flash the tap just
+      // started.
+      if (flashTimer !== undefined) return;
+      cellCursor?.classList.remove("on");
+    };
+    const placeCursor = (clientX: number, clientY: number) => {
+      if (!cellCursor || !term || !screenEl || term.cols < 1 || term.rows < 1) return;
+      const hit = pointerToCell(
+        clientX,
+        clientY,
+        screenEl.getBoundingClientRect(),
+        host.getBoundingClientRect(),
+        uiZoom(),
+        term.cols,
+        term.rows,
+      );
+      if (!hit.inside || !(hit.cellW > 0) || !(hit.cellH > 0)) {
+        cellCursor.classList.remove("on");
+        return;
+      }
+      // Cell size changes only on fit/font changes — write width/height just
+      // when they move; the per-event hot path is transform + class only.
+      if (hit.cellW !== lastW || hit.cellH !== lastH) {
+        lastW = hit.cellW;
+        lastH = hit.cellH;
+        cellCursor.style.width = `${hit.cellW}px`;
+        cellCursor.style.height = `${hit.cellH}px`;
+      }
+      cellCursor.style.transform = `translate(${hit.left}px, ${hit.top}px)`;
+      cellCursor.classList.add("on");
+    };
+    const flushHover = () => {
+      rafId = 0;
+      if (hoverEvt) placeCursor(hoverEvt.clientX, hoverEvt.clientY);
+      hoverEvt = null;
+    };
+    const onHoverMove = (e: PointerEvent) => {
+      if (e.pointerType !== "mouse" && e.pointerType !== "pen") return;
+      hoverEvt = e;
+      if (!rafId) rafId = requestAnimationFrame(flushHover);
+    };
+    const onTouchDown = (e: PointerEvent) => {
+      if (e.pointerType === "mouse") return; // hover already tracks the mouse
+      placeCursor(e.clientX, e.clientY);
+      clearTimeout(flashTimer);
+      flashTimer = window.setTimeout(() => {
+        flashTimer = undefined;
+        cellCursor?.classList.remove("on");
+      }, 600);
+    };
+    host.addEventListener("pointermove", onHoverMove);
+    host.addEventListener("pointerdown", onTouchDown);
+    host.addEventListener("pointerleave", hideCursor);
     // Harden the hidden input for mobile: no autocorrect/capitalize/IME surprises.
     const ta = host.querySelector(".xterm-helper-textarea") as HTMLTextAreaElement | null;
     if (ta) {
@@ -222,6 +328,14 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     onCleanup(() => {
       ro.disconnect();
       host.removeEventListener("keydown", onTermKey, true);
+      for (const t of ["mousedown", "mousemove", "mouseup"] as const) {
+        host.removeEventListener(t, normalizeForXterm, true);
+      }
+      host.removeEventListener("pointermove", onHoverMove);
+      host.removeEventListener("pointerdown", onTouchDown);
+      host.removeEventListener("pointerleave", hideCursor);
+      if (rafId) cancelAnimationFrame(rafId);
+      clearTimeout(flashTimer);
       document.removeEventListener("visibilitychange", onVisibility);
       clearTimeout(hideTimer);
       clearInterval(liveTimer);
@@ -238,6 +352,9 @@ export default function TerminalPane(props: { termId?: string; session?: string;
       >
         <div class="term-host" ref={host}>
           <span class="term-status" classList={{ [status()]: true }} data-tip={status()} />
+          {/* Cell-snapped pointer indicator — sized/positioned from JS in
+              onMount (termPointer mapping). aria-hidden: purely visual. */}
+          <div class="term-cell-cursor" ref={cellCursor} aria-hidden="true" />
           {/* Make a dead/dropped connection obvious — the cursor still blinks
               locally, so without this the terminal just looks alive but eats
               keystrokes. */}
