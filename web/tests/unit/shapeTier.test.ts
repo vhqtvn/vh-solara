@@ -1,20 +1,25 @@
 // @vitest-environment jsdom
-// shapeTier — the Phase 3 S2a height-tier signal (short-pane defense).
-// Pins: threshold classification (short <= 520 visual px, tiny <= 400),
-// hysteresis (entering is immediate, leaving needs +16px), zoom normalization
-// (RO measures the LOCAL zoom-divided box; thresholds are VISUAL px =
-// local x uiZoom()), rAF coalescing (latest height in a frame wins), the
-// explicit "normal" attribute after the first observation, cleanup reset, and
-// the persisted kill-switch (vh.prefs.shapeTier.v1 = "off" -> no observer,
-// no attribute, stale attribute cleared).
+// shapeTier — the Phase 3 shape-tier signal (S2a heights + S2b widths).
+// Pins: threshold classification (short <= 520 / tiny <= 400 visual px; narrow
+// < 560 / rail 560–720 / wide > 720), hysteresis (entering is immediate,
+// leaving needs +16px), zoom normalization (RO measures the LOCAL zoom-divided
+// box; thresholds are VISUAL px = local x uiZoom()), rAF coalescing (latest
+// box in a frame wins), the explicit "normal" attribute after the first
+// observation, BOTH tier attributes landing from ONE observer, cleanup reset,
+// and the persisted kill-switch (vh.prefs.shapeTier.v1 = "off" -> no observer,
+// NO attribute on either axis, stale attributes cleared).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   classifyHeightTier,
+  classifyWidthTier,
   heightTier,
   installShapeTier,
+  widthTier,
   SHORT_TIER_PX,
   TIER_HYST_PX,
   TINY_TIER_PX,
+  W_TIER_RAIL_MIN,
+  W_TIER_WIDE,
 } from "../../src/shapeTier";
 
 // --- controllable ResizeObserver (repo pattern; see ChatViewNavigator) ------
@@ -40,10 +45,10 @@ class FakeRO {
 }
 (globalThis as { ResizeObserver?: unknown }).ResizeObserver = FakeRO;
 
-function fireRO(el: Element, localHeight: number): void {
+function fireRO(el: Element, localHeight: number, localWidth: number = localHeight): void {
   const reg = roRegistrations.find((r) => r.el === el && !r.inst.disconnected);
   if (!reg) throw new Error(`no live RO registration for ${el}`);
-  const entry = { contentRect: { height: localHeight } } as unknown as ResizeObserverEntry;
+  const entry = { contentRect: { height: localHeight, width: localWidth } } as unknown as ResizeObserverEntry;
   reg.cb([entry], {} as ResizeObserver);
 }
 
@@ -102,6 +107,48 @@ describe("classifyHeightTier — hysteresis (leaving needs +buffer)", () => {
 
   it("a jump that skips a tier leaves directly (tiny -> normal)", () => {
     expect(classifyHeightTier(900, "tiny")).toBe("normal");
+  });
+});
+
+describe("classifyWidthTier — pure thresholds (S2b rail band)", () => {
+  it("wide above the band", () => {
+    expect(classifyWidthTier(W_TIER_WIDE + 1, "wide")).toBe("wide");
+    expect(classifyWidthTier(3000, "wide")).toBe("wide");
+  });
+
+  it("rail spans 560–720 inclusive (the exact boundaries)", () => {
+    expect(classifyWidthTier(559, "wide")).toBe("narrow"); // narrow is < 560 STRICT
+    expect(classifyWidthTier(W_TIER_RAIL_MIN, "wide")).toBe("rail");
+    expect(classifyWidthTier(W_TIER_WIDE, "wide")).toBe("rail");
+    expect(classifyWidthTier(W_TIER_WIDE + 1, "wide")).toBe("wide"); // > 720 wide
+  });
+
+  it("narrow below 560", () => {
+    expect(classifyWidthTier(W_TIER_RAIL_MIN - 1, "rail")).toBe("narrow");
+    expect(classifyWidthTier(200, "rail")).toBe("narrow"); // immediate compacting
+  });
+});
+
+describe("classifyWidthTier — hysteresis (leaving needs +buffer)", () => {
+  it("narrow is held until 575, left at 576", () => {
+    expect(classifyWidthTier(W_TIER_RAIL_MIN + TIER_HYST_PX - 1, "narrow")).toBe("narrow");
+    expect(classifyWidthTier(W_TIER_RAIL_MIN + TIER_HYST_PX, "narrow")).toBe("rail");
+  });
+
+  it("rail is held through 736, left at 737", () => {
+    expect(classifyWidthTier(W_TIER_WIDE + TIER_HYST_PX, "rail")).toBe("rail");
+    expect(classifyWidthTier(W_TIER_WIDE + TIER_HYST_PX + 1, "rail")).toBe("wide");
+  });
+
+  it("entering is NOT buffered (no hysteresis toward the more compact tier)", () => {
+    // From wide, 719 is rail directly (no buffer toward compact); from rail,
+    // 559 is narrow directly.
+    expect(classifyWidthTier(W_TIER_WIDE - 1, "wide")).toBe("rail");
+    expect(classifyWidthTier(W_TIER_RAIL_MIN - 1, "rail")).toBe("narrow");
+  });
+
+  it("a jump that skips a tier leaves directly (narrow -> wide)", () => {
+    expect(classifyWidthTier(1280, "narrow")).toBe("wide");
   });
 });
 
@@ -174,6 +221,69 @@ describe("installShapeTier — observer wiring", () => {
     expect(reg.inst.disconnected).toBe(true);
     expect(heightTier()).toBe("normal");
     expect(el.hasAttribute("data-h-tier")).toBe(false);
+    expect(widthTier()).toBe(null); // width resets to the inert sentinel
+    expect(el.hasAttribute("data-w-tier")).toBe(false);
+  });
+
+  it("widthTier() is null before the first observation lands (inert sentinel)", () => {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const cleanup = installShapeTier(el);
+    expect(widthTier()).toBe(null);
+    cleanup();
+  });
+
+  it("width tiers classify live: 500 narrow, 640 rail, 1280 wide", async () => {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const cleanup = installShapeTier(el);
+    fireRO(el, 800, 500);
+    await nextFrame();
+    expect(el.getAttribute("data-w-tier")).toBe("narrow");
+    expect(widthTier()).toBe("narrow");
+    fireRO(el, 800, 640);
+    await nextFrame();
+    expect(el.getAttribute("data-w-tier")).toBe("rail");
+    fireRO(el, 800, 1280);
+    await nextFrame();
+    expect(el.getAttribute("data-w-tier")).toBe("wide");
+    expect(widthTier()).toBe("wide");
+    cleanup();
+  });
+
+  it("BOTH attributes land from ONE observer (640x700 -> h normal + w rail)", async () => {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const roCountBefore = roRegistrations.length;
+    const cleanup = installShapeTier(el);
+    // Exactly one registration for this element — the width axis reuses the
+    // height observer; a second RO would have added a second registration.
+    expect(roRegistrations.filter((r) => r.el === el)).toHaveLength(1);
+    fireRO(el, 700, 640);
+    await nextFrame();
+    expect(el.getAttribute("data-h-tier")).toBe("normal");
+    expect(el.getAttribute("data-w-tier")).toBe("rail");
+    expect(roRegistrations.length).toBe(roCountBefore + 1);
+    cleanup();
+  });
+
+  it("width hysteresis at the live boundary: rail holds at 736, left at 737", async () => {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const cleanup = installShapeTier(el);
+    fireRO(el, 800, 640);
+    await nextFrame();
+    expect(el.getAttribute("data-w-tier")).toBe("rail");
+    fireRO(el, 800, W_TIER_WIDE + TIER_HYST_PX); // 736 — inside the buffer
+    await nextFrame();
+    expect(el.getAttribute("data-w-tier")).toBe("rail"); // held
+    fireRO(el, 800, W_TIER_WIDE + TIER_HYST_PX + 1); // 737 — clear of it
+    await nextFrame();
+    expect(el.getAttribute("data-w-tier")).toBe("wide");
+    fireRO(el, 800, W_TIER_WIDE); // re-enter the band immediately at 720
+    await nextFrame();
+    expect(el.getAttribute("data-w-tier")).toBe("rail");
+    cleanup();
   });
 });
 
@@ -214,8 +324,56 @@ describe("installShapeTier — zoom normalization (visual px = local x uiZoom)",
   });
 });
 
+describe("installShapeTier — width zoom normalization (visual px = local x uiZoom)", () => {
+  it("uiZoom 1.25: 448 local px = 560 visual -> rail (band entry boundary)", async () => {
+    setUiZoom("1.25");
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const cleanup = installShapeTier(el);
+    fireRO(el, 800, 448);
+    await nextFrame();
+    expect(el.getAttribute("data-w-tier")).toBe("rail");
+    cleanup();
+  });
+
+  it("uiZoom 1.25: 576 local px = 720 visual -> rail (band exit boundary)", async () => {
+    setUiZoom("1.25");
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const cleanup = installShapeTier(el);
+    fireRO(el, 800, 576);
+    await nextFrame();
+    expect(el.getAttribute("data-w-tier")).toBe("rail");
+    cleanup();
+  });
+
+  it("uiZoom 1.25: 577 local px = 721.25 visual -> wide (raw local px would say rail)", async () => {
+    setUiZoom("1.25");
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const cleanup = installShapeTier(el);
+    fireRO(el, 800, 577);
+    await nextFrame();
+    // Without the multiply, 577 <= 720 would classify "rail" — this pins that
+    // the normalization is applied to the width axis, not bypassed.
+    expect(el.getAttribute("data-w-tier")).toBe("wide");
+    cleanup();
+  });
+
+  it("uiZoom 1.25: 447 local px = 558.75 visual -> narrow (raw local px would say rail)", async () => {
+    setUiZoom("1.25");
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const cleanup = installShapeTier(el);
+    fireRO(el, 800, 447);
+    await nextFrame();
+    expect(el.getAttribute("data-w-tier")).toBe("narrow");
+    cleanup();
+  });
+});
+
 describe("installShapeTier — persisted kill-switch", () => {
-  it('vh.prefs.shapeTier.v1 = "off": no observer, no attribute, stale attribute cleared', async () => {
+  it('vh.prefs.shapeTier.v1 = "off": no observer, no attribute (either axis), stale attributes cleared', async () => {
     // The flag is read once at module init (persistedSignal hydrates from
     // localStorage at import), so set storage BEFORE re-importing the module.
     localStorage.setItem("vh.prefs.shapeTier.v1", JSON.stringify({ v: 1, data: "off" }));
@@ -225,14 +383,18 @@ describe("installShapeTier — persisted kill-switch", () => {
     const el = document.createElement("div");
     document.body.appendChild(el);
     el.setAttribute("data-h-tier", "short"); // stale state from an earlier run
+    el.setAttribute("data-w-tier", "rail");
     const roCountBefore = roRegistrations.length;
 
     const cleanup = mod.installShapeTier(el);
     expect(el.getAttribute("data-h-tier")).toBe(null); // cleared, never set
+    expect(el.getAttribute("data-w-tier")).toBe(null); // cleared, never set
     expect(roRegistrations.length).toBe(roCountBefore); // no observer constructed
     expect(mod.heightTier()).toBe("normal");
+    expect(mod.widthTier()).toBe(null); // inert sentinel — the legacy fallback key
     cleanup(); // no-op disposal
     expect(mod.heightTier()).toBe("normal");
+    expect(mod.widthTier()).toBe(null);
   });
 
   it("a foreign stored flag value does NOT enable the module (only exactly \"on\" does)", async () => {
@@ -244,6 +406,8 @@ describe("installShapeTier — persisted kill-switch", () => {
     const cleanup = mod.installShapeTier(el);
     expect(roRegistrations.some((r) => r.el === el)).toBe(false); // no observer
     expect(el.hasAttribute("data-h-tier")).toBe(false);
+    expect(el.hasAttribute("data-w-tier")).toBe(false);
+    expect(mod.widthTier()).toBe(null);
     cleanup();
   });
 });

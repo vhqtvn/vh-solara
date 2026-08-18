@@ -35,8 +35,8 @@ import PerformanceDialog from "./components/PerformanceDialog";
 import ProtocolConfirm from "./components/ProtocolConfirm";
 import Icon from "./components/Icon";
 import { menuTriggers } from "./sessionMenu";
-import { isDesktop, sidebarCollapsed, sidebarWidth, toggleSidebar } from "./layout";
-import { installShapeTier } from "./shapeTier";
+import { sidebarCollapsed, sidebarMode, sidebarWidth, toggleSidebar } from "./layout";
+import { installShapeTier, widthTier } from "./shapeTier";
 import { draft, selectedId, state } from "./sync";
 import { startDiagCapture } from "./sync/diaglog";
 import { refreshViews, views } from "./views";
@@ -53,12 +53,15 @@ export default function App() {
   const [navOpen, setNavOpen] = createSignal(false);
   const [inspectorOpen, setInspectorOpen] = createSignal(false);
   const [managedOpen, setManagedOpen] = createSignal(false);
-  // Back-dismissal for the App-local surfaces. navOpen is the MOBILE slide-over
-  // only (desktop collapse is a persisted layout preference, not a surface);
-  // inspector/managed compound their render gates so a token never outlives
-  // the visible panel (e.g. session deselected under an open inspector).
+  // Back-dismissal for the App-local surfaces. navOpen is the NARROW (drawer)
+  // slide-over only — gated on the sidebar MODE (S2b: width-tier driven), not
+  // isDesktop, so the rail band (560–720 visual px) never binds a back entry
+  // for a drawer it cannot show; wide (desktop) collapse is a persisted layout
+  // preference, not a surface. inspector/managed compound their render gates so
+  // a token never outlives the visible panel (e.g. session deselected under an
+  // open inspector).
   bindBackDismiss(
-    () => navOpen() && !isDesktop(),
+    () => navOpen() && sidebarMode() === "narrow",
     () => setNavOpen(false),
     "nav",
   );
@@ -250,8 +253,26 @@ export default function App() {
   // Drive the persisted, resizable sidebar width via a CSS var.
   createEffect(() => document.documentElement.style.setProperty("--sidebar-w", `${sidebarWidth()}px`));
 
-  // Menu button: collapse/expand on desktop, slide-over toggle on mobile.
-  const toggleNav = () => (isDesktop() ? toggleSidebar() : setNavOpen((v) => !v));
+  // Leaving the narrow (drawer) mode with the drawer still open — e.g. a pane
+  // widened from 500 to 640px crossing into the rail band — must not leave a
+  // stale navOpen: its `.open` class would fight the rail's inline layout.
+  // Tier-gated on purpose: when the signal is inert (kill-switch off) legacy
+  // behavior is preserved exactly (a stale navOpen above 720px was harmless
+  // there — nothing consumed it).
+  createEffect(() => {
+    if (widthTier() !== null && sidebarMode() !== "narrow") setNavOpen(false);
+  });
+
+  // Menu button: collapse/expand on wide (desktop), slide-over toggle on
+  // narrow (phone). Rail has nothing to toggle — the sidebar is always
+  // visible there and the button is hidden by CSS — so it no-ops. The
+  // decision follows the sidebar MODE (S2b: width-tier driven), not isDesktop:
+  // the rail band (560–720 visual px) must not engage drawer semantics.
+  const toggleNav = () => {
+    const m = sidebarMode();
+    if (m === "narrow") setNavOpen((v) => !v);
+    else if (m === "wide") toggleSidebar();
+  };
 
   return (
     <div class="app" classList={{ "sidebar-collapsed": sidebarCollapsed() }} ref={appEl}>

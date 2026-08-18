@@ -10,10 +10,15 @@
   overflow: hidden;
   transition: flex-basis 0.16s var(--ease, ease), width 0.16s var(--ease, ease);
 }
-/* Resize handle — desktop only (mobile sidebar is a slide-over). */
+/* Resize handle — desktop only (mobile sidebar is a slide-over). The :not()
+   guards (Phase 3 S2b) keep the RAIL band (560–720 visual px) from showing
+   the handle or honoring the desktop collapse: the rail is fixed-width and
+   always visible, and the persisted --sidebar-w must never be written from
+   rail. A missing data-w-tier attribute (kill-switch off / first frame)
+   MATCHES :not() — legacy desktop behavior is preserved exactly. */
 .sidebar-resize { display: none; }
 @media (min-width: 721px) {
-  .sidebar-resize {
+  .app:not([data-w-tier="rail"]) .sidebar-resize {
     display: block;
     position: absolute;
     top: 0;
@@ -25,7 +30,7 @@
     touch-action: none; /* keep the horizontal drag from being claimed as scroll */
   }
   .sidebar-resize:hover { background: color-mix(in srgb, var(--accent) 35%, transparent); }
-  .app.sidebar-collapsed .sidebar {
+  .app:not([data-w-tier="rail"]).sidebar-collapsed .sidebar {
     flex-basis: 0;
     width: 0;
     border-right: 0;

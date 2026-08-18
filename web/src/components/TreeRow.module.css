@@ -85,3 +85,13 @@
   padding-left: 5px;
   padding-right: 5px;
 }
+
+/* ── Rail band (Phase 3 S2b, reversible default) ──────────────────────────
+   .rowTags is SCOPED, so the rail's hide-the-tag-chips rule lives HERE (the
+   bulk of the rail tree compaction is in Sidebar.module.css, which can only
+   reach global classes). Attention dots + the agent chip are KEPT in rail —
+   they are the load-bearing monitoring signal; the tag chips are identity
+   chrome that does not fit 160px. */
+:global([data-w-tier="rail"]) .rowTags {
+  display: none;
+}

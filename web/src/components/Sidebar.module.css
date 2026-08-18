@@ -186,3 +186,82 @@
   color: var(--fg-dim);
   white-space: nowrap;
 }
+
+/* ── Width-tier rail band (Phase 3 S2b) ──────────────────────────────────────
+   Between 560–720 VISUAL px (`data-w-tier="rail"` on `.app`, set by
+   web/src/shapeTier.ts) the sidebar presents as a compact, always-visible rail
+   so the session tree + chat coexist in narrow host panes. All selectors here
+   are :global — they reach legacy shared chrome (.sidebar, .tree-*, .proj-*,
+   .sidebar-foot-btn, .nav-toggle) per docs/ai/web-css-architecture.md rule 7
+   (locate-ability + concurrent-edit isolation); the module loads after the
+   legacy shards, so ties resolve here. GPU-safe only — no mask-image, no
+   backdrop-filter, no contain/content-visibility (AGENTS.md WebRender rules).
+
+   RAIL CONTENT is a REVERSIBLE DEFAULT awaiting operator judgment (marked at
+   each rule): titles shown (session icons don't differentiate sessions;
+   identity is required for switching), attention dots + agent chip KEPT (the
+   load-bearing signal), time / descendant count / tag chips hidden, search +
+   tag-filter affordances compacted away (entering rail clears any active
+   filter — Sidebar.tsx), archived foot icon-only, nav-toggle hidden (nothing
+   to toggle — the rail is always visible). Adjust any of these in one place
+   if the operator rules differently. */
+
+/* The rail column itself: inline (never the fixed off-canvas drawer), fixed
+   width. TUNABLE: 160px pairs with W_TIER_RAIL_MIN/W_TIER_WIDE in
+   shapeTier.ts — it leaves 400–560px of chat inside the band. transform/box-
+   shadow are neutralized so a stale drawer `.open` (e.g. drawer opened at
+   500px, pane widened into the band) cannot pierce the rail with the drawer
+   scrim; App.tsx also resets navOpen when leaving narrow mode. */
+:global([data-w-tier="rail"] .sidebar) {
+  position: relative;
+  transform: none;
+  box-shadow: none;
+  width: 160px; /* TUNABLE: rail width (keep in sync with the comment above) */
+  flex: 0 0 160px;
+}
+/* Nothing to toggle in rail (always visible; wide keeps collapse/expand) —
+   hide the header button. [reversible default] */
+:global([data-w-tier="rail"] .nav-toggle) { display: none; }
+/* Resize never applies in rail (fixed width + the no-write rule) — CSS twin
+   of the Sidebar.tsx markup gate, for the zoom edge where the legacy
+   min-width:721px media block could match a rail-tier viewport. */
+:global([data-w-tier="rail"] .sidebar-resize) { display: none; }
+
+/* Header compaction: the rail head is status-mark + the lone `+` button
+   (wordmark/helper/search/tag toggles are unmounted by Sidebar.tsx). Push the
+   `+` to the row's right edge. */
+:global([data-w-tier="rail"] .sidebar-head) { padding: 8px 10px; gap: 6px; }
+:global([data-w-tier="rail"] .sidebar-head .icon-btn) { margin-left: auto; }
+
+/* Project bar compaction: icon-only switcher (name + chevron hidden, the
+   layers glyph centered). The dialog it opens is unchanged. */
+:global([data-w-tier="rail"] .proj-current) { justify-content: center; padding: 6px 4px; }
+:global([data-w-tier="rail"] .proj-current .proj-name),
+:global([data-w-tier="rail"] .proj-current svg:last-of-type) { display: none; }
+
+/* ── Session tree compaction (reversible defaults) ─────────────────────────
+   ~26px rows: the twisty cell (the row's height driver, 18×30 base) shrinks
+   to 14×22 and the node padding halves. Reduced indent for subsessions: each
+   guide cell narrows 16→10px. Titles ellipsize (the base .tree-title contract
+   — overflow:hidden + text-overflow:ellipsis — now against ~100px of space).
+   KEPT: the per-row attention/activity dots and the agent chip (the
+   load-bearing monitoring signal); the twisty + its running ring are
+   untouched (they center in the smaller cell). HIDDEN: the updated-time, the
+   "▸ N" descendant badge, and the root tag chips (TreeRow.module.css owns the
+   scoped .rowTags rule). */
+:global([data-w-tier="rail"] .tree) { padding: 4px; }
+:global([data-w-tier="rail"] .tree-twisty) { width: 14px; height: 22px; }
+/* min-height:0 clears the phone touch-target floor (38px, the legacy
+   @media (max-width:720px) rule in 70-composer-diff-git.css — the rail band
+   also matches that media query). A rail pane is a desktop monitoring
+   surface; compact rows are the point. [reversible default] */
+:global([data-w-tier="rail"] .tree-node) { padding: 3px 8px 3px 2px; min-height: 0; }
+:global([data-w-tier="rail"] .tree-line1) { gap: 6px; }
+:global([data-w-tier="rail"] .tg-cell) { width: 10px; }
+:global([data-w-tier="rail"] .tree-time),
+:global([data-w-tier="rail"] .tree-count) { display: none; }
+
+/* Archived foot compaction: icon-only, centered (label unmounted by
+   Sidebar.tsx). */
+:global([data-w-tier="rail"] .sidebar-foot) { padding: 4px; }
+:global([data-w-tier="rail"] .sidebar-foot-btn) { justify-content: center; padding: 7px 6px; }

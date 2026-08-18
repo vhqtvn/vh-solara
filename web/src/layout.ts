@@ -3,6 +3,7 @@
 // stays a slide-over driven by navOpen (collapse doesn't apply there).
 import { createSignal } from "solid-js";
 import { loadVersioned, saveVersioned } from "./lib/store";
+import { widthTier } from "./shapeTier";
 
 const LS_W = "vh.sidebar.w.v1";
 const LS_C = "vh.sidebar.collapsed.v1";
@@ -35,3 +36,20 @@ const [isDesktop, setDesktop] = createSignal(mq.matches);
 mq.addEventListener?.("change", (e) => setDesktop(e.matches));
 
 export { sidebarWidth, sidebarCollapsed, isDesktop };
+
+// ── Sidebar presentation mode (Phase 3 S2b) ──────────────────────────────────
+// HOW the sidebar presents: "narrow" = the phone drawer (off-canvas, navOpen),
+// "rail" = the compact always-visible rail band (560–720 visual px), "wide" =
+// the full resizable inline column. When the width-tier signal is LIVE the
+// tier IS the mode (visual px, zoom-normalized). When it is inert — kill-switch
+// off, or the first observation hasn't landed yet (RO → rAF is async) — the
+// legacy 721px matchMedia decision stands, making flag-off the EXACT pre-S2b
+// revert. Note this is the sidebar PRESENTATION decision only; isDesktop()'s
+// other consumers (CodeFrame overlay, ManagedPanel, ChatNavigator, code dock)
+// are deliberately untouched and stay on the legacy breakpoint.
+export type SidebarMode = "narrow" | "rail" | "wide";
+export function sidebarMode(): SidebarMode {
+  const t = widthTier();
+  if (t !== null) return t;
+  return isDesktop() ? "wide" : "narrow";
+}

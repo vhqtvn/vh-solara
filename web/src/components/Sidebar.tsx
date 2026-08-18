@@ -1,9 +1,9 @@
-import { createSignal, createMemo, Show, For } from "solid-js";
+import { createSignal, createMemo, createEffect, Show, For } from "solid-js";
 import { newSession, state, isStale, isUpdating, STALE_MS, projectDir } from "../sync";
 import { searchQuery, setSearchQuery, selectedTagIds, filterOpen, setFilterOpen, toggleTagFilter, clearTagFilter } from "../sidebar";
 import { pinsLastError, clearPinsError } from "../pins";
 import { labelsTags } from "../labels";
-import { setSidebarWidth } from "../layout";
+import { setSidebarWidth, sidebarMode } from "../layout";
 import SessionTree from "./SessionTree";
 import ArchivedDialog from "./ArchivedDialog";
 import ProjectSwitcher from "./ProjectSwitcher";
@@ -36,6 +36,16 @@ function pinSyncErrorLabel(): string {
 
 export default function Sidebar(props: { open: boolean; onClose: () => void }) {
   const [archivedOpen, setArchivedOpen] = createSignal(false);
+  // ── Rail band (Phase 3 S2b) ──────────────────────────────────────────────
+  // Between 560–720 visual px the sidebar presents as a compact, ALWAYS-visible
+  // rail (sidebarMode in layout.ts; CSS keyed on [data-w-tier="rail"] — see the
+  // rail section in Sidebar.module.css). The few MARKUP conditionals hang off
+  // this signal; everything else is CSS. RAIL CONTENT is a REVERSIBLE DEFAULT
+  // awaiting operator judgment: titles shown (session icons don't differentiate
+  // sessions; identity is required for switching), attention dots + agent chip
+  // kept, time/descendant-count/tag-chips hidden, search + tag-filter
+  // affordances compacted away, archived foot icon-only.
+  const rail = () => sidebarMode() === "rail";
   // Connection-health facets for the status indicator. `stale` (Feature 1): the
   // live stream has gone quiet past the heartbeat window but the socket hasn't
   // dropped yet (the watchdog will force a reconnect shortly). `syncing`
@@ -80,6 +90,24 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
       setSearchOpen(false);
     }
   };
+  // Entering the rail band with a live search/tag filter would leave the tree
+  // silently filtered with no visible control to clear it (both affordances
+  // are compacted away in rail — see the markup Shows below). Clear the LOCAL
+  // UI state on entry — searchQuery / tag selection are pure in-memory signals
+  // (sidebar.ts), never persisted, so this mutates no stored preference.
+  // (Placed after the searchOpen declaration: Solid runs effects
+  // synchronously at creation, so the closure must not capture a TDZ binding.)
+  createEffect(() => {
+    if (!rail()) return;
+    if (searchOpen() || searchQuery()) {
+      setSearchQuery("");
+      setSearchOpen(false);
+    }
+    if (filterOpen() || selectedTagIds().length > 0) {
+      clearTagFilter();
+      setFilterOpen(false);
+    }
+  });
 
   // Tag-filter rail (slice 6 labels): mirrors the search toggle — a header
   // icon reveals a horizontal chip rail above the tree; an active selection
@@ -159,30 +187,37 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
     <aside class="sidebar" classList={{ open: props.open }}>
       <div class="sidebar-head">
         <StatusMark state={indState()} tip={statusTip()} />
-        <strong>VHSolara</strong>
-        <HelpInspector />
-        <button
-          type="button"
-          class="icon-btn"
-          classList={{ on: searchOpen() || !!searchQuery() }}
-          onClick={toggleSearch}
-          data-tip="Search sessions"
-          aria-label="Search sessions"
-          aria-pressed={searchOpen() || !!searchQuery()}
-        >
-          <Icon name="search" />
-        </button>
-        <button
-          type="button"
-          class="icon-btn"
-          classList={{ on: filterOpen() || selectedTagIds().length > 0 }}
-          onClick={toggleFilter}
-          data-tip="Filter by tags"
-          aria-label="Filter sessions by tags"
-          aria-pressed={filterOpen() || selectedTagIds().length > 0}
-        >
-          <Icon name="tag" />
-        </button>
+        {/* Rail compaction (S2b): the wordmark, the drag-to-inspect helper and
+            the search/tag-filter toggles are compacted away in the rail band —
+            the head reduces to status-mark + the `+` new-session affordance
+            (kept: it is already an icon and session creation is primary).
+            Reversible default; see the rail section in Sidebar.module.css. */}
+        <Show when={!rail()}>
+          <strong>VHSolara</strong>
+          <HelpInspector />
+          <button
+            type="button"
+            class="icon-btn"
+            classList={{ on: searchOpen() || !!searchQuery() }}
+            onClick={toggleSearch}
+            data-tip="Search sessions"
+            aria-label="Search sessions"
+            aria-pressed={searchOpen() || !!searchQuery()}
+          >
+            <Icon name="search" />
+          </button>
+          <button
+            type="button"
+            class="icon-btn"
+            classList={{ on: filterOpen() || selectedTagIds().length > 0 }}
+            onClick={toggleFilter}
+            data-tip="Filter by tags"
+            aria-label="Filter sessions by tags"
+            aria-pressed={filterOpen() || selectedTagIds().length > 0}
+          >
+            <Icon name="tag" />
+          </button>
+        </Show>
         <button type="button" class="icon-btn" onClick={() => void newSession()} data-tip="New session" aria-label="Create session">
           <Icon name="plus" />
         </button>
@@ -239,7 +274,7 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
           </Show>
         </div>
       </div>
-      <Show when={searchOpen() || searchQuery()}>
+      <Show when={(searchOpen() || searchQuery()) && !rail()}>
         <div class="session-search">
           <Icon name="search" size={13} />
           <input
@@ -263,7 +298,7 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
           density rules; wraps on desktop. Each chip is aria-pressed; the dot
           uses the tag's own color. "Clear" resets the whole AND selection.
           Hidden when no tags exist and none are selected (nothing to filter). */}
-      <Show when={filterOpen() || selectedTagIds().length > 0}>
+      <Show when={(filterOpen() || selectedTagIds().length > 0) && !rail()}>
         <div class={styles.filterRail} role="group" aria-label="Filter sessions by tag">
           <For each={labelsTags()}>
             {(t) => {
@@ -324,14 +359,23 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
         <SessionTree />
       </Show>
       <div class="sidebar-foot">
+        {/* Rail compaction: icon-only (the "Archived" label drops; CSS centers
+            the layers glyph). Reversible default. */}
         <button type="button" class="sidebar-foot-btn" onClick={() => setArchivedOpen(true)}>
-          <Icon name="layers" size={14} /> Archived
+          <Icon name="layers" size={14} />
+          <Show when={!rail()}> Archived</Show>
         </button>
       </div>
       <Show when={archivedOpen()}>
         <ArchivedDialog onClose={() => setArchivedOpen(false)} />
       </Show>
-      <div class="sidebar-resize" onPointerDown={startResize} data-tip="Drag to resize" />
+      {/* Resize handle — absent from the DOM in the rail band: the rail has its
+          own fixed width and MUST NOT write the persisted --sidebar-w
+          preference (the no-write rule; display:none in CSS is belt+braces for
+          the zoom edge where the min-width:721px media block could match). */}
+      <Show when={!rail()}>
+        <div class="sidebar-resize" onPointerDown={startResize} data-tip="Drag to resize" />
+      </Show>
     </aside>
   );
 }
