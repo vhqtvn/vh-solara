@@ -27,6 +27,7 @@ import { chooseVariant, models } from "../../models";
 import { queueFor, queueMode, removeQueued } from "../../queue";
 import { highlightInput } from "../../lib/composerHighlight";
 import { isInlineChipOrphan } from "../../lib/inlineAttach";
+import { layoutPx } from "../../lib/zoom";
 import Icon from "../Icon";
 import { QueueChip } from "../QueueChip";
 import Select from "../Select";
@@ -88,11 +89,15 @@ export function Composer(props: ComposerProps) {
     props.ac.acItems(); // recompute when the list changes
     if (!composerEl) return {};
     const r = composerEl.getBoundingClientRect();
+    // r (and window.innerHeight) are VIEWPORT px, but these inline lengths land
+    // in the popup's own ZOOMED-LAYOUT space (CSS `zoom` on :root — see
+    // lib/zoom.ts); convert each at this style boundary or the popup offsets by
+    // the zoom factor. Identity at zoom = 1.
     return {
       position: "fixed",
-      left: `${Math.round(r.left)}px`,
-      width: `${Math.round(r.width)}px`,
-      bottom: `${Math.round(window.innerHeight - r.top + 6)}px`,
+      left: `${layoutPx(Math.round(r.left))}px`,
+      width: `${layoutPx(Math.round(r.width))}px`,
+      bottom: `${layoutPx(Math.round(window.innerHeight - r.top + 6))}px`,
     };
   };
   // Local copy of the mirror element for the textarea onScroll lockstep write
