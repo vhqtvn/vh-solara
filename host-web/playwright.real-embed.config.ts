@@ -108,7 +108,22 @@ export default defineConfig({
       // port from the mock lane (:5173) so concurrent runs don't clash. The
       // inline env sets VITE_IFRAME_ORIGIN for this process tree only (Vite
       // inherits it), so each pane's iframe points at the real server.
-      command: `VITE_IFRAME_ORIGIN=${REAL_ORIGIN} npm run dev:host:real-embed`,
+      //
+      // POST-FOLD (f461094): the single-server SPA lives at /app on the real
+      // server — `/` is the HOST shell (pkg/web/host-dist; cold build = the
+      // "host shell was not built" placeholder, which has NO script tags). The
+      // pane fleet is the mock resolver (mockUrl → `${IFRAME_ORIGIN}/?server=&view=`),
+      // so the base URL must carry the /app prefix: panes load
+      // http://localhost:8765/app/?server=…&view=… → serveAppIndex → the REAL
+      // SPA shell (pkg/web/dist embed). This mirrors the folded host's own
+      // self-seed target (mockData.ts localAppEntry() → origin + "/app") — the
+      // production fold topology, minus same-origin (this lane is deliberately
+      // the harder cross-origin posture). Pointing at the bare origin re-broke
+      // the lane silently when the fold landed (CI served the host placeholder;
+      // a leftover local host-dist materialization served the folded HOST shell,
+      // whose /host/assets/index-* substring-matched the spec's old `src*=`
+      // probe and masked the break until the liveness gates).
+      command: `VITE_IFRAME_ORIGIN=${REAL_ORIGIN}/app npm run dev:host:real-embed`,
       cwd: hostRoot,
       url: `http://127.0.0.1:${HOST_PORT}/`,
       reuseExistingServer: !process.env.CI,

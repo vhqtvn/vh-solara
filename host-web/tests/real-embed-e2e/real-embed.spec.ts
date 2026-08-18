@@ -83,7 +83,15 @@ async function firstRealFrame(page: Page, timeout = 30000): Promise<Frame> {
 }
 
 /** Wait until the real SPA mounted inside the iframe (real shell, not the
- *  placeholder banner). */
+ * placeholder banner and not the folded HOST shell).
+ *
+ * The probe is ANCHORED (`src^="/assets/index-"`): the single-server SPA's
+ * bundle lives at root-level `/assets/index-*`, while the folded host shell's
+ * bundle is `/host/assets/index-*`. The old substring match (`src*=`) let the
+ * host shell's script satisfy this assertion, masking the post-fold breakage
+ * (panes pointed at `/`, which the fold turned into the host-shell route) until
+ * the later liveness gates. The anchor makes any wrong-document regression fail
+ * HERE, at the earliest seam, with a clear message. */
 async function waitForSpaMounted(frame: Frame, timeout = 30000) {
   const deadline = Date.now() + timeout;
   let last: { hasAssetsScript: boolean; rootChildren: number; bodyText: string } | null = null;
@@ -92,7 +100,7 @@ async function waitForSpaMounted(frame: Frame, timeout = 30000) {
       last = await frame.evaluate(() => {
         const root = document.getElementById("root");
         return {
-          hasAssetsScript: !!document.querySelector('script[src*="/assets/index-"]'),
+          hasAssetsScript: !!document.querySelector('script[src^="/assets/index-"]'),
           rootChildren: root ? root.children.length : 0,
           bodyText: document.body ? document.body.innerText.slice(0, 200) : "",
         };
