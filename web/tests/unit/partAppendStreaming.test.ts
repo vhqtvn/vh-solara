@@ -27,6 +27,9 @@ import { createEffect } from "solid-js";
 import {
   appendPartSuffix,
   utf8ByteLength,
+  upsertMessage,
+  upsertPart,
+  prependMessagesIfAbsent,
   type PartAppendPayload,
 } from "../../src/lib/reduce";
 import type { SessionMessages } from "../../src/types";
@@ -209,6 +212,97 @@ describe("appendPartSuffix — pure suffix apply (offset validation + append)", 
     };
     expect(appendPartSuffix(sm, pay)).toBe("applied");
     expect((sm.byId.m1.parts.p1 as { reasoning: string }).reasoning).toBe("thinking... more");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F4 — appendPartSuffix × KEYLESS SHADOW path (281a2f2 mechanism; coverage
+// gap flagged by the 2026-08-20 study: message-not-resident and
+// part-not-resident were covered, parent-is-SHADOW-with-part-present was
+// not). A shadow is byId-only (never in order); its stub info has NO time,
+// so the not-completed check passes; a held part is found → offset-validated
+// append applies; an unknown part routes to mismatch → the transport layer
+// triggers a cursorless re-snapshot (session-stream flushAppends). These are
+// coverage-only (the study traced the path correct-by-construction) —
+// expected GREEN.
+// ---------------------------------------------------------------------------
+
+// Seed a KEYLESS SHADOW for message "mSh" holding one text part "p1" with
+// `text` — via the production part-only path (upsertPart for a non-resident
+// message), NOT a hand-built byId entry, so the stub shape is exactly what
+// production creates.
+function smWithShadowPart(fieldText: string): SessionMessages {
+  const sm: SessionMessages = { order: [], byId: {} };
+  upsertPart(sm, { id: "p1", sessionID: "s", messageID: "mSh", type: "text", text: fieldText });
+  return sm;
+}
+
+function shadowPay(overrides: Partial<PartAppendPayload> & { start: number; text: string }): PartAppendPayload {
+  return {
+    sessionID: "s",
+    messageID: "mSh",
+    partID: "p1",
+    field: "text",
+    ...overrides,
+  };
+}
+
+describe("appendPartSuffix × keyless shadow (F4 coverage)", () => {
+  it("applies a suffix onto a SHADOW-HELD part; the shadow stays out of order", () => {
+    const sm = smWithShadowPart("Hello"); // 5 ASCII bytes
+    const partRef = sm.byId.mSh.parts.p1;
+    expect(sm.order).toEqual([]); // precondition: mSh is a shadow, not rendered
+    const res = appendPartSuffix(sm, shadowPay({ start: 5, text: " world" }));
+    expect(res).toBe("applied");
+    expect((sm.byId.mSh.parts.p1 as { text: string }).text).toBe("Hello world");
+    // In-place append — the held Part object keeps its identity (promotion
+    // later hands the SAME object to the rendered row).
+    expect(sm.byId.mSh.parts.p1).toBe(partRef);
+    // Still a shadow: applying a suffix must NOT realize it into order.
+    expect(sm.order).toEqual([]);
+  });
+
+  it("a later keyed promotion (message.upsert) carries the appended text", () => {
+    const sm = smWithShadowPart("Hello");
+    appendPartSuffix(sm, shadowPay({ start: 5, text: " world" }));
+    upsertMessage(sm, { id: "mSh", sessionID: "s", role: "assistant", time: { created: 42 } });
+    // Promoted into order at its chronological slot — with the appended
+    // suffix still in the held part.
+    expect(sm.order).toEqual(["mSh"]);
+    expect((sm.byId.mSh.parts.p1 as { text: string }).text).toBe("Hello world");
+  });
+
+  it("a later page-merge promotion (completed copy) carries the appended text and keeps part identity", () => {
+    const sm = smWithShadowPart("Hello");
+    appendPartSuffix(sm, shadowPay({ start: 5, text: " world" }));
+    const partRef = sm.byId.mSh.parts.p1;
+    // A Load-older page re-brings the message as a COMPLETED copy (terminal
+    // upgrade path — the server copy is authoritative, parts assign in place).
+    const added = prependMessagesIfAbsent(sm, [
+      {
+        info: { id: "mSh", sessionID: "s", role: "assistant", time: { created: 42, completed: 50 } },
+        parts: [{ id: "p1", sessionID: "s", messageID: "mSh", type: "text", text: "Hello world" }],
+      },
+    ]);
+    expect(added).toBe(0); // shadow-resident → upgrade/promotion, not an insert
+    expect(sm.order).toEqual(["mSh"]);
+    // mergePartsOrdered keeps the resident (held) object and Object.assigns
+    // the completed copy onto it — identity preserved, text converged.
+    expect(sm.byId.mSh.parts.p1).toBe(partRef);
+    expect((sm.byId.mSh.parts.p1 as { text: string }).text).toBe("Hello world");
+  });
+
+  it("UNKNOWN part on a shadow → mismatch (routes to cursorless re-snapshot)", () => {
+    const sm = smWithShadowPart("Hello");
+    expect(
+      appendPartSuffix(sm, shadowPay({ start: 5, text: "x", partID: "p-UNKNOWN" })),
+    ).toBe("mismatch");
+    // The held part is unchanged (no splice at any offset); the repair is the
+    // transport layer's cursorless re-snapshot, already covered above.
+    expect((sm.byId.mSh.parts.p1 as { text: string }).text).toBe("Hello");
+    // The shadow itself is untouched by the failed apply.
+    expect(sm.order).toEqual([]);
+    expect(sm.byId.mSh).toBeDefined();
   });
 });
 

@@ -69,8 +69,12 @@ export function upsertPart(sm: SessionMessages, part: Part): void {
     // Pre-fix this pushed the id onto the END of order — stale rows rendered
     // AFTER the final message (incident 2026-08-19), the idle bridge stamped
     // the phantom tail (suppressing Inv-2 recovery), and the next sort flung
-    // it to the TOP (created treated as 0). Shadow memory is bounded by the
-    // same part data the old code held AND rendered — strictly less exposure.
+    // it to the TOP (created treated as 0). RENDER exposure is now strictly
+    // less than the old code (a shadow never renders). MEMORY exposure is
+    // bounded by the same resident gate as everything else: approxResidentBytes
+    // counts byId-only entries, and the eviction path reaps shadows when over
+    // cap (reapKeylessShadows in reduce.ts, called from evictIfOverCap in
+    // sync/history.ts) — the two F3 followups to 281a2f2.
     msg = {
       id: part.messageID,
       info: { id: part.messageID, sessionID: part.sessionID, role: "assistant" },
@@ -247,7 +251,10 @@ export function prependMessagesIfAbsent(sm: SessionMessages, items: any[]): numb
 // tail (newest messages, at the bottom of order) which is what an active
 // session streams into. Returns the count actually removed. Does NOT touch
 // the last `protectTail` messages (default 1) so an in-flight assistant turn
-// at the tail is never yanked. Bidirectional eviction (tail-end when reading
+// at the tail is never yanked. NOTE: this removes ORDER-PRESENT ids only —
+// byId-only keyless shadows (upsertPart) have no chronological slot here and
+// are reclaimed separately via reapKeylessShadows; the eviction gate
+// (evictIfOverCap) calls both. Bidirectional eviction (tail-end when reading
 // history) is a documented follow-up — this minimal cut covers the OOM risk
 // for the common live-session case.
 export function deleteMessagesFromTop(sm: SessionMessages, count: number, protectTail = 1): number {
@@ -259,6 +266,48 @@ export function deleteMessagesFromTop(sm: SessionMessages, count: number, protec
   sm.order = sm.order.slice(n);
   for (const id of removed) delete sm.byId[id];
   return n;
+}
+
+// F3 — reap byId-only KEYLESS SHADOWS (part-only placeholders created by
+// upsertPart for messages with no resident copy: never entered into order,
+// never rendered, parts held only in the hope a later promotion/page merge
+// realizes them). Called by the eviction gate (evictIfOverCap) when the
+// resident cache is over cap: before F3 the gate was blind to shadows via
+// BOTH metrics (its count read order.length and approxResidentBytes iterated
+// order), so distinct out-of-window (messageID, partID) pairs — compaction
+// bursts sweeping deeper, fork sessions — accumulated outside the 5 MiB gate
+// with no reclaim path (s.messages[sid] also survives session removal, and
+// tree-resync only wholesale-replaces NON-active sessions, so nothing else
+// reclaims them either).
+//
+// REAPING DISCARDS THE SHADOW'S HELD PARTS. That is acceptable ONLY because
+// the data is NOT lost: it remains server-side and re-fetchable via the
+// Load-older page path — pages carry FULL parts, and prependMessagesIfAbsent
+// re-realizes the message at its chronological slot with the page's
+// authoritative bodies (a page merge would supersede the held parts anyway;
+// their marginal value was only the parts a page might lack).
+//
+// ORDERING: a shadow has no time.created — there is no honest chronological
+// key among shadows, so this reaps ALL of them instead of picking an
+// arbitrary partial order. Any subset ordering (e.g. byId insertion order,
+// which approximates ARRIVAL order, not age — out-of-window bursts arrive
+// newest-compacted-first) would be arbitrary; a total reap has no ordering to
+// get wrong and is user-invisible (shadows never render). Ordered messages
+// are never touched by this call.
+//
+// 281a2f2 semantics preserved: shadows still never render, parts are still
+// held until promotion (or cap-pressure reap), promotion re-slots by
+// time.created, and oldestResidentID (order[0]) is unaffected — order is not
+// modified here.
+export function reapKeylessShadows(sm: SessionMessages): number {
+  const inOrder = new Set(sm.order);
+  let reaped = 0;
+  for (const id of Object.keys(sm.byId)) {
+    if (inOrder.has(id)) continue;
+    delete sm.byId[id];
+    reaped++;
+  }
+  return reaped;
 }
 
 // === Slice 3: part.append suffix streaming (pure apply) =====================
@@ -364,9 +413,16 @@ export function appendPartSuffix(
 // the eviction gate alongside MAX_RESIDENT_MESSAGES. Mirrors the server's
 // messageSerializedBytes() rationale (per-part 1 MiB cap is the hard OOM
 // guardrail; the aggregate cap is an approximate content budget).
+//
+// F3: iterates byId (NOT order). byId-only KEYLESS SHADOW entries (upsertPart)
+// are resident memory too — iterating order left their bytes invisible to the
+// MAX_RESIDENT_BYTES gate, letting out-of-window (messageID, partID) pairs
+// accumulate outside the 5 MiB budget. Every byId entry is counted exactly
+// once (order-present ids are byId keys too — there is no separate order pass
+// to double-count them).
 export function approxResidentBytes(sm: SessionMessages): number {
   let total = 0;
-  for (const id of sm.order) {
+  for (const id of Object.keys(sm.byId)) {
     const msg = sm.byId[id];
     if (!msg) continue;
     total += msg.info ? JSON.stringify(msg.info).length : 0;

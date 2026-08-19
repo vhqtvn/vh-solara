@@ -43,8 +43,10 @@
 //     regresses the "Load-older unusable on actively-streaming sessions" bug (a
 //     part.upsert flood would exhaust MAX_PAGE_RETRIES and abandon with no merge).
 //   - §3h (eviction caps): evictIfOverCap evicts from the OLDEST end (protectTail=1
-//     keeps the live tail); the sticky evictedHistory flag ORs into hasOlder so the
-//     Load-older button re-appears for evicted messages.
+//     keeps the live tail), reaping byId-only keyless shadows FIRST (F3 — both
+//     cap metrics count every byId entry, shadows included); the sticky
+//     evictedHistory flag ORs into hasOlder so the Load-older button re-appears
+//     for evicted messages.
 //   - §5d#2 (live always wins): applyPageMerge uses prependMessagesIfAbsent
 //     (insert-if-not-present; an existing byId entry is left untouched EXCEPT
 //     the upgrade-on-completed path, reduce.ts:123-136, which replaces a
@@ -59,7 +61,7 @@
 //   - actions.ts switchProject: resetPageInFlight().
 import { produce } from "solid-js/store";
 import type { MessageWindowMeta } from "../types";
-import { prependMessagesIfAbsent, deleteMessagesFromTop, approxResidentBytes } from "../lib/reduce";
+import { prependMessagesIfAbsent, deleteMessagesFromTop, approxResidentBytes, reapKeylessShadows } from "../lib/reduce";
 import { log } from "../lib/log";
 import { state, setState, projectDir } from "./store";
 import { decodeGzip64 } from "./decode";
@@ -144,13 +146,16 @@ const MAX_PAGE_RETRIES = 3;
 
 // Resident-cache soft caps. After each page merge, if EITHER cap is exceeded,
 // evict from the OLDEST end (top of order). The live tail is never yanked
-// (deleteMessagesFromTop protects the last protectTail entries). This bounds
-// the multi-page history-loading OOM vector (a user who clicks Load older
-// repeatedly). The live-streaming growth vector (a long-lived session where
-// Stream2 message.upsert/part.upsert events grow messages[sid] without a page
-// merge) is NOT bounded by this slice — that's the bidirectional-eviction
-// follow-up (C-F4). Bidirectional eviction (tail-end when reading history) is
-// also a documented follow-up.
+// (deleteMessagesFromTop protects the last protectTail entries). Both metrics
+// count EVERY resident byId entry — including byId-only keyless shadows (F3:
+// part-only placeholders that never render), which are reclaimed FIRST by the
+// gate (reapKeylessShadows) since that is user-invisible and the data is
+// server-refetchable. This bounds the multi-page history-loading OOM vector
+// (a user who clicks Load older repeatedly). The live-streaming growth vector
+// (a long-lived session where Stream2 message.upsert/part.upsert events grow
+// messages[sid] without a page merge) is NOT bounded by this slice — that's
+// the bidirectional-eviction follow-up (C-F4). Bidirectional eviction
+// (tail-end when reading history) is also a documented follow-up.
 export const MAX_RESIDENT_MESSAGES = 500;
 export const MAX_RESIDENT_BYTES = 5 * 1024 * 1024; // 5 MiB
 
@@ -455,26 +460,45 @@ function applyPageMerge(
 }
 
 // evictIfOverCap — bounded-resident-cache eviction. Fires after a page merge
-// if EITHER MAX_RESIDENT_MESSAGES or MAX_RESIDENT_BYTES is exceeded. Evicts
-// from the oldest end (top of order) until under BOTH caps or only
-// protectTail entries remain. Returns true if any eviction occurred. The
-// caller ORs the eviction signal into hasOlder so the "Load older" button
-// re-appears (the evicted messages exist on the server and can be re-fetched)
-// even when the just-fetched page reported end-of-history (has_older=false).
+// if EITHER MAX_RESIDENT_MESSAGES or MAX_RESIDENT_BYTES is exceeded. Both
+// metrics count ALL resident byId entries (F3): the count is byId keys — NOT
+// order.length, which hid byId-only keyless shadows — and approxResidentBytes
+// iterates byId. Reclaim is two-stage:
+//   1. Reap keyless shadows FIRST (reapKeylessShadows, reduce.ts). A shadow
+//      never renders, so reclaiming it is user-invisible, and discarding its
+//      held parts is safe ONLY because the data remains server-side and
+//      re-fetchable via Load-older pages (full parts carried;
+//      prependMessagesIfAbsent re-realizes the message on merge).
+//   2. If still over cap, evict from the oldest end (top of order) until
+//      under BOTH caps or only protectTail entries remain.
+// Returns true if ANY reclaim occurred — shadow reap included: the reaped
+// data is server-resident and re-fetchable, which is exactly what the sticky
+// evictedHistory flag promises. The caller ORs the eviction signal into
+// hasOlder so the "Load older" button re-appears (the evicted messages exist
+// on the server and can be re-fetched) even when the just-fetched page
+// reported end-of-history (has_older=false).
 function evictIfOverCap(s: any, sid: string): boolean {
   const sm = s.messages[sid];
   if (!sm) return false;
-  let bytes = approxResidentBytes(sm);
-  let count = sm.order.length;
+  let bytes = approxResidentBytes(sm); // includes byId-only shadows (F3)
+  let count = Object.keys(sm.byId).length; // resident entries, shadows included
   if (count <= MAX_RESIDENT_MESSAGES && bytes <= MAX_RESIDENT_BYTES) return false;
-  // Evict in a single pass — compute how many to drop to get under BOTH caps.
-  // Walk from the top (oldest), accumulating freed bytes, until both caps are
-  // satisfied or only protectTail entries remain.
+  // Stage 1 — reap keyless shadows. After this, byId === the order set, so
+  // the stage-2 walk (which slices order) addresses every remaining entry.
+  const evicted = reapKeylessShadows(sm) > 0;
+  if (evicted) {
+    bytes = approxResidentBytes(sm);
+    count = Object.keys(sm.byId).length;
+    if (count <= MAX_RESIDENT_MESSAGES && bytes <= MAX_RESIDENT_BYTES) return true;
+  }
+  // Stage 2 — evict in a single pass — compute how many to drop to get under
+  // BOTH caps. Walk from the top (oldest), accumulating freed bytes, until
+  // both caps are satisfied or only protectTail entries remain.
   const protectTail = 1;
   let dropCount = 0;
   let freedBytes = 0;
   while (
-    dropCount < count - protectTail &&
+    dropCount < sm.order.length - protectTail &&
     (count - dropCount > MAX_RESIDENT_MESSAGES || bytes - freedBytes > MAX_RESIDENT_BYTES)
   ) {
     // Approximate freed bytes for the candidate message (cheap recompute of
@@ -495,5 +519,5 @@ function evictIfOverCap(s: any, sid: string): boolean {
     deleteMessagesFromTop(sm, dropCount, protectTail);
     return true;
   }
-  return false;
+  return evicted;
 }

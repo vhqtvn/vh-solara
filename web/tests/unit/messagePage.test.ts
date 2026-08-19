@@ -34,6 +34,8 @@ import {
   buildMessages,
   deleteMessagesFromTop,
   prependMessagesIfAbsent,
+  reapKeylessShadows,
+  upsertMessage,
   upsertPart,
 } from "../../src/lib/reduce";
 import { state, setState } from "../../src/sync/store";
@@ -198,6 +200,50 @@ describe("deleteMessagesFromTop (pure)", () => {
   });
 });
 
+describe("reapKeylessShadows (pure) — F3 reclaim of byId-only shadows", () => {
+  it("removes byId-only shadows; ordered messages and their parts stay intact", () => {
+    const sm = buildMessages([item("a", 10, "aaa"), item("b", 20, "bbb")]);
+    upsertPart(sm, { id: "p-x1", sessionID: "s1", messageID: "shX", type: "text", text: "x" });
+    upsertPart(sm, { id: "p-y1", sessionID: "s1", messageID: "shY", type: "tool", state: "completed" });
+    expect(sm.byId["shX"]).toBeDefined();
+    const reaped = reapKeylessShadows(sm);
+    expect(reaped).toBe(2);
+    expect(sm.byId["shX"]).toBeUndefined();
+    expect(sm.byId["shY"]).toBeUndefined();
+    expect(sm.order).toEqual(["a", "b"]); // order untouched (shadows were never in it)
+    expect(sm.byId["a"].parts["p-a"].text).toBe("aaa");
+    expect(sm.byId["b"].parts["p-b"].text).toBe("bbb");
+  });
+
+  it("no shadows → no-op returning 0", () => {
+    const sm = buildMessages([item("a"), item("b")]);
+    expect(reapKeylessShadows(sm)).toBe(0);
+    expect(sm.order).toEqual(["a", "b"]);
+    expect(Object.keys(sm.byId)).toEqual(["a", "b"]);
+  });
+
+  it("does NOT touch a PROMOTED shadow (order-present keeps its held parts)", () => {
+    // The promotion contract from 281a2f2 must survive the reap: once a
+    // keyed message.upsert realizes the shadow into order, it is no longer a
+    // shadow and its held parts stay.
+    const sm = buildMessages([item("a", 10)]);
+    upsertPart(sm, { id: "p-s", sessionID: "s1", messageID: "sh", type: "text", text: "held" });
+    upsertMessage(sm, { id: "sh", sessionID: "s1", role: "assistant", time: { created: 5 } } as MessageInfo);
+    expect(sm.order).toContain("sh");
+    expect(reapKeylessShadows(sm)).toBe(0);
+    expect(sm.byId["sh"].parts["p-s"].text).toBe("held");
+  });
+
+  it("multi-part shadows: all held (messageID, partID) pairs go with one reap", () => {
+    const sm = buildMessages([item("a", 10)]);
+    upsertPart(sm, { id: "p-s1", sessionID: "s1", messageID: "sh", type: "text", text: "one" });
+    upsertPart(sm, { id: "p-s2", sessionID: "s1", messageID: "sh", type: "text", text: "two" });
+    expect(reapKeylessShadows(sm)).toBe(1); // one shadow MESSAGE (two parts)
+    expect(sm.byId["sh"]).toBeUndefined();
+    expect(approxResidentBytes(sm)).toBe(approxResidentBytes(buildMessages([item("a", 10)])));
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Incident 2026-08-19 symptom (e) — eviction re-opens the placeholder path.
 //
@@ -262,6 +308,49 @@ describe("approxResidentBytes (pure)", () => {
     deleteMessagesFromTop(sm, 2);
     const after = approxResidentBytes(sm);
     expect(after).toBeLessThan(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3 — keyless-shadow accounting. Since 281a2f2, a part-only event for a
+// non-resident message creates a KEYLESS SHADOW: resident in byId ONLY, never
+// in order, never rendered, parts held until promotion. approxResidentBytes
+// used to iterate sm.order ONLY — shadow bytes were invisible to the
+// MAX_RESIDENT_BYTES gate (unbounded accumulation outside the 5 MiB budget).
+// These tests pin that byId-only entries count toward the metric.
+// ---------------------------------------------------------------------------
+describe("approxResidentBytes — shadow accounting (F3)", () => {
+  it("counts byId-only shadow entries (stub info + held parts), not just order-present ids", () => {
+    const base = buildMessages([item("a", 10, "hello"), item("b", 20, "world")]);
+    const withShadow = buildMessages([item("a", 10, "hello"), item("b", 20, "world")]);
+    upsertPart(withShadow, {
+      id: "p-sh", sessionID: "s1", messageID: "sh", type: "text", text: "shadow-body",
+    });
+    // The shadow is byId-only — never entered order.
+    expect(withShadow.order).toEqual(["a", "b"]);
+    expect(withShadow.byId["sh"]).toBeDefined();
+
+    const delta = approxResidentBytes(withShadow) - approxResidentBytes(base);
+    // The shadow's contribution is its stub info + its held part (the stub
+    // shape is fixed by upsertPart: {id, sessionID, role:"assistant"}).
+    const stubInfo = { id: "sh", sessionID: "s1", role: "assistant" };
+    const shadowPart = { id: "p-sh", sessionID: "s1", messageID: "sh", type: "text", text: "shadow-body" };
+    expect(delta).toBe(JSON.stringify(stubInfo).length + JSON.stringify(shadowPart).length);
+  });
+
+  it("counts every byId entry EXACTLY ONCE (no order×byId double counting)", () => {
+    const sm = buildMessages([item("a", 10, "hello"), item("b", 20, "world")]);
+    upsertPart(sm, { id: "p-sh", sessionID: "s1", messageID: "sh", type: "text", text: "shadow-body" });
+    // Expected = sum over byId entries of (info JSON + each part JSON) — the
+    // resident set is byId; order is only a subset view of it. A fix that
+    // iterates order AND byId would double-count a..b and fail this.
+    let expected = 0;
+    for (const id of Object.keys(sm.byId)) {
+      const mv = sm.byId[id];
+      expected += JSON.stringify(mv.info).length;
+      for (const pid of mv.partOrder) expected += JSON.stringify(mv.parts[pid]).length;
+    }
+    expect(approxResidentBytes(sm)).toBe(expected);
   });
 });
 
@@ -521,6 +610,99 @@ describe("loadOlder state machine", () => {
     // Prior eviction signal preserved.
     expect(state.messageWindows.s1?.hasOlder).toBe(true);
     expect(state.messageWindows.s1?.evictedHistory).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3 — shadow reap through the eviction gate. byId-only keyless shadows were
+// invisible to BOTH cap metrics (count read order.length; approxResidentBytes
+// iterated order), so out-of-window (messageID, partID) pairs accumulated
+// with no reclaim path. The gate must be able to RECLAIM shadows when over
+// cap — reaping discards held parts, acceptable ONLY because the data remains
+// server-side and re-fetchable via Load-older pages (full parts carried;
+// prependMessagesIfAbsent merge re-realizes the message).
+// ---------------------------------------------------------------------------
+describe("shadow reap through evictIfOverCap (F3 integration)", () => {
+  it("shadows count toward MAX_RESIDENT_MESSAGES and are reaped without losing ordered history", async () => {
+    // 498 ordered + 3 shadows; a page adding 2 ordered messages puts byId at
+    // 503 > 500. Pre-fix the count metric read order.length only (500 — at
+    // cap, no eviction) and the shadows survived with no reclaim path.
+    const sm = buildMessages(buildItems("m", range(1, 499))); // m1..m498
+    for (const shadowID of ["sh1", "sh2", "sh3"]) {
+      upsertPart(sm, { id: `p-${shadowID}`, sessionID: "s1", messageID: shadowID, type: "text", text: "held-part" });
+    }
+    expect(sm.order.length).toBe(498);
+    seedSession(sm, "m1", true);
+    const page = [item("o-2", -2), item("o-1", -1)];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      makeResponse(pageResponse(page, { oldest_id: "o-2", has_older: false })),
+    );
+    await loadOlder("s1");
+    // All three shadows were reaped (over-cap reclaim).
+    expect(state.messages.s1?.byId["sh1"]).toBeUndefined();
+    expect(state.messages.s1?.byId["sh2"]).toBeUndefined();
+    expect(state.messages.s1?.byId["sh3"]).toBeUndefined();
+    // Ordered history intact: 498 + 2 = 500 (reaping the shadows alone got
+    // under the cap — NO user-visible ordered eviction was needed).
+    expect(state.messages.s1?.order.length).toBe(500);
+    expect(state.messages.s1?.order).toContain("m1");
+    expect(state.messages.s1?.order).toContain("m498");
+    expect(state.messageWindows.s1?.oldestResidentID).toBe("o-2");
+    // Shadow reap IS an eviction for the sticky flag: the reaped data is
+    // server-resident and re-fetchable, so the button stays available even
+    // though the server reported has_older=false for this page.
+    expect(state.messageWindows.s1?.hasOlder).toBe(true);
+  });
+
+  it("shadow BYTES alone trip MAX_RESIDENT_BYTES and are reaped; ordered messages untouched", async () => {
+    // The study's core scenario: few ordered messages, but compaction-burst
+    // shadows push resident bytes past the 5 MiB gate — invisible pre-fix
+    // because approxResidentBytes iterated order only.
+    const fat = "g".repeat(Math.floor(1.2 * 1024 * 1024)); // ~1.2 MiB per shadow part
+    const sm = buildMessages([item("a1", 1, "x"), item("a2", 2, "y"), item("a3", 3, "z")]);
+    for (const shadowID of ["shBig1", "shBig2", "shBig3", "shBig4", "shBig5"]) {
+      upsertPart(sm, { id: `p-${shadowID}`, sessionID: "s1", messageID: shadowID, type: "text", text: fat });
+    }
+    seedSession(sm, "a1", true);
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      makeResponse(pageResponse([item("o1", 0)], { oldest_id: "o1", has_older: false })),
+    );
+    await loadOlder("s1");
+    // All fat shadows reaped → back under the byte cap.
+    expect(state.messages.s1?.byId["shBig1"]).toBeUndefined();
+    expect(state.messages.s1?.byId["shBig5"]).toBeUndefined();
+    // Ordered history fully intact (no ordered eviction needed once the
+    // invisible shadows were reclaimed).
+    expect(state.messages.s1?.order).toEqual(["o1", "a1", "a2", "a3"]);
+    expect(state.messages.s1?.byId["a2"].parts["p-a2"].text).toBe("y");
+    expect(state.messageWindows.s1?.hasOlder).toBe(true);
+  });
+
+  it("combined pressure: shadow reap (stage 1) is insufficient → ordered eviction (stage 2) completes the reclaim", async () => {
+    // Reviewer D4 scenario: ordered messages ALONE are over the count cap, so
+    // reaping the shadows cannot get under it — the stage-1 recompute must
+    // feed the stage-2 walk correctly (both stages fire in one call).
+    const sm = buildMessages(buildItems("m", range(1, 504))); // m1..m503 ordered
+    upsertPart(sm, { id: "p-sh1", sessionID: "s1", messageID: "sh1", type: "text", text: "held" });
+    upsertPart(sm, { id: "p-sh2", sessionID: "s1", messageID: "sh2", type: "text", text: "held" });
+    seedSession(sm, "m1", true);
+    // Page adds 2 older ordered → 505 ordered + 2 shadows = 507 byId > 500.
+    const page = [item("o-2", -2), item("o-1", -1)];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      makeResponse(pageResponse(page, { oldest_id: "o-2", has_older: false })),
+    );
+    await loadOlder("s1");
+    // Stage 1: both shadows reaped.
+    expect(state.messages.s1?.byId["sh1"]).toBeUndefined();
+    expect(state.messages.s1?.byId["sh2"]).toBeUndefined();
+    // Stage 2: still 505 > 500 → the 5 oldest ordered evicted (o-2, o-1, m1,
+    // m2, m3) down to exactly the cap.
+    expect(state.messages.s1?.order.length).toBe(500);
+    expect(state.messages.s1?.order).not.toContain("m1");
+    expect(state.messageWindows.s1?.oldestResidentID).toBe("m4");
+    // The live tail (newest) survives.
+    expect(state.messages.s1?.order).toContain("m503");
+    expect(state.messageWindows.s1?.hasOlder).toBe(true);
   });
 });
 
