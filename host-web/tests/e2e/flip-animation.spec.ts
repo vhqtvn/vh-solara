@@ -57,8 +57,11 @@ import * as H from "./util";
  *      FLIP runs again.
  *  11. NO-EXCURSION — during a swap, EVERY per-frame visual rect
  *      (getBoundingClientRect — includes the interpolating transform) of the
- *      moving panes stays INSIDE the viewport: the hold-until-stable chase
- *      never chases an off-window transient (no out-and-back dart).
+ *      moving panes stays INSIDE the viewport (clip-bounded: overhang that
+ *      lies wholly beyond the pane's overflow:hidden ancestors cannot render
+ *      and is only allowed as an ANCHORED pinned-size morph — see the
+ *      test-body comment): the hold-until-stable chase never chases an
+ *      off-window transient (no out-and-back dart).
  *
  * Chromium + Firefox (the suite's browsers; WebKit launch is environmental —
  * see playwright.config.ts). Serial with the rest of the suite
@@ -780,6 +783,24 @@ test.describe("FLIP layout animation (deferred reflow)", () => {
     // Release the sash: the marker clears…
     await page.mouse.up();
     await expect.poll(draggingRoots).toBe(0);
+    // …but on WebKit the release teardown is still settling for a few frames
+    // after the class is gone (dockview's sash-end flush + the FLIP module's
+    // drag-end baseline re-seed, ≤2 chained rAFs). A discrete op fired into
+    // that window can be consumed with ZERO FLIP animations (measured
+    // 2026-08-19: a split fired at t=0 after marker-clear lands the new pane
+    // but runs no transition; the same split one bridge-roundtrip later
+    // animates 3 panes) — that race was the first-attempt webkit flake
+    // (retry-stable, absorbed by CI retries). Wait it out FRAME-ALIGNED, not
+    // with a fixed sleep: the marker must be absent at rAF time (not merely
+    // at poll time) and the re-seed chain must have had its frames.
+    await page.evaluate(
+      () =>
+        new Promise<void>((res) =>
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() => requestAnimationFrame(() => res())),
+          ),
+        ),
+    );
 
     // …and the FLIP runs again on the next discrete op (the skip was the
     // marker, not a broken install).
@@ -812,6 +833,33 @@ test.describe("FLIP layout animation (deferred reflow)", () => {
     // overlay in-viewport throughout, overhang strictly decreasing to 0, no
     // dart). The excursion property — never LEAVING the window on a
     // position move — is exactly what the equal-size swap isolates.
+    //
+    // CLIP-BOUNDED OVERHANG (webkit, measured 2026-08-19): on WebKit the
+    // swap's first moveTo momentarily docks both panels into ONE group, the
+    // native tab strip rule (.dv-groupview:has(.dv-tab:nth-of-type(2)))
+    // shows, and the destination slot shrinks+shifts by the strip height —
+    // and WebKit keeps that geometry through the pin. The pane is pinned at
+    // its OLD size against the shorter slot (observed: slot [0,71,640,720],
+    // pane pinned 640x684 → rect.bottom 755 = 33px past the 720 window
+    // bottom) for exactly the frames before the settle scale morph runs
+    // (scale 1 → 649/684, bottom 755→720 monotonically). That overhang lies
+    // WHOLLY beyond the pane's clipping ancestors (`._main_`/`._app_`,
+    // overflow:hidden, bottom edge == the window bottom): it is
+    // unrenderable — the composited frames show the pane inside its slot the
+    // whole time (no dart, no edge artifact). Chromium/Firefox commit equal
+    // slots and never overhang at all (4/4 baseline green). Asserting RAW
+    // rect containment would therefore over-specify: it asserts on pixels
+    // that cannot render. The honest, engine-agnostic invariant below keeps
+    // the same sampler and fails exactly the VISIBLE excursion classes:
+    //   (1) DESTINATION containment — every pane's overlay (its live slot)
+    //       must stay inside the viewport: the chase never plays toward (or
+    //       parks a pane in) an off-window destination.
+    //   (2) RENDERABLE containment — a raw rect MAY overhang the viewport
+    //       only while ANCHORED at its slot origin (the pinned-size morph;
+    //       a translating dart breaks anchoring) AND with its renderable
+    //       portion (rect ∩ clipContainer) still inside the slot's bounds —
+    //       a pinned-oversized pane overlapping the sibling's territory is
+    //       renderable overhang and still fails.
     const ids = await H.panes(page);
     const a = ids[0];
     for (const id of ids.slice(1)) await H.closePane(page, id);
@@ -828,25 +876,74 @@ test.describe("FLIP layout animation (deferred reflow)", () => {
       const vw = window.innerWidth;
       const vh = window.innerHeight;
       const SLACK = 2; // sub-pixel rounding at the viewport edges
+      // The pane's clip container: nearest ancestor that actually clips
+      // (overflow != visible). Overhang past its bounds cannot render.
+      const clipperOf = (el: HTMLElement): HTMLElement => {
+        let n: HTMLElement | null = el.parentElement;
+        while (n && n !== document.documentElement) {
+          const cs = getComputedStyle(n);
+          if (cs.overflowX !== "visible" || cs.overflowY !== "visible") return n;
+          n = n.parentElement;
+        }
+        return document.documentElement;
+      };
+      const clips: Record<string, HTMLElement> = { [a]: clipperOf(ea), [b]: clipperOf(eb) };
       let frames = 0;
-      let maxOverflow = 0; // px beyond the viewport (0 = inside), worst sample
+      const violations: string[] = [];
+      const fmt = (r: DOMRect) =>
+        `[${r.left.toFixed(1)},${r.top.toFixed(1)},${r.right.toFixed(1)},${r.bottom.toFixed(1)}]`;
+      const check = (id: string, el: HTMLElement) => {
+        const rect = el.getBoundingClientRect();
+        const slot = el.closest<HTMLElement>(".dv-render-overlay")!.getBoundingClientRect();
+        // (1) destination containment
+        const slotOver = Math.max(
+          0,
+          -(slot.left + SLACK),
+          -(slot.top + SLACK),
+          slot.right - (vw + SLACK),
+          slot.bottom - (vh + SLACK),
+        );
+        if (slotOver > 0) {
+          violations.push(
+            `f${frames} pane ${id}: overlay/slot ${fmt(slot)} left the viewport by ${slotOver.toFixed(1)}px (chased an off-window destination)`,
+          );
+          return;
+        }
+        // (2) renderable containment (only when the RAW rect overhangs)
+        const over = Math.max(
+          0,
+          -(rect.left + SLACK), // rect.left beyond the left edge by > SLACK
+          -(rect.top + SLACK), // rect.top beyond the top edge by > SLACK
+          rect.right - (vw + SLACK),
+          rect.bottom - (vh + SLACK),
+        );
+        if (over === 0) return;
+        const clip = clips[id].getBoundingClientRect();
+        const anchored =
+          Math.abs(rect.left - slot.left) <= SLACK && Math.abs(rect.top - slot.top) <= SLACK;
+        const escapesSlot =
+          Math.min(rect.right, clip.right) > slot.right + SLACK ||
+          Math.min(rect.bottom, clip.bottom) > slot.bottom + SLACK ||
+          Math.max(rect.left, clip.left) < slot.left - SLACK ||
+          Math.max(rect.top, clip.top) < slot.top - SLACK;
+        if (!anchored) {
+          violations.push(
+            `f${frames} pane ${id}: rect ${fmt(rect)} overhangs the viewport by ${over.toFixed(1)}px UNANCHORED from its slot origin ${fmt(slot)} (translation excursion — out-and-back dart)`,
+          );
+        } else if (escapesSlot) {
+          violations.push(
+            `f${frames} pane ${id}: anchored at ${fmt(slot)} but the RENDERABLE portion (rect ∩ clip ${fmt(clip)}) escapes the slot (visible overhang)`,
+          );
+        }
+      };
       const h = (window as unknown as { __host?: { swap(x: string, y: string): void } }).__host;
       // Sample every animation frame THROUGH the swap window: hold (1-2
       // frames) + play (FLIP_DURATION_MS=150) + settle, plus margin.
       let sampling = true;
       const sampler = (async () => {
         while (sampling) {
-          for (const el of [ea, eb]) {
-            const rect = el.getBoundingClientRect();
-            const overflow = Math.max(
-              0,
-              -(rect.left + SLACK), // rect.left beyond the left edge by > SLACK
-              -(rect.top + SLACK), // rect.top beyond the top edge by > SLACK
-              rect.right - (vw + SLACK),
-              rect.bottom - (vh + SLACK),
-            );
-            if (overflow > maxOverflow) maxOverflow = overflow;
-          }
+          check(a, ea);
+          check(b, eb);
           frames++;
           // eslint-disable-next-line no-await-in-loop
           await new Promise<void>((res) => requestAnimationFrame(() => res()));
@@ -856,14 +953,14 @@ test.describe("FLIP layout animation (deferred reflow)", () => {
       await new Promise((res) => setTimeout(res, 450)); // whole swap window
       sampling = false;
       await sampler;
-      return { frames, maxOverflow, vw, vh };
+      return { frames, violations: violations.slice(0, 10), vw, vh };
     }, [a, b]);
 
     expect(r.frames, "sampler actually covered the swap window (rAF drove frames)").toBeGreaterThanOrEqual(10);
     expect(
-      r.maxOverflow,
-      `every per-frame visual rect stayed within the viewport (+${r.vw}x${r.vh} ±2px) — no out-and-back dart`,
-    ).toBe(0);
+      r.violations,
+      `every per-frame visual rect stayed within the viewport (+${r.vw}x${r.vh} ±2px, clip-bounded) — no out-and-back dart`,
+    ).toEqual([]);
 
     // Post-swap hygiene: settled, clean, both panes alive.
     await assertNoResidual(page);
