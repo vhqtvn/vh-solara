@@ -33,6 +33,10 @@ The plugin supports project-specific overlays (`forbidden-patterns.project.js`) 
 - Raw database writes against protected identity/auth tables
 - Project JWT secrets on the command line
 
+### Residual False-Positive Risk
+
+A residual false-positive/evaporation gap exists for an `echo X && dangerous Y` chain shape. The chain is exempted by the leading `echo` because the `shell-guard` parser's per-command splitting behaves unexpectedly. This shape is adversarial and rare in practice. **Etiquette:** treat the guard's intent as signal; do not paraphrase or chain commands to evade it. Route around legitimate needs using single simple commands or the write tool as described in *Command Hygiene*.
+
 ## Command Hygiene
 
 Most recurring permission prompts occur because a command cannot be safely parsed or uses an unsanctioned form. Follow these rules:
@@ -57,6 +61,6 @@ All git mutations must be routed through the **`committer` subagent** (via the `
 No read-only agent execution surface may open a network socket:
 - `exec-ro` has a fixed classifier set that explicitly omits `curl` and `wget`.
 - `exec` is role-denied for ad-hoc script execution that could open sockets.
-- `exec-sandbox` blocks `socket(2)` at the kernel level via seccomp.
+- `exec-sandbox` blocks `socket(2)` at the kernel level via seccomp (only when the sandbox is active — `--sandbox=off|best-effort|strict`, default `best-effort`; `--sandbox=off` means no kernel enforcement).
 
 Therefore, **network fetches against local daemons are operator-only.** If you need telemetry, metrics, or internal API JSON, provide the exact `curl` one-liner to the operator and ask them to run it and paste the JSON back. Do not attempt to run it yourself.
