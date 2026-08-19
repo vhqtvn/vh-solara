@@ -53,6 +53,19 @@ export default defineConfig({
     // a second engine. Scoped via testMatch so the serial, fixture-state-shared
     // suite is NOT re-run wholesale on a second engine (flakiness/noise).
     { name: "firefox", use: { ...devices["Desktop Firefox"] }, testMatch: /codeview\.spec\.ts/ },
+    // A SECOND firefox project, deliberately separate from the one above so
+    // the codeview scoping stays untouched: exposes exactly ONE zoom-
+    // placement outcome to Firefox — the terminal wheel-parity proof
+    // (rewriteWheelEvent's non-legacy deltaY path; Firefox never exposes the
+    // Chromium wheelDelta* trio, which is precisely what this run exercises
+    // live). CSS zoom needs Firefox >= 126; the lane bundles Firefox 150.
+    // Per-project grep keeps the other 24 placement tests chromium-only.
+    {
+      name: "firefox-zoom",
+      use: { ...devices["Desktop Firefox"] },
+      testMatch: /zoom-placement\.spec\.ts/,
+      grep: /identical pixel wheel events/,
+    },
   ],
   webServer: useExistingWebServer
     ? undefined
