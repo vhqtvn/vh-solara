@@ -271,3 +271,167 @@ test("anchor at 100% zoom: autocomplete popup and context menu track (identity s
   expect(Math.abs(m.top - y)).toBeLessThanOrEqual(TOL);
   await page.keyboard.press("Escape");
 });
+
+// Wheel-scroll parity across zoom (76dfaeb2 follow-up). xterm.js v6's wheel
+// consumers mix a VISUAL-px pixel-mode delta into LAYOUT-px math (scrollback
+// scrollTop in SmoothScrollableElement; consumeWheelEvent's layout-px cell
+// divisor), so at zoom ≠ 1 the terminal scrolls ~×z: 1.25× too fast at 125%,
+// 1.25× too slow at 80%. The TerminalPane wheel seam (rewriteWheelEvent)
+// divides pixel-mode deltas by zoom once at the capture boundary.
+//
+// Live-browser proof strategy: the same physical wheel gesture (identical
+// pixel-mode deltaY notches) must advance the terminal by the same VISUAL
+// distance at every zoom. Rows are LAYOUT units, so the parity invariant is
+// Δrows(1.25) × 1.25 ≈ Δrows(1) — inside a tolerance covering xterm's
+// per-event round() row quantization (≤ z×0.5 + 0.5 rows ≈ 1.13 at 1.25).
+// Unfixed code scrolls Δrows(1.25) = Δrows(1) (layout px are what the delta
+// is wrongly treated as), so |Δ×1.25 − Δ| = 0.25Δ ≈ 7 rows for this test's
+// ~28-row gesture — far outside tolerance. The assertion is font-metric
+// INDEPENDENT: no cell size is assumed, only that both zoom phases share the
+// same layout dims (dock height pref is layout px) and the same PTY buffer.
+//
+// The buffer survives the in-test zoom switch: the PTY lives server-side and
+// replays identical scrollback bytes on reattach, so phase 2 (localStorage
+// 1.25 + reload, NO PTY kill) measures the very same content ladder (`seq`
+// emits pure-integer lines — the first pure-int row of .xterm-rows innerText
+// is a font-free scroll marker). A non-vacuity floor (≥ 12 rows) guards
+// against a 0==0 pass.
+test.describe("terminal wheel parity across UI zoom", () => {
+  const NOTCHES = 8;
+  const NOTCH = -300; // visual px per wheel event (pixel deltaMode)
+  const PARITY_TOL_ROWS = 1.5;
+  // Non-vacuity floor: the observed gesture moves ~25-30 rows at 100% (the
+  // per-notch advance depends on engine wheel heuristics — measured ~3.4
+  // rows/notch in this lane), far above quantization noise; a broken seam
+  // (0 rows) or a trackpad-damped no-op must not pass vacuously.
+  const FLOOR_ROWS = 8;
+
+  test.beforeEach(async ({ request }) => {
+    // Same rationale as the drag describe above: one shared fixtureserver
+    // backs the serial lane; kill every live PTY so this test boots a fresh
+    // shell with a known-empty scrollback (the in-test reload keeps it).
+    const res = await request.get("/vh/term/list");
+    const terms = res.ok() ? ((await res.json()) as Array<{ dir: string; id: string }>) : [];
+    await Promise.all(
+      terms.map((tm) =>
+        request.post("/vh/term/kill", { headers: { "X-VH-CSRF": "1" }, data: { dir: tm.dir, id: tm.id } }),
+      ),
+    );
+  });
+
+  // First pure-integer line visible in the terminal — a scroll marker that
+  // needs no font metrics (seq output is a ladder of ints; any prompt/echo
+  // noise above it is skipped identically in both phases).
+  const topLineNumber = (page: Page) =>
+    page.locator(".xterm-rows").evaluate((el) => {
+      for (const line of (el as HTMLElement).innerText.split("\n")) {
+        if (/^\d+$/.test(line.trim())) return Number.parseInt(line, 10);
+      }
+      return null;
+    });
+
+  // xterm v6 smoothScrollDuration defaults to 0 (immediate), but the seq
+  // burst streams asynchronously — poll until the marker is stable.
+  async function settledTopLineNumber(page: Page): Promise<number> {
+    let prev: number | null = null;
+    for (let i = 0; i < 40; i++) {
+      const cur = await topLineNumber(page);
+      if (cur !== null && cur === prev) return cur;
+      prev = cur;
+      await page.waitForTimeout(150);
+    }
+    throw new Error(`terminal scroll marker never settled (last: ${prev})`);
+  }
+
+  async function measureWheelAdvance(page: Page): Promise<number> {
+    const before = await settledTopLineNumber(page);
+    const box = await page.locator(".xterm-screen").boundingBox();
+    if (!box) throw new Error(".xterm-screen not rendered");
+    // Hover the screen center — well inside the viewport, clear of the dock
+    // header and the scrollbar lane. mouse.wheel dispatches pixel-mode wheel
+    // events at the current pointer position (visual px, like a real wheel).
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    for (let i = 0; i < NOTCHES; i++) await page.mouse.wheel(0, NOTCH);
+    const after = await settledTopLineNumber(page);
+    return before - after; // rows scrolled UP (layout units)
+  }
+
+  test("identical pixel wheel events scroll the same VISUAL distance at 100% and 125%", async ({ page }) => {
+    // ---- Phase 1: boot at zoom 1, fill the scrollback ----
+    // No addInitScript here on purpose: init scripts re-run on the phase-2
+    // reload and would clobber the 1.25 value. Each Playwright test gets a
+    // fresh context (clean localStorage → default zoom 1), and the premise
+    // asserts below prove the live zoom of BOTH phases.
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto(`/?dir=${encodeURIComponent(repoRoot)}`);
+    await page.getByRole("button", { name: "Terminal", exact: true }).click();
+    await expect(page.locator(".term-host")).toBeVisible({ timeout: 10000 });
+    await expect(page.locator(".term-status.open")).toBeVisible({ timeout: 10000 });
+    await page.locator(".term-host").click(); // focus the terminal
+    await page.keyboard.type("seq 1 250");
+    await page.keyboard.press("Enter");
+    await expect
+      .poll(() => topLineNumber(page), { timeout: 15000 })
+      .toBeLessThanOrEqual(250); // output complete (marker visible)
+
+    // Live premise, phase 1: the engine is really at zoom 1 (same probe as
+    // openSessionAtZoom — guards a leaked/changed default pref). applyScale
+    // writes the inline values even at scale 1 (zoom="1", --ui-zoom: 1).
+    const premise1 = await page.evaluate(() => {
+      const root = document.documentElement;
+      const cs = getComputedStyle(root);
+      return { inlineZoom: root.style.zoom, computedZoom: cs.zoom, uiZoomVar: cs.getPropertyValue("--ui-zoom").trim() };
+    });
+    expect(premise1.inlineZoom, "root.style.zoom at phase 1").toBe("1");
+    expect(Number(premise1.computedZoom) || 1, "computed root zoom at phase 1").toBeCloseTo(1, 3);
+    expect(premise1.uiZoomVar, "--ui-zoom at phase 1").toBe("1");
+
+    const moved100 = await measureWheelAdvance(page);
+    expect(moved100, `non-vacuity: the gesture must scroll at 100% (got ${moved100})`).toBeGreaterThanOrEqual(FLOOR_ROWS);
+
+    // ---- Phase 2: same page, zoom 1.25, SAME PTY (replays identical buffer) ----
+    await page.evaluate(
+      ([k, v]) => localStorage.setItem(k, JSON.stringify({ v: 1, data: v })),
+      [UI_KEY, 1.25] as [string, number],
+    );
+    await page.reload();
+    // termOpen is session-scoped (deliberately not persisted — ui.ts), so the
+    // dock needs re-opening after the reload; the server-side PTY survives it.
+    await page.getByRole("button", { name: "Terminal", exact: true }).click();
+    await expect(page.locator(".term-host")).toBeVisible({ timeout: 10000 });
+    await expect(page.locator(".term-status.open")).toBeVisible({ timeout: 10000 });
+    await expect
+      .poll(() => topLineNumber(page), { timeout: 15000 })
+      .toBeLessThanOrEqual(250); // replay complete
+
+    // The file-standard live zoom premise (see openSessionAtZoom): prove the
+    // engine really applied 1.25 before trusting the parity assertion.
+    const premise = await page.evaluate(() => {
+      const root = document.documentElement;
+      const cs = getComputedStyle(root);
+      const probe = document.createElement("div");
+      probe.style.cssText = "position:fixed;left:0;top:0;width:100px;height:10px;visibility:hidden;";
+      document.body.appendChild(probe);
+      const probeW = probe.getBoundingClientRect().width;
+      probe.remove();
+      return { inlineZoom: root.style.zoom, computedZoom: cs.zoom, uiZoomVar: cs.getPropertyValue("--ui-zoom").trim(), probeW };
+    });
+    expect(premise.inlineZoom, "root.style.zoom at uiScale=1.25 (wheel phase 2)").toBe("1.25");
+    expect(Number(premise.computedZoom), "computed root zoom at uiScale=1.25 (wheel phase 2)").toBeCloseTo(1.25, 3);
+    expect(premise.uiZoomVar, "--ui-zoom at uiScale=1.25 (wheel phase 2)").toBe("1.25");
+    expect(premise.probeW, "100px probe gBCR width at uiScale=1.25 (wheel phase 2)").toBeCloseTo(125, 1);
+
+    const moved125 = await measureWheelAdvance(page);
+    expect(moved125, `non-vacuity: the gesture must scroll at 125% (got ${moved125})`).toBeGreaterThanOrEqual(FLOOR_ROWS);
+
+    // Parity: rows are layout px, so equal VISUAL advance means
+    // moved125 × 1.25 ≈ moved100. Unfixed code leaves moved125 == moved100
+    // (0.25×moved ≈ 7 rows off at this gesture size — well outside the 1.5-row
+    // quantization tolerance); the fix lands within it.
+    console.log(`[wheel-parity] moved100=${moved100} moved125=${moved125} → ${moved125 * 1.25} vs ${moved100}`);
+    expect(
+      Math.abs(moved125 * 1.25 - moved100),
+      `visual wheel parity: Δrows@125%×1.25 (${moved125 * 1.25}) ≈ Δrows@100% (${moved100})`,
+    ).toBeLessThanOrEqual(PARITY_TOL_ROWS);
+  });
+});

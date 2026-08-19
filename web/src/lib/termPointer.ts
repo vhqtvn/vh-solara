@@ -174,3 +174,64 @@ export function rewriteMouseEvent(
   }
   return true;
 }
+
+/** WheelEvent.DOM_DELTA_PIXEL — the only deltaMode whose deltas are px. */
+const DOM_DELTA_PIXEL = 0;
+
+/**
+ * The xterm seam fix for wheel events: a pixel-mode wheel delta is reported in
+ * VISUAL/viewport px (zoom-invariant for a given physical wheel motion), but
+ * every xterm.js v6 wheel consumer divides it by — or adds it to — LAYOUT-px
+ * quantities:
+ *
+ *   - Viewport's SmoothScrollableElement (scrollback scroll,
+ *     vs/base/browser/ui/scrollbar/scrollableElement.ts): on Chromium it reads
+ *     the legacy `wheelDeltaY` (preferred over `deltaY` when present), scales
+ *     it by SCROLL_WHEEL_SENSITIVITY, and adds the result to the Scrollable's
+ *     scrollTop, whose whole coordinate space (scrollHeight =
+ *     css.cell.height × buffer lines) is layout px;
+ *   - CoreMouseService.consumeWheelEvent (mouse-protocol wheel reporting AND
+ *     alternate-buffer arrow-key synthesis): reads `deltaY` and divides by
+ *     device cell height / dpr = the LAYOUT-px cell height.
+ *
+ * In both, mixing a visual-px delta into layout-px math scales the scroll by
+ * exactly the zoom factor (too fast at 125%, too slow at 80%). Rewriting the
+ * delta to layout px at the seam makes every downstream hop unit-consistent;
+ * one capture listener covers all consumers because they all read the SAME
+ * live event object (see rewriteMouseEvent for the listener ordering).
+ *
+ * LINE/PAGE deltaModes are line/page COUNTS, not px — zoom-invariant by
+ * definition — and are left untouched. The legacy `wheelDelta*` trio is
+ * converted by the same factor when present (Chromium), preserving each
+ * engine's internal factor (Chrome: wheelDelta* = −3·delta*). Identity at
+ * zoom = 1; never preventDefault()s or cancels anything (getters only).
+ */
+export function rewriteWheelEvent(
+  e: { deltaX: number; deltaY: number; deltaMode: number },
+  zoom: number,
+): boolean {
+  const z = zoom > 0 ? zoom : 1;
+  if (z === 1) return false;
+  if (e.deltaMode !== DOM_DELTA_PIXEL) return false;
+  const dx = e.deltaX;
+  const dy = e.deltaY;
+  // Capture the legacy values BEFORE installing getters; absent props (Firefox
+  // and jsdom never expose them) stay absent — nothing to convert there.
+  const legacyKeys = ["wheelDelta", "wheelDeltaX", "wheelDeltaY"] as const;
+  const legacyVals = legacyKeys.map(
+    (k) => (e as unknown as Record<string, unknown>)[k],
+  );
+  try {
+    Object.defineProperty(e, "deltaX", { configurable: true, get: () => dx / z });
+    Object.defineProperty(e, "deltaY", { configurable: true, get: () => dy / z });
+    legacyKeys.forEach((k, i) => {
+      if (typeof legacyVals[i] === "number") {
+        const v = legacyVals[i] as number;
+        Object.defineProperty(e, k, { configurable: true, get: () => v / z });
+      }
+    });
+  } catch {
+    return false; // exotic/frozen event object — leave the event untouched
+  }
+  return true;
+}

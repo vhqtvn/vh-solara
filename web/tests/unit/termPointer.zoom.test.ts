@@ -20,6 +20,7 @@ import {
   pointerOffsetLayout,
   pointerToCell,
   rewriteMouseEvent,
+  rewriteWheelEvent,
 } from "../../src/lib/termPointer";
 
 // Fixture (all VISUAL px unless noted): an 80×24 terminal of 9×20 LAYOUT-px
@@ -167,5 +168,117 @@ describe("rewriteMouseEvent (in-place event rewrite)", () => {
     expect(rewriteMouseEvent(e, screenAt(1), 1)).toBe(false);
     expect(e.clientX).toBe(118);
     expect(Object.prototype.hasOwnProperty.call(e, "clientX")).toBe(false);
+  });
+});
+
+// Wheel seam (76dfaeb2 follow-up): xterm.js v6's wheel consumers mix a
+// VISUAL-px pixel-mode delta into LAYOUT-px math (scrollback scroll via
+// SmoothScrollableElement; consumeWheelEvent for mouse-protocol reports
+// and alternate-buffer arrow synthesis), scaling every wheel scroll by ~×z.
+// rewriteWheelEvent converts pixel-mode deltas ONCE at the seam; hand-derived
+// values below.
+describe("rewriteWheelEvent (in-place wheel-delta rewrite)", () => {
+  it("zoom 1 is the identity (returns false, no getters installed)", () => {
+    const e = new WheelEvent("wheel", { deltaY: 120, deltaX: -40 });
+    expect(rewriteWheelEvent(e, 1)).toBe(false);
+    expect(e.deltaY).toBe(120);
+    expect(Object.prototype.hasOwnProperty.call(e, "deltaY")).toBe(false);
+  });
+  it("125% pixel mode: deltaY 120 → 96, deltaX −40 → −32", () => {
+    const e = new WheelEvent("wheel", { deltaY: 120, deltaX: -40 });
+    expect(rewriteWheelEvent(e, 1.25)).toBe(true);
+    expect(e.deltaY).toBeCloseTo(96, 6);
+    expect(e.deltaX).toBeCloseTo(-32, 6);
+  });
+  it("80% pixel mode: deltaY 120 → 150, deltaX 40 → 50", () => {
+    const e = new WheelEvent("wheel", { deltaY: 120, deltaX: 40 });
+    expect(rewriteWheelEvent(e, 0.8)).toBe(true);
+    expect(e.deltaY).toBeCloseTo(150, 6);
+    expect(e.deltaX).toBeCloseTo(50, 6);
+  });
+  it("LINE-mode deltas are counts, not px — untouched even at zoom ≠ 1", () => {
+    const e = new WheelEvent("wheel", { deltaY: 3, deltaX: 0, deltaMode: 1 });
+    expect(rewriteWheelEvent(e, 1.25)).toBe(false);
+    expect(e.deltaY).toBe(3);
+    expect(Object.prototype.hasOwnProperty.call(e, "deltaY")).toBe(false);
+  });
+  it("PAGE-mode deltas are page counts — untouched (deltaMode 2)", () => {
+    const e = new WheelEvent("wheel", { deltaY: 1, deltaMode: 2 });
+    expect(rewriteWheelEvent(e, 1.25)).toBe(false);
+    expect(e.deltaY).toBe(1);
+  });
+  it("converts Chromium's legacy wheelDelta* by the same factor, preserving its −3×delta relation", () => {
+    // Chromium exposes wheelDeltaY = −3·deltaY on wheel events, and xterm v6's
+    // StandardWheelEvent PREFERS it over deltaY (vs/base/browser/mouseEvent.ts)
+    // for the scrollback path — so the seam must convert it too. jsdom does
+    // not implement the legacy props, so install the Chromium shape by hand.
+    const e = new WheelEvent("wheel", { deltaY: 120, deltaX: 0 });
+    Object.defineProperty(e, "wheelDelta", { configurable: true, value: -360 });
+    Object.defineProperty(e, "wheelDeltaX", { configurable: true, value: 0 });
+    Object.defineProperty(e, "wheelDeltaY", { configurable: true, value: -360 });
+    expect(rewriteWheelEvent(e, 1.25)).toBe(true);
+    expect(e.deltaY).toBeCloseTo(96, 6);
+    expect(e.wheelDeltaY).toBeCloseTo(-288, 6); // −360/1.25
+    expect(e.wheelDelta).toBeCloseTo(-288, 6);
+    expect(e.wheelDeltaY).toBeCloseTo(-3 * e.deltaY, 6); // engine factor survives
+  });
+  it("leaves absent legacy props absent (Firefox/jsdom shape)", () => {
+    const e = new WheelEvent("wheel", { deltaY: 120 });
+    expect(rewriteWheelEvent(e, 1.25)).toBe(true);
+    expect(e.deltaY).toBeCloseTo(96, 6);
+    expect(Object.prototype.hasOwnProperty.call(e, "wheelDeltaY")).toBe(false);
+    expect(e.wheelDeltaY).toBeUndefined();
+  });
+});
+
+// Dogfood: replay xterm v6's REAL unit formulas (from the vendored sources)
+// on rewritten vs raw events. Numbers: deltaY=120 visual px, cell 20 LAYOUT px
+// tall, dpr 1 (device cell 20 device px), scrollSensitivity 1.
+describe("dogfood: xterm's real wheel formulas on the rewritten event", () => {
+  // Scrollback path (Chromium): SmoothScrollableElement._onMouseWheel —
+  // stdDeltaY = wheelDeltaY/120 (legacy preferred; numerically −deltaY/40),
+  // deltaScrollTop = SCROLL_WHEEL_SENSITIVITY(50) × stdDeltaY, and the
+  // |deltaScrollTop| px are added to the Scrollable's LAYOUT-px scrollTop.
+  const scrollbackDeltaLayout = (deltaY: number, wheelDeltaY: number): number =>
+    Math.abs(50 * (wheelDeltaY / 120));
+
+  it("scrollback: the VISUAL advance (Δlayout × zoom) is zoom-invariant only after the rewrite", () => {
+    const D = 120; // visual px
+    // Zoom 1 (identity — no rewrite): Δ = 50×(−360/120) = 150 layout = 150 visual.
+    const truthVisual = scrollbackDeltaLayout(D, -3 * D) * 1;
+    expect(truthVisual).toBe(150);
+    // Unfixed at 1.25: the same 120-visual-px delta treated as layout px →
+    // 150 layout px = 187.5 visual px — 1.25× too far.
+    const raw = scrollbackDeltaLayout(D, -3 * D) * 1.25;
+    expect(raw).toBe(187.5);
+    // Rewritten at 1.25: deltaY′ = 96, wheelDeltaY′ = −288 → Δ = 120 layout
+    // px → ×1.25 = 150 visual px — parity restored.
+    const z = 1.25;
+    const e = new WheelEvent("wheel", { deltaY: D });
+    Object.defineProperty(e, "wheelDeltaY", { configurable: true, value: -3 * D });
+    rewriteWheelEvent(e, z);
+    const fixed = scrollbackDeltaLayout(e.deltaY, e.wheelDeltaY ?? -3 * e.deltaY) * z;
+    expect(fixed).toBeCloseTo(truthVisual, 6);
+  });
+
+  // consumeWheelEvent path (mouse-protocol wheel reports + alternate-buffer
+  // arrow synthesis): lines = deltaY ÷ (deviceCellHeight/dpr) — the divisor is
+  // the LAYOUT-px cell height (device dims are layout×dpr, so dpr cancels).
+  const consumeLines = (deltaY: number, cellLayout: number): number => deltaY / cellLayout;
+
+  it("consumeWheelEvent: lines-per-notch match the zoom-1 truth only after the rewrite", () => {
+    const D = 120;
+    const cell = 20;
+    const truth = consumeLines(D, cell); // zoom 1: 6 lines
+    expect(truth).toBe(6);
+    // Unfixed at 1.25: 120/20 = 6 lines — but the truth is 120 visual px =
+    // 96 layout px = 4.8 lines; the raw event over-reports by 1.25×.
+    expect(consumeLines(D / 1.25, cell)).toBeCloseTo(4.8, 6);
+    // Rewritten at 1.25 (and at 0.8): the divisor sees layout px.
+    for (const z of [1.25, 0.8]) {
+      const e = new WheelEvent("wheel", { deltaY: D });
+      rewriteWheelEvent(e, z);
+      expect(consumeLines(e.deltaY, cell) * z).toBeCloseTo(truth * 1, 6);
+    }
   });
 });

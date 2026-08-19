@@ -6,7 +6,7 @@ import { projectDir } from "../sync";
 import { termKeys } from "../ui";
 import { monoFontStack } from "../font";
 import { uiZoom } from "../lib/zoom";
-import { pointerToCell, rewriteMouseEvent } from "../lib/termPointer";
+import { pointerToCell, rewriteMouseEvent, rewriteWheelEvent } from "../lib/termPointer";
 
 // A real terminal: xterm.js over a WebSocket-backed PTY (/vh/term/ws). Input
 // flows through term.onData() so IME/composition resolves to final bytes (the
@@ -211,6 +211,24 @@ export default function TerminalPane(props: { termId?: string; session?: string;
       host.addEventListener(t, normalizeForXterm, true);
     }
 
+    // Wheel rides the same seam (terminal cousin of the 76dfaeb2 follow-up):
+    // xterm.js v6's wheel consumers mix a VISUAL-px pixel-mode delta into
+    // LAYOUT-px math — the SmoothScrollableElement adds SCROLL_WHEEL_SENSITIVITY
+    // × (wheelDeltaY/120 on Chromium) to a layout-px scrollTop, and
+    // CoreMouseService.consumeWheelEvent divides deltaY by the layout-px cell
+    // height — so at zoom ≠ 1 every wheel scroll lands ~×z (too fast at 125%,
+    // too slow at 80%). One capture-phase rewrite of the wheel event covers
+    // all consumers (scrollback scroll, mouse-protocol wheel reports, and
+    // alternate-buffer arrow-key synthesis) because they read the same live
+    // event object from listeners on descendants of this host. LINE/PAGE-mode
+    // deltas are counts, not px, and pass through untouched; getters only —
+    // nothing is preventDefault()ed, so xterm's own listeners behave
+    // identically. Identity at zoom = 1. See lib/termPointer.rewriteWheelEvent.
+    const normalizeWheelForXterm = (e: WheelEvent) => {
+      rewriteWheelEvent(e, uiZoom());
+    };
+    host.addEventListener("wheel", normalizeWheelForXterm, true);
+
     // Cell indicator: the OS cursor is much taller than a terminal line, so
     // which cell a click/touch will hit is ambiguous. One tiny overlay
     // snapped to the cell grid under the pointer, positioned by the SAME
@@ -331,6 +349,7 @@ export default function TerminalPane(props: { termId?: string; session?: string;
       for (const t of ["mousedown", "mousemove", "mouseup"] as const) {
         host.removeEventListener(t, normalizeForXterm, true);
       }
+      host.removeEventListener("wheel", normalizeWheelForXterm, true);
       host.removeEventListener("pointermove", onHoverMove);
       host.removeEventListener("pointerdown", onTouchDown);
       host.removeEventListener("pointerleave", hideCursor);
