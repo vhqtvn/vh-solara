@@ -16,6 +16,7 @@ import { describe, expect, it } from "vitest";
 import {
   cellFromOffset,
   cellSizeLayout,
+  documentRewriteApplies,
   normalizedClient,
   pointerOffsetLayout,
   pointerToCell,
@@ -228,6 +229,45 @@ describe("rewriteWheelEvent (in-place wheel-delta rewrite)", () => {
     expect(e.deltaY).toBeCloseTo(96, 6);
     expect(Object.prototype.hasOwnProperty.call(e, "wheelDeltaY")).toBe(false);
     expect(e.wheelDeltaY).toBeUndefined();
+  });
+});
+
+// Drag-escape document seam guard (76dfaeb2 review B-F2): xterm v6 installs
+// its selection/mouse-reporting drag listeners on the DOCUMENT after
+// mousedown, so escaped events (target outside .term-host) need a document
+// capture rewrite — but document capture fires BEFORE host capture for
+// in-host events, so the document seam must skip exactly those or the same
+// event is divided by zoom twice.
+describe("documentRewriteApplies (drag-escape document seam guard)", () => {
+  const host = document.createElement("div");
+  const deep = document.createElement("span");
+  host.appendChild(deep);
+  document.body.appendChild(host);
+  const outside = document.createElement("div");
+  document.body.appendChild(outside);
+
+  it("applies to targets outside the host (escaped drag events)", () => {
+    expect(documentRewriteApplies(outside, host)).toBe(true);
+    expect(documentRewriteApplies(document.documentElement, host)).toBe(true);
+  });
+  it("skips targets inside the host — the host capture seam already rewrote them (exactly once)", () => {
+    expect(documentRewriteApplies(host, host)).toBe(false);
+    expect(documentRewriteApplies(deep, host)).toBe(false);
+  });
+  it("treats unprovable containment (null host / null target / non-Node) as escaped — normalize, never skip", () => {
+    expect(documentRewriteApplies(outside, null)).toBe(true);
+    expect(documentRewriteApplies(null, host)).toBe(true);
+    expect(documentRewriteApplies({}, host)).toBe(true);
+  });
+  it("why the guard exists: rewriting an already-rewritten event would divide twice", () => {
+    const screen = screenAt(1.25);
+    const e = new MouseEvent("mousemove", { clientX: 118, clientY: 210 });
+    rewriteMouseEvent(e, screen, 1.25);
+    const once = e.clientX; // 99.2
+    expect(once).toBeCloseTo(99.2, 6);
+    rewriteMouseEvent(e, screen, 1.25); // what a guardless document seam would do to in-host events
+    expect(e.clientX).toBeCloseTo(84.16, 6); // 24 + (99.2−24)/1.25 — double division, wrong
+    expect(e.clientX).not.toBeCloseTo(once, 6);
   });
 });
 

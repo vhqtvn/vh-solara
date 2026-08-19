@@ -755,3 +755,189 @@ test.describe("terminal wheel parity across UI zoom", () => {
     ).toBeLessThanOrEqual(PARITY_TOL_ROWS);
   });
 });
+
+// Escaped selection drag (76dfaeb2 review B-F2). xterm.js v6 installs its
+// selection drag listeners on the DOCUMENT after mousedown (SelectionService
+// _addMouseDownListeners — "Listen on the document so that dragging outside of
+// viewport works"), so mousemove/mouseup events whose target is OUTSIDE
+// .term-host never pass through the host's capture seam — xterm consumes RAW
+// visual clientX/clientY in its layout-px cell math. At zoom < 1 the escaped
+// drag's end cell lands at ~×z of the intended column, so the selection stops
+// short of the grid edge; at zoom 1 raw == normalized and the defect is
+// invisible. The TerminalPane document-capture drag seam must normalize those
+// escaped events relative to the same .xterm-screen rect.
+//
+// Gesture (real PTY, real engine): mousedown on a known seq output row INSIDE
+// the terminal, sweep right THROUGH the screen on the SAME row, keep going
+// past the host/window's right edge, release outside. The escape must be
+// HORIZONTAL: a vertical escape zeroes the signal by design — xterm's
+// _handleMouseMove sets selectionEnd[0]=0 whenever the pointer is above the
+// screen (drag-scroll regime), at every zoom. On one row the selection is a
+// single div [anchorCol..endCol]: its right edge is the user-visible
+// selection ENDPOINT; with the pointer beyond the last column xterm clamps
+// the end to cols+1, so the fixed state selects THROUGH to the screen's right
+// edge at every zoom.
+//
+// Invariant (font-metric-free): the anchor edge tracks the press point and
+// the end edge reaches the screen's right edge, both in VISUAL px, at every
+// zoom. The anchor edge passes in BOTH states (the in-host mousedown path was
+// already seam-covered — a built-in negative control); the end edge only
+// reaches the grid edge once escaped events are normalized. Unfixed at 0.8
+// the raw end column lands at min(ceil(u/cellW), cols) ≈ 0.85×cols for this
+// gesture — the selection visibly stops ~15% of the screen width short.
+test.describe("terminal selection drag escaping the host under UI zoom", () => {
+  // End edge: the div's right edge is clamped to the canvas width exactly
+  // (sub-pixel rounding only) once the end clamps to cols+1; the anchor edge
+  // carries xterm's half-cell snap bias, so allow ~1.5 visual cells.
+  const EDGE_TOL = 14;
+  const ROW_TOL = 3;
+
+  test.beforeEach(async ({ request }) => {
+    // Same rationale as the two describes above: kill every live PTY so this
+    // test boots a fresh shell with a known screen (seq ladder).
+    const res = await request.get("/vh/term/list");
+    const terms = res.ok() ? ((await res.json()) as Array<{ dir: string; id: string }>) : [];
+    await Promise.all(
+      terms.map((tm) =>
+        request.post("/vh/term/kill", { headers: { "X-VH-CSRF": "1" }, data: { dir: tm.dir, id: tm.id } }),
+      ),
+    );
+  });
+
+  // One row div per rendered line; seq rows have pure-integer textContent.
+  // Returns the row div rects for every pure-int row, in DOM (top→bottom)
+  // order — the anchor is picked a few rows above the bottom number row so
+  // the press lands mid-screen, clear of the screen's bottom edge and the
+  // prompt/echo lines below the ladder.
+  const numberRowRects = (page: Page) =>
+    page.locator(".xterm-rows").evaluate((el) => {
+      const out: Array<{ left: number; top: number; width: number; height: number }> = [];
+      for (const div of (el as HTMLElement).querySelectorAll(":scope > div")) {
+        const t = (div as HTMLElement).textContent?.trim() ?? "";
+        if (/^\d+$/.test(t)) {
+          const r = (div as HTMLElement).getBoundingClientRect();
+          out.push({ left: r.left, top: r.top, width: r.width, height: r.height });
+        }
+      }
+      return out;
+    });
+
+  async function runEscapedDragTest(page: Page, scale: number): Promise<void> {
+    test.setTimeout(90_000);
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.addInitScript(
+      ([k, v]) => localStorage.setItem(k, JSON.stringify({ v: 1, data: v })),
+      [UI_KEY, scale] as [string, number],
+    );
+    await page.goto(`/?dir=${encodeURIComponent(repoRoot)}`);
+    await page.getByRole("button", { name: "Terminal", exact: true }).click();
+    await expect(page.locator(".term-host")).toBeVisible({ timeout: 10000 });
+    await expect(page.locator(".term-status.open")).toBeVisible({ timeout: 10000 });
+    await page.locator(".term-host").click(); // focus the terminal
+    await page.keyboard.type("seq 1 250");
+    await page.keyboard.press("Enter");
+    await expect
+      .poll(() => numberRowRects(page).then((rs) => rs.length), { timeout: 15000 })
+      .toBeGreaterThanOrEqual(5); // output complete (number ladder rendered)
+    await assertZoomPremise(page, scale);
+
+    // Geometry (all VISUAL px): screen rect, host rect, and the anchor row —
+    // the number row 3 above the bottom-most one.
+    const screen = await rect(page.locator(".xterm-screen"));
+    const host = await rect(page.locator(".term-host"));
+    const rows = await numberRowRects(page);
+    expect(rows.length, "seq number rows rendered").toBeGreaterThanOrEqual(5);
+    const anchorRow = rows[rows.length - 4];
+
+    const anchorX = screen.left + screen.width * 0.15;
+    const anchorY = anchorRow.top + anchorRow.height / 2;
+    // Release point: ~60 visual px beyond the SCREEN's right edge — past
+    // .term-host (which ends within ~10px of the screen) and past the
+    // 1280px window's right edge. A real user makes this exact gesture by
+    // dragging past the window edge while holding the button; the browser's
+    // implicit mouse capture keeps delivering document events (the scenario
+    // xterm's document listeners exist for). Playwright dispatches it as CDP
+    // input events at out-of-viewport coordinates. The Y stays INSIDE the
+    // screen rows: vertical escapes trigger xterm's drag-scroll regime,
+    // which zeroes the end column at every zoom and masks the defect.
+    const releaseX = screen.right + 60;
+    const releaseY = anchorY;
+    expect(releaseX, "release point is beyond the host's right edge (escaped)").toBeGreaterThan(host.right + 2);
+    expect(releaseY, "release row is vertically inside the screen").toBeGreaterThan(screen.top + 10);
+    expect(releaseY, "release row is vertically inside the screen").toBeLessThan(screen.bottom - 10);
+
+    // The gesture: press on the anchor row, sweep right THROUGH the screen
+    // (in-host moves — already seam-covered), then ONE move out of the host
+    // and an immediate release.
+    await page.mouse.move(anchorX, anchorY);
+    await page.mouse.down();
+    await page.mouse.move(screen.left + screen.width * 0.7, anchorY, { steps: 6 });
+    await page.mouse.move(releaseX, releaseY);
+    await page.mouse.up();
+
+    // Stability guard: the horizontal escape cannot drag-scroll (that regime
+    // is vertical-only), so the ladder's first visible number must be intact.
+    const marker = await page.locator(".xterm-rows").evaluate((el) => {
+      for (const line of (el as HTMLElement).innerText.split("\n")) {
+        if (/^\d+$/.test(line.trim())) return Number.parseInt(line, 10);
+      }
+      return null;
+    });
+    expect(marker, "viewport content intact after the escape (no drag-scroll)").not.toBeNull();
+
+    // The oracle: .xterm-selection holds one div per selected row-run (visual
+    // px via gBCR); xterm may append zero-height "middle rows" crumbs when the
+    // clamped end lands on a row boundary — filter those out. Normalized, the
+    // end clamps to (cols+1, anchorRow): ONE full-height div on the pressed
+    // row, spanning [anchorCol..EOL]. Unfixed at 0.8 the raw escaped events
+    // put the end ~2 rows ABOVE the anchor at ~0.84×cols — a REVERSED
+    // multi-row selection whose anchor-row div reads [BOL..anchorCol]
+    // instead (observed live: 3 full-height divs, anchor-row right edge at
+    // the press point, ~133px short of the grid edge).
+    const sel = await page.evaluate(() =>
+      Array.from(document.querySelectorAll(".xterm-selection > div")).map((el) => {
+        const r = el.getBoundingClientRect();
+        return { left: r.left, top: r.top, width: r.width, height: r.height };
+      }),
+    );
+    const real = sel.filter((d) => d.height >= anchorRow.height * 0.5);
+    console.log(
+      `[escape-drag z=${scale}] anchorX=${anchorX.toFixed(1)} releaseX=${releaseX.toFixed(1)} ` +
+        `screen=[${screen.left.toFixed(1)},${screen.right.toFixed(1)}] anchorRowTop=${anchorRow.top.toFixed(1)} ` +
+        `alldivs=${JSON.stringify(sel)}`,
+    );
+    expect(real.length, "exactly one real (full-height) selection row — not a reversed multi-row composition").toBe(1);
+    const div = real[0];
+    const selRight = div.left + div.width;
+
+    // Sanity: the selection sits on the pressed row.
+    expect(Math.abs(div.top - anchorRow.top), "selection div sits on the pressed row").toBeLessThanOrEqual(ROW_TOL);
+    // Non-vacuity: the gesture selected most of the row's width.
+    expect(div.width, "selection covers a substantial span").toBeGreaterThan(screen.width * 0.5);
+
+    // The anchor edge tracks the press point (in-host mousedown seam — also
+    // regression-guards against a double rewrite of in-host events).
+    expect(
+      Math.abs(div.left - anchorX),
+      "anchor (left) edge tracks the press point",
+    ).toBeLessThanOrEqual(EDGE_TOL);
+
+    // The crux: the escaped END reaches the grid edge. With the pointer
+    // beyond the last column, xterm clamps the end to cols+1 and the div to
+    // the canvas width — the user sees the selection run THROUGH to the
+    // screen's right edge, at every zoom. Unfixed at 0.8 it stops ~15% of
+    // the screen width short.
+    expect(
+      Math.abs(selRight - screen.right),
+      "escaped selection END (right edge) reaches the screen's right edge",
+    ).toBeLessThanOrEqual(EDGE_TOL);
+  }
+
+  test("escaped selection drag reaches the grid edge at 80%", async ({ page }) => {
+    await runEscapedDragTest(page, 0.8);
+  });
+
+  test("escaped selection drag reaches the grid edge at 100% (identity control)", async ({ page }) => {
+    await runEscapedDragTest(page, 1);
+  });
+});

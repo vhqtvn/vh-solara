@@ -6,7 +6,7 @@ import { projectDir } from "../sync";
 import { termKeys } from "../ui";
 import { monoFontStack } from "../font";
 import { uiZoom } from "../lib/zoom";
-import { pointerToCell, rewriteMouseEvent, rewriteWheelEvent } from "../lib/termPointer";
+import { pointerToCell, documentRewriteApplies, rewriteMouseEvent, rewriteWheelEvent } from "../lib/termPointer";
 
 // A real terminal: xterm.js over a WebSocket-backed PTY (/vh/term/ws). Input
 // flows through term.onData() so IME/composition resolves to final bytes (the
@@ -200,9 +200,9 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     // visual-offset ÷ layout-cell division unit-consistent. Identity at
     // zoom = 1 (no rewrite). PointerEvents are untouched — hostGesture and
     // the cell indicator below expect visual px and convert via
-    // lib/termPointer themselves. Drags that leave the terminal are not
-    // rewritten (capture only fires for targets inside); xterm clamps those
-    // out-of-bounds coords to the grid edge, which is the intended behavior.
+    // lib/termPointer themselves. Events whose target leaves the host
+    // mid-drag (xterm listens for those on the document) are covered by the
+    // drag-escape seam below, using the same rewrite.
     const normalizeForXterm = (e: MouseEvent) => {
       if (!screenEl) return;
       rewriteMouseEvent(e, screenEl.getBoundingClientRect(), uiZoom());
@@ -210,6 +210,45 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     for (const t of ["mousedown", "mousemove", "mouseup"] as const) {
       host.addEventListener(t, normalizeForXterm, true);
     }
+
+    // Drag-escape coverage (76dfaeb2 review B-F2): xterm.js v6 installs its
+    // selection / mouse-reporting move+up listeners on the DOCUMENT after a
+    // mousedown (SelectionService._addMouseDownListeners — "so that dragging
+    // outside of viewport works"), so when a drag's pointer leaves .term-host
+    // those events reach xterm with RAW visual coords and the selection end
+    // lands ~×z off (stops short of the grid edge at zoom < 1; row drifts at
+    // any zoom ≠ 1). While a drag that started inside this host is active,
+    // mirror xterm's own lifecycle: document-level CAPTURE move/up listeners
+    // normalizing by the SAME screen-rect seam. documentRewriteApplies skips
+    // in-host events (the host capture listener above already rewrote them —
+    // document capture fires first, so rewriting there too would divide by
+    // zoom twice), and the listeners exist only while the drag is active, so
+    // unrelated document events are never touched. Any button press inside
+    // the host activates the pair — xterm's mouse-reporting path tracks
+    // non-primary buttons too; the rewrite itself is identity at zoom = 1.
+    let dragRewriteActive = false;
+    const rewriteEscapedForXterm = (e: MouseEvent) => {
+      if (!screenEl || !documentRewriteApplies(e.target, host)) return;
+      rewriteMouseEvent(e, screenEl.getBoundingClientRect(), uiZoom());
+    };
+    const onDocDragMove = (e: MouseEvent) => rewriteEscapedForXterm(e);
+    const onDocDragUp = (e: MouseEvent) => {
+      rewriteEscapedForXterm(e); // mouseup outside the host ends the drag — normalize it too
+      endDragRewrite();
+    };
+    function endDragRewrite() {
+      if (!dragRewriteActive) return;
+      dragRewriteActive = false;
+      document.removeEventListener("mousemove", onDocDragMove, true);
+      document.removeEventListener("mouseup", onDocDragUp, true);
+    }
+    const onDragStart = () => {
+      if (dragRewriteActive) return;
+      dragRewriteActive = true;
+      document.addEventListener("mousemove", onDocDragMove, true);
+      document.addEventListener("mouseup", onDocDragUp, true);
+    };
+    host.addEventListener("mousedown", onDragStart, true);
 
     // Wheel rides the same seam (terminal cousin of the 76dfaeb2 follow-up):
     // xterm.js v6's wheel consumers mix a VISUAL-px pixel-mode delta into
@@ -349,6 +388,8 @@ export default function TerminalPane(props: { termId?: string; session?: string;
       for (const t of ["mousedown", "mousemove", "mouseup"] as const) {
         host.removeEventListener(t, normalizeForXterm, true);
       }
+      host.removeEventListener("mousedown", onDragStart, true);
+      endDragRewrite(); // a drag still active at unmount must not leak its document listeners
       host.removeEventListener("wheel", normalizeWheelForXterm, true);
       host.removeEventListener("pointermove", onHoverMove);
       host.removeEventListener("pointerdown", onTouchDown);

@@ -183,6 +183,24 @@ export function rewriteMouseEvent(
 const DOM_DELTA_PIXEL = 0;
 
 /**
+ * Whether a DOCUMENT-level capture rewrite should apply to an event whose
+ * target is `target`: true only for events that did NOT originate inside the
+ * terminal host. Drag-escape coverage (76dfaeb2 review B-F2): xterm.js v6
+ * moves its selection / mouse-reporting move+up listeners to the DOCUMENT
+ * after mousedown ("Listen on the document so that dragging outside of
+ * viewport works" — SelectionService._addMouseDownListeners), so a drag whose
+ * pointer leaves the host feeds xterm RAW visual coords unless the seam also
+ * rides a document capture listener. But document capture fires BEFORE the
+ * host's own capture listener in the same capture phase for in-host events —
+ * rewriting there too would divide by zoom TWICE — so the document seam must
+ * skip exactly the events the host seam already handled. PURE (DOM
+ * containment only); pinned in termPointer.zoom.test.ts.
+ */
+export function documentRewriteApplies(target: EventTarget | null, host: Element | null): boolean {
+  return !(host !== null && target instanceof Node && host.contains(target));
+}
+
+/**
  * The xterm seam fix for wheel events: a pixel-mode wheel delta is reported in
  * VISUAL/viewport px (zoom-invariant for a given physical wheel motion), but
  * every xterm.js v6 wheel consumer divides it by — or adds it to — LAYOUT-px
