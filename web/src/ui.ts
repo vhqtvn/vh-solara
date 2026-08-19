@@ -3,7 +3,6 @@
 import { createRoot, createSignal } from "solid-js";
 import { bindBackDismiss, pushBackSurface, releaseBackSurface, type BackSurface } from "./lib/backStack";
 import { loadVersioned, saveVersioned } from "./lib/store";
-import { isEmbedded } from "./embedded";
 
 // Built-in views plus consumer-registered embedded views, keyed "view:<id>".
 export type BuiltinView = "chat" | "changes" | "notes" | "preferences" | "code";
@@ -63,37 +62,19 @@ export const [paletteOpen, setPaletteOpen] = createSignal(false);
 export const [projSwitcherOpen, setProjSwitcherOpen] = createSignal(false);
 // Terminal: a bottom dock that can expand to full-screen (always full on mobile).
 //
-// S1b embedded default: when this SPA runs inside the host shell's iframe
-// (isEmbedded()), the dock's DEFAULT presentation on its first open in a
-// session is overlay-full (.full in TerminalDock.css) — opening a terminal
-// never permanently consumes pane vertical space. Standalone keeps the
-// bottom-dock default. The default is applied at first OPEN, not by
-// initializing the signal true: bindBackDismiss(termFull, …) below would
-// otherwise push a back-history token at every embedded load — before any
-// terminal is open — swallowing the first back press (pinned in
-// termEmbeddedDefault.test.ts). Any explicit setTermFull (the Dock/Full-screen
-// toggle, or a back-dismissal of the overlay) records the session's choice,
-// which then wins over the default for the rest of the session — matching the
-// signal's existing session-scoped (deliberately non-persisted) lifetime. No
-// persistence is added.
-const [termOpen, setTermOpenCore] = createSignal(false);
-const [termFull, setTermFullCore] = createSignal(false);
-export { termOpen, termFull };
-// True once a terminal presentation exists for this session — either the
-// embedded default was applied (first open) or the user toggled explicitly.
-let termPresentationSet = false;
-export function setTermOpen(v: boolean | ((prev: boolean) => boolean)) {
-  const open = typeof v === "function" ? v(termOpen()) : v;
-  if (open && !termPresentationSet) {
-    termPresentationSet = true;
-    if (isEmbedded()) setTermFullCore(true);
-  }
-  setTermOpenCore(open);
-}
-export function setTermFull(v: boolean | ((prev: boolean) => boolean)) {
-  termPresentationSet = true;
-  setTermFullCore(typeof v === "function" ? v(termFull()) : v);
-}
+// First-open default (ALL contexts — standalone and embedded host-shell iframe
+// alike): the dock opens DOCKED at the bottom (300px default, height persisted
+// via vh.term.height.v1); the user expands to overlay-full (.full in
+// TerminalDock.css) explicitly via the Dock/Full-screen toggle. This REVERSES
+// the earlier S1b embedded default (the first embedded open forced
+// overlay-full so opening a terminal never permanently consumed pane vertical
+// space) at operator request — docked-first is the desired behavior
+// everywhere. termFull stays session-scoped (deliberately non-persisted) and
+// initializes false, so bindBackDismiss(termFull, …) below never pushes a
+// back-history token at load, before any terminal is open (pinned in
+// termEmbeddedDefault.test.ts).
+export const [termOpen, setTermOpen] = createSignal(false);
+export const [termFull, setTermFull] = createSignal(false);
 // Toggleable on-screen key bar (esc/tab/ctrl/arrows). Persisted; default on.
 const [termKeys, setTermKeysSig] = createSignal<boolean>(
   loadVersioned<boolean>("vh.term.keys.v1", 1, true, (o) => o !== false && o !== 0 && o !== "0"),

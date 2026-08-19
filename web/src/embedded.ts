@@ -4,8 +4,7 @@
 // (`window.parent !== window`) — the post-fold default: the SPA at /app is
 // embedded same-origin by the host shell at /. This module is the ONE source
 // of truth for that check; embed-aware modules (heartbeat, statusEmitter,
-// selectListener, hostGesture, prefs, ui — the S1b embedded terminal-dock
-// default) import it instead of each re-deriving
+// selectListener, hostGesture, prefs) import it instead of each re-deriving
 // the raw comparison. The inbound source-guards (`ev.source !== window.parent`)
 // in those modules are a DIFFERENT check (message authenticity, not embed
 // status) and stay local to them.

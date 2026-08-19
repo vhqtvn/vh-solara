@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 //
-// S1b: the embedded terminal-dock DEFAULT presentation (web/src/ui.ts).
-// When the SPA runs inside the host shell's iframe (isEmbedded()), the FIRST
-// open of the terminal dock in a session presents overlay-full (.full) so
-// opening a terminal never permanently consumes pane vertical space;
-// standalone keeps the bottom-dock default. An explicit setTermFull (the
-// Dock/Full-screen toggle, or a back-dismissal) records the session's choice,
-// which then wins over the default.
+// Terminal-dock DEFAULT presentation (web/src/ui.ts): docked-first in ALL
+// contexts — standalone AND embedded (host shell iframe). This REVERSES the
+// earlier S1b embedded default (first embedded open forced overlay-full) at
+// operator request: the first terminal open now presents the small bottom
+// dock everywhere; overlay-full (.full) is an explicit user action via the
+// Dock/Full-screen toggle, and the choice is session-scoped (never
+// persisted).
 //
 // termFull/termOpen are module-level signals, so each case re-imports ui.ts
 // fresh (vi.resetModules + dynamic import) with the desired window.parentage
@@ -44,7 +44,7 @@ const backToken = (state: unknown): string | null =>
     ? (state as { vhBack: string }).vhBack
     : null;
 
-describe("terminal dock default presentation (S1b)", () => {
+describe("terminal dock default presentation (docked-first; S1b full-first reversed)", () => {
   it("standalone: first open stays docked (termFull false); updater-form setters keep working", async () => {
     parentWindow = window;
     installParentGetter();
@@ -60,7 +60,7 @@ describe("terminal dock default presentation (S1b)", () => {
     expect(ui.termFull()).toBe(false);
   });
 
-  it("embedded: no full state and no back token before open; first open presents overlay-full", async () => {
+  it("embedded: no full state and no back token before open; first open stays DOCKED", async () => {
     parentWindow = { postMessage: () => {} } as unknown as Window;
     installParentGetter();
     const ui = await freshUi();
@@ -69,28 +69,29 @@ describe("terminal dock default presentation (S1b)", () => {
     expect(backToken(window.history.state)).toBeNull(); // … and NO phantom back entry
     ui.setTermOpen(true);
     expect(ui.termOpen()).toBe(true);
-    expect(ui.termFull()).toBe(true); // the embedded default — the crux
+    expect(ui.termFull()).toBe(false); // docked-first in the iframe too — the crux (S1b reversed)
   });
 
-  it("embedded: an explicit Dock choice wins over the default for the session (survives close/reopen)", async () => {
+  it("embedded: an explicit Full choice persists for the session (survives close/reopen)", async () => {
     parentWindow = { postMessage: () => {} } as unknown as Window;
     installParentGetter();
     const ui = await freshUi();
-    ui.setTermOpen(true); // default applies: full
-    ui.setTermFull(false); // user clicks "Dock"
+    ui.setTermOpen(true); // opens docked
+    ui.setTermFull(true); // user clicks "Full screen"
     ui.setTermOpen(false); // close the dock
-    ui.setTermOpen(true); // reopen — the choice persists for the session
-    expect(ui.termFull()).toBe(false);
+    ui.setTermOpen(true); // reopen — still full: the choice persists for the session
+    expect(ui.termFull()).toBe(true);
   });
 
-  it("design pin: a signal INITIALIZED true would push a back token at bind time — why the default applies at first open, not signal init", async () => {
-    // Simulates the alternative mechanism (createSignal(isEmbedded()) — true
-    // when embedded) against the SAME bindBackDismiss wiring ui.ts installs:
-    // the bind's effect sees open() === true on its first run and pushes a
-    // URL-transparent history entry at every embedded LOAD, before any
-    // terminal is open — the first back press is then swallowed dismissing an
-    // invisible surface. If this pin ever fails (binds no longer push at
-    // init), the simpler signal-init default may be reconsidered.
+  it("design pin: a signal INITIALIZED true would push a back token at bind time — why termFull must init false", async () => {
+    // Simulates the rejected alternative (createSignal(true)) against the
+    // SAME bindBackDismiss wiring ui.ts installs: the bind's effect sees
+    // open() === true on its first run and pushes a URL-transparent history
+    // entry at every LOAD, before any terminal is open — the first back press
+    // is then swallowed dismissing an invisible surface. Docked-first (init
+    // false) is both the desired default everywhere and the only init that
+    // pushes no phantom token. If this pin ever fails (binds no longer push
+    // at init), the mechanism note needs revisiting.
     const { createRoot, createSignal } = await import("solid-js");
     const { bindBackDismiss, __resetBackStackForTest } = await import("../../src/lib/backStack");
     const [sig, setSig] = createSignal(true);
