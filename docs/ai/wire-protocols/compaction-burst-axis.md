@@ -113,3 +113,15 @@ No contradiction with the settled suffix design in the recommended path (preserv
 - Source: focused `/solution-brief` (researcher→debate→planner), dispatched 2026-08-12.
 - Evidence: user-verified opencode.db reconstruction (addendum `tmp/part-stream-linear-delta-brief.md` lines 59-87).
 - Settled context: `docs/ai/wire-protocols/part-stream-suffix-axis.md` (O(L²) axis).
+
+## Addendum: F2 Gate Resolution (2026-08-20)
+
+**Gate verdict:** `identical-fraction = 0/8481 = 0.0%` → the reopen bar (material identical-fraction AND measured regression) fails on the first conjunct → **O1 stands, now evidence-confirmed** (previously gate-forced by absence of telemetry). The doc's uncertainty #1 is resolved: byte-identical re-emits did not occur in this window, so O2 suppression would have saved 0 bytes.
+
+**Caveats:**
+- Single read, one worker, process-lifetime cumulative window (~8.4h, mixed projects — not burst-windowed).
+- Classification counts new parts as changed (identical requires byte-equality with a prior resident).
+- `distinct_part` table saturated (256 slots + 7933 overflow) — informational only.
+
+**Observation (note-only, no action):**
+- `sub_chan_events_high_water: 256` — the subscription channel buffer filled completely at some point (slice-4A fixture reference: 13–16; overflow needs ~7× + blocked writer). Single cumulative max, no timing, no measured settle/latency regression → re-check on any future telemetry read; escalate only if it recurs alongside a measured regression.
