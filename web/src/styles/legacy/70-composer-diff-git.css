@@ -665,7 +665,18 @@
   font-size: 12px;
 }
 
-/* Focus mode: a tall composer card for longer prompts. */
+/* Focus mode: a tall composer card for longer prompts. The card's containing
+   block is `.composer-wrap` (position:relative) — a content-sized strip at the
+   bottom of `.chat`, NOT the chat pane. Unlifted, the absolute card spans only
+   the wrap, which collapses to its ~20px of padding once the composer leaves
+   the flow; the card's field then overflows below the viewport edge (clipped
+   by the composer's overflow:hidden) and the input sits off-screen. The wrap
+   mirrors the focus class (Composer.tsx) and is lifted HERE over `.chat`
+   (position:relative), so the card's inset:0 spans the full chat pane. The
+   card's border-radius:0/border:0 design is edge-to-edge, so the wrap's
+   padding drops too; z-index still applies (the box stays positioned), keeping
+   the composer/jump-pill paint order unchanged. */
+.composer-wrap.focus { position: absolute; inset: 0; padding: 0; }
 .composer.focus {
   position: absolute;
   inset: 0;

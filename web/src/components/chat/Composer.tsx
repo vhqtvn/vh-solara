@@ -123,7 +123,18 @@ export function Composer(props: ComposerProps) {
   }
 
   return (
-    <div class="composer-wrap">
+    <div
+      class="composer-wrap"
+      // Focus mode mirrors onto the wrap: `.composer.focus` (inset:0) is sized
+      // by the wrap (its nearest positioned ancestor), so the wrap must be
+      // lifted over `.chat` (see .composer-wrap.focus in
+      // 70-composer-diff-git.css) for the card to span the chat pane. Gated on
+      // !isChild: a child-session view renders the child-note instead of the
+      // composer, and focusMode can persist across a session switch — an
+      // ungated lift would overlay (and block pointer events on) the child
+      // transcript with a transparent full-pane wrap.
+      classList={{ focus: props.focusMode() && !props.isChild() }}
+    >
         <Show
           when={!props.isChild()}
           fallback={
