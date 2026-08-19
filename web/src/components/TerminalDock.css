@@ -55,11 +55,13 @@
    will hit (the OS cursor is taller than a line, so the target cell is
    ambiguous). Sized/positioned from JS (TerminalPane → lib/termPointer) in
    the host's layout space — width/height on fit changes, transform per move.
-   Perf: one tiny element, transform-only movement, pointer-events none, no
-   backdrop-filter / mask-image — WebRender-safe (AGENTS.md GPU rules).
-   z-index 2 is local to .term-host's own stacking context (same tier as
-   .term-status), below the .term-overlay (3) so a dropped connection still
-   reads. */
+    Perf: one tiny element, transform-only movement, pointer-events none, no
+    backdrop-filter / mask-image — WebRender-safe (AGENTS.md GPU rules).
+    z-index note: position: relative alone creates NO stacking context, so
+    this z-index 2 is not ".term-host-local" — it competes in the nearest
+    real stacking context, where it sits at the same tier as .term-status
+    (z-index 2) and below .term-overlay (z-index 3), so a dropped connection
+    still reads. */
 .term-host .term-cell-cursor {
   position: absolute; left: 0; top: 0;
   box-sizing: border-box;

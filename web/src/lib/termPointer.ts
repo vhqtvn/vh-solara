@@ -75,9 +75,13 @@ export function cellSizeLayout(
 /**
  * 0-based cell index of a layout-px offset, clamped to the grid. Uses xterm's
  * own ceil-then-subtract snapping (getCoords: ceil(offset/cell) − 1), so a
- * point exactly ON a cell boundary belongs to the cell ending there — the
- * indicator predicts exactly what xterm will select (for real pointers the
- * boundary is measure-zero; the alignment matters for the dogfood contract).
+ * point exactly ON a cell boundary belongs to the cell ending there. The
+ * indicator matches the cells xterm's MOUSE-REPORTING and LINKIFIER paths
+ * resolve exactly; xterm's selection path additionally applies a
+ * cssCellWidth/2 x-bias (Mouse.ts getCoords), so the column a drag-select
+ * starts on can differ from the indicator by half a cell (for real pointers
+ * the boundary is measure-zero; the alignment matters for the dogfood
+ * contract).
  */
 export function cellFromOffset(
   x: number,
@@ -202,9 +206,12 @@ const DOM_DELTA_PIXEL = 0;
  *
  * LINE/PAGE deltaModes are line/page COUNTS, not px — zoom-invariant by
  * definition — and are left untouched. The legacy `wheelDelta*` trio is
- * converted by the same factor when present (Chromium), preserving each
- * engine's internal factor (Chrome: wheelDelta* = −3·delta*). Identity at
- * zoom = 1; never preventDefault()s or cancels anything (getters only).
+ * converted by the same factor when present (Chromium), preserving
+ * whatever engine-internal factor relates it to delta* (−3 is only the
+ * consistency constant between the vendored path's preferred branch,
+ * wheelDeltaY/120, and its fallback, −deltaY/40 — and the shape the tests
+ * install — not a documented engine invariant). Identity at zoom = 1; never
+ * preventDefault()s or cancels anything (getters only).
  */
 export function rewriteWheelEvent(
   e: { deltaX: number; deltaY: number; deltaMode: number },

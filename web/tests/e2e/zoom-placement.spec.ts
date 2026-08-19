@@ -16,23 +16,46 @@ import { projectUrl } from "./util";
 // asserts the surface's getBoundingClientRect (visual px) against the pointer /
 // anchor (visual px), tolerance 2px (gBCR subpixel rounding under zoom).
 //
-// Surfaces covered, in the slice's priority order:
+// Surfaces covered, in slice order (1-4: the original four; 5-10: the
+// follow-up slice that closed the campaign's remaining excluded surfaces):
 //   1. Chat autocomplete popup (Composer acStyle, a191148d) — REQUIRED.
 //   2. Select popup (Select popStyle, fc2ef59d) — composer agent select
-//      (flip-up at the screen bottom) and Settings→Appearance font select
-//      (open-down mid-screen).
+//      (flip-up at the screen bottom; branch PINNED per review F7) and
+//      Settings→Appearance font select (open-down mid-screen; branch PINNED).
 //   3. Session context menu (SessionContextMenu pos, fc2ef59d) — right-click
 //      the chat header title; menu must land at the pointer.
 //   4. TerminalDock drag-resize (f9a8bbd4) — dock height grows by the VISUAL
 //      drag distance at any zoom.
+//   5. Sidebar drag-resize (Sidebar startResize, fc2ef59d) — width =
+//      layoutPx(clientX); the right edge tracks the pointer at any zoom.
+//   6. Code-dock drag-resize (CodeFrame startResize, fc2ef59d) — delta-based
+//      layoutPx width; the inner edge tracks the pointer (the resize handle
+//      lives in the PARENT document, beside the iframe).
+//   7. Tasks-popover drag-resize (ChatTasksStatus startTasksResize, fc2ef59d)
+//      — the demo session's seeded todos (pkg/fixtures/opencode.go) make the
+//      pill + popover reachable; the grip grows width/height by the visual
+//      drag deltas while the bottom-right anchor stays put.
+//   8. Hover tooltip (Tooltip placeTooltip + the layoutPx style boundary,
+//      fc2ef59d) — a real sidebar data-tip anchor; the bubble's visual
+//      centre-x and below-branch top track the anchor's visual rect at any
+//      zoom. (Non-zoom behaviour — delay, nesting, edge clamping — has its
+//      own spec, tooltip.spec.ts.)
+//   9. PathSelectionAction floating button (f9a8bbd4) — a REAL DOM selection
+//      (Range + addRange fires the same selectionchange the product listens
+//      for) over a transcript .filepath span; the button centres on the
+//      selection's visual centre and floats 8×zoom visual px above its top
+//      (the 8px gap is a LAYOUT-px quantity inside the transform).
+//  10. Code-view folder context menu (CodeView .code-ctx, fc2ef59d) —
+//      right-click a .code-tree-row.dir INSIDE the same-origin code iframe.
+//      The standalone code document shares localStorage, so its own :root
+//      carries the same uiScale zoom (prefs.ts's module render-effect runs
+//      in any importing document); the layoutPx seam under test is the
+//      IFRAME document's own, and the click point, menu rect, and zoom
+//      premise are all asserted in the iframe's coordinate space.
 //
-// Surfaces EXCLUDED from this spec (recorded per the slice contract):
-//   - Sidebar / code-dock / tasks-popover pane drags and hover tooltips
-//     (fc2ef59d): same conversion class, outside this slice's four-surface
-//     priority list; tooltip placement already has its own non-zoom spec
-//     (tooltip.spec.ts).
-//   - PathSelectionAction (f9a8bbd4): needs a multi-path selection flow in the
-//     code viewer; lower priority than the four covered surfaces.
+// Surfaces EXCLUDED from this spec: none remain — the original exclusion
+// list (sidebar / code-dock / tasks-popover drags, hover tooltips,
+// PathSelectionAction, code-view folder ctxm) was closed by surfaces 5-10.
 //
 // Engines: spec-compliant CSS zoom needs Chromium ≥ 128 (lane bundles
 // playwright-core 1.60.0 → Chrome for Testing 148.0.7778.96, see
@@ -59,21 +82,15 @@ async function rect(loc: Locator): Promise<Rect> {
   });
 }
 
-// Boot the app with the UI-zoom pref persisted BEFORE first load (the same
-// {v,data} envelope the Settings slider writes), on a DESKTOP viewport so
-// applyScale takes the CSS-zoom branch — mobile-standalone pins --ui-zoom to 1
-// and would fail the premise asserts below, so a vacuously-unzoomed run cannot
-// pass. Then open the demo session and PROVE the premise in the live engine.
-async function openSessionAtZoom(page: Page, scale: number): Promise<void> {
-  await page.setViewportSize({ width: 1280, height: 900 });
-  await page.addInitScript(
-    ([k, v]) => localStorage.setItem(k, JSON.stringify({ v: 1, data: v })),
-    [UI_KEY, scale] as [string, number],
-  );
-  await page.goto(projectUrl("/"));
-  await page.getByRole("button", { name: /Demo session/ }).click();
-  await page.getByPlaceholder(/Message/).waitFor({ timeout: 15000 });
-
+// The live zoom-premise proof, extracted from openSessionAtZoom so ANY test
+// can run it after its OWN navigation (review F1: the TerminalDock drag boots
+// via /?dir=<repo> and previously inferred the zoom implicitly from its
+// 300×scale height assertion). Proves the inline + computed root zoom,
+// --ui-zoom, and — the defect premise itself — that a 100px fixed-probe box
+// renders at 100×zoom VISUAL px (gBCR reports visual px while inline px
+// styles resolve in layout px). If this ever fails, every placement assert
+// in this file is vacuous.
+async function assertZoomPremise(page: Page, scale: number): Promise<void> {
   const premise = await page.evaluate((s) => {
     const root = document.documentElement;
     const cs = getComputedStyle(root);
@@ -92,10 +109,24 @@ async function openSessionAtZoom(page: Page, scale: number): Promise<void> {
   expect(premise.inlineZoom, `root.style.zoom at uiScale=${scale}`).toBe(String(scale));
   expect(Number(premise.computedZoom), `computed root zoom at uiScale=${scale}`).toBeCloseTo(scale, 3);
   expect(premise.uiZoomVar, `--ui-zoom at uiScale=${scale}`).toBe(String(scale));
-  // The defect premise itself, live: a 100 LAYOUT-px box renders at 100×zoom
-  // VISUAL px — gBCR reports visual px while inline px styles resolve in
-  // layout px. If this ever fails, the placement asserts below are vacuous.
   expect(premise.probeW, `100px probe gBCR width at uiScale=${scale}`).toBeCloseTo(100 * scale, 1);
+}
+
+// Boot the app with the UI-zoom pref persisted BEFORE first load (the same
+// {v,data} envelope the Settings slider writes), on a DESKTOP viewport so
+// applyScale takes the CSS-zoom branch — mobile-standalone pins --ui-zoom to 1
+// and would fail the premise asserts below, so a vacuously-unzoomed run cannot
+// pass. Then open the demo session and PROVE the premise in the live engine.
+async function openSessionAtZoom(page: Page, scale: number): Promise<void> {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.addInitScript(
+    ([k, v]) => localStorage.setItem(k, JSON.stringify({ v: 1, data: v })),
+    [UI_KEY, scale] as [string, number],
+  );
+  await page.goto(projectUrl("/"));
+  await page.getByRole("button", { name: /Demo session/ }).click();
+  await page.getByPlaceholder(/Message/).waitFor({ timeout: 15000 });
+  await assertZoomPremise(page, scale);
 }
 
 // The Select popup opens 4px below the trigger's bottom, or flips UP to 4px
@@ -117,6 +148,20 @@ test.skip(
   ({ browserName }) => browserName === "webkit",
   "WebKit does not implement the spec-compliant CSS zoom model this spec asserts",
 );
+
+// Open the code dock on the open demo session by clicking a file path in the
+// transcript (the codeview.spec.ts navigation). The serial lane appends turns
+// to the shared demo session, windowing the original path-bearing messages
+// out of the rendered DOM at the tail — scroll to the top to surface them
+// first. Returns the docked pane locator (the resize handle + head chrome
+// live in the PARENT document; only the tree/file view is inside the iframe).
+async function openCodeDock(page: Page): Promise<Locator> {
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => (el.scrollTop = 0));
+  await page.locator(".filepath", { hasText: "src/parser.go" }).first().click();
+  const dock = page.locator(".code-dock.dock");
+  await expect(dock).toBeVisible({ timeout: 6000 });
+  return dock;
+}
 
 for (const scale of [1.25, 0.8] as const) {
   const pct = `${Math.round(scale * 100)}%`;
@@ -149,6 +194,12 @@ for (const scale of [1.25, 0.8] as const) {
     // The composer bar sits at the screen bottom, so this exercises the
     // FLIP-UP branch (bottom-anchored popup) of Select's popStyle.
     await expectSelectTracks(pop, trig);
+    // Flip-branch pinning (review F7): expectSelectTracks accepts EITHER
+    // branch via min(gapDown, gapUp) — pin THIS one to flip-up: the popup's
+    // bottom edge must sit ≈4px ABOVE the trigger's top, never below it.
+    const pf = await rect(pop);
+    const tf = await rect(trig);
+    expect(pf.bottom, "flip-up branch pinned: popup visual bottom ≤ trigger visual top").toBeLessThanOrEqual(tf.top + TOL);
     await page.keyboard.press("Escape");
   });
 
@@ -179,6 +230,251 @@ for (const scale of [1.25, 0.8] as const) {
     await page.keyboard.press("Escape");
   });
 
+  test(`sidebar drag-resize tracks the pointer at UI zoom ${pct}`, async ({ page }) => {
+    await openSessionAtZoom(page, scale);
+    const sb = page.locator(".sidebar");
+    await expect(sb).toBeVisible();
+    const handle = page.locator(".sidebar-resize");
+    // Desktop 1280px viewport → the wide (non-rail) band, where the handle is
+    // displayed (rail hides it; see 10-sidebar-statusmark.css).
+    await expect(handle).toBeVisible();
+
+    // Sidebar.startResize (fc2ef59d): the sidebar is pinned to the viewport's
+    // left, so the new width IS the pointer's X — setSidebarWidth(layoutPx(
+    // clientX)) (clamped 200..480 LAYOUT px, rounded to int) → the sidebar's
+    // VISUAL right edge lands exactly at the pointer's final VISUAL X, at any
+    // zoom. (Growth-vs-drag-distance is NOT the clean invariant here: the
+    // handle's centre sits 5 LAYOUT px inside the edge, so the edge-to-pointer
+    // contract is the honest assertion — unlike the TerminalDock drag, whose
+    // handle straddles the edge ±0.5px.) The .sidebar width carries a 0.16s
+    // transition — settle before measuring.
+    const before = await rect(sb);
+    const h = await rect(handle);
+    const cy = h.top + h.height / 2;
+    const x0 = h.left + h.width / 2;
+    const DRAG = 100; // visual px, rightward
+    const xEnd = x0 + DRAG;
+    await page.mouse.move(x0, cy);
+    await page.mouse.down();
+    await page.mouse.move(xEnd, cy, { steps: 8 });
+    await page.mouse.up();
+    await page.waitForTimeout(350); // let the width transition settle
+
+    const after = await rect(sb);
+    expect(Math.abs(after.right - xEnd), "sidebar visual right edge lands at the pointer's final X").toBeLessThanOrEqual(TOL);
+    expect(Math.abs(after.width - xEnd), "sidebar visual width ≈ pointer's final visual X (pinned at viewport left)").toBeLessThanOrEqual(TOL);
+    // Non-vacuity: the drag visibly widened the sidebar.
+    expect(after.width, "sidebar actually grew").toBeGreaterThan(before.width);
+  });
+
+  test(`code dock drag-resize tracks the pointer at UI zoom ${pct}`, async ({ page }) => {
+    await openSessionAtZoom(page, scale);
+    const dock = await openCodeDock(page);
+
+    // CodeFrame.startResize (fc2ef59d): delta-based — the dock is right-docked
+    // by default, so dragging the inner (left) edge LEFT by D VISUAL px adds
+    // D/z to flex-basis (LAYOUT px, clamped 280..900, rounded) → the dock's
+    // VISUAL width grows by exactly D and its left edge tracks the pointer.
+    // No transition on .code-dock — measure right after pointerup.
+    const before = await rect(dock);
+    const handle = page.locator(".code-dock-resize");
+    const h = await rect(handle);
+    const cy = h.top + h.height / 2;
+    const x0 = h.left + h.width / 2;
+    const DRAG = 100; // visual px, leftward (widens a right-docked pane)
+    await page.mouse.move(x0, cy);
+    await page.mouse.down();
+    await page.mouse.move(x0 - DRAG, cy, { steps: 8 });
+    await page.mouse.up();
+
+    const after = await rect(dock);
+    expect(Math.abs(after.width - before.width - DRAG), "code dock visual width grows by the visual drag distance").toBeLessThanOrEqual(TOL);
+    expect(Math.abs(before.left - after.left - DRAG), "code dock visual left edge tracks the pointer").toBeLessThanOrEqual(TOL);
+
+    // Serial-lane hygiene: close the dock (state is per-context anyway, but
+    // leave the shared fixture session's UI tidy).
+    await page.locator(".code-dock .icon-btn[aria-label='Close']").click();
+    await expect(page.locator(".code-dock.dock")).toHaveCount(0);
+  });
+
+  test(`tasks popover drag-resize tracks the pointer at UI zoom ${pct}`, async ({ page }) => {
+    await openSessionAtZoom(page, scale);
+    // The fixture seeds the demo session's todos (pkg/fixtures/opencode.go:
+    // 1 in_progress + 3 pending), so the Tasks pill appears once the
+    // subtree-todos poll settles (immediate fetch + 5s cadence).
+    const pill = page.locator(".tasks-pill");
+    await expect(pill).toBeVisible({ timeout: 15000 });
+    await pill.click();
+    const pop = page.locator(".tasks-popup");
+    await expect(pop).toBeVisible();
+
+    // ChatTasksStatus.startTasksResize (fc2ef59d): the grip at the popup's
+    // top-left grows the popup UP/LEFT from its bottom-right anchor — the
+    // width/height inline styles are LAYOUT px fed layoutPx-converted pointer
+    // deltas (w clamped 220..560, h ≤ 0.72×layoutPx(innerHeight)), so a
+    // D-VISUAL-px drag grows the VISUAL dimension by exactly D while the
+    // anchored right/bottom edges stay put.
+    const before = await rect(pop);
+    const grip = page.locator(".tasks-resize");
+    const g = await rect(grip);
+    const x0 = g.left + g.width / 2;
+    const y0 = g.top + g.height / 2;
+    const DX = 80; // visual px, leftward → wider
+    const DY = 60; // visual px, upward → taller
+    await page.mouse.move(x0, y0);
+    await page.mouse.down();
+    await page.mouse.move(x0 - DX, y0 - DY, { steps: 8 });
+    await page.mouse.up();
+
+    const after = await rect(pop);
+    expect(Math.abs(after.width - before.width - DX), "tasks popup visual width grows by the visual drag delta").toBeLessThanOrEqual(TOL);
+    expect(Math.abs(after.height - before.height - DY), "tasks popup visual height grows by the visual drag delta").toBeLessThanOrEqual(TOL);
+    expect(Math.abs(after.right - before.right), "popup stays anchored at its visual right edge").toBeLessThanOrEqual(TOL);
+    expect(Math.abs(after.bottom - before.bottom), "popup stays anchored at its visual bottom edge").toBeLessThanOrEqual(TOL);
+
+    // Hygiene: toggle the popover closed (the persisted size is per-context).
+    await pill.click();
+    await expect(pop).toHaveCount(0);
+  });
+
+  test(`hover tooltip tracks its anchor at UI zoom ${pct}`, async ({ page }) => {
+    await openSessionAtZoom(page, scale);
+    // A real data-tip surface in the unclamped mid-screen regime: the
+    // sidebar's search toggle. Hover arms the 450ms delay, then the bubble
+    // places. tip-in animates opacity only — gBCR is stable while it fades.
+    const anchor = page.locator(".icon-btn[aria-label='Search sessions']");
+    await expect(anchor).toBeVisible();
+    await anchor.hover();
+    const bubble = page.locator(".tooltip");
+    await expect(bubble).toBeVisible({ timeout: 5000 });
+
+    // placeTooltip computes in VIEWPORT px (anchor gBCR, bubble gBCR, and
+    // innerWidth/innerHeight are all visual); Tooltip.tsx converts the
+    // assigned left/top through layoutPx — so the bubble's VISUAL centre-x
+    // tracks the anchor's visual centre and, on the below branch (anchor
+    // near the screen top), its visual top sits 6px under the anchor's
+    // visual bottom, at any zoom.
+    const a = await rect(anchor);
+    const b = await rect(bubble);
+    const anchorCx = a.left + a.width / 2;
+    expect(Math.abs(b.left + b.width / 2 - anchorCx), "tooltip visual centre ≈ anchor visual centre").toBeLessThanOrEqual(TOL);
+    expect(Math.abs(b.top - (a.bottom + 6)), "tooltip visual top ≈ 6px below anchor visual bottom").toBeLessThanOrEqual(TOL);
+    // Mouse off the anchor onto a tip-free surface (the composer textarea)
+    // so the bubble hides again — a blind mid-screen move could land on a
+    // transcript data-tip element and re-arm a NEW bubble (lane hygiene).
+    await page.getByPlaceholder(/Message/).hover();
+    await expect(bubble).toHaveCount(0);
+  });
+
+  test(`path selection action floats above the selection at UI zoom ${pct}`, async ({ page }) => {
+    await openSessionAtZoom(page, scale);
+    await page.locator(".chat-scroll").evaluate((el: HTMLElement) => (el.scrollTop = 0));
+    const span = page.locator(".filepath", { hasText: "src/parser.go" }).first();
+    await expect(span).toBeVisible();
+
+    // A REAL DOM selection over the path span: Range + addRange fires the
+    // same selectionchange the component listens for, and the geometry comes
+    // from the same getRangeAt(0).getBoundingClientRect() the product reads.
+    await span.evaluate((el) => {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    });
+    const btn = page.getByRole("button", { name: /Open file/ });
+    await expect(btn).toBeVisible({ timeout: 5000 });
+
+    // PathSelectionAction (f9a8bbd4): left = layoutPx(selection centre-x),
+    // top = layoutPx(selection top); the fixed button then self-translates
+    // (-50%, calc(-100% - 8px)) — so its VISUAL centre-x equals the
+    // selection's visual centre and its VISUAL bottom sits 8×zoom px above
+    // the selection's visual top (the 8px gap lives in the transform, a
+    // LAYOUT-px quantity — it is NOT zoom-compensated, by design).
+    const s = await rect(span);
+    const b = await rect(btn);
+    const selCx = s.left + s.width / 2;
+    expect(Math.abs(b.left + b.width / 2 - selCx), "action visual centre ≈ selection visual centre").toBeLessThanOrEqual(TOL);
+    expect(Math.abs(b.bottom - (s.top - 8 * scale)), "action visual bottom ≈ 8×zoom px above selection visual top").toBeLessThanOrEqual(TOL);
+
+    // Hygiene: drop the selection (hides the button via the same rAF path).
+    await page.evaluate(() => window.getSelection()?.removeAllRanges());
+    await expect(btn).toHaveCount(0);
+  });
+
+  test(`code-view folder context menu lands at the pointer at UI zoom ${pct}`, async ({ page }) => {
+    // The demo fixture dir is EMPTY on disk (its transcript paths like
+    // src/parser.go are fake — only the chat content exists), so the code TREE
+    // needs a real project. Boot the repo itself (same rationale as the
+    // TerminalDock describe: repoRoot is a real on-disk dir) and open the code
+    // dock with its Ctrl+B hotkey (App.tsx global binding — the header
+    // switcher has no Code tab; the dock is the code surface).
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.addInitScript(
+      ([k, v]) => localStorage.setItem(k, JSON.stringify({ v: 1, data: v })),
+      [UI_KEY, scale] as [string, number],
+    );
+    await page.goto(`/?dir=${encodeURIComponent(repoRoot)}`);
+    await assertZoomPremise(page, scale); // F1: prove the premise on THIS navigation
+    await page.keyboard.press("Control+b");
+    const dock = page.locator(".code-dock.dock");
+    await expect(dock).toBeVisible({ timeout: 6000 });
+
+    // The tree (and its fixed .code-ctx menu) live INSIDE the same-origin
+    // code iframe. The standalone code document shares localStorage, so its
+    // own :root carries the same zoom (prefs.ts's module render-effect runs
+    // in any importing document) — prove that in-iframe premise, then assert
+    // EVERYTHING (click point, menu rect) in the iframe's own coordinate
+    // space: the menu tracks the pointer iff the iframe document's layoutPx
+    // conversion (fc2ef59d) is correct, regardless of how the parent's zoom
+    // layers onto the frame box.
+    const code = page.frameLocator('iframe[title="Code"]');
+    const framePremise = await code.locator("html").evaluate((el) => {
+      const cs = getComputedStyle(el);
+      return {
+        inlineZoom: (el as HTMLElement).style.zoom,
+        uiZoomVar: cs.getPropertyValue("--ui-zoom").trim(),
+      };
+    });
+    expect(framePremise.inlineZoom, `iframe root.style.zoom at uiScale=${scale}`).toBe(String(scale));
+    expect(framePremise.uiZoomVar, `iframe --ui-zoom at uiScale=${scale}`).toBe(String(scale));
+
+    const row = code.locator(".code-tree-row.dir").first();
+    await expect(row).toBeVisible({ timeout: 8000 });
+    const r = await row.evaluate((el) => {
+      const b = el.getBoundingClientRect();
+      return { left: b.left, top: b.top, width: b.width, height: b.height };
+    });
+    // Right-click the row's centre. Playwright's click hit-test mis-maps
+    // element-relative offsets for an iframe nested in a CSS-zoomed parent
+    // whose OWN document is also zoomed (the computed point lands off the row
+    // — observed interceptors differ per zoom: the row's <aside> at 1.25, the
+    // frame <html> at 0.8), so dispatch the contextmenu SYNTHETICALLY at the
+    // row's real in-iframe gBCR centre — the same clientX/clientY (the
+    // iframe's visual space) a real pointer at that point would produce.
+    // Everything downstream of the event is fully live: Solid's delegated
+    // handler, the layoutPx conversion in the zoomed iframe document, and
+    // the fixed menu's rendered position.
+    await row.evaluate((el, pos) => {
+      el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: pos.x, clientY: pos.y }));
+    }, { x: r.left + r.width * 0.5, y: r.top + r.height / 2 });
+    const menu = code.locator(".code-ctx");
+    await expect(menu).toBeVisible();
+    const m = await menu.evaluate((el) => {
+      const b = el.getBoundingClientRect();
+      return { left: b.left, top: b.top };
+    });
+    expect(Math.abs(m.left - (r.left + r.width * 0.5)), "code ctx visual left ≈ pointer clientX (iframe space)").toBeLessThanOrEqual(TOL);
+    expect(Math.abs(m.top - (r.top + r.height / 2)), "code ctx visual top ≈ pointer clientY (iframe space)").toBeLessThanOrEqual(TOL);
+
+    // Hygiene: close the dock — the parent-document click does NOT reach the
+    // iframe's own document-click dismiss (separate documents), but the dock
+    // unmount hides the frame (and its menu) and the per-test context dies
+    // with it anyway.
+    await page.locator(".code-dock .icon-btn[aria-label='Close']").click();
+    await expect(page.locator(".code-dock.dock")).toHaveCount(0);
+  });
+
   test.describe(`terminal dock drag at UI zoom ${pct}`, () => {
     test.beforeEach(async ({ request }) => {
       // Same rationale as terminal.spec.ts: one shared fixtureserver backs the
@@ -204,6 +500,10 @@ for (const scale of [1.25, 0.8] as const) {
       await page.getByRole("button", { name: "Terminal", exact: true }).click();
       const dock = page.locator(".term-dock");
       await expect(dock).toBeVisible();
+      // Review F1: prove the live zoom premise on THIS navigation too (this
+      // describe boots via /?dir=<repo>, not openSessionAtZoom) instead of
+      // inferring the zoom implicitly from the 300×scale height assert below.
+      await assertZoomPremise(page, scale);
 
       // Default height is 300 LAYOUT px (vh.term.height.v1) → the dock renders
       // 300×zoom VISUAL px — a real-surface restatement of the zoom premise.
@@ -212,8 +512,12 @@ for (const scale of [1.25, 0.8] as const) {
 
       // startResize (f9a8bbd4): height = layoutPx(innerHeight − clientY), so
       // dragging the edge up by D VISUAL px must grow the dock by exactly D
-      // VISUAL px at any zoom. Without the conversion it grows by D×zoom
-      // (150px at 125% / 96px at 80% for D=120 — far outside TOL).
+      // VISUAL px at any zoom. The pre-fix code recomputed the height from
+      // viewport coords each move (h = innerHeight − clientY, unconverted —
+      // NOT an incremental-drag defect that would grow D×zoom): at a 300
+      // layout-px start height a 120 visual-px drag writes h = 300z + 120
+      // LAYOUT px, so the VISUAL growth is 300z(z−1) + 120z ≈ +244px at 1.25
+      // and ≈ +48px at 0.8 — both far outside TOL.
       const handle = page.locator(".term-dock-resize");
       const h = await rect(handle);
       const cx = h.left + h.width / 2;
@@ -233,6 +537,15 @@ for (const scale of [1.25, 0.8] as const) {
 
 test("settings display-font select popup (open-down) tracks its trigger at UI zoom 125%", async ({ page }) => {
   await openSessionAtZoom(page, 1.25);
+  // Branch determinism for the F7 pin: Select flips UP when less than
+  // min(maxH,220)px of viewport remains below the trigger (Select.tsx
+  // popStyle). The Settings dialog is a FIXED min(82vh,560px) layout-px tall
+  // (70-composer-diff-git.css .dialog.settings) and flex-centered, so the
+  // Display-font row (near the tab's bottom) sits ~697 visual px into the
+  // dialog — on the standard 900px viewport only ~103px remain below and the
+  // popup flips UP. Grow the viewport to 1400px: the fixed-height dialog just
+  // re-centers, leaving ~353px below the trigger → the open-down branch.
+  await page.setViewportSize({ width: 1280, height: 1400 });
   await page.getByRole("button", { name: "Settings" }).click();
   const dialog = page.getByRole("dialog", { name: "Settings" });
   await dialog.getByRole("button", { name: "Appearance" }).click();
@@ -241,8 +554,15 @@ test("settings display-font select popup (open-down) tracks its trigger at UI zo
   await trig.click();
   const pop = page.locator(".vh-select-pop");
   await expect(pop).toBeVisible();
-  // Mid-screen trigger → the OPEN-DOWN branch (top-anchored popup).
+  // Tall-viewport trigger → the OPEN-DOWN branch (top-anchored popup).
   await expectSelectTracks(pop, trig);
+  // Flip-branch pinning (review F7): pin THIS one to open-down — the popup's
+  // top edge must sit ≈4px BELOW the trigger's bottom, never above it.
+  {
+    const pd = await rect(pop);
+    const td = await rect(trig);
+    expect(pd.top, "open-down branch pinned: popup visual top ≥ trigger visual bottom").toBeGreaterThanOrEqual(td.bottom - TOL);
+  }
   await page.keyboard.press("Escape");
 });
 
