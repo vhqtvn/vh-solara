@@ -810,6 +810,7 @@ func (f *FakeOpenCode) Handler() http.Handler {
 	})
 	mux.HandleFunc("/fixture/reset", f.handleFixtureReset)
 	mux.HandleFunc("/fixture/busy", f.handleFixtureBusy)
+	mux.HandleFunc("/fixture/compaction-burst", f.handleFixtureCompactionBurst)
 	mux.HandleFunc("/fixture/delete", f.handleFixtureDelete)
 	mux.HandleFunc("/question/", f.handleQuestion)
 	mux.HandleFunc("/question", func(w http.ResponseWriter, r *http.Request) {
@@ -1735,6 +1736,190 @@ func (f *FakeOpenCode) handleFixtureBusy(w http.ResponseWriter, r *http.Request)
 		"status":    map[string]any{"type": "busy"},
 	})
 	writeJSON(w, map[string]any{"busy": session})
+}
+
+// handleFixtureCompactionBurst scripts the incident-shaped end-of-turn
+// compaction burst (2026-08-19 stale-rows incident; FE fix 281a2f2+bcc578c,
+// server egress filter 9401881) onto a session through the fake's REAL /event
+// stream — the same authoritative ingress path production events take. It is
+// the fixture-side scripting seam for web/tests/e2e/compaction-burst.spec.ts:
+//
+//	POST /fixture/compaction-burst?session=<sid>&tag=<unique>&parents=<n>&promote=<k>
+//
+// Emitted sequence (deterministic order, all via f.emit):
+//  1. session.status busy — a live turn starts.
+//  2. The REAL live tail: a user message + text part, then an assistant
+//     message whose final text part and completed message.updated land last.
+//     This assistant message is the session's real newest message.
+//  3. THE BURST: `parents` message ids (tag-m0..m{n-1}) that NEVER receive a
+//     message.updated during the burst receive part-ONLY
+//     message.part.updated frames — COMPLETED tool parts with old time
+//     windows, the fork-like re-publication shape (every 3rd parent gets a
+//     second part so multi-part shadows are exercised). Because the store
+//     holds part-first messages as keyless placeholders appended at order END
+//     (pkg/state reducers.go upsertPartLocked → hydration.go
+//     insertMessageIDOrdered: keyless sorts +∞), each parent is the NEWEST
+//     and therefore INSIDE the egress window (message_window.go: newest is
+//     always in-window) — the real Stream-2 sendable filter DELIVERS these
+//     frames by design (the "keyless newest message on the live tail" class).
+//     The FE must hold them as keyless shadows: never rendered, never ordered.
+//  4. PROMOTION: the first `promote` parents receive message.updated with OLD
+//     ascending time.created (minutes ago, older than the live tail). The FE
+//     promotion path re-slots these ex-shadows into their chronological
+//     positions BEFORE the live tail — rendered, but never as tail rows.
+//  5. session.idle — the turn ends; the transcript must settle clean.
+//
+// The handler also PERSISTS the scripted messages into f.messages (keyed info
+// for live tail + promoted parents; stub info for unpromoted parents) so the
+// established /fixture/reset hygiene removes them: reset diffs f.messages
+// against the seeded baseline and emits message.removed for every scripted
+// id, clearing both the fixture store and the aggregator store for later
+// serial-suite specs. Test-only infrastructure — never exercised by the
+// shipped binary.
+func (f *FakeOpenCode) handleFixtureCompactionBurst(w http.ResponseWriter, r *http.Request) {
+	session := r.URL.Query().Get("session")
+	tag := r.URL.Query().Get("tag")
+	parents, _ := strconv.Atoi(r.URL.Query().Get("parents"))
+	promote, _ := strconv.Atoi(r.URL.Query().Get("promote"))
+	if session == "" || tag == "" || parents <= 0 || promote < 0 || promote > parents {
+		http.Error(w, "need session, tag, parents>0, 0<=promote<=parents", http.StatusBadRequest)
+		return
+	}
+	now := func() float64 { return float64(time.Now().UnixMilli()) }
+	f.mu.Lock()
+	f.counter++
+	n := f.counter
+	f.mu.Unlock()
+
+	// Phase 1 — busy.
+	f.emit("session.status", map[string]any{"sessionID": session, "status": map[string]any{"type": "busy"}})
+
+	// Phase 2 — the real live tail (user + completed assistant).
+	userID := tag + "-lu"
+	asstID := tag + "-la"
+	t0 := now()
+	userInfo := map[string]any{"id": userID, "sessionID": session, "role": "user", "time": map[string]any{"created": t0, "completed": t0}}
+	userPart := textPart(userID, session, tag+"-lup", "Run the end-of-turn migration.", t0)
+	f.emit("message.updated", map[string]any{"info": userInfo})
+	f.emit("message.part.updated", map[string]any{"part": userPart})
+	time.Sleep(40 * time.Millisecond)
+	asstInfo := map[string]any{"id": asstID, "sessionID": session, "role": "assistant", "agent": "build",
+		"time": map[string]any{"created": now()}}
+	f.emit("message.updated", map[string]any{"info": asstInfo})
+	asstText := "Migration applied. Compaction sweep finished; the transcript tail stays clean."
+	asstPart := textPart(asstID, session, tag+"-lap", asstText, now())
+	f.emit("message.part.updated", map[string]any{"part": asstPart})
+	// Mirror streamAssistant's real bookend: the final message.part.updated is
+	// followed by message.updated carrying time.completed (the settle signal
+	// the FE's settled() presentation reads) before the turn ends.
+	asstInfo["time"] = map[string]any{"created": asstInfo["time"].(map[string]any)["created"], "completed": now()}
+	f.emit("message.updated", map[string]any{"info": asstInfo})
+	time.Sleep(40 * time.Millisecond)
+
+	// Phase 3 — THE BURST: part-ONLY re-publications for non-resident parents.
+	// No message.updated is emitted for these ids until Phase 4 (and never for
+	// the unpromoted remainder). Tool outputs are a few hundred bytes each —
+	// incident-shaped completed tool bodies, kept small so the whole burst sits
+	// far inside the egress window's 1 MiB byte bound.
+	toolBody := func(i int) string {
+		return strings.Repeat(fmt.Sprintf("src/pkg%02d/file.go:%d: match line with context\n", i%7, 10+i), 8)
+	}
+	type scripted struct {
+		info    map[string]any   // nil for unpromoted (stub written at persist time)
+		parts   []map[string]any // keyed by the parent's own part ids
+		created float64
+	}
+	burst := make([]scripted, parents)
+	for i := 0; i < parents; i++ {
+		mid := fmt.Sprintf("%s-m%d", tag, i)
+		pid := fmt.Sprintf("%s-pt%d", tag, i)
+		old := now() - float64((parents-i)*60_000) // old, ascending per i
+		part := map[string]any{
+			"id": pid, "sessionID": session, "messageID": mid, "type": "tool",
+			"callID": fmt.Sprintf("%s-c%d", tag, i), "tool": "grep",
+			"state": map[string]any{
+				"status": "completed", "title": fmt.Sprintf("search history slice %d", i),
+				"input":  map[string]any{"pattern": fmt.Sprintf("token%d", i)},
+				"output": toolBody(i),
+				"time":   map[string]any{"start": old, "end": old + 800},
+			},
+		}
+		f.emit("message.part.updated", map[string]any{"part": part})
+		p := []map[string]any{part}
+		if i%3 == 0 {
+			// A second part for every 3rd parent: multi-part shadows.
+			pid2 := fmt.Sprintf("%s-pt%db", tag, i)
+			part2 := map[string]any{
+				"id": pid2, "sessionID": session, "messageID": mid, "type": "tool",
+				"callID": fmt.Sprintf("%s-c%db", tag, i), "tool": "read",
+				"state": map[string]any{
+					"status": "completed", "title": fmt.Sprintf("read file slice %d", i),
+					"input":  map[string]any{"filePath": fmt.Sprintf("src/pkg%02d/file.go", i%7)},
+					"output": "package demo\n\n// re-published historical file body\n",
+					"time":   map[string]any{"start": old + 100, "end": old + 600},
+				},
+			}
+			f.emit("message.part.updated", map[string]any{"part": part2})
+			p = append(p, part2)
+		}
+		burst[i] = scripted{parts: p, created: old}
+	}
+
+	// Phase 4 — promotion: keyed message.updated for the FIRST `promote`
+	// parents, with time.created older than the live tail and ascending with
+	// i (m0 oldest), so each promoted ex-shadow must slot chronologically
+	// BEFORE the live tail, in ascending-created order.
+	time.Sleep(40 * time.Millisecond)
+	for i := 0; i < promote; i++ {
+		mid := fmt.Sprintf("%s-m%d", tag, i)
+		created := now() - float64((parents-i)*60_000)
+		info := map[string]any{"id": mid, "sessionID": session, "role": "assistant", "agent": "build",
+			"time": map[string]any{"created": created, "completed": created + 900}}
+		f.emit("message.updated", map[string]any{"info": info})
+		burst[i].info = info
+		burst[i].created = created
+	}
+
+	// Phase 5 — idle.
+	f.emit("session.idle", map[string]any{"sessionID": session})
+
+	// Persist the scripted transcript so /fixture/reset removes it (diff vs
+	// seeded baseline emits message.removed per id, clearing the aggregator
+	// store too). Unpromoted parents get stub info — their identity exists only
+	// for the reset diff; nothing fetches them before the reset.
+	f.mu.Lock()
+	f.messages[session] = append(f.messages[session],
+		messageWithParts{Info: userInfo, Parts: []map[string]any{userPart}},
+		messageWithParts{Info: asstInfo, Parts: []map[string]any{asstPart}},
+	)
+	for i := range burst {
+		info := burst[i].info
+		if info == nil {
+			mid := fmt.Sprintf("%s-m%d", tag, i)
+			info = map[string]any{"id": mid, "sessionID": session, "role": "assistant"}
+		}
+		f.messages[session] = append(f.messages[session], messageWithParts{Info: info, Parts: burst[i].parts})
+	}
+	f.mu.Unlock()
+
+	writeJSON(w, map[string]any{
+		"session": session, "tag": tag, "parents": parents, "promote": promote,
+		"user": userID, "assistant": asstID, "turn": n,
+		"promoted": func() []string {
+			out := []string{}
+			for i := 0; i < promote; i++ {
+				out = append(out, fmt.Sprintf("%s-m%d", tag, i))
+			}
+			return out
+		}(),
+		"unpromoted": func() []string {
+			out := []string{}
+			for i := promote; i < parents; i++ {
+				out = append(out, fmt.Sprintf("%s-m%d", tag, i))
+			}
+			return out
+		}(),
+	})
 }
 
 // handleFixtureDelete removes a session entirely from the fake's in-memory
