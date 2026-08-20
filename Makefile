@@ -8,10 +8,13 @@
 .PHONY: web web-materialize host-web host-web-materialize embed-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-docker test-host-web-preview test-host-web-real-embed verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed clean-host-web-embed
 
 # Version stamping: local builds set cmd.Version to "<latest v-tag>+dev" (e.g.
-# v1.60.0+dev) so update checks treat them as newer-than/no-equal-to any tagged
-# release — never as a released version (release.yml stamps the bare tag via its
-# own ldflags and does not use these targets). Falls back to bare "dev" when git
-# describe finds no v* tag (e.g. a tarball export). Caller-overridable:
+# v1.60.0+dev) so the self-update check never treats them as an already-released
+# version: cmd/update.go compares by exact string equality against the release
+# tag, and "v1.60.0+dev" does not exactly equal the bare tag "v1.60.0". That
+# establishes inequality only — the check implements no version ordering or
+# SemVer precedence (release.yml stamps the bare tag via its own ldflags and
+# does not use these targets). Falls back to bare "dev" when git describe finds
+# no v* tag (e.g. a tarball export). Caller-overridable:
 # `make build VERSION=v9.9.9-custom`.
 V_LATEST ?= $(shell git describe --tags --abbrev=0 --match 'v*' 2>/dev/null)
 VERSION ?= $(if $(V_LATEST),$(V_LATEST)+dev,dev)
@@ -115,8 +118,8 @@ typecheck: ## Typecheck the web SPA (mirrors CI's `npm run typecheck`)
 
 verify: fmt-check vet test typecheck ## Local end-of-impl/release verification gate (mirrors CI: gofmt -> vet -> test -> typecheck). Run before any release or declaring implementation done.
 
-fixtures: embed-materialize ## Run the fixture-backed web stack locally on :8099 (no opencode needed); stamps cmd.Version=$(VERSION)
-	go run -ldflags "$(VERSION_LDFLAGS)" ./tools/fixtureserver -addr 127.0.0.1:8099
+fixtures: embed-materialize ## Run the fixture-backed web stack locally on :8099 (no opencode needed)
+	go run ./tools/fixtureserver -addr 127.0.0.1:8099
 
 bench: ## Benchmark the chat view (VH_BENCH_MESSAGES=N complex messages, default 300)
 	bash web/scripts/bench.sh
