@@ -296,6 +296,34 @@ export function projectMessageEvent(
         }
         prependMessagesIfAbsent(s.messages[payload.sessionID], items);
         s.messageWindows[payload.sessionID] = deriveMessageWindow(items, payload.window);
+        // Cross-stream completion bridge, arrival-path #3 (cold-load orphan
+        // tail). The bridge's two existing paths — the discrete activity=idle
+        // event and the snapshot projections — both no-op unless the session's
+        // messages are ALREADY resident, because they can only stamp what they
+        // can see. A cold load of a session whose opencode died mid-generation
+        // inverts that ordering: activity is idle in the boot snapshot (the
+        // daemon's status reconcile already cleared it), and only LATER does
+        // the transcript arrive here. Without this stamp nothing ever delivers
+        // a terminal for that orphaned last assistant message — no
+        // message.upsert{completed} will come, the instance is dead — so the
+        // tail renders live forever (blinking stream-caret + an ever-ticking
+        // ReasoningPart "Thinking…" timer) on every fresh load of an idle
+        // session. Stamping here, in the SAME produce() draft that installs
+        // the transcript, means the FIRST render of the tail is already
+        // settled (no transient live-then-settle flash).
+        //
+        // The epoch gate proves this boot's s.activity is server-refreshed:
+        // s.epoch is set only by an applied snapshot (never persisted — check-
+        // mated against the stale localStorage activity seed), and applying a
+        // snapshot wholesale-replaces s.activity. With epoch unset (messages
+        // somehow raced ahead of the first snapshot), we render live — the
+        // conservative direction — and the EXISTING snapshot-path stamp heals
+        // it once the snapshot lands (messages are resident by then). A
+        // genuinely busy session never stamps: the helper's own guard requires
+        // activity === "idle", the same server-authoritative signal
+        // sessionWorking trusts (selectors.ts:121-124 — no message-based
+        // heuristic).
+        if (s.epoch !== "") stampCompletionIfIdle(s, payload.sessionID);
       }
       break;
     }

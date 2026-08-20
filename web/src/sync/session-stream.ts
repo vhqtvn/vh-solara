@@ -53,6 +53,7 @@ import {
   isPageDirtyingKind,
 } from "./history";
 import { applyMessageEvent, bumpUpdating } from "./reconcile";
+import { stampCompletionIfIdle } from "./reducers";
 import {
   recordLatency,
   getExpectSessionSnap,
@@ -494,6 +495,19 @@ export function applySessionSnapshot(id: string, snap: Snapshot) {
       // guard: only the opened session is ever touched.
       const sessInfo = snap.sessions?.find((x) => x?.id === id);
       if (sessInfo) s.sessions[id] = sessInfo;
+      // Cross-stream completion bridge, arrival-path #3 (see the messages.batch
+      // twin in reducers.ts): a session snapshot can be the moment a cold
+      // session's messages become resident — the daemon already holds the full
+      // transcript (e.g. it was open when opencode died mid-generation), so
+      // Stream-2's snapshot — not a later messages.batch — delivers the
+      // orphaned incomplete tail. Activity for an already-dead session is
+      // idle in the boot snapshot and never transitions again, so the
+      // discrete-activity bridge cannot fire; stamp here, in the SAME
+      // produce() that installs the rows, so the tail's first paint is
+      // settled. The epoch gate (server-refreshed activity, not the stale
+      // localStorage seed) + the helper's idle guard keep genuinely streaming
+      // sessions live.
+      if (s.epoch !== "") stampCompletionIfIdle(s, id);
     }),
   );
   // Phase 3 (transcript windowing): populate the resident-window state from the

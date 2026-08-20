@@ -165,6 +165,13 @@ function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) 
   const elapsed = () => {
     const s = start();
     if (!s) return "";
+    // Settled with no end — an orphaned tail (the instance died mid-thought;
+    // the cross-stream completion bridge stamped the MESSAGE terminal, but
+    // nothing will ever stamp this part's time.end). The true duration is
+    // unknown: `now` froze at component creation, so the fallback below would
+    // show a bogus frozen (page-load − start) delta that grows with every
+    // reload. Render nothing — unknown, not fabricated.
+    if (!live() && !end()) return "";
     const secs = Math.max(0, Math.round(((end() ?? now()) - s) / 1000));
     return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${secs % 60}s`;
   };

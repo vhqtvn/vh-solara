@@ -324,3 +324,151 @@ describe("idle bridge vs keyless shadows (incident 2026-08-19)", () => {
     expect(store.state.messages["s1"].byId["mLost"].parts["pTurn"].text).toBe("streamed answer");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Arrival-path #3 — the cold-load orphan tail (2026-08-20 dead-instance bug).
+//
+// The bridge's discrete-activity and snapshot paths both require the session's
+// messages to be ALREADY resident when idle is observed. A cold load of a
+// session whose opencode instance DIED mid-generation inverts that ordering:
+// activity is idle in the boot snapshot (the daemon's status reconcile cleared
+// it; no transition will ever fire again), and the transcript arrives only
+// when the user opens the session — via messages.batch (cold upstream fetch)
+// or the Stream-2 session snapshot (daemon-resident history). Without a stamp
+// at those arrival moments, the orphaned last assistant message (no
+// time.completed, reasoning part with no time.end) renders live forever:
+// blinking stream-caret + ever-ticking ReasoningPart "Thinking…" timer on
+// every fresh load of an idle session.
+//
+// The stamp is gated on s.epoch (a snapshot applied THIS boot ⇒ s.activity is
+// server-refreshed, not the stale localStorage seed) and on the helper's own
+// activity==="idle" guard — the same server-authoritative signal
+// sessionWorking trusts. A genuinely busy session never stamps.
+// ---------------------------------------------------------------------------
+describe("arrival-path #3 — cold-load orphan tail (messages become resident while already idle)", () => {
+  // The dead-instance shape: a user turn, then an assistant turn that died
+  // mid-generation — no time.completed, and a reasoning part with time.start
+  // but NO time.end (nothing will ever stamp either terminal).
+  const orphanBatch = (sid: string) => ({
+    sessionID: sid,
+    messages: [
+      {
+        info: { id: "mUser", sessionID: sid, role: "user", time: { created: 10 } },
+        parts: [{ id: "pu", sessionID: sid, messageID: "mUser", type: "text", text: "go" }],
+      },
+      {
+        info: { id: "mOrphan", sessionID: sid, role: "assistant", time: { created: 20 } },
+        parts: [
+          { id: "pr", sessionID: sid, messageID: "mOrphan", type: "reasoning", text: "half a thought", time: { start: 21 } },
+        ],
+      },
+    ],
+  });
+
+  // Seed everything EXCEPT the messages: session known, activity authoritative
+  // (`act`), and a snapshot having landed this boot (epoch set) unless
+  // `withEpoch` is false.
+  function seedIdleScope(act: string, withEpoch = true): void {
+    store.setState("sessions", "s1", { id: "s1" });
+    store.setState("activity", "s1", act);
+    store.setState("epoch", withEpoch ? "e1" : "");
+  }
+
+  it("messages.batch stamps the orphaned last assistant when a snapshot has landed and activity is idle", () => {
+    seedIdleScope("idle");
+    reconcile.applyMessageEvent("messages.batch", 1, orphanBatch("s1"), false);
+
+    const sm = store.state.messages["s1"];
+    // (a) the orphaned tail got a terminal — the transcript's FIRST render is
+    // settled (no stream-caret, no ticking timer).
+    const completed = sm.byId["mOrphan"].info.time?.completed;
+    expect(typeof completed).toBe("number");
+    expect(completed).toBeGreaterThan(0);
+    // (b) the stamp is message-level ONLY — the reasoning part's missing
+    // time.end is not fabricated (its true end is unknown).
+    expect(sm.byId["mOrphan"].parts["pr"].time?.end).toBeUndefined();
+    // (c) the user message is untouched.
+    expect(sm.byId["mUser"].info.time?.completed).toBeUndefined();
+    // (d) idempotent: a second batch does not re-stamp.
+    const first = sm.byId["mOrphan"].info.time?.completed;
+    reconcile.applyMessageEvent("messages.batch", 2, orphanBatch("s1"), false);
+    expect(store.state.messages["s1"].byId["mOrphan"].info.time?.completed).toBe(first);
+  });
+
+  it("messages.batch does NOT stamp a busy session (genuinely streaming stays live)", () => {
+    seedIdleScope("busy");
+    reconcile.applyMessageEvent("messages.batch", 1, orphanBatch("s1"), false);
+    expect(store.state.messages["s1"].byId["mOrphan"].info.time?.completed).toBeUndefined();
+    // ...and retry equally (mid-turn retry must keep the live affordances).
+    store.setState("activity", "s1", "retry");
+    reconcile.applyMessageEvent("messages.batch", 2, orphanBatch("s1"), false);
+    expect(store.state.messages["s1"].byId["mOrphan"].info.time?.completed).toBeUndefined();
+  });
+
+  it("messages.batch does NOT stamp before any snapshot landed (epoch empty — stale localStorage activity must not settle an in-flight turn)", () => {
+    // The exact stale-seed race the epoch gate exists for: localStorage
+    // hydrated activity=idle from a PREVIOUS tab session while the session is
+    // actually mid-turn, and the batch somehow raced ahead of the boot
+    // snapshot. Stamping here would mis-render a live turn as settled with no
+    // un-stamp path; instead we keep today's live render and let the snapshot
+    // heal (next test).
+    seedIdleScope("idle", false);
+    reconcile.applyMessageEvent("messages.batch", 1, orphanBatch("s1"), false);
+    expect(store.state.messages["s1"].byId["mOrphan"].info.time?.completed).toBeUndefined();
+  });
+
+  it("batch-before-snapshot still heals via the EXISTING snapshot-path stamp (composition, no permanent miss)", () => {
+    seedIdleScope("idle", false);
+    reconcile.applyMessageEvent("messages.batch", 1, orphanBatch("s1"), false);
+    expect(store.state.messages["s1"].byId["mOrphan"].info.time?.completed).toBeUndefined();
+
+    // The boot snapshot lands after the batch: epoch arrives, activity is
+    // wholesale-replaced (idle), and the messages are now resident — the
+    // pre-existing projectSnapshot stamp (reducers.ts) fires without any new
+    // code on that path.
+    reconcile.applySnapshot({
+      epoch: "e1",
+      seq: 5,
+      sessions: [{ id: "s1" }],
+      activity: { s1: "idle" },
+    } as never);
+    expect(typeof store.state.messages["s1"].byId["mOrphan"].info.time?.completed).toBe("number");
+  });
+
+  it("applySessionSnapshot stamps the daemon-resident orphan tail (the real dead-instance cold-open path)", () => {
+    // The daemon already held the full transcript when opencode died, so the
+    // Stream-2 session snapshot — not a later messages.batch — is the moment
+    // the orphan becomes resident.
+    seedIdleScope("idle");
+    sessionStream.applySessionSnapshot("s1", {
+      sessions: [{ id: "s1" }],
+      messages: { s1: orphanBatch("s1").messages },
+      gate: { s1: { messagesLoaded: true } },
+    } as never);
+
+    const sm = store.state.messages["s1"];
+    expect(typeof sm.byId["mOrphan"].info.time?.completed).toBe("number");
+    expect(sm.byId["mOrphan"].parts["pr"].time?.end).toBeUndefined();
+    expect(sm.byId["mUser"].info.time?.completed).toBeUndefined();
+  });
+
+  it("applySessionSnapshot does NOT stamp a busy session", () => {
+    seedIdleScope("busy");
+    sessionStream.applySessionSnapshot("s1", {
+      sessions: [{ id: "s1" }],
+      messages: { s1: orphanBatch("s1").messages },
+      gate: { s1: { messagesLoaded: true } },
+    } as never);
+    expect(store.state.messages["s1"].byId["mOrphan"].info.time?.completed).toBeUndefined();
+  });
+
+  it("applySessionSnapshot does NOT stamp before any snapshot landed (epoch gate)", () => {
+    seedIdleScope("idle", false);
+    sessionStream.applySessionSnapshot("s1", {
+      sessions: [{ id: "s1" }],
+      messages: { s1: orphanBatch("s1").messages },
+      gate: { s1: { messagesLoaded: true } },
+    } as never);
+    expect(store.state.messages["s1"].byId["mOrphan"].info.time?.completed).toBeUndefined();
+  });
+});
