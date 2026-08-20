@@ -44,6 +44,16 @@ func partUpdatedEvent(sid, mid, pid, text string) opencode.Event {
 	}
 }
 
+// windowFilterStreamDeadline bounds each test's /vh/stream request. It is
+// deliberately generous (5s vs the 750ms previously used here and the 500ms
+// common in sibling stream tests): these tests connect
+// to a session holding 105 messages, so the server must write a ~100-message
+// snapshot BEFORE the awaited live-tail/replay frame; under full-tree parallel
+// test load that write can exceed a sub-second deadline (observed flake at
+// 750ms). The done-predicates stop reading as soon as the expected frames
+// arrive, so a healthy unloaded run still completes in milliseconds.
+const windowFilterStreamDeadline = 5 * time.Second
+
 // seedSessionMessages seeds one session with n tiny messages (m1..mn) via
 // direct synchronous store Apply. With n > 100 the oldest n-100 messages fall
 // outside the snapshot window.
@@ -101,7 +111,7 @@ func TestStream2WindowFilter_ReplayDropsOutOfWindowParts(t *testing.T) {
 	srv.agg.Store().Apply(partUpdatedEvent("s1", "m105", "p-new", "live tail update"))
 	srv.agg.Store().Apply(messageUpdatedEvent("s1", "m1", "user"))
 
-	reader, _ := openSessionStreamReq(t, web.URL, "s1", cursor, true, 750*time.Millisecond)
+	reader, _ := openSessionStreamReq(t, web.URL, "s1", cursor, true, windowFilterStreamDeadline)
 	frames := readSSEFramesUntil(t, reader, func(fs []sseFrameID) bool {
 		return len(fs) >= 2 && hasPartFrameFor(t, fs, "m105") && hasMessageFrameFor(fs, "m1")
 	})
@@ -161,7 +171,7 @@ func TestStream2WindowFilter_LiveTailDropsOutOfWindowParts(t *testing.T) {
 
 	seedSessionMessages(t, srv, "s1", 105)
 
-	reader, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, 750*time.Millisecond)
+	reader, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, windowFilterStreamDeadline)
 	if ev := firstFrameEvent(t, reader); ev != "snapshot" {
 		t.Fatalf("live-tail: first frame = %q, want snapshot (cold open)", ev)
 	}
@@ -214,7 +224,7 @@ func TestStream2WindowFilter_FirehoseAlsoDrops(t *testing.T) {
 	srv.agg.Store().Apply(partUpdatedEvent("s1", "m1", "p-old", "stale re-publication"))
 	srv.agg.Store().Apply(partUpdatedEvent("s1", "m105", "p-new", "live tail update"))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), windowFilterStreamDeadline)
 	t.Cleanup(cancel)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		web.URL+"/vh/stream?sessions=all&cursor="+fmt.Sprint(cursor), nil)
@@ -253,7 +263,7 @@ func TestStream2WindowFilter_SnapshotWindowUnchanged(t *testing.T) {
 	seedSessionMessages(t, srv, "s1", 105)
 	srv.agg.Store().Apply(partUpdatedEvent("s1", "m1", "p-old", "stale re-publication"))
 
-	reader, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, 750*time.Millisecond)
+	reader, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, windowFilterStreamDeadline)
 	// The snapshot is the first dispatchable frame (comments/retry hints are
 	// skipped by the parser), so accumulate until it lands and parse it.
 	frames := readSSEFramesUntil(t, reader, func(fs []sseFrameID) bool {
@@ -329,7 +339,7 @@ func TestStream2WindowFilter_LiveStreamingNewMessageDelivered(t *testing.T) {
 
 	seedSessionMessages(t, srv, "s1", 105)
 
-	reader, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, 750*time.Millisecond)
+	reader, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, windowFilterStreamDeadline)
 	if ev := firstFrameEvent(t, reader); ev != "snapshot" {
 		t.Fatalf("live-new: first frame = %q, want snapshot (cold open)", ev)
 	}
