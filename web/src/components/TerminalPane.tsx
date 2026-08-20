@@ -268,6 +268,28 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     };
     host.addEventListener("wheel", normalizeWheelForXterm, true);
 
+    // Native long-press selection on coarse pointers (mobile): xterm.js v6's
+    // NON-macOS contextmenu listener (CoreBrowserTerminal) is NOT
+    // button-guarded, and mobile browsers fire contextmenu for a touch
+    // long-press. Its rightClickHandler → moveTextAreaUnderMouseCursor
+    // teleports a 20×20 z-index:1000 helper textarea centered under the press
+    // and focuses it, so the long-press resolves to a focused editable → the
+    // OS "Paste" bubble instead of text selection. While the pointer is
+    // coarse, stop the event's propagation here — CAPTURE on the host runs
+    // before xterm's bubble listener on the .xterm root — so the textarea
+    // stays parked and the OS long-press machinery sees the selectable DOM
+    // rows (they're opted back into native selection by the coarse-pointer
+    // rule in TerminalDock.css; stock xterm.css parks user-select:none on
+    // .xterm, which an ancestor's carve-out cannot beat). NEVER
+    // preventDefault: the browser's default long-press behavior IS the
+    // selection UI we're restoring. Fine pointers are untouched — desktop
+    // right-click keeps xterm's behavior (pinned by the e2e control test).
+    const onContextMenu = (e: MouseEvent) => {
+      if (!window.matchMedia("(pointer: coarse)").matches) return;
+      e.stopPropagation();
+    };
+    host.addEventListener("contextmenu", onContextMenu, true);
+
     // Cell indicator: the OS cursor is much taller than a terminal line, so
     // which cell a click/touch will hit is ambiguous. One tiny overlay
     // snapped to the cell grid under the pointer, positioned by the SAME
@@ -391,6 +413,7 @@ export default function TerminalPane(props: { termId?: string; session?: string;
       host.removeEventListener("mousedown", onDragStart, true);
       endDragRewrite(); // a drag still active at unmount must not leak its document listeners
       host.removeEventListener("wheel", normalizeWheelForXterm, true);
+      host.removeEventListener("contextmenu", onContextMenu, true);
       host.removeEventListener("pointermove", onHoverMove);
       host.removeEventListener("pointerdown", onTouchDown);
       host.removeEventListener("pointerleave", hideCursor);

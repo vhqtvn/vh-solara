@@ -122,6 +122,152 @@ test("terminal: a session-bound tab can be opened for the selected session", asy
   await expect(page.locator(".term-tab.on")).toHaveCount(1);
 });
 
+// --- Coarse-pointer long-press selection (mobile regression) -----------------
+//
+// MECHANISM pins (agent-runnable). The real-device OUTCOME — long-press on
+// terminal text starts OS selection instead of the native "Paste" bubble —
+// needs a real touch device and is operator-verified; these pins lock the two
+// mechanisms that produce it:
+//
+//  M1  xterm.js v6's NON-macOS `contextmenu` listener (CoreBrowserTerminal) is
+//      NOT button-guarded, and mobile browsers fire `contextmenu` for a touch
+//      long-press. Its rightClickHandler → moveTextAreaUnderMouseCursor
+//      teleports a 20×20 z-index:1000 helper textarea centered under the press
+//      and focuses it — the long-press resolves to a focused editable → OS
+//      "Paste" bubble, never selection. Pin: under a forced coarse pointer,
+//      contextmenu on the terminal must NOT move the helper textarea.
+//  M2  xterm.css parks `.xterm { user-select: none }` on the terminal root,
+//      which beats the app's `.term` carve-out (00-app-globals.css) because an
+//      explicit descendant declaration wins over ancestor inheritance — the
+//      DOM-rendered rows are never natively selectable. Pin: the shipped CSS
+//      contains a `(pointer: coarse)` rule opting `.term .xterm` back into
+//      native selection, while fine-pointer desktop stays `none` (xterm's own
+//      mouse selection keeps preventDefaulting native selection there).
+//
+// The desktop CONTROL test right-clicks with the default fine pointer and
+// asserts the teleport STILL happens — the guard must not eat xterm's
+// right-click behavior on desktop.
+
+// Force `matchMedia("(pointer: coarse)")` to report true. Playwright/CDP cannot
+// emulate the pointer media query itself, so we patch matchMedia in the page
+// before app code runs; TerminalPane's contextmenu guard reads it at event
+// time, so the patch is effective for the whole test.
+async function forceCoarsePointer(page: import("@playwright/test").Page) {
+  await page.addInitScript(() => {
+    const orig = window.matchMedia.bind(window);
+    window.matchMedia = ((q: string) => {
+      if (q.includes("pointer: coarse")) {
+        return {
+          matches: true,
+          media: q,
+          onchange: null,
+          addListener() {},
+          removeListener() {},
+          addEventListener() {},
+          removeEventListener() {},
+          dispatchEvent: () => false,
+        } as MediaQueryList;
+      }
+      return orig(q);
+    }) as typeof window.matchMedia;
+  });
+}
+
+// Fingerprint the teleport SYNCHRONOUSLY at dispatch time. The helper
+// textarea's inline geometry is racy to read after the fact: xterm v6's
+// _syncTextArea (cursor-cell tracking for IME) also writes width/left/top and
+// resets zIndex to -5 on every cursor move / PTY output. moveTextAreaUnderMouseCursor
+// is the ONLY writer of width "20px" + zIndex "1000", so dispatch the
+// contextmenu and read the styles in the SAME JS task — no macrotask gap for
+// a PTY-triggered sync to overwrite the fingerprint.
+async function contextmenuTextareaState(page: import("@playwright/test").Page) {
+  return page.evaluate(() => {
+    const host = document.querySelector(".term-host")!;
+    const ta = host.querySelector(".xterm-helper-textarea") as HTMLTextAreaElement;
+    const screen = host.querySelector(".xterm-screen") as HTMLElement | null;
+    const target = (screen ?? host) as HTMLElement;
+    const r = target.getBoundingClientRect();
+    const before = { width: ta.style.width, left: ta.style.left, zIndex: ta.style.zIndex, focused: document.activeElement === ta };
+    // Synthetic contextmenu bubbles from the screen to the .xterm root where
+    // xterm's (unguarded, non-macOS) listener lives; TerminalPane's capture
+    // guard on the host sees it first — exactly the real event path.
+    target.dispatchEvent(
+      new MouseEvent("contextmenu", {
+        bubbles: true,
+        cancelable: true,
+        clientX: r.x + r.width / 2,
+        clientY: r.y + r.height / 2,
+      }),
+    );
+    const after = { width: ta.style.width, left: ta.style.left, zIndex: ta.style.zIndex, focused: document.activeElement === ta };
+    return { before, after };
+  });
+}
+
+async function openTerminal(page: import("@playwright/test").Page) {
+  await page.goto(`/?dir=${encodeURIComponent(repoRoot)}`);
+  await page.getByRole("button", { name: "Terminal", exact: true }).click();
+  await page.waitForSelector(".term-host");
+  await page.waitForSelector(".term-status.open", { timeout: 10000 });
+}
+
+test("terminal long-press: coarse pointer — contextmenu must not park the helper textarea under the press", async ({ page }) => {
+  await forceCoarsePointer(page);
+  await openTerminal(page);
+
+  // M1: xterm's unguarded contextmenu handler (teleport + focus) must be
+  // stopped at the host seam while the pointer is coarse, so the OS
+  // long-press machinery sees the DOM rows, not a focused editable.
+  const { before, after } = await contextmenuTextareaState(page);
+  expect(after).toEqual(before); // nothing moved, nothing focused
+});
+
+test("terminal long-press: desktop control — xterm right-click teleport still works (fine pointer)", async ({ page }) => {
+  await openTerminal(page);
+
+  // Unguarded path: xterm's rightClickHandler moved the helper textarea under
+  // the press (20×20 box, z-index 1000) and focused it. This MUST keep
+  // working on desktop.
+  const { after } = await contextmenuTextareaState(page);
+  expect(after.width).toBe("20px");
+  expect(after.zIndex).toBe("1000");
+  expect(after.left).toMatch(/^-?\d+(\.\d+)?px$/);
+  expect(after.focused).toBe(true);
+});
+
+test("terminal long-press: coarse-pointer native-selection rule is shipped and desktop-gated", async ({ page }) => {
+  await openTerminal(page);
+
+  // M2 (rule shipped): the built page's CSSOM contains a (pointer: coarse)
+  // media rule opting the terminal subtree back into native selection.
+  const ruleShipped = await page.evaluate(() => {
+    for (const sheet of Array.from(document.styleSheets)) {
+      let rules: CSSRuleList;
+      try {
+        rules = (sheet as CSSStyleSheet).cssRules;
+      } catch {
+        continue; // cross-origin sheet — none expected same-origin
+      }
+      for (const r of Array.from(rules)) {
+        if (r instanceof CSSMediaRule && r.media.mediaText.includes("pointer: coarse")) {
+          for (const inner of Array.from(r.cssRules)) {
+            const t = inner.cssText;
+            if (t.includes(".term .xterm") && /user-select:\s*text/.test(t)) return true;
+          }
+        }
+      }
+    }
+    return false;
+  });
+  expect(ruleShipped).toBe(true);
+
+  // M2 (desktop-gated): on this FINE-pointer desktop context the computed
+  // user-select of the terminal rows stays none — xterm's own mouse selection
+  // owns the desktop; the carve-out is touch-only.
+  const rowsSelect = await page.locator(".xterm-rows").evaluate((el) => getComputedStyle(el).userSelect);
+  expect(rowsSelect).toBe("none");
+});
+
 test("terminal: full-screen TUI (vim) stays live — xterm DECRQM stall regression", async ({ page }) => {
   // Regression for the xterm.js v6 DECRQM parser stall. vim emits
   // CSI [?] 12 $ p (DECRQM — "report mode") during startup to probe the

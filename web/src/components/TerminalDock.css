@@ -74,6 +74,28 @@
   transition: opacity 120ms;
 }
 .term-host .term-cell-cursor.on { opacity: 1; }
+
+/* Coarse-pointer long-press selection: xterm.css parks `.xterm {
+   user-select: none }` on the terminal root, which beats the app-wide `.term`
+   carve-out in styles/legacy/00-app-globals.css — an explicit descendant
+   declaration always wins over ancestor inheritance — so the DOM-rendered
+   rows are never natively selectable and a touch long-press cannot start OS
+   selection. On touch devices only, opt the terminal subtree back into
+   native selection: `.term .xterm` (0,2,0) out-specifies xterm.css's `.xterm`
+   (0,1,0), and user-select:auto descendants (the rows) then resolve to text.
+   Fine pointers keep xterm's own mouse selection — its mousedown handler
+   preventDefaults native selection there, so this rule changes nothing on
+   desktop. Pairs with the contextmenu guard in TerminalPane (which stops
+   xterm's long-press textarea teleport on coarse pointers); pinned by
+   tests/unit/termLongpressSelect.test.ts + the e2e long-press specs. */
+@media (pointer: coarse) {
+  .term .xterm {
+    -webkit-user-select: text;
+    user-select: text;
+    -webkit-touch-callout: default;
+  }
+}
+
 .term-empty { padding: 16px; color: var(--fg-dim); font-size: 13px; }
 .term-keys { display: flex; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--border); overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .term-keys button {
