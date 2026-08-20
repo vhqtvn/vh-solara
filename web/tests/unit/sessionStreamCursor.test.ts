@@ -29,12 +29,17 @@ beforeEach(() => {
 describe("applyMessageEvent trackCursor:false — Stream2 replay invariant", () => {
   it("message.upsert with trackCursor:false does not advance state.cursor", () => {
     // Seed a session with one message so upsertMessage has a store to mutate.
+    // Shape note: the entry must be a well-formed MessageView (parts record +
+    // partOrder array) — the C-F4 live shadow reap walks every resident entry
+    // (approxResidentBytes) on message.upsert and relies on that contract,
+    // which every production writer guarantees.
     setState("messages", "s1", {
       order: ["m1"],
       byId: {
         m1: {
           info: { id: "m1", sessionID: "s1", role: "user", time: { created: 1 } },
-          parts: [],
+          parts: {},
+          partOrder: [],
         },
       },
     });

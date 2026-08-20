@@ -4,7 +4,8 @@
 // Owns: the in-flight page tracker (pageInFlight), the GET /vh/session/{sid}/messages
 // fetcher, the Contract-B response gate (sesGen/epoch/dirty-retry), the clean-response
 // merge (insert-if-not-present), the narrow dirty-kind filter, resident-cache eviction,
-// and the pure deriveMessageWindow helper that projects server window meta into the
+// the C-F4 live-path stage-1 shadow reap (reapShadowsIfOverCap), and the pure
+// deriveMessageWindow helper that projects server window meta into the
 // resident MessageWindowState.
 //
 // SEAM — sesGen accessor (Option A). The response gate must recheck the Stream2
@@ -152,10 +153,13 @@ const MAX_PAGE_RETRIES = 3;
 // gate (reapKeylessShadows) since that is user-invisible and the data is
 // server-refetchable. This bounds the multi-page history-loading OOM vector
 // (a user who clicks Load older repeatedly). The live-streaming growth vector
-// (a long-lived session where Stream2 message.upsert/part.upsert events grow
-// messages[sid] without a page merge) is NOT bounded by this slice — that's
-// the bidirectional-eviction follow-up (C-F4). Bidirectional eviction
-// (tail-end when reading history) is also a documented follow-up.
+// (a long-lived session where Stream2 part.upsert events grow messages[sid]
+// with no page merge — the user never pages back) is bounded by the C-F4
+// live-path stage-1 reap: reapShadowsIfOverCap below, called from
+// reconcileEvent on message-class events only. ORDERED live growth
+// (message.upsert tail appends) remains page-merge-gated — stage-2 ordered
+// eviction is deliberately still Load-older-only. Bidirectional eviction
+// (tail-end when reading history) remains a documented follow-up.
 export const MAX_RESIDENT_MESSAGES = 500;
 export const MAX_RESIDENT_BYTES = 5 * 1024 * 1024; // 5 MiB
 
@@ -520,4 +524,59 @@ function evictIfOverCap(s: any, sid: string): boolean {
     return true;
   }
   return evicted;
+}
+
+// reapShadowsIfOverCap — C-F4 live-path stage-1-ONLY shadow reap. The
+// page-merge eviction gate above fires ONLY after a user-triggered
+// Load-older merge with added > 0, so for the active session of a user who
+// never pages back, window-blind out-of-window part.upsert traffic
+// (compaction bursts, warm reconcile re-publishes) grew byId-only keyless
+// shadows past the resident caps with NO reclaim path (the C-F4 gap from
+// bcc578c; measured ingress ~18 MB / 8.4 h vs the 5 MiB cap). This helper is
+// the studied (i-prime) close: reconcileEvent calls it on MESSAGE-CLASS
+// events only (message.upsert / messages.batch — see the gate there), and it
+// re-checks the same two cap metrics and reaps shadows ONLY:
+//   - Stage 1 only: NO ordered eviction. The live path must never yank a
+//     visible, in-window message (stage 2 stays page-merge-only, where the
+//     user has expressed history-reading intent). Returning still-over-cap is
+//     CORRECT: if ordered content alone exceeds a cap, the resident set stays
+//     over until the next page merge.
+//   - part.upsert is deliberately NOT a trigger: a full approxResidentBytes
+//     walk per streaming token is the hot-path cost the message-class gate
+//     exists to avoid (one walk per MESSAGE event is the accepted budget).
+// The cheap count metric is checked FIRST so the bytes walk (JSON.stringify
+// over every resident entry) is paid only when count alone does not already
+// prove over-cap.
+//
+// On a non-zero reap the sticky evictedHistory flag is OR'd into the resident
+// window (mirroring evictIfOverCap's contract): reaped shadow data is
+// server-resident and re-fetchable via Load-older pages, which is exactly
+// what the flag promises — so hasOlder flips true even if the server's window
+// meta said has_older=false. A session with no resident window state yet
+// (messages seeded, snapshot not landed) still reaps — memory hygiene must
+// not depend on UI bookkeeping — but skips the flag write; the next window
+// derivation (batch/snapshot) owns the authoritative meta from scratch.
+//
+// The reap→promote race is benign (281a2f2 + the C-F4 study): a message.upsert
+// for a reaped id takes upsertMessage's fresh-insert path; a part.upsert first
+// recreates the shadow and a later keyed upsert promotes it with held parts.
+// Returns whether any shadow was reaped (helper-level testability).
+export function reapShadowsIfOverCap(sid: string): boolean {
+  let reapedAny = false;
+  setState(
+    produce((s) => {
+      const sm = s.messages[sid];
+      if (!sm) return;
+      const count = Object.keys(sm.byId).length;
+      // Cheap metric first: if count alone is over cap, skip the bytes walk.
+      if (count <= MAX_RESIDENT_MESSAGES && approxResidentBytes(sm) <= MAX_RESIDENT_BYTES) return;
+      if (reapKeylessShadows(sm) === 0) return;
+      reapedAny = true;
+      const win = s.messageWindows[sid];
+      if (win) {
+        s.messageWindows[sid] = { ...win, hasOlder: true, evictedHistory: true };
+      }
+    }),
+  );
+  return reapedAny;
 }

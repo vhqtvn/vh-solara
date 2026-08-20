@@ -271,14 +271,17 @@ export function deleteMessagesFromTop(sm: SessionMessages, count: number, protec
 // F3 — reap byId-only KEYLESS SHADOWS (part-only placeholders created by
 // upsertPart for messages with no resident copy: never entered into order,
 // never rendered, parts held only in the hope a later promotion/page merge
-// realizes them). Called by the eviction gate (evictIfOverCap) when the
-// resident cache is over cap: before F3 the gate was blind to shadows via
+// realizes them). Before F3 the eviction gate was blind to shadows via
 // BOTH metrics (its count read order.length and approxResidentBytes iterated
 // order), so distinct out-of-window (messageID, partID) pairs — compaction
 // bursts sweeping deeper, fork sessions — accumulated outside the 5 MiB gate
 // with no reclaim path (s.messages[sid] also survives session removal, and
-// tree-resync only wholesale-replaces NON-active sessions, so nothing else
-// reclaims them either).
+// tree-resync only wholesale-replaces NON-active sessions). TWO callers
+// reclaim shadows now: the page-merge eviction gate (evictIfOverCap,
+// sync/history.ts) and — since C-F4 — the ACTIVE-session LIVE path
+// (reapShadowsIfOverCap, called from reconcileEvent in sync/reconcile.ts on
+// message-class events only: message.upsert / messages.batch), which bounds
+// the never-pages-back growth vector without any Load-older merge.
 //
 // REAPING DISCARDS THE SHADOW'S HELD PARTS. That is acceptable ONLY because
 // the data is NOT lost: it remains server-side and re-fetchable via the

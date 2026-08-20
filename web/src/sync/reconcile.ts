@@ -28,7 +28,7 @@ import {
 import { pushNotification } from "../notify";
 import { dropPinnedSession } from "../pins";
 import { dropLabelRoot } from "../labels";
-import { resetPageInFlight } from "./history";
+import { resetPageInFlight, reapShadowsIfOverCap } from "./history";
 import { patchTreeAgent } from "./treeState";
 import { maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
 import { openSessionStream } from "./session-stream";
@@ -114,6 +114,15 @@ export function reconcileEvent(event: ReconcileEvent, context: ReconcileContext)
       }
     }),
   );
+  // C-F4 — live-path stage-1 shadow reap, gated to MESSAGE-CLASS events ONLY
+  // (message.upsert / messages.batch). part.upsert is deliberately excluded:
+  // it fires once per streamed token, and the cap check walks every resident
+  // entry — running that per token is the hot-path cost this gate avoids.
+  // Stage-2 (ordered/visible) eviction stays page-merge-only; see
+  // reapShadowsIfOverCap in history.ts for the full contract.
+  if (event.kind === "message.upsert" || event.kind === "messages.batch") {
+    reapShadowsIfOverCap(event.payload?.sessionID);
+  }
   interpretEffects(effects);
   // Advance the resume cursor AFTER projection (Stream 1 only) so persistence
   // below captures the final value. Nothing reactive reads cursor synchronously,
