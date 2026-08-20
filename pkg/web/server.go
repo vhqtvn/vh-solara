@@ -1907,6 +1907,26 @@ func messageFilter(r *http.Request) map[string]bool {
 	return filter
 }
 
+// partWindowKey extracts the (sessionID, messageID) parent key from a
+// part-class event payload. All part payloads carry both ids at the top level
+// (part.upsert = the raw part envelope; part.append / part.delete reducer
+// payloads). ok is false when the payload is unparseable or lacks either id —
+// the sendable window filter treats that as NOT eligible for dropping
+// (conservative pass-through; never drop what cannot be attributed).
+func partWindowKey(payload []byte) (sid, mid string, ok bool) {
+	var p struct {
+		SessionID string `json:"sessionID"`
+		MessageID string `json:"messageID"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return "", "", false
+	}
+	if p.SessionID == "" || p.MessageID == "" {
+		return "", "", false
+	}
+	return p.SessionID, p.MessageID, true
+}
+
 // projectInfo describes one bridged project instance (a per-directory aggregator)
 // for the discovery endpoint.
 type projectInfo struct {
@@ -2209,6 +2229,30 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	filter := messageFilter(r)
 	filter = s.projectScopedFilter(agg, filter)
 	sendable := func(kind string, payload []byte) bool {
+		// Window filter (2026-08-20 stale-rows follow-up): part-class
+		// re-publications (compaction prune re-publishing old completed TOOL
+		// parts — decision O1 in docs/ai/wire-protocols/compaction-burst-axis.md
+		// — and warm full-history reconcile diffs) for messages OUTSIDE the
+		// client snapshot window are dropped at egress. The FE already holds
+		// such events as keyless shadows (never rendered, never ordered;
+		// 281a2f2 + bcc578c), so this is a bandwidth/CPU optimization only:
+		//   - message-class events pass UNCHANGED even for out-of-window
+		//     parents (cold clients converge via snapshot + message events);
+		//   - the filter applies to the firehose (filter == nil) too, since
+		//     every client shadows out-of-window parts identically;
+		//   - drops happen BEFORE the delivery ordinal increments, so no O3
+		//     ordinal gap is created;
+		//   - residual: any client-held row outside the server's CURRENT
+		//     window — a load-older'd row, or a stale pre-reconnect snapshot
+		//     whose rows have since slid out — misses in-place part updates,
+		//     as does a cursor-replaying client whose drops are judged against
+		//     the window at DELIVERY time; all converge on the next page fetch
+		//     or fresh snapshot (pages carry current full parts).
+		if strings.HasPrefix(kind, "part.") {
+			if sid, mid, ok := partWindowKey(payload); ok && !store.MessageInWindow(sid, mid) {
+				return false
+			}
+		}
 		if filter == nil { // "all"
 			return true
 		}

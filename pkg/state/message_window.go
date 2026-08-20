@@ -765,6 +765,112 @@ func (s *Store) OldestResidentCursorTuple(sid string) (id string, timeMs float64
 	return id, t, true
 }
 
+// messageEntrySerializedBytes is the messageEntry counterpart of
+// messageSerializedBytes: len(info) + sum(len(parts)) walked in partOrder.
+// Same raw-value size measure the window projector budgets against, computed
+// without building the defensive-copy []MessageWithParts (the copy loops in
+// SnapshotMessagesPage / captureMessagesBatchLocked exist because the bytes
+// ESCAPE the lock; this helper reads under the caller's lock and does not).
+// Pure: no allocation, no store access.
+func messageEntrySerializedBytes(me *messageEntry) int {
+	n := len(me.info)
+	for _, pid := range me.partOrder {
+		n += len(me.parts[pid])
+	}
+	return n
+}
+
+// messageInWindowOrder reports whether `mid` falls inside the newest-tail
+// dual-bound window that projectMessageWindow would project for the session's
+// ordered message list. It replicates the projector's semantics EXACTLY —
+// same walk direction (newest → oldest), same bound checks in the same order,
+// same maxCount<1 clamp — but answers a membership question without building
+// the bounded list: the newest is ALWAYS in (oversized included); an oversized
+// newest collapses the window to {newest} alone; older candidates enter only
+// while len(tail)+1 <= maxCount and accumulated+size <= maxBytes. The walk
+// stops at the first bound hit, so it visits at most maxCount+1 entries with
+// len()-only size computation — microseconds at the default bounds.
+//
+// nil byID entries are skipped (they are also skipped by the capture loops
+// that feed the projector, so membership semantics stay identical). A missing
+// id, empty order, or empty mid is OUT-of-window (false) — the caller treats
+// "not classifiably in-window" as "do not deliver part-class re-publications
+// for it"; message-level state always arrives via message-class events, which
+// this predicate is never consulted for.
+//
+// PURE: no locks, no store access, no allocation. Same-package tests pin the
+// anti-divergence property (helper verdict == id ∈ projectMessageWindow output
+// for the same list) — keep this in sync with the projector if either changes.
+//
+// Byte-measure caveat: messageEntrySerializedBytes matches the COLD-batch
+// capture loops exactly, and the snapshot capture conservatively — during
+// active streaming materializeSnapshot overlays unflushed delta-buffer text
+// while this helper counts base parts only, so the helper can admit an entry
+// the snapshot byte bound would exclude. The divergence direction is the
+// pre-change pass-through behavior (deliver), it is transient (the delta
+// flushes), and it only matters when the byte bound binds first.
+func messageInWindowOrder(order []string, byID map[string]*messageEntry, mid string, maxCount, maxBytes int) bool {
+	n := len(order)
+	if n == 0 || mid == "" {
+		return false
+	}
+	if maxCount < 1 {
+		maxCount = 1 // always include at least the newest (projector parity)
+	}
+	if order[n-1] == mid {
+		return true // the newest is ALWAYS in the window, oversized included
+	}
+	newest := byID[order[n-1]]
+	if newest == nil {
+		return false // defensive: ordering invariant broken; treat as out-of-window
+	}
+	newestSize := messageEntrySerializedBytes(newest)
+	if newestSize > maxBytes {
+		return false // oversized newest → the window is {newest} alone
+	}
+	tailLen, accumulated := 1, newestSize
+	for i := n - 2; i >= 0; i-- {
+		me := byID[order[i]]
+		if me == nil {
+			continue // capture loops skip nil entries; so does the window
+		}
+		size := messageEntrySerializedBytes(me)
+		if tailLen+1 > maxCount {
+			return false
+		}
+		if accumulated+size > maxBytes {
+			return false
+		}
+		if order[i] == mid {
+			return true
+		}
+		tailLen++
+		accumulated += size
+	}
+	return false
+}
+
+// MessageInWindow reports whether message `mid` of session `sid` is inside the
+// session's bounded recent window — the same newest-tail dual-bound projection
+// (windowMaxCount / windowMaxBytes instance fields) that the cold-client
+// surfaces (Snapshot → materializeSnapshot, captureMessagesBatchLocked cold
+// messages.batch) and the initial historical page carry. It exists for the
+// Stream-2 egress window filter (pkg/web sendable): part-class re-publication
+// events (part.upsert / part.append / part.delete — part-only frames with no
+// accompanying message event) for OUT-of-window parents are dropped there, so
+// a cold client never receives part frames for messages its snapshot does not
+// carry. Read-only: RLock, no writeback, no msgRev bump. Missing session or
+// message → false (out-of-window).
+func (s *Store) MessageInWindow(sid, mid string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sm := s.messages[sid]
+	if sm == nil {
+		return false
+	}
+	return messageInWindowOrder(sm.order, sm.byID, mid, s.windowMaxCount, s.windowMaxBytes)
+}
+
 // bumpMsgRev advances the Store-wide monotonic token and assigns it to the
 // owning session's msgRev[sid]. Called under s.mu for EVERY mutation capable
 // of changing a session's cold-batch/snapshot message projection (message/part
