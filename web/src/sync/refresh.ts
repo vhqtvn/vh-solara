@@ -26,10 +26,12 @@
 // streaming hot path. The part.upsert → upsertPart → state.messages mutation →
 // Part re-render path (coalesced ~5fps) is UNCHANGED by relocation.
 import type { MessageWindowMeta, Snapshot } from "../types";
+import { produce } from "solid-js/store";
 import { buildMessages } from "../lib/reduce";
 import { state, setState, projectDir, selectedId } from "./store";
 import { decodeSnapshot } from "./decode";
 import { deriveMessageWindow } from "./history";
+import { stampCompletionIfIdle } from "./reducers";
 
 async function fetchSessionMessages(
   id: string,
@@ -108,7 +110,26 @@ export async function refreshOpenSessions() {
     if (id === active) return;
     try {
       const { items, window } = await fetchSessionMessages(id);
-      setState("messages", id, buildMessages(items));
+      // Cross-stream completion bridge, arrival-path #3 — the THIRD
+      // transcript-arrival seam (twins: messages.batch in reducers.ts +
+      // applySessionSnapshot in session-stream.ts). The wholesale
+      // buildMessages replace re-introduces whatever transcript the server
+      // holds — including an orphaned incomplete tail from an instance that
+      // died mid-generation (idle forever; no terminal event will ever
+      // come). Without a stamp here, every tree reconnect re-created the
+      // unstamped orphan tail in the cache (commit-review F5). Stamp inside
+      // the SAME produce() that installs the rows so the tail's first
+      // re-render after the refresh is already settled. The epoch gate (a
+      // snapshot applied THIS boot ⇒ s.activity is server-refreshed, not
+      // the stale localStorage seed) + the helper's own idle guard are
+      // identical to the landed seams; a genuinely busy session never
+      // stamps.
+      setState(
+        produce((s) => {
+          s.messages[id] = buildMessages(items);
+          if (s.epoch !== "") stampCompletionIfIdle(s, id);
+        }),
+      );
       setState("messagesDelivered", id, true);
       // Phase 3: populate the resident-window state alongside the messages so
       // the Phase-4 "Load older" affordance works after a tree reconnect (not

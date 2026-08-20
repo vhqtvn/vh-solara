@@ -77,7 +77,23 @@ export function MessageParts(props: {
     cache = next;
     return out;
   });
-  const settled = () => props.m.info.role === "user" || !!props.m.info.time?.completed;
+  // Settled = presentation-final. Three independent disjuncts:
+  //   1. user role — user messages never stream;
+  //   2. authoritative completion (time.completed — includes the cross-stream
+  //      bridge stamp on the tail);
+  //   3. POSITIONAL (2026-08-20 mid-history orphan fix): an assistant message
+  //      that is currently NOT the newest in its transcript renders settled.
+  //      A generating instance can die mid-turn and the session resumes with a
+  //      later message; such a mid-history orphan would otherwise tick its
+  //      ReasoningPart timer and stream-caret forever (the bridge stamps only
+  //      the LAST assistant message). Pure computation on the reactive
+  //      position — NO time.completed is ever written here, so the message
+  //      honestly returns to live presentation if ordering later makes it
+  //      newest again (revert/delete). Do NOT cache this.
+  const settled = () =>
+    props.m.info.role === "user" ||
+    !!props.m.info.time?.completed ||
+    (props.m.info.role === "assistant" && !props.isLastMessage());
   const tailId = () =>
     !settled() && props.isLastMessage() ? props.m.partOrder[props.m.partOrder.length - 1] : null;
   // F-SHAPE-B UX safety net for S5: a COMPLETED assistant message with ZERO

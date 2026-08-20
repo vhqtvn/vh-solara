@@ -97,6 +97,7 @@ let store: typeof import("../../src/sync/store") = null as unknown as typeof imp
 // store) and silently no-op. Same discipline as stream/store above.
 let reconcile: typeof import("../../src/sync/reconcile") = null as unknown as typeof import("../../src/sync/reconcile");
 let sessionStream: typeof import("../../src/sync/session-stream") = null as unknown as typeof import("../../src/sync/session-stream");
+let refresh: typeof import("../../src/sync/refresh") = null as unknown as typeof import("../../src/sync/refresh");
 
 async function setupFresh(): Promise<void> {
   vi.resetModules();
@@ -104,6 +105,7 @@ async function setupFresh(): Promise<void> {
   store = await import("../../src/sync/store");
   reconcile = await import("../../src/sync/reconcile");
   sessionStream = await import("../../src/sync/session-stream");
+  refresh = await import("../../src/sync/refresh");
   store.setProjectDirRaw("/test");
   store.setSelectedIdRaw("s1");
 }
@@ -469,6 +471,140 @@ describe("arrival-path #3 — cold-load orphan tail (messages become resident wh
       messages: { s1: orphanBatch("s1").messages },
       gate: { s1: { messagesLoaded: true } },
     } as never);
+    expect(store.state.messages["s1"].byId["mOrphan"].info.time?.completed).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Arrival-path #3, THIRD transcript-arrival seam — the tree-reconnect warm
+// refresh (refreshOpenSessions). Commit-review finding F5 (7b0c31d review):
+// the two landed seams above cover messages.batch (cold-load fetch) and
+// applySessionSnapshot (Stream-2 open/reconnect), but the warm refresh on a
+// TREE reconnect wholesale-replaced messages[id] via buildMessages WITHOUT
+// stamping — re-introducing an unstamped orphan tail into the cache on every
+// tree reconnect for any open non-active session whose instance died
+// mid-generation (same forever-live tail: blinking caret + ticking
+// "Thinking…" timer, resurrected by the reconnect itself). The stamp mirrors
+// the landed seams exactly: epoch gate (s.epoch !== "" ⇒ activity is
+// server-refreshed, not the stale localStorage seed) + the helper's own
+// activity==="idle" guard.
+// ---------------------------------------------------------------------------
+describe("arrival-path #3 — tree-reconnect warm refresh (refreshOpenSessions wholesale replace)", () => {
+  // Same dead-instance shape as orphanBatch above, as the raw items array a
+  // /vh/snapshot refresh response carries. Typed any[] to keep the fixture
+  // loose (mirrors the arrival-path fixtures' payload typing).
+  const orphanItems = (sid: string): any[] => [
+    {
+      info: { id: "mUser", sessionID: sid, role: "user", time: { created: 10 } },
+      parts: [{ id: "pu", sessionID: sid, messageID: "mUser", type: "text", text: "go" }],
+    },
+    {
+      info: { id: "mOrphan", sessionID: sid, role: "assistant", time: { created: 20 } },
+      parts: [
+        { id: "pr", sessionID: sid, messageID: "mOrphan", type: "reasoning", text: "half a thought", time: { start: 21 } },
+      ],
+    },
+  ];
+
+  // The refresh fetch shape: one /vh/snapshot?sessions=<id> pull per open
+  // non-active session (refreshOpenSessions.test.ts's stub pattern); reply
+  // with the given per-session transcript items. Uncompressed body —
+  // decodeSnapshot passes a non-encoded payload through.
+  const stubRefreshFetch = (bySession: Record<string, any[]>): void => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const id = new URL(url, "http://x").searchParams.get("sessions") || "";
+        return Promise.resolve({ ok: true, json: () => ({ messages: { [id]: bySession[id] ?? [] } }) });
+      }),
+    );
+  };
+
+  // Seed everything EXCEPT the transcript for s2: session known, messages
+  // RESIDENT (open) but empty, activity authoritative (`act`), epoch set
+  // unless `withEpoch` is false. s2 is NOT the active session (setupFresh
+  // selected s1), so refreshOpenSessions pulls it.
+  function seedRefreshScope(act: string, withEpoch = true): void {
+    store.setState("sessions", "s2", { id: "s2" });
+    store.setState("messages", "s2", buildMessages([]));
+    store.setState("activity", "s2", act);
+    store.setState("epoch", withEpoch ? "e1" : "");
+  }
+
+  it("refreshOpenSessions stamps the orphaned tail when idle + epoch set (the wholesale replace must not re-introduce a live orphan)", async () => {
+    seedRefreshScope("idle");
+    stubRefreshFetch({ s2: orphanItems("s2") });
+    await refresh.refreshOpenSessions();
+
+    const sm = store.state.messages["s2"];
+    const completed = sm.byId["mOrphan"].info.time?.completed;
+    expect(typeof completed).toBe("number");
+    expect(completed).toBeGreaterThan(0);
+    // (b) the stamp is message-level ONLY — the reasoning part's missing
+    // time.end is not fabricated (its true end is unknown).
+    expect(sm.byId["mOrphan"].parts["pr"].time?.end).toBeUndefined();
+    // (c) the user message is untouched.
+    expect(sm.byId["mUser"].info.time?.completed).toBeUndefined();
+  });
+
+  it("refreshOpenSessions does NOT stamp a busy or retry session (genuinely streaming stays live)", async () => {
+    seedRefreshScope("busy");
+    stubRefreshFetch({ s2: orphanItems("s2") });
+    await refresh.refreshOpenSessions();
+    expect(store.state.messages["s2"].byId["mOrphan"].info.time?.completed).toBeUndefined();
+    // ...and retry equally (mid-turn retry keeps the live affordances).
+    store.setState("activity", "s2", "retry");
+    await refresh.refreshOpenSessions();
+    expect(store.state.messages["s2"].byId["mOrphan"].info.time?.completed).toBeUndefined();
+  });
+
+  it("refreshOpenSessions does NOT stamp before any snapshot landed (epoch gate — stale localStorage activity must not settle an in-flight turn)", async () => {
+    seedRefreshScope("idle", false);
+    stubRefreshFetch({ s2: orphanItems("s2") });
+    await refresh.refreshOpenSessions();
+    expect(store.state.messages["s2"].byId["mOrphan"].info.time?.completed).toBeUndefined();
+  });
+
+  it("re-refresh never regresses the tail to unstamped-live (the wholesale replace re-settles the orphan on every reconnect)", async () => {
+    seedRefreshScope("idle");
+    stubRefreshFetch({ s2: orphanItems("s2") });
+    await refresh.refreshOpenSessions();
+    const first = store.state.messages["s2"].byId["mOrphan"].info.time?.completed;
+    expect(typeof first).toBe("number");
+
+    // A second tree reconnect re-pulls the SAME unstamped server transcript:
+    // buildMessages wholesale-replaces messages[s2] (the first stamp dies
+    // with the replaced map), so the seam must stamp again in the same
+    // produce() or the orphan tail comes back live. Unlike the
+    // messages.batch twin (a merge — completed stays the same VALUE), the
+    // honest assertion here is settled-ness, not value-equality.
+    await refresh.refreshOpenSessions();
+    const second = store.state.messages["s2"].byId["mOrphan"].info.time?.completed;
+    expect(typeof second).toBe("number");
+    expect(second as number).toBeGreaterThanOrEqual(first as number);
+  });
+
+  it("a wire-authoritative completed tail is preserved verbatim (the helper's !completed guard — no re-stamp over the server's value)", async () => {
+    seedRefreshScope("idle");
+    const items = orphanItems("s2");
+    items[1].info.time = { created: 20, completed: 21 };
+    stubRefreshFetch({ s2: items });
+    await refresh.refreshOpenSessions();
+    expect(store.state.messages["s2"].byId["mOrphan"].info.time?.completed).toBe(21);
+  });
+
+  it("skips the ACTIVE session (owned by the live session stream) — no fetch, no stamp", async () => {
+    // s1 is the selected id (setupFresh): its transcript is owned by
+    // Stream-2, whose applySessionSnapshot seam carries the stamp for it.
+    // The refresh path must neither round-trip it nor stamp it.
+    store.setState("sessions", "s1", { id: "s1" });
+    store.setState("messages", "s1", buildMessages(orphanItems("s1")));
+    store.setState("activity", "s1", "idle");
+    store.setState("epoch", "e1");
+    const fetchMock = vi.fn(() => Promise.resolve({ ok: true, json: () => ({}) }));
+    vi.stubGlobal("fetch", fetchMock);
+    await refresh.refreshOpenSessions();
+    expect(fetchMock).not.toHaveBeenCalled();
     expect(store.state.messages["s1"].byId["mOrphan"].info.time?.completed).toBeUndefined();
   });
 });
