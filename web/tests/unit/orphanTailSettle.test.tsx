@@ -44,6 +44,32 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+// F4 hardening (2026-08-21 real-runtime e2e slice): the caret is placed by the
+// coalesced streaming flush (Part.tsx FRAME_MS=200 window), which is scheduled
+// on REAL setTimeout/performance — the same toFake carve-out the reactive-flip
+// tests below rely on — so the original fixed `await setTimeout(260)` had only
+// a 60ms margin over the flush deadline. Under a loaded runner that margin is
+// thin (the flush can land later than 260ms after mount and the assertion
+// flakes). Poll the DOM for the caret with a bounded real-time deadline
+// instead of sleeping a fixed interval: identical meaning (the caret arrives
+// via the coalesced flush), no thin margin. performance.now() drives the
+// deadline (NOT Date.now) because the fake-timer tests freeze Date.
+async function untilCaret(container: HTMLElement, timeoutMs = 3000): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    if (container.querySelector(".stream-caret")) return;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+// The NEGATIVE waits (asserting NO caret appears) cannot poll for absence.
+// They keep a fixed wait, widened from 260ms to 500ms: a wrongly-scheduled
+// flush would fire within FRAME_MS(200)+scheduler-jitter, so 500ms observes
+// it with real margin on both sides of the 200ms coalescing window.
+async function flushWindowElapses(ms = 500): Promise<void> {
+  await new Promise((r) => setTimeout(r, ms));
+}
+
 // The dead-instance reasoning part: start stamped, end missing forever.
 function orphanReasoning(id: string, start: number): Part {
   return {
@@ -151,8 +177,9 @@ describe("MessageParts — orphan tail record (post-stamp) renders settled", () 
     ));
     expect(container.querySelector(".md-stream")).not.toBeNull();
     expect(container.querySelector(".tool-dur.live")).not.toBeNull();
-    // The caret is placed by the coalesced streaming flush (~200ms frame).
-    await new Promise((r) => setTimeout(r, 260));
+    // The caret is placed by the coalesced streaming flush (F4: poll, not a
+    // fixed sleep — see untilCaret).
+    await untilCaret(container);
     expect(container.querySelector(".stream-caret")).not.toBeNull();
   });
 });
@@ -225,7 +252,7 @@ describe("MessageParts — positional settlement of mid-history orphans (O-C)", 
     ));
     expect(container.querySelector(".md-stream")).not.toBeNull();
     expect(container.querySelector(".tool-dur.live")).not.toBeNull();
-    await new Promise((r) => setTimeout(r, 260));
+    await untilCaret(container);
     expect(container.querySelector(".stream-caret")).not.toBeNull();
   });
 
@@ -257,8 +284,9 @@ describe("MessageParts — positional settlement of mid-history orphans (O-C)", 
     // The restored reasoning timer actually TICKS — live again, not frozen.
     vi.advanceTimersByTime(3000);
     expect(dur()?.textContent).toMatch(/8s/);
-    // And the streaming caret returns on the tail after the coalesced flush.
-    await new Promise((r) => setTimeout(r, 260));
+    // And the streaming caret returns on the tail after the coalesced flush
+    // (F4: poll — see untilCaret).
+    await untilCaret(container);
     expect(container.querySelector(".stream-caret")).not.toBeNull();
   });
 
@@ -275,7 +303,7 @@ describe("MessageParts — positional settlement of mid-history orphans (O-C)", 
     ));
     // Live first, with the caret actually placed by the coalesced flush…
     expect(container.querySelector(".md-stream")).not.toBeNull();
-    await new Promise((r) => setTimeout(r, 260));
+    await untilCaret(container);
     expect(container.querySelector(".stream-caret")).not.toBeNull();
     expect(container.querySelector(".tool-dur.live")).not.toBeNull();
 
@@ -352,8 +380,9 @@ describe("MessageParts — positional settlement of mid-history orphans (O-C)", 
     expect(container.textContent).toContain("late delta arrived");
     expect(container.querySelector(".md-stream")).toBeNull();
     // No LATE resurrection either — nothing schedules a streaming flush for a
-    // row that stays non-last.
-    await new Promise((r) => setTimeout(r, 260));
+    // row that stays non-last (F4: fixed wait widened past the 200ms flush
+    // window — see flushWindowElapses).
+    await flushWindowElapses();
     expect(container.querySelector(".md-stream")).toBeNull();
     expect(container.querySelector(".stream-caret")).toBeNull();
   });

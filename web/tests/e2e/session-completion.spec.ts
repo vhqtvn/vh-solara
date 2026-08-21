@@ -887,3 +887,366 @@ test("regression: stale reconnect snapshot must not clobber the settled tail (me
     `REGRESSION FAILED: stale reconnect snapshot dropped the settled tail (applySessionSnapshot merge-if-absent regressed). transitions=${JSON.stringify(parsed.transitions)} after=${JSON.stringify(after)}`,
   ).toBe("no");
 });
+
+// ============================================================================
+// ORPHANED TRANSCRIPT TAILS — real-runtime e2e for the 2026-08-20 dead-instance
+// fix pair (7b0c31d epoch-gated stampCompletionIfIdle at the
+// messages.batch/applySessionSnapshot seams + Part.tsx elapsed guard; 4faad3f
+// third seam refreshOpenSessions + positional settlement in MessageParts).
+// Until these specs, both fixes were unit-proven only at jsdom seams — the
+// end-to-end path (real browser, real aggregator via fixtureserver, real SSE
+// delivery) had never been exercised. They close the corroborating
+// commit-review deferrals 7b0c31d F1/F2/F3 and 4faad3f a-F1/d-F1.
+//
+// Scenario class: an opencode instance DIES MID-GENERATION. Its session keeps
+// an orphaned incomplete assistant tail forever — message with NO
+// time.completed, trailing reasoning/text parts with time.start but NO
+// time.end, activity idle, and silence (no terminal event will ever arrive).
+// Scripting seam: POST /oc/fixture/orphan (pkg/fixtures handleFixtureOrphan)
+// emits the death sequence through the fake's REAL /event stream (the same
+// authoritative ingress path production events take) and persists it for
+// /fixture/reset hygiene.
+//
+//   O1 — cold load, orphan IS the newest: the tail must render SETTLED (no
+//        .md-stream engine, no .stream-caret, no .tool-dur — a duration would
+//        be fabricated: the true value is unknown) and no timer may tick.
+//        Closes 7b0c31d F1/F2/F3 (cold-snapshot seam + elapsed guard) + the
+//        cold half of 4faad3f d-F1.
+//   O2 — cold load, orphan MID-HISTORY (a later turn completed after the
+//        death): the incomplete assistant is no longer the newest, so
+//        settlement must come from the POSITIONAL disjunct (MessageParts
+//        settled() clause 3 — no stamp involved at all). Closes the mid-history
+//        half of 4faad3f d-F1.
+//   O3 — tree-reconnect WARM refresh: with the orphan a NON-active open
+//        session, force a REAL tree-stream reconnect (close + synthetic error
+//        → the app's onerror reconnect path → fresh EventSource → server
+//        replay + snapshot bootstrap) and prove refreshOpenSessions (the
+//        third seam, web/src/sync/refresh.ts) re-stamps the orphan's cached
+//        transcript. Closes 4faad3f a-F1.
+// ============================================================================
+
+const ORPHAN_SESSION = "other"; // this family's empty-seeded scratch session
+const ORPHAN_MID = "orph-a";    // the scripted orphan assistant message id
+const ORPHAN_PARTIAL = "flywheel is detached"; // cut-mid-word partial text marker
+
+// Arm the orphan death scripting through the real /oc/* passthrough (same
+// route discipline as resetSession — the daemon only proxies /oc/*).
+async function armOrphan(page: Page, later: 0 | 1) {
+  const res = await page.request.post(`/oc/fixture/orphan?session=${ORPHAN_SESSION}&later=${later}`, {
+    headers: { "X-VH-CSRF": "1" },
+  });
+  if (!res.ok()) throw new Error(`armOrphan(later=${later}) -> ${res.status()} ${res.statusText()}`);
+}
+
+// Settled-render state of one message row: the streaming affordances an
+// orphaned tail must NOT show after the fix, plus its visible text (settled ≠
+// blank). Single synchronous read — no auto-wait (the row renders settled on
+// its FIRST paint: the stamp lands in the same produce() that installs the
+// rows, so visibility implies settlement).
+async function orphanRowState(page: Page, mid: string) {
+  return page.evaluate((id) => {
+    const row = document.querySelector(`.msg[data-mid="${id}"]`);
+    if (!row) return null;
+    return {
+      mdStream: row.querySelectorAll(".md-stream").length,
+      caret: row.querySelectorAll(".stream-caret").length,
+      toolDur: row.querySelectorAll(".tool-dur").length,
+      toolDurLive: row.querySelectorAll(".tool-dur.live").length,
+      text: (row.textContent || "").trim().slice(0, 400),
+    };
+  }, mid);
+}
+
+// All reasoning/tool duration texts inside one row, joined — read twice ~1.1s
+// apart to prove no live timer is ticking (a ticking ReasoningPart interval
+// rewrites the text every 1s).
+async function readRowDurations(page: Page, mid: string) {
+  return page.evaluate((id) => {
+    const row = document.querySelector(`.msg[data-mid="${id}"]`);
+    if (!row) return null;
+    return Array.from(row.querySelectorAll(".tool-dur"))
+      .map((el) => el.textContent || "")
+      .join("|");
+  }, mid);
+}
+
+test("ORPHAN TAIL cold load: incomplete assistant as NEWEST renders settled (no stream engine, no caret, no fabricated/ticking duration)", async ({ page }) => {
+  await page.setViewportSize(VP);
+  await resetSession(page, ORPHAN_SESSION);
+  await armOrphan(page, 0);
+  await page.goto(projectUrl("/?session=" + ORPHAN_SESSION));
+  await expect(page.locator(".chat-scroll")).toBeVisible({ timeout: 10000 });
+
+  // Exactly the scripted pair: the user turn + the orphan assistant (the
+  // reset cleared any accumulation from earlier specs in this serial suite).
+  const rows = page.locator(".msg[data-mid]");
+  await expect(rows).toHaveCount(2, { timeout: 10000 });
+  await expect(rows.last()).toHaveAttribute("data-mid", ORPHAN_MID);
+  await expect(page.locator(`.msg[data-mid="orph-u"]`)).toContainText("wobble engine");
+
+  // CRUX — settled render of the orphan tail (single read, no auto-wait).
+  const st = await orphanRowState(page, ORPHAN_MID);
+  expect(st, `orphan row ${ORPHAN_MID} not found`).not.toBeNull();
+  expect(
+    st!.mdStream,
+    `BUG: orphan tail still mounts the live streaming engine (.md-stream) on cold load — the idle-snapshot stamp did not settle it. row=${JSON.stringify(st)}`,
+  ).toBe(0);
+  expect(st!.caret, `BUG: orphan tail shows a streaming caret. row=${JSON.stringify(st)}`).toBe(0);
+  expect(
+    st!.toolDur,
+    `BUG: orphan tail shows a duration — for a settled part with no time.end the true duration is unknown and must render NOTHING (Part.tsx elapsed guard). row=${JSON.stringify(st)}`,
+  ).toBe(0);
+  expect(st!.toolDurLive, `BUG: orphan tail shows a LIVE duration ticker. row=${JSON.stringify(st)}`).toBe(0);
+  // Settled ≠ blank: the partial text renders, final-shaped.
+  expect(st!.text, `orphan tail content missing. row=${JSON.stringify(st)}`).toContain(ORPHAN_PARTIAL);
+
+  // The session is idle (busy cleared by the scripted death) — no shimmer.
+  await expect(page.locator(".working-text")).toHaveCount(0);
+
+  // No ticking reasoning timer: two reads ~1.1s apart are identical (a live
+  // ReasoningPart interval would rewrite its duration text every 1s).
+  const d1 = await readRowDurations(page, ORPHAN_MID);
+  await page.waitForTimeout(1100);
+  const d2 = await readRowDurations(page, ORPHAN_MID);
+  expect(d2, `BUG: reasoning duration text changed over 1.1s (a timer ticks on the settled orphan): "${d1}" → "${d2}"`).toBe(d1);
+  // And nothing anywhere on the page is ticking live.
+  await expect(page.locator(".tool-dur.live")).toHaveCount(0);
+
+  console.log(`[orphan-cold-tail] settled row=${JSON.stringify(st)} durations="${d2}"`);
+});
+
+test("ORPHAN TAIL cold load (mid-history): incomplete assistant BEHIND a later completed turn renders settled POSITIONALLY", async ({ page }) => {
+  await page.setViewportSize(VP);
+  await resetSession(page, ORPHAN_SESSION);
+  await armOrphan(page, 1);
+  await page.goto(projectUrl("/?session=" + ORPHAN_SESSION));
+  await expect(page.locator(".chat-scroll")).toBeVisible({ timeout: 10000 });
+
+  // Four rows in scripted order; the orphan is NOT the newest (orph-la is).
+  const rows = page.locator(".msg[data-mid]");
+  await expect(rows).toHaveCount(4, { timeout: 10000 });
+  const order = await page.evaluate(() =>
+    Array.from(document.querySelectorAll(".msg[data-mid]")).map((el) => el.getAttribute("data-mid")),
+  );
+  expect(order).toEqual(["orph-u", ORPHAN_MID, "orph-lu", "orph-la"]);
+
+  // CRUX — the mid-history orphan renders settled via the POSITIONAL disjunct
+  // (assistant && !isLastMessage): no stamp can ever land on this message (the
+  // bridge stamps only the LAST assistant), so settlement is pure position.
+  const st = await orphanRowState(page, ORPHAN_MID);
+  expect(st, `orphan row ${ORPHAN_MID} not found`).not.toBeNull();
+  expect(st!.mdStream, `BUG: mid-history orphan still streams (.md-stream). row=${JSON.stringify(st)}`).toBe(0);
+  expect(st!.caret, `BUG: mid-history orphan shows a caret. row=${JSON.stringify(st)}`).toBe(0);
+  expect(st!.toolDur, `BUG: mid-history orphan shows a (ticking) duration. row=${JSON.stringify(st)}`).toBe(0);
+  expect(st!.text, `mid-history orphan content missing. row=${JSON.stringify(st)}`).toContain(ORPHAN_PARTIAL);
+
+  // The NEWEST turn completed normally and renders settled with its final text.
+  const last = await orphanRowState(page, "orph-la");
+  expect(last!.mdStream, `the completed resumed turn must render settled too. row=${JSON.stringify(last)}`).toBe(0);
+  expect(last!.text, `completed resumed turn content missing. row=${JSON.stringify(last)}`).toContain("flywheel is reattached");
+  await expect(page.locator(".working-text")).toHaveCount(0);
+
+  console.log(`[orphan-cold-mid] order=${JSON.stringify(order)} orphanRow=${JSON.stringify(st)}`);
+});
+
+// --- O3 plumbing: forced tree reconnect + refresh-seam observability --------
+//
+// The tree EventSource is stashed at construction; __vhForceTreeReconnect
+// closes it (readyState → CLOSED) and dispatches a synthetic error event — the
+// app's own onerror CLOSED branch then schedules the backoff connect() (a REAL
+// new EventSource; the server replays the ring + bootstraps a fresh snapshot —
+// see pkg/web/tree_resume_detail_test.go). That fresh detail snapshot is what
+// triggers refreshOpenSessions (web/src/sync/refresh.ts — its sole callers).
+//
+// Attribution for the warm-refresh crux: while __vhDelayOrphanSnap is armed,
+// EVERY event on the orphan's session stream (Stream 2 — including its
+// snapshot and messages.batch) is held ~8s, so when the test warm-switches
+// back to the orphan the rendered rows can come ONLY from the cached
+// transcript that refreshOpenSessions rebuilt (fetch + wholesale
+// buildMessages + stamp). If that seam's stamp were missing, the cache would
+// hold the server's UNSTAMPED orphan and the row would render live
+// (.md-stream + caret + ticker). The /vh/snapshot?sessions=<orphan> fetch is
+// the seam's exact fingerprint — refresh.ts is the ONLY caller of that
+// endpoint with a sessions= filter.
+async function installReconnectProbe(page: Page, orphanSession: string) {
+  await page.addInitScript((sid) => {
+    (window as any).__vhTreeES = null;
+    (window as any).__vhESUrls = [];
+    (window as any).__vhSnapFetches = [];
+    (window as any).__vhReconnectT = 0;
+    (window as any).__vhDelayOrphanSnap = false;
+    const OrigES = (window as any).EventSource;
+    function ProbeES(url: string, opts?: any) {
+      const es = opts !== undefined ? new OrigES(url, opts) : new OrigES(url);
+      const u = typeof url === "string" ? url : "";
+      try { (window as any).__vhESUrls.push(u); } catch { /* ignore */ }
+      // Tree stream: sessions= EMPTY + tree=2 negotiated.
+      if (u.indexOf("sessions=&") !== -1 && u.indexOf("tree=2") !== -1) {
+        (window as any).__vhTreeES = es;
+      }
+      // Orphan session stream: hold events while armed (holds the switch-back
+      // snapshot so the warm cache is what renders).
+      if (u.indexOf("sessions=" + sid) !== -1) {
+        const origAdd = es.addEventListener.bind(es);
+        es.addEventListener = function (type: string, listener: any, options?: any) {
+          return origAdd(
+            type,
+            (ev: MessageEvent) => {
+              const dispatch = () => {
+                if (typeof listener === "function") listener(ev);
+                else if (listener) listener.handleEvent(ev);
+              };
+              if ((window as any).__vhDelayOrphanSnap) setTimeout(dispatch, 8000);
+              else dispatch();
+            },
+            options,
+          );
+        };
+      }
+      return es;
+    }
+    ProbeES.prototype = OrigES.prototype;
+    // Static constants MUST be re-exported: the app compares
+    // `es.readyState === EventSource.CLOSED` against window.EventSource (this
+    // wrapper) — without the copies the constants are undefined and the
+    // CLOSED-reconnect branches never match (same discipline as installCapture).
+    (ProbeES as any).CLOSED = OrigES.CLOSED;
+    (ProbeES as any).OPEN = OrigES.OPEN;
+    (ProbeES as any).CONNECTING = OrigES.CONNECTING;
+    (window as any).EventSource = ProbeES;
+    (window as any).__vhForceTreeReconnect = () => {
+      const es = (window as any).__vhTreeES;
+      if (!es || es.readyState !== 1) return false;
+      (window as any).__vhReconnectT = performance.now();
+      es.close();
+      es.dispatchEvent(new Event("error"));
+      return true;
+    };
+    // fetchSessionMessages fingerprint: /vh/snapshot?sessions=… is the
+    // refresh.ts seam's exclusive endpoint.
+    const origFetch = window.fetch.bind(window);
+    window.fetch = (input: any, init?: any) => {
+      const u = typeof input === "string" ? input : (input && input.url) || "";
+      const p = origFetch(input, init);
+      if (u.indexOf("/vh/snapshot?") !== -1) {
+        const rec: any = { url: u, tStart: performance.now(), tDone: null };
+        (window as any).__vhSnapFetches.push(rec);
+        p.then(
+          () => { rec.tDone = performance.now(); },
+          () => { rec.tDone = performance.now(); },
+        );
+      }
+      return p;
+    };
+  }, orphanSession);
+}
+
+// Warm session switch WITHOUT a page reload (the established pushState +
+// popstate pattern from the wholesale-replace spec above).
+async function warmSwitch(page: Page, session: string) {
+  await page.evaluate((sid) => {
+    const u = new URL(location.href);
+    u.searchParams.set("session", sid);
+    history.pushState({}, "", u.toString());
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  }, session);
+}
+
+test("ORPHAN TAIL tree-reconnect warm refresh: refreshOpenSessions re-stamps a NON-active open session's cached orphan tail (a-F1)", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.setViewportSize(VP);
+  // Serial-suite hygiene: orphan host + the normal ACTIVE session for the
+  // reconnect window.
+  await resetSession(page, ORPHAN_SESSION);
+  await resetSession(page, "demo");
+  await armOrphan(page, 0);
+  await installReconnectProbe(page, ORPHAN_SESSION);
+
+  // Cold open the orphan: its transcript becomes the cached state this test
+  // refreshes. Sanity — the cold seam already renders it settled (O1's crux).
+  await page.goto(projectUrl("/?session=" + ORPHAN_SESSION));
+  await expect(page.locator(".chat-scroll")).toBeVisible({ timeout: 10000 });
+  await expect(page.locator(".msg[data-mid]")).toHaveCount(2, { timeout: 10000 });
+  const cold = await orphanRowState(page, ORPHAN_MID);
+  expect(cold && cold.mdStream === 0 && cold.toolDurLive === 0, `precondition: cold load settled. row=${JSON.stringify(cold)}`).toBe(true);
+
+  // Warm-switch away to a NORMAL session (demo becomes the active stream; the
+  // orphan stays cached as a NON-active open session).
+  await warmSwitch(page, "demo");
+  await expect(page.locator(".msg[data-mid=\"m1\"]")).toBeVisible({ timeout: 10000 });
+  await page.waitForTimeout(250); // let the switch settle (streams swap, no pending writes to the orphan)
+
+  // Force the REAL tree reconnect: wait for the tree ES to be OPEN, then close
+  // + synthetic error → the app's onerror CLOSED branch → backoff connect().
+  await expect.poll(
+    () => page.evaluate(() => ((window as any).__vhTreeES && (window as any).__vhTreeES.readyState === 1) ? 1 : 0),
+    { timeout: 8000, message: "tree EventSource never reached OPEN — reconnect cannot be forced" },
+  ).toBe(1);
+  const forced = await page.evaluate(() => (window as any).__vhForceTreeReconnect());
+  expect(forced, "forcing the tree reconnect failed").toBe(true);
+
+  // CRUX (wire): refreshOpenSessions ran for the NON-active orphan — its
+  // exclusive /vh/snapshot?sessions=<orphan> fetch STARTED and COMPLETED after
+  // the reconnect was forced. (The reconnect itself is asynchronous — onerror
+  // schedules connect() on a 1s backoff — so this poll is also what waits for
+  // the replacement connection and its fresh snapshot.)
+  await expect.poll(
+    () => page.evaluate((sid) => {
+      const recs = (window as any).__vhSnapFetches as any[];
+      const t = (window as any).__vhReconnectT as number;
+      return recs.some((r) => r.url.indexOf("sessions=" + sid) !== -1 && r.tStart > t && r.tDone !== null) ? 1 : 0;
+    }, ORPHAN_SESSION),
+    {
+      timeout: 15000,
+      message:
+        "refreshOpenSessions never pulled the orphan session after the forced tree reconnect " +
+        "(no completed /vh/snapshot?sessions=<orphan> fetch after the reconnect marker)",
+    },
+  ).toBe(1);
+  await page.waitForTimeout(250); // produce() + Solid flush of the rebuilt cache
+
+  // The reconnect re-created the tree EventSource (real transport teardown —
+  // now that the refresh has landed, the replacement connection exists).
+  const treeCount = await page.evaluate(() =>
+    ((window as any).__vhESUrls as string[]).filter((u) => u.indexOf("sessions=&") !== -1 && u.indexOf("tree=2") !== -1).length,
+  );
+  expect(treeCount, "expected ≥2 tree EventSource constructions (original + reconnect)").toBeGreaterThanOrEqual(2);
+
+  // Warm-switch BACK with the orphan's Stream-2 held (delay armed BEFORE the
+  // switch): whatever renders is the cache refreshOpenSessions rebuilt — the
+  // delayed snapshot/messages.batch cannot have written anything yet.
+  await page.evaluate(() => { (window as any).__vhDelayOrphanSnap = true; });
+  await warmSwitch(page, ORPHAN_SESSION);
+  await expect(page.locator(`.msg[data-mid="${ORPHAN_MID}"]`)).toBeVisible({ timeout: 10000 });
+
+  // CRUX (DOM): the warm-cached orphan tail renders SETTLED. Without the
+  // refresh.ts stamp, buildMessages(items) would have re-created the server's
+  // UNSTAMPED tail and this row would stream (.md-stream/caret/ticker).
+  const warm = await orphanRowState(page, ORPHAN_MID);
+  expect(warm, `orphan row ${ORPHAN_MID} not found on warm switch-back`).not.toBeNull();
+  expect(
+    warm!.mdStream,
+    `BUG (a-F1): the tree-reconnect refresh re-created an UNSTAMPED orphan tail in the warm cache — refreshOpenSessions' stampCompletionIfIdle did not run. row=${JSON.stringify(warm)}`,
+  ).toBe(0);
+  expect(warm!.caret, `BUG (a-F1): warm-cache orphan shows a caret. row=${JSON.stringify(warm)}`).toBe(0);
+  expect(warm!.toolDurLive, `BUG (a-F1): warm-cache orphan ticks a duration. row=${JSON.stringify(warm)}`).toBe(0);
+  expect(warm!.text, `warm-cache orphan content missing. row=${JSON.stringify(warm)}`).toContain(ORPHAN_PARTIAL);
+
+  // Release the hold (the delayed Stream-2 frames land; the page tears down at
+  // test end regardless — the 8s delay is also self-releasing).
+  await page.evaluate(() => { (window as any).__vhDelayOrphanSnap = false; });
+
+  const fetches = await page.evaluate(() => (window as any).__vhSnapFetches);
+  console.log(`[orphan-warm-refresh] treeES=${treeCount} snapFetches=${JSON.stringify(fetches)} warmRow=${JSON.stringify(warm)}`);
+});
+
+// Serial-suite hygiene for the orphan scripting: restore the touched sessions
+// to their seeded baselines after each ORPHAN TAIL test — the /fixture/reset
+// fan-out clears the scripted transcript fixture-side AND aggregator-store-side
+// (message.removed per non-baseline id). Scoped to the ORPHAN TAIL tests only
+// so the pre-existing tests' post-state is unchanged.
+test.afterEach(async ({ page }) => {
+  if (!test.info().title.startsWith("ORPHAN TAIL")) return;
+  await resetSession(page, ORPHAN_SESSION);
+  await resetSession(page, "demo");
+});

@@ -811,6 +811,7 @@ func (f *FakeOpenCode) Handler() http.Handler {
 	mux.HandleFunc("/fixture/reset", f.handleFixtureReset)
 	mux.HandleFunc("/fixture/busy", f.handleFixtureBusy)
 	mux.HandleFunc("/fixture/compaction-burst", f.handleFixtureCompactionBurst)
+	mux.HandleFunc("/fixture/orphan", f.handleFixtureOrphan)
 	mux.HandleFunc("/fixture/delete", f.handleFixtureDelete)
 	mux.HandleFunc("/question/", f.handleQuestion)
 	mux.HandleFunc("/question", func(w http.ResponseWriter, r *http.Request) {
@@ -1919,6 +1920,150 @@ func (f *FakeOpenCode) handleFixtureCompactionBurst(w http.ResponseWriter, r *ht
 			}
 			return out
 		}(),
+	})
+}
+
+// handleFixtureOrphan scripts the "instance died mid-generation" orphaned-tail
+// state (2026-08-20 dead-instance incident; FE fix 7b0c31d + 4faad3f,
+// unit-proven only until the session-completion e2e specs) onto a session
+// through the fake's REAL /event stream — the same authoritative ingress path
+// production events take. It is the fixture-side scripting seam for the
+// orphan-tail tests in web/tests/e2e/session-completion.spec.ts:
+//
+//	POST /fixture/orphan?session=<sid>&later=<0|1>
+//
+// The orphan shape (what a mid-generation death leaves behind — the generating
+// opencode process is GONE, so no terminal event will ever come):
+//   - a session whose activity transitions busy → idle and then falls SILENT
+//     (the session.idle below is the last event the "instance" ever emits);
+//   - a user message that completed normally;
+//   - an assistant message with NO time.completed whose parts carry time.start
+//     but NO time.end — a reasoning part and a text part both cut mid-word.
+//     This is the orphaned incomplete tail the SPA must render SETTLED (no
+//     streaming engine, no caret, no ticking/fabricated reasoning duration).
+//
+// later=1 appends a SECOND, fully-completed turn AFTER the death (the operator
+// resumed the session later and got a fresh finished turn) — making the
+// incomplete assistant MID-HISTORY: the transcript's newest message is a
+// different, completed one, so the orphan's settlement must come from the
+// POSITIONAL disjunct (MessageParts settled() clause 3), not from any stamp.
+//
+// Re-arm + /fixture/reset hygiene: scripted ids use the fixed "orph" prefix.
+// Re-arming first strips any prior orphan scripting from f.messages and emits
+// message.removed for each stripped id (clearing the aggregator store — same
+// rationale as handleFixtureReset's fan-out), so the handler is
+// idempotent/re-armable; /fixture/reset removes the scripting the same way
+// (scratch sessions like `other` have no seeded baseline, so EVERY resident id
+// is non-baseline and gets the fan-out). Test-only infrastructure — never
+// exercised by the shipped binary.
+func (f *FakeOpenCode) handleFixtureOrphan(w http.ResponseWriter, r *http.Request) {
+	session := r.URL.Query().Get("session")
+	later := r.URL.Query().Get("later") == "1"
+	if session == "" {
+		http.Error(w, "missing session", http.StatusBadRequest)
+		return
+	}
+	now := func() float64 { return float64(time.Now().UnixMilli()) }
+
+	// Re-arm hygiene: strip prior orphan-scripted messages (fixture store) and
+	// collect their ids so the post-unlock emits clear the aggregator store.
+	f.mu.Lock()
+	var removedMsgs []string
+	kept := f.messages[session][:0]
+	for _, m := range f.messages[session] {
+		if id, _ := m.Info["id"].(string); strings.HasPrefix(id, "orph") {
+			removedMsgs = append(removedMsgs, id)
+			continue
+		}
+		kept = append(kept, m)
+	}
+	f.messages[session] = kept
+	f.mu.Unlock()
+	for _, mid := range removedMsgs {
+		f.emit("message.removed", map[string]any{"sessionID": session, "messageID": mid})
+	}
+
+	// Phase 1 — busy (the turn starts; drives the sidebar dot + activity map).
+	f.emit("session.status", map[string]any{"sessionID": session, "status": map[string]any{"type": "busy"}})
+
+	// Phase 2 — the user turn (completes normally).
+	t0 := now()
+	orphUserInfo := map[string]any{"id": "orph-u", "sessionID": session, "role": "user", "time": map[string]any{"created": t0, "completed": t0}}
+	orphUserPart := textPart("orph-u", session, "orph-up", "orphan probe: refactor the wobble engine and explain", t0)
+	f.emit("message.updated", map[string]any{"info": orphUserInfo})
+	f.emit("message.part.updated", map[string]any{"part": orphUserPart})
+
+	// Phase 3 — the assistant turn that NEVER finishes: message.info has NO
+	// time.completed and both trailing parts have time.start with NO time.end
+	// (reasoning first, then a text part cut mid-word). This is the orphaned
+	// incomplete tail.
+	time.Sleep(40 * time.Millisecond)
+	orphAsstInfo := map[string]any{"id": "orph-a", "sessionID": session, "role": "assistant", "agent": "build",
+		"time": map[string]any{"created": now()}}
+	f.emit("message.updated", map[string]any{"info": orphAsstInfo})
+	orphReasonPart := map[string]any{"id": "orph-ar", "sessionID": session, "messageID": "orph-a", "type": "reasoning",
+		"text": "the wobble engine has three moving parts; first I inspect the flywheel asse", // cut mid-word
+		"time": map[string]any{"start": now()}}
+	f.emit("message.part.updated", map[string]any{"part": orphReasonPart})
+	time.Sleep(40 * time.Millisecond)
+	orphTextPart := map[string]any{"id": "orph-at", "sessionID": session, "messageID": "orph-a", "type": "text",
+		"text": "I started refactoring the wobble engine. The flywheel is detached from the conne", // cut mid-word
+		"time": map[string]any{"start": now()}}
+	f.emit("message.part.updated", map[string]any{"part": orphTextPart})
+
+	// Phase 4 — the DEATH: session.idle is the last event the instance ever
+	// emits for this turn. Busy clears; no completion bookend will EVER arrive
+	// for the assistant above. Silence follows.
+	f.emit("session.idle", map[string]any{"sessionID": session})
+
+	// Optional Phase 5 — later=1: a fully-completed RESUMED turn AFTER the
+	// death, making the orphan mid-history.
+	var lateUserInfo, lateAsstInfo map[string]any
+	var lateUserPart, lateAsstPart map[string]any
+	if later {
+		time.Sleep(40 * time.Millisecond)
+		f.emit("session.status", map[string]any{"sessionID": session, "status": map[string]any{"type": "busy"}})
+		t1 := now()
+		lateUserInfo = map[string]any{"id": "orph-lu", "sessionID": session, "role": "user", "time": map[string]any{"created": t1, "completed": t1}}
+		lateUserPart = textPart("orph-lu", session, "orph-lup", "orphan probe: resume and finish the refactor", t1)
+		f.emit("message.updated", map[string]any{"info": lateUserInfo})
+		f.emit("message.part.updated", map[string]any{"part": lateUserPart})
+		time.Sleep(40 * time.Millisecond)
+		lateAsstInfo = map[string]any{"id": "orph-la", "sessionID": session, "role": "assistant", "agent": "build",
+			"time": map[string]any{"created": now()}}
+		f.emit("message.updated", map[string]any{"info": lateAsstInfo})
+		lateAsstPart = textPart("orph-la", session, "orph-lt",
+			"Resumed cleanly. The wobble engine refactor is complete and the flywheel is reattached.", now())
+		f.emit("message.part.updated", map[string]any{"part": lateAsstPart})
+		// Normal completion bookend (the contrast with the orphan above): the
+		// message gains time.completed AFTER the final part — the settle signal
+		// the FE's settled() presentation reads. Then the turn ends idle.
+		lateAsstInfo["time"] = map[string]any{"created": lateAsstInfo["time"].(map[string]any)["created"], "completed": now()}
+		f.emit("message.updated", map[string]any{"info": lateAsstInfo})
+		f.emit("session.idle", map[string]any{"sessionID": session})
+	}
+
+	// Persist the scripted transcript so /fixture/reset removes it (diff vs
+	// seeded baseline → message.removed per id, clearing the aggregator store
+	// too) and any EnsureMessages re-fetch returns the same shape.
+	f.mu.Lock()
+	f.messages[session] = append(f.messages[session],
+		messageWithParts{Info: orphUserInfo, Parts: []map[string]any{orphUserPart}},
+		messageWithParts{Info: orphAsstInfo, Parts: []map[string]any{orphReasonPart, orphTextPart}},
+	)
+	if later {
+		f.messages[session] = append(f.messages[session],
+			messageWithParts{Info: lateUserInfo, Parts: []map[string]any{lateUserPart}},
+			messageWithParts{Info: lateAsstInfo, Parts: []map[string]any{lateAsstPart}},
+		)
+	}
+	f.mu.Unlock()
+
+	writeJSON(w, map[string]any{
+		"session": session, "later": later, "user": "orph-u", "orphan": "orph-a",
+		"reasoning": "orph-ar", "partial": "orph-at",
+		"resumeUser": "orph-lu", "resumeAssistant": "orph-la",
+		"stripped": len(removedMsgs),
 	})
 }
 

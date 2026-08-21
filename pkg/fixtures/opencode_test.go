@@ -419,3 +419,134 @@ func TestFixtureReset_EmitsMessageRemovedForAccumulated(t *testing.T) {
 		t.Errorf("belt: accumulated messages still present in f.messages after reset (gotIDs=%v)", gotIDs)
 	}
 }
+
+// TestFixtureOrphan_ScriptsIncompleteTail pins the handleFixtureOrphan
+// contract the orphan-tail e2e specs (web/tests/e2e/session-completion.spec.ts)
+// depend on: a scripted session whose LAST turn is an assistant message with NO
+// time.completed and parts (reasoning + text) carrying time.start with NO
+// time.end, activity ending idle, and SILENCE thereafter (no completion
+// bookend ever arrives — the "instance died mid-generation" state). Also pins
+// re-arm stripping and the /fixture/reset removal of the scripting.
+func TestFixtureOrphan_ScriptsIncompleteTail(t *testing.T) {
+	t.Parallel()
+	f := New()
+	srv := startFixtureHTTP(t, f)
+	ch, unsub := f.subscribe()
+	defer unsub()
+
+	// 1. Arm later=0 (orphan is the newest message). The handler emits
+	// synchronously, so every event is already in the channel when the POST
+	// returns.
+	resp, _ := postJSON(t, srv, "/fixture/orphan?session=other&later=0", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("arm later=0: got %d want 200", resp.StatusCode)
+	}
+
+	// 2. Fixture-side transcript shape: user(completed) → assistant orphan.
+	f.mu.Lock()
+	msgs := append([]messageWithParts(nil), f.messages["other"]...)
+	f.mu.Unlock()
+	if len(msgs) != 2 {
+		t.Fatalf("later=0: fixture transcript len=%d want 2 (user + orphan assistant)", len(msgs))
+	}
+	if id, _ := msgs[0].Info["id"].(string); id != "orph-u" {
+		t.Fatalf("later=0: first message id=%q want orph-u (user)", id)
+	}
+	orphan := msgs[1]
+	if id, _ := orphan.Info["id"].(string); id != "orph-a" {
+		t.Fatalf("later=0: second message id=%q want orph-a (orphan assistant)", id)
+	}
+	if tm, _ := orphan.Info["time"].(map[string]any); tm != nil {
+		if _, has := tm["completed"]; has {
+			t.Fatalf("orphan assistant must NOT carry time.completed (the death bookend never arrives)")
+		}
+	}
+	sawReason, sawText := false, false
+	for _, p := range orphan.Parts {
+		pt, _ := p["time"].(map[string]any)
+		hasStart := pt != nil && pt["start"] != nil
+		hasEnd := pt != nil && pt["end"] != nil
+		switch p["type"] {
+		case "reasoning":
+			sawReason = true
+			if !hasStart || hasEnd {
+				t.Errorf("orphan reasoning part must carry time.start WITHOUT time.end (got start=%v end=%v)", pt["start"], pt["end"])
+			}
+		case "text":
+			sawText = true
+			if !hasStart || hasEnd {
+				t.Errorf("orphan text part must carry time.start WITHOUT time.end (got start=%v end=%v)", pt["start"], pt["end"])
+			}
+		}
+	}
+	if !sawReason || !sawText {
+		t.Fatalf("orphan assistant must carry a reasoning AND a text part (reason=%v text=%v)", sawReason, sawText)
+	}
+
+	// 3. Event sequence: collect everything the arm emitted; the LAST event
+	// must be session.idle, and NO message.updated for orph-a may carry
+	// "completed" (nothing after the death stamps the tail).
+	var events []string
+	completedOnOrphan := false
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		select {
+		case raw := <-ch:
+			events = append(events, raw)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if len(events) == 0 {
+		t.Fatalf("no events observed for the arm sequence")
+	}
+	last := events[len(events)-1]
+	if !strings.Contains(last, "session.idle") {
+		t.Fatalf("last scripted event must be session.idle (silence thereafter), got %s", last)
+	}
+	for _, raw := range events {
+		if strings.Contains(raw, "message.updated") && strings.Contains(raw, "orph-a") && strings.Contains(raw, "completed") {
+			completedOnOrphan = true
+		}
+	}
+	if completedOnOrphan {
+		t.Fatalf("a message.updated for the orphan assistant carried time.completed — the scripted death shape is wrong")
+	}
+
+	// 4. SILENCE: no further events for the session after the terminal idle.
+	if extra := countEvents(t, ch, time.Now().Add(400*time.Millisecond), "other"); extra != 0 {
+		t.Fatalf("silence violated: %d events observed after the scripted session.idle", extra)
+	}
+
+	// 5. Re-arm with later=1: strips the prior scripting (fixture + emit side)
+	//    and appends a completed resumed turn, making the orphan mid-history.
+	resp2, body2 := postJSON(t, srv, "/fixture/orphan?session=other&later=1", "")
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("re-arm later=1: got %d want 200", resp2.StatusCode)
+	}
+	if !strings.Contains(string(body2), `"stripped":2`) {
+		t.Fatalf("re-arm must report stripping the 2 prior scripted ids, body=%s", body2)
+	}
+	f.mu.Lock()
+	msgs2 := append([]messageWithParts(nil), f.messages["other"]...)
+	f.mu.Unlock()
+	if len(msgs2) != 4 {
+		t.Fatalf("later=1: fixture transcript len=%d want 4 (user, orphan, resumed user, resumed assistant)", len(msgs2))
+	}
+	lastInfo := msgs2[3].Info
+	if id, _ := lastInfo["id"].(string); id != "orph-la" {
+		t.Fatalf("later=1: last message id=%q want orph-la (completed resumed assistant)", id)
+	}
+	if tm, _ := lastInfo["time"].(map[string]any); tm == nil || tm["completed"] == nil {
+		t.Fatalf("later=1: resumed assistant must carry time.completed (the contrast shape)")
+	}
+
+	// 6. /fixture/reset removes the scripting entirely (scratch session: no
+	//    seeded baseline → the whole transcript is non-baseline).
+	postJSON(t, srv, "/fixture/reset?session=other", "")
+	f.mu.Lock()
+	remaining := len(f.messages["other"])
+	f.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("after /fixture/reset: f.messages[other] len=%d want 0 (scripting must be removable for serial-suite hygiene)", remaining)
+	}
+}
