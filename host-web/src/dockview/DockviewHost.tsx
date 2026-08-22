@@ -6,6 +6,10 @@ import {
   applyColdRestoreForWorkspace,
   installLayoutSaver,
 } from "./layoutPersistence";
+import {
+  installProportionalResize,
+  type ProportionsHandle,
+} from "./proportions";
 import { installFlipAnimation } from "../layoutAnimation";
 import { normalizeWorkspaceOrientation } from "../viewportShape";
 import type { HostOps } from "./types";
@@ -54,6 +58,9 @@ export function DockviewHost(props: { workspaceId: string }) {
   // FLIP layout animation uninstall handle (assigned in onMount; detached in
   // onCleanup). See layoutAnimation.ts.
   let uninstallFlip: (() => void) | undefined;
+  // Proportional resize re-normalizer handle (assigned in onMount; detached in
+  // onCleanup). See proportions.ts.
+  let proportionsHandle: ProportionsHandle | undefined;
 
   // Mutable ops object breaks the dockview↔controller creation cycle: the
   // factory captures it; the controller fills it after the api exists.
@@ -98,7 +105,17 @@ export function DockviewHost(props: { workspaceId: string }) {
     // they mutate the live tree. applyColdRestoreForWorkspace is structurally
     // one-shot per workspace id (a second call is a cached no-op), so no code
     // path can drive a second restore.
-    const restored = applyColdRestoreForWorkspace(api, props.workspaceId);
+    //
+    // v3 FRACTIONAL RESTORE: the persisted tree stores per-branch FRACTIONS;
+    // materialization recomputes px = fraction × branch extent against the
+    // CURRENT container content box (measured HERE, before fromJSON), so the
+    // saved split SHARES land at any viewport size. A degenerate measurement
+    // (0×0 — container unsized at mount) falls back to the saved grid w/h.
+    const extent = {
+      width: container.clientWidth,
+      height: container.clientHeight,
+    };
+    const restored = applyColdRestoreForWorkspace(api, props.workspaceId, extent);
     if (!restored) {
       if (shouldSeedWorkspace(props.workspaceId)) {
         seedInitialPanes(api);
@@ -122,6 +139,17 @@ export function DockviewHost(props: { workspaceId: string }) {
     // Hook the debounced save AFTER cold init so the initial seed/restore does
     // not itself trigger a save — only subsequent user mutations persist.
     installLayoutSaver(api);
+
+    // ---- PROPORTIONAL RESIZE RE-NORMALIZER (proportions.ts) ------------------
+    // Keeps the fractional split geometry authoritative across window resizes
+    // on the LIVE tree (BranchNode.resizeChild — never fromJSON), healing the
+    // post-flip lost-proportions regime the probe measured (auto-transpose's
+    // flipNode rebuilds branch splitviews without saved proportions, so
+    // subsequent resizes drift to last-view-absorbs). Installed AFTER the
+    // orientation normalization so the initial snapshot reflects the final
+    // cold geometry; its capture-on-onDidLayoutChange ignores pure resizes,
+    // so the stored fractions remain the user's intent.
+    proportionsHandle = installProportionalResize(api, props.workspaceId);
 
     // If this host is already active at mount (the default workspace on a cold
     // load, or a freshly-added workspace), project its display signals now.
@@ -204,6 +232,7 @@ export function DockviewHost(props: { workspaceId: string }) {
       window.removeEventListener("pointercancel", onGeometryDragEnd, true);
     }
     uninstallFlip?.();
+    proportionsHandle?.dispose();
     controller?.dispose();
     clearDisplayFor(props.workspaceId);
     api?.dispose();

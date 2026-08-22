@@ -16,6 +16,7 @@ import {
   uninstallKeyboardFocus,
 } from "./keyboardFocus";
 import { installAutoTranspose, uninstallAutoTranspose } from "./viewportShape";
+import { installProportionsDevBridge } from "./dockview/proportions";
 import s from "./App.module.css";
 
 /**
@@ -73,6 +74,11 @@ export function App() {
     // (gridview flipNode keeps iframes mounted) + reversible (localStorage
     // toggle, default ON). Self-contained listeners + DEV bridge; cleanup below.
     installAutoTranspose();
+    // Proportions DEV bridge (window.__hostProportions): pure-fraction test
+    // surface + deterministic re-normalize hooks for the proportions e2e.
+    // Page-level singleton, DEV-gated, idempotent — no uninstall needed
+    // (mirrors window.__host's page-lifetime install).
+    installProportionsDevBridge();
   });
   onCleanup(() => {
     uninstallKeyboardFocus();

@@ -1239,8 +1239,13 @@ export async function twoPanes(page: Page): Promise<[string, string]> {
 
 // ---- layout-persistence helpers -------------------------------------------
 
-/** Storage key persistence writes (must match src/dockview/layoutPersistence.ts). */
-export const LAYOUT_STORAGE_KEY = "vh-host:layout:v2";
+/** Storage key persistence writes (must match src/dockview/layoutPersistence.ts).
+ *  v3 = fractional grid trees (px blobs under the legacy v2 key migrate on
+ *  read — the legacy const below is for the migration e2e). */
+export const LAYOUT_STORAGE_KEY = "vh-host:layout:v3";
+/** The superseded v2 key (px geometry) — read as a fallback on cold start and
+ *  migrated in-memory to fractions; the first v3 write removes it. */
+export const LEGACY_LAYOUT_STORAGE_KEY_V2 = "vh-host:layout:v2";
 
 /** Wait until localStorage holds a saved layout with the expected TOTAL panel
  *  count across all workspaces. The v2 schema wraps each workspace's serialized

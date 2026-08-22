@@ -2,16 +2,20 @@ import { test, expect } from "@playwright/test";
 import * as H from "./util";
 
 // =============================================================================
-// Layout-persistence regression gate (multi-workspace v2 schema) — proves the
-// Dockview tiling round-trips through a page reload AND that a poisoned saved
-// layout is rejected.
+// Layout-persistence regression gate (multi-workspace v3 fractional schema) —
+// proves the Dockview tiling round-trips through a page reload AND that a
+// poisoned saved layout is rejected.
 //
 // Mechanism under test (src/dockview/layoutPersistence.ts):
-//   SAVE   — debounced, serializes EVERY workspace's api.toJSON() into the v2
-//            blob localStorage["vh-host:layout:v2"] =
-//              { activeWorkspaceId, workspaces: [{id, name, layout}] }, hooked
-//            on any workspace's onDidLayoutChange + workspace add/close/switch.
-//   RESTORE — cold init reads the v2 blob, validates every workspace's every
+//   SAVE   — debounced, serializes EVERY workspace's api.toJSON() into the v3
+//            blob localStorage["vh-host:layout:v3"] =
+//              { v: 3, activeWorkspaceId, workspaces: [{id, name, layout}] }
+//            where each grid child stores `fraction` (share of its parent
+//            branch) instead of dockview's px `size`; hooked on any
+//            workspace's onDidLayoutChange + workspace add/close/switch.
+//   RESTORE — cold init reads the v3 blob (hash → v3 key → legacy v2 key,
+//            migrating px→fractions in-memory), materializes px = fraction ×
+//            the CURRENT container extent, validates every workspace's every
 //            pane url through the SAME isFleetEntry http/https guard the fleet
 //            resolver uses, REPAIRS (drops invalid panes per workspace), and
 //            calls api.fromJSON() exactly ONCE PER WORKSPACE (COLD ONLY — it
@@ -29,12 +33,14 @@ import * as H from "./util";
 // lane's project set).
 // =============================================================================
 
-/** Wrap a serialized Dockview layout in the v2 envelope as the default
+/** Wrap a serialized Dockview layout in the workspace envelope as the default
  *  workspace (ws-1), so a pre-seeded blob matches what the app cold-restores.
  *  The default workspace id on a fresh context is "ws-1" (nextWsId starts at 1).
- *  This keeps the poison test's blob otherwise structurally valid so the restore
- *  rejects it for the POISON, not a shape defect. */
-function wrapV2(layout: Record<string, unknown>): {
+ *  Deliberately carries NO `v: 3` marker — the payload is raw dockview px
+ *  output, exactly like a legacy v2-era blob, so the read path MIGRATES it
+ *  (px→fractions) like real legacy data while keeping this test otherwise
+ *  structurally valid (the poison test rejects for the POISON, not shape). */
+function wrapLayout(layout: Record<string, unknown>): {
   activeWorkspaceId: string;
   workspaces: Array<{ id: string; name: string; layout: Record<string, unknown> }>;
 } {
@@ -112,13 +118,13 @@ test.describe("layout persistence", () => {
     const victim = ids[ids.length - 1];
     panels[victim].params = { url: "javascript:alert(document.domain)", label: "evil" };
 
-    // Wrap in the v2 envelope (default workspace ws-1) so the app cold-restores
-    // this workspace, then pre-seed it into the host origin's localStorage.
-    // (addInitScript is avoided because it also runs in every child iframe — the
-    // cross-origin mock panes on :5174 — which is the wrong origin; writing on
-    // the live :5173 page then reloading is unambiguous and scopes to the host
-    // origin only.)
-    const payload = wrapV2(state);
+    // Wrap in the workspace envelope (default workspace ws-1) so the app
+    // cold-restores this workspace, then pre-seed it into the host origin's
+    // localStorage. (addInitScript is avoided because it also runs in every
+    // child iframe — the cross-origin mock panes on :5174 — which is the wrong
+    // origin; writing on the live :5173 page then reloading is unambiguous and
+    // scopes to the host origin only.)
+    const payload = wrapLayout(state);
     await page.evaluate(
       ({ payload, key }) => {
         localStorage.setItem(key, JSON.stringify(payload));

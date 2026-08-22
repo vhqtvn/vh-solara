@@ -37,25 +37,28 @@ test.describe("host shell — production build (vite preview)", () => {
   });
 
   test("production build has NO window.__host (and no DEV bridges)", async ({ page }) => {
-    // The DEV-only test bridges (host + keyboard-focus + viewport auto-transpose)
-    // and their destructive hooks must be entirely absent from the running
-    // production app. (The i3-keys bridge was removed when the Alt-shortcut
-    // module was dropped.)
+    // The DEV-only test bridges (host + keyboard-focus + viewport auto-transpose
+    // + proportions re-normalizer) and their destructive hooks must be entirely
+    // absent from the running production app. (The i3-keys bridge was removed
+    // when the Alt-shortcut module was dropped.)
     const hasBridge = await page.evaluate(() => {
       const w = window as unknown as {
         __host?: unknown;
         __hostKbdFocus?: unknown;
         __hostViewport?: unknown;
+        __hostProportions?: unknown;
       };
       return {
         host: typeof w.__host !== "undefined",
         kbdFocus: typeof w.__hostKbdFocus !== "undefined",
         viewport: typeof w.__hostViewport !== "undefined",
+        proportions: typeof w.__hostProportions !== "undefined",
       };
     });
     expect(hasBridge.host, "window.__host must be absent in production").toBe(false);
     expect(hasBridge.kbdFocus, "window.__hostKbdFocus must be absent in production").toBe(false);
     expect(hasBridge.viewport, "window.__hostViewport must be absent in production").toBe(false);
+    expect(hasBridge.proportions, "window.__hostProportions must be absent in production").toBe(false);
   });
 
   test("production tabstrip HAS workspace chrome (ws-tab/ws-add/add-server)", async ({ page }) => {

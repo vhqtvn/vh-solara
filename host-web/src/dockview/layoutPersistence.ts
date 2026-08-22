@@ -6,6 +6,7 @@ import {
   seedPaneSeq,
   type FleetEntry,
 } from "../state/mockData";
+import { fractionsToSizes, sizesToFractions } from "./fractionMath";
 
 // =============================================================================
 // Layout persistence — multi-workspace edition.
@@ -39,17 +40,40 @@ import {
 // │   a second restore.                                                       │
 // └─────────────────────────────────────────────────────────────────────────┘
 //
-// SCHEMA (v2 — bumped from v1's single-layout blob; v1 data will not parse and
-// cleanly falls back to seed, so a stale v1 blob can never corrupt a restore):
+// SCHEMA (v3 — FRACTIONAL split geometry; operator directive 2026-08-23: "the
+// layout is bad when there are window resizing — store split offsets as
+// global percentage instead of pixels"):
 //
 //   {
+//     v: 3,                        // schema marker (v2 blobs lack it → migrate)
 //     activeWorkspaceId: string,
 //     workspaces: Array<{
 //       id: string,
 //       name: string,
-//       layout: SerializedDockview | null   // null = empty workspace
+//       layout: FractionalLayout | null   // null = empty workspace
 //     }>
 //   }
+//
+// A FractionalLayout is dockview's serialized shape EXCEPT every grid-tree
+// child carries `fraction` (its share of the PARENT branch's extent, siblings
+// summing to ~1) instead of a pixel `size`. Per-branch fractions compose into
+// viewport-independent "global percentages": restoring at ANY container size
+// recomputes px = fraction × the branch's extent (root extent = the CURRENT
+// container, measured at cold-restore time), largest-remainder distributed so
+// siblings sum exactly to the extent. Dockview then re-derives its own
+// splitview proportions from those px, so the restore is proportional by
+// construction (probe-verified: px blobs restored proportionally too, via
+// ctor-time saveProportions — but the STORED artifact is now size-free).
+//
+// v2 → v3 MIGRATION (lossless, in-memory on read): a v2 px blob (localStorage
+// key vh-host:layout:v2 OR an old #state= hash payload) fractionizes with
+// fraction = size / siblingSum — viewport-independent math — and restores the
+// same way. No forced re-seed; the next save writes the v3 key. v1
+// (pre-workspace single-layout) blobs still fail the envelope parse → seed.
+//
+// ZERO-SIZE GUARD: a branch whose sibling px sum is 0/missing/non-finite (or
+// whose fractions are degenerate) restores to EQUAL fractions (documented in
+// fractionMath.ts sizesToFractions) — never NaN, never a crash.
 //
 // PRECEDENCE (defensible default — NOT settled canon): on cold start, for each
 // workspace, SAVED-LAYOUT-WINS-WITH-VALIDATION; the fleet/mock seed is the
@@ -58,9 +82,16 @@ import {
 // by design (the empty-workspace affordance prompts Add Server).
 // =============================================================================
 
-/** Versioned + namespaced storage key. Bumped to v2 for the multi-workspace
- *  schema (v1's single-layout blob will not parse → falls back to seed). */
-export const LAYOUT_STORAGE_KEY = "vh-host:layout:v2";
+/** Versioned + namespaced storage key. Bumped v2→v3 for FRACTIONAL split
+ *  geometry (v2 stored dockview's serialized px sizes). Legacy v2 blobs are
+ *  migrated losslessly on read (px→fraction is viewport-independent); v1
+ *  blobs fall back to seed. */
+export const LAYOUT_STORAGE_KEY = "vh-host:layout:v3";
+
+/** The superseded v2 key — read as a fallback when the v3 key is absent (the
+ *  operator's existing px blob migrates instead of re-seeding), and removed
+ *  on the first v3 write AND on a full clear (it is superseded). */
+const LEGACY_V2_STORAGE_KEY = "vh-host:layout:v2";
 
 /** Debounce window for saves. onDidLayoutChange fires in bursts (one drag fires
  *  many); coalescing into one write avoids hammering localStorage. ~450ms is a
@@ -68,6 +99,10 @@ export const LAYOUT_STORAGE_KEY = "vh-host:layout:v2";
 const SAVE_DEBOUNCE_MS = 450;
 
 // ---- persisted-state shape -------------------------------------------------
+
+/** Schema marker. v3 = fractional grid trees (written since the split-offset
+ *  directive). Absent = a legacy v2 px blob — migrated in-memory on read. */
+export type PersistedStateVersion = 3;
 
 export interface WorkspaceSetEntry {
   id: string;
@@ -77,6 +112,7 @@ export interface PersistedWorkspace extends WorkspaceSetEntry {
   layout: SerializedDockview | null;
 }
 export interface PersistedState {
+  v?: PersistedStateVersion;
   activeWorkspaceId: string;
   workspaces: PersistedWorkspace[];
 }
@@ -134,15 +170,25 @@ function flushSave(): void {
   // Fork 1: a single JSON string feeds BOTH mirrors (URL hash + localStorage)
   // so they can never drift. An empty/absent state clears both.
   const json =
-    state && state.workspaces.length > 0 ? JSON.stringify(state) : null;
+    state && state.workspaces.length > 0
+      ? JSON.stringify(fractionizePersistedState(state))
+      : null;
 
   // localStorage mirror — keeps the bare-`/` reopen working (inherits last
   // state when there is no hash).
   try {
     if (json === null) {
       localStorage.removeItem(LAYOUT_STORAGE_KEY);
+      // State cleared (no workspaces left) — remove the legacy v2 blob TOO:
+      // readBlob() falls back to the v2 key when the v3 key is absent, so a
+      // surviving v2 blob would RESURRECT stale px geometry on the next load
+      // right after the user cleared everything.
+      localStorage.removeItem(LEGACY_V2_STORAGE_KEY);
     } else {
       localStorage.setItem(LAYOUT_STORAGE_KEY, json);
+      // The legacy v2 px blob is superseded by this v3 write — remove it so a
+      // later v3-key clear can never resurrect stale px geometry.
+      localStorage.removeItem(LEGACY_V2_STORAGE_KEY);
     }
   } catch {
     // localStorage unavailable / quota exceeded / private mode — swallow.
@@ -153,6 +199,26 @@ function flushSave(): void {
   // fromJSON is the cold restore on page load, which reads the hash via
   // readBlob at module init, never on a runtime save).
   writeHashState(json);
+}
+
+/** v3 save transform: stamp the schema marker and convert every workspace
+ *  layout's grid trees from dockview px sizes to per-branch fractions
+ *  (`fraction` = child share of its parent branch extent; px `size` stripped).
+ *  Floating/popout groups keep their own width/height/position (overlay
+ *  geometry, not container splits) but their INNER grid trees fractionize
+ *  against the floating group's own extent. Never throws; a layout that
+ *  fails the walk is passed through untouched (validation owns rejection). */
+function fractionizePersistedState(state: PersistedState): PersistedState {
+  return {
+    v: 3,
+    activeWorkspaceId: state.activeWorkspaceId,
+    workspaces: state.workspaces.map((ws) => ({
+      ...ws,
+      layout: ws.layout
+        ? (fractionizeSavedLayout(ws.layout as unknown as SavedLayout) as unknown as SerializedDockview)
+        : null,
+    })),
+  };
 }
 
 /**
@@ -219,12 +285,27 @@ export function loadWorkspaceSet(): {
   };
 }
 
+/** The container extent a cold restore materializes fractions against: the
+ *  workspace element's content box, measured by DockviewHost at mount. */
+export interface RestoreExtent {
+  width: number;
+  height: number;
+}
+
 /**
  * COLD-RESTORE ONLY (HARD RULE). Read the saved layout for ONE workspace from
  * the init blob, validate every pane url via the SAME isFleetEntry guard the
  * fleet resolver uses, repair (drop invalid panes from that workspace's tree),
+ * MATERIALIZIZE the fractional split geometry against `extent` (px = fraction
+ * × branch extent, recomputed for the CURRENT container — the v3 semantics),
  * and — if ≥1 valid pane survives — call api.fromJSON() EXACTLY ONCE for this
  * workspace, before any of its iframes has a live identity.
+ *
+ * `extent` is the workspace element's content box at cold-restore time (the
+ * caller measures it). A degenerate extent (0×0) is tolerated: fractions
+ * materialize to zeros and dockview's ResizeObserver redistributes
+ * proportionally once the element gains its real size (the injected px define
+ * the splitview's ctor-time proportions).
  *
  * Returns true when a saved layout was restored (caller skips seed); false when
  * there was no valid saved layout for this workspace (caller falls back to seed
@@ -237,13 +318,14 @@ export function loadWorkspaceSet(): {
 export function applyColdRestoreForWorkspace(
   api: DockviewApi,
   workspaceId: string,
+  extent?: RestoreExtent,
 ): boolean {
   if (restoredWorkspaceIds.has(workspaceId)) {
     return restoredWorkspaceResult.get(workspaceId) ?? false;
   }
   restoredWorkspaceIds.add(workspaceId);
   try {
-    const repaired = loadRepairedWorkspaceLayout(workspaceId);
+    const repaired = loadRepairedWorkspaceLayout(workspaceId, extent);
     if (!repaired) {
       restoredWorkspaceResult.set(workspaceId, false);
       return false;
@@ -273,12 +355,13 @@ export function applyColdRestoreForWorkspace(
 }
 
 /**
- * Read + repair ONE workspace's saved layout from the init blob. Returns the
- * repaired SerializedDockview (only valid panes), or null when this workspace
- * has no entry / no layout / a layout with zero valid panes. Never throws.
- */
+ * Read + repair + MATERIALIZIZE ONE workspace's saved layout from the init
+ * blob. Returns the px-serialized SerializedDockview (only valid panes, sizes
+ * recomputed from fractions × the CURRENT extent), or null when this workspace
+ * has no entry / no layout / a layout with zero valid panes. Never throws. */
 export function loadRepairedWorkspaceLayout(
   workspaceId: string,
+  extent?: RestoreExtent,
 ): SerializedDockview | null {
   if (!initBlob) return null;
   const ws = initBlob.workspaces.find((w) => w.id === workspaceId);
@@ -287,7 +370,9 @@ export function loadRepairedWorkspaceLayout(
   const validIds = validRestoreIds(ws.layout.panels);
   if (validIds.size === 0) return null;
   const repaired = repairLayout(ws.layout, validIds);
-  return repaired ? (repaired as unknown as SerializedDockview) : null;
+  if (!repaired) return null;
+  // v3 semantics: fractions → px against the CURRENT container extent.
+  return materializeSavedLayout(repaired, extent) as unknown as SerializedDockview;
 }
 
 // ---- per-pane url validation (defense-in-depth: never trust stored data) ----
@@ -364,13 +449,17 @@ function maxPaneSeqSuffix(ids: Iterable<string>): number {
  *  state (two same-origin tabs stay independent — each carries its own
  *  `#state=` hash). localStorage is the write-through mirror so a bare `/`
  *  reopen inherits the last-saved state. Read the hash FIRST; if absent or
- *  invalid, fall back to localStorage. This per-tab independence is the whole
- *  point of the hash: localStorage is shared across tabs, so two tabs at `/`
- *  would otherwise clobber each other. */
+ *  invalid, fall back to the v3 localStorage key, then to the LEGACY v2 key
+ *  (px blob — migrated losslessly to fractions in-memory; never re-seeds).
+ *  This per-tab independence is the whole point of the hash: localStorage is
+ *  shared across tabs, so two tabs at `/` would otherwise clobber each
+ *  other. */
 function readBlob(): PersistedState | null {
   const fromHash = readHashState();
   if (fromHash !== null) return fromHash;
-  return readLocalStorageState();
+  const v3 = readLocalStorageState(LAYOUT_STORAGE_KEY);
+  if (v3 !== null) return v3;
+  return readLocalStorageState(LEGACY_V2_STORAGE_KEY);
 }
 
 /**
@@ -393,11 +482,12 @@ function readHashState(): PersistedState | null {
   return validatePersistedState(parsed);
 }
 
-/** The pre-Fork-1 localStorage-only read path. Kept as the hash-miss fallback. */
-function readLocalStorageState(): PersistedState | null {
+/** The localStorage read path for ONE key (v3 primary, legacy v2 fallback).
+ *  Returns null on a miss / corrupt JSON — the caller chains the fallback. */
+function readLocalStorageState(key: string): PersistedState | null {
   let raw: string | null;
   try {
-    raw = localStorage.getItem(LAYOUT_STORAGE_KEY);
+    raw = localStorage.getItem(key);
   } catch {
     return null; // localStorage unavailable
   }
@@ -411,8 +501,15 @@ function readLocalStorageState(): PersistedState | null {
   return validatePersistedState(parsed);
 }
 
-/** Structural guard for the v2 envelope. Per-workspace layout blobs are
- *  validated separately by isSavedLayout() inside loadRepairedWorkspaceLayout.
+/** Structural guard for the persisted envelope (v2 px or v3 fractional).
+ *  Per-workspace layout blobs are validated separately by isSavedLayout()
+ *  inside loadRepairedWorkspaceLayout.
+ *
+ *  MIGRATION: a payload without `v: 3` is a legacy v2 px blob (localStorage
+ *  key vh-host:layout:v2, or an old #state= hash) — each layout is
+ *  fractionized IN-MEMORY (fraction = size / siblingSum, viewport-independent)
+ *  and the state is stamped v3. The on-disk key/hash stays untouched until the
+ *  next save writes v3; restoring is unaffected either way.
  *
  *  ENVELOPE POLICY (deliberate, conservative): if ANY workspace entry is
  *  structurally malformed (bad id/name, or a layout that fails isSavedLayout),
@@ -447,7 +544,18 @@ function validatePersistedState(v: unknown): PersistedState | null {
   // would activate a ghost. Drop the whole blob (fall back to seed) on mismatch
   // — a clean, conservative recovery.
   if (!workspaces.some((w) => w.id === o.activeWorkspaceId)) return null;
-  return { activeWorkspaceId: o.activeWorkspaceId, workspaces };
+  // v3 fractional already; anything else (v2 px, marker-less) → migrate.
+  if (o.v === 3) return { v: 3, activeWorkspaceId: o.activeWorkspaceId, workspaces };
+  return {
+    v: 3,
+    activeWorkspaceId: o.activeWorkspaceId,
+    workspaces: workspaces.map((ws) => ({
+      ...ws,
+      layout: ws.layout
+        ? (fractionizeSavedLayout(ws.layout as unknown as SavedLayout) as unknown as SerializedDockview)
+        : null,
+    })),
+  };
 }
 
 // =============================================================================
@@ -591,6 +699,188 @@ function pickActive(
   return undefined; // let dockview pick the first view
 }
 
+// =============================================================================
+// FRACTIONAL GEOMETRY TRANSFORMS (v3 core).
+//
+// Dockview's serialized child `size` is the child's extent ALONG ITS PARENT
+// BRANCH'S SPLIT AXIS (siblings sum to the branch's extent on that axis; the
+// orth axis propagates unchanged down the tree). The v3 blob replaces that px
+// with `fraction` = size / siblingSum — the child's share of its parent. The
+// transforms:
+//
+//   SAVE       api.toJSON() px tree ──fractionizeSavedLayout──▶ fractional tree
+//   v2 READ    px blob          ──fractionizeSavedLayout──▶ fractional tree
+//   RESTORE    fractional tree  ──materializeSavedLayout(ext)──▶ px tree for
+//              fromJSON, with px = fraction × the branch's extent recomputed
+//              against the CURRENT container size (largest-remainder so
+//              siblings sum EXACTLY to the extent).
+//
+// The recursion invariant: materialize(node, splitExtent, orthExtent) — a
+// branch's children split `splitExtent`; each child i's ORTHOGONAL extent is
+// its computed target (which becomes the split extent for a child branch).
+// =============================================================================
+
+/** Fractional tree walk: strip px `size` from every node, and on each branch
+ *  compute per-child `fraction` from the children's px sizes (equal fallback
+ *  when the sibling sum is 0/missing — see sizesToFractions). Already-
+ *  fractional nodes (every child fraction, no child px) pass through
+ *  unchanged, making the walk idempotent. `visible` and leaf `data` are
+ *  untouched; branch structure (incl. single-child branches — the
+ *  orientation-preserving invariant) is preserved verbatim. Never throws. */
+function fractionizeSavedLayout(layout: SavedLayout): SavedLayout {
+  const out: SavedLayout = {
+    ...layout,
+    grid: { ...layout.grid, root: fractionizeNode(layout.grid.root) },
+  };
+  if (layout.floatingGroups) {
+    out.floatingGroups = layout.floatingGroups.map(fractionizeFloatingGroup);
+  }
+  if (layout.popoutGroups) {
+    out.popoutGroups = layout.popoutGroups.map(fractionizeFloatingGroup);
+  }
+  return out;
+}
+
+function fractionizeFloatingGroup(fg: FloatingGroup): FloatingGroup {
+  if (!fg.grid) return fg; // single-group floating overlay — no inner split
+  return { ...fg, grid: { ...fg.grid, root: fractionizeNode(fg.grid.root) } };
+}
+
+function fractionizeNode(node: GridNode): GridNode {
+  if (node.type === "leaf") {
+    if (node.size === undefined) return node;
+    const { size: _drop, ...rest } = node;
+    void _drop;
+    return rest as GridNode;
+  }
+  const children = node.data;
+  const hasPx = children.some((c) => typeof c.size === "number");
+  const allFrac = children.every((c) => typeof c.fraction === "number");
+  const fractions = !hasPx && allFrac
+    ? children.map((c) => c.fraction as number) // idempotent pass-through
+    : sizesToFractions(
+        children.map((c) => (typeof c.size === "number" ? c.size : 0)),
+      );
+  const out: GridBranch = { ...node, data: [] };
+  delete out.size; // the branch's own px belongs to its PARENT's axis — stripped
+  out.data = children.map((c, i) => {
+    const fc = fractionizeNode(c);
+    (fc as GridLeaf & { fraction?: number }).fraction = fractions[i];
+    return fc;
+  });
+  return out;
+}
+
+/** Px tree walk for fromJSON: recompute every child's px `size` from its
+ *  `fraction` × the branch's extent, where the ROOT extent comes from the
+ *  CURRENT container (`extent` — measured by the caller at cold-restore time;
+ *  falls back to the saved grid width/height, then 1024×768 so proportions
+ *  always exist for dockview's ctor-time saveProportions). Degenerate/missing
+ *  fractions restore to equal shares. Writes grid.width/height = the extent
+ *  used (self-consistent blob). Never mutates the input; never throws. */
+function materializeSavedLayout(
+  layout: SavedLayout,
+  extent?: RestoreExtent,
+): SavedLayout {
+  const width =
+    extent && extent.width > 0
+      ? extent.width
+      : typeof layout.grid.width === "number" && layout.grid.width > 0
+        ? layout.grid.width
+        : 1024;
+  const height =
+    extent && extent.height > 0
+      ? extent.height
+      : typeof layout.grid.height === "number" && layout.grid.height > 0
+        ? layout.grid.height
+        : 768;
+  const orientation =
+    layout.grid.orientation === "VERTICAL" ? "VERTICAL" : "HORIZONTAL";
+  const rootSplit = orientation === "HORIZONTAL" ? width : height;
+  const rootOrth = orientation === "HORIZONTAL" ? height : width;
+  const root = materializeNode(layout.grid.root, rootSplit, rootOrth);
+  const out: SavedLayout = {
+    ...layout,
+    grid: { ...layout.grid, root, width, height, orientation },
+  };
+  if (layout.floatingGroups) {
+    out.floatingGroups = layout.floatingGroups.map((fg) =>
+      materializeFloatingGroup(fg, extent),
+    );
+  }
+  if (layout.popoutGroups) {
+    out.popoutGroups = layout.popoutGroups.map((fg) =>
+      materializeFloatingGroup(fg, extent),
+    );
+  }
+  return out;
+}
+
+function materializeFloatingGroup(
+  fg: FloatingGroup,
+  extent: RestoreExtent | undefined,
+): FloatingGroup {
+  if (!fg.grid) return fg; // single-group floating overlay — no inner split
+  // A floating group's grid lays out inside the OVERLAY's width/height (px,
+  // persisted as overlay geometry), NOT the container — prefer its own extent.
+  const width =
+    typeof fg.grid.width === "number" && fg.grid.width > 0
+      ? fg.grid.width
+      : extent && extent.width > 0
+        ? extent.width
+        : 1024;
+  const height =
+    typeof fg.grid.height === "number" && fg.grid.height > 0
+      ? fg.grid.height
+      : extent && extent.height > 0
+        ? extent.height
+        : 768;
+  const orientation =
+    fg.grid.orientation === "VERTICAL" ? "VERTICAL" : "HORIZONTAL";
+  const rootSplit = orientation === "HORIZONTAL" ? width : height;
+  const rootOrth = orientation === "HORIZONTAL" ? height : width;
+  return {
+    ...fg,
+    grid: {
+      ...fg.grid,
+      root: materializeNode(fg.grid.root, rootSplit, rootOrth),
+      width,
+      height,
+      orientation,
+    },
+  };
+}
+
+function materializeNode(
+  node: GridNode,
+  splitExtent: number,
+  orthExtent: number,
+): GridNode {
+  if (node.type === "leaf") {
+    // The parent writes this leaf's px size; just strip the stored fraction so
+    // fromJSON sees dockview's exact serialized shape.
+    if (node.fraction === undefined && node.size === undefined) return node;
+    const { fraction: _drop, ...rest } = node;
+    void _drop;
+    return rest as GridNode;
+  }
+  const children = node.data;
+  const fractions = children.map((c) =>
+    typeof c.fraction === "number" ? c.fraction : NaN,
+  );
+  const safe = fractions.every((f) => Number.isFinite(f))
+    ? fractions
+    : children.map(() => 1 / children.length);
+  const targets = fractionsToSizes(safe, Math.max(splitExtent, 0));
+  const out: GridBranch = { ...node, data: [] };
+  delete out.fraction; // strip any fraction the branch itself carries
+  out.data = children.map((c, i) => {
+    const mc = materializeNode(c, orthExtent, targets[i]);
+    return { ...mc, size: targets[i] } as GridNode;
+  });
+  return out;
+}
+
 // ---- structural shape guards (so the walker is safe; fromJSON is the final
 //      authority on full validity, and applyColdRestoreForWorkspace catches any throw) ----
 
@@ -655,16 +945,22 @@ interface GroupView {
   views: string[];
   activeView?: string;
 }
+/** v3 grid node: a NON-ROOT node carries `fraction` (its share of the parent
+ *  branch's extent) instead of dockview's px `size`. In-memory states may
+ *  carry either (px before fractionize / after materialize; fraction in the
+ *  stored blob), so both are optional here. */
 interface GridLeaf {
   type: "leaf";
   data: GroupView;
   size?: number;
+  fraction?: number;
   visible?: boolean;
 }
 interface GridBranch {
   type: "branch";
   data: GridNode[];
   size?: number;
+  fraction?: number;
   visible?: boolean;
 }
 type GridNode = GridLeaf | GridBranch;
