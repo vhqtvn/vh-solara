@@ -57,14 +57,50 @@ const windowFilterStreamDeadline = 5 * time.Second
 // seedSessionMessages seeds one session with n tiny messages (m1..mn) via
 // direct synchronous store Apply. With n > 100 the oldest n-100 messages fall
 // outside the snapshot window.
-func seedSessionMessages(t *testing.T, srv *Server, sid string, n int) {
+//
+// Reconcile safety (the 2026-08-23 CI flake fix): newReloadServer starts
+// `go agg.Run(...)` whose FIRST hydrate fetches the fake's /session list, and
+// state.Store.Hydrate DELETES every store session absent from that list (the
+// fake starts empty). The 5s tree-reconcile tick ghost-removes the same way
+// (ReconcileSessions). Direct store seeding races BOTH: on a slow/loaded CI
+// runner the initial hydrate can complete AFTER the seeding and delete the
+// just-seeded session (observed as "got 0 messages" at 0.00s and as a live
+// part event that is never delivered). Two guards close the class:
+//  1. BARRIER: wait for the aggregator's initial hydrate to fully complete
+//     BEFORE seeding, so its empty-list delete pass runs against the
+//     pre-seed store. AnyHydrateCompleted is the sticky end-of-success flag
+//     Run's hydrate sets; nothing else hydrates in these tests (the only
+//     other Rehydrate callers are the archive HTTP handlers, unused here).
+//  2. REGISTRATION: add the session to the fake's authoritative /session
+//     list (race-safe setter, mirroring setMessage), so every LATER fetch —
+//     the 5s tree-reconcile tick, any reconnect hydrate — preserves it.
+//     The envelope is byte-identical to the info blob sessionCreatedEvent
+//     seeds, so a re-hydrate's bytes.Equal comparison emits no spurious
+//     session.upsert into the replay window.
+func seedSessionMessages(t *testing.T, srv *Server, fake *fakeOpenCode, sid string, n int) {
 	t.Helper()
+	waitFor(t, func() bool { return srv.agg.AnyHydrateCompleted() },
+		"aggregator initial hydrate before seeding "+sid)
+	fake.addSession(sid)
 	srv.agg.Store().Apply(sessionCreatedEvent(sid))
 	waitFor(t, func() bool { return srv.agg.Store().HasSession(sid) },
 		"seed session "+sid)
 	for i := 1; i <= n; i++ {
 		srv.agg.Store().Apply(messageUpdatedEvent(sid, fmt.Sprintf("m%d", i), "user"))
 	}
+}
+
+// addSession appends one session envelope to the fake's authoritative /session
+// list (the endpoint the aggregator's hydrate and tree-reconcile poll). The
+// handler reads f.sessions under f.mu, so post-start writes MUST go through
+// here (see setMessage for the identical rationale). The envelope mirrors the
+// info sub-blob sessionCreatedEvent seeds — same fields, same order — so
+// Hydrate's byte-equality check treats the hydrated and seeded entries as
+// identical and emits nothing.
+func (f *fakeOpenCode) addSession(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sessions = append(f.sessions, fmt.Sprintf(`{"id":%q,"title":%q}`, id, id))
 }
 
 // framePartMessageID extracts the top-level messageID from a part-class frame
@@ -104,7 +140,7 @@ func TestStream2WindowFilter_ReplayDropsOutOfWindowParts(t *testing.T) {
 	srv, fake, _, web := newReloadServer(t)
 	_ = fake
 
-	seedSessionMessages(t, srv, "s1", 105) // window = m6..m105; m1 out
+	seedSessionMessages(t, srv, fake, "s1", 105) // window = m6..m105; m1 out
 	cursor := srv.agg.Store().Head()
 
 	srv.agg.Store().Apply(partUpdatedEvent("s1", "m1", "p-old", "stale re-publication"))
@@ -169,7 +205,7 @@ func TestStream2WindowFilter_LiveTailDropsOutOfWindowParts(t *testing.T) {
 	srv, fake, _, web := newReloadServer(t)
 	_ = fake
 
-	seedSessionMessages(t, srv, "s1", 105)
+	seedSessionMessages(t, srv, fake, "s1", 105)
 
 	reader, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, windowFilterStreamDeadline)
 	if ev := firstFrameEvent(t, reader); ev != "snapshot" {
@@ -218,7 +254,7 @@ func TestStream2WindowFilter_FirehoseAlsoDrops(t *testing.T) {
 	srv, fake, _, web := newReloadServer(t)
 	_ = fake
 
-	seedSessionMessages(t, srv, "s1", 105)
+	seedSessionMessages(t, srv, fake, "s1", 105)
 	cursor := srv.agg.Store().Head()
 
 	srv.agg.Store().Apply(partUpdatedEvent("s1", "m1", "p-old", "stale re-publication"))
@@ -260,7 +296,7 @@ func TestStream2WindowFilter_SnapshotWindowUnchanged(t *testing.T) {
 	srv, fake, _, web := newReloadServer(t)
 	_ = fake
 
-	seedSessionMessages(t, srv, "s1", 105)
+	seedSessionMessages(t, srv, fake, "s1", 105)
 	srv.agg.Store().Apply(partUpdatedEvent("s1", "m1", "p-old", "stale re-publication"))
 
 	reader, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, windowFilterStreamDeadline)
@@ -337,7 +373,7 @@ func TestStream2WindowFilter_LiveStreamingNewMessageDelivered(t *testing.T) {
 	srv, fake, _, web := newReloadServer(t)
 	_ = fake
 
-	seedSessionMessages(t, srv, "s1", 105)
+	seedSessionMessages(t, srv, fake, "s1", 105)
 
 	reader, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, windowFilterStreamDeadline)
 	if ev := firstFrameEvent(t, reader); ev != "snapshot" {
@@ -355,6 +391,80 @@ func TestStream2WindowFilter_LiveStreamingNewMessageDelivered(t *testing.T) {
 	if !hasPartFrameFor(t, live, "m-fresh") {
 		t.Fatalf("live-new: part event for brand-new (keyless-newest) m-fresh must be delivered (live=%s)",
 			frameSummarys(live))
+	}
+}
+
+// TestStream2WindowFilter_LateHydrateKeepsSeededSession is the deterministic
+// regression for the 2026-08-23 CI flake (both failures above): the seeded
+// session vanished mid-test because the aggregator's reconcile completed AFTER
+// seeding. newReloadServer starts `go agg.Run(...)`, whose first hydrate fetches
+// the fake's /session list and state.Store.Hydrate DELETES every store session
+// absent from that list (hydration.go: "a session absent from the fetch is
+// deleted"); the 5s tree-reconcile tick ghost-removes the same way
+// (ReconcileSessions). On a fast machine the hydrate lands before seeding; on a
+// slow/loaded CI runner it can land after — and the seeded s1 (which exists only
+// in the store, never in the fake's empty /session list) is deleted. That
+// reproduces BOTH reported failures with one mechanism:
+//   - SnapshotWindowUnchanged: projectScopedFilter drops the now-unknown s1 →
+//     filter={} → snapshot omits messages → "got 0 messages" at 0.00s;
+//   - LiveStreamingNewMessageDelivered: interest.MessageSessions={} (non-nil,
+//     empty) excludes the m-fresh part.upsert AT EMIT → nothing is ever
+//     delivered → 5s deadline with only the 3 bootstrap sub-snapshots.
+//
+// The natural race is not reliably reproducible locally (the hydrate wins on
+// an unloaded machine), so this test INJECTS the losing interleaving
+// deterministically: seed first, then run the same hydrate Run would (via the
+// exported Rehydrate), then assert the cold snapshot still carries exactly the
+// newest-100 window and a subsequent live part event is still delivered.
+// seedSessionMessages holds the fix: it waits for the initial hydrate AND
+// registers the session in the fake's authoritative /session list, so any
+// later hydrate/reconcile preserves it. Before that fix this test is red
+// (session deleted → 0-message snapshot, part event never delivered).
+func TestStream2WindowFilter_LateHydrateKeepsSeededSession(t *testing.T) {
+	srv, fake, _, web := newReloadServer(t)
+
+	seedSessionMessages(t, srv, fake, "s1", 105)
+
+	// The CI interleaving: the (re)hydrate completes AFTER the seeding. Same
+	// production path Run uses on every (re)connect.
+	if err := srv.agg.Rehydrate(context.Background()); err != nil {
+		t.Fatalf("rehydrate: %v", err)
+	}
+	if !srv.agg.Store().HasSession("s1") {
+		t.Fatal("late hydrate: seeded session s1 was deleted by the reconcile — the seeded state must survive a hydrate that lands after seeding")
+	}
+
+	// Failure #1 shape: cold snapshot still carries EXACTLY newest-100.
+	reader, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, windowFilterStreamDeadline)
+	frames := readSSEFramesUntil(t, reader, func(fs []sseFrameID) bool {
+		return len(fs) >= 1 && fs[0].event == "snapshot"
+	})
+	var snap struct {
+		Messages map[string][]struct {
+			Info struct {
+				ID string `json:"id"`
+			} `json:"info"`
+		} `json:"messages"`
+	}
+	if len(frames) == 0 || frames[0].event != "snapshot" {
+		t.Fatalf("late hydrate: first dispatchable frame = %q, want snapshot", firstEventName(frames))
+	}
+	if err := json.Unmarshal([]byte(frames[0].data), &snap); err != nil {
+		t.Fatalf("late hydrate: snapshot frame unmarshal: %v", err)
+	}
+	if got := len(snap.Messages["s1"]); got != 100 {
+		t.Fatalf("late hydrate: snapshot window: got %d messages for s1, want 100", got)
+	}
+
+	// Failure #2 shape: a live part event for a brand-new message is still
+	// delivered on the same connection.
+	srv.agg.Store().Apply(partUpdatedEvent("s1", "m-fresh2", "p0", "streaming start"))
+	live := readSSEFramesUntil(t, reader, func(fs []sseFrameID) bool {
+		return hasPartFrameFor(t, postSnapshotFrames(fs), "m-fresh2")
+	})
+	if !hasPartFrameFor(t, postSnapshotFrames(live), "m-fresh2") {
+		t.Fatalf("late hydrate: part event for m-fresh2 must be delivered after a late reconcile (live=%s)",
+			frameSummarys(postSnapshotFrames(live)))
 	}
 }
 
