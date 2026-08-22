@@ -137,12 +137,10 @@ func ordinalOf(t *testing.T, id string) int {
 // pre-commit greens (hand-crafted contiguous ordinals) missed.
 func TestStream2Ordinal_StructuralInterleave(t *testing.T) {
 	srv, fake, _, web := newReloadServer(t)
-	_ = fake
 
-	// Seed a session so the stream has a scope.
-	srv.agg.Store().Apply(sessionCreatedEvent("s1"))
-	waitFor(t, func() bool { return srv.agg.Store().HasSession("s1") },
-		"seed session s1")
+	// Seed a session so the stream has a scope (guarded against the
+	// seed-vs-hydrate ghost-delete race — see seed_helpers_test.go).
+	seedSession(t, srv, fake, "s1")
 
 	// Record the cursor BEFORE the interleave — the replay branch ships events
 	// with seq > cursor.

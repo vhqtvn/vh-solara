@@ -18,10 +18,17 @@ package web
 //   1. A valid cursor → replay (deltas from ring, NOT a fresh snapshot).
 //   2. No cursor → fresh snapshot (the cold-open path).
 //   3. A too-old cursor (ring overflow) → fresh snapshot (the windowing bound).
+//
+// Seeding: sessions are seeded via seedSession (seed_helpers_test.go) — the
+// seed-vs-hydrate ghost-delete race guard. A bare Apply of
+// sessionCreatedEvent races the aggregator's initial hydrate and the 5s
+// reconcile tick, both of which DELETE store sessions absent from the fake's
+// (initially empty) /session list.
 
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"testing"
@@ -69,12 +76,10 @@ func firstFrameEvent(t *testing.T, r *bufio.Reader) string {
 // streams) / PASS-with.
 func TestSessionStream_ReplayOnValidCursor(t *testing.T) {
 	srv, fake, _, web := newReloadServer(t)
-	_ = fake
 
-	// Seed a session. After this, head = seq of the session.created event.
-	srv.agg.Store().Apply(sessionCreatedEvent("s1"))
-	waitFor(t, func() bool { return srv.agg.Store().HasSession("s1") },
-		"seed session s1")
+	// Seed a session (guarded — see seed_helpers_test.go). After this,
+	// head = seq of the session.created event.
+	seedSession(t, srv, fake, "s1")
 
 	// Cursor = the session.created seq. Replay will return events with seq >
 	// this cursor.
@@ -108,18 +113,44 @@ func TestSessionStream_ReplayOnValidCursor(t *testing.T) {
 // existing behavior and the correct path for a session switch / first open.
 func TestSessionStream_FreshSnapshotOnNoCursor(t *testing.T) {
 	srv, fake, _, web := newReloadServer(t)
-	_ = fake
 
-	srv.agg.Store().Apply(sessionCreatedEvent("s1"))
-	waitFor(t, func() bool { return srv.agg.Store().HasSession("s1") },
-		"seed session s1")
+	seedSession(t, srv, fake, "s1")
 
 	// Open with NO cursor — the server must take the fresh-snapshot branch.
 	reader, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, 500*time.Millisecond)
 
-	first := firstFrameEvent(t, reader)
-	if first != "snapshot" {
-		t.Fatalf("no cursor: want first frame 'snapshot', got %q (fresh-snapshot branch not taken)", first)
+	frames := readSSEFramesUntil(t, reader, func(fs []sseFrameID) bool {
+		return len(fs) >= 1 && fs[0].event == "snapshot"
+	})
+	if len(frames) == 0 || frames[0].event != "snapshot" {
+		t.Fatalf("no cursor: want first frame 'snapshot', got %q (fresh-snapshot branch not taken)",
+			firstEventName(frames))
+	}
+
+	// The snapshot must genuinely carry the seeded session. Before the
+	// seed-vs-hydrate guard this test could pass VACUOUSLY: a ghost-delete
+	// (hydrate/reconcile landing after a bare Apply) emptied the store, and
+	// an EMPTY snapshot still satisfied the branch check above. s1 now
+	// survives re-hydrate/reconcile, so pin its presence — the cold-open
+	// snapshot is only proven when it carries the seeded session's content.
+	var snap struct {
+		Sessions []struct {
+			ID string `json:"id"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal([]byte(frames[0].data), &snap); err != nil {
+		t.Fatalf("no cursor: snapshot frame unmarshal: %v", err)
+	}
+	found := false
+	for _, s := range snap.Sessions {
+		if s.ID == "s1" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no cursor: seeded session s1 absent from snapshot sessions (ghost-delete regression; snapshot=%s)",
+			frames[0].data)
 	}
 }
 
@@ -130,11 +161,8 @@ func TestSessionStream_FreshSnapshotOnNoCursor(t *testing.T) {
 // The test ring capacity is 100 (newReloadServer → aggregator.New(url, 100)).
 func TestSessionStream_FreshSnapshotOnStaleCursor(t *testing.T) {
 	srv, fake, _, web := newReloadServer(t)
-	_ = fake
 
-	srv.agg.Store().Apply(sessionCreatedEvent("s1"))
-	waitFor(t, func() bool { return srv.agg.Store().HasSession("s1") },
-		"seed session s1")
+	seedSession(t, srv, fake, "s1")
 
 	// Record a cursor BEFORE overflowing the ring.
 	staleCursor := srv.agg.Store().Head()
@@ -163,11 +191,8 @@ func TestSessionStream_FreshSnapshotOnStaleCursor(t *testing.T) {
 // manual CLOSED→fresh-snapshot retry path.
 func TestSessionStream_RetryHintSent(t *testing.T) {
 	srv, fake, _, web := newReloadServer(t)
-	_ = fake
 
-	srv.agg.Store().Apply(sessionCreatedEvent("s1"))
-	waitFor(t, func() bool { return srv.agg.Store().HasSession("s1") },
-		"seed session s1")
+	seedSession(t, srv, fake, "s1")
 
 	reader, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, 500*time.Millisecond)
 
