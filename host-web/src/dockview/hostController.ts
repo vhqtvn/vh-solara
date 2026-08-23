@@ -1,4 +1,4 @@
-import type { DockviewApi, IDockviewPanel } from "dockview-core";
+import type { DockviewApi, IDockviewPanel, SerializedDockview } from "dockview-core";
 import type { IframeRenderer } from "./iframeRenderer";
 import type { AddServerOutcome, FocusDir, HostOps, LayoutMode, OverlaySplitDir, PaneVm, SplitDir } from "./types";
 import {
@@ -17,9 +17,15 @@ import { firstNeedsYouAtFor } from "./store";
 import { scheduleSave } from "./layoutPersistence";
 import {
   deleteNamedLayout,
-  listNamedLayouts,
+  listTabLayouts,
+  listMasterLayouts,
   loadNamedLayout,
-  saveNamedLayout,
+  renameNamedLayout,
+  saveTabLayout,
+  // Aliased: the controller class has a saveMasterLayout METHOD (the HostOps
+  // facet); the un-aliased name would shadow the module function that method
+  // calls (typecheck-correct but a readability trap).
+  saveMasterLayout as writeMasterLayout,
 } from "./namedLayouts";
 import { next as attentionNext, nextTarget as attentionNextTarget } from "../attentionNext";
 import {
@@ -29,6 +35,7 @@ import {
   bindContentWindow,
   bindScratchSource,
   captureActiveLayout,
+  captureAllLayouts,
   closeOverlay,
   closeWorkspace as storeCloseWorkspace,
   configuredOriginFor,
@@ -663,37 +670,126 @@ export class HostController implements HostOps {
   // ---- named layouts (shell-level; routed through the ACTIVE facet) --------
 
   /**
-   * Save the ACTIVE workspace's current layout under `name`. SHELL-LEVEL op:
-   * hostOps() resolves the active workspace's facet, so by construction this
-   * runs on the ACTIVE controller — captureActiveLayout() reads the active
-   * workspace's api (this.api) and serializes it through the SAME fractional
-   * transform the persistence writer uses. Read-only: toJSON never mutates
-   * the tree, no iframe is touched. Same name = overwrite (savedAt refreshes;
-   * see namedLayouts.ts). Returns true when written, false when the active
-   * layout could not be captured (no active api) or the name is empty.
+   * Save the ACTIVE workspace's current layout under `name` with the save's
+   * TAB TITLE (scope "tab"). SHELL-LEVEL op: hostOps() resolves the active
+   * workspace's facet, so by construction this runs on the ACTIVE controller —
+   * captureActiveLayout() reads the active workspace's api (this.api) and
+   * serializes it through the SAME fractional transform the persistence
+   * writer uses. Read-only: toJSON never mutates the tree, no iframe is
+   * touched. Same name = overwrite (savedAt refreshes; see namedLayouts.ts).
+   * Returns true when written, false when the active layout could not be
+   * captured (no active api) or the name is empty.
    */
-  saveLayout(name: string): boolean {
+  saveLayout(name: string, tabTitle?: string): boolean {
     const layout = captureActiveLayout();
     if (!layout) return false;
-    return saveNamedLayout(name, layout);
+    return saveTabLayout(name, tabTitle ?? name, layout);
   }
 
   /**
-   * Instantiate the named layout as a NEW workspace (cold mount). Reads the
-   * saved blob, hands it to addWorkspace (which STAGES it for the fresh
-   * workspace id so the new DockviewHost cold-restores it at mount through the
-   * existing persistence pipeline — fromJSON exactly once, before any of the
-   * new workspace's iframes exist), names the workspace after the save, and
+   * Save a WHOLE-SESSION snapshot under `name` (scope "master"): every
+   * workspace's NAME + layout plus the active workspace's name, via
+   * store.captureAllLayouts (the same fractional serialization, one entry per
+   * workspace). Read-only. Returns true when written; false when the name is
+   * empty or there are no workspaces to snapshot (the never-zero invariant
+   * makes that unreachable in practice — the UI guards it with a hint too).
+   * A workspace whose layout could not be captured (null — the brief mount
+   * window) is skipped: a master save is a point-in-time snapshot of LIVE
+   * trees, and a null-layout entry would restore as an empty workspace.
+   */
+  saveMasterLayout(name: string): boolean {
+    const captured = captureAllLayouts();
+    const workspaces = captured.workspaces.filter(
+      (w): w is { name: string; layout: SerializedDockview } => w.layout !== null,
+    );
+    if (workspaces.length === 0) return false;
+    return writeMasterLayout(name, {
+      activeWorkspaceName: captured.activeWorkspaceName,
+      workspaces,
+    });
+  }
+
+  /**
+   * Instantiate the named (scope "tab") layout as a NEW workspace (cold
+   * mount). Reads the saved blob, hands it to addWorkspace (which STAGES it
+   * for the fresh workspace id so the new DockviewHost cold-restores it at
+   * mount through the existing persistence pipeline — fromJSON exactly once,
+   * before any of the new workspace's iframes exist), names the workspace
+   * after the save's TAB TITLE (the operator's chosen title, not the layout
+   * label — falling back to the name when the save carried none), and
    * activates it (addWorkspace's existing activation path; FLIP/normalize
    * effects compose exactly as on any workspace add). NEVER touches any live
    * workspace's tree — the only mutations are a new workspace record +
-   * activation. Returns the new workspace id, or null when no layout is saved
-   * under the name.
+   * activation. Returns the new workspace id, or null when no TAB layout is
+   * saved under the name (a master-scope entry is NOT loadable here — its
+   * destructive path is loadMasterLayout).
    */
   loadLayout(name: string): string | null {
     const entry = loadNamedLayout(name);
-    if (!entry) return null;
-    return storeAddWorkspace(name, entry.layout);
+    if (!entry || entry.scope !== "tab") return null;
+    return storeAddWorkspace(entry.tabTitle || entry.name, entry.layout);
+  }
+
+  /**
+   * DESTRUCTIVE session replace (scope "master"): re-create the whole saved
+   * session as fresh cold-mounted workspaces and close every pre-existing
+   * workspace. Sequence (order matters):
+   *
+   *  1. ADD every saved workspace FIRST via the existing addWorkspace(name,
+   *     layout) staged-slot path — each new host cold-restores its layout AT
+   *     MOUNT (pane ids re-minted; fromJSON never runs against a live tree).
+   *     Adding before closing keeps the shell's NEVER-ZERO invariant intact
+   *     throughout (closeWorkspace refuses to close the last workspace, so a
+   *     close-everything-first ordering could never remove the final old
+   *     workspace — noted in the mission; add-then-close reaches exactly the
+   *     saved set).
+   *  2. CLOSE every pre-existing workspace through the EXISTING closeWorkspace
+   *     path (explicit destroy — the same semantics as the workspace-delete
+   *     button; the destroyed workspaces' iframes are disposed with them,
+   *     which is the point of a session replace).
+   *  3. ACTIVATE the saved active workspace by NAME (first match on duplicate
+   *     names; fallback: the first saved workspace — the never-zero invariant
+   *     guarantees at least one was created).
+   *
+   * The persistence saver debounces (~450ms) and every add/close schedules it,
+   * so the final flush serializes exactly the post-replace session — no fight.
+   * Returns true when applied; false when no MASTER layout is saved under the
+   * name or its session is empty (the UI's two-step confirm gates this call).
+   */
+  loadMasterLayout(name: string): boolean {
+    const entry = loadNamedLayout(name);
+    if (!entry || entry.scope !== "master") return false;
+    const saved = entry.session.workspaces;
+    if (saved.length === 0) return false;
+    // Pre-existing ids captured BEFORE the adds (the close set).
+    const oldIds = storeWorkspaces().map((w) => w.id);
+    // 1. Cold-mount every saved workspace (blob order preserved).
+    const created: { id: string; name: string }[] = [];
+    for (const w of saved) {
+      const id = storeAddWorkspace(w.name, w.layout);
+      created.push({ id, name: w.name });
+    }
+    // 2. Close every pre-existing workspace via the existing destroy path.
+    //    Active is on a NEW workspace throughout (the last add activated it),
+    //    so no close re-activates anything unexpectedly.
+    for (const id of oldIds) storeCloseWorkspace(id);
+    // 3. Activate the saved active by name (first match; fallback = first).
+    const activeName = entry.session.activeWorkspaceName;
+    const target = activeName
+      ? created.find((c) => c.name === activeName)
+      : undefined;
+    storeSetActiveWorkspace(target?.id ?? created[0].id);
+    return true;
+  }
+
+  /**
+   * Rename a saved layout (either scope) through the storage module's
+   * renameNamedLayout (trim/cap validation; collision REJECTED — the caller's
+   * inline error is the correct UX for a refused rename). Pure storage: no
+   * live tree is touched. Returns true when the entry now carries newName.
+   */
+  renameLayout(name: string, newName: string): boolean {
+    return renameNamedLayout(name, newName);
   }
 
   /** Spatial nearest-neighbor in a cardinal direction, by group bounding-box
@@ -942,8 +1038,11 @@ export class HostController implements HostOps {
     this.ops.overlaySplit = (paneId, dir) => this.overlaySplit(paneId, dir);
     this.ops.overlaySwap = (paneId, dir) => this.overlaySwap(paneId, dir);
     this.ops.overlaySwapTargets = (paneId) => this.overlaySwapTargets(paneId);
-    this.ops.saveLayout = (name) => this.saveLayout(name);
+    this.ops.saveLayout = (name, tabTitle) => this.saveLayout(name, tabTitle);
     this.ops.loadLayout = (name) => this.loadLayout(name);
+    this.ops.saveMasterLayout = (name) => this.saveMasterLayout(name);
+    this.ops.loadMasterLayout = (name) => this.loadMasterLayout(name);
+    this.ops.renameLayout = (name, newName) => this.renameLayout(name, newName);
   }
 
   /** Dispose this controller: unregister from the store + the controller map so
@@ -1018,16 +1117,27 @@ export class HostController implements HostOps {
         storeWorkspaces().find((w) => w.id === id)?.name ?? "",
 
       // ---- named layouts (drives the SAME production HostOps paths the
-      // Settings → Layouts… manager uses; reads for assertions) ----
-      // Save/load route through the ACTIVE controller's facet exactly like a
-      // Settings click; list/delete read the namedLayouts store directly (pure
-      // module — no live-tree involvement).
-      saveLayout: (name: string): boolean =>
-        activeController()?.saveLayout(name) ?? false,
+      // Layouts popover uses; reads for assertions) ----
+      // Save/load (both scopes) + rename route through the ACTIVE controller's
+      // facet exactly like a popover click; list/delete read the namedLayouts
+      // store directly (pure module — no live-tree involvement).
+      saveLayout: (name: string, tabTitle?: string): boolean =>
+        activeController()?.saveLayout(name, tabTitle) ?? false,
       loadLayout: (name: string): string | null =>
         activeController()?.loadLayout(name) ?? null,
-      namedLayouts: (): Array<{ name: string; savedAt: number }> =>
-        listNamedLayouts(),
+      saveMasterLayout: (name: string): boolean =>
+        activeController()?.saveMasterLayout(name) ?? false,
+      loadMasterLayout: (name: string): boolean =>
+        activeController()?.loadMasterLayout(name) ?? false,
+      renameLayout: (name: string, newName: string): boolean =>
+        activeController()?.renameLayout(name, newName) ?? false,
+      namedLayouts: (): Array<
+        | { scope: "tab"; name: string; tabTitle: string; savedAt: number }
+        | { scope: "master"; name: string; tabs: number; savedAt: number }
+      > => [
+        ...listTabLayouts().map((e) => ({ scope: "tab" as const, ...e })),
+        ...listMasterLayouts().map((e) => ({ scope: "master" as const, ...e })),
+      ],
       deleteNamedLayout: (name: string): boolean => deleteNamedLayout(name),
 
       // ---- active-workspace-scoped reads/ops ----

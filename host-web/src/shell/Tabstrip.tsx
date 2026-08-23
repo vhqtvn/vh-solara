@@ -13,6 +13,7 @@ import {
 } from "../dockview/store";
 import { next } from "../attentionNext";
 import { AddServer } from "./AddServer";
+import { Layouts } from "./Layouts";
 import { Settings } from "./Settings";
 import s from "./Tabstrip.module.css";
 
@@ -90,8 +91,16 @@ export function Tabstrip() {
         +
       </button>
       <AddServer />
-      {/* Settings gear (host-chrome popover: reload + auto-rotate toggle).
-          Sits after AddServer in the right cluster; see Settings.tsx. */}
+      {/* Saved-layouts popover (Layouts.tsx) — the de-confusion slice's new
+          tabstrip surface: per-workspace ("this tab") layouts AND whole-session
+          ("all tabs") master snapshots, each renamable. The manager moved OUT
+          of Settings here (Settings used to carry both "Layout…" and
+          "Layouts…" — two near-identical labels, different functions; its
+          overlay trigger is now "Edit layout…"). Same tabstrip popover group
+          as AddServer + Settings (mutually exclusive). */}
+      <Layouts />
+      {/* Settings gear (host-chrome popover: Edit layout…, reload + auto-rotate
+          toggle). Sits after Layouts in the right cluster; see Settings.tsx. */}
       <Settings />
       {/* P3 NEXT hero button (moved from the deleted bottom statusbar). The
           attention-loop trigger: visible only when the active workspace has a

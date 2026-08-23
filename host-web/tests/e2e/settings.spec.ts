@@ -8,15 +8,17 @@ import * as H from "./util";
 //
 // Part 1 — the tabstrip SETTINGS gear (host-web/src/shell/Settings.tsx): the
 // host's only settings surface (statusbar + per-pane headers are gone). Menu
-// items: "Layout…" (opens the layout overlay for the FOCUSED pane through the
-// production HostOps path — the host-side no-gesture fallback the statusbar
+// items: "Edit layout…" (opens the layout overlay for the FOCUSED pane through
+// the production HostOps path — the host-side no-gesture fallback the statusbar
 // removal in aa244b3 had orphaned; aria-disabled + no-op when no pane is
-// focused), "Reload page" (location.reload — the post-deploy refresh path)
-// and "Auto-rotate layout" (the vh-host:autotranspose localStorage toggle,
-// which had NO UI until now). All assertions drive the REAL UI, not the DEV
-// bridge; the toggle's effect is proven LIVE (a resize flip gated by the UI
-// toggle, no reload), which works because viewportShape.applyTranspose re-reads
-// the key on every evaluation.
+// focused; renamed from "Layout…" in the de-confusion slice — the manager
+// formerly "Layouts…" now lives in its own tabstrip Layouts popover, see
+// named-layouts.spec.ts), "Reload page" (location.reload — the post-deploy
+// refresh path) and "Auto-rotate layout" (the vh-host:autotranspose
+// localStorage toggle, which had NO UI until now). All assertions drive the
+// REAL UI, not the DEV bridge; the toggle's effect is proven LIVE (a resize
+// flip gated by the UI toggle, no reload), which works because
+// viewportShape.applyTranspose re-reads the key on every evaluation.
 //
 // Part 2 — AddServer catalog click-to-prefill: clicking a catalog row fills
 // the url+label inputs (focus + select-all on the URL); the × remove button
@@ -152,7 +154,7 @@ test.describe("settings popover", () => {
     await expect(page.locator('[data-testid="layout-overlay-card"]')).toHaveCount(0);
   });
 
-  test("Layout… item opens the layout overlay for the focused pane", async ({ page }) => {
+  test("Edit layout… item opens the layout overlay for the focused pane", async ({ page }) => {
     // Two+ panes; focus the SECOND so the anchor is distinguishable from the
     // boot default (seed focuses the first pane).
     const ids = await H.panes(page);
@@ -171,7 +173,7 @@ test.describe("settings popover", () => {
     // Renders as an enabled menuitem (a pane IS focused) — FIRST in the menu.
     await expect(item).toHaveAttribute("role", "menuitem");
     await expect(item).not.toHaveAttribute("aria-disabled", "true");
-    await expect(item).toHaveText(/Layout…/);
+    await expect(item).toHaveText(/Edit layout…/);
 
     await item.click();
 
@@ -196,7 +198,7 @@ test.describe("settings popover", () => {
     });
   });
 
-  test("Layout… is aria-disabled + a no-op when no pane is focused (empty workspace)", async ({ page }) => {
+  test("Edit layout… is aria-disabled + a no-op when no pane is focused (empty workspace)", async ({ page }) => {
     // Close every pane → empty workspace → nothing focused.
     const ids = await H.panes(page);
     for (const id of ids) {
@@ -228,7 +230,7 @@ test.describe("settings popover", () => {
     });
   });
 
-  test("Layout… flips aria-disabled LIVE while the popover stays open (focusedId → null via pane closes)", async ({ page }) => {
+  test("Edit layout… flips aria-disabled LIVE while the popover stays open (focusedId → null via pane closes)", async ({ page }) => {
     // The item's disabled state reads the focusedId() SIGNAL inside the JSX
     // class/aria-disabled expressions (not a snapshot taken at open), so a
     // focusedId change while the popover is OPEN must flip the item in place

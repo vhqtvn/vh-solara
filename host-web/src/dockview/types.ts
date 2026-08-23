@@ -403,27 +403,58 @@ export interface HostOps {
   overlaySwapTargets?(paneId: string): Record<OverlaySplitDir, string | null>;
   /**
    * Save the ACTIVE workspace's current layout under `name` (named layouts,
-   * `vh-host:namedLayouts:v1`). Captures via the SAME serialization the
-   * workspace-set persistence writes (fractional v3 —
-   * store.captureActiveLayout); read-only, never mutates the live tree, never
-   * reloads an iframe. SAME NAME = OVERWRITE (savedAt refreshes). The name is
-   * trimmed + capped (60); an empty name after trim is refused. Returns true
-   * when saved. NOTE: saving an EMPTY workspace's layout is legal at this
-   * layer (it round-trips as an empty workspace) — the Settings manager's
-   * Save-current button owns the "no panes to save" UI guard. */
-  saveLayout?(name: string): boolean;
+   * `vh-host:namedLayouts:v2`, scope "tab"). `tabTitle` is the workspace
+   * title applied when the layout is loaded; an empty (after trim) title
+   * falls back to the layout name (the storage layer owns that fallback).
+   * Captures via the SAME serialization the workspace-set persistence writes
+   * (fractional v3 — store.captureActiveLayout); read-only, never mutates the
+   * live tree, never reloads an iframe. SAME NAME = OVERWRITE (savedAt
+   * refreshes). The name is trimmed + capped (60); an empty name after trim
+   * is refused. Returns true when saved. NOTE: saving an EMPTY workspace's
+   * layout is legal at this layer (it round-trips as an empty workspace) —
+   * the Layouts popover's save button owns the "no panes to save" UI guard. */
+  saveLayout?(name: string, tabTitle?: string): boolean;
   /**
-   * Instantiate the named layout as a NEW workspace (cold mount): reads the
-   * saved blob, creates a workspace whose host cold-restores the layout AT
-   * MOUNT through the existing persistence pipeline (staged-layout seam —
-   * fromJSON runs exactly once, before any of the new workspace's iframes
-   * exist), names it after the save, and activates it. NEVER mutates any live
-   * workspace's tree (the only mutations are a new workspace record +
-   * activation). Deliberately NOT replace-current — replacing the active
-   * workspace's layout in place needs a live-diff engine (runtime fromJSON is
-   * banned); noted as future work. Returns the new workspace id, or null when
-   * no layout is saved under the name. */
+   * Save a WHOLE-SESSION snapshot under `name` (named layouts, scope
+   * "master"): every workspace's NAME + layout plus the active workspace's
+   * name (ids are deliberately not stored — they re-mint on load). Read-only
+   * capture through the same fractional serialization. SAME NAME =
+   * OVERWRITE. Returns true when saved; false when the name is empty after
+   * trim or nothing could be captured (no workspaces). */
+  saveMasterLayout?(name: string): boolean;
+  /**
+   * Instantiate the named (scope "tab") layout as a NEW workspace (cold
+   * mount): reads the saved blob, creates a workspace whose host cold-restores
+   * the layout AT MOUNT through the existing persistence pipeline
+   * (staged-layout seam — fromJSON runs exactly once, before any of the new
+   * workspace's iframes exist), names it after the saved TAB TITLE, and
+   * activates it. NEVER mutates any live workspace's tree (the only mutations
+   * are a new workspace record + activation). Deliberately NOT
+   * replace-current — replacing the active workspace's layout in place needs
+   * a live-diff engine (runtime fromJSON is banned). A master-scope entry
+   * under this name returns null (the destructive session-replace path is
+   * loadMasterLayout). Returns the new workspace id, or null when no TAB
+   * layout is saved under the name. */
   loadLayout?(name: string): string | null;
+  /**
+   * DESTRUCTIVE session replace (named layouts, scope "master"): closes every
+   * existing workspace through the existing closeWorkspace path (explicit
+   * destroy — the same semantics as the workspace-delete button) and
+   * re-creates each saved workspace as a NEW cold-mounted workspace (staged
+   * layouts; pane ids re-minted; never a runtime fromJSON into a live
+   * workspace), then activates the saved active workspace by NAME (first
+   * match; falls back to the first saved workspace). The UI owns the
+   * two-step confirm — this op is the irreversible step. Returns true when
+   * applied; false when no MASTER layout is saved under the name or its
+   * session is empty (never leaves zero workspaces). */
+  loadMasterLayout?(name: string): boolean;
+  /**
+   * Rename a saved layout (either scope): re-key the entry, preserving scope,
+   * payload, and the original savedAt. `newName` is trimmed + capped (60); an
+   * empty result is refused; a COLLISION with an existing name (either scope)
+   * is REJECTED (no overwrite — the UI surfaces an inline error). Returns
+   * true when the store now carries the entry under `newName`. */
+  renameLayout?(name: string, newName: string): boolean;
 }
 
 /** State pushed to a pane's header so it can reflect tray/zoom affordances. */

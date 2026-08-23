@@ -1,0 +1,367 @@
+/* Saved-layouts popover (tabstrip "Layouts" button). The popover chrome
+ * (positioning/z-index/border/padding/gap/shadow) + heading come from the
+ * SHARED Popover.module.css via composes — the same primitive AddServer +
+ * Settings use, so the three tabstrip popovers cannot drift apart. This
+ * module contributes ONLY what is specific: the scope segmented control, the
+ * two save forms, the list rows (rename edit + master two-step confirm), and
+ * the 320px width. GPU-cheap only: plain bg/border/shadow — no mask-image,
+ * backdrop-filter, or contain:paint (AGENTS.md Firefox/WebRender rules). */
+.wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+/* Icon + label trigger (the AddServer family — collapses to icon-only on
+ * narrow strips via the media query below, keeping the aria-label). */
+.trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  -webkit-user-select: none;
+  user-select: none;
+  flex: 0 0 auto;
+}
+.trigger:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.trigger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.triggerIcon {
+  font-size: 13px;
+  line-height: 1;
+}
+.triggerText {
+  font-size: 12px;
+}
+/* Narrow strips (phone width): hide the "Layouts" text, keep the icon + the
+ * aria-label (the AddServer pattern). */
+@media (max-width: 480px) {
+  .triggerText {
+    display: none;
+  }
+  .trigger {
+    padding: 0;
+    width: 26px;
+    justify-content: center;
+  }
+}
+
+.popover {
+  composes: popover from "./Popover.module.css";
+  width: 320px;
+}
+.heading {
+  composes: heading from "./Popover.module.css";
+}
+
+/* ---- scope segmented control (This tab | All tabs) ------------------------- */
+.scopeToggle {
+  display: flex;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  width: fit-content;
+}
+.scopeBtn {
+  appearance: none;
+  border: 0;
+  padding: 4px 10px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.scopeBtn + .scopeBtn {
+  border-left: 1px solid var(--border);
+}
+.scopeBtn:hover {
+  color: var(--fg);
+}
+.scopeBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+/* Selected segment: the accent-soft fill (the tab-active treatment). */
+.scopeBtnOn,
+.scopeBtnOn:hover {
+  background: var(--accent-soft);
+  color: var(--fg);
+}
+
+/* ---- save forms (per scope) ------------------------------------------------ */
+.saveForm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.fieldLabel {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.nameInput {
+  width: 100%;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 12px;
+  box-sizing: border-box;
+}
+.nameInput:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.helper {
+  font-size: 10px;
+  color: var(--fg-dim);
+  line-height: 1.35;
+}
+.saveBtn {
+  height: 28px;
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  background: var(--accent-soft);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.saveBtn:hover {
+  background: var(--accent);
+  color: var(--bg);
+}
+/* Disabled save (no panes / no workspaces / empty name): the aria-disabled
+ * pattern — dimmed, no hover affordance, focus-visible KEPT so the entry
+ * stays discoverable. Defined after .saveBtn/:hover so the later
+ * equal-specificity rules win. */
+.saveBtnDisabled,
+.saveBtnDisabled:hover {
+  color: var(--fg-dim);
+  background: transparent;
+  border-color: var(--border);
+  cursor: default;
+}
+.saveHint {
+  font-size: 10px;
+  color: var(--fg-dim);
+  line-height: 1.35;
+}
+
+/* ---- saved list ------------------------------------------------------------ */
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+/* One saved-layout row. flex-wrap so the (rare) inline error line + the
+ * master confirm label can occupy a full second line without squeezing the
+ * action buttons. */
+.row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
+  -webkit-user-select: none;
+  user-select: none;
+  border-radius: 4px;
+}
+/* Master two-step confirm state: the amber destructive tint (the
+ * workspace-delete confirm treatment). */
+.rowConfirming {
+  background: rgba(210, 153, 34, 0.14);
+}
+.rowMain {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.rowMain:hover {
+  background: var(--bg-soft);
+}
+.rowMain:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.rowText {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.rowName {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Subtitle: the tab title (tab scope, when it differs from the name) or the
+ * workspace count (master scope). */
+.rowSub {
+  font-size: 10px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rowMeta {
+  font-size: 10px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+/* Rename pencil (20px, the sibling-action size). */
+.actBtn {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.actBtn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.actBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.delBtn {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--warn);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.delBtn:hover {
+  border-color: var(--warn);
+}
+.delBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* Inline rename input — replaces the row's main button while editing
+ * (the tabstrip's inline-rename treatment). */
+.renameInput {
+  appearance: none;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  height: 22px;
+  padding: 0 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  outline: none;
+}
+/* Refused-rename inline error (collision): full-width second line. */
+.rowError {
+  flex: 1 1 100%;
+  font-size: 10px;
+  color: var(--warn);
+  line-height: 1.35;
+  padding: 0 6px 2px;
+}
+/* Master two-step confirm: the "Replace all tabs?" label + ✓/✕. */
+.confirmLabel {
+  flex: 1 1 auto;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--warn);
+  padding: 4px 6px;
+  white-space: nowrap;
+}
+.confirmBtn {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.confirmBtn:hover {
+  background: var(--warn);
+  color: var(--bg);
+}
+.cancelBtn {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.cancelBtn:hover {
+  color: var(--fg);
+  border-color: var(--fg-dim);
+}
+.confirmBtn:focus-visible,
+.cancelBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.empty {
+  font-size: 11px;
+  color: var(--fg-dim);
+  padding: 2px 0 4px;
+}

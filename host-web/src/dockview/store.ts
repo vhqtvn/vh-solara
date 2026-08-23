@@ -236,6 +236,35 @@ export function captureActiveLayout(): SerializedDockview | null {
 }
 
 /**
+ * ALL workspaces' layouts + the active workspace's NAME (the master named-
+ * layout capture primitive — HostOps.saveMasterLayout). One entry per
+ * workspace in workspaces() order; each layout is the SAME fractional v3
+ * serialization captureActiveLayout produces (null for a workspace whose api
+ * has not registered yet — the brief mount window; the master saver SKIPS
+ * such entries rather than persisting a would-restore-empty snapshot). Names,
+ * not ids: ids re-mint on load anyway (addWorkspace mints fresh ids; pane
+ * ids are re-minted by the staged-restore pipeline), so only names are
+ * durable in a master snapshot.
+ */
+export function captureAllLayouts(): {
+  activeWorkspaceName: string | null;
+  workspaces: { name: string; layout: SerializedDockview | null }[];
+} {
+  const activeId = activeWorkspaceId();
+  const activeName =
+    workspaces().find((w) => w.id === activeId)?.name ?? null;
+  return {
+    activeWorkspaceName: activeName,
+    workspaces: workspaces().map((ws) => ({
+      name: ws.name,
+      layout: workspaceApis.get(ws.id)
+        ? serializeWorkspaceLayout(workspaceApis.get(ws.id)!)
+        : null,
+    })),
+  };
+}
+
+/**
  * Close (destroy) a workspace. Removing it from the workspaces signal makes
  * SolidJS <For> unmount that workspace's DockviewHost, whose onCleanup calls
  * api.dispose() (the SINGLE dispose — do NOT dispose here too, or Dockview
