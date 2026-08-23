@@ -15,6 +15,12 @@ import {
 } from "../state/serverList";
 import { firstNeedsYouAtFor } from "./store";
 import { scheduleSave } from "./layoutPersistence";
+import {
+  deleteNamedLayout,
+  listNamedLayouts,
+  loadNamedLayout,
+  saveNamedLayout,
+} from "./namedLayouts";
 import { next as attentionNext, nextTarget as attentionNextTarget } from "../attentionNext";
 import {
   activeWorkspaceId,
@@ -22,6 +28,7 @@ import {
   baselineFor,
   bindContentWindow,
   bindScratchSource,
+  captureActiveLayout,
   closeOverlay,
   closeWorkspace as storeCloseWorkspace,
   configuredOriginFor,
@@ -629,9 +636,9 @@ export class HostController implements HostOps {
 
   /**
    * Read the swappable neighbor (if any) in each cardinal direction, for the
-   *  overlay's Swap-mode arrow-enable computation. A direction maps to null
-   *  when there is no neighbor OR the source/neighbor is not swap-eligible
-   *  (the overlay disables that arrow rather than silently no-op'ing). */
+   * overlay's Swap-mode arrow-enable computation. A direction maps to null
+   * when there is no neighbor OR the source/neighbor is not swap-eligible
+   * (the overlay disables that arrow rather than silently no-op'ing). */
   overlaySwapTargets(paneId: string): Record<OverlaySplitDir, string | null> {
     const result: Record<OverlaySplitDir, string | null> = {
       above: null,
@@ -651,6 +658,42 @@ export class HostController implements HostOps {
       result[dir] = neighborId;
     }
     return result;
+  }
+
+  // ---- named layouts (shell-level; routed through the ACTIVE facet) --------
+
+  /**
+   * Save the ACTIVE workspace's current layout under `name`. SHELL-LEVEL op:
+   * hostOps() resolves the active workspace's facet, so by construction this
+   * runs on the ACTIVE controller — captureActiveLayout() reads the active
+   * workspace's api (this.api) and serializes it through the SAME fractional
+   * transform the persistence writer uses. Read-only: toJSON never mutates
+   * the tree, no iframe is touched. Same name = overwrite (savedAt refreshes;
+   * see namedLayouts.ts). Returns true when written, false when the active
+   * layout could not be captured (no active api) or the name is empty.
+   */
+  saveLayout(name: string): boolean {
+    const layout = captureActiveLayout();
+    if (!layout) return false;
+    return saveNamedLayout(name, layout);
+  }
+
+  /**
+   * Instantiate the named layout as a NEW workspace (cold mount). Reads the
+   * saved blob, hands it to addWorkspace (which STAGES it for the fresh
+   * workspace id so the new DockviewHost cold-restores it at mount through the
+   * existing persistence pipeline — fromJSON exactly once, before any of the
+   * new workspace's iframes exist), names the workspace after the save, and
+   * activates it (addWorkspace's existing activation path; FLIP/normalize
+   * effects compose exactly as on any workspace add). NEVER touches any live
+   * workspace's tree — the only mutations are a new workspace record +
+   * activation. Returns the new workspace id, or null when no layout is saved
+   * under the name.
+   */
+  loadLayout(name: string): string | null {
+    const entry = loadNamedLayout(name);
+    if (!entry) return null;
+    return storeAddWorkspace(name, entry.layout);
   }
 
   /** Spatial nearest-neighbor in a cardinal direction, by group bounding-box
@@ -899,6 +942,8 @@ export class HostController implements HostOps {
     this.ops.overlaySplit = (paneId, dir) => this.overlaySplit(paneId, dir);
     this.ops.overlaySwap = (paneId, dir) => this.overlaySwap(paneId, dir);
     this.ops.overlaySwapTargets = (paneId) => this.overlaySwapTargets(paneId);
+    this.ops.saveLayout = (name) => this.saveLayout(name);
+    this.ops.loadLayout = (name) => this.loadLayout(name);
   }
 
   /** Dispose this controller: unregister from the store + the controller map so
@@ -971,6 +1016,19 @@ export class HostController implements HostOps {
       // round-tripped through persistence). Reads the live store.
       workspaceName: (id: string): string =>
         storeWorkspaces().find((w) => w.id === id)?.name ?? "",
+
+      // ---- named layouts (drives the SAME production HostOps paths the
+      // Settings → Layouts… manager uses; reads for assertions) ----
+      // Save/load route through the ACTIVE controller's facet exactly like a
+      // Settings click; list/delete read the namedLayouts store directly (pure
+      // module — no live-tree involvement).
+      saveLayout: (name: string): boolean =>
+        activeController()?.saveLayout(name) ?? false,
+      loadLayout: (name: string): string | null =>
+        activeController()?.loadLayout(name) ?? null,
+      namedLayouts: (): Array<{ name: string; savedAt: number }> =>
+        listNamedLayouts(),
+      deleteNamedLayout: (name: string): boolean => deleteNamedLayout(name),
 
       // ---- active-workspace-scoped reads/ops ----
       panes: (): string[] => activeController()?.api.panels.map((p) => p.id) ?? [],

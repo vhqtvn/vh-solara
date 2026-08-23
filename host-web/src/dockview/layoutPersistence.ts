@@ -2,6 +2,7 @@ import type { DockviewApi, SerializedDockview } from "dockview-core";
 import {
   hasRealFleetEnv,
   isFleetEntry,
+  nextPaneId,
   resolveBaseFleet,
   seedPaneSeq,
   type FleetEntry,
@@ -145,9 +146,58 @@ const initBlob: PersistedState | null = readBlob();
 // =============================================================================
 
 /** Register the serializer the debounced writer calls on flush. The store owns
- *  this (it has the workspace list + the DockviewApi registry). */
+ *  this (it has the workspace list + the per-workspace DockviewApi registry). */
 export function setSerializeAllFn(fn: (() => PersistedState | null) | null): void {
   serializeAllFn = fn;
+}
+
+/**
+ * Serialize ONE workspace's live api into the SAVED (fractional v3) shape —
+ * the exact transform flushSave applies to every workspace on save
+ * (api.toJSON() → fractionizeSavedLayout). Read-only + never throws. The
+ * named-layouts save path uses this so a saved named layout is
+ * byte-compatible with a PersistedWorkspace.layout (no second serialization
+ * format); the cold-restore pipeline consumes it verbatim.
+ */
+export function serializeWorkspaceLayout(api: DockviewApi): SerializedDockview {
+  return fractionizeSavedLayout(
+    api.toJSON() as unknown as SavedLayout,
+  ) as unknown as SerializedDockview;
+}
+
+// ---- staged runtime-layout slot (named-layout load path) --------------------
+// A workspace created AT RUNTIME (addWorkspace) has no entry in the init blob
+// (read once at module init), so its cold restore would find nothing and it
+// would mount empty. The named-layout LOAD path instead instantiates the saved
+// layout as a NEW workspace: addWorkspace(name, layout) stages the saved-shape
+// blob here keyed by the fresh workspace id BEFORE the store push, and that
+// workspace's DockviewHost cold-restores it at mount through the SAME
+// loadRepairedWorkspaceLayout pipeline an initBlob entry gets (url validation,
+// repair, fraction materialization, one-shot fromJSON). This reuses the
+// existing cold-restore path verbatim — there is no second restore
+// implementation, and fromJSON still runs exactly once per workspace, at mount,
+// before any of its iframes exist (the HARD RULE above is preserved).
+//
+// CONSUMED ON READ (one-shot): the entry is taken — not peeked — by
+// loadRepairedWorkspaceLayout, so one load = one instantiation and a staged
+// blob can never restore twice. Pane ids are RE-ASSIGNED at consume time
+// (reIdLayoutPanels): fromJSON recreates panels with their saved ids verbatim,
+// but pane ids are GLOBAL keys in the host store (survivalMap, sourceMap,
+// statusByPane, …) — reusing the saved ids while the source workspace is still
+// live (or loading the same named layout twice) would alias two live iframes
+// to one paneId and thrash their heartbeat identities. Group ids are left
+// verbatim: they are PER-DOCKVIEW-INSTANCE namespaces (verified in
+// dockview-core: nextGroupId is an instance field, getNextGroupId skips ids
+// already in the instance's _groups, and createGroup reassigns duplicates).
+const stagedRuntimeLayouts = new Map<string, SerializedDockview>();
+
+/** Stage a saved-shape layout for a workspace that does not exist yet. The
+ *  next applyColdRestoreForWorkspace for `wsId` consumes it at cold mount. */
+export function stageRuntimeWorkspaceLayout(
+  wsId: string,
+  layout: SerializedDockview,
+): void {
+  stagedRuntimeLayouts.set(wsId, layout);
 }
 
 /** Request a debounced save of the full multi-workspace state. Idempotent under
@@ -355,24 +405,104 @@ export function applyColdRestoreForWorkspace(
 }
 
 /**
- * Read + repair + MATERIALIZIZE ONE workspace's saved layout from the init
- * blob. Returns the px-serialized SerializedDockview (only valid panes, sizes
- * recomputed from fractions × the CURRENT extent), or null when this workspace
- * has no entry / no layout / a layout with zero valid panes. Never throws. */
+ * Read + repair + MATERIALIZIZE ONE workspace's saved layout. Returns the
+ * px-serialized SerializedDockview (only valid panes, sizes recomputed from
+ * fractions × the CURRENT extent), or null when this workspace has no entry /
+ * no layout / a layout with zero valid panes. Never throws.
+ *
+ * SOURCE ORDER: a STAGED runtime layout (the named-layout load path) is taken
+ * first — one-shot, consumed on read — then the init blob. Both sources run
+ * the same validation + repair + materialization pipeline. A staged layout is
+ * additionally RE-IDDDED (fresh pane ids per instantiation) so its panels
+ * never alias live panes in the source workspace or a sibling instantiation
+ * (pane ids are global store keys — see the staged-slot block above). */
 export function loadRepairedWorkspaceLayout(
   workspaceId: string,
   extent?: RestoreExtent,
 ): SerializedDockview | null {
-  if (!initBlob) return null;
-  const ws = initBlob.workspaces.find((w) => w.id === workspaceId);
-  if (!ws || !ws.layout) return null;
-  if (!isSavedLayout(ws.layout)) return null;
-  const validIds = validRestoreIds(ws.layout.panels);
+  const staged = stagedRuntimeLayouts.get(workspaceId);
+  if (staged !== undefined) stagedRuntimeLayouts.delete(workspaceId); // consume
+  const saved =
+    staged !== undefined
+      ? staged
+      : (initBlob?.workspaces.find((w) => w.id === workspaceId)?.layout ?? null);
+  if (!saved || !isSavedLayout(saved)) return null;
+  const validIds = validRestoreIds(saved.panels);
   if (validIds.size === 0) return null;
-  const repaired = repairLayout(ws.layout, validIds);
+  let repaired = repairLayout(saved, validIds);
   if (!repaired) return null;
+  if (staged !== undefined) {
+    repaired = reIdLayoutPanels(repaired);
+  }
   // v3 semantics: fractions → px against the CURRENT container extent.
   return materializeSavedLayout(repaired, extent) as unknown as SerializedDockview;
+}
+
+/**
+ * Re-assign every PANEL id in a repaired saved layout to a fresh `pane-N`
+ * (nextPaneId), rewriting the panels map keys, the INNER `id` field of each
+ * serialized panel value (dockview's deserializer names the recreated panel
+ * from `panelData.id` — the map key alone is NOT authoritative), and every
+ * grid/floating/popout leaf's views + activeView. Group ids, geometry, and
+ * params are untouched. Called ONLY on the staged (named-layout) path, at
+ * consume time, so each instantiation mints its own ids — fromJSON reuses
+ * saved panel ids verbatim, and pane ids are GLOBAL keys in the host store
+ * (survivalMap, sourceMap, statusByPane, cwById…): reusing them would alias
+ * two live iframes to one paneId (heartbeat identity thrash). Structurally a
+ * pure tree walk over the SAME local SavedLayout shapes the repair walker
+ * uses; never throws. */
+function reIdLayoutPanels(layout: SavedLayout): SavedLayout {
+  const idMap = new Map<string, string>();
+  for (const id of Object.keys(layout.panels)) idMap.set(id, nextPaneId());
+  const mapId = (v: string): string => idMap.get(v) ?? v;
+  const panels: SavedLayout["panels"] = {};
+  for (const [id, st] of Object.entries(layout.panels)) {
+    // Rewrite BOTH the map key and the inner id (the deserializer's source).
+    panels[mapId(id)] = { ...st, id: mapId(id) } as typeof st;
+  }
+  const mapNode = (node: GridNode): GridNode => {
+    if (node.type === "leaf") {
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          views: node.data.views.map(mapId),
+          activeView: node.data.activeView !== undefined
+            ? mapId(node.data.activeView)
+            : undefined,
+        },
+      };
+    }
+    return { ...node, data: node.data.map(mapNode) };
+  };
+  const mapGroup = (fg: FloatingGroup): FloatingGroup => {
+    if (fg.data) {
+      return {
+        ...fg,
+        data: {
+          ...fg.data,
+          views: fg.data.views.map(mapId),
+          activeView: fg.data.activeView !== undefined
+            ? mapId(fg.data.activeView)
+            : undefined,
+        },
+      };
+    }
+    if (fg.grid) return { ...fg, grid: { ...fg.grid, root: mapNode(fg.grid.root) } };
+    return fg;
+  };
+  const out: SavedLayout = {
+    ...layout,
+    grid: { ...layout.grid, root: mapNode(layout.grid.root) },
+    panels,
+  };
+  if (layout.floatingGroups) {
+    out.floatingGroups = layout.floatingGroups.map(mapGroup);
+  }
+  if (layout.popoutGroups) {
+    out.popoutGroups = layout.popoutGroups.map(mapGroup);
+  }
+  return out;
 }
 
 // ---- per-pane url validation (defense-in-depth: never trust stored data) ----
@@ -971,7 +1101,10 @@ interface FloatingGroup {
 }
 interface SavedLayout {
   grid: { root: GridNode; width?: number; height?: number; orientation?: string };
-  panels: Record<string, { params?: unknown }>;
+  // The serialized panel value carries its own `id` — dockview's deserializer
+  // names the recreated panel from it (the map key is a parallel index; the
+  // repair/reId walkers keep both in sync).
+  panels: Record<string, { id?: string; params?: unknown }>;
   activeGroup?: string;
   floatingGroups?: FloatingGroup[];
   popoutGroups?: FloatingGroup[];

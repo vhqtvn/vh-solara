@@ -1,6 +1,6 @@
 import { createSignal } from "solid-js";
 import { createStore, produce } from "solid-js/store";
-import type { DockviewApi } from "dockview-core";
+import type { DockviewApi, SerializedDockview } from "dockview-core";
 import type {
   Attention,
   Activity,
@@ -16,7 +16,9 @@ import {
   hadSavedStateAtInit,
   loadWorkspaceSet,
   scheduleSave,
+  serializeWorkspaceLayout,
   setSerializeAllFn,
+  stageRuntimeWorkspaceLayout,
 } from "./layoutPersistence";
 
 // Module-level singleton store. Signals created at module scope are fine in
@@ -192,20 +194,45 @@ export function setActiveWorkspace(id: string): void {
 }
 
 /**
- * Create + activate a new (empty) workspace. The new host mounts empty — no seed
- * (only the default workspace on a first-ever load seeds the fleet). Returns the
- * new workspace id. Triggers a debounced save so the workspace set persists.
+ * Create + activate a new workspace. The new host mounts empty — no seed
+ * (only the default workspace on a first-ever load seeds the fleet) — UNLESS
+ * `layout` is given (the named-layout LOAD path): the saved-shape blob is
+ * STAGED for the fresh workspace id BEFORE the store push, so by the time
+ * App.tsx's <For> renders the new DockviewHost and its onMount runs
+ * applyColdRestoreForWorkspace, the staged layout is consumed through the
+ * SAME cold-restore pipeline a reload-restored workspace gets (validation +
+ * repair + fraction materialization + one-shot fromJSON, before any iframe
+ * exists — the HARD RULE holds). Never mutates any LIVE workspace's tree.
+ * Returns the new workspace id. Triggers a debounced save so the workspace
+ * set (now including the instantiated layout, once its api registers) persists.
  */
-export function addWorkspace(name?: string): string {
+export function addWorkspace(name?: string, layout?: SerializedDockview): string {
   const id = nextWsId();
   const ws: Workspace = {
     id,
     name: name?.trim() || `Workspace ${workspaces().length + 1}`,
   };
+  if (layout) stageRuntimeWorkspaceLayout(id, layout);
   setWorkspacesStore(produce((list) => { list.push(ws); }));
   setActiveWorkspaceIdSignal(id);
   scheduleSave();
   return id;
+}
+
+/**
+ * The ACTIVE workspace's layout in the SAVED (fractional v3) shape — the exact
+ * serialization the persistence writer produces (api.toJSON() → fractionize;
+ * see serializeWorkspaceLayout). Read-only (toJSON never mutates), safe to
+ * call anytime. Returns null when there is no active workspace/api yet (the
+ * brief cold-init window). This is the capture primitive the named-layouts
+ * save path (HostOps.saveLayout) uses — one serialization helper, no second
+ * format.
+ */
+export function captureActiveLayout(): SerializedDockview | null {
+  const ws = activeWorkspaceId();
+  const api = ws ? workspaceApis.get(ws) : undefined;
+  if (!api) return null;
+  return serializeWorkspaceLayout(api);
 }
 
 /**

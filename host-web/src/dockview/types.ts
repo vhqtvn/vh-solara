@@ -395,12 +395,35 @@ export interface HostOps {
   overlaySwap?(paneId: string, dir: OverlaySplitDir): string | null;
   /**
    * Read the swappable neighbor (if any) in each cardinal direction for the
-   *  overlay's Swap-mode arrow-enable computation. Returns a 4-entry record
-   *  mapping each direction to the neighbor pane id, or null when there is no
-   *  neighbor OR the source/neighbor is not swap-eligible (tabbed/stacked/
-   *  floating/maximized). A null entry means the overlay disables that arrow
-   *  (visual + aria-disabled) rather than silently no-op'ing. Read-only. */
+   * overlay's Swap-mode arrow-enable computation. Returns a 4-entry record
+   * mapping each direction to the neighbor pane id, or null when there is no
+   * neighbor OR the source/neighbor is not swap-eligible (tabbed/stacked/
+   * floating/maximized). A null entry means the overlay disables that arrow
+   * (visual + aria-disabled) rather than silently no-op'ing. Read-only. */
   overlaySwapTargets?(paneId: string): Record<OverlaySplitDir, string | null>;
+  /**
+   * Save the ACTIVE workspace's current layout under `name` (named layouts,
+   * `vh-host:namedLayouts:v1`). Captures via the SAME serialization the
+   * workspace-set persistence writes (fractional v3 —
+   * store.captureActiveLayout); read-only, never mutates the live tree, never
+   * reloads an iframe. SAME NAME = OVERWRITE (savedAt refreshes). The name is
+   * trimmed + capped (60); an empty name after trim is refused. Returns true
+   * when saved. NOTE: saving an EMPTY workspace's layout is legal at this
+   * layer (it round-trips as an empty workspace) — the Settings manager's
+   * Save-current button owns the "no panes to save" UI guard. */
+  saveLayout?(name: string): boolean;
+  /**
+   * Instantiate the named layout as a NEW workspace (cold mount): reads the
+   * saved blob, creates a workspace whose host cold-restores the layout AT
+   * MOUNT through the existing persistence pipeline (staged-layout seam —
+   * fromJSON runs exactly once, before any of the new workspace's iframes
+   * exist), names it after the save, and activates it. NEVER mutates any live
+   * workspace's tree (the only mutations are a new workspace record +
+   * activation). Deliberately NOT replace-current — replacing the active
+   * workspace's layout in place needs a live-diff engine (runtime fromJSON is
+   * banned); noted as future work. Returns the new workspace id, or null when
+   * no layout is saved under the name. */
+  loadLayout?(name: string): string | null;
 }
 
 /** State pushed to a pane's header so it can reflect tray/zoom affordances. */

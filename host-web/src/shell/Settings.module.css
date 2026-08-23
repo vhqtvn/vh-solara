@@ -112,3 +112,181 @@
 .itemDisabled .itemLabel {
   color: var(--fg-dim);
 }
+
+/* ---- named-layouts manager sub-view ("Layouts…") --------------------------
+ * Swapped into the SAME popover as the menu (no new chrome). Tokens mirror
+ * AddServer.module.css's input/button treatment so the two tabstrip popovers
+ * stay visually consistent. GPU-cheap only: plain bg/border — no mask-image,
+ * backdrop-filter, or contain (AGENTS.md Firefox/WebRender rules). */
+.manager {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.managerHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.backBtn {
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.backBtn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.managerTitle {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--fg);
+}
+.saveForm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.fieldLabel {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.nameInput {
+  width: 100%;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 12px;
+}
+.nameInput:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.saveBtn {
+  height: 28px;
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  background: var(--accent-soft);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.saveBtn:hover {
+  background: var(--accent);
+  color: var(--bg);
+}
+/* Disabled save (no panes / empty name): same aria-disabled pattern as the
+ * menu's itemDisabled — dimmed, no hover affordance, focus-visible KEPT so
+ * the entry stays discoverable. Defined after .saveBtn/:hover so the later
+ * equal-specificity rules win. */
+.saveBtnDisabled,
+.saveBtnDisabled:hover {
+  color: var(--fg-dim);
+  background: transparent;
+  border-color: var(--border);
+  cursor: default;
+}
+.saveHint {
+  font-size: 10px;
+  color: var(--fg-dim);
+  line-height: 1.35;
+}
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+/* One saved-layout row: a plain flex container for two SIBLING buttons (the
+ * AddServer catalog-row pattern). No role/tabindex of its own; the Load
+ * button is the row's target. */
+.row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.rowMain {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.rowMain:hover {
+  background: var(--bg-soft);
+}
+.rowMain:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.rowName {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.rowMeta {
+  font-size: 10px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+.delBtn {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--warn);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.delBtn:hover {
+  border-color: var(--warn);
+}
+.delBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.empty {
+  font-size: 11px;
+  color: var(--fg-dim);
+  padding: 2px 0 4px;
+}
