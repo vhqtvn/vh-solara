@@ -26,6 +26,7 @@ import { isSendInFlight } from "../lib/sendSingleFlight";
 import { bindBackDismiss } from "../lib/backStack";
 import PartView, { ActivityGroup } from "./Part";
 import ChatTasksStatus from "./ChatTasksStatus";
+import { bindChatTail } from "../tailFollow";
 
 // scrollEl ResizeObserver "stuck on ↓ Latest" recovery admission window: the
 // largest PRE-resize (pinnedGeom) gap-from-bottom for which a pure clientHeight
@@ -542,6 +543,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     pendingInputAt = 0;
     pin();
   }
+  // Tail-follow bridge (host tail/follow control): expose the active chat's
+  // following state + jumpToLatest to out-of-component consumers (the embed-
+  // gated statusEmitter reports `following` in {type:"status"}; the host-driven
+  // tailListener dispatches {type:"vh-host-tail",following:true} here). This is
+  // the SPA's own "↓ Latest" path — an external force-follow is indistinguish-
+  // able from the in-pane pill click. FORCE-UNFOLLOW is deliberately NOT
+  // exposed: no native unfollow action exists and an at-bottom following=false
+  // is re-engaged by the RO/self-heal recoveries (see tailFollow.ts). App.tsx
+  // mounts exactly one ChatView at a time (draft XOR session, in a Switch), so
+  // this single late binding is the active instance by construction.
+  onCleanup(bindChatTail(following, jumpToLatest));
 
   // ── Phase-4 load-older (historical page prepend) ─────────────────────────
   // The server (Phase 1-3) ships only a bounded recent tail of a session's

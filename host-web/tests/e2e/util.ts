@@ -246,6 +246,7 @@ export interface PaneStatus {
   title: string;
   attention: "none" | "needs_reply" | "needs_permission";
   activity: "running" | "idle" | "done_unread" | "error" | "unknown";
+  following: boolean;
 }
 
 /** Post a {type:"status"} message from a pane (source-bound) through the real
@@ -596,6 +597,24 @@ export async function selectTarget(
     const h = (window as unknown as { __host?: { selectTarget(p: string, d: string, s: string): void } }).__host;
     h?.selectTarget(paneId, dir, session);
   }, { paneId, dir, session });
+}
+
+// Tail/follow control: drive a force-follow through the production HostOps path
+// (hostOps().setTail). Posts {type:'vh-host-tail',following:true} to the pane's
+// contentWindow; the mock stand-in flips its modeled tail state + re-emits
+// {type:"status",following} as the round-trip signal (the real SPA's
+// statusEmitter does the same after its jumpToLatest). The SPA dispatches only
+// the true path (read-first verdict: force-unfollow is not durably
+// expressible).
+export async function setTail(
+  page: Page,
+  paneId: string,
+  following: boolean,
+): Promise<void> {
+  await page.evaluate(({ paneId, following }) => {
+    const h = (window as unknown as { __host?: { setTail(p: string, f: boolean): void } }).__host;
+    h?.setTail(paneId, following);
+  }, { paneId, following });
 }
 
 // ---- P4 attention-target registry (flat tabstrip) --------------------------

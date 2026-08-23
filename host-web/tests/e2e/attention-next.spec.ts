@@ -52,12 +52,12 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.probeStatus(page, {
       sourcePaneId: a,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "a", title: "A", attention: "needs_permission", activity: "running" },
+      payload: { type: "status", dir: "", session: "a", title: "A", attention: "needs_permission", activity: "running", following: true },
     });
     await H.probeStatus(page, {
       sourcePaneId: b,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "b", title: "B", attention: "needs_reply", activity: "idle" },
+      payload: { type: "status", dir: "", session: "b", title: "B", attention: "needs_reply", activity: "idle", following: true },
     });
 
     // N=2 need you (the underlying aggregate drives the tabstrip NEXT button's
@@ -79,7 +79,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.probeStatus(page, {
       sourcePaneId: needy,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "a", title: "A", attention: "needs_permission", activity: "idle" },
+      payload: { type: "status", dir: "", session: "a", title: "A", attention: "needs_permission", activity: "idle", following: true },
     });
     // Focus the OTHER pane first so the needy one is not already focused.
     await H.focusPane(page, other);
@@ -108,13 +108,13 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.probeStatus(page, {
       sourcePaneId: reply,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "r", title: "R", attention: "needs_reply", activity: "idle" },
+      payload: { type: "status", dir: "", session: "r", title: "R", attention: "needs_reply", activity: "idle", following: true },
     });
     await page.waitForTimeout(15);
     await H.probeStatus(page, {
       sourcePaneId: perm,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "p", title: "P", attention: "needs_permission", activity: "idle" },
+      payload: { type: "status", dir: "", session: "p", title: "P", attention: "needs_permission", activity: "idle", following: true },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(2);
 
@@ -131,13 +131,13 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.probeStatus(page, {
       sourcePaneId: older,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "o", title: "O", attention: "needs_reply", activity: "idle" },
+      payload: { type: "status", dir: "", session: "o", title: "O", attention: "needs_reply", activity: "idle", following: true },
     });
     await page.waitForTimeout(20);
     await H.probeStatus(page, {
       sourcePaneId: newer,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "n", title: "N", attention: "needs_reply", activity: "idle" },
+      payload: { type: "status", dir: "", session: "n", title: "N", attention: "needs_reply", activity: "idle", following: true },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(2);
 
@@ -163,7 +163,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.probeStatus(page, {
       sourcePaneId: needy,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "a", title: "A", attention: "needs_permission", activity: "idle" },
+      payload: { type: "status", dir: "", session: "a", title: "A", attention: "needs_permission", activity: "idle", following: true },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);
     const before = (await H.survival(page, needy))!;
@@ -208,7 +208,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.probeStatus(page, {
       sourcePaneId: ws2Pane!,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "w2", title: "W2", attention: "needs_permission", activity: "idle" },
+      payload: { type: "status", dir: "", session: "w2", title: "W2", attention: "needs_permission", activity: "idle", following: true },
     });
 
     // Switch back to ws1 + make a ws1 pane LOW-priority needy (needs_reply) so
@@ -220,7 +220,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.probeStatus(page, {
       sourcePaneId: ws1Pane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "w1", title: "W1", attention: "needs_reply", activity: "idle" },
+      payload: { type: "status", dir: "", session: "w1", title: "W1", attention: "needs_reply", activity: "idle", following: true },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);
     await expect(page.locator('[data-testid="attention-next"]')).toBeVisible();
@@ -253,7 +253,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.probeStatus(page, {
       sourcePaneId: needyPane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "n", title: "N", attention: "needs_permission", activity: "idle" },
+      payload: { type: "status", dir: "", session: "n", title: "N", attention: "needs_permission", activity: "idle", following: true },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);
 
@@ -293,7 +293,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.probeStatus(page, {
       sourcePaneId: needyPane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "n", title: "N", attention: "needs_permission", activity: "idle" },
+      payload: { type: "status", dir: "", session: "n", title: "N", attention: "needs_permission", activity: "idle", following: true },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);
 
@@ -334,7 +334,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "s", title: "S", attention: "needs_permission", activity: "idle" },
+      payload: { type: "status", dir: "", session: "s", title: "S", attention: "needs_permission", activity: "idle", following: true },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);
 
@@ -393,7 +393,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.probeStatus(page, {
       sourcePaneId: ws2Needy!,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "w2", title: "W2", attention: "needs_permission", activity: "idle" },
+      payload: { type: "status", dir: "", session: "w2", title: "W2", attention: "needs_permission", activity: "idle", following: true },
     });
 
     // Capture survival baseline for the trayed pane BEFORE the cross-ws+restore.
@@ -409,7 +409,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.probeStatus(page, {
       sourcePaneId: ws1Pane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "w1", title: "W1", attention: "needs_reply", activity: "idle" },
+      payload: { type: "status", dir: "", session: "w1", title: "W1", attention: "needs_reply", activity: "idle", following: true },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);
     await expect(page.locator('[data-testid="attention-next"]')).toBeVisible();
@@ -481,7 +481,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.probeStatus(page, {
       sourcePaneId: ws2Pane!,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "w2", title: "W2", attention: "needs_permission", activity: "idle" },
+      payload: { type: "status", dir: "", session: "w2", title: "W2", attention: "needs_permission", activity: "idle", following: true },
     });
 
     // Switch back to ws1 + make a ws1 pane LOW-priority needy (needs_reply) so
@@ -495,7 +495,7 @@ test.describe("P3 attention loop + NEXT hero button", () => {
     await H.probeStatus(page, {
       sourcePaneId: ws1Focused,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "w1", title: "W1", attention: "needs_reply", activity: "idle" },
+      payload: { type: "status", dir: "", session: "w1", title: "W1", attention: "needs_reply", activity: "idle", following: true },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);
     await expect(page.locator('[data-testid="attention-next"]')).toBeVisible();

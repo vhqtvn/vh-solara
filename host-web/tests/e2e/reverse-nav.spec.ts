@@ -188,6 +188,7 @@ test("F3: NEXT button pulse animation applies (scoped is-pulsing class matches)"
       title: "",
       attention: "needs_permission",
       activity: "idle",
+      following: true,
     },
   });
   await expect.poll(async () => H.needsYou(page), { timeout: 5000 }).toBe(1);

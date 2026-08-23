@@ -878,7 +878,8 @@ export function routeMessage(
         typeof d.session !== "string" ||
         typeof d.title !== "string" ||
         typeof d.attention !== "string" ||
-        typeof d.activity !== "string"
+        typeof d.activity !== "string" ||
+        typeof d.following !== "boolean"
       ) {
         return { routed: false, paneId: null, accepted: false, reason: "ignored-non-pane-to-host" };
       }
@@ -917,6 +918,7 @@ export function routeMessage(
         title: d.title,
         attention,
         activity,
+        following: d.following,
       });
       return { routed: true, paneId, accepted: true, reason: "accepted:non-heartbeat" };
     }

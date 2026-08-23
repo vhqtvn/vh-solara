@@ -16,6 +16,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { reconcile } from "solid-js/store";
 import { setState } from "../../src/sync/store";
 import { startStatusEmitter } from "../../src/statusEmitter";
+import { bindChatTail } from "../../src/tailFollow";
 
 const HOST_ORIGIN = "https://host.example";
 
@@ -102,6 +103,10 @@ describe("status emitter — no-op when standalone (embed gate)", () => {
 describe("status emitter — derivation + emission (embedded)", () => {
   let posted: Posted[];
   let dispose: (() => void) | undefined;
+  // Tail-follow bridge binding for the `following` tests. The bridge is module
+  // state (late-bound accessor); always unbind so later tests see the honest
+  // unbound default (true).
+  let unbindTail: (() => void) | undefined;
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -114,6 +119,8 @@ describe("status emitter — derivation + emission (embedded)", () => {
     expect(dispose, "embedded → disposer returned").toBeDefined();
   });
   afterEach(() => {
+    unbindTail?.();
+    unbindTail = undefined;
     dispose?.();
     dispose = undefined;
     vi.clearAllTimers();
@@ -342,6 +349,60 @@ describe("status emitter — derivation + emission (embedded)", () => {
     expect(reEmitted.activity).toBe(emittedStatus.activity);
     expect(reEmitted.title).toBe(emittedStatus.title);
     expect(reEmitted.session).toBe(emittedStatus.session);
+  });
+
+  // ---- tail-follow (following) ----------------------------------------------
+
+  it("carries following=true when the chat is at the tail (bridge default)", () => {
+    resident();
+    handshakeAndTick();
+    const last = statusMsgs(posted).at(-1)!.msg;
+    expect(last.following, "unbound bridge → honest on default").toBe(true);
+  });
+
+  it("carries following=false when the bound chat reads history", () => {
+    // Bind a ChatView-like accessor reporting the reader scrolled up; the next
+    // tick's status must carry following=false.
+    unbindTail = bindChatTail(
+      () => false,
+      () => {},
+    );
+    resident();
+    handshakeAndTick();
+    const last = statusMsgs(posted).at(-1)!.msg;
+    expect(last.following, "bound accessor false → reported").toBe(false);
+  });
+
+  it("reports following=true when no session is open (nothing to not-follow)", () => {
+    setUrl(""); // no session
+    handshakeAndTick();
+    const last = statusMsgs(posted).at(-1)!.msg;
+    expect(last.session).toBe("");
+    expect(last.following, "no session → honest on default").toBe(true);
+  });
+
+  it("a following flip re-emits (following is in the idempotence key)", () => {
+    resident("T");
+    setState("activity", SID, "idle");
+    handshakeAndTick();
+    const afterFirst = statusMsgs(posted).length;
+    expect(afterFirst, "baseline status posted").toBeGreaterThan(0);
+    expect(statusMsgs(posted).at(-1)!.msg.following).toBe(true);
+
+    // The operator scrolls up inside the pane → the bridge reports false → the
+    // next tick emits exactly one more status (key change), carrying false.
+    unbindTail = bindChatTail(
+      () => false,
+      () => {},
+    );
+    vi.advanceTimersByTime(1000);
+    expect(statusMsgs(posted).length, "following flip re-emits").toBe(afterFirst + 1);
+    expect(statusMsgs(posted).at(-1)!.msg.following).toBe(false);
+
+    // Stable false → no further emissions (idempotent-on-change).
+    vi.advanceTimersByTime(1000);
+    vi.advanceTimersByTime(1000);
+    expect(statusMsgs(posted).length, "unchanged following does not re-emit").toBe(afterFirst + 1);
   });
 
   it("disposer stops emission (listener removed, interval cleared)", () => {

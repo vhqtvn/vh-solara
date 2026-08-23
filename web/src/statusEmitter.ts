@@ -26,6 +26,7 @@
 import { isEmbedded } from "./embedded";
 import { state } from "./sync/store";
 import { rootOf, sessionWorking } from "./sync/selectors";
+import { chatTailFollowing } from "./tailFollow";
 
 // Attention is emit-on-change, not a latency-critical cursor: 1 Hz is the right
 // cadence (sub-second detection of a needs-permission transition without the
@@ -42,6 +43,15 @@ export interface StatusMessage {
   title: string;
   attention: Attention;
   activity: Activity;
+  /**
+   * Whether the chat view is currently following the transcript tail (Live) or
+   * reading history (following=false). Derived from the active ChatView via the
+   * tailFollow bridge — `true` when no chat is mounted / no session is open
+   * (nothing is being not-followed). Part of the idempotence key, so a
+   * following flip re-emits and the host's tail indicator tracks the operator
+   * scrolling inside the pane.
+   */
+  following: boolean;
 }
 
 /**
@@ -165,10 +175,15 @@ export function startStatusEmitter(): (() => void) | undefined {
     const attention: Attention = session ? deriveAttention(session) : "none";
     const activity: Activity = session ? deriveActivity(session) : "unknown";
     const title: string = session ? (state.sessions[session]?.title ?? "") : "";
-    const key = `${dir}\u0000${session}\u0000${title}\u0000${attention}\u0000${activity}`;
+    // Tail-follow is a CHAT-VIEW property (per open chat), not per-session
+    // state: when no session is open there is no transcript to not-follow, so
+    // the honest value is true. Read through the tailFollow bridge (unbound →
+    // true). In the idempotence key, so a following flip re-emits.
+    const following: boolean = session ? chatTailFollowing() : true;
+    const key = `${dir}\u0000${session}\u0000${title}\u0000${attention}\u0000${activity}\u0000${following}`;
     if (key === lastKey) return; // idempotent-on-change
     lastKey = key;
-    const msg: StatusMessage = { type: "status", dir, session, title, attention, activity };
+    const msg: StatusMessage = { type: "status", dir, session, title, attention, activity, following };
     try {
       // Q2-A: targeted to the captured host origin — never '*'.
       window.parent.postMessage(msg, hostOrigin);

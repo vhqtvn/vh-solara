@@ -47,8 +47,16 @@ test.describe("P1 session-attention", () => {
     const ids = await H.panes(page);
     const pane = ids[0];
 
-    // Before: no status reported yet.
-    expect(await H.status(page, pane), "no status before any post").toBeNull();
+    // Before: only the mock's handshake-time status echo (tail-follow facet,
+    // neutral attention) — no ATTENTION-bearing status posted yet. (Since the
+    // tail feature, the mock reports an initial {type:"status",following:true}
+    // once the handshake captures the reply origin — the faithful stand-in for
+    // the real SPA's statusEmitter, which starts its idempotent-on-change
+    // emission at handshake.)
+    const initial = await H.status(page, pane);
+    expect(initial, "handshake status echo present").not.toBeNull();
+    expect(initial!.attention, "initial echo is attention-neutral").toBe("none");
+    expect(initial!.following, "initial echo reports tail on").toBe(true);
 
     const r = await H.probeStatus(page, {
       sourcePaneId: pane,
@@ -60,6 +68,7 @@ test.describe("P1 session-attention", () => {
         title: "Refactor parser",
         attention: "needs_permission",
         activity: "running",
+        following: true,
       },
     });
     expect(r.accepted, "status message accepted (source-bound)").toBe(true);
@@ -85,7 +94,7 @@ test.describe("P1 session-attention", () => {
     const malformed = await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "", title: "", attention: "bogus", activity: "also-bogus" },
+      payload: { type: "status", dir: "", session: "", title: "", attention: "bogus", activity: "also-bogus", following: true },
     });
     expect(malformed.accepted, "out-of-vocabulary status rejected").toBe(false);
     expect(malformed.reason).toBe("ignored-non-pane-to-host");
@@ -102,7 +111,7 @@ test.describe("P1 session-attention", () => {
     await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "/proj", session: "s1", title: "Baseline", attention: "needs_permission", activity: "running" },
+      payload: { type: "status", dir: "/proj", session: "s1", title: "Baseline", attention: "needs_permission", activity: "running", following: true },
     });
     const baseline = await H.status(page, pane);
     expect(baseline!.attention, "baseline established").toBe("needs_permission");
@@ -119,7 +128,7 @@ test.describe("P1 session-attention", () => {
     const r = await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: WRONG_ORIGIN,
-      payload: { type: "status", dir: "/evil", session: "evil", title: "Forged", attention: "needs_reply", activity: "error" },
+      payload: { type: "status", dir: "/evil", session: "evil", title: "Forged", attention: "needs_reply", activity: "error", following: true },
     });
     expect(r.accepted, "wrong-origin status rejected").toBe(false);
     expect(r.reason).toBe("rejected:origin-mismatch");
@@ -158,7 +167,7 @@ test.describe("P1 session-attention", () => {
     await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "s1", title: "T", attention: "needs_permission", activity: "running" },
+      payload: { type: "status", dir: "", session: "s1", title: "T", attention: "needs_permission", activity: "running", following: true },
     });
 
     // The needs-you aggregate flips to 1 → the tabstrip NEXT button appears.
@@ -176,7 +185,7 @@ test.describe("P1 session-attention", () => {
     await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "s1", title: "", attention: "needs_permission", activity: "running" },
+      payload: { type: "status", dir: "", session: "s1", title: "", attention: "needs_permission", activity: "running", following: true },
     });
 
     // Identity SURVIVED: mountTs/nonce/connId unchanged (P1 is additive DOM
@@ -191,7 +200,7 @@ test.describe("P1 session-attention", () => {
     await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "s1", title: huge, attention: "none", activity: "idle" },
+      payload: { type: "status", dir: "", session: "s1", title: huge, attention: "none", activity: "idle", following: true },
     });
     const st = await H.status(page, pane);
     expect(st!.title.length, "title capped at ingress").toBeLessThanOrEqual(120);

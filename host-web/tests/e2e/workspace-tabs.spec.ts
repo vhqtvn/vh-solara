@@ -165,6 +165,7 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
         title: "Needs Reply",
         attention: "needs_reply",
         activity: "idle",
+        following: true,
       },
     });
 

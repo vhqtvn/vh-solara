@@ -370,7 +370,7 @@ test.describe("layout overlay interaction model", () => {
     await H.probeStatus(page, {
       sourcePaneId: ids[1],
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "/p", session: "s1", title: "T", attention: "needs_permission", activity: "running" },
+      payload: { type: "status", dir: "/p", session: "s1", title: "T", attention: "needs_permission", activity: "running", following: true },
     });
     await expect.poll(async () => H.needsYou(page), { timeout: 8000 }).toBe(1);
     await expect(page.locator('[data-testid="attention-next"]')).toBeVisible();

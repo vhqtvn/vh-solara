@@ -167,6 +167,43 @@ function postToParent(msg: unknown): void {
 postToParent({ type: "title", title: `${SERVER} · ${VIEW}` });
 postToParent({ type: "route" });
 
+// ---- pane → host: session-attention status echo (tail-follow) ---------------
+// Stand-in for the real SPA's statusEmitter (web/src/statusEmitter.ts): once
+// the host handshake establishes the reply origin, report a {type:"status"}
+// message idempotent-on-change. The mock models only the tail-follow facet
+// (`following`); dir/session/title/attention/activity carry the honest neutral
+// values (the mock has no session tree). `following` flips when the modeled
+// reader scrolls away from / back to the tail (the click affordance below) and
+// when a valid host tail command lands, so the host's Tail row round-trips
+// through the SAME status bridge the real SPA uses.
+let tailFollowing = true;
+
+function postStatus(): void {
+  postToParent({
+    type: "status",
+    dir: "",
+    session: "",
+    title: "",
+    attention: "none",
+    activity: "unknown",
+    following: tailFollowing,
+  });
+}
+
+// Model the reader's scroll position: a click in the mock's chat area toggles
+// between "reading history" (following=false — the reader scrolled up) and
+// "at the tail" (following=true — scrolled back to the bottom). This is the
+// deterministic e2e hook for reaching following=false WITHOUT a real scroll
+// container; the real SPA produces the same transition via its scroll
+// classifier. Surfaced in the DOM (data-tail-following) so a gate can assert
+// the modeled state directly.
+app.addEventListener("click", () => {
+  tailFollowing = !tailFollowing;
+  app.dataset.tailFollowing = String(tailFollowing);
+  postStatus();
+});
+app.dataset.tailFollowing = String(tailFollowing);
+
 // P4 reverse-nav (mock stand-in for the real SPA's selectListener): the host
 // posts {type:'vh-host-select',dir,session} to direct this mock pane to a
 // specific {dir, session} WITHOUT reloading (a survival-safe SPA-internal route
@@ -251,6 +288,10 @@ window.addEventListener("message", (ev) => {
     // and changes on reload (new document ⇒ new handshake ⇒ new nonce).
     hostOrigin = ev.origin;
     if (typeof data.nonce === "string") nonce = data.nonce;
+    // The handshake establishes the reply origin: report the initial status
+    // (tail-follow state), mirroring the real SPA's statusEmitter which starts
+    // its idempotent-on-change emission once the origin is captured.
+    postStatus();
   } else if (data && data.type === "focus") {
     app.classList.add("is-focused");
   } else if (data && data.type === "blur") {
@@ -278,5 +319,28 @@ window.addEventListener("message", (ev) => {
     app.dataset.selectDir = sel.dir;
     app.dataset.selectSession = sel.session;
     postToParent({ type: "route", route: currentRoute });
+  } else if (data && data.type === "vh-host-tail") {
+    // Tail/follow command (mock stand-in for the real SPA's tailListener,
+    // web/src/tailListener.ts). F1 (inbound source-guard): mirror the real
+    // listener EXACTLY — only the actual parent window may drive a tail
+    // command; an untrusted sibling pane that grabbed this window's WindowProxy
+    // must not hijack the modeled follow state. event.source for the real host
+    // tail is window.parent.
+    if (ev.source !== window.parent) return;
+    // CF1 payload allowlist: following MUST be a boolean (drop everything else
+    // — a poison field never reaches the modeled state). Mirrors the real SPA.
+    const tail = data as { following?: unknown };
+    if (typeof tail.following !== "boolean") return;
+    // READ-FIRST VERDICT (mirror the real listener): only following=true is
+    // dispatched — force-unfollow is not durably expressible in the real
+    // ChatView (its RO/self-heal recoveries re-engage an at-bottom
+    // following=false), so a validated false is a deliberate no-op here too.
+    if (tail.following) {
+      tailFollowing = true;
+      app.dataset.tailFollowing = "true";
+      // Round-trip: re-report the status so the host's Tail row flips from the
+      // REPORTED state (the same status bridge the real SPA's emitter uses).
+      postStatus();
+    }
   }
 });

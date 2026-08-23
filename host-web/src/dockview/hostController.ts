@@ -417,6 +417,27 @@ export class HostController implements HostOps {
   }
 
   /**
+   * Direct a pane's embedded SPA to force its chat back onto the transcript
+   * tail (jump-to-latest) via a survival-safe postMessage — mirrors
+   * selectTarget's shape exactly. The iframe src + element are NEVER touched;
+   * the SPA performs an INTERNAL scroll action (its own jumpToLatest path), so
+   * survival is unchanged. The round-trip signal is the SPA's existing
+   * {type:'status'} emission (the idempotence key now includes `following`),
+   * captured by setStatusFor — the UI reflects the REPORTED state, never a
+   * local echo. NOTE: the SPA dispatches only following=true (force-unfollow
+   * is not durably expressible in its scroll machinery — read-first verdict;
+   * see web/src/tailListener.ts); the host UI exposes indicator +
+   * "Jump to latest" only. No-op when the pane is not found or its origin is
+   * unbound (never '*').
+   */
+  setTail(paneId: string, following: boolean): void {
+    const cw = lookupContentWindow(paneId);
+    const origin = configuredOriginFor(paneId);
+    if (!cw || !origin) return;
+    cw.postMessage({ type: "vh-host-tail", following }, origin);
+  }
+
+  /**
    * Rename a pane's LABEL inline (tabs=panes model, operator point #2: "rename
    * mean rename the prefix"). Updates the panel params via
    * `api.updateParameters({label})` WITHOUT reloading the iframe (same
@@ -868,6 +889,7 @@ export class HostController implements HostOps {
     this.ops.removeServer = (url) => this.removeServer(url);
     this.ops.updateRoute = (paneId, route) => this.updateRoute(paneId, route);
     this.ops.selectTarget = (paneId, dir, session) => this.selectTarget(paneId, dir, session);
+    this.ops.setTail = (paneId, following) => this.setTail(paneId, following);
     this.ops.renamePane = (paneId, label) => this.renamePane(paneId, label);
     this.ops.setLayoutMode = (paneId, mode) => this.setLayoutMode(paneId, mode);
     this.ops.focusDirection = (paneId, dir) => this.focusDirection(paneId, dir);
@@ -1072,6 +1094,16 @@ export class HostController implements HostOps {
       // round-trip lands in the pane regardless of its workspace.
       selectTarget: (paneId: string, dir: string, session: string): void => {
         activeController()?.selectTarget(paneId, dir, session);
+      },
+
+      // Tail/follow control: drive a force-follow through the SAME production
+      // HostOps path the layout overlay's Tail row uses (hostOps().setTail).
+      // Routes through the active controller's facet; the method itself does a
+      // global store lookup (lookupContentWindow/configuredOriginFor), so the
+      // post lands in the pane regardless of its workspace. The SPA dispatches
+      // only the true path (read-first verdict).
+      setTail: (paneId: string, following: boolean): void => {
+        activeController()?.setTail(paneId, following);
       },
 
       dockAsTab: (a: string, b: string): void => {

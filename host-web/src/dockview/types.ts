@@ -74,6 +74,15 @@ export interface PaneStatus {
   title: string;
   attention: Attention;
   activity: Activity;
+  /**
+   * Whether the pane's chat is following the transcript tail (Live) or reading
+   * history. Reported by the SPA's status bridge (the tailFollow seam over the
+   * ChatView following signal); `true` when no chat/session is open (nothing is
+   * being not-followed). Drives the layout overlay's Tail row; part of the
+   * SPA-side idempotence key so the host indicator tracks the operator
+   * scrolling inside the pane.
+   */
+  following: boolean;
 }
 
 /** Survival identity/signal reported by each iframe's heartbeat. */
@@ -132,6 +141,8 @@ export type PaneToHost =
       title: string;
       attention: Attention;
       activity: Activity;
+      /** Tail-follow state of the pane's chat (see PaneStatus.following). */
+      following: boolean;
     }
   // Layout-overlay gesture (double-Ctrl desktop / triple-tap mobile) + pane-
   // activate forward (cross-origin activation bridge). The SPA forwards ONE
@@ -161,6 +172,17 @@ export type HostToPane =
   | { type: "blur" }
   | { type: "vh-host-handshake"; nonce: string }
   | { type: "vh-host-select"; dir: string; session: string }
+  // Host tail/follow command (see web/src/tailListener.ts): directs the
+  // embedded SPA to force its chat back onto the transcript tail via the SPA's
+  // own jumpToLatest() ("↓ Latest") path — a survival-safe SPA-INTERNAL scroll
+  // action; the iframe src + element are NEVER touched. The payload is the
+  // closed {following: boolean}; the SPA dispatches only the true (follow)
+  // path — force-unfollow is not durably expressible in the SPA's scroll
+  // machinery (read-first verdict; see tailListener.ts) — but the wire contract
+  // stays the full boolean for forwards-compatibility. Origin-scoped to the
+  // pane's configured origin (never '*'); the SPA source-guards
+  // `ev.source === window.parent` before acting.
+  | { type: "vh-host-tail"; following: boolean }
   | { type: "host-mode"; mode: "keyboard-focus" | "normal" };
 
 // ---- document-liveness indicator (Q1-C) ------------------------------------
@@ -293,6 +315,20 @@ export interface HostOps {
    * its existing {type:'route'} emission — that round-trip is the success
    * signal (no new reply message). See web/src/selectListener.ts. */
   selectTarget?(paneId: string, dir: string, session: string): void;
+  /**
+   * Direct a pane's embedded SPA to force its chat back onto the transcript
+   * tail (jump-to-latest) via a survival-safe postMessage. Posts
+   * {type:'vh-host-tail',following:true} to the pane's bound contentWindow
+   * targeted at its configured origin (never '*') — mirrors selectTarget. The
+   * round-trip signal is the SPA's existing {type:'status'} emission (its
+   * idempotence key includes `following`), which setStatusFor stores — the
+   * overlay's Tail row flips back to "on" from the reported state, not from a
+   * local echo. NOTE: only following=true is meaningfully dispatchable (the
+   * SPA's read-first verdict: force-unfollow is not durable, so its listener
+   * validates but does not dispatch false); the host UI exposes indicator +
+   * "Jump to latest" only. No-op when the pane is not found or its origin is
+   * unbound. See web/src/tailListener.ts. */
+  setTail?(paneId: string, following: boolean): void;
   /**
    * Rename a pane's LABEL inline (tabs=panes model). Updates the panel params
    * via `api.updateParameters({label})` WITHOUT reloading the iframe (same

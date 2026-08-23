@@ -205,6 +205,18 @@ export function LayoutOverlay(props: { mainEl: () => HTMLElement | null }) {
     mode() === "swap" && swapTargets()[dir] === null;
   const arrowVerb = (): string => (mode() === "swap" ? "Swap" : "Split");
 
+  // Tail row (host-side tail/follow control). State source: the source pane's
+  // LAST-REPORTED status (PaneVm.status.following, reactive via panes(); true
+  // until the pane reports otherwise — no status yet ⇒ honest "on" default,
+  // matching the SPA's unbound/no-session default). Action: force-follow via
+  // HostOps.setTail(paneId, true). Deliberately NO unfollow action (read-first
+  // verdict: not durably expressible in the SPA).
+  const tailOn = (): boolean => sourceVm()?.status?.following ?? true;
+  const jumpTail = (): void => {
+    const id = source();
+    if (id) hostOps()?.setTail?.(id, true);
+  };
+
   return (
     <Show when={source() !== null} keyed>
       <div class={s.overlay}>
@@ -285,6 +297,31 @@ export function LayoutOverlay(props: { mainEl: () => HTMLElement | null }) {
             >
               Swap
             </button>
+          </div>
+          {/* Tail row: the source pane's chat tail-follow state, as REPORTED by
+              the pane's status bridge (statusFor → PaneVm.status.following;
+              reactive through panes()). Read-first verdict: force-unfollow is
+              not durably expressible in the SPA's scroll machinery, so there is
+              NO toggle — the row renders the state and offers a single
+              "Jump to latest" action when the pane reports following=false.
+              Clicking it posts {type:'vh-host-tail',following:true} through
+              HostOps.setTail; the pane re-reports its status and the row flips
+              back to "on" from the REPORTED state (no local echo). */}
+          <div class={s.tailRow} data-testid="layout-overlay-tail-row">
+            <span class={s.tailLabel} data-testid="layout-overlay-tail-state">
+              Tail: {tailOn() ? "on" : "off"}
+            </span>
+            <Show when={!tailOn()}>
+              <button
+                type="button"
+                class={s.tailBtn}
+                data-testid="layout-overlay-tail-jump"
+                title="Force the pane's chat back onto the tail (jump to latest)"
+                onClick={() => jumpTail()}
+              >
+                ↓ Jump to latest
+              </button>
+            </Show>
           </div>
           <div class={s.actionRow}>
             <button

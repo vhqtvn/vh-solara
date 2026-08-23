@@ -185,6 +185,42 @@
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+/* Tail row: the source pane's chat tail-follow indicator + (when the pane
+ * reports following=false) the single "Jump to latest" force-follow action.
+ * No unfollow toggle — the SPA cannot durably express it (read-first verdict).
+ * GPU-cheap plain elements (no mask/backdrop/filter). */
+.tailRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1;
+}
+.tailLabel {
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.tailBtn {
+  appearance: none;
+  flex: 1 1 0;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1;
+  padding: 6px 0;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.tailBtn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.tailBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 .hint {
   font-size: 10px;
   color: var(--fg-dim);

@@ -19,6 +19,7 @@ import { startPresence } from "./alerts";
 import { startHeartbeat } from "./heartbeat";
 import { startStatusEmitter } from "./statusEmitter";
 import { startSelectListener } from "./selectListener";
+import { startTailListener } from "./tailListener";
 import { startHostGesture } from "./hostGesture";
 import { refreshProjectSettings } from "./projectSettings";
 import "./styles/main.css";
@@ -98,6 +99,15 @@ if (standalone === "code") {
   // SPA-INTERNAL route change (setSelectedId/switchProject) — the iframe element
   // + src are NEVER touched. See web/src/selectListener.ts.
   startSelectListener();
+  // Host tail/follow command listener (no-op when standalone). Same embed gate
+  // + inbound source-guard + payload-allowlist security pattern as the select
+  // listener. When the host posts a {type:"vh-host-tail",following:true}, the
+  // SPA force-follows the chat tail via its own jumpToLatest() ("↓ Latest")
+  // path — a survival-safe SPA-INTERNAL scroll action; the iframe element
+  // + src are NEVER touched. The round-trip signal is the statusEmitter's
+  // {type:"status"} emission (its key now includes `following`). See
+  // web/src/tailListener.ts.
+  startTailListener();
   // Host gesture recognizer (no-op when standalone). Same embed gate +
   // captured-origin security pattern as the heartbeat/status/select bridges.
   // When embedded, recognizes a double-Ctrl (desktop) / triple-tap (mobile)
