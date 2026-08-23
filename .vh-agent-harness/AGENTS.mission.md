@@ -158,7 +158,7 @@ is **no pytest** anywhere in this repo.
    binary via `//go:embed`) instead of the mock content page
    (`host-web/iframe-content/content.ts`). Boots a real Go server (`:8765`,
    `--auth-mode none` loopback default, `--frame-ancestors`) + the host dev server
-   (`:5183`, `VITE_IFRAME_ORIGIN=:8765`) cross-origin, then asserts: gate
+   (`:5183`, `VITE_IFRAME_ORIGIN=:8765/app`) cross-origin, then asserts: gate
    continuity (iframe loads the SPA, not `/auth/login`), real SPA render, real SSE
    connect, the **live production heartbeat emitter** (`web/src/heartbeat.ts`)
    drives the host's Q1-C "document alive" indicator (the crux), and the real-SPA
