@@ -204,6 +204,26 @@ app.addEventListener("click", () => {
 });
 app.dataset.tailFollowing = String(tailFollowing);
 
+// ---- pane-activate forward (mock stand-in for web/src/hostGesture.ts) -------
+// The REAL SPA forwards {type:"host-gesture",gesture:"pane-activate"} on every
+// focus/pointerdown/focusin inside the pane (capture-phase listeners) — the
+// cross-origin activation bridge (a tap inside a cross-origin iframe does not
+// bubble to the host). The mock mirrors the pointerdown forward (the tap path)
+// so lane-7 e2e can exercise the REAL gesture → postMessage → router chain:
+// a genuine click inside this iframe posts the same CLOSED payload the real
+// SPA posts, and the host's activation + anchored-popover dismissal react
+// identically (routeMessage derives the pane from event.source; the payload
+// carries no ids).
+document.addEventListener(
+  "pointerdown",
+  () => {
+    postToParent({ type: "host-gesture", gesture: "pane-activate" });
+  },
+  // Capture phase — mirrors the real SPA: an element/library handler calling
+  // stopPropagation on the bubble path cannot block the forward.
+  true,
+);
+
 // P4 reverse-nav (mock stand-in for the real SPA's selectListener): the host
 // posts {type:'vh-host-select',dir,session} to direct this mock pane to a
 // specific {dir, session} WITHOUT reloading (a survival-safe SPA-internal route

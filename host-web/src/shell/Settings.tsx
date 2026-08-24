@@ -15,9 +15,10 @@ import s from "./Settings.module.css";
  * pointerdown outside the wrap closes, and the tabstrip group keeps this
  * popover mutually exclusive with the other tabstrip popovers. The listeners
  * live only while a surface is open — no shell-lifetime document handlers.
- * Note the click-outside limit: pointerdown on a CROSS-ORIGIN IFRAME never
- * reaches this document, so tapping a pane does not close the popover —
- * Escape + any host-chrome tap do.
+ * Pane taps close it too: pointerdown on a CROSS-ORIGIN IFRAME never reaches
+ * this document, so the SPA's forwarded pane-activate gesture drives the same
+ * dismissal (routeMessage → dismissAnchoredSurfaces) — Escape + any
+ * host-chrome or pane tap do.
  *
  * EXTENSIBLE BY DESIGN: the menu items are a plain typed array below. Adding
  * a future setting = appending one entry (action or toggle); no rendering

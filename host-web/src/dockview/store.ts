@@ -20,6 +20,7 @@ import {
   setSerializeAllFn,
   stageRuntimeWorkspaceLayout,
 } from "./layoutPersistence";
+import { dismissAnchoredSurfaces } from "../shell/popover";
 
 // Module-level singleton store. Signals created at module scope are fine in
 // SolidJS: components that read them inside a tracking scope re-render on
@@ -1012,6 +1013,20 @@ export function routeMessage(
       // focusPane(sourcePaneId) → setActive() → onDidActivePanelChange → the
       // focus indicator (is-active + 3px outline + 5px top edge) moves to this
       // pane.
+      //
+      // ANCHORED-POPOVER DISMISSAL (the cross-boundary outside-click): a tap
+      // inside a pane never reaches this document's pointerdown (cross-origin
+      // iframe), so the surface stack's outside-click pass cannot see it — a
+      // VALID activation IS the tap signal. Dismiss every anchored surface (the
+      // tabstrip popovers) BEFORE the idempotent focus no-op below: a tap on an
+      // already-focused pane changes nothing about focus, but the tap still
+      // happened and must close the popovers. Anchor-less surfaces (the layout
+      // overlay) are skipped by the dismiss pass — its pane-activate
+      // composition is the explicit same-pane/different-pane handling below.
+      // Note the dismissal therefore also fires on focus/focusin-derived
+      // activations, not just literal taps — same signal, same meaning:
+      // attention moved into a pane.
+      dismissAnchoredSurfaces();
       //
       // IDEMPOTENT: if this pane is already the focused pane, no-op (don't
       // thrash — the SPA throttles to once per focus session, but the host

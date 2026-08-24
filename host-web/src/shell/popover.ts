@@ -24,12 +24,17 @@
 //
 // OUTSIDE-CLICK: a pointerdown outside a surface's `anchor` element (the
 // trigger + popover wrapper) closes it. pointerdown (not click) so the close
-// wins the race against whatever the outside tap activates. Known limit (same
-// as every host-chrome popover here): a pointerdown inside a CROSS-ORIGIN
-// IFRAME never reaches this document, so tapping a pane does not close a
-// popover — Escape and any host-chrome tap do. Surfaces that own their own
+// wins the race against whatever the outside tap activates. A pointerdown
+// inside a CROSS-ORIGIN IFRAME never reaches this document, so pane taps do
+// NOT flow through that listener — they route through the pane-activate
+// bridge instead: the SPA forwards {type:"host-gesture",gesture:"pane-
+// activate"} on every pane focus/pointerdown/focusin (web/src/hostGesture.ts),
+// and the host's routeMessage (dockview/store.ts, host-gesture branch) calls
+// dismissAnchoredSurfaces() on each VALID activation — closing every anchored
+// popover exactly like a host-chrome tap would. Surfaces that own their own
 // outside handling (the layout overlay's <main> capture layer) register
-// WITHOUT an anchor and are skipped by the outside-click pass.
+// WITHOUT an anchor and are skipped by BOTH the outside-click pass and
+// dismissAnchoredSurfaces.
 //
 // This module is UI-framework-lazy on purpose: registerSurface/releaseSurface
 // are plain functions (the layout overlay wires them in an effect), while
@@ -118,6 +123,28 @@ export function releaseSurface(id: string): void {
   const i = stack.findIndex((s) => s.id === id);
   if (i !== -1) stack.splice(i, 1);
   syncListeners();
+}
+
+/** Dismiss every ANCHORED surface (the tabstrip popovers). Anchor-less
+ *  surfaces — those that own their outside-dismissal (the layout overlay's
+ *  <main> capture layer) — are skipped, mirroring onPointerDown's anchor-less
+ *  skip. (One deliberate difference: the test here is anchor EXISTENCE, not
+ *  the accessor's event-time return — a pane tap is outside every popover, so
+ *  even a transiently null-resolving anchored surface still closes here where
+ *  the outside-click pass would have skipped it.)
+ *
+ *  This is the cross-boundary completion of the outside-click pass: a tap
+ *  inside a cross-origin pane iframe never fires this document's pointerdown,
+ *  so the SPA's forwarded pane-activate gesture is the only signal that
+ *  attention moved into a pane. routeMessage (dockview/store.ts) calls this
+ *  on every VALID pane-activate (source-bound + origin-checked), BEFORE its
+ *  idempotent focus no-op — a tap on an already-focused pane still dismisses. */
+export function dismissAnchoredSurfaces(): void {
+  for (let i = stack.length - 1; i >= 0; i--) {
+    const entry = stack[i];
+    if (!entry.anchor) continue;
+    entry.close();
+  }
 }
 
 export interface PopoverSurface {

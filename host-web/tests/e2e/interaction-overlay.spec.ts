@@ -531,6 +531,145 @@ test.describe("layout overlay interaction model", () => {
     expect(await H.focused(page), "focus unchanged after wrong-origin").toBe(ids[0]);
   });
 
+  // ---- (6b) pane-activate × surface stack (cross-boundary popover dismissal) --
+  // The surface stack's outside-click pass (shell/popover.ts) listens on
+  // document.pointerdown — which NEVER fires for a tap inside a cross-origin
+  // pane iframe. A VALID pane-activate is that tap's bridge signal:
+  // routeMessage dismisses every ANCHORED surface (the tabstrip popovers) on
+  // the way through. Anchor-less surfaces (the layout overlay) are skipped;
+  // spoofed messages (wrong origin / unregistered source) are rejected BEFORE
+  // the dismiss call.
+
+  test("pane-activate closes each tabstrip popover (Layouts, Settings, AddServer)", async ({ page }) => {
+    const ids = await H.panes(page);
+    const pane = ids[0];
+    // One per popover: open via the REAL tabstrip trigger, post a valid
+    // pane-activate from a pane's contentWindow (the SAME routeMessage path
+    // the SPA's hostGesture.ts posts through), assert the popover closed.
+    const cases = [
+      { btn: '[data-testid="layouts-btn"]', pop: '[data-testid="layouts-popover"]' },
+      { btn: '[data-testid="settings-btn"]', pop: '[data-testid="settings-popover"]' },
+      { btn: '[data-testid="add-server-btn"]', pop: '[data-testid="add-server-popover"]' },
+    ];
+    for (const { btn, pop } of cases) {
+      await page.locator(btn).click();
+      await expect(page.locator(pop)).toBeVisible();
+      const r = await H.probePaneMessage(page, {
+        sourcePaneId: pane,
+        origin: H.MOCK_ORIGIN,
+        payload: { type: "host-gesture", gesture: "pane-activate" },
+      });
+      expect(r.accepted, `${pop}: pane-activate accepted`).toBe(true);
+      await expect(page.locator(pop), `${pop}: closed by pane-activate`).toHaveCount(0);
+    }
+  });
+
+  test("pane-activate from an ALREADY-focused pane still dismisses (focus no-op, tap still happened)", async ({ page }) => {
+    const ids = await H.panes(page);
+    const pane = ids[0];
+    // Focus the pane FIRST (the end state a prior activate produces), so the
+    // probe below takes the idempotent focus no-op branch.
+    await H.focusPane(page, pane);
+    await expect.poll(async () => H.focused(page)).toBe(pane);
+
+    await page.locator('[data-testid="settings-btn"]').click();
+    await expect(page.locator('[data-testid="settings-popover"]')).toBeVisible();
+
+    const r = await H.probePaneMessage(page, {
+      sourcePaneId: pane,
+      origin: H.MOCK_ORIGIN,
+      payload: { type: "host-gesture", gesture: "pane-activate" },
+    });
+    expect(r.accepted, "activate on the focused pane accepted").toBe(true);
+    expect(await H.focused(page), "focus unchanged (idempotent no-op)").toBe(pane);
+    // The popover STILL closed — the dismiss runs before/independent of the
+    // focus no-op.
+    await expect(page.locator('[data-testid="settings-popover"]')).toHaveCount(0);
+  });
+
+  test("pane-activate does NOT dismiss the layout overlay (anchor-less skip)", async ({ page }) => {
+    const ids = await H.panes(page);
+    const source = ids[0];
+    await H.openLayoutOverlay(page, source);
+    await expect.poll(async () => H.overlaySource(page)).toBe(source);
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
+    // Make the source the focused pane explicitly, so the probe takes the
+    // idempotent branch AND the same-pane overlay composition is a no-op.
+    await H.focusPane(page, source);
+    await expect.poll(async () => H.focused(page)).toBe(source);
+
+    // Post pane-activate from the overlay's own source pane. A synthetic
+    // postMessage bypasses the overlay's <main> capture layer entirely, so the
+    // ONLY dismissal paths in play are the anchor-less skip (must hold) and
+    // the same-pane overlay composition (no-op) — deterministic.
+    const r = await H.probePaneMessage(page, {
+      sourcePaneId: source,
+      origin: H.MOCK_ORIGIN,
+      payload: { type: "host-gesture", gesture: "pane-activate" },
+    });
+    expect(r.accepted, "activate accepted").toBe(true);
+    await expect.poll(async () => H.overlaySource(page)).toBe(source);
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
+  });
+
+  test("spoofed pane-activate (wrong origin / unregistered source) does NOT dismiss", async ({ page }) => {
+    const ids = await H.panes(page);
+    const pane = ids[0];
+    await page.locator('[data-testid="settings-btn"]').click();
+    await expect(page.locator('[data-testid="settings-popover"]')).toBeVisible();
+
+    // Wrong origin (origin-checked tier): rejected before the dismiss call.
+    const r1 = await H.probePaneMessage(page, {
+      sourcePaneId: pane,
+      origin: WRONG_ORIGIN,
+      payload: { type: "host-gesture", gesture: "pane-activate" },
+    });
+    expect(r1.accepted, "wrong-origin activate rejected").toBe(false);
+    expect(r1.reason).toBe("rejected:origin-mismatch");
+    await expect(page.locator('[data-testid="settings-popover"]'), "popover survives wrong-origin").toBeVisible();
+
+    // Unregistered source (no pane bound to that window): rejected before the
+    // dismiss call.
+    const r2 = await H.probePaneMessage(page, {
+      sourcePaneId: "nonexistent-pane",
+      origin: H.MOCK_ORIGIN,
+      payload: { type: "host-gesture", gesture: "pane-activate" },
+    });
+    expect(r2.accepted, "unknown-source activate rejected").toBe(false);
+    expect(r2.reason).toBe("rejected:unknown-source");
+    await expect(page.locator('[data-testid="settings-popover"]'), "popover survives unknown-source").toBeVisible();
+  });
+
+  test("REAL tap inside a pane closes an anchored popover (full cross-origin chain)", async ({ page }) => {
+    const ids = await H.panes(page);
+    const pane = ids[0];
+    // Focus a DIFFERENT pane first so the tap's activation (not just the
+    // dismissal) is observable as a real focus move.
+    await H.focusPane(page, ids[1]);
+    await expect.poll(async () => H.focused(page)).toBe(ids[1]);
+
+    await page.locator('[data-testid="layouts-btn"]').click();
+    await expect(page.locator('[data-testid="layouts-popover"]')).toBeVisible();
+
+    // A REAL click inside the pane's cross-origin iframe: the host document
+    // receives NO pointerdown (cross-origin), so the ONLY dismissal path is
+    // the bridge — the mock's capture-phase pointerdown forward (the faithful
+    // stand-in for web/src/hostGesture.ts) posts pane-activate through the
+    // REAL postMessage boundary into the REAL router → dismissAnchoredSurfaces
+    // + focusPane. This exercises the production interaction chain (real
+    // input events, real cross-origin delivery) end to end; the real SPA's
+    // own recognizer is out of scope here (lane 8 covers the real SPA).
+    const frame = page
+      .locator(`[data-pane-id="${pane}"] iframe.pane-iframe`)
+      .contentFrame();
+    await frame.locator(".view-label").click();
+
+    // OUTCOME: the popover closed AND the tapped pane became the focused pane
+    // — both through the real cross-origin bridge.
+    await expect(page.locator('[data-testid="layouts-popover"]')).toHaveCount(0);
+    await expect.poll(async () => H.focused(page)).toBe(pane);
+  });
+
   // ---- (7) Slice 2: Swap mode + swap-with-direction -------------------------
 
   test("Swap mode toggle: arrow aria-label + data-mode reflect the selected mode", async ({ page }) => {

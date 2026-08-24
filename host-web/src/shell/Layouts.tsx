@@ -22,9 +22,10 @@ import s from "./Layouts.module.css";
  * OPEN/CLOSE goes through the shared surface stack (popover.ts) — the same
  * primitive AddServer + Settings use: Escape closes (topmost-only), a
  * pointerdown outside the wrap closes, and the tabstrip group keeps the three
- * popovers mutually exclusive. Known limit (same as every host popover): a
- * pointerdown inside a CROSS-ORIGIN IFRAME never reaches this document, so
- * tapping a pane does not close it — Escape + any host-chrome tap do.
+ * popovers mutually exclusive. Pane taps close it too: a pointerdown inside a
+ * CROSS-ORIGIN IFRAME never reaches this document, so the SPA's forwarded
+ * pane-activate gesture drives the same dismissal (routeMessage →
+ * dismissAnchoredSurfaces) — Escape + any host-chrome or pane tap do.
  *
  * TWO SCOPES (segmented toggle, default "This tab"):
  *  - THIS TAB: per-workspace layouts. A save carries BOTH a layout name and a
