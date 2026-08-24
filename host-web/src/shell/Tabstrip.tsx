@@ -76,7 +76,10 @@ export function Tabstrip() {
         <span class={s.brandText}>VHSolara</span>
         <span class={s.brandSub}>host</span>
       </div>
-      <div class={s.tabs} data-testid="ws-tabs">
+      {/* a11y completion: the tabs container carries the tablist role the
+          per-tab role="tab"/aria-selected semantics already imply (a tab
+          without a tablist parent is incomplete AT structure). */}
+      <div class={s.tabs} data-testid="ws-tabs" role="tablist" aria-label="Workspaces">
         <For each={workspaces()}>
           {(ws) => <WorkspaceTab ws={ws} />}
         </For>
@@ -252,6 +255,14 @@ function WorkspaceTab(props: { ws: Workspace }) {
       }}
       onKeyDown={(e) => {
         if (editing() || confirming()) return;
+        // F2 = the standard rename key (file managers, IDEs): the keyboard
+        // entry into the same inline rename long-press opens, so rename stays
+        // reachable without a pointer.
+        if (e.key === "F2") {
+          e.preventDefault();
+          beginEdit();
+          return;
+        }
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           setActiveWorkspace(props.ws.id);

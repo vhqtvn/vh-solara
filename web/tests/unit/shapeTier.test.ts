@@ -410,4 +410,54 @@ describe("installShapeTier — persisted kill-switch", () => {
     expect(mod.widthTier()).toBe(null);
     cleanup();
   });
+
+  it("BARE legacy string \"off\" (no envelope) DISABLES the module — the kill-switch footgun fix", async () => {
+    // The footgun: writing the raw string "off" (not JSON, no {v,data}
+    // envelope) used to fall back to "on" — silently re-enabling the tiers
+    // the operator tried to disable. The migrate at the persistedSignal call
+    // site must accept it. Both storage spellings route there: the raw
+    // 3-char value (JSON.parse throws → migrate(raw)) and the JSON-encoded
+    // string "\"off\"" (parses to a non-envelope → migrate(parsed)).
+    for (const stored of ["off", JSON.stringify("off")]) {
+      localStorage.setItem("vh.prefs.shapeTier.v1", stored);
+      vi.resetModules();
+      const mod = await import("../../src/shapeTier");
+      const el = document.createElement("div");
+      document.body.appendChild(el);
+      el.setAttribute("data-h-tier", "short"); // stale attrs must clear
+      const roCountBefore = roRegistrations.length;
+      const cleanup = mod.installShapeTier(el);
+      expect(roRegistrations.length).toBe(roCountBefore); // no observer
+      expect(el.getAttribute("data-h-tier")).toBe(null);
+      expect(el.getAttribute("data-w-tier")).toBe(null);
+      expect(mod.widthTier()).toBe(null);
+      cleanup();
+    }
+  });
+
+  it("BARE legacy string \"on\" (no envelope) still enables the module", async () => {
+    localStorage.setItem("vh.prefs.shapeTier.v1", "on");
+    vi.resetModules();
+    const mod = await import("../../src/shapeTier");
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const cleanup = mod.installShapeTier(el);
+    const reg = roRegistrations.find((r) => r.el === el);
+    expect(reg, "observer constructed (module enabled)").toBeTruthy();
+    fireRO(el, 480);
+    await nextFrame();
+    expect(el.getAttribute("data-h-tier")).toBe("short");
+    cleanup();
+  });
+
+  it("any other bare junk falls back to the default \"on\" (enabled)", async () => {
+    localStorage.setItem("vh.prefs.shapeTier.v1", "nonsense");
+    vi.resetModules();
+    const mod = await import("../../src/shapeTier");
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const cleanup = mod.installShapeTier(el);
+    expect(roRegistrations.some((r) => r.el === el)).toBe(true);
+    cleanup();
+  });
 });

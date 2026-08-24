@@ -219,5 +219,99 @@ test.describe("layout persistence", () => {
       expect(ws1UrlsBefore.has(r.url), `ws1 restored url ${r.url} was seeded before`).toBe(true);
     }
   });
+
+  test("maximal workspace clear (to the last-workspace guard) removes a coexisting legacy v2 blob; v3 persists the survivor", async ({ page }) => {
+    // SCOPE NOTE (audit item, verified): flushSave's clear-all branch
+    // (json === null → BOTH keys removed) is UNREACHABLE through app paths —
+    // closeWorkspace refuses to close the last workspace (the never-zero
+    // invariant, store.ts) and validatePersistedState rejects empty blobs, so
+    // serializeAllFn always reports >= 1 workspace. The code path itself is
+    // verified present (layoutPersistence.ts flushSave: the json===null arm
+    // removeItem's BOTH the v3 key and the legacy v2 key). What IS reachable
+    // — and what this test pins — is the same hygiene at the maximal
+    // user-driven clear: close workspaces until the guard refuses, then the
+    // post-clear save (a) REMOVES a coexisting legacy v2 blob (the
+    // resurrection hazard: readBlob falls back to the v2 key whenever the v3
+    // key is absent, so a surviving v2 blob could resurrect stale px
+    // geometry) and (b) persists exactly the surviving workspace under v3.
+    await H.loadHost(page);
+    const ws1 = (await H.workspaces(page))[0];
+    const ws1PaneCount = (await H.panes(page)).length;
+    expect(ws1PaneCount, "ws1 has seeded panes").toBeGreaterThanOrEqual(2);
+
+    // A second workspace, so a user-driven "clear" has something to close.
+    const ws2 = await H.addWorkspace(page, "Doomed");
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws2);
+    // Flush the debounced save BEFORE planting the legacy key — a pending
+    // save would remove it, firing the assertion's gesture early.
+    await H.waitForSavedLayout(page, ws1PaneCount);
+
+    // Plant the DANGEROUS coexistence: a legacy v2 px blob next to the live
+    // v3 state (mid-session plant; the module's init blob is already fixed,
+    // so only the WRITE side — the next save's legacy-key removal — runs).
+    const pxLayout = await H.serialize(page);
+    await page.evaluate(
+      ({ legacyKey, payload }) => {
+        localStorage.setItem(
+          legacyKey,
+          JSON.stringify({
+            activeWorkspaceId: "ws-1",
+            workspaces: [{ id: "ws-1", name: "Workspace 1", layout: payload }],
+          }),
+        );
+      },
+      { legacyKey: H.LEGACY_LAYOUT_STORAGE_KEY_V2, payload: pxLayout },
+    );
+    expect(
+      await page.evaluate((k) => localStorage.getItem(k), H.LEGACY_LAYOUT_STORAGE_KEY_V2),
+      "legacy v2 blob planted",
+    ).not.toBeNull();
+
+    // Maximal user-driven clear: close ws2 (applies), then ws1 (REFUSED by
+    // the last-workspace guard — the shell never has zero workspaces).
+    const closed = await H.closeWorkspace(page, ws2!);
+    expect(closed, "non-last workspace closed").toBe(true);
+    const refused = await H.closeWorkspace(page, ws1!);
+    expect(refused, "last-workspace close refused (never-zero invariant)").toBe(false);
+    await expect.poll(async () => H.workspaces(page)).toEqual([ws1]);
+
+    // The post-clear debounced save: the legacy v2 key is REMOVED…
+    await expect
+      .poll(
+        async () =>
+          page.evaluate((k) => localStorage.getItem(k), H.LEGACY_LAYOUT_STORAGE_KEY_V2),
+        { timeout: 8000 },
+      )
+      .toBeNull();
+    // …and the v3 key holds exactly the surviving workspace (a clear at the
+    // guard is still a SAVE, not a wipe — the survivor persists).
+    await expect
+      .poll(
+        async () =>
+          page.evaluate((key) => {
+            const raw = localStorage.getItem(key);
+            if (!raw) return null;
+            try {
+              const p = JSON.parse(raw) as { workspaces?: Array<{ id: string }> };
+              return (p.workspaces ?? []).map((w) => w.id).sort().join(",");
+            } catch {
+              return null;
+            }
+          }, H.LAYOUT_STORAGE_KEY),
+        { timeout: 8000 },
+      )
+      .toBe(ws1);
+
+    // Cold reload: the survivor restores from v3 (panes intact); with the
+    // legacy key gone there is nothing for readBlob's v2 fallback to
+    // resurrect even if the v3 key were later cleared.
+    await page.reload();
+    await expect.poll(async () => H.connected(page), { timeout: 20000 }).toBe(true);
+    await expect.poll(async () => (await H.workspaces(page)).sort()).toEqual([ws1]);
+    await expect
+      .poll(async () => (await H.panes(page)).length, { timeout: 20000 })
+      .toBe(ws1PaneCount);
+    for (const id of await H.panes(page)) await H.waitForReady(page, id);
+  });
 });
 

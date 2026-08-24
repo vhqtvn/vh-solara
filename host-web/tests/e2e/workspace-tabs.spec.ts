@@ -39,6 +39,28 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     await page.screenshot({ path: path.join(VISION_DIR, "01-workspace-tabs.png"), fullPage: true });
   });
 
+  // Feature: a11y tab semantics — the container is a tablist; each tab carries
+  // role=tab + aria-selected, and the ACTIVE tab reports selected=true.
+  test("tabs expose tablist/tab/aria-selected semantics", async ({ page }) => {
+    const list = page.locator('[data-testid="ws-tabs"]');
+    await expect(list).toHaveAttribute("role", "tablist");
+
+    const first = page.locator('[data-testid="ws-tab"]').first();
+    await expect(first).toHaveAttribute("role", "tab");
+    await expect(first).toHaveAttribute("aria-selected", "true");
+
+    // A second workspace (addWorkspace ACTIVATES it — switch back so the
+    // un-selected state is observable before the switch-under-test).
+    const ws2 = await H.addWorkspace(page, "Second");
+    const second = page.locator(`[data-testid="ws-tab"][data-workspace="${ws2}"]`);
+    await expect(second).toHaveAttribute("aria-selected", "true");
+    await H.setActiveWorkspace(page, (await H.workspaces(page))[0]);
+    await expect(second).toHaveAttribute("aria-selected", "false");
+    await H.setActiveWorkspace(page, ws2!);
+    await expect(second).toHaveAttribute("aria-selected", "true");
+    await expect(first).toHaveAttribute("aria-selected", "false");
+  });
+
   // Feature: switching workspace is survival-safe (the overlay stack keeps every
   // iframe mounted; switching is CSS-visibility-only). The crux of the model.
   test("switching workspace is survival-safe (no iframe reload)", async ({ page }) => {
@@ -145,6 +167,26 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     await input.press("Enter");
 
     await expect.poll(async () => H.workspaceName(page, ws1)).toBe("Renamed WS");
+  });
+
+  // Feature: keyboard rename entry — F2 on a focused tab opens the same inline
+  // rename (the no-pointer twin of the long-press; standard rename key).
+  test("F2 on a focused tab opens rename; Enter commits", async ({ page }) => {
+    const ws1 = (await H.workspaces(page))[0];
+    const before = await H.workspaceName(page, ws1);
+
+    const tab = page.locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`);
+    await tab.focus();
+    await page.keyboard.press("F2");
+
+    const input = page.locator('[data-testid="ws-rename-input"]');
+    await expect(input).toBeVisible();
+    expect(await input.inputValue()).toBe(before);
+
+    await input.fill("F2 Renamed");
+    await input.press("Enter");
+
+    await expect.poll(async () => H.workspaceName(page, ws1)).toBe("F2 Renamed");
   });
 
   // Feature: per-tab needs-you badge reflects the workspace's needy-session count.

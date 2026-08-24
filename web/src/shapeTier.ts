@@ -73,7 +73,15 @@ export const W_TIER_WIDE = 720;
 export const TIER_HYST_PX = 16;
 
 const FLAG_KEY = "vh.prefs.shapeTier.v1";
-const [shapeTierFlag] = persistedSignal(FLAG_KEY, 1, "on");
+// Migrate bare legacy strings: an operator who disabled the tiers by writing
+// the RAW string "off" (not the {v:1,data:"off"} envelope — e.g. via devtools
+// or an old snippet) must not be silently re-enabled. Without this migrate,
+// loadVersioned treats the bare string as a foreign payload and falls back to
+// "on" — the kill-switch footgun (bare "off" DISABLED nothing). Bare "on"
+// passes through; anything else falls back to the default "on".
+const [shapeTierFlag] = persistedSignal(FLAG_KEY, 1, "on", (old) =>
+  old === "off" ? "off" : "on",
+);
 
 /**
  * Pure height-tier classification with hysteresis.

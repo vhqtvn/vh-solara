@@ -10,6 +10,7 @@
 import { createEffect, createMemo, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js";
 import { fetchSubtreeTodos, type SubtreeTodosResp } from "../subtreeTodos";
 import type { CurrentVerb } from "../sync";
+import { bindBackDismiss } from "../lib/backStack";
 import { layoutPx } from "../lib/zoom";
 import Icon from "./Icon";
 import Spinner from "./Spinner";
@@ -61,6 +62,10 @@ export default function ChatTasksStatus(props: {
   const todoCounts = createMemo(() => subtreeTodos()?.totals ?? { active: 0, left: 0, total: 0 });
   const todoItems = createMemo(() => subtreeTodos()?.items ?? []);
   const [todosOpen, setTodosOpen] = createSignal(false);
+  // Browser back dismisses the Tasks popover (same bindBackDismiss wiring every
+  // peer popover — settings, admin, codepicker, … — uses; the binding dies with
+  // this component, releasing its entry if still open).
+  bindBackDismiss(() => todosOpen(), () => setTodosOpen(false), "taskspop");
   let tasksBarEl: HTMLDivElement | undefined;
   let tasksPopupEl: HTMLDivElement | undefined;
   // The popover is anchored bottom-right, so resizing means changing its size

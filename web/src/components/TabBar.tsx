@@ -1,5 +1,6 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { tabStyle } from "../prefs";
+import { bindBackDismiss } from "../lib/backStack";
 import { layoutPx } from "../lib/zoom";
 import Icon from "./Icon";
 import Select from "./Select";
@@ -23,6 +24,10 @@ export default function TabBar(props: { items: () => TabItem[]; active: () => st
   const [avail, setAvail] = createSignal(0);
   const [widths, setWidths] = createSignal<number[]>([]);
   const [menuOpen, setMenuOpen] = createSignal(false);
+  // Browser back dismisses the "⋯" overflow menu (same bindBackDismiss wiring
+  // every peer popover uses; the binding dies with this component, releasing
+  // its entry if still open).
+  bindBackDismiss(() => menuOpen(), () => setMenuOpen(false), "tabmenu");
 
   const GAP = 4;
   const MORE_W = 40;
