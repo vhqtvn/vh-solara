@@ -436,4 +436,276 @@ test.describe("lane 8: real SPA cross-origin iframe embed", () => {
       .toBe(target);
     await expect(page.locator(`.pane[data-pane-id="${target}"].is-active`)).toHaveCount(1);
   });
+
+  // ===========================================================================
+  // RECEIPTS BATCH — four deferred obligations closed against the REAL SPA in
+  // one additive slice. Each test pins a contract previously proven only at
+  // the mock seam (lane 7) or not at all, now exercised end-to-end through the
+  // production SPA embedded cross-origin. Honest per-receipt limits are stated
+  // in each test's header.
+  // ===========================================================================
+
+  // ---- Receipt 1: tail round-trip (real SPA) --------------------------------
+  // The {type:'vh-host-tail'} round-trip was pinned only at the mock seam
+  // (lane-7 tail.spec.ts). Here, against the REAL SPA:
+  //   (a) the production statusEmitter (web/src/statusEmitter.ts) carries the
+  //       `following` field through the real status bridge — with no session
+  //       open (dead-OC fixture) the honest default is `true` (tailFollow.ts:
+  //       unbound bridge → true; statusEmitter.ts: no session → true);
+  //   (b) the production HostOps.setTail posts {type:'vh-host-tail',
+  //       following:true} into the real SPA's contentWindow; the real
+  //       tailListener (source=parent ✓, boolean allowlist ✓) dispatches
+  //       forceChatTailFollow() — a documented NO-OP with no ChatView mounted
+  //       (web/src/tailFollow.ts returns false when unbound), so the observable
+  //       halves here are: the document is unharmed (still alive) and the pane
+  //       identity SURVIVED (postMessage-only — a tail command never touches
+  //       the iframe element).
+  // HONEST LIMIT: the false→true flip leg (a live chat scrolled off-tail,
+  // forced back to following=true) requires a mounted ChatView; the dead-OC
+  // fixture has none, so that leg stays mock-seam-covered (lane-7 tail.spec.ts
+  // models the reader's scroll + re-emits following transitions through the
+  // same status bridge the real emitter uses).
+  test("real SPA tail: statusEmitter reports following=true; setTail(true) is postMessage-only (identity survives)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const frame = await firstRealFrame(page);
+    await waitForSpaMounted(frame);
+    const id = await firstRealPaneId(page);
+    await waitForRealAlive(page, id);
+
+    // (a) the real emitter's `following` field reached the host store through
+    // the source-bound status bridge (setStatusFor is the only writer — not a
+    // local echo).
+    await expect
+      .poll(async () => (await H.status(page, id))?.following, {
+        timeout: 10000,
+        message: "real statusEmitter reported following=true (honest no-session default)",
+      })
+      .toBe(true);
+
+    // (b) production tail command into the real SPA. No crash, still alive,
+    // identity unchanged across the post.
+    const before = (await H.survival(page, id))!;
+    expect(before.mountTs, "baseline mountTs present").toBeGreaterThan(0);
+    await H.setTail(page, id, true);
+    expect(await H.liveness(page, id), "real SPA still alive after the tail command").toBe("alive");
+    await H.assertSurvived(page, id, before, "real tail command");
+    // The emitter's report is unchanged by the command (following stayed true —
+    // the dispatch no-ops without a chat; nothing regressed the report either).
+    expect((await H.status(page, id))?.following, "following still reported true").toBe(true);
+  });
+
+  // ---- Receipt 2a: vh-host-select round-trip (real SPA) ---------------------
+  // Deferred from the reverse-nav slice: the REAL selectListener's dispatch was
+  // never exercised (lane 7 proves the host side with the mock stand-in). Here
+  // the full round-trip runs against the production SPA:
+  //   host selectTarget → {type:'vh-host-select',dir,session} → the real
+  //   selectListener (source=parent, string allowlist) → dispatchSelect →
+  //   switchProject/setSelectedId → syncUrl REWRITES the iframe URL
+  //   (history.replaceState — pure URL state, observable with the dead OC) →
+  //   the heartbeat's allowlistRoute tick (web/src/heartbeat.ts) posts
+  //   {type:"route"} → the host's updateRoute captures it in pane params.
+  test("real SPA vh-host-select round-trips a route change WITHOUT reloading (survival)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const frame = await firstRealFrame(page);
+    await waitForSpaMounted(frame);
+    const id = await firstRealPaneId(page);
+    await waitForRealAlive(page, id);
+    const before = (await H.survival(page, id))!;
+
+    // The fixture boots with no project (dead OC → no ?dir=), so this select
+    // exercises the CROSS-DIR dispatch leg: switchProject(dir) followed by
+    // setSelectedId(session).
+    const DIR = "/proj-real-embed";
+    const SESSION = "sess-re-1";
+    await H.selectTarget(page, id, DIR, SESSION);
+
+    // ROUND-TRIP: the real SPA's route emission was captured by the host. The
+    // heartbeat reconstructs a canonical allowlisted "?dir=…&session=…"
+    // (URLSearchParams encoding — %2F for "/"), identical in shape to lane 7's
+    // mock contract.
+    const expectedRoute = `?dir=${encodeURIComponent(DIR)}&session=${encodeURIComponent(SESSION)}`;
+    await expect
+      .poll(async () => (await H.paneParams(page)).find((p) => p.id === id)?.route ?? null, {
+        timeout: 10000,
+        message: "real SPA route emission captured by the host (select dispatch round-trip)",
+      })
+      .toBe(expectedRoute);
+
+    // The dispatch's LOCAL effect is observable in the iframe's own URL (the
+    // ?dir/?session deep-link syncUrl wrote) — proves the listener dispatched
+    // inside the real SPA, not just that some route arrived at the host.
+    await expect
+      .poll(
+        () =>
+          frame.evaluate(() => {
+            const p = new URLSearchParams(window.location.search);
+            return `${p.get("dir")}\u0000${p.get("session")}`;
+          }),
+        { timeout: 5000, message: "real SPA URL deep-link updated by the select dispatch" },
+      )
+      .toBe(`${DIR}\u0000${SESSION}`);
+
+    // CRUX — SURVIVAL: the select is postMessage + SPA-internal state; the
+    // iframe element is untouched. Identity unchanged (no reload).
+    await H.assertSurvived(page, id, before, "real select");
+  });
+
+  // ---- Receipt 2b: select listener allowlist pin (real SPA) -----------------
+  // The REAL selectListener's payload allowlist against a poison payload: a
+  // {type:'vh-host-select'} posted directly from the host window into the
+  // pane's contentWindow passes the source-guard (the sender IS
+  // window.parent) — only the allowlist (dir/session MUST be strings) can
+  // reject it. Dropped → no dispatch → no URL change → no route emission, and
+  // the document is unharmed. Mirrors lane 7's tail poison pin (mock seam),
+  // here against the real SPA's web/src/selectListener.ts.
+  test("real SPA select listener drops out-of-contract payloads (allowlist pin, no crash)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const frame = await firstRealFrame(page);
+    await waitForSpaMounted(frame);
+    const id = await firstRealPaneId(page);
+    await waitForRealAlive(page, id);
+
+    // Establish a KNOWN route state first (a valid select round-trip).
+    const DIR = "/proj-poison-pin";
+    await H.selectTarget(page, id, DIR, "sess-known");
+    const knownRoute = `?dir=${encodeURIComponent(DIR)}&session=sess-known`;
+    await expect
+      .poll(async () => (await H.paneParams(page)).find((p) => p.id === id)?.route ?? null, {
+        timeout: 10000,
+        message: "known route state established",
+      })
+      .toBe(knownRoute);
+
+    // POISON: non-string session (an object payload) + a smuggled
+    // access_token — the allowlist must drop it BEFORE dispatch (CF1: neither
+    // ever reaches setSelectedId).
+    await page.evaluate(
+      ({ pane, payload }) => {
+        const f = document.querySelector(
+          `[data-pane-id="${pane}"] iframe.pane-iframe`,
+        ) as HTMLIFrameElement | null;
+        f?.contentWindow?.postMessage(payload, "*");
+      },
+      {
+        pane: id,
+        payload: { type: "vh-host-select", dir: "/evil", session: { evil: true }, access_token: "SECRET" },
+      },
+    );
+
+    // No dispatch happened: the iframe URL is unchanged (still the known dir +
+    // session), no new route was emitted, and the document is unharmed.
+    await page.waitForTimeout(800);
+    expect(
+      await frame.evaluate(() => ({
+        dir: new URLSearchParams(window.location.search).get("dir"),
+        session: new URLSearchParams(window.location.search).get("session"),
+      })),
+      "poison payload dispatched nothing (URL unchanged)",
+    ).toEqual({ dir: DIR, session: "sess-known" });
+    expect(
+      (await H.paneParams(page)).find((p) => p.id === id)?.route,
+      "no route re-emission",
+    ).toBe(knownRoute);
+    expect(await H.liveness(page, id), "real SPA unharmed by the poison payload").toBe("alive");
+
+    // A VALID payload through the SAME direct route DOES dispatch (proves the
+    // rejection above was the allowlist, not the transport): same dir → the
+    // setSelectedId warm-switch leg.
+    await page.evaluate(
+      ({ pane, payload }) => {
+        const f = document.querySelector(
+          `[data-pane-id="${pane}"] iframe.pane-iframe`,
+        ) as HTMLIFrameElement | null;
+        f?.contentWindow?.postMessage(payload, "*");
+      },
+      { pane: id, payload: { type: "vh-host-select", dir: DIR, session: "sess-after-poison" } },
+    );
+    await expect
+      .poll(async () => (await H.paneParams(page)).find((p) => p.id === id)?.route ?? null, {
+        timeout: 10000,
+        message: "valid direct post dispatched (transport proven)",
+      })
+      .toBe(`?dir=${encodeURIComponent(DIR)}&session=sess-after-poison`);
+  });
+
+  // ---- Receipt 3: embedded TerminalDock presentation (real SPA) -------------
+  // Deferred from S1b — with a CONTRACT CORRECTION: the deferred obligation's
+  // original wording ("embedded first-open presents overlay-full") describes
+  // the S1b default that was later REVERSED at operator request. Current
+  // contract (web/src/ui.ts + the unit pin web/tests/unit/
+  // termEmbeddedDefault.test.ts): first open is DOCKED (bottom dock) in ALL
+  // contexts — standalone AND embedded; overlay-full (.full) is an explicit
+  // user action via the dock's Full-screen toggle, session-scoped (never
+  // persisted). This test pins the CURRENT contract inside the real embed
+  // context (the lane-8 pane IS the real embedded SPA — the receipt's
+  // territory), not the stale S1b expectation. Flagged in the slice closeout.
+  // The dead-OC fixture has no terminal content, but the presentation state
+  // (.full on the dock element) is pure CSS-class state, assertable at rest.
+  test("real SPA embedded TerminalDock: first open DOCKED; explicit toggle → .full; session-scoped reopen keeps it", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const frame = await firstRealFrame(page);
+    await waitForSpaMounted(frame);
+    const ids = await H.panes(page);
+    const id = ids[0];
+    await waitForRealAlive(page, id);
+
+    // Desktop-width precondition: the dock's docked/mobile-full split and the
+    // Full-screen toggle button both key on the IFRAME's own
+    // (min-width: 721px) media query (web/src/layout.ts isDesktop). Close the
+    // sibling seeded panes so the survivor spans the full grid width (default
+    // 1280px viewport), then settle the FLIP animation.
+    for (const other of ids.slice(1)) await H.closePane(page, other);
+    await H.waitForLayoutSettled(page);
+    await expect
+      .poll(() => frame.evaluate(() => matchMedia("(min-width: 721px)").matches), {
+        timeout: 5000,
+        message: "pane is desktop-width after closing siblings (isDesktop)",
+      })
+      .toBe(true);
+
+    // First open: the SPA header's Terminal button mounts the dock DOCKED —
+    // no .full (the operator-requested reversal of S1b full-first).
+    await frame.locator('button[aria-label="Terminal"]').click();
+    const dock = frame.locator(".term-dock");
+    await expect(dock, "terminal dock mounted on first open").toBeVisible();
+    await expect(dock, "first open is DOCKED (no overlay-full — S1b reversed)").not.toHaveClass(/full/);
+
+    // Explicit Full-screen toggle → the overlay-full presentation (.full).
+    await frame.locator('button[aria-label="Toggle full screen"]').click();
+    await expect(dock, "explicit toggle presents overlay-full").toHaveClass(/full/);
+
+    // Session-scoped persistence (deliberately never written to storage):
+    // close + reopen keeps the full choice for this SPA session.
+    await frame.locator('button[aria-label="Close terminal"]').click();
+    await expect(dock, "dock unmounted on close").toHaveCount(0);
+    await frame.locator('button[aria-label="Terminal"]').click();
+    await expect(dock, "dock remounted on reopen").toBeVisible();
+    await expect(dock, "session-scoped: reopen keeps the full choice").toHaveClass(/full/);
+  });
+
+  // ---- Receipt 4: PWA static assets on the real server ----------------------
+  // From the favicon researcher pass: the CI-stable targets on the real
+  // server's static surface (the lane pipeline builds web/ → materializes
+  // dist → go build, so the app dist's PWA assets are embedded).
+  // /favicon.ico is deliberately NOT asserted: in production mode it serves
+  // the HOST shell's icon from pkg/web/host-dist, which is COLD in this lane
+  // (404 by design — pinned in pkg/web/favicon_test.go).
+  test("real server serves the SPA PWA assets (icon.svg, icon-192.png, manifest.webmanifest)", async ({
+    request,
+  }) => {
+    const targets = ["/icon.svg", "/icon-192.png", "/manifest.webmanifest"];
+    for (const p of targets) {
+      const resp = await request.get(`${REAL}${p}`);
+      expect(resp.status(), `GET ${p} → 200`).toBe(200);
+      expect((await resp.body()).length, `GET ${p} non-empty body`).toBeGreaterThan(0);
+    }
+  });
 });
