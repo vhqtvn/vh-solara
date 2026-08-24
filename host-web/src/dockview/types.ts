@@ -77,12 +77,31 @@ export interface PaneStatus {
   /**
    * Whether the pane's chat is following the transcript tail (Live) or reading
    * history. Reported by the SPA's status bridge (the tailFollow seam over the
-   * ChatView following signal); `true` when no chat/session is open (nothing is
-   * being not-followed). Drives the layout overlay's Tail row; part of the
+   * ChatView following signal); `true` when no chat/session is open (nothing to
+   * be not-followed). Drives the layout overlay's Tail row; part of the
    * SPA-side idempotence key so the host indicator tracks the operator
    * scrolling inside the pane.
    */
   following: boolean;
+  /**
+   * TAB-PAIRS: number of RUNNING sessions in the pane's project dir (own
+   * activity busy|retry). Reported by the SPA's status bridge, derived from
+   * server-authoritative store state only — so every device reports the SAME
+   * number (the cross-device sync requirement rides the existing tree-stream +
+   * ack machinery; the host NEVER persists or derives these numbers itself).
+   * Validated at ingress: a closed non-negative integer (junk rejects the whole
+   * status message).
+   */
+  runningCount: number;
+  /**
+   * TAB-PAIRS: number of UNREAD sessions in the pane's project dir (DISTINCT
+   * roots with the server-tracked unread watermark set). Selecting an unread
+   * session on ANY device acks it server-side (POST /vh/ack via the SPA's
+   * selection funnel), and the tree stream carries unread.set/clear to every
+   * connected client — so this count converges across devices by construction.
+   * Validated at ingress: closed non-negative integer.
+   */
+  unreadCount: number;
 }
 
 /** Survival identity/signal reported by each iframe's heartbeat. */
@@ -143,6 +162,12 @@ export type PaneToHost =
       activity: Activity;
       /** Tail-follow state of the pane's chat (see PaneStatus.following). */
       following: boolean;
+      /** TAB-PAIRS aggregate: running sessions in the pane's dir (closed
+       * non-negative integer; see PaneStatus.runningCount). */
+      runningCount: number;
+      /** TAB-PAIRS aggregate: unread (distinct-root) sessions in the pane's
+       * dir (closed non-negative integer; see PaneStatus.unreadCount). */
+      unreadCount: number;
     }
   // Layout-overlay gesture (double-Ctrl desktop / triple-tap mobile) + pane-
   // activate forward (cross-origin activation bridge). The SPA forwards ONE

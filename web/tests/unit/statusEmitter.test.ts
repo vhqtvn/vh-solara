@@ -15,7 +15,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { reconcile } from "solid-js/store";
 import { setState } from "../../src/sync/store";
-import { startStatusEmitter } from "../../src/statusEmitter";
+import { startStatusEmitter, derivePaneCounts } from "../../src/statusEmitter";
 import { bindChatTail } from "../../src/tailFollow";
 
 const HOST_ORIGIN = "https://host.example";
@@ -415,5 +415,80 @@ describe("status emitter — derivation + emission (embedded)", () => {
     vi.advanceTimersByTime(1000);
     vi.advanceTimersByTime(1000);
     expect(statusMsgs(posted).length, "no emission after dispose").toBe(before);
+  });
+
+  // ---- TAB-PAIRS: per-pane aggregates (runningCount + unreadCount) ---------
+  // Derivation contract: running = sessions in the dir tree whose OWN activity
+  // is busy|retry (idle/error never count); unread = DISTINCT roots carrying
+  // the server watermark (subsessions share the root — no double count). Both
+  // derive from server-authoritative store maps ONLY, which is what makes the
+  // host-rendered (X|Y) identical across devices by construction.
+
+  it("derivePaneCounts: empty dir → 0/0", () => {
+    expect(derivePaneCounts()).toEqual({ runningCount: 0, unreadCount: 0 });
+  });
+
+  it("derivePaneCounts: running counts busy+retry, not idle/error", () => {
+    setState("sessions", "a", { id: "a" });
+    setState("sessions", "b", { id: "b" });
+    setState("sessions", "c", { id: "c" });
+    setState("sessions", "d", { id: "d" });
+    setState("activity", "a", "busy");
+    setState("activity", "b", "retry");
+    setState("activity", "c", "idle");
+    setState("activity", "d", "error");
+    expect(derivePaneCounts().runningCount, "busy+retry only").toBe(2);
+    expect(derivePaneCounts().unreadCount, "no unread roots").toBe(0);
+  });
+
+  it("derivePaneCounts: unread counts DISTINCT roots once (no subsession double-count)", () => {
+    // Tree: root r → children c1, c2; separate root s. Only r is unread.
+    setState("sessions", "r", { id: "r" });
+    setState("sessions", "c1", { id: "c1", parentID: "r" });
+    setState("sessions", "c2", { id: "c2", parentID: "r" });
+    setState("sessions", "s", { id: "s" });
+    setState("unread", "r", true);
+    expect(derivePaneCounts().unreadCount, "3 sessions under one unread root → 1").toBe(1);
+    expect(derivePaneCounts().runningCount).toBe(0);
+    // A busy SUBSESSION counts as a running session (own activity).
+    setState("activity", "c1", "busy");
+    expect(derivePaneCounts().runningCount).toBe(1);
+  });
+
+  it("carries runningCount + unreadCount on the emitted status", () => {
+    setState("sessions", SID, { id: SID });
+    setState("activity", SID, "busy");
+    setState("unread", SID, true);
+    handshakeAndTick();
+    const last = statusMsgs(posted).at(-1)!.msg;
+    expect(last.runningCount).toBe(1);
+    expect(last.unreadCount).toBe(1);
+  });
+
+  it("a count change re-emits (counts are in the idempotence key)", () => {
+    setState("sessions", SID, { id: SID });
+    setState("activity", SID, "idle");
+    handshakeAndTick();
+    const afterFirst = statusMsgs(posted).length;
+    expect(afterFirst, "baseline posted").toBeGreaterThan(0);
+    expect(statusMsgs(posted).at(-1)!.msg.runningCount).toBe(0);
+
+    // No change → no re-emit.
+    vi.advanceTimersByTime(1000);
+    expect(statusMsgs(posted).length).toBe(afterFirst);
+
+    // A session goes busy → the aggregate change re-emits exactly once.
+    setState("activity", SID, "busy");
+    vi.advanceTimersByTime(1000);
+    expect(statusMsgs(posted).length, "count change re-emits").toBe(afterFirst + 1);
+    expect(statusMsgs(posted).at(-1)!.msg.runningCount).toBe(1);
+
+    // An unread watermark lands (server busy→idle elsewhere in the dir) →
+    // another single re-emit.
+    setState("sessions", "r2", { id: "r2" });
+    setState("unread", "r2", true);
+    vi.advanceTimersByTime(1000);
+    expect(statusMsgs(posted).length, "unread change re-emits").toBe(afterFirst + 2);
+    expect(statusMsgs(posted).at(-1)!.msg.unreadCount).toBe(1);
   });
 });

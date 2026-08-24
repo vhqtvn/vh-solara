@@ -57,7 +57,7 @@ test.describe("host shell UI wiring", () => {
     await H.probeStatus(page, {
       sourcePaneId: needy,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "a", title: "A", attention: "needs_permission", activity: "idle", following: true },
+      payload: { type: "status", dir: "", session: "a", title: "A", attention: "needs_permission", activity: "idle", following: true, runningCount: 0, unreadCount: 0 },
     });
     await expect.poll(async () => H.needsYou(page)).toBe(1);
 

@@ -22,10 +22,17 @@
 //
 // This is ADDITIVE: it does not change the physical topology, the heartbeat, or
 // the Q1-C liveness indicator. Survival is unchanged.
+//
+// TAB-PAIRS EXTENSION: the same message also carries `runningCount` +
+// `unreadCount` — per-pane aggregates over the dir's whole session tree (see
+// derivePaneCounts). The host renders them as the workspace tab's (X|Y) pair
+// for this pane. Cross-device by construction: both numbers derive ONLY from
+// server-authoritative state (the activity map + the root-scoped unread
+// watermark), which the tree stream keeps identical on every connected device.
 
 import { isEmbedded } from "./embedded";
 import { state } from "./sync/store";
-import { rootOf, sessionWorking } from "./sync/selectors";
+import { rootOf, sessionWorking, isActivityWorking } from "./sync/selectors";
 import { chatTailFollowing } from "./tailFollow";
 
 // Attention is emit-on-change, not a latency-critical cursor: 1 Hz is the right
@@ -52,6 +59,49 @@ export interface StatusMessage {
    * scrolling inside the pane.
    */
   following: boolean;
+  /**
+   * PER-PANE AGGREGATE (tab-pairs): number of RUNNING sessions in this pane's
+   * project dir — sessions in the dir's tree whose own activity is busy|retry
+   * (NOT subtreeBusy: the busy descendant counts itself, so a parent+child both
+   * working read as 2 running sessions; idle/error never count). Derived from
+   * the same server-authoritative store maps the tree renders from, so every
+   * device derives the SAME number by construction (no host-side storage).
+   * Closed integer field: always a non-negative integer (0 before the
+   * authoritative tree snapshot lands — the counts grow as data lands, exactly
+   * like every other store-derived field on a cold load). Part of the
+   * idempotence key.
+   */
+  runningCount: number;
+  /**
+   * PER-PANE AGGREGATE (tab-pairs): number of UNREAD sessions in this pane's
+   * project dir — DISTINCT roots r in the dir's tree with unread[r] === true
+   * (unread is ROOT-scoped server-side; subsessions under an unread root count
+   * ONCE). Cross-device by construction: the server tracks the watermark, the
+   * tree stream carries unread.set/clear continuously, and selecting the
+   * session anywhere acks it (actions.setSelectedId → ackSession → POST
+   * /vh/ack). Closed non-negative integer; part of the idempotence key.
+   */
+  unreadCount: number;
+}
+
+/**
+ * Per-pane scope aggregates for the status message. A pane = one SPA = one
+ * server + one selected dir; `state.sessions` holds exactly that dir's session
+ * tree (reset to {} on every switchProject), so iterating its keys IS "over the
+ * dir's full session tree". running counts sessions whose OWN activity is
+ * busy|retry (idle/error never); unread counts DISTINCT unread roots (a root's
+ * subsessions share the root's watermark — no double count). Exported for unit
+ * tests; the emitter calls it per tick.
+ */
+export function derivePaneCounts(): { runningCount: number; unreadCount: number } {
+  let runningCount = 0;
+  const unreadRoots = new Set<string>();
+  for (const id of Object.keys(state.sessions)) {
+    if (isActivityWorking(state.activity[id])) runningCount++;
+    const root = rootOf(id);
+    if (state.unread[root]) unreadRoots.add(root);
+  }
+  return { runningCount, unreadCount: unreadRoots.size };
 }
 
 /**
@@ -180,10 +230,14 @@ export function startStatusEmitter(): (() => void) | undefined {
     // the honest value is true. Read through the tailFollow bridge (unbound →
     // true). In the idempotence key, so a following flip re-emits.
     const following: boolean = session ? chatTailFollowing() : true;
-    const key = `${dir}\u0000${session}\u0000${title}\u0000${attention}\u0000${activity}\u0000${following}`;
+    // Per-pane aggregates (tab-pairs): derived over the WHOLE dir tree, not the
+    // selected session — they are pane-scoped, so they report even with no
+    // session open (the host still renders this pane's (X|Y) pair).
+    const { runningCount, unreadCount } = derivePaneCounts();
+    const key = `${dir}\u0000${session}\u0000${title}\u0000${attention}\u0000${activity}\u0000${following}\u0000${runningCount}\u0000${unreadCount}`;
     if (key === lastKey) return; // idempotent-on-change
     lastKey = key;
-    const msg: StatusMessage = { type: "status", dir, session, title, attention, activity, following };
+    const msg: StatusMessage = { type: "status", dir, session, title, attention, activity, following, runningCount, unreadCount };
     try {
       // Q2-A: targeted to the captured host origin — never '*'.
       window.parent.postMessage(msg, hostOrigin);

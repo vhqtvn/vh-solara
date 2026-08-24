@@ -777,8 +777,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // scroll from pin() is skipped by the self-pin sentinel in onScrolled).
       // Ack explicitly so the finished-unread dot clears immediately when a
       // finished session is opened already at the bottom. The anchor branch
-      // above deliberately does NOT ack — a restored mid-history anchor means
-      // the user had NOT read to the bottom.
+      // above deliberately does NOT ack here — but since the tab-pairs slice,
+      // SELECTION itself acks (actions.setSelectedId → ackSession), so an
+      // unread root is already server-cleared by the time either branch runs;
+      // this force call remains for the fresh-load race (selection restored
+      // from URL/localStorage goes through setSelectedIdRaw, before Stream-1
+      // arms the FE unread flag — see ackSession's force doc).
       if (!props.draft) ackSession(props.sessionId, { force: true });
     }
     setReady(true); // positioned — safe to reveal

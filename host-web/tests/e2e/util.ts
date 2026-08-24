@@ -247,6 +247,9 @@ export interface PaneStatus {
   attention: "none" | "needs_reply" | "needs_permission";
   activity: "running" | "idle" | "done_unread" | "error" | "unknown";
   following: boolean;
+  /** TAB-PAIRS per-pane aggregates (non-negative integers). */
+  runningCount: number;
+  unreadCount: number;
 }
 
 /** Post a {type:"status"} message from a pane (source-bound) through the real

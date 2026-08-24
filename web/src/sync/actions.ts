@@ -28,6 +28,7 @@ import { resetPageInFlight } from "./history";
 import { resetTreeStore, clearUserToggled, applyTreeOpStore } from "./treeState";
 import { resetLabelsScope } from "../labels";
 import { resetArchiveFailuresScope } from "../archiveFailures";
+import { ackSession } from "./orchestration";
 
 // Selecting any real session leaves draft mode.
 //
@@ -44,6 +45,22 @@ export function setSelectedId(id: string | null) {
   if (id) setDraft(false);
   setSelectedIdRaw(id);
   syncUrl(id);
+  // ACK-ON-SELECT (tab-pairs slice, cross-device unread sync): selecting a
+  // session acks it server-side (POST /vh/ack → the root's finished-unread
+  // watermark clears → every device's aggregate drops). This funnel is the ONE
+  // selection chokepoint — tree clicks, CommandPalette, NotificationCenter,
+  // ToolPart jumps, archive restores, and the host shell's reverse-nav
+  // (vh-host-select → selectListener → setSelectedId) all land here, so
+  // embedded mode is covered by construction. Before this, the ack fired only
+  // on bottom-reached/open-at-bottom scroll gestures, which left a gap: a
+  // session with a stored mid-history read anchor did NOT ack on selection, so
+  // another device's (X|Y) kept showing a stale unread count. ackSession
+  // resolves the ROOT internally (subsession selects ack the root watermark)
+  // and early-returns when nothing is armed, so this is a no-op for
+  // non-unread selections. The anchor/scroll machinery is untouched — the read
+  // CURSOR still restores mid-history; only the unread watermark semantics
+  // changed (selection = read).
+  if (id) ackSession(id);
   // Persist the selection per-project so an OS-driven PWA relaunch (which
   // drops ?session=) restores it. switchProject/newSession bypass this via
   // setSelectedIdRaw (they clear, not select), so a project switch never

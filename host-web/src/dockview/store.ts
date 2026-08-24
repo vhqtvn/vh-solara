@@ -48,6 +48,16 @@ function isClosedHostGesture(data: unknown): boolean {
   return keys.length === 2 && keys.includes("type") && keys.includes("gesture");
 }
 
+/** TAB-PAIRS: closed-set validator for the per-pane aggregate counts. The ONLY
+ * acceptable value domain is a non-negative integer (a count). Returns false
+ * for missing/undefined, fractions, negatives, NaN/Infinity, and non-numbers —
+ * the status branch rejects the whole message when this fails (no silent
+ * default; see the status case in routeMessage). Doubles as a type guard so the
+ * validated value narrows to `number` for the PaneStatus store write. */
+function isValidCount(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v >= 0;
+}
+
 // ============================================================================
 // MULTI-WORKSPACE MODEL
 //
@@ -402,6 +412,17 @@ const [runningCount, setRunningCount] = createSignal<number>(0);
 // see on the active grid — surfacing them on EVERY tab is the whole point.
 // Mirrors rankNeedy()'s pane→ws mapping (workspaceApiFor(wsId).panels).
 const [needsYouByWs, setNeedsYouByWs] = createSignal<Record<string, number>>({});
+// TAB-PAIRS: per-workspace ordered (running|unread) pairs, one per pane in the
+// workspace's LIVE serialized panel order (api.panels — the same iteration the
+// display projection's syncPanes uses; groups.flatMap(group.panels), which
+// fromJSON reproduces from the persisted layout, so the order is stable across
+// reload). Recomputed in recomputeAggregates alongside needsYouByWs (same
+// triggers: every status store, setPanesVm, unregisterPane, closeWorkspace).
+// A pane with NO status yet reports (0|0) — the neutral placeholder that keeps
+// pair POSITIONS stable; the Tabstrip's zero-fork hides the whole run when
+// every pair is (0|0). statusByPane is the ONLY data source (server-reported
+// SPA aggregates) — the host never derives or persists these numbers itself.
+const [pairsByWs, setPairsByWs] = createSignal<Record<string, { running: number; unread: number }[]>>({});
 // Layout overlay: the source pane id (in the ACTIVE workspace) whose bounds the
 // overlay is anchored to, or null when closed. Set by routeMessage on a valid
 // host-gesture (source-bound) and by HostOps.openLayoutOverlay (the DEV test
@@ -415,11 +436,21 @@ const [overlaySourcePaneId, setOverlaySourcePaneId] = createSignal<string | null
 export { panes, focusedId, trayIds, isMaximized, connected, needsYouCount, runningCount, overlaySourcePaneId };
 
 /** Needs-you count for a SPECIFIC workspace (its panes whose attention is
- *  needs_permission or needs_reply). Reactive: tracks needsYouByWs(). Returns 0
- *  for an unknown/empty workspace. Used by the per-tab badge so a background
- *  workspace's needy sessions are visible on its tab. */
+ * needs_permission or needs_reply). Reactive: tracks needsYouByWs(). Returns 0
+ * for an unknown/empty workspace. Used by the per-tab badge so a background
+ * workspace's needy sessions are visible on its tab. */
 export function needsYouCountFor(wsId: string): number {
   return needsYouByWs()[wsId] ?? 0;
+}
+
+/** TAB-PAIRS: the ordered (running|unread) pairs for a SPECIFIC workspace, one
+ * per pane in the live serialized panel order (stable across reload). Reactive:
+ * tracks pairsByWs() (recomputed on every status store + pane-list change).
+ * Returns [] for an unknown workspace / one whose api has not registered yet
+ * (renders as no pairs — visually identical to the all-zero fork). The host
+ * renders exactly these server-reported numbers; it never derives them. */
+export function statusPairsFor(wsId: string): { running: number; unread: number }[] {
+  return pairsByWs()[wsId] ?? [];
 }
 
 /** Recompute the active-workspace attention aggregates (needs-you + running)
@@ -442,6 +473,7 @@ function recomputeAggregates(): void {
   // pane to its owning workspace via the live Dockview apis (same pattern as
   // rankNeedy). Only stores entries for workspaces with count > 0; absent ⇒ 0.
   const byWs: Record<string, number> = {};
+  const pairs: Record<string, { running: number; unread: number }[]> = {};
   for (const ws of workspaces()) {
     const api = workspaceApis.get(ws.id);
     if (!api) continue;
@@ -453,8 +485,18 @@ function recomputeAggregates(): void {
       }
     }
     if (wn > 0) byWs[ws.id] = wn;
+    // TAB-PAIRS: one (running|unread) per pane, in the live serialized panel
+    // order (stable across reload — see the pairsByWs decl). A pane whose
+    // status has not landed yet contributes the neutral (0|0).
+    pairs[ws.id] = api.panels.map((panel) => {
+      const st = statusByPane.get(panel.id);
+      return st
+        ? { running: st.runningCount, unread: st.unreadCount }
+        : { running: 0, unread: 0 };
+    });
   }
   setNeedsYouByWs(byWs);
+  setPairsByWs(pairs);
 }
 
 /** Clear the display projection (used by a host on unmount / dispose so a
@@ -936,7 +978,14 @@ export function routeMessage(
         typeof d.title !== "string" ||
         typeof d.attention !== "string" ||
         typeof d.activity !== "string" ||
-        typeof d.following !== "boolean"
+        typeof d.following !== "boolean" ||
+        // TAB-PAIRS: the two aggregate fields are REQUIRED closed non-negative
+        // integers. A missing field (version-skewed SPA) or junk (fractional,
+        // negative, non-number) rejects the WHOLE message — the same closed-
+        // payload discipline as every other required field above; there is no
+        // silent default that could mask a skew.
+        !isValidCount(d.runningCount) ||
+        !isValidCount(d.unreadCount)
       ) {
         return { routed: false, paneId: null, accepted: false, reason: "ignored-non-pane-to-host" };
       }
@@ -976,6 +1025,8 @@ export function routeMessage(
         attention,
         activity,
         following: d.following,
+        runningCount: d.runningCount,
+        unreadCount: d.unreadCount,
       });
       return { routed: true, paneId, accepted: true, reason: "accepted:non-heartbeat" };
     }

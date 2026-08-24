@@ -208,6 +208,8 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
         attention: "needs_reply",
         activity: "idle",
         following: true,
+        runningCount: 0,
+        unreadCount: 0,
       },
     });
 

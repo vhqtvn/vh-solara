@@ -7,6 +7,7 @@ import {
   needsYouCountFor,
   renameWorkspace,
   setActiveWorkspace,
+  statusPairsFor,
   trayIds,
   workspaces,
   type Workspace,
@@ -62,11 +63,22 @@ import s from "./Tabstrip.module.css";
  */
 
 /** Long-press threshold (ms) to enter rename mode. Long enough that a tap never
- *  triggers it; short enough to feel responsive on touch. */
+ * triggers it; short enough to feel responsive on touch. */
 const RENAME_PRESS_MS = 500;
 /** Auto-revert window for the delete two-step confirm (ms). If the operator
- *  doesn't confirm within this window, the tab exits the confirming state. */
+ * doesn't confirm within this window, the tab exits the confirming state. */
 const DELETE_CONFIRM_MS = 3500;
+
+/**
+ * TAB-PAIRS display cap (REVERSIBLE DEFAULT). A count of 10 or more renders as
+ * the fixed-width "9+" instead of its full integer, keeping every pair a tight
+ * constant-width token even on a heavily-loaded dir. Alternative (flip): render
+ * the raw integer — denser information, wider/shifting tabs. The SPA sends the
+ * TRUE integer; the cap is host-side display formatting only.
+ */
+function fmtCount(n: number): string {
+  return n >= 10 ? "9+" : String(n);
+}
 
 export function Tabstrip() {
   return (
@@ -141,6 +153,19 @@ function WorkspaceTab(props: { ws: Workspace }) {
   const need = () => needsYouCountFor(props.ws.id);
   // The × is disabled when this is the last remaining workspace (never zero).
   const isLast = () => workspaces().length <= 1;
+
+  // ---- TAB-PAIRS: per-pane (running|unread) inside the tab label ------------
+  // One pair per pane, in the workspace's live serialized panel order (stable
+  // across reload). ZERO-PAIR FORK (REVERSIBLE DEFAULT): when ANY pair is
+  // nonzero we render EVERY pair — including (0|0) — so each pane's position in
+  // the run is stable and the operator can correlate pair i ↔ pane i; when ALL
+  // pairs are zero we render nothing after the name (a quiet workspace reads as
+  // a bare label). Alternative (flip): hide individual zero pairs — denser, but
+  // the run shifts as counts change, breaking the position↔pane correlation.
+  // A pane whose status has not landed yet contributes (0|0).
+  const pairs = () => statusPairsFor(props.ws.id);
+  const showPairs = () => pairs().some((p) => p.running > 0 || p.unread > 0);
+  const pairsText = () => pairs().map((p) => `(${fmtCount(p.running)}|${fmtCount(p.unread)})`).join("");
 
   // ---- delete two-step confirm ---------------------------------------------
   const [confirming, setConfirming] = createSignal(false);
@@ -275,17 +300,36 @@ function WorkspaceTab(props: { ws: Workspace }) {
           <Show
             when={confirming()}
             fallback={
-              <span
-                class={s.tabLabel}
-                data-testid="ws-tab-label"
-                title={props.ws.name}
-                onPointerDown={onLabelPointerDown}
-                onPointerUp={clearPressTimer}
-                onPointerLeave={clearPressTimer}
-                onPointerCancel={clearPressTimer}
-              >
-                {props.ws.name}
-              </span>
+              <>
+                <span
+                  class={s.tabLabel}
+                  data-testid="ws-tab-label"
+                  title={props.ws.name}
+                  onPointerDown={onLabelPointerDown}
+                  onPointerUp={clearPressTimer}
+                  onPointerLeave={clearPressTimer}
+                  onPointerCancel={clearPressTimer}
+                >
+                  {props.ws.name}
+                </span>
+                {/* TAB-PAIRS: the ordered per-pane (running|unread) run, a
+                    sibling of the (possibly ellipsized) name span so the pairs
+                    themselves are NEVER truncated — on overflow the tabstrip's
+                    .tabs row scrolls horizontally instead (measured behavior,
+                    not silent clipping). data-pairs mirrors the exact rendered
+                    run for deterministic e2e/vision assertions. */}
+                <Show when={showPairs()}>
+                  <span
+                    class={s.tabPairs}
+                    data-testid="ws-tab-pairs"
+                    data-workspace={props.ws.id}
+                    data-pairs={pairsText()}
+                    title={`${pairs().length} pane${pairs().length === 1 ? "" : "s"} — per pane: (running|unread)`}
+                  >
+                    {pairsText()}
+                  </span>
+                </Show>
+              </>
             }
           >
             <span class={s.tabConfirmLabel} title="Confirm delete?">

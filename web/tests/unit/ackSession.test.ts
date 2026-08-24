@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { reconcile } from "solid-js/store";
 import { ackSession } from "../../src/sync/orchestration";
+import { setSelectedId } from "../../src/sync/actions";
 import { state, setState } from "../../src/sync/store";
 
 // Locks in the open-at-bottom ack race fix (P1-WEB-005): the maybeRestore
@@ -30,6 +31,7 @@ function postedCalls(calls: ReturnType<typeof vi.fn>["mock"]["calls"]): { url: s
 
 beforeEach(() => {
   setState("unread", reconcile({}));
+  setState("sessions", reconcile({}));
 });
 
 afterEach(() => {
@@ -84,5 +86,45 @@ describe("ackSession — open-at-bottom force flag", () => {
     expect(posts[0].sid).toBe("other");
     // Optimistic clear fired because armed was true.
     expect(state.unread["other"]).toBeFalsy();
+  });
+});
+
+// ACK-ON-SELECT (tab-pairs slice): setSelectedId — the ONE selection funnel
+// (tree click, palette, notifications, reverse-nav vh-host-select, …) — acks
+// the selection server-side so a read on ANY device clears the unread
+// watermark everywhere (the cross-device (X|Y) sync requirement). Locks the
+// alignment: before this, only bottom-reached scroll gestures acked, so a
+// session with a stored mid-history anchor stayed unread-looking on selection.
+describe("setSelectedId — ack-on-select alignment", () => {
+  it("selecting an unread SUBSESSION acks its ROOT's watermark (root-scoped)", async () => {
+    // Tree: root "r" with child "c". Unread is ROOT-scoped server-side, so the
+    // watermark lives on "r"; selecting "c" must clear it (ackSession resolves
+    // rootOf internally) and POST the raw id (the server resolves root too).
+    setState("sessions", "r", { id: "r" });
+    setState("sessions", "c", { id: "c", parentID: "r" });
+    setState("unread", "r", true as unknown as undefined);
+    const fetchMock = vi.fn().mockResolvedValue(new Response("{}"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    setSelectedId("c");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const posts = postedCalls(fetchMock.mock.calls);
+    expect(posts).toHaveLength(1);
+    expect(posts[0].sid).toBe("c");
+    expect(state.unread["r"], "root watermark optimistically cleared").toBeFalsy();
+  });
+
+  it("selecting a non-unread session posts nothing (armed guard, no redundant POSTs)", async () => {
+    setState("sessions", "solo", { id: "solo" });
+    const fetchMock = vi.fn().mockResolvedValue(new Response("{}"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    setSelectedId("solo");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(postedCalls(fetchMock.mock.calls)).toHaveLength(0);
   });
 });

@@ -69,6 +69,8 @@ test.describe("P1 session-attention", () => {
         attention: "needs_permission",
         activity: "running",
         following: true,
+        runningCount: 0,
+        unreadCount: 0,
       },
     });
     expect(r.accepted, "status message accepted (source-bound)").toBe(true);
@@ -94,7 +96,7 @@ test.describe("P1 session-attention", () => {
     const malformed = await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "", title: "", attention: "bogus", activity: "also-bogus", following: true },
+      payload: { type: "status", dir: "", session: "", title: "", attention: "bogus", activity: "also-bogus", following: true, runningCount: 0, unreadCount: 0 },
     });
     expect(malformed.accepted, "out-of-vocabulary status rejected").toBe(false);
     expect(malformed.reason).toBe("ignored-non-pane-to-host");
@@ -111,7 +113,7 @@ test.describe("P1 session-attention", () => {
     await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "/proj", session: "s1", title: "Baseline", attention: "needs_permission", activity: "running", following: true },
+      payload: { type: "status", dir: "/proj", session: "s1", title: "Baseline", attention: "needs_permission", activity: "running", following: true, runningCount: 0, unreadCount: 0 },
     });
     const baseline = await H.status(page, pane);
     expect(baseline!.attention, "baseline established").toBe("needs_permission");
@@ -128,7 +130,7 @@ test.describe("P1 session-attention", () => {
     const r = await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: WRONG_ORIGIN,
-      payload: { type: "status", dir: "/evil", session: "evil", title: "Forged", attention: "needs_reply", activity: "error", following: true },
+      payload: { type: "status", dir: "/evil", session: "evil", title: "Forged", attention: "needs_reply", activity: "error", following: true, runningCount: 0, unreadCount: 0 },
     });
     expect(r.accepted, "wrong-origin status rejected").toBe(false);
     expect(r.reason).toBe("rejected:origin-mismatch");
@@ -167,7 +169,7 @@ test.describe("P1 session-attention", () => {
     await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "s1", title: "T", attention: "needs_permission", activity: "running", following: true },
+      payload: { type: "status", dir: "", session: "s1", title: "T", attention: "needs_permission", activity: "running", following: true, runningCount: 0, unreadCount: 0 },
     });
 
     // The needs-you aggregate flips to 1 → the tabstrip NEXT button appears.
@@ -185,7 +187,7 @@ test.describe("P1 session-attention", () => {
     await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "s1", title: "", attention: "needs_permission", activity: "running", following: true },
+      payload: { type: "status", dir: "", session: "s1", title: "", attention: "needs_permission", activity: "running", following: true, runningCount: 0, unreadCount: 0 },
     });
 
     // Identity SURVIVED: mountTs/nonce/connId unchanged (P1 is additive DOM
@@ -200,7 +202,7 @@ test.describe("P1 session-attention", () => {
     await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: H.MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "s1", title: huge, attention: "none", activity: "idle", following: true },
+      payload: { type: "status", dir: "", session: "s1", title: huge, attention: "none", activity: "idle", following: true, runningCount: 0, unreadCount: 0 },
     });
     const st = await H.status(page, pane);
     expect(st!.title.length, "title capped at ingress").toBeLessThanOrEqual(120);

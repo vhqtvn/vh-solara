@@ -176,6 +176,12 @@ postToParent({ type: "route" });
 // reader scrolls away from / back to the tail (the click affordance below) and
 // when a valid host tail command lands, so the host's Tail row round-trips
 // through the SAME status bridge the real SPA uses.
+//
+// TAB-PAIRS: the payload also carries the two per-pane aggregate fields the
+// real emitter now sends. The mock has no session tree, so it reports the
+// honest neutral (0|0); e2e drives arbitrary values through the host's DEV
+// bridge (probeStatus routes a full payload through the REAL router), which is
+// the deterministic stand-in for "the SPA's store derived these counts".
 let tailFollowing = true;
 
 function postStatus(): void {
@@ -187,6 +193,8 @@ function postStatus(): void {
     attention: "none",
     activity: "unknown",
     following: tailFollowing,
+    runningCount: 0,
+    unreadCount: 0,
   });
 }
 
