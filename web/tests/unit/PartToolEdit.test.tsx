@@ -4,7 +4,7 @@
 // import is evaluated — see _matchMedia.ts.
 import "./_matchMedia";
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render } from "@solidjs/testing-library";
+import { cleanup, fireEvent, render } from "@solidjs/testing-library";
 import PartView from "../../src/components/Part";
 import { EDIT_DIFF_MAX_LINES } from "../../src/components/ToolPart";
 import type { Part } from "../../src/types";
@@ -107,5 +107,34 @@ describe("ToolPart edit contents preview", () => {
     );
     const { container } = render(() => <PartView part={part} tail />);
     expect((container as unknown as HTMLElement).textContent).toContain("replaces every match");
+  });
+
+  // DEFER 2 (interaction path): a real click on the head of a NON-tail row
+  // (disclosure starts closed) expands it and reveals the preview. The
+  // browser-side expand is pinned end-to-end by tests/e2e/
+  // tooledit-preview.spec.ts (incl. the scoped CSS classes, which Vitest
+  // cannot see); this pins the component-level wiring (Solid event
+  // delegation → toggle → setPartOpen → disclosure gate) in jsdom.
+  it("reveals the preview when a collapsed non-tail row's head is clicked", () => {
+    const part = toolPart(
+      "edit-preview-6",
+      "edit",
+      { filePath: "src/parser.go", oldString: "func parse() {}", newString: "func parse(s string) {}" },
+      "The file src/parser.go has been edited.",
+    );
+    const { container } = render(() => <PartView part={part} />);
+    const el = container as unknown as HTMLElement;
+    // No tail → disclosure closed on mount: no preview in the DOM.
+    expect(el.textContent).not.toContain("func parse() {}");
+    expect(el.textContent).not.toContain("func parse(s string) {}");
+    const head = el.querySelector(".tool-head");
+    expect(head).toBeTruthy();
+    fireEvent.click(head!);
+    // The same row now renders the del and add blocks (Solid's delegated
+    // click flushes synchronously).
+    expect(el.textContent).toContain("func parse() {}");
+    expect(el.textContent).toContain("func parse(s string) {}");
+    const text = el.textContent!;
+    expect(text.indexOf("func parse() {}")).toBeLessThan(text.indexOf("func parse(s string) {}"));
   });
 });

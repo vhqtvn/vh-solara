@@ -201,7 +201,11 @@ func New() *FakeOpenCode {
 				{
 					"id": "p3", "sessionID": "demo", "messageID": "m2", "type": "tool", "callID": "c1", "tool": "edit",
 					"state": map[string]any{"status": "completed", "title": "edit parser.go",
-						"input":  map[string]any{"filePath": "parser.go"},
+						// oldString/newString make ToolPart's edit-contents preview
+						// (editDiffLines) render for the e2e lane — web/tests/e2e/
+						// tooledit-preview.spec.ts expands this NON-tail row. The new
+						// string matches what the earlier p2b read shows for the file.
+						"input":  map[string]any{"filePath": "parser.go", "oldString": "func parse() {}", "newString": "func parse(s string) {}"},
 						"output": "Applied 1 edit to parser.go",
 						// LSP diagnostics OpenCode attaches after an edit (keyed by file).
 						"metadata": map[string]any{"diagnostics": map[string]any{
@@ -343,6 +347,40 @@ func New() *FakeOpenCode {
 						"```mermaid\ngraph TD\n    A[Start] --> B{Decision}\n    B -->|Yes| C[Run]\n    B -->|No| D[Skip]\n    C --> E[End]\n    D --> E\n```\n\n"+
 						"That is the deploy flow.",
 					now-6000),
+			},
+		},
+	}
+	// Edit-preview session: a self-contained transcript exercising the edit
+	// contents preview's replaceAll meta header (ToolPart editDiffLines).
+	// Loaded ONLY by web/tests/e2e/tooledit-preview.spec.ts; separate root
+	// session so it does not perturb the demo session tree shape other specs
+	// assert against (same isolation pattern as mdhard/mermaid above).
+	f.sessions = append(f.sessions, map[string]any{
+		"id": "editpvw", "projectID": "proj", "title": "Edit previews", "directory": demoDir,
+		"model": map[string]any{"providerID": "fake", "id": "dummy", "variant": "default"},
+		"time":  map[string]any{"created": now - 6200, "updated": now - 6200},
+	})
+	f.messages["editpvw"] = []messageWithParts{
+		{
+			Info:  map[string]any{"id": "ep1", "sessionID": "editpvw", "role": "user", "time": map[string]any{"created": now - 6200, "completed": now - 6200}},
+			Parts: []map[string]any{textPart("ep1", "editpvw", "epp1", "Rename the pool helper everywhere.", now-6200)},
+		},
+		{
+			Info: map[string]any{"id": "ep2", "sessionID": "editpvw", "role": "assistant", "agent": "build", "time": map[string]any{"created": now - 6150, "completed": now - 6100},
+				"model": map[string]any{"providerID": "fake", "modelID": "dummy", "variant": "default"}},
+			Parts: []map[string]any{
+				// A many-match replace: replaceAll drives the "replaces every
+				// match" meta line, and multi-line old/new exercise the per-line
+				// class mapping (4 del + 4 add rows).
+				{
+					"id": "epp2", "sessionID": "editpvw", "messageID": "ep2", "type": "tool", "callID": "ec1", "tool": "edit",
+					"state": map[string]any{"status": "completed", "title": "edit pool.go",
+						"input": map[string]any{"filePath": "src/db/pool.go", "replaceAll": true,
+							"oldString": "c, err := acquire()\nif err != nil {\n\treturn err\n}",
+							"newString": "c, err := get()\nif err != nil {\n\treturn err\n}"},
+						"output": "Replaced 4 matches in src/db/pool.go",
+						"time":   map[string]any{"start": now - 6140, "end": now - 6110}},
+				},
 			},
 		},
 	}
