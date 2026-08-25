@@ -492,6 +492,18 @@ describe("status emitter — derivation + emission (embedded)", () => {
     expect(derivePaneCounts().runningCount, "root+sub both busy → ONE running root").toBe(1);
   });
 
+  it("derivePaneCounts: orphaned-parent session counts as a root (busy orphan → runningCount 1)", () => {
+    // The orphaned-parent disjunct of the root enumeration: parentID is set
+    // but points at a session NOT resident in state.sessions (the parent
+    // left the store) — the session still enumerates as a root, so its busy
+    // activity counts. Pins the `state.sessions[p]` residency check against
+    // a future `if (p) continue;` "simplification" that would silently stop
+    // counting busy orphans while the rest of the suite stays green.
+    setState("sessions", "o", { id: "o", parentID: "missing" });
+    setState("activity", "o", "busy");
+    expect(derivePaneCounts().runningCount, "busy orphan counts as a root").toBe(1);
+  });
+
   it("derivePaneCounts: idle root + busy subsession → X=1 via the subtreeBusy rollup (chosen default)", () => {
     // PIN THE ROLLUP DEFAULT: the root's OWN activity is idle; the server
     // rolls its busy descendant up into flags.subtreeBusy on the root (the
