@@ -61,10 +61,10 @@
   cursor: pointer;
   white-space: nowrap;
   flex: 0 0 auto;
-  /* Prevent text selection / long-press context menu during the rename
+  /* Prevent text selection / long-press context menu during the menu
    * long-press, and double-tap-to-zoom on rapid tab taps (touch-friendly). The
    * -webkit-touch-callout suppression specifically stops iOS Safari's native
-   * callout from racing the ~500ms RENAME_PRESS_MS threshold. */
+   * callout from racing the ~500ms MENU_PRESS_MS threshold. */
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;
@@ -100,7 +100,12 @@
 .tabPairs {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  /* Inter-pane gap (TUNABLE — was 5px before the pill-compaction slice). The
+   * 2px intra-pane gap below is deliberately untouched: the operator's
+   * "spaces between numbers" complaint was the CIRCLE's inherent width
+   * overhead (a circle must be as wide as tall), answered by the pill below —
+   * not the badge-pair spacing itself. */
+  gap: 4px;
   white-space: nowrap;
   flex: 0 0 auto;
 }
@@ -110,19 +115,25 @@
   gap: 2px;
   flex: 0 0 auto;
 }
-/* Badge base (REVERSIBLE DEFAULT — size): 15px circle for one digit, pill
- * (border-radius 999px + padding) for "9+". One notch below the 16px amber
- * needs-you badge so the demand-signal stays visually dominant. 10px/600 with
- * tabular numerals keeps digits width-stable (no jitter as counts tick).
- * Alternative (flip): 16px matching needBadge exactly, or 14px denser. */
+/* Badge base (REVERSIBLE DEFAULT — shape): COMPACT PILL. Was a 15px
+ * min-width circle (border-radius 999px + 4px inline padding) — the circle
+ * must be as wide as it is tall, so every single-digit badge paid ~3px of
+ * dead width; on a width-constrained tab row that was the cost the operator
+ * asked about ("do we really need the spaces between numbers for border
+ * radiuses?"). Now: border-radius 4px (crisp rounded-rect) + 3px horizontal
+ * padding + NO min-width — the badge hugs its number. Height stays 15px (one
+ * notch below the 16px amber needs-you badge so the demand-signal stays
+ * visually dominant); 10px/600 tabular numerals keep digits width-stable
+ * (no jitter as counts tick). Alternatives (flip): 14px height for one more
+ * notch of compaction (held at 15px for legibility at ~360px), or restore
+ * the circle. */
 .countBadge {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 15px;
   height: 15px;
-  padding: 0 4px;
-  border-radius: 999px;
+  padding: 0 3px;
+  border-radius: 4px;
   font-size: 10px;
   font-weight: 600;
   line-height: 1;
@@ -146,30 +157,6 @@
   background: var(--accent);
   color: var(--bg);
 }
-/* Two-step delete confirm state. GPU-cheap: a slow opacity pulse ONLY (no
- * mask-image / backdrop-filter — AGENTS.md Firefox/WebRender rules). Honored
- * under prefers-reduced-motion. The destructive tint uses --warn (amber, the
- * established "operator action needed" color) so it reads as cautionary. */
-.tabConfirming {
-  background: rgba(210, 153, 34, 0.18);
-  border-color: var(--warn);
-  color: var(--fg);
-  animation: ws-confirm-pulse 1.4s ease-in-out infinite;
-}
-@keyframes ws-confirm-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.6; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .tabConfirming { animation: none; }
-}
-.tabConfirmLabel {
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--warn);
-  white-space: nowrap;
-  flex: 0 1 auto;
-}
 /* Inline rename input — replaces the label while editing. Sized to fit the tab
  * height; inherits the tab's color so it reads as in-place editing. */
 .tabInput {
@@ -187,53 +174,59 @@
   outline: none;
   flex: 0 0 auto;
 }
-/* Per-tab delete/confirm affordances. The × is always rendered (touch has no
- * hover); it's subtle by default and brightens on hover of the tab. */
-.tabDel,
-.tabDelConfirm,
-.tabDelCancel {
+/* ---- Tab CONTEXT MENU (right-click / long-press / F2) ------------------------
+ * Replaced the per-tab × (+ two-step confirm) and the direct long-press
+ * rename. Rendered INSIDE the tab (the surface-stack anchor contains trigger +
+ * menu so a menu-item pointerdown is never an outside click) but
+ * position:fixed — it escapes the .tabs overflow clip (verified: no
+ * transform/filter/perspective/will-change ancestor creates a containing
+ * block). Fixed 176px width = MENU_WIDTH_PX in Tabstrip.tsx (placeMenu's
+ * viewport clamp depends on the match). Same visual family as the Settings
+ * popover: plain bg/border/shadow, static, GPU-cheap — no animation. */
+.tabMenu {
+  position: fixed;
+  width: 176px;
+  z-index: 50;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.tabMenuItem {
   appearance: none;
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  padding: 0;
+  padding: 6px 10px;
   border: 0;
-  border-radius: 4px;
+  border-radius: 5px;
   background: transparent;
-  color: var(--fg-dim);
-  font-size: 13px;
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
   line-height: 1;
   cursor: pointer;
-  flex: 0 0 auto;
 }
-.tab.tab:hover .tabDel {
-  color: var(--warn);
+.tabMenuItem:hover {
+  background: var(--bg);
 }
-.tabDel:hover:not(:disabled) {
-  color: var(--warn);
-  background: rgba(210, 153, 34, 0.2);
+.tabMenuItem:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
-.tabDel:disabled {
-  opacity: 0.3;
-  cursor: not-allowed;
-}
-.tabDelConfirm {
-  color: var(--warn);
-  font-size: 12px;
-}
-.tabDelConfirm:hover {
-  background: var(--warn);
-  color: var(--bg);
-}
-.tabDelCancel {
+/* Last-workspace guard (Close / Close others): aria-disabled + dimmed; the
+ * button stays focusable so keyboard/AT users can discover the entry, and
+ * activation is a full no-op (Settings' disabled-action semantics). */
+.tabMenuItemDisabled {
   color: var(--fg-dim);
-  font-size: 11px;
+  opacity: 0.5;
+  cursor: default;
 }
-.tabDelCancel:hover {
-  color: var(--fg);
-  background: var(--bg-elev);
+.tabMenuItemDisabled:hover {
+  background: transparent;
 }
 /* P1 workspace-aggregate needs-you count badge. Distinct shape from the
  * per-pane attention badge (pill here) and from the Q1-C liveness dot.

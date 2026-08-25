@@ -1,4 +1,4 @@
-import { For, Show, createSignal, onCleanup } from "solid-js";
+import { For, Show, createEffect, createSignal, onCleanup, untrack } from "solid-js";
 import {
   activeWorkspaceId,
   addWorkspace,
@@ -12,6 +12,7 @@ import {
   workspaces,
   type Workspace,
 } from "../dockview/store";
+import { TABSTRIP_POPOVER_GROUP, usePopoverSurface } from "./popover";
 import { next } from "../attentionNext";
 import { AddServer } from "./AddServer";
 import { Layouts } from "./Layouts";
@@ -44,12 +45,18 @@ import s from "./Tabstrip.module.css";
  * named containers you switch between; panes tile WITHIN a workspace.
  *
  * PER-TAB AFFORDANCES:
- *  - DELETE: a × on each tab. Fat-finger-safe two-step inline confirm (first tap
- *    enters a "delete?" state with ✓/✗; second tap confirms; auto-revert after a
- *    short timeout). The last remaining workspace is guarded (× disabled).
+ *  - CONTEXT MENU (right-click / long-press / F2): Rename, Close, Close
+ *    others. This REPLACED the per-tab × (with its two-step "Delete?" confirm)
+ *    and the direct long-press→rename — tabs are width-constrained, the × cost
+ *    horizontal space on EVERY tab, and the gestures now have one home. The
+ *    menu rides the SAME surface stack as Settings/AddServer/Layouts
+ *    (popover.ts, mutually exclusive group): Esc closes topmost-only, a
+ *    pointerdown outside the tab closes it, a pane tap closes it, a workspace
+ *    switch closes it reactively. Last-workspace guard: Close + Close others
+ *    are aria-disabled no-ops (the store refuses to empty the shell anyway).
  *    Deleting a workspace DESTROYS its panes (intentional; not a survival op).
- *  - RENAME: long-press the label → inline edit. Commit on blur/Enter; cancel on
- *    Esc. Long-press over double-tap (double-tap conflicts with mobile zoom).
+ *  - RENAME: menu → Rename opens the inline edit. Commit on blur/Enter; cancel
+ *    on Esc. Long-press over double-tap (double-tap conflicts with mobile zoom).
  *  - PER-TAB BADGE: needs-you count on EVERY tab (background ws's needy sessions
  *    are the ones the operator can't see). Rounded-rect number, GPU-cheap,
  *    distinct from Q1-C liveness.
@@ -62,12 +69,17 @@ import s from "./Tabstrip.module.css";
  * for the DEV bridge + future overlay work.
  */
 
-/** Long-press threshold (ms) to enter rename mode. Long enough that a tap never
- * triggers it; short enough to feel responsive on touch. */
-const RENAME_PRESS_MS = 500;
-/** Auto-revert window for the delete two-step confirm (ms). If the operator
- * doesn't confirm within this window, the tab exits the confirming state. */
-const DELETE_CONFIRM_MS = 3500;
+/** Long-press threshold (ms) to open the tab context menu. Same value the old
+ * direct-rename long-press used (RENAME_PRESS_MS=500): long enough that a tap
+ * never triggers it, short enough to feel responsive on touch. */
+const MENU_PRESS_MS = 500;
+/** Pointer drift (px) that cancels an armed long-press — a touch that moves
+ * (scroll intent) must never summon the menu. */
+const MENU_PRESS_DRIFT_PX = 12;
+/** Fixed .tabMenu width (px). Declared here so placeMenu's viewport clamp uses
+ * the same number the CSS renders (keep in sync with .tabMenu in
+ * Tabstrip.module.css). */
+const MENU_WIDTH_PX = 176;
 
 /**
  * TAB-PAIRS display cap (REVERSIBLE DEFAULT). A count of 10 or more renders as
@@ -168,13 +180,14 @@ export function Tabstrip() {
   );
 }
 
-/** One workspace tab. Owns its local interaction state: a two-step delete
- *  confirm + a long-press rename edit. Only ONE of confirming/editing is active
- *  at a time (rename cancels confirm and vice versa). */
+/** One workspace tab. Owns its local interaction state: the context menu
+ *  (right-click / long-press / F2 → Rename | Close | Close others) and the
+ *  inline rename the menu can open. */
 function WorkspaceTab(props: { ws: Workspace }) {
   const active = () => activeWorkspaceId() === props.ws.id;
   const need = () => needsYouCountFor(props.ws.id);
-  // The × is disabled when this is the last remaining workspace (never zero).
+  // Last-workspace guard: Close + Close others render aria-disabled no-ops in
+  // the menu (the store's closeWorkspace refuses to empty the shell anyway).
   const isLast = () => workspaces().length <= 1;
 
   // ---- TAB-PAIRS: per-pane (running|unread) micro-badges in the tab label ----
@@ -195,46 +208,84 @@ function WorkspaceTab(props: { ws: Workspace }) {
   // this attribute is the data.
   const pairsText = () => pairs().map((p) => `(${fmtCount(p.running)}|${fmtCount(p.unread)})`).join("");
 
-  // ---- delete two-step confirm ---------------------------------------------
-  const [confirming, setConfirming] = createSignal(false);
-  let confirmTimer: ReturnType<typeof setTimeout> | undefined;
-  const armConfirmTimer = () => {
-    if (confirmTimer) clearTimeout(confirmTimer);
-    confirmTimer = setTimeout(() => setConfirming(false), DELETE_CONFIRM_MS);
+  // ---- tab context menu (right-click / long-press / F2) ---------------------
+  // Registered on the shared surface stack (popover.ts) in the SAME group as
+  // the other tabstrip popovers (mutually exclusive with Settings/AddServer/
+  // Layouts): Escape closes topmost-only, a pointerdown outside this tab
+  // closes it, a pane tap closes it via dismissAnchoredSurfaces. The anchor is
+  // the TAB element: it contains both the trigger (the tab itself) and the
+  // menu, so a pointerdown on a menu item never counts as an outside click
+  // that would dismiss-before-activate. The menu is position:fixed — it
+  // escapes the .tabs overflow clip (verified: no transform/filter/
+  // perspective/will-change ancestor would turn it into a containing block).
+  let tabEl: HTMLDivElement | undefined;
+  const [menuPos, setMenuPos] = createSignal({ left: 0, top: 0 });
+  // Fixed coords, computed on open: drop under the tab, clamped so a
+  // right-edge tab (or a ~360px viewport) never pushes the menu offscreen.
+  const placeMenu = () => {
+    const r = tabEl?.getBoundingClientRect();
+    if (!r) return;
+    const vw = document.documentElement.clientWidth;
+    setMenuPos({
+      left: Math.max(4, Math.min(r.left, vw - MENU_WIDTH_PX - 8)),
+      top: r.bottom + 2,
+    });
   };
-  const clearConfirmTimer = () => {
-    if (confirmTimer) {
-      clearTimeout(confirmTimer);
-      confirmTimer = undefined;
-    }
+  const menu = usePopoverSurface({
+    id: `ws-tab-menu:${props.ws.id}`,
+    group: TABSTRIP_POPOVER_GROUP,
+    anchor: () => tabEl,
+    onOpen: placeMenu,
+  });
+
+  // Dismiss on workspace switch: a KEYBOARD switch (focus another tab, Enter)
+  // moves no pointer, so the surface stack's outside-click pass never fires —
+  // close reactively instead. activeWorkspaceId() is the tracked dep; the
+  // menu state is deliberately untracked (reading it would re-run on open).
+  createEffect(() => {
+    activeWorkspaceId();
+    if (untrack(menu.open)) menu.closePopover();
+  });
+
+  // Menu actions. Every item stops its click from reaching the tab's own
+  // click handler (bubbling would read as a tap-again toggle / a workspace
+  // switch). The menu closes FIRST for the destructive items (never leave an
+  // open menu over a workspace that is already gone); a disabled
+  // (last-workspace) item is a FULL no-op — no close, no run — matching the
+  // Settings popover's disabled-action semantics so the operator can still
+  // pick another entry.
+  const menuRename = () => {
+    menu.closePopover();
+    beginEdit();
   };
-  const startConfirm = () => {
-    if (isLast()) return; // guarded — can't delete the last workspace
-    setEditing(false);
-    clearPressTimer();
-    setConfirming(true);
-    armConfirmTimer();
-  };
-  const cancelConfirm = () => {
-    setConfirming(false);
-    clearConfirmTimer();
-  };
-  const confirmDelete = () => {
-    clearConfirmTimer();
-    setConfirming(false);
+  const menuClose = () => {
+    if (isLast()) return;
+    menu.closePopover();
     closeWorkspace(props.ws.id);
   };
+  const menuCloseOthers = () => {
+    if (isLast()) return;
+    menu.closePopover();
+    // Snapshot first: closeWorkspace splices the very array being iterated.
+    // Closing the ACTIVE workspace (when this tab is a background one) is fine
+    // — the store activates a remaining one (this tab).
+    for (const w of workspaces().slice()) {
+      if (w.id !== props.ws.id) closeWorkspace(w.id);
+    }
+  };
+  /** Wrap a menu action: swallow the click at the menu (see above), run it. */
+  const onMenuItem = (run: () => void) => (e: MouseEvent) => {
+    e.stopPropagation();
+    run();
+  };
 
-  // ---- rename via long-press → inline edit ---------------------------------
+  // ---- rename (menu → Rename → inline edit) ---------------------------------
   const [editing, setEditing] = createSignal(false);
   const [draft, setDraft] = createSignal("");
   let inputEl: HTMLInputElement | undefined;
-  let pressTimer: ReturnType<typeof setTimeout> | undefined;
 
   const beginEdit = () => {
     clearPressTimer();
-    setConfirming(false);
-    clearConfirmTimer();
     setDraft(props.ws.name);
     setEditing(true);
     // Focus after the input mounts. queueMicrotask runs after SolidJS renders
@@ -255,65 +306,137 @@ function WorkspaceTab(props: { ws: Workspace }) {
     setEditing(false);
   };
 
-  // Long-press detection: pointerdown arms a timer; if it elapses while still
-  // pressed, enter rename. pointerup/leave/cancel clears an unfired timer so a
-  // quick tap never triggers rename.
-  const onLabelPointerDown = () => {
-    if (editing() || confirming()) return;
-    clearPressTimer();
-    pressTimer = setTimeout(() => {
-      pressTimer = undefined;
-      beginEdit();
-    }, RENAME_PRESS_MS);
-  };
+  // ---- long-press → menu (the old direct-rename gesture, retargeted) --------
+  // pointerdown arms a timer; if MENU_PRESS_MS elapses while still pressed
+  // (and unmoved), the menu opens. pointerup/leave/cancel clears an unfired
+  // timer so a quick tap never triggers it; moving > MENU_PRESS_DRIFT_PX
+  // (scroll intent) cancels it too.
+  let pressTimer: ReturnType<typeof setTimeout> | undefined;
+  let pressX = 0;
+  let pressY = 0;
+  // Set when the long-press timer actually fires; consumed by the tab's click
+  // handler so the release click never ALSO switches the workspace. Reset on
+  // every pointerdown so an unconsumed flag can never swallow a later click.
+  let suppressClick = false;
   const clearPressTimer = () => {
     if (pressTimer) {
       clearTimeout(pressTimer);
       pressTimer = undefined;
     }
   };
-
-  onCleanup(() => {
-    clearConfirmTimer();
+  const onTabPointerDown = (e: PointerEvent) => {
+    suppressClick = false;
+    if (editing() || menu.open()) return;
     clearPressTimer();
-  });
+    pressX = e.clientX;
+    pressY = e.clientY;
+    pressTimer = setTimeout(() => {
+      pressTimer = undefined;
+      // If a contextmenu event already opened it (Android Chrome fires one on
+      // long-press too), this is a duplicate — don't re-place or re-flag.
+      if (menu.open()) return;
+      suppressClick = true;
+      menu.openPopover();
+    }, MENU_PRESS_MS);
+  };
+  const onTabPointerMove = (e: PointerEvent) => {
+    if (!pressTimer) return;
+    if (Math.hypot(e.clientX - pressX, e.clientY - pressY) > MENU_PRESS_DRIFT_PX) {
+      clearPressTimer();
+    }
+  };
+
+  // Right-click (desktop) — and Android Chrome's native long-press — opens the
+  // same menu. preventDefault suppresses the browser's own menu (and the
+  // long-press text-selection callout). While RENAMING, let the native
+  // input menu (cut/copy/paste) through untouched.
+  const onTabContextMenu = (e: MouseEvent) => {
+    if (editing()) return;
+    e.preventDefault();
+    if (!menu.open()) menu.openPopover();
+  };
+
+  onCleanup(clearPressTimer);
 
   return (
     <div
+      ref={tabEl}
       classList={{
         [s.tab]: true,
         [s.tabActive]: active(),
-        [s.tabConfirming]: confirming(),
       }}
       data-testid="ws-tab"
       data-workspace={props.ws.id}
       data-active={active() ? "1" : "0"}
-      data-confirming={confirming() ? "1" : "0"}
       data-editing={editing() ? "1" : "0"}
+      data-menu-open={menu.open() ? "1" : "0"}
       // a11y: the tab was a <button> (focusable, Enter/Space to activate). It is
-      // now a <div> because nested interactive buttons (×/✓/✗) cannot live
-      // inside a <button>. Restore the keyboard + AT semantics explicitly so
-      // workspace-switch + rename remain reachable without a pointer.
+      // now a <div> because it hosts nested interactive elements (the rename
+      // input + the context menu's items). Restore the keyboard + AT semantics
+      // explicitly so workspace-switch + the menu stay reachable without a
+      // pointer. aria-haspopup/expanded advertise the context menu to AT.
       role="tab"
       tabindex={editing() ? -1 : 0}
       aria-selected={active() ? "true" : "false"}
       aria-label={props.ws.name}
-      // Clicking anywhere on the tab (that isn't a nested button or an active
-      // edit/confirm state) switches the workspace. Nested × / ✓ / ✗ buttons
-      // stopPropagation so they never trigger a switch. After a long-press
-      // enters edit mode, editing() is true and the click is suppressed.
+      aria-haspopup="menu"
+      aria-expanded={menu.open() ? "true" : "false"}
+      // Clicking the tab switches the workspace — EXCEPT: the release click
+      // after a fired long-press (menu just opened; consumed), while renaming,
+      // and when this tab's own menu is open (tap-again = toggle it closed).
       onClick={() => {
-        if (editing() || confirming()) return;
+        if (suppressClick) {
+          suppressClick = false;
+          return;
+        }
+        if (editing()) return;
+        if (menu.open()) {
+          menu.closePopover();
+          return;
+        }
         setActiveWorkspace(props.ws.id);
       }}
+      // Right-click / Menu key / Shift+F10 (the browser synthesizes a
+      // contextmenu event for the last two on the focused element).
+      onContextMenu={onTabContextMenu}
+      // Long-press arms the menu timer (see onTabPointerDown). The handlers
+      // live on the WHOLE tab now — the × is gone, so every pixel of the tab
+      // is menu target (the old rename long-press was label-only).
+      onPointerDown={onTabPointerDown}
+      onPointerMove={onTabPointerMove}
+      onPointerUp={clearPressTimer}
+      onPointerLeave={clearPressTimer}
+      onPointerCancel={clearPressTimer}
       onKeyDown={(e) => {
-        if (editing() || confirming()) return;
-        // F2 = the standard rename key (file managers, IDEs): the keyboard
-        // entry into the same inline rename long-press opens, so rename stays
-        // reachable without a pointer.
+        if (editing()) return;
+        // F2 = the standard rename key (file managers, IDEs): it now opens the
+        // menu that CONTAINS Rename (the direct-rename entry is gone). The
+        // keyboard path to a menu ACTION is F2 → Tab (into the items) → Enter;
+        // item activation below must keep its native button behavior.
         if (e.key === "F2") {
           e.preventDefault();
-          beginEdit();
+          menu.togglePopover();
+          return;
+        }
+        // The context-menu keys (Menu key, Shift+F10). Browsers synthesize a
+        // contextmenu event for these on the focused element — but not
+        // uniformly (Firefox's dispatched Shift+F10 produces no contextmenu),
+        // so handle the keys directly and let onTabContextMenu's open-guard
+        // dedupe when the browser ALSO synthesizes the event.
+        if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+          e.preventDefault();
+          if (!menu.open()) menu.openPopover();
+          return;
+        }
+        if (menu.open()) {
+          // Menu open: an Enter/Space on the TAB ITSELF must not fall through
+          // to the workspace-switch branch (the early return already covers
+          // it — no preventDefault needed: the tab div has no native Enter
+          // default, and an UNCONDITIONAL one would swallow the keydowns that
+          // bubble here from the focused MENU ITEMS (buttons are DOM children
+          // of this tab), killing their native Enter/Space activation — found
+          // by commit-review). The items are the next Tab stops; Escape closes
+          // via the surface stack.
           return;
         }
         if (e.key === "Enter" || e.key === " ") {
@@ -325,21 +448,10 @@ function WorkspaceTab(props: { ws: Workspace }) {
       <Show
         when={editing()}
         fallback={
-          <Show
-            when={confirming()}
-            fallback={
-              <>
-                <span
-                  class={s.tabLabel}
-                  data-testid="ws-tab-label"
-                  title={props.ws.name}
-                  onPointerDown={onLabelPointerDown}
-                  onPointerUp={clearPressTimer}
-                  onPointerLeave={clearPressTimer}
-                  onPointerCancel={clearPressTimer}
-                >
-                  {props.ws.name}
-                </span>
+          <>
+            <span class={s.tabLabel} data-testid="ws-tab-label" title={props.ws.name}>
+              {props.ws.name}
+            </span>
                 {/* TAB-PAIRS badges: per-pane micro-badge groups — a NEUTRAL
                     "running" badge + an ACCENT "unread" badge per pane,
                     nonzero counts only. A sibling of the (possibly
@@ -393,12 +505,6 @@ function WorkspaceTab(props: { ws: Workspace }) {
                 </Show>
               </>
             }
-          >
-            <span class={s.tabConfirmLabel} title="Confirm delete?">
-              Delete?
-            </span>
-          </Show>
-        }
       >
         <input
           ref={inputEl}
@@ -438,60 +544,57 @@ function WorkspaceTab(props: { ws: Workspace }) {
         </span>
       </Show>
 
-      {/* Delete affordance. When NOT confirming: a single × (disabled on the
-          last ws). When confirming: a ✓ confirm + a ✗ cancel, replacing the ×. */}
-      <Show
-        when={confirming()}
-        fallback={
-          <Show when={!editing()}>
-            <button
-              type="button"
-              class={s.tabDel}
-              data-testid="ws-delete"
-              data-workspace={props.ws.id}
-              disabled={isLast()}
-              title={
-                isLast()
-                  ? "Can't delete the last workspace"
-                  : `Delete "${props.ws.name}"`
-              }
-              // stopPropagation so the tap never also switches the workspace.
-              onClick={(e) => {
-                e.stopPropagation();
-                startConfirm();
-              }}
-            >
-              ×
-            </button>
-          </Show>
-        }
-      >
-        <button
-          type="button"
-          class={s.tabDelConfirm}
-          data-testid="ws-delete-confirm"
+      {/* Tab CONTEXT MENU (right-click / long-press / F2). A child of the tab
+          (the surface-stack anchor) but position:fixed — it escapes the .tabs
+          overflow clip; coords are set in onOpen (placeMenu). role="menu" +
+          menuitem mirror the Settings popover pattern. The Close pair is
+          aria-disabled (NOT native-disabled) on the last workspace so
+          keyboard/AT users can still discover the entries; activation is a
+          full no-op then. Plain bg/border/shadow only — GPU-cheap, static. */}
+      <Show when={menu.open()}>
+        <div
+          class={s.tabMenu}
+          style={{ left: `${menuPos().left}px`, top: `${menuPos().top}px` }}
+          role="menu"
+          data-testid="ws-tab-menu"
           data-workspace={props.ws.id}
-          title="Confirm delete"
-          onClick={(e) => {
-            e.stopPropagation();
-            confirmDelete();
-          }}
+          aria-label={`Workspace menu: ${props.ws.name}`}
         >
-          ✓
-        </button>
-        <button
-          type="button"
-          class={s.tabDelCancel}
-          data-testid="ws-delete-cancel"
-          data-workspace={props.ws.id}
-          title="Cancel"
-          onClick={(e) => {
-            e.stopPropagation();
-            cancelConfirm();
-          }}
-        >
-          ✕
-        </button>
+          <button
+            type="button"
+            class={s.tabMenuItem}
+            data-testid="ws-menu-rename"
+            data-workspace={props.ws.id}
+            role="menuitem"
+            onClick={onMenuItem(menuRename)}
+          >
+            Rename
+          </button>
+          <button
+            type="button"
+            classList={{ [s.tabMenuItem]: true, [s.tabMenuItemDisabled]: isLast() }}
+            data-testid="ws-menu-close"
+            data-workspace={props.ws.id}
+            role="menuitem"
+            aria-disabled={isLast() ? "true" : undefined}
+            title={isLast() ? "Can't close the last workspace" : `Close "${props.ws.name}"`}
+            onClick={onMenuItem(menuClose)}
+          >
+            Close
+          </button>
+          <button
+            type="button"
+            classList={{ [s.tabMenuItem]: true, [s.tabMenuItemDisabled]: isLast() }}
+            data-testid="ws-menu-close-others"
+            data-workspace={props.ws.id}
+            role="menuitem"
+            aria-disabled={isLast() ? "true" : undefined}
+            title={isLast() ? "Only one workspace" : `Close every workspace except "${props.ws.name}"`}
+            onClick={onMenuItem(menuCloseOthers)}
+          >
+            Close others
+          </button>
+        </div>
       </Show>
     </div>
   );

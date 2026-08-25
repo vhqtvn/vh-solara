@@ -434,8 +434,10 @@ test.describe("tab-pairs badges (per-pane running/unread micro-badges in the wor
       const tabs = document.querySelector('[data-testid="ws-tabs"]') as HTMLElement | null;
       const runEl = document.querySelector('[data-testid="ws-tab-pairs"]') as HTMLElement | null;
       const badge = runEl?.querySelector("[data-kind]") as HTMLElement | null;
+      const unread = runEl?.querySelector('[data-kind="unread"]') as HTMLElement | null;
       const box = runEl?.getBoundingClientRect();
       const badgeBox = badge?.getBoundingClientRect();
+      const unreadBox = unread?.getBoundingClientRect();
       const vw = window.innerWidth;
       const clipRight = tabs ? tabs.getBoundingClientRect().right : vw;
       // The badges are VISUALLY visible at scroll position 0 only if their
@@ -450,6 +452,7 @@ test.describe("tab-pairs badges (per-pane running/unread micro-badges in the wor
         runWidth: box ? Math.round(box.width) : 0,
         badgeWidth: badgeBox ? Math.round(badgeBox.width) : 0,
         badgeHeight: badgeBox ? Math.round(badgeBox.height) : 0,
+        unreadWidth: unreadBox ? Math.round(unreadBox.width) : 0,
         badgesVisibleAtScroll0: !!box && box.right <= clipRight && box.left >= 0,
       };
     });
@@ -458,8 +461,15 @@ test.describe("tab-pairs badges (per-pane running/unread micro-badges in the wor
       JSON.stringify(geom, null, 2) + "\n",
     );
     expect(geom.runWidth).toBeGreaterThan(0);
-    // Badge stays at legible size at 360px (never shrunk below the 15px base).
+    // Badge stays at legible size at 360px (the 15px pill height is kept).
     expect(geom.badgeHeight).toBeGreaterThanOrEqual(14);
+    // PILL COMPACTION (the circle→pill slice): a single-digit badge used to be
+    // a 15px-min-width circle (as wide as tall by construction). The compact
+    // pill (4px radius, 3px horizontal padding, NO min-width) hugs its number:
+    // a single-digit unread badge is now strictly narrower than the old 15px
+    // floor. Shape change asserted from GEOMETRY, not CSS text.
+    expect(geom.unreadWidth).toBeLessThan(15);
+    expect(geom.badgeWidth).toBeLessThanOrEqual(geom.badgeHeight);
     // Scrollable overflow is the tabstrip's designed narrow behavior (the
     // row scrolls horizontally rather than ellipsizing the badges). Prove the
     // reveal: scroll the tab row to its end and the badge run becomes visible
