@@ -87,20 +87,64 @@
   border-color: var(--accent);
   color: var(--fg);
 }
-/* TAB-PAIRS: the ordered per-pane (running|unread) run inside a workspace tab
- * label — e.g. "Workspace 1 (2|0)(0|3)". Slightly dimmed vs the name so the
- * name stays primary; tabular numerals keep digits width-stable (no jitter as
- * counts tick); nowrap + flex-shrink 0 so a pair is NEVER ellipsized — on
- * overflow the .tabs row scrolls horizontally instead. GPU-cheap static text
- * (no mask/backdrop-filter/animation — AGENTS.md Firefox/WebRender rules). */
+/* TAB-PAIRS badges: per-pane micro-badge groups inside a workspace tab label —
+ * e.g. "Workspace 1 [2][3]" where [2] is a neutral running badge and [3] an
+ * accent unread badge. Replaces the raw "(2|0)(0|3)" text run (operator
+ * directive: design better UI/UX — the pair notation was annotation, not UI).
+ * Structure: .tabPairs (the run) > .paneBadges (one group per NONZERO pane,
+ * gap between panes) > up to two .countBadge variants (tight gap within a
+ * pane). Static colors only, NO animation (GPU rules — these update live and
+ * any pulse would be noisy; AGENTS.md Firefox/WebRender). nowrap +
+ * flex-shrink 0 so badges are NEVER ellipsized — on overflow the .tabs row
+ * scrolls horizontally instead. */
 .tabPairs {
-  font-size: 11px;
-  font-weight: 500;
-  font-variant-numeric: tabular-nums;
-  color: var(--fg-dim);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   white-space: nowrap;
   flex: 0 0 auto;
-  letter-spacing: 0.01em;
+}
+.paneBadges {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+/* Badge base (REVERSIBLE DEFAULT — size): 15px circle for one digit, pill
+ * (border-radius 999px + padding) for "9+". One notch below the 16px amber
+ * needs-you badge so the demand-signal stays visually dominant. 10px/600 with
+ * tabular numerals keeps digits width-stable (no jitter as counts tick).
+ * Alternative (flip): 16px matching needBadge exactly, or 14px denser. */
+.countBadge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+/* COLOR ASSIGNMENT (REVERSIBLE DEFAULT): running = NEUTRAL (secondary fg on a
+ * subtle elevated bg + border — ambient information, not a demand); unread =
+ * ACCENT blue (--accent, distinct from the amber --warn needs-you badge; the
+ * host's accent is blue so no token clash). Alternative (flip): green --good
+ * for running — but green reads as "healthy/done", wrong for in-flight work,
+ * and a second saturated color would crowd the tab. */
+.badgeRunning {
+  composes: countBadge;
+  background: var(--bg-elev);
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+}
+.badgeUnread {
+  composes: countBadge;
+  background: var(--accent);
+  color: var(--bg);
 }
 /* Two-step delete confirm state. GPU-cheap: a slow opacity pulse ONLY (no
  * mask-image / backdrop-filter — AGENTS.md Firefox/WebRender rules). Honored

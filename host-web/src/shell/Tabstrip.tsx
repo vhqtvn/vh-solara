@@ -71,13 +71,36 @@ const DELETE_CONFIRM_MS = 3500;
 
 /**
  * TAB-PAIRS display cap (REVERSIBLE DEFAULT). A count of 10 or more renders as
- * the fixed-width "9+" instead of its full integer, keeping every pair a tight
+ * the fixed-width "9+" instead of its full integer, keeping every badge a tight
  * constant-width token even on a heavily-loaded dir. Alternative (flip): render
  * the raw integer — denser information, wider/shifting tabs. The SPA sends the
- * TRUE integer; the cap is host-side display formatting only.
+ * TRUE integer; the cap is host-side display formatting only (the badge's
+ * data-count attribute always carries the true integer).
  */
 function fmtCount(n: number): string {
   return n >= 10 ? "9+" : String(n);
+}
+
+/** A pair renders iff at least one of its counts is nonzero. */
+function isNonzero(p: { running: number; unread: number }): boolean {
+  return p.running > 0 || p.unread > 0;
+}
+
+/**
+ * TAB-PAIRS human label (REVERSIBLE DEFAULT): the badge run's title/aria-label
+ * in aggregate human words — "2 running, 3 unread" — never pair notation (the
+ * operator reads "(X|Y)" as noise; the numbers are the signal). Aggregated
+ * across panes because the per-pane split is already visible as badge groups.
+ * Alternative (flip): a per-pane breakdown ("pane 1: 2 running; …") — more
+ * precise, but noisy for the common 1-2-pane workspace.
+ */
+function pairsLabel(pairs: { running: number; unread: number }[]): string {
+  const running = pairs.reduce((n, p) => n + p.running, 0);
+  const unread = pairs.reduce((n, p) => n + p.unread, 0);
+  const parts: string[] = [];
+  if (running > 0) parts.push(`${running} running`);
+  if (unread > 0) parts.push(`${unread} unread`);
+  return parts.join(", ");
 }
 
 export function Tabstrip() {
@@ -154,17 +177,22 @@ function WorkspaceTab(props: { ws: Workspace }) {
   // The × is disabled when this is the last remaining workspace (never zero).
   const isLast = () => workspaces().length <= 1;
 
-  // ---- TAB-PAIRS: per-pane (running|unread) inside the tab label ------------
+  // ---- TAB-PAIRS: per-pane (running|unread) micro-badges in the tab label ----
   // One pair per pane, in the workspace's live serialized panel order (stable
-  // across reload). ZERO-PAIR FORK (REVERSIBLE DEFAULT): when ANY pair is
-  // nonzero we render EVERY pair — including (0|0) — so each pane's position in
-  // the run is stable and the operator can correlate pair i ↔ pane i; when ALL
-  // pairs are zero we render nothing after the name (a quiet workspace reads as
-  // a bare label). Alternative (flip): hide individual zero pairs — denser, but
-  // the run shifts as counts change, breaking the position↔pane correlation.
-  // A pane whose status has not landed yet contributes (0|0).
+  // across reload). NONZERO-ONLY BADGES (REVERSIBLE DEFAULT — the badge-UI
+  // redesign flipped the old rule): only panes with a nonzero count render a
+  // badge group at all — a (0|0) pane renders NOTHING (the old text run
+  // rendered every pair incl (0|0) once any pair was nonzero). Pane↔group
+  // association is preserved by data-pane-index (the pane's index in the live
+  // panel order), not by visual position. When ALL pairs are zero we render
+  // nothing after the name (a quiet workspace reads as a bare label —
+  // unchanged). A pane whose status has not landed yet contributes (0|0).
   const pairs = () => statusPairsFor(props.ws.id);
   const showPairs = () => pairs().some((p) => p.running > 0 || p.unread > 0);
+  // Machine-readable mirror of the FULL pair run (incl zero pairs, incl the
+  // 9+ cap) — the derivation-contract surface e2e asserts against
+  // (pair[i] === the status pane[i] reported). The badge DOM is presentation;
+  // this attribute is the data.
   const pairsText = () => pairs().map((p) => `(${fmtCount(p.running)}|${fmtCount(p.unread)})`).join("");
 
   // ---- delete two-step confirm ---------------------------------------------
@@ -312,21 +340,55 @@ function WorkspaceTab(props: { ws: Workspace }) {
                 >
                   {props.ws.name}
                 </span>
-                {/* TAB-PAIRS: the ordered per-pane (running|unread) run, a
-                    sibling of the (possibly ellipsized) name span so the pairs
-                    themselves are NEVER truncated — on overflow the tabstrip's
-                    .tabs row scrolls horizontally instead (measured behavior,
-                    not silent clipping). data-pairs mirrors the exact rendered
-                    run for deterministic e2e/vision assertions. */}
+                {/* TAB-PAIRS badges: per-pane micro-badge groups — a NEUTRAL
+                    "running" badge + an ACCENT "unread" badge per pane,
+                    nonzero counts only. A sibling of the (possibly
+                    ellipsized) name span so the badges are NEVER truncated —
+                    on overflow the tabstrip's .tabs row scrolls horizontally
+                    instead (measured behavior, not silent clipping).
+                    data-pairs mirrors the full pair run (incl zeros) for
+                    deterministic e2e/vision assertions; each badge carries
+                    data-kind + data-count (the TRUE integer — the 9+ cap is
+                    display text only). role="img" + aria-label give AT the
+                    human-words summary ("2 running, 3 unread"). */}
                 <Show when={showPairs()}>
                   <span
                     class={s.tabPairs}
                     data-testid="ws-tab-pairs"
                     data-workspace={props.ws.id}
                     data-pairs={pairsText()}
-                    title={`${pairs().length} pane${pairs().length === 1 ? "" : "s"} — per pane: (running|unread)`}
+                    role="img"
+                    aria-label={pairsLabel(pairs())}
+                    title={pairsLabel(pairs())}
                   >
-                    {pairsText()}
+                    <For each={pairs()}>
+                      {(p, i) => (
+                        <Show when={isNonzero(p)}>
+                          <span class={s.paneBadges} data-pane-index={i()}>
+                            <Show when={p.running > 0}>
+                              <span
+                                class={s.badgeRunning}
+                                data-kind="running"
+                                data-count={p.running}
+                                title={`${p.running} running`}
+                              >
+                                {fmtCount(p.running)}
+                              </span>
+                            </Show>
+                            <Show when={p.unread > 0}>
+                              <span
+                                class={s.badgeUnread}
+                                data-kind="unread"
+                                data-count={p.unread}
+                                title={`${p.unread} unread`}
+                              >
+                                {fmtCount(p.unread)}
+                              </span>
+                            </Show>
+                          </span>
+                        </Show>
+                      )}
+                    </For>
                   </span>
                 </Show>
               </>
