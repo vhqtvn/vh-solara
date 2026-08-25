@@ -24,15 +24,17 @@
 // the Q1-C liveness indicator. Survival is unchanged.
 //
 // TAB-PAIRS EXTENSION: the same message also carries `runningCount` +
-// `unreadCount` — per-pane aggregates over the dir's whole session tree (see
+// `unreadCount` — per-pane aggregates over the dir's ROOT sessions ONLY
+// (operator directive: subsessions never inflate the pair — see
 // derivePaneCounts). The host renders them as the workspace tab's (X|Y) pair
 // for this pane. Cross-device by construction: both numbers derive ONLY from
-// server-authoritative state (the activity map + the root-scoped unread
-// watermark), which the tree stream keeps identical on every connected device.
+// server-authoritative state (the activity map + tree facets + the root-scoped
+// unread watermark), which the tree stream keeps identical on every connected
+// device.
 
 import { isEmbedded } from "./embedded";
 import { state } from "./sync/store";
-import { rootOf, sessionWorking, isActivityWorking } from "./sync/selectors";
+import { rootOf, sessionWorking } from "./sync/selectors";
 import { chatTailFollowing } from "./tailFollow";
 
 // Attention is emit-on-change, not a latency-critical cursor: 1 Hz is the right
@@ -60,12 +62,15 @@ export interface StatusMessage {
    */
   following: boolean;
   /**
-   * PER-PANE AGGREGATE (tab-pairs): number of RUNNING sessions in this pane's
-   * project dir — sessions in the dir's tree whose own activity is busy|retry
-   * (NOT subtreeBusy: the busy descendant counts itself, so a parent+child both
-   * working read as 2 running sessions; idle/error never count). Derived from
-   * the same server-authoritative store maps the tree renders from, so every
-   * device derives the SAME number by construction (no host-side storage).
+   * PER-PANE AGGREGATE (tab-pairs): number of RUNNING ROOT sessions in this
+   * pane's project dir — ROOT sessions only (operator directive: subsessions
+   * never inflate the count), where "running" is the sessionWorking() rollup:
+   * the root's own activity is busy|retry OR the server-computed subtreeBusy
+   * facet is set (a streaming subsession keeps its root "working" — the SAME
+   * predicate the sidebar's per-session indicator uses, so a root counts ONCE
+   * whether it or a subsession is streaming). Derived from the same
+   * server-authoritative store maps the tree renders from, so every device
+   * derives the SAME number by construction (no host-side storage).
    * Closed integer field: always a non-negative integer (0 before the
    * authoritative tree snapshot lands — the counts grow as data lands, exactly
    * like every other store-derived field on a cold load). Part of the
@@ -73,13 +78,14 @@ export interface StatusMessage {
    */
   runningCount: number;
   /**
-   * PER-PANE AGGREGATE (tab-pairs): number of UNREAD sessions in this pane's
-   * project dir — DISTINCT roots r in the dir's tree with unread[r] === true
-   * (unread is ROOT-scoped server-side; subsessions under an unread root count
-   * ONCE). Cross-device by construction: the server tracks the watermark, the
-   * tree stream carries unread.set/clear continuously, and selecting the
-   * session anywhere acks it (actions.setSelectedId → ackSession → POST
-   * /vh/ack). Closed non-negative integer; part of the idempotence key.
+   * PER-PANE AGGREGATE (tab-pairs): number of UNREAD ROOT sessions in this
+   * pane's project dir — roots r in the dir's tree with unread[r] === true
+   * (unread is ROOT-scoped server-side; a root's subsessions share its
+   * watermark and never add to the count). Cross-device by construction: the
+   * server tracks the watermark, the tree stream carries unread.set/clear
+   * continuously, and selecting the session anywhere acks it
+   * (actions.setSelectedId → ackSession → POST /vh/ack). Closed non-negative
+   * integer; part of the idempotence key.
    */
   unreadCount: number;
 }
@@ -87,21 +93,36 @@ export interface StatusMessage {
 /**
  * Per-pane scope aggregates for the status message. A pane = one SPA = one
  * server + one selected dir; `state.sessions` holds exactly that dir's session
- * tree (reset to {} on every switchProject), so iterating its keys IS "over the
- * dir's full session tree". running counts sessions whose OWN activity is
- * busy|retry (idle/error never); unread counts DISTINCT unread roots (a root's
- * subsessions share the root's watermark — no double count). Exported for unit
- * tests; the emitter calls it per tick.
+ * tree (reset to {} on every switchProject). ROOT GRANULARITY (operator
+ * directive: "we dont need these counts" for subsessions): both counts
+ * enumerate ROOT sessions ONLY — a session whose parentID is absent or whose
+ * parent is not resident (the same predicate `rootOf` walks to, enumerated in
+ * one pass instead of per-session walks). running counts roots where
+ * sessionWorking() holds (own busy|retry OR the server-computed subtreeBusy
+ * rollup); unread counts roots carrying the root-scoped unread watermark.
+ * Exported for unit tests; the emitter calls it per tick.
  */
 export function derivePaneCounts(): { runningCount: number; unreadCount: number } {
   let runningCount = 0;
-  const unreadRoots = new Set<string>();
+  let unreadCount = 0;
   for (const id of Object.keys(state.sessions)) {
-    if (isActivityWorking(state.activity[id])) runningCount++;
-    const root = rootOf(id);
-    if (state.unread[root]) unreadRoots.add(root);
+    // Root filter (operator granularity): a subsession is represented by its
+    // root's pair — skip any session whose parent is resident in the tree.
+    const p = state.sessions[id]?.parentID;
+    if (p && state.sessions[p]) continue;
+    // REVERSIBLE DEFAULT (flagged for the operator): X uses the
+    // sessionWorking() ROLLUP — own busy|retry OR the server-computed
+    // subtreeBusy facet — the SAME predicate the sidebar's per-session working
+    // indicator uses, so a root with a streaming subsession still counts as
+    // running. The stricter alternative (the root's OWN activity only, so an
+    // idle root + busy subsession reads 0) is a one-line change: swap
+    // `sessionWorking(id)` for `isActivityWorking(state.activity[id])`.
+    if (sessionWorking(id)) runningCount++;
+    // unread is root-scoped server-side, so iterating roots directly needs no
+    // descendant de-dup: the root's own watermark IS the pane's count.
+    if (state.unread[id]) unreadCount++;
   }
-  return { runningCount, unreadCount: unreadRoots.size };
+  return { runningCount, unreadCount };
 }
 
 /**

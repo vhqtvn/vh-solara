@@ -15,6 +15,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { reconcile } from "solid-js/store";
 import { setState } from "../../src/sync/store";
+import { seedTreeStore, resetTreeStore } from "../../src/sync/treeState";
+import type { TreeNode } from "../../src/sync/treeMap";
 import { startStatusEmitter, derivePaneCounts } from "../../src/statusEmitter";
 import { bindChatTail } from "../../src/tailFollow";
 
@@ -68,6 +70,35 @@ function resetStore(): void {
   setState("questions", reconcile({}));
   setState("unread", reconcile({}));
   setState("authoritativeReady", false);
+  // The tree flat map is a module singleton (the subtreeBusy rollup source);
+  // reset it so a seeded facet never bleeds across cases.
+  resetTreeStore();
+}
+
+// A minimal tree node for the subtreeBusy rollup tests (same inert-defaults
+// shape as childrenIndex.test.ts's tNode — only activity + flags matter to
+// sessionWorking).
+function tNode(
+  id: string,
+  opts?: { parentId?: string | null; activity?: string; subtreeBusy?: boolean },
+): TreeNode {
+  return {
+    id,
+    parentId: opts?.parentId ?? null,
+    title: id,
+    activity: (opts?.activity ?? "idle") as TreeNode["activity"],
+    childCount: 0,
+    loaded: false,
+    flags: {
+      pendingInput: false,
+      subtreeNeedsInput: false,
+      subtreeBusy: opts?.subtreeBusy,
+      permission: false,
+      archived: false,
+      orphan: false,
+    },
+    updatedMs: 0,
+  };
 }
 
 function resident(title = ""): void {
@@ -418,17 +449,27 @@ describe("status emitter — derivation + emission (embedded)", () => {
   });
 
   // ---- TAB-PAIRS: per-pane aggregates (runningCount + unreadCount) ---------
-  // Derivation contract: running = sessions in the dir tree whose OWN activity
-  // is busy|retry (idle/error never count); unread = DISTINCT roots carrying
-  // the server watermark (subsessions share the root — no double count). Both
-  // derive from server-authoritative store maps ONLY, which is what makes the
-  // host-rendered (X|Y) identical across devices by construction.
+  // Derivation contract (ROOT GRANULARITY, operator directive — subsessions
+  // never inflate the pair): running = ROOT sessions where sessionWorking()
+  // holds (own busy|retry OR the server-computed subtreeBusy rollup — the same
+  // predicate the sidebar's working indicator uses); unread = ROOT sessions
+  // carrying the server watermark. Both derive from server-authoritative store
+  // maps ONLY, which is what makes the host-rendered (X|Y) identical across
+  // devices by construction.
 
   it("derivePaneCounts: empty dir → 0/0", () => {
     expect(derivePaneCounts()).toEqual({ runningCount: 0, unreadCount: 0 });
   });
 
-  it("derivePaneCounts: running counts busy+retry, not idle/error", () => {
+  it("derivePaneCounts: all idle (root + subsession) → 0/0", () => {
+    setState("sessions", "r", { id: "r" });
+    setState("sessions", "c", { id: "c", parentID: "r" });
+    setState("activity", "r", "idle");
+    setState("activity", "c", "idle");
+    expect(derivePaneCounts()).toEqual({ runningCount: 0, unreadCount: 0 });
+  });
+
+  it("derivePaneCounts: running counts busy+retry ROOTS, not idle/error (two busy roots → X=2)", () => {
     setState("sessions", "a", { id: "a" });
     setState("sessions", "b", { id: "b" });
     setState("sessions", "c", { id: "c" });
@@ -437,11 +478,42 @@ describe("status emitter — derivation + emission (embedded)", () => {
     setState("activity", "b", "retry");
     setState("activity", "c", "idle");
     setState("activity", "d", "error");
-    expect(derivePaneCounts().runningCount, "busy+retry only").toBe(2);
+    expect(derivePaneCounts().runningCount, "busy+retry roots only").toBe(2);
     expect(derivePaneCounts().unreadCount, "no unread roots").toBe(0);
   });
 
-  it("derivePaneCounts: unread counts DISTINCT roots once (no subsession double-count)", () => {
+  it("derivePaneCounts: busy root + busy subsession → X=1 (root granularity; was 2)", () => {
+    // The operator directive: a subsession's own activity must NOT add a
+    // second count on top of its root.
+    setState("sessions", "r", { id: "r" });
+    setState("sessions", "c", { id: "c", parentID: "r" });
+    setState("activity", "r", "busy");
+    setState("activity", "c", "busy");
+    expect(derivePaneCounts().runningCount, "root+sub both busy → ONE running root").toBe(1);
+  });
+
+  it("derivePaneCounts: idle root + busy subsession → X=1 via the subtreeBusy rollup (chosen default)", () => {
+    // PIN THE ROLLUP DEFAULT: the root's OWN activity is idle; the server
+    // rolls its busy descendant up into flags.subtreeBusy on the root (the
+    // same facet the sidebar indicator trusts), and sessionWorking() ORs it
+    // in — so the root still counts as running. The stricter own-activity-only
+    // reading would report 0 here (see the REVERSIBLE DEFAULT note in
+    // derivePaneCounts).
+    setState("sessions", "r", { id: "r" });
+    setState("sessions", "c", { id: "c", parentID: "r" });
+    setState("activity", "c", "busy");
+    // Before the tree facet lands, the count never walks children itself
+    // (sessionWorking's self-only fallback) → the honest interim value is 0.
+    expect(derivePaneCounts().runningCount, "no facet yet → no client-side subtree walk").toBe(0);
+    // The tree snapshot lands carrying the server-computed rollup → X=1.
+    seedTreeStore([
+      tNode("r", { subtreeBusy: true }),
+      tNode("c", { parentId: "r", activity: "busy" }),
+    ]);
+    expect(derivePaneCounts().runningCount, "rollup: busy sub keeps root working").toBe(1);
+  });
+
+  it("derivePaneCounts: unread counts the unread ROOT once (subsessions never add)", () => {
     // Tree: root r → children c1, c2; separate root s. Only r is unread.
     setState("sessions", "r", { id: "r" });
     setState("sessions", "c1", { id: "c1", parentID: "r" });
@@ -450,9 +522,11 @@ describe("status emitter — derivation + emission (embedded)", () => {
     setState("unread", "r", true);
     expect(derivePaneCounts().unreadCount, "3 sessions under one unread root → 1").toBe(1);
     expect(derivePaneCounts().runningCount).toBe(0);
-    // A busy SUBSESSION counts as a running session (own activity).
+    // A busy SUBSESSION alone does NOT count as running either (root r's own
+    // activity is idle and no subtreeBusy facet is seeded — root granularity
+    // means the pair speaks only for roots).
     setState("activity", "c1", "busy");
-    expect(derivePaneCounts().runningCount).toBe(1);
+    expect(derivePaneCounts().runningCount, "busy subsession alone does not count").toBe(0);
   });
 
   it("carries runningCount + unreadCount on the emitted status", () => {
