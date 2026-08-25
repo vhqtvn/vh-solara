@@ -1,5 +1,11 @@
 import { For, Show } from "solid-js";
 import { autoTransposeOn, setAutoTranspose } from "../viewportShape";
+import {
+  attentionNotifyHint,
+  attentionNotifyOn,
+  requestEnableAttentionNotify,
+  setAttentionNotifyEnabled,
+} from "../attentionNotify";
 import { focusedId, hostOps } from "../dockview/store";
 import { TABSTRIP_POPOVER_GROUP, usePopoverSurface } from "./popover";
 import s from "./Settings.module.css";
@@ -63,7 +69,7 @@ interface ActionItem {
 }
 
 /** A boolean menu entry (aria-checked checkbox semantics). `isOn` is read
- *  reactively (a Solid signal accessor) so the checkmark tracks the state. */
+ * reactively (a Solid signal accessor) so the checkmark tracks the state. */
 interface ToggleItem {
   kind: "toggle";
   testid: string;
@@ -71,6 +77,10 @@ interface ToggleItem {
   description: string;
   isOn(): boolean;
   set(on: boolean): void;
+  /** Optional reactive inline hint rendered under the description when
+   *  non-null (e.g. a permission denial explaining how to unblock). Reads a
+   *  signal accessor so it appears/disappears live while the popover is open. */
+  hint?(): string | null;
 }
 
 type MenuItem = ActionItem | ToggleItem;
@@ -126,6 +136,26 @@ export function Settings() {
       description: "Flip split orientation when the viewport rotates.",
       isOn: () => autoTransposeOn(),
       set: (v) => setAutoTranspose(v),
+    },
+    {
+      // Needs-you notifications (attentionNotify.ts). OPT-IN: absent key =
+      // OFF. Enabling goes through requestEnableAttentionNotify() so the
+      // permission prompt (if any) fires from THIS click's user gesture; a
+      // denied/declined grant leaves the toggle off + surfaces `hint` (an
+      // inline line under the description, live while the popover is open).
+      // The checkmark tracks attentionNotifyOn() — the reactive mirror, which
+      // flips only when a grant actually landed (possibly a tick after the
+      // click, since requestPermission is async).
+      kind: "toggle",
+      testid: "settings-notify",
+      label: "Needs-you notifications",
+      description: "OS notification when a session needs you (opt-in).",
+      isOn: () => attentionNotifyOn(),
+      set: (v) => {
+        if (v) void requestEnableAttentionNotify();
+        else setAttentionNotifyEnabled(false);
+      },
+      hint: () => attentionNotifyHint(),
     },
   ];
 
@@ -190,6 +220,18 @@ export function Settings() {
                   <span class={s.itemText}>
                     <span class={s.itemLabel}>{item.label}</span>
                     <span class={s.itemDesc}>{item.description}</span>
+                    {/* Optional live hint line (permission denial guidance).
+                        Called in the JSX expression so SolidJS tracks the
+                        hint signal while the popover is open. */}
+                    {item.kind === "toggle" && item.hint ? (
+                      <Show when={item.hint()} keyed>
+                        {(h) => (
+                          <span class={s.itemHint} data-testid={`${item.testid}-hint`}>
+                            {h}
+                          </span>
+                        )}
+                      </Show>
+                    ) : null}
                   </span>
                   {item.kind === "toggle" ? (
                     /* Cheap checkbox affordance: a bordered square with a ✓

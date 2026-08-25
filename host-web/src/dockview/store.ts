@@ -433,7 +433,12 @@ const [pairsByWs, setPairsByWs] = createSignal<Record<string, { running: number;
 // matching pane element imperatively (see shell/LayoutOverlay.tsx).
 const [overlaySourcePaneId, setOverlaySourcePaneId] = createSignal<string | null>(null);
 
-export { panes, focusedId, trayIds, isMaximized, connected, needsYouCount, runningCount, overlaySourcePaneId };
+// ATTENTION-NOTIFY: needsYouByWs is exported as the REACTIVE re-evaluation
+// trigger for the needs-you notification manager (attentionNotify.ts). It is
+// recomputed (fresh object → the signal always notifies) on EVERY status
+// store, pane-list change, unregister, and workspace close — exactly the
+// change set that can alter the global needy set.
+export { panes, focusedId, trayIds, isMaximized, connected, needsYouCount, runningCount, overlaySourcePaneId, needsYouByWs };
 
 /** Needs-you count for a SPECIFIC workspace (its panes whose attention is
  * needs_permission or needs_reply). Reactive: tracks needsYouByWs(). Returns 0

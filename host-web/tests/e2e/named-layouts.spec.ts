@@ -740,9 +740,12 @@ test.describe("named layouts", () => {
     await expect(editItem).toHaveText(/Edit layout…/);
     await expect(editItem).not.toHaveText(/Layout…/);
     await expect(page.locator('[data-testid="settings-layouts"]')).toHaveCount(0);
-    // The menu is exactly: Edit layout…, Reload page, Auto-rotate layout.
+    // The menu is exactly: Edit layout…, Reload page, Auto-rotate layout,
+    // Needs-you notifications (the attention-notify opt-in toggle — the second
+    // menuitemcheckbox, added by the needs-you notifications slice).
     await expect(page.locator('[data-testid="settings-popover"] [role="menuitem"]')).toHaveCount(2);
-    await expect(page.locator('[data-testid="settings-popover"] [role="menuitemcheckbox"]')).toHaveCount(1);
+    await expect(page.locator('[data-testid="settings-popover"] [role="menuitemcheckbox"]')).toHaveCount(2);
+    await expect(page.locator('[data-testid="settings-notify"]')).toHaveText(/Needs-you notifications/);
     await page.keyboard.press("Escape");
 
     // The tabstrip Layouts button opens the new popover.

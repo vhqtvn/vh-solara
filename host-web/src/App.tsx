@@ -16,6 +16,10 @@ import {
   uninstallKeyboardFocus,
 } from "./keyboardFocus";
 import { installAutoTranspose, uninstallAutoTranspose } from "./viewportShape";
+import {
+  installAttentionNotify,
+  uninstallAttentionNotify,
+} from "./attentionNotify";
 import { installProportionsDevBridge } from "./dockview/proportions";
 import s from "./App.module.css";
 
@@ -79,10 +83,17 @@ export function App() {
     // Page-level singleton, DEV-gated, idempotent — no uninstall needed
     // (mirrors window.__host's page-lifetime install).
     installProportionsDevBridge();
+    // Needs-you notifications (attentionNotify.ts): OS notifications when a
+    // pane's session needs the operator. Opt-in (Settings toggle; default
+    // OFF), alive-tab semantics, SW-based show/cleanup + app-badge. Self-
+    // contained reactive evaluation + visibilitychange listener + DEV bridge;
+    // cleanup below.
+    installAttentionNotify();
   });
   onCleanup(() => {
     uninstallKeyboardFocus();
     uninstallAutoTranspose();
+    uninstallAttentionNotify();
   });
 
   // While the keyboard is open and the operator switches workspace, re-point

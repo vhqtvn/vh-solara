@@ -75,6 +75,13 @@
   color: var(--fg-dim);
   line-height: 1.35;
 }
+/* Live inline hint under a toggle's description (e.g. notification permission
+ * denial guidance). Warn-tinted so it reads as actionable; GPU-cheap. */
+.itemHint {
+  font-size: 10px;
+  color: var(--warn);
+  line-height: 1.35;
+}
 /* Checkbox affordance for toggle items (menuitemcheckbox). A bordered square
  * with a ✓ when on — same accent treatment as the AddServer outcome line. */
 .itemCheck {

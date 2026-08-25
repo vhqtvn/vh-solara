@@ -69,11 +69,16 @@ self.addEventListener("push", (e) => {
     }),
   );
 });
+// Notification click: focus an existing window when one exists, open the app
+// otherwise. Deliberately GENERAL (push notices and the host shell's
+// needs-you notifications — tags starting "vh-needy-" — share this path):
+// never route to a specific pane/session from the (possibly stale)
+// notification payload; the app re-derives fresh state on arrival.
 self.addEventListener("notificationclick", (e) => {
   e.notification.close();
   e.waitUntil(
     (async () => {
-      const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      const all = await self.clients.matchAll({ type: "window", includeUncontrolled: false });
       for (const c of all) {
         if ("focus" in c) return c.focus();
       }
