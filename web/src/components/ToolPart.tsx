@@ -1,10 +1,10 @@
 // Tool-rendering concern extracted from components/Part.tsx (TS refactor slice 2).
 // Houses the tool-row component (ToolPart), its output renderer (ToolBody), the
-// tool-output → markdown-fence classifiers (jsonPretty / looksXML), and the
-// tool-icon / duration helpers ToolPart consumes. Behavior-preserving move from
-// Part.tsx — bodies carried character-for-character; only `export` keywords
-// added where the new Part.tsx ↔ ToolPart.tsx seam or the characterization test
-// requires it.
+// tool-output → markdown-fence classifiers (jsonPretty / looksXML), the
+// edit-contents preview builder (editDiffLines), and the tool-icon / duration
+// helpers ToolPart consumes. Behavior-preserving move from Part.tsx — bodies
+// carried character-for-character; only `export` keywords added where the new
+// Part.tsx ↔ ToolPart.tsx seam or the characterization test requires it.
 //
 // GPU-heat invariants (see AGENTS.md → "Web frontend performance"): this module
 // holds NONE of the streaming-render loop (FRAME_MS=200 coalesce / StreamMd.push
@@ -92,6 +92,77 @@ export function looksXML(s: string): boolean {
   return /^<[a-zA-Z?!]/.test(t) && /<\/[a-zA-Z][\w:-]*>\s*$/.test(t);
 }
 
+// ---- edit/write contents preview -------------------------------------------
+// One rendered line of an edit/write tool's contents preview. `del` = removed
+// (edit oldString), `add` = inserted (edit newString, or a write's content —
+// a whole-file write is all additions), `meta` = a non-content annotation
+// (the replaceAll header, the "… N more lines" truncation note).
+export interface EditDiffLine {
+  kind: "del" | "add" | "meta";
+  text: string;
+}
+
+// Default per-block line cap for editDiffLines. Long transcripts hold many
+// edit rows; each EXPANDED row's preview is bounded to ~2× this + meta lines
+// so a single huge edit (a whole-file write, a giant block replace) can't blow
+// up DOM size. The disclosure gate means collapsed rows render nothing at all.
+export const EDIT_DIFF_MAX_LINES = 30;
+
+// Split a text block into preview lines: "\n"-separated, with ONE trailing
+// empty segment dropped when the text ends with a newline (a byte-exact
+// trailing blank reads as noise in a compact preview). Interior blank lines are
+// kept — they are real content. An entirely empty text yields no lines.
+function textToLines(s: string): string[] {
+  if (s === "") return [];
+  const ls = s.split("\n");
+  if (ls.length > 1 && ls[ls.length - 1] === "") ls.pop();
+  return ls;
+}
+
+// Edit/write tool input → unified red/green preview lines for the tool row's
+// disclosure body. Pure (no component/store imports) so the characterization
+// test can pin it directly — same export pattern as jsonPretty/looksXML.
+//
+// Shape-driven, not name-driven: any tool input carrying the edit fields
+// renders a preview (edit: oldString/newString; write: content). Input with
+// none of those fields returns null — read/bash/grep rows render exactly as
+// before. `replaceAll: true` prepends a meta header so a many-match replace
+// isn't mistaken for a single-site edit.
+//
+// Truncation is PER BLOCK (del and add capped independently at `maxLines` with
+// a "… N more lines" meta line in place of the omitted tail) so a huge
+// oldString can never hide the newString, and vice versa.
+export function editDiffLines(
+  input: Record<string, unknown> | null | undefined,
+  maxLines: number = EDIT_DIFF_MAX_LINES,
+): EditDiffLine[] | null {
+  if (!input) return null;
+  const oldStr = input.oldString;
+  const newStr = input.newString;
+  const content = input.content;
+  const hasOld = typeof oldStr === "string";
+  const hasNew = typeof newStr === "string";
+  const hasContent = typeof content === "string";
+  if (!hasOld && !hasNew && !hasContent) return null;
+  const lines: EditDiffLine[] = [];
+  if (input.replaceAll === true) lines.push({ kind: "meta", text: "replaces every match" });
+  const push = (kind: "del" | "add", text: string) => {
+    const ls = textToLines(text);
+    if (ls.length > maxLines) {
+      for (const l of ls.slice(0, maxLines)) lines.push({ kind, text: l });
+      lines.push({ kind: "meta", text: `… ${ls.length - maxLines} more lines` });
+    } else {
+      for (const l of ls) lines.push({ kind, text: l });
+    }
+  };
+  if (hasOld) push("del", oldStr as string);
+  if (hasNew) push("add", newStr as string);
+  // Only fall through to `content` when this isn't an old/new edit payload —
+  // edit inputs never carry `content`, write inputs never carry old/new.
+  if (!hasOld && !hasNew && hasContent) push("add", content as string);
+  return lines;
+}
+
 // Tool output body: highlight valid JSON / XML through the markdown code path,
 // otherwise show it as plain preformatted text.
 function ToolBody(props: { text: string }) {
@@ -140,6 +211,15 @@ export function ToolPart(props: { part: Part; tail?: boolean }) {
     return durationText(props.part);
   };
   const output = () => state().output || state().error || "";
+  // Edit/write contents (oldString/newString, or write content) as compact
+  // red/green preview lines inside the disclosure body. Reads input via the
+  // same state().input || part.input pattern as diagnostics()/openableFile().
+  // null (renders nothing) unless the input is edit/write-shaped.
+  const editPreview = (): EditDiffLine[] | null => {
+    const input = (state().input || (props.part as any).input || {}) as Record<string, unknown>;
+    const lines = editDiffLines(input);
+    return lines && lines.length > 0 ? lines : null;
+  };
   // LSP diagnostics OpenCode attaches to edit/write/patch results, keyed by file.
   // Surface the errors (severity 1) so a broken edit is visible without digging.
   const diagnostics = (): { line: number; col: number; message: string }[] => {
@@ -321,6 +401,27 @@ export function ToolPart(props: { part: Part; tail?: boolean }) {
           <Show when={revealed()}>
             <Show when={expr()}>
               <pre class={styles["tool-cmd"]}>{exprPrefix()}{expr()}</pre>
+            </Show>
+            {/* Edit contents sit between the command line and the tool output —
+                what changed, then what the tool reported. Renders only inside
+                the disclosure gate, with per-block line caps (editDiffLines). */}
+            <Show when={editPreview()}>
+              <div class={styles["tool-edit"]}>
+                <For each={editPreview()}>
+                  {(l) => (
+                    <div
+                      class={styles["tool-edit-line"]}
+                      classList={{
+                        [styles["tool-edit-del"]]: l.kind === "del",
+                        [styles["tool-edit-add"]]: l.kind === "add",
+                        [styles["tool-edit-meta"]]: l.kind === "meta",
+                      }}
+                    >
+                      {l.text}
+                    </div>
+                  )}
+                </For>
+              </div>
             </Show>
             <Show when={output()}>
               <ToolBody text={output()} />

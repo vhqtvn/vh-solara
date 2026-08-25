@@ -185,6 +185,47 @@
   font: 12px/1.5 var(--font-mono);
   white-space: pre-wrap;
 }
+/* Edit/write contents preview (oldString/newString, or write content) inside a
+   tool row's disclosure body: compact unified red/green lines. Same visual
+   recipe as .tool-output (bordered code surface, mono 12/1.5, bounded height)
+   and the same theme-aware color-mix tints the server-rendered .vh-diff-* lines
+   use (80-professional-pass.css) — deliberately a SEPARATE scoped surface so
+   the e2e-queried global .vh-diff-* classes stay the server-rendered path.
+   Cheap paints only — no mask-image/backdrop-filter/contain (GPU-hot
+   chat-scroll surface; AGENTS.md GPU-perf bans); renders only when the
+   disclosure is expanded, and editDiffLines() caps each block's line count so
+   DOM stays bounded. */
+.tool-edit {
+  margin: 2px 0 4px 20px;
+  padding: 6px 0;
+  background: var(--code-surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow-x: auto;
+  max-height: 320px;
+  overflow-y: auto;
+  font: 12px/1.5 var(--font-mono);
+}
+.tool-edit-line {
+  padding: 0 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Sigil gutter via ::before: the −/+ markers are style, not content, so copied
+   text stays raw. Blank +/- lines keep row height (the sigil is content); meta
+   lines inherit the same 1ch gutter so their text aligns under code text. */
+.tool-edit-line::before {
+  display: inline-block;
+  width: 1ch;
+  margin-right: 4px;
+  color: var(--fg-dim);
+  text-align: center;
+}
+.tool-edit-del { background: color-mix(in srgb, var(--danger) 14%, transparent); }
+.tool-edit-del::before { content: "-"; }
+.tool-edit-add { background: color-mix(in srgb, var(--ok) 15%, transparent); }
+.tool-edit-add::before { content: "+"; }
+.tool-edit-meta { color: var(--fg-dim); font-style: italic; }
 /* JSON/XML tool output rendered through the markdown code path: the highlighted
    <pre> is the single scroll surface, so the wrapper must NOT also scroll — drop
    its own max-height/overflow/padding (otherwise you get two nested scrollbars).

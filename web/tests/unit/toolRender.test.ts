@@ -21,7 +21,7 @@
 // component import is evaluated — see _matchMedia.ts.
 import "./_matchMedia";
 import { describe, expect, it } from "vitest";
-import { jsonPretty, looksXML, toolIconName } from "../../src/components/ToolPart";
+import { editDiffLines, jsonPretty, looksXML, toolIconName } from "../../src/components/ToolPart";
 
 // ---- jsonPretty ----------------------------------------------------------
 // Detects object/array-shaped strings and returns 2-space pretty JSON so ToolBody
@@ -221,5 +221,153 @@ describe("toolIconName", () => {
     // A name containing both a write and a todo keyword takes edit (earlier
     // branch), NOT check — pins the branch ordering.
     expect(toolIconName("todo_writer")).toBe("edit");
+  });
+});
+
+// ---- editDiffLines --------------------------------------------------------
+// Builds the edit/write contents preview (oldString → del lines, newString /
+// write content → add lines) rendered inside a tool row's disclosure body.
+// Shape-driven: an input carrying the edit fields renders, anything else
+// returns null so non-edit tools keep their current body untouched. These pin
+// the exact line/kind/output so a refactor can't silently shift the preview.
+describe("editDiffLines", () => {
+  it("returns null for null/undefined input", () => {
+    expect(editDiffLines(null)).toBeNull();
+    expect(editDiffLines(undefined)).toBeNull();
+  });
+
+  it("returns null for an empty input object", () => {
+    expect(editDiffLines({})).toBeNull();
+  });
+
+  it("returns null for non-edit input (read/bash shapes carry none of the fields)", () => {
+    expect(editDiffLines({ filePath: "src/parser.go" })).toBeNull();
+    expect(editDiffLines({ command: "go test ./..." })).toBeNull();
+    expect(editDiffLines({ filePath: "a.go", pattern: "foo" })).toBeNull();
+  });
+
+  it("returns null when the edit fields are present but not strings", () => {
+    expect(editDiffLines({ oldString: 1, newString: null, content: true })).toBeNull();
+  });
+
+  it("renders del lines for oldString then add lines for newString, in order", () => {
+    const out = editDiffLines({ filePath: "parser.go", oldString: "a\nb", newString: "x" });
+    expect(out).toEqual([
+      { kind: "del", text: "a" },
+      { kind: "del", text: "b" },
+      { kind: "add", text: "x" },
+    ]);
+  });
+
+  it("drops ONE trailing blank line when a block ends with a newline", () => {
+    // A byte-exact trailing "\n" renders as a noise blank; interior blanks stay.
+    const out = editDiffLines({ oldString: "a\n\nb\n", newString: "c\n" });
+    expect(out).toEqual([
+      { kind: "del", text: "a" },
+      { kind: "del", text: "" },
+      { kind: "del", text: "b" },
+      { kind: "add", text: "c" },
+    ]);
+  });
+
+  it("keeps an entirely empty oldString as zero del lines (insert)", () => {
+    const out = editDiffLines({ oldString: "", newString: "new line" });
+    expect(out).toEqual([{ kind: "add", text: "new line" }]);
+  });
+
+  it("keeps an entirely empty newString as zero add lines (delete)", () => {
+    const out = editDiffLines({ oldString: "gone", newString: "" });
+    expect(out).toEqual([{ kind: "del", text: "gone" }]);
+  });
+
+  it("renders a write's content as all add lines", () => {
+    const out = editDiffLines({ filePath: "new.go", content: "package main\n\nfunc f() {}" });
+    expect(out).toEqual([
+      { kind: "add", text: "package main" },
+      { kind: "add", text: "" },
+      { kind: "add", text: "func f() {}" },
+    ]);
+  });
+
+  it("prefers oldString/newString over content when both are present", () => {
+    // Edit inputs never carry `content`; if some tool sent both, the edit pair
+    // is the truth and content must NOT be appended.
+    const out = editDiffLines({ oldString: "a", newString: "b", content: "c" });
+    expect(out).toEqual([
+      { kind: "del", text: "a" },
+      { kind: "add", text: "b" },
+    ]);
+  });
+
+  it("prepends a 'replaces every match' meta header when replaceAll is true", () => {
+    const out = editDiffLines({ oldString: "a", newString: "b", replaceAll: true });
+    expect(out).toEqual([
+      { kind: "meta", text: "replaces every match" },
+      { kind: "del", text: "a" },
+      { kind: "add", text: "b" },
+    ]);
+  });
+
+  it("adds no meta header when replaceAll is false or absent", () => {
+    expect(editDiffLines({ oldString: "a", newString: "b", replaceAll: false })).toEqual([
+      { kind: "del", text: "a" },
+      { kind: "add", text: "b" },
+    ]);
+    expect(editDiffLines({ oldString: "a", newString: "b" })![0].kind).toBe("del");
+  });
+
+  it("truncates each block independently at maxLines with a '… N more lines' note", () => {
+    // 35-line oldString, 2-line newString, cap 3: the del block keeps its first
+    // 3 lines + a note, and the (small) add block stays fully visible.
+    const bigOld = Array.from({ length: 35 }, (_, i) => `old${i}`).join("\n");
+    const out = editDiffLines({ oldString: bigOld, newString: "n1\nn2" }, 3);
+    expect(out).toEqual([
+      { kind: "del", text: "old0" },
+      { kind: "del", text: "old1" },
+      { kind: "del", text: "old2" },
+      { kind: "meta", text: "… 32 more lines" },
+      { kind: "add", text: "n1" },
+      { kind: "add", text: "n2" },
+    ]);
+  });
+
+  it("emits one truncation note per oversized block (both blocks capped)", () => {
+    const old = Array.from({ length: 5 }, (_, i) => `o${i}`).join("\n");
+    const nu = Array.from({ length: 5 }, (_, i) => `n${i}`).join("\n");
+    const out = editDiffLines({ oldString: old, newString: nu }, 2);
+    expect(out).toEqual([
+      { kind: "del", text: "o0" },
+      { kind: "del", text: "o1" },
+      { kind: "meta", text: "… 3 more lines" },
+      { kind: "add", text: "n0" },
+      { kind: "add", text: "n1" },
+      { kind: "meta", text: "… 3 more lines" },
+    ]);
+  });
+
+  it("truncates a write's content block like any other", () => {
+    const content = Array.from({ length: 4 }, (_, i) => `l${i}`).join("\n");
+    const out = editDiffLines({ content }, 2);
+    expect(out).toEqual([
+      { kind: "add", text: "l0" },
+      { kind: "add", text: "l1" },
+      { kind: "meta", text: "… 2 more lines" },
+    ]);
+  });
+
+  it("does not truncate blocks that fit exactly at maxLines", () => {
+    const exactly = "a\nb\nc";
+    const out = editDiffLines({ oldString: exactly }, 3);
+    expect(out).toEqual([
+      { kind: "del", text: "a" },
+      { kind: "del", text: "b" },
+      { kind: "del", text: "c" },
+    ]);
+  });
+
+  it("returns an empty array (not null) when the fields exist but hold no lines", () => {
+    // Shape present, content empty — the component maps [] to "render nothing".
+    expect(editDiffLines({ oldString: "", newString: "" })).toEqual([]);
+    expect(editDiffLines({ content: "" })).toEqual([]);
   });
 });
