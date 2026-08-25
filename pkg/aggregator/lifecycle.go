@@ -151,9 +151,23 @@ func (a *Aggregator) SetOnHydrate(fn func()) {
 // safe to call on the request path (aggFor) without taking seedMu.
 func (a *Aggregator) AnyHydrateCompleted() bool { return a.anyHydrateCompleted.Load() }
 
+// hydrateBackoffMax caps the exponential backoff between hydrate retries in
+// Run's per-connection loop (a.hydrateRetryBase doubling up to this value).
+// It deliberately mirrors the stream-reconnect backoff's 30s cap below while
+// staying a separate constant: hydrate retries and stream reconnects are
+// independent concerns with independent state.
+const hydrateBackoffMax = 30 * time.Second
+
 // Run keeps a live tail on OpenCode's event stream, re-hydrating the full view
-// on every (re)connect because the stream has no replay. It blocks until ctx is
-// cancelled.
+// on every (re)connect because the stream has no replay. A hydrate attempt
+// that fails while the stream stays healthy is retried with capped backoff
+// (a.hydrateRetryBase doubling to hydrateBackoffMax) until the first success
+// for that connection, so a transient upstream failure (e.g. a cold-start
+// ListSessions timeout) self-heals instead of leaving the store unhydrated
+// (empty view, seq 0 — the tree reconciler cannot repair it, it only deletes
+// ghosts / re-asserts archives) until the stream happens to end or an operator
+// POSTs /vh/reload. Retries stop at the first success for the connection. It
+// blocks until ctx is cancelled.
 func (a *Aggregator) Run(ctx context.Context) {
 	// Capture the aggregator's lifetime ctx so background work (the cold-seed)
 	// can derive from it instead of a short-lived request ctx. Done once, under
@@ -185,6 +199,21 @@ func (a *Aggregator) Run(ctx context.Context) {
 	go a.runTreeReconcile(ctx)
 
 	backoff := time.Second
+
+	// logHydrateFailure emits one log line per failed hydrate attempt. The
+	// wording distinguishes a not-yet-hydrated aggregator (store still empty —
+	// the UI would show a blank project) from a failed rehydrate after a
+	// reconnect (store may hold a stale view). AnyHydrateCompleted is sticky
+	// (set at the first successful hydrate, never reset), so the first
+	// wording reads exactly until then.
+	logHydrateFailure := func(err error) {
+		if a.AnyHydrateCompleted() {
+			log.Printf("[aggregator] rehydrate failed (store may be stale): %v", err)
+		} else {
+			log.Printf("[aggregator] hydrate failed (store still empty): %v", err)
+		}
+	}
+
 	for {
 		if ctx.Err() != nil {
 			return
@@ -208,13 +237,59 @@ func (a *Aggregator) Run(ctx context.Context) {
 			})
 		}()
 
+		// Hydrate the full view for this connection. A failed hydrate with
+		// the stream still healthy must not park this aggregator unhydrated
+		// (empty view at seq 0 until the stream happens to end), so a failed
+		// first attempt is retried with capped backoff until the first
+		// success for THIS connection. The live tail above is already open
+		// and store.Apply is idempotent, so a retried hydrate loses no
+		// events. hydrateBackoff is deliberately separate from the
+		// stream-reconnect backoff below: it resets at the top of each
+		// connection iteration (declared here) and stops growing entirely at
+		// the first success.
+		var streamErr error
+		hydrateBackoff := a.hydrateRetryBase
 		if err := a.hydrate(ctx); err != nil {
-			log.Printf("[aggregator] hydrate failed: %v", err)
+			logHydrateFailure(err)
+		retryHydrate:
+			for {
+				select {
+				case <-ctx.Done():
+					// Aggregator shutting down mid-retry: cancel the tail's
+					// subCtx and stop. The subscriber goroutine's send lands
+					// in errc's cap-1 buffer; nothing blocks or leaks.
+					cancel()
+					return
+				case streamErr = <-errc:
+					// The event stream itself ended while hydrate kept
+					// failing — stop retrying against this connection and
+					// take the normal reconnect path below, whose fresh
+					// connection re-runs hydrate from the top. errc is
+					// buffered (cap 1) so this receive never blocks, and
+					// carrying streamErr skips the blocking wait below.
+					break retryHydrate
+				case <-time.After(hydrateBackoff):
+					err := a.hydrate(ctx)
+					if err == nil {
+						log.Printf("[aggregator] hydrated; tailing events")
+						break retryHydrate
+					}
+					logHydrateFailure(err)
+					if hydrateBackoff < hydrateBackoffMax {
+						hydrateBackoff *= 2
+					}
+				}
+			}
 		} else {
 			log.Printf("[aggregator] hydrated; tailing events")
 		}
 
-		err := <-errc
+		// streamErr is already set when the stream ended mid-retry; otherwise
+		// hydrate succeeded and we park here until the healthy stream ends.
+		if streamErr == nil {
+			streamErr = <-errc
+		}
+		err := streamErr
 		cancel()
 		if ctx.Err() != nil {
 			return

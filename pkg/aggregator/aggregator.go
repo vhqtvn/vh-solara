@@ -195,6 +195,21 @@ type Aggregator struct {
 	// goroutine's ticker loop; set it before calling Run / RunManaged so the
 	// goroutine launch establishes the happens-before edge to the read.
 	treeReconcileInterval time.Duration
+
+	// hydrateRetryBase is the initial backoff between hydrate retries inside
+	// Run's per-connection loop: when a connection's first hydrate attempt
+	// fails while the event stream stays healthy, Run retries hydrate with
+	// this base delay, doubling up to hydrateBackoffMax, until the first
+	// success for that connection (see Run). It defaults to 1s, set at
+	// construction in New / NewForDirectory. It is a PER-INSTANCE field —
+	// NOT a package global — mirroring statusReconcileInterval /
+	// treeReconcileInterval: the instance field lets a test shrink it (e.g.
+	// agg.hydrateRetryBase = 2*time.Millisecond) without racing a lingering
+	// goroutine from another aggregator / a prior -count iteration. It is
+	// read only by Run on its own goroutine; set it before calling Run /
+	// RunManaged so the goroutine launch establishes the happens-before edge
+	// to the read.
+	hydrateRetryBase time.Duration
 }
 
 // olderPageInflight is the single-flight slot for a Part-B older-page fetch
@@ -230,6 +245,7 @@ func New(baseURL string, ringCapacity int) *Aggregator {
 		pageInflight:            map[string]*olderPageInflight{},
 		statusReconcileInterval: 60 * time.Second,
 		treeReconcileInterval:   5 * time.Second,
+		hydrateRetryBase:        time.Second,
 	}
 }
 
@@ -245,6 +261,7 @@ func NewForDirectory(baseURL, directory string, ringCapacity int) *Aggregator {
 		pageInflight:            map[string]*olderPageInflight{},
 		statusReconcileInterval: 60 * time.Second,
 		treeReconcileInterval:   5 * time.Second,
+		hydrateRetryBase:        time.Second,
 	}
 }
 
