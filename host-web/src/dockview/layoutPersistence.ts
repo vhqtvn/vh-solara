@@ -139,6 +139,52 @@ let serializeAllFn: (() => PersistedState | null) | null = null;
 // SAME parsed snapshot rather than re-reading localStorage mid-init.
 const initBlob: PersistedState | null = readBlob();
 
+// ---- flush-on-hide (mobile kill mitigation) ---------------------------------
+// The debounced save assumes the page lives ≥ SAVE_DEBOUNCE_MS after the last
+// mutation. Android PWAs break that assumption: a backgrounded standalone app
+// is frozen (timers suspended) and later killed WITHOUT firing unload-family
+// events at kill time, so a save scheduled inside that window dies with the
+// process — the relaunch (clean start_url, NO hash) falls back to the
+// localStorage mirror, which is still the PREVIOUS flush (on a fresh PWA
+// context: the boot-time seed write) → "PWA relaunch resets workspaces". The
+// LAST event the page is guaranteed to see before such a kill is the
+// transition to HIDDEN (visibilitychange → hidden — screen off / home /
+// app-switch / swipe-away all fire it), plus pagehide for navigations and
+// graceful closes. Both flush SYNCHRONOUSLY below: localStorage.setItem and
+// history.replaceState are sync and unload-safe, while ANY async deferral
+// (promise/setTimeout) would itself die with the process.
+//
+// Both hooks are guarded by `saveTimer !== null`: a hide with NOTHING pending
+// performs NO write (no spurious mirror churn — pinned by the kill/relaunch
+// e2e's byte-identical-blob test). Double-firing is impossible: the first
+// flush clears the timer. Installed ONCE at module init, right after the
+// init-blob read; listeners live for the page lifetime (no uninstall needed —
+// the module is page-scoped and tests get a fresh page/document each).
+function flushPendingSaveNow(): void {
+  if (saveTimer === null) return; // nothing pending — no spurious writes
+  clearTimeout(saveTimer);
+  flushSave();
+}
+
+/** Install the visibilitychange(hidden) + pagehide listeners that flush a
+ *  pending debounced save synchronously before the page can be killed.
+ *  Idempotent; browser-guarded (SSR/no-window safety, mirroring writeHashState). */
+export function installFlushOnHide(): void {
+  if (typeof window === "undefined" || typeof document === "undefined") return;
+  if ((window as FlushOnHideFlag).__vhFlushOnHideInstalled) return;
+  (window as FlushOnHideFlag).__vhFlushOnHideInstalled = true;
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushPendingSaveNow();
+  });
+  window.addEventListener("pagehide", () => flushPendingSaveNow());
+}
+/** Marker-interface for the idempotence flag above (window stays untyped). */
+interface FlushOnHideFlag {
+  __vhFlushOnHideInstalled?: boolean;
+}
+
+installFlushOnHide();
+
 // =============================================================================
 // SAVE SIDE — read-only serialization, debounced, on any workspace's layout-
 // change event OR on a workspace-set/active change. Hooked per workspace via
