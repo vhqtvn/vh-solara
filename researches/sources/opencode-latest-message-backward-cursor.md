@@ -105,7 +105,7 @@ Probe matrix (read-only GETs; the host opencode DB was read in parallel under
   page** — consistent with §1's "next cursor = oldest tuple" rule. Sending it as
   the next `?before=` pages one window further back.
 - *Historical note (superseded)*: A prior deployed probe found the no-cursor baseline (`?limit=10`) returned the newest-10 and carried NO cursor headers. This occurred because that specific probe hit an **exhausted window** (total session messages ≤ limit).
-- **Current contract:** A limited no-before tail fetch (`?limit=N`) **does** carry the `X-Next-Cursor` and `Link` response headers whenever there is more history beyond the requested limit (i.e. `rows.length > input.limit`). It is omitted only when the session is fully exhausted.
+- **Current contract:** A limited no-before tail fetch (`?limit=N`) **does** carry the `X-Next-Cursor` and `Link` response headers whenever there is more history beyond the requested limit (i.e. `rows.length > input.limit`). It is omitted only when the session is fully exhausted. (source-derived from refs/opencode message-v2.ts:425-467; a re-probe confirming this is recommended on the next version bump)
 
 ---
 
@@ -196,10 +196,10 @@ non-goal.
    a row.
 2. **The cursor is the OLDEST tuple of the page, not the newest.** Sending the
    newest would re-return the same page.
-3. **`Client.getJSON` discards response headers** (`pkg/opencode/client.go:53-68`)
-   — a header-aware variant is needed to consume `X-Next-Cursor` / `Link`.
-4. **`MessagesTail`'s doc comment is now stale** (`pkg/opencode/client.go:347-353`):
-   it should note the `?before=<token>` paging surface exists alongside `?limit=N`.
+3. **`Client.getJSON` discarded response headers** (`pkg/opencode/client.go:53-68` prior to `1dfcd9e903b778864ecbdb71f7df8a8c8a1babbd`)
+   — a header-aware variant was needed to consume `X-Next-Cursor` / `Link`. *(Resolved in vh-solara commit `1dfcd9e903b778864ecbdb71f7df8a8c8a1babbd` which added a header-aware `MessagesTail` variant).*
+4. **`MessagesTail`'s doc comment was stale** (`pkg/opencode/client.go:347-353` prior to `1dfcd9e903b778864ecbdb71f7df8a8c8a1babbd`):
+   it needed to note the `?before=<token>` paging surface exists alongside `?limit=N`. *(Resolved in vh-solara commit `1dfcd9e903b778864ecbdb71f7df8a8c8a1babbd` which fixed the doc comment).*
 5. **Send a cursor TOKEN, never a raw `msg_…` id** — the route runs
    `cursor.decode` on `before`; a raw id is `400 BadRequest` (§3).
 6. **Initial (tail) fetch**: `?limit=N` with no `?before` returns the newest-N and **does** include the `X-Next-Cursor` header if more history exists. Consume the authoritative response header to page backward. Do NOT construct the first cursor client-side.
@@ -246,7 +246,7 @@ and the prior "no backward cursor" blocker is corrected.
 | 4 | Prior "no backward cursor" inference was WRONG for latest; the raw-id `?before=<msgid>` 400 is `cursor.decode` rejecting a non-base64url-JSON value, not API absence | **high** | fact (correction) | handlers/session.ts:111-117 + the raw-id 400 in the probe matrix |
 | 5 | SSE/REST delivery contract unchanged (event types, `WithParts`, envelopes, list-vs-by-id cardinality); delta is only the cursor paging + index + optional `CompactionPart.tail_start_id` | **high** | fact | refs/opencode snapshot vs v1.17.18 sibling packet |
 | 6 | Direct-SQLite older-page (option c) is strictly dominated by the REST cursor | **high** | inference | REST cursor (§1–§2) covers the need; direct-SQLite is an architecture non-goal |
-| 7 | `Client.getJSON` discards headers → a header-aware variant is needed to read `X-Next-Cursor`; `MessagesTail` doc is stale | **high** | fact | pkg/opencode/client.go:53-68,347-353 |
+| 7 | `Client.getJSON` discarded headers → a header-aware variant was needed to read `X-Next-Cursor`; `MessagesTail` doc was stale. (Resolved in `1dfcd9e903b778864ecbdb71f7df8a8c8a1babbd`) | **high** | fact | pkg/opencode/client.go (prior to `1dfcd9e903b778864ecbdb71f7df8a8c8a1babbd`) |
 
 ### Gaps / not verified
 - The probe was run against ONE deployed instance (`127.0.0.1:43889`); other
