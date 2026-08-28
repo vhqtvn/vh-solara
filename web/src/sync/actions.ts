@@ -19,6 +19,8 @@ import {
   loadLastAgents,
   loadSessionAgents,
   resetSessionAgentPicks,
+  loadSessionModels,
+  resetSessionModelPicks,
   loadCursor,
   persistSelection,
   LS_PROJECT,
@@ -125,6 +127,12 @@ export function switchProject(dir: string, fromUrl = false) {
   // resetSessionAgentPicks only swaps memory; the new dir already owns its
   // persisted copy.
   resetSessionAgentPicks(loadSessionAgents(dir));
+  // Same re-seed for the per-session MODEL picks (P1): the map is per-project
+  // keyed by dir; without this, the outgoing project's picks would leak into
+  // the incoming project's composer resolution (and an id shared across
+  // projects would resolve the wrong pick). resetSessionModelPicks only swaps
+  // memory; the new dir already owns its persisted copy.
+  resetSessionModelPicks(loadSessionModels(dir));
   // Project switch clears the tree (flat map + in-memory userExpanded). A
   // same-project resync does NOT clear — connect(true) swaps the snapshot
   // atomically (seedTreeStore) and preserves userExpanded; only a true project

@@ -118,9 +118,27 @@ export function projectSnapshot(s: SyncState, snap: Snapshot, effects: Reconcile
     changed ||
     s.epochChanged ||
     Object.values(snap.gate || {}).some((g) => !!g && g.hasMessages === false);
+  // b-F1 (id-reuse guard, snapshot path): the wholesale replace below drops
+  // every PRIOR session this authoritative snapshot omits — e.g. a session
+  // deleted while this client was OFFLINE, whose discrete session.delete
+  // never arrived. The session-removed cascade (which clears the persisted
+  // pick stores) never ran for those ids, so their picks would survive in
+  // localStorage and — on a server-side id REUSE — restore the PRIOR
+  // occupant's explicit model/agent picks for the new occupant. Diff the
+  // PRIOR id set (read from the pre-mutation draft, BEFORE the replace
+  // below) against the incoming ids and record the disappeared ids as ONE
+  // effect; orchestration runs the existing clear functions (the projection
+  // stays pure). Scoped partials never reach this path (they merge by scope
+  // and cannot infer deletion from omission). Ids never known to s.sessions
+  // (LS orphans from before this page load) are NOT pruned here — the pick
+  // cap owns those.
+  const priorIds = Object.keys(s.sessions);
+  const incomingIds = new Set((snap.sessions || []).map((sess) => sess.id));
+  const removedIds = priorIds.filter((id) => !incomingIds.has(id));
   // Reconcile: replace the session set with the authoritative snapshot.
   s.sessions = {};
   for (const sess of snap.sessions || []) s.sessions[sess.id] = sess;
+  if (removedIds.length) effects.push({ kind: "snapshot-prune-picks", removed: removedIds });
   s.activity = { ...(snap.activity || {}) };
   // Cross-stream completion bridge (fix B, delivery-path-independent): stamp
   // time.completed for any session now idle via this wholesale snapshot path,

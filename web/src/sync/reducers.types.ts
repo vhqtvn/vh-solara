@@ -37,6 +37,18 @@ export type ReconcileEffect =
   // cascade: resetPageInFlight + dropPinnedSession. Emitted by session.delete
   // and the eager archive prune (both route through projectSessionRemoval).
   | { kind: "session-removed"; sessionID: string }
+  // An AUTHORITATIVE full snapshot (wholesale path, projectSnapshot) replaced
+  // the session set and DROPPED ids that were resident in the prior store —
+  // typically sessions deleted while this client was offline, whose discrete
+  // session.delete never arrived and whose session-removed cascade therefore
+  // never ran. Orchestration clears the persisted per-session pick stores
+  // (clearSessionModelPick + clearSessionAgentPick) for each id so a
+  // server-side id reuse cannot restore the PRIOR occupant's explicit picks.
+  // Emitted by the wholesale path ONLY — frontier-scoped partials merge by
+  // scope and must not infer deletion from omission. Deliberately NOT a
+  // session-removed: the rest of the deletion cascade (page-flight/pin/label)
+  // is not implied here; those keep their own server-broadcast self-heal.
+  | { kind: "snapshot-prune-picks"; removed: string[] }
   // A cold-seed lastAgent.set event filled an agent label for an un-opened
   // session. The tree node must be patched so the chip renders on collapsed
   // nodes without an expand round-trip — a cross-store (tree) mutation that is

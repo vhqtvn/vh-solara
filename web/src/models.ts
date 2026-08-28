@@ -2,10 +2,14 @@
 //   - models carry named `variants` (param presets, e.g. reasoning effort);
 //   - selection is per-session, seeded from the session's last user message,
 //     falling back to a persisted global default (so new sessions inherit it);
-//   - the chosen model is sent as `model`, the variant as a top-level `variant`.
+//   - the chosen model is sent as `model`, the variant as a top-level `variant`;
+//   - an EXPLICIT per-session pick (chooseModel/chooseVariant) is also mirrored
+//     into the per-project pick map (sync/store.ts sessionModelPicks,
+//     vh.sessionmodels.v1:<dir>) so it survives reload — sticky until the
+//     session is removed, never consumed on send (P1).
 import { createSignal } from "solid-js";
 import { createStore, produce } from "solid-js/store";
-import { inlineSessionModel, lastUserMessageModel, sessionModel } from "./sync";
+import { inlineSessionModel, lastUserMessageModel, sessionModel, sessionModelPicks, setSessionModelPick } from "./sync";
 import { loadVersioned, saveVersioned } from "./lib/store";
 
 export interface ModelRef {
@@ -87,23 +91,31 @@ const draftPick = loadVersioned<Selection | null>(LS_DRAFT, 1, null, (old) => {
 });
 const [defaultSel, setDefaultSig] = createSignal<Selection | null>(loadJSON<Selection | null>(LS_DEFAULT, null));
 
-// Per-session in-memory selection overrides. A REAL session's entry is in-memory
-// only (NOT persisted): on reload selectionFor falls back to the server-persisted
-// model. The DRAFT "" entry is the one exception — hydrated from LS_DRAFT above
-// so an explicit pre-first-send pick survives reload (see saveDraft/clearDraft).
+// Per-session in-memory selection overrides. A REAL session's entry is
+// in-memory only — but since P1 its explicit picks are ALSO mirrored into the
+// per-project pick map (vh.sessionmodels.v1:<dir>, see sync/store.ts), so on
+// reload selectionFor restores the explicit pick from that map instead of
+// falling back to the server-persisted model. The DRAFT "" entry is hydrated
+// from LS_DRAFT above so an explicit pre-first-send pick survives reload (see
+// saveDraft/clearDraft); real ids never enter the draft key, and "" never
+// enters the pick map (the two persistence channels stay disjoint).
 const [sessionSel, setSessionSel] = createStore<Record<string, Selection>>(
   draftPick ? { "": draftPick } : {},
 );
 
 // Tracks sessions ("" = draft) for which the user has made an explicit composer
 // model/variant pick. An agent's declared model is a DEFAULT — it must never
-// override such an explicit pick. In-memory for real sessions (provenance does
-// not survive reload; on reload the server-persisted session model wins); the
-// DRAFT "" membership IS restored from LS_DRAFT on load — the draft record
-// carries the Selection + its explicit provenance together — and this hydration
-// runs at module load, BEFORE any agent-model application (the draft init effect
-// in ChatView runs selectAgentForSession("", agent) → applyAgentModel("", …)
-// only after mount), so applyAgentModel's explicit guard keeps the restored pick.
+// override such an explicit pick. In-memory for real sessions, but the
+// PERSISTED pick map (sessionModelPicks) carries the same provenance across
+// reload: applyAgentModel's guard checks BOTH, so a restored pick suppresses
+// the agent's declared model exactly like an in-session pick. The DRAFT ""
+// membership IS restored from LS_DRAFT on load — the draft record carries the
+// Selection + its explicit provenance together — and this hydration runs at
+// module load, BEFORE any agent-model application (the draft init effect in
+// ChatView runs selectAgentForSession("", agent) → applyAgentModel("", …)
+// only after mount), so applyAgentModel's explicit guard keeps the restored
+// pick. The pick map hydrates at its own module load (sync/store.ts), also
+// before any agent-model application.
 const explicitModelPicks = new Set<string>();
 if (draftPick) explicitModelPicks.add("");
 
@@ -178,11 +190,16 @@ function normalizeSelection(sel: Selection | undefined): Selection | null {
 }
 
 // Effective selection for a session: a just-made (unsent) pick, else the
-// server-persisted session model, else its last-used message model, else the
-// global default.
+// persisted explicit pick for a real session (P1 — restored on reload from
+// vh.sessionmodels.v1:<dir>; behaves identically to an in-session explicit
+// pick), else the server-persisted session model, else its last-used message
+// model, else the global default.
 export function selectionFor(sessionId: string): Selection | null {
+  // Real sessions only: the draft "" never enters the pick map (its own
+  // LS_DRAFT record carries Selection + provenance together).
+  const persisted = sessionId ? sessionModelPicks[sessionId] : undefined;
   return normalizeSelection(
-    sessionSel[sessionId] ?? sessionModel(sessionId) ?? lastUserMessageModel(sessionId) ?? defaultSel() ?? undefined,
+    sessionSel[sessionId] ?? persisted ?? sessionModel(sessionId) ?? lastUserMessageModel(sessionId) ?? defaultSel() ?? undefined,
   );
 }
 
@@ -198,6 +215,10 @@ export function chooseModel(sessionId: string, providerID: string, modelID: stri
   // USER gesture: this session now has an explicit model pick that an
   // agent-select must not override.
   explicitModelPicks.add(sessionId);
+  // P1: persist the explicit pick for a REAL session (write-through, capped)
+  // so it survives reload. Never for the draft "" — the draft has its own
+  // record (saveDraft below) and must stay disjoint from the per-session map.
+  if (sessionId !== "") setSessionModelPick(sessionId, sel);
   if (sessionId === "") saveDraft(sel);
 }
 
@@ -209,6 +230,7 @@ export function chooseVariant(sessionId: string, variant: string | undefined) {
   setDefault(sel);
   // USER gesture: mark the session explicit (same as chooseModel).
   explicitModelPicks.add(sessionId);
+  if (sessionId !== "") setSessionModelPick(sessionId, sel);
   if (sessionId === "") saveDraft(sel);
 }
 
@@ -241,7 +263,14 @@ export function applyModel(sessionID: string, providerID: string, modelID: strin
 // (sessionID "") it writes the global default so the new session inherits the
 // agent's model. It never touches agent state (that stays in agents.ts).
 export function applyAgentModel(sessionID: string, providerID: string, modelID: string, variant?: string) {
+  // Explicit user pick wins — in-memory (this session's lifetime) OR the
+  // PERSISTED pick restored on reload (P1): the pick map is hydrated at module
+  // load BEFORE any agent-model application (the composer's agent init effect
+  // runs only after mount), so a restored pick's provenance survives the
+  // round-trip and still suppresses the agent's declared model post-reload.
+  // (The draft "" never enters the map — its provenance comes from LS_DRAFT.)
   if (explicitModelPicks.has(sessionID)) return; // explicit user pick wins
+  if (sessionID && sessionModelPicks[sessionID]) return; // restored explicit pick (P1)
   // A real session whose model is ALREADY established on the server (after ≥1
   // send — OpenCode persists session.model and stamps each message) is treated
   // as implicit intent: switching agents must NOT silently flip its model.
@@ -320,6 +349,13 @@ export function migrateModelPick(fromID: string, toID: string) {
   if (explicitModelPicks.has(fromID)) {
     explicitModelPicks.add(toID);
     explicitModelPicks.delete(fromID);
+    // P1: a draft materializing into a real session must PERSIST the
+    // transferred intent for the live id — the draft's in-memory record dies
+    // with the reload, and without this write a reload between the first send
+    // and a second pick-less send fell back to the server model / global
+    // default (the silent flip). Gated on `from` existing: never persist an
+    // incomplete pick (setSessionModelPick also refuses empty ids).
+    if (fromID === "" && from) setSessionModelPick(toID, from);
   }
   // A draft materializing into a real session consumes the draft record: the
   // pick (and its explicit provenance) transfer to the live id, so the draft

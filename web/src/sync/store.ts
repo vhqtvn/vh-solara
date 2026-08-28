@@ -18,6 +18,10 @@ const LS_LASTAGENTS = "vh.lastagents.v1";
 // switchProject and clobber the NEW project's saved picks with the OLD
 // project's values).
 const LS_SESSIONAGENTS = "vh.sessionagents.v1";
+// Explicit per-session model/variant picks (the composer model picker),
+// persisted per project dir. Same write-through rationale as LS_SESSIONAGENTS
+// above — never part of the debounced persist() batch.
+const LS_SESSIONMODELS = "vh.sessionmodels.v1";
 // Last-selected session id, persisted per project so the installed PWA reopens
 // the same session after an OS-driven relaunch (which drops ?session=). NOT part
 // of the debounced persist() batch — see persistSelection() for why.
@@ -34,6 +38,7 @@ export const lsCursor = (dir: string) => `${LS_CURSOR}:${dir}`;
 export const lsActivity = (dir: string) => `${LS_ACTIVITY}:${dir}`;
 export const lsLastAgents = (dir: string) => `${LS_LASTAGENTS}:${dir}`;
 export const lsSessionAgents = (dir: string) => `${LS_SESSIONAGENTS}:${dir}`;
+export const lsSessionModels = (dir: string) => `${LS_SESSIONMODELS}:${dir}`;
 export const lsSelected = (dir: string) => `${LS_SELECTED}:${dir}`;
 
 export const loadCursor = (dir: string) =>
@@ -105,6 +110,56 @@ export function loadSessionAgents(dir: string): Record<string, SessionAgentPick>
   // There is no legacy format to migrate, so version-mismatch/corrupt-JSON
   // simply fall back to the empty map via loadVersioned's null fallback.
   return sanitizePicks(loadVersioned<unknown>(lsSessionAgents(dir), 1, null));
+}
+
+// One explicit per-session model/variant pick. Mirrors SessionAgentPick: `t`
+// is the write time (Date.now()), used ONLY to bound the store under
+// SESSION_MODEL_PICKS_CAP — not a recency signal for resolution (an explicit
+// pick is authoritative for its session until the session is removed).
+export interface SessionModelPick {
+  providerID: string;
+  modelID: string;
+  variant?: string;
+  t: number;
+}
+
+// Cap on the persisted model-pick map (same rationale + bound as
+// SESSION_AGENT_PICKS_CAP above).
+export const SESSION_MODEL_PICKS_CAP = 200;
+
+// Sanitize a foreign/corrupt payload: keep only entries whose shape is
+// {providerID: non-empty string, modelID: non-empty string, variant?: string,
+//  t: number}. Fail-closed — malformed input yields at most the well-formed
+// subset, never a crash, never junk dispatched as intent.
+function sanitizeModelPicks(o: unknown): Record<string, SessionModelPick> {
+  if (!o || typeof o !== "object" || Array.isArray(o)) return {};
+  const out: Record<string, SessionModelPick> = {};
+  for (const [id, v] of Object.entries(o as Record<string, unknown>)) {
+    if (!id || !v || typeof v !== "object") continue;
+    const p = v as { providerID?: unknown; modelID?: unknown; variant?: unknown; t?: unknown };
+    if (typeof p.providerID !== "string" || !p.providerID) continue;
+    if (typeof p.modelID !== "string" || !p.modelID) continue;
+    out[id] = {
+      providerID: p.providerID,
+      modelID: p.modelID,
+      variant: typeof p.variant === "string" && p.variant ? p.variant : undefined,
+      t: typeof p.t === "number" && Number.isFinite(p.t) ? p.t : 0,
+    };
+  }
+  return out;
+}
+
+// Explicit per-session model/variant picks, persisted per project dir so an
+// explicit composer model-picker choice for a REAL session SURVIVES a reload/
+// PWA relaunch (P1 — the silent-flip where a reloaded session dispatched the
+// stale server session.model or the global fallback instead of the user's
+// unconsumed explicit choice). Mirrors loadSessionAgents verbatim: sanitize
+// UNCONDITIONALLY (loadVersioned returns env.data AS-IS on a matching envelope
+// version), and there is no legacy format to migrate, so version-mismatch /
+// corrupt-JSON fall back to the empty map (fail-closed — never dispatch from
+// incomplete state).
+export function loadSessionModels(dir: string): Record<string, SessionModelPick> {
+  return sanitizeModelPicks(loadVersioned<unknown>(lsSessionModels(dir), 1, null));
 }
 
 // Last-selected session id for this project — the localStorage counterpart to
@@ -445,6 +500,71 @@ export function clearSessionAgentPick(id: string): void {
 // dir's key).
 export function resetSessionAgentPicks(next: Record<string, SessionAgentPick>): void {
   setSessionAgentPicks(reconcile(next));
+}
+
+// Explicit per-session model/variant picks (see SessionModelPick). Seeded from
+// the same initialDir as state, re-seeded on switchProject
+// (resetSessionModelPicks), pruned per-id on session removal
+// (clearSessionModelPick — mirrors the agent-pick id-reuse guard). The pick is
+// STICKY: never consumed on send (success or failure); it clears ONLY on
+// session removal, and a restored pick behaves identically to an in-session
+// explicit pick.
+const [sessionModelPicks, setSessionModelPicks] = createStore<Record<string, SessionModelPick>>(
+  loadSessionModels(initialDir),
+);
+export { sessionModelPicks };
+
+// Enforce the cap + write through to localStorage for the CURRENT project dir.
+// Sort by write time descending, keep the newest SESSION_MODEL_PICKS_CAP
+// entries. Whole-map last-writer-wins cross-tab (no storage-event merge) —
+// mirrors persistPicks exactly.
+function persistModelPicks(): void {
+  const dir = projectDir();
+  const entries = Object.entries(sessionModelPicks).sort((a, b) => b[1].t - a[1].t);
+  const capped: Record<string, SessionModelPick> = {};
+  for (let i = 0; i < entries.length && i < SESSION_MODEL_PICKS_CAP; i++) capped[entries[i][0]] = entries[i][1];
+  saveVersioned(lsSessionModels(dir), 1, capped);
+  // Reflect the cap in memory too, so selectionFor can never resurrect a
+  // dropped pick from the in-memory map (reconcile diffs the replacement in).
+  setSessionModelPicks(reconcile(capped));
+}
+
+// Record an explicit model/variant pick for a REAL session (write-through,
+// capped). Never called for the draft "" — the draft has its own record
+// (LS_DRAFT in models.ts) and real ids must never leak into it. Re-picking
+// refreshes the write time (keeps active sessions alive under the cap).
+export function setSessionModelPick(id: string, sel: { providerID: string; modelID: string; variant?: string }): void {
+  if (!id || !sel.providerID || !sel.modelID) return;
+  setSessionModelPicks(id, {
+    providerID: sel.providerID,
+    modelID: sel.modelID,
+    variant: sel.variant || undefined,
+    t: Date.now(),
+  });
+  persistModelPicks();
+}
+
+// Drop a session's pick (session removed / id reused server-side). Prunes both
+// memory and the persisted map. Like clearSessionAgentPick, the delete MUST go
+// through the setter (produce): the exported store value is a read proxy and a
+// bare `delete sessionModelPicks[id]` on it is SILENTLY SWALLOWED — the entry
+// would survive in memory and persistModelPicks() would re-persist it.
+export function clearSessionModelPick(id: string): void {
+  if (!(id in sessionModelPicks)) return;
+  setSessionModelPicks(
+    produce((m) => {
+      delete m[id];
+    }),
+  );
+  persistModelPicks();
+}
+
+// Swap the whole map on project switch (actions.ts switchProject): seed the
+// new project dir's persisted model picks WITHOUT persisting (the new dir
+// already owns its persisted copy — same rationale as
+// resetSessionAgentPicks).
+export function resetSessionModelPicks(next: Record<string, SessionModelPick>): void {
+  setSessionModelPicks(reconcile(next));
 }
 
 // Current project directory ("" = default). Multi-project: snapshot/stream and

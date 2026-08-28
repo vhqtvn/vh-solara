@@ -16,7 +16,7 @@ import { produce } from "solid-js/store";
 import { createSignal } from "solid-js";
 import type { Snapshot } from "../types";
 import type { ReconcileContext, ReconcileEffect, ReconcileEvent } from "./reducers.types";
-import { setState, persist, clearSessionAgentPick, type SyncState, selectedId, state } from "./store";
+import { setState, persist, clearSessionAgentPick, clearSessionModelPick, type SyncState, selectedId, state } from "./store";
 import {
   projectSnapshot,
   projectSessionEvent,
@@ -64,6 +64,26 @@ function interpretEffects(effects: ReconcileEffect[]): void {
         // would resurrect the old session's explicit agent pick for the new
         // occupant — the same silent-flip class this slice closes.
         clearSessionAgentPick(e.sessionID);
+        // P1: same id-reuse guard for the PERSISTED model pick. The pick is
+        // sticky by contract (never consumed on send; clears ONLY on session
+        // removal) — this is the one removal path, pruning BOTH memory and the
+        // persisted map so a reused id never inherits the old occupant's
+        // explicit model choice.
+        clearSessionModelPick(e.sessionID);
+        break;
+      case "snapshot-prune-picks":
+        // b-F1 (missed session.delete): the authoritative FULL snapshot
+        // dropped these ids — deleted while this client was offline, so the
+        // session-removed cascade above never ran for them. Run the SAME
+        // persisted-pick prune here so a server-side id reuse cannot restore
+        // the PRIOR occupant's explicit picks for the new occupant. The rest
+        // of the deletion cascade (page-flight/pin/label) is deliberately NOT
+        // run: this is not a removal event, and those slices keep their own
+        // server-broadcast self-heal backstops.
+        for (const id of e.removed) {
+          clearSessionAgentPick(id);
+          clearSessionModelPick(id);
+        }
         break;
       case "reconcile-tree-agent":
         // Cold-seed gap fill: patch the tree node so the chip renders on

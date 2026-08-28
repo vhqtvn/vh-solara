@@ -197,6 +197,18 @@ export {
   loadSessionAgents,
 } from "./sync/store";
 export type { SessionAgentPick } from "./sync/store";
+// Persisted per-session model/variant picks (composer model picker), per
+// project dir. Consumed by models.ts (selectionFor read precedence +
+// applyAgentModel's restored-provenance guard) — see sync/store.ts
+// SessionModelPick for the contract.
+export {
+  sessionModelPicks,
+  setSessionModelPick,
+  clearSessionModelPick,
+  resetSessionModelPicks,
+  loadSessionModels,
+} from "./sync/store";
+export type { SessionModelPick } from "./sync/store";
 // Feature 1 (stale indicator) + Feature 2 (updating indicator): connection-
 // health selectors + their thresholds, for the sidebar status dot and any
 // diagnostic surface.

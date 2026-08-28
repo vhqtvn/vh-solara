@@ -135,49 +135,43 @@ describe("model/agent precedence — explicit user pick beats agent-declared mod
     expect(sel!.variant).toBe(GPT_AGENT.variant);
   });
 
-  it("(d) reload-sim: a sent session's model survives a post-reload agent switch", async () => {
-    // Regression for the reload hole: explicitModelPicks is in-memory only and
-    // is wiped on reload. After a send, OpenCode stamps session.model
-    // server-side; a reload clears the in-memory explicit-pick intent, so
-    // without honoring the server-persisted model a subsequent agent switch
-    // would let the new agent's declared model clobber it (the original bug
-    // re-emerging). Models the reload as vi.resetModules() (wipes sessionSel +
-    // explicitModelPicks + the sync store singleton) and re-seeds the server
-    // snapshot (state.sessions[id].model) that arrives on load.
-    //
-    // PROVENANCE SCOPE: this seeds an INLINE model on the session record, so
-    // the guard resolves it via inlineSessionModel(sessionID) directly — the
-    // INLINE-session-model path (the per-session server value), NOT the
-    // production hoist path. Projected snapshots under hoist=1 strip this field
-    // and resolve through projectConstants.model; that distinct case is covered
-    // by (f).
+  it("(d) reload-sim: an UNSENT explicit pick survives reload and blocks the agent switch (P1)", async () => {
+    // Regression for the P1 reload hole: explicitModelPicks + sessionSel are
+    // in-memory only and wiped on reload. Pre-P1, an explicit pick that had
+    // NOT yet been sent (or whose server stamp disagreed) was lost on reload —
+    // the next agent switch applied the new agent's declared model (the silent
+    // flip). Post-P1 the pick is persisted per-session
+    // (vh.sessionmodels.v1:<dir>, sync/store.ts sessionModelPicks), restored at
+    // module load, and its provenance suppresses the agent model identically
+    // to an in-session pick. Models the reload as vi.resetModules() (wipes
+    // sessionSel + explicitModelPicks + the sync store singletons); the pick
+    // must come back purely from the persisted map — NO server model is seeded
+    // (this is the unsent-pick case; the server-stamp paths are covered by (e)
+    // inline-model and (g) message-provenance).
     vi.resetModules();
     const before = await import("../../src/models");
     const sid = "sess-d";
-    // 1) Pre-reload: the user explicitly picked GLM (intent is in-memory only).
+    // 1) Pre-reload: the user explicitly picked GLM (persisted by P1).
     before.chooseModel(sid, GLM_PROVIDER, GLM_MODEL);
+    before.chooseVariant(sid, GLM_VARIANT);
 
-    // 2) Reload: wipe ALL module state, then re-seed the server snapshot.
+    // 2) Reload: wipe ALL module state — no server snapshot is seeded.
     vi.resetModules();
     installFetchStub();
     const after = {
-      store: await import("../../src/sync/store"),
       models: await import("../../src/models"),
       agents: await import("../../src/agents"),
     };
-    after.store.setState("sessions", sid, {
-      id: sid,
-      model: { providerID: GLM_PROVIDER, modelID: GLM_MODEL, variant: GLM_VARIANT },
-    });
     await after.agents.loadAgents();
 
     // 3) After reload, switch to the GPT-declaring agent.
     after.agents.selectAgentForSession(sid, GPT_AGENT.name);
 
-    // 4) The server-persisted GLM model must survive.
-    //    PRE-FIX: applyAgentModel's guard only checked explicitModelPicks (empty
-    //    after reload), so GPT clobbered GLM -> sel.modelID === "gpt-4" (RED).
-    //    POST-FIX: the guard also honors sessionModel(sid) -> GLM sticks (GREEN).
+    // 4) The restored explicit GLM pick must survive.
+    //    PRE-P1 (RED): explicitModelPicks empty after reload + no server model
+    //    → GPT was applied to sessionSel → sel.modelID === "gpt-4".
+    //    POST-P1 (GREEN): the restored pick (sessionModelPicks[sid]) guards
+    //    applyAgentModel AND tops selectionFor → GLM sticks.
     const sel = after.models.selectionFor(sid);
     expect(sel).toBeTruthy();
     expect(sel!.providerID).toBe(GLM_PROVIDER);
