@@ -382,12 +382,26 @@ func (c *Client) Messages(ctx context.Context, sessionID string) ([]json.RawMess
 }
 
 // MessagesTail returns the most recent `limit` messages of a session as raw JSON
-// objects. It uses OpenCode's `?limit=N` query (sst/opencode MessageV2.page:
-// orders by desc(time_created) then reverses → the N NEWEST messages, in
-// chronological order within the page). A limit <= 0 requests the full list.
+// objects, plus the parsed X-Next-Cursor response header. It uses OpenCode's
+// `?limit=N` query (sst/opencode MessageV2.page: orders by desc(time_created)
+// then reverses → the N NEWEST messages, in chronological order within the
+// page). A limit <= 0 requests the full list.
 // Used by the aggregator during cold hydrate to seed the tree's per-agent chips
 // (the agent lives on assistant messages as info.agent) without fetching every
 // session's full history.
+//
+// Header semantics (load-bearing for has_older truthfulness): MessageV2.page
+// computes `more = rows.length > limit` and a cursor (the OLDEST tuple of the
+// returned slice) INDEPENDENT of `before` (message-v2.ts:457-465), and the
+// handler emits X-Next-Cursor iff that cursor exists
+// (handlers/session.ts:130-144; pinned by upstream httpapi-session.test.ts
+// 354-359 + 955-973: a no-before `?limit=1` on a 2-message session carries
+// x-next-cursor). So on a limit>0 tail GET: nextCursor != "" ⇒ older history
+// EXISTS beyond the tail (authoritative); nextCursor == "" ⇒ the tail IS the
+// whole transcript (authoritative — no len<limit guessing, no inverse lie).
+// A limit<=0 fetch sends no limit param, so no paging headers come back
+// (nextCursor == "" regardless); callers fetching the full list already hold
+// everything. Unlike getJSON, this variant does NOT discard response headers.
 //
 // For OLDER pages (strictly-older-than-a-cursor), use MessagesBefore — opencode
 // supports backward paging via `?before=<cursor-token>&limit=N` + the
@@ -395,16 +409,29 @@ func (c *Client) Messages(ctx context.Context, sessionID string) ([]json.RawMess
 // message-backward-cursor.md). The earlier "no backward pagination" inference
 // was wrong for latest; it was a raw-id-probe artifact (a raw msg_ id is not a
 // valid cursor token → 400).
-func (c *Client) MessagesTail(ctx context.Context, sessionID string, limit int) ([]json.RawMessage, error) {
+func (c *Client) MessagesTail(ctx context.Context, sessionID string, limit int) ([]json.RawMessage, string, error) {
 	path := "/session/" + sessionID + "/message"
 	if limit > 0 {
 		path += "?limit=" + fmt.Sprintf("%d", limit)
 	}
-	var out []json.RawMessage
-	if err := c.getJSON(ctx, path, &out); err != nil {
-		return nil, err
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, "", err
 	}
-	return out, nil
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, "", fmt.Errorf("GET %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var out []json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, "", err
+	}
+	return out, resp.Header.Get("X-Next-Cursor"), nil
 }
 
 // EncodeMessageCursor builds an opencode backward-paging cursor token for the

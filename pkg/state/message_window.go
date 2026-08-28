@@ -115,16 +115,30 @@ func messageCreatedFromInfo(info json.RawMessage) (float64, bool) {
 // and signals oversized_item + actual_bytes/budget_bytes so a client can render
 // a diagnostic without a freeze).
 //
-// PURE and DETERMINISTIC: same input list → same bounded list + same WindowMeta.
-// This is what preserves the monotonic revision-validation contract under
-// windowing (no false staleness discard): the same captured state always
-// projects to the same bytes, so publishColdBatch's msgRev equality check is
-// sound. The projector performs NO store access and NO lock acquisition — it
-// operates on an already-captured []MessageWithParts.
+// historyExhausted is the EXPLICIT exhaustion input: whether the RESIDENT list
+// already holds the session's oldest message (learned by the CALLER from
+// opencode's X-Next-Cursor on the cold tail fetch — "" ⇒ exhausted — or from a
+// backward page walk that reached the floor; see SetSessionMessagesExhausted /
+// MergeOlderMessages). It is what makes HasOlder truthful when NEITHER dual
+// bound fires on a resident list that was itself truncated at FETCH time: a
+// cold tail of exactly windowMaxCount light messages has countLimited=false and
+// bytesLimited=false, yet older history exists in opencode — HasOlder must be
+// true, and the resident list alone cannot know that. Conversely a fully
+// loaded small session (exhausted=true, no limit fired) MUST report
+// has_older=false — the no-inverse-lie direction.
+//
+// PURE and DETERMINISTIC: same input list + same exhaustion flag → same bounded
+// list + same WindowMeta. The flag is an explicit INPUT (never read from store
+// state inside the projector), so this stays what preserves the monotonic
+// revision-validation contract under windowing (no false staleness discard):
+// the same captured state — list AND flag, captured together under the same
+// lock — always projects to the same bytes, so publishColdBatch's msgRev
+// equality check is sound. The projector performs NO store access and NO lock
+// acquisition — it operates on an already-captured []MessageWithParts.
 //
 // The result preserves creation order (oldest first), matching the wire shape
 // the client expects for prepend-on-load-more.
-func projectMessageWindow(list []MessageWithParts, maxCount, maxBytes int) ([]MessageWithParts, WindowMeta) {
+func projectMessageWindow(list []MessageWithParts, maxCount, maxBytes int, historyExhausted bool) ([]MessageWithParts, WindowMeta) {
 	meta := WindowMeta{}
 	n := len(list)
 	if n == 0 {
@@ -153,12 +167,14 @@ func projectMessageWindow(list []MessageWithParts, maxCount, maxBytes int) ([]Me
 
 	if newestSize > maxBytes {
 		// Oversized newest: return it ALONE. has_older reflects whether older
-		// messages exist beyond this one. The diagnostics let a client explain
+		// messages exist beyond this one — older RESIDENT messages (n > 1) or,
+		// when the resident list itself may be truncated, older opencode
+		// history (!historyExhausted). The diagnostics let a client explain
 		// WHY it sees a single oversized item instead of the expected window.
 		meta.MessageCount = 1
 		meta.SerializedBytes = newestSize
 		meta.OldestLoadedID = oldestID
-		meta.HasOlder = n > 1
+		meta.HasOlder = n > 1 || !historyExhausted
 		meta.OversizedItem = true
 		meta.ActualBytes = newestSize
 		meta.BudgetBytes = maxBytes
@@ -185,7 +201,15 @@ func projectMessageWindow(list []MessageWithParts, maxCount, maxBytes int) ([]Me
 	meta.MessageCount = len(tail)
 	meta.SerializedBytes = accumulated
 	meta.OldestLoadedID = oldestID
-	meta.HasOlder = countLimited || bytesLimited
+	// HasOlder (truthful, both directions): a dual-bound limit firing means
+	// older messages exist beyond the window (affordance true). When NEITHER
+	// fired, the window is the whole RESIDENT list — but the resident list
+	// itself may be a fetch-bounded tail, so older history exists iff the
+	// caller-reported exhaustion flag says the floor was not reached.
+	// countLimited/bytesLimited already dominate when set; !historyExhausted
+	// only adds the truncated-tail case (and a fully-loaded session with
+	// exhausted=true keeps has_older=false — no inverse lie).
+	meta.HasOlder = countLimited || bytesLimited || !historyExhausted
 	meta.CountLimited = countLimited
 	meta.BytesLimited = bytesLimited
 	// tail was built newest-first; reverse to creation order (oldest first).
@@ -904,8 +928,15 @@ func (s *Store) bumpMsgRev(sid string) {
 // window, and older messages arrive via the historical HTTP page endpoint. The
 // returned WindowMeta describes the window (has_older, limits, oversized) so
 // packageMessagesBatch can carry it in the outer payload without decompression.
-// The revision token is still the FULL-state msgRev[sid] (the bound is pure and
-// deterministic, so the revision gate's equality check remains sound).
+// The window's HasOlder is TRUTHFUL for a fetch-truncated resident list: the
+// session's historyExhausted flag (set from the cold tail's X-Next-Cursor by
+// SetSessionMessagesExhausted, or a floor-reaching page walk by
+// MergeOlderMessages) is read HERE under the SAME s.mu hold that captures the
+// list, then handed to the pure projector as an explicit input — so the
+// projection input stays a single consistent (list, flag) pair and the
+// revision gate's equality check remains sound. The revision token is still
+// the FULL-state msgRev[sid] (the bound is pure and deterministic, so the
+// revision gate's equality check remains sound).
 func (s *Store) captureMessagesBatchLocked(sid string) ([]MessageWithParts, uint64, WindowMeta) {
 	sm := s.messages[sid]
 	if sm == nil {
@@ -926,7 +957,7 @@ func (s *Store) captureMessagesBatchLocked(sid string) ([]MessageWithParts, uint
 			Parts: parts,
 		})
 	}
-	bounded, meta := projectMessageWindow(full, s.windowMaxCount, s.windowMaxBytes)
+	bounded, meta := projectMessageWindow(full, s.windowMaxCount, s.windowMaxBytes, sm.historyExhausted)
 	return bounded, s.msgRev[sid], meta
 }
 

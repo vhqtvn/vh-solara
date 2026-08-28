@@ -1262,8 +1262,21 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Tail (no cursor): newest N messages, chronological within the window.
-	if limit > 0 && limit < len(msgs) {
+	// Mirror real OpenCode's MessageV2.page (message-v2.ts:457-465 + the
+	// httpapi handler session.ts:130-144, pinned by upstream
+	// httpapi-session.test.ts:955-973): when more history remains beyond the
+	// window (len(msgs) > limit), set X-Next-Cursor to the OLDEST tuple of the
+	// returned slice; when the tail IS the whole transcript, emit NO header.
+	// The aggregator's cold load reads this as the authoritative exhaustion
+	// verdict (has-older truthfulness), so the fixture must be faithful here.
+	if limit > 0 && len(msgs) > limit {
 		msgs = msgs[len(msgs)-limit:]
+		oldest := msgs[0]
+		oid, _ := oldest.Info["id"].(string)
+		otime, _ := messageCreatedTime(oldest)
+		if oid != "" {
+			w.Header().Set("X-Next-Cursor", encodeMessageCursor(oid, otime))
+		}
 	}
 	writeJSON(w, msgs)
 }

@@ -72,7 +72,7 @@ func TestWindow_CountBound(t *testing.T) {
 		winMsg("m4", 10),
 		winMsg("m5", 10),
 	}
-	bounded, meta := projectMessageWindow(list, 3, 1<<20)
+	bounded, meta := projectMessageWindow(list, 3, 1<<20, true)
 
 	if got := msgIDs(bounded); !equalStrings(got, []string{"m3", "m4", "m5"}) {
 		t.Fatalf("count-bound window must be the 3 newest in creation order: got %v", got)
@@ -110,7 +110,7 @@ func TestWindow_ByteBound(t *testing.T) {
 	// Budget fits m3 + m2 exactly, but adding m1 would exceed. So the window is
 	// {m2, m3} and m1 is the excluded older message.
 	budget := size1 * 2 // fits exactly 2 messages (the 2 newest)
-	bounded, meta := projectMessageWindow([]MessageWithParts{m1, m2, m3}, 100, budget)
+	bounded, meta := projectMessageWindow([]MessageWithParts{m1, m2, m3}, 100, budget, true)
 
 	if got := msgIDs(bounded); !equalStrings(got, []string{"m2", "m3"}) {
 		t.Fatalf("byte-bound window must be the 2 newest that fit: got %v", got)
@@ -141,7 +141,7 @@ func TestWindow_OversizedNewest(t *testing.T) {
 	small := winMsg("m1", 10)
 	huge := winMsg("m2", 5000) // 5 KiB — far over a tiny budget
 
-	bounded, meta := projectMessageWindow([]MessageWithParts{small, huge}, 100, 1000)
+	bounded, meta := projectMessageWindow([]MessageWithParts{small, huge}, 100, 1000, true)
 
 	if got := msgIDs(bounded); !equalStrings(got, []string{"m2"}) {
 		t.Fatalf("oversized window must be the newest alone: got %v", got)
@@ -170,7 +170,7 @@ func TestWindow_OversizedNewest(t *testing.T) {
 // message. has_older must be false (nothing older exists).
 func TestWindow_OversizedNewest_SingleMessage(t *testing.T) {
 	huge := winMsg("only", 5000)
-	bounded, meta := projectMessageWindow([]MessageWithParts{huge}, 100, 1000)
+	bounded, meta := projectMessageWindow([]MessageWithParts{huge}, 100, 1000, true)
 
 	if got := msgIDs(bounded); !equalStrings(got, []string{"only"}) {
 		t.Fatalf("oversized single-message window: got %v", got)
@@ -190,7 +190,7 @@ func TestWindow_OversizedNewest_SingleMessage(t *testing.T) {
 // TestColdBatchInvalidatedByMessageRemoved work (deleted message → 0-message
 // session → empty batch emitted, not silently dropped).
 func TestWindow_EmptySession(t *testing.T) {
-	bounded, meta := projectMessageWindow([]MessageWithParts{}, 100, 1<<20)
+	bounded, meta := projectMessageWindow([]MessageWithParts{}, 100, 1<<20, true)
 
 	if bounded == nil {
 		t.Fatalf("empty-session window must be NON-NIL ([]MessageWithParts{}) so it is not mistaken for a gone session")
@@ -213,7 +213,7 @@ func TestWindow_EmptySession(t *testing.T) {
 // has_older=false (the window IS the whole transcript).
 func TestWindow_SingleMessage(t *testing.T) {
 	m := winMsg("solo", 100)
-	bounded, meta := projectMessageWindow([]MessageWithParts{m}, 100, 1<<20)
+	bounded, meta := projectMessageWindow([]MessageWithParts{m}, 100, 1<<20, true)
 
 	if got := msgIDs(bounded); !equalStrings(got, []string{"solo"}) {
 		t.Fatalf("single-message window: got %v", got)
@@ -238,7 +238,7 @@ func TestWindow_ExactFit(t *testing.T) {
 		winMsg("m2", 10),
 		winMsg("m3", 10),
 	}
-	bounded, meta := projectMessageWindow(list, 3, 1<<20)
+	bounded, meta := projectMessageWindow(list, 3, 1<<20, true)
 
 	if got := msgIDs(bounded); !equalStrings(got, []string{"m1", "m2", "m3"}) {
 		t.Fatalf("exact-fit window must include all 3: got %v", got)
@@ -265,8 +265,8 @@ func TestWindow_Determinism(t *testing.T) {
 		winMsg("m4", 80),
 		winMsg("m5", 90),
 	}
-	b1, m1 := projectMessageWindow(list, 3, 500)
-	b2, m2 := projectMessageWindow(list, 3, 500)
+	b1, m1 := projectMessageWindow(list, 3, 500, false)
+	b2, m2 := projectMessageWindow(list, 3, 500, false)
 
 	if !equalMessageLists(b1, b2) {
 		t.Fatalf("determinism: repeated projection produced different message lists")
@@ -287,7 +287,7 @@ func TestWindow_OrderingPreserved(t *testing.T) {
 		winMsg("newest", 10),
 	}
 	// Force a window that drops the oldest (count-bound at 2).
-	bounded, _ := projectMessageWindow(list, 2, 1<<20)
+	bounded, _ := projectMessageWindow(list, 2, 1<<20, false)
 	if got := msgIDs(bounded); !equalStrings(got, []string{"mid", "newest"}) {
 		t.Fatalf("ordering: want [mid newest] (creation order), got %v", got)
 	}
@@ -433,6 +433,197 @@ func TestWindow_ColdBatchRevisionValidationHoldsUnderBound(t *testing.T) {
 	msgs := decodeBatchMessages(t, batches[0].Payload)
 	if len(msgs) != 3 {
 		t.Fatalf("batch messages: want 3 (WindowMaxCount), got %d", len(msgs))
+	}
+}
+
+// TestWindow_TruncatedTailLight_HasOlderTrue is THE regression pin for the
+// has-older lie: a cold tail of EXACTLY maxCount light messages (aggregate far
+// under the byte budget) trips NEITHER dual bound, yet the resident list was
+// truncated at FETCH time — older history exists in opencode beyond it. The
+// caller-threaded exhaustion flag (historyExhausted=false, learned from the
+// tail GET's X-Next-Cursor) must surface has_older=true so the SPA renders the
+// Load-older affordance and pages history (repro: ses_ff9d55010ffer8bsHjyJ4Q4pMr,
+// 1074 messages, newest-100 tail ~803KB < 1MiB, old code reported
+// has_older=false + count_limited=false).
+func TestWindow_TruncatedTailLight_HasOlderTrue(t *testing.T) {
+	const maxCount = 100
+	list := make([]MessageWithParts, 0, maxCount)
+	for i := 1; i <= maxCount; i++ {
+		list = append(list, winMsg("m"+itoa(i), 10))
+	}
+	bounded, meta := projectMessageWindow(list, maxCount, 1<<20, false)
+
+	if len(bounded) != maxCount {
+		t.Fatalf("window: want all %d light messages, got %d", maxCount, len(bounded))
+	}
+	if meta.MessageCount != maxCount {
+		t.Fatalf("MessageCount: want %d, got %d", maxCount, meta.MessageCount)
+	}
+	if !meta.HasOlder {
+		t.Fatalf("HasOlder: want TRUE (fetch-truncated tail, cursor evidence says older history exists) — the has-older lie regression")
+	}
+	if meta.CountLimited {
+		t.Fatalf("CountLimited: want false (resident len == maxCount, no resident message was dropped)")
+	}
+	if meta.BytesLimited {
+		t.Fatalf("BytesLimited: want false (light tail under the byte budget)")
+	}
+	if meta.OversizedItem {
+		t.Fatalf("OversizedItem: want false")
+	}
+}
+
+// TestWindow_FullyLoadedNoInverseLie pins the opposite direction: a session the
+// store KNOWS is fully loaded (historyExhausted=true — the tail GET returned no
+// X-Next-Cursor) must NOT advertise has_older, including the exact-fit edge
+// (len == maxCount) where the old len<limit heuristic would have guessed
+// "not exhausted" and forced a wasted self-correcting fetch. Cursor evidence
+// settles both directions without guessing.
+func TestWindow_FullyLoadedNoInverseLie(t *testing.T) {
+	cases := []struct {
+		name string
+		n    int
+	}{
+		{"small session (n < maxCount)", 42},
+		{"exact fit (n == maxCount)", 100},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			list := make([]MessageWithParts, 0, tc.n)
+			for i := 1; i <= tc.n; i++ {
+				list = append(list, winMsg("m"+itoa(i), 10))
+			}
+			bounded, meta := projectMessageWindow(list, 100, 1<<20, true)
+			if len(bounded) != tc.n {
+				t.Fatalf("window: want all %d messages resident, got %d", tc.n, len(bounded))
+			}
+			if meta.HasOlder {
+				t.Fatalf("HasOlder: want FALSE (fully loaded, cursor said exhausted — no inverse lie)")
+			}
+			if meta.CountLimited || meta.BytesLimited || meta.OversizedItem {
+				t.Fatalf("no limit flags should be set: %+v", meta)
+			}
+		})
+	}
+}
+
+// TestWindow_OversizedExhaustionDirections: the oversized-newest short-circuit
+// also honors the exhaustion input — a lone oversized resident that IS the whole
+// transcript keeps has_older=false (exhausted=true), while one that may have
+// older history beyond the fetch-bounded resident (exhausted=false) reports
+// has_older=true.
+func TestWindow_OversizedExhaustionDirections(t *testing.T) {
+	huge := winMsg("huge", 5000)
+
+	bounded, meta := projectMessageWindow([]MessageWithParts{huge}, 100, 1000, true)
+	if len(bounded) != 1 || !meta.OversizedItem {
+		t.Fatalf("oversized single-message shape: len=%d oversized=%v", len(bounded), meta.OversizedItem)
+	}
+	if meta.HasOlder {
+		t.Fatalf("oversized + exhausted: HasOlder want false (the lone resident IS the whole transcript)")
+	}
+
+	_, meta2 := projectMessageWindow([]MessageWithParts{huge}, 100, 1000, false)
+	if !meta2.HasOlder {
+		t.Fatalf("oversized + NOT exhausted: HasOlder want true (older history may exist beyond the truncated resident)")
+	}
+}
+
+// TestWindow_StoreSnapshot_TruncatedTailHasOlder: STORE-level pin for the
+// SNAPSHOT WindowMeta producer (materializeSnapshot): a cold load installed via
+// SetSessionMessagesExhausted with cursor evidence (a) not-exhausted → snapshot
+// has_older=true even though neither dual bound fires on the light exact-window
+// resident; (b) exhausted → has_older=false (no inverse lie). The exhaustion
+// flag must travel through the snapshot CAPTURE (captured under the same lock
+// as the message lists) into the projector.
+func TestWindow_StoreSnapshot_TruncatedTailHasOlder(t *testing.T) {
+	s := mustNew(t, withWindowBounds(DefaultConfig(100), 4, 1<<20))
+
+	seedFourMessages(t, s, "trunc")
+	seedFourMessages(t, s, "full")
+	// "trunc": a 4-message resident at an exact 4-message window (the truncated
+	// tail shape) whose tail GET carried X-Next-Cursor → NOT exhausted.
+	// "full": a 3-message resident under the window whose tail GET carried NO
+	// cursor → exhausted.
+	s.SetSessionMessagesExhausted("trunc", fourMessageList("trunc"), false)
+	s.SetSessionMessagesExhausted("full", fourMessageList("full")[:3], true)
+
+	snap := s.Snapshot(map[string]bool{"trunc": true, "full": true})
+	mt, ok := snap.MessageWindows["trunc"]
+	if !ok {
+		t.Fatalf("snapshot must carry MessageWindows[trunc]")
+	}
+	if !mt.HasOlder {
+		t.Fatalf("snapshot MessageWindows[trunc].HasOlder: want true (fetch-truncated exact-window tail, not exhausted) — the has-older lie regression")
+	}
+	if mt.CountLimited || mt.BytesLimited {
+		t.Fatalf("snapshot MessageWindows[trunc]: want no limit flags (light tail), got %+v", mt)
+	}
+	mf, ok := snap.MessageWindows["full"]
+	if !ok {
+		t.Fatalf("snapshot must carry MessageWindows[full]")
+	}
+	if mf.HasOlder {
+		t.Fatalf("snapshot MessageWindows[full].HasOlder: want false (fully loaded, exhausted) — no inverse lie")
+	}
+}
+
+// TestWindow_StoreColdBatch_TruncatedTailHasOlder: STORE-level pin for the COLD
+// messages.batch WindowMeta producer (captureMessagesBatchLocked →
+// publishColdBatch): the same truthful has_older as the snapshot — a
+// cursor-evidenced not-exhausted exact-window light tail carries
+// window.has_older=true in the OUTER batch envelope (the field the SPA's
+// history.ts reads without decompressing), and an exhausted small session
+// carries false.
+func TestWindow_StoreColdBatch_TruncatedTailHasOlder(t *testing.T) {
+	s := mustNew(t, withWindowBounds(DefaultConfig(100), 4, 1<<20))
+
+	seedFourMessages(t, s, "trunc")
+	ch, unsub := s.Subscribe(256)
+	defer unsub()
+	drainAll(ch)
+
+	s.SetSessionMessagesExhausted("trunc", fourMessageList("trunc"), false)
+	s.EmitMessagesLoaded("trunc", 1, 1)
+
+	batches := collectBatches(t, ch)
+	if len(batches) != 1 {
+		t.Fatalf("want exactly 1 cold batch, got %d", len(batches))
+	}
+	meta := decodeBatchWindow(t, batches[0].Payload)
+	if len(decodeBatchMessages(t, batches[0].Payload)) != 4 {
+		t.Fatalf("batch messages: want all 4 (exact window fit), got %d", len(decodeBatchMessages(t, batches[0].Payload)))
+	}
+	if !meta.HasOlder {
+		t.Fatalf("batch window.HasOlder: want TRUE (fetch-truncated tail, not exhausted) — the has-older lie regression")
+	}
+	if meta.CountLimited || meta.BytesLimited {
+		t.Fatalf("batch window: want no limit flags (light tail), got %+v", meta)
+	}
+}
+
+// TestWindow_SetSessionMessagesHeuristicFallback: the no-evidence entry
+// (SetSessionMessages) keeps the len<windowMaxCount fallback for backward
+// compatibility — a partial window ⇒ exhausted (has_older=false), a full window
+// ⇒ assume older may exist (has_older=true, self-correcting via the
+// boundary-demand floor walk). Fresh creation only: the lists are installed
+// WITHOUT prior live Apply (a live-created sessionMessages carries the
+// zero-value flag, which the heuristic path preserves — warm reconciles never
+// re-derive it without evidence).
+func TestWindow_SetSessionMessagesHeuristicFallback(t *testing.T) {
+	s := mustNew(t, withWindowBounds(DefaultConfig(100), 4, 1<<20))
+
+	s.Apply(ev("session.created", `{"info":{"id":"part"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"fit"}}`))
+	s.SetSessionMessages("part", fourMessageList("part")[:3]) // partial → exhausted
+	s.SetSessionMessages("fit", fourMessageList("fit"))       // exact → assume older
+
+	snap := s.Snapshot(map[string]bool{"part": true, "fit": true})
+	if snap.MessageWindows["part"].HasOlder {
+		t.Fatalf("partial-window heuristic: has_older want false (len < windowMaxCount ⇒ exhausted)")
+	}
+	if !snap.MessageWindows["fit"].HasOlder {
+		t.Fatalf("full-window heuristic: has_older want true (len == windowMaxCount ⇒ assume older may exist)")
 	}
 }
 

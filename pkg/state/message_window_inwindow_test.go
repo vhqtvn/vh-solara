@@ -57,7 +57,7 @@ func TestMessageInWindow_PureMatchesProjector(t *testing.T) {
 	const maxCount = 3
 	const maxBytes = 1 << 20
 
-	bounded, _ := projectMessageWindow(list, maxCount, maxBytes)
+	bounded, _ := projectMessageWindow(list, maxCount, maxBytes, false)
 	want := map[string]bool{}
 	for _, m := range bounded {
 		want[messageIDFromInfo(m.Info)] = true
@@ -124,7 +124,7 @@ func TestMessageInWindow_PureByteBoundAndOversized(t *testing.T) {
 		me := byID[id]
 		list = append(list, MessageWithParts{Info: me.info, Parts: []json.RawMessage{me.parts[id+"-p0"]}})
 	}
-	bounded, _ := projectMessageWindow(list, 100, 400)
+	bounded, _ := projectMessageWindow(list, 100, 400, false)
 	want := map[string]bool{}
 	for _, m := range bounded {
 		want[messageIDFromInfo(m.Info)] = true
@@ -210,7 +210,7 @@ func TestMessageInWindow_KeylessPlaceholderNewest(t *testing.T) {
 		me := byID[id]
 		list = append(list, MessageWithParts{Info: me.info, Parts: []json.RawMessage{me.parts[id+"-p0"]}})
 	}
-	bounded, _ := projectMessageWindow(list, maxCount, maxBytes)
+	bounded, _ := projectMessageWindow(list, maxCount, maxBytes, false)
 	if len(bounded) != 3 {
 		t.Fatalf("projector sanity: want all 3 (newest always in, keyless included), got %d", len(bounded))
 	}

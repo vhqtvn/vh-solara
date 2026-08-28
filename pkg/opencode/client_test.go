@@ -228,3 +228,55 @@ func TestMessage5xx(t *testing.T) {
 		t.Fatalf("5xx must not satisfy ErrMessageNotFound")
 	}
 }
+
+// TestMessagesTailNextCursor pins the has-older truthfulness contract at the
+// transport seam: the tail GET (?limit=N, no before) carries X-Next-Cursor IFF
+// more history exists beyond the window (upstream MessageV2.page computes
+// more=rows.length>limit independent of `before` — message-v2.ts:457-465,
+// handlers/session.ts:130-144, pinned by httpapi-session.test.ts:955-973), so
+// MessagesTail must surface it as the authoritative exhaustion verdict:
+// header present ⇒ nextCursor != "" (older exists); absent ⇒ "" (the tail IS
+// the whole transcript).
+func TestMessagesTailNextCursor(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/session/s1/message", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("limit") != "2" {
+			http.Error(w, "expected ?limit=2", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// More-history case: 3 messages exist, window is the newest 2.
+		w.Header().Set("X-Next-Cursor", "Y3Vyc29yLXRva2Vu")
+		w.Write([]byte(`[{"info":{"id":"m2"}},{"info":{"id":"m3"}}]`))
+	})
+	mux.HandleFunc("/session/s2/message", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Exhausted case: everything fits in the window — NO header at all.
+		w.Write([]byte(`[{"info":{"id":"only"}}]`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL)
+
+	items, next, err := c.MessagesTail(context.Background(), "s1", 2)
+	if err != nil {
+		t.Fatalf("MessagesTail (more history): %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items: want 2, got %d", len(items))
+	}
+	if next != "Y3Vyc29yLXRva2Vu" {
+		t.Fatalf("nextCursor: want the X-Next-Cursor header value, got %q", next)
+	}
+
+	items2, next2, err := c.MessagesTail(context.Background(), "s2", 2)
+	if err != nil {
+		t.Fatalf("MessagesTail (exhausted): %v", err)
+	}
+	if len(items2) != 1 {
+		t.Fatalf("items: want 1, got %d", len(items2))
+	}
+	if next2 != "" {
+		t.Fatalf("nextCursor: want empty (no header — tail is the whole transcript), got %q", next2)
+	}
+}

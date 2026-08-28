@@ -227,7 +227,14 @@ func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error
 			// bound (7648673) is recovered. The prior revert's regression guard
 			// (TestSnapshotMessagesPage_FullResidentSupportsOlderHistory, now
 			// extended for the boundary-demand path) stays green.
-			items, err := a.client.MessagesTail(ctx, sessionID, state.WindowMaxCount)
+			//
+			// Has-older truthfulness: MessagesTail reads the tail GET's
+			// X-Next-Cursor (set iff more history exists beyond the window —
+			// refs/opencode message-v2.ts:457-465 + handlers/session.ts:130-144)
+			// and hands the exhaustion verdict to the store, so the cold batch /
+			// snapshot WindowMeta report has_older truthfully for sessions whose
+			// light tail trips neither dual bound.
+			items, nextCursor, err := a.client.MessagesTail(ctx, sessionID, state.WindowMaxCount)
 			if err != nil {
 				// Signal failure to any async caller that deduped against this
 				// sync winner (shared-slot completion contract). The session
@@ -238,7 +245,7 @@ func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error
 			}
 			fetchMs := time.Since(t0).Milliseconds()
 			tR := time.Now()
-			res := a.store.SetSessionMessages(sessionID, decodeMessages(items))
+			res := a.store.SetSessionMessagesExhausted(sessionID, decodeMessages(items), nextCursor == "")
 			reconcileMs := time.Since(tR).Milliseconds()
 			// Emit completion ONLY when a batch was published (cold) or it was
 			// a genuine warm reconcile (no batch required) AND the resident-
@@ -406,8 +413,9 @@ func (a *Aggregator) EnsureMessagesAsync(sessionID string) {
 			t0 := time.Now()
 			// Part A/B: bound the initial cold-load to the render window
 			// (state.WindowMaxCount newest). See EnsureMessages for the full
-			// rationale + Part B recovery.
-			items, err := a.client.MessagesTail(fetchCtx, sessionID, state.WindowMaxCount)
+			// rationale + Part B recovery + the X-Next-Cursor exhaustion
+			// verdict (has-older truthfulness).
+			items, nextCursor, err := a.client.MessagesTail(fetchCtx, sessionID, state.WindowMaxCount)
 			if err != nil {
 				if fetchCtx.Err() != nil {
 					// Aggregator shutting down (or caller ctx cancelled in a
@@ -425,7 +433,7 @@ func (a *Aggregator) EnsureMessagesAsync(sessionID string) {
 			}
 			fetchMs := time.Since(t0).Milliseconds()
 			tR := time.Now()
-			res := a.store.SetSessionMessages(sessionID, decodeMessages(items))
+			res := a.store.SetSessionMessagesExhausted(sessionID, decodeMessages(items), nextCursor == "")
 			reconcileMs := time.Since(tR).Milliseconds()
 			// Emit completion ONLY when a batch was published (cold) or it was
 			// a genuine warm reconcile (no batch required) AND the resident-

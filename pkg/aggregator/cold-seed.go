@@ -143,7 +143,9 @@ func (a *Aggregator) seedColdLastAgents(ctx context.Context, sessions []json.Raw
 		go func(id string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			items, err := a.client.MessagesTail(ctx, id, coldTailLimit)
+			// The tail GET's X-Next-Cursor is irrelevant here (cold-seed only
+			// scans the newest assistant's agent) — discarded deliberately.
+			items, _, err := a.client.MessagesTail(ctx, id, coldTailLimit)
 			if err != nil {
 				log.Printf("[aggregator] lastAgent tail fetch failed for %s: %v", id, err)
 				return

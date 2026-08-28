@@ -1135,3 +1135,55 @@ func TestSnapshotMessagesPage_FullResidentSupportsOlderHistory(t *testing.T) {
 		}
 	})
 }
+
+// TestSnapshotMessagesPage_CursorSetExhaustion pins that the cold-load cursor
+// evidence entry (SetSessionMessagesExhausted — the tail GET's X-Next-Cursor
+// verdict) drives the page endpoint's HasOlder correction exactly like the
+// MergeOlderMessages-set flag does: a NOT-exhausted bounded resident (cursor
+// present) pages with has_older=true; an exhausted one (cursor absent — even at
+// an exact window fit, the old len<limit heuristic's blind edge) reports
+// has_older=false with no wasted affordance.
+func TestSnapshotMessagesPage_CursorSetExhaustion(t *testing.T) {
+	t.Run("cursor-present-not-exhausted", func(t *testing.T) {
+		st := New(1024)
+		st.Apply(ev("session.created", `{"info":{"id":"s","title":"S"}}`))
+		bounded := make([]MessageWithParts, WindowMaxCount)
+		for i := 0; i < WindowMaxCount; i++ {
+			bounded[i] = pageMsg(fmt.Sprintf("m%d", i+1), 10) // m1..m100, light
+		}
+		st.SetSessionMessagesExhausted("s", bounded, false) // X-Next-Cursor present
+
+		page := st.SnapshotMessagesPage("s", "m1", WindowMaxCount, 1<<20)
+		if !page.BoundaryFound {
+			t.Fatalf("boundary_found: want true (m1 resident), got false")
+		}
+		if !page.HasOlder {
+			t.Fatalf("has_older: want true (cursor said older history exists beyond the tail), got false")
+		}
+		if page.HistoryExhausted {
+			t.Fatalf("history_exhausted: want false, got true")
+		}
+	})
+
+	t.Run("cursor-absent-exhausted-exact-fit", func(t *testing.T) {
+		st := New(1024)
+		st.Apply(ev("session.created", `{"info":{"id":"s","title":"S"}}`))
+		full := make([]MessageWithParts, WindowMaxCount)
+		for i := 0; i < WindowMaxCount; i++ {
+			full[i] = pageMsg(fmt.Sprintf("m%d", i+1), 10) // exactly WindowMaxCount
+		}
+		st.SetSessionMessagesExhausted("s", full, true) // NO X-Next-Cursor: tail IS everything
+
+		// Page from the oldest resident: anchor == session oldest → floor.
+		page := st.SnapshotMessagesPage("s", "m1", WindowMaxCount, 1<<20)
+		if !page.BoundaryFound {
+			t.Fatalf("boundary_found: want true, got false")
+		}
+		if page.HasOlder {
+			t.Fatalf("has_older: want false (cursor-absent exhaustion — no inverse lie at the exact-fit edge), got true")
+		}
+		if !page.HistoryExhausted {
+			t.Fatalf("history_exhausted: want true, got false")
+		}
+	})
+}

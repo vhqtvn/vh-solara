@@ -472,6 +472,14 @@ type snapshotCapture struct {
 	perms       map[string][][]byte
 	statuses    map[string][]byte
 	messages    map[string][]snapMessageCap
+	// historyExhausted captures each session's per-sessionMessages
+	// historyExhausted flag (set by SetSessionMessagesExhausted from the cold
+	// tail's X-Next-Cursor, or MergeOlderMessages on a floor-reaching page
+	// walk). It is an explicit INPUT to projectMessageWindow during
+	// materialization (HasOlder truthfulness for a fetch-truncated resident
+	// list); captured here under the same lock as the message lists so the
+	// (list, flag) pair the projector consumes is consistent.
+	historyExhausted map[string]bool
 }
 
 // captureSnapshotLocked is the CAPTURE PHASE of Snapshot. Caller MUST hold s.mu
@@ -604,10 +612,12 @@ func (s *Store) captureSnapshotLocked(messagesFor map[string]bool) snapshotCaptu
 	// (nil=all ship; empty=none ship; non-empty=only listed) — a SEPARATE gate
 	// from inScope, identical to the prior code.
 	messages := map[string][]snapMessageCap{}
+	historyExhausted := map[string]bool{}
 	for sid, sm := range s.messages {
 		if messagesFor != nil && !messagesFor[sid] {
 			continue
 		}
+		historyExhausted[sid] = sm.historyExhausted
 		list := make([]snapMessageCap, 0, len(sm.order))
 		for _, mid := range sm.order {
 			me := sm.byID[mid]
@@ -653,17 +663,18 @@ func (s *Store) captureSnapshotLocked(messagesFor map[string]bool) snapshotCaptu
 	}
 
 	return snapshotCapture{
-		epoch:       epoch,
-		seq:         seq,
-		subtreeBusy: subtreeBusy,
-		sessions:    sessions,
-		questions:   questions,
-		activity:    activity,
-		unread:      unread,
-		todos:       todos,
-		perms:       perms,
-		statuses:    statuses,
-		messages:    messages,
+		epoch:            epoch,
+		seq:              seq,
+		subtreeBusy:      subtreeBusy,
+		sessions:         sessions,
+		questions:        questions,
+		activity:         activity,
+		unread:           unread,
+		todos:            todos,
+		perms:            perms,
+		statuses:         statuses,
+		messages:         messages,
+		historyExhausted: historyExhausted,
 	}
 }
 
@@ -839,7 +850,14 @@ func (s *Store) materializeSnapshot(c snapshotCapture) Snapshot {
 		// The full list is materialized first (this is the status quo — the
 		// capture loop walks sm.order in full); the window bound is a WIRE/
 		// browser-memory fix, not a store-memory optimization.
-		bounded, meta := projectMessageWindow(out, s.windowMaxCount, s.windowMaxBytes)
+		//
+		// The captured historyExhausted flag is the projector's explicit
+		// exhaustion input (captured under the same lock as the list): when
+		// neither dual bound fires on a fetch-truncated resident tail,
+		// has_older is true iff the floor was not reached — the truthful
+		// HasOlder fix (a fully-loaded session with exhausted=true keeps
+		// has_older=false; no inverse lie).
+		bounded, meta := projectMessageWindow(out, s.windowMaxCount, s.windowMaxBytes, c.historyExhausted[sid])
 		snap.Messages[sid] = bounded
 		snap.MessageWindows[sid] = meta
 	}

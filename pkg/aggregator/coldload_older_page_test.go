@@ -74,3 +74,94 @@ func TestEnsureOlderMessagesFetchesAndMerges(t *testing.T) {
 		t.Fatalf("after merge: has_older want false (history exhausted — fixture returned ≤WindowMaxCount, no X-Next-Cursor), got true")
 	}
 }
+
+// TestColdLoadTailCursorTruthfulHasOlder is the has-older-truthfulness CRUX:
+// with a fixture session of >WindowMaxCount small messages (light tail under
+// 1MiB — the exact repro shape that used to report has_older=false), a cold
+// load via the tail GET's X-Next-Cursor must leave the store NOT-exhausted, so
+// (a) the snapshot messageWindows meta reports has_older=true (the Load-older
+// affordance the SPA keys on), and (b) a client load-older walk — pages via
+// SnapshotMessagesPage with the same boundary-demand D-trigger the HTTP handler
+// runs (messages_http.go:122) — reaches the session's OLDEST message (cm1).
+// It also pins the no-inverse-lie direction: a small fully-fetched session
+// (no X-Next-Cursor on its tail) reports has_older=false.
+func TestColdLoadTailCursorTruthfulHasOlder(t *testing.T) {
+	fake := fixtures.New()
+	const sid = "bigtail"
+	n := state.WindowMaxCount + 74 // light tail under 1 MiB, older history beyond
+	fake.SeedChronologicalMessages(sid, n)
+	oc := httptest.NewServer(fake.Handler())
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+	ctx := context.Background()
+
+	// Cold load. The fixture tail GET (limit=WindowMaxCount < n) sets
+	// X-Next-Cursor → the aggregator records NOT-exhausted.
+	if err := agg.EnsureMessages(ctx, sid); err != nil {
+		t.Fatalf("EnsureMessages (cold-load): %v", err)
+	}
+
+	// (a) CRUX — snapshot messageWindows meta reports has_older=true even
+	// though neither dual bound fires on the light exact-window resident.
+	snap := agg.Store().Snapshot(map[string]bool{sid: true})
+	meta, ok := snap.MessageWindows[sid]
+	if !ok {
+		t.Fatalf("snapshot must carry MessageWindows[%s]", sid)
+	}
+	if len(snap.Messages[sid]) != state.WindowMaxCount {
+		t.Fatalf("snapshot window: want %d messages, got %d", state.WindowMaxCount, len(snap.Messages[sid]))
+	}
+	if meta.HasOlder != true {
+		t.Fatalf("CRUX (a) FAIL: snapshot MessageWindows[%s].HasOlder want true (fetch-truncated light tail, cursor present), got false", sid)
+	}
+	if meta.CountLimited || meta.BytesLimited {
+		t.Fatalf("snapshot window: want no limit flags (light tail), got %+v", meta)
+	}
+
+	// (b) CRUX — a client load-older walk reaches the session's oldest
+	// message. Replicates the FE walk + the HTTP handler's boundary-demand
+	// D-trigger (fetch one older page via the backward cursor, merge, re-page).
+	before := meta.OldestLoadedID
+	if before == "" {
+		t.Fatal("window meta carried no OldestLoadedID to walk from")
+	}
+	reached := ""
+	for step := 0; step < 32; step++ {
+		page := agg.Store().SnapshotMessagesPage(sid, before, state.WindowMaxCount, 1<<20)
+		// Boundary-demand D-trigger (messages_http.go:122): floor hit without
+		// a count/byte/oversized limit and not known-exhausted → fetch one
+		// older page from opencode, merge, re-project.
+		if page.BoundaryFound && !page.CountLimited && !page.BytesLimited && !page.OversizedItem && !page.HistoryExhausted {
+			if oid, oms, ok := agg.Store().OldestResidentCursorTuple(sid); ok {
+				if err := agg.EnsureOlderMessages(sid, oid, oms); err != nil {
+					t.Fatalf("EnsureOlderMessages (walk step %d): %v", step, err)
+				}
+				page = agg.Store().SnapshotMessagesPage(sid, before, state.WindowMaxCount, 1<<20)
+			}
+		}
+		reached = page.OldestID
+		if !page.HasOlder {
+			break
+		}
+		before = page.OldestID
+	}
+	if reached != "cm1" {
+		t.Fatalf("CRUX (b) FAIL: load-older walk reached %q, want cm1 (the session oldest)", reached)
+	}
+
+	// No-inverse-lie: a small session (n < WindowMaxCount) whose tail GET
+	// carries NO X-Next-Cursor reports has_older=false (fully loaded).
+	const small = "small"
+	fake.SeedChronologicalMessages(small, 40)
+	if err := agg.EnsureMessages(ctx, small); err != nil {
+		t.Fatalf("EnsureMessages (small session): %v", err)
+	}
+	smallMeta, ok := agg.Store().Snapshot(map[string]bool{small: true}).MessageWindows[small]
+	if !ok {
+		t.Fatalf("snapshot must carry MessageWindows[%s]", small)
+	}
+	if smallMeta.HasOlder {
+		t.Fatalf("no-inverse-lie FAIL: small fully-fetched session HasOlder want false, got true (%+v)", smallMeta)
+	}
+}

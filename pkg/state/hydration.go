@@ -50,6 +50,12 @@ import (
 // (re)connect to OpenCode, whose event stream has no replay. Byte comparison
 // decides "changed".
 //
+// CONTRACT: every per-session list in `messages` is the session's FULL
+// transcript (the aggregator fetches via client.Messages — no limit param). The
+// reconcile therefore records historyExhausted=true from this path — the
+// authoritative exhaustion fact for the window's has_older. Callers must NOT
+// pass fetch-bounded tails here (use SetSessionMessagesExhausted for those).
+//
 // The session reconcile + message reconcile run under s.mu, then the lock is
 // released BEFORE the cold-batch packaging loop: marshal+gzip+base64 is too
 // expensive to hold the global lock for (it blocks all Apply ingestion). Each
@@ -138,7 +144,13 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 	// lock — it blocks all Apply ingestion during compression). ---
 	var coldBatched []string
 	for sid, list := range messages {
-		cold, _ := s.reconcileMessagesLocked(sid, list)
+		// Hydrate's lists are FULL transcripts (the aggregator fetches them
+		// via client.Messages — no limit param), so the fetch definitionally
+		// reached each session's oldest message: historyExhausted=true is
+		// authoritative for this path. This holds on warm reconciles too — a
+		// full-list re-fetch also proves exhaustion (nothing older can exist
+		// beyond a list that already holds everything).
+		cold, _ := s.reconcileMessagesLocked(sid, list, true, true)
 		if cold {
 			coldBatched = append(coldBatched, sid)
 		}
@@ -243,6 +255,18 @@ func (sm *sessionMessages) setCreatedKey(id string, createdMs float64, createdOK
 // lock for — it blocks all event ingestion). On the warm/incremental path it
 // returns false and no batch is produced (individual upserts are emitted here).
 //
+// exhaustedKnown/exhausted carry the CALLER's authoritative knowledge of
+// whether the fetched list reaches the session's oldest message (the cold tail
+// GET's X-Next-Cursor — "" ⇒ exhausted; a full-list fetch ⇒ always exhausted).
+// When known, the per-session historyExhausted flag is SET from it (on fresh
+// creation AND on warm reconciles — the latest authoritative evidence wins, so
+// a tail re-fetch that reaches the floor clears a stale has-older and one that
+// sees a cursor records older-history-exists). When NOT known
+// (SetSessionMessages), fresh creation falls back to the len(list) <
+// windowMaxCount heuristic (a partial window ⇒ everything fetched; a full
+// window ⇒ assume older may exist — self-correcting via the boundary-demand
+// D-trigger's floor-reaching page walk) and warm reconciles preserve the flag.
+//
 // Cold-load batching: when the session was NOT previously loaded
 // (s.msgLoaded[sid] false at entry — the SetSessionMessages lazy-hydration path,
 // or a Hydrate on a fresh daemon with no connected clients), the per-message
@@ -255,7 +279,7 @@ func (sm *sessionMessages) setCreatedKey(id string, createdMs float64, createdOK
 // ingests in one mutation. The warm/incremental path (msgLoaded already true — a
 // daemon OpenCode-stream reconnect for an already-loaded session) keeps emitting
 // individual upserts so a connected client reconciles only the diffs.
-func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (coldLoad bool, blockedByUnconfirmedEmpty bool) {
+func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts, exhaustedKnown, exhausted bool) (coldLoad bool, blockedByUnconfirmedEmpty bool) {
 	coldLoad = !s.msgLoaded[sid] // detect BEFORE setting it true (msgLoaded lifecycle is unchanged)
 	s.msgLoaded[sid] = true
 	// The authoritative history reconcile rewrites this session's message/part
@@ -271,17 +295,30 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 	sm := s.messages[sid]
 	if sm == nil {
 		// Part B: historyExhausted records whether the resident holds the
-		// session's oldest message. The cold-load fetches MessagesTail(windowMaxCount),
-		// so a PARTIAL window (len < windowMaxCount) means the session had fewer
-		// than windowMaxCount messages → all fetched → exhausted; a FULL window
-		// (len == windowMaxCount) means older history likely exists → NOT exhausted
-		// (the boundary-demand path will fetch + merge it, then MergeOlderMessages
-		// sets exhausted=true when the cursor's X-Next-Cursor is empty). Set only
-		// on FRESH creation; warm reconciles preserve the existing flag so a
-		// boundary-demand's exhaustion survives a reconnect re-fetch.
-		exhausted := len(list) < s.windowMaxCount
-		sm = &sessionMessages{byID: map[string]*messageEntry{}, historyExhausted: exhausted}
+		// session's oldest message. PREFERRED: the caller's authoritative
+		// cursor evidence (exhaustedKnown) — the cold tail GET's X-Next-Cursor
+		// is definitive both ways ("" ⇒ the tail IS the whole transcript;
+		// present ⇒ older history exists). FALLBACK (no evidence): a PARTIAL
+		// window (len < windowMaxCount) means the session had fewer than
+		// windowMaxCount messages → all fetched → exhausted; a FULL window
+		// (len == windowMaxCount) means older history likely exists → NOT
+		// exhausted (the boundary-demand path will fetch + merge it, then
+		// MergeOlderMessages sets exhausted=true when the page's X-Next-Cursor
+		// is empty). Set only on FRESH creation; warm reconciles without
+		// evidence preserve the existing flag so a boundary-demand's exhaustion
+		// survives a reconnect re-fetch.
+		he := len(list) < s.windowMaxCount
+		if exhaustedKnown {
+			he = exhausted
+		}
+		sm = &sessionMessages{byID: map[string]*messageEntry{}, historyExhausted: he}
 		s.messages[sid] = sm
+	} else if exhaustedKnown {
+		// Authoritative evidence on a warm reconcile: the latest cursor
+		// verdict wins (a re-fetch that reached the floor exhausts history; a
+		// re-fetch that still sees a cursor records older-history-exists —
+		// e.g. history backfilled upstream since the last fetch).
+		sm.historyExhausted = exhausted
 	}
 	for _, mwp := range list {
 		var env messageInfoEnvelope
@@ -552,9 +589,14 @@ func (s *Store) ClearColdFetchActive(sessionID string) {
 }
 
 // SetSessionMessages installs a freshly-fetched message list for one session
-// (used by lazy hydration when a client first opens it). On the COLD path
-// (session not previously loaded) it does NOT return until a revision-valid
-// cold batch has been published.
+// (used by lazy hydration when a client first opens it) when the caller has NO
+// authoritative exhaustion evidence: the reconcile derives historyExhausted via
+// the len(list) < windowMaxCount fallback heuristic (partial window ⇒ exhausted;
+// full window ⇒ assume older may exist — self-correcting via the boundary-demand
+// floor walk). Production cold loads — which read the tail GET's X-Next-Cursor —
+// use SetSessionMessagesExhausted instead. On the COLD path (session not
+// previously loaded) it does NOT return until a revision-valid cold batch has
+// been published.
 //
 // Returns a SessionMessagesResult the aggregator uses to gate EmitMessagesLoaded
 // (Finding 3): Status.Emitted means a valid messages.batch was published (caller
@@ -571,8 +613,27 @@ func (s *Store) ClearColdFetchActive(sessionID string) {
 // ONE bounded re-fetch in that case to disambiguate schema-drift from a
 // genuinely-empty turn (see reconcileMessagesLocked / latestAssistantResidentLocked).
 func (s *Store) SetSessionMessages(sid string, list []MessageWithParts) SessionMessagesResult {
+	return s.setSessionMessages(sid, list, false, false)
+}
+
+// SetSessionMessagesExhausted is the AUTHORITATIVE-exhaustion variant of
+// SetSessionMessages: the caller states whether the fetched list reaches the
+// session's oldest message, learned from the tail GET's X-Next-Cursor response
+// header ("" ⇒ historyExhausted=true — the tail IS the whole transcript;
+// present ⇒ false — older history exists beyond the bounded tail). This is the
+// has-older truthfulness fix's cold-load entrypoint: it makes the snapshot /
+// cold-batch WindowMeta.has_older truthful BOTH ways for a fetch-bounded
+// resident list (>windowMaxCount session ⇒ has_older=true even when the light
+// tail trips neither dual bound; fully-loaded session ⇒ has_older=false — no
+// inverse lie, and no len==limit edge-case wasted fetch). Same cold/warm
+// batching contract + SessionMessagesResult semantics as SetSessionMessages.
+func (s *Store) SetSessionMessagesExhausted(sid string, list []MessageWithParts, historyExhausted bool) SessionMessagesResult {
+	return s.setSessionMessages(sid, list, true, historyExhausted)
+}
+
+func (s *Store) setSessionMessages(sid string, list []MessageWithParts, exhaustedKnown, exhausted bool) SessionMessagesResult {
 	s.mu.Lock()
-	cold, blocked := s.reconcileMessagesLocked(sid, list)
+	cold, blocked := s.reconcileMessagesLocked(sid, list, exhaustedKnown, exhausted)
 	s.mu.Unlock()
 	var status ColdBatchStatus
 	if cold {
