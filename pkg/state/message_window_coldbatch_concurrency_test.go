@@ -256,3 +256,91 @@ func TestColdBatchHookExhaustionFlipDiscardsStaleHasOlder(t *testing.T) {
 		t.Fatalf("publishColdBatch capture attempts: got %d (via hookAttempts), want exactly 2 (1 stale-discarded + 1 emitted)", hookAttempts)
 	}
 }
+
+// TestColdBatchHookAllDupesFloorFlipDiscardsStaleHasOlder is the has_older
+// OUTCOME crux for the ALL-DUPLICATES floor-reaching merge — the residual ABA
+// sibling of TestColdBatchHookExhaustionFlipDiscardsStaleHasOlder: the
+// f57c32f9 bump keyed on len(items)==0, but a NON-empty floor page whose every
+// item is already resident (the overlap anchor re-served, or ids that arrived
+// live before the page landed) dedups `prepend` to nothing and STILL flips
+// historyExhausted false→true. A publishColdBatch that captured (list,
+// exhausted=false) before that flip must NOT be able to emit its stale
+// has_older=true window after it. The hook fires the all-resident
+// floor-reaching merge BETWEEN capture and validation (mid-package,
+// deterministic — the hook is synchronous):
+//
+//   - attempt 0: capture (3-message light tail, exhausted=false, rev T) with
+//     window has_older=true; hook runs MergeOlderMessages(sid, [m1,m2,m3],
+//     true) → every id resident → ZERO prepends, flag flips, msgRev bumps
+//     T→T+1; the packaged window still says has_older=true; validation
+//     msgRev==T? NO → DISCARD (stale capture rejected).
+//   - attempt 1: capture (same list, exhausted=true, rev T+1) with window
+//     has_older=false; hook merges the same page again (flag already true →
+//     NO bump; dedup still prepends nothing); validation msgRev==T+1? YES →
+//     EMIT.
+//
+// The load-bearing assertion is the EMITTED batch's window.has_older=false
+// (the user-visible truthfulness outcome), NOT the revision counter: with the
+// flip half of the bump condition disabled, this exact scenario emits the
+// stale has_older=true batch (attempt 0 passes validation because the flag
+// changed while the token didn't). The ==2 hook-attempts pin also catches
+// repeat-flip churn at the outcome level (a merge that re-bumped on the
+// already-true flag would fail attempt 1's validation and force a third
+// capture).
+func TestColdBatchHookAllDupesFloorFlipDiscardsStaleHasOlder(t *testing.T) {
+	const sid = "s" // matches pageMsg's embedded sessionID
+	s := mustNew(t, DefaultConfig(100))
+	s.Apply(ev("session.created", `{"info":{"id":"s","title":"S"}}`))
+	res := s.SetSessionMessagesExhausted(sid, []MessageWithParts{
+		pageMsg("m1", 10), pageMsg("m2", 10), pageMsg("m3", 10),
+	}, false) // fetch-truncated light tail: has_older=true, exhausted=false
+	if res.Status != ColdBatchEmitted {
+		t.Fatalf("seed: SetSessionMessagesExhausted want ColdBatchEmitted, got %v", res.Status)
+	}
+
+	// Firehose subscriber (the plain Subscribe pattern the sibling test
+	// uses); the seed-time batch predates the subscription, drain residue.
+	ch, unsub := s.Subscribe(256)
+	defer unsub()
+	drainAll(ch)
+
+	// The all-resident floor page: NON-empty, but the byID dedup empties
+	// `prepend` — the exact shape the len(items)==0-keyed bump missed.
+	allDupes := []MessageWithParts{pageMsg("m1", 10), pageMsg("m2", 10), pageMsg("m3", 10)}
+	var hookAttempts int
+	coldBatchAfterCaptureHook = func(hsid string) {
+		if hsid != sid {
+			return
+		}
+		hookAttempts++
+		// THE crux call on EVERY capture attempt: the all-resident
+		// floor-reaching merge, mid-package. First fire flips the flag +
+		// bumps msgRev with zero prepends; later fires hit the already-true
+		// flag and must NOT bump.
+		s.MergeOlderMessages(sid, allDupes, true)
+	}
+	t.Cleanup(func() { coldBatchAfterCaptureHook = nil })
+
+	if status := s.publishColdBatch(sid); status != ColdBatchEmitted {
+		t.Fatalf("publishColdBatch: want ColdBatchEmitted, got %v", status)
+	}
+
+	// CRUX — the emitted batch's window is the POST-flip truthful one.
+	batches := collectBatches(t, ch)
+	if len(batches) != 1 {
+		t.Fatalf("want exactly 1 emitted cold batch, got %d", len(batches))
+	}
+	window := decodeBatchWindow(t, batches[0].Payload)
+	if window.HasOlder {
+		t.Fatalf("CRUX FAIL: emitted cold batch window.has_older=true — the STALE exhausted=false capture leaked through the ABA guard on the all-dupes flip path (want false, the post-flip truthful end-of-history)")
+	}
+	if window.MessageCount != 3 {
+		t.Fatalf("emitted window message_count: want 3 (same resident list; the all-dupes page prepended nothing), got %d", window.MessageCount)
+	}
+	// Exactly 2 capture attempts: 1 stale-discarded + 1 emitted. This also
+	// proves the repeat all-dupes flip did not re-bump (a re-bump would fail
+	// attempt 1's validation and force attempt 2, surfacing here as 3+).
+	if hookAttempts != 2 {
+		t.Fatalf("publishColdBatch capture attempts: got %d (via hookAttempts), want exactly 2 (1 stale-discarded + 1 emitted)", hookAttempts)
+	}
+}

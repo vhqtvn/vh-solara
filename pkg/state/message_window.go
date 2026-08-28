@@ -709,15 +709,18 @@ func (s *Store) SnapshotMessagesPage(sid, before string, limit, maxBytes int) Me
 // merged view; the X-VH-Seq header stamped at request entry stays comparable to
 // BaselineSeq — only a LIVE event during the fetch bumps s.seq, which the client
 // dirty-flag discards correctly). Bumps msgRev[sid] so a concurrent cold-batch
-// projection stays consistent: on every non-empty prepend, and EXACTLY ONCE when
-// an empty floor-reaching page flips historyExhausted false→true (the projection
-// input changed with no prepend to bump for it — without this bump an in-flight
-// publishColdBatch that captured the stale exhausted=false pair passes the
-// revision equality check and emits a stale has_older=true window). A repeated
-// floor-reaching call on an already-true flag does NOT bump (no snapshot retry
-// churn); an empty non-floor merge bumps nothing. Caller: aggregator
-// EnsureOlderMessages (lock-free fetch → this merge under s.mu.Lock). Contract
-// (b) + (e).
+// projection stays consistent: EXACTLY ONCE per logical merge that changed the
+// projection input — every merge with a genuinely-new prepend, and every
+// historyExhausted false→true flip, INCLUDING the NON-empty all-duplicates
+// floor-reaching page whose sm.byID dedup empties `prepend` entirely (the
+// projection input changed with no prepend to bump for it — without this bump
+// an in-flight publishColdBatch that captured the stale exhausted=false pair
+// passes the revision equality check and emits a stale has_older=true window).
+// A prepend AND a flip in one merge is ONE bump (one logical change, one
+// token); a repeated floor-reaching call on an already-true flag does NOT bump
+// (no snapshot retry churn); an all-duplicates or empty non-floor merge bumps
+// nothing. Caller: aggregator EnsureOlderMessages (lock-free fetch → this merge
+// under s.mu.Lock). Contract (b) + (e).
 func (s *Store) MergeOlderMessages(sid string, items []MessageWithParts, historyExhausted bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -725,23 +728,14 @@ func (s *Store) MergeOlderMessages(sid string, items []MessageWithParts, history
 	if sm == nil {
 		return // session gone between fetch and merge
 	}
-	if historyExhausted && !sm.historyExhausted {
+	// flipped records whether THIS merge flips the flag false→true, captured
+	// BEFORE the flag is written (once written, the pre-value is gone). It is
+	// half of the single bump condition at the tail: a flip changes the
+	// cold-batch/snapshot projection input (the SAME resident list now
+	// projects has_older=false) exactly like a genuinely-new prepend does.
+	flipped := historyExhausted && !sm.historyExhausted
+	if flipped {
 		sm.historyExhausted = true
-		if len(items) == 0 {
-			// Empty floor-reaching page that flipped the flag: the same
-			// resident list now projects has_older=false, but the early
-			// return below would skip the prepend-path bump entirely. Bump
-			// HERE so an in-flight publishColdBatch that captured the stale
-			// (list, exhausted=false) pair under the same-lock contract fails
-			// the msgRev equality check and discards its stale has_older=true
-			// window instead of emitting it. A repeated floor-reaching call
-			// finds the flag already true and never reaches this branch.
-			s.bumpMsgRev(sid)
-			return
-		}
-	}
-	if len(items) == 0 {
-		return
 	}
 	prepend := make([]string, 0, len(items))
 	for _, mw := range items {
@@ -785,6 +779,23 @@ func (s *Store) MergeOlderMessages(sid string, items []MessageWithParts, history
 		newOrder = append(newOrder, prepend...)  // fetched oldest-first
 		newOrder = append(newOrder, sm.order...) // resident oldest-first
 		sm.order = newOrder
+	}
+	// EXACTLY ONE bump per logical merge, iff the merge changed the projection
+	// input. `len(prepend) > 0` alone (the pre-fix condition) misses the
+	// ALL-DUPLICATES floor page: a non-empty floor-reaching page whose every
+	// id is already resident (the overlap anchor re-served, or ids that arrived
+	// live concurrently) empties `prepend` in the dedup loop above yet still
+	// flips the flag — the same resident list now projects has_older=false —
+	// so the flip alone must advance the token, or an in-flight
+	// publishColdBatch that captured the stale (list, exhausted=false) pair
+	// under the same-lock contract passes the msgRev equality check and emits
+	// a stale has_older=true window. `flipped` alone misses nothing the
+	// prepend path covered, and the two DISJUNCT keeps one bump when both
+	// occur (prepend + flip = one logical change, one token). No bump when
+	// neither: repeat floor call on an already-true flag, all-dupes non-floor
+	// page, empty non-floor merge — same input, same bytes, nothing to
+	// invalidate (the ABA same-input→same-bytes assumption stays sound).
+	if len(prepend) > 0 || flipped {
 		s.bumpMsgRev(sid)
 	}
 }

@@ -1189,17 +1189,20 @@ func TestSnapshotMessagesPage_CursorSetExhaustion(t *testing.T) {
 }
 
 // TestMergeOlderMessagesExhaustionFlipBumpsMsgRev pins the msgRev contract of
-// the empty floor-reaching merge — the revision-validation gap the has_older
-// truthfulness fix (1dfcd9e9) left open. Flipping historyExhausted false→true
-// with an empty page changes the cold-batch/snapshot projection input (the SAME
-// resident list now projects has_older=false), so msgRev[sid] MUST advance
-// exactly once; without the bump, an in-flight publishColdBatch that captured
-// the stale (list, exhausted=false) pair under the same lock passes the ABA
-// equality check and emits a stale has_older=true window. The flip's observable
-// outcome (WindowMeta.HasOlder turning false) is asserted alongside the
-// revision mechanics, and the neighboring no-bump cases (repeat floor call,
-// non-floor empty merge) plus the preserved non-empty prepend bump are pinned
-// so "exactly when" stays exact.
+// the exhaustion flip — the empty AND the all-duplicates floor-reaching merge,
+// the two revision-validation gaps the has_older truthfulness chain left open
+// (1dfcd9e9 left the flip unbumped; f57c32f9 bumped only the len(items)==0
+// variant, leaving the non-empty all-dupes sibling). Flipping
+// historyExhausted false→true changes the cold-batch/snapshot projection input
+// (the SAME resident list now projects has_older=false), so msgRev[sid] MUST
+// advance exactly once — with or without a prepend surviving dedup; without
+// the bump, an in-flight publishColdBatch that captured the stale (list,
+// exhausted=false) pair under the same lock passes the ABA equality check and
+// emits a stale has_older=true window. The flip's observable outcome
+// (WindowMeta.HasOlder turning false) is asserted alongside the revision
+// mechanics, and the neighboring no-bump cases (repeat floor call — empty AND
+// all-dupes, non-floor empty merge) plus the preserved non-empty prepend bump
+// are pinned so "exactly when" stays exact.
 func TestMergeOlderMessagesExhaustionFlipBumpsMsgRev(t *testing.T) {
 	// seedNotExhausted builds a session whose resident list is a
 	// fetch-truncated tail: 3 light messages, historyExhausted=false
@@ -1285,6 +1288,68 @@ func TestMergeOlderMessagesExhaustionFlipBumpsMsgRev(t *testing.T) {
 		post := st.Snapshot(map[string]bool{"s": true}).MessageWindows["s"]
 		if post.HasOlder {
 			t.Fatalf("after floor merge: has_older want false, got true")
+		}
+	})
+
+	t.Run("all-dupes-floor-flip-bumps-exactly-once-and-flips-HasOlder", func(t *testing.T) {
+		// The f57c32f9 bump keyed on len(items)==0; this sibling is the
+		// NON-empty floor page whose every item is already resident (e.g. the
+		// overlap anchor re-served alone, or ids that arrived live before the
+		// page landed): the byID dedup empties `prepend`, but the flag still
+		// flipped — the same resident list now projects has_older=false — so
+		// msgRev must advance exactly once anyway.
+		st := seedNotExhausted(t)
+		before := st.msgRevSnapshot("s")
+		if before == 0 {
+			t.Fatalf("precondition: reconcile must have bumped msgRev (non-zero baseline), got 0")
+		}
+		st.MergeOlderMessages("s", []MessageWithParts{
+			pageMsg("m1", 10), pageMsg("m2", 10), pageMsg("m3", 10),
+		}, true) // all-resident floor page: flips the flag, prepends nothing
+		if after := st.msgRevSnapshot("s"); after != before+1 {
+			t.Fatalf("all-dupes floor flip: msgRev want exactly before+1 (one bump), got %d → %d", before, after)
+		}
+		post := st.Snapshot(map[string]bool{"s": true}).MessageWindows["s"]
+		if post.HasOlder {
+			t.Fatalf("after all-dupes floor flip: has_older want false (truthful end-of-history), got true")
+		}
+		if post.MessageCount != 3 {
+			t.Fatalf("after all-dupes floor flip: window message_count want 3 (dedup prepended nothing), got %d", post.MessageCount)
+		}
+	})
+
+	t.Run("repeat-all-dupes-floor-no-rebump", func(t *testing.T) {
+		st := seedNotExhausted(t)
+		allDupes := []MessageWithParts{
+			pageMsg("m1", 10), pageMsg("m2", 10), pageMsg("m3", 10),
+		}
+		st.MergeOlderMessages("s", allDupes, true) // the flip (bumps once)
+		rev := st.msgRevSnapshot("s")
+		st.MergeOlderMessages("s", allDupes, true) // repeat: flag already true, all items still resident
+		if got := st.msgRevSnapshot("s"); got != rev {
+			t.Fatalf("repeated all-dupes floor merge must NOT bump msgRev (snapshot retry churn): %d → %d", rev, got)
+		}
+	})
+
+	t.Run("mixed-dupe-new-floor-single-bump", func(t *testing.T) {
+		// The PRODUCTION floor-page shape: the overlap anchor (a dupe by
+		// design) alongside a genuinely-new older id, floor-reaching.
+		// Prepends AND flips — still exactly ONE bump (one logical merge).
+		st := seedNotExhausted(t)
+		rev := st.msgRevSnapshot("s")
+		st.MergeOlderMessages("s", []MessageWithParts{
+			pageMsg("m1", 10), // dupe overlap anchor
+			pageMsg("m0", 10), // genuinely-new older id
+		}, true)
+		if got := st.msgRevSnapshot("s"); got != rev+1 {
+			t.Fatalf("mixed dupe+new floor merge: msgRev want exactly rev+1 (single bump for prepend+flip), got %d → %d", rev, got)
+		}
+		post := st.Snapshot(map[string]bool{"s": true}).MessageWindows["s"]
+		if post.HasOlder {
+			t.Fatalf("after mixed floor merge: has_older want false, got true")
+		}
+		if post.MessageCount != 4 {
+			t.Fatalf("after mixed floor merge: window message_count want 4 (m0 prepended), got %d", post.MessageCount)
 		}
 	})
 }

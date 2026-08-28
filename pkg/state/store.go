@@ -559,13 +559,38 @@ type messageEntry struct {
 type sessionMessages struct {
 	order []string // message ids in creation order
 	byID  map[string]*messageEntry
-	// historyExhausted is true once a backward older-page fetch (Part B
-	// EnsureOlderMessages) reached the session's oldest message
-	// (X-Next-Cursor == ""). Until then false → projectMessagePage's HasOlder
-	// stays truthful even when the resident walk hits the resident floor (older
+	// historyExhausted records whether the RESIDENT list holds the session's
+	// oldest message — the explicit exhaustion input that keeps HasOlder
+	// truthful when neither dual bound fires on a fetch-truncated tail (older
 	// history may exist in opencode beyond the bounded cold-load tail).
-	// Reset to false implicitly when a fresh sessionMessages is created (cold
-	// load / reconnect) — the bounded tail never proves exhaustion.
+	//
+	// Learners (read under the same lock as the message list, so the (list,
+	// flag) pair each projector consumes is consistent):
+	//   - captureMessagesBatchLocked (message_window.go) — cold-batch window;
+	//   - captureSnapshotLocked (snapshots.go) — snapshot window;
+	//   - SnapshotMessagesPage (message_window.go) — page envelope
+	//     history_exhausted + the HasOlder floor correction.
+	//
+	// Writers — the COMPLETE current set:
+	//   - Older-page learning: MergeOlderMessages (message_window.go) —
+	//     set-only true when a backward older-page fetch (Part B
+	//     EnsureOlderMessages) reached the floor (X-Next-Cursor == "");
+	//     within that writer the flag is never cleared.
+	//   - Cursor-authoritative entry: SetSessionMessagesExhausted
+	//     (hydration.go reconcileMessagesLocked) — the aggregator's cold-tail
+	//     MessagesTail GET's X-Next-Cursor verdict ("" ⇒ true). On FRESH
+	//     state it installs the verdict; on a WARM reconcile it follows
+	//     last-evidence-wins and may CLEAR a learned true (reversible fetch
+	//     evidence — the deliberate writer split per
+	//     researches/decisions/warm-reconcile-exhaustion-policy-inputs.md,
+	//     pinned by TestWarmReconcileHistoryExhaustedIsReversibleFromTailEvidence).
+	//     SetSessionMessages (no cursor evidence) seeds fresh state via the
+	//     len(list)<windowMaxCount partial-window heuristic only.
+	//   - Fresh-state initialization/reset: a newly created sessionMessages
+	//     starts at the reconcile-time value above, or FALSE for the lazy
+	//     live-event constructors (reducers.go upsertMessageLocked /
+	//     upsertPartLocked / appendPartDeltaLocked) — a bounded tail alone
+	//     never proves exhaustion, so absent evidence the flag is false.
 	historyExhausted bool
 }
 
