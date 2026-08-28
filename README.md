@@ -193,6 +193,10 @@ separate service to manage), but **detached** and tracked via a per-project
 pidfile. On a vh restart/self-update, vh checks whether *its* OpenCode is still
 alive + reachable and **reconnects** to it instead of spawning a duplicate — so
 the session survives. On shutdown vh leaves it running (to reconnect next time).
+Concurrent starters (two daemons racing on the same project, or a restart
+overlapping a boot) are serialized by per-project `flock` files — the loser
+never spawns a second OpenCode; it fails fast and keeps serving (see "State &
+files" for the lock files).
 
 ```bash
 ./vh-solara client-daemon --web vh --opencode-detached \
@@ -358,8 +362,10 @@ unset; it only falls back to the OS temp dir if that can't be resolved).
 |------|----------|
 | `<base>/opencode/<sha1(cwd)>.json` | Detached-OpenCode pidfile (`{pid,port}`) — written by `--opencode-detached` so a vh restart reconnects to it |
 | `<base>/opencode/<sha1(cwd)>.log`  | That detached OpenCode's accumulated stdout/stderr log |
+| `<base>/opencode/<sha1(cwd)>.spawn.lock` | Starter lock (transient `flock`) — serializes concurrent detached-start transactions per project; held only across classify → spawn → readiness → pidfile publication |
+| `<base>/opencode/<sha1(cwd)>.owner.lock` | Owner lock (`flock` held via inherited fd 3 by the detached OpenCode child itself) — marks "someone may own the spawn slot" even if the starter died mid-spawn; a starter seeing it held with no valid pidfile reports orphaned-owner and never spawns beside it |
 | `<base>/daemons/<sha1(cwd)>.json`  | vh daemon registry entry (pid + cwd) — how `vh-solara kill` finds running daemons |
 | `<base>/notes/<sha1(cwd)>.json`    | Per-project Notes + todos (shared across devices, survives reconnects) |
 | `<base>/alerts.jsonc`              | Host-level notification config (channels/profiles/detector thresholds) |
 
-Sources: `cmd/opencode_detached.go`, `pkg/web/notes.go`, `pkg/alerts/config.go`.
+Sources: `cmd/opencode_detached.go`, `cmd/opencode_lock.go`, `cmd/opencode_lock_linux.go`, `pkg/web/notes.go`, `pkg/alerts/config.go`.

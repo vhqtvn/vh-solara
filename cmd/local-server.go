@@ -95,70 +95,15 @@ with --opencode-url, or spawn a survivable detached instance with
 			}
 
 		case localOpenCodeDetached:
-			// SPLIT-BRAIN GUARD (incident 2026-08-28): the gate below NEVER
-			// spawns beside a live, cmdline-matching instance. If the recorded
-			// instance is alive but its HTTP listener isn't answering, we
-			// degrade to a failed lifecycle and keep serving; the operator
-			// recovers via the restart action. Mirrors client-daemon's
-			// setupVHMode — both detached spawn paths route through the same
-			// classifyOCInstance gate.
-			st, haveState := readOCState()
-			switch gate := classifyOCInstance(st, haveState); gate.Verdict {
-			case ocGateReattach:
-				opencodePort = st.Port
-				opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", st.Port)
-				ocLife.SetReady() // reconnected to a known-live instance
-				// Seed the lifecycle ring with the detached disk-log tail so
-				// /vh/opencode/logs reflects recent history after a reconnect
-				// (mirrors client-daemon's reattach branch): the in-memory
-				// ring is fresh here, but the process kept running and
-				// accumulating output on disk.
-				seedRingFromDiskLog(ocLife.Ring(), ocLogPath())
-				log.Printf("local-server: reconnected to our detached OpenCode pid=%d port=%d", st.PID, st.Port)
-
-			case ocGateOccupied:
-				// Alive and OURS but not answering probes. NEVER spawn a
-				// second instance beside it (split-brain on the shared
-				// project DB). Keep pointing at it and record the failure so
-				// /vh/opencode/status tells the operator to use the restart
-				// action (which kills + respawns this exact pid/port).
-				// local-server stays up (decoupling).
-				opencodePort = st.Port
-				opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", st.Port)
-				ocLife.SetFailed(fmt.Sprintf("detached OpenCode pid=%d port=%d is alive but not answering probes (%s); NOT spawning a second instance beside it — use the OpenCode restart action to recover", st.PID, st.Port, gate.Reason), nil)
-				// Seed the lifecycle ring from the disk log (mirrors
-				// client-daemon's occupied branch): the detached topology
-				// advertises HasLogTail=true, and a wedged instance's recent
-				// output is exactly what the operator needs to diagnose it —
-				// without seeding, /vh/opencode/logs returns 200/empty.
-				seedRingFromDiskLog(ocLife.Ring(), ocLogPath())
-				log.Printf("local-server: detached OpenCode pid=%d port=%d alive but unreachable: %s (local-server stays up; opencode status=failed; refusing to spawn beside it)", st.PID, st.Port, gate.Reason)
-
-			default: // ocGateNoState, ocGateForeign → spawning beside nothing
-				opencodePort = freePort()
-				if haveState && portFree(st.Port) {
-					opencodePort = st.Port
-				}
-				// Pre-set opencodeURL so a failure below still leaves a
-				// parseable (dead) loopback target for the aggregator's
-				// lazy proxy.
-				opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", opencodePort)
-				c, err := startOpenCodeServeDetached(localOpenCodeBin, opencodePort, cwd)
-				if err != nil {
-					log.Printf("Failed to start detached opencode serve: %v (local-server stays up; opencode status=failed)", err)
-					ocLife.SetFailed(fmt.Sprintf("failed to start detached opencode serve: %v", err), nil)
-				} else {
-					opencodeServeCmd = c
-					if err := waitForPort(opencodePort, 30*time.Second); err != nil {
-						log.Printf("opencode serve failed to listen on port %d: %v (local-server stays up; opencode status=failed)", opencodePort, err)
-						ocLife.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", opencodePort, err), nil)
-					} else {
-						writeOCState(ocState{PID: c.Process.Pid, Port: opencodePort})
-						ocLife.SetReady()
-						log.Printf("local-server: spawned detached OpenCode pid=%d port=%d", c.Process.Pid, opencodePort)
-					}
-				}
-			}
+			// SPLIT-BRAIN GUARD (incident 2026-08-28) + CROSS-PROCESS SPAWN
+			// SERIALIZATION (P1-API-002): the whole cooperating-starter
+			// transaction lives in EnsureDetachedOpenCode — the same single
+			// code path client-daemon's setupVHMode routes through. It never
+			// spawns beside a live, cmdline-matching instance; losers
+			// (Contended/OrphanedOwner) fail fast into a failed lifecycle while
+			// local-server keeps serving. This arm only wires the result.
+			res := EnsureDetachedOpenCode(localOpenCodeBin, cwd)
+			opencodePort, opencodeURL, opencodeServeCmd = ApplyDetachedOCStart(res, ocLife, "local-server")
 
 		default:
 			opencodePort = freePort()
@@ -235,25 +180,23 @@ with --opencode-url, or spawn a survivable detached instance with
 				return nil
 			}
 			if localOpenCodeDetached {
+				// Serialized restart (P1-API-002): the same shared transaction
+				// client-daemon routes through — under the starter lock, revalidate
+				// the recorded pid before signaling (never signal a recycled pid),
+				// wait out the old owner, respawn on the stable port.
 				ocLife.SetStarting()
-				if st, ok := readOCState(); ok {
-					killPID(st.PID)
-				}
+				curPID := 0
 				if opencodeServeCmd != nil && opencodeServeCmd.Process != nil {
-					killPID(opencodeServeCmd.Process.Pid)
+					curPID = opencodeServeCmd.Process.Pid
 				}
-				time.Sleep(300 * time.Millisecond)
-				c, err := startOpenCodeServeDetached(localOpenCodeBin, opencodePort, cwd)
+				c, err := restartDetachedOpenCode(localOpenCodeBin, opencodePort, cwd, curPID)
+				if c != nil {
+					opencodeServeCmd = c
+				}
 				if err != nil {
-					ocLife.SetFailed(fmt.Sprintf("failed to start detached opencode serve: %v", err), nil)
+					ocLife.SetFailed(fmt.Sprintf("detached opencode restart failed: %v", err), nil)
 					return err
 				}
-				opencodeServeCmd = c
-				if err := waitForPort(opencodePort, 30*time.Second); err != nil {
-					ocLife.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", opencodePort, err), nil)
-					return err
-				}
-				writeOCState(ocState{PID: c.Process.Pid, Port: opencodePort})
 				ocLife.SetReady()
 				return nil
 			}

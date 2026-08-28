@@ -276,7 +276,13 @@ func killPID(pid int) {
 // when the daemon exits). When extraW writers are supplied, they are fanned out
 // alongside the disk log — used to mirror the output into the OpenCode
 // lifecycle ring so /vh/opencode/logs (Slice 2) can serve a bounded tail.
-func startOpenCodeServeDetached(bin string, port int, workspace string, extraW ...io.Writer) (*exec.Cmd, error) {
+//
+// extraFiles is the exec.Cmd.ExtraFiles payload for the spawn-slot owner-lock
+// handoff (fd 3 in the child, non-CLOEXEC by construction); nil spawns without
+// the handoff (non-Linux platforms, or callers outside the guarded
+// transaction). Callers must NOT close the files themselves — the guarded
+// choreography (startChildWithOwner) owns the parent's copy lifecycle.
+func startOpenCodeServeDetached(bin string, port int, workspace string, extraFiles []*os.File, extraW ...io.Writer) (*exec.Cmd, error) {
 	if bin == "" {
 		bin = "opencode"
 	}
@@ -285,6 +291,7 @@ func startOpenCodeServeDetached(bin string, port int, workspace string, extraW .
 		cmd.Dir = workspace
 	}
 	cmd.Env = os.Environ()
+	cmd.ExtraFiles = extraFiles
 	// Fan output to the per-project disk log AND any extra sinks (the lifecycle
 	// ring). A nil sink is dropped so a caller passing an explicit nil stays
 	// safe; io.MultiWriter would otherwise panic on a nil Write.
