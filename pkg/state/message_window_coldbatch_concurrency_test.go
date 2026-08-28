@@ -179,3 +179,80 @@ func TestColdBatchHookFiresFlushingSnapshotMidPackage(t *testing.T) {
 		t.Fatalf("publishColdBatch capture attempts: got %d (via hookAttempts), want 2 (1 discard + 1 emit) — non-convergent or extra retries", hookAttempts)
 	}
 }
+
+// TestColdBatchHookExhaustionFlipDiscardsStaleHasOlder is the has_older OUTCOME
+// crux for the empty floor-reaching merge's msgRev bump (the revision gap the
+// truthfulness fix left open): a publishColdBatch that captured
+// (list, historyExhausted=false) BEFORE the flip must NOT be able to emit its
+// stale has_older=true window AFTER the flip. The hook fires the empty
+// floor-reaching merge BETWEEN capture and validation (mid-package,
+// deterministic — the hook is synchronous, no goroutine race needed):
+//
+//   - attempt 0: capture (3-message light tail, exhausted=false, rev T) with
+//     window has_older=true; hook runs MergeOlderMessages(sid, nil, true) →
+//     flag flips + msgRev bumps T→T+1; the packaged window says has_older=true;
+//     validation msgRev==T? NO → DISCARD (stale capture rejected).
+//   - attempt 1: capture (same list, exhausted=true, rev T+1) with window
+//     has_older=false; hook merges again (flag already true → NO bump);
+//     validation msgRev==T+1? YES → EMIT.
+//
+// The load-bearing assertion is on the EMITTED batch's window.has_older (the
+// user-visible truthfulness outcome), NOT merely the revision mechanics:
+// without the bump, this exact scenario emits the stale has_older=true batch
+// (attempt 0 passes validation because the flag changed while the token
+// didn't). The ==2 hook-attempts pin also catches repeat-flip churn at the
+// outcome level: a merge that re-bumped on the already-true flag would fail
+// attempt 1's validation and force a third capture.
+func TestColdBatchHookExhaustionFlipDiscardsStaleHasOlder(t *testing.T) {
+	const sid = "s" // matches pageMsg's embedded sessionID
+	s := mustNew(t, DefaultConfig(100))
+	s.Apply(ev("session.created", `{"info":{"id":"s","title":"S"}}`))
+	res := s.SetSessionMessagesExhausted(sid, []MessageWithParts{
+		pageMsg("m1", 10), pageMsg("m2", 10), pageMsg("m3", 10),
+	}, false) // fetch-truncated light tail: has_older=true, exhausted=false
+	if res.Status != ColdBatchEmitted {
+		t.Fatalf("seed: SetSessionMessagesExhausted want ColdBatchEmitted, got %v", res.Status)
+	}
+
+	// Firehose subscriber (the plain Subscribe pattern the other batch tests
+	// use); the seed-time batch predates the subscription, drain residue.
+	ch, unsub := s.Subscribe(256)
+	defer unsub()
+	drainAll(ch)
+
+	var hookAttempts int
+	coldBatchAfterCaptureHook = func(hsid string) {
+		if hsid != sid {
+			return
+		}
+		hookAttempts++
+		// THE crux call on EVERY capture attempt: the empty floor-reaching
+		// merge, mid-package. First fire flips the flag + bumps msgRev;
+		// later fires hit the already-true flag and must NOT bump.
+		s.MergeOlderMessages(sid, nil, true)
+	}
+	t.Cleanup(func() { coldBatchAfterCaptureHook = nil })
+
+	if status := s.publishColdBatch(sid); status != ColdBatchEmitted {
+		t.Fatalf("publishColdBatch: want ColdBatchEmitted, got %v", status)
+	}
+
+	// CRUX — the emitted batch's window is the POST-flip truthful one.
+	batches := collectBatches(t, ch)
+	if len(batches) != 1 {
+		t.Fatalf("want exactly 1 emitted cold batch, got %d", len(batches))
+	}
+	window := decodeBatchWindow(t, batches[0].Payload)
+	if window.HasOlder {
+		t.Fatalf("CRUX FAIL: emitted cold batch window.has_older=true — the STALE exhausted=false capture leaked through the ABA guard (want false, the post-flip truthful end-of-history)")
+	}
+	if window.MessageCount != 3 {
+		t.Fatalf("emitted window message_count: want 3 (same resident list, only the flag changed), got %d", window.MessageCount)
+	}
+	// Exactly 2 capture attempts: 1 stale-discarded + 1 emitted. This also
+	// proves the repeat flip did not re-bump (a re-bump would fail attempt
+	// 1's validation and force attempt 2, surfacing here as 3+).
+	if hookAttempts != 2 {
+		t.Fatalf("publishColdBatch capture attempts: got %d (via hookAttempts), want exactly 2 (1 stale-discarded + 1 emitted)", hookAttempts)
+	}
+}

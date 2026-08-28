@@ -1187,3 +1187,104 @@ func TestSnapshotMessagesPage_CursorSetExhaustion(t *testing.T) {
 		}
 	})
 }
+
+// TestMergeOlderMessagesExhaustionFlipBumpsMsgRev pins the msgRev contract of
+// the empty floor-reaching merge — the revision-validation gap the has_older
+// truthfulness fix (1dfcd9e9) left open. Flipping historyExhausted false→true
+// with an empty page changes the cold-batch/snapshot projection input (the SAME
+// resident list now projects has_older=false), so msgRev[sid] MUST advance
+// exactly once; without the bump, an in-flight publishColdBatch that captured
+// the stale (list, exhausted=false) pair under the same lock passes the ABA
+// equality check and emits a stale has_older=true window. The flip's observable
+// outcome (WindowMeta.HasOlder turning false) is asserted alongside the
+// revision mechanics, and the neighboring no-bump cases (repeat floor call,
+// non-floor empty merge) plus the preserved non-empty prepend bump are pinned
+// so "exactly when" stays exact.
+func TestMergeOlderMessagesExhaustionFlipBumpsMsgRev(t *testing.T) {
+	// seedNotExhausted builds a session whose resident list is a
+	// fetch-truncated tail: 3 light messages, historyExhausted=false
+	// (SetSessionMessagesExhausted is the authoritative-evidence entrypoint),
+	// so the window projects has_older=true with NEITHER dual bound firing.
+	seedNotExhausted := func(t *testing.T) *Store {
+		t.Helper()
+		st := New(1024)
+		st.Apply(ev("session.created", `{"info":{"id":"s","title":"S"}}`))
+		st.SetSessionMessagesExhausted("s", []MessageWithParts{
+			pageMsg("m1", 10), pageMsg("m2", 10), pageMsg("m3", 10),
+		}, false)
+		return st
+	}
+
+	t.Run("empty-floor-flip-bumps-exactly-once-and-flips-HasOlder", func(t *testing.T) {
+		st := seedNotExhausted(t)
+		// Precondition: the fetch-truncated light tail projects has_older=true.
+		pre := st.Snapshot(map[string]bool{"s": true}).MessageWindows["s"]
+		if !pre.HasOlder {
+			t.Fatalf("precondition: fetch-truncated not-exhausted resident must project has_older=true, got %+v", pre)
+		}
+		before := st.msgRevSnapshot("s")
+		if before == 0 {
+			t.Fatalf("precondition: reconcile must have bumped msgRev (non-zero baseline), got 0")
+		}
+		st.MergeOlderMessages("s", nil, true) // empty floor-reaching page: the flip
+		after := st.msgRevSnapshot("s")
+		if after != before+1 {
+			t.Fatalf("empty floor flip: msgRev want exactly before+1 (one bump), got %d → %d", before, after)
+		}
+		// Outcome: the flag flip is observable — the same resident list now
+		// projects has_older=false (truthful end-of-history, no inverse lie).
+		post := st.Snapshot(map[string]bool{"s": true}).MessageWindows["s"]
+		if post.HasOlder {
+			t.Fatalf("after empty floor flip: has_older want false, got true")
+		}
+	})
+
+	t.Run("repeat-empty-floor-no-rebump", func(t *testing.T) {
+		st := seedNotExhausted(t)
+		st.MergeOlderMessages("s", nil, true) // the flip (bumps once)
+		rev := st.msgRevSnapshot("s")
+		st.MergeOlderMessages("s", nil, true) // repeat: flag already true
+		if got := st.msgRevSnapshot("s"); got != rev {
+			t.Fatalf("repeated empty floor merge must NOT bump msgRev (snapshot retry churn): %d → %d", rev, got)
+		}
+	})
+
+	t.Run("empty-non-floor-merge-no-bump", func(t *testing.T) {
+		st := seedNotExhausted(t)
+		rev := st.msgRevSnapshot("s")
+		st.MergeOlderMessages("s", nil, false) // empty page, NOT floor-reaching: nothing changed
+		if got := st.msgRevSnapshot("s"); got != rev {
+			t.Fatalf("empty non-floor merge must NOT bump msgRev: %d → %d", rev, got)
+		}
+	})
+
+	t.Run("nonempty-prepend-bump-preserved", func(t *testing.T) {
+		st := seedNotExhausted(t)
+		rev := st.msgRevSnapshot("s")
+		st.MergeOlderMessages("s", []MessageWithParts{pageMsg("m0", 10)}, false)
+		if got := st.msgRevSnapshot("s"); got != rev+1 {
+			t.Fatalf("non-empty prepend: msgRev want exactly rev+1 (existing bump preserved), got %d → %d", rev, got)
+		}
+		// The prepend is observable: paging before=m1 now reaches m0.
+		page := st.SnapshotMessagesPage("s", "m1", 10, 1<<20)
+		if page.OldestID != "m0" {
+			t.Fatalf("after prepend: page oldest_id want m0, got %q", page.OldestID)
+		}
+	})
+
+	t.Run("nonempty-floor-page-single-bump", func(t *testing.T) {
+		// A floor-reaching page that DOES carry a genuinely-new older id flips
+		// the flag AND prepends: exactly ONE bump total (the prepend-path bump
+		// covers both — no double bump for one logical change).
+		st := seedNotExhausted(t)
+		rev := st.msgRevSnapshot("s")
+		st.MergeOlderMessages("s", []MessageWithParts{pageMsg("m0", 10)}, true)
+		if got := st.msgRevSnapshot("s"); got != rev+1 {
+			t.Fatalf("non-empty floor merge: msgRev want exactly rev+1 (single bump for prepend+flip), got %d → %d", rev, got)
+		}
+		post := st.Snapshot(map[string]bool{"s": true}).MessageWindows["s"]
+		if post.HasOlder {
+			t.Fatalf("after floor merge: has_older want false, got true")
+		}
+	})
+}

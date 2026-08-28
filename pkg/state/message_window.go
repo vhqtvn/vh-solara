@@ -701,8 +701,15 @@ func (s *Store) SnapshotMessagesPage(sid, before string, limit, maxBytes int) Me
 // merged view; the X-VH-Seq header stamped at request entry stays comparable to
 // BaselineSeq — only a LIVE event during the fetch bumps s.seq, which the client
 // dirty-flag discards correctly). Bumps msgRev[sid] so a concurrent cold-batch
-// projection stays consistent. Caller: aggregator EnsureOlderMessages
-// (lock-free fetch → this merge under s.mu.Lock). Contract (b) + (e).
+// projection stays consistent: on every non-empty prepend, and EXACTLY ONCE when
+// an empty floor-reaching page flips historyExhausted false→true (the projection
+// input changed with no prepend to bump for it — without this bump an in-flight
+// publishColdBatch that captured the stale exhausted=false pair passes the
+// revision equality check and emits a stale has_older=true window). A repeated
+// floor-reaching call on an already-true flag does NOT bump (no snapshot retry
+// churn); an empty non-floor merge bumps nothing. Caller: aggregator
+// EnsureOlderMessages (lock-free fetch → this merge under s.mu.Lock). Contract
+// (b) + (e).
 func (s *Store) MergeOlderMessages(sid string, items []MessageWithParts, historyExhausted bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -710,8 +717,20 @@ func (s *Store) MergeOlderMessages(sid string, items []MessageWithParts, history
 	if sm == nil {
 		return // session gone between fetch and merge
 	}
-	if historyExhausted {
+	if historyExhausted && !sm.historyExhausted {
 		sm.historyExhausted = true
+		if len(items) == 0 {
+			// Empty floor-reaching page that flipped the flag: the same
+			// resident list now projects has_older=false, but the early
+			// return below would skip the prepend-path bump entirely. Bump
+			// HERE so an in-flight publishColdBatch that captured the stale
+			// (list, exhausted=false) pair under the same-lock contract fails
+			// the msgRev equality check and discards its stale has_older=true
+			// window instead of emitting it. A repeated floor-reaching call
+			// finds the flag already true and never reaches this branch.
+			s.bumpMsgRev(sid)
+			return
+		}
 	}
 	if len(items) == 0 {
 		return
