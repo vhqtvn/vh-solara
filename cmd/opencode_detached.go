@@ -48,13 +48,22 @@ func ocStateDir() string {
 	return dir
 }
 
+// OCProjectKey returns the per-project key the detached-OpenCode state, log,
+// and lock files are named by: the sha1 of the given working directory, hex
+// encoded. Exported so cross-package tests (tests/integration) derive the
+// exact key the binaries use instead of reimplementing the derivation (a
+// reimplementation would silently drift if the key function ever changes).
+func OCProjectKey(dir string) string {
+	sum := sha1.Sum([]byte(dir))
+	return hex.EncodeToString(sum[:])
+}
+
 func ocProjectKey() string {
 	cwd, err := os.Getwd()
 	if err != nil {
 		cwd = "."
 	}
-	sum := sha1.Sum([]byte(cwd))
-	return hex.EncodeToString(sum[:])
+	return OCProjectKey(cwd)
 }
 
 func ocStatePath() string { return filepath.Join(ocStateDir(), ocProjectKey()+".json") }

@@ -1,7 +1,13 @@
+//go:build linux
+
 package cmd
 
-// Tests for the two-role flock spawn-lock protocol (P1-API-002). The
-// subprocess scenarios re-exec this test binary in two helper modes:
+// Tests for the two-role flock spawn-lock protocol (P1-API-002). Linux-only:
+// every scenario asserts flock(2) exclusion or /proc fd semantics that the
+// non-Linux degenerate guard (opencode_lock_other.go) cannot provide, and the
+// fake-`opencode` wrapper is a #!/bin/sh script.
+
+// The subprocess scenarios re-exec this test binary in two helper modes:
 //
 //   - VH_OC_LOCK_HELPER=starter — runs the REAL EnsureDetachedOpenCode +
 //     ApplyDetachedOCStart against a fake `opencode` wrapper, reports the

@@ -15,7 +15,6 @@
 package integration
 
 import (
-	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -249,10 +248,11 @@ func (sc *ocSpawnScenario) waitFakes(n int, d time.Duration) []int {
 
 // ownerLockPath derives the per-project owner lock path the binaries use
 // (<state>/opencode/<sha1(cwd)>.owner.lock) — for INDEPENDENT kernel-level
-// holder verification via /proc.
+// holder verification via /proc. The project key comes from the exported
+// cmd.OCProjectKey (the exact derivation the binaries use) so this cannot
+// drift from it.
 func (sc *ocSpawnScenario) ownerLockPath() string {
-	sum := sha1.Sum([]byte(sc.dir))
-	return filepath.Join(sc.stateDir, "opencode", fmt.Sprintf("%x.owner.lock", sum))
+	return filepath.Join(sc.stateDir, "opencode", cmd.OCProjectKey(sc.dir)+".owner.lock")
 }
 
 // procFD3Holders scans /proc for live processes whose fd 3 resolves to the

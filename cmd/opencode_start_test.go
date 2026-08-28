@@ -1,20 +1,26 @@
+//go:build linux
+
 package cmd
 
 // Boot-seam wiring tests (DEFER 1 payoff) and serialized-restart tests (DEFER
-// 2 payoff) for the shared detached-start transaction. The boot seam is
-// proven at two levels:
+// 2 payoff) for the shared detached-start transaction. Linux-only: the
+// scenarios assert flock/owner-lock and /proc semantics through the
+// ocLockScenario scaffolding (opencode_lock_test.go, also linux-only). The
+// portable verdict→wiring matrix (TestApplyDetachedOCStartMatrix) lives in
+// opencode_start_apply_test.go so it keeps running on every platform.
 //
-//  1. TestApplyDetachedOCStartMatrix — the verdict→wiring mapping both cobra
-//     arms consume (lifecycle transitions, ring seeding, port/URL/cmd).
-//  2. TestClientDaemonBootSeam* — clientDaemonRuntime.startDetachedOpenCode,
+// The boot seam is proven at one level here:
+//
+//   - TestClientDaemonBootSeam* — clientDaemonRuntime.startDetachedOpenCode,
 //     the EXACT code the client-daemon --web=vh cobra arm runs (the arm is a
 //     one-line call to it). local-server's arm is the same Ensure + Apply
-//     pair, covered by level 1.
+//     pair, covered by the platform-independent matrix test.
 //
 // The restart tests prove the restart path participates in the same
 // per-project serialization, revalidates the recorded pid immediately before
-// signaling (never signals a recycled pid), and never respawns beside an
-// owner-lock holder.
+// signaling (never signals a recycled pid), re-derives the port when handed
+// none (D2), waits out a live owner-lock holder even when nothing of ours was
+// signaled (A1), and never respawns beside an owner-lock holder.
 
 import (
 	"os"
@@ -22,112 +28,20 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/oclife"
 )
 
-func TestApplyDetachedOCStartMatrix(t *testing.T) {
-	sc := newOCLockScenario(t)
-	_ = sc // state-dir/cwd scoping only
-
-	// A disk log to observe ring seeding (reattach/occupied seed it; the
-	// fresh-ring reconnect is exactly what the tail exists for).
-	if err := os.WriteFile(ocLogPath(), []byte("detached-log-tail\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	dummy := &exec.Cmd{}
-
-	cases := []struct {
-		name           string
-		res            DetachedStartResult
-		wantLife       oclife.State
-		wantPort       int
-		wantURL        string
-		wantCmd        *exec.Cmd
-		wantRingSeeded bool
-	}{
-		{
-			name:           "spawned",
-			res:            DetachedStartResult{Verdict: DetachedStartSpawned, PID: 11, Port: 4100, Cmd: dummy},
-			wantLife:       oclife.StateReady,
-			wantPort:       4100,
-			wantURL:        "http://127.0.0.1:4100",
-			wantCmd:        dummy,
-			wantRingSeeded: false,
-		},
-		{
-			name:           "reattached",
-			res:            DetachedStartResult{Verdict: DetachedStartReattached, PID: 12, Port: 4101},
-			wantLife:       oclife.StateReady,
-			wantPort:       4101,
-			wantURL:        "http://127.0.0.1:4101",
-			wantRingSeeded: true,
-		},
-		{
-			name:           "occupied",
-			res:            DetachedStartResult{Verdict: DetachedStartOccupied, PID: 13, Port: 4102, Reason: "probe refused"},
-			wantLife:       oclife.StateFailed,
-			wantPort:       4102,
-			wantURL:        "http://127.0.0.1:4102",
-			wantRingSeeded: true,
-		},
-		{
-			name:     "contended without known port",
-			res:      DetachedStartResult{Verdict: DetachedStartContended, Reason: "starter lock held"},
-			wantLife: oclife.StateFailed,
-			wantPort: 0,
-			wantURL:  "", // caller's dead-loopback fallback applies
-		},
-		{
-			name:     "contended with recorded port hint",
-			res:      DetachedStartResult{Verdict: DetachedStartContended, Port: 4103, Reason: "starter lock held"},
-			wantLife: oclife.StateFailed,
-			wantPort: 4103,
-			wantURL:  "http://127.0.0.1:4103",
-		},
-		{
-			name:     "orphaned owner",
-			res:      DetachedStartResult{Verdict: DetachedStartOrphanedOwner, Reason: "holders: pid 1 (sleep)", Holders: []string{"pid 1 (sleep)"}},
-			wantLife: oclife.StateFailed,
-			wantPort: 0,
-			wantURL:  "",
-		},
-		{
-			name:     "failed with targeted port",
-			res:      DetachedStartResult{Verdict: DetachedStartFailed, Port: 4104, Reason: "readiness timeout"},
-			wantLife: oclife.StateFailed,
-			wantPort: 4104,
-			wantURL:  "http://127.0.0.1:4104",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			life := oclife.New(oclife.TopologyDetached)
-			port, url, cmd := ApplyDetachedOCStart(tc.res, life, "test")
-			snap := life.Snapshot()
-			if snap.State != tc.wantLife {
-				t.Fatalf("life state=%s want=%s", snap.State, tc.wantLife)
-			}
-			if port != tc.wantPort || url != tc.wantURL {
-				t.Fatalf("port/url=%d/%q want %d/%q", port, url, tc.wantPort, tc.wantURL)
-			}
-			if cmd != tc.wantCmd {
-				t.Fatalf("cmd passthrough mismatch")
-			}
-			switch tc.res.Verdict {
-			case DetachedStartOccupied, DetachedStartContended, DetachedStartOrphanedOwner, DetachedStartFailed:
-				if snap.FailureSummary != tc.res.Reason {
-					t.Fatalf("failure summary=%q want the transaction reason %q", snap.FailureSummary, tc.res.Reason)
-				}
-			}
-			seeded := len(life.Ring().Tail(0)) > 0
-			if seeded != tc.wantRingSeeded {
-				t.Fatalf("ring seeded=%v want %v", seeded, tc.wantRingSeeded)
-			}
-		})
-	}
+// withOwnerReleaseWait shrinks the restart's owner-release wait budget so
+// holder-refuses-to-die tests fail in milliseconds instead of the full 15s.
+func withOwnerReleaseWait(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := ocOwnerReleaseWait
+	ocOwnerReleaseWait = d
+	t.Cleanup(func() { ocOwnerReleaseWait = old })
 }
 
 // bootSeamRuntime builds the runtime the cobra arm uses, with only the fields
@@ -405,6 +319,7 @@ func TestRestartDetachedContended(t *testing.T) {
 // it and surface the holder.
 func TestRestartDetachedOrphanedHolder(t *testing.T) {
 	sc := newOCLockScenario(t)
+	withOwnerReleaseWait(t, 300*time.Millisecond) // holder never releases; fail fast
 
 	a := sc.startStarter("A", map[string]string{
 		"VH_FAKE_OC_NOLISTEN":   "1",
@@ -436,4 +351,171 @@ func TestRestartDetachedOrphanedHolder(t *testing.T) {
 	if got := len(sc.alivePids(".fake")); got != 0 {
 		t.Fatalf("restart spawned %d children beside the holder", got)
 	}
+}
+
+// --- D2 payoff: port<=0 restart re-derivation ---
+
+// pickLowPort returns a free loopback port BELOW the Linux ephemeral port
+// range (ip_local_port_range, 32768+ by default) — a port freePort() can
+// never hand out — so the re-derived-from-state assertion below is a
+// deterministic discriminator, not a coincidence test.
+func pickLowPort(t *testing.T) int {
+	t.Helper()
+	for p := 24000; p < 24020; p++ {
+		if portFree(p) {
+			return p
+		}
+	}
+	t.Fatal("no free port in the low probe range")
+	return 0
+}
+
+// TestRestartDetachedReDerivesRecordedPort — D2: a restart handed port<=0
+// (a Contended/OrphanedOwner boot left port 0 wired on the runtime) with
+// VALID recorded state re-derives the RECORDED port and restarts on it —
+// instead of spawning `opencode serve --port 0`, whose readiness wait can
+// never succeed (30s hang, child stranded on an OS-assigned port).
+func TestRestartDetachedReDerivesRecordedPort(t *testing.T) {
+	sc := newOCLockScenario(t)
+	port := pickLowPort(t) // below the ephemeral range: freePort() cannot return it
+
+	// Valid recorded state naming a live but FOREIGN pid (the kill phase
+	// must skip and never signal it).
+	sacrifice := exec.Command("sleep", "300")
+	if err := sacrifice.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = sacrifice.Process.Kill()
+		_ = sacrifice.Wait()
+	})
+	writeOCState(ocState{PID: sacrifice.Process.Pid, Port: port})
+
+	c, err := restartDetachedOpenCode(sc.bin, 0, sc.dir, 0)
+	if err != nil {
+		t.Fatalf("restart at port<=0 must re-derive the recorded port and succeed: %v", err)
+	}
+	st, ok := readOCState()
+	if !ok || st.PID != c.Process.Pid || st.Port != port {
+		t.Fatalf("state=%+v ok=%v want pid=%d on the RECORDED port %d", st, ok, c.Process.Pid, port)
+	}
+	if !ocProcessAlive(sacrifice.Process.Pid) {
+		t.Fatal("the foreign recorded pid must stay untouched")
+	}
+	sc.waitAliveCount(".fake", 1, 5*time.Second)
+}
+
+// TestRestartDetachedFreshPortWhenNoState — D2: port<=0 with NO valid
+// recorded state (the boot verdict never read/published state) picks a fresh
+// free port: the restart SUCCEEDS and publishes state. The old behavior
+// (`--port 0`) could never pass readiness, wedging the directed recovery.
+func TestRestartDetachedFreshPortWhenNoState(t *testing.T) {
+	sc := newOCLockScenario(t)
+
+	if _, err := os.Stat(ocStatePath()); err == nil {
+		t.Fatal("precondition: a fresh scenario has no state file")
+	}
+	c, err := restartDetachedOpenCode(sc.bin, 0, sc.dir, 0)
+	if err != nil {
+		t.Fatalf("restart at port<=0 with no state must pick a fresh port and succeed: %v", err)
+	}
+	st, ok := readOCState()
+	if !ok || st.PID != c.Process.Pid || st.Port <= 0 {
+		t.Fatalf("state=%+v ok=%v want the respawned pid %d on a fresh port>0", st, ok, c.Process.Pid)
+	}
+	sc.waitAliveCount(".fake", 1, 5*time.Second)
+}
+
+// --- A1 payoff: the owner-release wait ---
+
+// TestRestartDetachedWaitsOutUnsignaledHolder — A1's residual gap: NOTHING of
+// ours was signaled (curPID 0, no valid state) yet the owner lock is held by
+// a live holder that releases shortly after the restart began. The restart
+// must enter the bounded release wait and proceed once the slot frees — not
+// fail instantly on EWOULDBLOCK from takeOwnerForChild. (Pre-fix, this test
+// fails: the wait was gated on the `signaled` flag.)
+func TestRestartDetachedWaitsOutUnsignaledHolder(t *testing.T) {
+	sc := newOCLockScenario(t)
+
+	// The test process itself becomes the transient holder: a second open
+	// file description on the owner lock, which flock denies to the
+	// transaction exactly like a foreign process would (flock excludes per
+	// description, not per process — see TestOCSpawnGuardStarterLockMutualExclusion).
+	fd, err := syscall.Open(ocOwnerLockPath(), syscall.O_RDWR|syscall.O_CREAT, 0o600)
+	if err != nil {
+		t.Fatalf("open owner lock: %v", err)
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock owner lock: %v", err)
+	}
+	released := make(chan time.Time, 1)
+	go func() {
+		time.Sleep(700 * time.Millisecond)
+		released <- time.Now()
+		_ = syscall.Close(fd)
+	}()
+	t.Cleanup(func() { _ = syscall.Close(fd) }) // no-op once the goroutine closed it
+
+	start := time.Now()
+	c, errRestart := restartDetachedOpenCode(sc.bin, freePort(), sc.dir, 0)
+	if errRestart != nil {
+		t.Fatalf("restart must wait out the un-signaled holder and proceed: %v", errRestart)
+	}
+	// The restart can only have acquired the slot after the holder released:
+	// it demonstrably WAITED rather than failed fast (or got lucky spawning
+	// beside a live holder — the split-brain invariant forbids that).
+	if elapsed := time.Since(start); elapsed < 500*time.Millisecond {
+		t.Fatalf("restart finished in %v — it did not wait out the 700ms holder", elapsed)
+	}
+	st, ok := readOCState()
+	if !ok || st.PID != c.Process.Pid {
+		t.Fatalf("state=%+v ok=%v want the respawned pid %d", st, ok, c.Process.Pid)
+	}
+	sc.waitAliveCount(".fake", 1, 5*time.Second)
+}
+
+// TestRestartDetachedCurPIDHolderWait — A1's literal shape from the card: the
+// caller's retained child (curPID) is the live owner-lock holder while the
+// recorded state names a different, foreign pid. The restart kills curPID,
+// ENTERS the bounded owner-release wait (SIGTERM alone does not free the slot
+// until the process actually exits), and respawns only after the release.
+func TestRestartDetachedCurPIDHolderWait(t *testing.T) {
+	sc := newOCLockScenario(t)
+
+	// Spawn the real instance (owns the slot, publishes state)…
+	res := EnsureDetachedOpenCode(sc.bin, sc.dir)
+	if res.Verdict != DetachedStartSpawned {
+		t.Fatalf("boot: %v (%s)", res.Verdict, res.Reason)
+	}
+	oldPID := res.Cmd.Process.Pid
+
+	// …then make the state stale: it names a live foreign pid, so the kill
+	// phase skips st.PID and only curPID (the real holder) is signaled.
+	sacrifice := exec.Command("sleep", "300")
+	if err := sacrifice.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = sacrifice.Process.Kill()
+		_ = sacrifice.Wait()
+	})
+	writeOCState(ocState{PID: sacrifice.Process.Pid, Port: 1})
+
+	port := freePort()
+	c, err := restartDetachedOpenCode(sc.bin, port, sc.dir, oldPID)
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	if !ocProcessAlive(sacrifice.Process.Pid) {
+		t.Fatal("the foreign recorded pid must stay untouched")
+	}
+	go func() { _ = res.Cmd.Wait() }() // reap ours so liveness assertions are honest
+	if !waitPidDead(oldPID, 5*time.Second) {
+		t.Fatal("the old holder must be dead after the restart")
+	}
+	st, ok := readOCState()
+	if !ok || st.PID != c.Process.Pid || st.Port != port {
+		t.Fatalf("state=%+v ok=%v want pid=%d port=%d", st, ok, c.Process.Pid, port)
+	}
+	sc.waitAliveCount(".fake", 1, 5*time.Second) // exactly one live child
 }

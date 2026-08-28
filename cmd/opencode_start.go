@@ -251,6 +251,12 @@ func ApplyDetachedOCStart(res DetachedStartResult, life *oclife.Lifecycle, prefi
 	}
 }
 
+// ocOwnerReleaseWait bounds how long a restart waits for the old owner chain
+// (or any live holder of the owner lock) to release the slot before failing
+// the restart explicitly. Package var so tests can shrink it, mirroring the
+// probe knobs above.
+var ocOwnerReleaseWait = 15 * time.Second
+
 // restartDetachedOpenCode is the serialized restart of the detached instance:
 // under the same per-project starter lock it rereads state and revalidates the
 // recorded pid (alive + cmdline match) IMMEDIATELY before signaling — a
@@ -258,13 +264,28 @@ func ApplyDetachedOCStart(res DetachedStartResult, life *oclife.Lifecycle, prefi
 // the owner lock before respawning through the same guarded handoff and
 // republishing state on the stable port.
 //
+// port <= 0 (a boot verdict that left no usable port on the runtime —
+// Contended/OrphanedOwner without readable state) is re-derived here the way
+// the boot path derives its stable port: the recorded state's port when
+// valid, else a fresh free one. `opencode serve --port 0` is never spawned
+// (it can never pass the readiness wait, which would wedge the very recovery
+// path this function is).
+//
+// The owner-release wait is bounded (ocOwnerReleaseWait) and applies whenever
+// the owner lock is still held after the signaling phase — whether we
+// signaled the old owner or merely met a live holder against stale or missing
+// state (curPID 0): a wedged holder fails the restart explicitly instead of
+// ever spawning beside possible live work.
+//
 // curPID is the caller's own retained child pid (0 when the daemon
 // reconnected instead of spawning); it is ours by construction and
 // zombie-safe (an un-reaped dead child cannot have its pid recycled).
 //
 // On success it returns the new child. On a readiness failure it returns the
-// spawned child AND the error — the caller keeps the handle, exactly like the
-// boot path.
+// spawned child AND the error so the caller retains and reaps the handle. The
+// failed child itself is left running and owner-covered with state
+// unpublished — the same posture as the boot path's readiness failure, which
+// surfaces only the pid/port, not the child handle.
 func restartDetachedOpenCode(bin string, port int, workspace string, curPID int, extraW ...io.Writer) (*exec.Cmd, error) {
 	guard, verdict, reason := acquireOCSpawnGuard()
 	if verdict != ocLockAcquired {
@@ -272,17 +293,33 @@ func restartDetachedOpenCode(bin string, port int, workspace string, curPID int,
 	}
 	defer guard.Release()
 
+	// D2 (P1-API-002 follow-up): a restart handed an unusable port (<= 0 —
+	// a Contended/OrphanedOwner boot with no readable state leaves port 0
+	// wired on the runtime) must never spawn `opencode serve --port 0`:
+	// waitForPort(0) can never succeed, so the directed recovery path would
+	// hang for the readiness budget and strand the child on an OS-assigned
+	// port with the owner lock held and state unpublished. Re-derive under
+	// the lock, exactly like the boot path's stable-port selection: the
+	// recorded state's port when valid, else a fresh free one.
+	if port <= 0 {
+		if st, ok := readOCState(); ok {
+			port = st.Port
+			log.Printf("detached restart: no usable port given — re-derived the recorded port %d", port)
+		} else {
+			port = freePort()
+			log.Printf("detached restart: no usable port given and no valid recorded state — picked a fresh port %d", port)
+		}
+	}
+
 	// Reread state under the lock and revalidate identity right before
 	// signaling. The recorded pid may have died and been recycled between
 	// the UI request and now; signaling it would kill an unrelated process.
-	signaled := false
 	killed := map[int]bool{}
 	if st, ok := readOCState(); ok {
 		if ocProcessAlive(st.PID) && ocCmdlineMatches(st.PID, st.Port) {
 			log.Printf("detached restart: stopping recorded instance pid=%d port=%d", st.PID, st.Port)
 			killPID(st.PID)
 			killed[st.PID] = true
-			signaled = true
 		} else {
 			log.Printf("detached restart: recorded pid %d (port %d) is not a live `opencode serve --port %d` (dead or recycled) — NOT signaling it",
 				st.PID, st.Port, st.Port)
@@ -293,29 +330,32 @@ func restartDetachedOpenCode(bin string, port int, workspace string, curPID int,
 	// child cannot have its pid recycled.
 	if curPID > 0 && !killed[curPID] {
 		killPID(curPID)
-		signaled = true
 	}
 
-	if signaled {
-		// Wait for the old owner chain to release the owner lock (fds close
-		// at process exit). Bounded: a wedged instance — or a descendant
-		// that retained fd 3 — fails the restart explicitly instead of ever
-		// spawning a second instance beside possible live work.
-		deadline := time.Now().Add(15 * time.Second)
-		for ocOwnerLockHeldByOthers() && time.Now().Before(deadline) {
-			time.Sleep(100 * time.Millisecond)
+	// Wait for the old owner chain to release the owner lock (fds close at
+	// process exit). A1 (P1-API-002 follow-up): this runs whenever the lock
+	// is still held after the signaling phase — not only when WE signaled
+	// someone. A restart against stale or missing state (curPID 0) can still
+	// meet a live holder it never named; without the wait it would fail
+	// instantly on EWOULDBLOCK in takeOwnerForChild instead of giving that
+	// holder the same bounded release window. Bounded either way: a wedged
+	// instance — or a descendant that retained fd 3 — fails the restart
+	// explicitly instead of ever spawning a second instance beside possible
+	// live work.
+	deadline := time.Now().Add(ocOwnerReleaseWait)
+	for ocOwnerLockHeldByOthers() && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if ocOwnerLockHeldByOthers() {
+		var names []string
+		for _, h := range ocOwnerLockHolders() {
+			names = append(names, h.String())
 		}
-		if ocOwnerLockHeldByOthers() {
-			var names []string
-			for _, h := range ocOwnerLockHolders() {
-				names = append(names, h.String())
-			}
-			if len(names) == 0 {
-				names = []string{"(none discoverable)"}
-			}
-			return nil, fmt.Errorf("old detached OpenCode did not release the project owner lock (a descendant may retain it) — NOT respawning beside it; holders: %s",
-				strings.Join(names, ", "))
+		if len(names) == 0 {
+			names = []string{"(none discoverable)"}
 		}
+		return nil, fmt.Errorf("old detached OpenCode did not release the project owner lock (a descendant may retain it) — NOT respawning beside it; holders: %s",
+			strings.Join(names, ", "))
 	}
 
 	cmd, err := guard.startChildWithOwner(bin, port, workspace, extraW...)
