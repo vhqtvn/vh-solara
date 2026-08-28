@@ -95,7 +95,7 @@ Probe matrix (read-only GETs; the host opencode DB was read in parallel under
 
 | Request | Status | Body | Headers | Match |
 |---------|--------|------|---------|-------|
-| `?limit=10` (no cursor) | 200 | newest-10, chronological | **no** `X-Next-Cursor` / `Link` | body == DB newest-10 |
+| `?limit=10` (no cursor) | 200 | newest-10, chronological | **no** `X-Next-Cursor` / `Link` (historical probe hit exhausted window) | body == DB newest-10 |
 | `?before=<cursor>&limit=10` | 200 | 10 strictly-older msgs, chronological | **`X-Next-Cursor` + `Link` present** | body == DB predicted strictly-older-10 |
 | `?before=<raw msg_ id>` (old probe) | **400** | BadRequest | — | raw id is NOT valid base64url-JSON → cursor.decode fails (see §3) |
 
@@ -104,9 +104,8 @@ Probe matrix (read-only GETs; the host opencode DB was read in parallel under
 - `X-Next-Cursor` decodes (base64url → JSON) to **the oldest item of the returned
   page** — consistent with §1's "next cursor = oldest tuple" rule. Sending it as
   the next `?before=` pages one window further back.
-- The no-cursor baseline (`?limit=10`) returns the newest-10 and carries NO cursor
-  headers — confirming the cursor header is a paging-only signal, not present on
-  the tail/initial fetch.
+- *Historical note (superseded)*: A prior deployed probe found the no-cursor baseline (`?limit=10`) returned the newest-10 and carried NO cursor headers. This occurred because that specific probe hit an **exhausted window** (total session messages ≤ limit).
+- **Current contract:** A limited no-before tail fetch (`?limit=N`) **does** carry the `X-Next-Cursor` and `Link` response headers whenever there is more history beyond the requested limit (i.e. `rows.length > input.limit`). It is omitted only when the session is fully exhausted.
 
 ---
 
@@ -203,10 +202,7 @@ non-goal.
    it should note the `?before=<token>` paging surface exists alongside `?limit=N`.
 5. **Send a cursor TOKEN, never a raw `msg_…` id** — the route runs
    `cursor.decode` on `before`; a raw id is `400 BadRequest` (§3).
-6. **Initial (tail) fetch**: `?limit=N` with no `?before` returns the newest-N and
-   NO cursor headers — page backward from the oldest id of that tail by
-   constructing the first cursor, or (if the server exposes it) use the tail's
-   paging signal.
+6. **Initial (tail) fetch**: `?limit=N` with no `?before` returns the newest-N and **does** include the `X-Next-Cursor` header if more history exists. Consume the authoritative response header to page backward. Do NOT construct the first cursor client-side.
 
 ---
 
@@ -269,10 +265,10 @@ and the prior "no backward cursor" blocker is corrected.
 ## Findings
 
 - **(finding)**: source=deployed opencode 127.0.0.1:43889 probe + refs/opencode message-v2.ts/handlers/session.ts, confidence=high, type=fact — `GET /session/:id/message?before=<cursor-token>&limit=N` returns strictly-older-N (chronological) + `X-Next-Cursor`/`Link` headers; cursor = `base64url(JSON{id,time})` (id-then-time, unpadded, time=time_created unix-ms); next cursor = oldest tuple of the slice.
-- **(finding)**: source=deployed opencode probe, confidence=high, type=fact — the deployed instance supports the cursor NOW (migration `20260312043431_session_message_cursor` landed); strictly-older set == DB prediction; `X-Next-Cursor` decodes to the oldest page item; baseline `?limit=N` (no cursor) = newest-N with no cursor headers.
+- **(finding)**: source=deployed opencode probe + refs/opencode message-v2.ts:425-467, confidence=high, type=fact — the deployed instance supports the cursor NOW (migration `20260312043431_session_message_cursor` landed); strictly-older set == DB prediction; `X-Next-Cursor` decodes to the oldest page item; baseline `?limit=N` (no cursor) = newest-N with `X-Next-Cursor` present if more history exists (the historical probe saw no headers because it hit an exhausted window).
 - **(finding)**: source=refs/opencode handlers/session.ts:111-117 + the raw-id probe 400, confidence=high, type=fact (correction of record) — the prior "opencode REST has no backward cursor" inference was WRONG for latest; the raw-id `?before=<msgid>` 400 is `cursor.decode` rejecting a non-base64url-JSON value, NOT API absence.
 - **(finding)**: source=refs/opencode snapshot vs v1.17.18 sibling packet, confidence=high, type=fact — delta vs v1.17.18 is ONLY the cursor paging + `message_session_time_created_id_idx` index + optional `CompactionPart.tail_start_id`; SSE/REST delivery contract (event types, `WithParts`, envelopes, list-vs-by-id cardinality) unchanged.
-- **(finding)**: source=pkg/opencode/client.go:53-68,347-353, confidence=high, type=fact — `Client.getJSON` discards response headers (a header-aware variant is needed for `X-Next-Cursor`); `MessagesTail`'s doc comment is now stale (omits the `?before=<token>` paging surface).
+- **(finding)**: source=pkg/opencode/client.go (prior to `1dfcd9e903b778864ecbdb71f7df8a8c8a1babbd`), confidence=high, type=fact — `Client.getJSON` discarded response headers (a header-aware variant was needed for `X-Next-Cursor`); `MessagesTail`'s doc comment was stale. (Resolved in vh-solara commit `1dfcd9e903b778864ecbdb71f7df8a8c8a1babbd` which adds header-aware reading in `MessagesTail`).
 - **(finding)**: source=REST cursor (§1–§2) vs cold-load-overfetch.md option (c), confidence=high, type=inference — direct-SQLite older-page is strictly dominated by the REST cursor; the REST path is sufficient and avoids the direct-SQLite-reads architecture non-goal.
 
 ## Contradictions
@@ -297,8 +293,8 @@ This packet is the **evidence base, not active repo policy.** If/when Part B
   cursor tokens (never raw ids), and page backward from the tail's oldest tuple.
 - **Promotion targets** (separate from this packet): update
   `tmp/agent-runs/delivery-proof/cold-load-overfetch.md` §Open Decision 1 (the
-  contradiction, §Contradictions); refresh the `MessagesTail` doc comment
-  (`pkg/opencode/client.go:347-353`); add a header-aware client variant.
+  contradiction, §Contradictions).
+  *Note: Consumer-side promotion (header-aware client variant and `MessagesTail` update) has already landed in vh-solara commit `1dfcd9e903b778864ecbdb71f7df8a8c8a1babbd`.*
 - On an OpenCode version bump: re-run the §2 probe matrix, confirm migration
   `20260312043431_session_message_cursor` is present, and refresh the §1
   `file:line` citations.
