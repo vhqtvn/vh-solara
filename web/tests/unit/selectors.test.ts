@@ -339,7 +339,7 @@ describe("sessionLastAgent (tree chip / cold + live)", () => {
     expect(sessionLastAgent(LIVE)).toBe("build");
   });
 
-  it("returns undefined when loaded but no assistant message carries an agent", () => {
+  it("falls back to the lastAgents facet when loaded but no message carries an agent", () => {
     setState("lastAgents", LIVE, "build");
     setState("messages", LIVE, {
       order: ["m1"],
@@ -347,7 +347,12 @@ describe("sessionLastAgent (tree chip / cold + live)", () => {
         m1: { id: "m1", info: { id: "m1", sessionID: LIVE, role: "user" }, partOrder: [], parts: {} },
       },
     });
-    // Loaded + authoritative: no assistant → undefined (NOT the stale seed).
-    expect(sessionLastAgent(LIVE)).toBeUndefined();
+    // Loaded window with NO agent stamp: user messages are sender-stamped
+    // with `agent`, so the live scan is fresh after every send — it misses
+    // only in the evidence-less window (e.g. tail aggregation still running).
+    // There the server-computed facet (stale but REAL) beats fabricating a
+    // default: fall through to lastAgents instead of undefined (the
+    // silent-flip fix — undefined let the caller resolve the config default).
+    expect(sessionLastAgent(LIVE)).toBe("build");
   });
 });

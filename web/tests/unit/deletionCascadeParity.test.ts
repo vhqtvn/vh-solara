@@ -20,7 +20,14 @@ import { produce, reconcile } from "solid-js/store";
 import { projectSessionEvent, projectSessionRemoval } from "../../src/sync/reducers";
 import { applySessionEvent, pruneSessionDeleted } from "../../src/sync/reconcile";
 import type { ReconcileEffect } from "../../src/sync/reducers.types";
-import { state, setState } from "../../src/sync/store";
+import {
+  lsSessionAgents,
+  resetSessionAgentPicks,
+  sessionAgentPicks,
+  setSessionAgentPick,
+  setState,
+  state,
+} from "../../src/sync/store";
 
 beforeEach(() => {
   setState("sessions", reconcile({}));
@@ -132,5 +139,40 @@ describe("deletion-cascade parity (L-08/M4)", () => {
     ]);
     // The orchestration path is also a safe re-prune.
     expect(() => pruneSessionDeleted("neverexisted")).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3 (review): the deletion cascade must prune the PERSISTED per-session agent
+// pick. The session-removed effect consumer (reconcile.ts interpretEffects →
+// clearSessionAgentPick) must drop BOTH the in-memory sessionAgentPicks entry
+// AND the persisted localStorage map (vh.sessionagents.v1:<dir>) — or a
+// server-side id reuse resurrects the old session's explicit agent pick for
+// the new occupant (the silent-flip class this slice closes).
+// ---------------------------------------------------------------------------
+describe("deletion cascade prunes the persisted agent pick (F3)", () => {
+  beforeEach(() => {
+    resetSessionAgentPicks({});
+    localStorage.removeItem(lsSessionAgents(""));
+  });
+
+  it("session.delete event removes the pick in-memory AND from the persisted map", () => {
+    setSessionAgentPick("x", "build");
+    expect(sessionAgentPicks["x"]?.agent).toBe("build");
+    expect(JSON.parse(localStorage.getItem(lsSessionAgents("")) ?? "null")?.data?.x?.agent).toBe("build");
+
+    applySessionEvent("session.delete", 7, { id: "x" });
+
+    expect(sessionAgentPicks["x"]).toBeUndefined();
+    expect(JSON.parse(localStorage.getItem(lsSessionAgents("")) ?? "null")?.data?.x).toBeUndefined();
+  });
+
+  it("eager archive prune (pruneSessionDeleted) removes the pick identically", () => {
+    setSessionAgentPick("x", "build");
+
+    pruneSessionDeleted("x");
+
+    expect(sessionAgentPicks["x"]).toBeUndefined();
+    expect(JSON.parse(localStorage.getItem(lsSessionAgents("")) ?? "null")?.data?.x).toBeUndefined();
   });
 });

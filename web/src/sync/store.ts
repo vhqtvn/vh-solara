@@ -3,7 +3,7 @@
 // helpers. This is the leaf every other sync module reads from — it imports
 // nothing from its siblings, so the rest of the decomposition hangs off it
 // without a cycle. State is reconciled by id, never nuked.
-import { createStore } from "solid-js/store";
+import { createStore, produce, reconcile } from "solid-js/store";
 import { createSignal } from "solid-js";
 import type { ConnStatus, GateFacts, Permission, ProjectConstants, Question, Session, SessionMessages, VerbFacet } from "../types";
 import { loadVersioned, saveVersioned } from "../lib/store";
@@ -11,6 +11,13 @@ import { loadVersioned, saveVersioned } from "../lib/store";
 const LS_CURSOR = "vh.cursor.v1";
 const LS_ACTIVITY = "vh.activity.v1";
 const LS_LASTAGENTS = "vh.lastagents.v1";
+// Explicit per-session agent picks (the composer dropdown), persisted per
+// project dir. NOT part of the debounced persist() batch — picks are written
+// through explicitly at pick time (setSessionAgentPick), mirroring
+// persistSelection()'s rationale (a reactive debounced write could race a
+// switchProject and clobber the NEW project's saved picks with the OLD
+// project's values).
+const LS_SESSIONAGENTS = "vh.sessionagents.v1";
 // Last-selected session id, persisted per project so the installed PWA reopens
 // the same session after an OS-driven relaunch (which drops ?session=). NOT part
 // of the debounced persist() batch — see persistSelection() for why.
@@ -26,6 +33,7 @@ export const LS_PROJECT = "vh.project.dir";
 export const lsCursor = (dir: string) => `${LS_CURSOR}:${dir}`;
 export const lsActivity = (dir: string) => `${LS_ACTIVITY}:${dir}`;
 export const lsLastAgents = (dir: string) => `${LS_LASTAGENTS}:${dir}`;
+export const lsSessionAgents = (dir: string) => `${LS_SESSIONAGENTS}:${dir}`;
 export const lsSelected = (dir: string) => `${LS_SELECTED}:${dir}`;
 
 export const loadCursor = (dir: string) =>
@@ -48,6 +56,55 @@ export function loadLastAgents(dir: string): Record<string, string> {
   return loadVersioned<Record<string, string>>(lsLastAgents(dir), 1, {}, (o) =>
     o && typeof o === "object" ? (o as Record<string, string>) : {},
   );
+}
+
+// One explicit per-session agent pick. `t` is the write time (Date.now()) —
+// used ONLY to bound the store: when the map exceeds
+// SESSION_AGENT_PICKS_CAP, the OLDEST picks are dropped. It is not a
+// recency signal for resolution (an explicit pick is authoritative for its
+// session until the session is removed or the agent becomes unavailable).
+export interface SessionAgentPick {
+  agent: string;
+  t: number;
+}
+
+// Cap on the persisted pick map. Picks are tiny (~50B each), but the store is
+// per-project localStorage seeded at module load and never server-pruned, so
+// without a cap a long-lived install accumulates one entry per session ever
+// picked in. 200 comfortably exceeds "sessions you actively switch agents
+// between" while bounding the payload at ~10KiB.
+export const SESSION_AGENT_PICKS_CAP = 200;
+
+// Sanitize a foreign/corrupt payload: keep only entries whose shape is
+// {agent: non-empty string, t: number}.
+function sanitizePicks(o: unknown): Record<string, SessionAgentPick> {
+  if (!o || typeof o !== "object" || Array.isArray(o)) return {};
+  const out: Record<string, SessionAgentPick> = {};
+  for (const [id, v] of Object.entries(o as Record<string, unknown>)) {
+    if (!id || !v || typeof v !== "object") continue;
+    const p = v as { agent?: unknown; t?: unknown };
+    if (typeof p.agent !== "string" || !p.agent) continue;
+    out[id] = { agent: p.agent, t: typeof p.t === "number" && Number.isFinite(p.t) ? p.t : 0 };
+  }
+  return out;
+}
+
+// Explicit per-session agent picks, persisted per project dir so an explicit
+// composer dropdown choice SURVIVES a reload/PWA relaunch. Rationale (the
+// 2026-08 silent-flip incidents): the previous in-memory map was lost on
+// reload, and while hydration hadn't caught up the resolver fell back to the
+// config default_agent — sending an existing session's prompt under the WRONG
+// agent. A persisted pick is the top rung of the evidence ladder (see
+// agents.ts resolveAgentForSession). Mirrors loadLastAgents' instant-rehydrate
+// rationale; the live stream + session-removal prune keep it convergent.
+export function loadSessionAgents(dir: string): Record<string, SessionAgentPick> {
+  // Sanitize UNCONDITIONALLY, not just via loadVersioned's migrate hook:
+  // loadVersioned returns env.data AS-IS when the envelope version matches
+  // (no type validation — see loadSelected's note), so a foreign/corrupt
+  // {v:1,data:<garbage>} payload would otherwise flow into the store raw.
+  // There is no legacy format to migrate, so version-mismatch/corrupt-JSON
+  // simply fall back to the empty map via loadVersioned's null fallback.
+  return sanitizePicks(loadVersioned<unknown>(lsSessionAgents(dir), 1, null));
 }
 
 // Last-selected session id for this project — the localStorage counterpart to
@@ -327,6 +384,67 @@ export function isSending(id: string): boolean {
 }
 export function setSending(id: string, v: boolean): void {
   setSendingState(id, v);
+}
+
+// Explicit per-session agent picks (see SessionAgentPick). Seeded from the
+// same initialDir as state, re-seeded on switchProject (resetSessionAgentPicks),
+// pruned per-id on session removal (clearSessionAgentPick — mirrors the B2b
+// lastAgents id-reuse guard in projectSessionRemoval's effect path).
+const [sessionAgentPicks, setSessionAgentPicks] = createStore<Record<string, SessionAgentPick>>(
+  loadSessionAgents(initialDir),
+);
+export { sessionAgentPicks };
+
+// Enforce the cap + write through to localStorage for the CURRENT project dir.
+// Sort by write time descending, keep the newest SESSION_AGENT_PICKS_CAP
+// entries. Write-through (not debounced): a pick is a rare, explicit user
+// action, and mirroring persistSelection's explicit-write rationale avoids a
+// switchProject race clobbering the new project's persisted picks.
+function persistPicks(): void {
+  const dir = projectDir();
+  const entries = Object.entries(sessionAgentPicks).sort((a, b) => b[1].t - a[1].t);
+  const capped: Record<string, SessionAgentPick> = {};
+  for (let i = 0; i < entries.length && i < SESSION_AGENT_PICKS_CAP; i++) capped[entries[i][0]] = entries[i][1];
+  saveVersioned(lsSessionAgents(dir), 1, capped);
+  // Reflect the cap in memory too, so the resolver can never resurrect a
+  // dropped pick from the in-memory map. `reconcile` diffs the replacement
+  // into the store so reactive readers only re-run for actually-dropped keys.
+  setSessionAgentPicks(reconcile(capped));
+}
+
+// Record an explicit pick for a session (write-through, capped). Re-picking
+// the same agent refreshes its write time (keeps active sessions alive under
+// the cap).
+export function setSessionAgentPick(id: string, agent: string): void {
+  if (!id || !agent) return;
+  setSessionAgentPicks(id, { agent, t: Date.now() });
+  persistPicks();
+}
+
+// Drop a session's pick (session removed / id reused server-side). Prunes
+// both memory and the persisted map. The delete MUST go through the setter
+// (produce): the exported store value is a read proxy, and a bare
+// `delete sessionAgentPicks[id]` on it is SILENTLY SWALLOWED — the entry
+// survives in memory and persistPicks() below re-persists it, so the
+// session-removed effect path left stale picks behind (exactly the id-reuse
+// silent-flip guard this function exists for; pinned by
+// deletionCascadeParity.test.ts).
+export function clearSessionAgentPick(id: string): void {
+  if (!(id in sessionAgentPicks)) return;
+  setSessionAgentPicks(
+    produce((m) => {
+      delete m[id];
+    }),
+  );
+  persistPicks();
+}
+
+// Swap the whole map on project switch (actions.ts switchProject): seed the
+// new project dir's persisted picks, WITHOUT persisting (the new dir already
+// owns its persisted copy — writing here would save the OLD map under the NEW
+// dir's key).
+export function resetSessionAgentPicks(next: Record<string, SessionAgentPick>): void {
+  setSessionAgentPicks(reconcile(next));
 }
 
 // Current project directory ("" = default). Multi-project: snapshot/stream and

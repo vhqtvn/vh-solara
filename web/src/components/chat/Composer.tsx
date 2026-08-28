@@ -21,7 +21,7 @@
 
 import { type Accessor, type Setter, For, Show } from "solid-js";
 import { Portal } from "solid-js/web";
-import { agents, agentForSession, selectAgentForSession } from "../../agents";
+import { agents, resolveAgentForSession, selectAgentForSession } from "../../agents";
 import { agentDisplay } from "../../projectSettings";
 import { chooseVariant, models } from "../../models";
 import { queueFor, queueMode, removeQueued } from "../../queue";
@@ -121,6 +121,30 @@ export function Composer(props: ComposerProps) {
     }
     props.hist.onHistoryKey(e);
   }
+
+  // Agent select display state — the SAME resolver the send path snapshots
+  // at tap (resolveAgentForSession), tying display to what is sent:
+  //   agent       → the evidence-backed name; a send at this moment carries
+  //                 EXACTLY this value (snapshot-once: later evidence changes
+  //                 never flip an already-tapped send);
+  //   pending     → hydration hasn't produced evidence yet ("Resolving…"); a
+  //                 send waits for the FIRST valid resolution and displays
+  //                 that same value once it lands (the pending→resolved
+  //                 transition both surfaces observe);
+  //   unavailable → evidence points at an agent NOT in the live list — show
+  //                 which one is missing and require an explicit pick; NEVER
+  //                 silently substitute list[0]/config default.
+  // Helpers (not inline props) so TS narrows the AgentResolution union once.
+  const agentRes = () => resolveAgentForSession(props.sessionId());
+  const agentValue = () => {
+    const r = agentRes();
+    return r.state === "agent" ? r.agent : "";
+  };
+  const agentPlaceholder = () => {
+    const r = agentRes();
+    if (r.state === "unavailable") return `@${r.agent} unavailable — pick an agent`;
+    return r.state === "pending" ? "Resolving agent…" : "Select agent";
+  };
 
   return (
     <div
@@ -293,13 +317,27 @@ export function Composer(props: ComposerProps) {
           </div>
           <div class="composer-bar">
             <Show when={agents().length > 0} fallback={<span class="bar-loading">Loading agents…</span>}>
-              <Select
-                class="bar-select agent-select"
-                ariaLabel="Agent"
-                value={agentForSession(props.sessionId())}
-                options={agents().map((a) => ({ value: a.name, label: `@${a.name}`, swatch: agentDisplay(a.name)?.color, sub: a.description }))}
-                onChange={(v) => selectAgentForSession(props.sessionId(), v)}
-              />
+              {/* Pending: hydration evidence hasn't landed for this existing
+                  session — an explicit non-interactive state, NOT a default
+                  agent. Unavailable: evidence names an agent missing from the
+                  live list — the picker stays interactive so the user can pick
+                  a replacement; the send gate refuses until they do (or the
+                  agent returns). The Select's value/placeholder come from the
+                  SAME resolver the send path snapshots at tap (display ties
+                  to what is sent; see the agentRes note above). */}
+              <Show
+                when={agentRes().state !== "pending"}
+                fallback={<span class="bar-loading" data-tip="Waiting for this session's agent evidence…">Resolving agent…</span>}
+              >
+                <Select
+                  class="bar-select agent-select"
+                  ariaLabel="Agent"
+                  value={agentValue()}
+                  placeholder={agentPlaceholder()}
+                  options={agents().map((a) => ({ value: a.name, label: `@${a.name}`, swatch: agentDisplay(a.name)?.color, sub: a.description }))}
+                  onChange={(v) => selectAgentForSession(props.sessionId(), v)}
+                />
+              </Show>
             </Show>
             <Show when={models().length > 0}>
               <button type="button" class="bar-btn model-btn" aria-label="Model" onClick={() => props.setModelDialog(true)}>

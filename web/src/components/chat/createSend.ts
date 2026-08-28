@@ -9,7 +9,13 @@
 // so the cluster is unit-testable in isolation.
 //
 // Behavior-preserving extraction: bodies moved verbatim from ChatView; the
-// only edits are `this.X` → `deps.X()` / local refs. The drainer's dispatch
+// only edits are `this.X` → `deps.X()` / local refs — EXCEPT the agent
+// evidence gate (sendText/dispatchQueuedItem/runShell/send/resendText
+// resolving the agent through deps.awaitAgent/resolveAgent instead of a
+// single eagerly-read selected-agent string): a deliberate behavior change
+// fixing the silent agent-flip incidents (see src/agents.ts' evidence
+// ladder). The drainer's
+// dispatch
 // closure config-fallback (the `item.sendConfig?.providerID && ... ?
 // ... : captureConfig(id)` ternary that lived in ChatView's queueDrainer wire-
 // up) moved INTO the public dispatchQueuedItem so the drainer wire-up is a
@@ -35,6 +41,17 @@ import type { Notification } from "../../notify";
 // Model/agent/variant a prompt is sent with (captured at queue time too).
 type QueueConfig = { providerID?: string; modelID?: string; variant?: string; agent?: string };
 
+// F5 (review): bound on the LEGACY agent-less queued item's re-resolve gate
+// inside the drainer's dispatch window. The drainer bounds a whole dispatch
+// with a 12s AbortController (DEFAULT_DISPATCH_TIMEOUT_MS, queueDrain.ts);
+// letting the gate wait the full AGENT_RESOLVE_TIMEOUT_MS (10s) would leave
+// only ~2s of POST headroom and, on timeout, classify the item with the
+// POST-ambiguous `unknown` even though no POST was ever attempted. 5s caps
+// the wait so a resolution — or a pre-POST failure classification — settles
+// with ≥7s of the dispatch budget still available for the actual
+// prompt_async POST.
+const QUEUED_DISPATCH_GATE_TIMEOUT_MS = 5_000;
+
 export type SendDependencies = {
   // session
   sessionId: Accessor<string>;
@@ -49,7 +66,26 @@ export type SendDependencies = {
   queueMode: Accessor<boolean>;
   // model/agent selection
   selectionFor: (id: string) => { providerID?: string; modelID?: string; variant?: string } | null | undefined;
-  activeAgent: (sessionId: string) => string;
+  // Agent resolution (src/agents.ts). `awaitAgent` is the bounded evidence
+  // gate: for an existing session with no local agent evidence it WAITS for
+  // hydration (message window, lastAgent.set facet, snapshot) up to
+  // opts.timeoutMs (default AGENT_RESOLVE_TIMEOUT_MS), then fails with
+  // ok:false (reason timeout | unavailable | hydration-error) — it NEVER
+  // substitutes the config/global default. `resolveAgent` is the synchronous
+  // resolver (the SAME one the composer's agent Select renders); send()
+  // snapshots it ONCE at tap — a resolved tap sends that exact displayed
+  // value, a pending tap waits (awaitAgent) for the FIRST valid resolution
+  // (the same pending→resolved transition the composer's reactive display
+  // follows). `adoptDraftAgent` records a draft's displayed agent as the
+  // materialized session's first evidence.
+  awaitAgent: (
+    sessionId: string,
+    opts?: { signal?: AbortSignal; timeoutMs?: number },
+  ) => Promise<{ ok: true; agent: string } | { ok: false; reason: string }>;
+  resolveAgent: (
+    sessionId: string,
+  ) => { state: "agent"; agent: string } | { state: "pending" } | { state: "unavailable"; agent: string };
+  adoptDraftAgent: (sessionID: string, agent: string) => void;
   models: Accessor<unknown[]>;
   loadModels: () => Promise<void>;
   migrateModelPick: (fromId: string, toId: string) => void;
@@ -123,10 +159,14 @@ export function createSend(deps: SendDependencies): SendController {
   }
 
   // The model/agent/variant to send with — the per-session selection, captured
-  // so a queued message keeps the config it was composed with.
-  function captureConfig(id: string): QueueConfig {
+  // so a queued message keeps the config it was composed with. The agent is
+  // threaded in EXPLICITLY (never re-read here): the caller resolved it ONCE
+  // (send() snapshots the tap-time display value, or the first valid
+  // resolution for a pending tap; the queued legacy path re-gates), and this
+  // snapshot is the exact agent the composer displayed at send time.
+  function captureConfig(id: string, agent?: string): QueueConfig {
     const s = deps.selectionFor(id);
-    return { providerID: s?.providerID, modelID: s?.modelID, variant: s?.variant, agent: deps.activeAgent(deps.sessionId()) || undefined };
+    return { providerID: s?.providerID, modelID: s?.modelID, variant: s?.variant, agent: agent || undefined };
   }
 
   // Build + POST a prompt with explicit parts and send config (shared by direct
@@ -160,22 +200,49 @@ export function createSend(deps: SendDependencies): SendController {
   // here (setting it during enqueue would block the drain effect, stalling the
   // just-enqueued item in `pending` until a later queueFor/working transition
   // re-arms the drain). Duplicate enqueue on a rapid re-tap is PREVENTED one
-  // layer up: send() wraps this call in runSendSingleFlight (per-session
-  // single-flight), so a re-tap during the (up to 12s) enqueue window is
-  // dropped instead of spawning a parallel enqueue. The no-loss invariant is
-  // preserved either way — a visible duplicate was always preferred over any
-  // chance of silent loss (operator policy); single-flight removes the
-  // duplicate without ever risking loss.
-  async function sendText(text: string, id: string): Promise<boolean> {
-    const atts = deps.attachments();
+  // layer up: send() runs its WHOLE admission (agent gate + uploads + this
+  // call) inside runSendSingleFlight (per-session single-flight, engaged at
+  // tap), so a re-tap during that window is dropped instead of spawning a
+  // parallel enqueue. The no-loss invariant is preserved either way — a
+  // visible duplicate was always preferred over any chance of silent loss
+  // (operator policy); single-flight removes the duplicate without ever
+  // risking loss.
+  // D1 (round 2): the enqueued attachment set is OWNERSHIP-decided, never a
+  // bare live-array read. The caller threads a per-object identity set
+  // (send(): the tap-time set; resendText(): empty — a retry is text-only by
+  // construction), and the enqueue carries exactly the owned objects STILL
+  // PRESENT at enqueue time (intersection with the live array, computed as
+  // late as possible). Attachments added during the agent-gate/flush/upload
+  // waits are therefore excluded from the send, and an explicit operator
+  // removal during those waits is honored — the removed object is simply no
+  // longer present to intersect.
+  async function sendText(text: string, id: string, agent?: string, owned?: Set<Attachment>): Promise<boolean> {
+    const ownedNow = () =>
+      owned ? deps.attachments().filter((a) => owned.has(a)) : deps.attachments();
+    const atts = ownedNow();
     if ((!text && atts.length === 0) || !id) return false;
+    // An existing-session prompt MUST carry an agent: the SENDER stamps it and
+    // every later message inherits it. An empty/omitted agent would let
+    // opencode resolve the omitted field to its config default_agent server-
+    // side — the silent-flip path (2026-08-16 / 2026-08-26 incidents). Refuse
+    // loudly instead; the caller keeps the composed text.
+    if (!agent) {
+      log.error("send", "sendText refused: no resolved agent", { id });
+      deps.pushNotification({
+        kind: "error", sessionID: id, title: "Not sent — agent unresolved",
+        detail: "No agent evidence for this session; pick an agent before sending.",
+      });
+      return false;
+    }
     // Always capture a model. OpenCode rejects a prompt with no model. If models
     // haven't loaded, fetch once before enqueue so the persisted queue item
     // carries a valid sendConfig.
     if (!deps.selectionFor(id) && deps.models().length === 0) await deps.loadModels();
-    const config = captureConfig(id);
+    const config = captureConfig(id, agent);
     try {
-      await deps.enqueue(id, { text, attachments: atts, sendConfig: config });
+      // Recompute the intersection AFTER the loadModels await: "still present
+      // at enqueue" is decided as late as possible (D1).
+      await deps.enqueue(id, { text, attachments: ownedNow(), sendConfig: config });
     } catch (e) {
       // Enqueue failed (offline / non-2xx / ambiguous 2xx-without-item) —
       // preserve the composed text + attachments (no silent loss) and warn.
@@ -203,21 +270,52 @@ export function createSend(deps: SendDependencies): SendController {
   //
   // dispatchQueuedItem (below) holds the actual POST + outcome classification +
   // scroll/notification side effects; the drainer only owns the lifecycle shell.
-  // The config-fallback (use the item's captured sendConfig when it has both
-  // provider+model, else re-capture from the live selection) lives HERE now —
-  // it was previously in ChatView's drainer dispatch closure; moving it in
-  // aligns this method's signature with queueDrain.ts's `dispatch` dep
+  // The config-fallback (use the item's captured sendConfig when it is complete
+  // — provider + model + AGENT — else re-resolve through the agent evidence
+  // gate and re-capture from the live selection) lives HERE now — it was
+  // previously in ChatView's drainer dispatch closure; moving it in aligns
+  // this method's signature with queueDrain.ts's `dispatch` dep
   // `(id, item, signal) => Promise<DrainOutcome>`.
   async function dispatchQueuedItem(
     id: string,
     item: QueuedMessage,
     signal: AbortSignal,
   ): Promise<DrainOutcome> {
-    const config = item.sendConfig?.providerID && item.sendConfig?.modelID
-      ? (item.sendConfig as QueueConfig)
-      : captureConfig(id);
+    // The item's captured sendConfig is honored only when COMPLETE (provider +
+    // model + agent). A LEGACY item persisted without an agent (or a capture
+    // that lost it) must NOT dispatch with an omitted agent — opencode would
+    // resolve the omission to its config default (the silent flip). Instead
+    // re-resolve through the evidence gate. A PRE-POST gate failure (timeout /
+    // no evidence) never terminally classifies the item `unknown`: nothing was
+    // POSTed, so it is NOT POST-ambiguous — it fails with an explicit
+    // pre-POST detail (dismissable / retract-to-compose; `failed` never
+    // repends, so there is no auto-retry risk). The wrong-agent protections
+    // are untouched: the gate still refuses to send without evidence.
+    const captured =
+      item.sendConfig?.providerID && item.sendConfig?.modelID && item.sendConfig?.agent
+        ? (item.sendConfig as QueueConfig)
+        : null;
+    let config: QueueConfig;
+    if (captured) {
+      config = captured;
+    } else {
+      // Bounded well under the drainer's 12s AbortController budget so a
+      // settled gate leaves real POST headroom (QUEUED_DISPATCH_GATE_TIMEOUT_MS).
+      const ag = await deps.awaitAgent(id, { signal, timeoutMs: QUEUED_DISPATCH_GATE_TIMEOUT_MS });
+      if (!ag.ok) {
+        const msg = `pre-POST gate: agent unresolved (${ag.reason}) — nothing was sent`;
+        log.error("send", "queued dispatch aborted: agent unresolved", { id, itemId: item.id, reason: ag.reason });
+        deps.pushNotification({
+          kind: "error", sessionID: id, title: "Queued message not sent — agent unresolved", detail: msg,
+        });
+        return { state: "failed", detail: msg };
+      }
+      config = captureConfig(id, ag.agent);
+    }
     const body: any = { parts: buildParts(item.text, item.attachments) };
-    if (config.agent) body.agent = config.agent;
+    // Unconditional: every dispatched prompt carries an explicit agent string
+    // (the gate above guarantees a non-empty one) — never omitted.
+    body.agent = config.agent;
     if (config.providerID && config.modelID) {
       body.model = { providerID: config.providerID, modelID: config.modelID };
       if (config.variant) body.variant = config.variant;
@@ -319,13 +417,33 @@ export function createSend(deps: SendDependencies): SendController {
   }
 
   // Leading "!" runs a shell command in the session instead of prompting.
-  async function runShell(command: string, id: string): Promise<boolean> {
+  // Shell turns stamp the agent too (sender-stamped, inherited by later
+  // messages), so the SAME evidence gate applies: an existing session must
+  // never run a shell under the config default. `agent` is normally threaded
+  // in from send()'s already-gated resolution; the internal fallback covers
+  // any direct call.
+  async function runShell(command: string, id: string, agent?: string): Promise<boolean> {
     const key = deps.sessionId() || "draft";
     if (!command || !id || deps.isSending(key)) return false;
+    let ag: string | undefined = agent;
+    if (!ag) {
+      const r = await deps.awaitAgent(deps.sessionId());
+      if (r.ok) ag = r.agent;
+    }
+    if (!ag) {
+      // Gate refused — abort before any state change; the caller restores the
+      // composer text.
+      log.error("send", "runShell aborted: agent unresolved", { id });
+      deps.pushNotification({
+        kind: "error", sessionID: id, title: "Not sent — agent unresolved",
+        detail: "No agent evidence for this session; pick an agent before sending.",
+      });
+      return false;
+    }
     deps.setSending(key, true);
     const body: any = { command };
-    const ag = deps.activeAgent(deps.sessionId());
-    if (ag) body.agent = ag; // never fall back to a hardcoded "build" that may be disabled
+    // Unconditional — never omit (opencode would fill the config default).
+    body.agent = ag;
     const s = deps.selectionFor(id);
     if (s) body.model = { providerID: s.providerID, modelID: s.modelID };
     // Same intent-latch gate as sendParts above: don't yank a reader who
@@ -337,8 +455,37 @@ export function createSend(deps: SendDependencies): SendController {
   }
 
   async function send() {
-    const text = deps.input().trim();
-    if (!text && deps.attachments().length === 0) return;
+    // F1: composer OWNERSHIP snapshot at TAP time — before ANY agent/session
+    // wait. A send can spend up to AGENT_RESOLVE_TIMEOUT_MS (10s) in the
+    // evidence gate; edits the operator makes during that wait must SURVIVE:
+    // the tap-time text is what enqueues, and the composer's text is cleared
+    // after enqueue ONLY if it still holds that exact value. Attachments are
+    // owned as PER-OBJECT identity: `owned` is the tap-time set, re-
+    // intersected with the live array at every decision point (sendText's
+    // enqueue, the success clear). It grows ONLY across this send's OWN
+    // documented mutations — the draft flush REPLACING pending chips (see the
+    // D2 transfer below) and the inline-resolve appending image parts — never
+    // across an operator edit: additions made during any wait stay in the
+    // composer, and explicit removals are honored (not resurrected).
+    const ownedText = deps.input();
+    const ownedAtts = deps.attachments();
+    const owned = new Set<Attachment>(ownedAtts);
+    const text = ownedText.trim();
+    if (!text && ownedAtts.length === 0) return;
+    // F2: ONE agent capture at tap, through the SAME resolver the composer's
+    // agent Select renders. `tapAgent` is either the evidence-backed value
+    // the composer DISPLAYED at the tap — sent EXACTLY, never re-resolved,
+    // so a later evidence change cannot flip the send — or undefined
+    // (pending / unavailable / empty at tap → the bounded gate inside
+    // admission waits for the FIRST valid resolution; the composer's
+    // pending→resolved transition displays that same first value once it
+    // lands). For a DRAFT this snapshot is the config-default policy
+    // (legitimate for a genuinely new session) and is ADOPTED as the
+    // materialized session's first evidence below.
+    const wasDraft = deps.draft();
+    const tapResolution = deps.resolveAgent(deps.sessionId());
+    const tapAgent =
+      tapResolution.state === "agent" && tapResolution.agent ? tapResolution.agent : undefined;
     // Gate before any state change: if agents/models aren't loaded yet, a send
     // would route through the leak-prone fallback chain (empty agent list) and
     // likely fail. Surface it and preserve the typed text (do NOT clear input).
@@ -359,140 +506,193 @@ export function createSend(deps: SendDependencies): SendController {
       deps.pushNotification({ kind: "info", sessionID: deps.sessionId(), title: "Busy — turn in progress" });
       return;
     }
-    if (text) deps.pushHistory(text, deps.sessionId() || "__new__"); // plain Up (session) + Ctrl+Up (global)
-    deps.resetHistory();
-    // /undo /redo only make sense for an existing session.
+    // /undo /redo only make sense for an existing session — synchronous local
+    // commands that never enqueue, so they bypass send admission entirely.
     if (!deps.draft() && text === "/undo") { deps.setInput(""); return void deps.undo(); }
     if (!deps.draft() && text === "/redo") { deps.setInput(""); return void deps.redo(); }
-    // Resolve the target session id. For a DRAFT this is the createSession POST,
-    // which can lag — and the draft composer's sendInFlight memo reads
-    // isSendInFlight("draft") (props.sessionId is ""), NOT the live id the
-    // enqueue below engages. Without engaging "draft" here the draft Send button
-    // shows no feedback during that lag (the bug: pulse/disabled only appeared
-    // once the live id was known, i.e. after the draft→live unmount). So for a
-    // draft, wrap ensureSession in a "draft"-keyed single-flight:
-    //   (a) the guard marks "draft" in-flight SYNCHRONOUSLY, before the await —
-    //       the draft button pulses + disables on the same tap, before the live
-    //       id is known / before backend custody;
-    //   (b) a re-tap during the createSession POST is dropped here (IGNORED)
-    //       instead of spawning a parallel createSession.
-    // The guard releases "draft" in finally as soon as ensureSession resolves —
-    // by then the draft ChatView is unmounting (createSession → setSelectedId)
-    // and the live view's memo reads the live id, so holding "draft" longer
-    // would only risk a NEW draft inheriting this send's in-flight state
-    // (per-session invariant). The enqueue tail below then engages the LIVE id
-    // via runSendSingleFlight(id, …), which the live view's memo reads. For a
-    // LIVE session ensureSession returns props.sessionId synchronously — no
-    // draft-key wrapper needed (the memo already reads that id).
-    let id: string | null;
-    if (deps.draft()) {
-      const r = await runSendSingleFlight("draft", deps.ensureSession);
-      if (r === IGNORED) return; // re-tap during createSession dropped; in-flight send owns the composer
-      id = r; // string | null (null = createSession failed)
-    } else {
-      id = await deps.ensureSession();
-    }
-    if (!id) {
-      deps.setInput(text); // session creation failed; keep the text for retry
-      return;
-    }
-    // A draft is materialized into a real session on first send. The composer's
-    // explicit model/variant pick was made under the draft key (props.sessionId
-    // ""), but captureConfig/sendText below read the live id — carry the pick
-    // (and its explicit-pick intent) over so it isn't lost and an agent-declared
-    // model can't override it post-migration. No-op for a non-draft send
-    // (props.sessionId === id).
-    deps.migrateModelPick(deps.sessionId(), id);
-    // A draft may have queued attachments locally (no session existed at paste
-    // time). Now that we have an id, upload them so buildParts sees real urls.
-    await deps.flushPendingAttachments(id);
-    // Shell commands (leading "!") dispatch directly against the live session —
-    // they are NOT enqueued (they only make sense against a live shell). Clear
-    // the composer text; on failure restore it so a silent noop never loses what
-    // the user typed. (Out of scope for the send-loss fix — dispatchSend's
-    // accepted-by-time race stays for shell only.)
-    if (text.startsWith("!")) {
-      deps.setInput("");
-      const ok = await runShell(text.slice(1).trim(), id);
-      if (!ok) deps.setInput(text);
-      else if (deps.draft()) localStorage.removeItem(deps.draftKey("__new__"));
-      return;
-    }
-    // Normal prompt: enqueue-first for durability. sendText acquires durable
-    // custody (bounded wait) and returns true on confirmation, false on failure
-    // — it does NOT clear the composer. Clearing is this caller's job, gated on
-    // an ownership snapshot so a slow enqueue can never erase state entered
-    // AFTER Send was pressed (finding #2): the enqueue can take up to 12s, and
-    // the composer stays editable during that window. We capture the exact text
-    // + attachment array right before enqueue and clear ONLY if the composer
-    // still holds that identical state when custody confirms. Reference
-    // identity on the array catches any add/remove (setAttachments always
-    // produces a new array); value equality on text catches any keystroke. On
-    // enqueue failure the text + attachments are preserved and the operator
-    // can re-press Send.
-    //
-    // Single-flight (the duplicate-send-on-slow-network bug): on a weak/hung
-    // network the enqueue POST can take up to 12s, during which the composer
-    // text is NOT cleared and no chip appears yet — so the operator sees no
-    // feedback and re-taps Send, each re-tap spawning a PARALLEL enqueue that
-    // lands as a duplicate once the network settles. runSendSingleFlight drops
-    // re-taps while one enqueue is in-flight for this session (keyed by the
-    // live session id). For a LIVE session this is ALSO the synchronous tap-time
-    // engagement (the memo reads this id, so the Send button disables + the
-    // animation shows IMMEDIATELY, before backend custody confirms). For a DRAFT
-    // the tap-time pulse is already provided by the "draft"-keyed wrapper above
-    // (the live id isn't known until ensureSession resolves); this inner guard
-    // then engages the live id so the LIVE ChatView — mounted after the
-    // draft→live transition — keeps showing the sending state, and a re-tap
-    // during the enqueue is dropped. The guard releases in finally on BOTH
-    // success and failure so a genuine retry still works after a timeout.
-    // Distinct from `sending` (the dispatch guard) — see lib/sendSingleFlight.ts.
-    // S4: resolve inline-mode attachment tokens in the composer text into real
-    // server paths. In inline mode (non-vision model, OR vision + user-forced
-    // pref) the text holds markdown refs whose link target is a synthetic
-    // vh-attach:<localId> token. Upload ONLY tokens still present (a ref the
-    // user deleted -> its held File is NEVER uploaded: lazy upload), substitute
-    // each token with its real project-relative path, and (vision only) add one
-    // image file part per referenced IMAGE attachment. Non-inline mode skips
-    // this block entirely — byte-for-byte unchanged. NEVER emits literal
-    // "@file <path>": substitution is the bare path inside the markdown ref.
-    // Original `text` is preserved for the failure-restore setInput(text); only
-    // the ENQUEUED text uses resolvedText.
-    let resolvedText = text;
-    // S5 dF2 (b-F1 targeted removal): track the imageParts the resolve block
-    // appends so a send FAILURE removes ONLY those parts — NOT the whole list.
-    // The prior UNCONDITIONAL snapshot restore (setAttachments(preResolveAtts))
-    // would silently discard an operator-added chip (or real upload) appended to
-    // the live list during the await resolveInlineAttachments / await sendText
-    // window. resolveInlineAttachments returns a FRESH imageParts array per call
-    // (selectInlineImageParts .filter), so reference identity (`includes`)
-    // isolates exactly ours, and a failed-then-retried inline send still yields
-    // NO duplicate image parts (the dF2 guarantee). Non-inline mode leaves this
-    // null, so the failure path only restores the text.
-    let appendedImageParts: ResolvedAttachment[] | null = null;
-    if (effectiveInline(modelHasVision(deps.curModel()), inlineAttachForced())) {
-      const r = await resolveInlineAttachments(
-        text,
-        deps.inlineFiles,
-        (f) => deps.uploadFile(f, id),
-        modelHasVision(deps.curModel()),
-      );
-      resolvedText = r.resolvedText;
-      // Vision-only image file parts carry real file:// urls; add them to the
-      // chip list BEFORE the ownership snapshot below so buildParts (at dispatch)
-      // emits them and the success-clear still fires. The synthetic vh-attach:
-      // chips already in the list are excluded by buildParts (isInlineChipUrl).
-      if (r.imageParts.length > 0) {
-        appendedImageParts = r.imageParts;
-        deps.setAttachments((a) => [...a, ...r.imageParts]);
+
+    // ADMISSION (F4): everything from here on runs inside the per-session
+    // send single-flight, engaged at TAP time — a re-tap during the (up to
+    // 10s) agent gate wait is DROPPED (IGNORED) instead of spawning a
+    // parallel waiter with duplicate history/enqueue side effects. The
+    // history push/reset side effects live INSIDE admission so dropped
+    // re-taps never duplicate them. The composer stays EDITABLE throughout
+    // (F1's ownership snapshot protects edits made during any wait).
+    const admission = async (id: string): Promise<void> => {
+      // D4 (round 2): pushHistory fires ONLY after successful admission —
+      // enqueue confirmed (normal/draft→session path) or the shell POST
+      // accepted (shell path); see the success sites below. A gate timeout,
+      // an unavailable agent, an upload failure, or an enqueue rejection
+      // writes NOTHING to history: the attempted text stays recallable by
+      // being preserved in the composer, not by a history entry.
+      deps.resetHistory();
+      // AGENT EVIDENCE GATE (the silent-flip fix) — F2 snapshot-once:
+      //   resolved at tap → send that EXACT displayed value; no re-resolution;
+      //   pending at tap  → wait (bounded, AGENT_RESOLVE_TIMEOUT_MS) for the
+      //                     FIRST valid resolution and send it;
+      //   unavailable     → the gate refuses immediately (pick an agent).
+      // On timeout / hydration error / unavailability abort LOUDLY — no
+      // enqueue, the composer text is preserved (nothing has been cleared).
+      // Drafts resolved synchronously at tap (above); their agent is adopted
+      // as the new session's first evidence so the fresh id never pends.
+      let sendAgent: string;
+      if (wasDraft) {
+        if (!tapAgent) {
+          log.error("send", "draft send aborted: no agent resolved", { id });
+          deps.pushNotification({
+            kind: "error", sessionID: id, title: "Not sent — agent unresolved",
+            detail: "No agent selected for the new session; pick an agent before sending.",
+          });
+          return;
+        }
+        sendAgent = tapAgent;
+        deps.adoptDraftAgent(id, sendAgent);
+      } else if (tapAgent) {
+        sendAgent = tapAgent;
+      } else {
+        // Bounded (AGENT_RESOLVE_TIMEOUT_MS) and deliberately NOT unmount-
+        // cancelled: an orphaned waiter settles on its own timer (bounded,
+        // acceptable — review out-of-scope note).
+        const ag = await deps.awaitAgent(deps.sessionId());
+        if (!ag.ok) {
+          log.error("send", "send aborted: agent unresolved", { id, reason: ag.reason });
+          deps.pushNotification({
+            kind: "error", sessionID: id, title: "Not sent — agent unresolved",
+            detail: `Agent evidence did not arrive (${ag.reason}); nothing was sent. Retry shortly or pick an agent.`,
+          });
+          return;
+        }
+        sendAgent = ag.agent;
       }
-    }
-    await runSendSingleFlight(id, async () => {
-      const snapText = deps.input();
-      const snapAtts = deps.attachments();
-      const ok = await sendText(resolvedText, id);
+      // A draft is materialized into a real session on first send. The composer's
+      // explicit model/variant pick was made under the draft key (props.sessionId
+      // ""), but captureConfig/sendText below read the live id — carry the pick
+      // (and its explicit-pick intent) over so it isn't lost and an agent-declared
+      // model can't override it post-migration. No-op for a non-draft send
+      // (props.sessionId === id).
+      deps.migrateModelPick(deps.sessionId(), id);
+      // A draft may have queued attachments locally (no session existed at paste
+      // time). Now that we have an id, upload them so buildParts sees real urls.
+      // D2 (round 2): ownership across the flush is identity-guarded — NO
+      // blanket re-baseline (the old unconditional `ownedAtts =
+      // deps.attachments()` absorbed any edit made during the await). The real
+      // flush (createAttachments.flushPendingAttachments) REPLACES tap-owned
+      // pending chips (.file set) with fresh server-backed objects, so
+      // ownership must TRANSFER across that replacement for those chips to
+      // stay sent — but never across an operator edit. The transfer below
+      // verifies the flush's documented output shape positionally
+      // ([...prev.filter(a => !a.file), ...resolved]: preserved entries first
+      // IN ORDER, fresh outputs at the tail) and adopts the tail ONLY when it
+      // is within the replaced-chip count (tail.length <= |removedPending| —
+      // the real flush emits at most one fresh object per replaced chip; an
+      // uploadFile failure yields a SHORTER tail, never a longer one). ANY
+      // ambiguity — unexpected shape, a non-fresh tail entry, an unowned
+      // pending chip among the removed, MORE tail entries than replaced chips
+      // (a post-tap addition after the flush's own write, e.g. [.., U1, A3]
+      // against one removed chip) — adopts NOTHING: the transfer fails
+      // closed, because adopting a post-tap addition is the forbidden
+      // direction (D2), while dropping a transferred output only occurs in
+      // states unreachable from the real controller (the draft composer is
+      // unmounted during this await, and a live session's flush is a no-op).
+      const preFlush = deps.attachments();
+      await deps.flushPendingAttachments(id);
+      const postFlush = deps.attachments();
+      if (postFlush !== preFlush) {
+        const preSet = new Set(preFlush);
+        const postSet = new Set(postFlush);
+        const preNoFile = preFlush.filter((a) => !a.file);
+        let shapeOk = postFlush.length >= preNoFile.length;
+        for (let i = 0; shapeOk && i < preNoFile.length; i++) {
+          if (postFlush[i] !== preNoFile[i]) shapeOk = false;
+        }
+        const tail = postFlush.slice(preNoFile.length);
+        const tailFresh = tail.every((a) => !preSet.has(a));
+        const removedPending = preFlush.filter((a) => a.file && !postSet.has(a));
+        const allRemovedOwned = removedPending.every((a) => owned.has(a));
+        if (shapeOk && tailFresh && allRemovedOwned && tail.length > 0 && removedPending.length > 0 && tail.length <= removedPending.length) {
+          // The bound holds, so the tail is exactly the flush's own
+          // replacement set (at most one fresh object per removed chip):
+          // adopt it in full.
+          for (const a of tail) owned.add(a);
+        }
+      }
+      // Shell commands (leading "!") dispatch directly against the live session —
+      // they are NOT enqueued (they only make sense against a live shell). Text-
+      // only path (no attachments). D3 (round 2): the clear/restore are
+      // ownership-guarded exactly like the prompt path — an edit made during
+      // the gate/flush waits is never ERASED by the clear (clear only if the
+      // composer still holds the tap-time text), and a newer edit made during
+      // the shell request is never OVERWRITTEN by the failure-restore (restore
+      // only if the composer is still holding — or was cleared of — the sent
+      // text). On failure the text is preserved for retry; on success it is
+      // recorded in prompt history (D4: success only).
+      if (text.startsWith("!")) {
+        if (deps.input() === ownedText) deps.setInput("");
+        const ok = await runShell(text.slice(1).trim(), id, sendAgent);
+        if (!ok) {
+          if (deps.input() === "" || deps.input() === ownedText) deps.setInput(text);
+        } else {
+          if (text) deps.pushHistory(text, deps.sessionId() || "__new__"); // plain Up (session) + Ctrl+Up (global)
+          if (deps.draft()) localStorage.removeItem(deps.draftKey("__new__"));
+        }
+        return;
+      }
+      // Normal prompt: enqueue-first for durability. sendText acquires durable
+      // custody (bounded wait) and returns true on confirmation, false on
+      // failure — it does NOT clear the composer. Clearing is this caller's
+      // job, gated on the TAP-time ownership snapshot (F1) so a slow
+      // gate/enqueue can never erase state entered AFTER Send was pressed.
+      //
+      // S4: resolve inline-mode attachment tokens in the composer text into real
+      // server paths. In inline mode (non-vision model, OR vision + user-forced
+      // pref) the text holds markdown refs whose link target is a synthetic
+      // vh-attach:<localId> token. Upload ONLY tokens still present (a ref the
+      // user deleted -> its held File is NEVER uploaded: lazy upload), substitute
+      // each token with its real project-relative path, and (vision only) add one
+      // image file part per referenced IMAGE attachment. Non-inline mode skips
+      // this block entirely — byte-for-byte unchanged. NEVER emits literal
+      // "@file <path>": substitution is the bare path inside the markdown ref.
+      // Original `text` is preserved for the failure-restore setInput(text); only
+      // the ENQUEUED text uses resolvedText.
+      let resolvedText = text;
+      // S5 dF2 (b-F1 targeted removal): track the imageParts the resolve block
+      // appends so a send FAILURE removes ONLY those parts — NOT the whole list.
+      // The prior UNCONDITIONAL snapshot restore (setAttachments(preResolveAtts))
+      // would silently discard an operator-added chip (or real upload) appended to the
+      // live list during the await resolveInlineAttachments / await sendText
+      // window. resolveInlineAttachments returns a FRESH imageParts array per call
+      // (selectInlineImageParts .filter), so reference identity (`includes`)
+      // isolates exactly ours, and a failed-then-retried inline send still yields
+      // NO duplicate image parts (the dF2 guarantee). Non-inline mode leaves this
+      // null, so the failure path only restores the text.
+      let appendedImageParts: ResolvedAttachment[] | null = null;
+      if (effectiveInline(modelHasVision(deps.curModel()), inlineAttachForced())) {
+        const r = await resolveInlineAttachments(
+          text,
+          deps.inlineFiles,
+          (f) => deps.uploadFile(f, id),
+          modelHasVision(deps.curModel()),
+        );
+        resolvedText = r.resolvedText;
+        // Vision-only image file parts carry real file:// urls; add them to the
+        // chip list BEFORE enqueue so buildParts (at dispatch) emits them and
+        // the success-clear still fires. The synthetic vh-attach: chips already
+        // in the list are excluded by buildParts (isInlineChipUrl). This is our
+        // OWN append, so the parts join the per-object owned set — no array
+        // re-baseline needed, and an operator's concurrent additions are
+        // untouched (they are not in the set).
+        if (r.imageParts.length > 0) {
+          appendedImageParts = r.imageParts;
+          deps.setAttachments((a) => [...a, ...r.imageParts]);
+          for (const p of r.imageParts) owned.add(p);
+        }
+      }
+      const ok = await sendText(resolvedText, id, sendAgent, owned);
       if (!ok) {
-        deps.setInput(text);
+        // Preserve the composed text for retry — but never OVER an edit made
+        // during the wait (F1): if the operator diverged, their newer text
+        // stays (the tap text remains recallable via prompt history).
+        if (deps.input() === ownedText) deps.setInput(text);
         // dF2/b-F1: remove ONLY the imageParts the resolve block appended so a
         // retry re-resolves from the same baseline (no stacking) WITHOUT
         // discarding an operator-added chip during the await window. Reference
@@ -504,17 +704,25 @@ export function createSend(deps: SendDependencies): SendController {
         }
         return;
       }
-      // Durable custody confirmed. Clear the composer ONLY if it still owns the
-      // submitted snapshot. If the operator typed a new draft or changed
-      // attachments during the enqueue wait, that newer state survives.
-      if (deps.input() === snapText && deps.attachments() === snapAtts) {
-        deps.setInput("");
-        deps.setAttachments([]);
+      // Durable custody confirmed. Record the successful send in prompt
+      // history (D4: exactly ONE push per successful send — the normal path
+      // and the draft→session path both land here exactly once, and every
+      // failure return above pushes nothing).
+      if (text) deps.pushHistory(text, deps.sessionId() || "__new__"); // plain Up (session) + Ctrl+Up (global)
+      // Clear ONLY what this tap still owns (D1/F1): the TEXT by value (an
+      // edit made during the gate/flush/upload/enqueue waits survives), the
+      // ATTACHMENTS per object identity — the sent (still-present owned)
+      // objects are removed; additions made during the waits survive, and a
+      // tap-owned attachment the operator removed mid-wait is not resurrected.
+      if (deps.input() === ownedText) deps.setInput("");
+      const stillOwned = deps.attachments().filter((a) => owned.has(a));
+      if (stillOwned.length > 0) {
+        deps.setAttachments((cur) => cur.filter((a) => !owned.has(a)));
         // S5 dF1: a successful inline send consumed every held File (lazy
-        // upload resolved all present tokens, and the chips are now cleared).
-        // Clear inlineFiles so the raw bytes do not linger for the ChatView
-        // lifetime. Inside the snapshot guard so a composer the operator changed
-        // during the wait keeps its (new) chips and their held bytes intact.
+        // upload resolved all present tokens, and the owned chips are now
+        // cleared). Clear inlineFiles so the raw bytes do not linger for the
+        // ChatView lifetime. An operator's mid-wait additions (not owned) keep
+        // their chips and their held bytes intact.
         deps.inlineFiles.clear();
       }
       // For a draft, the draft->live transition (ensureSession -> createSession
@@ -524,17 +732,77 @@ export function createSend(deps: SendDependencies): SendController {
       // re-inflate the composer on the next New session. Clear it explicitly at
       // the moment of success, before the unmount races it.
       if (deps.draft()) localStorage.removeItem(deps.draftKey("__new__"));
-    });
-    // A re-tap during the in-flight enqueue returns IGNORED and the body above
-    // never runs — the composer is left untouched, which is correct (the
+    };
+
+    // Resolve the target session id. For a DRAFT this is the createSession POST,
+    // which can lag — and the draft composer's sendInFlight memo reads
+    // isSendInFlight("draft") (props.sessionId is ""), NOT the live id the
+    // admission below engages. Without engaging "draft" here the draft Send
+    // button shows no feedback during that lag. So for a draft, wrap
+    // ensureSession in a "draft"-keyed single-flight:
+    //   (a) the guard marks "draft" in-flight SYNCHRONOUSLY, before the await —
+    //       the draft button pulses + disables on the same tap;
+    //   (b) a re-tap during the createSession POST is dropped here (IGNORED)
+    //       instead of spawning a parallel createSession.
+    // The guard releases "draft" in finally as soon as ensureSession resolves —
+    // by then the draft ChatView is unmounting and the live view's memo reads
+    // the live id. The admission tail then engages the LIVE id via
+    // runSendSingleFlight(id, …), which the live view's memo reads.
+    if (wasDraft) {
+      const r = await runSendSingleFlight("draft", deps.ensureSession);
+      if (r === IGNORED) return; // re-tap during createSession dropped; in-flight send owns the composer
+      const id = r; // string | null (null = createSession failed)
+      if (!id) {
+        // Session creation failed; keep the text for retry — but only where we
+        // still own it (edits made during the createSession wait survive, F1).
+        if (deps.input() === ownedText) deps.setInput(text);
+        return;
+      }
+      // A re-tap once the live id exists is dropped at the LIVE key (the live
+      // ChatView's memo reads it); the in-flight admission owns clearing on
+      // its own success.
+      await runSendSingleFlight(id, () => admission(id));
+    } else {
+      // LIVE session: the id is known at tap, so the single-flight engages
+      // SYNCHRONOUSLY here — the Send button disables + pulses on the same
+      // tap (the memo reads this id), and the WHOLE admission (evidence gate
+      // + uploads + enqueue) is one single-flight region (F4). The guard
+      // releases in finally on BOTH success and failure so a genuine retry
+      // still works after a timeout. Distinct from `sending` (the dispatch
+      // guard) — see lib/sendSingleFlight.ts. ensureSession for a live
+      // session returns props.sessionId (no draft-key wrapper needed).
+      await runSendSingleFlight(deps.sessionId(), async () => {
+        const id = await deps.ensureSession();
+        if (!id) return;
+        await admission(id);
+      });
+    }
+    // A re-tap at any point above returns IGNORED and the admission body never
+    // runs twice — the composer is left untouched, which is correct (the
     // in-flight send owns clearing on its own success).
   }
 
   // retry() reuses sendText() to resend an OLD message; named resendText on the
   // public surface so ChatView's retry closure can call it without reaching
-  // into the private sendText.
+  // into the private sendText. Same evidence gate as send(): the session
+  // exists by definition, so the agent must come from the ladder — never the
+  // config default.
   async function resendText(text: string, id: string): Promise<boolean> {
-    return sendText(text, id);
+    const ag = await deps.awaitAgent(id);
+    if (!ag.ok) {
+      log.error("send", "resend aborted: agent unresolved", { id, reason: ag.reason });
+      deps.pushNotification({
+        kind: "error", sessionID: id, title: "Not sent — agent unresolved",
+        detail: `Agent evidence did not arrive (${ag.reason}); nothing was sent.`,
+      });
+      return false;
+    }
+    // A retry is text-only by construction (createMessageActions extracts
+    // the message's text part), so the resend owns NO composer attachments:
+    // an empty identity set keeps sendText from reading the live composer
+    // array (D1) — attachments staged for the NEXT message never ride along
+    // with a resend.
+    return sendText(text, id, ag.agent, new Set());
   }
 
   return { send, resendText, dispatchQueuedItem };

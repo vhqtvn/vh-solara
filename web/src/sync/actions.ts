@@ -17,6 +17,8 @@ import {
   setDraft,
   loadActivity,
   loadLastAgents,
+  loadSessionAgents,
+  resetSessionAgentPicks,
   loadCursor,
   persistSelection,
   LS_PROJECT,
@@ -117,6 +119,12 @@ export function switchProject(dir: string, fromUrl = false) {
       s.status = "connecting";
     }),
   );
+  // Project switch: re-seed the persisted per-session agent picks from the
+  // NEW project dir's localStorage (mirrors the lastAgents/activity re-seeds
+  // above — the picks map is per-project and must not leak across the switch).
+  // resetSessionAgentPicks only swaps memory; the new dir already owns its
+  // persisted copy.
+  resetSessionAgentPicks(loadSessionAgents(dir));
   // Project switch clears the tree (flat map + in-memory userExpanded). A
   // same-project resync does NOT clear — connect(true) swaps the snapshot
   // atomically (seedTreeStore) and preserves userExpanded; only a true project

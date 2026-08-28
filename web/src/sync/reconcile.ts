@@ -16,7 +16,7 @@ import { produce } from "solid-js/store";
 import { createSignal } from "solid-js";
 import type { Snapshot } from "../types";
 import type { ReconcileContext, ReconcileEffect, ReconcileEvent } from "./reducers.types";
-import { setState, persist, type SyncState, selectedId, state } from "./store";
+import { setState, persist, clearSessionAgentPick, type SyncState, selectedId, state } from "./store";
 import {
   projectSnapshot,
   projectSessionEvent,
@@ -59,6 +59,11 @@ function interpretEffects(effects: ReconcileEffect[]): void {
         resetPageInFlight(e.sessionID);
         dropPinnedSession(e.sessionID);
         dropLabelRoot(e.sessionID);
+        // B2b id-reuse guard (mirrors the reducer's lastAgents prune): drop the
+        // removed session's PERSISTED agent pick too, or a server-side id reuse
+        // would resurrect the old session's explicit agent pick for the new
+        // occupant — the same silent-flip class this slice closes.
+        clearSessionAgentPick(e.sessionID);
         break;
       case "reconcile-tree-agent":
         // Cold-seed gap fill: patch the tree node so the chip renders on

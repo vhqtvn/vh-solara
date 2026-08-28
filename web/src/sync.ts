@@ -186,6 +186,17 @@ export {
   consumeEpochChanged,
 } from "./sync/actions";
 export type { SyncState } from "./sync/store";
+// Persisted per-session agent picks (composer dropdown), per project dir.
+// Consumed by agents.ts's evidence ladder — see sync/store.ts
+// SessionAgentPick for the contract.
+export {
+  sessionAgentPicks,
+  setSessionAgentPick,
+  clearSessionAgentPick,
+  resetSessionAgentPicks,
+  loadSessionAgents,
+} from "./sync/store";
+export type { SessionAgentPick } from "./sync/store";
 // Feature 1 (stale indicator) + Feature 2 (updating indicator): connection-
 // health selectors + their thresholds, for the sidebar status dot and any
 // diagnostic surface.

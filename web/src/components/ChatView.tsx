@@ -13,7 +13,7 @@ import { createReadCursorStash } from "../lib/readCursorStash";
 import { layoutPx } from "../lib/zoom";
 import { findModel, loadModels, migrateModelPick, models, selectionFor } from "../models";
 import { loadVersioned, saveVersioned } from "../lib/store";
-import { activeAgent, agents, selectAgentForSession, selectedAgent } from "../agents";
+import { adoptDraftAgent, agents, awaitSendAgent, resolveAgentForSession, selectAgentForSession, selectedAgent } from "../agents";
 import { claimQueued, enqueue, fetchQueue, hasQueueState, migrateLegacyQueue, queueFor, queueMode, removeQueued, resolveQueued } from "../queue";
 import { createQueueDrainer } from "../queueDrain";
 import { pushHistory } from "../history";
@@ -165,11 +165,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   const sendInFlight = createMemo(() => isSendInFlight(props.sessionId || "draft"));
   // Whether send() can resolve an agent + model right now — the single hinge for
   // the disabled Send button AND the send() guard. agents() must be loaded
-  // (activeAgent falls back to a leak-prone chain when empty), and a model must
-  // be resolvable for this session — mirroring sendText's own check
+  // (the evidence resolver pends while the list is empty — send() would just
+  // wait out its gate), and a model must be resolvable for this session —
+  // mirroring sendText's own check
   // (selectionFor(id) present, else the catalog must be loaded so models()[0]
   // exists). Once agents/models load this clears automatically: the grayed-out
-  // Send re-enables with no extra wiring.
+  // Send re-enables with no extra wiring. Agent-evidence waits beyond this
+  // hinge are handled by send()'s bounded awaitSendAgent gate.
   const readyToSend = createMemo(() =>
     agents().length > 0 && (models().length > 0 || !!selectionFor(props.sessionId)),
   );
@@ -1575,7 +1577,9 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     working,
     queueMode,
     selectionFor,
-    activeAgent,
+    awaitAgent: (sid, opts) => awaitSendAgent(sid, opts),
+    resolveAgent: (sid) => resolveAgentForSession(sid),
+    adoptDraftAgent,
     models,
     loadModels,
     // migrateModelPick is referenced lazily (via this closure) rather than

@@ -75,16 +75,25 @@ export function lastUserMessageModel(id: string): ModelRefLite | undefined {
 }
 
 // The agent of the session's most recent message that carries one (OpenCode
-// stamps `agent` on assistant messages). Used to restore the composer's agent
-// per session, the same way the model is restored from the last user message,
-// AND to render the per-agent chip in the tree.
+// stamps `agent` on user AND assistant messages — the SENDER stamps user
+// messages, which is why the live scan is fresh after every successful send).
+// Used to restore the composer's agent per session, the same way the model is
+// restored from the last user message, AND to render the per-agent chip in the
+// tree.
 //
-// When the session's messages are LOADED (open), the live scan is authoritative
-// — it reflects the newest assistant turn as events stream in (the snapshot-seeded
-// lastAgents map only refreshes on snapshot/reconnect, so preferring it would
-// show a STALE agent for an open session). When messages are NOT loaded
-// (cold/un-opened session on a fresh tree), fall back to the snapshot-seeded
-// lastAgents map so the chip renders immediately without opening the session.
+// Precedence: (1) when the session's messages are LOADED (open), the live
+// newest-first scan is authoritative — it reflects the newest turn as events
+// stream in. (2) If the loaded window contains NO agent-stamped message, fall
+// through to the snapshot-seeded `lastAgents` map — NOT to `undefined`. This
+// is the 2026-08 silent-flip guard: user messages are agent-stamped, so the
+// live scan misses ONLY in the evidence-less window (windowed tail of a
+// long-old session, or hydration still in flight); in exactly that window a
+// possibly-stale-but-REAL lastAgents entry beats a fabricated config default.
+// The old behavior (return undefined here) let the composer resolver fall all
+// the way to the config `default_agent` and silently flip an existing session
+// onto it. (3) When messages are NOT loaded (cold/un-opened session on a
+// fresh tree), the snapshot-seeded lastAgents map renders the chip immediately
+// without opening the session.
 export function sessionLastAgent(id: string): string | undefined {
   const sm = state.messages[id];
   if (sm) {
@@ -92,7 +101,7 @@ export function sessionLastAgent(id: string): string | undefined {
       const info: any = sm.byId[sm.order[i]]?.info;
       if (info?.agent) return info.agent as string;
     }
-    return undefined; // loaded but no assistant message with an agent yet
+    return state.lastAgents[id]; // loaded window has no agent stamp yet — server-computed facet, stale-real > fabricated-default
   }
   return state.lastAgents[id];
 }

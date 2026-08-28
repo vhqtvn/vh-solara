@@ -2,24 +2,29 @@
 //
 // AREA 2 — Ownership snapshots (send-cluster characterization).
 //
-// Pins the OWNERSHIP-SNAPSHOT clear guard in send() so a future createSend
-// extraction preserves it. send() captures the composer's exact text + the
-// attachment ARRAY REFERENCE right before enqueue, and clears ONLY if the
-// composer STILL holds that identical state when custody confirms:
+// Pins the OWNERSHIP guards in send() so a future createSend extraction
+// preserves them. Round-2 (D1) semantics: the TEXT clear is guarded BY VALUE
+// (clear only if the composer still holds the tap-time text), and attachments
+// are cleared PER OBJECT IDENTITY (exactly the still-present tap-owned set —
+// plus this send's own documented mutations: the draft-flush replacement and
+// the inline-resolve image parts):
 //
-//     if (input() === snapText && att.attachments() === snapAtts) { clear }
+//     if (input() === ownedText) setInput("");
+//     if (ownedStillPresent.length > 0)
+//       setAttachments(cur => cur.filter(a => owned.has(a)));
 //
-// Reference identity on the array catches any add/remove (setAttachments always
-// produces a NEW array); value equality on text catches any keystroke. This
-// prevents a slow (up to 12s) enqueue from erasing state the operator entered
-// AFTER pressing Send.
+// This prevents a slow (up to 12s) enqueue from erasing state the operator
+// entered AFTER pressing Send: an added chip is never owned (survives), a
+// keystroke blocks the text clear, and an explicit chip removal is honored
+// (never resurrected).
 //
 // Tests:
-//   (1) text changed during the enqueue window -> NOT cleared.
-//   (2) attachment ADDED during the enqueue window -> NOT cleared (chip survives).
-//   (3) attachment REMOVED during the enqueue window -> NOT cleared — this
-//       isolates the array-IDENTITY guard (text is unchanged, so only the
-//       attachment-array mismatch blocks the clear).
+//   (1) text changed during the enqueue window -> text NOT cleared.
+//   (2) attachment ADDED during the enqueue window -> NOT cleared (chip
+//       survives; the inline insert also changes the text, blocking its clear).
+//   (3) attachment REMOVED during the enqueue window -> removal HONORED (chip
+//       not resurrected) and the SENT text still clears — the text guard is
+//       independent of attachment changes (D1).
 //
 // The enqueue mock is held open with a controllable promise so we can mutate the
 // composer mid-window, then release custody and observe the (non-)clear. We
@@ -114,8 +119,9 @@ describe("AREA 2 — ownership snapshot: state entered DURING enqueue is not era
     // Add an attachment mid-window (inline chip + markdown ref inserted).
     addFileViaInput(container, "note.txt", "text/plain");
     await waitFor(() => expect(removeAttachmentButtons(container).length).toBe(1));
-    // Custody confirms. The composer text + attachments both changed during the
-    // window -> the ownership snapshot no longer matches -> clear SKIPPED. The
+    // Custody confirms. The inline insert appended a markdown ref to the TEXT
+    // (so the text guard blocks its clear), and the new chip was added AFTER
+    // the tap (never tap-owned — the per-object clear never touches it). The
     // chip and the (appended) text both survive.
     release();
     await awaitSettled();
@@ -123,11 +129,13 @@ describe("AREA 2 — ownership snapshot: state entered DURING enqueue is not era
     expect(removeAttachmentButtons(container).length).toBe(1); // chip preserved
   });
 
-  it("(3) an attachment REMOVED during the enqueue window is NOT cleared (isolates the array-identity guard)", async () => {
-    // Add a chip BEFORE send so snapAtts captures [chip]. Then during the enqueue
-    // window REMOVE the chip: the text is UNCHANGED (only the array identity
-    // changes), so the ONLY thing blocking the clear is the attachment-array
-    // reference mismatch — isolating that guard from the text guard.
+  it("(3) an attachment REMOVED during the enqueue window is honored — not resurrected; the sent text still clears", async () => {
+    // Add a chip BEFORE send so the tap snapshot owns [chip]. Then during the
+    // enqueue window REMOVE the chip: the text is UNCHANGED. Under the D1
+    // per-object guards the text clear is INDEPENDENT of attachment changes:
+    // the sent text clears (the message went out — keeping it would duplicate
+    // on the next send), and the operator's removal is honored (the chip is
+    // never resurrected into the composer).
     const release = holdEnqueue();
     const { container } = render(() => liveView(SID));
     addFileViaInput(container, "note.txt", "text/plain");
@@ -142,8 +150,10 @@ describe("AREA 2 — ownership snapshot: state entered DURING enqueue is not era
     expect(composerValue(container)).toBe(textAtSend);
     release();
     await awaitSettled();
-    // NOT cleared: the attachment-array identity mismatch blocked the clear even
-    // though the text matched the snapshot. This is the reference-identity guard.
-    expect(composerValue(container)).toBe(textAtSend);
+    // The message was SENT (enqueue confirmed) and the text still matched the
+    // tap snapshot -> the text clears. The removal is honored: no chip comes
+    // back (per-object identity never resurrects a removed attachment).
+    expect(composerValue(container)).toBe("");
+    expect(removeAttachmentButtons(container).length).toBe(0);
   });
 });
