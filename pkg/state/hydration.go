@@ -259,10 +259,16 @@ func (sm *sessionMessages) setCreatedKey(id string, createdMs float64, createdOK
 // whether the fetched list reaches the session's oldest message (the cold tail
 // GET's X-Next-Cursor — "" ⇒ exhausted; a full-list fetch ⇒ always exhausted).
 // When known, the per-session historyExhausted flag is SET from it (on fresh
-// creation AND on warm reconciles — the latest authoritative evidence wins, so
-// a tail re-fetch that reaches the floor clears a stale has-older and one that
-// sees a cursor records older-history-exists). When NOT known
-// (SetSessionMessages), fresh creation falls back to the len(list) <
+// creation AND on warm reconciles — the latest fetch evidence wins, and the
+// flag is deliberately REVERSIBLE, not a permanent floor marker: a warm
+// bounded-tail re-fetch's non-empty cursor proves only that history exists
+// beyond the tail page — which may already be resident from an earlier floor
+// walk — so it is not evidence that the resident lacks the session's oldest
+// message; the reconcile nevertheless follows it and may clear a previously
+// learned exhaustion, and a later floor-reaching fetch re-establishes it —
+// see the warm-reconcile branch below + the decision memo
+// researches/decisions/warm-reconcile-exhaustion-policy-inputs.md). When NOT
+// known (SetSessionMessages), fresh creation falls back to the len(list) <
 // windowMaxCount heuristic (a partial window ⇒ everything fetched; a full
 // window ⇒ assume older may exist — self-correcting via the boundary-demand
 // D-trigger's floor-reaching page walk) and warm reconciles preserve the flag.
@@ -314,10 +320,22 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts, exh
 		sm = &sessionMessages{byID: map[string]*messageEntry{}, historyExhausted: he}
 		s.messages[sid] = sm
 	} else if exhaustedKnown {
-		// Authoritative evidence on a warm reconcile: the latest cursor
-		// verdict wins (a re-fetch that reached the floor exhausts history; a
-		// re-fetch that still sees a cursor records older-history-exists —
-		// e.g. history backfilled upstream since the last fetch).
+		// Deliberate last-evidence-wins policy: historyExhausted is
+		// reversible FETCH evidence, not a permanent floor marker. A
+		// warm bounded-tail re-fetch's non-empty cursor proves only
+		// that history exists beyond the tail page — which may already
+		// be resident from an earlier floor walk — so it is not
+		// evidence that the resident lacks the session's oldest
+		// message; the reconcile nevertheless follows this latest
+		// fetch evidence and may CLEAR a previously learned
+		// exhaustion. The defect direction is benign and
+		// self-correcting: one boundary-demand older-page fetch that
+		// returns no rows re-establishes exhaustion
+		// (MergeOlderMessages(sid, [], true)). MergeOlderMessages
+		// itself never clears the flag (set-only); reversibility lives
+		// HERE alone. Pinned by
+		// TestWarmReconcileHistoryExhaustedIsReversibleFromTailEvidence.
+		// Decision: researches/decisions/warm-reconcile-exhaustion-policy-inputs.md.
 		sm.historyExhausted = exhausted
 	}
 	for _, mwp := range list {

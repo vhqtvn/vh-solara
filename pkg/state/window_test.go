@@ -627,6 +627,66 @@ func TestWindow_SetSessionMessagesHeuristicFallback(t *testing.T) {
 	}
 }
 
+// TestWarmReconcileHistoryExhaustedIsReversibleFromTailEvidence is a
+// CHARACTERIZATION pin (2026-08-28): it records CURRENT deliberate policy —
+// last-evidence-wins reversible exhaustion — NOT an ideal. The warm-reconcile
+// branch of reconcileMessagesLocked (hydration.go) overwrites the flag with
+// the latest fetch evidence even when that evidence is merely "this bounded
+// tail response still had a next cursor" (the G-F2 shape: non-empty list of
+// already-resident newest messages + a truthful non-empty next cursor), so a
+// floor-learned exhausted=true CAN flip false; one empty older-page fetch
+// restores it.
+// Decision: researches/decisions/warm-reconcile-exhaustion-policy-inputs.md.
+func TestWarmReconcileHistoryExhaustedIsReversibleFromTailEvidence(t *testing.T) {
+	s := mustNew(t, withWindowBounds(DefaultConfig(100), 4, 1<<20))
+	seedFourMessages(t, s, "w")
+
+	// (i) Floor established: the tail GET proved exhaustion (no X-Next-Cursor)
+	// — SetSessionMessagesExhausted(true) installs the list and learns the
+	// flag. This is also the production msgLoaded lifecycle entry: the NEXT
+	// reconcile for this session is warm.
+	s.SetSessionMessagesExhausted("w", fourMessageList("w"), true)
+	p1 := s.SnapshotMessagesPage("w", "m1", 4, 1<<20)
+	if !p1.HistoryExhausted || p1.HasOlder {
+		t.Fatalf("(i) floor-learned: want historyExhausted=true/has_older=false, got %v/%v", p1.HistoryExhausted, p1.HasOlder)
+	}
+	wantCount := s.Snapshot(map[string]bool{"w": true}).MessageWindows["w"].MessageCount
+	if wantCount != 4 {
+		t.Fatalf("(i) resident count: want 4, got %d", wantCount)
+	}
+
+	// (ii) THE PIN — warm reconcile with cursor-present evidence: the session
+	// is re-entered and the bounded tail GET returns the SAME resident newest
+	// messages plus a non-empty next cursor (truthful upstream evidence that
+	// history exists beyond the tail page — in the production G-F2 shape that
+	// history may already be resident from an earlier floor walk, so the
+	// cursor is not evidence that the resident lacks the session's oldest
+	// message). The flag flips false anyway (deliberate reversibility; the
+	// defect direction is benign).
+	s.SetSessionMessagesExhausted("w", fourMessageList("w"), false)
+	p2 := s.SnapshotMessagesPage("w", "m1", 4, 1<<20)
+	if p2.HistoryExhausted || !p2.HasOlder {
+		t.Fatalf("(ii) warm cursor-present reconcile: want historyExhausted=false/has_older=true (last-evidence-wins), got %v/%v", p2.HistoryExhausted, p2.HasOlder)
+	}
+	// (iv) Re-reconciling already-resident items neither duplicates nor
+	// removes anything — the resident count is unchanged across (ii).
+	if n := s.Snapshot(map[string]bool{"w": true}).MessageWindows["w"].MessageCount; n != wantCount {
+		t.Fatalf("(iv) resident count across the warm reconcile: want %d (no duplication/removal), got %d", wantCount, n)
+	}
+
+	// (iii) Self-correction: one boundary-demand older-page fetch that returns
+	// no rows (empty page + empty cursor → MergeOlderMessages(sid, [], true))
+	// re-establishes exhaustion.
+	s.MergeOlderMessages("w", nil, true)
+	p3 := s.SnapshotMessagesPage("w", "m1", 4, 1<<20)
+	if !p3.HistoryExhausted || p3.HasOlder {
+		t.Fatalf("(iii) self-correction: want historyExhausted restored true/has_older=false, got %v/%v", p3.HistoryExhausted, p3.HasOlder)
+	}
+	if n := s.Snapshot(map[string]bool{"w": true}).MessageWindows["w"].MessageCount; n != wantCount {
+		t.Fatalf("(iii) resident count after self-correction: want %d, got %d", wantCount, n)
+	}
+}
+
 // --- helpers used only by window_test.go ---
 
 // equalStrings is a shallow slice equality helper (testing/stdlib has none).

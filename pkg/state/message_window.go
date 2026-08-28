@@ -695,7 +695,15 @@ func (s *Store) SnapshotMessagesPage(sid, before string, limit, maxBytes int) Me
 // than the resident oldest, and the fetched page is chronological oldest-first,
 // so concatenating fetched + resident preserves oldest-first order).
 // historyExhausted records whether the fetch reached the session's oldest
-// message (X-Next-Cursor == ""); once true it stays true (truthful HasOlder).
+// message (X-Next-Cursor == ""). Within THIS function the flag is set-only:
+// a true verdict sets it (truthful HasOlder) and a false verdict never clears
+// it — exhaustion is only ever learned here, never unlearned. The STORE flag
+// as a whole is deliberately NOT monotonic: warm reconciliation in
+// hydration.go (reconcileMessagesLocked) follows the latest fetch evidence
+// and may clear a learned true (reversible fetch evidence — the non-empty
+// warm-tail cursor truthfully shows history beyond the tail page, not
+// whether it is already resident; the rationale lives there). Deliberate
+// writer split per researches/decisions/warm-reconcile-exhaustion-policy-inputs.md.
 //
 // No SSE emit, no s.seq bump (silent merge: the HTTP page response carries the
 // merged view; the X-VH-Seq header stamped at request entry stays comparable to
