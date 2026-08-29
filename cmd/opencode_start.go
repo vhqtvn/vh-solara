@@ -28,7 +28,12 @@ const (
 	// answering — NEVER spawn beside it (split-brain guard).
 	DetachedStartOccupied
 	// DetachedStartContended: another starter is mid-flight (starter lock
-	// held). We returned in milliseconds without spawning or waiting.
+	// held). We returned without spawning and without waiting out the
+	// winner's spawn/readiness budget. Bounded, though not always
+	// milliseconds: when recorded state names a live, cmdline-matching
+	// instance the loser still classifies it once (reattaching instantly on
+	// success, else paying the bounded probe budget — see below) before
+	// returning Occupied.
 	DetachedStartContended
 	// DetachedStartOrphanedOwner: the owner lock is held but no live recorded
 	// `opencode serve` exists — opencode died while a descendant retains its
@@ -87,8 +92,12 @@ type DetachedStartResult struct {
 //
 //   - Never-spawn-while-alive: classifyOCInstance remains the spawn
 //     authority; Occupied never spawns, with or without locks.
-//   - Losers are bounded: a Contended starter returns in milliseconds and
-//     never waits out the winner's ~13s classification + 30s readiness.
+//   - Losers are bounded: a Contended starter never spawns and never waits
+//     out the winner's ~13s classification + 30s readiness budgets. Its own
+//     worst case is one classify probe of the recorded state (~1s
+//     refused-fast → ~7.5s one-endpoint-timeout → ~13s worst) when that
+//     state names a live, cmdline-matching instance — bounded by the probe
+//     alone, never the winner's budget.
 //   - An OrphanedOwner loser never spawns beside maybe-live work; the
 //     fd-holders are surfaced for the operator.
 //   - State is written only on a successful spawn; Reattach/Occupied/
@@ -100,9 +109,12 @@ func EnsureDetachedOpenCode(bin string, workspace string, extraW ...io.Writer) D
 	guard, verdict, reason := acquireOCSpawnGuard()
 	if verdict == ocLockContended {
 		// Fast-fail loser. We still classify a recorded state (cheap read;
-		// the probe only runs for a reattach candidate) so a loser that CAN
-		// simply reattach does — but we NEVER spawn and NEVER wait out the
-		// winner's spawn/readiness budget.
+		// the probe runs only when that state names a live, cmdline-matching
+		// instance) so a loser that CAN simply reattach does — but we NEVER
+		// spawn and NEVER wait out the winner's spawn/readiness budget. A
+		// loser whose recorded instance looks reattachable but is not
+		// answering pays the probe budget (~1s refused-fast → ~7.5s
+		// one-endpoint-timeout → ~13s worst) before returning Occupied.
 		st, ok := readOCState()
 		switch gate := classifyOCInstance(st, ok); gate.Verdict {
 		case ocGateReattach:
@@ -261,8 +273,9 @@ var ocOwnerReleaseWait = 15 * time.Second
 // under the same per-project starter lock it rereads state and revalidates the
 // recorded pid (alive + cmdline match) IMMEDIATELY before signaling — a
 // recycled pid is never signaled — then waits for the old owner to release
-// the owner lock before respawning through the same guarded handoff and
-// republishing state on the stable port.
+// the owner lock, re-checks the spawn port for a foreign listener (port
+// parity with the boot path's stable-port selection), and respawns through
+// the same guarded handoff, republishing state.
 //
 // port <= 0 (a boot verdict that left no usable port on the runtime —
 // Contended/OrphanedOwner without readable state) is re-derived here the way
@@ -282,10 +295,16 @@ var ocOwnerReleaseWait = 15 * time.Second
 // zombie-safe (an un-reaped dead child cannot have its pid recycled).
 //
 // On success it returns the new child. On a readiness failure it returns the
-// spawned child AND the error so the caller retains and reaps the handle. The
-// failed child itself is left running and owner-covered with state
-// unpublished — the same posture as the boot path's readiness failure, which
-// surfaces only the pid/port, not the child handle.
+// spawned child AND the error so the caller can retain the handle — its pid
+// feeds the next restart's curPID — but no production caller ever Wait()s
+// the detached child. A dead un-reaped child therefore stays a zombie until
+// the daemon (its parent) exits, which is DELIBERATE pid-recycling safety: a
+// zombie's pid cannot be recycled, so the curPID signaling above can never
+// hit an unrelated process. Do not "fix" this with a reaper goroutine —
+// reaping opens exactly that recycling window. The failed child itself is
+// left running and owner-covered with state unpublished — the same posture
+// as the boot path's readiness failure, which surfaces only the pid/port,
+// not the child handle.
 func restartDetachedOpenCode(bin string, port int, workspace string, curPID int, extraW ...io.Writer) (*exec.Cmd, error) {
 	guard, verdict, reason := acquireOCSpawnGuard()
 	if verdict != ocLockAcquired {
@@ -356,6 +375,24 @@ func restartDetachedOpenCode(bin string, port int, workspace string, curPID int,
 		}
 		return nil, fmt.Errorf("old detached OpenCode did not release the project owner lock (a descendant may retain it) — NOT respawning beside it; holders: %s",
 			strings.Join(names, ", "))
+	}
+
+	// Port parity with the boot path's stable-port selection (P1-API-002
+	// advisory cleanup): `port` here is either the D2-re-derived recorded
+	// port or a caller-supplied one, and neither has been checked for a
+	// FOREIGN listener. Stale state can name a port another process now
+	// squats: handing it to the child would kill the child with EADDRINUSE
+	// while the dial-only waitForPort below succeeds against the foreign
+	// listener — publishing poisoned state (a lying "ready" whose proxy
+	// targets the foreign service, re-poisoned by every further restart,
+	// healed only at daemon boot). One final freeness check at this single
+	// port-finalization point trades that for truthful fresh-port state; the
+	// caller's stale URL target heals at the next daemon boot (port
+	// propagation is deliberately out of scope).
+	if !portFree(port) {
+		fresh := freePort()
+		log.Printf("detached restart: spawn port %d is taken by a foreign listener — respawning on a fresh port %d", port, fresh)
+		port = fresh
 	}
 
 	cmd, err := guard.startChildWithOwner(bin, port, workspace, extraW...)

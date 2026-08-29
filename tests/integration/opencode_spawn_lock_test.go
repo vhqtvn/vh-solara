@@ -166,6 +166,28 @@ func newOCSpawnScenario(t *testing.T) *ocSpawnScenario {
 	t.Setenv("VH_STATE_DIR", sc.stateDir)
 	t.Setenv("VH_OC_TESTBIN", os.Args[0])
 	t.Setenv("VH_FAKE_OC_PIDS_DIR", sc.pidsDir)
+
+	// Scenario-level fake sweep: the fake opencodes sleep-loop forever, and
+	// only the STARTER subprocesses get per-spawn cleanups — fakes whose
+	// starter exited on its own (starter C) currently get NO cleanup at all
+	// and leak past the run. Registered here — FIRST — so LIFO cleanup order
+	// runs it AFTER every assertion and every starter cleanup: the crux test
+	// ENDS by asserting a LIVE fake (starter C's child), so the sweep must
+	// never fire before the test body completes.
+	t.Cleanup(func() {
+		for _, suffix := range []string{".fake", ".gchild"} {
+			ents, _ := os.ReadDir(sc.pidsDir)
+			for _, e := range ents {
+				if !strings.HasSuffix(e.Name(), suffix) {
+					continue
+				}
+				if pid, err := strconv.Atoi(strings.TrimSuffix(e.Name(), suffix)); err == nil && pidAlive(pid) {
+					t.Logf("scenario sweep: SIGKILLing leftover %q pid %d", suffix, pid)
+					killPid9(pid)
+				}
+			}
+		}
+	})
 	return sc
 }
 

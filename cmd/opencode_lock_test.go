@@ -189,6 +189,23 @@ func newOCLockScenario(t *testing.T) *ocLockScenario {
 	t.Setenv("VH_OC_TESTBIN", os.Args[0])
 	t.Setenv("VH_FAKE_OC_PIDS_DIR", sc.pidsDir)
 	t.Chdir(sc.dir)
+
+	// Scenario-level fake sweep: the fake opencodes sleep-loop FOREVER, and
+	// the per-starter/per-spawn cleanups kill only the STARTER (parent)
+	// processes — fakes they spawned, in-process transaction children, and
+	// fd-3-holding grandchildren can outlive the test and leak across runs
+	// (squatting ports and holding owner locks). Registered here — FIRST —
+	// so LIFO cleanup order runs it AFTER every assertion and every other
+	// cleanup: tests stay free to END by asserting a live fake; the sweep
+	// only reaps what is still alive once the test is over.
+	t.Cleanup(func() {
+		for _, suffix := range []string{".fake", ".gchild"} {
+			for _, pid := range sc.alivePids(suffix) {
+				t.Logf("scenario sweep: SIGKILLing leftover %q pid %d", suffix, pid)
+				killPid9(pid)
+			}
+		}
+	})
 	return sc
 }
 

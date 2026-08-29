@@ -20,14 +20,19 @@ package cmd
 // per-project serialization, revalidates the recorded pid immediately before
 // signaling (never signals a recycled pid), re-derives the port when handed
 // none (D2), waits out a live owner-lock holder even when nothing of ours was
-// signaled (A1), and never respawns beside an owner-lock holder.
+// signaled (A1), never respawns beside an owner-lock holder, and swaps a
+// spawn port squatted by a foreign listener for a fresh one — whatever the
+// port's provenance, re-derived or caller-supplied (the port-parity guard).
 
 import (
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -356,17 +361,37 @@ func TestRestartDetachedOrphanedHolder(t *testing.T) {
 // --- D2 payoff: port<=0 restart re-derivation ---
 
 // pickLowPort returns a free loopback port BELOW the Linux ephemeral port
-// range (ip_local_port_range, 32768+ by default) — a port freePort() can
-// never hand out — so the re-derived-from-state assertion below is a
-// deterministic discriminator, not a coincidence test.
+// range (ip_local_port_range) — a port freePort() can never hand out — so
+// re-derived-from-state and fresh-port assertions below are deterministic
+// discriminators, not coincidence tests.
+//
+// The floor is read from /proc/sys/net/ipv4/ip_local_port_range (fallback
+// 32768) and the candidate window is the 2048 ports under it, clamped above
+// the privileged range: a fixed 20-port window gets exhausted by leaked fake
+// processes from earlier runs squatting exactly those ports. On true
+// unsatisfiability (every candidate taken, or a floor so low that no
+// unprivileged window remains) the discriminator is unavailable and the
+// caller's test SKIPS with a reason instead of failing the run.
 func pickLowPort(t *testing.T) int {
 	t.Helper()
-	for p := 24000; p < 24020; p++ {
+	floor := 32768 // default ip_local_port_range lower bound
+	if b, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range"); err == nil {
+		if fields := strings.Fields(string(b)); len(fields) > 0 {
+			if f, err := strconv.Atoi(fields[0]); err == nil && f > 1 {
+				floor = f
+			}
+		}
+	}
+	lo := floor - 2048
+	if lo < 1024 {
+		lo = 1024 // never hand back a privileged port the test cannot bind
+	}
+	for p := floor - 1; p >= lo; p-- {
 		if portFree(p) {
 			return p
 		}
 	}
-	t.Fatal("no free port in the low probe range")
+	t.Skipf("no free port below the ephemeral floor %d (window %d..%d exhausted)", floor, lo, floor-1)
 	return 0
 }
 
@@ -426,6 +451,106 @@ func TestRestartDetachedFreshPortWhenNoState(t *testing.T) {
 	sc.waitAliveCount(".fake", 1, 5*time.Second)
 }
 
+// --- port-parity guard (P1-API-002 advisory cleanup) ---
+
+// TestRestartDetachedForeignListenerOnRecordedPort — a FOREIGN listener
+// squats exactly the recorded port. Without the guard the child is handed a
+// port it can never bind (EADDRINUSE) while the dial-only waitForPort
+// succeeds against the FOREIGN listener — poisoned state, a lying "ready",
+// re-poisoned by every later restart. With the guard the restart succeeds on
+// a DIFFERENT (fresh) port and publishes truthful state.
+func TestRestartDetachedForeignListenerOnRecordedPort(t *testing.T) {
+	sc := newOCLockScenario(t)
+	port := pickLowPort(t) // below the ephemeral range: freePort() cannot return it
+
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("foreign listener on the recorded port %d: %v", port, err)
+	}
+	defer ln.Close()
+
+	// Stale recorded state: a live FOREIGN pid on the squatted port (the
+	// kill phase must skip and never signal it).
+	sacrifice := exec.Command("sleep", "300")
+	if err := sacrifice.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = sacrifice.Process.Kill()
+		_ = sacrifice.Wait()
+	})
+	writeOCState(ocState{PID: sacrifice.Process.Pid, Port: port})
+
+	// port<=0: D2 re-derives the recorded (squatted) port; the guard must
+	// catch it and swap in a fresh one.
+	c, err := restartDetachedOpenCode(sc.bin, 0, sc.dir, 0)
+	if err != nil {
+		t.Fatalf("restart beside a foreign listener on the recorded port must succeed on a fresh port: %v", err)
+	}
+	st, ok := readOCState()
+	if !ok || st.PID != c.Process.Pid {
+		t.Fatalf("state=%+v ok=%v want the respawned pid %d", st, ok, c.Process.Pid)
+	}
+	if st.Port == port {
+		t.Fatalf("PORT-PARITY REGRESSION: published port %d is the squatted recorded port — poisoned state (the child died EADDRINUSE while waitForPort dialed the foreign listener)", st.Port)
+	}
+	if st.Port <= 0 {
+		t.Fatalf("published port %d must be a fresh port > 0", st.Port)
+	}
+	if !ocCmdlineMatches(c.Process.Pid, st.Port) {
+		t.Fatalf("the child must have been spawned with --port %d (the fresh port)", st.Port)
+	}
+	if !ocProcessAlive(sacrifice.Process.Pid) {
+		t.Fatal("the foreign recorded pid must stay untouched")
+	}
+	sc.waitAliveCount(".fake", 1, 5*time.Second)
+}
+
+// TestRestartDetachedForeignListenerOnSuppliedPort — the same guard covering
+// the caller-supplied port>0 provenance (a port wired on the runtime at
+// boot): the supplied port is squatted by a foreign listener, so the restart
+// must swap it for a fresh one instead of handing the child a port it can
+// never bind.
+func TestRestartDetachedForeignListenerOnSuppliedPort(t *testing.T) {
+	sc := newOCLockScenario(t)
+	port := pickLowPort(t) // below the ephemeral range: freePort() cannot return it
+
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("foreign listener on the supplied port %d: %v", port, err)
+	}
+	defer ln.Close()
+
+	sacrifice := exec.Command("sleep", "300")
+	if err := sacrifice.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = sacrifice.Process.Kill()
+		_ = sacrifice.Wait()
+	})
+	writeOCState(ocState{PID: sacrifice.Process.Pid, Port: port})
+
+	c, err := restartDetachedOpenCode(sc.bin, port, sc.dir, 0) // caller-supplied >0
+	if err != nil {
+		t.Fatalf("restart beside a foreign listener on the supplied port must succeed on a fresh port: %v", err)
+	}
+	st, ok := readOCState()
+	if !ok || st.PID != c.Process.Pid {
+		t.Fatalf("state=%+v ok=%v want the respawned pid %d", st, ok, c.Process.Pid)
+	}
+	if st.Port == port {
+		t.Fatalf("PORT-PARITY REGRESSION: published port %d is the squatted supplied port — poisoned state", st.Port)
+	}
+	if st.Port <= 0 {
+		t.Fatalf("published port %d must be a fresh port > 0", st.Port)
+	}
+	if !ocCmdlineMatches(c.Process.Pid, st.Port) {
+		t.Fatalf("the child must have been spawned with --port %d (the fresh port)", st.Port)
+	}
+	sc.waitAliveCount(".fake", 1, 5*time.Second)
+}
+
 // --- A1 payoff: the owner-release wait ---
 
 // TestRestartDetachedWaitsOutUnsignaledHolder — A1's residual gap: NOTHING of
@@ -448,13 +573,17 @@ func TestRestartDetachedWaitsOutUnsignaledHolder(t *testing.T) {
 	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		t.Fatalf("flock owner lock: %v", err)
 	}
-	released := make(chan time.Time, 1)
+	// Close exactly once: the release goroutine and the t.Cleanup below can
+	// both run, and a second Close on a recycled fd number would close an
+	// unrelated descriptor (the restart in between spawns a child and opens
+	// files, so fd recycling is a real possibility).
+	var closeOnce sync.Once
+	release := func() { closeOnce.Do(func() { _ = syscall.Close(fd) }) }
 	go func() {
 		time.Sleep(700 * time.Millisecond)
-		released <- time.Now()
-		_ = syscall.Close(fd)
+		release()
 	}()
-	t.Cleanup(func() { _ = syscall.Close(fd) }) // no-op once the goroutine closed it
+	t.Cleanup(release)
 
 	start := time.Now()
 	c, errRestart := restartDetachedOpenCode(sc.bin, freePort(), sc.dir, 0)
