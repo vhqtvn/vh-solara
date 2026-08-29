@@ -242,3 +242,26 @@ flock2/ofd2/abstract2/parentonly/inheritshared), `harness/probe_abs/`
 (abstract-socket isolation probe), `run_matrix.sh` (barriers: before-start,
 post-start, post-ready, post-state, statefail-release, statefail-alive,
 contended, normal, grandchild, racehammer ×15). Raw logs under `results/`.
+
+## Amendment (2026-08-29) — the 2–4 ms loser figure is harness-accurate, not landed-code-accurate
+
+> NOTE: Dated amendment; every historical section above is preserved
+> unchanged.
+> Date: 2026-08-29
+> Context: P1-API-002 advisory-cleanup slice that followed the landed
+> implementation (classify gate + two-role flock + serialized restart:
+> commits eb03548, ef8e084, a0f3312).
+
+§2's B-loser latency claim — "every non-spawn decision returned in 2–4 ms" —
+is accurate FOR THE HARNESS: the experiment's loser B never classified; it
+short-circuited on the lock verdicts alone. The LANDED contended loser runs
+`classifyOCInstance` once when the recorded state looks reattachable (pid
+alive + cmdline match), paying the probe budget — ~1 s refused-fast, ~7.5 s
+with one timing-out endpoint per attempt, ~13 s worst case (3 attempts × 2
+endpoints × 2 s timeout + 2 × 500 ms retry gaps) — before returning Occupied
+(or reattaching at once when the probe succeeds). That is bounded by the
+classify probe ALONE and never the winner's ~13 s classification + 30 s
+readiness budget, which is what invariant 2 actually promises. Losers with
+no recorded state, or with a dead/foreign recorded pid, remain
+millisecond-fast. The landed behavior lives in the contended arm of
+`EnsureDetachedOpenCode` (cmd/opencode_start.go).
