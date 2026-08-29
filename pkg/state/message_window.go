@@ -316,15 +316,24 @@ type MessagePageResult struct {
 	// session's oldest message (X-Next-Cursor == ""). The boundary-demand
 	// handler (Part B D trigger) reads this to decide whether to fetch an older
 	// page from opencode when the resident walk hits the resident floor without a
-	// count/byte limit. HasOlder = countLimited || bytesLimited || !HistoryExhausted.
+	// count/byte limit. HasOlder = countLimited || bytesLimited ||
+	// !HistoryExhausted for a non-oversized page; an OVERSIZED page instead ORs
+	// !HistoryExhausted into the projector's resident-local verdict (the
+	// SnapshotMessagesPage envelope — a projector-set true is never downgraded).
 	HistoryExhausted bool `json:"history_exhausted"`
 	// OversizedItem / ActualBytes / BudgetBytes mirror WindowMeta. They are
 	// set in three cases (all keep messages atomic — a message is NEVER split
 	// or truncated):
-	//  1. Oversized anchor WITH NO older history (anchorIdx==0): the ?before=
-	//     message alone exceeds the byte budget AND is the session's oldest →
-	//     the page returns [anchor] ALONE (truthful end-of-history; HasOlder=
-	//     false). ActualBytes is the anchor's byte size.
+	//  1. Oversized anchor WITH NO older RESIDENT history (anchorIdx==0): the
+	//     ?before= message alone exceeds the byte budget AND is the oldest
+	//     RESIDENT message → the page returns [anchor] ALONE (projector
+	//     HasOlder=false). This is truthful end-of-history ONLY when
+	//     historyExhausted=true; when the resident list is a fetch-bounded
+	//     tail (historyExhausted=false) the resident floor is NOT the session
+	//     floor, and the SnapshotMessagesPage envelope ORs !historyExhausted
+	//     in so the wire HasOlder stays true (older opencode history may
+	//     exist beyond the oversized floor). ActualBytes is the anchor's byte
+	//     size.
 	//  2. Oversized anchor WITH older history (anchorIdx>0, sub-case d): the
 	//     anchor alone exceeds the byte budget but older messages exist → the
 	//     page returns the REQUIRED ATOMIC PAIR [neighbor, anchor] (neighbor
@@ -343,12 +352,17 @@ type MessagePageResult struct {
 	//     whether even-older messages exist beyond it.
 	// In all three cases ActualBytes is the OVERSIZED ITEM's byte size (NOT
 	// the page total) and BudgetBytes is the maxBytes bound. OversizedItem is
-	// kept true in ALL THREE cases (1, 2, and 3); the Part-B boundary-demand
-	// D-triggers (messages_http.go:122 + SnapshotMessagesPage) gate their
-	// opencode older-page fetch on !OversizedItem. That gating rationale is
-	// load-bearing only in cases 2 and 3 (where HasOlder may be true): case 1
-	// returns with HasOlder=false, so there is no "Load older" affordance to
-	// misfire on even though OversizedItem is still stamped.
+	// kept true in ALL THREE cases (1, 2, and 3) as a client-facing
+	// diagnostic. It does NOT by itself suppress the Part-B boundary-demand
+	// D-trigger: messages_http.go fires the opencode older-page fetch when the
+	// anchor IS the resident floor (before == OldestResidentCursorTuple's ID,
+	// regardless of OversizedItem), and the SnapshotMessagesPage envelope ORs
+	// !historyExhausted into oversized pages' HasOlder. OversizedItem still
+	// matters for anti-misfire in the OTHER direction: an oversized page whose
+	// anchor is NOT the floor (cases 2/3 with anchorIdx>1, or a c/d pair
+	// whose neighbor is not the floor) still has RESIDENT-local older messages
+	// to walk first — the fetch must not fire until the walk's `before`
+	// reaches the floor.
 	OversizedItem bool `json:"oversized_item,omitempty"`
 	ActualBytes   int  `json:"actual_bytes,omitempty"`
 	BudgetBytes   int  `json:"budget_bytes,omitempty"`
@@ -380,8 +394,10 @@ type MessagePageResult struct {
 //     (b) neighbor-alone <= maxBytes but anchor + neighbor > maxBytes: the
 //     neighbor is included; bytes_limited fires on the next older message
 //     (if one remains) as the "overshot budget by one atomic item" signal.
-//     When the neighbor IS the session's oldest (no further older),
-//     bytes_limited stays false so HasOlder is truthful (false).
+//     When the neighbor IS the oldest RESIDENT message (no further
+//     resident-local older), bytes_limited stays false so the projector
+//     HasOlder is false — the envelope assigns !historyExhausted for the
+//     wire verdict (truthful end-of-history only when exhausted).
 //     (c) neighbor-alone > maxBytes: the neighbor is included anyway (atomic
 //     forward progress); oversized_item + actual_bytes/budget_bytes are
 //     stamped (bytes_limited/count_limited stay false, matching
@@ -389,14 +405,17 @@ type MessagePageResult struct {
 //     (d) ANCHOR-alone > maxBytes AND anchorIdx > 0 (oversized anchor WITH
 //     older history): the required atomic pair [neighbor, anchor] is
 //     returned — the neighbor (list[anchorIdx-1]) is force-included so
-//     OldestID ADVANCES past the cursor. OversizedItem stays true so the
-//     D-triggers below do not misfire; HasOlder reflects whether messages
-//     beyond the neighbor exist (anchorIdx > 1). This mirrors
-//     projectMessageWindow force-including its oversized newest regardless
-//     of maxCount. (When anchorIdx == 0 — the oversized anchor IS the
-//     session's oldest — no older history exists, so no progress is needed
-//     and the page returns [anchor] alone with HasOlder=false, truthful
-//     end-of-history.)
+//     OldestID ADVANCES past the cursor. OversizedItem stays true as the
+//     client-facing overshoot diagnostic; HasOlder reflects whether
+//     RESIDENT messages beyond the neighbor exist (anchorIdx > 1). This
+//     mirrors projectMessageWindow force-including its oversized newest
+//     regardless of maxCount. (When anchorIdx == 0 — the oversized anchor
+//     IS the oldest RESIDENT message — no resident-local progress is
+//     needed and the page returns [anchor] alone with projector
+//     HasOlder=false. That is truthful end-of-history only when
+//     historyExhausted=true; the SnapshotMessagesPage envelope ORs
+//     !historyExhausted in, and the boundary-demand D-trigger fires once
+//     the walk's `before` equals this resident floor.)
 //
 // The maxCount=1 TWO-ITEM EXCEPTION: in sub-case (d) (and the atomic force-
 // includes in b/c), the page may return 2 items even when the caller passed
@@ -409,11 +428,12 @@ type MessagePageResult struct {
 // first-older IS the session's oldest, the loop exits at the floor with no
 // limit flag. See TestPage_ForwardProgress_MaxCount1_NormalAnchor.
 //
-// In every overshoot sub-case where further older messages remain, at least
-// one of bytes_limited/oversized_item is true, so the Part-B boundary-demand
-// triggers at messages_http.go:122 and message_window.go (SnapshotMessagesPage
-// — see the !CountLimited && !BytesLimited && !OversizedItem gate) — do NOT
-// misfire and re-fetch from opencode for a pure byte-budget overshoot.
+// In every overshoot sub-case where further RESIDENT-local older messages
+// remain (the anchor is not yet the resident floor), the boundary-demand
+// D-trigger at messages_http.go does NOT misfire: it fires only when `before`
+// EQUALS the resident-floor id from OldestResidentCursorTuple, so a pure
+// byte-budget overshoot page with resident-local older history walks locally
+// first instead of re-fetching from opencode.
 //
 // Contract:
 //   - `before` is REQUIRED. An empty cursor returns an empty page with
@@ -424,10 +444,12 @@ type MessagePageResult struct {
 //     Contract-B's dirty-flag is the primary guard against resurrecting a
 //     deleted-then-recreated message).
 //   - If the anchor (`before`) alone exceeds maxBytes, two sub-cases:
-//     (A) the anchor is the session's OLDEST message (anchorIdx==0, no older
-//     history) → the page returns [anchor] alone with oversized_item +
-//     actual_bytes/budget_bytes and HasOlder=false (truthful end-of-
-//     history); (B) the anchor HAS older history (anchorIdx>0) → the page
+//     (A) the anchor is the OLDEST RESIDENT message (anchorIdx==0, no older
+//     resident history) → the page returns [anchor] alone with oversized_item
+//   - actual_bytes/budget_bytes and projector HasOlder=false (truthful
+//     end-of-history only when historyExhausted=true — the envelope ORs
+//     !historyExhausted in for the wire verdict); (B) the anchor HAS older
+//     resident history (anchorIdx>0) → the page
 //     returns the required atomic pair [neighbor, anchor] (sub-case d
 //     above) so OldestID ADVANCES past the cursor. In both, oversized_item
 //     is stamped and messages stay atomic (NEVER split or truncated).
@@ -482,15 +504,22 @@ func projectMessagePage(list []MessageWithParts, before string, maxCount, maxByt
 	if anchorSize > maxBytes {
 		// Oversized anchor: the ?before= message alone exceeds the byte
 		// budget. Two sub-cases, decided by whether the anchor HAS older
-		// history (the UNIVERSAL FORWARD-PROGRESS GUARANTEE below applies):
+		// RESIDENT history (the UNIVERSAL FORWARD-PROGRESS GUARANTEE below
+		// applies):
 		//
-		//  A. anchorIdx == 0 (the anchor IS the session's oldest message):
-		//     return it ALONE. HasOlder=false — truthful end-of-history (no
-		//     older message exists, so no forward progress is needed). This
-		//     is the ONLY case where Items=[anchor] alone with
-		//     OversizedItem=true is the final page.
+		//  A. anchorIdx == 0 (the anchor IS the oldest RESIDENT message):
+		//     return it ALONE with projector HasOlder=false. This projector
+		//     verdict covers only the resident list — when the resident list
+		//     is a fetch-bounded tail (historyExhausted=false), the envelope
+		//     (SnapshotMessagesPage) ORs !historyExhausted in so the wire
+		//     HasOlder stays true, and the boundary-demand D-trigger fires
+		//     once the walk's `before` equals this resident floor. Truthful
+		//     end-of-history holds only when historyExhausted=true. This is
+		//     the ONLY case where Items=[anchor] alone with
+		//     OversizedItem=true is the projector's final page.
 		//
-		//  B. anchorIdx > 0 (the oversized anchor HAS older history): return
+		//  B. anchorIdx > 0 (the oversized anchor HAS older resident history):
+		//     return
 		//     the REQUIRED ATOMIC PAIR [neighbor, anchor] where neighbor is
 		//     list[anchorIdx-1] (creation order: neighbor is strictly older).
 		//     Stopping at [anchor] alone here would set OldestID==before and
@@ -502,8 +531,9 @@ func projectMessagePage(list []MessageWithParts, before string, maxCount, maxByt
 		//     pair: do NOT continue the normal accumulation loop for further
 		//     older messages in this branch.
 		if anchorIdx == 0 {
-			// Sub-case A: oversized anchor IS the session's oldest.
-			// Truthful end-of-history.
+			// Sub-case A: oversized anchor IS the oldest RESIDENT message.
+			// Projector HasOlder=false; the SnapshotMessagesPage envelope
+			// ORs !historyExhausted in for the wire verdict.
 			res.Items = page
 			res.HasOlder = false
 			res.OversizedItem = true
@@ -518,15 +548,16 @@ func projectMessagePage(list []MessageWithParts, before string, maxCount, maxByt
 		page = append(page, neighbor)
 		res.SerializedBytes += neighborSize
 		res.OldestID = messageIDFromInfo(neighbor.Info) // ADVANCED past cursor
-		// HasOlder is truthful: are there messages beyond the neighbor?
-		// (neighbor is list[anchorIdx-1]; list[anchorIdx-2] and below remain
-		// iff anchorIdx > 1.)
+		// HasOlder is truthful: are there RESIDENT messages beyond the
+		// neighbor? (neighbor is list[anchorIdx-1]; list[anchorIdx-2] and
+		// below remain iff anchorIdx > 1.)
 		res.HasOlder = anchorIdx > 1
-		// OversizedItem stays true so BOTH Part-B boundary-demand D-trigger
-		// readers (messages_http.go:122 and SnapshotMessagesPage's
-		// !CountLimited && !BytesLimited && !OversizedItem gate below) — which
-		// gate the opencode older-page fetch on !OversizedItem — do NOT
-		// misfire. SerializedBytes carries the truthful page total
+		// OversizedItem stays true as the client-facing overshoot
+		// diagnostic. It does not gate the Part-B boundary-demand D-trigger
+		// (messages_http.go fires on `before` == the resident-floor id, not
+		// on !OversizedItem), and the SnapshotMessagesPage envelope ORs
+		// !historyExhausted into this projector verdict instead of
+		// overwriting it. SerializedBytes carries the truthful page total
 		// for the returned pair; ActualBytes follows the struct contract
 		// (the OVERSIZED ITEM's bytes — the anchor here, matching the
 		// projectMessageWindow oversized-newest precedent).
@@ -572,9 +603,12 @@ func projectMessagePage(list []MessageWithParts, before string, maxCount, maxByt
 			// Sub-case (b) or normal: include even when anchor + first-older >
 			// maxBytes. The byte loop below sets bytes_limited on the NEXT
 			// older message (if one remains) as the "overshot budget by one
-			// atomic item" signal. When the first-older IS the session's
-			// oldest (no further older), the loop exits with no limit flag so
-			// HasOlder stays false (truthful end-of-history).
+			// atomic item" signal. When the first-older IS the oldest
+			// RESIDENT message (no further resident-local older), the loop
+			// exits with no limit flag so the projector HasOlder stays false
+			// — and the envelope (SnapshotMessagesPage) assigns
+			// !historyExhausted, keeping the wire verdict truthful: true
+			// end-of-history only when historyExhausted=true.
 			page = append(page, firstOlder)
 			res.SerializedBytes += firstOlderSize
 			res.OldestID = messageIDFromInfo(firstOlder.Info)
@@ -677,11 +711,26 @@ func (s *Store) SnapshotMessagesPage(sid, before string, limit, maxBytes int) Me
 	res.BaselineSeq = seq
 	res.HistoryExhausted = historyExhausted
 	// Part B (truthful HasOlder): when the resident strictly-older walk hit the
-	// resident floor WITHOUT a count/byte limit (and not the oversized-anchor
-	// case), older history may still exist in opencode beyond the bounded
-	// cold-load tail — HasOlder hinges on !historyExhausted. (countLimited/
-	// bytesLimited already set HasOlder=true via projectMessagePage.)
-	if !res.CountLimited && !res.BytesLimited && !res.OversizedItem {
+	// resident floor WITHOUT a count/byte limit, older history may still exist
+	// in opencode beyond the bounded cold-load tail — the exhaustion flag is
+	// what makes HasOlder truthful about it. Two envelope shapes:
+	//   - NON-oversized page: assign !historyExhausted outright (countLimited/
+	//     bytesLimited already set HasOlder=true via projectMessagePage, so
+	//     this branch only refines the projector's no-limit verdict).
+	//   - OVERSIZED page (OversizedItem, sub-cases A/B/c): the projector's
+	//     HasOlder covers only the RESIDENT-local older component (false at
+	//     the resident floor — an oversized anchor that IS the oldest resident
+	//     message, or an oversized pair whose neighbor is the floor). The
+	//     resident list itself may be a fetch-bounded tail (the resident floor
+	//     is NOT the session floor when historyExhausted=false), so older
+	//     opencode history can exist beyond an oversized floor: OR in
+	//     !historyExhausted. NEVER a plain assignment — the OR must not
+	//     DOWNGRADE a projector-set true (an anchorIdx>1 oversized pair has
+	//     resident-local older messages beyond the neighbor, and that verdict
+	//     stays true even when historyExhausted=true).
+	if res.OversizedItem {
+		res.HasOlder = res.HasOlder || !historyExhausted
+	} else if !res.CountLimited && !res.BytesLimited {
 		res.HasOlder = !historyExhausted
 	}
 	return res

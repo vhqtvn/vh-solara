@@ -1143,6 +1143,13 @@ func TestSnapshotMessagesPage_FullResidentSupportsOlderHistory(t *testing.T) {
 // present) pages with has_older=true; an exhausted one (cursor absent — even at
 // an exact window fit, the old len<limit heuristic's blind edge) reports
 // has_older=false with no wasted affordance.
+//
+// The oversized-floor subtests pin the OF1 remedy's envelope half: an OVERSIZED
+// page at the resident floor must not report has_older=false while
+// historyExhausted=false (the resident floor is then NOT the session floor —
+// older opencode history may exist beyond it), and the envelope's OR must never
+// DOWNGRADE a projector-set has_older=true (the anchorIdx>1 oversized pair has
+// resident-local older history; that verdict survives even exhaustion).
 func TestSnapshotMessagesPage_CursorSetExhaustion(t *testing.T) {
 	t.Run("cursor-present-not-exhausted", func(t *testing.T) {
 		st := New(1024)
@@ -1184,6 +1191,115 @@ func TestSnapshotMessagesPage_CursorSetExhaustion(t *testing.T) {
 		}
 		if !page.HistoryExhausted {
 			t.Fatalf("history_exhausted: want true, got false")
+		}
+	})
+
+	// OF1: an OVERSIZED message sitting AT the resident floor. The projector's
+	// sub-case A returns [anchor] alone with HasOlder=false (resident-local
+	// verdict: no resident message is older). The envelope must OR
+	// !historyExhausted in — the resident list may be a fetch-bounded tail, so
+	// the oversized resident floor is NOT necessarily the session floor.
+	t.Run("oversized-floor-not-exhausted", func(t *testing.T) {
+		st := New(1024)
+		st.Apply(ev("session.created", `{"info":{"id":"s","title":"S"}}`))
+		// Creation order (oldest first): the oversized big IS the resident
+		// floor; m2/m3 are newer light messages.
+		list := []MessageWithParts{pageMsg("big", 700), pageMsg("m2", 10), pageMsg("m3", 10)}
+		st.SetSessionMessagesExhausted("s", list, false) // bounded tail, older history unknown
+
+		page := st.SnapshotMessagesPage("s", "big", WindowMaxCount, 512)
+		if !page.BoundaryFound {
+			t.Fatalf("boundary_found: want true (big resident), got false")
+		}
+		if !page.OversizedItem {
+			t.Fatalf("oversized_item: want true (big alone exceeds the 512B budget), got false")
+		}
+		if page.CountLimited || page.BytesLimited {
+			t.Fatalf("limits: want none (oversized sub-case A sets neither), got count=%v bytes=%v",
+				page.CountLimited, page.BytesLimited)
+		}
+		if len(page.Items) != 1 || page.OldestID != "big" {
+			t.Fatalf("items: want the lone oversized anchor [big] (sub-case A), got %d items oldest=%q",
+				len(page.Items), page.OldestID)
+		}
+		// THE OF1 fix: has_older must stay true — the affordance must not die
+		// at the oversized floor while historyExhausted=false.
+		if !page.HasOlder {
+			t.Fatalf("has_older: want true (oversized resident floor, historyExhausted=false — resident floor ≠ session floor), got false")
+		}
+		if page.HistoryExhausted {
+			t.Fatalf("history_exhausted: want false, got true")
+		}
+	})
+
+	t.Run("oversized-floor-exhausted", func(t *testing.T) {
+		st := New(1024)
+		st.Apply(ev("session.created", `{"info":{"id":"s","title":"S"}}`))
+		list := []MessageWithParts{pageMsg("big", 700), pageMsg("m2", 10), pageMsg("m3", 10)}
+		st.SetSessionMessagesExhausted("s", list, true) // backward walk reached the session's oldest
+
+		page := st.SnapshotMessagesPage("s", "big", WindowMaxCount, 512)
+		if !page.BoundaryFound || !page.OversizedItem {
+			t.Fatalf("boundary_found/oversized_item: want true/true, got %v/%v",
+				page.BoundaryFound, page.OversizedItem)
+		}
+		// Truthful end-of-history ONLY when historyExhausted=true: the same
+		// oversized floor that reports has_older=true when not exhausted.
+		if page.HasOlder {
+			t.Fatalf("has_older: want false (oversized floor IS the session floor once historyExhausted=true), got true")
+		}
+		if !page.HistoryExhausted {
+			t.Fatalf("history_exhausted: want true, got false")
+		}
+	})
+
+	// The envelope ORs; it must never DOWNGRADE. An anchorIdx>1 oversized
+	// anchor projects the atomic pair [neighbor, anchor] with HasOlder=true
+	// (resident-local older history exists beyond the neighbor) — exhaustion
+	// must not clear a projector-set true.
+	t.Run("oversized-pair-anchorIdx2-exhausted-keeps-projector-true", func(t *testing.T) {
+		st := New(1024)
+		st.Apply(ev("session.created", `{"info":{"id":"s","title":"S"}}`))
+		// Creation order: m1, m2, big(anchor, oversized), m4 (newest).
+		list := []MessageWithParts{pageMsg("m1", 10), pageMsg("m2", 10), pageMsg("big", 700), pageMsg("m4", 10)}
+		st.SetSessionMessagesExhausted("s", list, true)
+
+		page := st.SnapshotMessagesPage("s", "big", WindowMaxCount, 512)
+		if !page.BoundaryFound || !page.OversizedItem {
+			t.Fatalf("boundary_found/oversized_item: want true/true, got %v/%v",
+				page.BoundaryFound, page.OversizedItem)
+		}
+		if len(page.Items) != 2 || page.OldestID != "m2" {
+			t.Fatalf("items: want the atomic pair [m2, big] (sub-case d), got %d items oldest=%q",
+				len(page.Items), page.OldestID)
+		}
+		// Projector set HasOlder=true (anchorIdx=2 > 1: m1 remains beyond the
+		// neighbor). historyExhausted=true must NOT clear it — the walk still
+		// has resident-local older history to page through.
+		if !page.HasOlder {
+			t.Fatalf("has_older: want true (projector-set resident-local older survives the envelope OR; exhaustion must not downgrade), got false")
+		}
+		if !page.HistoryExhausted {
+			t.Fatalf("history_exhausted: want true, got false")
+		}
+	})
+
+	// Companion pin from the other side: the SAME sub-case d shape at
+	// anchorIdx==1 projects HasOlder=false (the neighbor IS the floor), so an
+	// exhausted pair reports has_older=false — the OR is false||false.
+	t.Run("oversized-pair-anchorIdx1-exhausted", func(t *testing.T) {
+		st := New(1024)
+		st.Apply(ev("session.created", `{"info":{"id":"s","title":"S"}}`))
+		list := []MessageWithParts{pageMsg("m1", 10), pageMsg("big", 700), pageMsg("m3", 10)}
+		st.SetSessionMessagesExhausted("s", list, true)
+
+		page := st.SnapshotMessagesPage("s", "big", WindowMaxCount, 512)
+		if len(page.Items) != 2 || page.OldestID != "m1" {
+			t.Fatalf("items: want the atomic pair [m1, big] (sub-case d), got %d items oldest=%q",
+				len(page.Items), page.OldestID)
+		}
+		if page.HasOlder {
+			t.Fatalf("has_older: want false (neighbor m1 IS the floor and historyExhausted=true — truthful end-of-history), got true")
 		}
 	})
 }

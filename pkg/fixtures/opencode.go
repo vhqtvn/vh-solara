@@ -105,7 +105,33 @@ type FakeOpenCode struct {
 	// exactly one on release" observable. Guarded by f.mu; never read by the
 	// shipped binary or by existing fixtures/tests.
 	promptArrivals map[string]int
+
+	// messagesBeforeCount is an always-on atomic counter of backward-cursor
+	// message-list GETs (GET /session/:sid/message?before=...). Harmless to
+	// existing fixtures/tests (none read it); gives the OF1 oversized-floor
+	// boundary-demand e2e a race-free observable for "did the D-trigger's
+	// EnsureOlderMessages actually reach opencode" and for the anti-misfire
+	// assert (zero backward fetches before the walk reaches the resident
+	// floor).
+	messagesBeforeCount int64 // atomic
+
+	// --- test-only agent-evidence hold latch (composer-hydration e2e) ---
+	//
+	// The agenthold session's message-LIST GET (GET /session/agenthold/message)
+	// blocks on <-agentHoldBlock while armed. See handleFixtureAgentHoldArm —
+	// the /fixture/agent-hold/{arm,release,reset} control surface. The GET
+	// blocks OUTSIDE f.mu (same discipline as the slow-sleep and the
+	// reconcileGetBlock seam above) so the held fetch can never stall the
+	// /session list, the SSE emit fan-out, or sibling sessions' cold-seed.
+	agentHoldMu    sync.Mutex
+	agentHoldBlock chan struct{}
 }
+
+// agentHoldSessionID is the dedicated agent-evidence-hold session (lane-6
+// composer-hydration e2e). It is NOT seeded by New(): it exists only between
+// a /fixture/agent-hold/arm and the matching /fixture/agent-hold/reset, so
+// sibling specs in the serial suite never observe it.
+const agentHoldSessionID = "agenthold"
 
 type messageWithParts struct {
 	Info  map[string]any   `json:"info"`
@@ -593,6 +619,17 @@ func (f *FakeOpenCode) ReconcileGetCount() int64 {
 	return atomic.LoadInt64(&f.reconcileGetCount)
 }
 
+// MessagesBeforeCount returns the number of backward-cursor message-list GETs
+// (GET /session/:sid/message?before=...) observed since the fake was created.
+// Race-free (atomic). Used by the OF1 oversized-floor boundary-demand e2e to
+// assert the D-trigger's remote fetch actually fired (count advanced by
+// exactly one) and the anti-misfire invariant (count frozen while the walk
+// still has resident-local older messages). Delta-based: the shared cluster
+// fake accumulates GETs across the serial package.
+func (f *FakeOpenCode) MessagesBeforeCount() int64 {
+	return atomic.LoadInt64(&f.messagesBeforeCount)
+}
+
 // UserMessageCount returns the number of committed user messages for a session.
 // It reads the fake's in-memory message store (the same store simulatePrompt
 // and commitUserMessage append to), so it reflects what OpenCode has durably
@@ -851,6 +888,9 @@ func (f *FakeOpenCode) Handler() http.Handler {
 	mux.HandleFunc("/fixture/compaction-burst", f.handleFixtureCompactionBurst)
 	mux.HandleFunc("/fixture/orphan", f.handleFixtureOrphan)
 	mux.HandleFunc("/fixture/delete", f.handleFixtureDelete)
+	mux.HandleFunc("/fixture/agent-hold/arm", f.handleFixtureAgentHoldArm)
+	mux.HandleFunc("/fixture/agent-hold/release", f.handleFixtureAgentHoldRelease)
+	mux.HandleFunc("/fixture/agent-hold/reset", f.handleFixtureAgentHoldReset)
 	mux.HandleFunc("/question/", f.handleQuestion)
 	mux.HandleFunc("/question", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -1223,6 +1263,26 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(900 * time.Millisecond)
 	}
 
+	// Agent-evidence hold (web/tests/e2e/agent-hydration-send.spec.ts): while
+	// armed, the agenthold session's message-LIST GET is held INDEFINITELY
+	// (until /fixture/agent-hold/release), not for a bounded sleep — the
+	// composer's "Resolving agent…" pending window must be observable for as
+	// long as the spec needs, with release as the ONLY clock (no timing-only
+	// sleeps in the acceptance contract). Like the slow-sleep above, the block
+	// happens OUTSIDE f.mu: a held GET holds no locks, so the /session list,
+	// the SSE emit fan-out, and sibling cold-seed fetches keep flowing. Only
+	// the message-LIST GET reaches here — the exact-GET (/message/:mid) and
+	// every mutating action return inside the switch above, so the reconciler
+	// and prompt flow are unaffected by the hold.
+	if id == agentHoldSessionID && r.Method == http.MethodGet {
+		f.agentHoldMu.Lock()
+		ch := f.agentHoldBlock
+		f.agentHoldMu.Unlock()
+		if ch != nil {
+			<-ch
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// Honor the backward cursor API (sst/opencode MessageV2.page) like real
@@ -1233,6 +1293,10 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 	msgs := f.messages[id]
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	if before := r.URL.Query().Get("before"); before != "" {
+		// OF1 e2e observable: count every backward-cursor list GET (the
+		// D-trigger's EnsureOlderMessages is the only caller shaped like
+		// this). Atomic, outside f.mu, harmless to every other consumer.
+		atomic.AddInt64(&f.messagesBeforeCount, 1)
 		cid, ctime, ok := decodeMessageCursor(before)
 		if !ok {
 			http.Error(w, "invalid before cursor", http.StatusBadRequest)
@@ -1355,6 +1419,62 @@ func (f *FakeOpenCode) SeedChronologicalMessages(sid string, n int) {
 	if !already {
 		f.sessions = append(f.sessions, map[string]any{
 			"id": sid, "title": "Chronological " + strconv.Itoa(n),
+			"directory": demoDir,
+			"time":      map[string]any{"created": base - float64(n)*1000, "updated": base},
+		})
+	}
+}
+
+// SeedOversizedFloorMessages seeds cm1..cmN chronological (same shape as
+// SeedChronologicalMessages) EXCEPT the message at 1-based index oversizedIdx,
+// which carries TWO ~600 KiB text parts (~1.2 MiB total — over the 1 MiB
+// WindowMaxBytes byte budget, while each part stays under the 1 MiB per-PART
+// capPartJSON cap so the cold-load ingest stores it verbatim). This is the OF1
+// shape: cold tail = newest WindowMaxCount messages INCLUDING the oversized
+// one at the tail's oldest edge (the resident-floor boundary) when
+// oversizedIdx == n-WindowMaxCount+1; the WINDOW projection excludes it
+// (bytesLimited) but the resident store keeps it, so the load-older walk meets
+// an oversized anchor AT the resident floor with remote older history (cm1..)
+// upstream. Measurement/test helper only: appends to f.messages; no live emit.
+func (f *FakeOpenCode) SeedOversizedFloorMessages(sid string, n, oversizedIdx int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	base := float64(time.Now().UnixMilli())
+	out := make([]messageWithParts, 0, n)
+	for i := 0; i < n; i++ {
+		t := base - float64(n-i)*1000 // ascending: cm1 oldest
+		id := fmt.Sprintf("cm%d", i+1)
+		parts := []map[string]any{
+			{"id": "cp" + strconv.Itoa(i+1), "sessionID": sid, "messageID": id, "type": "text", "text": "older turn " + strconv.Itoa(i+1)},
+		}
+		if i+1 == oversizedIdx {
+			// Two ~600 KiB parts: total ~1.2 MiB > 1 MiB WindowMaxBytes
+			// (oversized), each part < 1 MiB (survives capPartJSON verbatim).
+			big := strings.Repeat("x", 600_000)
+			parts = []map[string]any{
+				{"id": "cpA" + strconv.Itoa(i+1), "sessionID": sid, "messageID": id, "type": "text", "text": big},
+				{"id": "cpB" + strconv.Itoa(i+1), "sessionID": sid, "messageID": id, "type": "text", "text": big},
+			}
+		}
+		out = append(out, messageWithParts{
+			Info: map[string]any{
+				"id": id, "sessionID": sid, "role": "assistant", "agent": "build",
+				"time": map[string]any{"created": t, "completed": t + 500},
+			},
+			Parts: parts,
+		})
+	}
+	f.messages[sid] = out
+	already := false
+	for _, s := range f.sessions {
+		if id, _ := s["id"].(string); id == sid {
+			already = true
+			break
+		}
+	}
+	if !already {
+		f.sessions = append(f.sessions, map[string]any{
+			"id": sid, "title": "OversizedFloor " + strconv.Itoa(n),
 			"directory": demoDir,
 			"time":      map[string]any{"created": base - float64(n)*1000, "updated": base},
 		})
@@ -2145,8 +2265,189 @@ func (f *FakeOpenCode) handleFixtureDelete(w http.ResponseWriter, r *http.Reques
 	// Emit a session.deleted event so the aggregator's event subscriber drops it
 	// immediately too (not just on the next reconcile tick). Real OpenCode emits
 	// this when a session is hard-deleted.
-	f.emit("session.deleted", map[string]any{"sessionID": session})
+	//
+	// Shape note: {"info":{"id":...}} — TranslatorV1's session.deleted arm
+	// (pkg/state/translate.go:148) parses an info envelope; the bare
+	// {"sessionID":...} this handler used to emit is silently IGNORED
+	// (NormIgnored), so the live purge never fired and only the 5s tree-reconcile
+	// tick cleaned the store (found while pinning the agent-hold arm/reset
+	// determinism — same trap).
+	f.emit("session.deleted", map[string]any{"info": map[string]any{"id": session}})
 	writeJSON(w, map[string]any{"deleted": session})
+}
+
+// agentHoldSessionRow builds the agenthold session row. A ROOT (no parentID)
+// with a real model so the composer's model side resolves, timestamps old
+// enough to sit among the seeded roots. Fresh `now` per arm so a re-arm after
+// a release reads as a genuinely new row for time-sorted UI.
+func agentHoldSessionRow(now float64) map[string]any {
+	return map[string]any{
+		"id": agentHoldSessionID, "projectID": "proj", "title": "Agent evidence hold", "directory": demoDir,
+		"model": map[string]any{"providerID": "fake", "id": "dummy", "variant": "default"},
+		"time":  map[string]any{"created": now - 6000, "updated": now - 6000},
+	}
+}
+
+// agentHoldTranscript builds the scripted release-time transcript: one user
+// message WITHOUT an agent stamp and one assistant message stamped with the
+// `plan` agent (a real primary agent in the fixture's /agent list). The FE
+// resolver's live scan (sessionLastAgent, web/src/sync/selectors.ts) reads
+// info.agent off ANY message newest-first, so the assistant stamp is the
+// evidence that flips the composer from "Resolving agent…" to "@plan".
+func agentHoldTranscript(now float64) []messageWithParts {
+	return []messageWithParts{
+		{
+			Info:  map[string]any{"id": "hold-u1", "sessionID": agentHoldSessionID, "role": "user", "time": map[string]any{"created": now - 4000, "completed": now - 4000}},
+			Parts: []map[string]any{textPart("hold-u1", agentHoldSessionID, "hold-p1", "Map the deployment topology for the parser service.", now-4000)},
+		},
+		{
+			Info: map[string]any{"id": "hold-a1", "sessionID": agentHoldSessionID, "role": "assistant", "agent": "plan",
+				"time":  map[string]any{"created": now - 3900, "completed": now - 3500},
+				"model": map[string]any{"providerID": "fake", "modelID": "dummy-think", "variant": "high"}},
+			Parts: []map[string]any{textPart("hold-a1", agentHoldSessionID, "hold-p2", "Topology mapped: parser feeds the tokenizer; the fixture harness wraps both. No external calls.", now-3900)},
+		},
+	}
+}
+
+// releaseAgentHoldLatch closes any installed hold latch and disarms it.
+// Idempotent. Closing (not nil-then-race) wakes every held GET at once.
+func (f *FakeOpenCode) releaseAgentHoldLatch() {
+	f.agentHoldMu.Lock()
+	ch := f.agentHoldBlock
+	f.agentHoldBlock = nil
+	f.agentHoldMu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+// handleFixtureAgentHoldArm performs a full deterministic (re)arm of the
+// agent-evidence-hold session. It is idempotent and order-independent: every
+// arm starts from the same fixture-side AND aggregator-visible state, however
+// many releases, prompts, or sibling resets happened before. Steps:
+//
+//  1. Close any stale latch (unblock GETs wedged by a prior arm).
+//  2. Fixture-side reset under f.mu: script the release-time transcript
+//     (dropping any turns accumulated by prompts since the last arm), clear
+//     busy/pending blocker state, bump resetGen (invalidates leaked stall
+//     defers — same rationale as handleFixtureReset), drop any existing row,
+//     append a fresh one.
+//  3. Install the fresh latch BEFORE any emit, so a GET racing the
+//     session.created fan-out already blocks.
+//  4. Emit session.deleted (only if a row existed — the aggregator store's
+//     deleteSessionLocked clears messages, msgLoaded, lastAgent, the
+//     cold-seed memo, and the EnsureMessages single-flight latch: BOTH
+//     memoization traps the brief warns about) then session.created (fresh
+//     re-admit with no lastAgent).
+//
+// While armed: the row is visible in /session immediately (nonempty tree row
+// for the SPA), and the message-LIST GET holds indefinitely — the FE sees no
+// window (not provably-empty), so resolveAgentForSession stays `pending` and
+// the composer shows "Resolving agent…". Test-only infrastructure.
+func (f *FakeOpenCode) handleFixtureAgentHoldArm(w http.ResponseWriter, r *http.Request) {
+	f.releaseAgentHoldLatch()
+	now := float64(time.Now().UnixMilli())
+	row := agentHoldSessionRow(now)
+
+	f.mu.Lock()
+	existed := false
+	filtered := f.sessions[:0]
+	for _, s := range f.sessions {
+		if id, _ := s["id"].(string); id != agentHoldSessionID {
+			filtered = append(filtered, s)
+		} else {
+			existed = true
+		}
+	}
+	f.sessions = append(filtered, row)
+	f.messages[agentHoldSessionID] = agentHoldTranscript(now)
+	delete(f.busy, agentHoldSessionID)
+	delete(f.archived, agentHoldSessionID)
+	for qid, sid := range f.pendingQ {
+		if sid == agentHoldSessionID {
+			delete(f.pendingQ, qid)
+			delete(f.pendingQReq, qid)
+		}
+	}
+	for pid, req := range f.pendingP {
+		if s, _ := req["sessionID"].(string); s == agentHoldSessionID {
+			delete(f.pendingP, pid)
+		}
+	}
+	f.resetGen[agentHoldSessionID]++
+	f.mu.Unlock()
+
+	// Latch first, emits second: any message GET the aggregator spawns off the
+	// session.created fan-out (cold-seed or client-open fetch) must already
+	// block. (A GET that slipped through in the microsecond window between the
+	// stale-latch close above and this install would serve the fresh scripted
+	// transcript early; in the serial spec flow nothing is fetching agenthold
+	// at arm time — the previous page is closed.)
+	f.agentHoldMu.Lock()
+	f.agentHoldBlock = make(chan struct{})
+	f.agentHoldMu.Unlock()
+
+	if existed {
+		// Shape: {"info":{"id":...}} — what TranslatorV1's session.deleted arm
+		// parses (pkg/state/translate.go:148). A bare {"sessionID":...} is
+		// silently IGNORED (NormIgnored), leaving the aggregator store holding
+		// the session's messages/lastAgent/msgLoaded — exactly the stale-state
+		// trap that made a re-arm nondeterministic (repeat-run flake).
+		f.emit("session.deleted", map[string]any{"info": map[string]any{"id": agentHoldSessionID}})
+	}
+	f.emit("session.created", map[string]any{"info": row})
+	writeJSON(w, map[string]any{"armed": agentHoldSessionID})
+}
+
+// handleFixtureAgentHoldRelease releases the evidence hold: held message GETs
+// complete and serve the scripted plan-stamped transcript, which the
+// aggregator's reconcile turns into message deltas + messages.loaded — the FE
+// live scan then resolves the composer to @plan. Idempotent (no-op when not
+// armed). No session-list change: the row was already visible from arm.
+func (f *FakeOpenCode) handleFixtureAgentHoldRelease(w http.ResponseWriter, r *http.Request) {
+	f.releaseAgentHoldLatch()
+	writeJSON(w, map[string]any{"released": agentHoldSessionID})
+}
+
+// handleFixtureAgentHoldReset is the afterEach hygiene teardown: release any
+// hold, remove the session row + transcript + blocker state fixture-side, and
+// emit session.deleted so the aggregator store forgets it entirely. After a
+// reset the session does not exist at all — sibling specs in the serial suite
+// never observe agenthold, making the spec order-independent.
+func (f *FakeOpenCode) handleFixtureAgentHoldReset(w http.ResponseWriter, r *http.Request) {
+	f.releaseAgentHoldLatch()
+	f.mu.Lock()
+	existed := false
+	filtered := f.sessions[:0]
+	for _, s := range f.sessions {
+		if id, _ := s["id"].(string); id != agentHoldSessionID {
+			filtered = append(filtered, s)
+		} else {
+			existed = true
+		}
+	}
+	f.sessions = filtered
+	delete(f.messages, agentHoldSessionID)
+	delete(f.busy, agentHoldSessionID)
+	delete(f.archived, agentHoldSessionID)
+	delete(f.resetGen, agentHoldSessionID)
+	for qid, sid := range f.pendingQ {
+		if sid == agentHoldSessionID {
+			delete(f.pendingQ, qid)
+			delete(f.pendingQReq, qid)
+		}
+	}
+	for pid, req := range f.pendingP {
+		if s, _ := req["sessionID"].(string); s == agentHoldSessionID {
+			delete(f.pendingP, pid)
+		}
+	}
+	f.mu.Unlock()
+	if existed {
+		// Same info-envelope shape as arm (see the note there).
+		f.emit("session.deleted", map[string]any{"info": map[string]any{"id": agentHoldSessionID}})
+	}
+	writeJSON(w, map[string]any{"reset": agentHoldSessionID})
 }
 
 func (f *FakeOpenCode) appendMessage(sessionID string, m messageWithParts) {
