@@ -189,13 +189,24 @@ with --opencode-url, or spawn a survivable detached instance with
 				if opencodeServeCmd != nil && opencodeServeCmd.Process != nil {
 					curPID = opencodeServeCmd.Process.Pid
 				}
-				c, err := restartDetachedOpenCode(localOpenCodeBin, opencodePort, cwd, curPID)
+				oldPort := opencodePort
+				c, effectivePort, err := restartDetachedOpenCode(localOpenCodeBin, oldPort, cwd, curPID)
 				if c != nil {
 					opencodeServeCmd = c
 				}
 				if err != nil {
 					ocLife.SetFailed(fmt.Sprintf("detached opencode restart failed: %v", err), nil)
 					return err
+				}
+				// P1-API-003: BEFORE the readiness flip, propagate a fresh spawn
+				// port to everything still targeting the old one — the ocLife
+				// status URL and the RUNNING web server's proxy + aggregators
+				// (applyFreshPortRetarget is the SAME wiring client-daemon's arm
+				// uses, so the two binaries cannot drift). Same-port restarts
+				// no-op here.
+				if p, u, retargeted := applyFreshPortRetarget(effectivePort, oldPort, ocLife, srv); retargeted {
+					opencodePort, opencodeURL = p, u
+					log.Printf("detached opencode restart landed on a fresh port %d — retargeted the running local-server (was port %d)", p, oldPort)
 				}
 				ocLife.SetReady()
 				return nil

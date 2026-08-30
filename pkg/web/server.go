@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
@@ -55,8 +56,14 @@ var hostDistFS embed.FS
 // Server wires the aggregator's view to HTTP: /vh/* protocol endpoints, /oc/*
 // OpenCode passthrough, and the embedded SPA at /.
 type Server struct {
-	agg      *aggregator.Aggregator // default project (OpenCode serve cwd)
-	proxy    *httputil.ReverseProxy
+	agg *aggregator.Aggregator // default project (OpenCode serve cwd)
+	// proxy is the /oc/* reverse proxy target. Stored in an atomic pointer
+	// (P1-API-003): RetargetOpenCode swaps the WHOLE proxy after a
+	// fresh-port restart of the serve process, and handlePassthrough loads
+	// it per request — never a torn half-retargeted director. Always built
+	// by newOpenCodeProxy so a swap preserves the proxy configuration
+	// exactly (FlushInterval + ErrorHandler).
+	proxy    atomic.Pointer[httputil.ReverseProxy]
 	staticFS fs.FS
 	static   http.Handler
 	// hostFS is the embedded multi-server HOST shell (host-dist), served at `/`
@@ -472,16 +479,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 	if err != nil {
 		return nil, err
 	}
-	rp := httputil.NewSingleHostReverseProxy(target)
-	rp.FlushInterval = -1 // flush immediately so any proxied stream isn't buffered
-	// A failed proxy hop (OpenCode down, connection reset) otherwise surfaces as
-	// a bare 502 with nothing in the logs — exactly the case that's painful to
-	// diagnose. Log the upstream error with the method+path that triggered it.
-	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		vhlog.Error("proxy upstream error", "method", r.Method, "path", r.URL.Path, "err", err)
-		w.WriteHeader(http.StatusBadGateway)
-		_, _ = w.Write([]byte("upstream error: " + err.Error()))
-	}
+	rp := newOpenCodeProxy(target)
 
 	// Ensure the PWA manifest is served with a sensible content type (Go's
 	// default mime table has no .webmanifest entry).
@@ -529,7 +527,6 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 	}
 	srv := &Server{
 		agg:        agg,
-		proxy:      rp,
 		staticFS:   sub,
 		renderer:   render.New(),
 		static:     http.FileServer(http.FS(sub)),
@@ -564,6 +561,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		archiveJobsActiveRoots:  map[archiveFailureKey]bool{},
 		archiveBackstopInterval: defaultArchiveBackstopInterval,
 	}
+	srv.proxy.Store(rp)
 	// Arm the DEFAULT aggregator synchronously, BEFORE the server can serve
 	// any HTTP request. The default aggregator is created in the daemon
 	// (cmd/local-server.go / cmd/client-daemon.go) and started with plain
@@ -585,6 +583,61 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 	srv.bgWG.Add(1)
 	go srv.runArchiveBackstop()
 	return srv, nil
+}
+
+// newOpenCodeProxy builds the /oc/* reverse proxy for target. The ONE builder
+// for both NewServer and RetargetOpenCode (P1-API-003) so a re-target rebuild
+// preserves the proxy configuration exactly: immediate flushing (SSE through
+// the passthrough must not be buffered) and the 502 ErrorHandler that logs
+// the method+path of a failed upstream hop instead of surfacing a bare 502.
+func newOpenCodeProxy(target *url.URL) *httputil.ReverseProxy {
+	rp := httputil.NewSingleHostReverseProxy(target)
+	rp.FlushInterval = -1 // flush immediately so any proxied stream isn't buffered
+	// A failed proxy hop (OpenCode down, connection reset) otherwise surfaces as
+	// a bare 502 with nothing in the logs — exactly the case that's painful to
+	// diagnose. Log the upstream error with the method+path that triggered it.
+	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		vhlog.Error("proxy upstream error", "method", r.Method, "path", r.URL.Path, "err", err)
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("upstream error: " + err.Error()))
+	}
+	return rp
+}
+
+// RetargetOpenCode re-targets the RUNNING server at a new OpenCode base URL
+// (P1-API-003: after a fresh-port restart of the serve process — foreign
+// listener on the old port, or a re-derived port — the daemon must keep
+// serving through the new port immediately). Under aggMu it:
+//
+//  1. records s.opencodeURL, so per-directory aggregators created LAZILY
+//     after the swap inherit the new target (aggFor reads it under the same
+//     lock);
+//  2. atomically swaps the /oc/* reverse proxy for one built against the new
+//     target (whole-proxy swap: a director's parsed target is captured at
+//     construction, so mutating it in place could never take effect);
+//  3. re-targets every LIVE aggregator's client, the default "" included —
+//     the aggregator keeps its store/subscribers and its reconnect loop
+//     re-dials the new BaseURL per connection.
+//
+// Callers re-target BEFORE flipping any readiness signal (ocLife.SetReady):
+// an observer that acts on readiness must never see ready state served
+// through the old port. A same-URL call is a benign refresh. An unparseable
+// URL keeps the current target (per-request 502s) rather than corrupting the
+// running server; daemon-resolved URLs are parseable by construction.
+func (s *Server) RetargetOpenCode(baseURL string) {
+	u := strings.TrimRight(baseURL, "/")
+	target, err := url.Parse(u)
+	if err != nil {
+		vhlog.Error("retarget refused an unparseable opencode URL; keeping the current target", "url", baseURL, "err", err)
+		return
+	}
+	s.aggMu.Lock()
+	defer s.aggMu.Unlock()
+	s.opencodeURL = u
+	s.proxy.Store(newOpenCodeProxy(target))
+	for _, a := range s.aggs {
+		a.Retarget(u)
+	}
 }
 
 // SetReassertDelay overrides the per-Server re-assert delay (a test seam that
@@ -3123,7 +3176,11 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "" {
 		r.URL.Path = "/"
 	}
-	s.proxy.ServeHTTP(w, r)
+	// P1-API-003: load per request — the proxy is swapped wholesale (under
+	// aggMu in RetargetOpenCode) after a fresh-port restart, and the atomic
+	// load/store pair guarantees every request sees exactly one coherent
+	// proxy: old or new, never torn.
+	s.proxy.Load().ServeHTTP(w, r)
 }
 
 // knownStatic reports whether p is a real embedded static file path in the

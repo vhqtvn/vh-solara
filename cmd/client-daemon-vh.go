@@ -347,13 +347,23 @@ func (rt *clientDaemonRuntime) restartOpencode() error {
 		if rt.opencodeServeCmd != nil && rt.opencodeServeCmd.Process != nil {
 			curPID = rt.opencodeServeCmd.Process.Pid
 		}
-		c, err := restartDetachedOpenCode(daemonOpenCodeBin, rt.opencodePort, rt.cwd, curPID, rt.ocLife.Ring().Writer())
+		oldPort := rt.opencodePort
+		c, effectivePort, err := restartDetachedOpenCode(daemonOpenCodeBin, oldPort, rt.cwd, curPID, rt.ocLife.Ring().Writer())
 		if c != nil {
 			rt.opencodeServeCmd = c
 		}
 		if err != nil {
 			rt.ocLife.SetFailed(fmt.Sprintf("detached opencode restart failed: %v", err), nil)
 			return err
+		}
+		// P1-API-003: BEFORE the readiness flip, propagate a fresh spawn
+		// port (foreign listener on the old port, or a D2 re-derive) to
+		// everything still targeting the old one — the ocLife status URL
+		// and the RUNNING web server's proxy + aggregators. Same-port
+		// restarts no-op here.
+		if p, u, retargeted := applyFreshPortRetarget(effectivePort, oldPort, rt.ocLife, rt.vhSrv); retargeted {
+			rt.opencodePort, rt.opencodeURL = p, u
+			log.Printf("detached opencode restart landed on a fresh port %d — retargeted the running daemon (was port %d)", p, oldPort)
 		}
 		rt.ocLife.SetReady()
 		return nil

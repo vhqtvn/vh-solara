@@ -245,7 +245,7 @@ func TestRestartDetachedOpenCodeSerial(t *testing.T) {
 	}
 	oldPID := res.Cmd.Process.Pid
 
-	c2, err := restartDetachedOpenCode(sc.bin, res.Port, sc.dir, oldPID)
+	c2, _, err := restartDetachedOpenCode(sc.bin, res.Port, sc.dir, oldPID)
 	if err != nil {
 		t.Fatalf("restart: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestRestartDetachedSkipsForeignPID(t *testing.T) {
 	// Recorded state points at the sacrificial pid with a foreign cmdline.
 	writeOCState(ocState{PID: sacrifice.Process.Pid, Port: 1})
 
-	c, err := restartDetachedOpenCode(sc.bin, freePort(), sc.dir, 0)
+	c, _, err := restartDetachedOpenCode(sc.bin, freePort(), sc.dir, 0)
 	if err != nil {
 		t.Fatalf("restart: %v", err)
 	}
@@ -307,7 +307,7 @@ func TestRestartDetachedContended(t *testing.T) {
 	}
 	defer g.Release()
 
-	c, err := restartDetachedOpenCode(sc.bin, freePort(), sc.dir, 0)
+	c, _, err := restartDetachedOpenCode(sc.bin, freePort(), sc.dir, 0)
 	if err == nil || c != nil {
 		t.Fatalf("restart under contention must fail; got cmd=%v err=%v", c, err)
 	}
@@ -340,7 +340,7 @@ func TestRestartDetachedOrphanedHolder(t *testing.T) {
 	}
 	writeOCState(ocState{PID: fakes[0], Port: 1}) // dead recorded pid
 
-	c, err := restartDetachedOpenCode(sc.bin, freePort(), sc.dir, 0)
+	c, _, err := restartDetachedOpenCode(sc.bin, freePort(), sc.dir, 0)
 	if err == nil || c != nil {
 		t.Fatalf("restart beside an orphaned owner must fail; got cmd=%v err=%v", c, err)
 	}
@@ -416,7 +416,7 @@ func TestRestartDetachedReDerivesRecordedPort(t *testing.T) {
 	})
 	writeOCState(ocState{PID: sacrifice.Process.Pid, Port: port})
 
-	c, err := restartDetachedOpenCode(sc.bin, 0, sc.dir, 0)
+	c, _, err := restartDetachedOpenCode(sc.bin, 0, sc.dir, 0)
 	if err != nil {
 		t.Fatalf("restart at port<=0 must re-derive the recorded port and succeed: %v", err)
 	}
@@ -440,7 +440,7 @@ func TestRestartDetachedFreshPortWhenNoState(t *testing.T) {
 	if _, err := os.Stat(ocStatePath()); err == nil {
 		t.Fatal("precondition: a fresh scenario has no state file")
 	}
-	c, err := restartDetachedOpenCode(sc.bin, 0, sc.dir, 0)
+	c, _, err := restartDetachedOpenCode(sc.bin, 0, sc.dir, 0)
 	if err != nil {
 		t.Fatalf("restart at port<=0 with no state must pick a fresh port and succeed: %v", err)
 	}
@@ -483,7 +483,7 @@ func TestRestartDetachedForeignListenerOnRecordedPort(t *testing.T) {
 
 	// port<=0: D2 re-derives the recorded (squatted) port; the guard must
 	// catch it and swap in a fresh one.
-	c, err := restartDetachedOpenCode(sc.bin, 0, sc.dir, 0)
+	c, effectivePort, err := restartDetachedOpenCode(sc.bin, 0, sc.dir, 0)
 	if err != nil {
 		t.Fatalf("restart beside a foreign listener on the recorded port must succeed on a fresh port: %v", err)
 	}
@@ -496,6 +496,11 @@ func TestRestartDetachedForeignListenerOnRecordedPort(t *testing.T) {
 	}
 	if st.Port <= 0 {
 		t.Fatalf("published port %d must be a fresh port > 0", st.Port)
+	}
+	// P1-API-003: the returned effective port is what the running daemon
+	// retargets onto — it must equal the published fresh spawn port exactly.
+	if effectivePort != st.Port {
+		t.Fatalf("effectivePort=%d want the published fresh port %d (a mismatch retargets the running daemon at the wrong port)", effectivePort, st.Port)
 	}
 	if !ocCmdlineMatches(c.Process.Pid, st.Port) {
 		t.Fatalf("the child must have been spawned with --port %d (the fresh port)", st.Port)
@@ -531,7 +536,7 @@ func TestRestartDetachedForeignListenerOnSuppliedPort(t *testing.T) {
 	})
 	writeOCState(ocState{PID: sacrifice.Process.Pid, Port: port})
 
-	c, err := restartDetachedOpenCode(sc.bin, port, sc.dir, 0) // caller-supplied >0
+	c, effectivePort, err := restartDetachedOpenCode(sc.bin, port, sc.dir, 0) // caller-supplied >0
 	if err != nil {
 		t.Fatalf("restart beside a foreign listener on the supplied port must succeed on a fresh port: %v", err)
 	}
@@ -544,6 +549,11 @@ func TestRestartDetachedForeignListenerOnSuppliedPort(t *testing.T) {
 	}
 	if st.Port <= 0 {
 		t.Fatalf("published port %d must be a fresh port > 0", st.Port)
+	}
+	// P1-API-003: the returned effective port must equal the published fresh
+	// spawn port — it is what the running daemon retargets onto.
+	if effectivePort != st.Port {
+		t.Fatalf("effectivePort=%d want the published fresh port %d (a mismatch retargets the running daemon at the wrong port)", effectivePort, st.Port)
 	}
 	if !ocCmdlineMatches(c.Process.Pid, st.Port) {
 		t.Fatalf("the child must have been spawned with --port %d (the fresh port)", st.Port)
@@ -586,7 +596,7 @@ func TestRestartDetachedWaitsOutUnsignaledHolder(t *testing.T) {
 	t.Cleanup(release)
 
 	start := time.Now()
-	c, errRestart := restartDetachedOpenCode(sc.bin, freePort(), sc.dir, 0)
+	c, _, errRestart := restartDetachedOpenCode(sc.bin, freePort(), sc.dir, 0)
 	if errRestart != nil {
 		t.Fatalf("restart must wait out the un-signaled holder and proceed: %v", errRestart)
 	}
@@ -631,7 +641,7 @@ func TestRestartDetachedCurPIDHolderWait(t *testing.T) {
 	writeOCState(ocState{PID: sacrifice.Process.Pid, Port: 1})
 
 	port := freePort()
-	c, err := restartDetachedOpenCode(sc.bin, port, sc.dir, oldPID)
+	c, _, err := restartDetachedOpenCode(sc.bin, port, sc.dir, oldPID)
 	if err != nil {
 		t.Fatalf("restart: %v", err)
 	}

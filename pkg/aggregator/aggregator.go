@@ -274,3 +274,11 @@ func (a *Aggregator) Store() *state.Store { return a.store }
 
 // Client exposes the underlying OpenCode client (used for write passthrough).
 func (a *Aggregator) Client() *opencode.Client { return a.client }
+
+// Retarget points the aggregator's OpenCode client at a new base URL
+// (P1-API-003: after a fresh-port restart of the serve process, the RUNNING
+// daemon keeps this aggregator and simply re-targets it — the reconnect loop
+// re-dials per connection and picks up the new target on its own, so no
+// reconnect-nudging is needed here). Safe for concurrent use; the store, its
+// subscribers, and all cached state survive the swap.
+func (a *Aggregator) Retarget(baseURL string) { a.client.SetBaseURL(baseURL) }

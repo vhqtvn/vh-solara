@@ -1011,12 +1011,16 @@ func (s *Server) handleReloadProject(w http.ResponseWriter, r *http.Request) {
 	// to it directly.
 	s.aggMu.Lock()
 	a, ok := s.aggs[dir]
+	// opencodeURL is read UNDER the lock (P1-API-003): RetargetOpenCode made
+	// it mutable — an unlocked read here could observe a stale target after
+	// a fresh-port restart, sending Dispose at a dead port.
+	target := s.opencodeURL
 	s.aggMu.Unlock()
 	var client *opencode.Client
 	if ok {
 		client = a.Client()
 	} else {
-		client = opencode.New(s.opencodeURL)
+		client = opencode.New(target)
 		client.Directory = dir
 	}
 	if err := client.Dispose(r.Context()); err != nil {

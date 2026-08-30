@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/oclife"
+	"github.com/vhqtvn/vh-solara/pkg/web"
 )
 
 // DetachedStartVerdict is the structured outcome of the one cooperating
@@ -305,10 +306,18 @@ var ocOwnerReleaseWait = 15 * time.Second
 // left running and owner-covered with state unpublished — the same posture
 // as the boot path's readiness failure, which surfaces only the pid/port,
 // not the child handle.
-func restartDetachedOpenCode(bin string, port int, workspace string, curPID int, extraW ...io.Writer) (*exec.Cmd, error) {
+//
+// Returns (cmd, effectivePort, err): effectivePort is the FINAL spawn port
+// on success (the D2 re-derived port, the caller-supplied port, or the
+// fresh port a foreign-listener swap picked — exactly what writeOCState
+// published), the ATTEMPTED port on a readiness failure (available for
+// boot-parity wiring; nothing is proven listening), and 0 on a spawn error
+// (no child exists). P1-API-003: the detached-restart arms consume it to
+// retarget the RUNNING daemon at the new port (applyFreshPortRetarget).
+func restartDetachedOpenCode(bin string, port int, workspace string, curPID int, extraW ...io.Writer) (cmd *exec.Cmd, effectivePort int, err error) {
 	guard, verdict, reason := acquireOCSpawnGuard()
 	if verdict != ocLockAcquired {
-		return nil, fmt.Errorf("detached restart serialized out (%s): %s", verdict, reason)
+		return nil, 0, fmt.Errorf("detached restart serialized out (%s): %s", verdict, reason)
 	}
 	defer guard.Release()
 
@@ -373,7 +382,7 @@ func restartDetachedOpenCode(bin string, port int, workspace string, curPID int,
 		if len(names) == 0 {
 			names = []string{"(none discoverable)"}
 		}
-		return nil, fmt.Errorf("old detached OpenCode did not release the project owner lock (a descendant may retain it) — NOT respawning beside it; holders: %s",
+		return nil, 0, fmt.Errorf("old detached OpenCode did not release the project owner lock (a descendant may retain it) — NOT respawning beside it; holders: %s",
 			strings.Join(names, ", "))
 	}
 
@@ -387,25 +396,57 @@ func restartDetachedOpenCode(bin string, port int, workspace string, curPID int,
 	// targets the foreign service, re-poisoned by every further restart,
 	// healed only at daemon boot). One final freeness check at this single
 	// port-finalization point trades that for truthful fresh-port state; the
-	// caller's stale URL target heals at the next daemon boot (port
-	// propagation is deliberately out of scope).
+	// caller retargets the RUNNING daemon at the fresh port immediately
+	// (P1-API-003 — applyFreshPortRetarget), so the stale-URL healing no
+	// longer waits for the next daemon boot.
 	if !portFree(port) {
 		fresh := freePort()
 		log.Printf("detached restart: spawn port %d is taken by a foreign listener — respawning on a fresh port %d", port, fresh)
 		port = fresh
 	}
 
-	cmd, err := guard.startChildWithOwner(bin, port, workspace, extraW...)
+	cmd, err = guard.startChildWithOwner(bin, port, workspace, extraW...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to start detached opencode serve: %v", err)
+		return nil, 0, fmt.Errorf("failed to start detached opencode serve: %v", err)
 	}
 	if err := waitForPort(port, 30*time.Second); err != nil {
 		// Child left running + owner-covered; state stays unpublished (same
 		// posture as the boot path's readiness failure).
-		return cmd, fmt.Errorf("opencode serve failed to listen on port %d: %v", port, err)
+		return cmd, port, fmt.Errorf("opencode serve failed to listen on port %d: %v", port, err)
 	}
 	writeOCState(ocState{PID: cmd.Process.Pid, Port: port}) // best-effort; unchanged discard semantics
-	return cmd, nil
+	return cmd, port, nil
+}
+
+// applyFreshPortRetarget is the P1-API-003 port-propagation wiring shared by
+// BOTH detached-restart arms (client-daemon --web=vh and local-server), so
+// the two binaries cannot drift: when a serialized restart landed on a port
+// DIFFERENT from the one the runtime was serving through, it re-targets the
+// running daemon at the new port — the lifecycle status URL plus every live
+// web-server/proxy capture — and hands the caller the new port/URL to
+// record. Returns retargeted=false for a no-op.
+//
+// Called BEFORE the restart's ocLife.SetReady so an observer that acts on
+// readiness (Snapshot().OpenCodeURL, UI restart flows) never sees ready
+// state served through the old port.
+//
+// effectivePort semantics come from restartDetachedOpenCode: final spawn
+// port on success, attempted port on readiness-failure, 0 on spawn error.
+// A <=0 or port-equal value is a no-op — a same-port restart needs no
+// proxy swap, and a failed restart keeps the truthful OLD target (dead
+// loopback 502s) rather than wiring an unverified port. A nil srv (no web
+// server built — not a production shape, but a defensive one) still updates
+// the lifecycle URL.
+func applyFreshPortRetarget(effectivePort, currentPort int, life *oclife.Lifecycle, srv *web.Server) (port int, u string, retargeted bool) {
+	if effectivePort <= 0 || effectivePort == currentPort {
+		return currentPort, "", false
+	}
+	u = fmt.Sprintf("http://127.0.0.1:%d", effectivePort)
+	life.SetOpenCodeURL(u)
+	if srv != nil {
+		srv.RetargetOpenCode(u)
+	}
+	return effectivePort, u, true
 }
 
 // reattachedResult / occupiedResult keep the operator-facing reasons of the

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -278,5 +280,83 @@ func TestMessagesTailNextCursor(t *testing.T) {
 	}
 	if next2 != "" {
 		t.Fatalf("nextCursor: want empty (no header — tail is the whole transcript), got %q", next2)
+	}
+}
+
+// TestClientSetBaseURLConcurrent — P1-API-003: SetBaseURL retargets a Client
+// that may be mid-request (the RUNNING daemon swaps the serve target after a
+// fresh-port restart while the aggregator's fetches and reconnect loop keep
+// issuing requests). Concurrent SetBaseURL + request traffic must be
+// race-free (run under -race) and every request must land intact on ONE of
+// the two targets — a torn base URL would fail to parse/dial and surface as
+// a request error.
+func TestClientSetBaseURLConcurrent(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`[]`)) // a valid empty session page for ListSessions
+	}
+	s1 := httptest.NewServer(http.HandlerFunc(handler))
+	t.Cleanup(s1.Close)
+	s2 := httptest.NewServer(http.HandlerFunc(handler))
+	t.Cleanup(s2.Close)
+
+	c := New(s1.URL)
+	if got := c.BaseURL(); got != s1.URL {
+		t.Fatalf("BaseURL: want %q, got %q", s1.URL, got)
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	var reqErr atomic.Int64
+
+	// Writers flip the target between the two servers.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if i%2 == 0 {
+					c.SetBaseURL(s1.URL)
+				} else {
+					c.SetBaseURL(s2.URL)
+				}
+			}
+		}(i)
+	}
+	// Readers issue real requests; every one must succeed against one of the
+	// two live targets.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := c.ListSessions(context.Background()); err != nil {
+					reqErr.Add(1)
+				}
+			}
+		}()
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	if n := reqErr.Load(); n != 0 {
+		t.Fatalf("%d concurrent requests failed while SetBaseURL raced them — a torn target escaped the guard", n)
+	}
+	// Trailing slash normalization survives the swap path too.
+	c.SetBaseURL(s2.URL + "/")
+	if got := c.BaseURL(); got != s2.URL {
+		t.Fatalf("SetBaseURL must TrimRight('/'): want %q, got %q", s2.URL, got)
 	}
 }

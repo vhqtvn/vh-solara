@@ -16,6 +16,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
@@ -23,24 +24,53 @@ import (
 
 // Client talks to a local opencode server (from `opencode serve`).
 type Client struct {
-	BaseURL string // e.g. http://127.0.0.1:4096
+	// baseURL is the serve target (e.g. http://127.0.0.1:4096). MUTABLE
+	// (P1-API-003): a fresh-port restart of the serve process retargets the
+	// RUNNING daemon's client in place via SetBaseURL instead of rebuilding
+	// it, so every holder keeps its handle and the next request dials the
+	// new port. Guarded by mu; newRequest reads it under RLock on every
+	// request. Precedent: Directory is likewise mutated post-construction
+	// (construction-time only, before concurrent use).
+	baseURL string
 	HTTP    *http.Client
 
 	// Directory scopes requests to a workspace. When empty, the server falls
 	// back to the serve process's cwd (the single-workspace v1 case).
 	Directory string
+
+	// mu guards baseURL. RWMutex: newRequest takes the read side per
+	// request; SetBaseURL takes the write side (rare — once per fresh-port
+	// restart).
+	mu sync.RWMutex
 }
 
 // New builds a Client for the given base URL.
 func New(baseURL string) *Client {
 	return &Client{
-		BaseURL: strings.TrimRight(baseURL, "/"),
+		baseURL: strings.TrimRight(baseURL, "/"),
 		HTTP:    &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
+// BaseURL returns the current serve target.
+func (c *Client) BaseURL() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.baseURL
+}
+
+// SetBaseURL retargets the client at a new serve target (P1-API-003: the
+// running daemon follows a fresh-port restart of `opencode serve`). Safe for
+// concurrent use: a request racing the swap dials either the old or the new
+// target — never a torn URL.
+func (c *Client) SetBaseURL(baseURL string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.baseURL = strings.TrimRight(baseURL, "/")
+}
+
 func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, body)
+	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL()+path, body)
 	if err != nil {
 		return nil, err
 	}
