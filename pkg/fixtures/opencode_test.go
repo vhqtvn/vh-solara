@@ -725,7 +725,7 @@ func TestAgentHoldReArmStripsAccumulatedTurns(t *testing.T) {
 	body := `{"parts":[{"type":"text","text":"probe turn"}]}`
 	resp, _ := postJSON(t, srv, "/session/agenthold/prompt_async", body)
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("prompt_async: got %d want 204", resp.StatusCode)
+		t.Fatalf("prompt_async: got %d want 204 (or 502 drop-mode)", resp.StatusCode)
 	}
 	waitForTranscript(t, f, 4) // 2 scripted + committed user + streamed assistant
 
@@ -805,8 +805,10 @@ func TestAgentHoldEventsCarryTranslatorShapes(t *testing.T) {
 	postJSON(t, srv, "/fixture/agent-hold/reset", "")
 
 	// Sequence on the feed: created (arm #1 — row absent before), deleted
-	// (reset — row existed), deleted + created (arm #2 — the path a repeat
-	// run takes). The pins: EVERY deleted must carry the info envelope the
+	// (reset — the row existed THERE; the reset site owns that emit), created
+	// (arm #2 — post-reset the row is absent again, so the arm site runs with
+	// existed=false and emits created only; this is the path a repeat run
+	// takes). The pins: EVERY deleted must carry the info envelope the
 	// translator parses, and a created must carry the fresh row as info.
 	postJSON(t, srv, "/fixture/agent-hold/arm", "")
 
@@ -834,5 +836,43 @@ func TestAgentHoldEventsCarryTranslatorShapes(t *testing.T) {
 	}
 	if !sawCreated {
 		t.Fatalf("no session.created (with the fresh row as info) observed on the SSE feed within 2s")
+	}
+
+	// ARM-site deleted pin: arm #2 re-created the row, so the deleted pinned
+	// above can only have come from the RESET site — the arm site's own
+	// deleted (pkg/fixtures/opencode.go: if existed { emit session.deleted })
+	// has not been observed on this feed yet. Arm once more, now on the
+	// EXISTING row (existed=true), and pin that SECOND session.deleted
+	// carrying the same info envelope. Drain leftover buffered events first
+	// (the loop above exits as soon as both flags are set, e.g. before arm
+	// #2's created is read), so any deleted seen below is provably the
+	// arm-site one.
+	quiesced := false
+	for !quiesced {
+		select {
+		case <-ch:
+		case <-time.After(150 * time.Millisecond):
+			quiesced = true
+		}
+	}
+	postJSON(t, srv, "/fixture/agent-hold/arm", "")
+
+	var sawArmDeleted bool
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !sawArmDeleted {
+		select {
+		case raw := <-ch:
+			if strings.Contains(raw, `"session.deleted"`) {
+				if strings.Contains(raw, `"info":{"id":"`+agentHoldSessionID+`"}`) {
+					sawArmDeleted = true
+				} else {
+					t.Fatalf("arm-site session.deleted payload lacks the info envelope the translator parses (got %s) — it would be silently ignored", raw)
+				}
+			}
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if !sawArmDeleted {
+		t.Fatalf("no arm-site session.deleted observed on the SSE feed within 2s")
 	}
 }

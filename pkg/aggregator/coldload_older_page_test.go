@@ -129,9 +129,15 @@ func TestColdLoadTailCursorTruthfulHasOlder(t *testing.T) {
 	reached := ""
 	for step := 0; step < 32; step++ {
 		page := agg.Store().SnapshotMessagesPage(sid, before, state.WindowMaxCount, 1<<20)
-		// Boundary-demand D-trigger (messages_http.go:122): floor hit without
-		// a count/byte/oversized limit and not known-exhausted → fetch one
-		// older page from opencode, merge, re-project.
+		// Boundary-demand D-trigger (pkg/web/messages_http.go:133-140): the
+		// handler gate is resident-floor equality — BoundaryFound &&
+		// !CountLimited && !BytesLimited && !HistoryExhausted && before ==
+		// floorID (before != floorID defers to the next click; the old
+		// !OversizedItem term was dropped). This walk keeps a stricter inline
+		// replication — still testing !OversizedItem, walking `before` via
+		// the loop cursor instead of floor equality — equivalent on this
+		// light, never-oversized fixture: fetch one older page from opencode,
+		// merge, re-project.
 		if page.BoundaryFound && !page.CountLimited && !page.BytesLimited && !page.OversizedItem && !page.HistoryExhausted {
 			if oid, oms, ok := agg.Store().OldestResidentCursorTuple(sid); ok {
 				if err := agg.EnsureOlderMessages(sid, oid, oms); err != nil {

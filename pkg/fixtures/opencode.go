@@ -1295,7 +1295,9 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 	if before := r.URL.Query().Get("before"); before != "" {
 		// OF1 e2e observable: count every backward-cursor list GET (the
 		// D-trigger's EnsureOlderMessages is the only caller shaped like
-		// this). Atomic, outside f.mu, harmless to every other consumer.
+		// this). The atomic ops keep the counter race-free; that this
+		// critical section holds f.mu is incidental — readers observe the
+		// count via atomic.LoadInt64, never via the mutex.
 		atomic.AddInt64(&f.messagesBeforeCount, 1)
 		cid, ctime, ok := decodeMessageCursor(before)
 		if !ok {

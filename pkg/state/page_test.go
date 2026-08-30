@@ -168,9 +168,9 @@ func TestPage_OversizedAnchor(t *testing.T) {
 		t.Fatalf("newest_id: want m2 (overlap == RequestBefore), got %q", res.NewestID)
 	}
 	// m1 IS the session's oldest (index 0, no further older) → has_older false
-	// (truthful end-of-history beyond the pair).
+	// (truthful end of resident history beyond the pair).
 	if res.HasOlder {
-		t.Fatalf("has_older: want false (m1 is the session's oldest; truthful end-of-history), got true")
+		t.Fatalf("has_older: want false (m1 is the session's oldest; truthful end of resident history), got true")
 	}
 	if !res.OversizedItem {
 		t.Fatalf("oversized_item: want true (anchor alone > maxBytes), got false")
@@ -410,9 +410,9 @@ func TestPage_ForwardProgress_ByteOvershoot(t *testing.T) {
 	// fires when the byte bound rejects the NEXT older message after the
 	// force-included first-older. Here m0 IS the session's oldest (index 0, no
 	// further older), so the loop exits naturally with no limit flag →
-	// bytes_limited false, has_older false (truthful end-of-history).
+	// bytes_limited false, has_older false (truthful end of resident history).
 	if res.HasOlder {
-		t.Fatalf("has_older: want false (m0 is the session's oldest; truthful end-of-history), got true")
+		t.Fatalf("has_older: want false (m0 is the session's oldest; truthful end of resident history), got true")
 	}
 	if res.BytesLimited {
 		t.Fatalf("bytes_limited: want false (loop exited naturally at the oldest), got true")
@@ -548,7 +548,7 @@ func TestPage_ForwardProgress_OversizedNeighbor_WithMoreOlder(t *testing.T) {
 // TestPage_ForwardProgress_ForceIncludedIsOldest guards constraint #2: when the
 // force-included first-older IS the session's oldest message (no further older
 // exists), has_older MUST be false — do NOT leave a stale bytes_limited=true
-// implying more exist. This is the truthful end-of-history signal.
+// implying more exist. This is the truthful end-of-resident-history signal.
 func TestPage_ForwardProgress_ForceIncludedIsOldest(t *testing.T) {
 	// [m0(big-ish), m1(anchor)]: m0 is the ONLY strictly-older. anchor + m0 >
 	// maxBytes (sub-case b), but m0 alone fits. After force-including m0, the
@@ -681,8 +681,13 @@ func TestPage_ForwardProgress_OversizedAnchor_WithNeighbors(t *testing.T) {
 	if !res.OversizedItem {
 		t.Fatalf("oversized_item: want true (anchor alone > maxBytes), got false")
 	}
-	// The D-trigger gating flags: OversizedItem=true suppresses the boundary-
-	// demand fetch; bytes_limited/count_limited stay false (no ordinary
+	// The D-trigger gating flags: the boundary-demand fetch gates on
+	// resident-floor equality (pkg/web/messages_http.go:133-140), NOT on
+	// !OversizedItem — it fires only when BoundaryFound && !CountLimited &&
+	// !BytesLimited && !HistoryExhausted && before == floorID. This shape
+	// (oversized pair with m0 still resident-older) keeps before != floorID,
+	// so the fetch defers to the click that walks `before` down to the
+	// floor. bytes_limited/count_limited stay false (no ordinary
 	// accumulation ran for this branch).
 	if res.BytesLimited || res.CountLimited {
 		t.Fatalf("bytes/count limited: want both false (oversized-anchor pair branch), got bytes=%v count=%v", res.BytesLimited, res.CountLimited)
@@ -742,7 +747,7 @@ func TestPage_ForwardProgress_OversizedAnchor_MaxCount1(t *testing.T) {
 // CountLimited=true, HasOlder=true, OldestID advances to the first-older.
 // Sub-case B (anchorIdx==1): the first-older IS the session's oldest → the loop
 // exits at the floor with no limit flag → CountLimited=false, HasOlder=false
-// (truthful end-of-history).
+// (truthful end of resident history).
 func TestPage_ForwardProgress_MaxCount1_NormalAnchor(t *testing.T) {
 	t.Run("anchorIdx_gt1_count_bound_fires", func(t *testing.T) {
 		// [m0, m1, m2(anchor), m3]: anchor m2 fits; first-older m1 is force-
@@ -811,7 +816,7 @@ func TestPage_ForwardProgress_MaxCount1_NormalAnchor(t *testing.T) {
 			t.Fatalf("oversized_item: want false (non-oversized anchor), got true")
 		}
 		if res.HasOlder {
-			t.Fatalf("has_older: want false (m0 is the session's oldest; truthful end-of-history), got true")
+			t.Fatalf("has_older: want false (m0 is the session's oldest; truthful end of resident history), got true")
 		}
 	})
 }
@@ -872,7 +877,7 @@ func TestPage_ForwardProgress_ChainedWalk_OversizedCursor(t *testing.T) {
 		t.Fatalf("call 2: oldest_id %q must be strictly older than cursor m2", res2.OldestID)
 	}
 	// With the generous budget relative to small messages, call 2 reaches the
-	// oldest message m0 → has_older=false (truthful end-of-history).
+	// oldest message m0 → has_older=false (truthful end of resident history).
 	if res2.OldestID != "m0" {
 		t.Fatalf("call 2 (before=m2): oldest_id want m0 (reached start), got %q", res2.OldestID)
 	}
