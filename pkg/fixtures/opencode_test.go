@@ -550,3 +550,289 @@ func TestFixtureOrphan_ScriptsIncompleteTail(t *testing.T) {
 		t.Fatalf("after /fixture/reset: f.messages[other] len=%d want 0 (scripting must be removable for serial-suite hygiene)", remaining)
 	}
 }
+
+// --- agent-evidence hold (composer-hydration lane-6 e2e) ---------------------
+//
+// The /fixture/agent-hold/{arm,release,reset} control surface must be
+// deterministic in the shared serial fixtureserver: armed = nonempty session
+// row visible in /session with the message tail withheld; released = the
+// scripted plan-stamped transcript serves through the normal message path;
+// re-arm returns to the armed state (stripping turns accumulated by prompts
+// in between); reset removes the session entirely so sibling specs never
+// observe it.
+
+// getAsync runs a GET off the test goroutine, delivering status+body on the
+// returned channel. The armed-hold assertions need a GET that may never
+// return; http.Client calls cannot run on the test goroutine against a
+// blocked handler, and t.Fatalf is illegal off the test goroutine — so the
+// helper only TRANSPORTS the outcome and the caller asserts.
+func getAsync(srv *httptest.Server, path string) <-chan struct {
+	status int
+	body   []byte
+} {
+	ch := make(chan struct {
+		status int
+		body   []byte
+	}, 1)
+	go func() {
+		resp, err := srv.Client().Get(srv.URL + path)
+		if err != nil {
+			ch <- struct {
+				status int
+				body   []byte
+			}{-1, []byte(err.Error())}
+			return
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		ch <- struct {
+			status int
+			body   []byte
+		}{resp.StatusCode, b}
+	}()
+	return ch
+}
+
+// sessionListIDs fetches GET /session and returns the id set.
+func sessionListIDs(t *testing.T, srv *httptest.Server) map[string]bool {
+	t.Helper()
+	resp, body := get(t, srv, "/session")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /session: got %d want 200", resp.StatusCode)
+	}
+	var rows []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &rows); err != nil {
+		t.Fatalf("unmarshal /session: %v (body=%s)", err, body)
+	}
+	ids := map[string]bool{}
+	for _, r := range rows {
+		ids[r.ID] = true
+	}
+	return ids
+}
+
+// assertHeld fails the test if the message-LIST GET for agenthold completes
+// within the window — the evidence hold must actually withhold.
+func assertHeld(t *testing.T, srv *httptest.Server, window time.Duration) {
+	t.Helper()
+	done := getAsync(srv, "/session/agenthold/message?limit=50")
+	select {
+	case r := <-done:
+		t.Fatalf("message GET served while armed (status=%d body=%s) — the hold latch is not withholding", r.status, r.body)
+	case <-time.After(window):
+		// Still held — correct.
+	}
+}
+
+// waitForTranscript polls f.messages[agenthold] until it has >= min messages
+// (the async simulatePrompt goroutine commits + streams off-handler).
+func waitForTranscript(t *testing.T, f *FakeOpenCode, min int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		n := len(f.messages[agentHoldSessionID])
+		f.mu.Unlock()
+		if n >= min {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	f.mu.Lock()
+	n := len(f.messages[agentHoldSessionID])
+	f.mu.Unlock()
+	t.Fatalf("transcript never reached %d messages (got %d) within 5s", min, n)
+}
+
+// TestAgentHoldArmWithholdsEvidenceUntilRelease pins the arm/release core:
+// absent by default → armed (row visible, tail withheld) → released (the
+// scripted plan-stamped transcript serves) → re-armed (withheld again).
+func TestAgentHoldArmWithholdsEvidenceUntilRelease(t *testing.T) {
+	f := New()
+	srv := startFixtureHTTP(t, f)
+
+	if ids := sessionListIDs(t, srv); ids[agentHoldSessionID] {
+		t.Fatalf("agenthold must be absent by default (not seeded by New) so sibling specs never observe it")
+	}
+
+	// ARM.
+	resp, _ := postJSON(t, srv, "/fixture/agent-hold/arm", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("arm: got %d want 200", resp.StatusCode)
+	}
+	if ids := sessionListIDs(t, srv); !ids[agentHoldSessionID] {
+		t.Fatalf("armed: agenthold missing from GET /session — the tree row would never render")
+	}
+	assertHeld(t, srv, 250*time.Millisecond)
+
+	// RELEASE: the withheld GET must now complete with the scripted evidence.
+	resp, _ = postJSON(t, srv, "/fixture/agent-hold/release", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("release: got %d want 200", resp.StatusCode)
+	}
+	r := <-getAsync(srv, "/session/agenthold/message?limit=50")
+	if r.status != http.StatusOK {
+		t.Fatalf("released message GET: got %d want 200 (body=%s)", r.status, r.body)
+	}
+	var msgs []struct {
+		Info struct {
+			ID    string  `json:"id"`
+			Role  string  `json:"role"`
+			Agent *string `json:"agent"`
+		} `json:"info"`
+	}
+	if err := json.Unmarshal(r.body, &msgs); err != nil {
+		t.Fatalf("unmarshal transcript: %v (body=%s)", err, r.body)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("released transcript len=%d want 2 (user + plan-stamped assistant)", len(msgs))
+	}
+	if msgs[0].Info.Role != "user" || msgs[0].Info.Agent != nil {
+		t.Fatalf("user message must carry NO agent stamp (evidence must come from the assistant), got role=%q agent=%v", msgs[0].Info.Role, msgs[0].Info.Agent)
+	}
+	if msgs[1].Info.Role != "assistant" || msgs[1].Info.Agent == nil || *msgs[1].Info.Agent != "plan" {
+		t.Fatalf("assistant must be stamped agent=plan (the release evidence), got role=%q agent=%v", msgs[1].Info.Role, msgs[1].Info.Agent)
+	}
+
+	// RE-ARM after release: back to the withheld state.
+	resp, _ = postJSON(t, srv, "/fixture/agent-hold/arm", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("re-arm: got %d want 200", resp.StatusCode)
+	}
+	assertHeld(t, srv, 250*time.Millisecond)
+
+	// Release before cleanup: the assertHeld probe GETs are still blocked on
+	// the latch inside the handler, and httptest.Server.Close() waits for
+	// outstanding requests — a held GET at test end would hang the cleanup.
+	postJSON(t, srv, "/fixture/agent-hold/release", "")
+}
+
+// TestAgentHoldReArmStripsAccumulatedTurns pins the serial-suite determinism:
+// a prompt committed between an arm's release and the next arm (turns the
+// spec itself sends) must NOT survive the re-arm — every arm starts from the
+// same scripted two-message baseline.
+func TestAgentHoldReArmStripsAccumulatedTurns(t *testing.T) {
+	f := New()
+	srv := startFixtureHTTP(t, f)
+
+	postJSON(t, srv, "/fixture/agent-hold/arm", "")
+	postJSON(t, srv, "/fixture/agent-hold/release", "")
+
+	// Send one real prompt turn (Normal mode): user message committed +
+	// assistant reply streamed — the accumulation a re-arm must strip.
+	body := `{"parts":[{"type":"text","text":"probe turn"}]}`
+	resp, _ := postJSON(t, srv, "/session/agenthold/prompt_async", body)
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("prompt_async: got %d want 204", resp.StatusCode)
+	}
+	waitForTranscript(t, f, 4) // 2 scripted + committed user + streamed assistant
+
+	// RE-ARM: transcript must collapse back to the scripted baseline.
+	postJSON(t, srv, "/fixture/agent-hold/arm", "")
+	f.mu.Lock()
+	n := len(f.messages[agentHoldSessionID])
+	f.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("re-arm must strip accumulated turns: transcript len=%d want 2", n)
+	}
+	postJSON(t, srv, "/fixture/agent-hold/release", "")
+	r := <-getAsync(srv, "/session/agenthold/message?limit=50")
+	if r.status != http.StatusOK {
+		t.Fatalf("post-rearm released GET: got %d want 200 (body=%s)", r.status, r.body)
+	}
+	var msgs []struct {
+		Info struct {
+			ID string `json:"id"`
+		} `json:"info"`
+	}
+	if err := json.Unmarshal(r.body, &msgs); err != nil {
+		t.Fatalf("unmarshal: %v (body=%s)", err, r.body)
+	}
+	if len(msgs) != 2 || msgs[0].Info.ID != "hold-u1" || msgs[1].Info.ID != "hold-a1" {
+		t.Fatalf("post-rearm transcript must be exactly the scripted ids, got %+v", msgs)
+	}
+}
+
+// TestAgentHoldResetRemovesSession pins the afterEach hygiene: after reset the
+// session does not exist — absent from /session, empty message store — so the
+// spec leaves zero residue for sibling specs in the serial suite.
+func TestAgentHoldResetRemovesSession(t *testing.T) {
+	f := New()
+	srv := startFixtureHTTP(t, f)
+
+	postJSON(t, srv, "/fixture/agent-hold/arm", "")
+	resp, _ := postJSON(t, srv, "/fixture/agent-hold/reset", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("reset: got %d want 200", resp.StatusCode)
+	}
+	if ids := sessionListIDs(t, srv); ids[agentHoldSessionID] {
+		t.Fatalf("after reset: agenthold still in GET /session — sibling specs would observe it")
+	}
+	r := <-getAsync(srv, "/session/agenthold/message?limit=50")
+	if r.status != http.StatusOK {
+		t.Fatalf("after reset: message GET got %d want 200 (body=%s)", r.status, r.body)
+	}
+	var msgs []json.RawMessage
+	if err := json.Unmarshal(r.body, &msgs); err != nil {
+		t.Fatalf("unmarshal: %v (body=%s)", err, r.body)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("after reset: transcript len=%d want 0", len(msgs))
+	}
+	// Idempotent: a second reset (e.g. afterEach racing a failed beforeEach)
+	// must not error.
+	resp, _ = postJSON(t, srv, "/fixture/agent-hold/reset", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second reset: got %d want 200", resp.StatusCode)
+	}
+}
+
+// TestAgentHoldEventsCarryTranslatorShapes pins the EVENT shapes the
+// aggregator's TranslatorV1 actually parses — the regression guard for the
+// repeat-run flake where a bare {"sessionID":...} session.deleted payload was
+// silently NormIgnored (translate.go:148 parses an info envelope), so the
+// store kept the prior repeat's messages/lastAgent/msgLoaded and the second
+// run opened an already-resolved composer instead of "Resolving agent…".
+func TestAgentHoldEventsCarryTranslatorShapes(t *testing.T) {
+	f := New()
+	srv := startFixtureHTTP(t, f)
+	ch, unsub := f.subscribe()
+	defer unsub()
+
+	postJSON(t, srv, "/fixture/agent-hold/arm", "")
+	postJSON(t, srv, "/fixture/agent-hold/reset", "")
+
+	// Sequence on the feed: created (arm #1 — row absent before), deleted
+	// (reset — row existed), deleted + created (arm #2 — the path a repeat
+	// run takes). The pins: EVERY deleted must carry the info envelope the
+	// translator parses, and a created must carry the fresh row as info.
+	postJSON(t, srv, "/fixture/agent-hold/arm", "")
+
+	var sawDeleted, sawCreated bool
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !(sawDeleted && sawCreated) {
+		select {
+		case raw := <-ch:
+			if strings.Contains(raw, `"session.deleted"`) {
+				if strings.Contains(raw, `"info":{"id":"`+agentHoldSessionID+`"}`) {
+					sawDeleted = true
+				} else {
+					t.Fatalf("session.deleted payload lacks the info envelope the translator parses (got %s) — it would be silently ignored", raw)
+				}
+			}
+			if strings.Contains(raw, `"session.created"`) &&
+				strings.Contains(raw, `"title":"Agent evidence hold"`) {
+				sawCreated = true
+			}
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if !sawDeleted {
+		t.Fatalf("no well-shaped session.deleted observed on the SSE feed within 2s")
+	}
+	if !sawCreated {
+		t.Fatalf("no session.created (with the fresh row as info) observed on the SSE feed within 2s")
+	}
+}
