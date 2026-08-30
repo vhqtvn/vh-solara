@@ -116,6 +116,17 @@ func ocLockFakeOCHelper(t *testing.T) {
 	dir := os.Getenv("VH_FAKE_OC_PIDS_DIR")
 	fd3, _ := os.Readlink("/proc/self/fd/3")
 	_ = os.WriteFile(filepath.Join(dir, fmt.Sprintf("%d.fake", os.Getpid())), []byte(fd3), 0o644)
+	// P1-API-005 knobs — model a replacement child that dies BEFORE
+	// readiness (a lost bind race in real opencode exits with EADDRINUSE; a
+	// crash exits too). The restart contract attributes readiness via the
+	// child's EXIT, never by parsing its output, so the fake simply exits(1)
+	// without listening. Both default off (existing scenarios unchanged).
+	if os.Getenv("VH_FAKE_OC_DIE_FAST") == "1" {
+		os.Exit(1)
+	}
+	if diePort, err := strconv.Atoi(os.Getenv("VH_FAKE_OC_DIE_ON_PORT")); err == nil && diePort > 0 && diePort == port {
+		os.Exit(1)
+	}
 	if os.Getenv("VH_FAKE_OC_GRANDCHILD") == "1" {
 		c := exec.Command("sleep", "3000") // inherits the non-CLOEXEC fd 3
 		if err := c.Start(); err == nil {

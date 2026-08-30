@@ -39,8 +39,11 @@ type clientDaemonRuntime struct {
 	opencodeMu       sync.Mutex // serializes restarts of opencodeServeCmd
 	// ocReapDone is closed by the owned-topology reaper goroutine once it has
 	// reaped opencodeServeCmd (the SOLE Wait() caller in normal operation).
-	// restartOpencode waits on it instead of a racing second Wait().
-	ocReapDone chan struct{}
+	// restartOpencode waits on it instead of a racing second Wait(). It is a
+	// receive-only view of the current child's reaper-done channel; the
+	// restart path hands the shared owned-restart operation a fresh one per
+	// replacement child.
+	ocReapDone <-chan struct{}
 	// ocLife is the worker-local OpenCode lifecycle, served at
 	// /vh/opencode/status. nil outside the WebVH arm. It is the decoupling
 	// hinge: a fatal OpenCode startup failure is recorded here as a failed

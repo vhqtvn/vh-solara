@@ -96,8 +96,9 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 			// previously nobody reaped the owned child, so a crash was
 			// never detected). The done channel lets restartOpencode
 			// observe the reap without a racing second Wait().
-			rt.ocReapDone = make(chan struct{})
-			go reapOwnedOpenCode(c, rt.ocReapDone, rt.ocLife)
+			done := make(chan struct{})
+			rt.ocReapDone = done
+			go reapOwnedOpenCode(c, done, rt.ocLife)
 			if err := waitForPort(rt.opencodePort, 30*time.Second); err != nil {
 				log.Printf("opencode serve failed to listen on port %d: %v (worker stays up; opencode status=failed)", rt.opencodePort, err)
 				rt.ocLife.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", rt.opencodePort, err), nil)
@@ -368,10 +369,15 @@ func (rt *clientDaemonRuntime) restartOpencode() error {
 		rt.ocLife.SetReady()
 		return nil
 	}
-	// Owned. The reaper goroutine is the SOLE Wait() caller, so stop the
-	// current child by signaling + waiting on its reaper-done channel
-	// (NOT a second Wait — that would race the reaper). Then respawn on
-	// the same port and start a fresh reaper for the new child.
+	// Owned (P1-API-005). The reaper goroutine is the SOLE Wait() caller, so
+	// stop the current child by signaling + waiting on its reaper-done
+	// channel (NOT a second Wait — that would race the reaper). Then the
+	// SHARED child-aware restart operation drives the replacement: readiness
+	// is attributed to the replacement child itself — never to "something
+	// accepting connections" on the port — with one bounded fresh-port
+	// attempt, retargeted through the P1-API-003 seam BEFORE SetReady, when
+	// the stable port is occupied or the child loses the bind race, and
+	// fail-closed exhaustion (SetFailed + worker keeps serving).
 	rt.ocLife.SetStarting()
 	oldDone := rt.ocReapDone
 	if rt.opencodeServeCmd != nil && rt.opencodeServeCmd.Process != nil {
@@ -380,20 +386,34 @@ func (rt *clientDaemonRuntime) restartOpencode() error {
 	if oldDone != nil {
 		<-oldDone // reaper has reaped the old child; safe to respawn
 	}
-	c, err := startOpenCodeServe(daemonOpenCodeBin, rt.opencodePort, rt.cwd, rt.ocLife.Ring().Writer())
-	if err != nil {
-		rt.ocLife.SetFailed(fmt.Sprintf("failed to start opencode serve: %v", err), nil)
-		rt.opencodeServeCmd = nil
-		rt.ocReapDone = nil
-		return err
+	res := restartOwnedOpenCode(ownedRestartConfig{
+		Life:       rt.ocLife,
+		Srv:        rt.vhSrv,
+		StablePort: rt.opencodePort,
+		// Sole-reaper ownership preserved: the closure starts the ONE
+		// Wait() goroutine for the replacement child and hands the core its
+		// exit oracle (closed once the exit is recorded in the lifecycle).
+		// The core never Wait()s the child.
+		Spawn: func(port int) (*exec.Cmd, <-chan struct{}, error) {
+			c, err := startOpenCodeServe(daemonOpenCodeBin, port, rt.cwd, rt.ocLife.Ring().Writer())
+			if err != nil {
+				return nil, nil, err
+			}
+			done := make(chan struct{})
+			go reapOwnedOpenCode(c, done, rt.ocLife)
+			return c, done, nil
+		},
+	})
+	rt.opencodeServeCmd = res.Cmd
+	rt.ocReapDone = res.Exited
+	if res.Err != nil {
+		// The core already recorded SetFailed; the worker keeps serving
+		// (p1-oc-001). Nothing after this point may SetReady — the
+		// write-order guarantee that a child-failure state stays final.
+		return res.Err
 	}
-	rt.opencodeServeCmd = c
-	rt.ocReapDone = make(chan struct{})
-	go reapOwnedOpenCode(c, rt.ocReapDone, rt.ocLife)
-	if err := waitForPort(rt.opencodePort, 30*time.Second); err != nil {
-		rt.ocLife.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", rt.opencodePort, err), nil)
-		return err
+	if res.Retargeted {
+		rt.opencodePort, rt.opencodeURL = res.Port, res.URL
 	}
-	rt.ocLife.SetReady()
 	return nil
 }
