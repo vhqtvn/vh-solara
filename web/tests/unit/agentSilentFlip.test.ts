@@ -19,7 +19,9 @@
 //   (c) an explicit per-session pick survives a reload (persisted store);
 //   (d) evidence-backed agent absent from the live list → unavailable, no
 //       silent list[0]/config substitution;
-//   (e) draft ("") + provably-empty sessions keep the config-default policy.
+//   (e) draft ("") + provably-empty sessions keep the config-default policy,
+//       validated against the loaded list (a stale default demotes to list[0]
+//       identically in both branches — never handed back unvalidated);
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { reconcile } from "solid-js/store";
 
@@ -54,6 +56,7 @@ import {
   resolveAgentForSession,
   selectAgentForSession,
   selectedAgent,
+  type SendAgentOutcome,
 } from "../../src/agents";
 import {
   lsSessionAgents,
@@ -161,6 +164,29 @@ describe("(b) cold session with no evidence", () => {
     }
   });
 
+  it("pre-aborted signal settles the gate IMMEDIATELY — no subscription, no timer wait", async () => {
+    await boot();
+    vi.useFakeTimers();
+    try {
+      const ctrl = new AbortController();
+      ctrl.abort(); // aborted BEFORE the gate is entered
+      let out: SendAgentOutcome | undefined;
+      awaitSendAgent("ses_b", { timeoutMs: 30_000, signal: ctrl.signal }).then((o) => {
+        out = o;
+      });
+      // ZERO clock advance — only the microtask queue flushes. An
+      // already-aborted signal never fires its "abort" listener (that event
+      // fired at abort time, before the gate subscribed), so without the
+      // upfront aborted check this rides the full 30s window: `out` would
+      // still be undefined here and a timeout timer would be armed.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(out).toEqual({ ok: false, reason: "timeout" }); // caller-aborted = timeout semantics
+      expect(vi.getTimerCount()).toBe(0); // no timeout timer was ever armed
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("resolves the moment the facet lands mid-wait", async () => {
     await boot();
     const p = awaitSendAgent("ses_b", { timeoutMs: 5_000 });
@@ -199,6 +225,33 @@ describe("(e) drafts and provably-empty sessions", () => {
     const r = resolveAgentForSession("ses_empty");
     expect(r.state).toBe("agent");
     if (r.state === "agent") expect(r.agent).toBe("coordination");
+  });
+
+  it("provably-empty + config default NOT in the loaded list → demotes exactly like the draft branch (list[0], never the stale default)", async () => {
+    await boot();
+    // Post-boot posture: the live list is [supervisor, coordination] but the
+    // GLOBAL default names an agent NOT in it (a config default_agent that
+    // points at a since-removed/renamed agent). A draft pick ("") is the only
+    // public way to update the global default.
+    selectAgentForSession("", "retired-default");
+    expect(selectedAgent()).toBe("retired-default");
+    setState("messagesDelivered", "ses_empty_retired", true);
+    setState("messages", "ses_empty_retired", { order: [], byId: {} });
+
+    // Both branches see the SAME state (loaded list + stale default). The
+    // draft branch ("")…
+    const draft = resolveAgentForSession("");
+    // …and the provably-empty branch (delivered + zero messages) must agree:
+    // the stale default is validated against the live list and demoted to
+    // list[0] — never handed back as a sendable agent.
+    const empty = resolveAgentForSession("ses_empty_retired");
+    expect(empty).toEqual(draft);
+    expect(empty).toEqual({ state: "agent", agent: "supervisor" }); // list[0], NOT "retired-default"
+    expect(agentForSession("ses_empty_retired")).toBe("supervisor");
+
+    // And the stale default never reaches a send outcome.
+    const out = await awaitSendAgent("ses_empty_retired");
+    expect(out).toEqual({ ok: true, agent: "supervisor" });
   });
 
   it("delivered-but-nonempty session with no stamps/facet is NOT provably empty → pending", async () => {

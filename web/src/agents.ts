@@ -50,7 +50,8 @@ export function setSelectedAgent(name: string) {
 //      under the config/global default (awaitSendAgent waits, then fails
 //      loudly). The ONE legitimate exception: a provably-empty session —
 //      hydration complete (messagesDelivered) with zero messages ever — which
-//      is new-session-like, so the config default applies.
+//      is new-session-like, so the config default applies (validated against
+//      the live list exactly like a draft — see resolveDraftDefault).
 
 export type AgentResolution =
   | { state: "agent"; agent: string }
@@ -83,22 +84,37 @@ export function isProvablyEmptySession(id: string): boolean {
 // returns. While the list is empty (not yet loaded) nothing is demoted: an
 // `agent` outcome stays `agent` (the list may just be slow), and a pending
 // outcome stays pending.
+// The draft/default policy: the GLOBAL config default, VALIDATED against the
+// live agent list. Shared verbatim by the draft branch (sessionID === "") and
+// the provably-empty branch — a genuinely-new session is draft-like, so it
+// must get the identical policy, not a lookalike. While the list is not
+// loaded, a stored default resolves as-is and an absent one is PENDING; once
+// the list is loaded, a default NOT in it never sticks — it demotes to
+// list[0] (a removed/renamed config default must not be handed back as a
+// sendable agent).
+function resolveDraftDefault(): AgentResolution {
+  const pick = selectedAgent();
+  const list = agents();
+  if (list.length === 0) return pick ? { state: "agent", agent: pick } : { state: "pending" };
+  if (pick && list.some((a) => a.name === pick)) return { state: "agent", agent: pick };
+  return { state: "agent", agent: list[0].name };
+}
+
 export function resolveAgentForSession(sessionID: string): AgentResolution {
   const list = agents();
   if (!sessionID) {
     // Draft (composing a NEW session): the config-default policy applies —
     // the global default, validated against the live list so a
     // removed/disabled agent never sticks.
-    const pick = selectedAgent();
-    if (list.length === 0) return pick ? { state: "agent", agent: pick } : { state: "pending" };
-    if (pick && list.some((a) => a.name === pick)) return { state: "agent", agent: pick };
-    return { state: "agent", agent: list[0].name };
+    return resolveDraftDefault();
   }
   const pick = sessionAgentPicks[sessionID]?.agent ?? sessionLastAgent(sessionID);
   if (!pick) {
     return isProvablyEmptySession(sessionID)
-      ? // Genuinely new session (draft-like): config default is legitimate.
-        { state: "agent", agent: selectedAgent() || list[0]?.name || "" }
+      ? // Genuinely new session (draft-like): config default is legitimate —
+        // validated against the live list EXACTLY like a draft (a stale
+        // default demotes to list[0], never an unsendable name).
+        resolveDraftDefault()
       : { state: "pending" };
   }
   if (list.length === 0) return { state: "agent", agent: pick };
@@ -225,6 +241,14 @@ export function awaitSendAgent(
   sessionID: string,
   opts?: { timeoutMs?: number; signal?: AbortSignal },
 ): Promise<SendAgentOutcome> {
+  // Caller-aborted BEFORE entry: settle NOW with the abort outcome. An
+  // already-aborted signal never fires its "abort" listener (that event fired
+  // at abort time, before the gate could subscribe), so without this check an
+  // abandoned dispatch rides the full timeout window — and could even resolve
+  // agent-ok for a slot the caller already gave up on. Abort keeps the
+  // existing caller-aborted outcome ("timeout" semantics, see the signal
+  // note above).
+  if (opts?.signal?.aborted) return Promise.resolve({ ok: false, reason: "timeout" });
   const first = resolveAgentForSession(sessionID);
   if (first.state === "agent" || first.state === "unavailable") {
     return Promise.resolve(toOutcome(first));
