@@ -431,4 +431,262 @@ test.describe("host keyboard focus-mode", () => {
       .poll(async () => H.appRootTransform(page), { timeout: 8000 })
       .toBe("translateY(240px)");
   });
+
+  // ---- 6. OWNERSHIP EDGES (review-defer F1/F2/F3, 2026-08-09) ----------------
+  //
+  // Three edge gaps around the focus-mode's MAXIMIZE OWNERSHIP model
+  // (host-web/src/keyboardFocus.ts): what happens when the owned maximize's
+  // world changes AFTER keyboard-open — a workspace switch re-points it (F1),
+  // the user re-maximizes manually (F2), the visible viewport changes size
+  // (F3). Deterministic headless MECHANISM pins of CURRENT behavior, driven
+  // through this file's established seams (DEV bridge + vv mock + real ws-tab
+  // clicks). No real soft-keyboard / real-device claims.
+
+  test("F1: switching workspace while the keyboard is open re-points the owned maximize without reloading any iframe", async ({ page }) => {
+    const ws1 = (await H.workspaces(page))[0];
+    // Create ws B (addWorkspace ACTIVATES it — the keyboard is still closed,
+    // so the activation effect no-ops) and give it one live pane.
+    const ws2 = (await H.addWorkspace(page, "Kbd B"))!;
+    const paneB = await H.addServer(page, H.serverUrl("kbdfocus-ws-b"), "Kbd B pane");
+    expect(paneB, "ws B got a live pane").toBeTruthy();
+    await H.waitForReady(page, paneB!);
+    // Back to ws A via the REAL ws-tab click (the operator's actual gesture —
+    // there is a real UI control for switching, so we use it).
+    await page.locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`).click();
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws1);
+
+    const ids = await H.panes(page);
+    const focused = await H.focused(page);
+    const target = focused ?? ids[0];
+    if (focused !== target) await H.focusPane(page, target);
+    await page.waitForTimeout(200); // Dockview overlay positioning settle (file idiom)
+    const beforeA = (await H.survival(page, target))!;
+    const beforeB = (await H.survival(page, paneB!))!;
+
+    // Keyboard opens in ws A: A's focused group maximized, ownership = ws A.
+    await H.kbdFocusOpen(page, KEYBOARD_VISIBLE_H);
+    await expect.poll(async () => H.isMaximized(page)).toBe(true);
+    await expect.poll(async () => (await H.kbdFocusState(page)).ownedWs).toBe(ws1);
+    await expect.poll(async () => H.appRootHeight(page)).toBe(KEYBOARD_VISIBLE_H);
+
+    // SWITCH to ws B with the keyboard open (real tab click). App.tsx's effect
+    // (activeWorkspaceId → onWorkspaceActivated) must: exit ws A's owned
+    // maximize, maximize ws B's focused pane, re-point ownership to B.
+    await page.locator(`[data-testid="ws-tab"][data-workspace="${ws2}"]`).click();
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws2);
+    // CRUX — ownership re-pointed at ws B. (isMaximized reads the ACTIVE ws,
+    // so "maximized" here is B's group, not a leftover of A's.)
+    await expect
+      .poll(async () => (await H.kbdFocusState(page)).ownedWs, { timeout: 8000 })
+      .toBe(ws2);
+    await expect.poll(async () => H.isMaximized(page), { timeout: 8000 }).toBe(true);
+    // The keyboard itself stays open — the shrunk root is host-global.
+    await expect.poll(async () => H.appRootHeight(page)).toBe(KEYBOARD_VISIBLE_H);
+    // NO iframe reloaded across the switch: A's pane identity intact with a
+    // fresh heartbeat (the now-hidden pane is still mounted + beating).
+    await H.assertSurvived(page, target, beforeA, "keyboard-open workspace switch (ws A pane)");
+
+    // SWITCH BACK to ws A: exit B's owned maximize, re-maximize A's focused
+    // pane, ownership back to A. Consistency check with the ownership model:
+    // had the first switch NOT exited A's maximize, maximizeActive() would
+    // find hasMaximizedGroup() true here and set ownedWs=null instead — so
+    // ownedWs=ws1 below ALSO proves the exit on the first switch happened.
+    await page.locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`).click();
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws1);
+    await expect
+      .poll(async () => (await H.kbdFocusState(page)).ownedWs, { timeout: 8000 })
+      .toBe(ws1);
+    await expect.poll(async () => H.isMaximized(page), { timeout: 8000 }).toBe(true);
+    await expect.poll(async () => H.appRootHeight(page)).toBe(KEYBOARD_VISIBLE_H);
+
+    // Close: exits A's owned maximize, restores the root, ownership null.
+    await H.kbdFocusClose(page);
+    await expect.poll(async () => H.isMaximized(page), { timeout: 8000 }).toBe(false);
+    await expect.poll(async () => (await H.kbdFocusState(page)).ownedWs).toBeNull();
+    await expect
+      .poll(async () => H.appRootHeight(page), { timeout: 8000 })
+      .toBeGreaterThanOrEqual(VIEWPORT.height - 5);
+    // Both panes (A's and B's) survived the whole open→switch→switch→close
+    // dance without a reload — workspace switching is CSS-visibility-only.
+    await H.assertSurvived(page, target, beforeA, "F1 full cycle (ws A pane)");
+    await H.assertSurvived(page, paneB!, beforeB, "F1 full cycle (ws B pane)");
+  });
+
+  // F2 — POST-OPEN RE-MAXIMIZE (review-defer 2026-08-09). PIN of CURRENT
+  // behavior, and the current behavior CLOBBERS the user's later manual
+  // maximize — this is a PINNED CANDIDATE DEFECT, not an endorsement:
+  //
+  //   ownership is recorded per WORKSPACE at open time (keyboardFocus.ts
+  //   `ownedWs`: "Scoped to a single ws: the one active when we maximized"),
+  //   and close's exitOwned() exits whatever group is CURRENTLY maximized in
+  //   that ws — it cannot distinguish focus-mode's own (already-replaced)
+  //   maximize from the user's LATER manual one. Contrast test 3 above
+  //   (manual maximize BEFORE open survives close — there ownedWs stays null
+  //   because maximizeActive() sees hasMaximizedGroup() true at OPEN time).
+  //
+  // If a fix lands (e.g. group-instance or generation-scoped ownership), the
+  // pinned assertion below MUST FLIP to "still maximized" — this test is the
+  // regression tripwire for that split implementation card.
+  test("F2: keyboard-close EXITS a manual re-maximize made after keyboard-open (PINNED current behavior — candidate defect)", async ({ page }) => {
+    // Two side-by-side panes = two groups (deterministic manual-maximize
+    // target; the keyboard-open maximize owns a's group, the user re-maxes b).
+    const [a, b] = await H.twoPanes(page);
+    await H.focusPane(page, a);
+    await page.waitForTimeout(200);
+    const beforeA = (await H.survival(page, a))!;
+    const beforeB = (await H.survival(page, b))!;
+
+    // Keyboard opens: a's group maximized, focus-mode owns it (ownedWs = ws).
+    await H.kbdFocusOpen(page, KEYBOARD_VISIBLE_H);
+    await expect.poll(async () => H.isMaximized(page)).toBe(true);
+    const ws = (await H.kbdFocusState(page)).ownedWs;
+    expect(ws, "focus-mode owns the maximize it entered").toBeTruthy();
+    await expect.poll(async () => H.appRootHeight(page)).toBe(KEYBOARD_VISIBLE_H);
+
+    // The user manually exits the maximize, then manually re-maximizes a
+    // DIFFERENT group (b). These bridge calls drive the exact dockview api
+    // sequence the real gesture path (toggleZoom, hostController.ts) produces
+    // — the shell has no clickable zoom control anymore (the statusbar zoom
+    // cluster was removed), so the bridge IS the manual-action surrogate.
+    await H.exitMaximized(page);
+    await expect.poll(async () => H.isMaximized(page)).toBe(false);
+    await H.maximize(page, b);
+    await expect.poll(async () => H.isMaximized(page)).toBe(true);
+    // ROOT CAUSE (pinned): ownership is still the STALE ws recorded at open —
+    // the manual exit/re-maximize never updates it (nothing in the manual path
+    // notifies keyboardFocus). This stale ws-id is what makes close clobber.
+    expect(
+      (await H.kbdFocusState(page)).ownedWs,
+      "ownership is stale (ws-id only) across the manual re-maximize",
+    ).toBe(ws);
+
+    // Keyboard closes. CURRENT (pinned) behavior: exitOwned() resolves the
+    // stale ws, finds b's group maximized in it, and EXITS it — the user's
+    // manual re-maximize is clobbered. PINNED CANDIDATE DEFECT per the card's
+    // disposition rule (do not fix in-slice); flip when the fix lands.
+    await H.kbdFocusClose(page);
+    await expect
+      .poll(async () => H.isMaximized(page), { timeout: 8000 })
+      .toBe(false); // PINNED: the user's manual re-maximize IS exited by close
+    await expect.poll(async () => (await H.kbdFocusState(page)).ownedWs).toBeNull();
+    await expect
+      .poll(async () => H.appRootHeight(page), { timeout: 8000 })
+      .toBeGreaterThanOrEqual(VIEWPORT.height - 5);
+
+    // No reload through the whole maximize-ownership dance.
+    await H.assertSurvived(page, a, beforeA, "F2 open→manual re-maximize→close (a)");
+    await H.assertSurvived(page, b, beforeB, "F2 open→manual re-maximize→close (b)");
+  });
+
+  // F3 — POST-OPEN VIEWPORT RESIZE (review-defer 2026-08-09): after the
+  // keyboard is open, a visualViewport HEIGHT change (suggestion bar /
+  // accessory bar appearing on top of the keyboard — still below the open
+  // threshold, so no close transition) must keep the host-root geometry
+  // tracking the visible area. Two proofs, mirroring tests 4/5's split:
+  //   A (chromium+firefox): the re-apply MATH via the bridge's reapplyGeometry
+  //      — the exact function the production resize listener calls.
+  //   B (chromium only): the real EVENT WIRING — a synthetic resize dispatched
+  //      on the real visualViewport (no bridge call, no detection flush) re-
+  //      pins the root through onVvEvent. Firefox is excluded for the same
+  //      documented reason as test 5: it does not deliver synthetic
+  //      visualViewport events to addEventListener listeners.
+  test("F3: a post-open visualViewport height change re-tracks the host-root geometry", async ({ page, browserName }) => {
+    const ids = await H.panes(page);
+    const focused = await H.focused(page);
+    const target = focused ?? ids[0];
+    if (focused !== target) await H.focusPane(page, target);
+    await page.waitForTimeout(200);
+    const before = (await H.survival(page, target))!;
+
+    // Controllable-vv mock (file idiom): height + offsetTop getters + optional
+    // real-event dispatch.
+    await page.evaluate(() => {
+      const real = window.visualViewport!;
+      let mockH = real.height;
+      let mockOffset = 0;
+      Object.defineProperty(real, "height", { configurable: true, get: () => mockH });
+      Object.defineProperty(real, "offsetTop", { configurable: true, get: () => mockOffset });
+      (window as unknown as {
+        __setMockVv?: (h: number, offset: number, ev?: "resize" | "scroll") => void;
+      }).__setMockVv = (h, offset, ev) => {
+        mockH = h;
+        mockOffset = offset;
+        if (ev) real.dispatchEvent(new Event(ev));
+      };
+    });
+
+    // Open through the REAL detection path (mock shrink + flush).
+    await page.evaluate((h) => {
+      (window as unknown as { __setMockVv: (h: number, o: number) => void }).__setMockVv(h, 0);
+    }, KEYBOARD_VISIBLE_H);
+    await H.kbdFocusFlushDetection(page);
+    await expect.poll(async () => (await H.kbdFocusState(page)).open).toBe(true);
+    await expect.poll(async () => H.appRootHeight(page), { timeout: 8000 }).toBe(KEYBOARD_VISIBLE_H);
+
+    // --- A: post-open HEIGHT shrink (accessory bar): 360 → 300, offset too. ---
+    // BOTH dimensions move together (unlike test 4, which holds h constant and
+    // varies only the offset): the root must track the new height AND the new
+    // offset in the same re-apply.
+    await page.evaluate(
+      ({ h, offset }) => {
+        (window as unknown as { __setMockVv: (h: number, o: number) => void }).__setMockVv(h, offset);
+      },
+      { h: 300, offset: 40 },
+    );
+    await H.kbdFocusReapplyGeometry(page);
+    await expect.poll(async () => H.appRootHeight(page), { timeout: 8000 }).toBe(300);
+    await expect.poll(async () => H.appRootTransform(page), { timeout: 8000 }).toBe("translateY(40px)");
+    // Still open — a height change WITHIN the keyboard-open band is not a
+    // close transition (300 < 0.7*740 = 518).
+    expect((await H.kbdFocusState(page)).open, "in-band resize does not close").toBe(true);
+
+    // A second change (continuous tracking, not one-shot): 300 → 260.
+    await page.evaluate(
+      ({ h, offset }) => {
+        (window as unknown as { __setMockVv: (h: number, o: number) => void }).__setMockVv(h, offset);
+      },
+      { h: 260, offset: 0 },
+    );
+    await H.kbdFocusReapplyGeometry(page);
+    await expect.poll(async () => H.appRootHeight(page), { timeout: 8000 }).toBe(260);
+    await expect.poll(async () => H.appRootTransform(page), { timeout: 8000 }).toBe("translateY(0px)");
+
+    // --- B: real resize EVENT wiring (chromium only; see header comment) -----
+    if (browserName === "chromium") {
+      // A dispatched resize — NO bridge call, NO detection flush — must route
+      // onVvEvent → reapplyGeometryIfOpen and re-pin the root to the new vv.
+      await page.evaluate(
+        ({ h, offset, ev }) => {
+          (window as unknown as { __setMockVv: (h: number, o: number, e: "resize" | "scroll") => void }).__setMockVv(h, offset, ev);
+        },
+        { h: 320, offset: 0, ev: "resize" as const },
+      );
+      await expect.poll(async () => H.appRootHeight(page), { timeout: 8000 }).toBe(320);
+      expect((await H.kbdFocusState(page)).open, "in-band resize does not close").toBe(true);
+      // And again (event-driven tracking is continuous too).
+      await page.evaluate(
+        ({ h, offset, ev }) => {
+          (window as unknown as { __setMockVv: (h: number, o: number, e: "resize" | "scroll") => void }).__setMockVv(h, offset, ev);
+        },
+        { h: 280, offset: 0, ev: "resize" as const },
+      );
+      await expect.poll(async () => H.appRootHeight(page), { timeout: 8000 }).toBe(280);
+    }
+
+    // Close through the real path: grow past the threshold + flush.
+    await page.evaluate(
+      ({ h, offset }) => {
+        (window as unknown as { __setMockVv: (h: number, o: number) => void }).__setMockVv(h, offset);
+      },
+      { h: VIEWPORT.height, offset: 0 },
+    );
+    await H.kbdFocusFlushDetection(page);
+    await expect.poll(async () => (await H.kbdFocusState(page)).open, { timeout: 8000 }).toBe(false);
+    await expect
+      .poll(async () => H.appRootHeight(page), { timeout: 8000 })
+      .toBeGreaterThanOrEqual(VIEWPORT.height - 5);
+    await expect.poll(async () => H.appRootTransform(page), { timeout: 8000 }).toBe("");
+    // Identity survived the whole open → resize → resize → close cycle.
+    await H.assertSurvived(page, target, before, "F3 post-open vv resize cycle");
+  });
 });
