@@ -121,7 +121,7 @@ test.describe("host controller edge paths", () => {
     await H.waitForReady(page, twin!);
 
     const beforeKeeper = (await H.survival(page, keeper))!;
-    const beforeTwin = (await H.survival(page, twin))!;
+    const beforeTwin = (await H.survival(page, twin!))!;
     for (const id of seeded) await H.closePane(page, id);
 
     // Refusal precondition, PROVEN not assumed: the grid holds ONLY this
