@@ -708,4 +708,153 @@ test.describe("lane 8: real SPA cross-origin iframe embed", () => {
       expect((await resp.body()).length, `GET ${p} non-empty body`).toBeGreaterThan(0);
     }
   });
+
+  // ===========================================================================
+  // Receipt 5: embedded UI-scale geometry OUTCOME (real SPA iframe).
+  // defer-uiscale-embed-real-iframe-outcome — the UI-scale preference observed
+  // as a RENDERED geometry outcome inside the REAL cross-origin production SPA
+  // iframe, not as a pref flag.
+  //
+  // MECHANISM (web/src, read-only localization):
+  //   • pref key: `vh.prefs.uiScale.v1` (web/src/prefs.ts —
+  //     persistedSignal<number>("vh.prefs.uiScale.v1", 1, 1)).
+  //   • application: applyScale() (prefs.ts). When EMBEDDED
+  //     (web/src/embedded.ts isEmbedded() = window.parent !== window — TRUE
+  //     here: the SPA runs in the host shell's cross-origin iframe), the
+  //     else-branch sets document.documentElement.style.zoom = scale (and
+  //     --ui-zoom) — the viewport-meta path is a no-op inside an iframe, so
+  //     zoom is THE embedded scaling mechanism, on every device. It applies
+  //     reactively at module import (createRenderEffect(applyScale)), before
+  //     first paint.
+  //   • storage envelope: web/src/lib/store.ts loadVersioned() reads
+  //     {v: <version>, data: <value>} — uiScale is version 1.
+  //
+  // PROBE ELEMENT — svg.empty-mark (the no-project cold screen's brand mark):
+  //   • mounted with ZERO interaction: App.tsx renders
+  //     <Show when={projectDir()} fallback={<NoProjectState />}> and the
+  //     dead-OC fixture boots with no project → NoProjectState →
+  //     <BrandMark class="empty-mark" />.
+  //   • its size is a FIXED 64×64 CSS px square (.empty-mark in
+  //     web/src/components/EmptyState.css: width: 64px; height: 64px) — no
+  //     percentage, no viewport dependence — so documentElement zoom scales
+  //     its rendered box exactly ×scale: 64px at 1.0, 96px at 1.5.
+  //   • its idle `empty-float` animation is translateY-only (no scale), so the
+  //     bbox SIZE is invariant through the animation loop.
+  //
+  // PRELOAD SEAM: page.addInitScript writing the exact versioned envelope,
+  // BEFORE the SPA bundle runs (persistedSignal hydrates synchronously at
+  // module import). FRAME GUARD (lane-7 lesson, mirrored from
+  // attention-notify/named-layouts specs, inverted to target the CHILD):
+  // addInitScript also runs in about:blank child frames, where localStorage
+  // IS THE HOST SHELL'S OWN storage — guard on location.origin === REAL so
+  // the write lands ONLY in the real-SPA origin (about:blank is opaque
+  // "null"; the host origin is the other port; neither matches).
+  //
+  // HONEST LIMITS: emulated desktop engines (Chromium + Firefox, fine
+  // pointer). The embedded branch applies zoom regardless of pointer
+  // coarseness, so this exercises the same code path an embedded coarse-
+  // pointer device takes — but NO real-device, soft-keyboard, or standalone-
+  // mobile (viewport-meta path) claims. The measurement relies on
+  // getBoundingClientRect including CSS zoom (the Chromium ≥128 /
+  // Firefox ≥126 zoom model); the observed-ratio assertion IS the instrument
+  // for that.
+  // ===========================================================================
+  test("embedded UI-scale pref scales real geometry in the SPA iframe (bbox ratio 1.5 vs 1.0)", async ({
+    page,
+    browser,
+  }) => {
+    // Preload the uiScale pref into the real-SPA origin before its bundle
+    // runs. addInitScript takes ONE serializable arg — bundle origin+scale.
+    const preloadScale = (p: Page, scale: number) =>
+      p.addInitScript(
+        ({ origin, s }) => {
+          // FRAME GUARD: only the real-SPA origin's documents. Never the host
+          // shell's own storage (about:blank children inherit/opaque it).
+          if (location.origin !== origin) return;
+          localStorage.setItem("vh.prefs.uiScale.v1", JSON.stringify({ v: 1, data: s }));
+        },
+        { origin: REAL, s: scale },
+      );
+
+    // Measure the fixed-64px brand mark inside the real cross-origin SPA
+    // iframe. Returns null box until the element renders. Also captures the
+    // applied documentElement zoom as DIAGNOSTIC context (the crux is the
+    // bbox, not the flag — the zoom value rides along in failure messages to
+    // disambiguate "scale not applied" from "applied but not measured").
+    const measureEmptyMark = async (
+      p: Page,
+    ): Promise<{ box: { width: number; height: number } | null; zoom: string }> => {
+      const frame = await firstRealFrame(p);
+      await waitForSpaMounted(frame);
+      const deadline = Date.now() + 15000;
+      let box: { width: number; height: number } | null = null;
+      let zoom = "";
+      while (Date.now() < deadline && !box) {
+        const m = await frame
+          .evaluate(() => {
+            const el = document.querySelector("svg.empty-mark") as SVGElement | null;
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            return { width: r.width, height: r.height, zoom: document.documentElement.style.zoom };
+          })
+          .catch(() => null);
+        if (m && m.width > 0 && m.height > 0) {
+          box = { width: m.width, height: m.height };
+          zoom = m.zoom;
+        } else {
+          await p.waitForTimeout(100).catch(() => {});
+        }
+      }
+      return { box, zoom };
+    };
+
+    // ---- Scenario A (baseline): preload uiScale = 1.0 on the fixture page
+    // (full trace/video context). Explicit pin, not a default assumption.
+    const expectWithin = (v: number, target: number, tolPct: number, msg: string) => {
+      const lo = target * (1 - tolPct);
+      const hi = target * (1 + tolPct);
+      expect(v, `${msg} (expected ${lo.toFixed(1)}–${hi.toFixed(1)}px, got ${v}px)`).toBeGreaterThanOrEqual(lo);
+      expect(v, `${msg}`).toBeLessThanOrEqual(hi);
+    };
+    await preloadScale(page, 1.0);
+    await page.goto("/");
+    const base = await measureEmptyMark(page);
+    expect(base.box, `svg.empty-mark found at scale 1.0 (zoom=${base.zoom})`).not.toBeNull();
+    expect(base.box!.width, `non-vacuity: width non-zero at 1.0 (zoom=${base.zoom})`).toBeGreaterThan(0);
+    expect(base.box!.height, "non-vacuity: height non-zero at 1.0").toBeGreaterThan(0);
+    // Documentation band around the fixed 64px basis (±10%): catches CSS-not-
+    // loaded / wrong-element degeneracy the ratio alone would miss.
+    expectWithin(base.box!.width, 64, 0.1, `base width ≈ 64px (fixed .empty-mark, zoom=${base.zoom})`);
+
+    // ---- Scenario B: preload uiScale = 1.5 on a FRESH context — addInitScript
+    // is per-page and irremovable, so the 1.0 pin above cannot be cleared on
+    // the fixture page. The host origin mirrors the config's
+    // REAL_EMBED_HOST_PORT default.
+    const HOST = `http://localhost:${process.env.REAL_EMBED_HOST_PORT ?? "5183"}`;
+    const ctx = await browser.newContext();
+    const page2 = await ctx.newPage();
+    try {
+      await preloadScale(page2, 1.5);
+      await page2.goto(`${HOST}/`);
+      const scaled = await measureEmptyMark(page2);
+      expect(scaled.box, `svg.empty-mark found at scale 1.5 (zoom=${scaled.zoom})`).not.toBeNull();
+      expect(scaled.box!.width, `non-vacuity: width non-zero at 1.5 (zoom=${scaled.zoom})`).toBeGreaterThan(0);
+      expect(scaled.box!.height, "non-vacuity: height non-zero at 1.5").toBeGreaterThan(0);
+      expectWithin(scaled.box!.width, 96, 0.1, `scaled width ≈ 96px (64px × 1.5, zoom=${scaled.zoom})`);
+
+      // ---- THE CRUX (outcome, not mechanism): the same fixed-size element's
+      // rendered box inside the real cross-origin SPA iframe scales ~1.5×.
+      // Tolerance 1.35–1.65 (card band): unchanged geometry (ratio 1.0) or a
+      // broken preload cannot pass; non-zero bounds above rule out vacuous 0/0.
+      const ratioW = scaled.box!.width / base.box!.width;
+      const ratioH = scaled.box!.height / base.box!.height;
+      const ctxW = `base=${base.box!.width}px scaled=${scaled.box!.width}px zoom(base)=${base.zoom} zoom(scaled)=${scaled.zoom}`;
+      expect(ratioW, `width ratio 1.5-run / 1.0-run = ${ratioW.toFixed(3)} [${ctxW}]`).toBeGreaterThanOrEqual(1.35);
+      expect(ratioW, `width ratio within band: ${ratioW.toFixed(3)} [${ctxW}]`).toBeLessThanOrEqual(1.65);
+      expect(ratioH, `height ratio 1.5-run / 1.0-run = ${ratioH.toFixed(3)}`).toBeGreaterThanOrEqual(1.35);
+      expect(ratioH, `height ratio within band: ${ratioH.toFixed(3)}`).toBeLessThanOrEqual(1.65);
+    } finally {
+      await ctx.close();
+    }
+  });
 });
