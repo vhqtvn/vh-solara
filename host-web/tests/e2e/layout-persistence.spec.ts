@@ -315,3 +315,316 @@ test.describe("layout persistence", () => {
   });
 });
 
+// =============================================================================
+// Proof-gap closures F1/F2 (card hostweb-layout-restore-proof-gaps, from the
+// original /commit-review APPROVED-with-DEFER). The tests above prove pane
+// COUNT + ids + urls + labels round-trip; these close what they did NOT:
+//
+//   F1 — floating/tray round-trip: repairGroups() in layoutPersistence.ts is
+//        load-bearing for any layout with a collapsed-to-tray pane, but no test
+//        ever persisted one. Collapse parks a pane in a FLOATING GROUP
+//        (hostController.collapse: addFloatingGroup, never removePanel), the
+//        save side serializes it under floatingGroups, and cold restore runs it
+//        through repairGroups → fromJSON → a real floating group again.
+//
+//   F2 — normalized topology: the round-trip above asserts flat pane identity
+//        but NOT the split ARRANGEMENT. Here a NON-DEFAULT arrangement is built
+//        and a normalized topology fingerprint (tree + group ids + view order +
+//        orientation + per-pane identity, transient geometry excluded) must be
+//        byte-identical across the reload.
+// =============================================================================
+
+// ---- F2: normalized-topology helpers ----------------------------------------
+
+/** Minimal structural mirror of dockview's serialized grid — only the fields
+ *  the topology fingerprint consumes. Transient fields (px size, stored
+ *  fraction, visibility, viewport extents, focus) are dropped by the
+ *  normalizer, never modeled here. */
+interface TopoLeaf {
+  type: "leaf";
+  data: { id: string; views: string[]; activeView?: string };
+  size?: number;
+  fraction?: number;
+  visible?: boolean;
+}
+interface TopoBranch {
+  type: "branch";
+  data: TopoNode[];
+  size?: number;
+  fraction?: number;
+  visible?: boolean;
+}
+type TopoNode = TopoLeaf | TopoBranch;
+interface TopoLayout {
+  grid: { root: TopoNode; width?: number; height?: number; orientation?: string };
+  panels: Record<
+    string,
+    { id?: string; params?: { url?: string; label?: string; route?: string } }
+  >;
+  floatingGroups?: Array<{ data?: { views?: string[] }; grid?: unknown }>;
+}
+
+/** Normalize a serialized layout (api.toJSON, px shape) into a deterministic
+ *  topology fingerprint string: the branch/leaf tree (group id + per-group
+ *  view order), the root orientation, the per-pane {url,label,route} identity
+ *  map (sorted keys), and floating-group view membership. EXCLUDED as
+ *  transient/session-local: px `size`, stored `fraction`, `visible`, grid
+ *  width/height (viewport-dependent), activeGroup / per-group activeView
+ *  (focus state), and floating overlay px positions. Fixed literal key order
+ *  keeps the string directly comparable with toBe(). */
+function normalizeTopology(layout: TopoLayout): string {
+  const normNode = (n: TopoNode): unknown => {
+    if (n.type === "leaf") return { group: n.data.id, views: [...n.data.views] };
+    return { branch: n.data.map(normNode) };
+  };
+  const panels: Record<string, unknown> = {};
+  for (const id of Object.keys(layout.panels).sort()) {
+    const p = layout.panels[id];
+    panels[id] = {
+      id: p.id ?? null,
+      url: p.params?.url ?? null,
+      label: p.params?.label ?? null,
+      route: p.params?.route ?? null,
+    };
+  }
+  const floating = (layout.floatingGroups ?? []).map((fg) =>
+    fg.data ? { views: [...(fg.data.views ?? [])] } : { grid: true },
+  );
+  return JSON.stringify({
+    orientation: layout.grid.orientation ?? null,
+    root: normNode(layout.grid.root),
+    panels,
+    floating,
+  });
+}
+
+/** Count grid leaves (groups) in a serialized tree — the pane-slot count. */
+function countLeaves(n: TopoNode): number {
+  return n.type === "leaf" ? 1 : n.data.reduce((acc, c) => acc + countLeaves(c), 0);
+}
+
+test.describe("layout persistence — proof-gap closures (F1/F2)", () => {
+  test("F1: a collapsed (trayed) pane round-trips through reload as a floating pane", async ({
+    page,
+  }) => {
+    await H.loadHost(page);
+    const ids = await H.panes(page);
+    const victim = ids[ids.length - 1];
+    const victimBefore = (await H.paneParams(page)).find((p) => p.id === victim)!;
+    const gridBefore = await H.gridPaneCount(page);
+    expect(gridBefore, "enough grid panes for the collapse guard").toBeGreaterThanOrEqual(2);
+
+    // Collapse-to-tray through the production path (addFloatingGroup park; the
+    // pane stays in api.panels but leaves the grid).
+    await H.collapse(page, victim);
+    await expect.poll(async () => (await H.trayIds(page)).includes(victim)).toBe(true);
+    await expect.poll(async () => H.gridPaneCount(page)).toBe(gridBefore - 1);
+
+    // SAVE-SIDE witness: the debounced save flushed a v3 blob whose layout
+    // carries the victim INSIDE floatingGroups. Panel-count polling cannot see
+    // a collapse (the count is unchanged) — poll the raw blob instead.
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(
+            ({ key, victim }) => {
+              const raw = localStorage.getItem(key);
+              if (!raw) return false;
+              try {
+                const parsed = JSON.parse(raw) as {
+                  workspaces?: Array<{
+                    layout?: { floatingGroups?: Array<{ data?: { views?: string[] } }> };
+                  }>;
+                };
+                return (parsed.workspaces ?? []).some((ws) =>
+                  (ws.layout?.floatingGroups ?? []).some((fg) =>
+                    (fg.data?.views ?? []).includes(victim),
+                  ),
+                );
+              } catch {
+                return false;
+              }
+            },
+            { key: H.LAYOUT_STORAGE_KEY, victim },
+          ),
+        { timeout: 8000 },
+      )
+      .toBe(true);
+
+    // RELOAD → cold restore. repairGroups() walks the saved floatingGroups; the
+    // victim's group survives repair and fromJSON recreates it as a REAL
+    // floating group (back in the tray) with its {url,label} intact, off-grid.
+    await page.reload();
+    await expect.poll(async () => H.connected(page), { timeout: 20000 }).toBe(true);
+    await expect
+      .poll(async () => (await H.panes(page)).length, { timeout: 20000 })
+      .toBe(ids.length);
+    await expect
+      .poll(async () => (await H.trayIds(page)).includes(victim), { timeout: 20000 })
+      .toBe(true);
+    await expect
+      .poll(async () => H.gridPaneCount(page), { timeout: 20000 })
+      .toBe(gridBefore - 1);
+
+    const victimAfter = (await H.paneParams(page)).find((p) => p.id === victim);
+    expect(victimAfter, "trayed pane restored after reload").toBeDefined();
+    expect(victimAfter!.url, "trayed pane url round-trips").toBe(victimBefore.url);
+    expect(victimAfter!.label, "trayed pane label round-trips").toBe(victimBefore.label);
+
+    // The restored floating group is a REAL floating group: the production
+    // restore() op re-docks it into the grid (its guard requires the panel's
+    // group location to be "floating") and the re-docked pane goes live.
+    await H.restore(page, victim);
+    await expect.poll(async () => (await H.trayIds(page)).includes(victim)).toBe(false);
+    await expect.poll(async () => H.gridPaneCount(page)).toBe(gridBefore);
+    await H.waitForReady(page, victim);
+  });
+
+  test("F1 NEGATIVE: a poisoned floating-pane url is dropped by repairGroups on cold restore", async ({
+    page,
+  }) => {
+    await H.loadHost(page);
+    const ids = await H.panes(page);
+    const victim = ids[ids.length - 1];
+    const gridBefore = await H.gridPaneCount(page);
+    expect(gridBefore).toBeGreaterThanOrEqual(2);
+
+    await H.collapse(page, victim);
+    await expect.poll(async () => (await H.trayIds(page)).includes(victim)).toBe(true);
+
+    // Wait until the save has flushed the floating group, then poison the
+    // victim's url IN BOTH mirrors (localStorage v3 + the #state= hash — the
+    // same flushSave writes both, and readBlob() reads the hash FIRST, so
+    // poisoning only localStorage would be a no-op).
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(
+            ({ key, victim }) => {
+              const raw = localStorage.getItem(key);
+              if (!raw) return false;
+              try {
+                const parsed = JSON.parse(raw) as {
+                  workspaces?: Array<{
+                    layout?: { floatingGroups?: Array<{ data?: { views?: string[] } }> };
+                  }>;
+                };
+                return (parsed.workspaces ?? []).some((ws) =>
+                  (ws.layout?.floatingGroups ?? []).some((fg) =>
+                    (fg.data?.views ?? []).includes(victim),
+                  ),
+                );
+              } catch {
+                return false;
+              }
+            },
+            { key: H.LAYOUT_STORAGE_KEY, victim },
+          ),
+        { timeout: 8000 },
+      )
+      .toBe(true);
+    await page.evaluate(
+      ({ key, victim }) => {
+        const raw = localStorage.getItem(key);
+        if (!raw) throw new Error("no saved layout blob to poison");
+        const parsed = JSON.parse(raw) as {
+          workspaces?: Array<{
+            layout?: { panels?: Record<string, { params?: unknown }> };
+          }>;
+        };
+        for (const ws of parsed.workspaces ?? []) {
+          const panels = ws.layout?.panels;
+          if (panels && victim in panels) {
+            panels[victim].params = { url: "javascript:alert(document.domain)", label: "evil" };
+          }
+        }
+        const json = JSON.stringify(parsed);
+        localStorage.setItem(key, json);
+        // Mirror the poison into the URL hash exactly like flushSave would.
+        // history.replaceState fires no hashchange (no runtime listener is
+        // involved; the hash is read once, at module init on cold load).
+        window.history.replaceState(
+          null,
+          "",
+          window.location.pathname +
+            window.location.search +
+            "#state=" +
+            encodeURIComponent(json),
+        );
+      },
+      { key: H.LAYOUT_STORAGE_KEY, victim },
+    );
+
+    // Cold restore: isFleetEntry rejects the javascript: url → the victim is
+    // not in validRestoreIds → repairGroups drops the now-empty floating group
+    // (tray empty), while every valid GRID pane survives untouched.
+    await page.reload();
+    await expect.poll(async () => H.connected(page), { timeout: 20000 }).toBe(true);
+    await expect
+      .poll(async () => (await H.panes(page)).length, { timeout: 20000 })
+      .toBe(ids.length - 1);
+    await expect.poll(async () => H.trayIds(page), { timeout: 20000 }).toEqual([]);
+    await expect
+      .poll(async () => H.gridPaneCount(page), { timeout: 20000 })
+      .toBe(gridBefore - 1);
+
+    const restored = await H.paneParams(page);
+    expect(
+      restored.find((p) => p.id === victim),
+      "poisoned floating pane was not restored",
+    ).toBeUndefined();
+    expect(
+      (await H.iframeSrcs(page)).every((s) => !/^javascript:/i.test(s)),
+      "no javascript: iframe src after poisoned floating restore",
+    ).toBe(true);
+  });
+
+  test("F2: the split ARRANGEMENT round-trips — normalized grid topology unchanged across reload", async ({
+    page,
+  }) => {
+    await H.loadHost(page);
+
+    // The fresh-seed arrangement — what a NON-persisted cold load would fall
+    // back to. The round-tripped topology must differ from it (non-default).
+    const seedTopology = normalizeTopology((await H.serialize(page)) as unknown as TopoLayout);
+
+    // Build a NON-DEFAULT arrangement: split right off pane-1, then split the
+    // NEW pane DOWN — nesting a vertical branch inside the root branch.
+    const ids = await H.panes(page);
+    const mid = await H.split(page, ids[0], "right");
+    expect(mid, "first split created a pane").toBeTruthy();
+    await H.waitForReady(page, mid!);
+    const deep = await H.split(page, mid!, "down");
+    expect(deep, "second split created a pane").toBeTruthy();
+    await H.waitForReady(page, deep!);
+
+    const beforeLayout = (await H.serialize(page)) as unknown as TopoLayout;
+    const before = normalizeTopology(beforeLayout);
+    const total = ids.length + 2;
+    expect((await H.panes(page)).length, "two new panes exist").toBe(total);
+    expect(
+      countLeaves(beforeLayout.grid.root),
+      "each pane owns a grid leaf (group)",
+    ).toBe(total);
+    expect(
+      before,
+      "arrangement is non-default (differs from the fresh seed topology)",
+    ).not.toBe(seedTopology);
+
+    // Flush the debounced save, then cold-reload.
+    await H.waitForSavedLayout(page, total);
+    await page.reload();
+    await expect.poll(async () => H.connected(page), { timeout: 20000 }).toBe(true);
+    await expect
+      .poll(async () => (await H.panes(page)).length, { timeout: 20000 })
+      .toBe(total);
+    for (const id of await H.panes(page)) await H.waitForReady(page, id);
+
+    // The normalized topology — tree structure + group ids + per-group view
+    // order + root orientation + per-pane identity + floating membership — is
+    // IDENTICAL across the reload (transient geometry excluded by design).
+    const after = normalizeTopology((await H.serialize(page)) as unknown as TopoLayout);
+    expect(after, "normalized topology round-trips through reload").toBe(before);
+  });
+});
+

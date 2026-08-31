@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { paneParams } from "../e2e/util";
+import { addServer, paneParams, waitForSavedLayout } from "../e2e/util";
 import { FLEET_POISONED, FLEET_SERVERS } from "./fleet-data";
 
 // =============================================================================
@@ -147,5 +147,101 @@ test.describe("config-driven fleet seeding (VITE_SERVERS)", () => {
       srcs,
       "the poisoned url never reaches an iframe src",
     ).not.toContain(FLEET_POISONED.url);
+  });
+});
+
+// =============================================================================
+// F3 (card hostweb-layout-restore-proof-gaps): configured-fleet RESTORE
+// validation — the validRestoreIds() fleetOrigins branch in
+// src/dockview/layoutPersistence.ts.
+//
+// In this lane VITE_SERVERS is set (FLEET_JSON), so hasRealFleetEnv() is TRUE
+// and cold restore builds an origin allowlist from the BUILD-TIME config
+// (resolveBaseFleet → every FLEET_SERVERS url points at origin
+// http://127.0.0.1:5174). A saved pane whose url origin is NOT a member is
+// DROPPED; configured-origin panes survive. This branch is UNREACHABLE in the
+// default mock-only suite (fleetOrigins is null there — protocol check only),
+// which is exactly why the original review flagged it as unwitnessed.
+//
+// The allowlist is anchored to BUILD-TIME VITE_SERVERS, deliberately NOT the
+// runtime catalog — so a pane ADDED at runtime to a configured origin survives
+// restore, while one added at runtime to an unconfigured origin is dropped.
+// Both sides are proven below with runtime-added panes (the seeded configured
+// panes are the third, pre-existing side).
+// =============================================================================
+
+test.describe("configured-fleet restore validation (validRestoreIds fleetOrigins branch)", () => {
+  test("restore keeps configured-origin panes and drops unconfigured-origin panes", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await expect
+      .poll(async () => (await paneParams(page)).length, { timeout: 20_000 })
+      .toBe(FLEET_SERVERS.length);
+    const seeded = await paneParams(page);
+    expect(seeded.length, "fleet seeded before mutation").toBe(FLEET_SERVERS.length);
+
+    // A runtime-added server whose url ORIGIN is configured (the mock content
+    // page :5174 — the same origin every FLEET_SERVERS url points at; the
+    // query params differ, the origin does not).
+    const CONFIGURED_URL = "http://127.0.0.1:5174/?server=fleet-extra&view=chat";
+    const CONFIGURED_LABEL = "fleet-extra";
+    // A runtime-added server at an ORIGIN NOT in the configured fleet. Nothing
+    // listens on :5999 — the pane's iframe shows a connection error while
+    // live, but the pane itself exists and SAVES; only RESTORE must drop it.
+    const GHOST_URL = "http://127.0.0.1:5999/?server=ghost&view=chat";
+    const GHOST_LABEL = "ghost";
+
+    const extraPane = await addServer(page, CONFIGURED_URL, CONFIGURED_LABEL);
+    expect(extraPane, "configured-origin runtime pane opened").toBeTruthy();
+    const ghostPane = await addServer(page, GHOST_URL, GHOST_LABEL);
+    expect(ghostPane, "unconfigured-origin runtime pane opened").toBeTruthy();
+    await expect
+      .poll(async () => (await paneParams(page)).length, { timeout: 20_000 })
+      .toBe(FLEET_SERVERS.length + 2);
+
+    // SAVE SIDE: the debounced save carries BOTH runtime-added panes — the
+    // save path applies no origin filter; validation is restore-side only.
+    await waitForSavedLayout(page, FLEET_SERVERS.length + 2);
+
+    // RELOAD → cold restore under the fleetOrigins allowlist: the ghost pane
+    // (origin :5999 ∉ {http://127.0.0.1:5174}) is dropped; every
+    // configured-origin pane — seeded AND runtime-added — survives.
+    await page.reload();
+    await expect
+      .poll(async () => (await paneParams(page)).length, { timeout: 20_000 })
+      .toBe(FLEET_SERVERS.length + 1);
+
+    const restored = await paneParams(page);
+    // Every configured seeded pane survived with its exact {url,label}.
+    for (const f of FLEET_SERVERS) {
+      expect(
+        restored.some((p) => p.url === f.url && p.label === f.label),
+        `configured seeded pane "${f.label}" survived restore`,
+      ).toBe(true);
+    }
+    // The runtime-added CONFIGURED-origin pane survived too — origin
+    // membership, not seed-vs-runtime provenance, is the criterion.
+    const extra = restored.find((p) => p.url === CONFIGURED_URL);
+    expect(
+      extra,
+      "runtime-added configured-origin pane survived restore",
+    ).toBeDefined();
+    expect(extra!.label, "surviving runtime pane kept its label").toBe(CONFIGURED_LABEL);
+    // The runtime-added UNCONFIGURED-origin pane was DROPPED.
+    expect(
+      restored.find((p) => p.url === GHOST_URL || p.label === GHOST_LABEL),
+      "unconfigured-origin pane dropped on restore",
+    ).toBeUndefined();
+    // Defense in depth: no iframe src points at the unconfigured origin.
+    const srcs = await page
+      .locator(".pane-iframe")
+      .evaluateAll((els) =>
+        els.map((e) => (e as HTMLIFrameElement).getAttribute("src") ?? ""),
+      );
+    expect(
+      srcs.some((s) => s.startsWith("http://127.0.0.1:5999")),
+      "no iframe src points at the unconfigured origin",
+    ).toBe(false);
   });
 });
