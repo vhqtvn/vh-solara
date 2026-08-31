@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -847,13 +848,16 @@ func TestAgentHoldEventsCarryTranslatorShapes(t *testing.T) {
 	// (the loop above exits as soon as both flags are set, e.g. before arm
 	// #2's created is read), so any deleted seen below is provably the
 	// arm-site one.
-	quiesced := false
-	for !quiesced {
-		select {
-		case <-ch:
-		case <-time.After(150 * time.Millisecond):
-			quiesced = true
+	// Read until empty — after a scheduler yield, so an in-flight emit still
+	// lands — instead of a fixed 150ms quiesce, which under load could either
+	// cut the drain short or stall the test needlessly.
+	drained := false
+	for !drained {
+		for len(ch) > 0 {
+			<-ch
 		}
+		runtime.Gosched()
+		drained = len(ch) == 0
 	}
 	postJSON(t, srv, "/fixture/agent-hold/arm", "")
 

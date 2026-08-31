@@ -264,9 +264,10 @@ func TestPage_EmptyList(t *testing.T) {
 	}
 }
 
-// TestPage_BeforeIsOldest pins the end-of-history case: when the anchor IS the
-// oldest message, the page is [anchor] alone, boundary_found=true, has_older=
-// false (the client renders NO further "Load older" affordance below this page).
+// TestPage_BeforeIsOldest pins the end-of-resident-history case: when the
+// anchor IS the oldest resident message, the page is [anchor] alone,
+// boundary_found=true, has_older=false (the client renders NO further "Load
+// older" affordance below this page).
 func TestPage_BeforeIsOldest(t *testing.T) {
 	list := fiveMessageList() // m1 is oldest
 	res := projectMessagePage(list, "m1", 5, 1<<20)
@@ -382,8 +383,8 @@ func TestPage_ItemsAlwaysNonNil(t *testing.T) {
 // by one atomic item" signal — it fires on the NEXT older message IF one
 // remains. Here m0 IS the session's oldest (list [m0, m1(anchor), m2]), so the
 // loop exits naturally at the floor and bytes_limited stays FALSE (truthful
-// end-of-history). The companion test WithMoreOlder covers the variant where a
-// further older message does remain and bytes_limited fires.
+// end of resident history). The companion test WithMoreOlder covers the
+// variant where a further older message does remain and bytes_limited fires.
 func TestPage_ForwardProgress_ByteOvershoot(t *testing.T) {
 	// [m0, m1(anchor), m2]: m0 and m1 are each ~89B; anchor m1 alone fits the
 	// budget, but anchor + m0 (178B) exceeds it. m0 alone (89B) fits.

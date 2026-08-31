@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
@@ -484,4 +485,224 @@ func mustParseUint(s string) uint64 {
 		n = n*10 + uint64(c-'0')
 	}
 	return n
+}
+
+// ---------------------------------------------------------------------------
+// Part B boundary-demand (D-trigger) tests.
+//
+// The handler gate (messages_http.go) fires the remote older-page fetch
+// (EnsureOlderMessages + re-project) only when the projection says
+// BoundaryFound && !CountLimited && !BytesLimited && !HistoryExhausted AND the
+// resident floor tuple is usable AND `before` IS the resident floor id. The
+// two tests below pin BOTH arms at the HTTP-handler level — the deferral arm
+// (before != floorID ⇒ NO upstream fetch) and the firing arm (before ==
+// floorID ⇒ exactly ONE fetch + re-projection).
+//
+// None of the ten tests above can reach this gate: their fake serves the full
+// message list with no X-Next-Cursor, so hydration lands historyExhausted=true
+// and the gate's !HistoryExhausted conjunct never passes. The seam here
+// instead wraps the fake with an upstream that models an opencode whose
+// history extends beyond the bounded cold-load tail (the pkg/web port of the
+// pkg/fixtures MessagesBeforeCount observation pattern used by the e2e
+// coldload_boundary_demand lane).
+// ---------------------------------------------------------------------------
+
+// seedMsgWithTimeJSON builds ONE message JSON object (info+parts) for message
+// index i with an explicit info.time.created (unix-ms). The base
+// seedMsgListJSON omits time.created, which leaves the resident floor tuple
+// unusable (OldestResidentCursorTuple ok=false) and the boundary-demand gate
+// unreachable; the boundary-demand tests therefore seed via this variant.
+func seedMsgWithTimeJSON(sid string, i int, createdMs int64) string {
+	return fmt.Sprintf(
+		`{"info":{"id":"m%d","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"id":"m%dp","sessionID":%q,"messageID":"m%d","type":"text","text":"msg %d"}]}`,
+		i, sid, createdMs, i, sid, i, i,
+	)
+}
+
+// boundaryDemandUpstream intercepts GET /session/<sid>/message on behalf of
+// the boundary-demand tests and passes everything else through to the wrapped
+// fake. The upstream it models has 10 messages total (m1..m10, ascending
+// info.time.created) with the bounded cold-load tail m6..m10 resident:
+//
+//   - tail fetch (no ?before= — the EnsureMessages cold-load path): serves
+//     ONLY m6..m10 plus a NON-EMPTY X-Next-Cursor, so hydration leaves
+//     historyExhausted=false (older history exists upstream);
+//   - older-page fetch (?before= — the EnsureOlderMessages path): counts the
+//     call and serves the fixed older page m1..m5 with NO X-Next-Cursor (this
+//     fetch bottoms out at the session's true oldest, so the merge flips
+//     historyExhausted=true).
+//
+// The caller must NOT seed fake.messages[sid]: if a message GET escapes this
+// wrapper, the inner fake serves an empty list and the test fails loudly.
+func boundaryDemandUpstream(beforeFetches *atomic.Int64, sid string, inner http.Handler) http.Handler {
+	const baseMs = int64(1_700_000_000_000)
+	tail := make([]string, 0, 5)
+	older := make([]string, 0, 5)
+	for i := 1; i <= 10; i++ {
+		msg := seedMsgWithTimeJSON(sid, i, baseMs+int64(i)*1000)
+		if i <= 5 {
+			older = append(older, msg)
+		} else {
+			tail = append(tail, msg)
+		}
+	}
+	tailJSON := "[" + strings.Join(tail, ",") + "]"
+	olderJSON := "[" + strings.Join(older, ",") + "]"
+	msgPath := "/session/" + sid + "/message"
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != msgPath {
+			inner.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("before") != "" {
+			// The handler-triggered older-page fetch. Count it, then serve
+			// the fixed older page with no next cursor.
+			beforeFetches.Add(1)
+			io.WriteString(w, olderJSON)
+			return
+		}
+		// Cold-load tail fetch: bounded resident window + non-empty next
+		// cursor ⇒ historyExhausted=false after hydration.
+		w.Header().Set("X-Next-Cursor", "older-history-exists")
+		io.WriteString(w, tailJSON)
+	})
+}
+
+// setupBoundaryDemandTest wires the fake+aggregator+server pair for the
+// boundary-demand tests: same shape as setupPageTest, but the fake's handler
+// is wrapped in boundaryDemandUpstream (which owns every message-list GET, so
+// fake.messages stays unseeded). Returns the web server URL and the
+// older-page-fetch counter.
+func setupBoundaryDemandTest(t *testing.T, sid string) (webURL string, beforeFetches *atomic.Int64) {
+	t.Helper()
+	fake := newFake()
+	fake.sessions = []string{fmt.Sprintf(`{"id":%q,"title":"S"}`, sid)}
+	var n atomic.Int64
+	ocSrv := httptest.NewServer(boundaryDemandUpstream(&n, sid, fake.handler()))
+	t.Cleanup(ocSrv.Close)
+	agg := aggregator.New(ocSrv.URL, 1000)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go agg.Run(ctx)
+	srv, err := NewServer(agg, ocSrv.URL, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	web := httptest.NewServer(srv.Handler())
+	t.Cleanup(web.Close)
+	waitFor(t, func() bool { return len(agg.Store().SessionIDs()) >= 1 }, "session hydrated into tree")
+	if err := agg.EnsureMessages(ctx, sid); err != nil {
+		t.Fatalf("setup EnsureMessages: %v", err)
+	}
+	return web.URL, &n
+}
+
+// TestMessagesEndpoint_BeforeNotFloorDefersFetch pins the D-trigger's
+// ANTI-MISFIRE arm: a page whose walk touches or overlaps the resident floor
+// but whose `before` anchor is NOT the floor id must NOT fire the upstream
+// older-page fetch — the walk still has resident-local older messages to
+// advance through first, and the fetch belongs to the click that puts
+// `before` AT the floor (companion: ...FetchAtResidentFloor). Dropping the
+// handler's `before == floorID` conjunct makes this test fail (the
+// floor-touching pair over-fetches), proving the conjunct load-bearing at the
+// HTTP level.
+func TestMessagesEndpoint_BeforeNotFloorDefersFetch(t *testing.T) {
+	webURL, beforeFetches := setupBoundaryDemandTest(t, "s")
+	// Resident window after cold-load: m6..m10, floor=m6, historyExhausted=false.
+
+	// (a) Oversized pair mid-window: max_bytes=60 makes every seeded message
+	// oversized; anchor m8 (anchorIdx=2) → atomic pair [m7,m8]. The walk's
+	// next clicks are m7, then m6 — never the upstream.
+	env := getPage(t, webURL, "s", "m8", "", "60", "")
+	if got := pageItemIDs(env); !equalStrings(got, []string{"m7", "m8"}) {
+		t.Fatalf("items: want oversized pair [m7 m8], got %v", got)
+	}
+	if env["oversized_item"] != true {
+		t.Fatalf("oversized_item: want true, got %v", env["oversized_item"])
+	}
+	if n := beforeFetches.Load(); n != 0 {
+		t.Fatalf("before=m8 (mid-window pair): upstream older-page fetch must NOT fire, got %d fetch(es)", n)
+	}
+
+	// (b) THE anti-misfire shape: floor-touching oversized pair. Anchor m7's
+	// only strictly-older RESIDENT neighbor is the floor m6 → pair [m6,m7].
+	// The page touches the floor, but `before` (m7) != floorID (m6): the
+	// walk advances locally to m6 on the next click, and fetching here would
+	// duplicate that click's fetch.
+	env = getPage(t, webURL, "s", "m7", "", "60", "")
+	if got := pageItemIDs(env); !equalStrings(got, []string{"m6", "m7"}) {
+		t.Fatalf("items: want floor-touching pair [m6 m7], got %v", got)
+	}
+	if env["oversized_item"] != true {
+		t.Fatalf("oversized_item: want true, got %v", env["oversized_item"])
+	}
+	if n := beforeFetches.Load(); n != 0 {
+		t.Fatalf("before=m7 (floor-touching pair, before != floorID): upstream older-page fetch must NOT fire, got %d fetch(es)", n)
+	}
+
+	// (c) Same anchor, full default bounds: the normal (non-oversized) page
+	// [m6,m7] with has_older=true (upstream history exists) — still deferred.
+	env = getPage(t, webURL, "s", "m7", "", "", "")
+	if got := pageItemIDs(env); !equalStrings(got, []string{"m6", "m7"}) {
+		t.Fatalf("items: want [m6 m7], got %v", got)
+	}
+	if env["has_older"] != true {
+		t.Fatalf("has_older: want true (upstream history exists), got %v", env["has_older"])
+	}
+	if env["history_exhausted"] != false {
+		t.Fatalf("history_exhausted: want false (not yet fetched), got %v", env["history_exhausted"])
+	}
+	if n := beforeFetches.Load(); n != 0 {
+		t.Fatalf("before=m7 (default bounds): upstream older-page fetch must NOT fire, got %d fetch(es)", n)
+	}
+}
+
+// TestMessagesEndpoint_FetchAtResidentFloor pins the D-trigger's FIRING arm:
+// the request whose `before` IS the resident floor id (oversized-floor shape —
+// sub-case A: the anchor alone exceeds max_bytes) and whose walk hit the
+// floor without count/byte limits on a not-exhausted session DOES fetch the
+// upstream older page — EXACTLY ONCE — and re-projects, so this response
+// already carries the fetched older history (m5 was NOT resident before the
+// fetch; its presence in the returned pair is the re-projection proof). The
+// fetched page bottoms out at the true oldest (no next cursor), so the merge
+// flips history_exhausted=true.
+func TestMessagesEndpoint_FetchAtResidentFloor(t *testing.T) {
+	webURL, beforeFetches := setupBoundaryDemandTest(t, "s")
+	// before=m6 == floorID, max_bytes=60 → sub-case A projection [m6] alone,
+	// oversized, no limits, historyExhausted=false → the gate fires once,
+	// merges m1..m5, and re-projects: pair [m5,m6] with m5 freshly fetched.
+	env := getPage(t, webURL, "s", "m6", "", "60", "")
+	if n := beforeFetches.Load(); n != 1 {
+		t.Fatalf("upstream older-page fetches: want exactly 1, got %d", n)
+	}
+	if got := pageItemIDs(env); !equalStrings(got, []string{"m5", "m6"}) {
+		t.Fatalf("items: want re-projected pair [m5 m6] (m5 fetched from upstream), got %v", got)
+	}
+	if env["oversized_item"] != true {
+		t.Fatalf("oversized_item: want true, got %v", env["oversized_item"])
+	}
+	if env["has_older"] != true {
+		t.Fatalf("has_older: want true (anchorIdx now 5 > 1), got %v", env["has_older"])
+	}
+	if env["history_exhausted"] != true {
+		t.Fatalf("history_exhausted: want true (fetched page had no next cursor), got %v", env["history_exhausted"])
+	}
+	if env["oldest_id"] != "m5" {
+		t.Fatalf("oldest_id: want m5 (fetched older page), got %v", env["oldest_id"])
+	}
+
+	// The merge is resident state, not just this response: the next walk
+	// click (before=m5, default bounds) pages locally through m1..m5 with no
+	// second upstream fetch.
+	env = getPage(t, webURL, "s", "m5", "", "", "")
+	if got := pageItemIDs(env); !equalStrings(got, []string{"m1", "m2", "m3", "m4", "m5"}) {
+		t.Fatalf("items: want [m1..m5] served from merged resident state, got %v", got)
+	}
+	if env["history_exhausted"] != true {
+		t.Fatalf("history_exhausted: want true, got %v", env["history_exhausted"])
+	}
+	if n := beforeFetches.Load(); n != 1 {
+		t.Fatalf("upstream older-page fetches after local walk: want still 1, got %d", n)
+	}
 }
