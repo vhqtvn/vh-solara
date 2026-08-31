@@ -174,18 +174,25 @@ func newOCSpawnScenario(t *testing.T) *ocSpawnScenario {
 	// runs it AFTER every assertion and every starter cleanup: the crux test
 	// ENDS by asserting a LIVE fake (starter C's child), so the sweep must
 	// never fire before the test body completes.
+	//
+	// Identity revalidation (P2-API-009): a recorded pid may have died and
+	// been recycled into an innocent process within the test-run window, so
+	// the sweep re-reads /proc/<pid>/cmdline IMMEDIATELY before each
+	// SIGKILL and signals only pids that still carry the fake signature —
+	// this test binary re-exec'd with `-- opencode serve --port N …` argv,
+	// the same ocCmdlineMatches-style shape the production gate trusts.
+	// Unreadable (dead/zombie) or foreign cmdline → skip, never signal.
+	//
+	// (No `.gchild` iteration here: this scaffold's fake helper only ever
+	// records `<pid>.fake` files — it has no grandchild producer.)
 	t.Cleanup(func() {
-		for _, suffix := range []string{".fake", ".gchild"} {
-			ents, _ := os.ReadDir(sc.pidsDir)
-			for _, e := range ents {
-				if !strings.HasSuffix(e.Name(), suffix) {
-					continue
-				}
-				if pid, err := strconv.Atoi(strings.TrimSuffix(e.Name(), suffix)); err == nil && pidAlive(pid) {
-					t.Logf("scenario sweep: SIGKILLing leftover %q pid %d", suffix, pid)
-					killPid9(pid)
-				}
+		for _, pid := range sc.aliveFakes() {
+			if !integFakeOCIdentity(pid) {
+				t.Logf("scenario sweep: pid %d failed /proc cmdline identity revalidation — recycled or gone; NOT signaling", pid)
+				continue
 			}
+			t.Logf("scenario sweep: SIGKILLing leftover fake pid %d", pid)
+			killPid9(pid)
 		}
 	})
 	return sc
@@ -301,6 +308,21 @@ func procFD3Holders(ownerPath string) []int {
 func pidAlive(pid int) bool {
 	err := syscall.Kill(pid, 0)
 	return err == nil || err == syscall.EPERM
+}
+
+// integFakeOCIdentity is the sweep's pre-SIGKILL identity check: the fake
+// wrapper execs THIS test binary (VH_OC_TESTBIN = os.Args[0]) with
+// `-- opencode serve --port N …` argv, so a pid that is still ours carries
+// both markers in /proc/<pid>/cmdline — the same ocCmdlineMatches-style
+// signature the production gate trusts. A recycled innocent pid — or an
+// unreadable (dying/zombie) one — does not.
+func integFakeOCIdentity(pid int) bool {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false
+	}
+	args := strings.ReplaceAll(string(b), "\x00", " ")
+	return strings.Contains(args, os.Args[0]) && strings.Contains(args, "opencode")
 }
 
 func killPid9(pid int) {

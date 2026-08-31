@@ -391,7 +391,7 @@ func pickLowPort(t *testing.T) int {
 			return p
 		}
 	}
-	t.Skipf("no free port below the ephemeral floor %d (window %d..%d exhausted)", floor, lo, floor-1)
+	t.Skipf("%s: skipping — no free port below the ephemeral floor %d (window %d..%d exhausted); the below-ephemeral-port discriminator coverage is unavailable this run", t.Name(), floor, lo, floor-1)
 	return 0
 }
 

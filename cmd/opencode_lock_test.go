@@ -209,10 +209,28 @@ func newOCLockScenario(t *testing.T) *ocLockScenario {
 	// so LIFO cleanup order runs it AFTER every assertion and every other
 	// cleanup: tests stay free to END by asserting a live fake; the sweep
 	// only reaps what is still alive once the test is over.
+	//
+	// Identity revalidation (P2-API-009): a recorded pid may have died and
+	// been recycled into an innocent process within the test-run window, so
+	// the sweep re-reads /proc/<pid>/cmdline IMMEDIATELY before each
+	// SIGKILL and signals only pids that still carry this scenario's fake
+	// signature (the same ocCmdlineMatches-style shape the production gate
+	// trusts). Unreadable (dead/zombie) or foreign cmdline → skip, never
+	// signal.
 	t.Cleanup(func() {
-		for _, suffix := range []string{".fake", ".gchild"} {
-			for _, pid := range sc.alivePids(suffix) {
-				t.Logf("scenario sweep: SIGKILLing leftover %q pid %d", suffix, pid)
+		for _, kind := range []struct {
+			suffix    string
+			stillOurs func(int) bool
+		}{
+			{".fake", ocSweepIsFakeOC},
+			{".gchild", ocSweepIsGrandchild},
+		} {
+			for _, pid := range sc.alivePids(kind.suffix) {
+				if !kind.stillOurs(pid) {
+					t.Logf("scenario sweep: pid %d (%s) failed /proc cmdline identity revalidation — recycled or gone; NOT signaling", pid, kind.suffix)
+					continue
+				}
+				t.Logf("scenario sweep: SIGKILLing leftover %q pid %d", kind.suffix, pid)
 				killPid9(pid)
 			}
 		}
@@ -322,6 +340,35 @@ func killPid9(pid int) {
 	if p, err := os.FindProcess(pid); err == nil {
 		_ = p.Signal(syscall.SIGKILL)
 	}
+}
+
+// ocProcCmdlineArgs reads /proc/<pid>/cmdline as one space-separated
+// argument string ("" on any read failure — the same degradation
+// ocCmdlineMatches documents: a dying or zombie pid reads back empty).
+func ocProcCmdlineArgs(pid int) string {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return ""
+	}
+	return strings.ReplaceAll(string(b), "\x00", " ")
+}
+
+// ocSweepIsFakeOC is the sweep's pre-SIGKILL identity check for recorded
+// fake-opencode pids: the fake wrapper execs THIS test binary
+// (VH_OC_TESTBIN = os.Args[0]) with `-- opencode serve --port N …` argv, so
+// a pid that is still ours carries both markers in its cmdline — the same
+// ocCmdlineMatches-style signature the production gate trusts. A recycled
+// innocent pid does not.
+func ocSweepIsFakeOC(pid int) bool {
+	args := ocProcCmdlineArgs(pid)
+	return strings.Contains(args, os.Args[0]) && strings.Contains(args, "opencode")
+}
+
+// ocSweepIsGrandchild is the sweep's pre-SIGKILL identity check for recorded
+// grandchild pids: ocLockFakeOCHelper spawns them as exactly `sleep 3000`
+// (the fd-3-retaining holder).
+func ocSweepIsGrandchild(pid int) bool {
+	return strings.TrimSpace(ocProcCmdlineArgs(pid)) == "sleep 3000"
 }
 
 func waitPidDead(pid int, d time.Duration) bool {
