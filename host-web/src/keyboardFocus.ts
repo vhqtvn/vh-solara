@@ -60,11 +60,29 @@ let getAppEl: (() => HTMLElement | null) | null = null;
 let vvListener: (() => void) | null = null;
 let debounceTimer: number | undefined;
 let keyboardOpen = false;
-/** The workspace whose maximize focus-mode OWNS (null = not opened by us, e.g.
- *  the user had already manually maximized a pane when the keyboard opened, so
- *  we leave it alone and do not exit it on close). Scoped to a single ws: the
- *  one active when we maximized. */
-let ownedWs: string | null = null;
+/** The maximize focus-mode OWNS (null = owns none — not opened by us, e.g. the
+ *  user had already manually maximized a pane when the keyboard opened, so we
+ *  leave it alone and do not exit it on close).
+ *
+ *  Scoped to the GROUP INSTANCE we maximized, in the workspace that was active
+ *  when we maximized — NOT to the workspace alone. The ws-only scope was the
+ *  F2 defect: close's exitOwned() exited whatever group was CURRENTLY
+ *  maximized in that ws, so a user who exited our maximize and manually
+ *  re-maximized (while the keyboard was open) had their re-maximize clobbered
+ *  on close. Group-instance scope lets close distinguish: we exit ONLY if the
+ *  group we maximized is STILL the maximized one. A user's later manual
+ *  maximize of a DIFFERENT group survives close; a re-maximize of OUR group
+ *  recreates the exact state we entered (indistinguishable) and is still ours
+ *  to exit — see exitOwned(). */
+interface OwnedMaximize {
+  /** Workspace active when focus-mode maximized (exposed as the bridge's
+   *  ownedWs and used to resolve the right dockview api on close). */
+  ws: string;
+  /** id of the group focus-mode maximized (dockview group ids are unique per
+   *  component; getGroup(id) resolves undefined once the group is gone). */
+  groupId: string;
+}
+let owned: OwnedMaximize | null = null;
 /** Captured inline height string to restore on close ("" = no prior inline
  *  override; restore to CSS default by clearing the inline style). */
 let savedHeight = "";
@@ -152,8 +170,9 @@ export function isKeyboardOpen(): boolean {
  *  the maximize focus-mode owns). Used by the NEXT hero button when crossing to
  *  a different pane so the previously-focused pane's keyboard-maximize does not
  *  pin the layout. PRESERVES a user's manual maximize — exitOwned() only exits
- *  what focus-mode entered (ownedWs !== null); a user-owned maximize is never
- *  touched. No-op (and cheap) when the keyboard is already closed. */
+ *  what focus-mode entered (the group it owns is still the maximized one); a
+ *  user-owned maximize is never touched. No-op (and cheap) when the keyboard
+ *  is already closed. */
 export function exitKeyboardFocus(): void {
   if (!keyboardOpen) return;
   applyClose();
@@ -249,36 +268,50 @@ function maximizeActive(): void {
   const a = activeApi();
   const ws = activeWorkspaceId();
   if (!a || !ws) {
-    ownedWs = null;
+    owned = null;
     return;
   }
   const active = a.activePanel;
   if (!active) {
-    ownedWs = null;
+    owned = null;
     return;
   }
   if (a.hasMaximizedGroup()) {
     // A group is already maximized — the user did it manually (or it's leftover
     // from a prior open). Do NOT clobber; record that we don't own it so close
     // leaves it alone.
-    ownedWs = null;
+    owned = null;
     return;
   }
   // SURVIVAL-SAFE: maximizeGroup overlays the group in place. No iframe is
   // reparented/moved/removed → no reload. This is the SAME primitive manual
   // zoom (toggleZoom) uses; proven survival-safe by the maximize+restore gate.
   a.maximizeGroup(active);
-  ownedWs = ws;
+  // Ownership is group-instance-scoped (see OwnedMaximize): the group we just
+  // maximized, in the ws active now. active.group is set (maximizeGroup
+  // maximizes through it).
+  owned = { ws, groupId: active.group.id };
 }
 
-/** Exit the maximize focus-mode owns (if still maximized). Never touches a
- *  user-manual maximize (ownedWs === null in that case). */
+/** Exit the maximize focus-mode owns — but ONLY if the group we maximized is
+ *  still the maximized one. Never touches a user-manual maximize: if the user
+ *  exited ours and re-maximized (same or different group, while the keyboard
+ *  was open), the currently-maximized group is no longer the one we recorded,
+ *  so close leaves it alone (the F2 fix). A same-group re-maximize recreates
+ *  the exact state we entered — indistinguishable — and is still ours to
+ *  exit; ownership follows the group instance, not the maximize episode. */
 function exitOwned(): void {
-  const ws = ownedWs;
-  ownedWs = null;
-  if (!ws) return;
-  const a = workspaceApiFor(ws);
-  if (a && a.hasMaximizedGroup()) a.exitMaximizedGroup();
+  const o = owned;
+  owned = null;
+  if (!o) return;
+  const a = workspaceApiFor(o.ws);
+  if (!a || !a.hasMaximizedGroup()) return;
+  // OUR group must still be the maximized one. getGroup resolves undefined
+  // once the group was closed/disposed → nothing of ours remains → leave the
+  // current (user's) maximize alone.
+  const g = a.getGroup(o.groupId);
+  if (!g || !g.api.isMaximized()) return;
+  a.exitMaximizedGroup();
 }
 
 // ---- real keyboard detection (the on-device path) --------------------------
@@ -403,7 +436,7 @@ function installDevBridge(): void {
   if (!import.meta.env.DEV) return;
   const bridge: KbdFocusDevBridge = {
     isOpen: () => keyboardOpen,
-    ownedWs: () => ownedWs,
+    ownedWs: () => owned?.ws ?? null,
     open: (visibleHeight: number) => {
       if (keyboardOpen) return;
       const vv = window.visualViewport;

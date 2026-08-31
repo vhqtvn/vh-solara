@@ -512,22 +512,27 @@ test.describe("host keyboard focus-mode", () => {
     await H.assertSurvived(page, paneB!, beforeB, "F1 full cycle (ws B pane)");
   });
 
-  // F2 — POST-OPEN RE-MAXIMIZE (review-defer 2026-08-09). PIN of CURRENT
-  // behavior, and the current behavior CLOBBERS the user's later manual
-  // maximize — this is a PINNED CANDIDATE DEFECT, not an endorsement:
+  // F2 — POST-OPEN RE-MAXIMIZE (review-defer 2026-08-09; FIXED by group-
+  // instance ownership). Ownership used to be recorded per WORKSPACE at open
+  // time (keyboardFocus.ts `ownedWs`), and close's exitOwned() exited whatever
+  // group was CURRENTLY maximized in that ws — it could not distinguish
+  // focus-mode's own (already-replaced) maximize from the user's LATER manual
+  // one, so close CLOBBERED the user's re-maximize (the pinned defect this
+  // test used to tripwire as candidate-defect).
   //
-  //   ownership is recorded per WORKSPACE at open time (keyboardFocus.ts
-  //   `ownedWs`: "Scoped to a single ws: the one active when we maximized"),
-  //   and close's exitOwned() exits whatever group is CURRENTLY maximized in
-  //   that ws — it cannot distinguish focus-mode's own (already-replaced)
-  //   maximize from the user's LATER manual one. Contrast test 3 above
-  //   (manual maximize BEFORE open survives close — there ownedWs stays null
-  //   because maximizeActive() sees hasMaximizedGroup() true at OPEN time).
-  //
-  // If a fix lands (e.g. group-instance or generation-scoped ownership), the
-  // pinned assertion below MUST FLIP to "still maximized" — this test is the
-  // regression tripwire for that split implementation card.
-  test("F2: keyboard-close EXITS a manual re-maximize made after keyboard-open (PINNED current behavior — candidate defect)", async ({ page }) => {
+  // The fix scopes ownership to the GROUP INSTANCE focus-mode maximized
+  // (OwnedMaximize {ws, groupId} in keyboardFocus.ts): close exits ONLY if the
+  // group it maximized is STILL the maximized one. Semantics pinned here:
+  //   - DIFFERENT group re-maximized after open (the crux): close must NOT
+  //     touch it — the user's maximize survives.
+  //   - SAME group re-maximized after open: close DOES exit it. A re-maximize
+  //     of the owned group recreates the exact state focus-mode entered
+  //     (indistinguishable), so ownership follows the group instance, not the
+  //     maximize episode — close restores the pre-open layout.
+  // Contrast the pre-open case (test above: manual maximize BEFORE open
+  // survives close — there ownership is never claimed because maximizeActive()
+  // sees hasMaximizedGroup() true at OPEN time).
+  test("F2: keyboard-close preserves a manual re-maximize of a different group made after keyboard-open (exits a same-group re-maximize)", async ({ page }) => {
     // Two side-by-side panes = two groups (deterministic manual-maximize
     // target; the keyboard-open maximize owns a's group, the user re-maxes b).
     const [a, b] = await H.twoPanes(page);
@@ -552,22 +557,47 @@ test.describe("host keyboard focus-mode", () => {
     await expect.poll(async () => H.isMaximized(page)).toBe(false);
     await H.maximize(page, b);
     await expect.poll(async () => H.isMaximized(page)).toBe(true);
-    // ROOT CAUSE (pinned): ownership is still the STALE ws recorded at open —
-    // the manual exit/re-maximize never updates it (nothing in the manual path
-    // notifies keyboardFocus). This stale ws-id is what makes close clobber.
+    // The bridge's ownedWs still names the open-time ws (ownership was not
+    // re-claimed — nothing in the manual path notifies keyboardFocus), but
+    // with group-instance ownership that is no longer a clobber hazard: close
+    // compares the owned GROUP id, and b's group is not it.
     expect(
       (await H.kbdFocusState(page)).ownedWs,
-      "ownership is stale (ws-id only) across the manual re-maximize",
+      "ownership still names the open-time ws (group id is the guard now)",
     ).toBe(ws);
 
-    // Keyboard closes. CURRENT (pinned) behavior: exitOwned() resolves the
-    // stale ws, finds b's group maximized in it, and EXITS it — the user's
-    // manual re-maximize is clobbered. PINNED CANDIDATE DEFECT per the card's
-    // disposition rule (do not fix in-slice); flip when the fix lands.
+    // Keyboard closes. FIXED behavior: the currently-maximized group (b's) is
+    // not the group focus-mode owns → close leaves the user's manual
+    // re-maximize alone.
     await H.kbdFocusClose(page);
     await expect
       .poll(async () => H.isMaximized(page), { timeout: 8000 })
-      .toBe(false); // PINNED: the user's manual re-maximize IS exited by close
+      .toBe(true); // the user's manual re-maximize SURVIVES close (fixed)
+    await expect.poll(async () => (await H.kbdFocusState(page)).ownedWs).toBeNull();
+    await expect
+      .poll(async () => H.appRootHeight(page), { timeout: 8000 })
+      .toBeGreaterThanOrEqual(VIEWPORT.height - 5);
+
+    // --- Edge pin: SAME-group re-maximize IS exited on close ----------------
+    // (decision: ownership follows the group instance; a re-maximize of the
+    // owned group recreates the state focus-mode entered, so close restores
+    // the pre-open layout.) Clean b's maximize, then re-run the dance with
+    // the user re-maximizing the SAME group keyboard-open owned.
+    await H.exitMaximized(page);
+    await expect.poll(async () => H.isMaximized(page)).toBe(false);
+    await H.focusPane(page, a);
+    await page.waitForTimeout(200);
+    await H.kbdFocusOpen(page, KEYBOARD_VISIBLE_H);
+    await expect.poll(async () => H.isMaximized(page)).toBe(true);
+    expect((await H.kbdFocusState(page)).ownedWs, "focus-mode owns again").toBeTruthy();
+    await H.exitMaximized(page); // user exits focus-mode's maximize
+    await expect.poll(async () => H.isMaximized(page)).toBe(false);
+    await H.maximize(page, a); // user re-maximizes the SAME group
+    await expect.poll(async () => H.isMaximized(page)).toBe(true);
+    await H.kbdFocusClose(page);
+    await expect
+      .poll(async () => H.isMaximized(page), { timeout: 8000 })
+      .toBe(false); // same-group re-maximize is still ours → exited
     await expect.poll(async () => (await H.kbdFocusState(page)).ownedWs).toBeNull();
     await expect
       .poll(async () => H.appRootHeight(page), { timeout: 8000 })
