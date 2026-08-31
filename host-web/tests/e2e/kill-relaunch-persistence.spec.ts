@@ -589,4 +589,89 @@ test.describe("layout diag ring (kill/relaunch diagnostics)", () => {
     expect(ring.some((e) => e.kind === "read")).toBe(true);
     expect(ring.some((e) => e.kind === "seed")).toBe(true);
   });
+
+  // ---- DIAG ROUND 2 (restore events + seed blob fingerprint) ------------------
+  // The round-1 ring proved the SAVE side works and that relaunches read a
+  // valid v3 blob, but could NOT pin WHERE between initBlob and fromJSON a
+  // layout nulled (the operator's paste showed read v3 + seed — an event
+  // combination HEAD code cannot emit, which itself proved the deployed
+  // device bundle diverged from source). Round 2 adds the missing per-
+  // workspace `restore` events (outcome restored|failed + granular reason)
+  // and the seed event's incoming-blob fingerprint — asserted here in the
+  // dev posture; the folded lane asserts them against the production build.
+  test("restore events: failed/blob-null on a fresh boot (with diagv + empty seed fingerprint); restored with pane count on reload; failed/pruned-all on an all-poison blob with NO seed", async ({
+    page,
+  }) => {
+    // ---- Fresh boot: no blob → restore failed blob-null, then the seed with
+    // an EMPTY blob fingerprint (nothing was incoming).
+    await H.loadHost(page);
+    const ring0 = await H.diagRing(page);
+    const read0 = ring0.find((e) => e.kind === "read");
+    expect(read0, "read event present").toBeTruthy();
+    expect(read0!.diagv, "read carries the diag schema stamp").toBe(2);
+    const restore0 = ring0.find((e) => e.kind === "restore");
+    expect(restore0, "restore event present on the seeded boot").toBeTruthy();
+    expect(restore0!.outcome).toBe("failed");
+    expect(restore0!.reason).toBe("blob-null");
+    expect(restore0!.source).toBe("blob");
+    const seed0 = ring0.find((e) => e.kind === "seed");
+    expect(seed0, "seed event present").toBeTruthy();
+    expect(seed0!.blobPrefix, "no incoming blob → empty fingerprint").toBe("");
+
+    // ---- Reload: the seeded layout restores — outcome restored, with the
+    // restored pane count and the blob as the source.
+    await page.reload();
+    await expect.poll(async () => H.connected(page), { timeout: 20000 }).toBe(true);
+    const ring1 = await H.diagRing(page);
+    const restores1 = ring1.filter((e) => e.kind === "restore");
+    const r1 = restores1[restores1.length - 1];
+    expect(r1, "this session's restore event").toBeTruthy();
+    expect(r1!.outcome).toBe("restored");
+    expect(r1!.source).toBe("blob");
+    expect(r1!.panes, "all four seeded mock panes restored").toBe(4);
+    const read1 = ring1.filter((e) => e.kind === "read").pop();
+    expect(
+      ring1.filter((e) => e.kind === "seed" && e.t >= read1!.t).length,
+      "no seed on the restored boot",
+    ).toBe(0);
+
+    // ---- All-poison blob: EVERY panel url rewritten to javascript: → the
+    // envelope still validates (per-pane URL validation is the repair
+    // walker's job) → restore failed pruned-all:<ids>, workspace EMPTY, and
+    // (blob present) NO seed — the exact branch that must never re-seed.
+    const poisoned = await page.evaluate((key) => {
+      const raw = localStorage.getItem(key);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as {
+        workspaces: Array<{
+          layout: {
+            panels: Record<string, { params?: { url?: string } }>;
+          } | null;
+        }>;
+      };
+      for (const ws of parsed.workspaces) {
+        if (!ws.layout) continue;
+        for (const st of Object.values(ws.layout.panels)) {
+          if (st.params) st.params.url = "javascript:alert(1)";
+        }
+      }
+      localStorage.setItem(key, JSON.stringify(parsed));
+      return true;
+    }, H.LAYOUT_STORAGE_KEY);
+    expect(poisoned, "poisoned the stored blob").toBe(true);
+    await page.goto("/"); // clean start_url → read source v3
+    await expect
+      .poll(async () => (await H.panes(page)).length === 0 && (await H.workspaces(page)).length >= 1, { timeout: 10000 })
+      .toBe(true);
+    const ring2 = await H.diagRing(page);
+    const read2 = ring2.filter((e) => e.kind === "read").pop();
+    expect(read2!.source, "poisoned blob still reads as v3").toBe("v3");
+    const r2 = ring2.filter((e) => e.kind === "restore").pop();
+    expect(r2!.outcome).toBe("failed");
+    expect(String(r2!.reason).startsWith("pruned-all:"), "reason lists the pruned ids").toBe(true);
+    expect(
+      ring2.filter((e) => e.kind === "seed" && e.t >= read2!.t).length,
+      "a present-but-fully-pruned blob must NOT re-seed (empty workspace)",
+    ).toBe(0);
+  });
 });

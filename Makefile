@@ -5,7 +5,7 @@
 # (copy) BOTH staged bundles into pkg/web/dist + pkg/web/host-dist right before
 # `go build`, so one binary carries both SPAs (`/` → host, `/app` → single-server).
 
-.PHONY: web web-materialize host-web host-web-materialize embed-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-docker test-host-web-preview test-host-web-real-embed verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed clean-host-web-embed
+.PHONY: web web-materialize host-web host-web-materialize embed-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-docker test-host-web-preview test-host-web-real-embed test-host-web-folded verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed clean-host-web-embed
 
 # Version stamping: local builds set cmd.Version to "<latest v-tag>+dev" (e.g.
 # v1.60.0+dev) so the self-update check never treats them as an already-released
@@ -87,6 +87,9 @@ test-host-web-preview: ## Run host-web production-build shell proof (vite previe
 
 test-host-web-real-embed: ## Run host-web real-embedding e2e (real web/ SPA + real local-server, cross-origin host embed; LANE 8, nightly-grade, NOT PR-blocking). Full pipeline: builds web SPA, materializes into pkg/web/dist, builds the Go binary, runs Playwright. Needs go + Node >= 24 + Playwright browsers.
 	bash host-web/scripts/real-embed-run.sh
+
+test-host-web-folded: ## Run host-web FOLDED-posture restore e2e (LANE 9: real binary serving the folded host at / — the production fold topology; dispatch on PWA-relaunch layout regressions). Full pipeline: builds BOTH SPAs (host with VITE_HOST_FOLDED=1), materializes embeds, builds the binary, runs Playwright. Needs go + Node >= 24 + Playwright browsers.
+	bash host-web/scripts/folded-restore-run.sh
 
 # Docker-backed test routes (Phase 1: lane 7 only). See docs/ai/docker-test-routes.md.
 # Official Playwright image, pinned to the exact @playwright/test version in

@@ -91,10 +91,10 @@ reasoning body):
 > placement, runners, and seam choices from the repository's own verified testing
 > seam localization rather than generic harness defaults — but is deliberately
 > generic about what that localization IS. This section is this repo's actual
-> localization: the eight lanes, their runners, commands, and acceptance signals.
+> localization: the nine lanes, their runners, commands, and acceptance signals.
 
 Every meaningful change should add or update tests. This repo has three test
-trees (Go, web, and host-web) and four runner families across eight lanes. There
+trees (Go, web, and host-web) and four runner families across nine lanes. There
 is **no `tests/unit/` directory** — Go unit tests are co-located in `pkg/`. There
 is **no pytest** anywhere in this repo.
 
@@ -102,7 +102,7 @@ is **no pytest** anywhere in this repo.
 > `export PATH=$PATH:/usr/local/go/bin` (or use the harness equivalent:
 > `vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go ...'`).
 
-### The eight lanes
+### The nine lanes
 
 1. **Go co-located unit** — `pkg/*/*_test.go` beside the source under test.
    Runner: `go test ./pkg/<pkg>/` (whole tree: `go test ./pkg/...`).
@@ -170,9 +170,30 @@ is **no pytest** anywhere in this repo.
    Firefox (WebKit opt-in). **Scheduled/dispatchable ONLY** (nightly cron +
    `workflow_dispatch`); NOT in the push/PR matrix — additive to the PR-blocking
    mock survival gate, not PR-blocking until measured stable.
-   Runner: `make test-host-web-real-embed` (full pipeline), or
-   `cd host-web && npx playwright test --config=playwright.real-embed.config.ts`
-   (after the binary is built; or `bash host-web/scripts/real-embed-run.sh`).
+    Runner: `make test-host-web-real-embed` (full pipeline), or
+    `cd host-web && npx playwright test --config=playwright.real-embed.config.ts`
+    (after the binary is built; or `bash host-web/scripts/real-embed-run.sh`).
+
+9. **host-web folded-posture restore e2e** — `host-web/tests/folded-e2e/folded-restore.spec.ts`
+   (Playwright). The only lane that runs the host in the PRODUCTION FOLD
+   posture: the real `local-server` binary (both SPAs built + materialized,
+   host-web with `VITE_HOST_FOLDED=1`) serves the host shell at `/` with
+   same-origin `/app` pane iframes — no Vite dev server anywhere (every other
+   host-web lane runs the dev build, mock fleet, unfolded). Built for the
+   round-3 (2026-08-31) on-device PWA relaunch layout-loss diagnosis. Asserts,
+   production-safely (DOM + localStorage + the always-on layout diag ring —
+   no DEV bridges exist in the folded build): the folded self-seed layout
+   saves and a CLEAN relaunch (`goto /`, no hash — the PWA start_url posture)
+   RESTORES it with no seed; a planted operator-shaped v3 blob (multiple
+   `/app` panes with captured routes) restores; a second window booting at
+   `/` never clobbers a valid blob; and the diag round-2 `restore` events
+   (outcome + granular reason) record what actually happened. Runs
+   **serially** (`workers: 1`). Chromium (Firefox opt-in).
+   **Dispatchable** on PWA-relaunch/layout regressions; not PR-blocking.
+   Runner: `make test-host-web-folded` (full pipeline: builds BOTH SPAs,
+   materializes embeds, builds the binary, runs Playwright), or
+   `cd host-web && npx playwright test --config=playwright.folded.config.ts`
+   (after `tmp/vh-solara-folded` is built; or `bash host-web/scripts/folded-restore-run.sh`).
 
 Execution examples:
 
@@ -198,6 +219,8 @@ vh-agent-harness exec make test-host-web-docker
 vh-agent-harness exec npm --prefix host-web run test:e2e:preview
 # host-web real-embedding e2e (LANE 8: real web/ SPA + real local-server; NOT PR-blocking; full pipeline builds web→materializes→builds go→runs Playwright):
 vh-agent-harness exec bash host-web/scripts/real-embed-run.sh
+# host-web folded-posture restore e2e (LANE 9: real binary serving the FOLDED host at / — the production fold topology; dispatch on PWA-relaunch layout regressions):
+vh-agent-harness exec bash host-web/scripts/folded-restore-run.sh
 ```
 
 For any substantial boundary change, also update the relevant docs.

@@ -8,7 +8,7 @@ import {
   type FleetEntry,
 } from "../state/mockData";
 import { fractionsToSizes, sizesToFractions } from "./fractionMath";
-import { recordLayoutDiag } from "./layoutDiag";
+import { DIAG_VERSION, recordLayoutDiag } from "./layoutDiag";
 
 // =============================================================================
 // Layout persistence — multi-workspace edition.
@@ -149,10 +149,29 @@ let serializeAllFn: (() => PersistedState | null) | null = null;
 // downstream), or `hash` (unexpected hash at start_url), and from WHICH origin
 // (a different origin has different localStorage).
 export type BlobReadSource = "hash" | "v3" | "v2" | "none";
-const initRead: { state: PersistedState | null; source: BlobReadSource } =
-  readBlobWithSource();
+
+/** Cap on the seed event's blob content fingerprint (see readBlobWithSource).
+ *  DECLARED ABOVE the init-time `readBlobWithSource()` call: the read helpers
+ *  reference it while `const initRead = …` executes at module init, so a
+ *  declaration lower in the file is a TDZ ReferenceError that kills the whole
+ *  module graph — ONLY on a relaunch with an existing blob (a fresh context
+ *  returns before the reference), exactly the folded-lane relaunch crux. */
+const RAW_PREFIX_CAP = 200;
+
+const initRead: {
+  state: PersistedState | null;
+  source: BlobReadSource;
+  /** First ~200 chars of the blob AS READ (content fingerprint — ids/urls/
+   *  shape — carried on `seed` events so the next operator paste shows WHAT
+   *  was incoming, not just that N bytes existed). */
+  rawPrefix: string;
+} = readBlobWithSource();
 const initBlob: PersistedState | null = initRead.state;
 recordLayoutDiag("read", () => ({
+  // diagv = the DEVICE-CODE FINGERPRINT (round 3): a paste whose read events
+  // lack the current stamp proves the device runs a stale host bundle whose
+  // behavior has drifted from the source under diagnosis.
+  diagv: DIAG_VERSION,
   source: initRead.source,
   ws: initBlob ? initBlob.workspaces.length : 0,
   origin: safeLocationField((l) => l.origin),
@@ -515,12 +534,17 @@ export function hadSavedStateAtInit(): boolean {
  *                         validation/repair failure) — initWsIds shows which
  *                         workspaces the blob claimed.
  *   readSource "hash"   → an unexpected #state= hash was at start_url.
+ * ROUND 2: `blobPrefix` additionally carries the first ~200 chars of the
+ * incoming blob AS READ (content fingerprint — ids/urls/shape, or the raw
+ * bytes when the JSON was corrupt), so the next paste shows WHAT was incoming
+ * rather than only that N bytes existed.
  */
 export function noteDefaultWorkspaceSeeded(wsId: string): void {
   recordLayoutDiag("seed", () => ({
     ws: wsId,
     readSource: initRead.source,
     initWs: initBlob ? initBlob.workspaces.map((w) => w.id) : [],
+    blobPrefix: initRead.rawPrefix,
   }));
 }
 
@@ -581,22 +605,46 @@ export function applyColdRestoreForWorkspace(
     return restoredWorkspaceResult.get(workspaceId) ?? false;
   }
   restoredWorkspaceIds.add(workspaceId);
+  let detailed: DetailedRepair | null = null;
   try {
-    const repaired = loadRepairedWorkspaceLayout(workspaceId, extent);
-    if (!repaired) {
+    detailed = loadRepairedWorkspaceLayoutDetailed(workspaceId, extent);
+    if (!detailed.layout) {
+      // DIAG (round 2): WHERE the restore nulled, per workspace — the missing
+      // instrument from rounds 1-2 (a blob was read, a seed fired, but no
+      // event pinned which pipeline step returned null). Must never affect
+      // the restore itself.
+      recordLayoutDiag("restore", () => ({
+        ws: workspaceId,
+        outcome: "failed",
+        source: detailed!.source,
+        reason: detailed!.reason,
+      }));
       restoredWorkspaceResult.set(workspaceId, false);
       return false;
     }
     // COLD ONLY — the single fromJSON call for THIS workspace (outside the
     // DEV-only jsonReswap negative control, which exists to PROVE this reloads
     // iframes).
-    api.fromJSON(repaired);
+    api.fromJSON(detailed.layout);
     // Advance the pane-id counter past the restored ids so a post-reload split
     // does not collide with a restored pane-N (fromJSON reuses saved ids
     // verbatim while the module counter resets to 0 on a cold load).
-    seedPaneSeq(maxPaneSeqSuffix(Object.keys(repaired.panels)));
+    seedPaneSeq(maxPaneSeqSuffix(Object.keys(detailed.layout.panels)));
     restoredWorkspaceResult.set(workspaceId, true);
-  } catch {
+    recordLayoutDiag("restore", () => ({
+      ws: workspaceId,
+      outcome: "restored",
+      source: detailed!.source,
+      panes: Object.keys(detailed!.layout!.panels).length,
+    }));
+  } catch (err) {
+    // DIAG (round 2): fromJSON/repair threw — the message caps the ring size.
+    recordLayoutDiag("restore", () => ({
+      ws: workspaceId,
+      outcome: "failed",
+      source: detailed?.source ?? "blob",
+      reason: `exception:${diagErrMsg(err)}`,
+    }));
     // ANY failure — a malformed layout that slipped past validation, an
     // unexpected throw in the repair walker, or fromJSON rejecting the repaired
     // tree — falls back to seed/empty. Cold init must NEVER crash; persistence
@@ -611,6 +659,12 @@ export function applyColdRestoreForWorkspace(
   return restoredWorkspaceResult.get(workspaceId) ?? false;
 }
 
+/** Compact, length-capped error text for `exception:<msg>` restore reasons. */
+function diagErrMsg(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.length > 120 ? msg.slice(0, 120) : msg;
+}
+
 /**
  * Read + repair + MATERIALIZIZE ONE workspace's saved layout. Returns the
  * px-serialized SerializedDockview (only valid panes, sizes recomputed from
@@ -622,27 +676,74 @@ export function applyColdRestoreForWorkspace(
  * the same validation + repair + materialization pipeline. A staged layout is
  * additionally RE-IDDDED (fresh pane ids per instantiation) so its panels
  * never alias live panes in the source workspace or a sibling instantiation
- * (pane ids are global store keys — see the staged-slot block above). */
+ * (pane ids are global store keys — see the staged-slot block above).
+ */
 export function loadRepairedWorkspaceLayout(
   workspaceId: string,
   extent?: RestoreExtent,
 ): SerializedDockview | null {
+  return loadRepairedWorkspaceLayoutDetailed(workspaceId, extent).layout;
+}
+
+/** Why a workspace's cold restore produced no layout (DIAG round 2 — carried
+ *  on `restore` events; see loadRepairedWorkspaceLayoutDetailed). */
+export type RestoreFailReason =
+  | "blob-null" // no init blob at all (the legitimate seed case)
+  | "no-entry" // blob exists but has no entry for THIS ws (runtime-added)
+  | "layout-null" // entry's layout is null (an intentionally-empty workspace)
+  | "invalid-shape" // layout failed isSavedLayout (staged path only — the
+  //   envelope validator already rejects shape-invalid initBlob layouts)
+  | `pruned-all:${string}` // URL validation dropped EVERY panel (ids listed)
+  | "repair-empty"; // repair walker emptied the tree (defense-in-depth branch)
+
+/** The detailed repair result: the materialized layout (null on failure), the
+ *  source it came from, and the failure reason when null. */
+interface DetailedRepair {
+  layout: SerializedDockview | null;
+  source: "staged" | "blob";
+  reason: RestoreFailReason | null;
+}
+
+/** The repair pipeline WITH its failure reason (the diag `restore` event's
+ *  payload). Same pipeline as loadRepairedWorkspaceLayout — that public
+ *  wrapper just drops the reason. */
+function loadRepairedWorkspaceLayoutDetailed(
+  workspaceId: string,
+  extent?: RestoreExtent,
+): DetailedRepair {
   const staged = stagedRuntimeLayouts.get(workspaceId);
   if (staged !== undefined) stagedRuntimeLayouts.delete(workspaceId); // consume
+  const source: "staged" | "blob" = staged !== undefined ? "staged" : "blob";
+  if (staged === undefined && !initBlob) {
+    return { layout: null, source, reason: "blob-null" };
+  }
   const saved =
     staged !== undefined
       ? staged
       : (initBlob?.workspaces.find((w) => w.id === workspaceId)?.layout ?? null);
-  if (!saved || !isSavedLayout(saved)) return null;
+  if (saved === null) {
+    // initBlob non-null here (checked above) but no entry for this ws.
+    return { layout: null, source, reason: "no-entry" };
+  }
+  if (!isSavedLayout(saved)) {
+    return { layout: null, source, reason: "invalid-shape" };
+  }
   const validIds = validRestoreIds(saved.panels);
-  if (validIds.size === 0) return null;
+  if (validIds.size === 0) {
+    const ids = Object.keys(saved.panels).join(",").slice(0, 80);
+    return { layout: null, source, reason: `pruned-all:${ids}` };
+  }
   let repaired = repairLayout(saved, validIds);
-  if (!repaired) return null;
+  if (!repaired) return { layout: null, source, reason: "repair-empty" };
   if (staged !== undefined) {
     repaired = reIdLayoutPanels(repaired);
   }
   // v3 semantics: fractions → px against the CURRENT container extent.
-  return materializeSavedLayout(repaired, extent) as unknown as SerializedDockview;
+  return {
+    layout: materializeSavedLayout(repaired, extent) as unknown as SerializedDockview,
+    source,
+    reason: null,
+  };
 }
 
 /**
@@ -793,53 +894,83 @@ function maxPaneSeqSuffix(ids: Iterable<string>): number {
  *  shared across tabs, so two tabs at `/` would otherwise clobber each
  *  other. The read ORDER is unchanged (hash → v3 → v2 → none); the source
  *  label simply records which fork won. */
-function readBlobWithSource(): { state: PersistedState | null; source: BlobReadSource } {
+function readBlobWithSource(): {
+  state: PersistedState | null;
+  source: BlobReadSource;
+  rawPrefix: string;
+} {
   const fromHash = readHashState();
-  if (fromHash !== null) return { state: fromHash, source: "hash" };
+  if (fromHash.state !== null) {
+    return { state: fromHash.state, source: "hash", rawPrefix: fromHash.rawPrefix };
+  }
   const v3 = readLocalStorageState(LAYOUT_STORAGE_KEY);
-  if (v3 !== null) return { state: v3, source: "v3" };
+  if (v3.state !== null) return { state: v3.state, source: "v3", rawPrefix: v3.rawPrefix };
   const v2 = readLocalStorageState(LEGACY_V2_STORAGE_KEY);
-  if (v2 !== null) return { state: v2, source: "v2" };
-  return { state: null, source: "none" };
+  if (v2.state !== null) return { state: v2.state, source: "v2", rawPrefix: v2.rawPrefix };
+  // No VALID blob anywhere. Carry the last non-empty fingerprint (a corrupt
+  // v3/v2 string) so a seed event post-mortem shows the operator their own
+  // corrupted bytes instead of an empty string.
+  const corruptPrefix = v2.rawPrefix || v3.rawPrefix || fromHash.rawPrefix;
+  return { state: null, source: "none", rawPrefix: corruptPrefix };
 }
 
 /**
- * Read + decode + validate the `#state=<encoded>` URL hash. Returns null when
- * there is no hash, the hash is malformed, or the decoded JSON is structurally
- * invalid. Never throws — a corrupt hash falls through to the localStorage
- * fallback (the caller) rather than poisoning the restore.
+ * Read + decode + validate the `#state=<encoded>` URL hash. Returns a null
+ * state when there is no hash, the hash is malformed, or the decoded JSON is
+ * structurally invalid (the caller falls through to the localStorage
+ * fallback). Never throws — a corrupt hash falls through rather than
+ * poisoning the restore. `rawPrefix` is the first ~200 chars of the DECODED
+ * JSON (the content fingerprint; the encoded form is URI gibberish).
  */
-function readHashState(): PersistedState | null {
-  if (typeof window === "undefined" || typeof window.location === "undefined") return null;
+function readHashState(): { state: PersistedState | null; rawPrefix: string } {
+  if (typeof window === "undefined" || typeof window.location === "undefined") {
+    return { state: null, rawPrefix: "" };
+  }
   const hash = window.location.hash;
-  if (!hash || !hash.startsWith("#state=")) return null;
+  if (!hash || !hash.startsWith("#state=")) return { state: null, rawPrefix: "" };
   const encoded = hash.slice("#state=".length);
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(encoded);
+  } catch {
+    return { state: null, rawPrefix: "" }; // corrupt encoding → fall back
+  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(decodeURIComponent(encoded));
+    parsed = JSON.parse(decoded);
   } catch {
-    return null; // corrupt hash → fall back to localStorage
+    return { state: null, rawPrefix: "" }; // corrupt hash → fall back to localStorage
   }
-  return validatePersistedState(parsed);
+  return {
+    state: validatePersistedState(parsed),
+    rawPrefix: decoded.slice(0, RAW_PREFIX_CAP),
+  };
 }
 
 /** The localStorage read path for ONE key (v3 primary, legacy v2 fallback).
- *  Returns null on a miss / corrupt JSON — the caller chains the fallback. */
-function readLocalStorageState(key: string): PersistedState | null {
+ *  Returns a null state on a miss / corrupt JSON — the caller chains the
+ *  fallback. `rawPrefix` is the first ~200 chars of the stored string (the
+ *  content fingerprint for the seed diag). */
+function readLocalStorageState(key: string): {
+  state: PersistedState | null;
+  rawPrefix: string;
+} {
   let raw: string | null;
   try {
     raw = localStorage.getItem(key);
   } catch {
-    return null; // localStorage unavailable
+    return { state: null, rawPrefix: "" }; // localStorage unavailable
   }
-  if (!raw) return null;
+  if (!raw) return { state: null, rawPrefix: "" };
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return null; // corrupt JSON → treat as no blob → fall back to seed
+    // Corrupt JSON at THIS key: fingerprint it (the diag should show the
+    // operator their own corrupted bytes) but treat as no blob → fall through.
+    return { state: null, rawPrefix: raw.slice(0, RAW_PREFIX_CAP) };
   }
-  return validatePersistedState(parsed);
+  return { state: validatePersistedState(parsed), rawPrefix: raw.slice(0, RAW_PREFIX_CAP) };
 }
 
 /** Structural guard for the persisted envelope (v2 px or v3 fractional).

@@ -26,17 +26,33 @@
 //     operator's own server URL).
 //
 // EVENT KINDS (see layoutPersistence.ts for the emitters):
-//   read  — module-init blob read: source actually used (hash|v3|v2|none),
-//           workspace count, origin, href prefix, standalone display mode.
-//           Catches origin/start_url divergence: a DIFFERENT origin has
-//           DIFFERENT localStorage.
-//   seed  — the default workspace was seeded (the reset symptom's fingerprint:
-//           a relaunch that re-seeded when it should have restored). Carries
-//           what the init read found, so "seeded despite a blob" vs "no blob"
-//           is distinguishable.
-//   flush — every completed flushSave: trigger (debounce|hide|pagehide|freeze),
-//           written byte length, workspace count, active workspace id.
-//   clear — the layout keys were removed (state emptied).
+//   read    — module-init blob read: source actually used (hash|v3|v2|none),
+//             workspace count, origin, href prefix, standalone display mode,
+//             and the diag schema version stamp (`diagv`). Catches
+//             origin/start_url divergence: a DIFFERENT origin has DIFFERENT
+//             localStorage. The `diagv` stamp is the DEVICE-CODE FINGERPRINT:
+//             a paste whose read events lack the current diagv proves the
+//             device is running a stale host bundle (round-3 finding: the
+//             operator's ring contained a seed event HEAD code cannot emit,
+//             so the deployed bundle's seed path diverged from the source).
+//   seed    — the default workspace was seeded (the reset symptom's fingerprint:
+//             a relaunch that re-seeded when it should have restored). Carries
+//             what the init read found (readSource/initWs) plus `blobPrefix` —
+//             the first ~200 chars of the incoming blob (content fingerprint,
+//             not just byte count: ids/urls/shape visible in the paste).
+//   restore — per workspace, at cold mount: outcome restored (panes count)
+//             | failed (reason: blob-null | no-entry | layout-null |
+//             invalid-shape | pruned-all:<ids> | exception:<msg>). This is
+//             ROUND 2's missing instrument: it pins WHERE between initBlob and
+//             fromJSON a layout nulled, per workspace, on the next on-device
+//             paste. (`materialize-failed` cannot occur at HEAD —
+//             materializeSavedLayout never throws and always returns a tree —
+//             and a `stale-slot` shadow cannot occur — staged slots are keyed
+//             by workspace id and consumed-on-read; both were audit-verified
+//             rather than emitted.)
+//   flush   — every completed flushSave: trigger (debounce|hide|pagehide|freeze),
+//             written byte length, workspace count, active workspace id.
+//   clear   — the layout keys were removed (state emptied).
 //
 // (A `sched` event kind was considered and deliberately SKIPPED: onDidLayoutChange
 // fires in bursts during sash drags and would flood the 30-slot ring within one
@@ -47,11 +63,17 @@
 /** Versioned + namespaced storage key (distinct from the layout blob keys). */
 export const DIAG_STORAGE_KEY = "vh-host:layout:diag";
 
+/** Diag schema version — stamped on every `read` event. Bump when the event
+ *  vocabulary changes. A paste whose read events carry an older/absent stamp
+ *  proves the device runs a stale host bundle (the round-3 stale-bundle
+ *  finding made this stamp load-bearing). */
+export const DIAG_VERSION = 2;
+
 /** Ring cap: keep the LAST N events (drop oldest). */
 export const DIAG_RING_CAP = 30;
 
 /** The closed set of event kinds (structural guard for hydrated records). */
-export type LayoutDiagKind = "read" | "flush" | "seed" | "clear";
+export type LayoutDiagKind = "read" | "flush" | "seed" | "restore" | "clear";
 
 export interface LayoutDiagEvent {
   /** Wall-clock ms (Date.now) — enough to order events, no formatting. */
@@ -62,7 +84,13 @@ export interface LayoutDiagEvent {
 }
 
 function isLayoutDiagKind(v: unknown): v is LayoutDiagKind {
-  return v === "read" || v === "flush" || v === "seed" || v === "clear";
+  return (
+    v === "read" ||
+    v === "flush" ||
+    v === "seed" ||
+    v === "restore" ||
+    v === "clear"
+  );
 }
 
 /** Structural guard for one hydrated record (untrusted storage). */
