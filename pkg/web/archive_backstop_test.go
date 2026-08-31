@@ -16,10 +16,20 @@ package web
 //        terminal paths (success AND exhaust) — no leaked entries.
 //   BT4  Lock-order safety under -race: concurrent reconcileArchiveFailures +
 //        handleArchive (a blocked in-flight cascade) — no deadlock, no data race.
+//   BT5  Non-root contention (tier1_b-F4 proof gap): a failure keyed by a
+//        NON-ROOT descendant under an ACTIVE root cascade — the registry guard
+//        is a no-op for (dir, descendant) keys, so the clear is gated SOLELY by
+//        the resolution seam (survives unresolved; clears at OOB resolution
+//        while the root cascade is still registered).
 //
 // The crux is BT1 + BT2 together: the backstop clears a genuinely-resolved stale
 // warning (BT1) AND refuses to race a running cascade (BT2). Both halves are
 // exercised at the Go unit seam (unlike Slice 1's e2e gap), so `proven` is honest.
+// BT5 closes the proof-completeness gap those two left: BT1/BT2 exercise
+// ROOT-keyed failures only, where the registry key and the failure key MATCH.
+// The non-root path (registry key ≠ failure key) is correct-by-construction
+// (runArchiveCascade is one-shot-per-id; the clear fires only on confirmed OOB
+// resolution) — BT5 turns that assessment into a deterministic proof.
 
 import (
 	"encoding/json"
@@ -281,5 +291,107 @@ func TestBackstop_ConcurrentWithHandleArchive(t *testing.T) {
 	// concurrent sweep + cascade).
 	if n := srv.backstopActiveJobsCount(); n != 0 {
 		t.Errorf("active-jobs registry leaked %d entries after concurrent run", n)
+	}
+}
+
+// BT5 — the NON-ROOT contention proof (tier1_b-F4 gap). The active-jobs registry
+// is keyed by (dir, ROOT) — the id handleArchive registers (body.SessionID) — but
+// classifyArchiveFailure records a failure keyed by the id that reached terminal
+// failure, which can be a NON-ROOT descendant (an unresolvable chain that is NOT
+// a descendant-of-archived). For such a key reconcileOneArchiveFailure's
+// active-jobs lookup MISSES (the registry holds the root, not the descendant), so
+// the guard contributes nothing and the clear is gated SOLELY by the resolution
+// seam (Store.IsArchiveRootResolved).
+//
+// The two halves proven here, deterministically (no dispatch, no sleeps beyond
+// the SSE idle-drains BT1 already uses):
+//
+//	PHASE 1 (cascade active, descendant UNRESOLVED): the failure SURVIVES —
+//	  nothing but the resolution seam withholds the clear. This is the
+//	  discrimination assertion: neutering the IsArchiveRootResolved guard in
+//	  reconcileOneArchiveFailure makes exactly this phase fail (BT1/BT2 stay
+//	  green under that mutation — their keys are root-keyed and guard-covered).
+//	PHASE 2 (cascade STILL active, descendant OOB-resolved): the failure
+//	  CLEARS mid-cascade — the behavior the review panel unanimously assessed
+//	  as correct-by-construction (runArchiveCascade is one-shot-per-id — the
+//	  frozen `affected` loop never revisits d — so the running cascade cannot
+//	  re-record the cleared failure).
+func TestBackstop_NonRootFailureClearsOnlyViaResolution(t *testing.T) {
+	f := &fakeOC{}
+	web, agg, srv, _ := queueLifecycleServer(t, f)
+
+	// Live tree: root r with child d. d's parentID chain terminates at LIVE r
+	// — the unresolvable-chain shape classifyArchiveFailure RECORDS for the
+	// child (both descendant-of-archived authorities fail: r is neither in the
+	// authoritative archived snapshot nor in this job's succeeded set).
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"r"}}`))
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"d","parentID":"r"}}`))
+
+	// Seed the ACTIVE root cascade for r — the registry holds ("", "r"), the
+	// (dir, ROOT) key handleArchive's launch site registers. Deterministic
+	// direct seed (the registry IS the predicate — same seam as BT2).
+	srv.registerActiveArchiveJobForTest("", "r")
+	defer srv.deregisterActiveArchiveJobForTest("", "r")
+
+	// Seed the NON-ROOT failure record for d — the exact state
+	// classifyArchiveFailure produces via recordArchiveFailure(dir, d, r, …):
+	// keyed ("", "d") with RootSrc=r. Note the key MISMATCH against the
+	// registry's ("", "r") — the premise of this test.
+	srv.recordArchiveFailure("", "d", "r", "permanent:403")
+	if !hasArchiveFailureID(t, srv, "d") {
+		t.Fatalf("seed: d not recorded before backstop")
+	}
+
+	// Connect a client and drain the bootstrap snapshot (which carries d), so
+	// the phase-2 clear's fan-out is observable (BT1's plumbing).
+	sresp, err := http.Get(web.URL + "/vh/stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sresp.Body.Close()
+	ch := startSSEReader(t, sresp.Body)
+	drainIdle(ch, 500*time.Millisecond)
+
+	// PHASE 1 — root cascade ACTIVE, d unresolved (live, not in the archived
+	// snapshot, chain ends at live r → IsArchiveRootResolved("d") == false).
+	// The registry guard is a no-op for key ("", "d"), so ONLY the resolution
+	// seam can withhold the clear. Assert the failure survives.
+	srv.reconcileArchiveFailures()
+	if !hasArchiveFailureID(t, srv, "d") {
+		t.Errorf("PHASE 1: non-root failure d cleared while UNRESOLVED with the root cascade active — the resolution seam (IsArchiveRootResolved) failed to gate the non-root clear: %+v", srv.ArchiveFailures())
+	}
+
+	// PHASE 2 — establish OOB resolution of d through the EXISTING resolution
+	// seam's absent-from-live-tree authority: d archived/deleted out-of-band
+	// (another tool / direct OpenCode call) → the tree-reconcile tick would
+	// evict it from the live session tree. Model that eviction here. The root
+	// cascade is STILL registered — this is the mid-cascade contention window.
+	agg.Store().RemoveSessionIfPresent("d")
+	srv.reconcileArchiveFailures()
+
+	// CRUX 1 — the failure cleared exactly at resolution, the registry guard
+	// notwithstanding: the mid-cascade clear fired through the resolution seam.
+	if hasArchiveFailureID(t, srv, "d") {
+		t.Errorf("PHASE 2: non-root failure d still recorded after OOB resolution (clear did not fire through the resolution seam while the root cascade was active): %+v", srv.ArchiveFailures())
+	}
+
+	// CRUX 2 — the mid-cascade premise held: the root cascade was STILL
+	// registered when the clear fired, so the clear is not explained by
+	// deregistration (the guard was genuinely a no-op for the non-root key).
+	if n := srv.backstopActiveJobsCount(); n != 1 {
+		t.Errorf("root cascade registration did not survive the clear (want 1 active entry, got %d) — the mid-cascade premise collapsed", n)
+	}
+
+	// CRUX 3 — the clear was fanned out: the connected client received an
+	// archive-failures.updated frame with an empty failures set (client-visible
+	// clear, mirroring BT1's second crux).
+	evs := drainIdle(ch, 800*time.Millisecond)
+	data, ok := eventDataFor(evs, "archive-failures.updated", "failures")
+	if !ok {
+		t.Fatalf("no archive-failures.updated frame after non-root clear; events=%v", eventNames(evs))
+	}
+	doc := decodeArchiveFailuresSSE(t, data)
+	if len(doc.Failures) != 0 {
+		t.Errorf("updated frame not empty after non-root clear (got %d failures): %+v", len(doc.Failures), doc)
 	}
 }
