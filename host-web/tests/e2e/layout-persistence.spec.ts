@@ -284,20 +284,28 @@ test.describe("layout persistence", () => {
       )
       .toBeNull();
     // …and the v3 key holds exactly the surviving workspace (a clear at the
-    // guard is still a SAVE, not a wipe — the survivor persists).
+    // guard is still a SAVE, not a wipe — the survivor persists). WRITE-PATH
+    // NOTE (2026-08-31): poll the #state= HASH for the survivor, not the
+    // localStorage mirror — the mirror is now written SYNCHRONOUSLY at
+    // mutation time while the hash stays debounced, and the reload below
+    // reads the hash FIRST (a mirror-only wait would reload into the stale
+    // pre-clear hash). A hash carrying [ws1] implies the full flushSave ran
+    // (v2 key removed + v3 mirror written atomically with it).
     await expect
       .poll(
         async () =>
-          page.evaluate((key) => {
-            const raw = localStorage.getItem(key);
-            if (!raw) return null;
+          page.evaluate(() => {
+            const hash = window.location.hash;
+            if (!hash || !hash.startsWith("#state=")) return null;
             try {
-              const p = JSON.parse(raw) as { workspaces?: Array<{ id: string }> };
+              const p = JSON.parse(
+                decodeURIComponent(hash.slice("#state=".length)),
+              ) as { workspaces?: Array<{ id: string }> };
               return (p.workspaces ?? []).map((w) => w.id).sort().join(",");
             } catch {
               return null;
             }
-          }, H.LAYOUT_STORAGE_KEY),
+          }),
         { timeout: 8000 },
       )
       .toBe(ws1);

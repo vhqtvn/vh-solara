@@ -5,6 +5,7 @@ import { HostController } from "./hostController";
 import {
   applyColdRestoreForWorkspace,
   installLayoutSaver,
+  noteDefaultWorkspaceSeeded,
 } from "./layoutPersistence";
 import {
   installProportionalResize,
@@ -118,6 +119,12 @@ export function DockviewHost(props: { workspaceId: string }) {
     const restored = applyColdRestoreForWorkspace(api, props.workspaceId, extent);
     if (!restored) {
       if (shouldSeedWorkspace(props.workspaceId)) {
+        // DIAG (2026-08-31): the reset symptom's fingerprint — the default
+        // workspace is being SEEDED (fleet/mock laid out) instead of restored.
+        // Records what the init read found, so a post-mortem ring from the
+        // operator's device splits "no blob" from "blob existed, restore fell
+        // through" from "unexpected hash". Must never affect the seed itself.
+        noteDefaultWorkspaceSeeded(props.workspaceId);
         seedInitialPanes(api);
       }
       // else: empty workspace (e.g. a runtime-added workspace) — the

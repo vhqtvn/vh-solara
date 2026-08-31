@@ -38,10 +38,10 @@ test.describe("host shell — production build (vite preview)", () => {
 
   test("production build has NO window.__host (and no DEV bridges)", async ({ page }) => {
     // The DEV-only test bridges (host + keyboard-focus + viewport auto-transpose
-    // + proportions re-normalizer + needs-you notification manager) and their
-    // destructive hooks must be entirely absent from the running production
-    // app. (The i3-keys bridge was removed when the Alt-shortcut module was
-    // dropped.)
+    // + proportions re-normalizer + needs-you notification manager + the
+    // layout-diag bridge) and their destructive hooks must be entirely absent
+    // from the running production app. (The i3-keys bridge was removed when the
+    // Alt-shortcut module was dropped.)
     const hasBridge = await page.evaluate(() => {
       const w = window as unknown as {
         __host?: unknown;
@@ -49,6 +49,7 @@ test.describe("host shell — production build (vite preview)", () => {
         __hostViewport?: unknown;
         __hostProportions?: unknown;
         __hostAttention?: unknown;
+        __hostLayoutDiag?: unknown;
       };
       return {
         host: typeof w.__host !== "undefined",
@@ -56,6 +57,7 @@ test.describe("host shell — production build (vite preview)", () => {
         viewport: typeof w.__hostViewport !== "undefined",
         proportions: typeof w.__hostProportions !== "undefined",
         attention: typeof w.__hostAttention !== "undefined",
+        layoutDiag: typeof w.__hostLayoutDiag !== "undefined",
       };
     });
     expect(hasBridge.host, "window.__host must be absent in production").toBe(false);
@@ -63,6 +65,24 @@ test.describe("host shell — production build (vite preview)", () => {
     expect(hasBridge.viewport, "window.__hostViewport must be absent in production").toBe(false);
     expect(hasBridge.proportions, "window.__hostProportions must be absent in production").toBe(false);
     expect(hasBridge.attention, "window.__hostAttention must be absent in production").toBe(false);
+    expect(hasBridge.layoutDiag, "window.__hostLayoutDiag must be absent in production").toBe(false);
+
+    // The diag RING itself is production-always-on (only the bridge is
+    // DEV-gated): by the time the shell is ready, the module-init `read` event
+    // must already be persisted — this is what makes the operator's on-device
+    // "Settings → Copy layout diagnostics" export work in the production PWA.
+    const diag = await page.evaluate((key: string) => {
+      try {
+        const parsed = JSON.parse(localStorage.getItem(key) ?? "[]") as Array<{
+          kind?: string;
+        }>;
+        return { present: parsed.length > 0, hasRead: parsed.some((e) => e.kind === "read") };
+      } catch {
+        return { present: false, hasRead: false };
+      }
+    }, "vh-host:layout:diag");
+    expect(diag.present, "production diag ring persisted").toBe(true);
+    expect(diag.hasRead, "production ring carries the init read event").toBe(true);
   });
 
   test("production tabstrip HAS workspace chrome (ws-tab/ws-add/add-server)", async ({ page }) => {

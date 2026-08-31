@@ -8,6 +8,7 @@ import {
   type FleetEntry,
 } from "../state/mockData";
 import { fractionsToSizes, sizesToFractions } from "./fractionMath";
+import { recordLayoutDiag } from "./layoutDiag";
 
 // =============================================================================
 // Layout persistence — multi-workspace edition.
@@ -94,9 +95,11 @@ export const LAYOUT_STORAGE_KEY = "vh-host:layout:v3";
  *  on the first v3 write AND on a full clear (it is superseded). */
 const LEGACY_V2_STORAGE_KEY = "vh-host:layout:v2";
 
-/** Debounce window for saves. onDidLayoutChange fires in bursts (one drag fires
- *  many); coalescing into one write avoids hammering localStorage. ~450ms is a
- *  comfortable "user paused" cadence. */
+/** Debounce window for the URL-HASH write ONLY (see scheduleSave). onDidLayoutChange
+ *  fires in bursts (one drag fires many); history.replaceState churn is what this
+ *  debounce exists to coalesce. ~450ms is a comfortable "user paused" cadence. The
+ *  localStorage MIRROR is no longer behind this timer — see the write-path block
+ *  below (2026-08-31 hardening). */
 const SAVE_DEBOUNCE_MS = 450;
 
 // ---- persisted-state shape -------------------------------------------------
@@ -137,46 +140,92 @@ let serializeAllFn: (() => PersistedState | null) | null = null;
 // Reading once keeps cold init deterministic: loadWorkspaceSet(),
 // loadRepairedWorkspaceLayout(wsId), and hadSavedStateAtInit() all consult the
 // SAME parsed snapshot rather than re-reading localStorage mid-init.
-const initBlob: PersistedState | null = readBlob();
+//
+// DIAG (2026-08-31): the init read also feeds the diag ring's `read` event —
+// source actually used, workspace count, origin, href prefix, standalone
+// display mode. On the operator's device this is THE relaunch fingerprint: a
+// reset reproduced on-device will show whether the relaunch read `none`
+// (storage empty/partitioned), `v3` (blob present but restore failed
+// downstream), or `hash` (unexpected hash at start_url), and from WHICH origin
+// (a different origin has different localStorage).
+export type BlobReadSource = "hash" | "v3" | "v2" | "none";
+const initRead: { state: PersistedState | null; source: BlobReadSource } =
+  readBlobWithSource();
+const initBlob: PersistedState | null = initRead.state;
+recordLayoutDiag("read", () => ({
+  source: initRead.source,
+  ws: initBlob ? initBlob.workspaces.length : 0,
+  origin: safeLocationField((l) => l.origin),
+  href: safeLocationField((l) => l.href.slice(0, 120)),
+  standalone:
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia("(display-mode: standalone)").matches
+      : false,
+}));
+
+/** Read a location field with a browser-guard (SSR/no-window safety). */
+function safeLocationField(read: (l: Location) => string): string {
+  try {
+    if (typeof window === "undefined" || !window.location) return "";
+    return read(window.location);
+  } catch {
+    return "";
+  }
+}
 
 // ---- flush-on-hide (mobile kill mitigation) ---------------------------------
-// The debounced save assumes the page lives ≥ SAVE_DEBOUNCE_MS after the last
-// mutation. Android PWAs break that assumption: a backgrounded standalone app
+// The debounced HASH save assumes the page lives ≥ SAVE_DEBOUNCE_MS after the
+// last mutation. Android PWAs break that assumption: a backgrounded standalone app
 // is frozen (timers suspended) and later killed WITHOUT firing unload-family
 // events at kill time, so a save scheduled inside that window dies with the
 // process — the relaunch (clean start_url, NO hash) falls back to the
 // localStorage mirror, which is still the PREVIOUS flush (on a fresh PWA
 // context: the boot-time seed write) → "PWA relaunch resets workspaces". The
-// LAST event the page is guaranteed to see before such a kill is the
+// LAST events the page is guaranteed to see before such a kill are the
 // transition to HIDDEN (visibilitychange → hidden — screen off / home /
-// app-switch / swipe-away all fire it), plus pagehide for navigations and
-// graceful closes. Both flush SYNCHRONOUSLY below: localStorage.setItem and
+// app-switch / swipe-away all fire it), the Page Lifecycle `freeze` event
+// (Android freezes backgrounded pages; timers die AT FREEZE, so the freeze
+// moment itself is the last sync flush anchor), plus pagehide for navigations
+// and graceful closes. All flush SYNCHRONOUSLY below: localStorage.setItem and
 // history.replaceState are sync and unload-safe, while ANY async deferral
 // (promise/setTimeout) would itself die with the process.
 //
-// Both hooks are guarded by `saveTimer !== null`: a hide with NOTHING pending
+// All hooks are guarded by `saveTimer !== null`: a hide with NOTHING pending
 // performs NO write (no spurious mirror churn — pinned by the kill/relaunch
 // e2e's byte-identical-blob test). Double-firing is impossible: the first
 // flush clears the timer. Installed ONCE at module init, right after the
 // init-blob read; listeners live for the page lifetime (no uninstall needed —
 // the module is page-scoped and tests get a fresh page/document each).
-function flushPendingSaveNow(): void {
+//
+// 2026-08-31: the mirror write itself no longer waits for ANY of these anchors
+// (see the write-path block at scheduleSave) — these listeners now primarily
+// pin the URL-HASH mirror and act as belt-and-suspenders for the mirror.
+
+/** What caused a flushSave — recorded on the diag ring (`flush` events). */
+export type FlushTrigger = "debounce" | "hide" | "pagehide" | "freeze";
+
+function flushPendingSaveNow(trigger: FlushTrigger): void {
   if (saveTimer === null) return; // nothing pending — no spurious writes
   clearTimeout(saveTimer);
-  flushSave();
+  flushSave(trigger);
 }
 
-/** Install the visibilitychange(hidden) + pagehide listeners that flush a
- *  pending debounced save synchronously before the page can be killed.
- *  Idempotent; browser-guarded (SSR/no-window safety, mirroring writeHashState). */
+/** Install the visibilitychange(hidden) + freeze + pagehide listeners that
+ *  flush a pending debounced save synchronously before the page can be
+ *  killed/frozen. Idempotent; browser-guarded (SSR/no-window safety, mirroring
+ *  writeHashState). */
 export function installFlushOnHide(): void {
   if (typeof window === "undefined" || typeof document === "undefined") return;
   if ((window as FlushOnHideFlag).__vhFlushOnHideInstalled) return;
   (window as FlushOnHideFlag).__vhFlushOnHideInstalled = true;
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") flushPendingSaveNow();
+    if (document.visibilityState === "hidden") flushPendingSaveNow("hide");
   });
-  window.addEventListener("pagehide", () => flushPendingSaveNow());
+  // Page Lifecycle freeze (Android backgrounded-tab freezing): the last event
+  // before the renderer's timers are suspended. A pending debounced save must
+  // land HERE or it dies frozen.
+  document.addEventListener("freeze", () => flushPendingSaveNow("freeze"));
+  window.addEventListener("pagehide", () => flushPendingSaveNow("pagehide"));
 }
 /** Marker-interface for the idempotence flag above (window stays untyped). */
 interface FlushOnHideFlag {
@@ -246,32 +295,128 @@ export function stageRuntimeWorkspaceLayout(
   stagedRuntimeLayouts.set(wsId, layout);
 }
 
-/** Request a debounced save of the full multi-workspace state. Idempotent under
- *  rapid calls (coalesces into one write). Safe to call from any layout change,
- *  workspace add/remove, or active-workspace switch. */
+/** Request a save of the full multi-workspace state. Two mirrors, two timings
+ *  (2026-08-31 hardening — the structural fix for the residual on-device PWA
+ *  relaunch loss):
+ *
+ *  1. localStorage MIRROR: written SYNCHRONOUSLY (microtask-coalesced to one
+ *     write per JS task) on EVERY call. Any COMPLETED mutation then persists
+ *     instantly — the kill-timing dependency collapses from "the page lived
+ *     450ms AND fired a hide-family event" to "the mutation's event handler
+ *     ran", which the Android reality always satisfies (the mutation is what
+ *     the operator did on the foregrounded page). c557b1b's flush-on-hide
+ *     anchors remain as belt-and-suspenders.
+ *
+ *  2. URL HASH: still debounced 450ms — history.replaceState churn is what the
+ *     debounce exists for (one drag fires dozens of layout events). The hash
+ *     is per-tab state; if the process dies before the timer, the hash dies
+ *     with the (dead) tab and the mirror alone restores the relaunch.
+ *
+ *  COALESCING CHOICE (microtask, not rAF): a `queuedThisTick` flag +
+ *  queueMicrotask bounds the sync write to ONE per JS task. Pointer moves are
+ *  separate tasks, so a sash drag costs at most one stringify+setItem per
+ *  delivered event (browsers already coalesce pointermove to rAF) — profiling
+ *  of a 2-5KB JSON.stringify says this is noise. A 2-frame rAF coalesce was
+ *  considered and rejected: rAF does not run in hidden/frozen pages, which is
+ *  exactly the state an Android PWA is heading into. Microtasks always run.
+ *
+ *  Idempotent under rapid calls; safe from any layout change, workspace
+ *  add/remove, or active-workspace switch. */
 export function scheduleSave(): void {
+  scheduleSyncMirrorWrite();
   if (saveTimer !== null) clearTimeout(saveTimer);
-  saveTimer = setTimeout(flushSave, SAVE_DEBOUNCE_MS);
+  saveTimer = setTimeout(() => flushSave("debounce"), SAVE_DEBOUNCE_MS);
 }
 
-function flushSave(): void {
-  saveTimer = null;
-  if (!serializeAllFn) return;
+// ---- sync mirror write (microtask-coalesced) --------------------------------
+let mirrorWriteQueued = false;
+
+function scheduleSyncMirrorWrite(): void {
+  if (mirrorWriteQueued) return;
+  mirrorWriteQueued = true;
+  queueMicrotask(() => {
+    mirrorWriteQueued = false;
+    writeMirrorNow();
+  });
+}
+
+/** Serialize the CURRENT state and write the localStorage mirror NOW (no hash
+ *  write — that stays debounced). Never throws. */
+function writeMirrorNow(): void {
+  const json = serializeCurrentState();
+  if (json === undefined) return; // serializer unset/failed — the debounced
+  // flush retries later; the mirror keeps its previous content.
+  writeLocalStorageMirror(json);
+}
+
+/** Shared serializer for both flush paths: the single JSON string that feeds
+ *  BOTH mirrors (they can never drift), or null for "state cleared". Returns
+ *  undefined when there is nothing to write YET (no serializer / serialize
+ *  threw — a transient condition at boot). Never throws. */
+function serializeCurrentState(): string | null | undefined {
+  if (!serializeAllFn) return undefined;
   let state: PersistedState | null;
   try {
     state = serializeAllFn();
   } catch {
-    return; // serialize failure — never throw
+    return undefined; // serialize failure — never throw
   }
-  // Fork 1: a single JSON string feeds BOTH mirrors (URL hash + localStorage)
-  // so they can never drift. An empty/absent state clears both.
-  const json =
-    state && state.workspaces.length > 0
-      ? JSON.stringify(fractionizePersistedState(state))
-      : null;
+  return state && state.workspaces.length > 0
+    ? JSON.stringify(fractionizePersistedState(state))
+    : null;
+}
+
+function flushSave(trigger: FlushTrigger = "debounce"): void {
+  saveTimer = null;
+  const json = serializeCurrentState();
+  if (json === undefined) return;
 
   // localStorage mirror — keeps the bare-`/` reopen working (inherits last
-  // state when there is no hash).
+  // state when there is no hash). Also written per-mutation by
+  // scheduleSyncMirrorWrite; this full flush keeps hide/pagehide/freeze a
+  // single sync anchor for BOTH mirrors.
+  writeLocalStorageMirror(json);
+
+  // URL hash mirror — the per-tab source of truth. history.replaceState does
+  // NOT fire hashchange → no re-render / fromJSON (survival-safe: the only
+  // fromJSON is the cold restore on page load, which reads the hash via
+  // readBlob at module init, never on a runtime save).
+  writeHashState(json);
+
+  // DIAG: one `flush` record per completed flush (both mirrors written).
+  // `bytes`/`ws`/`active` fingerprint what landed; `trigger` says which anchor
+  // (or the debounce) wrote it.
+  recordLayoutDiag("flush", () => ({
+    trigger,
+    bytes: json ? json.length : 0,
+    ws: json ? countWorkspacesIn(json) : 0,
+    active: json ? activeIdIn(json) : null,
+  }));
+}
+
+/** Cheap field reads off the serialized JSON (no re-parse of the live state —
+ *  the string is already in hand). Both never throw (guarded JSON.parse). */
+function countWorkspacesIn(json: string): number {
+  try {
+    const o = JSON.parse(json) as { workspaces?: unknown[] };
+    return Array.isArray(o.workspaces) ? o.workspaces.length : 0;
+  } catch {
+    return 0;
+  }
+}
+function activeIdIn(json: string): string | null {
+  try {
+    const o = JSON.parse(json) as { activeWorkspaceId?: unknown };
+    return typeof o.activeWorkspaceId === "string" ? o.activeWorkspaceId : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The localStorage side of a flush / sync mirror write. Empty state (null)
+ *  removes the layout keys (and the superseded v2 key); non-empty state
+ *  writes the v3 blob and retires the v2 key. Never throws. */
+function writeLocalStorageMirror(json: string | null): void {
   try {
     if (json === null) {
       localStorage.removeItem(LAYOUT_STORAGE_KEY);
@@ -280,21 +425,17 @@ function flushSave(): void {
       // surviving v2 blob would RESURRECT stale px geometry on the next load
       // right after the user cleared everything.
       localStorage.removeItem(LEGACY_V2_STORAGE_KEY);
+      recordLayoutDiag("clear", () => ({}));
     } else {
       localStorage.setItem(LAYOUT_STORAGE_KEY, json);
       // The legacy v2 px blob is superseded by this v3 write — remove it so a
-      // later v3-key clear can never resurrect stale px geometry.
+      // later v3-key clear can never resurrect stale px geometry. (Housekeeping
+      // — NOT a `clear` diag event; the user's state was not emptied.)
       localStorage.removeItem(LEGACY_V2_STORAGE_KEY);
     }
   } catch {
     // localStorage unavailable / quota exceeded / private mode — swallow.
   }
-
-  // URL hash mirror — the per-tab source of truth. history.replaceState does
-  // NOT fire hashchange → no re-render / fromJSON (survival-safe: the only
-  // fromJSON is the cold restore on page load, which reads the hash via
-  // readBlob at module init, never on a runtime save).
-  writeHashState(json);
 }
 
 /** v3 save transform: stamp the schema marker and convert every workspace
@@ -361,6 +502,26 @@ export function installLayoutSaver(api: DockviewApi): void {
  *  the workspace SET + each workspace's layout are restored from the blob. */
 export function hadSavedStateAtInit(): boolean {
   return initBlob !== null;
+}
+
+/**
+ * DIAG hook for the RESET SYMPTOM'S FINGERPRINT: DockviewHost calls this the
+ * moment the DEFAULT workspace is seeded (cold init found no restorable layout
+ * for it — the fleet/mock fleet is being laid out instead of a saved blob).
+ * On-device, a `seed` event on a PWA relaunch that should have RESTORED is
+ * the smoking gun; the carried fields split the causes apart:
+ *   readSource "none"   → storage was empty (empty/partitioned/other origin)
+ *   readSource "v3"/"v2"→ a blob EXISTED but restore fell through (downstream
+ *                         validation/repair failure) — initWsIds shows which
+ *                         workspaces the blob claimed.
+ *   readSource "hash"   → an unexpected #state= hash was at start_url.
+ */
+export function noteDefaultWorkspaceSeeded(wsId: string): void {
+  recordLayoutDiag("seed", () => ({
+    ws: wsId,
+    readSource: initRead.source,
+    initWs: initBlob ? initBlob.workspaces.map((w) => w.id) : [],
+  }));
 }
 
 /**
@@ -618,8 +779,9 @@ function maxPaneSeqSuffix(ids: Iterable<string>): number {
 // BLOB READ + structural validation of the v2 envelope.
 // =============================================================================
 
-/** Read + parse + structurally validate the persisted state. Called ONCE at
- *  module init. Never throws.
+/** Read + parse + structurally validate the persisted state, reporting WHICH
+ *  source produced it (for the diag `read` event). Called ONCE at module init.
+ *  Never throws.
  *
  *  Fork 1 — HYBRID URL state: the URL hash is the source of truth for PER-TAB
  *  state (two same-origin tabs stay independent — each carries its own
@@ -629,13 +791,16 @@ function maxPaneSeqSuffix(ids: Iterable<string>): number {
  *  (px blob — migrated losslessly to fractions in-memory; never re-seeds).
  *  This per-tab independence is the whole point of the hash: localStorage is
  *  shared across tabs, so two tabs at `/` would otherwise clobber each
- *  other. */
-function readBlob(): PersistedState | null {
+ *  other. The read ORDER is unchanged (hash → v3 → v2 → none); the source
+ *  label simply records which fork won. */
+function readBlobWithSource(): { state: PersistedState | null; source: BlobReadSource } {
   const fromHash = readHashState();
-  if (fromHash !== null) return fromHash;
+  if (fromHash !== null) return { state: fromHash, source: "hash" };
   const v3 = readLocalStorageState(LAYOUT_STORAGE_KEY);
-  if (v3 !== null) return v3;
-  return readLocalStorageState(LEGACY_V2_STORAGE_KEY);
+  if (v3 !== null) return { state: v3, source: "v3" };
+  const v2 = readLocalStorageState(LEGACY_V2_STORAGE_KEY);
+  if (v2 !== null) return { state: v2, source: "v2" };
+  return { state: null, source: "none" };
 }
 
 /**

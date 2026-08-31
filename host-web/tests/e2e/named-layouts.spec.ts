@@ -595,27 +595,36 @@ test.describe("named layouts", () => {
     // above re-activated recon; persistence remembers the LAST active).
     const alphaId2 = ids[names.indexOf("alpha")];
     await H.setActiveWorkspace(page, alphaId2);
-    // Wait for a flush carrying the post-replace session AND alpha as the
-    // persisted active (panel-count polling cannot see an active-only
-    // switch — poll the persisted blob's activeWorkspaceId directly).
+    // Wait for a HASH flush carrying the post-replace session AND alpha as
+    // the persisted active. WRITE-PATH NOTE (2026-08-31): the localStorage
+    // mirror is now written SYNCHRONOUSLY at mutation time, so polling the
+    // mirror (as this test used to) passes while the debounced HASH — the
+    // per-tab source of truth this reload reads (the beforeEach init script
+    // clears the mirror on the fresh document) — still holds the pre-load
+    // state. Poll the HASH itself (panel-count polling cannot see an
+    // active-only switch either).
     await expect
       .poll(
         () =>
           page.evaluate(
-            ({ key, alphaId }) => {
-              const raw = localStorage.getItem(key);
-              if (!raw) return false;
+            (alphaId) => {
+              const hash = window.location.hash;
+              if (!hash || !hash.startsWith("#state=")) return false;
               try {
-                const parsed = JSON.parse(raw) as {
+                const parsed = JSON.parse(
+                  decodeURIComponent(hash.slice("#state=".length)),
+                ) as {
                   activeWorkspaceId?: string;
                   workspaces?: unknown[];
                 };
-                return parsed.activeWorkspaceId === alphaId && parsed.workspaces?.length === 2;
+                return (
+                  parsed.activeWorkspaceId === alphaId && parsed.workspaces?.length === 2
+                );
               } catch {
                 return false;
               }
             },
-            { key: H.LAYOUT_STORAGE_KEY, alphaId: alphaId2 },
+            alphaId2,
           ),
         { timeout: 8000 },
       )
@@ -740,10 +749,13 @@ test.describe("named layouts", () => {
     await expect(editItem).toHaveText(/Edit layout…/);
     await expect(editItem).not.toHaveText(/Layout…/);
     await expect(page.locator('[data-testid="settings-layouts"]')).toHaveCount(0);
-    // The menu is exactly: Edit layout…, Reload page, Auto-rotate layout,
-    // Needs-you notifications (the attention-notify opt-in toggle — the second
-    // menuitemcheckbox, added by the needs-you notifications slice).
-    await expect(page.locator('[data-testid="settings-popover"] [role="menuitem"]')).toHaveCount(2);
+    // The menu is exactly: Edit layout…, Reload page, Copy layout diagnostics,
+    // Auto-rotate layout, Needs-you notifications (the attention-notify opt-in
+    // toggle — the second menuitemcheckbox, added by the needs-you
+    // notifications slice; Copy layout diagnostics is the third menuitem,
+    // added by the 2026-08-31 diagnosis-first slice).
+    await expect(page.locator('[data-testid="settings-popover"] [role="menuitem"]')).toHaveCount(3);
+    await expect(page.locator('[data-testid="settings-copy-diag"]')).toHaveText(/Copy layout diagnostics/);
     await expect(page.locator('[data-testid="settings-popover"] [role="menuitemcheckbox"]')).toHaveCount(2);
     await expect(page.locator('[data-testid="settings-notify"]')).toHaveText(/Needs-you notifications/);
     await page.keyboard.press("Escape");
@@ -838,9 +850,15 @@ test.describe("named layouts", () => {
     await layoutRow(page, "battle").locator('[data-testid="layout-load"]').click();
     await expect.poll(async () => (await H.workspaces(page)).length, { timeout: 8000 }).toBe(2);
 
-    // Wait for the debounced save to flush the FULL state (source 2 panes +
-    // loaded 2 panes = 4 panels) before reloading.
-    await H.waitForSavedLayout(page, 4);
+    // Wait for the debounced HASH flush to carry the FULL state (source 2
+    // panes + loaded 2 panes = 4 panels) before reloading. WRITE-PATH NOTE
+    // (2026-08-31): the localStorage mirror is written SYNCHRONOUSLY at
+    // mutation time now, so the old localStorage poll (waitForSavedLayout)
+    // passes while the debounced hash — the per-tab source of truth this
+    // reload reads, since the beforeEach init script clears the mirror on
+    // the fresh document — is still pre-load. Poll the HASH itself; "patrol"
+    // exists only in the post-load state.
+    await H.waitForHashContent(page, "patrol");
 
     // Reload (NOT goto — a bare goto("/") would DISCARD the #state= hash,
     // which is the per-tab source of truth the restore reads first; the

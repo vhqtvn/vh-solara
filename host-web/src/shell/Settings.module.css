@@ -119,3 +119,21 @@
 .itemDisabled .itemLabel {
   color: var(--fg-dim);
 }
+/* Copy-diagnostics fallback textarea (readonly, staged + selected when the
+ * async clipboard is unavailable/denied — non-secure LAN origins). GPU-cheap:
+ * plain bg/border only; fixed height with scroll so a multi-KB ring JSON
+ * cannot blow up the popover. */
+.diagTextarea {
+  width: 100%;
+  height: 96px;
+  margin-top: 6px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  line-height: 1.35;
+  resize: vertical;
+}

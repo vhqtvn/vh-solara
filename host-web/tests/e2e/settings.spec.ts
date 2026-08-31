@@ -374,6 +374,89 @@ test.describe("settings popover", () => {
     await H.assertSurvived(page, a, ba, "live-toggle pane A");
     await H.assertSurvived(page, b, bb, "live-toggle pane B");
   });
+
+  test("Copy layout diagnostics: clipboard payload carries the ring JSON; denial falls back to a selected textarea", async ({
+    page,
+  }) => {
+    // The evidence-collection path for the on-device PWA relaunch loss
+    // (2026-08-31 diagnosis-first slice). The diag ring (layoutDiag.ts) is
+    // always-on and persisted; this Settings action is the operator's one-tap
+    // export. The beforeEach's localStorage.clear() means this boot's ring
+    // holds exactly the fresh-boot fingerprint: read(source:none) + seed.
+    await openSettings(page);
+
+    // Stub the async clipboard (capture writes). The REAL menu item + REAL
+    // copy handler run; only the browser clipboard is stubbed.
+    await page.evaluate(() => {
+      const w = window as unknown as { __diagCaptures?: string[] };
+      w.__diagCaptures = [];
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: {
+          writeText: (t: string) => {
+            w.__diagCaptures!.push(t);
+            return Promise.resolve();
+          },
+        },
+      });
+    });
+
+    await page.locator('[data-testid="settings-copy-diag"]').click();
+    await expect(page.locator('[data-testid="settings-copy-diag-hint"]')).toHaveText(
+      "Copied to clipboard ✓",
+    );
+    // No fallback textarea on the success path.
+    await expect(page.locator('[data-testid="settings-diag-textarea"]')).toHaveCount(0);
+
+    const payload = await page.evaluate(
+      () => (window as unknown as { __diagCaptures?: string[] }).__diagCaptures?.[0] ?? "",
+    );
+    expect(payload, "exactly one clipboard write happened").not.toBe("");
+    const events = JSON.parse(payload) as Array<{ kind: string; source?: string }>;
+    expect(Array.isArray(events), "payload is the ring JSON array").toBe(true);
+    const kinds = events.map((e) => e.kind);
+    expect(kinds, "fresh-boot fingerprint: read + seed events").toContain("read");
+    expect(kinds).toContain("seed");
+    const read = events.find((e) => e.kind === "read");
+    expect(read?.source).toBe("none");
+
+    // ---- DENIAL path: make writeText reject; the copy falls back to staging
+    // the ring JSON into a readonly textarea and selecting it (browsers without
+    // the async clipboard / denied permission — e.g. the operator's non-secure
+    // LAN origin).
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: {
+          writeText: () => Promise.reject(new Error("denied")),
+        },
+      });
+    });
+    await page.locator('[data-testid="settings-copy-diag"]').click();
+    await expect(page.locator('[data-testid="settings-diag-textarea"]')).toBeVisible();
+    await expect(page.locator('[data-testid="settings-copy-diag-hint"]')).toHaveText(
+      "Selected below — copy from the text box",
+    );
+    // The textarea holds the ring JSON and ALL of it is selected (the
+    // pwa-probe select-all fallback).
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const ta = document.querySelector(
+            '[data-testid="settings-diag-textarea"]',
+          ) as HTMLTextAreaElement | null;
+          if (!ta || !ta.value) return false;
+          const events = JSON.parse(ta.value) as unknown[];
+          return (
+            Array.isArray(events) &&
+            events.some((e) => (e as { kind?: string }).kind === "read") &&
+            ta.selectionStart === 0 &&
+            ta.selectionEnd === ta.value.length
+          );
+        }),
+      )
+      .toBe(true);
+  });
 });
 
 test.describe("add-server catalog click-to-prefill", () => {

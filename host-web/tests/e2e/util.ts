@@ -1269,77 +1269,142 @@ export const LAYOUT_STORAGE_KEY = "vh-host:layout:v3";
  *  migrated in-memory to fractions; the first v3 write removes it. */
 export const LEGACY_LAYOUT_STORAGE_KEY_V2 = "vh-host:layout:v2";
 
-/** Wait until localStorage holds a saved layout with the expected TOTAL panel
- *  count across all workspaces. The v2 schema wraps each workspace's serialized
- *  layout under `workspaces[*].layout`; this sums panels across every workspace
- *  so a multi-workspace save is validated. The save is debounced (~450ms); this
- *  polls the raw blob so a test can flush it before reloading. Returns a map of
- *  paneId → params aggregated across all workspaces. */
+// ---- layout diag ring (kill/relaunch diagnostics, layoutDiag.ts) ------------
+
+/** Storage key the diag ring persists at (must match
+ *  src/dockview/layoutDiag.ts). Always-on in production — only the
+ *  window.__hostLayoutDiag BRIDGE is DEV-gated. */
+export const DIAG_STORAGE_KEY = "vh-host:layout:diag";
+
+export interface DiagEvent {
+  t: number;
+  kind: string;
+  [field: string]: unknown;
+}
+
+/** The diag ring via the DEV bridge (oldest→newest). */
+export async function diagRing(page: Page): Promise<DiagEvent[]> {
+  return page.evaluate(() => {
+    const b = (window as unknown as { __hostLayoutDiag?: { ring(): unknown[] } })
+      .__hostLayoutDiag;
+    return (b ? b.ring() : []) as DiagEvent[];
+  });
+}
+
+/** Read + decode the `#state=` URL hash in the page. Returns the raw encoded
+ *  string (for stability comparison) + the parsed blob, or null when there is
+ *  no hash / it is malformed. */
+async function readHashBlob(
+  page: Page,
+): Promise<{ raw: string; parsed: unknown } | null> {
+  return page.evaluate(() => {
+    const raw = window.location.hash;
+    if (!raw || !raw.startsWith("#state=")) return null;
+    try {
+      return { raw, parsed: JSON.parse(decodeURIComponent(raw.slice("#state=".length))) };
+    } catch {
+      return null;
+    }
+  });
+}
+
+/** QUIESCENT hash wait: poll until `accept(parsed)` is true AND the hash has
+ *  been byte-STABLE for ≥700ms (> SAVE_DEBOUNCE_MS=450 + margin). Stability
+ *  for longer than one debounce window proves every pre-wait mutation's flush
+ *  has landed — a count-only/content-only check can otherwise pass on a flush
+ *  that fired MID-ARRANGEMENT (e.g. between a split and a later sash drag),
+ *  and a same-tab reload would then read the STALE hash (WRITE-PATH NOTE
+ *  2026-08-31: the localStorage mirror is written synchronously at mutation
+ *  time while the hash stays debounced, so the hash — the per-tab source of
+ *  truth a reload reads FIRST — is the artifact that must be waited on). */
+async function waitForQuiescentHash(
+  page: Page,
+  accept: (parsed: unknown) => boolean,
+  what: string,
+  timeoutMs: number,
+): Promise<unknown> {
+  const STABLE_MS = 700; // > 450ms debounce + poll margin
+  const deadline = Date.now() + timeoutMs;
+  let stableRaw: string | null = null;
+  let stableSince = 0;
+  while (Date.now() < deadline) {
+    const blob = await readHashBlob(page);
+    if (blob && accept(blob.parsed)) {
+      if (stableRaw === blob.raw) {
+        if (Date.now() - stableSince >= STABLE_MS) return blob.parsed;
+      } else {
+        stableRaw = blob.raw;
+        stableSince = Date.now();
+      }
+    } else {
+      stableRaw = null;
+    }
+    await page.waitForTimeout(80);
+  }
+  throw new Error(`${what} never appeared stably in the #state= hash within ${timeoutMs}ms`);
+}
+
+/** Wait until the saved layout carries the expected TOTAL panel count across
+ *  all workspaces — in the URL HASH (#state=), QUIESCENTLY (see
+ *  waitForQuiescentHash). The v3 schema wraps each workspace's serialized
+ *  layout under `workspaces[*].layout`; this sums panels across every
+ *  workspace so a multi-workspace save is validated. Returns a map of paneId →
+ *  params aggregated across all workspaces. */
 export async function waitForSavedLayout(
   page: Page,
   expectedTotalPanelCount: number,
   timeoutMs = 8000,
 ): Promise<Record<string, { params?: { url?: string; label?: string } }>> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const aggregated = await page.evaluate((key) => {
-      const raw = localStorage.getItem(key);
-      if (!raw) return null;
-      try {
-        const parsed = JSON.parse(raw) as {
-          workspaces?: Array<{ layout?: { panels?: Record<string, unknown> } }>;
-        };
-        const wsList = parsed.workspaces ?? [];
-        const panels: Record<string, unknown> = {};
-        for (const ws of wsList) {
-          const lp = ws.layout?.panels;
-          if (lp && typeof lp === "object") {
-            for (const [id, v] of Object.entries(lp)) panels[id] = v;
-          }
-        }
-        return panels;
-      } catch {
-        return null;
+  const aggregate = (parsed: unknown): Record<string, unknown> | null => {
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const wsList =
+      (parsed as { workspaces?: Array<{ layout?: { panels?: Record<string, unknown> } }> })
+        .workspaces ?? [];
+    const panels: Record<string, unknown> = {};
+    for (const ws of wsList) {
+      const lp = ws.layout?.panels;
+      if (lp && typeof lp === "object") {
+        for (const [id, v] of Object.entries(lp)) panels[id] = v;
       }
-    }, LAYOUT_STORAGE_KEY);
-    if (aggregated && Object.keys(aggregated).length === expectedTotalPanelCount) {
-      return aggregated as Record<string, { params?: { url?: string; label?: string } }>;
     }
-    await page.waitForTimeout(80);
-  }
-  throw new Error(
-    `saved layout with ${expectedTotalPanelCount} total panels never appeared in localStorage within ${timeoutMs}ms`,
+    return panels;
+  };
+  const parsed = await waitForQuiescentHash(
+    page,
+    (p) => {
+      const panels = aggregate(p);
+      return panels !== null && Object.keys(panels).length === expectedTotalPanelCount;
+    },
+    `saved layout with ${expectedTotalPanelCount} total panels`,
+    timeoutMs,
   );
+  return aggregate(parsed) as Record<
+    string,
+    { params?: { url?: string; label?: string } }
+  >;
 }
 
-/** Wait until the v2 layout blob in localStorage carries `name` for workspace
- *  `wsId`. The save is debounced; this polls the raw blob so a rename-round-trip
- *  test can flush the NEW name before reloading (waitForSavedLayout keys on
- *  panel COUNT, which a rename does not change, so it cannot detect a rename). */
+/** Wait until the persisted layout blob carries `name` for workspace `wsId` —
+ *  in the URL HASH (#state=), QUIESCENTLY (see waitForQuiescentHash; the
+ *  mirror leads the hash under the 2026-08-31 write path). Throws after
+ *  timeoutMs. */
 export async function waitForPersistedWorkspaceName(
   page: Page,
   wsId: string,
   name: string,
   timeoutMs = 8000,
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const match = await page.evaluate(({ key, wsId, name }) => {
-      const raw = localStorage.getItem(key);
-      if (!raw) return false;
-      try {
-        const parsed = JSON.parse(raw) as { workspaces?: Array<{ id: string; name: string }> };
-        const ws = parsed.workspaces?.find((w) => w.id === wsId);
-        return ws?.name === name;
-      } catch {
-        return false;
-      }
-    }, { key: LAYOUT_STORAGE_KEY, wsId, name });
-    if (match) return;
-    await page.waitForTimeout(80);
-  }
-  throw new Error(
-    `workspace ${wsId} name "${name}" never appeared in localStorage within ${timeoutMs}ms`,
+  await waitForQuiescentHash(
+    page,
+    (p) => {
+      if (typeof p !== "object" || p === null) return false;
+      const ws = (p as { workspaces?: Array<{ id: string; name: string }> }).workspaces?.find(
+        (w) => w.id === wsId,
+      );
+      return ws?.name === name;
+    },
+    `workspace ${wsId} name "${name}"`,
+    timeoutMs,
   );
 }
 

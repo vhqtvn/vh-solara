@@ -21,6 +21,7 @@ import {
   uninstallAttentionNotify,
 } from "./attentionNotify";
 import { installProportionsDevBridge } from "./dockview/proportions";
+import { installLayoutDiagDevBridge } from "./dockview/layoutDiag";
 import s from "./App.module.css";
 
 /**
@@ -83,6 +84,10 @@ export function App() {
     // Page-level singleton, DEV-gated, idempotent — no uninstall needed
     // (mirrors window.__host's page-lifetime install).
     installProportionsDevBridge();
+    // Layout-diag DEV bridge (window.__hostLayoutDiag): read/synthesize the
+    // persistence diag ring for the kill/relaunch e2e. The RING itself is
+    // production-always-on (layoutDiag.ts); only this bridge is DEV-gated.
+    installLayoutDiagDevBridge();
     // Needs-you notifications (attentionNotify.ts): OS notifications when a
     // pane's session needs the operator. Opt-in (Settings toggle; default
     // OFF), alive-tab semantics, SW-based show/cleanup + app-badge. Self-

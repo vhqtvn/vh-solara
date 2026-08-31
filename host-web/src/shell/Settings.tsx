@@ -1,4 +1,4 @@
-import { For, Show } from "solid-js";
+import { For, Show, createSignal, onCleanup } from "solid-js";
 import { autoTransposeOn, setAutoTranspose } from "../viewportShape";
 import {
   attentionNotifyHint,
@@ -7,6 +7,7 @@ import {
   setAttentionNotifyEnabled,
 } from "../attentionNotify";
 import { focusedId, hostOps } from "../dockview/store";
+import { getLayoutDiagRing } from "../dockview/layoutDiag";
 import { TABSTRIP_POPOVER_GROUP, usePopoverSurface } from "./popover";
 import s from "./Settings.module.css";
 
@@ -65,6 +66,11 @@ interface ActionItem {
    *  actions whose result is the NEXT surface (Edit layout… opens the layout
    *  overlay; two popovers open at once is confusing). */
   closeAfterRun?: boolean;
+  /** Optional reactive inline hint rendered under the description when
+   *  non-null (e.g. the copy-diagnostics item's transient "Copied" feedback).
+   *  Same shape as ToggleItem.hint — declared per-kind so the union stays a
+   *  plain structural match. */
+  hint?(): string | null;
   run(): void;
 }
 
@@ -92,6 +98,50 @@ export function Settings() {
     id: "settings",
     group: TABSTRIP_POPOVER_GROUP,
     anchor: () => wrapEl,
+  });
+
+  // ---- "Copy layout diagnostics" action (production-capable) ---------------
+  // Copies the layout-persistence diag ring (layoutDiag.ts — always-on, last
+  // 30 events, persisted across relaunches) as JSON to the clipboard. This is
+  // the operator's one-tap evidence-collection path for the on-device PWA
+  // relaunch loss: reproduce → Settings → Copy → paste back. Async clipboard
+  // first; when unavailable/denied (non-secure origin LAN http, older mobile
+  // browsers) a readonly textarea is staged + selected as the fallback (the
+  // PerformanceDialog/pwa-probe pattern). Inline "Copied"/"selected" feedback
+  // under the item.
+  const [diagHint, setDiagHint] = createSignal<string | null>(null);
+  const [diagFallback, setDiagFallback] = createSignal<string | null>(null);
+  let diagFlashTimer: ReturnType<typeof setTimeout> | undefined;
+  let diagTextarea: HTMLTextAreaElement | undefined;
+
+  const flashDiagHint = (text: string): void => {
+    setDiagHint(text);
+    if (diagFlashTimer !== undefined) clearTimeout(diagFlashTimer);
+    diagFlashTimer = setTimeout(() => setDiagHint(null), 2500);
+  };
+
+  const copyDiagnostics = (): void => {
+    const text = JSON.stringify(getLayoutDiagRing());
+    void (async () => {
+      try {
+        await navigator.clipboard.writeText(text);
+        setDiagFallback(null);
+        flashDiagHint("Copied to clipboard ✓");
+        return;
+      } catch {
+        /* clipboard unavailable/denied — fall through to the textarea */
+      }
+      setDiagFallback(text);
+      flashDiagHint("Selected below — copy from the text box");
+      queueMicrotask(() => {
+        diagTextarea?.focus();
+        diagTextarea?.select();
+      });
+    })();
+  };
+
+  onCleanup(() => {
+    if (diagFlashTimer !== undefined) clearTimeout(diagFlashTimer);
   });
 
   // The menu. Append entries here; the <For> below renders both kinds.
@@ -157,6 +207,20 @@ export function Settings() {
       },
       hint: () => attentionNotifyHint(),
     },
+    {
+      // Evidence collection for the on-device PWA relaunch layout loss
+      // (2026-08-31 diagnosis-first slice). The diag ring records the init
+      // read source/origin, every flush (trigger+bytes+ws), seeds, and clears
+      // — always-on in production. Kept the popover open (no closeAfterRun)
+      // so the "Copied" feedback (and the fallback textarea below) stay
+      // visible.
+      kind: "action",
+      testid: "settings-copy-diag",
+      label: "Copy layout diagnostics",
+      description: "Copy the persistence event log (last 30) as JSON.",
+      run: copyDiagnostics,
+      hint: diagHint,
+    },
   ];
 
   const activate = (item: MenuItem) => {
@@ -220,10 +284,11 @@ export function Settings() {
                   <span class={s.itemText}>
                     <span class={s.itemLabel}>{item.label}</span>
                     <span class={s.itemDesc}>{item.description}</span>
-                    {/* Optional live hint line (permission denial guidance).
-                        Called in the JSX expression so SolidJS tracks the
-                        hint signal while the popover is open. */}
-                    {item.kind === "toggle" && item.hint ? (
+                    {/* Optional live hint line (permission denial guidance,
+                        copy-diagnostics "Copied" feedback). Called in the JSX
+                        expression so SolidJS tracks the hint signal while the
+                        popover is open. */}
+                    {item.hint ? (
                       <Show when={item.hint()} keyed>
                         {(h) => (
                           <span class={s.itemHint} data-testid={`${item.testid}-hint`}>
@@ -246,6 +311,20 @@ export function Settings() {
               )}
             </For>
           </div>
+          {/* Copy-diagnostics FALLBACK: a readonly textarea staged with the
+              ring JSON and selected, for browsers where the async clipboard is
+              unavailable or denied (non-secure LAN origins — the operator's
+              http device path). Rendered only while the fallback is active. */}
+          <Show when={diagFallback()}>
+            <textarea
+              class={s.diagTextarea}
+              ref={diagTextarea}
+              readonly
+              data-testid="settings-diag-textarea"
+              value={diagFallback() ?? ""}
+              spellcheck={false}
+            />
+          </Show>
         </div>
       </Show>
     </div>
