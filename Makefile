@@ -137,4 +137,4 @@ clean-web-embed: ## Remove generated single-server SPA artifacts from pkg/web/di
 	rm -rf pkg/web/dist/assets pkg/web/dist/index.html pkg/web/dist/*.js pkg/web/dist/*.map pkg/web/dist/*.webmanifest pkg/web/dist/*.svg pkg/web/dist/*.png 2>/dev/null || true
 
 clean-host-web-embed: ## Remove generated host shell artifacts from pkg/web/host-dist (preserve tracked placeholder.html → cold-fallback embed)
-	rm -rf pkg/web/host-dist/assets pkg/web/host-dist/index.html pkg/web/host-dist/*.js pkg/web/host-dist/*.map 2>/dev/null || true
+	rm -rf pkg/web/host-dist/assets pkg/web/host-dist/index.html pkg/web/host-dist/*.js pkg/web/host-dist/*.map pkg/web/host-dist/*.webmanifest pkg/web/host-dist/*.svg pkg/web/host-dist/*.png 2>/dev/null || true
