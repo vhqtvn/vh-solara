@@ -1,0 +1,4 @@
+overrides:
+  docs/ai/shell-execution.md:
+    class: project_owned
+    reason: "Consumer-edited managed document, folded with platform content but project-owned to preserve network-fetch reality and git ops sections"
