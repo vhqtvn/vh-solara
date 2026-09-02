@@ -783,3 +783,91 @@ func TestLocalServerOwnedRestartRecoversAfterExhaustedBoot(t *testing.T) {
 	}
 	sc.waitAliveCount(".fake", 1, 5*time.Second)
 }
+
+// --- F3: detached-restart ring fan-in parity ---
+
+// bootLocalServerDetachedForTest boots the REAL localServerCmd.Run in the
+// DETACHED topology — the same choreography as bootLocalServerForTest with
+// localOpenCodeDetached flipped on BEFORE Run reads it (the flag restore
+// stays owned by withLocalServerFlags' cleanup snapshot).
+func bootLocalServerDetachedForTest(t *testing.T) (*localServerHandle, *ocLockScenario) {
+	t.Helper()
+	sc := newOCLockScenario(t)
+	useVersionFakeBin(t, sc)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	withLocalServerFlags(t, sc, fmt.Sprintf("127.0.0.1:%d", port))
+	localOpenCodeDetached = true
+
+	go localServerCmd.Run(nil, nil)
+
+	return &localServerHandle{base: fmt.Sprintf("http://127.0.0.1:%d", port)}, sc
+}
+
+// TestLocalServerDetachedRestartFansChildOutputIntoLogs — F3 parity: the
+// detached boot fans the child's output into the lifecycle ring
+// (EnsureDetachedOpenCode extraW), and an ACCEPTED detached restart must not
+// lose that feed when it replaces the child — the replacement's own startup
+// banner must appear in /vh/opencode/logs through the real running server,
+// not just the boot child's (the ring would otherwise serve a stale tail
+// despite HasLogTail: true). Asserted by banner COUNT: the boot child's
+// banner (1) plus the replacement's banner (2) — distinct pids, same line
+// shape, so two occurrences prove the REPLACEMENT's output landed.
+func TestLocalServerDetachedRestartFansChildOutputIntoLogs(t *testing.T) {
+	h, sc := bootLocalServerDetachedForTest(t)
+	waitLSBootReady(t, h)
+	bootPids := sc.waitAliveCount(".fake", 1, 5*time.Second)
+	bootPid := bootPids[0]
+
+	// Pre: the boot child's banner is already ring-fed.
+	code, body := lsLogsTail(t, h)
+	if code != 200 || !strings.Contains(body, "fake opencode serve") {
+		t.Fatalf("/vh/opencode/logs = %d/%q after detached boot, want the boot child's banner (the boot wiring's own precondition)", code, body)
+	}
+
+	// THE accepted detached restart, through the real trigger.
+	code, body = lsRestartTrigger(t, h)
+	if code != 200 || !strings.Contains(body, `"ok":true`) {
+		t.Fatalf("POST /vh/restart-opencode = %d/%q, want 200/{\"ok\":true} (an accepted detached restart)", code, body)
+	}
+	if snap := lsStatus(t, h); snap.State != oclife.StateReady {
+		t.Fatalf("lifecycle state=%s after the detached restart, want ready", snap.State)
+	}
+
+	// THE CRUX: the REPLACEMENT child's banner lands in the ring (written
+	// by the child into the inherited pipe — poll rather than assert
+	// instant visibility).
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		code, body = lsLogsTail(t, h)
+		if code == 200 && strings.Count(body, "fake opencode serve up") >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("/vh/opencode/logs = %d/%q after the detached restart, want BOTH children's banners — the replacement's output did not reach the ring (stale tail despite HasLogTail)", code, body)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// Outcome-level serving check: the running server's /oc proxy reaches
+	// the REPLACEMENT child on the same port.
+	if code, body := lsOcGet(t, h, "/oc/session"); code != 200 || body != "ok" {
+		t.Fatalf("post-restart /oc/session through the RUNNING server = %d/%q, want 200/ok from the replacement child", code, body)
+	}
+	// The boot child was stopped by the serialized restart. In the detached
+	// topology it stays an un-reaped ZOMBIE by design (the daemon never
+	// Waits it — pid-recycling safety; see restartDetachedOpenCode), and a
+	// zombie still answers signal-0, so reap it before the liveness count —
+	// the same discipline as TestRestartDetachedOpenCodeSerial.
+	if p, err := os.FindProcess(bootPid); err == nil {
+		go func() { _, _ = p.Wait() }()
+	}
+	if !waitPidDead(bootPid, 5*time.Second) {
+		t.Fatalf("boot child pid %d still alive after the detached restart", bootPid)
+	}
+	sc.waitAliveCount(".fake", 1, 5*time.Second)
+}

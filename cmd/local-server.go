@@ -197,7 +197,13 @@ with --opencode-url, or spawn a survivable detached instance with
 					curPID = opencodeServeCmd.Process.Pid
 				}
 				oldPort := opencodePort
-				c, effectivePort, err := restartDetachedOpenCode(localOpenCodeBin, oldPort, cwd, curPID)
+				// Ring fan-in parity (F3): the replacement detached child's
+				// output must keep flowing into the lifecycle ring — a
+				// ring-fed boot child must not lose the feed across an
+				// accepted detached restart. The same extraW sink the boot
+				// arm and client-daemon's detached restart arm wire, so
+				// /vh/opencode/logs stays truthful after the swap.
+				c, effectivePort, err := restartDetachedOpenCode(localOpenCodeBin, oldPort, cwd, curPID, ocLife.Ring().Writer())
 				if c != nil {
 					opencodeServeCmd = c
 				}
