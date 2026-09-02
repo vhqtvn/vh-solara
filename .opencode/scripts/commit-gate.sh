@@ -34,9 +34,12 @@
 #   SKIP_COMMIT_GATE=1         — bypass all gating, run git directly (operator-only, host terminal)
 #   COMMIT_GATE_TTL_SECONDS=N  — lock TTL in seconds (default 600)
 #
-# Lock dir: .git/commit-gate.lock/ (mkdir-based atomic lock, held only during acquire)
-# Lock metadata: .git/commit-gate.lock/meta (JSON v2)
-# Private index: .git/commit-gate/index-${UUID} (GIT_INDEX_FILE)
+# Lock dir: <git-dir>/commit-gate.lock/ (mkdir-based atomic lock, held only during acquire)
+#   <git-dir> = `git rev-parse --git-dir`, resolved per invocation: main checkout
+#   -> `.git`; linked worktree -> <main>/.git/worktrees/<name> (a worktree's
+#   `.git` is a FILE, so a literal cwd-relative `.git/...` path fails ENOTDIR)
+# Lock metadata: <git-dir>/commit-gate.lock/meta (JSON v2)
+# Private index: <git-dir>/commit-gate/index-${UUID} (GIT_INDEX_FILE)
 # Agent msg scratch: tmp/commit-gate-message/msg-${UUID} (committer-authored via the
 #   Write tool; reclaimed by this gate on success/release/no_changes + aged-orphan GC)
 #
@@ -60,10 +63,23 @@ _config_validate() {
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-LOCK_DIR=".git/commit-gate.lock"
+# Git-dir resolution (worktree-safe): resolve the git dir PER-INVOCATION via
+# `git rev-parse --git-dir` instead of the historical literal `.git`. In the
+# MAIN checkout at the repo root this resolves to `.git` — byte-equivalent to
+# the old constant. In a LINKED WORKTREE, `.git` is a FILE (a gitdir pointer),
+# and the resolution yields <main-checkout>/.git/worktrees/<name>, so the
+# mkdir-based lock, private index, session metadata, and closeout ledger all
+# anchor to a real per-worktree directory (each worktree commits against its
+# own HEAD/branch, so gate state is per-worktree by design). From a
+# subdirectory the resolution yields an ABSOLUTE path to the directory the old
+# literal `.git` MEANT to target (and silently missed) — still correct.
+# Outside a git repo (test/scratch environments without git metadata) fall
+# back to the historical literal `.git`, preserving prior behavior.
+_GIT_DIR="$(git rev-parse --git-dir 2>/dev/null || echo ".git")"
+LOCK_DIR="${_GIT_DIR}/commit-gate.lock"
 LOCK_META="${LOCK_DIR}/meta"
 DEFAULT_TTL=600
-GATE_INDEX_DIR=".git/commit-gate"
+GATE_INDEX_DIR="${_GIT_DIR}/commit-gate"
 CAS_MAX_RETRY=3
 # GC: scratch files (msg-/paths-/meta-/index-/merge-) older than this many
 # seconds are eligible for best-effort orphan sweep on successful commit and
@@ -86,7 +102,8 @@ MSG_SCRATCH_DIR="tmp/commit-gate-message"
 # check (#19) can read the tail for N-flatline detection after the transient
 # session meta is gone. GC: count cap via COMMIT_GATE_CLOSEOUT_LOG_MAX (default
 # DEFAULT_CLOSEOUT_LOG_MAX) — _gate_gc_sweep trims to the tail when exceeded.
-# Lives under .git/ → gitignored by nature, never committed, never under .local/.
+# Lives under the resolved git dir → gitignored by nature, never committed,
+# never under .local/.
 CLOSEOUT_LOG="${GATE_INDEX_DIR}/closeouts.log"
 DEFAULT_CLOSEOUT_LOG_MAX=200
 # Dedicated lockfile serializing closeout-ledger mutation (append + count-cap
@@ -888,12 +905,38 @@ EOF
     done < <(ls -1 "$GATE_INDEX_DIR"/meta-* 2>/dev/null)
   fi
 
-  # Atomic acquire via mkdir (POSIX mkdir is atomic)
-  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    # Race: another process grabbed it
-    local holder
-    holder=$(cat "$LOCK_META" 2>/dev/null || echo "{}")
-    json_out "{\"status\":\"contended\",\"reason\":\"race_lost\",\"holder\":${holder}}"
+  # Atomic acquire via mkdir (POSIX mkdir is atomic). Error honesty: capture
+  # the diagnostic instead of discarding it. EEXIST ("File exists") where the
+  # existing path is a DIRECTORY is the ONE failure that means a genuine race
+  # — keep the historical contended/race_lost semantics for it. EEXIST where
+  # the path is NOT a directory (a stray regular FILE at the lock path), and
+  # every other errno (ENOTDIR: a path component is a file — the
+  # linked-worktree failure mode where `.git` is a file; EACCES: unwritable
+  # git dir; ENOENT: missing parent), means the LOCK DIR ITSELF IS UNUSABLE —
+  # NOT contention — and MUST surface as a distinct error status so a retry
+  # loop cannot mistake an environment failure for a losable race (the
+  # shipped bug: stderr was suppressed and ENOTDIR was masked as contended/
+  # race_lost with an empty holder, inviting infinite retries; the
+  # committer-noted sibling: a regular FILE at <git-dir>/commit-gate.lock
+  # masqueraded as contended/race_lost the same way). LC_ALL=C pins the mkdir
+  # diagnostic to English so the EEXIST match is locale-independent.
+  local mkdir_err=""
+  if ! mkdir_err=$(LC_ALL=C mkdir "$LOCK_DIR" 2>&1); then
+    if [[ "$mkdir_err" == *"File exists"* ]] && [[ -d "$LOCK_DIR" ]]; then
+      # Race: another process grabbed it (the winner is a real DIRECTORY).
+      local holder
+      holder=$(cat "$LOCK_META" 2>/dev/null || echo "{}")
+      json_out "{\"status\":\"contended\",\"reason\":\"race_lost\",\"holder\":${holder}}"
+      return 1
+    fi
+    # Non-race failure: the lock dir cannot be created/used. Surface it as a
+    # distinct error, never as contention. A stray regular FILE at the lock
+    # path lands here too — and is deliberately left in place: it is not the
+    # gate's to destroy (same fail-safe as _stale_break's empty-uuid refusal:
+    # never remove a path the gate cannot identify as its own).
+    local lock_err_enc
+    lock_err_enc=$(json_encode "${mkdir_err:-mkdir failed without diagnostic}")
+    json_out "{\"status\":\"error\",\"reason\":\"lock_dir_unavailable\",\"lock_dir\":$(json_encode "$LOCK_DIR"),\"detail\":${lock_err_enc}}"
     return 1
   fi
 
@@ -910,12 +953,35 @@ EOF
 
   # Private index path (inside .git, NOT /tmp — survives container restarts)
   local private_index="${GATE_INDEX_DIR}/index-${uuid}"
-  "$_GATE_RO_SCRIPT" prep-tempdir
-  # prep-tempdir targets REPO_ROOT (script-relative, see readonly-scripts.sh),
-  # but GATE_INDEX_DIR is cwd-relative and tracks the target repo. Ensure the
-  # cwd-relative dir exists so GIT_INDEX_FILE writes succeed regardless of
-  # whether cwd == REPO_ROOT (production) or cwd == a temp/scratch repo (tests).
-  mkdir -p "$GATE_INDEX_DIR"
+  # AGG-F3: guard the prep-tempdir call. Under this script's `set -e`, an
+  # unguarded failure aborted the gate mid-acquire with NO honest-error JSON
+  # (a bare non-zero exit the caller cannot classify): readonly-scripts.sh
+  # runs its own `set -e`, so any mkdir it cannot satisfy — e.g.
+  # <git-dir>/commit-gate occupied by a regular file — kills it non-zero and
+  # used to kill this script with it, before any status line was printed.
+  # prep-tempdir performs the same mkdir as the authoritative, error-checked
+  # path below (it resolves the same per-invocation git dir — see
+  # readonly-scripts.sh), so a failure here is classified identically. We
+  # already hold the lock at this point but have NOT yet written LOCK_META —
+  # remove the half-born lock (best-effort) so the gate is not left held (a
+  # meta-less lock is unbreakable by _stale_break's fail-safe).
+  if ! "$_GATE_RO_SCRIPT" prep-tempdir 2>/dev/null; then
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+    json_out "{\"status\":\"error\",\"reason\":\"gate_index_dir_unavailable\",\"gate_index_dir\":$(json_encode "$GATE_INDEX_DIR")}"
+    return 1
+  fi
+  # The explicit mkdir below is the authoritative, error-checked path — it
+  # guarantees GIT_INDEX_FILE writes succeed regardless of whether cwd ==
+  # REPO_ROOT (production) or cwd == a temp/scratch repo (tests). Error
+  # honesty: a failure here is NOT a race and must not be silently swallowed
+  # (a missing index dir would surface later as confusing stage_failed /
+  # write_tree_failed errors). Same half-born-lock rollback as the guarded
+  # prep-tempdir call above.
+  if ! mkdir -p "$GATE_INDEX_DIR" 2>/dev/null; then
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+    json_out "{\"status\":\"error\",\"reason\":\"gate_index_dir_unavailable\",\"gate_index_dir\":$(json_encode "$GATE_INDEX_DIR")}"
+    return 1
+  fi
 
   # Write lock metadata v2 with private_index, head_at_acquire, and paths fields
   local msg_enc alias_enc paths_json

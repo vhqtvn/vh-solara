@@ -610,7 +610,7 @@ function block(reasonCode, detail) {
  * @param {object} params
  * @param {object|null|undefined} params.envelope - the f3_design_readiness envelope
  * @param {string} params.currentDesignDigest - the digest derived from current ground truth
- * @param {string} [params.transitionKind] - "task_ready" | "plan_approve" (diagnostic only; the predicate is transition-agnostic — one shared gate, two call sites)
+ * @param {string} [params.transitionKind] - diagnostic free string. Accepted vocabulary: "task_ready" | "task_ready_refresh" | "plan_approve" | "plan_dispatch" | "task_dispatch". The predicate is transition-agnostic — one shared gate, all call sites. Only a subset of known kinds get a non-empty transitionLabel (task_ready, task_ready_refresh, plan_approve); the other known kinds and any unknown kind fall through to "".
  * @returns {{passed: true, detail: string} | {passed: false, reasonCode: string, detail: string}}
  */
 export function validateF3DesignReadiness({
@@ -692,6 +692,9 @@ export function validateF3DesignReadiness({
 function transitionLabel(transitionKind) {
     if (transitionKind === "task_ready") {
         return " (task-card draft → ready)";
+    }
+    if (transitionKind === "task_ready_refresh") {
+        return " (task-card ready → ready envelope refresh)";
     }
     if (transitionKind === "plan_approve") {
         return " (draft-plan → approved)";

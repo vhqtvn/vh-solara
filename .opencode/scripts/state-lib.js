@@ -6407,24 +6407,38 @@ function readyCoordinationTask(sessionID, taskIDRaw, input = {}, options = {}) {
 
         const wasDraft = current.status === "draft";
 
-        // F3 design-readiness gate (sole BLOCKS family). Fires only at the
-        // draft -> ready BUILD-READY crossing. A ready -> ready metadata
-        // refresh does not cross BUILD-READY and is exempt. Fail-closed: a
-        // task whose design names an ownership hazard but lacks a complete,
-        // current-digest-bound resolution package is refused — the task
-        // stays draft and no task_readied event is emitted.
+        // F3 design-readiness gate (sole BLOCKS family). Two firing modes:
+        //
+        // 1. draft -> ready BUILD-READY crossing (authoritative primary
+        //    gate): validates the effective envelope — supplied or already
+        //    persisted. Fail-closed: a task whose design names an ownership
+        //    hazard but lacks a complete, current-digest-bound resolution
+        //    package is refused — the task stays draft and no task_readied
+        //    event is emitted.
+        //
+        // 2. ready -> ready envelope refresh (validate-when-supplied): a
+        //    ready -> ready metadata refresh that does NOT touch
+        //    f3_design_readiness crosses no BUILD-READY boundary and stays
+        //    exempt, but a refresh that SUPPLIES an envelope is validated
+        //    BEFORE the persist (which is otherwise unconditional). Without
+        //    this, any supplied value — null -> anything, malformed, stale
+        //    — persisted unvalidated on a ready card. Refusal keeps the
+        //    task ready with its previously persisted envelope; nothing is
+        //    persisted. Honesty ceiling: this closes the structural hole,
+        //    not authorship forgery — a forged complete current-digest
+        //    envelope still passes.
         //
         // Runs INSIDE the updateCoordinationTask lock so the digest is
         // computed from the locked `current` record, not a pre-load
         // snapshot. This prevents a TOCTOU race where a concurrent draft
         // metadata update changes a digest-bearing design field between
         // the check and the locked write.
+        const f3Envelope =
+            payload.f3_design_readiness !== undefined
+                ? payload.f3_design_readiness
+                : current.f3_design_readiness;
+        const designDigest = computeTaskDesignDigest(current, payload);
         if (wasDraft) {
-            const f3Envelope =
-                payload.f3_design_readiness !== undefined
-                    ? payload.f3_design_readiness
-                    : current.f3_design_readiness;
-            const designDigest = computeTaskDesignDigest(current, payload);
             const f3Result = validateF3DesignReadiness({
                 envelope: f3Envelope,
                 currentDesignDigest: designDigest,
@@ -6439,6 +6453,25 @@ function readyCoordinationTask(sessionID, taskIDRaw, input = {}, options = {}) {
                         `f3_design_readiness envelope bound to the current ` +
                         `design digest, or declare ownership_hazards: [] if ` +
                         `no hazard was named.`,
+                );
+            }
+        } else if (payload.f3_design_readiness !== undefined) {
+            // Validate-when-supplied on ready -> ready: the envelope a
+            // refresh carries must pass the same transition-agnostic
+            // predicate before the unconditional persist below applies it.
+            const f3Result = validateF3DesignReadiness({
+                envelope: f3Envelope,
+                currentDesignDigest: designDigest,
+                transitionKind: "task_ready_refresh",
+            });
+            if (!f3Result.passed) {
+                throw new StateError(
+                    `F3 design-readiness gate refused ready -> ready ` +
+                        `envelope refresh (reason: ${f3Result.reasonCode}). ` +
+                        `${f3Result.detail} ` +
+                        `The task remains ready with its existing ` +
+                        `f3_design_readiness envelope; the supplied ` +
+                        `envelope was not persisted.`,
                 );
             }
         }

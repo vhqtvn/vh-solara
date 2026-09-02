@@ -535,6 +535,172 @@ try {
         passed += 1;
     }
 
+    // === Crux 7b: ready -> ready SUPPLIED envelope is validated (not persisted blind) ===
+    // Adopter 4-step repro. A task created-as-ready via saveCoordinationTask
+    // carries no envelope (creation has no F3 primary gate); the dispatch
+    // backstop refuses its activation (missing_envelope). The ready -> ready
+    // refresh is the sanctioned way to supply an envelope to such a card —
+    // and a supplied envelope must pass the SAME transition-agnostic
+    // predicate before the unconditional persist applies it. Malformed,
+    // unresolved, and stale-digest envelopes are refused with a structured
+    // F3 reason; a complete current-digest envelope still refreshes and
+    // persists, and activation then passes the backstop.
+    // (Pre-fix, a stale envelope persisted unvalidated here and was only
+    // caught later at the dispatch backstop; post-fix the refresh itself
+    // refuses it. A forged complete current-digest envelope still passes —
+    // the gate is structural, not an authorship oracle.)
+    {
+        // STEP 1: created-as-ready via saveCoordinationTask, NO envelope.
+        const task = createDraftTask("ready-refresh-supplied", {
+            status: "ready",
+        });
+        if (task.task.status !== "ready") {
+            throw new StateError(
+                `Expected created-as-ready task to be ready, got ${task.task.status}.`,
+            );
+        }
+        passed += 1;
+        if (task.task.f3_design_readiness) {
+            throw new StateError(
+                "Expected created-as-ready task to carry no f3_design_readiness envelope.",
+            );
+        }
+        passed += 1;
+
+        // STEP 2: activation is refused by the dispatch backstop
+        // (missing_envelope); the card stays ready.
+        expectStateError(
+            () =>
+                activateCoordinationTask(
+                    coordinatorSessionID,
+                    task.task.task_id,
+                    { cwd: "/verification" },
+                ),
+            "reason: missing_envelope",
+        );
+        passed += 1;
+        const afterRefusal = readCoordinationTask(
+            coordinatorSessionID,
+            task.task.task_id,
+            { cwd: "/verification" },
+        );
+        if (afterRefusal.task.status !== "ready") {
+            throw new StateError(
+                `Expected task to remain ready after backstop refusal, got ${afterRefusal.task.status}.`,
+            );
+        }
+        passed += 1;
+
+        // STEP 3a: ready -> ready refreshes carrying bad envelopes are
+        // REFUSED with structured F3 reasons. Malformed (no design_digest):
+        expectF3Block(
+            () =>
+                readyCoordinationTask(
+                    coordinatorSessionID,
+                    task.task.task_id,
+                    { f3_design_readiness: { ownership_hazards: [] } },
+                    { cwd: "/verification" },
+                ),
+            "malformed_envelope",
+        );
+        passed += 1;
+
+        // Named-but-unresolved hazard (no resolution package):
+        const designDigest = computeTaskDesignDigest(task.task, {});
+        expectF3Block(
+            () =>
+                readyCoordinationTask(
+                    coordinatorSessionID,
+                    task.task.task_id,
+                    {
+                        f3_design_readiness:
+                            buildNamedButUnresolvedEnvelope(designDigest),
+                    },
+                    { cwd: "/verification" },
+                ),
+            "missing_resolution",
+        );
+        passed += 1;
+
+        // Stale-digest variant (complete package, WRONG digest) — refused
+        // at the refresh itself post-fix (pre-fix it persisted and was only
+        // caught at the dispatch backstop on activation):
+        expectF3Block(
+            () =>
+                readyCoordinationTask(
+                    coordinatorSessionID,
+                    task.task.task_id,
+                    {
+                        f3_design_readiness: buildCompleteEnvelope(
+                            "0".repeat(64),
+                        ),
+                    },
+                    { cwd: "/verification" },
+                ),
+            "stale_design_digest",
+        );
+        passed += 1;
+
+        // The refusals must not have persisted anything — still no envelope.
+        const unrefreshed = readCoordinationTask(
+            coordinatorSessionID,
+            task.task.task_id,
+            { cwd: "/verification" },
+        );
+        if (unrefreshed.task.f3_design_readiness) {
+            throw new StateError(
+                "Expected refused ready -> ready refreshes to persist no f3_design_readiness envelope.",
+            );
+        }
+        passed += 1;
+
+        // STEP 3b: complete current-digest envelope refresh SUCCEEDS and
+        // persists (legitimate corrected-envelope refresh preserved).
+        const refreshed = readyCoordinationTask(
+            coordinatorSessionID,
+            task.task.task_id,
+            { f3_design_readiness: buildCompleteEnvelope(designDigest) },
+            { cwd: "/verification" },
+        );
+        if (refreshed.task.status !== "ready") {
+            throw new StateError(
+                `Expected complete-envelope ready -> ready refresh to succeed, got ${refreshed.task.status}.`,
+            );
+        }
+        passed += 1;
+        if (
+            !refreshed.task.f3_design_readiness ||
+            refreshed.task.f3_design_readiness.design_digest !== designDigest
+        ) {
+            throw new StateError(
+                "Expected the complete envelope to persist on the ready task card.",
+            );
+        }
+        passed += 1;
+        const refreshEvent =
+            refreshed.task.history[refreshed.task.history.length - 1];
+        if (refreshEvent.event !== "task_ready_updated") {
+            throw new StateError(
+                `Expected task_ready_updated event for the envelope refresh, got ${refreshEvent.event}.`,
+            );
+        }
+        passed += 1;
+
+        // STEP 4: activation now succeeds (backstop passes with the
+        // persisted valid envelope).
+        const activated = activateCoordinationTask(
+            coordinatorSessionID,
+            task.task.task_id,
+            { cwd: "/verification" },
+        );
+        if (activated.task.status !== "working") {
+            throw new StateError(
+                `Expected task to activate after envelope refresh, got ${activated.task.status}.`,
+            );
+        }
+        passed += 1;
+    }
+
     // === Crux 8: direct readyCoordinationTask invocation cannot bypass F3 ===
     // Confirms the gate is in the function itself, not in a route handler.
     {

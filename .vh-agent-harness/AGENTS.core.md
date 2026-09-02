@@ -682,7 +682,7 @@ The canonical lifecycle is documented in
   owner-change / must-survive-session) + trigger fired (or operator override,
   for trigger-gated candidates) + concrete area + file scope + validation plan +
   clear slice + provenance Notes. Run the predicate checker
-  (`node .opencode/scripts/check-defer-triggers.mjs`) as a promotion-review aid
+  (`vh-agent-harness defer-triggers`) as a promotion-review aid
   — it is **promoter-use-only**, never wired into a commit hook, never blocking.
 - **Reviewer DEFER never becomes a direct backlog row.** A `/commit-review`
   DEFER finding is captured to `.local/` only after passing the intake bar, and

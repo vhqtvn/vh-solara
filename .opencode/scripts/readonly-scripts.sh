@@ -2,7 +2,8 @@
 # Audited read-only gate helper scripts.
 # Usage: .opencode/scripts/readonly-scripts.sh <subcommand>
 #   gen-uuid       — emit a UUID (uuidgen > python3 > /proc)
-#   prep-tempdir   — mkdir -p .git/commit-gate/
+#   prep-tempdir   — mkdir -p <git-dir>/commit-gate/ (git dir resolved per
+#                    invocation; worktree-safe)
 
 set -euo pipefail
 
@@ -27,7 +28,14 @@ case "${1:-}" in
     fi
     ;;
   prep-tempdir)
-    mkdir -p "$REPO_ROOT/.git/commit-gate/"
+    # Worktree-safe: a linked worktree's `.git` is a FILE, so the historical
+    # REPO_ROOT-relative literal failed ENOTDIR (and, under this script's
+    # set -e, killed the caller mid-acquire). Resolve the git dir per
+    # invocation — same resolution commit-gate.sh uses, from the same cwd —
+    # so the helper and the gate always agree on the same directory. Fall
+    # back to the historical literal outside a git repo.
+    _gd="$(git rev-parse --git-dir 2>/dev/null || echo ".git")"
+    mkdir -p "${_gd}/commit-gate/"
     ;;
   *)
     echo "Usage: $0 {gen-uuid|prep-tempdir}" >&2

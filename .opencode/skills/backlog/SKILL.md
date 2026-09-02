@@ -171,7 +171,7 @@ Run the normalizer check over the complete working tree (not just the ledger)
 **before the first commit and again after the archive-companion commit**:
 
 ```
-node .opencode/scripts/normalize-backlog.js --check
+vh-agent-harness exec node .opencode/scripts/normalize-backlog.js --check
 ```
 
 If the check fails on either pass, rerun the normalizer (without `--check`)

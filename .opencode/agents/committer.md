@@ -234,7 +234,7 @@ The review MUST be treated as BLOCKED (release lock, report failure to A) if ANY
        transaction. This documents the current permission split (no carve-out).
      1. Commit `docs/planning/backlog.md` alone (backlog-only acquire).
      2. Immediately commit only the changed, created, or removed `docs/planning/archive/**` companions as one archive-companion commit.
-     - Build/host runs `node .opencode/scripts/normalize-backlog.js --check` over the complete working tree **before the first commit and again after the second** — request the run from build/host (or have the worker include both passes in the handoff).
+     - Build/host runs `vh-agent-harness exec node .opencode/scripts/normalize-backlog.js --check` over the complete working tree **before the first commit and again after the second** — request the run from build/host (or have the worker include both passes in the handoff).
      - **Do not stop, hand off, close out, or report the normalization complete between the two commits** — they are one logical transaction.
      - If a `could_not_land` occurs (the backlog content-tangle — another session's backlog edit landed first), re-read the ledger, have build/host rerun the normalizer over the complete working tree, and recompute both exact path sets before retrying. Do NOT revert the archive companions to unblock.
 

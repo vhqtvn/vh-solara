@@ -92,21 +92,23 @@ join is auditable.
 #### 1c. Predicate checker (promoter-use-only, for trigger-gated candidates)
 
 For a deferred candidate whose admission hinges on a trigger, run
-`node .opencode/scripts/check-defer-triggers.mjs` to see which candidates'
+`vh-agent-harness defer-triggers` to see which candidates'
 `trigger:` conditions are currently met (`path_touched(<path>)` via
 `git diff --name-only`, `after_tag(<tag>)` via `git describe`). The checker
 is a **promotion-review aid only** — it never runs in a commit hook, never
 blocks. A false-negative from the checker is not a hard veto.
 
-**Read-only roles use the contained wrapper.** A `read_only` agent
-(`researcher`, `worker-read-only`) cannot run the bare `node …` invocation
-(no raw `node` grant) and must instead run `vh-agent-harness defer-triggers`
-— a no-arg command that runs the SAME canonical checker under a strict
-host-local sandbox (ModeStrict + NetDeny + DefaultProfile), with no
-caller-controlled exe/script/mode. The wrapper is the sanctioned, contained
-surface for trigger-currency inspection from a read-only charter; the bare
-`node` form remains available to `build` / interactive operator use. Both
-produce the identical promoter report.
+**Why the dedicated verb (not bare `node`).** The no-arg
+`vh-agent-harness defer-triggers` command runs the canonical checker
+(`.opencode/scripts/check-defer-triggers.mjs`) under a strict host-local
+sandbox (ModeStrict + NetDeny + DefaultProfile), with no
+caller-controlled exe/script/mode. It is granted per-agent to the read-only
+roles that evaluate trigger currency (`researcher`, `worker-read-only`) and
+resolves for the orchestrator roles (`build` / `coordination` /
+`project-coordinator`) through the `vh-agent-harness` wildcard — it is the
+engine-reachable form for every role that evaluates trigger currency. The bare `node …` invocation of
+that script resolves to DENY under the permission model (no raw `node` grant)
+and must not be prescribed. The verb produces the canonical promoter report.
 
 The report prints one line per candidate as `[FLAG] <id> (<file>) — <note>`:
 
@@ -198,7 +200,7 @@ accumulates between the backlog and reality. The promoter closes that gap each
 cycle with a narrow reconciliation pass. Run ALL of:
 
 1. **Normalize check.** Run
-   `node .opencode/scripts/normalize-backlog.js --check`. It MUST pass. If it
+   `vh-agent-harness exec node .opencode/scripts/normalize-backlog.js --check`. It MUST pass. If it
    reports drift (stale `Now`/`Next`/`Later` sections, un-archived history, or
    status/owner inconsistencies), fix the drift first — do NOT commit a backlog
    that fails `--check`.
