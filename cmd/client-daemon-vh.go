@@ -75,38 +75,7 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 		rt.startDetachedOpenCode()
 
 	default: // owned
-		rt.opencodePort = freePort()
-		log.Printf("Web mode: vh (opencode serve internal port=%d, web port=%d)", rt.opencodePort, rt.webPort)
-		// Pre-set opencodeURL so a failure below still leaves a parseable
-		// (dead) loopback target for the lazy proxy.
-		rt.opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", rt.opencodePort)
-		// Fan the owned process's output into the lifecycle ring alongside
-		// the daemon's stdout (unblocks Slice 2 logs view).
-		c, err := startOpenCodeServe(daemonOpenCodeBin, rt.opencodePort, rt.cwd, rt.ocLife.Ring().Writer())
-		if err != nil {
-			log.Printf("Failed to start opencode serve: %v (worker stays up; opencode status=failed)", err)
-			rt.ocLife.SetFailed(fmt.Sprintf("failed to start opencode serve: %v", err), nil)
-		} else {
-			rt.opencodeServeCmd = c
-			log.Printf("Started opencode serve on port %d (pid=%d)", rt.opencodePort, c.Process.Pid)
-			// Owned reaper: the SOLE Wait() caller for this child during
-			// normal operation. It records a post-startup crash in the
-			// lifecycle (and, as a side effect, populates cmd.ProcessState
-			// so the HealthCheck's existing ProcessState check works —
-			// previously nobody reaped the owned child, so a crash was
-			// never detected). The done channel lets restartOpencode
-			// observe the reap without a racing second Wait().
-			done := make(chan struct{})
-			rt.ocReapDone = done
-			go reapOwnedOpenCode(c, done, rt.ocLife)
-			if err := waitForPort(rt.opencodePort, 30*time.Second); err != nil {
-				log.Printf("opencode serve failed to listen on port %d: %v (worker stays up; opencode status=failed)", rt.opencodePort, err)
-				rt.ocLife.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", rt.opencodePort, err), nil)
-			} else {
-				rt.ocLife.SetReady()
-				log.Printf("Verified opencode serve is listening on port %d.", rt.opencodePort)
-			}
-		}
+		rt.startOwnedOpenCode()
 	}
 	if rt.opencodeURL == "" {
 		// Defensive: every arm above sets a parseable URL (a dead
@@ -292,6 +261,86 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 	log.Printf("Verified vh web server is listening on port %d.", rt.webPort)
 }
 
+// startOwnedOpenCode is the ENTIRE owned topology arm of setupVHMode's vh
+// mode (P1-API-006 A1): it runs the child-attributed initial boot and
+// FINALIZES the effective port/URL on the runtime. Extracted from the cobra
+// arm so the boot seam is testable without booting the whole daemon (mirrors
+// startDetachedOpenCode) — the arm itself is a one-line call, so what tests
+// exercise here is exactly what production runs.
+//
+// BOOT CONTRACT (settled design; researched — NO operator-fixed owned boot
+// port exists, both binaries select it internally, and no port-provenance
+// machinery is added):
+//
+//   - The initial candidate port is internally selected (freePort) when the
+//     runtime does not already carry one; a pre-set rt.opencodePort (tests,
+//     future callers) is honored as the candidate — the same field the
+//     restart arm treats as the stable port.
+//   - Readiness is CHILD-ATTRIBUTED (the old dial-only waitForPort credited
+//     any squatter that won the boot port — a false SetReady proxying
+//     foreign content): the boot routes through the same shared core as the
+//     restart, so a pre-readiness child exit (lost bind race,
+//     squatter-detected-via-child-death) earns exactly ONE fresh
+//     auto-selected-port retry, and exhaustion fails closed (SetFailed +
+//     the worker keeps serving, p1-oc-001).
+//   - The URL is finalized BEFORE any consumer is constructed: setupVHMode
+//     builds the aggregator/web server only after this arm returns, so at
+//     boot there are no subscribers to retarget — Srv stays nil and the
+//     lifecycle URL is still updated by the core's retarget seam.
+//   - The exit observer is installed from the start: each spawned child gets
+//     the sole-reaper gate, so a post-readiness crash flips the lifecycle to
+//     failed and a later restart can await the reap.
+func (rt *clientDaemonRuntime) startOwnedOpenCode() {
+	if rt.opencodePort == 0 {
+		rt.opencodePort = freePort()
+	}
+	log.Printf("Web mode: vh (opencode serve internal port=%d, web port=%d)", rt.opencodePort, rt.webPort)
+	// The shared child-aware boot/restart operation — boot is the degenerate
+	// restart: no previous child to stop, and the "stable" port is the
+	// internally selected initial candidate. Same attribution, retry, and
+	// synchronized publication rules as the restart (one mechanism, both
+	// paths — the A1 requirement).
+	res := restartOwnedOpenCode(ownedRestartConfig{
+		Life: rt.ocLife,
+		// No running server exists yet: the URL is finalized below, before
+		// setupVHMode constructs the aggregator/web server. A nil Srv is the
+		// designed defensive shape (the lifecycle URL still follows a fresh
+		// port through the retarget seam).
+		Srv:        nil,
+		StablePort: rt.opencodePort,
+		// Sole-reaper ownership: the closure starts the ONE Wait() goroutine
+		// per spawned child and hands the core its exit gate. The core never
+		// Wait()s the child.
+		Spawn: func(port int) (*exec.Cmd, *ownedExitGate, error) {
+			// Fan the owned process's output into the lifecycle ring
+			// alongside the daemon's stdout (unblocks Slice 2 logs view).
+			c, err := startOpenCodeServe(daemonOpenCodeBin, port, rt.cwd, rt.ocLife.Ring().Writer())
+			if err != nil {
+				return nil, nil, err
+			}
+			gate := newOwnedExitGate()
+			go reapOwnedOpenCode(c, gate, rt.ocLife)
+			return c, gate, nil
+		},
+	})
+	rt.opencodeServeCmd = res.Cmd
+	rt.ocReapDone = res.Exited
+	// FINALIZE the effective URL on the effective port — success and failure
+	// alike. On failure this is the last attempted port: a parseable dead
+	// loopback target for the lazy proxy (per-request 502), never a foreign
+	// listener's port masquerading as ready.
+	rt.opencodePort = res.Port
+	rt.opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", rt.opencodePort)
+	if res.Err != nil {
+		// The core already recorded SetFailed; the worker keeps serving
+		// (p1-oc-001). The child handle + observer are retained — the child
+		// may come up late, and its exit stays recorded.
+		log.Printf("owned opencode boot failed: %v (worker stays up; opencode status=failed)", res.Err)
+		return
+	}
+	log.Printf("Verified opencode serve is listening on port %d (pid=%d).", rt.opencodePort, res.Cmd.Process.Pid)
+}
+
 // startDetachedOpenCode is the ENTIRE detached topology arm of setupVHMode's
 // vh mode: it runs the one cooperating-starter transaction and wires the
 // result onto the runtime (port, proxy URL, retained child, lifecycle
@@ -392,16 +441,17 @@ func (rt *clientDaemonRuntime) restartOpencode() error {
 		StablePort: rt.opencodePort,
 		// Sole-reaper ownership preserved: the closure starts the ONE
 		// Wait() goroutine for the replacement child and hands the core its
-		// exit oracle (closed once the exit is recorded in the lifecycle).
+		// exit gate (whose oracle closes once the exit is recorded in the
+		// lifecycle, under the gate's synchronized publication boundary).
 		// The core never Wait()s the child.
-		Spawn: func(port int) (*exec.Cmd, <-chan struct{}, error) {
+		Spawn: func(port int) (*exec.Cmd, *ownedExitGate, error) {
 			c, err := startOpenCodeServe(daemonOpenCodeBin, port, rt.cwd, rt.ocLife.Ring().Writer())
 			if err != nil {
 				return nil, nil, err
 			}
-			done := make(chan struct{})
-			go reapOwnedOpenCode(c, done, rt.ocLife)
-			return c, done, nil
+			gate := newOwnedExitGate()
+			go reapOwnedOpenCode(c, gate, rt.ocLife)
+			return c, gate, nil
 		},
 	})
 	rt.opencodeServeCmd = res.Cmd

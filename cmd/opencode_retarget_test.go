@@ -18,8 +18,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -213,9 +215,9 @@ func TestOwnedRestartNeverServesForeignMarker(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = oldChild.Process.Kill() }) // no Wait: the reaper owns it
 	rt.opencodeServeCmd = oldChild
-	oldDone := make(chan struct{})
-	rt.ocReapDone = oldDone
-	go reapOwnedOpenCode(oldChild, oldDone, rt.ocLife)
+	oldGate := newOwnedExitGate()
+	rt.ocReapDone = oldGate.Done()
+	go reapOwnedOpenCode(oldChild, oldGate, rt.ocLife)
 	if err := waitForPort(port, 10*time.Second); err != nil {
 		t.Fatalf("old owned child never listened on %d: %v", port, err)
 	}
@@ -226,7 +228,7 @@ func TestOwnedRestartNeverServesForeignMarker(t *testing.T) {
 	if err := oldChild.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatalf("stop old child: %v", err)
 	}
-	<-oldDone // reaper has fully recorded the exit — the port is free
+	<-oldGate.Done() // reaper has fully recorded the exit — the port is free
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		t.Fatalf("foreign listener on port %d: %v", port, err)
@@ -381,5 +383,259 @@ func TestOwnedRestartExhaustedKeepsServing(t *testing.T) {
 	}
 
 	// Both replacement children died; nothing lingers.
+	sc.waitAliveCount(".fake", 0, 5*time.Second)
+}
+
+// --- P1-API-006 A1: owned INITIAL boot truthfulness (behavioral crux) ---
+//
+// The client-daemon's owned boot arm (startOwnedOpenCode — the exact method
+// setupVHMode calls) must never false-ready on a foreign port: the old arm
+// spawned on an internally selected port and credited whatever answered the
+// dial (waitForPort) — a squatter on that port yielded a false SetReady with
+// the daemon's /oc/* proxy serving foreign content. The boot now routes
+// through the same shared child-attributed core as the restart, and the
+// effective URL is finalized BEFORE any consumer is constructed. These tests
+// mirror the restart cruxes above (fake `opencode serve`, foreign marker
+// service, real web.NewServer + httptest) and build the post-boot consumer
+// surface exactly as setupVHMode does once the arm has returned.
+
+// newOwnedBootRuntime wires a client-daemon runtime for the owned boot arm
+// exactly as setupVHMode enters it: topology fixed, lifecycle built, initial
+// candidate port pre-set (below the ephemeral range so freePort() cannot
+// collide — the deterministic squatter/bind-race fixture).
+func newOwnedBootRuntime(sc *ocLockScenario, port int) *clientDaemonRuntime {
+	rt := &clientDaemonRuntime{cwd: sc.dir}
+	rt.ocLife = oclife.New(oclife.TopologyOwned)
+	rt.opencodePort = port
+	return rt
+}
+
+// newOwnedBootHarness constructs the post-boot consumer surface exactly as
+// setupVHMode does once the owned boot arm has returned and finalized
+// rt.opencodeURL: aggregator + web server + lifecycle route on the FINALIZED
+// effective URL. Asserting routed content through this surface proves the
+// boot never wired consumers to a foreign listener.
+func newOwnedBootHarness(t *testing.T, rt *clientDaemonRuntime) *httptest.Server {
+	t.Helper()
+	rt.ocLife.SetOpenCodeURL(rt.opencodeURL)
+	agg := aggregator.New(rt.opencodeURL, vhEventRingCapacity)
+	srv, err := web.NewServer(agg, rt.opencodeURL, vhEventRingCapacity)
+	if err != nil {
+		t.Fatalf("web.NewServer: %v", err)
+	}
+	srv.SetOpenCodeLifecycle(rt.ocLife)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// fakeSpawnCount counts the fake-child pid marker files the scenario's spawns
+// have written — the deterministic "how many children were spawned" signal.
+func fakeSpawnCount(t *testing.T, sc *ocLockScenario) int {
+	t.Helper()
+	entries, err := os.ReadDir(sc.pidsDir)
+	if err != nil {
+		t.Fatalf("read pids dir: %v", err)
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".fake") {
+			n++
+		}
+	}
+	return n
+}
+
+// TestOwnedBootNeverServesForeignMarker — THE boot crux: a foreign marker
+// service squats the initial candidate port BEFORE the daemon boots. The old
+// dial-only arm would have credited the squatter and proxied its content as
+// ready OpenCode. The child-attributed boot must instead move to a fresh port
+// whose child is the REAL one, finalize the URL there, and the post-boot
+// consumer surface must serve the replacement child's content — never the
+// squatter's marker.
+func TestOwnedBootNeverServesForeignMarker(t *testing.T) {
+	sc := newOCLockScenario(t)
+	withDaemonOpenCodeBin(t, sc.bin)
+	withDaemonOpenCodeDetached(t, false)
+	port := pickLowPort(t) // below the ephemeral range: freePort() cannot collide
+
+	// The squatter occupies the initial candidate port.
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("foreign listener on port %d: %v", port, err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		_ = http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "foreign-squatter-marker") }))
+	}()
+
+	rt := newOwnedBootRuntime(sc, port)
+	rt.startOwnedOpenCode()
+
+	fresh := rt.opencodePort
+	if fresh == port || fresh <= 0 {
+		t.Fatalf("rt.opencodePort=%d after boot, want a fresh port != the squatted candidate %d", fresh, port)
+	}
+	wantURL := "http://127.0.0.1:" + strconv.Itoa(fresh)
+	if rt.opencodeURL != wantURL {
+		t.Fatalf("rt.opencodeURL=%q, want %q (the URL must finalize on the effective port)", rt.opencodeURL, wantURL)
+	}
+	snap := rt.ocLife.Snapshot()
+	if snap.State != oclife.StateReady {
+		t.Fatalf("lifecycle state=%s, want ready (attributed to the replacement child)", snap.State)
+	}
+	if snap.OpenCodeURL != wantURL {
+		t.Fatalf("lifecycle OpenCodeURL=%q, want %q", snap.OpenCodeURL, wantURL)
+	}
+
+	// THE CRUX (outcome-level): the post-boot consumer surface — built on the
+	// finalized URL exactly as setupVHMode builds it — serves the replacement
+	// child's "ok", never the squatter's marker.
+	ts := newOwnedBootHarness(t, rt)
+	if code, body := ocGet(t, ts, "/oc/session"); code != 200 || body != "ok" {
+		t.Fatalf("post-boot /oc/session through the consumer surface = %d/%q, want 200/ok from the replacement child — the squatter's marker was served as ready OpenCode content", code, body)
+	}
+	// Exactly one child was spawned (the squatted candidate never received a
+	// doomed spawn), and it is alive.
+	if n := fakeSpawnCount(t, sc); n != 1 {
+		t.Fatalf("spawned %d fake children, want exactly 1 (the squatted candidate must not be handed a child)", n)
+	}
+	sc.waitAliveCount(".fake", 1, 5*time.Second)
+}
+
+// TestOwnedBootRetriesFreshPortWhenChildLosesBindRace — the boot bind-race
+// crux: the initial candidate port is FREE, but the child spawned on it dies
+// before readiness (lost check-to-bind race or crash — the core never tells
+// them apart and never parses output). Exactly ONE fresh-port attempt follows
+// and must carry the boot; readiness refers only to that replacement child.
+func TestOwnedBootRetriesFreshPortWhenChildLosesBindRace(t *testing.T) {
+	sc := newOCLockScenario(t)
+	withDaemonOpenCodeBin(t, sc.bin)
+	withDaemonOpenCodeDetached(t, false)
+	port := pickLowPort(t)
+	// The initial-candidate child dies pre-readiness; the fresh-port child
+	// (an ephemeral freePort) lives and listens.
+	t.Setenv("VH_FAKE_OC_DIE_ON_PORT", strconv.Itoa(port))
+
+	rt := newOwnedBootRuntime(sc, port)
+	rt.startOwnedOpenCode()
+
+	fresh := rt.opencodePort
+	if fresh == port || fresh <= 0 {
+		t.Fatalf("rt.opencodePort=%d after boot, want the fresh-port retry's port != %d", fresh, port)
+	}
+	wantURL := "http://127.0.0.1:" + strconv.Itoa(fresh)
+	if rt.opencodeURL != wantURL {
+		t.Fatalf("rt.opencodeURL=%q, want %q", rt.opencodeURL, wantURL)
+	}
+	snap := rt.ocLife.Snapshot()
+	if snap.State != oclife.StateReady {
+		t.Fatalf("lifecycle state=%s, want ready (readiness must be attributed only to the replacement child)", snap.State)
+	}
+	if snap.OpenCodeURL != wantURL {
+		t.Fatalf("lifecycle OpenCodeURL=%q, want %q", snap.OpenCodeURL, wantURL)
+	}
+	if code, body := ocGet(t, newOwnedBootHarness(t, rt), "/oc/session"); code != 200 || body != "ok" {
+		t.Fatalf("post-boot /oc/session = %d/%q, want 200/ok from the retry's fresh child", code, body)
+	}
+	// AT MOST ONE fresh retry: exactly two spawns total (candidate + retry),
+	// exactly one alive (the dead candidate left no live fake).
+	if n := fakeSpawnCount(t, sc); n != 2 {
+		t.Fatalf("spawned %d fake children, want exactly 2 (initial candidate + ONE fresh retry — recovery is bounded)", n)
+	}
+	sc.waitAliveCount(".fake", 1, 5*time.Second)
+}
+
+// TestOwnedBootExhaustedKeepsServing — the boot fail-closed crux: BOTH the
+// initial-candidate child and the one fresh retry die before readiness. The
+// boot fails, the lifecycle records failed (visible through the consumer
+// surface), and the daemon's serving shape is preserved (p1-oc-001): the
+// finalized URL stays a parseable dead loopback — the proxy answers 502, not
+// foreign content.
+func TestOwnedBootExhaustedKeepsServing(t *testing.T) {
+	sc := newOCLockScenario(t)
+	withDaemonOpenCodeBin(t, sc.bin)
+	withDaemonOpenCodeDetached(t, false)
+	port := pickLowPort(t)
+	t.Setenv("VH_FAKE_OC_DIE_FAST", "1") // every boot child dies pre-readiness
+
+	rt := newOwnedBootRuntime(sc, port)
+	rt.startOwnedOpenCode()
+
+	snap := rt.ocLife.Snapshot()
+	if snap.State != oclife.StateFailed {
+		t.Fatalf("lifecycle state=%s, want failed after boot exhaustion", snap.State)
+	}
+	if snap.FailureSummary == "" {
+		t.Fatal("exhaustion must record a failure summary")
+	}
+	// The URL still finalized on the last attempted port — parseable, dead.
+	if rt.opencodeURL != fmt.Sprintf("http://127.0.0.1:%d", rt.opencodePort) {
+		t.Fatalf("rt.opencodeURL=%q, want the finalized dead loopback on port %d", rt.opencodeURL, rt.opencodePort)
+	}
+	// p1-oc-001 outcome through the consumer surface: the server the daemon
+	// WOULD serve answers — status honestly failed…
+	ts := newOwnedBootHarness(t, rt)
+	res, err := http.Get(ts.URL + "/vh/opencode/status")
+	if err != nil {
+		t.Fatalf("GET /vh/opencode/status: %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("/vh/opencode/status = %d, want 200 (keep-serving)", res.StatusCode)
+	}
+	var st struct {
+		State   string `json:"state"`
+		Summary string `json:"failure_summary"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&st); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if st.State != string(oclife.StateFailed) || st.Summary == "" {
+		t.Fatalf("status = %s/%q, want failed with a summary", st.State, st.Summary)
+	}
+	// …and the /oc proxy answers 502 from the dead target — never foreign
+	// content masquerading as ready OpenCode.
+	if code, body := ocGet(t, ts, "/oc/session"); code != http.StatusBadGateway {
+		t.Fatalf("/oc/session = %d/%q, want 502 from the dead boot target (keep-serving, no foreign content)", code, body)
+	}
+	if n := fakeSpawnCount(t, sc); n != 2 {
+		t.Fatalf("spawned %d fake children, want exactly 2 (candidate + one retry, then exhaustion)", n)
+	}
+	sc.waitAliveCount(".fake", 0, 5*time.Second)
+}
+
+// TestOwnedBootPostReadyCrashFlipsFailed — the boot observer crux: after a
+// GENUINE child-attributed readiness, the boot child's death must transition
+// the lifecycle ready → failed (the sole-reaper gate installed by the boot's
+// Spawn closure), never leave it stuck on ready.
+func TestOwnedBootPostReadyCrashFlipsFailed(t *testing.T) {
+	sc := newOCLockScenario(t)
+	withDaemonOpenCodeBin(t, sc.bin)
+	withDaemonOpenCodeDetached(t, false)
+	port := pickLowPort(t)
+
+	rt := newOwnedBootRuntime(sc, port)
+	rt.startOwnedOpenCode()
+
+	if s := rt.ocLife.Snapshot(); s.State != oclife.StateReady {
+		t.Fatalf("lifecycle state=%s after a healthy boot, want ready", s.State)
+	}
+	if rt.opencodeServeCmd == nil || rt.opencodeServeCmd.Process == nil {
+		t.Fatal("the boot child handle must be retained for the crash")
+	}
+
+	// The post-readiness crash.
+	if err := rt.opencodeServeCmd.Process.Kill(); err != nil {
+		t.Fatalf("kill boot child: %v", err)
+	}
+	select {
+	case <-rt.ocReapDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the boot child's observer never recorded the exit")
+	}
+	if s := rt.ocLife.Snapshot(); s.State != oclife.StateFailed {
+		t.Fatalf("lifecycle state=%s after a post-ready crash, want failed (the boot observer must flip ready → failed)", s.State)
+	}
 	sc.waitAliveCount(".fake", 0, 5*time.Second)
 }

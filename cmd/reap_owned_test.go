@@ -54,14 +54,14 @@ func TestReapOwnedOpenCodeSetsStateBeforeClosingDone(t *testing.T) {
 	life.SetReady() // baseline: OpenCode was up before the child died
 
 	cmd := spawnBlocker(t)
-	done := make(chan struct{})
-	go reapOwnedOpenCode(cmd, done, life)
+	gate := newOwnedExitGate()
+	go reapOwnedOpenCode(cmd, gate, life)
 
 	// Kill the child (as a SIGTERM/killed exit) and wait for the reaper.
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatalf("kill helper: %v", err)
 	}
-	<-done
+	<-gate.Done()
 
 	// INVARIANT: the reaper recorded the exit BEFORE closing done. A killed
 	// child yields a non-zero exit, so the recorded state is failed (never the
@@ -89,15 +89,15 @@ func TestReapOwnedOpenCodeRestartDoesNotClobberReady(t *testing.T) {
 	life.SetReady()
 
 	cmd := spawnBlocker(t)
-	done := make(chan struct{})
-	go reapOwnedOpenCode(cmd, done, life)
+	gate := newOwnedExitGate()
+	go reapOwnedOpenCode(cmd, gate, life)
 
 	// Mirror restartOpencodeLocked's owned arm: signal the old child, wait for
 	// the reaper's done, then drive the fresh state machine.
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatalf("kill helper: %v", err)
 	}
-	<-done
+	<-gate.Done()
 	life.SetStarting()
 	life.SetReady()
 

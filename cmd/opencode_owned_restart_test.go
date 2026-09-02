@@ -57,10 +57,10 @@ func TestWaitForChildOwnedPortAcceptsWhileChildAlive(t *testing.T) {
 	}
 	defer ln.Close()
 	port := ln.Addr().(*net.TCPAddr).Port
-	exited := make(chan struct{}) // never closed: the child stays alive
+	gate := newOwnedExitGate() // never recorded: the child stays alive
 
 	start := time.Now()
-	if err := waitForChildOwnedPort(port, exited, 5*time.Second); err != nil {
+	if err := waitForChildOwnedPort(port, gate, 5*time.Second); err != nil {
 		t.Fatalf("attribution wait: %v", err)
 	}
 	if d := time.Since(start); d < 60*time.Millisecond {
@@ -81,12 +81,12 @@ func TestWaitForChildOwnedPortChildExitBeatsForeignListener(t *testing.T) {
 	}
 	defer ln.Close()
 	port := ln.Addr().(*net.TCPAddr).Port
-	exited := make(chan struct{})
+	gate := newOwnedExitGate()
 	// The child dies 100ms into the 400ms window — after its dial acceptance
 	// would already have been observed.
-	time.AfterFunc(100*time.Millisecond, func() { close(exited) })
+	time.AfterFunc(100*time.Millisecond, func() { gate.RecordExit(func() {}) })
 
-	err = waitForChildOwnedPort(port, exited, 5*time.Second)
+	err = waitForChildOwnedPort(port, gate, 5*time.Second)
 	if !errors.Is(err, errOwnedChildExited) {
 		t.Fatalf("err = %v, want errOwnedChildExited — the child's exit must beat the foreign listener's dial acceptance", err)
 	}
@@ -95,10 +95,10 @@ func TestWaitForChildOwnedPortChildExitBeatsForeignListener(t *testing.T) {
 // TestWaitForChildOwnedPortPreClosedOracleFailsFast — a child that already
 // exited fails the wait immediately, long before any readiness budget burns.
 func TestWaitForChildOwnedPortPreClosedOracleFailsFast(t *testing.T) {
-	exited := make(chan struct{})
-	close(exited)
+	gate := newOwnedExitGate()
+	gate.RecordExit(func() {})
 	start := time.Now()
-	err := waitForChildOwnedPort(1, exited, 30*time.Second)
+	err := waitForChildOwnedPort(1, gate, 30*time.Second)
 	if !errors.Is(err, errOwnedChildExited) {
 		t.Fatalf("err = %v, want errOwnedChildExited", err)
 	}
@@ -111,8 +111,8 @@ func TestWaitForChildOwnedPortPreClosedOracleFailsFast(t *testing.T) {
 // child: the failure is a readiness TIMEOUT, which the retry policy treats
 // as fail-closed (not the bind-race signature).
 func TestWaitForChildOwnedPortTimeoutIsNotChildExit(t *testing.T) {
-	exited := make(chan struct{}) // child alive, never listens
-	err := waitForChildOwnedPort(1, exited, 200*time.Millisecond)
+	gate := newOwnedExitGate() // child alive, never listens
+	err := waitForChildOwnedPort(1, gate, 200*time.Millisecond)
 	if err == nil {
 		t.Fatal("want timeout error")
 	}
@@ -138,27 +138,27 @@ func freeStablePort(t *testing.T) int {
 }
 
 // dyingSpawn models a replacement child that exits before readiness: a dummy
-// cmd plus an oracle a goroutine closes after d.
-func dyingSpawn(d time.Duration) func(int) (*exec.Cmd, <-chan struct{}, error) {
-	return func(port int) (*exec.Cmd, <-chan struct{}, error) {
-		exited := make(chan struct{})
-		time.AfterFunc(d, func() { close(exited) })
-		return &exec.Cmd{}, exited, nil
+// cmd plus a gate whose oracle a goroutine records (fully) after d.
+func dyingSpawn(d time.Duration) func(int) (*exec.Cmd, *ownedExitGate, error) {
+	return func(port int) (*exec.Cmd, *ownedExitGate, error) {
+		gate := newOwnedExitGate()
+		time.AfterFunc(d, func() { gate.RecordExit(func() {}) })
+		return &exec.Cmd{}, gate, nil
 	}
 }
 
 // listeningSpawn models a healthy replacement child: it binds the port it is
 // handed (so the dial acceptance is genuinely ITS listener) and its oracle
 // never closes while the listener lives.
-func listeningSpawn(t *testing.T) func(int) (*exec.Cmd, <-chan struct{}, error) {
+func listeningSpawn(t *testing.T) func(int) (*exec.Cmd, *ownedExitGate, error) {
 	t.Helper()
-	return func(port int) (*exec.Cmd, <-chan struct{}, error) {
+	return func(port int) (*exec.Cmd, *ownedExitGate, error) {
 		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 		if err != nil {
 			return nil, nil, fmt.Errorf("fake child bind: %w", err)
 		}
 		t.Cleanup(func() { ln.Close() })
-		return &exec.Cmd{}, make(chan struct{}), nil
+		return &exec.Cmd{}, newOwnedExitGate(), nil
 	}
 }
 
@@ -177,7 +177,7 @@ func TestOwnedRestartCoreRetriesFreshPortAndRetargetsBeforeReady(t *testing.T) {
 
 	var spawnPorts []int
 	serving := listeningSpawn(t)
-	spawn := func(port int) (*exec.Cmd, <-chan struct{}, error) {
+	spawn := func(port int) (*exec.Cmd, *ownedExitGate, error) {
 		spawnPorts = append(spawnPorts, port)
 		if len(spawnPorts) == 1 {
 			return dyingSpawn(40 * time.Millisecond)(port)
@@ -262,7 +262,7 @@ func TestOwnedRestartCoreStableOccupiedGoesFreshWithoutSpawn(t *testing.T) {
 		Life:       life,
 		Srv:        nil,
 		StablePort: stable,
-		Spawn: func(port int) (*exec.Cmd, <-chan struct{}, error) {
+		Spawn: func(port int) (*exec.Cmd, *ownedExitGate, error) {
 			spawnPorts = append(spawnPorts, port)
 			return serving(port)
 		},
@@ -295,7 +295,7 @@ func TestOwnedRestartCoreExhaustionFailsClosed(t *testing.T) {
 		Life:       life,
 		Srv:        nil,
 		StablePort: stable,
-		Spawn: func(port int) (*exec.Cmd, <-chan struct{}, error) {
+		Spawn: func(port int) (*exec.Cmd, *ownedExitGate, error) {
 			spawns++
 			return dyingSpawn(40 * time.Millisecond)(port)
 		},
@@ -334,9 +334,9 @@ func TestOwnedRestartCoreTimeoutFailsClosedNoRetry(t *testing.T) {
 		Life:       life,
 		Srv:        nil,
 		StablePort: stable,
-		Spawn: func(port int) (*exec.Cmd, <-chan struct{}, error) {
+		Spawn: func(port int) (*exec.Cmd, *ownedExitGate, error) {
 			spawns++
-			return &exec.Cmd{}, make(chan struct{}), nil // alive child, never listens
+			return &exec.Cmd{}, newOwnedExitGate(), nil // alive child, never listens
 		},
 	})
 	if res.Err == nil || errors.Is(res.Err, errOwnedChildExited) {
@@ -365,7 +365,7 @@ func TestOwnedRestartCoreRefusesNilOracle(t *testing.T) {
 		Life:       life,
 		Srv:        nil,
 		StablePort: stable,
-		Spawn: func(port int) (*exec.Cmd, <-chan struct{}, error) {
+		Spawn: func(port int) (*exec.Cmd, *ownedExitGate, error) {
 			spawns++
 			return &exec.Cmd{}, nil, nil
 		},
@@ -378,5 +378,210 @@ func TestOwnedRestartCoreRefusesNilOracle(t *testing.T) {
 	}
 	if s := life.Snapshot(); s.State != oclife.StateFailed {
 		t.Fatalf("state = %s, want failed", s.State)
+	}
+}
+
+// --- P1-API-006 A1: the synchronized publication boundary (DEFER-1) ---
+//
+// The gate serializes the exit recorder against the readiness publisher. A
+// single mutex admits exactly two linearizations; these tests drive BOTH
+// deterministically (no stress, no timing bound) using the caller-supplied
+// closures as the barrier, and a third test drives the boundary through the
+// REAL attempt code path. Together they discharge the P1-API-005 DEFER-1
+// residual: a child exit landing at the publication boundary can no longer
+// be transiently overwritten by the readiness write.
+
+// TestOwnedExitGateExitRecordedAtBoundaryRefusesPublication — THE DEFER-1
+// barrier: the child's exit is FULLY recorded (state-set + oracle close) at
+// the exact publication boundary; the readiness publisher released after that
+// must be refused — the failure state cannot be overwritten by SetReady.
+func TestOwnedExitGateExitRecordedAtBoundaryRefusesPublication(t *testing.T) {
+	life := oclife.New(oclife.TopologyOwned)
+	gate := newOwnedExitGate()
+
+	// The exit recorder completes first — the worst-case placement the old
+	// unsynchronized boundary could miss (exit after the final oracle poll).
+	gate.RecordExit(func() {
+		life.SetFailed("opencode serve exited with code 1", nil)
+	})
+
+	published := false
+	err := gate.PublishIfAlive(func() {
+		published = true
+		life.SetReady()
+	})
+	if err == nil || !errors.Is(err, errOwnedChildExited) {
+		t.Fatalf("err = %v, want errOwnedChildExited (wrapped) — publication must be refused after the exit is recorded", err)
+	}
+	if published {
+		t.Fatal("the readiness publication ran after the exit was recorded — the failure state was overwritten")
+	}
+	if s := life.Snapshot(); s.State != oclife.StateFailed {
+		t.Fatalf("state = %s, want failed (final, not overwritten)", s.State)
+	}
+}
+
+// TestOwnedExitGatePublicationBlocksExitRecorder — the converse linearization:
+// the readiness publisher is parked INSIDE its critical section (the test
+// barrier), and the exit recorder must queue on the gate. Once released, the
+// record lands AFTER the publication — the DESIGNED post-readiness-crash
+// direction (ready → failed), never the false-ready direction. The parked
+// publisher also proves the two publications are mutually exclusive.
+func TestOwnedExitGatePublicationBlocksExitRecorder(t *testing.T) {
+	life := oclife.New(oclife.TopologyOwned)
+	gate := newOwnedExitGate()
+
+	pubEntered := make(chan struct{})
+	releasePub := make(chan struct{})
+	pubDone := make(chan struct{})
+	go func() {
+		if err := gate.PublishIfAlive(func() {
+			close(pubEntered)
+			<-releasePub // the barrier: the publisher HOLDS the gate here
+			life.SetReady()
+		}); err != nil {
+			t.Errorf("publication: %v", err)
+		}
+		close(pubDone)
+	}()
+	<-pubEntered // the publisher is inside its critical section
+
+	recDone := make(chan struct{})
+	go func() {
+		gate.RecordExit(func() {
+			life.SetFailed("opencode serve exited with code 1", nil)
+		})
+		close(recDone)
+	}()
+
+	// The recorder must NOT complete while the publisher holds the gate.
+	// (Bounded negative wait — the load-bearing assertions below are the
+	// deterministic ordering ones.)
+	select {
+	case <-recDone:
+		t.Fatal("the exit recorder completed while the readiness publisher held the gate — the publications are not mutually exclusive")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releasePub)
+	<-pubDone
+	<-recDone
+	// pubEntered closed ⇒ the publication DID run; the final state is failed
+	// ⇒ the record landed after it. ready→failed is the designed direction.
+	if s := life.Snapshot(); s.State != oclife.StateFailed {
+		t.Fatalf("state = %s, want failed — the post-publication exit record must be final (post-readiness crash semantics)", s.State)
+	}
+}
+
+// TestOwnedExitGateRecordsOnce — one child, one exit: a second RecordExit
+// (e.g. a duplicated observer wiring) must not re-run the record closure or
+// double-close the oracle.
+func TestOwnedExitGateRecordsOnce(t *testing.T) {
+	gate := newOwnedExitGate()
+	records := 0
+	gate.RecordExit(func() { records++ })
+	gate.RecordExit(func() { records++ })
+	if records != 1 {
+		t.Fatalf("record ran %d times, want exactly 1", records)
+	}
+	select {
+	case <-gate.Done():
+	default:
+		t.Fatal("the oracle must be closed after the first record")
+	}
+}
+
+// TestOwnedRestartAttemptBoundaryExitNeverPublishesReady — the boundary
+// through the REAL attempt code path. The stable-port "child" binds its
+// listener, and its exit recorder fires the moment the readiness wait's dial
+// probe arrives — i.e. the exit record completes INSIDE the attempt's
+// observation window, anywhere between the wait's last alive poll and the
+// publication. Whatever the scheduler decides, the resting outcome is the
+// same invariant: the lifecycle never rests on ready for that child — either
+// the publication was refused (record first) or the record landed after it
+// as the designed post-readiness flip (ready → failed).
+//
+// Scope note (A1 review checkpoint): forcing the real-path publisher to a
+// specific PRE-LOCK position — record strictly between the wait's return and
+// PublishIfAlive — is not externally observable without a production pause
+// hook, which the gate design deliberately avoids. The exact boundary
+// interleavings (recorded-then-refused; publisher-parked-while-recorder-
+// waits) are pinned deterministically by the two gate-level barrier tests
+// above; this test proves the production attempt surfaces the same resting
+// invariant through its real call path.
+func TestOwnedRestartAttemptBoundaryExitNeverPublishesReady(t *testing.T) {
+	withOwnedPortStabilize(t, 60*time.Millisecond)
+	life := oclife.New(oclife.TopologyOwned)
+	stable := freeStablePort(t)
+
+	// Dial observation: the listener signals the first readiness probe so the
+	// releaser can unblock the exit recording without any sleep-based timing.
+	dialed := make(chan struct{}, 1)
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", stable))
+	if err != nil {
+		t.Fatalf("bind stable candidate: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			select {
+			case dialed <- struct{}{}:
+			default:
+			}
+			c.Close()
+		}
+	}()
+
+	var attemptGate *ownedExitGate
+	spawn := func(port int) (*exec.Cmd, *ownedExitGate, error) {
+		gate := newOwnedExitGate()
+		attemptGate = gate
+		// The child's observer: the moment the readiness wait's dial probe
+		// arrives, record the exit under the gate — modeling a reaper whose
+		// Wait() return lands inside the attempt's observation window.
+		go func() {
+			<-dialed
+			gate.RecordExit(func() {
+				life.SetFailed("opencode serve exited with code 1", nil)
+			})
+		}()
+		return &exec.Cmd{}, gate, nil
+	}
+
+	res, childDied := ownedRestartAttempt(ownedRestartConfig{
+		Life:       life,
+		Srv:        nil,
+		StablePort: stable,
+		Spawn:      spawn,
+	}, stable, "stable")
+
+	// The scheduling decides WHICH side observes the exit — the record may
+	// complete before the wait's final alive poll (wait branch: the attempt
+	// reports the retryable child exit), or the publisher may win the gate
+	// first and the record then lands as the designed post-readiness flip.
+	// Both branches must satisfy the same OUTCOME invariant, asserted below
+	// once the record has deterministically completed:
+	<-attemptGate.Done()
+	s := life.Snapshot()
+	if s.State != oclife.StateFailed {
+		t.Fatalf("state = %s, want failed — a child exit recorded inside the attempt's window must never leave the lifecycle resting on ready (err=%v)", s.State, res.Err)
+	}
+	if s.FailureSummary == "" {
+		t.Fatal("the recorded exit must carry a failure summary")
+	}
+	// Branch consistency: an error, when present, is exactly the retryable
+	// child-exit signature (never a timeout, never a silent success over an
+	// unrecorded exit — Done() is closed, so the exit IS recorded).
+	if res.Err != nil {
+		if !childDied {
+			t.Fatalf("err = %v with childDied=false — an errored boundary attempt must report the retryable signature", res.Err)
+		}
+		if !errors.Is(res.Err, errOwnedChildExited) {
+			t.Fatalf("err = %v, want errOwnedChildExited (wrapped)", res.Err)
+		}
 	}
 }

@@ -252,16 +252,19 @@ with --opencode-url, or spawn a survivable detached instance with
 				Srv:        srv,
 				StablePort: opencodePort,
 				// Direct-wait ownership adapted to the oracle contract: spawn
-				// ONE child and hand the core its exit oracle, closed only
-				// after the exit is recorded in the lifecycle.
-				Spawn: func(port int) (*exec.Cmd, <-chan struct{}, error) {
+				// ONE child and hand the core its exit gate, whose oracle
+				// closes only after the exit is recorded in the lifecycle
+				// (P1-API-006 A1 compile-preserving signature follow — the
+				// gate replaces the raw channel; same observer, same
+				// ordering, now synchronized with the publication boundary).
+				Spawn: func(port int) (*exec.Cmd, *ownedExitGate, error) {
 					c, err := startOpenCodeServe(localOpenCodeBin, port, cwd)
 					if err != nil {
 						return nil, nil, err
 					}
-					done := make(chan struct{})
-					go reapOwnedOpenCode(c, done, ocLife)
-					return c, done, nil
+					gate := newOwnedExitGate()
+					go reapOwnedOpenCode(c, gate, ocLife)
+					return c, gate, nil
 				},
 			})
 			opencodeServeCmd = res.Cmd

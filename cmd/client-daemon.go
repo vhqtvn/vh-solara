@@ -239,23 +239,23 @@ func waitForURL(url string, timeout time.Duration) error {
 // it records the exit in the lifecycle (so /vh/opencode/status reflects death
 // rather than lying "ready") and, as a side effect, populates cmd.ProcessState
 // (which the old HealthCheck relied on but never got, because nothing reaped
-// the owned child). The done channel is closed once the reap completes, so
-// restartOpencode can observe it instead of a racing second Wait (a
+// the owned child). The gate's Done() channel is closed once the reap completes,
+// so restartOpencode can observe it instead of a racing second Wait (a
 // second Wait on the same *Cmd races the first and is a data race).
 //
 // A clean (code 0) exit is recorded as stopped; any other exit (or a Wait
 // error) is recorded as failed with the exit code when observable. life may be
 // nil for callers that only want the reap side effect.
 //
-// ORDERING INVARIANT: the lifecycle state-set (SetStopped/SetFailed) MUST
-// happen BEFORE close(done). restartOpencode unblocks its owned restart
-// on <-oldDone, so closing done only after the state is recorded guarantees
-// that the restart path's SetStarting() → SetReady() overwrites the reaper's
-// honest exit report in the correct order. Closing done first (the old
-// ordering) let this reaper's state-set land AFTER the fresh SetReady() under
-// scheduler/GC delay, stranding the lifecycle on failed/stopped until the next
-// poll. See TestReapOwnedOpenCode* for the ordering guarantee.
-func reapOwnedOpenCode(cmd *exec.Cmd, done chan struct{}, life *oclife.Lifecycle) {
+// ORDERING INVARIANT (now the gate's, P1-API-006 A1): the lifecycle state-set
+// (SetStopped/SetFailed) and the oracle close run as ONE critical section
+// inside gate.RecordExit — state-set strictly BEFORE close(done), mutually
+// exclusive with the shared core's readiness publication (PublishIfAlive).
+// The boot and restart paths' SetStarting() → SetReady() sequences can
+// therefore only land AFTER a fully recorded exit, never between its two
+// halves. See TestReapOwnedOpenCode* and TestOwnedExitGate* for the ordering
+// guarantees.
+func reapOwnedOpenCode(cmd *exec.Cmd, gate *ownedExitGate, life *oclife.Lifecycle) {
 	err := cmd.Wait()
 	var (
 		ec      *int
@@ -268,8 +268,12 @@ func reapOwnedOpenCode(cmd *exec.Cmd, done chan struct{}, life *oclife.Lifecycle
 	if err != nil {
 		summary = err.Error()
 	}
-	// Record the exit BEFORE closing done — see the ORDERING INVARIANT above.
-	if life != nil {
+	// Record the exit and close the gate's oracle as one synchronized
+	// publication — see the ORDERING INVARIANT above.
+	gate.RecordExit(func() {
+		if life == nil {
+			return
+		}
 		switch {
 		case ec != nil && *ec == 0 && summary == "":
 			life.SetStopped()
@@ -280,12 +284,7 @@ func reapOwnedOpenCode(cmd *exec.Cmd, done chan struct{}, life *oclife.Lifecycle
 		default:
 			life.SetFailed(summary, ec)
 		}
-	}
-	// Close done LAST so a caller observing it knows the reaper has fully
-	// recorded the exit (both the Wait return and the lifecycle state-set).
-	if done != nil {
-		close(done)
-	}
+	})
 }
 
 func init() {

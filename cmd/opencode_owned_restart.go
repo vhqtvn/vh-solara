@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/oclife"
@@ -56,6 +57,102 @@ import (
 // which fails closed without a retry.
 var errOwnedChildExited = errors.New("replacement opencode child exited before readiness was attributed")
 
+// ownedExitGate is the SYNCHRONIZED PUBLICATION BOUNDARY between the two
+// writers of an owned child's lifecycle state (P1-API-006 A1):
+//
+//   - the EXIT RECORDER — the child's sole Wait() observer (reapOwnedOpenCode
+//     or local-server's direct-wait adapter) — which must publish the exit as
+//     a lifecycle failure; and
+//   - the READINESS PUBLISHER — the shared owned boot/restart operation —
+//     which must publish retarget+SetReady only for a child that is still
+//     alive at the moment of publication.
+//
+// DEFECT this closes (the P1-API-005 DEFER-1 residual): the old core ended its
+// readiness wait with a final NON-BLOCKING oracle poll followed by retarget
+// work and SetReady as three unsynchronized steps. A child exit landing
+// between that poll and SetReady was recorded by the reaper (SetFailed) and
+// then TRANSIENTLY OVERWRITTEN by the publisher's SetReady — a false ready
+// state on a dead child, with no later write guaranteed to repair it. Another
+// oracle poll, stress testing, or a documented timing bound cannot close that
+// window: the check and the publication must be ONE atomic step with respect
+// to the exit recording.
+//
+// PROTOCOL: one mutex serializes both publication paths. RecordExit runs the
+// caller's record closure (the lifecycle state-set) and then closes the done
+// oracle, both under the gate mutex. PublishIfAlive checks the oracle and runs
+// the caller's publish closure (retarget + SetReady) as one critical section
+// under the SAME mutex, refusing outright when the exit has been recorded.
+// The historical overwrite required check-then-publish to be non-atomic with
+// record-then-close; here the two critical sections are mutually exclusive,
+// so exactly two linearizations exist and both are correct:
+//
+//   - record first  → PublishIfAlive deterministically refuses; readiness is
+//     never published for the dead child (the failure state cannot be
+//     overwritten — structurally, not by timing).
+//   - publish first → the exit record lands AFTER readiness, which is the
+//     DESIGNED direction: a post-readiness crash must flip ready → failed
+//     (the reaper doing its job), and the gate's record still runs.
+//
+// TEST SEAM (A1 review checkpoint: no test-only hook is needed): both sides'
+// lifecycle writes are caller-supplied closures, so tests construct the exact
+// interleavings — including "exit recorded at the publication boundary" and
+// "publisher parked inside its critical section while the recorder waits" —
+// by sequencing RecordExit/PublishIfAlive directly, with the closures as the
+// barrier. Nothing in production exists only for tests.
+type ownedExitGate struct {
+	mu   sync.Mutex
+	done chan struct{}
+}
+
+// newOwnedExitGate builds the per-child publication gate. One gate per child:
+// the Spawn closure creates it, hands it to the child's exit recorder, and
+// returns it as the child's exit oracle for the shared core.
+func newOwnedExitGate() *ownedExitGate {
+	return &ownedExitGate{done: make(chan struct{})}
+}
+
+// Done is the child's exit oracle: a receive-only channel closed exactly once,
+// AFTER the exit has been fully recorded in the lifecycle (the reapOwnedOpenCode
+// ordering invariant, now enforced by the gate's critical section rather than
+// by recorder-side code order alone).
+func (g *ownedExitGate) Done() <-chan struct{} { return g.done }
+
+// RecordExit publishes one child exit: under the gate mutex, run record (the
+// lifecycle state-set — SetFailed/SetStopped), then close the oracle. Second
+// and later calls are idempotent no-ops (one child, one exit). While record
+// runs, the gate is HELD: a concurrent readiness publisher queues behind this
+// critical section and will observe the closed oracle when it finally runs.
+func (g *ownedExitGate) RecordExit(record func()) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	select {
+	case <-g.done:
+		return // already recorded — one child, one exit
+	default:
+	}
+	record()
+	close(g.done)
+}
+
+// PublishIfAlive publishes readiness under the gate mutex, atomically with the
+// liveness check: if the child's exit has already been recorded (or is being
+// recorded — RecordExit holds the same mutex), publication is REFUSED and the
+// retryable errOwnedChildExited is returned; otherwise publish runs (retarget
+// BEFORE the readiness flip, then SetReady) while no exit recording can
+// interleave. This is the write-order guarantee the old final non-blocking
+// oracle poll could only approximate.
+func (g *ownedExitGate) PublishIfAlive(publish func()) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	select {
+	case <-g.done:
+		return fmt.Errorf("readiness publication refused — the child exit was recorded at the publication boundary: %w", errOwnedChildExited)
+	default:
+	}
+	publish()
+	return nil
+}
+
 // ownedReadyWait is the per-attempt readiness budget (mirrors the historical
 // 30s waitForPort budget of the owned arms). Package var so tests can shrink
 // it, mirroring ocOwnerReleaseWait.
@@ -89,13 +186,15 @@ type ownedRestartConfig struct {
 	// (not a production shape) goes straight to the fresh-port attempt.
 	StablePort int
 	// Spawn starts ONE replacement child on the given port and returns the
-	// child handle plus its exit oracle — a channel closed once the child has
-	// exited AND the caller's observer has fully recorded that exit in the
-	// lifecycle (the reapOwnedOpenCode ordering invariant: state-set happens
-	// BEFORE close). The oracle is what attributes readiness to THIS child;
-	// Spawn returning a nil oracle is a caller contract violation and fails
-	// the attempt without a retry.
-	Spawn func(port int) (*exec.Cmd, <-chan struct{}, error)
+	// child handle plus its exit oracle — an ownedExitGate whose Done()
+	// channel closes once the child has exited AND the caller's observer has
+	// fully recorded that exit in the lifecycle (the reapOwnedOpenCode
+	// ordering invariant, enforced by the gate: state-set happens BEFORE the
+	// close, both under the gate mutex). The gate is what attributes
+	// readiness to THIS child and what makes the readiness publication
+	// atomic with the exit recording; Spawn returning a nil gate is a caller
+	// contract violation and fails the attempt without a retry.
+	Spawn func(port int) (*exec.Cmd, *ownedExitGate, error)
 }
 
 // ownedRestartResult is the shared operation's outcome. On failure Err is
@@ -162,15 +261,15 @@ func restartOwnedOpenCode(cfg ownedRestartConfig) ownedRestartResult {
 func ownedRestartAttempt(cfg ownedRestartConfig, port int, label string) (ownedRestartResult, bool) {
 	res := ownedRestartResult{Port: port}
 	cfg.Life.SetStarting()
-	cmd, exited, err := cfg.Spawn(port)
+	cmd, gate, err := cfg.Spawn(port)
 	if err != nil {
 		err = fmt.Errorf("failed to start opencode serve: %w", err)
 		cfg.Life.SetFailed(err.Error(), nil)
 		res.Err = err
 		return res, false
 	}
-	if exited == nil {
-		// Contract violation: without an exit oracle, readiness CANNOT be
+	if gate == nil {
+		// Contract violation: without an exit gate, readiness CANNOT be
 		// attributed to the child — refuse rather than degrade to the old
 		// dial-only lie.
 		err = fmt.Errorf("owned restart: spawn returned no child exit observer (attempt %s, port %d) — readiness cannot be attributed", label, port)
@@ -179,8 +278,8 @@ func ownedRestartAttempt(cfg ownedRestartConfig, port int, label string) (ownedR
 		res.Cmd = cmd
 		return res, false
 	}
-	res.Cmd, res.Exited = cmd, exited
-	if err := waitForChildOwnedPort(port, exited, ownedReadyWait); err != nil {
+	res.Cmd, res.Exited = cmd, gate.Done()
+	if err := waitForChildOwnedPort(port, gate, ownedReadyWait); err != nil {
 		res.Err = err
 		if errors.Is(err, errOwnedChildExited) {
 			// The caller's observer already recorded the exit (ordering
@@ -194,27 +293,27 @@ func ownedRestartAttempt(cfg ownedRestartConfig, port int, label string) (ownedR
 		cfg.Life.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", port, err), nil)
 		return res, false
 	}
-	// WRITE-ORDER GUARD (client-daemon requirement): a closed oracle means
-	// the child's failure was ALREADY recorded (the observer records state
-	// BEFORE closing) — publishing readiness now would overwrite that honest
-	// failure. The check is deliberately last: after it, only the child's
-	// own observer may speak (a post-startup crash landing after SetReady is
-	// the reaper doing its designed job).
-	select {
-	case <-exited:
-		res.Err = fmt.Errorf("port %d: %w", port, errOwnedChildExited)
-		log.Printf("owned opencode restart: %s-port child exited at the readiness boundary on port %d — not publishing ready", label, port)
+	// SYNCHRONIZED PUBLICATION BOUNDARY (P1-API-006 A1): the readiness
+	// publication runs as ONE critical section under the child's exit gate —
+	// the liveness check, the P1-API-003 retarget, and SetReady are atomic
+	// with respect to the exit recording. A child exit landing at (or after)
+	// the boundary makes PublishIfAlive refuse or serialize AFTER this
+	// publication respectively; the historical transient
+	// SetFailed-then-SetReady overwrite is structurally impossible. The
+	// retarget stays INSIDE the publication so an observer acting on
+	// readiness (Snapshot().OpenCodeURL, the running proxy) never sees ready
+	// state served through the old port. Same-port restarts no-op.
+	if err := gate.PublishIfAlive(func() {
+		if p, u, retargeted := applyFreshPortRetarget(port, cfg.StablePort, cfg.Life, cfg.Srv); retargeted {
+			res.Port, res.URL, res.Retargeted = p, u, true
+			log.Printf("owned opencode restart landed on a fresh port %d — retargeted the running daemon (was port %d)", p, cfg.StablePort)
+		}
+		cfg.Life.SetReady()
+	}); err != nil {
+		res.Err = err
+		log.Printf("owned opencode restart: %s-port child exit recorded at the publication boundary on port %d — not publishing ready", label, port)
 		return res, true
-	default:
 	}
-	// P1-API-003 seam: retarget BEFORE the readiness flip so an observer
-	// acting on readiness (Snapshot().OpenCodeURL, the running proxy) never
-	// sees ready state served through the old port. Same-port restarts no-op.
-	if p, u, retargeted := applyFreshPortRetarget(port, cfg.StablePort, cfg.Life, cfg.Srv); retargeted {
-		res.Port, res.URL, res.Retargeted = p, u, true
-		log.Printf("owned opencode restart landed on a fresh port %d — retargeted the running daemon (was port %d)", p, cfg.StablePort)
-	}
-	cfg.Life.SetReady()
 	return res, false
 }
 
@@ -227,10 +326,11 @@ func ownedRestartAttempt(cfg ownedRestartConfig, port int, label string) (ownedR
 //
 // Failure modes: errOwnedChildExited (wrapped — retryable by policy), a
 // readiness timeout (not retryable), or a missing exit oracle (caller bug).
-func waitForChildOwnedPort(port int, exited <-chan struct{}, timeout time.Duration) error {
-	if exited == nil {
+func waitForChildOwnedPort(port int, gate *ownedExitGate, timeout time.Duration) error {
+	if gate == nil {
 		return errors.New("waitForChildOwnedPort: no child exit observer supplied")
 	}
+	exited := gate.Done()
 	deadline := time.Now().Add(timeout)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	accepted := false
