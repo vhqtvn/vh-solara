@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -217,25 +218,32 @@ func newOCLockScenario(t *testing.T) *ocLockScenario {
 	// signature (the same ocCmdlineMatches-style shape the production gate
 	// trusts). Unreadable (dead/zombie) or foreign cmdline → skip, never
 	// signal.
-	t.Cleanup(func() {
-		for _, kind := range []struct {
-			suffix    string
-			stillOurs func(int) bool
-		}{
-			{".fake", ocSweepIsFakeOC},
-			{".gchild", ocSweepIsGrandchild},
-		} {
-			for _, pid := range sc.alivePids(kind.suffix) {
-				if !kind.stillOurs(pid) {
-					t.Logf("scenario sweep: pid %d (%s) failed /proc cmdline identity revalidation — recycled or gone; NOT signaling", pid, kind.suffix)
-					continue
-				}
-				t.Logf("scenario sweep: SIGKILLing leftover %q pid %d", kind.suffix, pid)
-				killPid9(pid)
-			}
-		}
-	})
+	t.Cleanup(func() { sc.sweepLeftovers(t) })
 	return sc
+}
+
+// sweepLeftovers is the scenario-level fake reap the registered cleanup
+// runs (see newOCLockScenario for why it must run LAST): every recorded
+// pid still alive at cleanup time, identity-revalidated against /proc
+// IMMEDIATELY before each signal, then SIGKILLed through ocSweepSignal —
+// the sweep's single signal boundary.
+func (sc *ocLockScenario) sweepLeftovers(t *testing.T) {
+	for _, kind := range []struct {
+		suffix    string
+		stillOurs func(int) bool
+	}{
+		{".fake", ocSweepIsFakeOC},
+		{".gchild", ocSweepIsGrandchild},
+	} {
+		for _, pid := range sc.alivePids(kind.suffix) {
+			if !kind.stillOurs(pid) {
+				t.Logf("scenario sweep: pid %d (%s) failed /proc cmdline identity revalidation — recycled or gone; NOT signaling", pid, kind.suffix)
+				continue
+			}
+			t.Logf("scenario sweep: SIGKILLing leftover %q pid %d", kind.suffix, pid)
+			ocSweepSignal(pid)
+		}
+	}
 }
 
 // startStarter spawns a starter subprocess running the real transaction.
@@ -341,6 +349,16 @@ func killPid9(pid int) {
 		_ = p.Signal(syscall.SIGKILL)
 	}
 }
+
+// ocSweepSignal is the sweep's single signal boundary (P2-API-010): every
+// SIGKILL the scenario sweep sends goes through here. A var rather than a
+// direct killPid9 call so the negative-case test can swap in a recording
+// forwarder and PROVE zero attempts against rejected candidates — a
+// survived innocent alone cannot distinguish "spared" from "attempted but
+// survived". The default is the real killPid9, so the registered cleanup
+// path is behavior-identical; this lives in test scaffolding only (no
+// production surface).
+var ocSweepSignal = killPid9
 
 // ocProcCmdlineArgs reads /proc/<pid>/cmdline as one space-separated
 // argument string ("" on any read failure — the same degradation
@@ -647,4 +665,122 @@ func TestOCSpawnLoserLatency(t *testing.T) {
 	if elapsed > 2*time.Second {
 		t.Fatalf("contended loser took %v — did it wait out a probe?", elapsed)
 	}
+}
+
+// --- P2-API-010: sweep negative-case evidence (attempt granularity) ---
+
+// TestOCSweepNeverSignalsRejectedPids — P2-API-010, discharging
+// P2-API-009's standing DEFER: the scenario sweep's defensive no-signal
+// branch, proven at ATTEMPT granularity rather than by survival alone.
+// The pidsDir is seeded with three candidate shapes:
+//
+//   - a MISSING pid (a reaped short-lived child): dead before the sweep;
+//   - a LIVE INNOCENT foreign process (`sleep 30`): alive, recorded under
+//     BOTH suffixes, but its cmdline matches neither sweep identity;
+//   - real MATCHING leftovers from a genuine starter run (the recorded
+//     fake `opencode serve` child AND its `sleep 3000` grandchild — both
+//     reparented to init when their starter exits, so they reap cleanly):
+//     positive controls proving discrimination, not a disabled signal path.
+//
+// ocSweepSignal is swapped for a recording forwarder around ONE direct run
+// of the REAL sweep loop; the attempt list must equal exactly the
+// positive-control pids (ZERO attempts against the missing and innocent
+// candidates), the innocent must survive, and the controls must die.
+func TestOCSweepNeverSignalsRejectedPids(t *testing.T) {
+	sc := newOCLockScenario(t)
+
+	// (a) MISSING pid — the pidsDir entry outlives its process.
+	dead := exec.Command("sleep", "0.05")
+	if err := dead.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadPid := dead.Process.Pid
+	if err := dead.Wait(); err != nil {
+		t.Fatalf("wait out the short-lived pid-holder: %v", err)
+	}
+	if ocProcessAlive(deadPid) {
+		t.Fatalf("precondition: pid %d must be missing/dead", deadPid)
+	}
+	_ = os.WriteFile(filepath.Join(sc.pidsDir, fmt.Sprintf("%d.fake", deadPid)), []byte("gone"), 0o644)
+	_ = os.WriteFile(filepath.Join(sc.pidsDir, fmt.Sprintf("%d.gchild", deadPid)), []byte("gone"), 0o644)
+
+	// (b) LIVE INNOCENT — our own `sleep 30`, a foreign cmdline that
+	// matches neither identity, recorded under both suffixes.
+	innoc := exec.Command("sleep", "30")
+	if err := innoc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = innoc.Process.Kill(); _ = innoc.Wait() })
+	innocPid := innoc.Process.Pid
+	_ = os.WriteFile(filepath.Join(sc.pidsDir, fmt.Sprintf("%d.fake", innocPid)), []byte("innocent"), 0o644)
+	_ = os.WriteFile(filepath.Join(sc.pidsDir, fmt.Sprintf("%d.gchild", innocPid)), []byte("innocent"), 0o644)
+
+	// (c) MATCHING positive controls — one real starter run (grandchild
+	// knob on, fake listening so the transaction completes fast) leaves
+	// the genuine leftover pair: the recorded fake plus its fd-3-retaining
+	// `sleep 3000` grandchild.
+	sc.startStarter("P", map[string]string{"VH_FAKE_OC_GRANDCHILD": "1"}, false)
+	rep := sc.waitReport("P", 30*time.Second)
+	if rep.Verdict != "spawned" {
+		t.Fatalf("positive-control starter never completed: %+v", rep)
+	}
+	fakes := sc.waitAliveCount(".fake", 2, 5*time.Second) // control + innocent
+	if !slices.Contains(fakes, rep.PID) {
+		t.Fatalf("control fake pid %d not among alive recorded fakes %v", rep.PID, fakes)
+	}
+	gchilds := sc.waitAliveCount(".gchild", 2, 10*time.Second) // control + innocent
+	gctl := 0
+	for _, p := range gchilds {
+		if p != innocPid {
+			gctl = p
+		}
+	}
+	if gctl == 0 {
+		t.Fatalf("no control grandchild among alive recorded gchildren %v", gchilds)
+	}
+
+	// Identity preconditions (supporting evidence; the crux is below).
+	if ocSweepIsFakeOC(innocPid) || ocSweepIsGrandchild(innocPid) {
+		t.Fatalf("precondition: innocent pid %d must fail both sweep identity checks", innocPid)
+	}
+	if !ocSweepIsFakeOC(rep.PID) {
+		t.Fatalf("precondition: control fake pid %d must pass the fake identity check", rep.PID)
+	}
+	if !ocSweepIsGrandchild(gctl) {
+		t.Fatalf("precondition: control grandchild pid %d must pass the grandchild identity check", gctl)
+	}
+
+	// THE observable: record every signal attempt, forward to the real
+	// kill, and run the REAL sweep loop once, directly.
+	var attempts []int
+	realSignal := ocSweepSignal
+	ocSweepSignal = func(pid int) {
+		attempts = append(attempts, pid)
+		realSignal(pid)
+	}
+	t.Cleanup(func() { ocSweepSignal = realSignal })
+
+	sc.sweepLeftovers(t)
+
+	// LOAD-BEARING: exactly the two matching controls were signaled —
+	// zero attempts against the missing pid and the live innocent.
+	slices.Sort(attempts)
+	want := []int{rep.PID, gctl}
+	slices.Sort(want)
+	if !slices.Equal(attempts, want) {
+		t.Fatalf("signal attempts = %v, want exactly the matching controls %v — a rejected candidate was signaled or a control was not", attempts, want)
+	}
+	// The innocent SURVIVED its recorded candidacy.
+	if !ocProcessAlive(innocPid) {
+		t.Fatal("live innocent recorded candidate did not survive the sweep")
+	}
+	// The controls actually died (the recorder forwards the real SIGKILL).
+	if !waitPidDead(rep.PID, 5*time.Second) {
+		t.Fatal("positive-control fake was not killed by the sweep")
+	}
+	if !waitPidDead(gctl, 5*time.Second) {
+		t.Fatal("positive-control grandchild was not killed by the sweep")
+	}
+	// The owner lock died with the control fake (both fd-3 holders gone).
+	sc.waitOwnerFree(5 * time.Second)
 }

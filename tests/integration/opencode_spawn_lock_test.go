@@ -1,3 +1,9 @@
+//go:build linux
+
+// Linux-only: the fd-3 owner-lock /proc inspection, cmdline identity
+// checks, and the #!/bin/sh fake-opencode wrapper are Linux-only by
+// design; syscall.Kill does not exist on windows/darwin.
+
 // Package integration — cross-process proof for P1-API-002 (detached
 // OpenCode spawn serialization). Unlike the cmd-package lock tests (which
 // exercise the transaction in-process and via same-package helpers), this
@@ -22,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -185,17 +192,24 @@ func newOCSpawnScenario(t *testing.T) *ocSpawnScenario {
 	//
 	// (No `.gchild` iteration here: this scaffold's fake helper only ever
 	// records `<pid>.fake` files — it has no grandchild producer.)
-	t.Cleanup(func() {
-		for _, pid := range sc.aliveFakes() {
-			if !integFakeOCIdentity(pid) {
-				t.Logf("scenario sweep: pid %d failed /proc cmdline identity revalidation — recycled or gone; NOT signaling", pid)
-				continue
-			}
-			t.Logf("scenario sweep: SIGKILLing leftover fake pid %d", pid)
-			killPid9(pid)
-		}
-	})
+	t.Cleanup(func() { sc.sweepLeftoverFakes(t) })
 	return sc
+}
+
+// sweepLeftoverFakes is the scenario-level fake reap the registered
+// cleanup runs (see newOCSpawnScenario for why it must run LAST): every
+// recorded fake pid still alive at cleanup time, identity-revalidated
+// against /proc IMMEDIATELY before each signal, then SIGKILLed through
+// integSweepSignal — the sweep's single signal boundary (P2-API-010).
+func (sc *ocSpawnScenario) sweepLeftoverFakes(t *testing.T) {
+	for _, pid := range sc.aliveFakes() {
+		if !integFakeOCIdentity(pid) {
+			t.Logf("scenario sweep: pid %d failed /proc cmdline identity revalidation — recycled or gone; NOT signaling", pid)
+			continue
+		}
+		t.Logf("scenario sweep: SIGKILLing leftover fake pid %d", pid)
+		integSweepSignal(pid)
+	}
 }
 
 func (sc *ocSpawnScenario) startStarter(name string, knobs map[string]string, stayAlive bool) *exec.Cmd {
@@ -329,6 +343,15 @@ func killPid9(pid int) {
 	_ = syscall.Kill(pid, syscall.SIGKILL)
 }
 
+// integSweepSignal is the integration sweep's single signal boundary
+// (P2-API-010) — the same attempt-observability seam as the cmd scaffold's
+// ocSweepSignal: a var rather than a direct killPid9 call so the
+// negative-case test can swap in a recording forwarder and PROVE zero
+// attempts against rejected candidates. The default is the real killPid9,
+// so the registered cleanup path is behavior-identical; this lives in test
+// scaffolding only (no production surface).
+var integSweepSignal = killPid9
+
 func waitPidDead(pid int, d time.Duration) bool {
 	deadline := time.Now().Add(d)
 	for pidAlive(pid) {
@@ -421,5 +444,95 @@ func TestDetachedSpawnSerializationCrux(t *testing.T) {
 	}
 	if !strings.Contains(string(bState), strconv.Itoa(fakesC[0])) {
 		t.Fatalf("published state %s should record the new pid %d", bState, fakesC[0])
+	}
+}
+
+// TestIntegSweepNeverSignalsRejectedPids — P2-API-010 helper-level
+// negative cases for the integration scaffold's sweep (the exported
+// surface's own leak safety net), proven at ATTEMPT granularity rather
+// than by survival alone. The pidsDir is seeded with:
+//
+//   - a MISSING pid (a reaped short-lived child);
+//   - a LIVE INNOCENT foreign process (`sleep 30`, cmdline failing the
+//     identity check);
+//   - a MATCHING positive control produced by a real starter run through
+//     the exported transaction (the fake outlives its exited starter —
+//     the exact leak shape the sweep exists to reap).
+//
+// integSweepSignal is swapped for a recording forwarder around ONE direct
+// run of the REAL sweep loop; the attempt list must equal exactly the
+// control pid (ZERO attempts against the missing and innocent
+// candidates), the innocent must survive, and the control must die.
+func TestIntegSweepNeverSignalsRejectedPids(t *testing.T) {
+	sc := newOCSpawnScenario(t)
+
+	// (a) MISSING pid — the pidsDir entry outlives its process.
+	dead := exec.Command("sleep", "0.05")
+	if err := dead.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadPid := dead.Process.Pid
+	if err := dead.Wait(); err != nil {
+		t.Fatalf("wait out the short-lived pid-holder: %v", err)
+	}
+	if pidAlive(deadPid) {
+		t.Fatalf("precondition: pid %d must be missing/dead", deadPid)
+	}
+	_ = os.WriteFile(filepath.Join(sc.pidsDir, fmt.Sprintf("%d.fake", deadPid)), []byte("gone"), 0o644)
+
+	// (b) LIVE INNOCENT — our own `sleep 30`, a foreign cmdline.
+	innoc := exec.Command("sleep", "30")
+	if err := innoc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = innoc.Process.Kill(); _ = innoc.Wait() })
+	innocPid := innoc.Process.Pid
+	_ = os.WriteFile(filepath.Join(sc.pidsDir, fmt.Sprintf("%d.fake", innocPid)), []byte("innocent"), 0o644)
+
+	// (c) MATCHING control — a real starter run leaves the genuine
+	// leftover: the starter exits after reporting, its fake lives on.
+	sc.startStarter("C", nil, false)
+	rep := sc.waitReport("C", 30*time.Second)
+	if rep.Verdict != "spawned" {
+		t.Fatalf("positive-control starter never completed: %+v", rep)
+	}
+	fakes := sc.waitFakes(2, 5*time.Second) // control + innocent
+	if !slices.Contains(fakes, rep.PID) {
+		t.Fatalf("control fake pid %d not among alive recorded fakes %v", rep.PID, fakes)
+	}
+
+	// Identity preconditions (supporting evidence; the crux is below).
+	if integFakeOCIdentity(innocPid) {
+		t.Fatalf("precondition: innocent pid %d must fail the sweep identity check", innocPid)
+	}
+	if !integFakeOCIdentity(rep.PID) {
+		t.Fatalf("precondition: control pid %d must pass the sweep identity check", rep.PID)
+	}
+
+	// THE observable: record every signal attempt, forward to the real
+	// kill, and run the REAL sweep loop once, directly.
+	var attempts []int
+	realSignal := integSweepSignal
+	integSweepSignal = func(pid int) {
+		attempts = append(attempts, pid)
+		realSignal(pid)
+	}
+	t.Cleanup(func() { integSweepSignal = realSignal })
+
+	sc.sweepLeftoverFakes(t)
+
+	// LOAD-BEARING: exactly the matching control was signaled — zero
+	// attempts against the missing pid and the live innocent.
+	if !slices.Equal(attempts, []int{rep.PID}) {
+		t.Fatalf("signal attempts = %v, want exactly the matching control [%d] — a rejected candidate was signaled or the control was not", attempts, rep.PID)
+	}
+	// The innocent SURVIVED its recorded candidacy.
+	if !pidAlive(innocPid) {
+		t.Fatal("live innocent recorded candidate did not survive the sweep")
+	}
+	// The control actually died (the recorder forwards the real SIGKILL;
+	// it is reparented to init by its starter's exit, so it reaps).
+	if !waitPidDead(rep.PID, 5*time.Second) {
+		t.Fatal("positive-control fake was not killed by the sweep")
 	}
 }
