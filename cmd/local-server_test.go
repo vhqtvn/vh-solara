@@ -216,9 +216,13 @@ func lsPortFromURL(t *testing.T, u string) int {
 }
 
 // waitLSBootState polls the running server's lifecycle status until it
-// reaches the wanted state; returns the satisfying snapshot. A successful
-// poll is itself keep-serving evidence: the status endpoint answers 200
-// through the running server whatever the state is.
+// reaches the wanted state; returns the satisfying snapshot. Every poll
+// that gets an HTTP response must see 200 — machine-asserted here (the
+// lsStatus discipline), not comment-carried: keep-serving means the
+// status endpoint answers 200 through the running server WHATEVER the
+// lifecycle state is, so a non-200 is a defect, not a poll miss.
+// Transport errors (the server not listening yet) still poll until the
+// deadline.
 func waitLSBootState(t *testing.T, h *localServerHandle, want oclife.State) oclife.Snapshot {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
@@ -226,6 +230,10 @@ func waitLSBootState(t *testing.T, h *localServerHandle, want oclife.State) ocli
 	for {
 		res, err := lsClient.Get(h.statusURL())
 		if err == nil {
+			if res.StatusCode != 200 {
+				res.Body.Close()
+				t.Fatalf("/vh/opencode/status = %d, want 200 (local-server keeps serving)", res.StatusCode)
+			}
 			var snap oclife.Snapshot
 			_ = json.NewDecoder(res.Body).Decode(&snap)
 			res.Body.Close()
@@ -605,7 +613,9 @@ func TestLocalServerOwnedBootExhaustedKeepsServing(t *testing.T) {
 	h, sc := bootLocalServerForTest(t)
 
 	// The failed-but-serving outcome through the REAL server: the status
-	// endpoint answers 200 (keep-serving) with state=failed + a summary.
+	// endpoint answers 200 (keep-serving — machine-asserted by
+	// waitLSBootState, which now rejects non-200 like lsStatus) with
+	// state=failed + a summary.
 	snap := waitLSBootState(t, h, oclife.StateFailed)
 	if snap.FailureSummary == "" {
 		t.Fatal("boot exhaustion must record a failure summary")
