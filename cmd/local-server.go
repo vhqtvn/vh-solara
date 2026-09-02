@@ -54,8 +54,10 @@ with --opencode-url, or spawn a survivable detached instance with
 		var opencodeServeCmd *exec.Cmd
 		// opencodeReapDone is the CURRENT owned child's exit oracle — closed
 		// once the child has exited AND its wait observer has recorded that
-		// exit in ocLife (P1-API-005). nil for the boot-spawned child (the
-		// boot arm owns its readiness wait and deliberately has no observer).
+		// exit in ocLife (P1-API-005). Since the A2 boot parity both the
+		// boot-spawned and the restart-spawned children carry an observer;
+		// nil only when the last attempt produced no oracle at all (e.g. a
+		// failed spawn).
 		var opencodeReapDone <-chan struct{}
 		var opencodeMu sync.Mutex
 		var vhCancel context.CancelFunc
@@ -111,24 +113,20 @@ with --opencode-url, or spawn a survivable detached instance with
 			opencodePort, opencodeURL, opencodeServeCmd = ApplyDetachedOCStart(res, ocLife, "local-server")
 
 		default:
-			opencodePort = freePort()
-			// Pre-set opencodeURL so a failure below still leaves a parseable
-			// (dead) loopback target for the aggregator's lazy proxy.
-			opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", opencodePort)
-			c, err := startOpenCodeServe(localOpenCodeBin, opencodePort, cwd)
-			if err != nil {
-				log.Printf("Failed to start opencode serve: %v (local-server stays up; opencode status=failed)", err)
-				ocLife.SetFailed(fmt.Sprintf("failed to start opencode serve: %v", err), nil)
-			} else {
-				opencodeServeCmd = c
-				if err := waitForPort(opencodePort, 30*time.Second); err != nil {
-					log.Printf("opencode serve failed to listen on port %d: %v (local-server stays up; opencode status=failed)", opencodePort, err)
-					ocLife.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", opencodePort, err), nil)
-				} else {
-					ocLife.SetReady()
-					log.Printf("local-server: spawned OpenCode pid=%d port=%d", c.Process.Pid, opencodePort)
-				}
-			}
+			// Owned INITIAL boot (P1-API-006 A2): the same shared
+			// child-attributed core client-daemon's startOwnedOpenCode
+			// routes through, so the two binaries cannot drift — readiness
+			// is attributed to the spawned child itself (never to a dial),
+			// the initial internally selected candidate port is
+			// squatter-guarded, a pre-readiness child exit earns exactly
+			// ONE fresh-port retry, and exhaustion fails closed (SetFailed +
+			// local-server keeps serving, p1-oc-001). The URL finalizes on
+			// the effective port (success and failure alike) BEFORE the
+			// aggregator/web server are constructed below, and the boot
+			// child's exit observer is installed (P1-API-005 DEFER 3): a
+			// post-readiness crash flips ocLife ready → failed.
+			opencodeServeCmd, opencodeReapDone, opencodePort, opencodeURL =
+				startLocalOwnedOpenCode(localOpenCodeBin, cwd, ocLife, freePort())
 		}
 		if opencodeURL == "" {
 			// Defensive: every arm above sets a parseable URL (a dead
@@ -242,9 +240,11 @@ with --opencode-url, or spawn a survivable detached instance with
 			if opencodeReapDone != nil {
 				<-opencodeReapDone // observer has reaped + recorded the old child
 			} else if opencodeServeCmd != nil && opencodeServeCmd.Process != nil {
-				// The BOOT-spawned child has no observer (its readiness wait
-				// is the boot arm's, deliberately untouched): the direct Wait
-				// stays here — nobody else is waiting on it.
+				// Defensive fallback only: since the A2 boot parity every
+				// owned child (boot and restart alike) carries an observer,
+				// so this direct Wait covers just a spawn that returned a
+				// child without an oracle (a contract-violation shape) —
+				// nobody else is waiting on it.
 				_ = opencodeServeCmd.Wait()
 			}
 			res := restartOwnedOpenCode(ownedRestartConfig{
@@ -377,6 +377,75 @@ with --opencode-url, or spawn a survivable detached instance with
 			log.Fatalf("vh local-server failed: %v", err)
 		}
 	},
+}
+
+// startLocalOwnedOpenCode is local-server's ENTIRE owned INITIAL boot arm
+// (P1-API-006 A2 — the parity mirror of client-daemon's startOwnedOpenCode):
+// it routes the boot through the shared child-attributed core
+// (restartOwnedOpenCode — boot is the degenerate restart: no previous child
+// to stop, and the "stable" port is the internally selected initial
+// candidate), finalizes the effective port/URL, and installs the boot child's
+// exit observer.
+//
+// BOOT CONTRACT (settled design — identical to client-daemon's A1 arm, so the
+// two binaries cannot drift):
+//
+//   - The initial candidate port is internally selected (freePort) by the
+//     caller; no operator-fixed owned boot port exists. A squatter on the
+//     candidate is never credited (the old dial-only waitForPort arm credited
+//     any listener that won the port — a false SetReady proxying foreign
+//     content), a pre-readiness child exit earns exactly ONE fresh
+//     auto-selected-port retry, and exhaustion fails closed: SetFailed +
+//     local-server keeps serving (p1-oc-001).
+//   - The returned URL is FINAL on the effective port — success and failure
+//     alike. On failure it is the last attempted port: a parseable dead
+//     loopback target for the lazy proxy (per-request 502), never a foreign
+//     listener's port masquerading as ready. Run constructs the
+//     aggregator/web server only AFTER this returns, so no consumer can be
+//     wired to a superseded port — no re-ordering needed (verified against
+//     the Run construction order).
+//   - The exit observer is installed from the start (P1-API-005 DEFER 3):
+//     each spawned child gets a reapOwnedOpenCode observer through its exit
+//     gate, so a post-readiness crash flips the lifecycle ready → failed
+//     (never stuck at ready), and the returned oracle lets a later restart
+//     await the reap instead of a racing second Wait.
+//
+// Extracted from the Run closure so the boot seam is testable without
+// booting the whole server (the arm itself is a one-line call — what tests
+// exercise here is exactly what production runs), mirroring client-daemon's
+// startOwnedOpenCode extraction.
+func startLocalOwnedOpenCode(bin, cwd string, life *oclife.Lifecycle, candidate int) (*exec.Cmd, <-chan struct{}, int, string) {
+	res := restartOwnedOpenCode(ownedRestartConfig{
+		Life: life,
+		// No running server exists yet: Run builds the aggregator/web
+		// server only after this arm returns. A nil Srv is the designed
+		// defensive shape (the lifecycle URL still follows a fresh port
+		// through the retarget seam).
+		Srv:        nil,
+		StablePort: candidate,
+		// Direct-wait ownership adapted to the oracle contract (the same
+		// adapter the restart arm uses): spawn ONE child per attempt and
+		// hand the core its exit gate. The core never Wait()s the child.
+		Spawn: func(port int) (*exec.Cmd, *ownedExitGate, error) {
+			c, err := startOpenCodeServe(bin, port, cwd)
+			if err != nil {
+				return nil, nil, err
+			}
+			gate := newOwnedExitGate()
+			go reapOwnedOpenCode(c, gate, life)
+			return c, gate, nil
+		},
+	})
+	url := fmt.Sprintf("http://127.0.0.1:%d", res.Port)
+	if res.Err != nil {
+		// The core already recorded SetFailed; local-server keeps serving
+		// (p1-oc-001). The child handle + observer are retained — the child
+		// may come up late, and its exit stays recorded.
+		log.Printf("local-server: owned opencode boot failed: %v (local-server stays up; opencode status=failed)", res.Err)
+		return res.Cmd, res.Exited, res.Port, url
+	}
+	log.Printf("local-server: spawned OpenCode pid=%d port=%d (child-attributed readiness)", res.Cmd.Process.Pid, res.Port)
+	return res.Cmd, res.Exited, res.Port, url
 }
 
 func init() {

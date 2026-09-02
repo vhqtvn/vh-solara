@@ -5,6 +5,15 @@ package cmd
 // P1-API-005 / Slice 2 — local-server owned-restart behavioral closure
 // through the REAL accepted restart trigger.
 //
+// P1-API-006 / Slice A2 — owned BOOT parity: the boot arm now routes through
+// the shared child-attributed core (startLocalOwnedOpenCode — the exact
+// function the Run arm calls), so the boot cruxes mirror A1's client-daemon
+// trio: squatter on the initial candidate is never credited, ONE fresh-port
+// retry on a pre-readiness child exit, exhaustion fails closed while the
+// server keeps serving (the P2-API-005 keep-serving crux, through the REAL
+// localServerCmd.Run), and a post-readiness boot-child crash flips ocLife
+// ready → failed (P1-API-005 DEFER 3, through the REAL Run).
+//
 // Slice 1 landed the shared child-aware core (restartOwnedOpenCode) and
 // client-daemon's behavioral crux trio; its review flagged the local-server
 // arm as "retarget verified structurally, not behaviorally". These tests
@@ -29,34 +38,77 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/oclife"
+	"github.com/vhqtvn/vh-solara/pkg/web"
 )
 
 // lsClient carries the generous timeout a real restart needs (the trigger is
 // synchronous: it returns only after readiness or bounded exhaustion).
 var lsClient = &http.Client{Timeout: 60 * time.Second}
 
+// --- P1-API-005 DEFER 4: cobra-test containment contract (P1-API-006 A2) ---
+//
+// These scenarios mutate process-global state: the cobra-bound package flag
+// vars (complete snapshot/restore in withLocalServerFlags), the process cwd
+// (t.Chdir via newOCLockScenario), ambient env (t.Setenv, restored per
+// test), and the process-lifetime HTTP listeners each `go
+// localServerCmd.Run` leaves behind (the keep-serving posture under test —
+// the unique per-test ports from bootLocalServerForTest keep them from
+// colliding). lsSerial mechanically serializes every local-server fixture
+// test against the others, so a future t.Parallel anywhere in this fixture
+// family cannot interleave two scenarios mid-mutation. No local-server test
+// calls t.Parallel.
+//
+// Subprocess isolation is deliberately NOT used: no leakage that in-process
+// containment cannot absorb has been demonstrated. The residual
+// process-lifetime state is the spawned servers themselves — which is the
+// behavior under test — plus their captured per-scenario state dirs, which
+// die with the per-test t.TempDir (writeDaemonState lands inside the
+// scenario-scoped VH_STATE_DIR).
+var lsFixtureMu sync.Mutex
+
+// lsSerial acquires the package-level local-server fixture guard for the
+// test's duration (released by t.Cleanup). Called ONCE per test, from the
+// fixture entry points (withLocalServerFlags / startLocalBootSeam) — the
+// guard is not reentrant.
+func lsSerial(t *testing.T) {
+	t.Helper()
+	lsFixtureMu.Lock()
+	t.Cleanup(lsFixtureMu.Unlock)
+}
+
 // withLocalServerFlags points the local-server command at a test scenario
 // (fake bin, loopback addr, no auth) and restores every flag global after —
-// the same save/restore discipline as withDaemonOpenCodeBin.
+// the same save/restore discipline as withDaemonOpenCodeBin. The snapshot is
+// COMPLETE over the command's cobra-bound package vars (the var block in
+// local-server.go), including the ones these tests never set
+// (localOpenCodeUpdate), so a future test that does set them inherits the
+// containment instead of re-deriving it.
 func withLocalServerFlags(t *testing.T, sc *ocLockScenario, addr string) {
 	t.Helper()
+	lsSerial(t)
 	oldAddr, oldBin := localAddr, localOpenCodeBin
 	oldURL, oldDetached, oldRestart := localOpenCodeURL, localOpenCodeDetached, localOpenCodeRestart
+	oldUpdate := localOpenCodeUpdate
 	oldSock, oldExt := localVHSock, localExternalManaged
 	oldCORS, oldFrame := localCORSOrigins, localFrameAncestors
 	oldAuth := localAuth
 	t.Cleanup(func() {
 		localAddr, localOpenCodeBin = oldAddr, oldBin
 		localOpenCodeURL, localOpenCodeDetached, localOpenCodeRestart = oldURL, oldDetached, oldRestart
+		localOpenCodeUpdate = oldUpdate
 		localVHSock, localExternalManaged = oldSock, oldExt
 		localCORSOrigins, localFrameAncestors = oldCORS, oldFrame
 		localAuth = oldAuth
@@ -163,10 +215,11 @@ func lsPortFromURL(t *testing.T, u string) int {
 	return p
 }
 
-// waitLSBootReady polls the running server until the real owned boot arm has
-// spawned the fake child and flipped the lifecycle ready; returns the boot
-// port the runtime recorded (the stable port the restart will target).
-func waitLSBootReady(t *testing.T, h *localServerHandle) int {
+// waitLSBootState polls the running server's lifecycle status until it
+// reaches the wanted state; returns the satisfying snapshot. A successful
+// poll is itself keep-serving evidence: the status endpoint answers 200
+// through the running server whatever the state is.
+func waitLSBootState(t *testing.T, h *localServerHandle, want oclife.State) oclife.Snapshot {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	var last string
@@ -177,17 +230,29 @@ func waitLSBootReady(t *testing.T, h *localServerHandle) int {
 			_ = json.NewDecoder(res.Body).Decode(&snap)
 			res.Body.Close()
 			last = fmt.Sprintf("state=%s url=%s", snap.State, snap.OpenCodeURL)
-			if snap.State == oclife.StateReady && snap.OpenCodeURL != "" {
-				return lsPortFromURL(t, snap.OpenCodeURL)
+			if snap.State == want {
+				return snap
 			}
 		} else {
 			last = err.Error()
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("local-server boot never reached ready (last: %s)", last)
+			t.Fatalf("local-server boot never reached %s (last: %s)", want, last)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// waitLSBootReady polls the running server until the real owned boot arm has
+// spawned the fake child and flipped the lifecycle ready; returns the boot
+// port the runtime recorded (the stable port the restart will target).
+func waitLSBootReady(t *testing.T, h *localServerHandle) int {
+	t.Helper()
+	snap := waitLSBootState(t, h, oclife.StateReady)
+	if snap.OpenCodeURL == "" {
+		t.Fatalf("ready snapshot carries no opencode_url: %+v", snap)
+	}
+	return lsPortFromURL(t, snap.OpenCodeURL)
 }
 
 // waitPortClosed polls until nothing accepts on the port (the listener died
@@ -210,18 +275,19 @@ func waitPortClosed(t *testing.T, port int, d time.Duration) {
 	}
 }
 
-// startLocalServerForTest runs the REAL localServerCmd.Run in a goroutine
+// bootLocalServerForTest runs the REAL localServerCmd.Run in a goroutine
 // (it blocks in ListenAndServe for the rest of the test process — the
-// keep-serving posture under test) and waits out the real owned boot. The
-// scenario sweep + flag restore handle cleanup; the HTTP listener is
-// process-lifetime by design.
-func startLocalServerForTest(t *testing.T) (*localServerHandle, *ocLockScenario, int) {
+// keep-serving posture under test) and returns immediately; the caller waits
+// for the boot outcome it expects (waitLSBootReady / waitLSBootState). The
+// server's own port is picked up front per test (bind :0, read, release —
+// the repo's standard freePort pattern; Run re-binds it moments later), so
+// every scenario's process-lifetime listener is unique. The scenario sweep +
+// flag restore handle cleanup.
+func bootLocalServerForTest(t *testing.T) (*localServerHandle, *ocLockScenario) {
 	t.Helper()
 	sc := newOCLockScenario(t)
 	useVersionFakeBin(t, sc)
 
-	// Pick the server's own port up front (bind :0, read, release — the
-	// repo's standard freePort pattern; Run re-binds it moments later).
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +298,14 @@ func startLocalServerForTest(t *testing.T) (*localServerHandle, *ocLockScenario,
 
 	go localServerCmd.Run(nil, nil)
 
-	h := &localServerHandle{base: fmt.Sprintf("http://127.0.0.1:%d", port)}
+	return &localServerHandle{base: fmt.Sprintf("http://127.0.0.1:%d", port)}, sc
+}
+
+// startLocalServerForTest runs bootLocalServerForTest and waits out the real
+// owned boot's readiness (the historical trio's entry).
+func startLocalServerForTest(t *testing.T) (*localServerHandle, *ocLockScenario, int) {
+	t.Helper()
+	h, sc := bootLocalServerForTest(t)
 	return h, sc, waitLSBootReady(t, h)
 }
 
@@ -365,5 +438,211 @@ func TestLocalServerOwnedRestartExhaustedKeepsServing(t *testing.T) {
 		t.Fatalf("/oc/session = %d/%q, want 502 from the dead old target (keep-serving, no foreign content)", code, body)
 	}
 	// Both replacement children died; nothing lingers.
+	sc.waitAliveCount(".fake", 0, 5*time.Second)
+}
+
+// --- P1-API-006 A2: owned INITIAL boot truthfulness (local-server parity) ---
+//
+// The boot arm (startLocalOwnedOpenCode — the exact function the Run arm
+// calls) must never false-ready on a foreign port: the old arm spawned on an
+// internally selected port and credited whatever answered the dial
+// (waitForPort) — a squatter on that port yielded a false SetReady with the
+// server's /oc/* proxy serving foreign content. Two cruxes run through the
+// REAL localServerCmd.Run surface (exhaustion keep-serving, post-ready
+// crash); the squatter and bind-race cruxes need a pre-set candidate port,
+// which the real Run selects internally — so they run the boot seam directly
+// (mirroring A1's client-daemon boot tests) with the post-boot consumer
+// surface built exactly as Run builds it.
+
+// localBootSeam is one run of local-server's owned boot seam with the
+// deterministic pre-set candidate port the cruxes need.
+type localBootSeam struct {
+	sc        *ocLockScenario
+	life      *oclife.Lifecycle
+	candidate int // pre-set initial candidate port (below the ephemeral range)
+	cmd       *exec.Cmd
+	done      <-chan struct{} // the boot child's exit oracle
+	port      int             // effective port (success) / last attempted (failure)
+	url       string          // finalized URL on the effective port
+}
+
+// startLocalBootSeam runs the boot seam exactly as the Run arm calls it,
+// except the initial candidate is the caller's deterministic low port
+// (pickLowPort — below the ephemeral range so the core's fresh freePort()
+// retry cannot collide with it).
+func startLocalBootSeam(t *testing.T, candidate int) *localBootSeam {
+	t.Helper()
+	lsSerial(t)
+	sc := newOCLockScenario(t)
+	life := oclife.New(oclife.TopologyOwned)
+	cmd, done, port, url := startLocalOwnedOpenCode(sc.bin, sc.dir, life, candidate)
+	return &localBootSeam{sc: sc, life: life, candidate: candidate, cmd: cmd, done: done, port: port, url: url}
+}
+
+// newLocalBootConsumerSurface builds the post-boot consumer surface exactly
+// as the Run arm does once the boot seam has returned and finalized the URL
+// (lifecycle URL → aggregator → web server → lifecycle route — the same
+// construction order Run uses). Asserting routed content through this
+// surface proves the boot never wires consumers to a foreign listener.
+func newLocalBootConsumerSurface(t *testing.T, s *localBootSeam) *httptest.Server {
+	t.Helper()
+	s.life.SetOpenCodeURL(s.url)
+	agg := aggregator.New(s.url, vhEventRingCapacity)
+	srv, err := web.NewServer(agg, s.url, vhEventRingCapacity)
+	if err != nil {
+		t.Fatalf("web.NewServer: %v", err)
+	}
+	srv.SetOpenCodeLifecycle(s.life)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// TestLocalServerOwnedBootNeverServesForeignMarker — THE boot crux: a
+// foreign marker service squats the initial candidate port BEFORE
+// local-server boots. The old dial-only arm would have credited the squatter
+// and proxied its content as ready OpenCode. The child-attributed boot must
+// instead move to a fresh port whose child is the REAL one, finalize the URL
+// there, and the post-boot consumer surface must serve the replacement
+// child's content — never the squatter's marker.
+func TestLocalServerOwnedBootNeverServesForeignMarker(t *testing.T) {
+	const marker = "local-boot-squatter-marker"
+	candidate := pickLowPort(t) // below the ephemeral range: freePort() cannot collide
+
+	// The squatter occupies the initial candidate port.
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", candidate))
+	if err != nil {
+		t.Fatalf("foreign listener on port %d: %v", candidate, err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		_ = http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, marker) }))
+	}()
+
+	s := startLocalBootSeam(t, candidate)
+
+	if s.port == s.candidate || s.port <= 0 {
+		t.Fatalf("effective port=%d after boot, want a fresh port != the squatted candidate %d", s.port, s.candidate)
+	}
+	wantURL := "http://127.0.0.1:" + strconv.Itoa(s.port)
+	if s.url != wantURL {
+		t.Fatalf("finalized url=%q, want %q", s.url, wantURL)
+	}
+	snap := s.life.Snapshot()
+	if snap.State != oclife.StateReady {
+		t.Fatalf("lifecycle state=%s, want ready (attributed to the replacement child)", snap.State)
+	}
+	if snap.OpenCodeURL != wantURL {
+		t.Fatalf("lifecycle OpenCodeURL=%q, want %q", snap.OpenCodeURL, wantURL)
+	}
+
+	// THE CRUX (outcome-level): the post-boot consumer surface — built on
+	// the finalized URL exactly as Run builds it — serves the replacement
+	// child's "ok", never the squatter's marker.
+	if code, body := ocGet(t, newLocalBootConsumerSurface(t, s), "/oc/session"); code != 200 || body != "ok" {
+		t.Fatalf("post-boot /oc/session through the consumer surface = %d/%q, want 200/ok from the replacement child — the squatter's marker was served as ready OpenCode content", code, body)
+	}
+	// Exactly one child was spawned (the squatted candidate was never handed
+	// a doomed spawn — the occupied-port guard skips straight to the fresh
+	// attempt), and it is alive.
+	if n := fakeSpawnCount(t, s.sc); n != 1 {
+		t.Fatalf("spawned %d fake children, want exactly 1 (the squatted candidate must not be handed a child)", n)
+	}
+	s.sc.waitAliveCount(".fake", 1, 5*time.Second)
+}
+
+// TestLocalServerOwnedBootRetriesFreshPortWhenChildLosesBindRace — the boot
+// bind-race crux: the initial candidate port is FREE, but the child spawned
+// on it dies before readiness (lost check-to-bind race or crash — the core
+// never tells them apart and never parses output). Exactly ONE fresh-port
+// attempt follows and must carry the boot; readiness refers only to that
+// replacement child.
+func TestLocalServerOwnedBootRetriesFreshPortWhenChildLosesBindRace(t *testing.T) {
+	candidate := pickLowPort(t)
+	// The initial-candidate child dies pre-readiness; the fresh-port child
+	// (an ephemeral freePort) lives and listens.
+	t.Setenv("VH_FAKE_OC_DIE_ON_PORT", strconv.Itoa(candidate))
+
+	s := startLocalBootSeam(t, candidate)
+
+	if s.port == s.candidate || s.port <= 0 {
+		t.Fatalf("effective port=%d after boot, want the fresh-port retry's port != %d", s.port, s.candidate)
+	}
+	wantURL := "http://127.0.0.1:" + strconv.Itoa(s.port)
+	if s.url != wantURL {
+		t.Fatalf("finalized url=%q, want %q", s.url, wantURL)
+	}
+	snap := s.life.Snapshot()
+	if snap.State != oclife.StateReady {
+		t.Fatalf("lifecycle state=%s, want ready (readiness must be attributed only to the replacement child)", snap.State)
+	}
+	if snap.OpenCodeURL != wantURL {
+		t.Fatalf("lifecycle OpenCodeURL=%q, want %q", snap.OpenCodeURL, wantURL)
+	}
+	if code, body := ocGet(t, newLocalBootConsumerSurface(t, s), "/oc/session"); code != 200 || body != "ok" {
+		t.Fatalf("post-boot /oc/session = %d/%q, want 200/ok from the retry's fresh child", code, body)
+	}
+	// AT MOST ONE fresh retry: exactly two spawns total (candidate + retry),
+	// exactly one alive (the dead candidate left no live fake).
+	if n := fakeSpawnCount(t, s.sc); n != 2 {
+		t.Fatalf("spawned %d fake children, want exactly 2 (initial candidate + ONE fresh retry — recovery is bounded)", n)
+	}
+	s.sc.waitAliveCount(".fake", 1, 5*time.Second)
+}
+
+// TestLocalServerOwnedBootExhaustedKeepsServing — the boot fail-closed crux
+// through the REAL localServerCmd.Run surface (the P2-API-005 keep-serving
+// crux): BOTH the initial-candidate child and the one fresh retry die before
+// readiness. The server still comes up and keeps serving, /vh/opencode/status
+// truthfully reports failed with a summary, the finalized URL stays a
+// parseable dead loopback whose /oc proxy answers 502 — never foreign
+// content — and exactly two spawns bound the recovery.
+func TestLocalServerOwnedBootExhaustedKeepsServing(t *testing.T) {
+	// Every boot child dies pre-readiness. Env is ambient for the boot
+	// spawn (startOpenCodeServe reads os.Environ() at exec time), so this
+	// must be set before the server starts.
+	t.Setenv("VH_FAKE_OC_DIE_FAST", "1")
+	h, sc := bootLocalServerForTest(t)
+
+	// The failed-but-serving outcome through the REAL server: the status
+	// endpoint answers 200 (keep-serving) with state=failed + a summary.
+	snap := waitLSBootState(t, h, oclife.StateFailed)
+	if snap.FailureSummary == "" {
+		t.Fatal("boot exhaustion must record a failure summary")
+	}
+	// The URL finalized on a parseable port — the truthful dead target.
+	port := lsPortFromURL(t, snap.OpenCodeURL)
+	if port <= 0 {
+		t.Fatalf("opencode_url=%q carries no usable port", snap.OpenCodeURL)
+	}
+	// The /oc proxy, targeting the finalized dead loopback, answers 502
+	// rather than foreign content.
+	if code, body := lsOcGet(t, h, "/oc/session"); code != http.StatusBadGateway {
+		t.Fatalf("/oc/session = %d/%q, want 502 from the dead boot target (keep-serving, no foreign content)", code, body)
+	}
+	// Bounded recovery: the candidate + ONE fresh retry, then exhaustion.
+	if n := fakeSpawnCount(t, sc); n != 2 {
+		t.Fatalf("spawned %d fake children, want exactly 2 (candidate + one retry, then exhaustion)", n)
+	}
+	sc.waitAliveCount(".fake", 0, 5*time.Second)
+}
+
+// TestLocalServerOwnedBootPostReadyCrashFlipsFailed — the boot observer
+// crux (P1-API-005 DEFER 3) through the REAL localServerCmd.Run surface:
+// after a GENUINE child-attributed boot readiness, the boot child's death
+// must flip ocLife ready → failed — never leave it stuck at ready.
+func TestLocalServerOwnedBootPostReadyCrashFlipsFailed(t *testing.T) {
+	h, sc, _ := startLocalServerForTest(t) // real boot, real readiness
+
+	// The post-readiness crash: kill the boot child (the one alive fake).
+	pids := sc.waitAliveCount(".fake", 1, 5*time.Second)
+	if p, err := os.FindProcess(pids[0]); err == nil {
+		_ = p.Signal(syscall.SIGKILL)
+	}
+
+	snap := waitLSBootState(t, h, oclife.StateFailed)
+	if snap.FailureSummary == "" {
+		t.Fatal("the recorded boot-child crash must carry a failure summary")
+	}
 	sc.waitAliveCount(".fake", 0, 5*time.Second)
 }
