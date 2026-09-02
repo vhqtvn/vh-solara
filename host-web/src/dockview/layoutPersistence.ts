@@ -188,7 +188,7 @@ export type BlobReadSource = "hash" | "v3" | "v2" | "none";
  *  stale-frozen-hash fingerprint):
  *   hash      — both candidates valid; the hash won (its seq ≥ LS seq, or the
  *               LS lead is inside STALE_HASH_WINDOW_MS — sibling-tab cadence)
- *   ls        — both valid; localStorage won DECISIVELY (newer by more than
+ *   ls        — both valid; localStorage won DECISIVELY (newer by at least
  *               the window — the launcher-frozen relic shape)
  *   ls-sole   — only the localStorage candidate was valid (no usable hash)
  *   hash-sole — only the hash candidate was valid
@@ -1060,8 +1060,9 @@ function maxPaneSeqSuffix(ids: Iterable<string>): number {
  *    • hash seq ≥ LS seq       → hash ("hash" — includes the tie: a tab
  *                                reloaded right after its own flush finds its
  *                                own state either way, so the hash wins)
- *    • LS newer BEYOND the
- *      STALE_HASH_WINDOW_MS    → localStorage ("ls" — decisively newer)
+ *    • LS newer AT OR BEYOND
+ *      the STALE_HASH_WINDOW_MS → localStorage ("ls" — decisively newer;
+ *                              the >= counts the boundary itself)
  *    • LS newer but WITHIN the
  *      window                  → hash (sibling-tab cadence: another tab's
  *                                mirror write is routinely a few seconds newer

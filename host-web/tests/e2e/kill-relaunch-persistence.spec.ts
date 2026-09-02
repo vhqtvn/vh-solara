@@ -704,6 +704,123 @@ test.describe("stale frozen #state= hash vs fresh localStorage (comparative read
     expect(read!.healed).toBe(false);
   });
 
+  // ---- STALE_HASH_WINDOW_MS window-edge pins --------------------------------
+  // The comparator branch: `lsSeq > hashSeq && lsSeq - hashSeq >=
+  // STALE_HASH_WINDOW_MS` → "ls" (decisive, healed); EVERYTHING else — tie,
+  // hash-newer, and LS-newer-but-within-the-window — falls through to "hash"
+  // (sibling-tab cadence; a winning hash is never healed). These three pins
+  // bracket the 30 000 ms boundary at millisecond resolution: 29 999 (just
+  // within → hash), 30 000 EXACTLY (the inclusive >= edge → ls), 5 000
+  // (comfortably within → hash). Deterministic seam (no real clock waits):
+  // seq is Date.now() stamped on the persisted WRITE, and the comparator
+  // compares the STORED seq fields — so the app settles LS naturally, then the
+  // HASH variant is back-dated against that settled seq via
+  // hashVariantWithExtraWs (its extra workspace proves which candidate won).
+
+  test("window edge T1: LS newer by 5 000ms (WITHIN the window) → hash wins, not healed", async ({
+    page,
+  }) => {
+    await H.loadHost(page);
+    const ws1 = (await H.workspaces(page))[0];
+    const ws2 = await H.addWorkspace(page, "Within LS");
+    await expect.poll(async () => (await H.workspaces(page)).length).toBe(2);
+    const fresh = await settleBothMirrors(
+      page,
+      (p) => blobWsIds(p).length === 2,
+      "2-ws fresh blob",
+    );
+    const lsSeq = fresh.seq!;
+
+    // A hash variant (extra ws proves the winner) whose seq is 5s OLDER than
+    // the mirror: LS IS newer — but well WITHIN the 30s window.
+    const hashSeq = lsSeq - 5_000;
+    await relaunchWithHash(page, hashVariantWithExtraWs(fresh, "ws-within-hash", hashSeq));
+
+    // The HASH's content restored: a mirror a few seconds newer (sibling-tab
+    // cadence) must NOT steal this tab's own frozen state.
+    await expect
+      .poll(async () => (await H.workspaces(page)).sort())
+      .toEqual([ws1, ws2, "ws-within-hash"].sort());
+    const ring = await H.diagRing(page);
+    const read = lastDiag(ring, "read");
+    expect(read!.pick, "within-window LS lead → hash (sibling-tab cadence)").toBe("hash");
+    expect(read!.hashSeq).toBe(hashSeq);
+    expect(read!.lsSeq).toBe(lsSeq);
+    expect(read!.healed, "a winning hash is never healed").toBe(false);
+    const hashState = (await H.readHashState(page)) as Blob | null;
+    expect(blobWsIds(hashState)).toContain("ws-within-hash");
+  });
+
+  test("window edge T2: LS newer by EXACTLY 30 000ms (the inclusive >= boundary) → LS wins, healed", async ({
+    page,
+  }) => {
+    await H.loadHost(page);
+    const ws1 = (await H.workspaces(page))[0];
+    const ws2 = await H.addWorkspace(page, "Boundary LS");
+    await expect.poll(async () => (await H.workspaces(page)).length).toBe(2);
+    const fresh = await settleBothMirrors(
+      page,
+      (p) => blobWsIds(p).length === 2,
+      "2-ws fresh blob",
+    );
+    const freshIds = blobWsIds(fresh);
+    const lsSeq = fresh.seq!;
+
+    // The hash variant back-dated to EXACTLY the window edge: the `>=` must
+    // count the boundary itself as decisive (a strict `>` would hand this
+    // case to the hash — that discrimination is this pin's whole point).
+    const hashSeq = lsSeq - 30_000;
+    await relaunchWithHash(page, hashVariantWithExtraWs(fresh, "ws-boundary-hash", hashSeq));
+
+    // The LS content restored — the hash variant's extra ws must NOT appear.
+    await expect
+      .poll(async () => (await H.workspaces(page)).sort())
+      .toEqual(freshIds.slice().sort());
+    const ring = await H.diagRing(page);
+    const read = lastDiag(ring, "read");
+    expect(read!.pick, "delta == window → ls (>= is inclusive)").toBe("ls");
+    expect(read!.source).toBe("v3");
+    expect(read!.hashSeq).toBe(hashSeq);
+    expect(read!.lsSeq).toBe(lsSeq);
+    expect(read!.healed, "the decisively-older hash was healed at boot").toBe(true);
+    // Post-boot hash carries the LS content — the frozen URL is rewritten.
+    const healedHash = (await H.readHashState(page)) as Blob | null;
+    expect(healedHash, "hash still #state=-shaped after the heal").toBeTruthy();
+    expect(blobWsIds(healedHash).sort()).toEqual(freshIds.slice().sort());
+  });
+
+  test("window edge T3: LS newer by 29 999ms (just within) → hash wins, not healed", async ({
+    page,
+  }) => {
+    await H.loadHost(page);
+    const ws1 = (await H.workspaces(page))[0];
+    const ws2 = await H.addWorkspace(page, "Just-Within LS");
+    await expect.poll(async () => (await H.workspaces(page)).length).toBe(2);
+    const fresh = await settleBothMirrors(
+      page,
+      (p) => blobWsIds(p).length === 2,
+      "2-ws fresh blob",
+    );
+    const lsSeq = fresh.seq!;
+
+    // One millisecond inside the window: the mirror is newer, the delta is
+    // 29 999 < 30 000 — NOT decisive, so the hash keeps the tab's own state.
+    const hashSeq = lsSeq - 29_999;
+    await relaunchWithHash(page, hashVariantWithExtraWs(fresh, "ws-just-within-hash", hashSeq));
+
+    await expect
+      .poll(async () => (await H.workspaces(page)).sort())
+      .toEqual([ws1, ws2, "ws-just-within-hash"].sort());
+    const ring = await H.diagRing(page);
+    const read = lastDiag(ring, "read");
+    expect(read!.pick, "29 999ms lead is still within the window → hash").toBe("hash");
+    expect(read!.hashSeq).toBe(hashSeq);
+    expect(read!.lsSeq).toBe(lsSeq);
+    expect(read!.healed, "a winning hash is never healed").toBe(false);
+    const hashState = (await H.readHashState(page)) as Blob | null;
+    expect(blobWsIds(hashState)).toContain("ws-just-within-hash");
+  });
+
   test("seq-LESS legacy hash vs seq-stamped LS → LS wins (the migration note)", async ({
     page,
   }) => {
