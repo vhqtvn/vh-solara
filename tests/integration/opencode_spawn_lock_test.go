@@ -1,8 +1,11 @@
 //go:build linux
 
 // Linux-only: the fd-3 owner-lock /proc inspection, cmdline identity
-// checks, and the #!/bin/sh fake-opencode wrapper are Linux-only by
-// design; syscall.Kill does not exist on windows/darwin.
+// checks, and the #!/bin/sh fake-opencode wrapper are Linux-only by design
+// — the machinery reads /proc/<pid>/{cmdline,fd} and hands fd 3 through
+// exec, which only Linux provides in this repo. syscall.Kill is NOT the
+// exclusion: it exists on darwin too (only windows lacks it outright), so
+// do not restate it as the reason.
 
 // Package integration — cross-process proof for P1-API-002 (detached
 // OpenCode spawn serialization). Unlike the cmd-package lock tests (which
@@ -350,6 +353,16 @@ func killPid9(pid int) {
 // attempts against rejected candidates. The default is the real killPid9,
 // so the registered cleanup path is behavior-identical; this lives in test
 // scaffolding only (no production surface).
+//
+// SERIAL DISCIPLINE (P2-API-010 standing note, re-asserted because this
+// slice touched the file): the recording test swaps this package var and
+// restores it via t.Cleanup. That swap is safe ONLY while package
+// integration's tests stay strictly serial — no t.Parallel anywhere in the
+// package — so no other test can read a half-swapped seam or interleave a
+// registered cleanup with the swap window. Do not introduce t.Parallel
+// into this package without first making the seam swap race-safe (e.g. a
+// mutex-guarded indirection). This is a documented serial-discipline
+// guarantee, NOT a race-safety claim about the var itself.
 var integSweepSignal = killPid9
 
 func waitPidDead(pid int, d time.Duration) bool {

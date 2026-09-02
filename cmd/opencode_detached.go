@@ -159,7 +159,10 @@ func ocCmdlineMatches(pid, port int) bool {
 //     cmdline-matching instance that answers slowly (or not at all) is NEVER
 //     spawned beside — spawning beside it is strictly worse than an explicit
 //     ocLife failed state the operator can recover from remotely via the
-//     restart action (which kills + respawns on the same port).
+//     restart action (which stops the recorded instance and respawns on the
+//     recorded port when it is still free at the post-release port-parity
+//     check, else on a fresh port with a running-daemon retarget — never a
+//     blind same-port respawn).
 //
 // EXPLICIT POLICY — probe refused + pid alive + cmdline match: NEVER spawn.
 // Connection refused with a live, matching process means the listener died or

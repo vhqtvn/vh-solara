@@ -656,3 +656,130 @@ func TestLocalServerOwnedBootPostReadyCrashFlipsFailed(t *testing.T) {
 	}
 	sc.waitAliveCount(".fake", 0, 5*time.Second)
 }
+
+// --- owned-lifecycle residual closure (R5 / R11 / R2) ---
+
+// lsLogsTail fetches /vh/opencode/logs through the running server and
+// returns status + body.
+func lsLogsTail(t *testing.T, h *localServerHandle) (int, string) {
+	t.Helper()
+	res, err := lsClient.Get(h.base + "/vh/opencode/logs")
+	if err != nil {
+		t.Fatalf("GET /vh/opencode/logs through the running server: %v", err)
+	}
+	defer res.Body.Close()
+	b, _ := io.ReadAll(res.Body)
+	return res.StatusCode, string(b)
+}
+
+// TestLocalServerOwnedBootFansChildOutputIntoLogs — R5 ring-fan-in parity:
+// the owned boot spawns through the lifecycle ring (startOpenCodeServe with
+// ocLife.Ring().Writer()), so the fake child's startup banner lands in the
+// ring and /vh/opencode/logs answers NON-EMPTY through the real running
+// server — the advertised HasLogTail capability is actually honored for
+// local-server, not just for client-daemon.
+func TestLocalServerOwnedBootFansChildOutputIntoLogs(t *testing.T) {
+	h, _, _ := startLocalServerForTest(t)
+
+	// The banner is written by the CHILD into the inherited pipe, so it
+	// lands in the ring shortly after readiness — poll for it rather than
+	// asserting instant visibility.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		code, body := lsLogsTail(t, h)
+		if code == 200 && strings.Contains(body, "fake opencode serve") {
+			return // the crux: non-empty ring tail through the real surface
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("/vh/opencode/logs = %d/%q, want the fake child's banner — the owned boot did not fan child output into the lifecycle ring", code, body)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestLocalServerOwnedRestartKillsWedgedOldChild — THE R11 behavioral crux,
+// through the REAL accepted restart trigger: the old owned child IGNORES
+// SIGTERM (VH_FAKE_OC_IGNORE_SIGTERM, ambient from boot so the BOOT child is
+// the wedged one), so the stop path must not wait forever on the reap
+// oracle: the SIGTERM grace expires, the escalation SIGKILLs the old child,
+// and the restart COMPLETES within the bound — new child ready, its "ok"
+// served through the real server, the wedged old child provably dead.
+// (The unbounded predecessor hung the restart handler — and every later
+// opencodeMu holder — on exactly this fixture.)
+func TestLocalServerOwnedRestartKillsWedgedOldChild(t *testing.T) {
+	withOwnedStopBounds(t, 750*time.Millisecond, 2*time.Second)
+	// Env is read at spawn time; set BEFORE boot so the boot child (the old
+	// child the restart must stop) installs the ignore.
+	t.Setenv("VH_FAKE_OC_IGNORE_SIGTERM", "1")
+	h, sc, _ := startLocalServerForTest(t)
+
+	oldPids := sc.waitAliveCount(".fake", 1, 5*time.Second)
+	oldPid := oldPids[0]
+
+	start := time.Now()
+	code, body := lsRestartTrigger(t, h)
+	elapsed := time.Since(start)
+	if code != 200 || !strings.Contains(body, `"ok":true`) {
+		t.Fatalf("POST /vh/restart-opencode = %d/%q, want 200/{\"ok\":true} — the restart must complete despite the SIGTERM-immune old child", code, body)
+	}
+	// Bounded, not merely eventual: grace + kill window + readiness must be
+	// far under the historical forever-wait (generous CI ceiling).
+	if elapsed > 15*time.Second {
+		t.Fatalf("restart took %v — the bounded stop did not bound it", elapsed)
+	}
+	snap := lsStatus(t, h)
+	if snap.State != oclife.StateReady {
+		t.Fatalf("lifecycle state=%s after the wedged-child restart, want ready", snap.State)
+	}
+	if code, body := lsOcGet(t, h, "/oc/session"); code != 200 || body != "ok" {
+		t.Fatalf("post-restart /oc/session through the RUNNING server = %d/%q, want 200/ok from the fresh child", code, body)
+	}
+	// The wedged old child is DEAD — the SIGKILL escalation fired and the
+	// reaper recorded its exit (a zombie reads alive to signal-0 until
+	// reaped; the production observer reaps promptly).
+	if !waitPidDead(oldPid, 5*time.Second) {
+		t.Fatalf("wedged old child pid %d survived the restart — the SIGKILL escalation did not fire", oldPid)
+	}
+	// Exactly the fresh replacement lives.
+	sc.waitAliveCount(".fake", 1, 5*time.Second)
+}
+
+// TestLocalServerOwnedRestartRecoversAfterExhaustedBoot — the R2
+// recovery-promise crux, end-to-end through the REAL server: a boot whose
+// every child dies pre-readiness (VH_FAKE_OC_DIE_FAST) leaves local-server
+// serving with a failed lifecycle; clearing the knob and hitting the REAL
+// restart trigger recovers to ready with a fresh child serving "ok" through
+// /oc/session — with a BOUNDED spawn count (2 exhausted boot attempts +
+// exactly 1 recovery spawn). This pins the p1-oc-001 promise that a failed
+// boot is recoverable without restarting the worker.
+func TestLocalServerOwnedRestartRecoversAfterExhaustedBoot(t *testing.T) {
+	// Every boot child dies pre-readiness; ambient before boot (env is read
+	// at spawn time).
+	t.Setenv("VH_FAKE_OC_DIE_FAST", "1")
+	h, sc := bootLocalServerForTest(t)
+	waitLSBootState(t, h, oclife.StateFailed)
+
+	// Clear the knob. VERIFIED against the fake helper: it gates on
+	// os.Getenv("VH_FAKE_OC_DIE_FAST") == "1", so the EMPTY STRING is OFF —
+	// children spawned after this line live and listen.
+	t.Setenv("VH_FAKE_OC_DIE_FAST", "")
+
+	code, body := lsRestartTrigger(t, h)
+	if code != 200 || !strings.Contains(body, `"ok":true`) {
+		t.Fatalf("POST /vh/restart-opencode = %d/%q, want 200/{\"ok\":true} — the recovery promise after an exhausted boot", code, body)
+	}
+	snap := lsStatus(t, h)
+	if snap.State != oclife.StateReady {
+		t.Fatalf("lifecycle state=%s after the recovery restart, want ready", snap.State)
+	}
+	if code, body := lsOcGet(t, h, "/oc/session"); code != 200 || body != "ok" {
+		t.Fatalf("post-recovery /oc/session through the RUNNING server = %d/%q, want 200/ok from the fresh child", code, body)
+	}
+	// Bounded: the 2 dead boot attempts + exactly 1 restart spawn (the
+	// stable port — the boot's last-attempted port — is free, so the
+	// restart's single attempt carries it; no retry is spent).
+	if n := fakeSpawnCount(t, sc); n != 3 {
+		t.Fatalf("spawned %d fake children, want exactly 3 (2 exhausted boot attempts + 1 recovery spawn)", n)
+	}
+	sc.waitAliveCount(".fake", 1, 5*time.Second)
+}

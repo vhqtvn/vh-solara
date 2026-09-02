@@ -639,3 +639,67 @@ func TestOwnedBootPostReadyCrashFlipsFailed(t *testing.T) {
 	}
 	sc.waitAliveCount(".fake", 0, 5*time.Second)
 }
+
+// TestOwnedRestartStopPathKillsWedgedOldChild — THE R11 behavioral crux for
+// the client-daemon arm, through its production restart entry
+// (rt.restartOpencode under rt.opencodeMu — exactly what the
+// SetRestartOpenCode hook calls): the old owned child IGNORES SIGTERM
+// (VH_FAKE_OC_IGNORE_SIGTERM, ambient before the old child is spawned), so
+// the bounded stop must escalate — SIGTERM grace expires, the old child is
+// SIGKILLed, the restart COMPLETES within the bound, and the replacement
+// serves through the running server. The unbounded predecessor hung this
+// handler — and every later opencodeMu holder — on exactly this fixture.
+func TestOwnedRestartStopPathKillsWedgedOldChild(t *testing.T) {
+	withOwnedStopBounds(t, 750*time.Millisecond, 2*time.Second)
+	sc := newOCLockScenario(t)
+	withDaemonOpenCodeBin(t, sc.bin)
+	withDaemonOpenCodeDetached(t, false)
+	port := pickLowPort(t)
+	// The OLD child (spawned below) is the wedged one: env is read at spawn
+	// time, so this must be set before startOpenCodeServe.
+	t.Setenv("VH_FAKE_OC_IGNORE_SIGTERM", "1")
+
+	rt, ts := newOwnedRestartHarness(t, sc, port)
+
+	// The OLD owned child, spawned exactly as the boot arm spawns it, with
+	// the production sole-reaper wiring — and the wedged SIGTERM posture.
+	oldChild, err := startOpenCodeServe(sc.bin, port, sc.dir, rt.ocLife.Ring().Writer())
+	if err != nil {
+		t.Fatalf("start old owned child: %v", err)
+	}
+	t.Cleanup(func() { _ = oldChild.Process.Kill() }) // no Wait: the reaper owns it
+	rt.opencodeServeCmd = oldChild
+	oldGate := newOwnedExitGate()
+	rt.ocReapDone = oldGate.Done()
+	go reapOwnedOpenCode(oldChild, oldGate, rt.ocLife)
+	if err := waitForPort(port, 10*time.Second); err != nil {
+		t.Fatalf("old owned child never listened on %d: %v", port, err)
+	}
+	rt.ocLife.SetReady()
+
+	start := time.Now()
+	rt.opencodeMu.Lock()
+	err = rt.restartOpencode()
+	rt.opencodeMu.Unlock()
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("restartOpencode with a wedged old child: %v", err)
+	}
+	// Bounded, not merely eventual (generous CI ceiling; the unbounded
+	// predecessor never returned at all).
+	if elapsed > 15*time.Second {
+		t.Fatalf("restart took %v — the bounded stop did not bound it", elapsed)
+	}
+	// The wedged old child is DEAD — the SIGKILL escalation fired.
+	if !waitPidDead(oldChild.Process.Pid, 5*time.Second) {
+		t.Fatalf("wedged old child pid %d survived the restart — the SIGKILL escalation did not fire", oldChild.Process.Pid)
+	}
+	snap := rt.ocLife.Snapshot()
+	if snap.State != oclife.StateReady {
+		t.Fatalf("lifecycle state=%s, want ready", snap.State)
+	}
+	if code, body := ocGet(t, ts, "/oc/session"); code != 200 || body != "ok" {
+		t.Fatalf("post-restart /oc/session through the RUNNING server = %d/%q, want 200/ok from the replacement — the restart did not complete through the fresh child", code, body)
+	}
+	sc.waitAliveCount(".fake", 1, 5*time.Second)
+}

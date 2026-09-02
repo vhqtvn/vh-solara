@@ -7,6 +7,7 @@ import (
 	"net"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/oclife"
@@ -169,6 +170,77 @@ var ownedReadyWait = 30 * time.Second
 // reaper's post-startup crash handling. Package var so tests can shrink it.
 var ownedPortStabilize = 750 * time.Millisecond
 
+// ownedStopGrace bounds the SIGTERM grace window the owned stop path gives
+// the current child before escalating to SIGKILL. Package var so tests can
+// shrink it, mirroring ownedReadyWait.
+var ownedStopGrace = 10 * time.Second
+
+// ownedKillWait bounds the final wait on the child's exit oracle after the
+// SIGKILL escalation. Beyond it the child is treated as unkillable-in-band
+// and the restart fails closed (stopOwnedOpenCodeChild). Package var so
+// tests can shrink it.
+var ownedKillWait = 5 * time.Second
+
+// stopOwnedOpenCodeChild stops the PREVIOUS owned child before a replacement
+// is spawned: SIGTERM, then a bounded wait (ownedStopGrace) on the child's
+// exit oracle; on expiry, SIGKILL plus a second bounded wait (ownedKillWait).
+//
+// DEFECT this closes (the owned-lifecycle liveness residual, R11): both owned
+// restart arms used to wait FOREVER on the reap oracle while holding the
+// caller's opencodeMu — a SIGTERM-immune wedged child hung the restart
+// handler and, with it, every later opencodeMu holder.
+//
+// Fail-closed refusal: if the oracle is still open after the SIGKILL window,
+// the lifecycle records "old opencode did not exit after SIGKILL" and the
+// error is returned WITHOUT a respawn attempt (p1-oc-001: the worker keeps
+// serving; the caller's deferred opencodeMu release still runs — lock
+// release semantics are unchanged). The wedged child's own exit observer
+// keeps running, so a later death is still recorded.
+//
+// done is the child's exit oracle (an ownedExitGate Done() — closed once the
+// exit is fully recorded). done == nil with a live cmd is the
+// contract-violation defensive shape (local-server's historical fallback):
+// nobody else owns that child's Wait, so it is adapted into the same bounded
+// escalation via a synthetic oracle (the goroutine exits once the kernel
+// reaps the SIGKILLed child). cmd == nil means there is nothing to signal; a
+// non-nil done is still honored (the observer may exist even when the caller
+// lost the process handle).
+func stopOwnedOpenCodeChild(life *oclife.Lifecycle, cmd *exec.Cmd, done <-chan struct{}) error {
+	if done == nil {
+		if cmd == nil || cmd.Process == nil {
+			return nil
+		}
+		ch := make(chan struct{})
+		go func() {
+			_ = cmd.Wait()
+			close(ch)
+		}()
+		done = ch
+	}
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+	}
+	select {
+	case <-done:
+		return nil
+	case <-time.After(ownedStopGrace):
+		log.Printf("owned opencode stop: old child did not exit after SIGTERM within %v — escalating to SIGKILL", ownedStopGrace)
+	}
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Signal(syscall.SIGKILL)
+	}
+	select {
+	case <-done:
+		return nil
+	case <-time.After(ownedKillWait):
+		err := errors.New("old opencode did not exit after SIGKILL")
+		if life != nil {
+			life.SetFailed(err.Error(), nil)
+		}
+		return err
+	}
+}
+
 // ownedRestartConfig parameterizes one shared owned-restart run. Bin and
 // workspace resolution stay inside the caller's Spawn closure (they differ per
 // binary and per output-sink wiring), so the core holds only the outcome
@@ -233,8 +305,23 @@ func restartOwnedOpenCode(cfg ownedRestartConfig) ownedRestartResult {
 		fresh := freePort()
 		res2, _ := ownedRestartAttempt(cfg, fresh, "fresh")
 		if res2.Err != nil {
+			freshChildDied := errors.Is(res2.Err, errOwnedChildExited)
 			res2.Err = fmt.Errorf("opencode restart exhausted (stable port %d, then fresh port %d): %w", cfg.StablePort, fresh, res2.Err)
-			cfg.Life.SetFailed(res2.Err.Error(), nil)
+			if freshChildDied {
+				// The fresh-port child ALSO died pre-readiness: the reaper's
+				// record ("opencode serve exited with code N", with the exit
+				// payload) is the most specific final failure state available,
+				// so it STANDS — the same rationale as the attempt-level
+				// skip above (the observer already recorded the exit; the
+				// next lifecycle write belongs to the next attempt). Only
+				// the returned error and the log line carry the exhaustion
+				// wrap; the lifecycle keeps the reaper's diagnostic.
+			} else {
+				// Readiness timeout on the fresh port: nothing more specific
+				// was recorded, so the wrapped exhaustion error is the
+				// failure summary.
+				cfg.Life.SetFailed(res2.Err.Error(), nil)
+			}
 			log.Printf("owned opencode restart exhausted — worker stays up; opencode status=failed")
 		}
 		return res2

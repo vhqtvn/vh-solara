@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,6 +36,18 @@ func withOwnedReadyWait(t *testing.T, d time.Duration) {
 	old := ownedReadyWait
 	ownedReadyWait = d
 	t.Cleanup(func() { ownedReadyWait = old })
+}
+
+// withOwnedStopBounds shrinks the owned stop path's SIGTERM grace and
+// post-SIGKILL wait so the bounded-stop tests run in milliseconds (mirrors
+// withOwnedReadyWait). Safe only under package cmd's strict serial
+// discipline — no t.Parallel anywhere in the package (the same documented
+// discipline the ocSweepSignal seam relies on).
+func withOwnedStopBounds(t *testing.T, grace, kill time.Duration) {
+	t.Helper()
+	oldGrace, oldKill := ownedStopGrace, ownedKillWait
+	ownedStopGrace, ownedKillWait = grace, kill
+	t.Cleanup(func() { ownedStopGrace, ownedKillWait = oldGrace, oldKill })
 }
 
 // TestWaitForChildOwnedPortRequiresExitObserver — without an exit oracle,
@@ -143,6 +156,22 @@ func dyingSpawn(d time.Duration) func(int) (*exec.Cmd, *ownedExitGate, error) {
 	return func(port int) (*exec.Cmd, *ownedExitGate, error) {
 		gate := newOwnedExitGate()
 		time.AfterFunc(d, func() { gate.RecordExit(func() {}) })
+		return &exec.Cmd{}, gate, nil
+	}
+}
+
+// reapingDyingSpawn is dyingSpawn PLUS the real observer's lifecycle record:
+// the exit is recorded exactly as reapOwnedOpenCode would (SetFailed with
+// the exit-code detail and payload) before the oracle closes. Used where a
+// test asserts the FINAL failure summary — the reaper's record is what the
+// R1 exhaustion policy lets stand.
+func reapingDyingSpawn(life *oclife.Lifecycle, d time.Duration) func(int) (*exec.Cmd, *ownedExitGate, error) {
+	return func(port int) (*exec.Cmd, *ownedExitGate, error) {
+		gate := newOwnedExitGate()
+		time.AfterFunc(d, func() {
+			code := 1
+			gate.RecordExit(func() { life.SetFailed("opencode serve exited with code 1", &code) })
+		})
 		return &exec.Cmd{}, gate, nil
 	}
 }
@@ -283,7 +312,10 @@ func TestOwnedRestartCoreStableOccupiedGoesFreshWithoutSpawn(t *testing.T) {
 
 // TestOwnedRestartCoreExhaustionFailsClosed — when the fresh-port attempt's
 // child also exits before readiness, recovery is EXHAUSTED: error out, record
-// failed, publish no readiness, retarget nothing.
+// failed, publish no readiness, retarget nothing. The R1 extension: the FINAL
+// failure summary is the reaper's exit-code detail (the most specific
+// diagnostic available), NOT the exhaustion wrap — the wrap names the
+// bounded-retry policy, the reaper names WHY the child died.
 func TestOwnedRestartCoreExhaustionFailsClosed(t *testing.T) {
 	life := oclife.New(oclife.TopologyOwned)
 	oldURL := "http://127.0.0.1:1"
@@ -297,7 +329,7 @@ func TestOwnedRestartCoreExhaustionFailsClosed(t *testing.T) {
 		StablePort: stable,
 		Spawn: func(port int) (*exec.Cmd, *ownedExitGate, error) {
 			spawns++
-			return dyingSpawn(40 * time.Millisecond)(port)
+			return reapingDyingSpawn(life, 40*time.Millisecond)(port)
 		},
 	})
 	if res.Err == nil {
@@ -305,6 +337,11 @@ func TestOwnedRestartCoreExhaustionFailsClosed(t *testing.T) {
 	}
 	if !errors.Is(res.Err, errOwnedChildExited) {
 		t.Fatalf("err = %v, want errOwnedChildExited (wrapped)", res.Err)
+	}
+	// The RETURNED error still names the bounded policy (the 502 body the
+	// operator sees names exhaustion)…
+	if !strings.Contains(res.Err.Error(), "exhausted") {
+		t.Fatalf("err = %v, want the exhaustion wrap in the returned error", res.Err)
 	}
 	if spawns != 2 {
 		t.Fatalf("spawns = %d, want exactly 2 (stable + one fresh; recovery is bounded)", spawns)
@@ -316,8 +353,15 @@ func TestOwnedRestartCoreExhaustionFailsClosed(t *testing.T) {
 	if snap.State != oclife.StateFailed {
 		t.Fatalf("state = %s, want failed", snap.State)
 	}
-	if snap.FailureSummary == "" {
-		t.Fatal("exhaustion must record a failure summary")
+	// …but the LIFECYCLE keeps the reaper's exit-code detail — the exhaustion
+	// wrap must NOT overwrite it (R1: the diagnostic the operator needs is
+	// why the child died, not that recovery is bounded).
+	const reaperSummary = "opencode serve exited with code 1"
+	if snap.FailureSummary != reaperSummary {
+		t.Fatalf("failure summary = %q, want the reaper's exit-code detail %q — the exhaustion wrap overwrote the reaper's record", snap.FailureSummary, reaperSummary)
+	}
+	if snap.ExitCode == nil || *snap.ExitCode != 1 {
+		t.Fatalf("exit code = %v, want 1 (the reaper's exit payload must stand)", snap.ExitCode)
 	}
 }
 
@@ -583,5 +627,67 @@ func TestOwnedRestartAttemptBoundaryExitNeverPublishesReady(t *testing.T) {
 		if !errors.Is(res.Err, errOwnedChildExited) {
 			t.Fatalf("err = %v, want errOwnedChildExited (wrapped)", res.Err)
 		}
+	}
+}
+
+// --- R11: the bounded owned stop path (portable, channel-only unit tests;
+// the wedged-child behavioral cruxes with real processes live in the
+// linux-gated files) ---
+
+// TestStopOwnedChildPreClosedOracleReturnsFast — a child that already exited
+// (oracle closed) stops immediately: no grace is burned, no error.
+func TestStopOwnedChildPreClosedOracleReturnsFast(t *testing.T) {
+	gate := newOwnedExitGate()
+	gate.RecordExit(func() {})
+	life := oclife.New(oclife.TopologyOwned)
+	start := time.Now()
+	if err := stopOwnedOpenCodeChild(life, nil, gate.Done()); err != nil {
+		t.Fatalf("stop with a pre-closed oracle: %v", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("took %v — a pre-closed oracle must return immediately", d)
+	}
+}
+
+// TestStopOwnedChildNilCmdNilDoneIsNoOp — nothing to signal, nothing to
+// wait on: the historical no-previous-child shape must stay a no-op.
+func TestStopOwnedChildNilCmdNilDoneIsNoOp(t *testing.T) {
+	if err := stopOwnedOpenCodeChild(nil, nil, nil); err != nil {
+		t.Fatalf("nil cmd + nil done must be a no-op, got %v", err)
+	}
+}
+
+// TestStopOwnedChildRefusalFailsClosed — an oracle that NEVER closes (the
+// wedged-child shape, modeled with channels only): the stop must burn the
+// SIGTERM grace, escalate (nothing to signal with a nil cmd — the SIGKILL
+// branch is skipped, the wait is still bounded), then FAIL CLOSED — the
+// lifecycle records the refusal summary and the error carries it. This is
+// the liveness defect's unit signature: the call RETURNS within the bound
+// instead of waiting forever.
+func TestStopOwnedChildRefusalFailsClosed(t *testing.T) {
+	withOwnedStopBounds(t, 40*time.Millisecond, 60*time.Millisecond)
+	life := oclife.New(oclife.TopologyOwned)
+	never := make(chan struct{}) // never closed
+	start := time.Now()
+	err := stopOwnedOpenCodeChild(life, nil, never)
+	if err == nil {
+		t.Fatal("a never-closing oracle must fail the stop")
+	}
+	const want = "old opencode did not exit after SIGKILL"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("err = %v, want it to name the refusal (%q)", err, want)
+	}
+	if d := time.Since(start); d < 100*time.Millisecond {
+		t.Fatalf("returned after %v — the grace+kill bounds were not honored", d)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("took %v — the stop must be bounded", d)
+	}
+	snap := life.Snapshot()
+	if snap.State != oclife.StateFailed {
+		t.Fatalf("state = %s, want failed (fail-closed refusal records the lifecycle failure)", snap.State)
+	}
+	if snap.FailureSummary != want {
+		t.Fatalf("failure summary = %q, want %q", snap.FailureSummary, want)
 	}
 }

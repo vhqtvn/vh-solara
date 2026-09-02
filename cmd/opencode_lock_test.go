@@ -28,6 +28,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -107,7 +108,16 @@ func ocLockStarterHelper(t *testing.T) {
 //	                         window open; the crash barrier's wide window)
 //	VH_FAKE_OC_GRANDCHILD=1 — spawn `sleep 3000` inheriting fd 3 (the
 //	                         orphaned-owner holder)
+//	VH_FAKE_OC_IGNORE_SIGTERM=1 — install a SIGTERM ignore BEFORE anything
+//	                         else: the wedged-child shape for the R11
+//	                         bounded-stop cruxes (a child that will not die
+//	                         to the graceful stop signal). Default off.
 func ocLockFakeOCHelper(t *testing.T) {
+	// FIRST (wedged-child knob): the ignore must be installed before any
+	// later phase so a stop signal arriving mid-startup already finds it.
+	if os.Getenv("VH_FAKE_OC_IGNORE_SIGTERM") == "1" {
+		signal.Ignore(syscall.SIGTERM)
+	}
 	port := 0
 	for i, a := range os.Args {
 		if a == "--port" && i+1 < len(os.Args) {
@@ -128,6 +138,12 @@ func ocLockFakeOCHelper(t *testing.T) {
 	if diePort, err := strconv.Atoi(os.Getenv("VH_FAKE_OC_DIE_ON_PORT")); err == nil && diePort > 0 && diePort == port {
 		os.Exit(1)
 	}
+	// Startup banner (R5 crux enabler): real `opencode serve` prints output
+	// at startup; the fake mirrors it so the owned output fan-in (the
+	// lifecycle ring behind /vh/opencode/logs) has genuine child output to
+	// capture. It flows to whatever sinks the spawner wired — the daemon's
+	// inherited stdout plus, in the owned topology, the ring writer.
+	fmt.Printf("fake opencode serve up (pid %d, port %d)\n", os.Getpid(), port)
 	if os.Getenv("VH_FAKE_OC_GRANDCHILD") == "1" {
 		c := exec.Command("sleep", "3000") // inherits the non-CLOEXEC fd 3
 		if err := c.Start(); err == nil {
@@ -358,11 +374,30 @@ func killPid9(pid int) {
 // survived". The default is the real killPid9, so the registered cleanup
 // path is behavior-identical; this lives in test scaffolding only (no
 // production surface).
+//
+// SERIAL DISCIPLINE (P2-API-010 standing note, re-asserted because this
+// slice touched the file): the recording tests swap this package var and
+// restore it via t.Cleanup. That swap is safe ONLY while package cmd's
+// tests stay strictly serial — no t.Parallel anywhere in the package — so
+// no other test can read a half-swapped seam or interleave a registered
+// cleanup with the swap window. Do not introduce t.Parallel into this
+// package without first making the seam swap race-safe (e.g. a
+// mutex-guarded indirection). This is a documented serial-discipline
+// guarantee, NOT a race-safety claim about the var itself.
 var ocSweepSignal = killPid9
 
 // ocProcCmdlineArgs reads /proc/<pid>/cmdline as one space-separated
-// argument string ("" on any read failure — the same degradation
-// ocCmdlineMatches documents: a dying or zombie pid reads back empty).
+// argument string ("" on any read failure). DELIBERATELY NOT the degradation
+// ocCmdlineMatches documents — the polarities are INVERTED on purpose:
+// production ocCmdlineMatches FAILS OPEN on a read error (returns true —
+// "cannot verify" must never downgrade the never-spawn-while-alive gate to
+// a spawn beside a possibly-ours process), while this helper fails CLOSED
+// ("" ⇒ every sweep identity check fails ⇒ the candidate is never
+// signaled). Closed-before-SIGKILL is the right direction HERE because the
+// sweep's signal is irreversible: an unreadable (dying/zombie/recycled) pid
+// must be spared on the chance it is innocent, whereas the production
+// gate's open failure mode only risks NOT spawning — the recoverable,
+// split-brain-safe direction there.
 func ocProcCmdlineArgs(pid int) string {
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {

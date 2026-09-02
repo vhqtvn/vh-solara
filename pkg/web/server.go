@@ -83,7 +83,12 @@ type Server struct {
 	hostShellAtRoot bool
 	renderer        *render.Renderer
 
-	// Multi-project: one aggregator per directory, created lazily. "" → agg.
+	// Multi-project: one aggregator per directory, created lazily. Access
+	// for "" is special-cased OUTSIDE the map (aggFor/aggForExisting return
+	// agg directly), but NewServer ALSO seeds an aggs[""] entry pointing at
+	// that same default aggregator — it is LOAD-BEARING for
+	// RetargetOpenCode's map walk, which covers the default only through
+	// that entry (the walk never reads s.agg). Do not remove the seed.
 	opencodeURL string
 	ringCap     int
 	aggMu       sync.Mutex
@@ -619,6 +624,26 @@ func newOpenCodeProxy(target *url.URL) *httputil.ReverseProxy {
 //     the aggregator keeps its store/subscribers and its reconnect loop
 //     re-dials the new BaseURL per connection.
 //
+// NON-OBVIOUS INVARIANT — default-aggregator coverage (step 3): the default
+// aggregator is ACCESSED outside the map (aggFor("")/aggForExisting("")
+// return s.agg without consulting s.aggs), but its retarget coverage flows
+// ONLY through the `s.aggs[""]` entry NewServer seeds alongside s.agg —
+// the map walk below never looks at s.agg. Removing that seeded entry as
+// "redundant" would silently drop default coverage (a retargeted server
+// whose default aggregator keeps dialing the dead old port); conversely,
+// "simplifying" the accessors to map-only lookups would still work only
+// because the entry exists. The two designs are coupled on purpose; see
+// reload_test.go's `s.aggs[""] == s.agg` assertions, which pin the entry.
+//
+// LOOPBACK ASSUMPTION: baseURL is a same-host loopback target by
+// construction — both binaries spawn/attach `opencode serve --hostname
+// 127.0.0.1` and retarget only to a port they just spawned on or
+// re-derived from their own recorded state. RetargetOpenCode parses the URL
+// but does NOT validate reachability or host shape; nothing here enforces
+// loopback. A future remote-OpenCode feature that hands this a non-loopback
+// URL is knowingly breaking that assumption (aggregator reconnects and the
+// /oc proxy would dial off-host).
+//
 // Callers re-target BEFORE flipping any readiness signal (ocLife.SetReady):
 // an observer that acts on readiness must never see ready state served
 // through the old port. A same-URL call is a benign refresh. An unparseable
@@ -843,7 +868,9 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 // that must not have the side effect of opening a project (header stamping on an
 // arbitrary ?dir=) use this, so a benign GET can't launch a project's managed
 // processes or grow the aggregator map for an attacker-chosen directory. Returns
-// the default aggregator for "" (already running) and nil for an unopened dir.
+// the default aggregator for "" (already running, accessed via s.agg OUTSIDE
+// the map — see the aggs field note and RetargetOpenCode's coverage invariant)
+// and nil for an unopened dir.
 func (s *Server) aggForExisting(dir string) *aggregator.Aggregator {
 	if dir == "" {
 		return s.agg

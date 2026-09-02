@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
@@ -362,11 +361,23 @@ func (rt *clientDaemonRuntime) startDetachedOpenCode() {
 	rt.opencodePort, rt.opencodeURL, rt.opencodeServeCmd = ApplyDetachedOCStart(res, rt.ocLife, "Web mode: vh")
 }
 
-// restartOpencode SIGTERMs + reaps the current opencode and respawns it on the
-// same port; the aggregator's reconnect loop re-hydrates automatically. Caller
-// must hold rt.opencodeMu. It also drives the lifecycle state machine
-// (starting → ready | failed) so /vh/opencode/status reflects the restart
-// outcome.
+// restartOpencode stops the current opencode and respawns it through the
+// topology-appropriate path; the aggregator's reconnect loop re-hydrates
+// automatically. Caller must hold rt.opencodeMu. It also drives the lifecycle
+// state machine (starting → ready | failed) so /vh/opencode/status reflects
+// the restart outcome.
+//
+// Port policy per arm (R9: "respawns on the same port" was never true for
+// either arm — do not restate it):
+//   - owned: the stop path is BOUNDED (stopOwnedOpenCodeChild: SIGTERM grace
+//     → SIGKILL → fail-closed). The replacement PREFERS the stable port but
+//     only when verifiably free; a pre-readiness child exit (the lost bind
+//     race) earns exactly ONE fresh-port attempt, retargeted through
+//     applyFreshPortRetarget BEFORE readiness is published.
+//   - detached: the serialized restart re-checks the recorded port for a
+//     foreign listener after the owner-release wait (port parity with the
+//     boot path) and respawns on it when still free, else swaps to a fresh
+//     port with the same running-daemon retarget.
 func (rt *clientDaemonRuntime) restartOpencode() error {
 	if rt.external {
 		// We don't own the process; restart via the operator's command
@@ -419,21 +430,24 @@ func (rt *clientDaemonRuntime) restartOpencode() error {
 		return nil
 	}
 	// Owned (P1-API-005). The reaper goroutine is the SOLE Wait() caller, so
-	// stop the current child by signaling + waiting on its reaper-done
-	// channel (NOT a second Wait — that would race the reaper). Then the
-	// SHARED child-aware restart operation drives the replacement: readiness
+	// stop the current child through stopOwnedOpenCodeChild — signal + wait
+	// on its reaper-done channel (NOT a second Wait — that would race the
+	// reaper), BOUNDED: SIGTERM grace → SIGKILL → fail-closed (R11: a
+	// SIGTERM-immune child can no longer wedge this handler and every later
+	// opencodeMu holder). Then the SHARED child-aware restart operation
+	// drives the replacement: readiness
 	// is attributed to the replacement child itself — never to "something
 	// accepting connections" on the port — with one bounded fresh-port
 	// attempt, retargeted through the P1-API-003 seam BEFORE SetReady, when
 	// the stable port is occupied or the child loses the bind race, and
 	// fail-closed exhaustion (SetFailed + worker keeps serving).
 	rt.ocLife.SetStarting()
-	oldDone := rt.ocReapDone
-	if rt.opencodeServeCmd != nil && rt.opencodeServeCmd.Process != nil {
-		_ = rt.opencodeServeCmd.Process.Signal(syscall.SIGTERM)
-	}
-	if oldDone != nil {
-		<-oldDone // reaper has reaped the old child; safe to respawn
+	if err := stopOwnedOpenCodeChild(rt.ocLife, rt.opencodeServeCmd, rt.ocReapDone); err != nil {
+		// Fail-closed (R11): the old child could not be stopped in band —
+		// the helper already recorded SetFailed; the worker keeps serving
+		// (p1-oc-001) and nothing after this point may SetReady. The
+		// caller's deferred opencodeMu release still runs.
+		return err
 	}
 	res := restartOwnedOpenCode(ownedRestartConfig{
 		Life:       rt.ocLife,

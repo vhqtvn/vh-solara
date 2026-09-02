@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -109,7 +108,12 @@ with --opencode-url, or spawn a survivable detached instance with
 			// spawns beside a live, cmdline-matching instance; losers
 			// (Contended/OrphanedOwner) fail fast into a failed lifecycle while
 			// local-server keeps serving. This arm only wires the result.
-			res := EnsureDetachedOpenCode(localOpenCodeBin, cwd)
+			// Ring fan-in parity (R5): fan the detached child's output into
+			// the lifecycle ring alongside the per-project disk log, exactly
+			// as client-daemon's detached arm does — /vh/opencode/logs must
+			// serve a bounded tail for THIS topology too, not just advertise
+			// HasLogTail: true.
+			res := EnsureDetachedOpenCode(localOpenCodeBin, cwd, ocLife.Ring().Writer())
 			opencodePort, opencodeURL, opencodeServeCmd = ApplyDetachedOCStart(res, ocLife, "local-server")
 
 		default:
@@ -226,26 +230,24 @@ with --opencode-url, or spawn a survivable detached instance with
 			// p1-oc-001).
 			//
 			// OWNERSHIP: local-server keeps DIRECT wait ownership — no
-			// sole-reaper subsystem. Its existing wait is adapted into the exit
-			// oracle the core requires: the Spawn closure starts one
-			// reapOwnedOpenCode observer per replacement child (that adapter's
-			// ordering invariant — lifecycle state-set BEFORE the oracle closes —
-			// is pinned by TestReapOwnedOpenCode*), and the stop path below
-			// awaits that oracle instead of a second racing Wait. The core itself
-			// never Wait()s the child.
+			// sole-reaper subsystem. Its existing wait is adapted into the
+			// exit oracle the core requires: the Spawn closure starts one
+			// reapOwnedOpenCode observer per replacement child (that
+			// adapter's ordering invariant — lifecycle state-set BEFORE the
+			// oracle closes — is pinned by TestReapOwnedOpenCode*), and the
+			// stop path below awaits that oracle instead of a second racing
+			// Wait — BOUNDED (stopOwnedOpenCodeChild: SIGTERM grace →
+			// SIGKILL → fail-closed, R11; the historical defensive
+			// no-oracle Wait folds into the same bounded escalation). The
+			// core itself never Wait()s the child.
 			ocLife.SetStarting()
-			if opencodeServeCmd != nil && opencodeServeCmd.Process != nil {
-				_ = opencodeServeCmd.Process.Signal(syscall.SIGTERM)
-			}
-			if opencodeReapDone != nil {
-				<-opencodeReapDone // observer has reaped + recorded the old child
-			} else if opencodeServeCmd != nil && opencodeServeCmd.Process != nil {
-				// Defensive fallback only: since the A2 boot parity every
-				// owned child (boot and restart alike) carries an observer,
-				// so this direct Wait covers just a spawn that returned a
-				// child without an oracle (a contract-violation shape) —
-				// nobody else is waiting on it.
-				_ = opencodeServeCmd.Wait()
+			if err := stopOwnedOpenCodeChild(ocLife, opencodeServeCmd, opencodeReapDone); err != nil {
+				// Fail-closed (R11): the wedged old child could not be
+				// stopped in band — the helper already recorded SetFailed;
+				// local-server keeps serving (p1-oc-001) and nothing after
+				// this point may SetReady. The caller's deferred opencodeMu
+				// release still runs.
+				return err
 			}
 			res := restartOwnedOpenCode(ownedRestartConfig{
 				Life:       ocLife,
@@ -258,7 +260,10 @@ with --opencode-url, or spawn a survivable detached instance with
 				// gate replaces the raw channel; same observer, same
 				// ordering, now synchronized with the publication boundary).
 				Spawn: func(port int) (*exec.Cmd, *ownedExitGate, error) {
-					c, err := startOpenCodeServe(localOpenCodeBin, port, cwd)
+					// Ring fan-in (R5): mirror the replacement child's
+					// output into the lifecycle ring alongside the daemon's
+					// stdout — the same sink client-daemon's owned arms wire.
+					c, err := startOpenCodeServe(localOpenCodeBin, port, cwd, ocLife.Ring().Writer())
 					if err != nil {
 						return nil, nil, err
 					}
@@ -427,7 +432,10 @@ func startLocalOwnedOpenCode(bin, cwd string, life *oclife.Lifecycle, candidate 
 		// adapter the restart arm uses): spawn ONE child per attempt and
 		// hand the core its exit gate. The core never Wait()s the child.
 		Spawn: func(port int) (*exec.Cmd, *ownedExitGate, error) {
-			c, err := startOpenCodeServe(bin, port, cwd)
+			// Ring fan-in (R5): the boot child's output lands in the
+			// lifecycle ring alongside the daemon's stdout, mirroring
+			// client-daemon's owned boot arm (startOpenCodeServe's extraW).
+			c, err := startOpenCodeServe(bin, port, cwd, life.Ring().Writer())
 			if err != nil {
 				return nil, nil, err
 			}
