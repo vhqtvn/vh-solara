@@ -27,7 +27,8 @@
 //
 // EVENT KINDS (see layoutPersistence.ts for the emitters):
 //   read    — module-init blob read: source actually used (hash|v3|v2|none),
-//             workspace count, origin, href prefix, standalone display mode,
+//             workspace count, origin, href prefix (the INCOMING url, captured
+//             before any boot-time heal rewrites it), standalone display mode,
 //             and the diag schema version stamp (`diagv`). Catches
 //             origin/start_url divergence: a DIFFERENT origin has DIFFERENT
 //             localStorage. The `diagv` stamp is the DEVICE-CODE FINGERPRINT:
@@ -35,6 +36,11 @@
 //             device is running a stale host bundle (round-3 finding: the
 //             operator's ring contained a seed event HEAD code cannot emit,
 //             so the deployed bundle's seed path diverged from the source).
+//             ROUND 3 (stale-frozen-hash): additionally `pick` (hash|ls|
+//             ls-sole|hash-sole|none — which candidate the COMPARATIVE read
+//             chose), `hashSeq`/`lsSeq` (the candidates' write timestamps,
+//             null when absent), and `healed` (the boot URL heal fired) — the
+//             hash-vs-mirror comparison, verbatim, in the paste.
 //   seed    — the default workspace was seeded (the reset symptom's fingerprint:
 //             a relaunch that re-seeded when it should have restored). Carries
 //             what the init read found (readSource/initWs) plus `blobPrefix` —
@@ -66,8 +72,9 @@ export const DIAG_STORAGE_KEY = "vh-host:layout:diag";
 /** Diag schema version — stamped on every `read` event. Bump when the event
  *  vocabulary changes. A paste whose read events carry an older/absent stamp
  *  proves the device runs a stale host bundle (the round-3 stale-bundle
- *  finding made this stamp load-bearing). */
-export const DIAG_VERSION = 2;
+ *  finding made this stamp load-bearing). v3 = the round-3 read fields
+ *  (pick/hashSeq/lsSeq/healed — the comparative hash-vs-mirror read). */
+export const DIAG_VERSION = 3;
 
 /** Ring cap: keep the LAST N events (drop oldest). */
 export const DIAG_RING_CAP = 30;

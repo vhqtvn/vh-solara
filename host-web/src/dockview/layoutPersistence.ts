@@ -48,6 +48,8 @@ import { DIAG_VERSION, recordLayoutDiag } from "./layoutDiag";
 //
 //   {
 //     v: 3,                        // schema marker (v2 blobs lack it → migrate)
+//     seq: number,                 // WRITE TIMESTAMP (additive, 2026-09-02; see
+//                                  // PersistedState.seq + readBlobWithSource)
 //     activeWorkspaceId: string,
 //     workspaces: Array<{
 //       id: string,
@@ -102,6 +104,26 @@ const LEGACY_V2_STORAGE_KEY = "vh-host:layout:v2";
  *  below (2026-08-31 hardening). */
 const SAVE_DEBOUNCE_MS = 450;
 
+/** The window within which a NEWER localStorage seq does NOT yet beat the URL
+ *  hash (see readBlobWithSource's comparative rule). Why not "any newer LS
+ *  wins": the hash exists for BROWSER per-tab independence — two same-origin
+ *  tabs each carry their own #state=, and a sibling tab's localStorage write
+ *  is routinely a few seconds newer than THIS tab's own frozen-by-inactivity
+ *  hash; the tab must still restore its OWN state (pinned by the route-state
+ *  two-tab e2e). An Android PWA relaunch replays a launcher-frozen URL whose
+ *  hash is not seconds but HOURS/DAYS old (install-era relic, per the
+ *  operator's diag ring) — decisively beyond any sibling-tab cadence. 30s
+ *  sits between those worlds with orders of magnitude of margin on both
+ *  sides; within the window the hash keeps HEAD's hash-first semantics. */
+const STALE_HASH_WINDOW_MS = 30_000;
+
+/** Top-URL query keys that are SPA route vocabulary leaked onto the HOST url
+ *  (install-era artifacts: `?dir=…&session=…`). The HOST never reads them (its
+ *  only query vocabulary is `?proto=` for the web+vhsolara protocol handler,
+ *  which MUST survive); strip exactly these keys at boot — see
+ *  stripLeakedSpaParams / applyBootUrlHygiene. */
+const LEAKED_SPA_PARAM_KEYS = new Set(["dir", "session"]);
+
 // ---- persisted-state shape -------------------------------------------------
 
 /** Schema marker. v3 = fractional grid trees (written since the split-offset
@@ -117,6 +139,18 @@ export interface PersistedWorkspace extends WorkspaceSetEntry {
 }
 export interface PersistedState {
   v?: PersistedStateVersion;
+  /** WRITE TIMESTAMP (Date.now at save; additive 2026-09-02, schema stays v3).
+   *  Every persisted write stamps the moment it was serialized; the two mirrors
+   *  of one flushSave share a json and therefore a seq, while a mirror-only
+   *  microtask write stamps its own (newer) moment. The COMPARATIVE init read
+   *  (readBlobWithSource) compares seqs to defuse a launcher-frozen stale
+   *  #state= hash on a PWA relaunch. Absent = 0 — seq-less (pre-seq) blobs
+   *  validate unchanged and lose to any seq-stamped candidate (the legacy hash
+   *  is by definition older, so a fresh seq-stamped localStorage blob beating
+   *  it is the desired migration outcome). Wall-clock comparison is SAME-DEVICE
+   *  only — one browser profile / one PWA — which is the only comparison that
+   *  ever happens (both candidates are read from the same origin's storage). */
+  seq?: number;
   activeWorkspaceId: string;
   workspaces: PersistedWorkspace[];
 }
@@ -150,6 +184,17 @@ let serializeAllFn: (() => PersistedState | null) | null = null;
 // (a different origin has different localStorage).
 export type BlobReadSource = "hash" | "v3" | "v2" | "none";
 
+/** Which candidate the COMPARATIVE init read chose (diag round 3 — the
+ *  stale-frozen-hash fingerprint):
+ *   hash      — both candidates valid; the hash won (its seq ≥ LS seq, or the
+ *               LS lead is inside STALE_HASH_WINDOW_MS — sibling-tab cadence)
+ *   ls        — both valid; localStorage won DECISIVELY (newer by more than
+ *               the window — the launcher-frozen relic shape)
+ *   ls-sole   — only the localStorage candidate was valid (no usable hash)
+ *   hash-sole — only the hash candidate was valid
+ *   none      — no valid candidate anywhere (seed). */
+export type BlobPick = "hash" | "ls" | "ls-sole" | "hash-sole" | "none";
+
 /** Cap on the seed event's blob content fingerprint (see readBlobWithSource).
  *  DECLARED ABOVE the init-time `readBlobWithSource()` call: the read helpers
  *  reference it while `const initRead = …` executes at module init, so a
@@ -165,8 +210,24 @@ const initRead: {
    *  shape — carried on `seed` events so the next operator paste shows WHAT
    *  was incoming, not just that N bytes existed). */
   rawPrefix: string;
+  pick: BlobPick;
+  /** The two candidates' seq values AS WRITTEN (null when the candidate is
+   *  absent/invalid or its blob predates the seq field) — the comparison,
+   *  verbatim, for the diag ring. */
+  hashSeq: number | null;
+  lsSeq: number | null;
 } = readBlobWithSource();
 const initBlob: PersistedState | null = initRead.state;
+// Capture the INCOMING href BEFORE the boot-time URL heal rewrites it — the
+// read event must fingerprint the URL the launcher actually delivered (the
+// frozen relic + its leaked query params), not our own correction.
+const initHref = safeLocationField((l) => l.href.slice(0, 120));
+// Boot-time URL hygiene (at most ONE replaceState): heal a #state= hash that
+// lost the comparative read to a fresher localStorage blob, and strip leaked
+// SPA route params (dir/session) from the top URL. Cheap, sync, safe
+// (replaceState fires no hashchange → no re-render). Returns whether the HASH
+// was healed (the diag `healed` field). See applyBootUrlHygiene.
+const initHealed = applyBootUrlHygiene(initRead);
 recordLayoutDiag("read", () => ({
   // diagv = the DEVICE-CODE FINGERPRINT (round 3): a paste whose read events
   // lack the current stamp proves the device runs a stale host bundle whose
@@ -175,11 +236,21 @@ recordLayoutDiag("read", () => ({
   source: initRead.source,
   ws: initBlob ? initBlob.workspaces.length : 0,
   origin: safeLocationField((l) => l.origin),
-  href: safeLocationField((l) => l.href.slice(0, 120)),
+  href: initHref,
   standalone:
     typeof window !== "undefined" && typeof window.matchMedia === "function"
       ? window.matchMedia("(display-mode: standalone)").matches
       : false,
+  // ROUND 3 (stale-frozen-hash diagnosis): the comparative read, verbatim —
+  // which candidate won (`pick`), both candidates' write timestamps
+  // (`hashSeq`/`lsSeq`, null when absent), and whether the boot URL was
+  // healed. A relaunch now shows its read shape directly, e.g.
+  //   pick=ls lsSeq≫hashSeq healed=true → the relic was defused (fixed path)
+  //   pick=hash hashSeq≫lsSeq           → a NEWER frozen hash won (regression)
+  pick: initRead.pick,
+  hashSeq: initRead.hashSeq,
+  lsSeq: initRead.lsSeq,
+  healed: initHealed,
 }));
 
 /** Read a location field with a browser-guard (SSR/no-window safety). */
@@ -189,6 +260,92 @@ function safeLocationField(read: (l: Location) => string): string {
     return read(window.location);
   } catch {
     return "";
+  }
+}
+
+// ---- boot-time URL hygiene (heal + leaked-param strip) -----------------------
+// The Android launcher replays a FROZEN task URL (captured around install
+// time): it carries a stale #state= relic and — because the install-era SPA
+// leaked its route vocabulary onto the top URL — ?dir=…&session=… params the
+// HOST never reads. The comparative read already defuses the stale CONTENT;
+// these two one-shot corrections fix the URL itself, at module init, so the
+// FIRST correct relaunch rewrites the launcher's snapshot and subsequent
+// launches carry the fresh URL:
+//   1. HASH HEAL: when localStorage decisively won the comparative read while
+//      a #state= hash was present, rewrite the hash to the chosen (LS) state
+//      re-encoded — the frozen relic dies on the spot instead of surviving
+//      every relaunch.
+//   2. PARAM STRIP: remove exactly the leaked `dir`/`session` keys from
+//      location.search, preserving the pathname, every OTHER param byte-
+//      identically (NOTABLY `?proto=` — the web+vhsolara protocol handler),
+//      and the (possibly healed) hash.
+// Both run in ONE history.replaceState when both apply (no double history
+// write at boot). replaceState only — no navigation, no hashchange, no
+// history entry. Never throws; browser-guarded like writeHashState.
+
+/** The seq value used for COMPARISON: absent/invalid = 0 (a seq-less blob is
+ *  by definition from before seq existed — i.e., older than any seq-stamped
+ *  write). */
+function seqValue(state: PersistedState | null): number {
+  if (state === null || typeof state.seq !== "number" || !Number.isFinite(state.seq)) {
+    return 0;
+  }
+  return state.seq;
+}
+
+/** The seq value as reported to the DIAG ring: null when absent (so a paste
+ *  distinguishes "no seq field" from "seq 0"). */
+function seqOrNull(state: PersistedState | null): number | null {
+  if (state === null || typeof state.seq !== "number" || !Number.isFinite(state.seq)) {
+    return null;
+  }
+  return state.seq;
+}
+
+/** Remove exactly the leaked SPA route params (`dir`, `session`) from a search
+ *  string. Returns the cleaned search ("?"-prefixed, or "" when nothing
+ *  survives), or null when nothing needs stripping (no rewrite). Splits on
+ *  "&" and matches the RAW key token (before "=") so every OTHER param stays
+ *  byte-identical — no URLSearchParams re-encoding round-trip. */
+function stripLeakedSpaParams(search: string): string | null {
+  if (!search) return null;
+  const parts = search.slice(1).split("&");
+  const kept = parts.filter((kv) => !LEAKED_SPA_PARAM_KEYS.has(kv.split("=")[0]));
+  if (kept.length === parts.length) return null; // nothing leaked — no rewrite
+  return kept.length > 0 ? `?${kept.join("&")}` : "";
+}
+
+/** One-shot boot URL correction (see the hygiene block above). Heals the hash
+ *  only when one was PRESENT and localStorage won the comparative read (pick
+ *  "ls" — decisively newer — or "ls-sole" — the present hash was invalid);
+ *  strips leaked dir/session params whenever they are on the top URL. Returns
+ *  whether the hash was healed. Never throws. */
+function applyBootUrlHygiene(read: {
+  state: PersistedState | null;
+  pick: BlobPick;
+}): boolean {
+  if (
+    typeof window === "undefined" ||
+    typeof window.location === "undefined" ||
+    typeof window.history === "undefined"
+  ) {
+    return false;
+  }
+  try {
+    const loc = window.location;
+    const hashPresent = loc.hash.startsWith("#state=");
+    const lsWon = read.pick === "ls" || read.pick === "ls-sole";
+    const healJson =
+      hashPresent && lsWon && read.state !== null ? JSON.stringify(read.state) : null;
+    const cleanSearch = stripLeakedSpaParams(loc.search);
+    if (healJson === null && cleanSearch === null) return false; // nothing to do
+    const search = cleanSearch !== null ? cleanSearch : loc.search;
+    const hash = healJson !== null ? `#state=${encodeURIComponent(healJson)}` : loc.hash;
+    window.history.replaceState(null, "", loc.pathname + search + hash);
+    return healJson !== null;
+  } catch {
+    // replaceState can throw on exotic URLs — never break boot over hygiene.
+    return false;
   }
 }
 
@@ -467,6 +624,13 @@ function writeLocalStorageMirror(json: string | null): void {
 function fractionizePersistedState(state: PersistedState): PersistedState {
   return {
     v: 3,
+    // saveSeq: stamp EVERY persisted write with its wall-clock moment (the
+    // single serialization feeds BOTH mirrors of a flushSave, so they share
+    // this seq; a mirror-only microtask write stamps its own, newer moment —
+    // its state IS newer than the still-debounced hash until the next flush
+    // rewrites both). The comparative init read (readBlobWithSource) compares
+    // these stamps to defuse a launcher-frozen stale #state= hash.
+    seq: Date.now(),
     activeWorkspaceId: state.activeWorkspaceId,
     workspaces: state.workspaces.map((ws) => ({
       ...ws,
@@ -884,34 +1048,110 @@ function maxPaneSeqSuffix(ids: Iterable<string>): number {
  *  source produced it (for the diag `read` event). Called ONCE at module init.
  *  Never throws.
  *
- *  Fork 1 — HYBRID URL state: the URL hash is the source of truth for PER-TAB
- *  state (two same-origin tabs stay independent — each carries its own
- *  `#state=` hash). localStorage is the write-through mirror so a bare `/`
- *  reopen inherits the last-saved state. Read the hash FIRST; if absent or
- *  invalid, fall back to the v3 localStorage key, then to the LEGACY v2 key
- *  (px blob — migrated losslessly to fractions in-memory; never re-seeds).
- *  This per-tab independence is the whole point of the hash: localStorage is
- *  shared across tabs, so two tabs at `/` would otherwise clobber each
- *  other. The read ORDER is unchanged (hash → v3 → v2 → none); the source
- *  label simply records which fork won. */
+ *  Fork 1 — HYBRID URL state, COMPARATIVE read (2026-09-02, the stale-frozen-
+ *  hash fix): the URL hash remains the source of truth for PER-TAB state (two
+ *  same-origin tabs stay independent — each carries its own `#state=` hash);
+ *  localStorage remains the write-through mirror a bare `/` reopen inherits.
+ *  But the read is no longer "hash first, unconditional": both candidates are
+ *  read, and the winner is chosen by `seq` (the wall-clock write timestamp
+ *  every save stamps on BOTH mirrors):
+ *
+ *    • only one valid          → it ("hash-sole" / "ls-sole")
+ *    • hash seq ≥ LS seq       → hash ("hash" — includes the tie: a tab
+ *                                reloaded right after its own flush finds its
+ *                                own state either way, so the hash wins)
+ *    • LS newer BEYOND the
+ *      STALE_HASH_WINDOW_MS    → localStorage ("ls" — decisively newer)
+ *    • LS newer but WITHIN the
+ *      window                  → hash (sibling-tab cadence: another tab's
+ *                                mirror write is routinely a few seconds newer
+ *                                than THIS tab's own inactive hash; per-tab
+ *                                independence — the hash's whole point — holds)
+ *
+ *  WHY THE TIMESTAMP COMPARISON (the load-bearing rationale): an Android PWA
+ *  relaunch does NOT open the clean start_url — the launcher replays a FROZEN
+ *  task URL captured around install time, carrying a #state= relic that is
+ *  arbitrarily OLD (the operator's diag ring: a 1-workspace install-era hash
+ *  beating the fresh 4-workspace localStorage blob, then the booted app saving
+ *  the stale restore over localStorage — the clobber). Hash-first-unconditional
+ *  made that relic win EVERY relaunch forever. The seq comparison defuses
+ *  exactly that: the relic's seq is hours/days behind the mirror, so the
+ *  mirror wins decisively, and applyBootUrlHygiene then REWRITES the frozen
+ *  URL so subsequent launches carry the fresh hash. seq is a wall-clock write
+ *  timestamp; the comparison is SAME-DEVICE only (one browser profile / one
+ *  PWA) — the only comparison that ever happens, since both candidates come
+ *  from the same origin's storage in one read.
+ *
+ *  MIGRATION: seq-less (pre-seq) blobs = seq 0 — they validate unchanged, and
+ *  any seq-stamped localStorage blob beats a seq-less (legacy) hash, which is
+ *  desired (the legacy hash is by definition older). */
 function readBlobWithSource(): {
   state: PersistedState | null;
   source: BlobReadSource;
   rawPrefix: string;
+  pick: BlobPick;
+  hashSeq: number | null;
+  lsSeq: number | null;
 } {
   const fromHash = readHashState();
-  if (fromHash.state !== null) {
-    return { state: fromHash.state, source: "hash", rawPrefix: fromHash.rawPrefix };
-  }
   const v3 = readLocalStorageState(LAYOUT_STORAGE_KEY);
-  if (v3.state !== null) return { state: v3.state, source: "v3", rawPrefix: v3.rawPrefix };
-  const v2 = readLocalStorageState(LEGACY_V2_STORAGE_KEY);
-  if (v2.state !== null) return { state: v2.state, source: "v2", rawPrefix: v2.rawPrefix };
+  const v2 = v3.state !== null ? null : readLocalStorageState(LEGACY_V2_STORAGE_KEY);
+  const ls = v3.state !== null ? v3 : v2; // the winning localStorage candidate
+  const hashValid = fromHash.state !== null;
+  const lsValid = ls !== null && ls.state !== null;
+
+  if (hashValid && lsValid) {
+    const hashSeqNum = seqValue(fromHash.state);
+    const lsSeqNum = seqValue(ls!.state);
+    const lsSource: BlobReadSource = ls === v3 ? "v3" : "v2";
+    if (lsSeqNum > hashSeqNum && lsSeqNum - hashSeqNum >= STALE_HASH_WINDOW_MS) {
+      // The launcher-frozen relic shape: the mirror is decisively newer.
+      return {
+        state: ls!.state,
+        source: lsSource,
+        rawPrefix: ls!.rawPrefix,
+        pick: "ls",
+        hashSeq: seqOrNull(fromHash.state),
+        lsSeq: seqOrNull(ls!.state),
+      };
+    }
+    // Tie or hash-newer — and ALSO the within-window sibling-tab case: keep
+    // HEAD's hash-first semantics there (see the comparative table above).
+    return {
+      state: fromHash.state,
+      source: "hash",
+      rawPrefix: fromHash.rawPrefix,
+      pick: "hash",
+      hashSeq: seqOrNull(fromHash.state),
+      lsSeq: seqOrNull(ls!.state),
+    };
+  }
+  if (hashValid) {
+    return {
+      state: fromHash.state,
+      source: "hash",
+      rawPrefix: fromHash.rawPrefix,
+      pick: "hash-sole",
+      hashSeq: seqOrNull(fromHash.state),
+      lsSeq: null,
+    };
+  }
+  if (lsValid) {
+    return {
+      state: ls!.state,
+      source: ls === v3 ? "v3" : "v2",
+      rawPrefix: ls!.rawPrefix,
+      pick: "ls-sole",
+      hashSeq: null,
+      lsSeq: seqOrNull(ls!.state),
+    };
+  }
   // No VALID blob anywhere. Carry the last non-empty fingerprint (a corrupt
   // v3/v2 string) so a seed event post-mortem shows the operator their own
   // corrupted bytes instead of an empty string.
-  const corruptPrefix = v2.rawPrefix || v3.rawPrefix || fromHash.rawPrefix;
-  return { state: null, source: "none", rawPrefix: corruptPrefix };
+  const corruptPrefix =
+    (v2 ? v2.rawPrefix : "") || v3.rawPrefix || fromHash.rawPrefix;
+  return { state: null, source: "none", rawPrefix: corruptPrefix, pick: "none", hashSeq: null, lsSeq: null };
 }
 
 /**
@@ -1016,10 +1256,17 @@ function validatePersistedState(v: unknown): PersistedState | null {
   // would activate a ghost. Drop the whole blob (fall back to seed) on mismatch
   // — a clean, conservative recovery.
   if (!workspaces.some((w) => w.id === o.activeWorkspaceId)) return null;
+  // Carry the WRITE TIMESTAMP through validation when present + finite (the
+  // comparative read compares it; absent = seq-less = 0 — see PersistedState.seq).
+  const seq =
+    typeof o.seq === "number" && Number.isFinite(o.seq) ? { seq: o.seq } : {};
   // v3 fractional already; anything else (v2 px, marker-less) → migrate.
-  if (o.v === 3) return { v: 3, activeWorkspaceId: o.activeWorkspaceId, workspaces };
+  if (o.v === 3) {
+    return { v: 3, ...seq, activeWorkspaceId: o.activeWorkspaceId, workspaces };
+  }
   return {
     v: 3,
+    ...seq,
     activeWorkspaceId: o.activeWorkspaceId,
     workspaces: workspaces.map((ws) => ({
       ...ws,

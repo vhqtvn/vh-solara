@@ -95,6 +95,133 @@ async function persistedHasWorkspace(
   return name === undefined || ws.name === name;
 }
 
+// ---- stale-frozen-hash (round 3) helpers -------------------------------------
+
+/** Loose parsed-blob shape for the comparative-read tests below. */
+type Blob = Record<string, unknown> & {
+  seq?: number;
+  workspaces?: Array<{ id: string; name?: string; layout?: unknown }>;
+};
+
+function blobWsIds(p: unknown): string[] {
+  if (typeof p !== "object" || p === null) return [];
+  return ((p as Blob).workspaces ?? []).map((w) => w.id);
+}
+
+/** Wait until BOTH mirrors carry the SAME blob (hash json === localStorage
+ *  string — the last flushSave wrote them together, so their seq matches too)
+ *  AND it satisfies `accept` AND has been byte-stable ≥700ms (> the 450ms hash
+ *  debounce + margin — the same quiescence discipline as util's
+ *  waitForQuiescentHash, tightened to "mirrors identical" because the
+ *  comparative read compares the TWO mirrors, not just the hash). */
+async function settleBothMirrors(
+  page: Page,
+  accept: (p: unknown) => boolean,
+  what: string,
+  timeoutMs = 10000,
+): Promise<Blob> {
+  const deadline = Date.now() + timeoutMs;
+  let stableRaw: string | null = null;
+  let stableSince = 0;
+  while (Date.now() < deadline) {
+    const raws = await page.evaluate(
+      (key) => ({
+        ls: localStorage.getItem(key),
+        hash: window.location.hash.startsWith("#state=")
+          ? decodeURIComponent(window.location.hash.slice("#state=".length))
+          : null,
+      }),
+      H.LAYOUT_STORAGE_KEY,
+    );
+    let ok = false;
+    let parsed: unknown = null;
+    if (raws.ls && raws.hash === raws.ls) {
+      try {
+        parsed = JSON.parse(raws.ls);
+        ok = accept(parsed);
+      } catch {
+        ok = false;
+      }
+    }
+    if (ok && raws.ls === stableRaw) {
+      if (Date.now() - stableSince >= 700) return parsed as Blob;
+    } else if (ok) {
+      stableRaw = raws.ls;
+      stableSince = Date.now();
+    } else {
+      stableRaw = null;
+    }
+    await page.waitForTimeout(80);
+  }
+  throw new Error(`${what} never settled (hash === LS, stable) within ${timeoutMs}ms`);
+}
+
+/** A hand-written install-era RELIC blob for the URL hash: ONE workspace, one
+ *  pane at a valid mock url, seq `seq` (null = a pre-seq seq-less blob — the
+ *  legacy migration case). Shaped like the operator's frozen launcher URL. */
+function relicHashJson(seq: number | null, paneUrl: string): string {
+  return JSON.stringify({
+    v: 3,
+    ...(seq !== null ? { seq } : {}),
+    activeWorkspaceId: "ws-relic",
+    workspaces: [
+      {
+        id: "ws-relic",
+        name: "Install Relic",
+        layout: {
+          grid: {
+            root: {
+              type: "branch",
+              data: [
+                {
+                  type: "leaf",
+                  fraction: 1,
+                  data: { id: "g-relic", views: ["pane-relic"], activeView: "pane-relic" },
+                },
+              ],
+            },
+            width: 1024,
+            height: 768,
+            orientation: "HORIZONTAL",
+          },
+          panels: {
+            "pane-relic": { id: "pane-relic", params: { url: paneUrl, label: "relic" } },
+          },
+          activeGroup: "g-relic",
+        },
+      },
+    ],
+  });
+}
+
+/** Clone a settled blob, ADD an empty workspace `extraId`, and re-stamp `seq`
+ *  — the "this tab's own later flush" hash used by the hash-newer/tie tests
+ *  (its extra workspace proves WHICH candidate won the comparative read). */
+function hashVariantWithExtraWs(base: Blob, extraId: string, seq: number): string {
+  const parsed = JSON.parse(JSON.stringify(base)) as Blob;
+  parsed.seq = seq;
+  parsed.workspaces = [...(parsed.workspaces ?? []), { id: extraId, name: "Hash WS", layout: null }];
+  return JSON.stringify(parsed);
+}
+
+/** Relaunch the page carrying `hashJson` on the URL (a real navigation — via
+ *  about:blank — so the hash is present at module init, exactly the frozen
+ *  launcher-replay posture), then wait for the app to come up. */
+async function relaunchWithHash(page: Page, hashJson: string): Promise<void> {
+  await page.goto("about:blank");
+  await page.goto("/#state=" + encodeURIComponent(hashJson));
+  await expect.poll(async () => H.connected(page), { timeout: 20000 }).toBe(true);
+}
+
+/** The LAST diag event of `kind` (the ring persists across sessions — anchor
+ *  "no X since the read" assertions on the read's own timestamp). */
+function lastDiag(events: H.DiagEvent[], kind: string): H.DiagEvent | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i].kind === kind) return events[i];
+  }
+  return null;
+}
+
 test.describe("PWA kill/relaunch persistence", () => {
   test("CRUX A (strongest): instant kill, NO hide grace — mutate → kill immediately → restored", async ({
     page,
@@ -442,6 +569,223 @@ test.describe("PWA kill/relaunch persistence", () => {
   });
 });
 
+test.describe("stale frozen #state= hash vs fresh localStorage (comparative read, round 3)", () => {
+  // ROOT CAUSE (operator diag ring, proven): Android's launcher replays a
+  // FROZEN install-time task URL — a stale #state= relic (1 workspace) plus
+  // leaked SPA params (?dir=…&session=…) on the top URL. Hash-first-
+  // unconditional read made the relic beat the fresh localStorage blob every
+  // relaunch, and the booted app then SAVED the stale restore back over
+  // localStorage (the clobber). The comparative read (seq = write timestamp,
+  // newest decisively wins) + the boot-time hash heal + param strip defuse it.
+
+  test("CRUX C (the operator's exact shape): ancient hash relic vs fresh 4-ws LS → LS restores, no seed, LS not regressed, hash HEALED", async ({
+    page,
+  }) => {
+    // ---- Session A: build the FRESH state (the operator's ws-2..5 shape).
+    await H.loadHost(page);
+    const ws1 = (await H.workspaces(page))[0];
+    const ws2 = await H.addWorkspace(page, "Fresh WS 2");
+    const ws3 = await H.addWorkspace(page, "Fresh WS 3");
+    const ws4 = await H.addWorkspace(page, "Fresh WS 4");
+    expect(ws2 && ws3 && ws4, "three workspaces added").toBeTruthy();
+    await expect.poll(async () => (await H.workspaces(page)).length).toBe(4);
+
+    // Settle: BOTH mirrors byte-identical (one flushSave wrote them, same
+    // seq) and stable — this is the "fresh" blob.
+    const fresh = await settleBothMirrors(
+      page,
+      (p) => blobWsIds(p).length === 4,
+      "fresh 4-ws blob",
+    );
+    const freshIds = blobWsIds(fresh);
+    expect(typeof fresh.seq, "fresh blob carries a seq stamp").toBe("number");
+    const freshSeq = fresh.seq!;
+
+    // The RELIC: install-era 1-workspace blob whose seq is 1h older —
+    // decisively beyond STALE_HASH_WINDOW_MS (the real one is days old).
+    const relicSeq = freshSeq - 3_600_000;
+
+    // ---- Relaunch carrying the frozen relic hash (the launcher replay).
+    await relaunchWithHash(page, relicHashJson(relicSeq, H.serverUrl("relic")));
+
+    // THE CRUX: the FRESH 4-workspace set restored — not the 1-ws relic.
+    await expect
+      .poll(async () => (await H.workspaces(page)).sort())
+      .toEqual(freshIds.slice().sort());
+    expect(await H.workspaceName(page, ws2!), "fresh names restored").toBe("Fresh WS 2");
+
+    // The read fingerprint: LS won the comparison DECISIVELY, hash healed.
+    const ring = await H.diagRing(page);
+    const read = lastDiag(ring, "read");
+    expect(read, "relaunch read event").toBeTruthy();
+    expect(read!.pick, "localStorage won the comparative read").toBe("ls");
+    expect(read!.source).toBe("v3");
+    expect(read!.healed, "the stale hash was healed at boot").toBe(true);
+    expect(read!.hashSeq, "the relic's seq, verbatim in the paste").toBe(relicSeq);
+    expect(read!.lsSeq, "the mirror's seq, verbatim in the paste").toBe(freshSeq);
+    expect(read!.ws).toBe(4);
+    // NO seed after the relaunch's own read (a seed here IS the reset symptom).
+    expect(
+      ring.filter((e) => e.kind === "seed" && (e.t as number) >= (read!.t as number)).length,
+      "no seed on the stale-hash relaunch",
+    ).toBe(0);
+
+    // The URL hash was HEALED to the fresh state — subsequent launches carry
+    // the fresh hash, killing the frozen launcher URL permanently.
+    const healedHash = (await H.readHashState(page)) as Blob | null;
+    expect(healedHash, "hash still #state=-shaped after the heal").toBeTruthy();
+    expect(blobWsIds(healedHash).sort()).toEqual(freshIds.slice().sort());
+
+    // The boot's subsequent save does NOT regress LS below the 4-ws shape
+    // (the pre-fix clobber: the stale restore was saved back over LS).
+    await page.waitForTimeout(1500);
+    const after = await readPersisted(page);
+    expect((after?.workspaces ?? []).map((w) => w.id).sort()).toEqual(freshIds.slice().sort());
+  });
+
+  test("hash NEWER than LS → hash wins (browser-tab independence preserved)", async ({
+    page,
+  }) => {
+    await H.loadHost(page);
+    const ws1 = (await H.workspaces(page))[0];
+    const ws2 = await H.addWorkspace(page, "LS WS");
+    await expect.poll(async () => (await H.workspaces(page)).length).toBe(2);
+    const fresh = await settleBothMirrors(
+      page,
+      (p) => blobWsIds(p).length === 2,
+      "2-ws fresh blob",
+    );
+    const lsSeq = fresh.seq!;
+
+    // This tab's own LATER flush as a hash: same state + one extra workspace,
+    // seq decisively (60s) newer than the mirror.
+    const hashSeq = lsSeq + 60_000;
+    await relaunchWithHash(page, hashVariantWithExtraWs(fresh, "ws-hash-newer", hashSeq));
+
+    // The HASH's content restored (its extra workspace exists) — the tab's
+    // own newest state, exactly the per-tab independence the hash exists for.
+    await expect
+      .poll(async () => (await H.workspaces(page)).sort())
+      .toEqual([ws1, ws2, "ws-hash-newer"].sort());
+
+    const ring = await H.diagRing(page);
+    const read = lastDiag(ring, "read");
+    expect(read!.pick).toBe("hash");
+    expect(read!.hashSeq).toBe(hashSeq);
+    expect(read!.lsSeq).toBe(lsSeq);
+    expect(read!.healed, "a winning hash is never healed").toBe(false);
+    const hashState = (await H.readHashState(page)) as Blob | null;
+    expect(blobWsIds(hashState)).toContain("ws-hash-newer");
+  });
+
+  test("seq TIE → hash wins (same-tab reload semantics)", async ({ page }) => {
+    await H.loadHost(page);
+    const ws1 = (await H.workspaces(page))[0];
+    const ws2 = await H.addWorkspace(page, "Tie LS");
+    await expect.poll(async () => (await H.workspaces(page)).length).toBe(2);
+    const fresh = await settleBothMirrors(
+      page,
+      (p) => blobWsIds(p).length === 2,
+      "2-ws fresh blob",
+    );
+    const tieSeq = fresh.seq!;
+
+    // A hash whose seq EXACTLY ties the mirror's, with different content.
+    await relaunchWithHash(page, hashVariantWithExtraWs(fresh, "ws-tie-hash", tieSeq));
+
+    await expect
+      .poll(async () => (await H.workspaces(page)).sort())
+      .toEqual([ws1, ws2, "ws-tie-hash"].sort());
+    const ring = await H.diagRing(page);
+    const read = lastDiag(ring, "read");
+    expect(read!.pick, "tie → hash (HEAD's reload semantics)").toBe("hash");
+    expect(read!.hashSeq).toBe(tieSeq);
+    expect(read!.lsSeq).toBe(tieSeq);
+    expect(read!.healed).toBe(false);
+  });
+
+  test("seq-LESS legacy hash vs seq-stamped LS → LS wins (the migration note)", async ({
+    page,
+  }) => {
+    await H.loadHost(page);
+    const ws1 = (await H.workspaces(page))[0];
+    await H.addWorkspace(page, "Legacy 2");
+    await H.addWorkspace(page, "Legacy 3");
+    await expect.poll(async () => (await H.workspaces(page)).length).toBe(3);
+    const fresh = await settleBothMirrors(
+      page,
+      (p) => blobWsIds(p).length === 3,
+      "3-ws fresh blob",
+    );
+    const freshIds = blobWsIds(fresh);
+    const freshSeq = fresh.seq!;
+
+    // A relic WITHOUT a seq field (a pre-seq blob): absent = 0 → the
+    // seq-stamped mirror (any epoch-ms stamp) beats it decisively.
+    await relaunchWithHash(page, relicHashJson(null, H.serverUrl("legacy")));
+
+    await expect
+      .poll(async () => (await H.workspaces(page)).sort())
+      .toEqual(freshIds.slice().sort());
+    const ring = await H.diagRing(page);
+    const read = lastDiag(ring, "read");
+    expect(read!.pick).toBe("ls");
+    expect(read!.hashSeq, "seq-less hash reports null in the paste").toBeNull();
+    expect(read!.lsSeq).toBe(freshSeq);
+    expect(read!.healed).toBe(true);
+  });
+
+  test("top-URL hygiene: leaked dir/session stripped, proto + hash preserved; also fires with no hash", async ({
+    page,
+  }) => {
+    await H.loadHost(page);
+    const ws1 = (await H.workspaces(page))[0];
+    const ws2 = await H.addWorkspace(page, "Hygiene WS");
+    await expect.poll(async () => (await H.workspaces(page)).length).toBe(2);
+    const fresh = await settleBothMirrors(
+      page,
+      (p) => blobWsIds(p).length === 2,
+      "2-ws fresh blob",
+    );
+    const freshIds = blobWsIds(fresh);
+
+    // The frozen install-era URL: leaked SPA route params + the stale relic.
+    await page.goto("about:blank");
+    await page.goto(
+      "/?dir=%2Fx&session=y&proto=keep#state=" +
+        encodeURIComponent(relicHashJson((fresh.seq as number) - 3_600_000, H.serverUrl("hygiene"))),
+    );
+    await expect.poll(async () => H.connected(page), { timeout: 20000 }).toBe(true);
+
+    // dir/session GONE; every other param (proto — the web+vhsolara protocol
+    // handler) preserved byte-identically; the hash present AND healed to the
+    // fresh state (LS won decisively).
+    const url = new URL(page.url());
+    expect(url.search, "dir/session stripped, proto kept byte-identically").toBe("?proto=keep");
+    expect(url.hash.startsWith("#state=")).toBe(true);
+    const healedHash = (await H.readHashState(page)) as Blob | null;
+    expect(blobWsIds(healedHash).sort()).toEqual(freshIds.slice().sort());
+    const ring = await H.diagRing(page);
+    const read = lastDiag(ring, "read");
+    expect(read!.pick).toBe("ls");
+    expect(read!.healed).toBe(true);
+    // And the fresh state restored (not the relic).
+    await expect
+      .poll(async () => (await H.workspaces(page)).sort())
+      .toEqual(freshIds.slice().sort());
+
+    // Hygiene ALSO fires with no hash at all (a params-only frozen URL): the
+    // clean search must not resurrect, and the mirror still restores.
+    await page.goto("about:blank");
+    await page.goto("/?dir=zz&session=qq");
+    await expect.poll(async () => H.connected(page), { timeout: 20000 }).toBe(true);
+    expect(new URL(page.url()).search, "leaked params stripped even without a hash").toBe("");
+    await expect
+      .poll(async () => (await H.workspaces(page)).sort())
+      .toEqual(freshIds.slice().sort());
+  });
+});
+
 test.describe("layout diag ring (kill/relaunch diagnostics)", () => {
   test("read + seed events on a fresh boot; flush events carry trigger/bytes/ws/active; ring survives reload and the reload reads v3", async ({
     page,
@@ -608,7 +952,7 @@ test.describe("layout diag ring (kill/relaunch diagnostics)", () => {
     const ring0 = await H.diagRing(page);
     const read0 = ring0.find((e) => e.kind === "read");
     expect(read0, "read event present").toBeTruthy();
-    expect(read0!.diagv, "read carries the diag schema stamp").toBe(2);
+    expect(read0!.diagv, "read carries the diag schema stamp").toBe(3);
     const restore0 = ring0.find((e) => e.kind === "restore");
     expect(restore0, "restore event present on the seeded boot").toBeTruthy();
     expect(restore0!.outcome).toBe("failed");
@@ -620,6 +964,25 @@ test.describe("layout diag ring (kill/relaunch diagnostics)", () => {
 
     // ---- Reload: the seeded layout restores — outcome restored, with the
     // restored pane count and the blob as the source.
+    //
+    // ARRANGEMENT FIX (2026-09-02, pre-existing-latent): a fresh dev-lane
+    // boot persists NOTHING on its own — the mock content page emits a
+    // routeless {type:"route"} (a no-op in the router; only a route STRING
+    // captures + saves), and the seed hooks the layout saver for SUBSEQUENT
+    // mutations only. On the operator's device the real SPA's route-string
+    // emission is exactly what flushes a boot (ring: flush ~130ms after
+    // boot). Without this step the reload below found NO blob and re-seeded
+    // (observed red at b363ea1 AND effectively-455251d with this slice's
+    // files reverted — a latent arrangement gap, not a persistence defect).
+    // Reproduce the device-shaped boot flush so the reload restores:
+    const seededIds = await H.panes(page);
+    const routeProbe = await H.probePaneMessage(page, {
+      sourcePaneId: seededIds[0],
+      origin: H.MOCK_ORIGIN,
+      payload: { type: "route", route: "?dir=/diag-round2&session=boot" },
+    });
+    expect(routeProbe.accepted, "route captured (the device-shaped boot flush)").toBe(true);
+    await H.waitForSavedLayout(page, seededIds.length);
     await page.reload();
     await expect.poll(async () => H.connected(page), { timeout: 20000 }).toBe(true);
     const ring1 = await H.diagRing(page);

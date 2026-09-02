@@ -375,4 +375,131 @@ test.describe.serial("folded-posture layout restore", () => {
     const panelsAfter = totalPanels(JSON.parse(blobAfter!));
     expect(panelsAfter, "blob still carries the window-1 layout (1 panel)").toBe(1);
   });
+
+  test("stale frozen #state= relic vs fresh LS: comparative read + hash heal (the operator's Android shape)", async ({ page }) => {
+    // Boot once so the origin has a live host document (and let the boot
+    // self-seed save settle so it cannot race the plant below).
+    await page.goto("/");
+    await expect(page.locator('[data-testid="host-app-root"]')).toBeVisible();
+    await waitForQuiescentMirror(page, (p) => totalPanels(p) === 1, "self-seed settle");
+
+    // Plant BOTH candidates of the launcher-replay posture, in-page (the
+    // folded build has no DEV bridge):
+    //   localStorage = the FRESH state: 2 workspaces, 1 pane each at
+    //                  origin + /app, seq = now.
+    //   URL hash     = the install-era RELIC: 1 workspace, seq 1h older —
+    //                  the frozen task URL Android's launcher replays.
+    const { freshIds, relicSeq, freshSeq, relicHash } = await page.evaluate(({ key }) => {
+      const origin = window.location.origin;
+      const now = Date.now();
+      const pane = (id: string, group: string) => ({
+        grid: {
+          root: {
+            type: "branch",
+            data: [
+              {
+                type: "leaf",
+                fraction: 1,
+                data: { id: group, views: [id], activeView: id },
+              },
+            ],
+          },
+          width: 1024,
+          height: 768,
+          orientation: "HORIZONTAL",
+        },
+        panels: {
+          [id]: { id, params: { url: `${origin}/app`, label: "this-server" } },
+        },
+        activeGroup: group,
+      });
+      const fresh = {
+        v: 3,
+        seq: now,
+        activeWorkspaceId: "ws-f1",
+        workspaces: [
+          { id: "ws-f1", name: "Fresh 1", layout: pane("pane-f1", "g-f1") },
+          { id: "ws-f2", name: "Fresh 2", layout: pane("pane-f2", "g-f2") },
+        ],
+      };
+      const relic = {
+        v: 3,
+        seq: now - 3_600_000,
+        activeWorkspaceId: "ws-old",
+        workspaces: [
+          { id: "ws-old", name: "Install Relic", layout: pane("pane-old", "g-old") },
+        ],
+      };
+      localStorage.setItem(key, JSON.stringify(fresh));
+      return {
+        freshIds: ["ws-f1", "ws-f2"],
+        relicSeq: now - 3_600_000,
+        freshSeq: now,
+        relicHash: "#state=" + encodeURIComponent(JSON.stringify(relic)),
+      };
+    }, { key: LAYOUT_STORAGE_KEY });
+
+    // Relaunch carrying the frozen relic hash on the URL (a real navigation —
+    // via about:blank, because the current page's URL already ends in the
+    // self-seed #state= and a hash-only goto would be a same-document
+    // fragment jump with no reload/module-init). relicHash already starts
+    // with "#state=".
+    await page.goto("about:blank");
+    await page.goto("/" + relicHash);
+
+    // CRUX 1: the FRESH 2-workspace state restored (its active workspace's
+    // pane is live; no empty-workspace affordance) — not the 1-ws relic.
+    await expect
+      .poll(async () => (await paneIds(page)).length, { timeout: 20000 })
+      .toBeGreaterThanOrEqual(1);
+    await expect(page.locator('[data-testid="empty-workspace"]')).toBeHidden();
+
+    // CRUX 2: the diag ring shows the comparative read verbatim — LS won
+    // decisively (pick=ls, lsSeq = freshSeq, hashSeq = relicSeq), the hash
+    // was HEALED, and NO seed fired after that read.
+    const events = await ring(page);
+    const read = lastOf(events, "read");
+    expect(read, "relaunch read event").toBeTruthy();
+    expect(read!.source).toBe("v3");
+    expect(read!.pick, "localStorage won the comparative read").toBe("ls");
+    expect(read!.hashSeq).toBe(relicSeq);
+    expect(read!.lsSeq).toBe(freshSeq);
+    expect(read!.healed, "the frozen hash was healed at boot").toBe(true);
+    expect(read!.ws).toBe(2);
+    expect(
+      since(events, "seed", read!.t),
+      `no seed after the stale-hash relaunch\nring:\n${fingerprint(events)}`,
+    ).toEqual([]);
+    const restore = lastOf(events, "restore");
+    expect(restore, "restore event present").toBeTruthy();
+    expect(restore!.outcome).toBe("restored");
+
+    // CRUX 3: the URL hash now carries the FRESH state (healed) — and the
+    // blob is not clobbered below the fresh 2-workspace shape by the boot.
+    const healed = await page.evaluate(() => {
+      const hash = window.location.hash;
+      if (!hash.startsWith("#state=")) return null;
+      try {
+        return JSON.parse(decodeURIComponent(hash.slice("#state=".length))) as {
+          workspaces?: Array<{ id: string }>;
+        };
+      } catch {
+        return null;
+      }
+    });
+    expect(healed, "hash still #state=-shaped after the heal").toBeTruthy();
+    expect(
+      (healed!.workspaces ?? []).map((w) => w.id).sort(),
+      "hash healed to the fresh 2-ws state",
+    ).toEqual(freshIds.slice().sort());
+    const after = (await waitForQuiescentMirror(
+      page,
+      (p) => totalPanels(p) === 2,
+      "post-relaunch blob (2 panels)",
+    )) as { workspaces?: Array<{ id?: string }> };
+    expect(
+      (after.workspaces ?? []).map((w) => w.id ?? "").sort(),
+      "LS not regressed below the fresh workspace set",
+    ).toEqual(freshIds.slice().sort());
+  });
 });
