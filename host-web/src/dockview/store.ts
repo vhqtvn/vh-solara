@@ -51,9 +51,11 @@ function isClosedHostGesture(data: unknown): boolean {
 /** TAB-PAIRS: closed-set validator for the per-pane aggregate counts. The ONLY
  * acceptable value domain is a non-negative integer (a count). Returns false
  * for missing/undefined, fractions, negatives, NaN/Infinity, and non-numbers —
- * the status branch rejects the whole message when this fails (no silent
- * default; see the status case in routeMessage). Doubles as a type guard so the
- * validated value narrows to `number` for the PaneStatus store write. */
+ * the status branch rejects the whole message when this fails on a PRESENT
+ * value (an ABSENT count is defaulted to 0 before this runs; see the
+ * mixed-version defaults in routeMessage's status case). Doubles as a type
+ * guard so the validated value narrows to `number` for the PaneStatus store
+ * write. */
 function isValidCount(v: unknown): v is number {
   return typeof v === "number" && Number.isInteger(v) && v >= 0;
 }
@@ -977,20 +979,40 @@ export function routeMessage(
       // inject a forged needs_permission/needs_reply; the origin check below
       // prevents that. Q1-C document-liveness stays driven by heartbeats only;
       // status is display/attention only.
+      // MIXED-VERSION STATUS DEFAULTS (c-F2): the fleet is multi-server by
+      // design and staggered updates make mixed worker versions the norm, so
+      // the status contract has ACCRETED — `following` (added 45c3e7f) and
+      // `runningCount`/`unreadCount` (added f834430) sit atop the original
+      // six required fields (type, dir, session, title, attention, activity).
+      // Policy: an ABSENT accreted field gets an honest default —
+      // `following`→true (the pre-following semantic: every pre-45c3e7f
+      // worker was a tail-follower by construction) and counts→0 — because
+      // wholesale rejection of a legacy status masks MORE than a default
+      // does: it silently drops that pane's needs_permission/needs_reply
+      // visibility, and an invisible absent badge hides more than a visible
+      // (0|0) pair. A PRESENT-but-invalid value still rejects the WHOLE
+      // message (non-boolean `following`; fractional/negative/NaN counts;
+      // out-of-vocabulary attention/activity checked below) — junk is junk,
+      // and the six original fields remain required with no defaults. The
+      // anti-spoof boundary is unchanged: the ORIGIN CHECK below (heartbeat
+      // trust tier) is what stops a forged status, not field presence.
+      // Own-property gate: an accreted field defaults ONLY when the key is
+      // ABSENT (`in`), never when it is present with value `undefined` — a
+      // structured-clone postMessage payload preserves present-`undefined`
+      // keys, and PRESENT-but-invalid (incl. `undefined`) rejects the whole
+      // message below. `=== undefined` alone cannot make that distinction.
+      const following = "following" in d ? d.following : true;
+      const runningCount = "runningCount" in d ? d.runningCount : 0;
+      const unreadCount = "unreadCount" in d ? d.unreadCount : 0;
       if (
         typeof d.dir !== "string" ||
         typeof d.session !== "string" ||
         typeof d.title !== "string" ||
         typeof d.attention !== "string" ||
         typeof d.activity !== "string" ||
-        typeof d.following !== "boolean" ||
-        // TAB-PAIRS: the two aggregate fields are REQUIRED closed non-negative
-        // integers. A missing field (version-skewed SPA) or junk (fractional,
-        // negative, non-number) rejects the WHOLE message — the same closed-
-        // payload discipline as every other required field above; there is no
-        // silent default that could mask a skew.
-        !isValidCount(d.runningCount) ||
-        !isValidCount(d.unreadCount)
+        typeof following !== "boolean" ||
+        !isValidCount(runningCount) ||
+        !isValidCount(unreadCount)
       ) {
         return { routed: false, paneId: null, accepted: false, reason: "ignored-non-pane-to-host" };
       }
@@ -1029,9 +1051,9 @@ export function routeMessage(
         title: d.title,
         attention,
         activity,
-        following: d.following,
-        runningCount: d.runningCount,
-        unreadCount: d.unreadCount,
+        following,
+        runningCount,
+        unreadCount,
       });
       return { routed: true, paneId, accepted: true, reason: "accepted:non-heartbeat" };
     }

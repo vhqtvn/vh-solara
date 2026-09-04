@@ -338,13 +338,29 @@ test.describe("fractional persistence (v3)", () => {
       .toBe(3);
     for (const id of await H.panes(page)) await H.waitForReady(page, id);
     await H.waitForLayoutSettled(page);
-    await page.waitForTimeout(400); // RO-driven relayout + settle
 
-    // CRUX: pane SHARES (not px) match the saved shares within ±2%.
-    const restoredRoot = await shares(page, [keeper, right], "width");
-    const restoredNested = await shares(page, [keeper, nested!], "height");
-    expectShares(restoredRoot, savedRoot, "restored root shares @800×600");
-    expectShares(restoredNested, savedNested, "restored nested shares @800×600");
+    // CRUX: pane SHARES (not px) match the saved shares within ±2%. POLLED,
+    // not a fixed 400ms wait + point assert: a late ResizeObserver-driven
+    // relayout can land after a fixed wait in slow environments (the leading
+    // flake suspect) — poll until the shares converge, same shape as the
+    // RE-NORMALIZE crux below. Tolerance stays ±2% (cleanly separates ±0.5%
+    // healthy from >9pp broken).
+    await expect
+      .poll(async () => {
+        const s = await shares(page, [keeper, right], "width");
+        return (
+          s.length === 2 && Math.abs(s[0] - savedRoot[0]) <= TOL && Math.abs(s[1] - savedRoot[1]) <= TOL
+        );
+      }, { timeout: 8000, message: "restored root shares @800×600" })
+      .toBe(true);
+    await expect
+      .poll(async () => {
+        const s = await shares(page, [keeper, nested!], "height");
+        return (
+          s.length === 2 && Math.abs(s[0] - savedNested[0]) <= TOL && Math.abs(s[1] - savedNested[1]) <= TOL
+        );
+      }, { timeout: 8000, message: "restored nested shares @800×600" })
+      .toBe(true);
 
     // Round-trip semantics preserved: same ids, same {url,label}.
     const restored = await H.paneParams(page);

@@ -103,6 +103,132 @@ test.describe("P1 session-attention", () => {
     expect(await H.status(page, pane), "nothing stored from a malformed status").toEqual(before);
   });
 
+  // ---- mixed-version status defaults (c-F2) ---------------------------------
+  // The status contract ACCRETED: `following` (45c3e7f) and runningCount/
+  // unreadCount (f834430) sit atop the original six required fields. Workers
+  // on staggered fleet versions emit the older shapes; the host accepts them
+  // with honest defaults (following→true, counts→0) while PRESENT-but-junk
+  // values still reject the whole message wholesale.
+
+  test("accepts a 6-field legacy status (pre-45c3e7f worker): following defaults true, counts default 0", async ({ page }) => {
+    const ids = await H.panes(page);
+    const pane = ids[0];
+    const r = await H.probeStatus(page, {
+      sourcePaneId: pane,
+      origin: H.MOCK_ORIGIN,
+      payload: {
+        type: "status",
+        dir: "/legacy",
+        session: "s6",
+        title: "Legacy worker",
+        attention: "needs_permission",
+        activity: "running",
+        // following / runningCount / unreadCount ABSENT — the 6-field shape a
+        // ≤v1.61.0 worker emits.
+      },
+    });
+    expect(r.accepted, "6-field legacy status accepted").toBe(true);
+    expect(r.reason).toBe("accepted:non-heartbeat");
+
+    const st = await H.status(page, pane);
+    expect(st, "legacy status stored").not.toBeNull();
+    // The six original fields land verbatim — needs_permission visibility is
+    // NOT dropped for a legacy worker (the whole point of c-F2).
+    expect(st!.dir).toBe("/legacy");
+    expect(st!.session).toBe("s6");
+    expect(st!.title).toBe("Legacy worker");
+    expect(st!.attention).toBe("needs_permission");
+    expect(st!.activity).toBe("running");
+    // Honest defaults for the absent accreted fields.
+    expect(st!.following, "absent following defaults true (pre-following semantic)").toBe(true);
+    expect(st!.runningCount, "absent runningCount defaults 0").toBe(0);
+    expect(st!.unreadCount, "absent unreadCount defaults 0").toBe(0);
+  });
+
+  test("accepts a 7-field interim status (following present, counts absent): counts default 0", async ({ page }) => {
+    const ids = await H.panes(page);
+    const pane = ids[0];
+    const r = await H.probeStatus(page, {
+      sourcePaneId: pane,
+      origin: H.MOCK_ORIGIN,
+      payload: {
+        type: "status",
+        dir: "/interim",
+        session: "s7",
+        title: "Interim worker",
+        attention: "none",
+        activity: "idle",
+        following: false,
+        // runningCount / unreadCount ABSENT — the 7-field interim shape.
+      },
+    });
+    expect(r.accepted, "7-field interim status accepted").toBe(true);
+    expect(r.reason).toBe("accepted:non-heartbeat");
+
+    const st = await H.status(page, pane);
+    expect(st, "interim status stored").not.toBeNull();
+    expect(st!.attention).toBe("none");
+    expect(st!.activity).toBe("idle");
+    // A PRESENT following is honored verbatim (no default applied).
+    expect(st!.following, "present following honored verbatim").toBe(false);
+    expect(st!.runningCount, "absent runningCount defaults 0").toBe(0);
+    expect(st!.unreadCount, "absent unreadCount defaults 0").toBe(0);
+  });
+
+  test("PRESENT-but-junk accreted fields still reject the whole message", async ({ page }) => {
+    const ids = await H.panes(page);
+    const pane = ids[0];
+    const before = await H.status(page, pane);
+
+    // A present-but-invalid `following` (non-boolean) or count (negative,
+    // fractional, NaN-as-string) rejects the WHOLE message — defaults apply
+    // only to ABSENT fields, never as a mask for junk.
+    const junkPayloads: unknown[] = [
+      { type: "status", dir: "", session: "", title: "", attention: "none", activity: "idle", following: "yes", runningCount: 0, unreadCount: 0 },
+      { type: "status", dir: "", session: "", title: "", attention: "none", activity: "idle", following: true, runningCount: -1, unreadCount: 0 },
+      { type: "status", dir: "", session: "", title: "", attention: "none", activity: "idle", following: true, runningCount: 1.5, unreadCount: 0 },
+      { type: "status", dir: "", session: "", title: "", attention: "none", activity: "idle", following: true, runningCount: "NaN", unreadCount: 0 },
+    ];
+    for (const payload of junkPayloads) {
+      const r = await H.probeStatus(page, { sourcePaneId: pane, origin: H.MOCK_ORIGIN, payload });
+      expect(r.accepted, `junk payload ${JSON.stringify(payload)} rejected`).toBe(false);
+      expect(r.reason).toBe("ignored-non-pane-to-host");
+    }
+    expect(await H.status(page, pane), "stored status untouched by junk").toEqual(before);
+  });
+
+  test("explicitly-present-undefined accreted field rejects the whole message (t1b-F1: present ≠ absent)", async ({ page }) => {
+    const ids = await H.panes(page);
+    const pane = ids[0];
+    const before = await H.status(page, pane);
+
+    // A structured-clone postMessage payload preserves PRESENT-`undefined`
+    // keys: the 6-field legacy shape plus `following: undefined` has the key
+    // PRESENT with an invalid (non-boolean) value. That is NOT an absent
+    // field, so the c-F2 default must NOT mask it — the whole message
+    // rejects and the stored status is untouched. (Pre-fix, the
+    // `d.following === undefined` gate conflated this with absence,
+    // silently defaulting it to true and storing the message.)
+    const r = await H.probeStatus(page, {
+      sourcePaneId: pane,
+      origin: H.MOCK_ORIGIN,
+      payload: {
+        type: "status",
+        dir: "/clone",
+        session: "s-undef",
+        title: "Clone with undefined",
+        attention: "needs_reply",
+        activity: "idle",
+        following: undefined,
+        // runningCount / unreadCount ABSENT — isolation: only `following`'s
+        // present-undefined semantics is under test.
+      },
+    });
+    expect(r.accepted, "present-undefined following rejected wholesale").toBe(false);
+    expect(r.reason).toBe("ignored-non-pane-to-host");
+    expect(await H.status(page, pane), "stored status untouched by present-undefined").toEqual(before);
+  });
+
   test("rejects a wrong-origin status — origin checked, not source-binding only (B-F1)", async ({ page }) => {
     const ids = await H.panes(page);
     const pane = ids[0];

@@ -303,9 +303,11 @@ test.describe("tab-pairs badges (per-pane running/unread micro-badges in the wor
     await expect(pairsEl(page, ws1)).toHaveCount(0);
   });
 
-  // Feature: closed-set validation — junk counts reject the whole status (the
-  // previously stored status is untouched; no partial store).
-  test("rejects junk counts (closed non-negative integers)", async ({ page }) => {
+  // Feature: closed-set validation — PRESENT junk counts reject the whole
+  // status (the previously stored status is untouched; no partial store). An
+  // ABSENT count no longer rejects — it defaults to 0 (c-F2 mixed-version
+  // policy; the full legacy-shape matrix lives in session-attention.spec.ts).
+  test("rejects PRESENT junk counts (closed non-negative integers); ABSENT defaults (c-F2)", async ({ page }) => {
     const ids = await H.panes(page);
     await probeCounts(page, ids[0], 1, 1);
     const before = await H.status(page, ids[0]);
@@ -329,7 +331,12 @@ test.describe("tab-pairs badges (per-pane running/unread micro-badges in the wor
       expect(r.accepted, `junk runningCount=${String(junk)} rejected`).toBe(false);
       expect(r.reason).toBe("ignored-non-pane-to-host");
     }
-    // A MISSING field rejects too (required closed payload — no silent default).
+    expect(await H.status(page, ids[0]), "stored status untouched by junk").toEqual(before);
+
+    // c-F2: a MISSING runningCount from a version-skewed worker is ACCEPTED
+    // and defaults to 0 — wholesale rejection would silently drop that pane's
+    // needs-you visibility (an invisible absent badge hides more than a
+    // visible (0|0) pair).
     const r2 = await H.probeStatus(page, {
       sourcePaneId: ids[0],
       origin: H.MOCK_ORIGIN,
@@ -344,9 +351,10 @@ test.describe("tab-pairs badges (per-pane running/unread micro-badges in the wor
         unreadCount: 0,
       },
     });
-    expect(r2.accepted, "missing runningCount rejected").toBe(false);
-
-    expect(await H.status(page, ids[0])).toEqual(before);
+    expect(r2.accepted, "absent runningCount accepted (defaults 0)").toBe(true);
+    const st2 = await H.status(page, ids[0]);
+    expect(st2!.runningCount, "absent runningCount stored as 0").toBe(0);
+    expect(st2!.unreadCount).toBe(0);
   });
 
   // Feature: display cap — a count ≥ 10 renders as the fixed-width "9+" while

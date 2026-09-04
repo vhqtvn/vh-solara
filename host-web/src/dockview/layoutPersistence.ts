@@ -878,16 +878,25 @@ function loadRepairedWorkspaceLayoutDetailed(
   const staged = stagedRuntimeLayouts.get(workspaceId);
   if (staged !== undefined) stagedRuntimeLayouts.delete(workspaceId); // consume
   const source: "staged" | "blob" = staged !== undefined ? "staged" : "blob";
-  if (staged === undefined && !initBlob) {
-    return { layout: null, source, reason: "blob-null" };
-  }
-  const saved =
-    staged !== undefined
-      ? staged
-      : (initBlob?.workspaces.find((w) => w.id === workspaceId)?.layout ?? null);
-  if (saved === null) {
-    // initBlob non-null here (checked above) but no entry for this ws.
-    return { layout: null, source, reason: "no-entry" };
+  let saved: SerializedDockview | null;
+  if (staged !== undefined) {
+    saved = staged;
+  } else {
+    if (!initBlob) return { layout: null, source, reason: "blob-null" };
+    // Split the two cases the old `.find(...)?.layout ?? null` conflated so
+    // the declared `layout-null` RestoreFailReason is actually REACHABLE and
+    // distinct in the diag `restore` events: no entry for this ws (a
+    // runtime-added workspace) is `no-entry`; an entry whose layout is null
+    // (an intentionally-empty workspace) is `layout-null`. Loose `== null`
+    // also treats an absent layout key as layout-null.
+    const entry = initBlob.workspaces.find((w) => w.id === workspaceId);
+    if (entry === undefined) {
+      return { layout: null, source, reason: "no-entry" };
+    }
+    if (entry.layout == null) {
+      return { layout: null, source, reason: "layout-null" };
+    }
+    saved = entry.layout;
   }
   if (!isSavedLayout(saved)) {
     return { layout: null, source, reason: "invalid-shape" };
