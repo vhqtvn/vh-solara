@@ -108,6 +108,17 @@ type fakeOC struct {
 	permHold    chan struct{}
 	permEntered chan struct{}
 	permDone    chan struct{}
+
+	// abortHold / abortReached (P1-API-007 restart-abort test seam): when
+	// abortHold is non-nil, a POST */abort increments the attempt count,
+	// signals abortReached (non-blocking) and then BLOCKS on <-abortHold
+	// before responding — modelling an Abort RPC that never completes (the
+	// "abort itself cannot complete" edge the pre-restart sweep must bound).
+	// The test closes abortHold to release the parked handler before the
+	// fake server's Close cleanup. nil (default) = no hold, existing
+	// immediate-200 behavior.
+	abortHold    chan struct{}
+	abortReached chan struct{}
 }
 
 func (f *fakeOC) handler() http.Handler {
@@ -163,6 +174,28 @@ func (f *fakeOC) handler() http.Handler {
 	})
 	mux.HandleFunc("/session/", func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
+		// P1-API-007 restart-abort seam: POST */abort counts the ATTEMPT,
+		// optionally signals + parks OUTSIDE f.mu (a hung Abort RPC), then
+		// responds. Handled before the lock so a parked abort never blocks
+		// the fake's other handlers.
+		if r.Method == http.MethodPost && bytesHasSuffix(p, "/abort") {
+			f.mu.Lock()
+			f.aborts++
+			hold := f.abortHold
+			reached := f.abortReached
+			f.mu.Unlock()
+			if reached != nil {
+				select {
+				case reached <- struct{}{}:
+				default:
+				}
+			}
+			if hold != nil {
+				<-hold
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		// F2 concurrent-reissue test seam: block PATCH OUTSIDE f.mu so two
 		// concurrent jobs' SetArchived calls overlap (the CAS race window).
 		if r.Method == http.MethodPatch {
@@ -824,6 +857,14 @@ func (f *fakeOC) promptCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.prompts)
+}
+
+// abortCount reports the number of POST */abort attempts received (counted at
+// attempt time, including any still parked on abortHold).
+func (f *fakeOC) abortCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.aborts
 }
 
 // TestP7_SendCASAwaitAbortSettling is the consumer RED suite: the FIRST

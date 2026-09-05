@@ -6,7 +6,94 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
+
+	"github.com/vhqtvn/vh-solara/pkg/aggregator"
+	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
+
+// Bounding constants for abortInflightBeforeRestart (P1-API-007 layer a).
+// Per-call ~2s: a healthy Abort is one HTTP round-trip; anything slower is a
+// dying instance. Shared budget ~5s across the whole fleet sweep so a fleet
+// of hung instances cannot serially stall the restart request. Both are
+// ceilings, not targets — the sweep returns as soon as every running session
+// is attempted, and budget expiry PROCEEDS to the restart (the store-side
+// interrupted-turn sweep heals whatever the abort could not close).
+const (
+	defaultRestartAbortPerCall = 2 * time.Second
+	defaultRestartAbortBudget  = 5 * time.Second
+)
+
+// abortInflightBeforeRestart runs the /vh/abort verb choreography (verbs.go:
+// Abort → InflightAssistantID → Stop) for EVERY running turn across the whole
+// aggregator fleet, before a restart kills the OpenCode process mid-turn
+// (P1-API-007 layer a). Without this, the killed turn's assistant message is
+// left permanently unmarked — OpenCode never writes a terminal for it — and
+// the UI silently truncates the turn. A graceful Abort lets OpenCode itself
+// write the REAL terminal (MessageAbortedError) into its own DB, the only
+// writer that can close the upstream row; layer (b) (pkg/state
+// sweepInterruptedTurnsLocked, authoritative-not-busy marker) heals the cases
+// the abort cannot reach (hang, error, daemon restart, crash, reboot).
+//
+// Semantics mirror verbs.go exactly, per session: Abort error → log + skip
+// Stop (the verb's early-return); Abort success → Stop(sid,
+// InflightAssistantID(sid)) so the stop-generation machinery settles and any
+// /vh/send CAS waiter wakes. Stop deliberately does NOT force idle
+// synchronously — settlement stays Store.Stop's settle timer + periodic
+// /session/status reconcile, unchanged.
+//
+// Failure containment (the operator's "abort itself cannot complete" case):
+// every Abort carries a per-call timeout and the whole sweep a shared
+// wall-clock budget. Expiry never blocks the restart — it logs and the caller
+// proceeds; the orphan sweep later synthesizes the interrupted marker for
+// turns the abort could not close. Bounded total worst case ≈ budget, not
+// N×per-call.
+//
+// Restart is fleet-wide by nature (restartOC restarts THE instance every
+// aggregator shares), so the sweep walks s.aggs under the same aggMu snapshot
+// pattern as handleRunningSessions — NOT just the request's own aggregator.
+func (s *Server) abortInflightBeforeRestart(ctx context.Context) {
+	aggs := make([]*aggregator.Aggregator, 0, len(s.aggs))
+	s.aggMu.Lock()
+	for _, a := range s.aggs {
+		aggs = append(aggs, a)
+	}
+	s.aggMu.Unlock()
+	if len(aggs) == 0 {
+		return
+	}
+	deadline := time.Now().Add(s.restartAbortBudget)
+	for _, agg := range aggs {
+		for _, sid := range agg.Store().RunningSessionIDs() {
+			if err := ctx.Err(); err != nil {
+				return
+			}
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				vhlog.Warn("restart abort sweep: shared budget expired; proceeding to restart without further aborts",
+					"runningSession", sid)
+				return
+			}
+			perCall := s.restartAbortPerCall
+			if perCall > remaining {
+				perCall = remaining
+			}
+			callCtx, cancel := context.WithTimeout(ctx, perCall)
+			if err := agg.Client().Abort(callCtx, sid); err != nil {
+				cancel()
+				// Mirror the verb's early-return semantics: no Stop, no
+				// retry — the sweep's job is opportunistic closure, and the
+				// store-side marker owns the heal for this turn.
+				vhlog.Warn("restart abort sweep: Abort failed; skipping Stop (turn heals via interrupted-marker sweep)",
+					"sessionID", sid, "error", err.Error())
+				continue
+			}
+			cancel()
+			canceledTurnID := agg.Store().InflightAssistantID(sid)
+			agg.Store().Stop(sid, canceledTurnID)
+		}
+	}
+}
 
 // OpenCode version/update hooks, wired by the daemon (which knows the binary
 // and the environment OpenCode runs under). nil when OpenCode isn't managed.
@@ -198,6 +285,12 @@ func (s *Server) handleOpenCodeRestart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "OpenCode restart is not wired on this server", http.StatusNotImplemented)
 		return
 	}
+	// P1-API-007 layer (a): abort every running turn fleet-wide BEFORE the
+	// restart kills the process mid-turn, so OpenCode itself writes the real
+	// terminal for each aborted turn. Bounded (≈5s shared budget): an abort
+	// that fails or hangs never blocks the restart — the store-side
+	// interrupted-marker sweep (layer b) heals those turns instead.
+	s.abortInflightBeforeRestart(r.Context())
 	if err := s.restartOC(r.Context()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

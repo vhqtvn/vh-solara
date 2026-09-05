@@ -117,6 +117,16 @@ type Server struct {
 	// restartOC, when set by the daemon, restarts the managed OpenCode process.
 	// nil in environments that don't manage OpenCode (e.g. the fixture server).
 	restartOC func(context.Context) error
+	// restartAbortPerCall / restartAbortBudget bound the P1-API-007
+	// pre-restart abort sweep (abortInflightBeforeRestart): per-call is the
+	// ctx timeout around each Abort RPC; budget is the shared wall-clock cap
+	// across the whole fleet sweep. Abort failure/hang must NEVER block the
+	// restart — budget expiry proceeds to restartOC and layer (b) (the
+	// store-side interrupted-turn sweep) heals whatever the abort could not
+	// close. Per-instance (mirrors reassertDelay et al.) so tests shrink them
+	// without touching shared state.
+	restartAbortPerCall time.Duration
+	restartAbortBudget  time.Duration
 	// externalOC reports whether OpenCode is attached externally (--opencode-url)
 	// rather than spawned/co-located by this daemon. Drives the direct-DB
 	// unarchive topology guard (pkg/web/archive.go): in external mode the local DB
@@ -559,6 +569,8 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		bgCtx:                   bgCtx,
 		bgCancel:                bgCancel,
 		reassertDelay:           defaultReassertDelay,
+		restartAbortPerCall:     defaultRestartAbortPerCall,
+		restartAbortBudget:      defaultRestartAbortBudget,
 		archiveRetryBudget:      defaultArchiveRetryBudget,
 		archiveRetryBase:        defaultArchiveRetryBase,
 		archiveRetryMax:         defaultArchiveRetryMax,

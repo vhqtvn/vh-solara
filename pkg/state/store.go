@@ -554,6 +554,28 @@ type messageEntry struct {
 	// reconcile (streaming deltas have authoritative accumulated text that a
 	// stale fetch must not discard). Cleared after each cold reconcile.
 	liveTouchedParts map[string]bool
+	// synthesizedTerminal + synthTerminalMs carry the P1-API-007
+	// interrupted-turn marker: this entry's terminal (completed +
+	// terminalError == InterruptedTurnErrorName + the merged info JSON) was
+	// written by THIS daemon's sweep (sweepInterruptedTurnsLocked), NOT by
+	// OpenCode. OpenCode never marks a turn killed by a process restart
+	// (~1.18.x orphan sweeps are prompt-gated), so it keeps re-serving the
+	// uncompleted row on every fetch forever. While the flag is set, a
+	// fetched or live message body that STILL lacks a real terminal
+	// (time.completed absent AND no info.error) cannot un-mark the entry:
+	// reconcileMessagesLocked / upsertMessageLocked merge it with the marker
+	// instead (stickiness — the marker survives warm diffs and a late
+	// message.updated must not resurrect the turn). A body carrying a REAL
+	// terminal (upstream completed, or an upstream error name such as
+	// MessageAbortedError written because our pre-restart abort succeeded)
+	// supersedes the marker and clears the flag. Cleared implicitly with the
+	// entry; never set on a message OpenCode itself terminalized.
+	synthesizedTerminal bool
+	// synthTerminalMs is the unix-ms completion time the sweep stamped into
+	// the merged info JSON. Kept beside the flag so later merges re-stamp
+	// the SAME bytes (byte-stable info ⇒ no spurious diff emits), instead of
+	// re-deriving a fresh "now" per reconcile.
+	synthTerminalMs float64
 }
 
 type sessionMessages struct {

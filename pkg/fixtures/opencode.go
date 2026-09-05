@@ -709,6 +709,48 @@ func (f *FakeOpenCode) EmitSessionTerminal(sessionID, eventName string) {
 	f.emit(eventName, map[string]any{"sessionID": sessionID})
 }
 
+// PlantInflightAssistantForTest persists an UNCOMPLETED assistant message
+// (no time.completed, one finished reasoning part) on sessionID and emits its
+// message.updated through the real /event stream. It is the P1-API-007
+// process-death model: the turn's assistant row exists durably (a later
+// GET /session/:sid/message re-serves it — exactly how real OpenCode re-serves
+// a restart-killed row forever), but NO terminal for it will ever arrive from
+// the fake. Pair with SilentClearBusyForTest to model the restarted instance
+// authoritatively reporting the session not-busy. Returns the message id.
+// TEST-ONLY seam: built from the existing appendMessage/emit primitives; the
+// shipped binary never reaches it.
+func (f *FakeOpenCode) PlantInflightAssistantForTest(sessionID string) string {
+	now := float64(time.Now().UnixMilli())
+	f.mu.Lock()
+	f.counter++
+	mid := fmt.Sprintf("planted_a%d", f.counter)
+	f.mu.Unlock()
+	part := map[string]any{
+		"id": mid + "_p1", "sessionID": sessionID, "messageID": mid, "type": "reasoning",
+		"text": "Half-finished reasoning…", "time": map[string]any{"start": now, "end": now},
+	}
+	info := map[string]any{
+		"id": mid, "sessionID": sessionID, "role": "assistant", "time": map[string]any{"created": now},
+	}
+	f.appendMessage(sessionID, messageWithParts{Info: info, Parts: []map[string]any{part}})
+	f.emit("message.updated", map[string]any{"info": info})
+	f.emit("message.part.updated", map[string]any{"part": part})
+	return mid
+}
+
+// SilentClearBusyForTest removes sessionID from the fake's /session/status
+// busy map WITHOUT emitting any event. It models the post-restart reality of
+// P1-API-007: the restarted OpenCode instance reports the session not-busy on
+// the next statuses fetch, while the turn it was killed running never gets a
+// terminal. Combined with PlantInflightAssistantForTest, the aggregate store
+// sees exactly the defect state: uncompleted newest assistant + authoritative
+// not-busy → the interrupted-marker sweep's firing condition. TEST-ONLY.
+func (f *FakeOpenCode) SilentClearBusyForTest(sessionID string) {
+	f.mu.Lock()
+	delete(f.busy, sessionID)
+	f.mu.Unlock()
+}
+
 // commitUserMessage persists a single user message for a session and returns
 // the allocated counter. It is the "commit" half of the
 // CommitThenDropResponse mode: the user turn is durably recorded (exactly what

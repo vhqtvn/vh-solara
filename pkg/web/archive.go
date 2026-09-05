@@ -1095,6 +1095,13 @@ func (s *Server) handleRestartServer(w http.ResponseWriter, r *http.Request) {
 // POST /vh/restart-opencode — restart the managed OpenCode process (interrupts
 // any in-flight turn; sessions persist in OpenCode's store). The aggregator
 // reconnects and re-hydrates automatically once OpenCode is back up.
+//
+// P1-API-007: before restarting, every running turn is aborted fleet-wide
+// (abortInflightBeforeRestart, the same choreography /vh/abort runs) so
+// OpenCode itself writes each turn's real terminal instead of leaving it
+// permanently unmarked by the kill; turns the bounded abort sweep cannot
+// close are healed by the store-side interrupted-marker sweep after
+// reconnect.
 func (s *Server) handleRestartOpenCode(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1104,6 +1111,7 @@ func (s *Server) handleRestartOpenCode(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "OpenCode is not managed by this server", http.StatusNotImplemented)
 		return
 	}
+	s.abortInflightBeforeRestart(r.Context())
 	if err := s.restartOC(r.Context()); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return

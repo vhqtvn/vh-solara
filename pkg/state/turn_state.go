@@ -89,6 +89,7 @@ package state
 
 import (
 	"context"
+	"sort"
 	"time"
 )
 
@@ -480,6 +481,29 @@ func (s *Store) InflightAssistantID(sessionID string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.inflightAssistantIDLocked(sessionID)
+}
+
+// RunningSessionIDs returns the sorted ids of every live session whose
+// activity is running-class (busy|retry) — exactly the sessions whose
+// in-flight turns a restart would kill, i.e. the population that makes
+// RunningRoots() non-zero (per-session view of the same activity-derived
+// index). TurnStopping sessions are included by design: stopLocked does not
+// touch activity, so a session draining an abort stays busy-class until its
+// terminal/settle — re-issuing Abort there is the verbs.go idempotent path.
+// Consumed by the pkg/web pre-restart abort sweep (P1-API-007 layer a) so the
+// restart handlers can abort every running turn fleet-wide, not just the
+// request's own directory. Read-only; sorted for deterministic logging/tests.
+func (s *Store) RunningSessionIDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make([]string, 0, len(s.sessions))
+	for id := range s.sessions {
+		if a := s.activity[id]; a == ActivityBusy || a == ActivityRetry {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // inflightAssistantIDLocked is the under-lock body of InflightAssistantID. It

@@ -352,6 +352,17 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 				delete(s.stopTurnID, sid)
 				s.turnState[sid] = TurnIdle
 			}
+			// P1-API-007 orphan sweep: the same authoritative not-busy evidence
+			// that cleared the activity also proves the run is over. If the
+			// session's newest assistant is still uncompleted, that turn was
+			// killed without a terminal (restart/crash/reboot/daemon-restart —
+			// OpenCode never marks it) — synthesize OUR terminal marker so the
+			// row stops rendering as a live-forever truncation. No-op (cheap
+			// predicate miss) for the ordinary idle case. Runs AFTER the
+			// TurnStopping settle above so a drained abort is marked too (the
+			// "abort cannot complete" heal). Authoritative-only by construction:
+			// this closure is reachable solely from a SUCCESSFUL statuses fetch.
+			s.sweepInterruptedTurnsLocked(sid)
 		}
 	}
 	for sid := range s.sessions {
@@ -825,13 +836,44 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 	var wasCompleted bool
 	if me := sm.byID[env.ID]; me != nil {
 		wasCompleted = me.completed
-		me.info = info
-		me.role = env.Role
-		me.completed = env.Time.Completed != nil
-		me.finish = env.Finish
-		me.tokens = env.Tokens
-		me.agent = env.Agent
-		me.terminalError = env.errorName()
+		// P1-API-007 marker stickiness (#2696-class guard, extended): a live
+		// message.updated arriving while THIS daemon's synthesized terminal is
+		// set and the incoming body STILL lacks a real terminal (no
+		// time.completed, no info.error) must not un-mark the entry or
+		// resurrect the turn — OpenCode re-serves the killed row uncompleted
+		// forever, so such an update is the stale uncompleted body, not
+		// evidence of a live run. Adopt the body's OTHER fields (role, agent,
+		// tokens...) but keep completed/terminalError and re-merge the marker
+		// into the emitted info. Because me.completed stays true,
+		// assistantInflightLocked stays false below → no busy escalation (the
+		// resurrection the guard exists to block). A REAL terminal in the
+		// incoming body (upstream completed, or an upstream error name — e.g.
+		// MessageAbortedError written because our pre-restart abort landed)
+		// takes the else branch and supersedes the marker wholesale.
+		keepMarker := me.synthesizedTerminal && env.Time.Completed == nil && env.errorName() == ""
+		if keepMarker {
+			me.role = env.Role
+			me.finish = env.Finish
+			me.tokens = env.Tokens
+			me.agent = env.Agent
+			if merged := mergeInterruptedMarkerInfo(info, me.synthTerminalMs); len(merged) > 0 {
+				me.info = merged
+			} else {
+				me.info = info
+			}
+		} else {
+			me.info = info
+			me.role = env.Role
+			// Terminal stickiness: a REAL terminal error arriving on an entry
+			// this view already closed refines WHICH terminal it is but must
+			// not re-open it (mirrors reconcileMessagesLocked's arm).
+			me.completed = env.Time.Completed != nil || (env.errorName() != "" && me.completed)
+			me.finish = env.Finish
+			me.tokens = env.Tokens
+			me.agent = env.Agent
+			me.terminalError = env.errorName()
+			me.synthesizedTerminal = false
+		}
 		// Keyless→keyed transition (placeholder promotion): reposition the id
 		// into its chronological slot. No-op on an already-keyed entry
 		// (created is immutable per id).
@@ -865,7 +907,10 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 	// lock. This is what lets publishColdBatch discard a stale prepared batch
 	// when a live mutation lands during (unlocked) packaging.
 	s.bumpMsgRev(env.SessionID)
-	s.emit(KindMessageUpsert, info)
+	// Emit the EFFECTIVE info: on the marker-stickiness path above the
+	// resident body is the marker-merged bytes (so clients see completed +
+	// error), not the stale uncompleted body that just arrived.
+	s.emit(KindMessageUpsert, sm.byID[env.ID].info)
 	if env.Role == "assistant" {
 		s.recomputeLastAssistantLocked(env.SessionID)
 		// An assistant message.updated marks a turn boundary (a completing turn's

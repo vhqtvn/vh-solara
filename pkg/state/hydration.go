@@ -348,9 +348,25 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts, exh
 			createdMs, createdOK = *env.Time.Created, true
 		}
 		me := sm.byID[env.ID]
+		// P1-API-007 marker stickiness: when the resident entry carries OUR
+		// synthesized terminal and the fetched body STILL lacks a real terminal
+		// (no time.completed, no info.error), the fetched bytes are the
+		// uncompleted row OpenCode re-serves forever — merging the marker into
+		// them keeps the view terminal (and byte-stable, via the stored
+		// synthTerminalMs) instead of resurrecting the turn on every warm
+		// diff. A fetched body WITH a real terminal takes the normal path and
+		// clears the flag (upstream truth outranks our inference).
+		preserveMarker := me != nil && me.synthesizedTerminal &&
+			env.Time.Completed == nil && env.errorName() == ""
+		fetchedInfo := mwp.Info
+		if preserveMarker {
+			if merged := mergeInterruptedMarkerInfo(mwp.Info, me.synthTerminalMs); len(merged) > 0 {
+				fetchedInfo = merged
+			}
+		}
 		if me == nil {
 			me = &messageEntry{
-				id: env.ID, info: mwp.Info, parts: map[string]json.RawMessage{},
+				id: env.ID, info: fetchedInfo, parts: map[string]json.RawMessage{},
 				createdMs: createdMs, createdOK: createdOK,
 			}
 			sm.byID[env.ID] = me
@@ -360,17 +376,17 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts, exh
 			// resident; appending them put an old block after the newer tail.
 			sm.insertMessageIDOrdered(env.ID, createdMs, createdOK)
 			if !coldLoad {
-				s.emit(KindMessageUpsert, mwp.Info)
+				s.emit(KindMessageUpsert, fetchedInfo)
 			}
-		} else if !bytes.Equal(me.info, mwp.Info) && !(coldLoad && me.liveTouchedBody) {
+		} else if !bytes.Equal(me.info, fetchedInfo) && !(coldLoad && me.liveTouchedBody) {
 			// C-F2: on a cold load, a live message.updated during the in-flight
 			// GET means the store body is NEWER than the stale fetched body —
 			// preserve the live body (skip the overwrite). The warm resync
 			// path (coldLoad==false) treats the fetch as authoritative and
 			// still overwrites unconditionally.
-			me.info = mwp.Info
+			me.info = fetchedInfo
 			if !coldLoad {
-				s.emit(KindMessageUpsert, mwp.Info)
+				s.emit(KindMessageUpsert, fetchedInfo)
 			}
 		}
 		// C-F2: when a live event touched the message body during the cold
@@ -378,12 +394,31 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts, exh
 		// fetched envelope — preserve them wholesale (do NOT overwrite the
 		// cached role/completed/finish/tokens/agent from the stale fetch).
 		if !(coldLoad && me.liveTouchedBody) {
-			me.role = env.Role
-			me.completed = env.Time.Completed != nil
-			me.finish = env.Finish
-			me.tokens = env.Tokens
-			me.agent = env.Agent
-			me.terminalError = env.errorName()
+			if preserveMarker {
+				// Adopt the fetched body's non-terminal cached fields; keep
+				// completed=true + terminalError=InterruptedTurnErrorName +
+				// the synthesizedTerminal/synthTerminalMs pair (the marker
+				// bytes were merged into me.info above).
+				me.role = env.Role
+				me.finish = env.Finish
+				me.tokens = env.Tokens
+				me.agent = env.Agent
+			} else {
+				me.role = env.Role
+				// Terminal stickiness: a REAL terminal error arriving on an
+				// entry this view already closed (e.g. our sweep's completed,
+				// about to be refined by the upstream MessageAbortedError our
+				// pre-restart abort triggered) refines WHICH terminal it is
+				// but must not re-open it (no time.completed → caret back).
+				// A plain error row fetched cold still mirrors upstream
+				// exactly (completed only when time.completed present).
+				me.completed = env.Time.Completed != nil || (env.errorName() != "" && me.completed)
+				me.finish = env.Finish
+				me.tokens = env.Tokens
+				me.agent = env.Agent
+				me.terminalError = env.errorName()
+				me.synthesizedTerminal = false
+			}
 			// Cache/refresh the chronological key. On an info-less placeholder
 			// this is the keyless→keyed transition: setCreatedKey repositions
 			// the id into its chronological slot (the placeholder was appended
