@@ -188,7 +188,11 @@ func TestRestartHungAbortStillRestartsAndSweepHeals(t *testing.T) {
 	// AFTERMATH — the restarted instance comes up and authoritatively
 	// reports nothing busy (the real chain: reconcile/hydrate statuses fetch
 	// → SetActivityFromStatuses clear path; here driven through the same
-	// public store entry the successful fetch uses).
+	// public store entry the successful fetch uses). The d-F1 stability gate
+	// requires TWO consecutive not-busy observations before the sweep fires:
+	// the first call below is observation 1 (hydrate/reload), the second is
+	// the confirming observation (the next 60s reconcile tick in production).
+	store.SetActivityFromStatuses(map[string]json.RawMessage{})
 	store.SetActivityFromStatuses(map[string]json.RawMessage{})
 
 	healDeadline := time.Now().Add(2 * time.Second)

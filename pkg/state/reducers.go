@@ -119,6 +119,19 @@ func (s *Store) setActivityAtLocked(sessionID, st string, at time.Time, markOnId
 	if s.isRecentlyArchivedLocked(sessionID) {
 		return
 	}
+	// P1-API-007 d-F1 sweep-stability latch: ANY busy-class activity write —
+	// a busy/retry statuses observation (SetActivityFromStatuses), a live
+	// session.status busy event, or the in-flight-assistant busy escalation
+	// (upsertMessageLocked) — ends the session's consecutive not-busy
+	// observation run, so the interrupted-turn sweep's two-observation gate
+	// restarts. Placed BEFORE the prev==st early-return so a busy write onto
+	// an already-busy session (e.g. a truthful busy re-observation) also
+	// resets the run. Non-busy writes never touch the latch (the latch IS the
+	// not-busy observation record; SetActivityFromStatuses' clear path owns
+	// setting it).
+	if st == ActivityBusy || st == ActivityRetry {
+		delete(s.notBusyOnce, sessionID)
+	}
 	prev := s.activity[sessionID]
 	if prev == st {
 		return
@@ -352,23 +365,52 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 				delete(s.stopTurnID, sid)
 				s.turnState[sid] = TurnIdle
 			}
-			// P1-API-007 orphan sweep: the same authoritative not-busy evidence
-			// that cleared the activity also proves the run is over. If the
-			// session's newest assistant is still uncompleted, that turn was
-			// killed without a terminal (restart/crash/reboot/daemon-restart —
-			// OpenCode never marks it) — synthesize OUR terminal marker so the
-			// row stops rendering as a live-forever truncation. No-op (cheap
-			// predicate miss) for the ordinary idle case. Runs AFTER the
-			// TurnStopping settle above so a drained abort is marked too (the
-			// "abort cannot complete" heal). Authoritative-only by construction:
-			// this closure is reachable solely from a SUCCESSFUL statuses fetch.
+			// P1-API-007 orphan sweep — d-F1 two-observation stability gate:
+			// the same authoritative not-busy evidence that cleared the
+			// activity also proves the run is over, but ONE not-busy snapshot
+			// cannot distinguish a genuinely-dead run from the fetch→apply
+			// race (statuses fetched at T, a turn starting before this
+			// closure acquires s.mu). The gate: the FIRST consecutive
+			// not-busy observation only primes the notBusyOnce latch; the
+			// sweep fires on the SECOND. Any busy-class signal (a busy
+			// statuses observation, or the live busy escalation a just-started
+			// turn performs) clears the latch between observations — the
+			// turn's escalation arrives before this closure runs, so the
+			// stale snapshot cannot mark the live turn. If the session's
+			// newest assistant is still uncompleted on a STABLE not-busy
+			// observation, that turn was killed without a terminal
+			// (restart/crash/reboot/daemon-restart — OpenCode never marks it)
+			// — synthesize OUR terminal marker so the row stops rendering as
+			// a live-forever truncation. No-op (cheap predicate miss) for the
+			// ordinary idle case. Runs AFTER the TurnStopping settle above so
+			// a drained abort is marked too (the "abort cannot complete"
+			// heal). Authoritative-only by construction: this closure is
+			// reachable solely from a SUCCESSFUL statuses fetch.
+			if !s.notBusyOnce[sid] {
+				s.notBusyOnce[sid] = true // first consecutive sighting: prime only
+				return
+			}
 			s.sweepInterruptedTurnsLocked(sid)
 		}
 	}
+	// Dedupe the union: a session can appear in BOTH s.sessions and
+	// s.messages (a messages-only session — entry pruned, history resident —
+	// is also cleared). clearActivity must run ONCE per session per snapshot:
+	// the d-F1 stability latch counts one invocation per call, so a duplicate
+	// pass would let a single not-busy observation prime AND sweep. (The
+	// pre-latch body was idempotent — the idle write early-returns, the
+	// TurnStopping settle is one-shot — so the duplicate pass was invisible
+	// before; the union preserves the exact same cleared set, once each.)
+	cleared := make(map[string]bool, len(s.sessions)+len(s.messages))
 	for sid := range s.sessions {
+		cleared[sid] = true
 		clearActivity(sid)
 	}
 	for sid := range s.messages {
+		if cleared[sid] {
+			continue
+		}
+		cleared[sid] = true
 		clearActivity(sid)
 	}
 }
@@ -686,6 +728,10 @@ func (s *Store) deleteSessionLocked(id string) {
 	// pre-confirm a new session's newest assistant). See the struct comment.
 	delete(s.pendingEmptyNewest, id)
 	delete(s.confirmedEmptyNewest, id)
+	// Drop the sweep-stability latch so a recreated id re-stabilizes from
+	// scratch (a prior incarnation's not-busy run must not pre-arm the
+	// interrupted-turn sweep for a fresh session).
+	delete(s.notBusyOnce, id)
 	// Drop the cold-seed memo so a session recreated under the same id (live
 	// session.deleted then session.created, an archive/un-archive, or a hydrate
 	// prune-then-reappear) gets its lastAgent re-seeded from a fresh tail fetch.

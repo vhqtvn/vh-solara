@@ -22,6 +22,11 @@ package state
 // deadlock).
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/base64"
+	"encoding/json"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -340,6 +345,151 @@ func TestColdBatchHookAllDupesFloorFlipDiscardsStaleHasOlder(t *testing.T) {
 	// Exactly 2 capture attempts: 1 stale-discarded + 1 emitted. This also
 	// proves the repeat all-dupes flip did not re-bump (a re-bump would fail
 	// attempt 1's validation and force attempt 2, surfacing here as 3+).
+	if hookAttempts != 2 {
+		t.Fatalf("publishColdBatch capture attempts: got %d (via hookAttempts), want exactly 2 (1 stale-discarded + 1 emitted)", hookAttempts)
+	}
+}
+
+// messageTerminalFromBatch decodes a KindMessagesBatch payload (same gzip64
+// envelope as partTextFromBatch) and returns (time.completed?,
+// info.error.name) for the named message — the terminal-state view the sweep's
+// ABA regression asserts on.
+func messageTerminalFromBatch(t *testing.T, payload json.RawMessage, sid, mid string) (bool, string) {
+	t.Helper()
+	var env struct {
+		SessionID string `json:"sessionID"`
+		Encoding  string `json:"encoding"`
+		Data      string `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &env); err != nil {
+		t.Fatalf("batch payload unmarshal: %v", err)
+	}
+	if env.SessionID != sid || env.Encoding != "gzip64" {
+		t.Fatalf("batch envelope: sessionID=%q encoding=%q", env.SessionID, env.Encoding)
+	}
+	raw, err := base64.StdEncoding.DecodeString(env.Data)
+	if err != nil {
+		t.Fatalf("batch base64 decode: %v", err)
+	}
+	gr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("batch gzip reader: %v", err)
+	}
+	inner, err := io.ReadAll(gr)
+	if err != nil {
+		t.Fatalf("batch gunzip: %v", err)
+	}
+	if err := gr.Close(); err != nil {
+		t.Fatalf("batch gzip close: %v", err)
+	}
+	var p struct {
+		Messages []MessageWithParts `json:"messages"`
+	}
+	if err := json.Unmarshal(inner, &p); err != nil {
+		t.Fatalf("batch inner unmarshal: %v", err)
+	}
+	for _, m := range p.Messages {
+		var me struct {
+			ID   string `json:"id"`
+			Time struct {
+				Completed *float64 `json:"completed"`
+			} `json:"time"`
+			Error *struct {
+				Name string `json:"name"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(m.Info, &me); err != nil || me.ID != mid {
+			continue
+		}
+		name := ""
+		if me.Error != nil {
+			name = me.Error.Name
+		}
+		return me.Time.Completed != nil, name
+	}
+	t.Fatalf("message %s/%s not found in batch", sid, mid)
+	return false, ""
+}
+
+// TestColdBatchHookSweepMarkDiscardsStaleBatch is the bc-F1 ABA regression:
+// markInterruptedLocked mutates me.info/me.completed, so it MUST bump the
+// session's msgRev (the Store-wide nextMsgRev ABA contract — the mirror of
+// upsertMessageLocked's bump). Without the bump, a cold messages.batch
+// projection captured just BEFORE the sweep and packaged outside s.mu passes
+// publishColdBatch's revision validation and transiently replaces the marked
+// row client-side (the client treats messages.batch as a WHOLESALE
+// replacement) until the next reconcile.
+//
+// The hook fires the sweep's confirming statuses observation BETWEEN capture
+// and validation (mid-package, deterministic — the hook is synchronous):
+//
+//   - attempt 0: capture the UNMARKED orphan row at rev T; hook runs
+//     SetActivityFromStatuses (the 2nd consecutive not-busy observation — the
+//     1st was primed before publishColdBatch) → sweep marks + bumps T→T+1;
+//     validation msgRev==T? NO → DISCARD (the stale pre-sweep batch is
+//     rejected — the crux).
+//   - attempt 1: capture the MARKED row at rev T+1; hook fires a 3rd
+//     observation (predicate no-op — the entry is completed — NO bump);
+//     validation msgRev==T+1? YES → EMIT.
+//
+// The load-bearing assertion is on the EMITTED batch's terminal state (the
+// client-visible outcome), not the revision counter: with the bc-F1 bump
+// removed, this exact scenario emits the STALE unmarked batch on attempt 0.
+func TestColdBatchHookSweepMarkDiscardsStaleBatch(t *testing.T) {
+	const sid = "s_sweep_aba"
+	s := mustNew(t, DefaultConfig(100))
+	s.Apply(ev("session.created", `{"info":{"id":"`+sid+`","title":"S"}}`))
+	// Cold-load the orphan shape (completed user turn + UNCOMPLETED newest
+	// assistant): resident, unmarked, and the session is batchable (msgLoaded).
+	res := s.SetSessionMessagesExhausted(sid, []MessageWithParts{
+		{Info: json.RawMessage(`{"id":"u1","sessionID":"` + sid + `","role":"user","time":{"created":10,"completed":11}}`)},
+		{Info: json.RawMessage(`{"id":"oa1","sessionID":"` + sid + `","role":"assistant","time":{"created":20}}`)},
+	}, true)
+	if res.Status != ColdBatchEmitted {
+		t.Fatalf("seed: SetSessionMessagesExhausted want ColdBatchEmitted, got %v", res.Status)
+	}
+	// Prime the sweep-stability latch (d-F1): observation 1 of 2 — the row
+	// stays unmarked (a single not-busy observation must not sweep).
+	s.SetActivityFromStatuses(map[string]json.RawMessage{})
+	if c, te, _ := orphanState(t, s, sid, "oa1"); c || te != "" {
+		t.Fatalf("seed: obs-1 must not mark (completed=%v err=%q)", c, te)
+	}
+
+	// Firehose subscriber; the seed-time batch predates it, drain residue.
+	ch, unsub := s.Subscribe(256)
+	defer unsub()
+	drainAll(ch)
+
+	var hookAttempts int
+	coldBatchAfterCaptureHook = func(hsid string) {
+		if hsid != sid {
+			return
+		}
+		hookAttempts++
+		// THE crux call on EVERY capture attempt: a successful not-busy
+		// statuses observation lands mid-package. Attempt 0's call is the
+		// CONFIRMING observation (sweep marks + bumps); attempt 1's is a
+		// further no-op observation (entry completed → no bump).
+		s.SetActivityFromStatuses(map[string]json.RawMessage{})
+	}
+	t.Cleanup(func() { coldBatchAfterCaptureHook = nil })
+
+	if status := s.publishColdBatch(sid); status != ColdBatchEmitted {
+		t.Fatalf("publishColdBatch: want ColdBatchEmitted, got %v", status)
+	}
+
+	// CRUX — the EMITTED batch carries the MARKED row; the stale pre-sweep
+	// capture (completed=false, no error) never landed.
+	batches := collectBatches(t, ch)
+	if len(batches) != 1 {
+		t.Fatalf("want exactly 1 emitted cold batch, got %d", len(batches))
+	}
+	completed, errName := messageTerminalFromBatch(t, batches[0].Payload, sid, "oa1")
+	if !completed || errName != InterruptedTurnErrorName {
+		t.Fatalf("CRUX FAIL: emitted batch carries the STALE pre-sweep row (completed=%v err=%q) — the sweep's bumpMsgRev did not invalidate the in-flight batch", completed, errName)
+	}
+	// Exactly 2 capture attempts: 1 stale-discarded + 1 emitted (convergent,
+	// no loop; also proves attempt 1's observation did not re-bump).
 	if hookAttempts != 2 {
 		t.Fatalf("publishColdBatch capture attempts: got %d (via hookAttempts), want exactly 2 (1 stale-discarded + 1 emitted)", hookAttempts)
 	}

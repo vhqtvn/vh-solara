@@ -960,6 +960,23 @@ type Store struct {
 	// persists for the session lifetime (marks "history was loaded"),
 	// coldFetchActive is a transient in-flight window.
 	coldFetchActive map[string]bool
+	// notBusyOnce is the P1-API-007 d-F1 sweep-stability latch: it records
+	// that the PREVIOUS successful /session/status observation reported this
+	// session not-busy (busy|retry absent from the fetched snapshot) AND no
+	// busy-class signal has arrived since. The interrupted-turn sweep
+	// (sweepInterruptedTurnsLocked) fires only on the SECOND consecutive
+	// not-busy observation — the two-observation stability gate that closes
+	// the statuses fetch→apply TOCTOU gap (a turn starting after the fetch but
+	// before SetActivityFromStatuses takes s.mu escalates activity to busy
+	// live, which clears this latch, so the stale not-busy snapshot cannot
+	// mark the just-started turn). The latch is cleared by EVERY busy-class
+	// signal — a busy/retry statuses observation (setActivityAtLocked's
+	// busy-class write) or a live busy escalation / session.status busy event
+	// (same chokepoint) — and set by each not-busy observation in
+	// SetActivityFromStatuses' clear path. Set for every known session on
+	// every successful fetch (cheap map write). Cleared on session delete so
+	// a recreated id re-stabilizes from scratch.
+	notBusyOnce map[string]bool
 	// pendingEmptyNewest / confirmedEmptyNewest distinguish a newest COMPLETED
 	// assistant message with zero resident parts that is SOURCE TRUTH (the
 	// server genuinely has no parts for that turn — e.g. a finished turn whose
@@ -1209,6 +1226,7 @@ func NewWithConfig(cfg Config) (*Store, error) {
 		msgLoaded:              map[string]bool{},
 		msgRev:                 map[string]uint64{},
 		coldFetchActive:        map[string]bool{},
+		notBusyOnce:            map[string]bool{},
 		pendingEmptyNewest:     map[string]string{},
 		confirmedEmptyNewest:   map[string]string{},
 		seeded:                 map[string]bool{},

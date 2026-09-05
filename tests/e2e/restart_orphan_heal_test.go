@@ -87,10 +87,20 @@ func TestE2E_RestartOrphanHeal(t *testing.T) {
 	// Driven on the worker's own vh server (the coordinator's fixed
 	// /api/workers route table has no reload passthrough; the crux under
 	// test is the worker's store heal, not the proxy hop).
-	reloadReq, _ := http.NewRequest(http.MethodPost, cluster.WorkerVHURL+"/vh/reload", nil)
-	reloadReq.Header.Set("X-VH-CSRF", "1")
-	if resp, err := http.DefaultClient.Do(reloadReq); err != nil || resp.StatusCode != 200 {
-		t.Fatalf("reload want 200, got %v (%v)", statusOf(resp), err)
+	//
+	// d-F1 stability gate: the sweep fires only on the SECOND consecutive
+	// not-busy statuses observation (a turn starting between a fetch and its
+	// application must not be false-marked). Reload #1 is observation 1
+	// (hydrate); reload #2 is the confirming observation (in production the
+	// next 60s reconcile tick, or the next reconnect, confirms — whichever
+	// comes first). This is the coherent heal latency, documented in the
+	// slice closeout.
+	for i := 0; i < 2; i++ {
+		reloadReq, _ := http.NewRequest(http.MethodPost, cluster.WorkerVHURL+"/vh/reload", nil)
+		reloadReq.Header.Set("X-VH-CSRF", "1")
+		if resp, err := http.DefaultClient.Do(reloadReq); err != nil || resp.StatusCode != 200 {
+			t.Fatalf("reload #%d want 200, got %v (%v)", i+1, statusOf(resp), err)
+		}
 	}
 
 	// 6. CRUX — the orphaned turn is healed: completed + our interrupted
