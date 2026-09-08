@@ -75,6 +75,12 @@ export const [projSwitcherOpen, setProjSwitcherOpen] = createSignal(false);
 // termEmbeddedDefault.test.ts).
 export const [termOpen, setTermOpen] = createSignal(false);
 export const [termFull, setTermFull] = createSignal(false);
+// NARROW-drawer open flag, lifted out of App (P1 portrait session monitor) so
+// two non-App surfaces can drive the same drawer: the session rail's pinned
+// opener (SessionRail.tsx) opens it, and a session select from the drawer tree
+// (SessionTree.openSessionChat) dismisses it. Still App-wired only — the
+// back-dismiss binding stays in App because it reads sidebarMode().
+export const [navOpen, setNavOpen] = createSignal(false);
 // Toggleable on-screen key bar (esc/tab/ctrl/arrows). Persisted; default on.
 const [termKeys, setTermKeysSig] = createSignal<boolean>(
   loadVersioned<boolean>("vh.term.keys.v1", 1, true, (o) => o !== false && o !== 0 && o !== "0"),

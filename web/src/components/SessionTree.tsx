@@ -25,6 +25,8 @@ import {
 } from "../sync/treeSelectors";
 import { searchQuery, selectedTagIds } from "../sidebar";
 import { reconciledPinnedOrder, isPinned } from "../pins";
+import { setNavOpen } from "../ui";
+import { widthTier } from "../shapeTier";
 import {
   labelsDoc,
   labelsGroups,
@@ -50,6 +52,15 @@ import styles from "./SessionTree.module.css";
 export const openSessionChat = (id: string) => {
   setSelectedId(id);
   setView("chat");
+  // P1 portrait monitor: in the NARROW tier the tree lives inside the
+  // covering drawer — a select there must DISMISS the drawer so the chat is
+  // revealed (the tap intent is "go to this session", not "keep browsing").
+  // Gated on widthTier() === "narrow" — the LIVE tier signal — rather than
+  // sidebarMode(): when the kill-switch is off the signal is null (legacy
+  // matchMedia drives the mode instead) and this no-ops, so flag-off keeps
+  // the exact legacy drawer behavior (no auto-close). The rail band and wide
+  // never show the drawer, so they are unaffected by construction.
+  if (widthTier() === "narrow") setNavOpen(false);
 };
 
 // Resolve a root's tag ids → fully-formed tag chips (id/name/color from the

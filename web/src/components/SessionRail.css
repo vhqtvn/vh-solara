@@ -1,0 +1,152 @@
+/* SessionRail (P1 portrait session monitor) — the 48px avatar rail.
+ *
+ * A PLAIN (non-module) co-located stylesheet with ALL-GLOBAL selectors, the
+ * established repo pattern for e2e-queried all-global surfaces
+ * (ProjectSwitcher.css, TerminalDock.css, EmptyState.css — see
+ * docs/ai/web-css-architecture.md): the e2e suite queries this surface by
+ * stable class names (.session-rail, .rail-avatar[data-session-id], …), and
+ * an all-:global .module.css exports an EMPTY class map that a production
+ * build tree-shakes away entirely (observed: rules absent from dist). Plain
+ * CSS always ships. Consumes global tokens only (var(--label-*), var(--sel),
+ * …) — no new theme tokens.
+ *
+ * GPU contract (Firefox/WebRender guardrails, AGENTS.md): static colors and
+ * borders only, state via class/attribute flips. NO mask-image, NO
+ * backdrop-filter, NO contain/content-visibility, NO animation/transition —
+ * the rail is always-on chrome next to the chat scroll, the hottest surface
+ * in the app.
+ */
+
+.session-rail {
+  /* Fixed 48px column, adjacent flex sibling of .main (never an overlay —
+     the covering drawer is the only overlapping surface, at --z-drawer). */
+  width: 48px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0; /* let the avatar list shrink + scroll */
+  background: var(--bg-2);
+  border-right: 1px solid var(--border);
+}
+
+/* Avatar stack: vertical only — no wrap, no horizontal scroll (invariant 2).
+   overflow-y auto keeps aggregates + opener pinned via flex order (the foot
+   is a flex:none sibling AFTER the scroll area). */
+.session-rail .rail-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0;
+}
+
+/* One avatar = a 40px hit target whose 2px border is the SELECTION ring; the
+   28px .rail-chip circle inside carries identity + the STATE ring, so
+   selection and state never compete for the same border. */
+.rail-avatar {
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  flex: none;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border: 2px solid transparent;
+  border-radius: 14px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.rail-avatar.selected {
+  border-color: var(--sel);
+}
+.rail-avatar:hover {
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+}
+
+.rail-chip {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #fff; /* white initials on the saturated --label-* mid-tones, both themes */
+}
+
+/* Avatar hue palette (REVERSIBLE DEFAULT — sessionRail.ts RAIL_HUES): the
+   app's semantic --label-* mid-tones, indexed by the stable id hash. */
+.rail-chip.hue0 { background: var(--label-red); }
+.rail-chip.hue1 { background: var(--label-orange); }
+.rail-chip.hue2 { background: var(--label-amber); }
+.rail-chip.hue3 { background: var(--label-green); }
+.rail-chip.hue4 { background: var(--label-teal); }
+.rail-chip.hue5 { background: var(--label-blue); }
+.rail-chip.hue6 { background: var(--label-purple); }
+.rail-chip.hue7 { background: var(--label-gray); }
+
+/* State rings — ONE per avatar, precedence needs > error > running > unread
+   (sessionRail.ringOf). Static border flips only. */
+.rail-chip[data-ring="needs"] { border-color: var(--warn); }
+.rail-chip[data-ring="error"] { border-color: var(--danger); }
+.rail-chip[data-ring="running"] { border-color: var(--ok); }
+.rail-chip[data-ring="unread"] { border-color: var(--accent-2); }
+
+/* Pinned foot: needs-you badge + connection dot + drawer opener. Always
+   present (empty dir ⇒ aggregates all-zero/hidden, opener remains). */
+.rail-foot {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0 max(10px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--border);
+}
+
+.rail-needs {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--warn);
+  color: var(--fg-strong);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.rail-conn {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--fg-dim);
+}
+/* Same state ladder as the sidebar StatusMark (Sidebar indState). */
+.rail-conn[data-state="live"] { background: var(--ok); }
+.rail-conn[data-state="syncing"] { background: var(--accent); }
+.rail-conn[data-state="stale"] { background: var(--warn); }
+.rail-conn[data-state="connecting"],
+.rail-conn[data-state="reconnecting"] { background: var(--danger); }
+
+.rail-open {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.rail-open:hover {
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+}

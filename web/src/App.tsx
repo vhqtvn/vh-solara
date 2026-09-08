@@ -35,6 +35,7 @@ import PerformanceDialog from "./components/PerformanceDialog";
 import ProtocolConfirm from "./components/ProtocolConfirm";
 import Icon from "./components/Icon";
 import { menuTriggers } from "./sessionMenu";
+import SessionRail from "./components/SessionRail";
 import { sidebarCollapsed, sidebarMode, sidebarWidth, toggleSidebar } from "./layout";
 import { installShapeTier, widthTier } from "./shapeTier";
 import { draft, selectedId, state } from "./sync";
@@ -45,12 +46,13 @@ import { displayName, notesVisible, refreshProjectSettings, watchProjectSettings
 import { pushNotification } from "./notify";
 import { broadcastTheme, postThemeTo } from "./themeTokens";
 import { customTheme, theme } from "./theme";
-import { adminOpen, diagLogOpen, embeddedViewId, isEmbeddedView, ocLogsOpen, perfDiagOpen, setAdminOpen, setDiagLogOpen, setOcLogsOpen, setPaletteOpen, setPerfDiagOpen, setSettingsOpen, setTermOpen, setView, settingsOpen, termOpen, view, VIEW_PREFIX } from "./ui";
+import { adminOpen, diagLogOpen, embeddedViewId, isEmbeddedView, navOpen, ocLogsOpen, perfDiagOpen, setAdminOpen, setDiagLogOpen, setNavOpen, setOcLogsOpen, setPaletteOpen, setPerfDiagOpen, setSettingsOpen, setTermOpen, setView, settingsOpen, termOpen, view, VIEW_PREFIX } from "./ui";
 import { bindBackDismiss } from "./lib/backStack";
 import { projectDir } from "./sync";
 
 export default function App() {
-  const [navOpen, setNavOpen] = createSignal(false);
+  // navOpen/setNavOpen live in ui.ts (P1): the session rail's opener and the
+  // tree's narrow-tier select-dismiss both drive the same drawer signal.
   const [inspectorOpen, setInspectorOpen] = createSignal(false);
   const [managedOpen, setManagedOpen] = createSignal(false);
   // Back-dismissal for the App-local surfaces. navOpen is the NARROW (drawer)
@@ -277,6 +279,12 @@ export default function App() {
   return (
     <div class="app" classList={{ "sidebar-collapsed": sidebarCollapsed() }} ref={appEl}>
       <Sidebar open={navOpen()} onClose={() => setNavOpen(false)} />
+      {/* P1 portrait session monitor: the 48px avatar rail, mounted only in
+          the NARROW tier + flag-on (SessionRail gates itself on the tier
+          signal; null when the kill-switch is off ⇒ exact legacy layout). It
+          is an in-flow flex sibling of .main, so the drawer (fixed,
+          --z-drawer) still covers it and the chat keeps the remaining width. */}
+      <SessionRail />
       <main class="main">
         <header class="main-head">
           <button type="button" class="nav-toggle" onClick={toggleNav} aria-label="Toggle sidebar">
