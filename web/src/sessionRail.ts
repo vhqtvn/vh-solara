@@ -41,7 +41,7 @@ import { isUpdating } from "./sync/reconcile";
 // REVERSIBLE DEFAULT (operator dials): the avatar hue palette SIZE. The hues
 // themselves are the app's semantic --label-* mid-tones (tokens.css) — the
 // same palette the server validates for groups/tags — consumed via the
-// hueN classes in SessionRail.module.css so every theme keeps working.
+// hueN classes in SessionRail.css so every theme keeps working.
 export const RAIL_HUES = 8;
 
 /**
@@ -97,7 +97,7 @@ export interface RailSession {
  * The single state ring shown on an avatar, by priority: needs-input >
  * error > running > unread. One ring per avatar (a class flip — attention is
  * never additive chrome); the selected-session ring is a SEPARATE indicator
- * on the button (see SessionRail.module.css) so selection and state never
+ * on the button (see SessionRail.css) so selection and state never
  * compete for the same border.
  */
 export type RailRing = "needs" | "error" | "running" | "unread" | null;

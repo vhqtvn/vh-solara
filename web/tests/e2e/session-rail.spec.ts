@@ -240,6 +240,17 @@ test("mixed states render on the rail (needs ring, unread ring, needs-you badge)
     );
 
   try {
+    // PAINT BASELINE (pre-arm): a fresh probe carries NO state, so its chip
+    // border is the transparent default. Paired with the post-arm color
+    // assertion below, this pins that the ring actually PAINTS (the chip's
+    // border-color CHANGES), not merely that the data-ring attribute lands on
+    // the button — the vacuous-green guard.
+    const askChip = rail.locator(`.rail-avatar[data-session-id='${askProbe}'] .rail-chip`);
+    await expect(rail.locator(`.rail-avatar[data-session-id='${askProbe}']`)).toBeVisible({
+      timeout: 15000,
+    });
+    await expect(askChip).toHaveCSS("border-color", "rgba(0, 0, 0, 0)");
+
     // [[ask]] arms a pending question on the unselected ask-probe →
     // needs-input ring; a plain prompt on the unselected unread-probe →
     // busy→idle → the root-scoped unread ring.
@@ -254,6 +265,16 @@ test("mixed states render on the rail (needs ring, unread ring, needs-you badge)
     ).toBeVisible({ timeout: 15000 });
     // needs-you grew by exactly the two armed roots — each counted once.
     await expect(rail.locator(".rail-needs")).toHaveAttribute("data-count", String(baseline + 2));
+
+    // PAINTED (post-arm): the needs ring's chip border now resolves
+    // var(--warn) in the live theme — calibrated against the needs-you
+    // badge's fill (the same token, read from the rendered page, so the
+    // assertion never drifts with theme-token values). Pre-arm the SAME
+    // element asserted the transparent default: attribute AND paint.
+    const warnFill = await rail
+      .locator(".rail-needs")
+      .evaluate((el) => getComputedStyle(el).backgroundColor);
+    await expect(askChip).toHaveCSS("border-color", warnFill);
 
     // Evidence (gitignored tmp/) for the operator's visual review + the
     // vision legibility pass.

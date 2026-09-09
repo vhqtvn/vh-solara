@@ -92,11 +92,20 @@
 .rail-chip.hue7 { background: var(--label-gray); }
 
 /* State rings — ONE per avatar, precedence needs > error > running > unread
-   (sessionRail.ringOf). Static border flips only. */
-.rail-chip[data-ring="needs"] { border-color: var(--warn); }
-.rail-chip[data-ring="error"] { border-color: var(--danger); }
-.rail-chip[data-ring="running"] { border-color: var(--ok); }
-.rail-chip[data-ring="unread"] { border-color: var(--accent-2); }
+   (sessionRail.ringOf). Static border flips only.
+   Selector shape: the data-ring ATTRIBUTE lives on the .rail-avatar button
+   (the automation/e2e query surface — the spec selects
+   .rail-avatar[data-session-id=…][data-ring=…]) while the ring PAINTS on the
+   inner .rail-chip border (the button's border belongs to the SELECTION ring
+   — selection and state never compete for one border), so each rule descends
+   from the attribute to the chip. Rejected shapes: painting on the button
+   (.rail-avatar[data-ring=…] alone) ties (0,2,0) specificity with
+   .rail-avatar.selected — one border, two meanings; moving the attribute
+   onto the chip would break the e2e queries that select it ON the button. */
+.rail-avatar[data-ring="needs"] .rail-chip { border-color: var(--warn); }
+.rail-avatar[data-ring="error"] .rail-chip { border-color: var(--danger); }
+.rail-avatar[data-ring="running"] .rail-chip { border-color: var(--ok); }
+.rail-avatar[data-ring="unread"] .rail-chip { border-color: var(--accent-2); }
 
 /* Pinned foot: needs-you badge + connection dot + drawer opener. Always
    present (empty dir ⇒ aggregates all-zero/hidden, opener remains). */

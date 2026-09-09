@@ -3,8 +3,11 @@
 // sessionRail — derivation unit tests (P1 portrait session monitor).
 //
 // Pins the four hard invariants of the rail's model:
-//   1. STABLE ORDER — rail order follows the tree store's root order
-//      (treeRoots), never attention state;
+//   1. STABLE ORDER — rail order follows the tree store's ARRIVAL order
+//      (rootNodes(treeMap()) — insertion/emit order), never attention state
+//      and never the rank-sorted treeRoots() the sidebar tree uses (that
+//      accessor front-promotes on working edges; rail positions are fixed
+//      muscle memory — see the sessionRail.ts module header);
 //   2. ROOT GRANULARITY + selected-inclusion — only roots enumerate, and the
 //      selected session's root is always among them;
 //   3. AGGREGATE DEDUPE — a root with BOTH needs-input AND unread counts
@@ -15,15 +18,17 @@
 // Drives the real tree store (seedTreeStore/applyTreeOpStore) and the real
 // sync store maps — no SSE, deterministic. jsdom because the import graph
 // (sync/store → lib/store) touches localStorage at module init.
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { reconcile } from "solid-js/store";
+import { render } from "@solidjs/testing-library";
 import {
   seedTreeStore,
   resetTreeStore,
   resetExpandedForTest,
   applyTreeOpStore,
 } from "../../src/sync/treeState";
-import { state, setState } from "../../src/sync/store";
+import { selectedId, setSelectedIdRaw, setState, state } from "../../src/sync/store";
+import SessionRail from "../../src/components/SessionRail";
 import type { TreeNode } from "../../src/sync/treeMap";
 import {
   RAIL_HUES,
@@ -33,6 +38,17 @@ import {
   railSessions,
   ringOf,
 } from "../../src/sessionRail";
+
+// The rail's mount gate reads the LIVE width tier (shapeTier's RO-driven
+// signal); jsdom has no observer, so mock the accessor per-case (the
+// autoclose-test precedent). The hoisted mock applies file-wide but is inert
+// for the derivation tests above — nothing in the sessionRail import graph
+// imports shapeTier.
+const { widthTierMock } = vi.hoisted(() => ({ widthTierMock: vi.fn() }));
+vi.mock("../../src/shapeTier", async (importActual) => {
+  const actual = await importActual<typeof import("../../src/shapeTier")>();
+  return { ...actual, widthTier: (): "narrow" | "rail" | "wide" | null => widthTierMock() };
+});
 
 function node(overrides: Partial<TreeNode> = {}): TreeNode {
   return {
@@ -270,5 +286,63 @@ describe("ring precedence (one ring per avatar)", () => {
     expect(rs[0].unread).toBe(true);
     expect(ringOf(rs[0])).toBe("unread");
     expect(state.unread["U"]).toBe(true); // sanity: the seeded map is live
+  });
+});
+
+describe("root-granular selection ring (the component marks rootOf(selected))", () => {
+  it("selecting a SUBSESSION marks its PARENT root's avatar; no subsession avatar exists", () => {
+    widthTierMock.mockReturnValue("narrow"); // the mount gate: the rail renders
+    seedTreeStore([
+      node({ id: "root1", title: "Root one", childCount: 1, updatedMs: 30 }),
+      node({ id: "child1", parentId: "root1", title: "Child", updatedMs: 40 }),
+      node({ id: "root2", title: "Root two", updatedMs: 20 }),
+    ]);
+    // The selRoot derivation reads selectedId() AND residency in
+    // state.sessions (the DETAIL store — distinct from the tree map): a
+    // resident SUBSESSION selection marks rootOf(child1) = root1.
+    setState(
+      "sessions",
+      reconcile({
+        root1: { id: "root1", title: "Root one" },
+        child1: { id: "child1", parentID: "root1", title: "Child" },
+        root2: { id: "root2", title: "Root two" },
+      }),
+    );
+    setSelectedIdRaw("child1");
+
+    const { container, unmount } = render(SessionRail);
+    try {
+      const root1 = container.querySelector(".rail-avatar[data-session-id='root1']");
+      const root2 = container.querySelector(".rail-avatar[data-session-id='root2']");
+      expect(root1).toBeTruthy();
+      expect(root2).toBeTruthy();
+      expect(selectedId()).toBe("child1"); // sanity: the selection IS the child
+      expect(root1!.classList.contains("selected")).toBe(true); // the PARENT root wears the ring
+      expect(root2!.classList.contains("selected")).toBe(false);
+      // Root granularity: the subsession never gets an avatar of its own.
+      expect(container.querySelector(".rail-avatar[data-session-id='child1']")).toBeNull();
+    } finally {
+      unmount();
+      setSelectedIdRaw(null);
+      setState("sessions", reconcile({}));
+    }
+  });
+
+  it("a GHOST selection (id not resident in state.sessions) marks nothing", () => {
+    widthTierMock.mockReturnValue("narrow");
+    seedTreeStore([node({ id: "root1", title: "Root one", updatedMs: 30 })]);
+    setState("sessions", reconcile({ root1: { id: "root1", title: "Root one" } }));
+    setSelectedIdRaw("ghost-id"); // not in state.sessions → selRoot is null
+
+    const { container, unmount } = render(SessionRail);
+    try {
+      const root1 = container.querySelector(".rail-avatar[data-session-id='root1']");
+      expect(root1).toBeTruthy();
+      expect(root1!.classList.contains("selected")).toBe(false);
+    } finally {
+      unmount();
+      setSelectedIdRaw(null);
+      setState("sessions", reconcile({}));
+    }
   });
 });
