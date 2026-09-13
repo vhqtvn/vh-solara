@@ -15,6 +15,7 @@ package fixtures
 // unit test and go test ./pkg/fixtures/ was not in the Slice-5 validation run).
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -878,5 +879,175 @@ func TestAgentHoldEventsCarryTranslatorShapes(t *testing.T) {
 	}
 	if !sawArmDeleted {
 		t.Fatalf("no arm-site session.deleted observed on the SSE feed within 2s")
+	}
+}
+
+// --- new-session cold-hold latch (lane-6 new-session reveal e2e) --------------
+//
+// The /fixture/new-session-hold/{arm,release} surface must be deterministic in
+// the shared serial fixtureserver AND crash-safe: armed = ses_new* message-LIST
+// GETs park (release is the only clock); non-ses_new* sessions, the exact-GET,
+// and any non-list GET shape pass through untouched; release drains parked
+// GETs; a re-arm closes the stale latch first; and a parked GET escapes when
+// its own REQUEST context dies (the hard-killed-run shape) instead of parking
+// forever on a stranded latch.
+
+func armNewHold(t *testing.T, srv *httptest.Server) {
+	t.Helper()
+	resp, _ := postJSON(t, srv, "/fixture/new-session-hold/arm", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("new-session-hold arm: got %d want 200", resp.StatusCode)
+	}
+}
+
+func releaseNewHold(t *testing.T, srv *httptest.Server) {
+	t.Helper()
+	resp, _ := postJSON(t, srv, "/fixture/new-session-hold/release", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("new-session-hold release: got %d want 200", resp.StatusCode)
+	}
+}
+
+// TestNewHoldLatchHoldsOnlySesNewMessageList pins the guard's precision (the
+// B2 tightening): while armed, ONLY the ses_new* message-LIST GET parks. The
+// exact-GET /message/:mid returns inside the switch, a non-ses_new session's
+// list GET is untouched, and a bare GET /session/ses_newN (action=="" — no
+// client verb issues it, but the latch must not capture unknown shapes) must
+// fall through and serve instead of parking.
+func TestNewHoldLatchHoldsOnlySesNewMessageList(t *testing.T) {
+	f := New()
+	srv := startFixtureHTTP(t, f)
+	armNewHold(t, srv)
+
+	// The held shape: ses_new* message-LIST GET must NOT complete in the window.
+	done := getAsync(srv, "/session/ses_new7/message")
+	select {
+	case r := <-done:
+		t.Fatalf("ses_new* message-LIST GET served while armed (status=%d body=%s) — the race cell would be vacuous", r.status, r.body)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Sibling sessions are unaffected (demo is seeded by New).
+	if resp, _ := get(t, srv, "/session/demo/message"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("non-ses_new message-LIST GET must not be held (got %d)", resp.StatusCode)
+	}
+
+	// Exact-GET returns inside the switch (404: no such persisted message) —
+	// the queue reconciler must stay live while the latch is armed.
+	if resp, _ := get(t, srv, "/session/ses_new7/message/msg_x1"); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("exact-GET must not be held (got %d want 404)", resp.StatusCode)
+	}
+
+	// Bare GET /session/ses_new7 (action=="") falls through to the tail and
+	// serves the (empty) list. Pre-B2 this parked on the loose prefix+method
+	// guard — the tightened message-LIST-only guard is what makes it pass.
+	if resp, body := get(t, srv, "/session/ses_new7"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("bare ses_new* session GET must not be held (got %d body=%s)", resp.StatusCode, body)
+	}
+
+	// Drain: release so the parked canary GET completes before srv.Close()
+	// (Close waits for outstanding handlers; a still-parked GET would hang it).
+	releaseNewHold(t, srv)
+	<-done
+}
+
+// TestNewHoldLatchReleaseDrainsAndRearmClosesStale pins the release/re-arm
+// semantics the crash-safety story leans on: release completes parked GETs and
+// lets later GETs pass; a second arm while armed closes the STALE latch first
+// (draining whatever parked on it) before installing the fresh sentinel; and
+// release is idempotent when unarmed.
+func TestNewHoldLatchReleaseDrainsAndRearmClosesStale(t *testing.T) {
+	f := New()
+	srv := startFixtureHTTP(t, f)
+
+	// Unarmed: release is a tolerated no-op (the global-setup disarm shape).
+	releaseNewHold(t, srv)
+
+	// Arm → park one GET → RELEASE: the parked GET must complete and serve.
+	armNewHold(t, srv)
+	parked := getAsync(srv, "/session/ses_new1/message")
+	select {
+	case r := <-parked:
+		t.Fatalf("GET completed while armed without any release (status=%d) — the latch is not withholding", r.status)
+	case <-time.After(150 * time.Millisecond):
+	}
+	releaseNewHold(t, srv)
+	r := <-parked
+	if r.status != http.StatusOK {
+		t.Fatalf("parked GET after release: got %d want 200 (body=%s)", r.status, r.body)
+	}
+	// Post-release GETs pass straight through.
+	if resp, _ := get(t, srv, "/session/ses_new1/message"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("post-release GET must pass through (got %d)", resp.StatusCode)
+	}
+
+	// Arm → park one GET → ARM AGAIN: the stale latch closes (draining the
+	// parked GET) and a FRESH sentinel takes over — a new GET parks again.
+	armNewHold(t, srv)
+	parked2 := getAsync(srv, "/session/ses_new2/message")
+	select {
+	case r := <-parked2:
+		t.Fatalf("GET completed while armed (status=%d) before the re-arm", r.status)
+	case <-time.After(150 * time.Millisecond):
+	}
+	armNewHold(t, srv)
+	r2 := <-parked2
+	if r2.status != http.StatusOK {
+		t.Fatalf("parked GET after stale-close re-arm: got %d want 200 (body=%s)", r2.status, r2.body)
+	}
+	done := getAsync(srv, "/session/ses_new2/message")
+	select {
+	case r := <-done:
+		t.Fatalf("GET served on the FRESH sentinel after re-arm (status=%d) — the re-arm did not install a new latch", r.status)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Drain: release the still-armed fresh sentinel so the parked GET
+	// completes before srv.Close() (Close waits for outstanding handlers).
+	releaseNewHold(t, srv)
+	<-done
+}
+
+// TestHoldLatchesEscapeOnRequestContextDone pins the B3 crash-safety contract
+// for BOTH hold latches: a parked GET whose request context dies (the killed
+// client / dead proxy connection of a hard-killed run) returns WITHOUT any
+// latch release. Proven handler-side — ServeHTTP itself must come back while
+// both latches remain armed — so the escape cannot be satisfied by the client
+// merely giving up on the connection.
+func TestHoldLatchesEscapeOnRequestContextDone(t *testing.T) {
+	f := New()
+	handler := f.Handler()
+	srv := startFixtureHTTP(t, f)
+	armNewHold(t, srv)
+	resp, _ := postJSON(t, srv, "/fixture/agent-hold/arm", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("agent-hold arm: got %d want 200", resp.StatusCode)
+	}
+
+	for _, tc := range []struct{ name, path string }{
+		{"new-hold ses_new* message-LIST", "/session/ses_new9/message"},
+		{"agent-hold message-LIST", "/session/agenthold/message"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil).WithContext(ctx)
+			rec := httptest.NewRecorder()
+			served := make(chan struct{})
+			go func() {
+				handler.ServeHTTP(rec, req)
+				close(served)
+			}()
+			// Give the handler a beat to reach the park, then kill the request
+			// context — the only wake source can be the ctx.Done escape (no
+			// release is issued).
+			time.Sleep(100 * time.Millisecond)
+			cancel()
+			select {
+			case <-served:
+				// Escaped the park on request death — the crash-safety contract.
+			case <-time.After(2 * time.Second):
+				t.Fatalf("parked GET %s did not return after request context cancel — goroutine stranded on the latch", tc.path)
+			}
+		})
 	}
 }

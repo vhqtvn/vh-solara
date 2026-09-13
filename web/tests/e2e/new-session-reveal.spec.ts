@@ -86,7 +86,20 @@ async function cleanQueue(request: APIRequestContext, sessionId: string): Promis
 test.afterEach(async ({ request }) => {
   // Release the cold-hold latch FIRST (no-op when not armed): parked cold
   // fetches drain, and no later spec's ses_new* fetch can ever park on it.
-  await request.post(`/oc/fixture/new-session-hold/release`, { headers: csrf }).catch(() => {});
+  // Failures are LOGGED, not swallowed (a swallowed release failure is exactly
+  // how a stranded latch hides until the next run wedges unrelated specs) —
+  // but stay non-fatal, same WARNING-not-fail posture as the fixture-delete
+  // below: the suite-level disarm in web/global-setup.ts is the next run's
+  // safety net.
+  const rel = await request
+    .post(`/oc/fixture/new-session-hold/release`, { headers: csrf })
+    .catch((err: unknown) => {
+      console.log(`[new-session-reveal] WARNING: latch release request failed: ${String(err)}`);
+      return null;
+    });
+  if (rel && !rel.ok()) {
+    console.log(`[new-session-reveal] WARNING: latch release -> ${rel.status()} ${rel.statusText()}`);
+  }
   if (!sid) return; // failed before materialization: context-local state only
   await cleanQueue(request, sid);
   const res = await request.post(`/oc/fixture/delete?session=${encodeURIComponent(sid)}`, {

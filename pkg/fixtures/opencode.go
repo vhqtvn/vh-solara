@@ -142,6 +142,9 @@ type FakeOpenCode struct {
 	// OUTSIDE f.mu (same discipline as agentHoldBlock / the slow sleep), so a
 	// held fetch never stalls the /session list, the SSE emit fan-out, or
 	// sibling sessions. Off by default; existing fixtures/tests never arm it.
+	// Crash-safety: parked GETs are bounded by their request context (see the
+	// select in handleSession), and web/global-setup.ts releases any latch a
+	// hard-killed run stranded before the next run's first spec.
 	newHoldMu    sync.Mutex
 	newHoldBlock chan struct{}
 }
@@ -1342,7 +1345,16 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 		ch := f.agentHoldBlock
 		f.agentHoldMu.Unlock()
 		if ch != nil {
-			<-ch
+			// Crash-safety: the park is bounded by the REQUEST lifetime, not
+			// just the latch. A hard-killed run (SIGKILL'd Playwright) leaves
+			// dead proxy connections behind; their parked GETs must drain via
+			// ctx.Done instead of piling up until a release that may never
+			// come. The latch itself stays armed — only release (or the
+			// suite-level disarm in web/global-setup.ts) clears it.
+			select {
+			case <-ch:
+			case <-r.Context().Done():
+			}
 		}
 	}
 
@@ -1353,15 +1365,24 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 	// cold hydration's messages.batch/messages.loaded completion for the new
 	// session while its turn's live events keep streaming — the wedge shape
 	// behind the operator-reported blank-viewport bug. Same OUTSIDE-f.mu
-	// discipline as the holds above; only the message-LIST GET reaches here
-	// (exact-GETs /message/:mid and every mutating action return inside the
-	// switch above), so the queue reconciler and the prompt flow are unaffected.
-	if strings.HasPrefix(id, "ses_new") && r.Method == http.MethodGet {
+	// discipline as the holds above. The guard is EXACTLY the message-LIST
+	// shape (action=="message" && len(parts)==3): the exact-GET /message/:mid
+	// returns inside the switch above, and the client's only GETs under
+	// /session/<sid>/… are Messages/MessagesTail/MessagesBefore (all
+	// /session/<sid>/message) plus that exact-GET — nothing else can reach the
+	// fall-through, so no unrelated GET shape can ever park on the latch.
+	if strings.HasPrefix(id, "ses_new") && action == "message" && len(parts) == 3 && r.Method == http.MethodGet {
 		f.newHoldMu.Lock()
 		ch := f.newHoldBlock
 		f.newHoldMu.Unlock()
 		if ch != nil {
-			<-ch
+			// Crash-safety: same request-bounded park as agentHoldBlock above
+			// (dead connections drain via ctx.Done; the latch stays armed
+			// until release or the web/global-setup.ts suite-level disarm).
+			select {
+			case <-ch:
+			case <-r.Context().Done():
+			}
 		}
 	}
 

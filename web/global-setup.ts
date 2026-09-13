@@ -29,4 +29,42 @@ export default async function globalSetup() {
   const repoRoot = path.resolve(webRoot, "..");
   const demoDir = process.env.VH_DEMO_DIR || path.join(repoRoot, "tmp", "fixture-demo");
   rmSync(path.join(demoDir, ".vh-solara", "sessions"), { recursive: true, force: true });
+
+  // --- suite-level hold-latch disarm (crash-safety) --------------------------
+  //
+  // A hard-killed run (SIGKILL'd Playwright, crashed worker) skips every
+  // afterEach, so the fixtureserver's test-only hold latches can stay ARMED:
+  // the agent-evidence hold (/oc/fixture/agent-hold/*) and the new-session
+  // cold hold (/oc/fixture/new-session-hold/*) that parks ses_new* message-
+  // LIST GETs. Locally reuseExistingServer:!CI then REUSES that orphaned
+  // server for the next run, and the first spec whose flow mints a ses_new*
+  // session (or observes agenthold) parks its cold fetch on the stranded
+  // latch → suite-wide timeouts in unrelated specs. Release BOTH latches
+  // here, before any spec runs.
+  //
+  // Ordering: Playwright brings the webServer up (readiness-gated on `url`)
+  // BEFORE globalSetup — the same assumption the queue-wipe above rests on —
+  // but a reused or just-bound server can still race the first connect, so
+  // each release retries until the server answers or a 15s budget expires.
+  // Both endpoints are idempotent (a clean prior run disarms nothing), the
+  // X-VH-CSRF header is required (csrfGuard covers POST /oc/*), and a non-2xx
+  // response is WARNED rather than thrown: the disarm is a safety net and
+  // must not become a new way to fail the lane.
+  const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? "http://127.0.0.1:8099";
+  for (const p of ["/oc/fixture/new-session-hold/release", "/oc/fixture/agent-hold/release"]) {
+    const deadline = Date.now() + 15_000;
+    for (;;) {
+      try {
+        const res = await fetch(baseURL + p, { method: "POST", headers: { "X-VH-CSRF": "1" } });
+        console.log(`[global-setup] hold-latch disarm: POST ${p} -> ${res.status}`);
+        break;
+      } catch (err) {
+        if (Date.now() >= deadline) {
+          console.log(`[global-setup] WARNING: hold-latch disarm POST ${p} never connected: ${String(err)}`);
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+  }
 }
