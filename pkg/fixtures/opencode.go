@@ -125,6 +125,25 @@ type FakeOpenCode struct {
 	// /session list, the SSE emit fan-out, or sibling sessions' cold-seed.
 	agentHoldMu    sync.Mutex
 	agentHoldBlock chan struct{}
+
+	// --- test-only new-session cold-hold latch (lane-6 new-session reveal e2e) ---
+	//
+	// While armed, the message-LIST GET (GET /session/:sid/message… — the
+	// fall-through below, same interception point as agentHoldBlock and the
+	// slow-sleep) blocks for any session whose id has the "ses_new" prefix —
+	// the ids POST /session mints (the SPA draft→first-send materialization
+	// path). Withholding that GET withholds the aggregator's cold hydration:
+	// no messages.batch / messages.loaded completion can be produced for the
+	// session, while the turn's live message.*/part.* events keep flowing on
+	// the /event feed — the deterministic e2e encoding of the "completion
+	// signal lost on the open connection while live events flow" wedge that
+	// commit 439b166's messagesDelivered flip guards (see
+	// web/tests/unit/ChatViewNewSessionBlank.test.tsx cells E/E2). Blocks
+	// OUTSIDE f.mu (same discipline as agentHoldBlock / the slow sleep), so a
+	// held fetch never stalls the /session list, the SSE emit fan-out, or
+	// sibling sessions. Off by default; existing fixtures/tests never arm it.
+	newHoldMu    sync.Mutex
+	newHoldBlock chan struct{}
 }
 
 // agentHoldSessionID is the dedicated agent-evidence-hold session (lane-6
@@ -933,6 +952,8 @@ func (f *FakeOpenCode) Handler() http.Handler {
 	mux.HandleFunc("/fixture/agent-hold/arm", f.handleFixtureAgentHoldArm)
 	mux.HandleFunc("/fixture/agent-hold/release", f.handleFixtureAgentHoldRelease)
 	mux.HandleFunc("/fixture/agent-hold/reset", f.handleFixtureAgentHoldReset)
+	mux.HandleFunc("/fixture/new-session-hold/arm", f.handleFixtureNewHoldArm)
+	mux.HandleFunc("/fixture/new-session-hold/release", f.handleFixtureNewHoldRelease)
 	mux.HandleFunc("/question/", f.handleQuestion)
 	mux.HandleFunc("/question", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -1320,6 +1341,25 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 		f.agentHoldMu.Lock()
 		ch := f.agentHoldBlock
 		f.agentHoldMu.Unlock()
+		if ch != nil {
+			<-ch
+		}
+	}
+
+	// New-session cold hold (web/tests/e2e/new-session-reveal.spec.ts): while
+	// armed, every message-LIST GET under a ses_new* session (the POST /session
+	// id prefix — the draft→send materialization path) blocks until
+	// /fixture/new-session-hold/release. This deterministically withholds the
+	// cold hydration's messages.batch/messages.loaded completion for the new
+	// session while its turn's live events keep streaming — the wedge shape
+	// behind the operator-reported blank-viewport bug. Same OUTSIDE-f.mu
+	// discipline as the holds above; only the message-LIST GET reaches here
+	// (exact-GETs /message/:mid and every mutating action return inside the
+	// switch above), so the queue reconciler and the prompt flow are unaffected.
+	if strings.HasPrefix(id, "ses_new") && r.Method == http.MethodGet {
+		f.newHoldMu.Lock()
+		ch := f.newHoldBlock
+		f.newHoldMu.Unlock()
 		if ch != nil {
 			<-ch
 		}
@@ -2492,6 +2532,44 @@ func (f *FakeOpenCode) handleFixtureAgentHoldReset(w http.ResponseWriter, r *htt
 		f.emit("session.deleted", map[string]any{"info": map[string]any{"id": agentHoldSessionID}})
 	}
 	writeJSON(w, map[string]any{"reset": agentHoldSessionID})
+}
+
+// releaseNewHoldLatch closes any installed new-session-hold latch and disarms
+// it. Idempotent. Closing (not nil-then-race) wakes every held message-LIST
+// GET at once — the held cold fetches then complete and the aggregator's
+// reconcile emits the withheld messages.batch + messages.loaded pair, so the
+// fixture returns to the faithful always-delivers behavior for sibling specs.
+func (f *FakeOpenCode) releaseNewHoldLatch() {
+	f.newHoldMu.Lock()
+	ch := f.newHoldBlock
+	f.newHoldBlock = nil
+	f.newHoldMu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+// handleFixtureNewHoldArm arms the new-session cold-hold latch. Idempotent:
+// a stale latch from a prior arm (possible only after a crashed spec — the
+// matching release normally ran) is closed first so no GET can wedge forever,
+// then a fresh sentinel is installed. No fixture-side state to reset: the
+// ses_new* sessions the latch governs do not exist yet at arm time (they are
+// minted by the spec's own draft→send POST). TEST-ONLY.
+func (f *FakeOpenCode) handleFixtureNewHoldArm(w http.ResponseWriter, r *http.Request) {
+	f.releaseNewHoldLatch()
+	f.newHoldMu.Lock()
+	f.newHoldBlock = make(chan struct{})
+	f.newHoldMu.Unlock()
+	writeJSON(w, map[string]any{"armed": "ses_new*"})
+}
+
+// handleFixtureNewHoldRelease releases the new-session cold hold: held
+// message-LIST GETs complete (their cold hydration then finishes normally),
+// and subsequent GETs pass through unheld until the next arm. Idempotent
+// (no-op when not armed). TEST-ONLY.
+func (f *FakeOpenCode) handleFixtureNewHoldRelease(w http.ResponseWriter, r *http.Request) {
+	f.releaseNewHoldLatch()
+	writeJSON(w, map[string]any{"released": "ses_new*"})
 }
 
 func (f *FakeOpenCode) appendMessage(sessionID string, m messageWithParts) {
