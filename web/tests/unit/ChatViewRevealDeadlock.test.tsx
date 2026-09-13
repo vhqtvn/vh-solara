@@ -278,4 +278,55 @@ describe("ChatView reveal-gate — O1 cold-stub deadlock self-heal", () => {
     await new Promise((r) => setTimeout(r, 30));
     expect(readyClass(container)).toMatch(/\bready\b/);
   });
+
+  it("third shape: early upsert-flip pins to bottom; the late history batch re-arms the anchor restore (439b166 follow-up)", async () => {
+    // A cold session WITH server-side history where a live message.upsert wins
+    // the wire race against the history messages.batch (server-side the cold
+    // batch is published outside the session lock, so live deltas can overtake
+    // it). The reducer flips messagesDelivered on the upsert — at upsert time
+    // this is indistinguishable from the only-ever-empty shape, so the flip
+    // MUST keep firing (the 439b166 wedge fix). With the flag flipped and the
+    // stored anchor (m4) still absent from the one-message order, the
+    // delivered() gate bypasses both maybeRestore defers → stale-anchor branch
+    // pins to bottom + sets the one-shot restoredFor lockout. Pre-fix the
+    // lockout then HELD: when the batch landed the anchor row moments later,
+    // nothing re-ran maybeRestore and the reader's stored position was
+    // silently dropped. The third-shape anchor re-arm effect must clear the
+    // lockout when the anchor row finally arrives and re-run maybeRestore —
+    // the genuine-anchor branch flips following()=false, observable as the
+    // "↓ Latest" (.jump) pill appearing. State is driven directly (the
+    // reducer-level contract — flip fires pre-batch, batch merges — is pinned
+    // in applySnapshot.test.ts, "third shape").
+    setReadAnchor("s1", "m4");
+    const { container } = render(() => <ChatView sessionId="s1" />);
+    // openSession reserves a cold empty slot; the rAF fallback defers (order
+    // empty + delivered=false + no failure).
+    await waitFor(() => expect(state.messages["s1"]).toBeTruthy());
+
+    // The live upsert wins the wire race: one live message lands and the
+    // delivery flag flips with it (the reducer's early flip, mirrored here).
+    setState("messages", "s1", { order: ["m9"], byId: { m9: mkMsg("m9") } });
+    setState("messagesDelivered", "s1", true);
+    // Early reveal — the disclosed cosmetic cost of not re-wedging the
+    // only-ever-empty shape: the gate opens onto the single live message,
+    // pinned at the bottom (stale-anchor branch), following() still true →
+    // NO .jump pill yet.
+    await waitFor(() => {
+      expect(readyClass(container)).toMatch(/\bready\b/);
+    });
+    expect(container.querySelector("button.jump")).toBeNull();
+
+    // The history batch lands AFTER the flip: anchor m4 arrives with the
+    // history rows (created-ordering keeps the live m9 at the tail). The
+    // re-arm effect clears restoredFor and re-runs maybeRestore →
+    // genuine-anchor branch → following()=false → the .jump pill appears
+    // (the reader is positioned at their stored read anchor).
+    setState("messages", "s1", {
+      order: ["m1", "m2", "m4", "m9"],
+      byId: { m1: mkMsg("m1"), m2: mkMsg("m2"), m4: mkMsg("m4"), m9: mkMsg("m9") },
+    });
+    await waitFor(() => {
+      expect(container.querySelector("button.jump")).not.toBeNull();
+    });
+  });
 });

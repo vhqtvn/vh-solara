@@ -249,26 +249,39 @@ export function projectMessageEvent(
       // First-live-message delivery flip (the new-session blank-viewport bug):
       // a session whose client-resident window has ONLY ever been empty (order
       // length 0 before this event) and whose delivery flag is not already
-      // true is in one of two shapes — a brand-new session streaming its first
-      // turn, or a cold-gated session whose messages.loaded completion signal
-      // has not (yet) arrived. In BOTH, this first live message is itself the
-      // hydration evidence the reveal gate waits for: waiting any longer hides
-      // actively-streaming content behind "Loading conversation…" when the
-      // completion signal never lands on the open connection (server-side the
-      // empty cold fetch's batch+loaded pair can be lost to a delivery race),
-      // and the Stream-2 watchdog cannot self-heal it — the live events ARE
-      // content, so the content-stall clock never ages out. Until a manual
-      // session switch re-snapshots warm, the viewport stays blank: the exact
-      // "new session renders nothing; switch away and back fixes it" symptom.
+      // true is in one of THREE shapes — (1) a brand-new session streaming its
+      // first turn, (2) a cold-gated session whose messages.loaded completion
+      // signal has not (yet) arrived, or (3) a cold session WITH server-side
+      // history whose live upsert reached the client BEFORE the history
+      // messages.batch did (server-side the cold batch is published outside
+      // the session lock, so live deltas can win the wire race). In all three,
+      // this first live message is itself the hydration evidence the reveal
+      // gate waits for: waiting any longer hides actively-streaming content
+      // behind "Loading conversation…" when the completion signal never lands
+      // on the open connection (server-side the empty cold fetch's
+      // batch+loaded pair can be lost to a delivery race), and the Stream-2
+      // watchdog cannot self-heal it — the live events ARE content, so the
+      // content-stall clock never ages out. Until a manual session switch
+      // re-snapshots warm, the viewport stays blank: the exact "new session
+      // renders nothing; switch away and back fixes it" symptom.
       //
-      // Scope is deliberately NARROW so the flash-of-partial-history concern
-      // (the reason the cold wait exists) is preserved: the flip requires an
+      // Shape (3) is indistinguishable from (1) at upsert time — both look
+      // like gate-not-loaded, empty order, no delivery flag, and whether
+      // history is in flight is unknowable client-side — so the flip fires
+      // here deliberately for (3) too. The cost is a TRANSIENT one-message
+      // reveal: the live row renders first, then the authoritative history
+      // MERGES above it via prependMessagesIfAbsent (batch path) with
+      // created-ordering placing the live message at its true tail position —
+      // history never replaces the view. The anchor harm of that early flip
+      // (a stored read anchor bypasses ChatView's defers, pins to bottom, and
+      // sets the one-shot restoredFor lockout) is healed in the view layer:
+      // ChatView's third-shape anchor re-arm effect re-runs maybeRestore when
+      // the batch lands the anchor row. Scope stays deliberately NARROW so
+      // the flash-of-partial-history concern (the reason the cold wait
+      // exists) is preserved for every other shape: the flip requires an
       // EMPTY resident order — a cold session that already holds ANY messages
       // (a live tail staged ahead of the history batch) keeps waiting for
-      // messages.loaded exactly as before. There is nothing to flash here:
-      // zero prior content means the reveal opens onto this message as the
-      // first row, and any later-arriving authoritative history MERGES via
-      // prependMessagesIfAbsent (batch path) rather than replacing the view.
+      // messages.loaded exactly as before.
       const sid = payload?.sessionID;
       const firstLiveForEmptySession =
         !!sid && !!sm && sm.order.length === 0 && s.messagesDelivered[sid] !== true;

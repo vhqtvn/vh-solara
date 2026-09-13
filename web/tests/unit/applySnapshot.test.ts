@@ -522,6 +522,52 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     expect(state.messagesDelivered.s1).toBe(false); // still cold-waiting
   });
 
+  it("third shape: live upsert BEFORE the history batch flips delivered early; the late batch merges without un-flipping (439b166 follow-up)", () => {
+    // A cold session WITH server-side history where the live upsert wins the
+    // wire race against the history messages.batch (server-side the cold
+    // batch is published outside the session lock, so live deltas can
+    // overtake it — see projectMessageEvent's three-shapes comment). At upsert
+    // time this is indistinguishable from the only-ever-empty shape (gate not
+    // loaded, order empty, no flag; whether history is in flight is
+    // unknowable client-side), so the flip MUST keep firing — this test pins
+    // that contract. What the reducer then owes for this shape: the late
+    // batch still merges cleanly (history rows join the resident live tail
+    // via prependMessagesIfAbsent with created-ordering placing the live
+    // message at its true tail position) and the delivery flag stays flipped.
+    // The anchor harm of the early flip (a stored read anchor bypasses the
+    // ChatView defers and pins to bottom under a one-shot lockout) is healed
+    // in the VIEW layer — ChatView's third-shape anchor re-arm effect, pinned
+    // in ChatViewRevealDeadlock.test.tsx ("third shape").
+    setState("messagesDelivered", "s1", false);
+    setState("messages", "s1", { order: [], byId: {} });
+    // The live upsert wins the race → the early flip fires (deliberate).
+    applyMessageEvent(
+      "message.upsert",
+      40,
+      { id: "m9", sessionID: "s1", role: "assistant", time: { created: 900 } },
+      false,
+    );
+    expect(state.messages.s1.order).toEqual(["m9"]);
+    expect(state.messagesDelivered.s1).toBe(true);
+    // The history batch lands AFTER the flip: rows merge, created-ordering
+    // keeps the live message at the tail, and the flag is not un-flipped.
+    applyMessageEvent(
+      "messages.batch",
+      41,
+      {
+        sessionID: "s1",
+        messages: [
+          { info: { id: "m1", sessionID: "s1", role: "user", time: { created: 1 } }, parts: [] },
+          { info: { id: "m2", sessionID: "s1", role: "user", time: { created: 2 } }, parts: [] },
+          { info: { id: "m4", sessionID: "s1", role: "user", time: { created: 4 } }, parts: [] },
+        ],
+      },
+      false,
+    );
+    expect(state.messages.s1.order).toEqual(["m1", "m2", "m4", "m9"]);
+    expect(state.messagesDelivered.s1).toBe(true);
+  });
+
   it("messages.batch wholesale-sets the transcript (cold-load structural fix)", () => {
     // Fix #3: a cold-load collapses the N per-message/per-part upserts into ONE
     // messages.batch carrying the full reconciled list. The client ingests it in

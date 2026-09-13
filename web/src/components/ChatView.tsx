@@ -707,9 +707,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // already flipped true while the order is STILL empty, there is nothing
       // left to wait for — either the session is genuinely empty (the stale-
       // anchor branch below pins to bottom + setReady, revealing the empty
-      // state), or the batch already staged before the gate flip (pendingBatch
-      // coordination in stream.ts guarantees messagesDelivered flips AFTER the batch
-      // resolves). Without this gate the empty-order defer returned false
+      // state), messagesDelivered flipped via messages.loaded AFTER the batch
+      // staged (pendingBatch coordination in stream.ts serializes that flip
+      // behind the batch decode), or — the third shape — a live
+      // message.upsert flipped it while the history batch was still IN FLIGHT
+      // (439b166: the reducer cannot distinguish a cold session with pending
+      // history from a genuinely-empty one at upsert time). In the third shape
+      // the defers below are bypassed with history merely pending: the
+      // stale-anchor branch pins to bottom and sets restoredFor, and the
+      // third-shape anchor re-arm effect below ("Third-shape anchor re-arm")
+      // clears that lockout and re-runs this restore when the batch lands the
+      // anchor row. Without this gate the empty-order defer returned false
       // FOREVER for a stored anchor → ready() never set → revealed() false →
       // the pre-selected session stayed blank until a manual switch-away+back.
       if (!sm()?.order?.length && !delivered() && !messageFailed()) return false;
@@ -888,6 +896,47 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       () => delivered() || messageFailed(),
       () => {
         if (!ready()) maybeRestore();
+      },
+    ),
+  );
+  // Third-shape anchor re-arm (439b166 follow-up): a cold session WITH
+  // server-side history can receive a live `message.upsert` BEFORE the history
+  // `messages.batch` arrives on the wire (server-side the cold batch is
+  // published outside the session lock, so live deltas can win the race). The
+  // reducer's first-live-message flip then fires with history merely in
+  // flight — at upsert time that shape is indistinguishable from a genuinely
+  // empty session, so the flip is deliberate (see projectMessageEvent's
+  // three-shapes comment). With delivered()=true and the stored anchor still
+  // absent from the one-message order, maybeRestore above bypasses both
+  // defers, falls to the stale-anchor pin-to-bottom, sets restoredFor, and
+  // locks out every retry — so when the batch lands moments later the
+  // reader's stored anchor is silently dropped (read position lost). This
+  // effect heals exactly that: on the false→true transition of "the stored
+  // anchor row is present in this session's resident order", clear the
+  // restoredFor lockout and re-run maybeRestore, which now takes the
+  // genuine-anchor branch and repositions the reader. Guards: restoredFor
+  // must be THIS session (the early-flip lockout exists), restoredAnchorId
+  // empty (a genuine restore or a load-older capture owns the viewport —
+  // never yank it), ready() with a scrollEl, and following() with
+  // !userScrolledUp() (a reader who scrolled during the early-reveal window
+  // chose a position — respect it; the anchor stays stashed for the next
+  // open). `on(...)` keys off the anchor-presence boolean only — NOT the
+  // many reads inside the guards — so this can't hot-loop on streaming, and
+  // the prev===false check means the mount run (prev undefined) never fires.
+  createEffect(
+    on(
+      () => {
+        const anchor = props.draft ? undefined : getReadAnchor(props.sessionId);
+        return !!anchor && !!sm()?.order?.includes(anchor);
+      },
+      (present, prev) => {
+        if (prev !== false || !present) return;
+        if (restoredFor !== props.sessionId) return;
+        if (restoredAnchorId !== undefined) return;
+        if (!ready() || !scrollEl) return;
+        if (!(following() && !userScrolledUp())) return;
+        restoredFor = "";
+        maybeRestore();
       },
     ),
   );
