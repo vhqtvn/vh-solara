@@ -598,3 +598,93 @@ func TestQueueCompactListArchivedGuardNoFreshFileDeletion(t *testing.T) {
 		t.Fatalf("b-F1 REGRESSION: fresh queue contents lost: got %+v, want 1 item id=%s", got, freshIt.ID)
 	}
 }
+
+// 13. (send-reliability slice 1) Replay after COMPACTION: compaction removes
+// the terminal item, but the admission receipt must survive it — a replay
+// returns the ORIGINAL receipt and does not resurrect the compacted item.
+// Receipts-bearing stores must also NOT take the empty-queue os.Remove
+// branch: the receipt log keeps queue.json alive (and loadable) after the
+// item list empties, or the replay guarantee would silently die with the
+// first compaction pass.
+func TestQueueCompactReplayAfterCompactionKeepsReceipt(t *testing.T) {
+	defer SetCompactionTTLsForTest(0, 0, 0)
+	SetCompactionTTLsForTest(1*time.Nanosecond, 1*time.Nanosecond, 1*time.Nanosecond)
+	s, root := newTestStore(t, "s1")
+
+	// Admit with an attempt id, claim, resolve sent — the full lifecycle.
+	first := mustEnqueueAttempt(t, s, "att-compact", "compacted away")
+	claimed, won, err := s.Claim()
+	if err != nil || !won || claimed.ID != first.ID {
+		t.Fatalf("claim: won=%v err=%v", won, err)
+	}
+	if _, err := s.Resolve(first.ID, QueueSent, "done"); err != nil {
+		t.Fatalf("resolve sent: %v", err)
+	}
+
+	// List() with 1ns TTLs compacts the expired terminal item away.
+	got, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("compaction should have removed the terminal item: %+v", got)
+	}
+
+	// The file must SURVIVE compaction: receipts are still live, so the
+	// empty-queue delete branch must not fire.
+	if _, err := os.Stat(s.path); err != nil {
+		t.Fatalf("queue.json deleted while receipts live — replay guarantee destroyed by compaction: %v", err)
+	}
+
+	// Replay (same store): original receipt, no resurrection.
+	r, replayed, err := s.EnqueueWithAttemptID("att-compact", "compacted away", nil, QueueSendConfig{}, "")
+	if err != nil || !replayed {
+		t.Fatalf("replay after compaction: replayed=%v err=%v", replayed, err)
+	}
+	if !itemsEqual(r, first) {
+		t.Fatalf("replay after compaction: got %+v, want the original receipt", r)
+	}
+
+	// Replay across a RELOAD (restart-equivalent) — the persisted receipt log
+	// must still answer.
+	fresh := &sessionQueueStore{path: queuePath(root, "s1")}
+	r2, replayed, err := fresh.EnqueueWithAttemptID("att-compact", "compacted away", nil, QueueSendConfig{}, "")
+	if err != nil || !replayed || !itemsEqual(r2, first) {
+		t.Fatalf("replay after compaction+reload: replayed=%v err=%v item=%+v", replayed, err, r2)
+	}
+	got2, err := fresh.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got2) != 0 {
+		t.Fatalf("replay resurrected the compacted item: %+v", got2)
+	}
+}
+
+// 14. (send-reliability slice 1) Once the receipt log is ALSO empty, the
+// empty-queue delete branch fires again — receipts extend the file's life
+// only while replay guarantees remain outstanding.
+func TestQueueCompactEmptyQueueStillDeletesFileWithoutReceipts(t *testing.T) {
+	defer SetCompactionTTLsForTest(0, 0, 0)
+	SetCompactionTTLsForTest(1*time.Nanosecond, 1*time.Nanosecond, 1*time.Nanosecond)
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	st := qr.store(root, "s1")
+
+	// Legacy admission (no receipt) whose item compacts away.
+	mustEnqueue(t, st, "legacy")
+	claimed, won, err := st.Claim()
+	if err != nil || !won {
+		t.Fatalf("claim: won=%v err=%v", won, err)
+	}
+	// Claim persisted queue.json; resolve → sent, then List() compacts it.
+	if _, err := st.Resolve(claimed.ID, QueueSent, "d"); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if _, err := st.List(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(queuePath(root, "s1")); !os.IsNotExist(err) {
+		t.Fatalf("legacy-only queue emptied by compaction should delete queue.json, got err=%v", err)
+	}
+}

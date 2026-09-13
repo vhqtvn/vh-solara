@@ -510,20 +510,28 @@ func TestQueueResolveNeverRepends(t *testing.T) {
 		t.Fatalf("resolve to pending: err=%v, want errQueueCannotRepend", err)
 	}
 
-	// Claim then resolve sent. Re-resolving to failed/unknown is allowed (idempotent
-	// re-report) but never repends.
+	// Claim then resolve sent. Re-resolving to a DIFFERENT terminal state is
+	// now a conflict (send-reliability slice 1 resolve matrix: a confirmed
+	// send is never downgraded), and an identical re-resolve is a no-op — but
+	// no path can repend.
 	if _, won, err := s.Claim(); err != nil || !won {
 		t.Fatalf("claim: %v", won)
 	}
 	if _, err := s.Resolve(a.ID, QueueSent, ""); err != nil {
 		t.Fatalf("resolve sent: %v", err)
 	}
-	if _, err := s.Resolve(a.ID, QueueUnknown, "network blip"); err != nil {
-		t.Fatalf("re-resolve terminal→terminal: %v", err)
+	if _, err := s.Resolve(a.ID, QueueUnknown, "network blip"); !errors.Is(err, errQueueResolveConflict) {
+		t.Fatalf("re-resolve sent→unknown: err=%v, want errQueueResolveConflict (no downgrades)", err)
+	}
+	if _, err := s.Resolve(a.ID, QueueFailed, "late report"); !errors.Is(err, errQueueResolveConflict) {
+		t.Fatalf("re-resolve sent→failed: err=%v, want errQueueResolveConflict (no downgrades)", err)
+	}
+	if _, err := s.Resolve(a.ID, QueueSent, ""); err != nil {
+		t.Fatalf("identical re-resolve sent→sent: err=%v, want no-op success", err)
 	}
 	got, _ := s.List()
-	if got[0].State != QueueUnknown {
-		t.Fatalf("after re-resolve state = %s, want unknown", got[0].State)
+	if got[0].State != QueueSent {
+		t.Fatalf("after guarded re-resolves state = %s, want sent (downgrades rejected)", got[0].State)
 	}
 	// No resolution path can return it to pending.
 	for _, st := range []QueueItemState{QueuePending} {

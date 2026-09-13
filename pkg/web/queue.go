@@ -22,6 +22,8 @@ package web
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -130,18 +132,28 @@ type QueueSendConfig struct {
 // treats as "legacy item, recover immediately" — exactly the operator's
 // restart-recovery case.
 type QueueItem struct {
-	ID                string            `json:"id"`
-	Order             uint64            `json:"order"`
-	State             QueueItemState    `json:"state"`
-	Text              string            `json:"text"`
-	Attachments       []QueueAttachment `json:"attachments"`
-	SendConfig        QueueSendConfig   `json:"sendConfig,omitempty"`
-	OriginClientID    string            `json:"originClientId,omitempty"`
-	OpencodeMsgID     string            `json:"opencodeMsgID,omitempty"`
-	CreatedAt         int64             `json:"createdAt"`
-	DispatchStartedAt int64             `json:"dispatchStartedAt,omitempty"`
-	ResolvedAt        int64             `json:"resolvedAt,omitempty"`
-	Detail            string            `json:"detail,omitempty"`
+	ID             string            `json:"id"`
+	Order          uint64            `json:"order"`
+	State          QueueItemState    `json:"state"`
+	Text           string            `json:"text"`
+	Attachments    []QueueAttachment `json:"attachments"`
+	SendConfig     QueueSendConfig   `json:"sendConfig,omitempty"`
+	OriginClientID string            `json:"originClientId,omitempty"`
+	// AttemptID is the OPTIONAL client-generated admission identity
+	// (send-reliability slice 1). When an enqueue carries one, the admission
+	// is durably idempotent: a replay of the same (attemptID, canonical
+	// payload) returns the ORIGINAL admission receipt instead of creating a
+	// second item, and a changed payload under the same attemptID is rejected
+	// as a conflict. Empty (legacy requests without an attempt id) keeps the
+	// legacy non-idempotent behavior. omitempty for on-disk backward
+	// compatibility: items persisted before this field deserialize with
+	// AttemptID=="".
+	AttemptID         string `json:"attemptId,omitempty"`
+	OpencodeMsgID     string `json:"opencodeMsgID,omitempty"`
+	CreatedAt         int64  `json:"createdAt"`
+	DispatchStartedAt int64  `json:"dispatchStartedAt,omitempty"`
+	ResolvedAt        int64  `json:"resolvedAt,omitempty"`
+	Detail            string `json:"detail,omitempty"`
 
 	// ReconcileAttempts counts reconciliation passes that FAILED to confirm the
 	// item as sent (404 / 5xx / transport / non-exact 200). Once it reaches
@@ -162,10 +174,27 @@ type QueueItem struct {
 
 // queueFile is the on-disk shape. Order is persisted so the monotonic commit
 // counter survives item removals (removing the highest-order item must not let a
-// later enqueue reuse a lower order).
+// later enqueue reuse a lower order). Receipts is the durable admission-receipt
+// log (send-reliability slice 1) — INDEPENDENT of Items by design: removal and
+// compaction erase item identity but must NOT erase the replay guarantee, so
+// receipts live in the same atomic save yet a different container. omitempty:
+// a queue.json written before receipts existed (or by a store with only legacy
+// admissions) has no key and loads as nil.
 type queueFile struct {
-	Order uint64      `json:"order"`
-	Items []QueueItem `json:"items"`
+	Order    uint64                           `json:"order"`
+	Items    []QueueItem                      `json:"items"`
+	Receipts map[string]queueAdmissionReceipt `json:"admissionReceipts,omitempty"`
+}
+
+// queueAdmissionReceipt is the durable dedupe record for ONE client attempt:
+// the canonical payload fingerprint (change → conflict) plus the ORIGINAL
+// admission snapshot — the exact item the first caller was handed, returned
+// verbatim to every replay, even after the live item was removed or compacted
+// (no resurrection). The map key in queueFile.Receipts is the client attempt
+// id, so the receipt itself carries no redundant id field.
+type queueAdmissionReceipt struct {
+	Fingerprint string    `json:"fingerprint"`
+	Item        QueueItem `json:"item"`
 }
 
 // Sentinel errors for the store. The HTTP layer maps these to status codes.
@@ -179,6 +208,26 @@ var (
 	// MUST NOT mutate or save(): doing so would resurrect archived-away messages
 	// (BLK-1). Mutations check this right after acquiring st.mu and refuse.
 	errQueueArchived = errors.New("session queue archived")
+	// errQueueAdmissionConflict: the same client attempt id was already
+	// admitted with a DIFFERENT canonical payload. The replay guarantee covers
+	// identical payloads only — a changed payload under a retained attempt id
+	// is a client bug (attempt id reuse) and is surfaced, never deduped.
+	errQueueAdmissionConflict = errors.New("queue admission conflict: attempt id already admitted with a different payload")
+	// errQueueAdmissionFull: the per-session receipt log is at capacity. New
+	// attempt-carrying admissions are REJECTED before any effect — valid dedupe
+	// records are never evicted to make room. Legacy (no attempt id) enqueues
+	// consume no receipt capacity and are unaffected.
+	errQueueAdmissionFull = errors.New("queue admission receipt log full")
+	// errQueueResolveConflict: the requested transition would REWRITE or
+	// DOWNGRADE a terminal resolution (e.g. sent → failed). Terminal states
+	// are monotonic: a confirmed sent can never be downgraded, and any
+	// non-identical terminal rewrite is surfaced as a conflict rather than
+	// silently applied (send-reliability slice 1 resolve matrix).
+	errQueueResolveConflict = errors.New("queue resolve conflict")
+	// errQueueBadAttemptID: a present-but-invalid client attempt id (oversized).
+	// Attempt ids index the persisted receipt map, so their size is bounded to
+	// keep the on-disk footprint sane.
+	errQueueBadAttemptID = errors.New("invalid queue attempt id")
 )
 
 // sessionQueueStore owns ONE session's queue: a mutex, a lazy-loaded in-memory
@@ -199,6 +248,17 @@ type sessionQueueStore struct {
 	order    uint64
 	loaded   bool
 	archived bool
+
+	// receipts is the durable admission-receipt log (send-reliability slice 1),
+	// keyed by client attempt id. Lazily loaded from queueFile.Receipts by
+	// load(); nil until the first attempt-carrying admission (or a receipts-
+	// bearing file) materializes it. INDEPENDENT of items: removal/compaction
+	// shrink s.items but never touch receipts — the replay guarantee outlives
+	// the item list and ends only with the store itself (deleteStore). The
+	// receipt and its item are written in the SAME atomic save (see
+	// EnqueueWithAttemptID), so a returned admission is always recoverable as
+	// a pair or not at all.
+	receipts map[string]queueAdmissionReceipt
 
 	// reconcileLast is an IN-MEMORY (NOT persisted) per-item-id throttle
 	// timestamp for message-id reconciliation: it paces the bounded reconciler
@@ -235,6 +295,7 @@ func (s *sessionQueueStore) load() error {
 	}
 	s.items = doc.Items
 	s.order = doc.Order
+	s.receipts = doc.Receipts
 	// Normalize legacy on-disk items: a queue.json persisted BEFORE the
 	// attachments-always-array contract had no `attachments` key (the field used
 	// omitempty), so json.Unmarshal leaves QueueItem.Attachments nil. With the
@@ -276,7 +337,7 @@ func (s *sessionQueueStore) save() error {
 	if s.archived {
 		return errQueueArchived
 	}
-	doc := queueFile{Order: s.order, Items: s.items}
+	doc := queueFile{Order: s.order, Items: s.items, Receipts: s.receipts}
 	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return fmt.Errorf("queue: encode: %w", err)
@@ -565,12 +626,20 @@ func (s *sessionQueueStore) compactTerminalItemsLocked(now time.Time) (changed b
 }
 
 // persistAfterCompaction persists the current in-memory state after a
-// recovery+compaction cycle. When compaction emptied the queue, it deletes
-// queue.json instead of writing an empty-items document — matching the
-// lazy-creation pattern where a queue that never had items has no file. An
-// empty-items file is harmless, but deleting it is cleaner and keeps the
-// on-disk footprint minimal. Idempotent on removal: a missing file is the
-// target state, not an error. Caller MUST hold s.mu.
+// recovery+compaction cycle. When compaction emptied the queue AND no
+// admission receipts remain, it deletes queue.json instead of writing an
+// empty-items document — matching the lazy-creation pattern where a queue
+// that never had items has no file. An empty-items file is harmless, but
+// deleting it is cleaner and keeps the on-disk footprint minimal. Idempotent
+// on removal: a missing file is the target state, not an error. Caller MUST
+// hold s.mu.
+//
+// RECEIPTS OVERRIDE THE DELETE BRANCH (send-reliability slice 1): receipts
+// legitimately outlive their items (operator dismissal, compaction), and the
+// replay guarantee must survive compaction — "return the original receipt
+// WITHOUT resurrecting the item". So a receipts-bearing store always takes
+// the save() path, keeping queue.json (now items-empty but receipts-live) on
+// disk. The file is deleted only when BOTH containers are empty.
 //
 // The archived guard on the remove branch is defense-in-depth mirroring
 // save()'s last-resort guard: even if a future mutation path forgets the
@@ -581,7 +650,7 @@ func (s *sessionQueueStore) compactTerminalItemsLocked(now time.Time) (changed b
 // errQueueArchived (not nil) so a future missing entry guard surfaces as a
 // loud error rather than silent success — matches save()'s pattern.
 func (s *sessionQueueStore) persistAfterCompaction(compactChanged bool) error {
-	if compactChanged && len(s.items) == 0 {
+	if compactChanged && len(s.items) == 0 && len(s.receipts) == 0 {
 		if s.archived {
 			// Tombstoned store: a fresh store may have already written
 			// queue.json at this path post-archive. Removing it would be
@@ -656,19 +725,105 @@ func (s *sessionQueueStore) List() ([]QueueItem, error) {
 	return out, nil
 }
 
-// Enqueue appends a new pending item. The backend issues the ID and the
-// monotonic order. Returns the created item.
+// Enqueue appends a new pending item (LEGACY, non-idempotent). The backend
+// issues the ID and the monotonic order. Requests without a client attempt id
+// keep exactly this behavior — no receipt, no dedupe — so pre-slice clients
+// and tests are unaffected. See EnqueueWithAttemptID for the idempotent path.
 func (s *sessionQueueStore) Enqueue(text string, attachments []QueueAttachment, cfg QueueSendConfig, originClientID string) (QueueItem, error) {
+	it, _, err := s.EnqueueWithAttemptID("", text, attachments, cfg, originClientID)
+	return it, err
+}
+
+// admissionReceiptCap bounds the per-session durable receipt log (provisional
+// 10,000 per the accepted send-reliability plan, brief §4.1). Receipts are
+// NEVER evicted while valid — evicting one would silently drop that attempt's
+// replay guarantee — so at capacity a NEW attempt-carrying admission is
+// REJECTED (errQueueAdmissionFull) before any effect. Legacy no-attempt-id
+// enqueues create no receipt and are never capacity-rejected. Snapshot-size
+// impact at the cap is measured/pinned by TestQueueAdmissionReceiptSnapshotSize.
+const admissionReceiptCap = 10000
+
+// admissionReceiptCapOverride is a TEST-ONLY capacity override (0 = use the
+// const default), mirroring the compaction TTL override pattern. Atomic so the
+// test-time write and the admission-time read can never race under
+// `go test -race`. Production code MUST NOT call
+// SetAdmissionReceiptCapForTest.
+var admissionReceiptCapOverride atomic.Int64
+
+func currentAdmissionReceiptCap() int {
+	if n := admissionReceiptCapOverride.Load(); n > 0 {
+		return int(n)
+	}
+	return admissionReceiptCap
+}
+
+// SetAdmissionReceiptCapForTest overrides the receipt capacity for the
+// duration of a test so the bound can be exercised without 10,000 real
+// admissions. TEST-ONLY. Pass n <= 0 to restore the default. Callers SHOULD
+// defer-restore (e.g. `defer SetAdmissionReceiptCapForTest(0)`). Race-free.
+func SetAdmissionReceiptCapForTest(n int) {
+	if n <= 0 {
+		admissionReceiptCapOverride.Store(0)
+		return
+	}
+	admissionReceiptCapOverride.Store(int64(n))
+}
+
+// attemptIDMaxLength bounds a client attempt id. Attempt ids index the
+// persisted receipt map; an unbounded id would let one request blow up
+// queue.json. 128 comfortably covers UUIDs/nanoids/ULIDs.
+const attemptIDMaxLength = 128
+
+// queuePayloadFingerprint computes the canonical fingerprint of the COMPLETE
+// prepared payload: text + attachments (ordered — order is part of the message
+// parts) + sendConfig. originClientID is deliberately EXCLUDED: it is
+// diagnostics-only (never affects ordering/visibility/dispatch), and including
+// it would spuriously conflict a legitimate retry observed from a different
+// browser (device handoff). nil attachments normalize to [] so a retry that
+// omits the key and one that sends [] fingerprint identically. Struct field
+// order in the canonical shape is fixed by the Go type, making the marshal
+// deterministic; sha256 makes collisions infeasible.
+func queuePayloadFingerprint(text string, attachments []QueueAttachment, cfg QueueSendConfig) string {
+	if attachments == nil {
+		attachments = []QueueAttachment{}
+	}
+	canonical := struct {
+		Text        string            `json:"text"`
+		Attachments []QueueAttachment `json:"attachments"`
+		SendConfig  QueueSendConfig   `json:"sendConfig"`
+	}{Text: text, Attachments: attachments, SendConfig: cfg}
+	sum := sha256.Sum256(jsonBytes(canonical))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+// EnqueueWithAttemptID appends a new pending item with OPTIONAL durable
+// idempotency keyed by a client-generated attempt id (send-reliability
+// slice 1). attemptID=="" is the legacy non-idempotent path (no receipt).
+//
+// Contract:
+//   - Same (attemptID, canonical payload) → returns the ORIGINAL admission
+//     receipt — the exact item snapshot the first caller was handed — with
+//     replayed=true. No second item is created, even if the original item was
+//     later removed or compacted away (no resurrection).
+//   - Same attemptID, changed payload → errQueueAdmissionConflict; no effect.
+//   - New attemptID at receipt capacity → errQueueAdmissionFull BEFORE any
+//     effect; valid receipts are never evicted.
+//   - The item and its receipt persist in the SAME atomic save: on save
+//     failure BOTH roll back, so an admission is recoverable as a pair or not
+//     at all (a caller never receives custody the disk cannot reproduce).
+//   - Receipt lifetime = store lifetime. deleteStore (archive/cleanup) ends
+//     the replay guarantee: a post-cleanup replay is a fresh admission.
+func (s *sessionQueueStore) EnqueueWithAttemptID(attemptID, text string, attachments []QueueAttachment, cfg QueueSendConfig, originClientID string) (QueueItem, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.archived {
 		// BLK-1: a retained pointer to a store whose deleteStore (archive) has
 		// completed must NOT append/save — its s.items are the stale pre-archive
 		// set and save() would resurrect archived-away messages.
-		return QueueItem{}, errQueueArchived
+		return QueueItem{}, false, errQueueArchived
 	}
 	if err := s.load(); err != nil {
-		return QueueItem{}, err
+		return QueueItem{}, false, err
 	}
 	// Normalize nil→empty so the wire shape is always "attachments":[] (never
 	// null, never omitted). Go marshals a nil slice as `null`; with the omitempty
@@ -676,6 +831,24 @@ func (s *sessionQueueStore) Enqueue(text string, attachments []QueueAttachment, 
 	// FE consumer (buildParts) iterates this field — the contract must be an array.
 	if attachments == nil {
 		attachments = []QueueAttachment{}
+	}
+	if attemptID != "" {
+		if len(attemptID) > attemptIDMaxLength {
+			return QueueItem{}, false, fmt.Errorf("%w: length %d exceeds %d", errQueueBadAttemptID, len(attemptID), attemptIDMaxLength)
+		}
+		fp := queuePayloadFingerprint(text, attachments, cfg)
+		if rec, ok := s.receipts[attemptID]; ok {
+			if rec.Fingerprint != fp {
+				return QueueItem{}, false, fmt.Errorf("%w (fingerprint mismatch)", errQueueAdmissionConflict)
+			}
+			// Replay: the ORIGINAL admission receipt, verbatim — including the
+			// admission-time state/timestamps, independent of whatever the live
+			// item has since become (claimed, resolved, removed, compacted).
+			return rec.Item, true, nil
+		}
+		if len(s.receipts) >= currentAdmissionReceiptCap() {
+			return QueueItem{}, false, fmt.Errorf("%w: %d receipts retained (capacity is a floor on the guarantee, not a target)", errQueueAdmissionFull, len(s.receipts))
+		}
 	}
 	s.order++
 	item := QueueItem{
@@ -686,6 +859,7 @@ func (s *sessionQueueStore) Enqueue(text string, attachments []QueueAttachment, 
 		Attachments:    attachments,
 		SendConfig:     cfg,
 		OriginClientID: originClientID,
+		AttemptID:      attemptID,
 		// OpencodeMsgID is intentionally NOT minted here: a `pending` item is
 		// not yet dispatched, and minting the OpenCode correlation id at enqueue
 		// time would let it encode a wall-clock earlier than messages that land
@@ -696,14 +870,30 @@ func (s *sessionQueueStore) Enqueue(text string, attachments []QueueAttachment, 
 		CreatedAt: time.Now().UnixMilli(),
 	}
 	s.items = append(s.items, item)
+	receiptRecorded := false
+	if attemptID != "" {
+		if s.receipts == nil {
+			s.receipts = map[string]queueAdmissionReceipt{}
+		}
+		s.receipts[attemptID] = queueAdmissionReceipt{
+			Fingerprint: queuePayloadFingerprint(text, attachments, cfg),
+			Item:        item,
+		}
+		receiptRecorded = true
+	}
 	if err := s.save(); err != nil {
-		// Roll back the in-memory append so the store stays consistent with disk
-		// (the item was never durably committed).
+		// Roll back the ENTIRE admission — item AND receipt — so the store
+		// stays consistent with disk (neither was durably committed). A ghost
+		// receipt here would make a later retry of the same attempt return
+		// "replayed" custody of an item that never existed on disk.
 		s.items = s.items[:len(s.items)-1]
 		s.order--
-		return QueueItem{}, err
+		if receiptRecorded {
+			delete(s.receipts, attemptID)
+		}
+		return QueueItem{}, false, err
 	}
-	return item, nil
+	return item, false, nil
 }
 
 // Remove deletes an item by id. Operators may dismiss any item that is not
@@ -801,10 +991,27 @@ func (s *sessionQueueStore) Claim() (QueueItem, bool, error) {
 // Resolve records a terminal outcome (sent/failed/unknown) on an item. It can
 // never repend: the target MUST be terminal, and a pending item must be claimed
 // first (a resolve on pending is a logic error — the item was never dispatched).
-// Resolving an already-terminal item is allowed (idempotent re-report after a
-// network blip) and updates the state/detail. After the terminal transition,
-// compactTerminalItemsLocked runs so a freshly-terminal item that pushes the
-// queue over a cap is trimmed in the same atomic save.
+//
+// Resolve matrix (send-reliability slice 1 — terminal states are MONOTONIC):
+//
+//	pending     → any terminal            REJECT (errQueueNotClaimed; claim first)
+//	dispatching → sent/failed/unknown     allow (normal lifecycle completion)
+//	terminal    → IDENTICAL result        successful no-op: the stored item —
+//	                                     including its ORIGINAL ResolvedAt and
+//	                                     Detail — is returned untouched (a retried
+//	                                     resolve after a lost response must not
+//	                                     bump timestamps or rewrite evidence)
+//	unknown     → sent                    ALLOW (manual "Mark sent" recovery +
+//	                                     the message-id reconciler)
+//	sent        → anything else          REJECT errQueueResolveConflict (a
+//	                                     confirmed send is never downgraded)
+//	any other terminal rewrite            REJECT errQueueResolveConflict —
+//	                                     surfaced, never silently applied or
+//	                                     silently lost
+//
+// "Identical" means same target state AND same detail string. After an allowed
+// terminal transition, compactTerminalItemsLocked runs so a freshly-terminal
+// item that pushes the queue over a cap is trimmed in the same atomic save.
 func (s *sessionQueueStore) Resolve(id string, target QueueItemState, detail string) (QueueItem, error) {
 	if !isTerminalState(target) {
 		return QueueItem{}, errQueueCannotRepend
@@ -818,31 +1025,52 @@ func (s *sessionQueueStore) Resolve(id string, target QueueItemState, detail str
 		return QueueItem{}, err
 	}
 	for i := range s.items {
-		if s.items[i].ID == id {
-			if s.items[i].State == QueuePending {
-				return QueueItem{}, errQueueNotClaimed
-			}
-			// Snapshot BEFORE any mutation so a save/remove failure restores
-			// the pre-resolve in-memory view across BOTH the terminal
-			// transition AND any compaction removals (mirrors the existing
-			// rollback, extended to cover compaction's slice shrink). Without
-			// this, a save failure would leave the new terminal state in
-			// memory while disk still has the prior state, and a later
-			// successful mutation would persist the resolved state — silently
-			// committing a transition whose persistence failed.
-			preSnapshot := make([]QueueItem, len(s.items))
-			copy(preSnapshot, s.items)
-			s.items[i].State = target
-			s.items[i].Detail = detail
-			s.items[i].ResolvedAt = time.Now().UnixMilli()
-			resolved := s.items[i] // capture before compaction may shrink s.items
-			compactChanged := s.compactTerminalItemsLocked(time.Now())
-			if err := s.persistAfterCompaction(compactChanged); err != nil {
-				s.items = preSnapshot
-				return QueueItem{}, err
-			}
-			return resolved, nil
+		if s.items[i].ID != id {
+			continue
 		}
+		cur := s.items[i].State
+		switch {
+		case cur == QueuePending:
+			return QueueItem{}, errQueueNotClaimed
+		case cur == QueueDispatching:
+			// Dispatching → any terminal: the normal lifecycle completion.
+		case cur == target && s.items[i].Detail == detail:
+			// Identical terminal result (same state AND detail): successful
+			// no-op. Return the stored item untouched so ResolvedAt/Detail
+			// (and any reconcile markers) are preserved verbatim.
+			return s.items[i], nil
+		case cur == QueueSent:
+			return QueueItem{}, fmt.Errorf("%w: confirmed sent cannot be downgraded or rewritten to %q", errQueueResolveConflict, target)
+		case cur == QueueFailed:
+			return QueueItem{}, fmt.Errorf("%w: terminal failed cannot be rewritten to %q", errQueueResolveConflict, target)
+		case cur == QueueUnknown && target == QueueSent:
+			// unknown → sent: manual "Mark sent" recovery path and the
+			// message-id reconciler's exact-match authority. Both compose:
+			// whichever lands first moves the item to sent; the other either
+			// no-ops (identical) or conflicts harmlessly (state stays sent).
+		default:
+			return QueueItem{}, fmt.Errorf("%w: terminal %q cannot be rewritten to %q", errQueueResolveConflict, cur, target)
+		}
+		// Snapshot BEFORE any mutation so a save/remove failure restores
+		// the pre-resolve in-memory view across BOTH the terminal
+		// transition AND any compaction removals (mirrors the existing
+		// rollback, extended to cover compaction's slice shrink). Without
+		// this, a save failure would leave the new terminal state in
+		// memory while disk still has the prior state, and a later
+		// successful mutation would persist the resolved state — silently
+		// committing a transition whose persistence failed.
+		preSnapshot := make([]QueueItem, len(s.items))
+		copy(preSnapshot, s.items)
+		s.items[i].State = target
+		s.items[i].Detail = detail
+		s.items[i].ResolvedAt = time.Now().UnixMilli()
+		resolved := s.items[i] // capture before compaction may shrink s.items
+		compactChanged := s.compactTerminalItemsLocked(time.Now())
+		if err := s.persistAfterCompaction(compactChanged); err != nil {
+			s.items = preSnapshot
+			return QueueItem{}, err
+		}
+		return resolved, nil
 	}
 	return QueueItem{}, errQueueNotFound
 }

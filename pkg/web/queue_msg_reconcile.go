@@ -36,9 +36,12 @@ package web
 //     item ReconcileTerminal (fail-closed, skipped forever). A 400 (caller bug)
 //     marks it terminal immediately.
 //
-// The reconciler is idempotent (Resolve is idempotent on terminal states;
-// re-snapshots re-check eligibility) and safe to run concurrently with the FE's
-// own Resolve calls (exact-match authority overrides a manual non-sent mark).
+// The reconciler is idempotent (an identical Resolve is a no-op; re-snapshots
+// re-check eligibility) and safe to run concurrently with the FE's own Resolve
+// calls: candidates are only unknown/stale-dispatching, and unknown → sent is
+// an allowed recovery transition in the resolve matrix — whichever lands first
+// moves the item to sent, and a later duplicate composes as a no-op or a
+// harmless conflict (the state stays sent).
 
 import (
 	"context"
@@ -281,9 +284,9 @@ func (s *sessionQueueStore) reconcileOne(c reconcileCandidate, sid string, resol
 	if info.Info.Role == "user" && info.Info.ID == c.Mid {
 		// Authoritative sent: the item became a real persisted user message
 		// under the minted id. Resolve to `sent` (the ONLY auto-clear state).
-		// Resolve persists + compacts and is idempotent on terminal states, so
-		// a concurrent FE resolve composes safely (exact-match authority
-		// overrides a manual non-sent mark).
+		// Resolve persists + compacts; an identical re-resolve is a no-op, so
+		// a concurrent FE resolve composes safely (candidates are unknown or
+		// stale-dispatching, both of which allow → sent in the resolve matrix).
 		if _, rerr := s.Resolve(c.ID, QueueSent, reconcileSentDetail); rerr != nil {
 			vhlog.Warn("queue reconcile: Resolve(sent) failed", "sessionID", sid, "messageID", c.Mid, "err", rerr)
 		}

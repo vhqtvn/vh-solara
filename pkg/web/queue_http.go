@@ -39,6 +39,10 @@ func (s *Server) resolveQueueCtx(w http.ResponseWriter, r *http.Request) (sid, r
 }
 
 // writeQueueStoreErr maps a store sentinel error to its HTTP status + body.
+// The two slice-1 conflict sentinels carry a machine-readable "code" field
+// (queue_admission_conflict / queue_resolve_conflict) so the FE can
+// feature-detect them without parsing prose; legacy sentinels keep the plain
+// errResp shape they always had.
 func writeQueueStoreErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, errQueueNotFound):
@@ -48,6 +52,14 @@ func writeQueueStoreErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, errQueueNotClaimed):
 		writeJSON(w, http.StatusConflict, errResp(err.Error()))
 	case errors.Is(err, errQueueCannotRepend):
+		writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+	case errors.Is(err, errQueueAdmissionConflict):
+		writeJSON(w, http.StatusConflict, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_admission_conflict"}))
+	case errors.Is(err, errQueueAdmissionFull):
+		writeJSON(w, http.StatusTooManyRequests, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_admission_full"}))
+	case errors.Is(err, errQueueResolveConflict):
+		writeJSON(w, http.StatusConflict, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_resolve_conflict"}))
+	case errors.Is(err, errQueueBadAttemptID):
 		writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
 	case errors.Is(err, errQueueArchived):
 		// 410 Gone: the session queue was archived away; the retained pointer
@@ -92,10 +104,20 @@ func (s *Server) handleQueueList(w http.ResponseWriter, r *http.Request) {
 
 // POST /vh/session/{sessionId}/queue — enqueue. Body:
 //
-//	{text, attachments?, sendConfig?, originClientId?}
+//	{text, attachments?, sendConfig?, originClientId?, attemptId?}
 //
 // The backend issues the id and monotonic order. originClientId is
 // diagnostics-only and never affects ordering/visibility/dispatch.
+//
+// attemptId (OPTIONAL, send-reliability slice 1) makes the admission durably
+// idempotent: the same (attemptId, canonical payload) replay returns the
+// ORIGINAL admission receipt with "replayed": true and creates no second
+// item; the same attemptId with a CHANGED payload is a 409 conflict
+// (code "queue_admission_conflict"); a new attemptId at receipt capacity is a
+// 429 (code "queue_admission_full"). Requests WITHOUT attemptId keep the
+// legacy non-idempotent behavior and always respond "replayed": false.
+// Receipt lifetime = session-queue lifetime; archive/cleanup ends the replay
+// guarantee (a post-cleanup replay is a fresh admission).
 func (s *Server) handleQueueEnqueue(w http.ResponseWriter, r *http.Request) {
 	sid, root, ok := s.resolveQueueCtx(w, r)
 	if !ok {
@@ -106,16 +128,17 @@ func (s *Server) handleQueueEnqueue(w http.ResponseWriter, r *http.Request) {
 		Attachments    []QueueAttachment `json:"attachments"`
 		SendConfig     QueueSendConfig   `json:"sendConfig"`
 		OriginClientID string            `json:"originClientId"`
+		AttemptID      string            `json:"attemptId"`
 	}
 	if !decodeBody(w, r, &body) {
 		return
 	}
-	item, err := s.queues.store(root, sid).Enqueue(body.Text, body.Attachments, body.SendConfig, body.OriginClientID)
+	item, replayed, err := s.queues.store(root, sid).EnqueueWithAttemptID(body.AttemptID, body.Text, body.Attachments, body.SendConfig, body.OriginClientID)
 	if err != nil {
 		writeQueueStoreErr(w, err)
 		return
 	}
-	writeJSONResp(w, map[string]any{"item": item})
+	writeJSONResp(w, map[string]any{"item": item, "replayed": replayed})
 }
 
 // DELETE /vh/session/{sessionId}/queue/{itemId} — remove an item. Operators
@@ -166,8 +189,13 @@ func (s *Server) handleQueueClaim(w http.ResponseWriter, r *http.Request) {
 
 // POST /vh/session/{sessionId}/queue/{itemId}/resolve — record a terminal
 // outcome. Body: {state, detail?}. state must be sent/failed/unknown (never
-// pending — cannot repend). A pending item must be claimed first (409); an
-// already-terminal item may be re-resolved (idempotent after a network blip).
+// pending — cannot repend). A pending item must be claimed first (409).
+// Terminal resolution is MONOTONIC (send-reliability slice 1): an IDENTICAL
+// re-resolve (same state + detail) is a successful no-op that preserves the
+// original timestamps; unknown → sent is allowed (manual/reconciler recovery);
+// any other terminal rewrite or downgrade — notably sent → failed/unknown —
+// is a 409 conflict (code "queue_resolve_conflict") rather than silently
+// applied or silently lost.
 func (s *Server) handleQueueResolve(w http.ResponseWriter, r *http.Request) {
 	sid, root, ok := s.resolveQueueCtx(w, r)
 	if !ok {
