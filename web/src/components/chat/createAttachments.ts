@@ -144,15 +144,37 @@ export function createAttachments(deps: AttachmentsDeps): Attachments {
   const [attachments, setAttachments] = createSignal<Attachment[]>([]);
   const [uploading, setUploading] = createSignal(false);
 
+  // Bounded timeout for the attachment upload POST (the stuck-send bug class —
+  // same precedent as queue.ts ENQUEUE_TIMEOUT_MS / code/api.ts timedFetch):
+  // a hung upload used to leave send()'s single-flight admission pending
+  // forever (flushPendingAttachments / resolveInlineAttachments await this),
+  // so the Send button pulsed (the glow) and stayed disabled until a page
+  // reload. On abort/network failure return null — the same contract as a
+  // non-ok response — so callers treat it as a failed upload (skip the chip)
+  // and the send settles with the composer text preserved.
+  const UPLOAD_TIMEOUT_MS = 12000;
+
   // Upload one file into the project's .vh-solara attachments dir; returns the
   // server-backed Attachment (with a real url) or null on failure.
   async function uploadFile(file: File, id: string): Promise<Attachment | null> {
     const fd = new FormData();
     fd.append("file", file);
-    const res = await fetch(`/vh/attach?session=${encodeURIComponent(id)}`, {
-      method: "POST",
-      body: fd,
-    });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), UPLOAD_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(`/vh/attach?session=${encodeURIComponent(id)}`, {
+        method: "POST",
+        body: fd,
+        signal: ctrl.signal,
+      });
+    } catch {
+      // Network error OR abort/timeout — a failed upload (null), never a
+      // hung admission.
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
     if (!res.ok) return null;
     const part = await res.json();
     if (!part?.url) return null;

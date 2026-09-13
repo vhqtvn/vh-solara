@@ -267,15 +267,38 @@ export async function removeQueued(sessionId: string, id: string): Promise<Remov
   return { removed: false, reason: String(res.status) };
 }
 
+// Bounded timeout for the claim POST (same class as ENQUEUE_TIMEOUT_MS above —
+// the stuck-send bug class: a hung claim left the drainer's `draining` flag
+// true forever, so the queue never dispatched again until a page reload).
+// Claim is a fast atomic file op server-side, so 12s is a generous bound. On
+// abort/network failure return null (no claim): the drain simply stops, and
+// the ~5s queue poll re-arms a later drain. If the backend DID award the
+// claim but the response was lost, the item is `dispatching` server-side and
+// is never re-claimed (claim awards only `pending`) — the reconcile/recovery
+// paths own that item; no double dispatch is possible.
+const CLAIM_TIMEOUT_MS = 12000;
+
 // claimQueued atomically claims the oldest pending item (the cross-client
 // boundary: only one browser wins). Returns the item, or null if nothing is
 // pending. The cache is updated to mark the item dispatching.
 export async function claimQueued(sessionId: string): Promise<QueuedMessage | null> {
-  const res = await fetch(queueUrl(sessionId, "/claim"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
-    body: "{}",
-  });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), CLAIM_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(queueUrl(sessionId, "/claim"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
+      body: "{}",
+      signal: ctrl.signal,
+    });
+  } catch {
+    // Network error OR abort/timeout — no confirmed claim; the drain stops
+    // (null), and a later drain attempt retries cleanly.
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) return null;
   const j = await readJSON(res);
   const item: QueuedMessage | null = j.item || null;
@@ -376,6 +399,14 @@ function applyOutcome(
   }));
 }
 
+// Per-attempt timeout for the resolve WRITE. The resolve is a fast local
+// record server-side; 5s per attempt bounds the worst-case guard hold
+// (3 attempts + 50ms delays ≈ 15.1s) so a hung resolve socket can never leave
+// the drainer's finally unreachable — that was the isSending-stuck-true bug:
+// the Send button disabled forever with no error until a page reload. On
+// abort the attempt counts as failed and the bounded retry loop continues.
+const RESOLVE_TIMEOUT_MS = 5000;
+
 // resolveWithRetry POSTs the resolve write a bounded number of times. Returns
 // the authoritative item echoed by the backend on success (may be undefined if
 // the 2xx body carried no item), or undefined if the write never landed.
@@ -392,14 +423,19 @@ async function resolveWithRetry(
   const headers = { "Content-Type": "application/json", "X-VH-CSRF": "1" };
   const MAX_ATTEMPTS = 3;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), RESOLVE_TIMEOUT_MS);
     try {
-      const res = await fetch(url, { method: "POST", headers, body });
+      const res = await fetch(url, { method: "POST", headers, body, signal: ctrl.signal });
       if (res.ok) {
         const j = await readJSON(res);
         return j.item as QueuedMessage | undefined;
       }
     } catch {
-      // Network error / interruption — retry (this is a record, not a dispatch).
+      // Network error / interruption / abort-timeout — retry (this is a
+      // record, not a dispatch).
+    } finally {
+      clearTimeout(timer);
     }
     if (attempt < MAX_ATTEMPTS) await delay(50);
   }

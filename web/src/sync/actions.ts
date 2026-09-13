@@ -194,14 +194,25 @@ export function newSession() {
   setView("chat"); // composing always happens in the chat view
 }
 
+// Bounded timeout for the createSession POST (the stuck-send bug class — same
+// precedent as queue.ts ENQUEUE_TIMEOUT_MS / code/api.ts timedFetch): a hung
+// socket used to leave runSendSingleFlight("draft") pending forever, so the
+// draft Send button pulsed (the glow) and stayed disabled until a page reload.
+// On abort the existing catch returns null and send() restores the composer
+// text for retry — no silent loss.
+const CREATE_SESSION_TIMEOUT_MS = 12000;
+
 // Create a session on the server (called when the draft's first message is
 // sent). Returns the new id, or null on failure.
 export async function createSession(): Promise<string | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), CREATE_SESSION_TIMEOUT_MS);
   try {
     const res = await fetch("/oc/session", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
+      signal: ctrl.signal,
     });
     const sess = await res.json();
     if (sess?.id) {
@@ -211,6 +222,8 @@ export async function createSession(): Promise<string | null> {
     }
   } catch {
     /* caller surfaces the failure */
+  } finally {
+    clearTimeout(timer);
   }
   return null;
 }
