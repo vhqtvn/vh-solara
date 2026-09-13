@@ -246,7 +246,34 @@ export function projectMessageEvent(
   switch (kind) {
     case "message.upsert": {
       const sm = s.messages[payload.sessionID];
+      // First-live-message delivery flip (the new-session blank-viewport bug):
+      // a session whose client-resident window has ONLY ever been empty (order
+      // length 0 before this event) and whose delivery flag is not already
+      // true is in one of two shapes — a brand-new session streaming its first
+      // turn, or a cold-gated session whose messages.loaded completion signal
+      // has not (yet) arrived. In BOTH, this first live message is itself the
+      // hydration evidence the reveal gate waits for: waiting any longer hides
+      // actively-streaming content behind "Loading conversation…" when the
+      // completion signal never lands on the open connection (server-side the
+      // empty cold fetch's batch+loaded pair can be lost to a delivery race),
+      // and the Stream-2 watchdog cannot self-heal it — the live events ARE
+      // content, so the content-stall clock never ages out. Until a manual
+      // session switch re-snapshots warm, the viewport stays blank: the exact
+      // "new session renders nothing; switch away and back fixes it" symptom.
+      //
+      // Scope is deliberately NARROW so the flash-of-partial-history concern
+      // (the reason the cold wait exists) is preserved: the flip requires an
+      // EMPTY resident order — a cold session that already holds ANY messages
+      // (a live tail staged ahead of the history batch) keeps waiting for
+      // messages.loaded exactly as before. There is nothing to flash here:
+      // zero prior content means the reveal opens onto this message as the
+      // first row, and any later-arriving authoritative history MERGES via
+      // prependMessagesIfAbsent (batch path) rather than replacing the view.
+      const sid = payload?.sessionID;
+      const firstLiveForEmptySession =
+        !!sid && !!sm && sm.order.length === 0 && s.messagesDelivered[sid] !== true;
       if (sm) upsertMessage(sm, payload);
+      if (firstLiveForEmptySession) s.messagesDelivered[sid] = true;
       // Observe an assistant-error fact. The legacy reducer called
       // notifyFromMessage(payload) here (a direct notification dispatch); the
       // notification policy is now decided by orchestration. The detail string

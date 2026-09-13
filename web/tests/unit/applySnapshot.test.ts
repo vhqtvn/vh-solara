@@ -472,11 +472,17 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     expect(state.messages.s1.byId["m1"].info.time?.completed).toBeUndefined();
   });
 
-  it("message.upsert arriving BEFORE completion is applied without claiming loaded", () => {
+  it("message.upsert arriving BEFORE completion is applied; for an only-ever-empty session it flips delivered (new-session blank-viewport fix)", () => {
     // Stream 2 forwards reconciled deltas on the same connection as the fetch;
-    // they can land before messages.loaded. They must populate the transcript
-    // but not flip the delivery flag (only messages.loaded does). The
-    // message.upsert payload is the FLAT MessageInfo ({id,sessionID,role}).
+    // they can land before messages.loaded. For a session whose resident window
+    // has ONLY ever been empty (the brand-new-session shape), the first live
+    // message is itself the hydration evidence the reveal gate waits for: the
+    // client has zero prior rows, so revealing cannot flash partial history,
+    // and waiting for a completion signal that never lands on the open
+    // connection hides actively-streaming content behind "Loading
+    // conversation…" until a manual session switch (the reported bug — see
+    // ChatViewNewSessionBlank.test.tsx cell E). The flag flips; a later
+    // messages.loaded/messages.batch still merges normally.
     setState("messagesDelivered", "s1", false);
     setState("messages", "s1", { order: [], byId: {} });
     applyMessageEvent(
@@ -486,7 +492,34 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
       false,
     );
     expect(state.messages.s1.order).toContain("m1");
-    expect(state.messagesDelivered.s1).toBe(false);
+    expect(state.messagesDelivered.s1).toBe(true);
+  });
+
+  it("message.upsert before completion does NOT flip delivered once the cold session already holds rows (flash-of-partial guard)", () => {
+    // The flash-guard half of the old contract, now explicit: a cold session
+    // that already staged a live tail (order non-empty, history batch still
+    // pending) must KEEP waiting for messages.loaded — revealing early there
+    // would show a partial transcript before the authoritative history lands.
+    setState("messagesDelivered", "s1", false);
+    setState("messages", "s1", {
+      order: ["m1"],
+      byId: {
+        m1: {
+          id: "m1",
+          info: { id: "m1", sessionID: "s1", role: "user", time: { created: 10 } },
+          partOrder: [],
+          parts: {},
+        },
+      },
+    });
+    applyMessageEvent(
+      "message.upsert",
+      41,
+      { id: "m2", sessionID: "s1", role: "user", time: { created: 20 } },
+      false,
+    );
+    expect(state.messages.s1.order).toContain("m2");
+    expect(state.messagesDelivered.s1).toBe(false); // still cold-waiting
   });
 
   it("messages.batch wholesale-sets the transcript (cold-load structural fix)", () => {
