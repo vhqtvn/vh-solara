@@ -179,6 +179,7 @@ export { ackSession } from "./sync/orchestration";
 export {
   newSession,
   createSession,
+  createSessionWithCertainty,
   respondPermission,
   respondQuestion,
   abortSession,

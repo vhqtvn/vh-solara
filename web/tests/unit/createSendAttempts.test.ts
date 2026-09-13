@@ -1,0 +1,432 @@
+// @vitest-environment jsdom
+//
+// Send-reliability slice 2 — createSend attempt-safety unit tests.
+//
+// Pins the client-side half of the immutable-prepared-attempt contract at the
+// createSend factory seam (fake deps, no ChatView):
+//   - attachment-failure BLOCKING (inline-failed, flush-failed, still
+//     uploading) halts the send pipeline BEFORE queue admission;
+//   - typed uncertainty: a response-less enqueue failure reconciles FIRST
+//     (list hit = custody confirmed) and otherwise records outcome-unknown
+//     with retry-same recovery — never "failed, safe to resend";
+//   - immutable retries: a re-tap of the retained uncertain attempt reuses
+//     the SAME attemptId + byte-identical payload, with NO re-resolution /
+//     re-upload / re-captured config;
+//   - definitive rejections (429 admission_full) hard-stop: no reconcile,
+//     no retry;
+//   - draft→live ownership transfer of the attempt record;
+//   - createSessionWithCertainty classification (502/timeout = unknown,
+//     other statuses = definitive).
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createSignal } from "solid-js";
+import { createSend, type SendDependencies } from "../../src/components/chat/createSend";
+import type { Attachment } from "../../src/components/chat/createAttachments";
+import { EnqueueError, type QueuedMessage } from "../../src/queue";
+import { __resetSendSingleFlightForTests } from "../../src/lib/sendSingleFlight";
+import {
+  __resetSendActionStatusForTests,
+  getSendAction,
+  sendActionsFor,
+} from "../../src/lib/sendActionStatus";
+import { createSessionWithCertainty } from "../../src/sync/actions";
+
+// inlineAttachForced reads localStorage at module load — jsdom provides it.
+const mem: Record<string, string> = {};
+(globalThis as any).localStorage = {
+  getItem: (k: string) => (k in mem ? mem[k] : null),
+  setItem: (k: string, v: string) => {
+    mem[k] = v;
+  },
+  removeItem: (k: string) => {
+    delete mem[k];
+  },
+};
+
+interface Harness {
+  send: ReturnType<typeof createSend>["send"];
+  input: () => string;
+  setInput: (v: string) => void;
+  atts: () => Attachment[];
+  setAtts: (v: Attachment[] | ((p: Attachment[]) => Attachment[])) => void;
+  notes: { kind: string; title: string; detail: string; sessionID?: string }[];
+  enqueueInputs: { id: string; input: any }[];
+  uploadCalls: number;
+  fetchQueueCalls: number;
+  setUploadResult: (r: Attachment | null) => void;
+  setDraft: (v: boolean) => void;
+}
+
+function harness(overrides: {
+  enqueue?: (id: string, input: any) => Promise<unknown>;
+  fetchQueue?: (id: string) => Promise<QueuedMessage[]>;
+  uploading?: () => boolean;
+  flush?: (id: string) => Promise<{ failed: Attachment[] }>;
+  draft?: () => boolean;
+  ensureSession?: () => Promise<string | null>;
+  curModel?: () => { vision?: boolean } | undefined;
+  inlineFiles?: Map<string, File>;
+} = {}): Harness {
+  const [input, setInput] = createSignal("");
+  const [atts, setAtts] = createSignal<Attachment[]>([]);
+  const [draft, setDraft] = createSignal(overrides.draft ? overrides.draft() : false);
+  const notes: Harness["notes"] = [];
+  const enqueueInputs: Harness["enqueueInputs"] = [];
+  let uploadCalls = 0;
+  let uploadResult: Attachment | null = null;
+  let fetchQueueCalls = 0;
+  const file = new File(["x"], "inl1.png", { type: "image/png" });
+  const inlineFiles = overrides.inlineFiles ?? new Map([["inl1", file]]);
+  void file;
+
+  const deps: SendDependencies = {
+    sessionId: () => "ses-1",
+    draft,
+    ensureSession: overrides.ensureSession ?? (async () => "ses-1"),
+    input,
+    setInput,
+    readyToSend: () => true,
+    working: () => false,
+    queueMode: () => true,
+    selectionFor: () => ({ providerID: "p", modelID: "m" }),
+    awaitAgent: async () => ({ ok: true, agent: "build" }),
+    resolveAgent: () => ({ state: "agent", agent: "build" }),
+    adoptDraftAgent: () => {},
+    models: () => [{ name: "m" }],
+    loadModels: async () => {},
+    migrateModelPick: () => {},
+    curModel: overrides.curModel ?? (() => ({ vision: true })),
+    enqueue: overrides.enqueue
+      ? (id, inp) => {
+          enqueueInputs.push({ id, input: JSON.parse(JSON.stringify(inp)) });
+          return overrides.enqueue!(id, inp);
+        }
+      : async (id, inp) => {
+          enqueueInputs.push({ id, input: JSON.parse(JSON.stringify(inp)) });
+          return { id: "q1" };
+        },
+    fetchQueue: overrides.fetchQueue
+      ? (id) => {
+          fetchQueueCalls++;
+          return overrides.fetchQueue!(id);
+        }
+      : (id) => {
+          fetchQueueCalls++;
+          return Promise.resolve([]);
+        },
+    uploading: overrides.uploading ?? (() => false),
+    isSending: () => false,
+    setSending: () => {},
+    userScrolledUp: () => false,
+    jumpToLatest: () => {},
+    pushHistory: () => {},
+    resetHistory: () => {},
+    pushNotification: (n) => {
+      notes.push(n as Harness["notes"][number]);
+    },
+    undo: () => {},
+    redo: () => {},
+    attachments: atts,
+    setAttachments: setAtts,
+    flushPendingAttachments: overrides.flush ?? (async () => ({ failed: [] })),
+    inlineFiles,
+    uploadFile: async () => {
+      uploadCalls++;
+      return uploadResult;
+    },
+    draftKey: (sid) => `vh.draft.${sid}`,
+  };
+  const { send } = createSend(deps);
+  return {
+    send,
+    input,
+    setInput,
+    atts,
+    setAtts,
+    notes,
+    enqueueInputs,
+    get uploadCalls() {
+      return uploadCalls;
+    },
+    get fetchQueueCalls() {
+      return fetchQueueCalls;
+    },
+    setUploadResult: (r) => {
+      uploadResult = r;
+    },
+    setDraft,
+  };
+}
+
+beforeEach(() => {
+  __resetSendSingleFlightForTests();
+  __resetSendActionStatusForTests();
+});
+
+afterEach(() => {
+  __resetSendSingleFlightForTests();
+  __resetSendActionStatusForTests();
+  for (const k of Object.keys(mem)) delete mem[k];
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
+});
+
+// ---------------------------------------------------------------------------
+// Attachment-failure blocking — the send pipeline halts BEFORE admission.
+// ---------------------------------------------------------------------------
+describe("createSend slice 2 — attachment-failure blocking", () => {
+  it("a FAILED INLINE attachment blocks admission: no enqueue, loud notification, text restored, action blocked", async () => {
+    const h = harness({
+      curModel: () => ({ vision: false }), // inline mode
+    });
+    const text = "see ![a](vh-attach:inl1) thanks";
+    h.setInput(text);
+    await h.send();
+    // THE CRUX: admission halted before the queue — no partial send with a
+    // dangling vh-attach: token.
+    expect(h.enqueueInputs).toHaveLength(0);
+    expect(h.notes.some((n) => n.title === "Not sent — attachment upload failed")).toBe(true);
+    expect(h.input()).toBe(text); // restored for retry
+    expect(sendActionsFor("ses-1").some((a) => a.stage === "blocked")).toBe(true);
+  });
+
+  it("a FAILED PENDING (flush) attachment blocks admission: no enqueue, chips retained", async () => {
+    const chip: Attachment = { url: "pending:1", filename: "f.txt", mime: "text/plain", file: new File(["f"], "f.txt") };
+    const h = harness({
+      flush: async () => ({ failed: [chip] }),
+    });
+    h.setAtts([chip]);
+    h.setInput("with a draft attachment");
+    await h.send();
+    expect(h.enqueueInputs).toHaveLength(0);
+    expect(h.notes.some((n) => n.title === "Not sent — attachment upload failed")).toBe(true);
+    expect(h.input()).toBe("with a draft attachment");
+    // The failed chip is RETAINED (never silently dropped).
+    expect(h.atts()).toHaveLength(1);
+    expect(sendActionsFor("ses-1").some((a) => a.stage === "blocked")).toBe(true);
+  });
+
+  it("an in-flight upload (uploading()) blocks admission before the flush", async () => {
+    const h = harness({ uploading: () => true });
+    h.setInput("wait for the upload");
+    await h.send();
+    expect(h.enqueueInputs).toHaveLength(0);
+    expect(h.notes.some((n) => n.title === "Not sent — attachment still uploading")).toBe(true);
+    expect(h.input()).toBe("wait for the upload");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Typed uncertainty — response-less enqueue failures reconcile first.
+// ---------------------------------------------------------------------------
+describe("createSend slice 2 — typed uncertainty + reconcile-first", () => {
+  it("response-less failure + reconcile MISS → outcome-unknown (retry-same), composer preserved", async () => {
+    const h = harness({
+      enqueue: async () => {
+        throw new Error("offline"); // plain Error — no HTTP status = no response
+      },
+      fetchQueue: async () => [], // authoritative list does NOT show our attempt
+    });
+    h.setInput("maybe queued?");
+    await h.send();
+    expect(h.enqueueInputs).toHaveLength(1);
+    expect(h.fetchQueueCalls).toBe(1); // reconcile-first ran
+    expect(h.notes.some((n) => n.title === "Queue confirmation unknown")).toBe(true);
+    expect(h.input()).toBe("maybe queued?"); // preserved for the retry-same path
+    const action = sendActionsFor("ses-1").find((a) => a.stage === "uncertain");
+    expect(action).toBeDefined();
+    expect(action!.certainty).toBe("unknown");
+    expect(action!.recovery).toBe("retry-same");
+    expect(action!.payload?.tapText).toBe("maybe queued?");
+  });
+
+  it("response-less failure + reconcile HIT (list shows our attemptId) → custody confirmed, send reports success", async () => {
+    let firstAttemptId = "";
+    const h = harness({
+      enqueue: async (_id, inp) => {
+        firstAttemptId = inp.attemptId;
+        throw new Error("timeout-ish");
+      },
+      fetchQueue: async () => [
+        { id: "q-9", order: 1, state: "pending", text: "x", attachments: [], createdAt: 1, attemptId: firstAttemptId } as QueuedMessage,
+      ],
+    });
+    h.setInput("made it after all");
+    await h.send();
+    // The reconcile matched the attempt the first POST carried.
+    expect(firstAttemptId).toBeTruthy();
+    expect(h.notes.some((n) => n.title === "Queue confirmation unknown")).toBe(false);
+    // Success shape: composer cleared + a history write happened (custody
+    // confirmed → normal success path).
+    expect(h.input()).toBe("");
+    // The action record is finished (admitted — the queue item is authority).
+    expect(getSendAction(firstAttemptId)).toBeUndefined();
+  });
+
+  it("429 queue_admission_full → definitive rejection: NO reconcile, NO retry", async () => {
+    const h = harness({
+      enqueue: async () => {
+        throw new EnqueueError("enqueue failed (429 queue_admission_full)", "queue_admission_full", 429);
+      },
+    });
+    h.setInput("no room");
+    await h.send();
+    expect(h.enqueueInputs).toHaveLength(1);
+    expect(h.fetchQueueCalls).toBe(0); // hard stop — 429 is definitive
+    expect(h.notes.some((n) => n.title === "Message not queued — queue is full")).toBe(true);
+    expect(h.input()).toBe("no room");
+    const action = sendActionsFor("ses-1").find((a) => a.stage === "rejected");
+    expect(action?.certainty).toBe("definitive");
+    expect(action?.recovery).toBe("restore");
+  });
+
+  it("409 queue_admission_conflict → explicit conflict state (never retry-forever)", async () => {
+    const h = harness({
+      enqueue: async () => {
+        throw new EnqueueError("enqueue failed (409 queue_admission_conflict)", "queue_admission_conflict", 409);
+      },
+    });
+    h.setInput("conflicting");
+    await h.send();
+    expect(h.fetchQueueCalls).toBe(0);
+    expect(h.notes.some((n) => n.title === "Message not queued — admission conflict")).toBe(true);
+    expect(sendActionsFor("ses-1").some((a) => a.stage === "conflict")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Immutable prepared attempts — the retry reuses identity + payload verbatim.
+// ---------------------------------------------------------------------------
+describe("createSend slice 2 — immutable prepared attempts", () => {
+  it("a re-tap after an outcome-unknown admission reuses the SAME attemptId + byte-identical payload, with NO re-upload", async () => {
+    let fail = true;
+    const h = harness({
+      curModel: () => ({ vision: false }), // inline mode → uploadFile involved
+      enqueue: async (_id, inp) => {
+        if (fail) throw new Error("response lost");
+        return { id: "q2", attemptId: inp.attemptId };
+      },
+      fetchQueue: async () => [], // reconcile miss → retained uncertain
+    });
+    h.setUploadResult({ url: "file://up/inl1.png", filename: "inl1.png", mime: "image/png", path: ".vh-solara/x.png" });
+    const text = "retry me ![a](vh-attach:inl1)";
+    h.setInput(text);
+
+    await h.send(); // first attempt: upload resolved, enqueue response lost
+    expect(h.uploadCalls).toBe(1);
+    expect(h.enqueueInputs).toHaveLength(1);
+
+    // Re-tap the SAME logical message (the retry the notification offers).
+    h.setInput(text);
+    fail = false;
+    await h.send();
+
+    // SECOND enqueue: same attemptId, byte-identical payload…
+    expect(h.enqueueInputs).toHaveLength(2);
+    expect(h.enqueueInputs[1].input.attemptId).toBe(h.enqueueInputs[0].input.attemptId);
+    expect(h.enqueueInputs[1].input).toEqual(h.enqueueInputs[0].input);
+    // …and NO re-resolution / re-upload of the inline file.
+    expect(h.uploadCalls).toBe(1);
+    // The retry succeeded → the retained action is finished.
+    expect(getSendAction(h.enqueueInputs[0].input.attemptId)).toBeUndefined();
+  });
+
+  it("a re-tap with CHANGED text is a NEW attempt (different attemptId), not a reuse", async () => {
+    const h = harness({
+      enqueue: async () => {
+        throw new Error("response lost");
+      },
+      fetchQueue: async () => [],
+    });
+    h.setInput("original");
+    await h.send();
+    h.setInput("edited before retry");
+    await h.send();
+    expect(h.enqueueInputs).toHaveLength(2);
+    expect(h.enqueueInputs[1].input.attemptId).not.toBe(h.enqueueInputs[0].input.attemptId);
+  });
+
+  it("draft→live ownership transfer: the attempt mints under draft and transfers to the live id", async () => {
+    const h = harness({
+      draft: () => true,
+      ensureSession: async () => "live-1",
+      enqueue: async () => {
+        throw new Error("response lost");
+      },
+      fetchQueue: async () => [],
+    });
+    h.setInput("from the draft");
+    await h.send();
+    expect(h.enqueueInputs).toHaveLength(1);
+    expect(h.enqueueInputs[0].id).toBe("live-1"); // enqueued against the live id
+    const attemptId = h.enqueueInputs[0].input.attemptId as string;
+    expect(attemptId).toBeTruthy();
+    // The retained uncertain action is now owned by the LIVE id (explicit
+    // transfer — the single-flight keys are distinct).
+    expect(getSendAction(attemptId)?.ownerKey).toBe("live-1");
+    expect(sendActionsFor("draft")).toHaveLength(0);
+    expect(sendActionsFor("live-1").map((a) => a.attemptId)).toContain(attemptId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createSessionWithCertainty — 502/timeout are outcome-unknown, not proof of
+// non-creation (the /oc proxy 502s on transport failure).
+// ---------------------------------------------------------------------------
+describe("createSessionWithCertainty — typed certainty classification", () => {
+  const respond = (status: number, body: unknown = {}) =>
+    vi.fn(() => Promise.resolve({ ok: status >= 200 && status < 300, status, json: async () => body, text: async () => "" }));
+
+  it("proxy 502 → outcome UNKNOWN (the session may exist)", async () => {
+    vi.stubGlobal("fetch", respond(502, { error: "upstream unreachable" }));
+    const r = await createSessionWithCertainty();
+    expect(r.id).toBeNull();
+    expect(r.certainty).toBe("unknown");
+  });
+
+  it("definitive 4xx → NOT created (certainty definitive)", async () => {
+    vi.stubGlobal("fetch", respond(400, { error: "bad request" }));
+    const r = await createSessionWithCertainty();
+    expect(r.id).toBeNull();
+    expect(r.certainty).toBe("definitive");
+  });
+
+  it("2xx with an id → the id, definitive", async () => {
+    vi.stubGlobal("fetch", respond(200, { id: "new-ses-1" }));
+    const r = await createSessionWithCertainty();
+    expect(r.id).toBe("new-ses-1");
+    expect(r.certainty).toBe("definitive");
+  });
+
+  it("2xx with NO id → definitive malformed (not unknown)", async () => {
+    vi.stubGlobal("fetch", respond(200, {}));
+    const r = await createSessionWithCertainty();
+    expect(r.id).toBeNull();
+    expect(r.certainty).toBe("definitive");
+  });
+
+  it("network throw → outcome UNKNOWN (response may have been applied)", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new TypeError("fetch failed"))));
+    const r = await createSessionWithCertainty();
+    expect(r.id).toBeNull();
+    expect(r.certainty).toBe("unknown");
+  });
+
+  it("timeout abort → outcome UNKNOWN", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: any) =>
+        new Promise((_res, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        }),
+      ),
+    );
+    vi.useFakeTimers();
+    const p = createSessionWithCertainty();
+    p.catch(() => {});
+    await vi.advanceTimersByTimeAsync(12000);
+    const r = await p;
+    expect(r.id).toBeNull();
+    expect(r.certainty).toBe("unknown");
+    expect(r.detail).toContain("timed out");
+  });
+});

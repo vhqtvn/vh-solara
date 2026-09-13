@@ -192,3 +192,75 @@ describe("stuck-send guard recovery — hung transport inside guard-held regions
     await expect(p).resolves.toBeNull();
   });
 });
+
+// Send-reliability slice 2 — the commit-review D-F2 follow-ups: the TWO sites
+// that read the response body AFTER the timer was cleared. Headers arriving
+// with a stalled body used to wedge the guard past the abort (the fetch
+// promise had already resolved, so the AbortController no longer covered the
+// body read). Both sites now read INSIDE the armed window: the aborting signal
+// tears down the body reader too, the read rejects AbortError, and the site
+// settles to its no-custody contract value.
+describe("stuck-send guard recovery — headers-arrived, body-stalled (D-F2)", () => {
+  // A fetch whose PROMISE resolves immediately (headers arrived, res.ok) but
+  // whose json() never settles on its own — it rejects AbortError only when
+  // the caller's signal aborts (the native reader-teardown shape).
+  function bodyHangsFetch(): ReturnType<typeof vi.fn> {
+    return vi.fn((_url: string, init?: any) =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          new Promise((_r, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject(new DOMException("aborted", "AbortError")),
+            );
+          }),
+        text: () => Promise.resolve(""),
+      }),
+    ) as any;
+  }
+
+  it("claimQueued settles (null) when headers arrive but the body stalls — the guard still releases", async () => {
+    const sid = "s-stuck-claim-body";
+    vi.stubGlobal("fetch", bodyHangsFetch());
+    vi.useFakeTimers();
+    try {
+      const p = claimQueued(sid);
+      p.catch(() => {});
+      // Pre-fix (D-F2): the fetch resolved, the finally cleared the timer,
+      // and the body read ran UNARMED — a stalled body wedged the drainer's
+      // `draining` flag forever → RED here.
+      const settled = await assertSettles(p, FAR_PAST_EVERY_BOUND_MS);
+      expect(settled).toBe(true);
+      await expect(p).resolves.toBeNull();
+    } finally {
+      clearQueueCache([sid]);
+    }
+  });
+
+  it("uploadFile settles (null) when headers arrive but the body stalls — admission still releases", async () => {
+    vi.stubGlobal("fetch", bodyHangsFetch());
+    let att: Attachments | null = null;
+    createRoot((dispose) => {
+      att = createAttachments({
+        input: () => "",
+        setInput: () => {},
+        textarea: () => undefined,
+        sessionId: () => "s1",
+        draft: () => false,
+        fileInput: () => undefined,
+        inlineActive: () => false,
+        syncCaret: () => {},
+      });
+      void dispose;
+    })!;
+    vi.useFakeTimers();
+    const p = att!.uploadFile(new File(["z"], "x.png", { type: "image/png" }), "s1");
+    p.catch(() => {});
+    // Pre-fix (D-F2): res.json() ran after clearTimeout — a stalled body held
+    // the admission guard open indefinitely → RED here.
+    const settled = await assertSettles(p, FAR_PAST_EVERY_BOUND_MS);
+    expect(settled).toBe(true);
+    await expect(p).resolves.toBeNull();
+  });
+});

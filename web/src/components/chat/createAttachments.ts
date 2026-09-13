@@ -61,6 +61,13 @@ export interface Attachment {
   mime: string;
   file?: File;
   path?: string;
+  // Send-reliability slice 2: this pending (draft-queued, `.file`-carrying)
+  // chip's upload FAILED at flush time. The chip is RETAINED (never silently
+  // dropped) so the operator sees it and can remove or retry it; a send that
+  // still owns it is BLOCKED before queue admission (createSend). A later
+  // flush re-attempts the upload and replaces the chip with a clean
+  // server-backed one on success.
+  uploadFailed?: boolean;
 }
 
 // Injectable inputs + side effects. ChatView passes its own signals/closures;
@@ -124,8 +131,10 @@ export interface Attachments {
   // Re-insert an orphaned inline chip's markdown ref back at the caret (S5).
   reinsertInlineChip: (a: Attachment) => void;
   // Upload draft-queued (pending) attachments now that a session exists,
-  // replacing their synthetic keys with real server urls.
-  flushPendingAttachments: (id: string) => Promise<void>;
+  // replacing their synthetic keys with real server urls. Returns the chips
+  // whose upload FAILED (retained in place, flagged `uploadFailed` — never
+  // silently dropped; the send path blocks on them).
+  flushPendingAttachments: (id: string) => Promise<{ failed: Attachment[] }>;
   // Upload one raw File into the project's .vh-solara attachments dir. Used by
   // the addFiles live-eager path AND the send() flow's resolveInlineAttachments
   // uploader.
@@ -155,34 +164,51 @@ export function createAttachments(deps: AttachmentsDeps): Attachments {
   const UPLOAD_TIMEOUT_MS = 12000;
 
   // Upload one file into the project's .vh-solara attachments dir; returns the
-  // server-backed Attachment (with a real url) or null on failure.
+  // server-backed Attachment (with a real url) or null on failure. The response
+  // BODY is read inside the armed timeout window (send-reliability slice 2,
+  // commit-review D-F2): headers arriving with a stalled body used to leave
+  // the admission guard wedged past the timer clear (res.json ran after the
+  // finally). Mirrors the createSession/resolveWithRetry shape.
   async function uploadFile(file: File, id: string): Promise<Attachment | null> {
     const fd = new FormData();
     fd.append("file", file);
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), UPLOAD_TIMEOUT_MS);
-    let res: Response;
     try {
-      res = await fetch(`/vh/attach?session=${encodeURIComponent(id)}`, {
+      const res = await fetch(`/vh/attach?session=${encodeURIComponent(id)}`, {
         method: "POST",
         body: fd,
         signal: ctrl.signal,
       });
+      if (!res.ok) return null;
+      // Read INSIDE the armed window, wrapped in try/catch (NOT .catch — the
+      // derived promise adds microtask hops that shallow test flushes count;
+      // production semantics are identical either way).
+      let part: { url?: string; filename?: string; mime?: string; path?: string } | null = null;
+      try {
+        part = await res.json();
+      } catch {
+        part = null; // unparseable body — failed upload
+      }
+      if (!part?.url) return null;
+      // Thread the project-relative attachment path returned by attach.go through
+      // into the FE Attachment (and onward into the queue via QueuedAttachment).
+      // S1 only carries the field; it is not yet used to build the dispatched
+      // part (buildParts). `path` may be absent on older backends → undefined.
+      // filename/mime fall back to the local File when the server omits them.
+      return {
+        url: part.url,
+        filename: part.filename ?? file.name,
+        mime: part.mime ?? file.type,
+        path: part.path,
+      };
     } catch {
-      // Network error OR abort/timeout — a failed upload (null), never a
-      // hung admission.
+      // Network error OR abort/timeout (incl. a hung BODY after headers) — a
+      // failed upload (null), never a hung admission.
       return null;
     } finally {
       clearTimeout(timer);
     }
-    if (!res.ok) return null;
-    const part = await res.json();
-    if (!part?.url) return null;
-    // Thread the project-relative attachment path returned by attach.go through
-    // into the FE Attachment (and onward into the queue via QueuedAttachment).
-    // S1 only carries the field; it is not yet used to build the dispatched
-    // part (buildParts). `path` may be absent on older backends → undefined.
-    return { url: part.url, filename: part.filename, mime: part.mime, path: part.path };
   }
 
   // Synthetic key for a draft-queued attachment (no server session yet). Real
@@ -226,18 +252,35 @@ export function createAttachments(deps: AttachmentsDeps): Attachments {
   // replacing their synthetic keys with real server urls. Called right after
   // createSession() in send(). A no-op for live sessions, whose attachments
   // upload immediately in addFiles.
-  async function flushPendingAttachments(id: string) {
+  //
+  // Send-reliability slice 2: a FAILED upload no longer drops the chip. The
+  // pending chip is RETAINED in place (same object, so the send's tap-time
+  // owned set keeps matching it) flagged `uploadFailed: true`, and returned
+  // in `failed` — createSend BLOCKS admission while any owned chip is failed
+  // (no partial send). A later flush re-attempts failed chips; success
+  // replaces them with clean server-backed objects.
+  async function flushPendingAttachments(id: string): Promise<{ failed: Attachment[] }> {
     const pending = attachments().filter((a) => a.file);
-    if (pending.length === 0) return;
+    if (pending.length === 0) return { failed: [] };
     setUploading(true);
     try {
       const resolved: Attachment[] = [];
+      const failed: Attachment[] = [];
       for (const a of pending) {
         const r = await uploadFile(a.file!, id);
-        if (r) resolved.push(r);
+        if (r) {
+          resolved.push(r);
+        } else {
+          // Retain the ORIGINAL chip object (identity-preserving: it stays in
+          // the send's tap-time owned set) flagged as failed.
+          a.uploadFailed = true;
+          failed.push(a);
+        }
       }
-      // Keep already-uploaded entries; replace pending ones with resolved urls.
-      setAttachments((prev) => [...prev.filter((a) => !a.file), ...resolved]);
+      // Keep already-uploaded entries; replace succeeded pending ones with
+      // resolved urls; RETAIN failed pending chips, flagged.
+      setAttachments((prev) => [...prev.filter((a) => !a.file), ...resolved, ...failed]);
+      return { failed };
     } finally {
       setUploading(false);
     }

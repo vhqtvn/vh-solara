@@ -47,6 +47,11 @@ const H = vi.hoisted(() => ({
     return "new-session-id";
   }),
 
+  // Slice 2 lever: when true, the createSessionWithCertainty wrapper answers
+  // {id:null, certainty:"unknown"} (timeout / proxy-502 shape) WITHOUT calling
+  // createSession — for the outcome-unknown draft-send tests.
+  createSessionUnknownCertainty: false,
+
   // enqueue: default resolves a minimal queue item WITHOUT touching the queue
   // store (so the drainer does not fire — the drain is area 5; areas 1-4 care
   // only about the enqueue custody + composer-ownership contract). Override
@@ -152,10 +157,30 @@ vi.mock("../../src/models", () => ({
 
 // --- sync mock (real store + controllable createSession) -------------------
 // Keep the REAL store so setSelectedId flips the real selectedId/draft signals
-// exactly as in production; override only createSession.
+// exactly as in production; override only createSession (+ the certainty-
+// carrying variant ChatView.ensureSession consumes, slice 2). Tests keep
+// controlling the OUTCOME through mocks.createSession; the wrapper adds the
+// certainty field. Set mocks.createSessionUnknownCertainty = true to simulate
+// the outcome-unknown create failure (timeout / proxy 502 shape).
 vi.mock("../../src/sync", async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
-  return { ...actual, createSession: H.createSession };
+  return {
+    ...actual,
+    createSession: H.createSession,
+    createSessionWithCertainty: async (): Promise<{
+      id: string | null;
+      certainty: "definitive" | "unknown";
+      detail?: string;
+    }> => {
+      if (H.createSessionUnknownCertainty) {
+        return { id: null, certainty: "unknown", detail: "mocked outcome-unknown create" };
+      }
+      const id = await H.createSession();
+      return id
+        ? { id, certainty: "definitive" }
+        : { id: null, certainty: "definitive", detail: "mocked definitive create failure" };
+    },
+  };
 });
 
 // --- queue mock (controllable, reads/writes H.queueStore) ------------------
@@ -232,6 +257,7 @@ export function resetHarness() {
   H.fetchQueue.mockReset();
   H.fetchQueue.mockImplementation(defaultFetchQueue);
   H.queueStore.items = {};
+  H.createSessionUnknownCertainty = false;
   H.modelsState.bySession = {};
   H.modelsState.explicit.clear();
 }
@@ -303,6 +329,12 @@ export const mocks = {
   },
   get fetchQueue() {
     return H.fetchQueue;
+  },
+  get createSessionUnknownCertainty() {
+    return H.createSessionUnknownCertainty;
+  },
+  set createSessionUnknownCertainty(v: boolean) {
+    H.createSessionUnknownCertainty = v;
   },
   get queueStore() {
     return H.queueStore;

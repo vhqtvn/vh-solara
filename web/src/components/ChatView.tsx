@@ -1,5 +1,6 @@
 import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
-import { ackSession, createSession, currentVerb, isSending, openSession, rootOf, sessionWorking, setSelectedId, setSending, state } from "../sync";
+import { ackSession, createSessionWithCertainty, currentVerb, isSending, openSession, rootOf, sessionWorking, setSelectedId, setSending, state } from "../sync";
+import { markOwnerSessionCreateUnknown } from "../lib/sendActionStatus";
 import {
   bottommostReadWithFallback,
   classifyScrollDelta,
@@ -1597,9 +1598,23 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   }));
 
   // In draft mode, materialize the server session on first send; otherwise use
-  // the current session id.
+  // the current session id. Send-reliability slice 2: the draft path consumes
+  // createSession's CERTAINTY — an outcome-unknown failure (timeout / proxy
+  // 502: the session MAY exist) marks the in-flight send attempt (ownerKey
+  // "draft", minted by createSend before the single-flight) uncertain so
+  // send()'s notification tells the operator to CHECK before re-sending (a
+  // re-send may create a second session; createSession has no idempotency
+  // key — a known unmet follow-up). A definitive failure returns plain null
+  // and send() records rejected/restore.
   async function ensureSession(): Promise<string | null> {
-    if (props.draft) return await createSession();
+    if (props.draft) {
+      const r = await createSessionWithCertainty();
+      if (r.id) return r.id;
+      if (r.certainty === "unknown") {
+        markOwnerSessionCreateUnknown("draft", r.detail || "session create outcome unknown");
+      }
+      return null;
+    }
     return props.sessionId;
   }
 
@@ -1640,6 +1655,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     migrateModelPick: (from, to) => migrateModelPick(from, to),
     curModel,
     enqueue,
+    // Send-reliability slice 2: authoritative queue list for the
+    // reconcile-first recovery path (enqueue response lost), and the
+    // live-upload gate (no partial send while an attachment upload runs).
+    fetchQueue,
+    uploading: att.uploading,
     isSending,
     setSending,
     userScrolledUp,

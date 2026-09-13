@@ -33,8 +33,17 @@ import {
   type ResolvedAttachment,
 } from "../../lib/inlineAttach";
 import { IGNORED, runSendSingleFlight } from "../../lib/sendSingleFlight";
+import {
+  findReusableSendAttempt,
+  finishSendAttempt,
+  getSendAction,
+  mintSendAttempt,
+  transferSendAttempt,
+  updateSendAction,
+  type PreparedSendPayload,
+} from "../../lib/sendActionStatus";
 import type { Attachment } from "./createAttachments";
-import type { QueuedMessage } from "../../queue";
+import { EnqueueError, type QueuedMessage } from "../../queue";
 import type { DrainOutcome } from "../../queueDrain";
 import type { Notification } from "../../notify";
 
@@ -93,8 +102,20 @@ export type SendDependencies = {
   // queue
   enqueue: (
     id: string,
-    input: { text: string; attachments: Attachment[]; sendConfig: QueueConfig },
+    input: {
+      text: string;
+      attachments: Attachment[];
+      sendConfig: QueueConfig;
+      attemptId?: string;
+    },
   ) => Promise<unknown>;
+  // Authoritative queue list (queue.ts fetchQueue) — injected for the
+  // reconcile-first recovery path when an enqueue response is lost
+  // (send-reliability slice 2).
+  fetchQueue: (id: string) => Promise<QueuedMessage[]>;
+  // True while an attachment upload is in flight (createAttachments'
+  // `uploading`) — admission blocks on it (no partial send).
+  uploading: Accessor<boolean>;
   // sending guard (sync store)
   isSending: (key: string) => boolean;
   setSending: (key: string, v: boolean) => void;
@@ -112,7 +133,7 @@ export type SendDependencies = {
   // attachments (from the createAttachments controller)
   attachments: Accessor<Attachment[]>;
   setAttachments: Setter<Attachment[]>;
-  flushPendingAttachments: (id: string) => Promise<void>;
+  flushPendingAttachments: (id: string) => Promise<{ failed: Attachment[] }>;
   inlineFiles: Map<string, File>;
   uploadFile: (file: File, id: string) => Promise<Attachment | null>;
   // draft-persistence key helper (pure; injected so the factory owns no ChatView-local symbol)
@@ -216,7 +237,110 @@ export function createSend(deps: SendDependencies): SendController {
   // waits are therefore excluded from the send, and an explicit operator
   // removal during those waits is honored — the removed object is simply no
   // longer present to intersect.
-  async function sendText(text: string, id: string, agent?: string, owned?: Set<Attachment>): Promise<boolean> {
+  // One logical send attempt's thread-through: stable identity + (on retry)
+  // the retained payload to reuse verbatim. `tapText` is the raw tap-time
+  // composer text (the retry-matching key recorded in the payload snapshot).
+  type SendAttemptRef = {
+    attemptId: string;
+    tapText: string;
+    reuse?: PreparedSendPayload;
+  };
+
+  // Typed admission-failure classification (send-reliability slice 2). The OLD
+  // "nothing was persisted" assumption after a failed enqueue is UNSAFE under
+  // response loss: a timeout/network failure (or an ambiguous 2xx) may have
+  // been admitted server-side. So: definitive HTTP errors classify by code,
+  // and response-less failures RECONCILE FIRST (an authoritative list showing
+  // an item admitted under our attemptId proves custody after all) before
+  // being recorded as outcome-unknown.
+  async function classifyAdmissionFailure(
+    e: unknown,
+    id: string,
+    attempt: SendAttemptRef | undefined,
+    composedText: string,
+  ): Promise<boolean> {
+    const err = e instanceof EnqueueError ? e : undefined;
+    if (attempt && err?.code === "queue_admission_conflict") {
+      // Same attemptId, changed payload — an explicit conflict state, never
+      // retry-forever. Immutable attempts make this unreachable in the normal
+      // flow; surface it if state ever diverges.
+      updateSendAction(attempt.attemptId, {
+        stage: "conflict", certainty: "definitive", recovery: "check",
+        detail: `admission conflict: ${err.message}`,
+      });
+      log.error("send", "enqueue admission conflict", { id, err: err.message });
+      deps.pushNotification({
+        kind: "error", sessionID: id, title: "Message not queued — admission conflict",
+        detail: "The queue reports a conflicting admission for this message; open the session queue to check before sending again.",
+      });
+      return false;
+    }
+    if (attempt && err?.code === "queue_admission_full") {
+      // 429 = hard user-visible error, no retry.
+      updateSendAction(attempt.attemptId, {
+        stage: "rejected", certainty: "definitive", recovery: "restore", detail: err.message,
+      });
+      log.error("send", "enqueue rejected: queue full", { id, err: err.message });
+      deps.pushNotification({
+        kind: "error", sessionID: id, title: "Message not queued — queue is full",
+        detail: "This session's queue is at capacity; remove queued messages before sending again.",
+      });
+      return false;
+    }
+    if (attempt && err && err.status !== undefined) {
+      // Any other non-2xx WITH a response from the local worker server is a
+      // definitive rejection (this is NOT the /oc upstream proxy).
+      updateSendAction(attempt.attemptId, {
+        stage: "rejected", certainty: "definitive", recovery: "restore", detail: err.message,
+      });
+      log.error("send", "enqueue failed", { id, err: err.message });
+      deps.pushNotification({
+        kind: "error", sessionID: id, title: "Could not queue message", detail: composedText.slice(0, 120),
+      });
+      return false;
+    }
+    if (attempt) {
+      // Response-less failure (timeout / network / ambiguous 2xx): the
+      // admission outcome is UNKNOWN — never "failed, safe to resend".
+      // Reconcile-first: a fresh authoritative list showing an item admitted
+      // under our attemptId proves durable custody after all.
+      let confirmed = false;
+      try {
+        const items = await deps.fetchQueue(id);
+        confirmed = items.some((it) => it.attemptId === attempt.attemptId);
+      } catch {
+        /* list unavailable — stay uncertain */
+      }
+      if (confirmed) {
+        finishSendAttempt(attempt.attemptId); // admitted after all; the item is authority
+        return true;
+      }
+      updateSendAction(attempt.attemptId, {
+        stage: "uncertain", certainty: "unknown", recovery: "retry-same",
+        detail: err?.message ?? String(e),
+      });
+      log.error("send", "enqueue outcome unknown (reconcile did not confirm)", { id, err: String(e) });
+      deps.pushNotification({
+        kind: "error", sessionID: id, title: "Queue confirmation unknown",
+        detail: "The message may or may not be queued. Check the session queue before sending again; pressing Send again re-sends the same message.",
+      });
+      return false;
+    }
+    // No attempt context: preserve the legacy contract exactly.
+    log.error("send", "enqueue failed", { id, err: String(e) });
+    deps.pushNotification({
+      kind: "error", sessionID: id, title: "Could not queue message", detail: composedText.slice(0, 120),
+    });
+    return false;
+  }
+
+  async function sendText(
+    text: string,
+    id: string,
+    agent?: string,
+    owned?: Set<Attachment>,
+    attempt?: SendAttemptRef,
+  ): Promise<boolean> {
     const ownedNow = () =>
       owned ? deps.attachments().filter((a) => owned.has(a)) : deps.attachments();
     const atts = ownedNow();
@@ -234,27 +358,60 @@ export function createSend(deps: SendDependencies): SendController {
       });
       return false;
     }
-    // Always capture a model. OpenCode rejects a prompt with no model. If models
-    // haven't loaded, fetch once before enqueue so the persisted queue item
-    // carries a valid sendConfig.
-    if (!deps.selectionFor(id) && deps.models().length === 0) await deps.loadModels();
-    const config = captureConfig(id, agent);
-    try {
+    // IMMUTABLE PREPARED ATTEMPT (send-reliability slice 2): a retry of an
+    // uncertain admission reuses the RETAINED payload verbatim (same text,
+    // same attachment objects, same captured config) under the SAME attemptId
+    // — no re-captured config, no re-resolved text, no re-upload. A fresh
+    // attempt captures its payload ONCE here (as late as possible, honoring
+    // D1) and records it on the action store so a later retry can reuse it.
+    let input: { text: string; attachments: Attachment[]; sendConfig: QueueConfig };
+    if (attempt?.reuse) {
+      input = {
+        text: attempt.reuse.text,
+        attachments: attempt.reuse.attachments,
+        // Captured payloads always carry a config (captureConfig is total);
+        // `|| {}` only satisfies the enqueue input's non-optional field.
+        sendConfig: attempt.reuse.sendConfig || {},
+      };
+    } else {
+      // Always capture a model. OpenCode rejects a prompt with no model. If models
+      // haven't loaded, fetch once before enqueue so the persisted queue item
+      // carries a valid sendConfig.
+      if (!deps.selectionFor(id) && deps.models().length === 0) await deps.loadModels();
+      const config = captureConfig(id, agent);
       // Recompute the intersection AFTER the loadModels await: "still present
       // at enqueue" is decided as late as possible (D1).
-      await deps.enqueue(id, { text, attachments: ownedNow(), sendConfig: config });
-    } catch (e) {
-      // Enqueue failed (offline / non-2xx / ambiguous 2xx-without-item) —
-      // preserve the composed text + attachments (no silent loss) and warn.
-      // Nothing was persisted, so a reconnect must NOT auto-send: there is no
-      // pending item for the drainer to pick up. The operator re-presses Send.
-      log.error("send", "enqueue failed", { id, err: String(e) });
-      deps.pushNotification({ kind: "error", sessionID: id, title: "Could not queue message", detail: text.slice(0, 120) });
-      return false;
+      input = { text, attachments: ownedNow(), sendConfig: config };
+      if (attempt) {
+        updateSendAction(attempt.attemptId, {
+          payload: {
+            tapText: attempt.tapText,
+            text: input.text,
+            attachments: input.attachments,
+            sendConfig: input.sendConfig,
+            files: input.attachments.map((a) => a.filename).filter(Boolean),
+          },
+        });
+      }
     }
-    // Durable custody confirmed. The caller decides whether to clear the
-    // composer (and only if it still owns the submitted state). This function
-    // does not touch setInput/setAttachments.
+    if (attempt) updateSendAction(attempt.attemptId, { stage: "admitting" });
+    try {
+      await deps.enqueue(
+        id,
+        attempt ? { ...input, attemptId: attempt.attemptId } : input,
+      );
+    } catch (e) {
+      // Enqueue failed or its response was lost — typed classification with
+      // reconcile-first (see classifyAdmissionFailure). The composed text +
+      // attachments are preserved by the caller (no silent loss).
+      return classifyAdmissionFailure(e, id, attempt, text);
+    }
+    // Durable custody confirmed — the queue item is now the authority. Drop
+    // the action record (Slice 3 renders the chip, not the action).
+    if (attempt) finishSendAttempt(attempt.attemptId);
+    // The caller decides whether to clear the composer (and only if it still
+    // owns the submitted state). This function does not touch
+    // setInput/setAttachments.
     return true;
   }
 
@@ -337,9 +494,23 @@ export function createSend(deps: SendDependencies): SendController {
         signal,
       });
       if (res.ok) return { state: "sent", detail: "" };
-      // Definitive rejection (non-2xx) — failed, never re-enqueue.
+      // Definitive rejection (non-2xx) — failed, never re-enqueue. EXCEPT the
+      // proxy-502 shape (send-reliability slice 2): the catch-all /oc proxy
+      // answers 502 on TRANSPORT failure to OpenCode (pkg/web/server.go), so
+      // a 502 does NOT prove the dispatch failed to reach the upstream — the
+      // POST may have been applied. Classify outcome-unknown, never failed:
+      // "failed" is reserved for rejections that prove non-delivery.
       let detail = "";
       try { detail = (await res.text()).slice(0, 300); } catch {}
+      if (res.status === 502) {
+        const msg = detail || "proxy 502";
+        log.error("send", "queued POST hit proxy 502 (outcome unknown)", { id, itemId: item.id, detail: msg });
+        deps.pushNotification({
+          kind: "error", sessionID: id, title: "Queued message send outcome unknown",
+          detail: `${msg} — the message may still have been delivered; check the transcript before resending.`,
+        });
+        return { state: "unknown", detail: `proxy 502 (outcome unknown): ${msg}` };
+      }
       const msg = detail || `HTTP ${res.status}`;
       log.error("send", "queued POST rejected", { id, itemId: item.id, status: res.status, detail: msg });
       deps.pushNotification({ kind: "error", sessionID: id, title: "Queued message failed to send", detail: msg });
@@ -511,6 +682,27 @@ export function createSend(deps: SendDependencies): SendController {
     if (!deps.draft() && text === "/undo") { deps.setInput(""); return void deps.undo(); }
     if (!deps.draft() && text === "/redo") { deps.setInput(""); return void deps.redo(); }
 
+    // IMMUTABLE ATTEMPT IDENTITY (send-reliability slice 2): every non-shell
+    // send gets ONE stable attempt identity owned by the sendActionStatus
+    // store (beside the single-flight guard). A re-tap whose text matches a
+    // retained uncertain admission RETRIES that attempt — same attemptId +
+    // verbatim payload; the server dedupes admission. Reuse additionally
+    // requires the tap-time owned attachment set to be a subset of the
+    // retained payload's (identity): an operator who added a chip is composing
+    // a NEW message, not retrying. Shell commands ("!") dispatch directly and
+    // carry no queue attempt.
+    const isShell = text.startsWith("!");
+    const attempt: SendAttemptRef | undefined = isShell
+      ? undefined
+      : (() => {
+          const ownerKey = wasDraft ? "draft" : deps.sessionId();
+          const reusable = findReusableSendAttempt(ownerKey, text);
+          if (reusable?.payload && ownedAtts.every((a) => reusable.payload!.attachments.includes(a as never))) {
+            return { attemptId: reusable.attemptId, tapText: text, reuse: reusable.payload };
+          }
+          return { attemptId: mintSendAttempt(ownerKey).attemptId, tapText: text };
+        })();
+
     // ADMISSION (F4): everything from here on runs inside the per-session
     // send single-flight, engaged at TAP time — a re-tap during the (up to
     // 10s) agent gate wait is DROPPED (IGNORED) instead of spawning a
@@ -571,6 +763,24 @@ export function createSend(deps: SendDependencies): SendController {
       // model can't override it post-migration. No-op for a non-draft send
       // (props.sessionId === id).
       deps.migrateModelPick(deps.sessionId(), id);
+      // ATTACHMENT BLOCKING (send-reliability slice 2): an eager live upload
+      // still in flight must not produce a partial send (the message would go
+      // out without the file). Halt admission before any composer change; the
+      // operator re-sends once the upload settles. (Checked BEFORE the flush:
+      // the flush itself arms `uploading` while it runs.)
+      if (deps.uploading()) {
+        if (attempt) {
+          updateSendAction(attempt.attemptId, {
+            stage: "blocked", certainty: "definitive", recovery: "restore",
+            detail: "an attachment upload is still in progress",
+          });
+        }
+        deps.pushNotification({
+          kind: "error", sessionID: id, title: "Not sent — attachment still uploading",
+          detail: "Wait for the upload to finish, then send again.",
+        });
+        return;
+      }
       // A draft may have queued attachments locally (no session existed at paste
       // time). Now that we have an id, upload them so buildParts sees real urls.
       // D2 (round 2): ownership across the flush is identity-guarded — NO
@@ -595,7 +805,7 @@ export function createSend(deps: SendDependencies): SendController {
       // states unreachable from the real controller (the draft composer is
       // unmounted during this await, and a live session's flush is a no-op).
       const preFlush = deps.attachments();
-      await deps.flushPendingAttachments(id);
+      const flushRes = await deps.flushPendingAttachments(id);
       const postFlush = deps.attachments();
       if (postFlush !== preFlush) {
         const preSet = new Set(preFlush);
@@ -615,6 +825,27 @@ export function createSend(deps: SendDependencies): SendController {
           // adopt it in full.
           for (const a of tail) owned.add(a);
         }
+      }
+      // ATTACHMENT BLOCKING (send-reliability slice 2): owned pending chips
+      // whose flush upload FAILED are retained in place (flagged
+      // `uploadFailed`, never silently dropped) and BLOCK admission here —
+      // the message must not be partially admitted without its files. The
+      // chips stay in the composer; the operator removes or retries them.
+      // (Unowned failed chips — an operator's concurrent paste — do not block
+      // THIS send: they are not part of its payload.)
+      const ownedFailedUploads = flushRes.failed.filter((a) => owned.has(a));
+      if (ownedFailedUploads.length > 0) {
+        if (attempt) {
+          updateSendAction(attempt.attemptId, {
+            stage: "blocked", certainty: "definitive", recovery: "restore",
+            detail: `${ownedFailedUploads.length} attachment upload(s) failed`,
+          });
+        }
+        deps.pushNotification({
+          kind: "error", sessionID: id, title: "Not sent — attachment upload failed",
+          detail: `${ownedFailedUploads.length} attachment(s) failed to upload and the message was not queued. Remove or retry them, then send again.`,
+        });
+        return;
       }
       // Shell commands (leading "!") dispatch directly against the live session —
       // they are NOT enqueued (they only make sense against a live shell). Text-
@@ -666,13 +897,40 @@ export function createSend(deps: SendDependencies): SendController {
       // NO duplicate image parts (the dF2 guarantee). Non-inline mode leaves this
       // null, so the failure path only restores the text.
       let appendedImageParts: ResolvedAttachment[] | null = null;
-      if (effectiveInline(modelHasVision(deps.curModel()), inlineAttachForced())) {
+      if (attempt?.reuse) {
+        // RETRY of an uncertain admission (send-reliability slice 2): the
+        // prepared payload (already inline-resolved text + uploaded
+        // attachments + captured config) is reused VERBATIM under the same
+        // attemptId — no re-resolution, no re-upload, no new config. The
+        // retained text/paths are the ones the first attempt enqueued.
+        resolvedText = attempt.reuse.text;
+      } else if (effectiveInline(modelHasVision(deps.curModel()), inlineAttachForced())) {
         const r = await resolveInlineAttachments(
           text,
           deps.inlineFiles,
           (f) => deps.uploadFile(f, id),
           modelHasVision(deps.curModel()),
         );
+        // ATTACHMENT BLOCKING (send-reliability slice 2): present inline
+        // tokens whose upload FAILED block admission — the message must not
+        // be partially admitted with unresolved vh-attach: tokens left in
+        // its text. (Previously failedIds was ignored, producing exactly
+        // that partial send.) The failed token(s) stay in the composer text;
+        // the operator removes or retries them.
+        if (r.failedIds.length > 0) {
+          if (attempt) {
+            updateSendAction(attempt.attemptId, {
+              stage: "blocked", certainty: "definitive", recovery: "restore",
+              detail: `${r.failedIds.length} inline attachment upload(s) failed (${r.failedIds.join(", ")})`,
+            });
+          }
+          deps.pushNotification({
+            kind: "error", sessionID: id, title: "Not sent — attachment upload failed",
+            detail: `${r.failedIds.length} inline attachment(s) failed to upload and the message was not queued. Remove or retry them, then send again.`,
+          });
+          if (deps.input() === ownedText) deps.setInput(text);
+          return;
+        }
         resolvedText = r.resolvedText;
         // Vision-only image file parts carry real file:// urls; add them to the
         // chip list BEFORE enqueue so buildParts (at dispatch) emits them and
@@ -687,7 +945,13 @@ export function createSend(deps: SendDependencies): SendController {
           for (const p of r.imageParts) owned.add(p);
         }
       }
-      const ok = await sendText(resolvedText, id, sendAgent, owned);
+      const ok = await sendText(
+        resolvedText,
+        id,
+        sendAgent,
+        owned,
+        attempt ? { attemptId: attempt.attemptId, tapText: attempt.tapText, reuse: attempt.reuse } : undefined,
+      );
       if (!ok) {
         // Preserve the composed text for retry — but never OVER an edit made
         // during the wait (F1): if the operator diverged, their newer text
@@ -751,13 +1015,43 @@ export function createSend(deps: SendDependencies): SendController {
     if (wasDraft) {
       const r = await runSendSingleFlight("draft", deps.ensureSession);
       if (r === IGNORED) return; // re-tap during createSession dropped; in-flight send owns the composer
-      const id = r; // string | null (null = createSession failed)
+      const id = r; // string | null (null = createSession failed or outcome unknown)
       if (!id) {
-        // Session creation failed; keep the text for retry — but only where we
-        // still own it (edits made during the createSession wait survive, F1).
+        // Session creation did not produce an id. CERTAINTY matters
+        // (send-reliability slice 2): ChatView.ensureSession marks the draft
+        // attempt "uncertain" when the create's OUTCOME is unknown (timeout /
+        // proxy 502 — the session may exist; a re-send may create a SECOND
+        // session, so the operator is told to check). A definitive failure
+        // leaves the attempt in preparing → rejected here. Either way the
+        // text is kept for retry — but only where we still own it (edits
+        // made during the createSession wait survive, F1).
+        const act = attempt ? getSendAction(attempt.attemptId) : undefined;
+        if (act?.stage === "uncertain") {
+          deps.pushNotification({
+            kind: "error", sessionID: deps.sessionId(), title: "Session creation outcome unknown",
+            detail: `${act.detail || "The create request may have succeeded."} Check the session list before sending again — sending again may create another session.`,
+          });
+        } else {
+          if (attempt) {
+            updateSendAction(attempt.attemptId, {
+              stage: "rejected", certainty: "definitive", recovery: "restore",
+              detail: "createSession failed (no session id)",
+            });
+          }
+          deps.pushNotification({
+            kind: "error", sessionID: deps.sessionId(), title: "Could not create session",
+            detail: "The message was kept in the composer; press Send again to retry.",
+          });
+        }
         if (deps.input() === ownedText) deps.setInput(text);
         return;
       }
+      // EXPLICIT draft→live ownership transfer (send-reliability slice 2):
+      // the attempt was minted under the "draft" key (no session existed at
+      // tap); the live id is known now, and the two single-flight keys are
+      // distinct by design — transfer the action so the live view's status
+      // surface (Slice 3) and retry linkage find it under the live id.
+      if (attempt) transferSendAttempt(attempt.attemptId, id);
       // A re-tap once the live id exists is dropped at the LIVE key (the live
       // ChatView's memo reads it); the in-flight admission owns clearing on
       // its own success.
@@ -802,7 +1096,12 @@ export function createSend(deps: SendDependencies): SendController {
     // an empty identity set keeps sendText from reading the live composer
     // array (D1) — attachments staged for the NEXT message never ride along
     // with a resend.
-    return sendText(text, id, ag.agent, new Set());
+    // Send-reliability slice 2: each operator-initiated resend is its own
+    // logical attempt (one stable identity + payload captured once inside
+    // sendText); if its confirmation is lost, the attempt's retained payload
+    // still guarantees an idempotent re-enqueue under the same attemptId.
+    const attemptId = mintSendAttempt(id).attemptId;
+    return sendText(text, id, ag.agent, new Set(), { attemptId, tapText: text });
   }
 
   return { send, resendText, dispatchQueuedItem };

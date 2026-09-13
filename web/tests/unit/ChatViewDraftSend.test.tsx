@@ -138,10 +138,20 @@ vi.mock("../../src/models", () => ({
 }));
 
 // sync: keep the REAL store (so setSelectedId flips the real selectedId/draft
-// signals exactly as in production) and override only createSession.
+// signals exactly as in production) and override only createSession (+ the
+// certainty-carrying variant ChatView.ensureSession consumes — slice 2).
 vi.mock("../../src/sync", async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
-  return { ...actual, createSession: createSessionMock };
+  return {
+    ...actual,
+    createSession: createSessionMock,
+    createSessionWithCertainty: async () => {
+      const id = await createSessionMock();
+      return id
+        ? { id, certainty: "definitive" as const }
+        : { id: null, certainty: "definitive" as const, detail: "mocked failure" };
+    },
+  };
 });
 
 // queue: keep the real store (queueMode() default true is fine) and override

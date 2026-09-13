@@ -196,10 +196,14 @@ export function createQueueRecovery(deps: QueueRecoveryDeps): QueueRecovery {
   }
 
   async function markSent(q: QueuedMessage): Promise<void> {
-    // Restricted to `unknown`. `failed` did NOT reach OpenCode (definitive
-    // rejection) so marking it sent would be wrong; `pending`/`dispatching` are
-    // non-terminal. `sent` is filtered upstream. Only `unknown` (ambiguous —
-    // the dispatch may have landed) is a candidate for operator confirmation.
+    // Restricted to `unknown`. Send-reliability slice 2 note: `failed` is now
+    // DEFINITIVE non-delivery only (createSend.dispatchQueuedItem classifies
+    // the proxy-502 shape as `unknown`, since a /oc proxy 502 is a transport
+    // failure and does NOT prove the POST failed to reach OpenCode —
+    // pkg/web/server.go). So marking `failed` sent would still be wrong (it
+    // was rejected upstream), `pending`/`dispatching` are non-terminal, and
+    // `sent` is filtered upstream. Only `unknown` (outcome-ambiguous — the
+    // dispatch may have landed) is a candidate for operator confirmation.
     if (q.state !== "unknown") return;
     // Reuse the EXISTING resolve op with target `sent` (the only auto-clear
     // state). This RECORDS an outcome for a dispatch that already happened; it

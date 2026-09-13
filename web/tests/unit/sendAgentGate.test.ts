@@ -100,10 +100,14 @@ function makeDeps(overrides: Partial<SendDependencies> = {}): SendDependencies {
     loadModels: async () => {},
     migrateModelPick: () => {},
     curModel: () => undefined,
-    enqueue: async (id: string, input: { text: string; attachments: Attachment[]; sendConfig: any }) => {
+    enqueue: async (id: string, input: { text: string; attachments: Attachment[]; sendConfig: any; attemptId?: string }) => {
       enqueued.push({ id, text: input.text, sendConfig: input.sendConfig, attachments: input.attachments });
       return {};
     },
+    // Slice 2 deps: reconcile-first list (empty = not confirmed) + no live
+    // upload in flight by default.
+    fetchQueue: async () => [],
+    uploading: () => false,
     isSending: () => false,
     setSending: () => {},
     userScrolledUp: () => false,
@@ -117,7 +121,7 @@ function makeDeps(overrides: Partial<SendDependencies> = {}): SendDependencies {
     redo: () => {},
     attachments: attsSig,
     setAttachments: setAttsSig,
-    flushPendingAttachments: async () => {},
+    flushPendingAttachments: async () => ({ failed: [] as Attachment[] }),
     inlineFiles: new Map(),
     uploadFile: async () => null,
     draftKey: (sid: string) => `vh.draft.${sid}`,
@@ -512,7 +516,7 @@ describe("D2: attachment ownership across the draft flush", () => {
     setAttsSig([P1]);
     let flushResolve!: () => void;
     const ctrl = createSend(makeDeps({
-      flushPendingAttachments: () => new Promise<void>((res) => { flushResolve = res; }),
+      flushPendingAttachments: () => new Promise<{ failed: Attachment[] }>((res) => { flushResolve = () => res({ failed: [] }); }),
     }));
 
     const p = ctrl.send();
@@ -546,6 +550,7 @@ describe("D2: attachment ownership across the draft flush", () => {
     const ctrl = createSend(makeDeps({
       flushPendingAttachments: async () => {
         setAttsSig((cur: Attachment[]) => [...cur.filter((a) => !a.file), U1]);
+        return { failed: [] };
       },
     }));
 
@@ -581,6 +586,7 @@ describe("D2: attachment ownership across the draft flush", () => {
         // …then an operator addition lands inside the same window, AFTER the
         // flush's own write → post-flush array [U1, A3].
         setAttsSig((cur: Attachment[]) => [...cur, A3]);
+        return { failed: [] };
       },
     }));
 
@@ -670,7 +676,11 @@ describe("D4: prompt history writes", () => {
     expect(enqueued).toHaveLength(0);
     expect(pushHistory).not.toHaveBeenCalled();
     expect(inputSig()).toBe("queue me"); // preserved for retry
-    expect(notes.some((n) => n.title === "Could not queue message")).toBe(true);
+    // Slice 2: a response-less enqueue rejection (plain Error — no HTTP
+    // status) is OUTCOME-UNKNOWN, not definitive failure: after the
+    // reconcile-first list check misses, the operator sees the
+    // outcome-unknown wording (never "failed, safe to resend").
+    expect(notes.some((n) => n.title === "Queue confirmation unknown")).toBe(true);
   });
 
   it("ordinary successful send → exactly ONE history write; an unchanged composer clears normally", async () => {

@@ -19,9 +19,11 @@
 // tests cover the cache/dispatch/migration contract the SPA relies on.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  __resetQueueAttemptSupportForTests,
   clearQueueCache,
   claimQueued,
   enqueue,
+  EnqueueError,
   fetchQueue,
   hasQueueState,
   migrateLegacyQueue,
@@ -31,6 +33,7 @@ import {
   resolveQueued,
   setQueueMode,
 } from "../../src/queue";
+import { __resetSendActionStatusForTests } from "../../src/lib/sendActionStatus";
 import { saveVersioned } from "../../src/lib/store";
 
 // In-memory localStorage for the node test env (matches store.test.ts).
@@ -63,6 +66,8 @@ beforeEach(() => {
 
 afterEach(() => {
   resetCache();
+  __resetQueueAttemptSupportForTests();
+  __resetSendActionStatusForTests();
   vi.unstubAllGlobals();
 });
 
@@ -84,6 +89,7 @@ function item(id: string, opts: Partial<{
   sendConfig: any;
   detail: string;
   resolvedAt: number;
+  attemptId: string;
 }> = {}): any {
   const state = opts.state ?? "pending";
   const out: any = {
@@ -96,6 +102,7 @@ function item(id: string, opts: Partial<{
   };
   if (opts.sendConfig) out.sendConfig = opts.sendConfig;
   if (opts.detail) out.detail = opts.detail;
+  if (opts.attemptId) out.attemptId = opts.attemptId;
   // The backend stamps resolvedAt on terminal transitions; mirror that for
   // realistic resolve-response fixtures.
   if (opts.resolvedAt !== undefined) out.resolvedAt = opts.resolvedAt;
@@ -794,5 +801,228 @@ describe("migrateLegacyQueue — vh.queue.v1 → backend", () => {
     expect(ok).toBe(false);
     expect(legacyMap()[sid].map((m: any) => m.id)).toEqual(["old-1"]);
     expect(mem["vh.queue.v1"]).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Send-reliability slice 2 — idempotent admission (attemptId), typed enqueue
+// errors, and the guarded resolve (409 conflict short-circuit + byte-identical
+// retry bodies).
+// ---------------------------------------------------------------------------
+describe("enqueue — attemptId idempotent admission (slice 2)", () => {
+  it("sends attemptId; a replayed receipt (same attemptId + payload) upserts ONE cache entry", async () => {
+    const sid = "s-att-1";
+    touched.push(sid);
+    const bodies: any[] = [];
+    let calls = 0;
+    const serverItem = () => item("q-att-1", { order: 1, text: "same text", attemptId: "att-1" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: any) => {
+        if (url.endsWith(`/vh/session/${sid}/queue`) && init?.method === "POST") {
+          calls++;
+          bodies.push(JSON.parse(init.body));
+          // Slice-1 server: replays answer the ORIGINAL receipt + replayed:true.
+          return Promise.resolve(res(200, { item: serverItem(), replayed: calls > 1 }));
+        }
+        return Promise.resolve(res(404, {}));
+      }),
+    );
+
+    const input = { text: "same text", attachments: [], sendConfig: { agent: "build" } };
+    const first = await enqueue(sid, { ...input, attemptId: "att-1" });
+    expect(first.id).toBe("q-att-1");
+    // Same attemptId + IDENTICAL payload → the server dedupes; the FE cache
+    // upserts by id: still exactly ONE entry, no duplicate chip.
+    const second = await enqueue(sid, { ...input, attemptId: "att-1" });
+    expect(second.id).toBe("q-att-1");
+    expect(calls).toBe(2);
+    // Both POST bodies carried the attemptId and were byte-identical payloads.
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].attemptId).toBe("att-1");
+    expect(bodies[1].attemptId).toBe("att-1");
+    expect(bodies[0]).toEqual(bodies[1]);
+    expect(queueFor(sid)).toHaveLength(1);
+  });
+
+  it("feature-detects legacy servers: no `replayed` field → later enqueues strip attemptId", async () => {
+    const sid = "s-att-2";
+    touched.push(sid);
+    const bodies: any[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: any) => {
+        bodies.push(JSON.parse(init.body));
+        // LEGACY server: {item} with NO replayed field.
+        return Promise.resolve(res(200, { item: item(`q-${bodies.length}`, {}) }));
+      }),
+    );
+
+    await enqueue(sid, { text: "probe", attachments: [], attemptId: "att-probe" });
+    // The probe carried the attemptId (the only way to detect is to send once).
+    expect(bodies[0].attemptId).toBe("att-probe");
+
+    // A later enqueue MUST fall back to the legacy contract: no attemptId sent
+    // (a legacy server must not silently appear to carry the stronger
+    // guarantee).
+    await enqueue(sid, { text: "next", attachments: [], attemptId: "att-2" });
+    expect("attemptId" in bodies[1]).toBe(false);
+
+    // The legacy verdict is memoized for the module's lifetime: even a server
+    // that WOULD answer `replayed` no longer receives attemptIds from this
+    // client session (re-probing would let a flapping proxy silently re-arm
+    // the stronger contract).
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: any) => {
+        bodies.push(JSON.parse(init.body));
+        return Promise.resolve(res(200, { item: item(`q-${bodies.length}`, {}), replayed: false }));
+      }),
+    );
+    await enqueue(sid, { text: "third", attachments: [], attemptId: "att-3" });
+    expect("attemptId" in bodies[2]).toBe(false);
+  });
+});
+
+describe("enqueue — typed failures (EnqueueError, slice 2)", () => {
+  it("409 queue_admission_conflict → EnqueueError with the machine code + status", async () => {
+    const sid = "s-att-409";
+    touched.push(sid);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(res(409, { ok: false, error: "payload changed for attempt", code: "queue_admission_conflict" }))),
+    );
+    const p = enqueue(sid, { text: "x", attachments: [], attemptId: "att-c" });
+    await expect(p).rejects.toMatchObject({
+      name: "EnqueueError",
+      code: "queue_admission_conflict",
+      status: 409,
+    });
+    expect(queueFor(sid)).toHaveLength(0);
+  });
+
+  it("429 queue_admission_full → EnqueueError queue_admission_full (hard rejection, no retry)", async () => {
+    const sid = "s-att-429";
+    touched.push(sid);
+    const fetchMock = vi.fn(() => Promise.resolve(res(429, { ok: false, error: "queue full", code: "queue_admission_full" })));
+    vi.stubGlobal("fetch", fetchMock);
+    const p = enqueue(sid, { text: "x", attachments: [], attemptId: "att-f" });
+    await expect(p).rejects.toMatchObject({ code: "queue_admission_full", status: 429 });
+    // Exactly one POST — the module itself never retries admission.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("other non-2xx → EnqueueError code unknown with status (definitive: local /vh server)", async () => {
+    const sid = "s-att-500";
+    touched.push(sid);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(500, { error: "boom" }))));
+    await expect(enqueue(sid, { text: "x", attachments: [] })).rejects.toMatchObject({
+      name: "EnqueueError",
+      code: "unknown",
+      status: 500,
+    });
+  });
+
+  it("timeout → EnqueueError code timeout (outcome-unknown, NOT definitive)", async () => {
+    const sid = "s-att-to";
+    touched.push(sid);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: any) =>
+        new Promise((_r, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        }),
+      ),
+    );
+    vi.useFakeTimers();
+    try {
+      const p = enqueue(sid, { text: "x", attachments: [], attemptId: "att-t" });
+      p.catch(() => {});
+      await vi.advanceTimersByTimeAsync(12000);
+      await expect(p).rejects.toMatchObject({ code: "timeout" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("is an EnqueueError instance (instanceof works for callers)", async () => {
+    const sid = "s-att-inst";
+    touched.push(sid);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(500, {}))));
+    const p = enqueue(sid, { text: "x", attachments: [] });
+    await expect(p).rejects.toBeInstanceOf(EnqueueError);
+  });
+});
+
+describe("resolveQueued — 409 queue_resolve_conflict (slice 2)", () => {
+  it("stops retrying immediately (exactly 1 POST), drops the overlay, refreshes from the server, marks the linked attempt", async () => {
+    const sid = "s-res-conf-1";
+    touched.push(sid);
+    // Seed the cache with a claimed item admitted under an attemptId.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(res(200, { items: [item("q-1", { state: "dispatching", attemptId: "att-r1" })] }))),
+    );
+    await fetchQueue(sid);
+
+    // The resolve write hits a coded conflict: the server holds a DIFFERENT
+    // terminal state. Any later list fetch answers the server truth (sent).
+    let resolveCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.endsWith("/resolve")) {
+          resolveCalls++;
+          return Promise.resolve(
+            res(409, { ok: false, error: "server holds sent for q-1", code: "queue_resolve_conflict" }),
+          );
+        }
+        return Promise.resolve(res(200, { items: [item("q-1", { state: "sent", attemptId: "att-r1" })] }));
+      }),
+    );
+
+    await resolveQueued(sid, "q-1", "unknown", "proxy 502");
+
+    // The conflict is TERMINAL for the write: exactly ONE resolve POST — no
+    // bounded-retry loop (explicit conflict ≠ transient failure).
+    expect(resolveCalls).toBe(1);
+    // Cache reflects SERVER truth: sent items are filtered from the visible
+    // queue; the optimistic `unknown` overlay must not survive.
+    expect(queueFor(sid)).toHaveLength(0);
+
+    // The linked send attempt carries the explicit conflict state.
+    const { getSendAction } = await import("../../src/lib/sendActionStatus");
+    const action = getSendAction("att-r1");
+    expect(action?.stage).toBe("conflict");
+    expect(action?.certainty).toBe("definitive");
+    expect(action?.recovery).toBe("check");
+  });
+});
+
+describe("resolveWithRetry — byte-identical bodies across retries (slice 2)", () => {
+  it("every retry POST carries the exact same (state, detail) body string", async () => {
+    const sid = "s-res-ident";
+    touched.push(sid);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(200, { items: [item("q-1", { state: "dispatching" })] }))));
+    await fetchQueue(sid);
+
+    const bodies: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: any) => {
+        if (url.endsWith("/resolve")) {
+          bodies.push(init.body);
+          return Promise.resolve(res(500, { error: "boom" })); // all attempts fail transiently
+        }
+        return Promise.resolve(res(200, { items: [] }));
+      }),
+    );
+    await resolveQueued(sid, "q-1", "failed", "HTTP 400: bad");
+    // Bounded retries happened...
+    expect(bodies.length).toBeGreaterThan(1);
+    // ...and every body was BYTE-IDENTICAL (a slice-1 server treats an
+    // identical terminal re-resolve as a no-op preserving timestamps).
+    expect(new Set(bodies).size).toBe(1);
+    expect(bodies[0]).toBe(JSON.stringify({ state: "failed", detail: "HTTP 400: bad" }));
   });
 });

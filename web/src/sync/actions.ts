@@ -202,9 +202,33 @@ export function newSession() {
 // text for retry — no silent loss.
 const CREATE_SESSION_TIMEOUT_MS = 12000;
 
+// Typed createSession outcome (send-reliability slice 2). A null id alone no
+// longer carries enough information: /oc/session is the PROXY route, and a
+// proxy 502 (transport failure, pkg/web/server.go) or a timeout/response loss
+// does NOT prove the session was not created. `certainty` distinguishes:
+//   definitive — the server answered definitively (non-502 error status, or a
+//                malformed 2xx): the session was NOT created.
+//   unknown    — timeout / network failure / proxy 502: the session MAY exist;
+//                a re-send may create a SECOND session (the caller must tell
+//                the operator to check first — createSession has no
+//                idempotency key, a known unmet follow-up in the brief).
+export type CreateSessionOutcome = {
+  id: string | null;
+  certainty: "definitive" | "unknown";
+  detail?: string;
+};
+
 // Create a session on the server (called when the draft's first message is
 // sent). Returns the new id, or null on failure.
+//
+// Legacy thin wrapper over createSessionWithCertainty (same contract as before
+// the slice: id or null) for callers that do not consume certainty.
 export async function createSession(): Promise<string | null> {
+  return (await createSessionWithCertainty()).id;
+}
+
+// The certainty-carrying variant ChatView.ensureSession uses.
+export async function createSessionWithCertainty(): Promise<CreateSessionOutcome> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), CREATE_SESSION_TIMEOUT_MS);
   try {
@@ -214,18 +238,36 @@ export async function createSession(): Promise<string | null> {
       body: "{}",
       signal: ctrl.signal,
     });
+    if (!res.ok) {
+      // NOTE: body already read inside the armed window shape-wise is not
+      // needed here — the classification only needs the status. A 502 from
+      // the catch-all proxy is a TRANSPORT failure (the POST may have been
+      // applied upstream): outcome unknown. Any other status is a definitive
+      // server answer: not created.
+      if (res.status === 502) {
+        return { id: null, certainty: "unknown", detail: `proxy 502 creating session` };
+      }
+      return { id: null, certainty: "definitive", detail: `HTTP ${res.status} creating session` };
+    }
     const sess = await res.json();
     if (sess?.id) {
       setSelectedId(sess.id);
       void openSession(sess.id);
-      return sess.id;
+      return { id: sess.id, certainty: "definitive" };
     }
-  } catch {
-    /* caller surfaces the failure */
+    return { id: null, certainty: "definitive", detail: "session create response had no id" };
+  } catch (e) {
+    // Network error OR abort/timeout — no response confirmed either way: the
+    // session may have been created. Outcome unknown, never "not created".
+    const aborted = ctrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError");
+    return {
+      id: null,
+      certainty: "unknown",
+      detail: aborted ? "session create timed out" : `session create request failed (${String(e)})`,
+    };
   } finally {
     clearTimeout(timer);
   }
-  return null;
 }
 
 // Reply to a pending permission request: "once" | "always" | "reject".

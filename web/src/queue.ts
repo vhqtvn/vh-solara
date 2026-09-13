@@ -22,6 +22,7 @@
 import { createSignal } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { loadVersioned, saveVersioned } from "./lib/store";
+import { markSendAttemptResolveConflict } from "./lib/sendActionStatus";
 
 export interface QueuedAttachment {
   url: string;
@@ -52,6 +53,11 @@ export interface QueuedMessage {
   // threads it into the dispatch POST so a later exact GET
   // /session/:sid/message/:mid can reconcile delivered-but-stuck items.
   opencodeMsgID?: string;
+  // Send-reliability slice 2: the client attempt id this item was admitted
+  // under (the idempotent-admission key). Echoed by the backend on the enqueued
+  // item; absent on legacy items/servers. Used by reconcile-first recovery to
+  // match a list item back to its uncertain admission attempt.
+  attemptId?: string;
   createdAt: number;
   resolvedAt?: number;
   // Failure / ambiguous detail for failed | unknown (diagnostics).
@@ -59,10 +65,45 @@ export interface QueuedMessage {
 }
 
 // Input shape for enqueue (the backend issues id + order + state + createdAt).
+// attemptId (send-reliability slice 2) makes admission durably idempotent on
+// slice-1 servers: the same (attemptId, canonical payload) replay returns the
+// ORIGINAL receipt ("replayed": true) and creates no second item. See
+// enqueue() for the legacy-server feature-detect.
 export type QueueInput = Pick<QueuedMessage, "text" | "attachments"> & {
   sendConfig?: QueuedMessage["sendConfig"];
   originClientId?: string;
+  attemptId?: string;
 };
+
+// Typed enqueue failure (send-reliability slice 2). `code` is machine-readable:
+//   queue_admission_conflict — 409, same attemptId with a CHANGED payload.
+//   queue_admission_full     — 429, receipt capacity; a definitive rejection.
+//   timeout / network        — NO response: the outcome is UNKNOWN (the POST
+//                              may have been admitted; reconcile before
+//                              deciding anything).
+//   ambiguous                — 2xx whose body carried no item.
+//   unknown                  — any other non-2xx WITH a response. /vh/queue is
+//                              served by the LOCAL worker server (not the /oc
+//                              proxy), so an HTTP error status is definitive
+//                              non-admission; `status` carries it.
+export type EnqueueErrorCode =
+  | "queue_admission_conflict"
+  | "queue_admission_full"
+  | "timeout"
+  | "network"
+  | "ambiguous"
+  | "unknown";
+
+export class EnqueueError extends Error {
+  code: EnqueueErrorCode;
+  status?: number;
+  constructor(message: string, code: EnqueueErrorCode, status?: number) {
+    super(message);
+    this.name = "EnqueueError";
+    this.code = code;
+    this.status = status;
+  }
+}
 
 const LS_QUEUE = "vh.queue.v1"; // LEGACY migration source only — never written for live queues
 const LS_QUEUE_MODE = "vh.prefs.queueMode.v1";
@@ -167,12 +208,41 @@ export async function fetchQueue(sessionId: string): Promise<QueuedMessage[]> {
 // precedent at web/src/code/api.ts:9-25.
 const ENQUEUE_TIMEOUT_MS = 12000;
 
+// Feature-detect state for idempotent admission (send-reliability slice 2).
+// Slice-1 servers echo `"replayed": <bool>` on every enqueue response; LEGACY
+// servers return `{item}` with NO `replayed` field. We probe on the first
+// attemptId-carrying enqueue and remember the verdict for the module's
+// lifetime: once a server is known legacy, later enqueues OMIT attemptId
+// (legacy requests keep the old non-idempotent behavior and must not silently
+// appear to carry the stronger guarantee). "unknown" (pre-probe) still sends
+// the attemptId — the probe IS the first such send.
+type AttemptSupport = "unknown" | "supported" | "legacy";
+let attemptSupport: AttemptSupport = "unknown";
+
+/** Test-only: reset the attempt-support feature-detect (module singleton). */
+export function __resetQueueAttemptSupportForTests(): void {
+  attemptSupport = "unknown";
+}
+
 // enqueue POSTs a new message; the backend issues the id + monotonic order.
-// Returns the created item. Throws on non-2xx, on a hung/timed-out response,
-// or on a 2xx-without-item ambiguous response so the caller can preserve the
-// composed text (no silent loss). Throwing on timeout means the caller NEVER
-// clears the composer until durable custody is confirmed.
+// Returns the created item. Throws EnqueueError on non-2xx (typed — see the
+// class), on a hung/timed-out response, or on a 2xx-without-item ambiguous
+// response so the caller can preserve the composed text (no silent loss).
+// Throwing on timeout means the caller NEVER clears the composer until durable
+// custody is confirmed — and must NOT assume "nothing persisted": the POST may
+// have been admitted (reconcile-first, see createSend.sendText).
+//
+// Idempotent admission (slice 2): when input.attemptId is present (and the
+// server is not known-legacy), it is sent with the payload; a slice-1 server
+// dedupes same-(attemptId,payload) replays and answers the ORIGINAL receipt
+// with `replayed: true`. The cache is UPSERTED by item id, so a replay never
+// produces a duplicate chip. After a session-queue cleanup/archive the replay
+// guarantee is over server-side (a replay is a fresh admission) — the client's
+// retries are user-driven re-taps, never an automatic loop, so no stale
+// attemptId is ever hammered.
 export async function enqueue(sessionId: string, input: QueueInput): Promise<QueuedMessage> {
+  const sendAttempt = !!input.attemptId && attemptSupport !== "legacy";
+  const body = sendAttempt ? input : { ...input, attemptId: undefined };
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ENQUEUE_TIMEOUT_MS);
   let res: Response;
@@ -180,21 +250,35 @@ export async function enqueue(sessionId: string, input: QueueInput): Promise<Que
     res = await fetch(queueUrl(sessionId), {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
-      body: JSON.stringify(input),
+      body: JSON.stringify(body),
       signal: ctrl.signal,
     });
   } catch (e) {
     clearTimeout(timer);
-    // Network error OR abort/timeout. Either way the response never confirmed
-    // durable custody, so throw — the caller preserves the composer. The POST
-    // may have reached the backend (ambiguous), so a retry can produce a
-    // visible duplicate, which is preferred over silent loss.
+    // Network error OR abort/timeout. Either way NO response arrived: the
+    // admission outcome is UNKNOWN (the POST may have been admitted), so throw
+    // typed — the caller reconciles before deciding anything.
     const aborted = ctrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError");
-    throw new Error(aborted ? "enqueue timed out" : `enqueue failed (${String(e)})`);
+    throw new EnqueueError(
+      aborted ? "enqueue timed out" : `enqueue failed (${String(e)})`,
+      aborted ? "timeout" : "network",
+    );
   }
   clearTimeout(timer);
   if (!res.ok) {
-    throw new Error(`enqueue failed (${res.status})`);
+    // The local worker server answered with an error — definitive
+    // non-admission (this is NOT the /oc upstream proxy, whose 502 is
+    // ambiguous). Surface the machine-readable code when present.
+    let code: string | undefined;
+    try {
+      code = (await res.json())?.code;
+    } catch {
+      /* body unreadable — plain status below */
+    }
+    if (code === "queue_admission_conflict" || code === "queue_admission_full") {
+      throw new EnqueueError(`enqueue failed (${res.status} ${code})`, code, res.status);
+    }
+    throw new EnqueueError(`enqueue failed (${res.status})`, "unknown", res.status);
   }
   const j = await readJSON(res);
   const item: QueuedMessage | undefined = j.item;
@@ -202,10 +286,21 @@ export async function enqueue(sessionId: string, input: QueueInput): Promise<Que
     // Ambiguous response (successful import lost / malformed): treat as a
     // failure so the caller retains the text. A retry may produce a visible
     // duplicate, which is preferred over silent loss (operator policy).
-    throw new Error("enqueue: no item in response");
+    throw new EnqueueError("enqueue: no item in response", "ambiguous");
+  }
+  // Feature-detect (slice 2): a response carrying the `replayed` field proves
+  // slice-1 admission semantics; its ABSENCE on an attemptId-carrying request
+  // proves a legacy server (fall back to non-idempotent, no attemptId sent).
+  if (sendAttempt) {
+    attemptSupport = "replayed" in j ? "supported" : "legacy";
   }
   setQueues(produce((q) => {
-    (q[sessionId] ||= []).push(item);
+    const arr = (q[sessionId] ||= []);
+    // Upsert by id: a replayed receipt (or a raced duplicate response) must
+    // never yield two cache entries for one server item.
+    const i = arr.findIndex((m) => m.id === item.id);
+    if (i >= 0) arr[i] = item;
+    else arr.push(item);
   }));
   return item;
 }
@@ -284,45 +379,52 @@ const CLAIM_TIMEOUT_MS = 12000;
 export async function claimQueued(sessionId: string): Promise<QueuedMessage | null> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), CLAIM_TIMEOUT_MS);
-  let res: Response;
+  let item: QueuedMessage | null = null;
   try {
-    res = await fetch(queueUrl(sessionId, "/claim"), {
+    const res = await fetch(queueUrl(sessionId, "/claim"), {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
       body: "{}",
       signal: ctrl.signal,
     });
+    if (res.ok) {
+      // Body read INSIDE the armed timeout window (send-reliability slice 2,
+      // commit-review D-F2): headers arriving with a stalled body used to
+      // wedge the drainer's `draining` flag past the timer clear (readJSON ran
+      // after the finally). Mirrors the createSession/resolveWithRetry shape.
+      const j = await readJSON(res);
+      item = j.item || null;
+    }
   } catch {
-    // Network error OR abort/timeout — no confirmed claim; the drain stops
-    // (null), and a later drain attempt retries cleanly.
+    // Network error OR abort/timeout (incl. a hung BODY after headers) — no
+    // confirmed claim; the drain stops (null), and a later drain attempt
+    // retries cleanly.
     return null;
   } finally {
     clearTimeout(timer);
   }
-  if (!res.ok) return null;
-  const j = await readJSON(res);
-  const item: QueuedMessage | null = j.item || null;
   if (!item) return null;
+  const claimed = item;
   setQueues(produce((q) => {
     const arr = q[sessionId];
     if (arr) {
       for (const m of arr) {
-        if (m.id === item.id) {
+        if (m.id === claimed.id) {
           // Reconcile with the authoritative claimed state (dispatching).
-          m.state = item.state;
-          m.detail = item.detail;
-          m.resolvedAt = item.resolvedAt;
+          m.state = claimed.state;
+          m.detail = claimed.detail;
+          m.resolvedAt = claimed.resolvedAt;
           return;
         }
       }
       // Not in the local cache (stale/empty view) — upsert the authoritative
       // claimed item so the UI still reflects dispatching truth.
-      arr.push(item);
+      arr.push(claimed);
     } else {
-      q[sessionId] = [item];
+      q[sessionId] = [claimed];
     }
   }));
-  return item;
+  return claimed;
 }
 
 // resolveQueued records a terminal outcome (sent | failed | unknown) for an
@@ -350,27 +452,54 @@ export async function resolveQueued(
   // Reflect the KNOWN terminal outcome into the local cache + overlay now, so
   // the UI is honest regardless of whether the resolve write lands.
   applyOutcome(sessionId, id, state, detail, resolvedAt);
-  // Bounded retry of the resolve WRITE (a record, not a dispatch — safe).
-  const echoed = await resolveWithRetry(sessionId, id, state, detail);
-  if (echoed) {
-    // Backend accepted and echoed the authoritative item — reconcile
-    // detail/resolvedAt to the server's stamp.
-    setQueues(produce((q) => {
-      const arr = q[sessionId];
-      if (arr) {
-        for (const m of arr) {
-          if (m.id === id) {
-            m.state = echoed.state;
-            m.detail = echoed.detail;
-            m.resolvedAt = echoed.resolvedAt;
-            break;
+  // Bounded retry of the resolve WRITE (a record, not a dispatch — safe), with
+  // the EXACT same (state, detail) body on every attempt (byte-identical
+  // detail reuse: a slice-1 server treats an identical terminal re-resolve as
+  // a no-op preserving timestamps, so legitimate retries never conflict).
+  const outcome = await resolveWithRetry(sessionId, id, state, detail);
+  if (outcome.kind === "recorded") {
+    const echoed = outcome.item;
+    if (echoed) {
+      // Backend accepted and echoed the authoritative item — reconcile
+      // detail/resolvedAt to the server's stamp.
+      setQueues(produce((q) => {
+        const arr = q[sessionId];
+        if (arr) {
+          for (const m of arr) {
+            if (m.id === id) {
+              m.state = echoed.state;
+              m.detail = echoed.detail;
+              m.resolvedAt = echoed.resolvedAt;
+              break;
+            }
           }
         }
-      }
-    }));
+      }));
+    }
+  } else if (outcome.kind === "conflict") {
+    // The server holds a DIFFERENT terminal state for this item (slice-1
+    // monotonic resolve: e.g. the reconciler already recorded `sent` while we
+    // are late-reporting `unknown`). This is an EXPLICIT conflict, not a
+    // transient failure — never retry-forever. The server's queue state is
+    // authoritative: drop our optimistic overlay and refresh from the server
+    // so the UI reflects the real terminal state instead of ours.
+    knownOutcomes.delete(id);
+    const linked = (queues[sessionId] || []).find((m) => m.id === id);
+    if (linked?.attemptId) {
+      // Surface the conflict on the linked send attempt (send-reliability
+      // slice 2): the operator-visible state must be expressible.
+      markSendAttemptResolveConflict(linked.attemptId, sessionId, outcome.detail || "queue_resolve_conflict");
+    }
+    try {
+      await fetchQueue(sessionId);
+    } catch {
+      /* offline: the optimistic local state stays; the next successful poll
+         reconciles (the overlay is gone, so server truth wins when it lands). */
+    }
   }
-  // If retries exhausted, the optimistic local terminal state (set above) stays;
-  // knownOutcomes keeps fetchQueue from flipping it back to dispatching.
+  // If retries exhausted (unrecorded), the optimistic local terminal state
+  // (set above) stays; knownOutcomes keeps fetchQueue from flipping it back
+  // to dispatching.
 }
 
 // applyOutcome records the known terminal outcome in both the local cache and
@@ -407,17 +536,31 @@ function applyOutcome(
 // abort the attempt counts as failed and the bounded retry loop continues.
 const RESOLVE_TIMEOUT_MS = 5000;
 
-// resolveWithRetry POSTs the resolve write a bounded number of times. Returns
-// the authoritative item echoed by the backend on success (may be undefined if
-// the 2xx body carried no item), or undefined if the write never landed.
-// Retries on any non-2xx or network error (transient). This only records an
-// outcome — it NEVER dispatches.
+// Typed outcome of the bounded resolve-write retry loop (send-reliability
+// slice 2):
+//   recorded   — a 2xx landed (item may be absent on a body-less 2xx).
+//   conflict   — the server answered 409 queue_resolve_conflict: it holds a
+//                DIFFERENT terminal state. Terminal for this write — the loop
+//                STOPS (an explicit conflict must never be retried forever).
+//   unrecorded — attempts exhausted on transient errors (network/5xx); the
+//                optimistic local terminal state stays visible.
+export type ResolveWriteOutcome =
+  | { kind: "recorded"; item?: QueuedMessage }
+  | { kind: "conflict"; detail: string }
+  | { kind: "unrecorded" };
+
+// resolveWithRetry POSTs the resolve write a bounded number of times. The
+// request body is built ONCE and reused byte-identically on every attempt
+// (slice-1 servers treat an identical terminal re-resolve as a no-op that
+// preserves timestamps, so legitimate retries never conflict). Returns the
+// outcome (see ResolveWriteOutcome). Retries only on transient errors (network
+// / non-coded non-2xx). This only records an outcome — it NEVER dispatches.
 async function resolveWithRetry(
   sessionId: string,
   id: string,
   state: "sent" | "failed" | "unknown",
   detail: string,
-): Promise<QueuedMessage | undefined> {
+): Promise<ResolveWriteOutcome> {
   const url = queueUrl(sessionId, `/${encodeURIComponent(id)}/resolve`);
   const body = JSON.stringify({ state, detail });
   const headers = { "Content-Type": "application/json", "X-VH-CSRF": "1" };
@@ -429,7 +572,17 @@ async function resolveWithRetry(
       const res = await fetch(url, { method: "POST", headers, body, signal: ctrl.signal });
       if (res.ok) {
         const j = await readJSON(res);
-        return j.item as QueuedMessage | undefined;
+        return { kind: "recorded", item: j.item as QueuedMessage | undefined };
+      }
+      if (res.status === 409) {
+        // Body read inside the armed window. A coded resolve-conflict is
+        // terminal for this write — STOP immediately (explicit conflict, not
+        // retry-forever). An uncoded 409 keeps the legacy transient-retry
+        // behavior (older servers, non-monotonic sentinels).
+        const j = await readJSON(res);
+        if (j.code === "queue_resolve_conflict") {
+          return { kind: "conflict", detail: String(j.error || "") };
+        }
       }
     } catch {
       // Network error / interruption / abort-timeout — retry (this is a
@@ -439,7 +592,7 @@ async function resolveWithRetry(
     }
     if (attempt < MAX_ATTEMPTS) await delay(50);
   }
-  return undefined;
+  return { kind: "unrecorded" };
 }
 
 // clearQueueCache drops cache entries for the given sessions (used on archive:
