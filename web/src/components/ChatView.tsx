@@ -1,6 +1,7 @@
 import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
 import { ackSession, createSessionWithCertainty, currentVerb, isSending, openSession, rootOf, sessionWorking, setSelectedId, setSending, state } from "../sync";
 import { markOwnerSessionCreateUnknown } from "../lib/sendActionStatus";
+import { setView } from "../ui";
 import {
   bottommostReadWithFallback,
   classifyScrollDelta,
@@ -1606,16 +1607,33 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // re-send may create a second session; createSession has no idempotency
   // key — a known unmet follow-up). A definitive failure returns plain null
   // and send() records rejected/restore.
+  //
+  // A1 create-linkage (send-defers study): the unknown branch also hands the
+  // POST-armed timestamp (r.startedAt) to markOwnerSessionCreateUnknown so the
+  // record carries the create-attempt window — SendStatus's draft-view
+  // affordance correlates it with a session whose time.created lands inside
+  // the window (operator-confirmed; never auto-re-keyed).
   async function ensureSession(): Promise<string | null> {
     if (props.draft) {
       const r = await createSessionWithCertainty();
       if (r.id) return r.id;
       if (r.certainty === "unknown") {
-        markOwnerSessionCreateUnknown("draft", r.detail || "session create outcome unknown");
+        markOwnerSessionCreateUnknown("draft", r.detail || "session create outcome unknown", r.startedAt);
       }
       return null;
     }
     return props.sessionId;
+  }
+
+  // A1 create-linkage confirm — the navigation half of the affordance's click
+  // (SendStatus does the record re-key via transferOwnerSendAttempts BEFORE
+  // calling this; the re-key never happens without the operator's click).
+  // openSessionChat semantics (SessionTree): select + jump to chat. The rail's
+  // narrow-tier drawer close is moot here — the affordance button lives in the
+  // composer, so the chat is already the revealed view when this can be hit.
+  function openLinkedSession(id: string) {
+    setSelectedId(id);
+    setView("chat");
   }
 
   // C8: the send/dispatch cluster (buildParts, captureConfig, sendText,
@@ -1920,6 +1938,8 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         send={send}
         abort={msgActions.abort}
         streamStatus={() => state.status}
+        sessions={() => state.sessions}
+        openSession={openLinkedSession}
         refTa={(el) => (taRef = el)}
         refMirror={(el) => (mirrorRef = el)}
         refFileInput={(el) => (fileInputRef = el)}

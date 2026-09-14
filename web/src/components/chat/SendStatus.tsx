@@ -43,12 +43,16 @@
 // always-possible composer surface; keep it a cheap, fixed-height text row).
 import { createSignal, For, Show, type Accessor } from "solid-js";
 import {
+  createLinkCandidates,
   finishSendAttempt,
   markSendAttemptResolveConflict,
   sendActionsFor,
+  transferOwnerSendAttempts,
+  type CreateLinkCandidate,
   type SendAction,
 } from "../../lib/sendActionStatus";
 import { hasQueueState, resolveQueued } from "../../queue";
+import type { Session } from "../../types";
 import "./SendStatus.module.css";
 
 export interface SendStatusProps {
@@ -65,6 +69,19 @@ export interface SendStatusProps {
   // Global stream status ("connecting" | "live" | "reconnecting") — the
   // server-custody line keys off a known-down stream ("reconnecting").
   streamStatus: Accessor<string>;
+  // A1 create-linkage (send-defers study): the sync store's session map,
+  // watched reactively for a session whose worker-stamped time.created falls
+  // inside a draft-owned create-outcome-unknown record's create-attempt
+  // window (createLinkCandidates ± CREATE_LINK_CLOCK_SKEW_MS). Timing is the
+  // ONLY correlation signal — the create POST body is "{}" (no client id is
+  // echoed back) — hence the affordance is operator-CONFIRMED, never a silent
+  // auto-re-key. Optional: absent a session map (minimal unit harnesses) there
+  // is nothing to correlate and the affordance stays hidden.
+  sessions?: Accessor<Record<string, Session>>;
+  // Navigation for a confirmed linkage (ChatView wires openSessionChat
+  // semantics: select the session + jump to chat). Called AFTER the record
+  // re-key, only from the operator's click.
+  openSession?: (id: string) => void;
 }
 
 function clip(s: string, n: number): string {
@@ -83,6 +100,37 @@ export function SendStatus(props: SendStatusProps) {
     props.streamStatus() === "reconnecting";
 
   const [saveBusy, setSaveBusy] = createSignal<string | null>(null);
+
+  // A1 create-linkage: candidate sessions for the draft's create-outcome-
+  // unknown record(s) — reactive over BOTH the record store (records()) and
+  // the session map (props.sessions(): the SSE-delivered session lands there
+  // while the draft view is still mounted, no re-tap needed). Draft-view only:
+  // a live session's ownerKey is its own id and can never be "draft".
+  const createCandidates = () => {
+    if (!props.draft() || !props.sessions || !props.openSession) return [];
+    return createLinkCandidates(Object.values(props.sessions()), records());
+  };
+
+  // A1 confirm — NEVER silent: the re-key runs only from the operator's click
+  // on the affordance. The sweep drains EVERY still-draft-owned record (the
+  // study's C2 ride-along: a stale earlier record follows too instead of
+  // stranding under "draft"), then navigation runs (openSessionChat
+  // semantics via props).
+  function confirmCreateLink(id: string) {
+    transferOwnerSendAttempts("draft", id);
+    props.openSession!(id);
+  }
+
+  // Candidate label: always carries the created clock time (the correlation
+  // signal); the title only when it is not the generic create-time default
+  // ("New session" — every fresh create is titled that, so it identifies
+  // nothing).
+  function candidateLabel(c: CreateLinkCandidate): string {
+    const t = new Date(c.created).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const title = c.title?.trim() ?? "";
+    const generic = title === "" || title === "New session";
+    return generic ? `it (${t})` : `“${clip(title, 24)}” (${t})`;
+  }
 
   // Retry STATUS SAVE (stage "unsaved"): re-records the already-known terminal
   // outcome via resolveQueued — a record, NEVER a resend (no prompt is ever
@@ -225,6 +273,34 @@ export function SendStatus(props: SendStatusProps) {
             );
           }}
         </For>
+        {/* A1 create-linkage (send-defers study): the draft's
+            create-outcome-unknown record + a session that appeared inside the
+            create-attempt window → an operator-CONFIRMED linkage affordance.
+            Timing is the ONLY correlation signal (the create POST carries no
+            client id), so nothing re-keys without this click; dismissing the
+            uncertain row above (the ×) removes the affordance with it. Multiple
+            candidates are each listed honestly — one button per session. */}
+        <Show when={createCandidates().length > 0}>
+          <div
+            class="sendStatusLine"
+            data-kind="create-link"
+            data-tip="A session was created while your send's session-create was in flight — timing is the only match signal. Confirming moves this status there and opens it."
+          >
+            <span class="sendStatusText">A new session may be your last send —</span>
+            <For each={createCandidates()}>
+              {(c) => (
+                <button
+                  type="button"
+                  class="sendStatusBtn"
+                  data-session-id={c.id}
+                  onClick={() => confirmCreateLink(c.id)}
+                >
+                  Open {candidateLabel(c)}
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
       </div>
     </Show>
   );

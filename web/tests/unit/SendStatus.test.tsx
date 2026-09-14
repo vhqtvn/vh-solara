@@ -21,8 +21,10 @@ import { SendStatus } from "../../src/components/chat/SendStatus";
 import {
   __resetSendActionStatusForTests,
   getSendAction,
+  markOwnerSessionCreateUnknown,
   markSendAttemptStatusUnsaved,
   mintSendAttempt,
+  sendActionsFor,
   updateSendAction,
 } from "../../src/lib/sendActionStatus";
 
@@ -258,5 +260,144 @@ describe("SendStatus — a11y + dismissal", () => {
     expect(r2.container.textContent).not.toContain("Queue confirmation unknown.");
     expect(getSendAction(b.attemptId)).toBeUndefined();
     r2.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A1 create-linkage affordance (send-defers study) — the draft view's
+// operator-CONFIRMED "a new session may be your last send" linkage. Never a
+// silent auto-re-key: the sweep runs only from the affordance's click.
+// ---------------------------------------------------------------------------
+describe("SendStatus — A1 create-linkage affordance (operator-confirmed, never silent)", () => {
+  type SessionLike = { id: string; title?: string; time?: { created?: number } };
+  const sessionsOf = (list: SessionLike[]) => () => Object.fromEntries(list.map((s) => [s.id, s]));
+
+  // Seeds one draft-owned create-outcome-unknown record with window
+  // [start, end] (fake time owns the mark-time end), then restores real time.
+  function seedCreateUnknown(start: number, end: number): string {
+    vi.useFakeTimers();
+    vi.setSystemTime(start);
+    const a = mintSendAttempt("draft");
+    vi.setSystemTime(end);
+    markOwnerSessionCreateUnknown("draft", "session create timed out", start);
+    vi.useRealTimers();
+    return a.attemptId;
+  }
+
+  it("renders the affordance when a session's created time falls inside the create-unknown window; confirm re-keys + navigates", () => {
+    const attemptId = seedCreateUnknown(1_000, 2_000);
+    const openSession = vi.fn();
+    const r = render(() => (
+      <SendStatus
+        {...baseProps({
+          draft: () => true,
+          sessionId: () => "",
+          sessions: sessionsOf([{ id: "s9", title: "New session", time: { created: 1_500 } }]),
+          openSession,
+        })}
+      />
+    ));
+    const row = r.container.querySelector('.sendStatusLine[data-kind="create-link"]');
+    expect(row).toBeTruthy();
+    expect(row!.textContent).toContain("A new session may be your last send");
+    const btn = row!.querySelector(".sendStatusBtn")!;
+    expect(btn.textContent).toMatch(/^Open/); // "Open it (hh:mm)" — generic title stays generic
+    btn.click();
+    // Confirm re-keyed the draft-owned record to the candidate session…
+    expect(getSendAction(attemptId)?.ownerKey).toBe("s9");
+    expect(sendActionsFor("draft")).toHaveLength(0);
+    // …and navigated (openSessionChat semantics via the injected callback).
+    expect(openSession).toHaveBeenCalledWith("s9");
+    r.unmount();
+  });
+
+  it("a NON-generic candidate title is surfaced in the button copy", () => {
+    seedCreateUnknown(1_000, 2_000);
+    const r = render(() => (
+      <SendStatus
+        {...baseProps({
+          draft: () => true,
+          sessionId: () => "",
+          sessions: sessionsOf([{ id: "s9", title: "Fix login flow", time: { created: 1_500 } }]),
+          openSession: () => {},
+        })}
+      />
+    ));
+    const btn = r.container.querySelector('.sendStatusLine[data-kind="create-link"] .sendStatusBtn')!;
+    expect(btn.textContent).toContain("Fix login flow");
+    r.unmount();
+  });
+
+  it("NO auto-re-key without the click: an in-window session alone moves nothing", () => {
+    const attemptId = seedCreateUnknown(1_000, 2_000);
+    const openSession = vi.fn();
+    const r = render(() => (
+      <SendStatus
+        {...baseProps({
+          draft: () => true,
+          sessionId: () => "",
+          sessions: sessionsOf([{ id: "s9", title: "New session", time: { created: 1_500 } }]),
+          openSession,
+        })}
+      />
+    ));
+    // The affordance is VISIBLE (session landed in-window via SSE)…
+    expect(r.container.querySelector('.sendStatusLine[data-kind="create-link"]')).toBeTruthy();
+    // …but the record is still draft-owned and nothing navigated.
+    expect(getSendAction(attemptId)?.ownerKey).toBe("draft");
+    expect(openSession).not.toHaveBeenCalled();
+    r.unmount();
+  });
+
+  it("an out-of-window session renders NO affordance", () => {
+    seedCreateUnknown(1_000, 2_000);
+    const r = render(() => (
+      <SendStatus
+        {...baseProps({
+          draft: () => true,
+          sessionId: () => "",
+          sessions: sessionsOf([{ id: "old", title: "Ancient", time: { created: 1_000 - 5 * 60_000 - 5_000 } }]),
+          openSession: () => {},
+        })}
+      />
+    ));
+    expect(r.container.querySelector('.sendStatusLine[data-kind="create-link"]')).toBeNull();
+    r.unmount();
+  });
+
+  it("dismissing the create-unknown record removes the affordance with it", () => {
+    const attemptId = seedCreateUnknown(1_000, 2_000);
+    const r = render(() => (
+      <SendStatus
+        {...baseProps({
+          draft: () => true,
+          sessionId: () => "",
+          sessions: sessionsOf([{ id: "s9", title: "New session", time: { created: 1_500 } }]),
+          openSession: () => {},
+        })}
+      />
+    ));
+    expect(r.container.querySelector('.sendStatusLine[data-kind="create-link"]')).toBeTruthy();
+    // The EXISTING per-record dismiss (×) on the uncertain row is the out.
+    r.container.querySelector('.sendStatusLine[data-kind="uncertain"] .sendStatusDismiss')!.click();
+    expect(getSendAction(attemptId)).toBeUndefined();
+    expect(r.container.querySelector('.sendStatusLine[data-kind="create-link"]')).toBeNull();
+    r.unmount();
+  });
+
+  it("a LIVE session view never renders the affordance (draft-owned records are not its ownerKey)", () => {
+    seedCreateUnknown(1_000, 2_000);
+    const r = render(() => (
+      <SendStatus
+        {...baseProps({
+          draft: () => false,
+          sessionId: () => "s-live",
+          sessions: sessionsOf([{ id: "s9", title: "New session", time: { created: 1_500 } }]),
+          openSession: () => {},
+        })}
+      />
+    ));
+    expect(r.container.querySelector('.sendStatusLine[data-kind="create-link"]')).toBeNull();
+    r.unmount();
   });
 });

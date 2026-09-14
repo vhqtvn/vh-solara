@@ -73,6 +73,14 @@ export interface ComposerProps {
   // server-custody line ("Queued — waiting for connection." while a session
   // with queue items is on a known-down stream).
   streamStatus: Accessor<string>;
+  // A1 create-linkage (send-defers study), forwarded to SendStatus: the sync
+  // store's session map (watched reactively for a session whose time.created
+  // lands inside a draft-owned create-unknown record's create-attempt window)
+  // and the navigation callback for the operator-confirmed linkage. Optional —
+  // a minimal-props unit harness without a session map simply renders no
+  // affordance (nothing to correlate).
+  sessions?: Accessor<Record<string, { id: string; title?: string; time?: { created?: number } }>>;
+  openSession?: (id: string) => void;
   // refs owned by ChatView (autosize reads taRef/mirrorRef; createAttachments
   // reads fileInputRef). Forwarded as ref callbacks.
   refTa: (el: HTMLTextAreaElement) => void;
@@ -246,6 +254,8 @@ export function Composer(props: ComposerProps) {
             send={props.send}
             uploadProgress={props.att.uploadProgress}
             streamStatus={props.streamStatus}
+            sessions={props.sessions}
+            openSession={props.openSession}
           />
           <Show when={props.att.attachments().length > 0 || props.att.uploading()}>
             <div class="attach-row">

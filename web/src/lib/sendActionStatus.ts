@@ -121,6 +121,16 @@ export interface SendAction {
   // the exact terminal (state, detail) of the dispatch outcome plus the queue
   // item id. resolveQueued(idempotent record) consumes this verbatim.
   retrySave?: { itemId: string; state: "sent" | "failed" | "unknown"; detail: string };
+  // A1 create-linkage (send-defers study): for a create-outcome-unknown record
+  // (markOwnerSessionCreateUnknown), the [start, end] CLIENT-clock window (ms)
+  // during which the session-create POST was in flight (start = when the POST
+  // was armed — CreateSessionOutcome.startedAt; end = when unknown was marked).
+  // A session whose WORKER-stamped time.created falls inside this window ±
+  // CREATE_LINK_CLOCK_SKEW_MS is a linkage CANDIDATE — timing is the only
+  // correlation signal (the create POST body is "{}"; no client id is echoed
+  // back by OpenCode). Consumed ONLY by the operator-confirmed linkage
+  // affordance in SendStatus; records are NEVER auto-re-keyed on it.
+  createAttempt?: { start: number; end: number };
 }
 
 // Reactive store keyed by attemptId. Reads via sendActionsFor(ownerKey) are
@@ -258,14 +268,75 @@ export function findReusableSendAttempt(ownerKey: string, tapText: string): Send
 /** ChatView.ensureSession calls this when createSession fails with UNKNOWN
  *  certainty (timeout / proxy 502): the session may exist. Marks the (single,
  *  single-flight-guaranteed) preparing action owned by `ownerKey` (="draft")
- *  as uncertain with check-before-resending recovery. */
-export function markOwnerSessionCreateUnknown(ownerKey: string, detail: string): void {
+ *  as uncertain with check-before-resending recovery.
+ *
+ *  A1 create-linkage: when `createStartedAt` is supplied (the POST-armed
+ *  timestamp from CreateSessionOutcome.startedAt), the create-attempt window
+ *  [createStartedAt, Date.now()] is recorded on the patched record so
+ *  SendStatus's operator-confirmed linkage affordance can correlate it with a
+ *  session that later appears (createLinkCandidates). */
+export function markOwnerSessionCreateUnknown(ownerKey: string, detail: string, createStartedAt?: number): void {
   for (const id of Object.keys(actions)) {
     const a = actions[id];
     if (a.ownerKey === ownerKey && a.stage === "preparing") {
-      patch(id, { stage: "uncertain", certainty: "unknown", recovery: "check", detail });
+      patch(id, {
+        stage: "uncertain",
+        certainty: "unknown",
+        recovery: "check",
+        detail,
+        createAttempt: createStartedAt != null ? { start: createStartedAt, end: Date.now() } : undefined,
+      });
     }
   }
+}
+
+// A1 create-linkage (send-defers study): how far the WORKER clock (which stamps
+// a session's time.created) may sit from the CLIENT clock (which stamps the
+// create-attempt window) before a candidate match is refused. Generous on
+// purpose: a false NEGATIVE hides the real session (the stranding defect
+// persists), while a false positive costs the operator one glance at an
+// affordance they can decline — and the re-key NEVER happens without that
+// click. Named + exported so tests can reason about (and override) it.
+export const CREATE_LINK_CLOCK_SKEW_MS = 5 * 60_000;
+
+/** Minimal session shape the A1 linkage matcher consumes (the sync store's
+ *  Session type satisfies this structurally). */
+export interface CreateLinkSessionInfo {
+  id: string;
+  title?: string;
+  time?: { created?: number };
+}
+
+/** A candidate linkage target the draft-view affordance offers the operator. */
+export interface CreateLinkCandidate {
+  id: string;
+  title?: string;
+  created: number;
+}
+
+/** A1 linkage candidates: sessions whose worker-stamped time.created falls
+ *  within the create-attempt window (± `skewMs`) of ANY retained
+ *  uncertain/check record in `records` (the draft-owned create-unknown shape —
+ *  only markOwnerSessionCreateUnknown mints that combination). Pure function —
+ *  SendStatus binds it to the sync store's sessions map reactively. Returns
+ *  newest-created first; a session matching several windows is listed once. */
+export function createLinkCandidates(
+  sessions: CreateLinkSessionInfo[],
+  records: SendAction[],
+  skewMs: number = CREATE_LINK_CLOCK_SKEW_MS,
+): CreateLinkCandidate[] {
+  const windows = records
+    .filter((r) => r.stage === "uncertain" && r.recovery === "check" && !!r.createAttempt)
+    .map((r) => r.createAttempt!);
+  if (windows.length === 0) return [];
+  const out: CreateLinkCandidate[] = [];
+  for (const s of sessions) {
+    const created = s.time?.created;
+    if (!created) continue;
+    const inWindow = windows.some((w) => created >= w.start - skewMs && created <= w.end + skewMs);
+    if (inWindow) out.push({ id: s.id, title: s.title, created });
+  }
+  return out.sort((a, b) => b.created - a.created);
 }
 
 /** queue.resolveQueued calls this when the resolve WRITE hits a 409

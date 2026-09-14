@@ -216,6 +216,13 @@ export type CreateSessionOutcome = {
   id: string | null;
   certainty: "definitive" | "unknown";
   detail?: string;
+  // A1 create-linkage (send-defers study): CLIENT clock (ms) at the moment the
+  // create POST was armed — the START of the create-attempt window. On an
+  // outcome-unknown result, ChatView.ensureSession hands this to
+  // markOwnerSessionCreateUnknown so the record carries [startedAt, markTime]
+  // and SendStatus's operator-confirmed linkage affordance can correlate a
+  // session whose time.created (worker clock) lands inside it.
+  startedAt: number;
 };
 
 // Create a session on the server (called when the draft's first message is
@@ -229,6 +236,7 @@ export async function createSession(): Promise<string | null> {
 
 // The certainty-carrying variant ChatView.ensureSession uses.
 export async function createSessionWithCertainty(): Promise<CreateSessionOutcome> {
+  const startedAt = Date.now();
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), CREATE_SESSION_TIMEOUT_MS);
   try {
@@ -245,17 +253,17 @@ export async function createSessionWithCertainty(): Promise<CreateSessionOutcome
       // applied upstream): outcome unknown. Any other status is a definitive
       // server answer: not created.
       if (res.status === 502) {
-        return { id: null, certainty: "unknown", detail: `proxy 502 creating session` };
+        return { id: null, certainty: "unknown", detail: `proxy 502 creating session`, startedAt };
       }
-      return { id: null, certainty: "definitive", detail: `HTTP ${res.status} creating session` };
+      return { id: null, certainty: "definitive", detail: `HTTP ${res.status} creating session`, startedAt };
     }
     const sess = await res.json();
     if (sess?.id) {
       setSelectedId(sess.id);
       void openSession(sess.id);
-      return { id: sess.id, certainty: "definitive" };
+      return { id: sess.id, certainty: "definitive", startedAt };
     }
-    return { id: null, certainty: "definitive", detail: "session create response had no id" };
+    return { id: null, certainty: "definitive", detail: "session create response had no id", startedAt };
   } catch (e) {
     // Network error OR abort/timeout — no response confirmed either way: the
     // session may have been created. Outcome unknown, never "not created".
@@ -264,6 +272,7 @@ export async function createSessionWithCertainty(): Promise<CreateSessionOutcome
       id: null,
       certainty: "unknown",
       detail: aborted ? "session create timed out" : `session create request failed (${String(e)})`,
+      startedAt,
     };
   } finally {
     clearTimeout(timer);

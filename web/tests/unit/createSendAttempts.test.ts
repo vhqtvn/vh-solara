@@ -516,4 +516,21 @@ describe("createSessionWithCertainty — typed certainty classification", () => 
     expect(r.certainty).toBe("unknown");
     expect(r.detail).toContain("timed out");
   });
+
+  it("carries the POST-armed client timestamp (A1 create-attempt window start) on every outcome", async () => {
+    // A1 create-linkage (send-defers study): markOwnerSessionCreateUnknown
+    // consumes startedAt as the create-attempt window START (end = the mark
+    // time), so the draft-view affordance can correlate a session whose
+    // worker-stamped time.created lands inside it.
+    const before = Date.now();
+    vi.stubGlobal("fetch", respond(502, { error: "upstream unreachable" }));
+    const unknown = await createSessionWithCertainty();
+    expect(unknown.startedAt).toBeGreaterThanOrEqual(before);
+    expect(unknown.startedAt).toBeLessThanOrEqual(Date.now());
+
+    vi.stubGlobal("fetch", respond(200, { id: "new-ses-1" }));
+    const ok = await createSessionWithCertainty();
+    expect(ok.id).toBe("new-ses-1");
+    expect(ok.startedAt).toBeGreaterThanOrEqual(before);
+  });
 });

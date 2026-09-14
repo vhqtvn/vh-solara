@@ -32,10 +32,13 @@
 /* Certainty tinting: unknown/unsaved states lean warn (attention, NOT failure
    — outcome-unknown must never look like "failed, safe to resend"); definitive
    rejections lean err; transient progress stays neutral. Text contrast comes
-   from var(--fg) on the mixed background — readable, never glow-only. */
+   from var(--fg) on the mixed background — readable, never glow-only. The A1
+   create-link affordance (data-kind="create-link") shares the warn tint: it is
+   the ACTION follow-up to the uncertain row it sits beside. */
 :global(.sendStatusLine[data-kind="uncertain"]),
 :global(.sendStatusLine[data-kind="unsaved"]),
-:global(.sendStatusLine[data-kind="custody"]) {
+:global(.sendStatusLine[data-kind="custody"]),
+:global(.sendStatusLine[data-kind="create-link"]) {
   background: color-mix(in srgb, var(--warn) 16%, var(--bg-2));
 }
 :global(.sendStatusLine[data-kind="conflict"]),
