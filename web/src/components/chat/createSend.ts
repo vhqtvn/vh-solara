@@ -702,6 +702,13 @@ export function createSend(deps: SendDependencies): SendController {
           }
           return { attemptId: mintSendAttempt(ownerKey).attemptId, tapText: text };
         })();
+    // Send-reliability slice 3: a reused attempt IS a retry of a retained
+    // uncertain admission — flag it so the status surface renders
+    // "Retrying queue confirmation…" instead of a plain "Sending…" while the
+    // same attemptId replays.
+    if (attempt?.reuse) {
+      updateSendAction(attempt.attemptId, { retry: true });
+    }
 
     // ADMISSION (F4): everything from here on runs inside the per-session
     // send single-flight, engaged at TAP time — a re-tap during the (up to

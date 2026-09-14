@@ -52,8 +52,11 @@ export interface DrainDeps {
   // treat an aborted signal as the "unknown" outcome (the POST may have reached
   // OpenCode — never repend, never auto-retry).
   dispatch: (id: string, item: QueuedMessage, signal: AbortSignal) => Promise<DrainOutcome>;
-  // Record the terminal outcome (can never repend).
-  resolve: (id: string, itemId: string, state: DrainOutcome["state"], detail: string) => Promise<void>;
+  // Record the terminal outcome (can never repend). Returns a value the
+  // drainer ignores — typed `unknown` so a resolve implementation may return
+  // its write outcome (queue.ts resolveQueued → ResolveWriteOutcome, surfaced
+  // by the slice-3 status surface) without a wrapper.
+  resolve: (id: string, itemId: string, state: DrainOutcome["state"], detail: string) => Promise<unknown>;
   // Sending-guard lifecycle (wraps sync/store setSending).
   setSending: (id: string, v: boolean) => void;
   isSending: (id: string) => boolean;

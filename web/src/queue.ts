@@ -22,7 +22,7 @@
 import { createSignal } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { loadVersioned, saveVersioned } from "./lib/store";
-import { markSendAttemptResolveConflict } from "./lib/sendActionStatus";
+import { markSendAttemptResolveConflict, markSendAttemptStatusUnsaved } from "./lib/sendActionStatus";
 
 export interface QueuedAttachment {
   url: string;
@@ -245,64 +245,91 @@ export async function enqueue(sessionId: string, input: QueueInput): Promise<Que
   const body = sendAttempt ? input : { ...input, attemptId: undefined };
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ENQUEUE_TIMEOUT_MS);
-  let res: Response;
+  // BOTH body reads (the error-path code probe AND the success-path payload)
+  // run INSIDE the armed timeout window (send-reliability slice 3, T1C-F1 /
+  // T1D-F2 — the D-F2 hang class on the most load-bearing path: admission).
+  // Headers arriving with a stalled body used to leave the read UNARMED:
+  // clearTimeout had already fired after the fetch promise resolved, so the
+  // abort signal no longer covered the body reader and a stalled body wedged
+  // the admission guard forever. Mirrors the slice-2 claimQueued/uploadFile
+  // shape: inside the window the aborting signal tears the reader down too,
+  // the read rejects, and enqueue settles to a typed error.
   try {
-    res = await fetch(queueUrl(sessionId), {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
-      body: JSON.stringify(body),
-      signal: ctrl.signal,
-    });
-  } catch (e) {
-    clearTimeout(timer);
-    // Network error OR abort/timeout. Either way NO response arrived: the
-    // admission outcome is UNKNOWN (the POST may have been admitted), so throw
-    // typed — the caller reconciles before deciding anything.
-    const aborted = ctrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError");
-    throw new EnqueueError(
-      aborted ? "enqueue timed out" : `enqueue failed (${String(e)})`,
-      aborted ? "timeout" : "network",
-    );
-  }
-  clearTimeout(timer);
-  if (!res.ok) {
-    // The local worker server answered with an error — definitive
-    // non-admission (this is NOT the /oc upstream proxy, whose 502 is
-    // ambiguous). Surface the machine-readable code when present.
-    let code: string | undefined;
+    let res: Response;
     try {
-      code = (await res.json())?.code;
+      res = await fetch(queueUrl(sessionId), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      // Network error OR abort/timeout. Either way NO response arrived: the
+      // admission outcome is UNKNOWN (the POST may have been admitted), so throw
+      // typed — the caller reconciles before deciding anything.
+      const aborted = ctrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError");
+      throw new EnqueueError(
+        aborted ? "enqueue timed out" : `enqueue failed (${String(e)})`,
+        aborted ? "timeout" : "network",
+      );
+    }
+    if (!res.ok) {
+      // The local worker server answered with an error — definitive
+      // non-admission (this is NOT the /oc upstream proxy, whose 502 is
+      // ambiguous). The STATUS LINE alone proves non-admission; the body only
+      // refines the machine-readable code, so a hung/unreadable error body
+      // (read inside the armed window; abort → rejection → caught) still
+      // settles to the typed plain-status error instead of wedging.
+      let code: string | undefined;
+      try {
+        code = (await res.json())?.code;
+      } catch {
+        /* body unreadable or stalled→aborted — status already proves non-admission */
+      }
+      if (code === "queue_admission_conflict" || code === "queue_admission_full") {
+        throw new EnqueueError(`enqueue failed (${res.status} ${code})`, code, res.status);
+      }
+      throw new EnqueueError(`enqueue failed (${res.status})`, "unknown", res.status);
+    }
+    let j: any;
+    try {
+      j = await res.json();
     } catch {
-      /* body unreadable — plain status below */
+      // Body read failed INSIDE the armed window. An abort here (headers
+      // arrived, body stalled, the 12s signal tore the reader down) is
+      // outcome-UNKNOWN — classify it honestly as a timeout, never as a parse
+      // ambiguity. A completed-but-unparseable body keeps the legacy
+      // ambiguous shape below.
+      if (ctrl.signal.aborted) {
+        throw new EnqueueError("enqueue timed out (response body stalled)", "timeout");
+      }
+      j = {};
     }
-    if (code === "queue_admission_conflict" || code === "queue_admission_full") {
-      throw new EnqueueError(`enqueue failed (${res.status} ${code})`, code, res.status);
+    const item: QueuedMessage | undefined = j.item;
+    if (!item) {
+      // Ambiguous response (successful import lost / malformed): treat as a
+      // failure so the caller retains the text. A retry may produce a visible
+      // duplicate, which is preferred over silent loss (operator policy).
+      throw new EnqueueError("enqueue: no item in response", "ambiguous");
     }
-    throw new EnqueueError(`enqueue failed (${res.status})`, "unknown", res.status);
+    // Feature-detect (slice 2): a response carrying the `replayed` field proves
+    // slice-1 admission semantics; its ABSENCE on an attemptId-carrying request
+    // proves a legacy server (fall back to non-idempotent, no attemptId sent).
+    if (sendAttempt) {
+      attemptSupport = "replayed" in j ? "supported" : "legacy";
+    }
+    setQueues(produce((q) => {
+      const arr = (q[sessionId] ||= []);
+      // Upsert by id: a replayed receipt (or a raced duplicate response) must
+      // never yield two cache entries for one server item.
+      const i = arr.findIndex((m) => m.id === item.id);
+      if (i >= 0) arr[i] = item;
+      else arr.push(item);
+    }));
+    return item;
+  } finally {
+    clearTimeout(timer);
   }
-  const j = await readJSON(res);
-  const item: QueuedMessage | undefined = j.item;
-  if (!item) {
-    // Ambiguous response (successful import lost / malformed): treat as a
-    // failure so the caller retains the text. A retry may produce a visible
-    // duplicate, which is preferred over silent loss (operator policy).
-    throw new EnqueueError("enqueue: no item in response", "ambiguous");
-  }
-  // Feature-detect (slice 2): a response carrying the `replayed` field proves
-  // slice-1 admission semantics; its ABSENCE on an attemptId-carrying request
-  // proves a legacy server (fall back to non-idempotent, no attemptId sent).
-  if (sendAttempt) {
-    attemptSupport = "replayed" in j ? "supported" : "legacy";
-  }
-  setQueues(produce((q) => {
-    const arr = (q[sessionId] ||= []);
-    // Upsert by id: a replayed receipt (or a raced duplicate response) must
-    // never yield two cache entries for one server item.
-    const i = arr.findIndex((m) => m.id === item.id);
-    if (i >= 0) arr[i] = item;
-    else arr.push(item);
-  }));
-  return item;
 }
 
 // Outcome of a remove attempt. A caller that takes a composer-restoring side
@@ -442,12 +469,16 @@ export async function claimQueued(sessionId: string): Promise<QueuedMessage | nu
 //
 // Invariants: NEVER re-dispatch (no second /oc/.../prompt_async). NEVER repend
 // (target is always terminal). NEVER return a stranded item to pending.
+//
+// Send-reliability slice 3: returns the ResolveWriteOutcome so a status-surface
+// retry (SendStatus's "Retry status save") knows whether the write recorded.
+// Callers that ignore the return value (the drainer) are unaffected.
 export async function resolveQueued(
   sessionId: string,
   id: string,
   state: "sent" | "failed" | "unknown",
   detail = "",
-): Promise<void> {
+): Promise<ResolveWriteOutcome> {
   const resolvedAt = Date.now();
   // Reflect the KNOWN terminal outcome into the local cache + overlay now, so
   // the UI is honest regardless of whether the resolve write lands.
@@ -496,10 +527,27 @@ export async function resolveQueued(
       /* offline: the optimistic local state stays; the next successful poll
          reconciles (the overlay is gone, so server truth wins when it lands). */
     }
+  } else {
+    // UNRECORDED (send-reliability slice 3): attempts exhausted on transient
+    // errors. The dispatch outcome IS known and visible (the optimistic
+    // terminal state applied above + the knownOutcomes overlay), but the
+    // backend never received the record. Surface the retryable status-save
+    // state — Slice 3 renders "Message outcome recorded; status not saved."
+    // with a Retry STATUS SAVE affordance (a record, never a resend). Linked
+    // by the item's attemptId when the item carries one (slice-1 servers); a
+    // synthetic id otherwise (the record still lands under the session's
+    // ownerKey so the status surface finds it).
+    const linked = (queues[sessionId] || []).find((m) => m.id === id);
+    markSendAttemptStatusUnsaved(linked?.attemptId || `save-${id}`, sessionId, {
+      itemId: id,
+      state,
+      detail,
+    });
   }
   // If retries exhausted (unrecorded), the optimistic local terminal state
   // (set above) stays; knownOutcomes keeps fetchQueue from flipping it back
   // to dispatching.
+  return outcome;
 }
 
 // applyOutcome records the known terminal outcome in both the local cache and

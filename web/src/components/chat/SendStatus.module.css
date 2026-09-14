@@ -1,0 +1,90 @@
+/* SendStatus (send-reliability slice 3) — the composer's readable send-action
+   status row. All classes are :global because unit/e2e tests query them by
+   name (repo CSS-architecture rule); the sendStatus* prefix keeps the global
+   namespace collision-free. Consumes global theme tokens only — defines none.
+
+   Perf posture (Firefox/WebRender rules, AGENTS.md): this row can be present
+   on every composer — NO mask-image, NO backdrop-filter, NO per-element
+   contain/content-visibility, no animated gradients. A single flat flex row
+   with plain text: cheap to composite, fixed-height. */
+
+:global(.sendStatus) {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px 4px 6px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--fg);
+}
+
+:global(.sendStatusLine) {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 22px;
+  border-radius: 8px;
+  padding: 3px 8px;
+  background: color-mix(in srgb, var(--bg-2) 88%, var(--fg) 12%);
+}
+
+/* Certainty tinting: unknown/unsaved states lean warn (attention, NOT failure
+   — outcome-unknown must never look like "failed, safe to resend"); definitive
+   rejections lean err; transient progress stays neutral. Text contrast comes
+   from var(--fg) on the mixed background — readable, never glow-only. */
+:global(.sendStatusLine[data-kind="uncertain"]),
+:global(.sendStatusLine[data-kind="unsaved"]),
+:global(.sendStatusLine[data-kind="custody"]) {
+  background: color-mix(in srgb, var(--warn) 16%, var(--bg-2));
+}
+:global(.sendStatusLine[data-kind="conflict"]),
+:global(.sendStatusLine[data-kind="rejected"]),
+:global(.sendStatusLine[data-kind="blocked"]) {
+  background: color-mix(in srgb, var(--err, #e5484d) 16%, var(--bg-2));
+}
+
+:global(.sendStatusText) {
+  color: var(--fg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+:global(.sendStatusPayload) {
+  color: color-mix(in srgb, var(--fg) 72%, var(--bg-2));
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+:global(.sendStatusBtn) {
+  flex: none;
+  font-size: 11.5px;
+  line-height: 1;
+  padding: 5px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--fg);
+  background: var(--bg-2);
+  color: var(--fg);
+  cursor: pointer;
+  /* Mobile-first hit target: ≥22px tall, generous padding. */
+  min-height: 22px;
+}
+:global(.sendStatusBtn):disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+:global(.sendStatusDismiss) {
+  flex: none;
+  margin-left: auto;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: color-mix(in srgb, var(--fg) 65%, var(--bg-2));
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}

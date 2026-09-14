@@ -69,8 +69,9 @@ describe("QueueChip — recovered `unknown` detail surfacing", () => {
     const chip = container.querySelector(".queue-chip");
     expect(chip).toBeTruthy();
     expect(chip!.getAttribute("data-state")).toBe("unknown");
-    // The Unknown label is still shown.
-    expect(container.querySelector(".queue-state")!.textContent).toBe("Unknown");
+    // The honest outcome-unknown label is still shown (send-reliability slice 3
+    // wording: never imply "didn't send").
+    expect(container.querySelector(".queue-state")!.textContent).toBe("Outcome unknown");
   });
 
   it("does NOT show the recovery detail for a `failed` item (only `unknown` surfaces recovery)", () => {

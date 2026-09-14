@@ -1919,6 +1919,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         recovery={recovery}
         send={send}
         abort={msgActions.abort}
+        streamStatus={() => state.status}
         refTa={(el) => (taRef = el)}
         refMirror={(el) => (mirrorRef = el)}
         refFileInput={(el) => (fileInputRef = el)}

@@ -123,6 +123,10 @@ export interface Attachments {
   // True while an upload is in flight (chip strip "Uploading…" + attach button
   // disabled).
   uploading: Accessor<boolean>;
+  // Send-reliability slice 3: ordinal upload progress while `uploading` is
+  // true — {done, total} of the SEQUENTIAL upload loop (flush or live eager
+  // path), null when idle. Feeds the SendStatus "Uploading 1 of 2…" copy.
+  uploadProgress: Accessor<{ done: number; total: number } | null>;
   // The attachment pipeline entry point. C4 paste hands harvested files here via
   // its addFiles hook; the hidden <input type=file> onChange calls this directly.
   addFiles: (files: FileList | File[] | null) => void;
@@ -152,6 +156,9 @@ export interface Attachments {
 export function createAttachments(deps: AttachmentsDeps): Attachments {
   const [attachments, setAttachments] = createSignal<Attachment[]>([]);
   const [uploading, setUploading] = createSignal(false);
+  // Slice 3: {done, total} of the in-flight sequential upload loop (null when
+  // idle). Updated alongside `uploading` in flushPendingAttachments / addFiles.
+  const [uploadProgress, setUploadProgress] = createSignal<{ done: number; total: number } | null>(null);
 
   // Bounded timeout for the attachment upload POST (the stuck-send bug class —
   // same precedent as queue.ts ENQUEUE_TIMEOUT_MS / code/api.ts timedFetch):
@@ -263,11 +270,13 @@ export function createAttachments(deps: AttachmentsDeps): Attachments {
     const pending = attachments().filter((a) => a.file);
     if (pending.length === 0) return { failed: [] };
     setUploading(true);
+    setUploadProgress({ done: 0, total: pending.length });
     try {
       const resolved: Attachment[] = [];
       const failed: Attachment[] = [];
       for (const a of pending) {
         const r = await uploadFile(a.file!, id);
+        setUploadProgress({ done: resolved.length + failed.length + 1, total: pending.length });
         if (r) {
           resolved.push(r);
         } else {
@@ -283,6 +292,7 @@ export function createAttachments(deps: AttachmentsDeps): Attachments {
       return { failed };
     } finally {
       setUploading(false);
+      setUploadProgress(null);
     }
   }
 
@@ -352,13 +362,18 @@ export function createAttachments(deps: AttachmentsDeps): Attachments {
     const id = deps.sessionId();
     if (!id) return;
     setUploading(true);
+    setUploadProgress({ done: 0, total: arr.length });
     try {
+      let done = 0;
       for (const file of arr) {
         const uploaded = await uploadFile(file, id);
+        done += 1;
+        setUploadProgress({ done, total: arr.length });
         if (uploaded) setAttachments((a) => [...a, uploaded]);
       }
     } finally {
       setUploading(false);
+      setUploadProgress(null);
     }
   }
 
@@ -404,6 +419,7 @@ export function createAttachments(deps: AttachmentsDeps): Attachments {
     attachments,
     setAttachments,
     uploading,
+    uploadProgress,
     addFiles,
     removeAttachment,
     reinsertInlineChip,

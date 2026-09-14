@@ -64,12 +64,14 @@ export interface QueueRecoveryDeps {
   // Observable remove (Slice 1) — the caller learns whether the DELETE took.
   removeQueued: (sid: string, id: string) => Promise<RemoveQueuedResult>;
   // Existing resolve op (Slice 4) — records a terminal outcome; never dispatches.
+  // Returns a value this module ignores (`unknown` — queue.ts resolveQueued
+  // now returns its ResolveWriteOutcome for the slice-3 status surface).
   resolveQueued: (
     sid: string,
     id: string,
     state: "sent" | "failed" | "unknown",
     detail?: string,
-  ) => Promise<void>;
+  ) => Promise<unknown>;
   // Non-fatal operator notices. Injected so this module has no notification
   // store coupling (ChatView passes pushNotification).
   notify: (n: RecoveryNotice) => void;

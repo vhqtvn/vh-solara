@@ -108,7 +108,12 @@ describe("AREA 3 — draft->live failure paths", () => {
     releaseCreate();
     await waitFor(() => expect(isSendInFlight("live-sess-1")).toBe(true));
     expect(isSendInFlight("draft")).toBe(false); // draft key released before enqueue
-    // Release enqueue -> live key released (settled).
+    // Release enqueue -> live key released (settled). Wait for the enqueue
+    // mock to actually ENGAGE before releasing it: the live single-flight key
+    // flips true BEFORE the admission body reaches the enqueue call, so the
+    // mock's release closure may not exist yet when the key is observed
+    // engaged (send-status reactive rendering can sit between the two).
+    await waitFor(() => expect(typeof releaseEnq).toBe("function"));
     releaseEnq();
     await waitFor(() => expect(isSendInFlight("live-sess-1")).toBe(false));
     expect(mocks.enqueue).toHaveBeenCalledTimes(1);

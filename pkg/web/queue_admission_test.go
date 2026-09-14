@@ -744,3 +744,140 @@ func TestQueueHTTPResolveGuardShapes(t *testing.T) {
 		t.Fatalf("stored record after guarded resolves: %+v", list.Items)
 	}
 }
+
+// 14. HTTP 429 capacity shape (slice-1 review B1): with the receipt cap
+// lowered, filling it via POST /queue rejects NEW attemptIds with 429 +
+// code "queue_admission_full", while a REPLAY of an already-receipted
+// attemptId still succeeds (capacity bounds fresh admissions, never dedupe).
+// The client-facing contract this pins: 429 is a DEFINITIVE rejection — the
+// FE surfaces an explicit state (queue_admission_full) and never retries
+// forever.
+func TestQueueHTTPAdmissionCapacity429ReplayStillOK(t *testing.T) {
+	SetAdmissionReceiptCapForTest(2)
+	defer SetAdmissionReceiptCapForTest(0) // restore default
+	web, _ := newQueueTestServer(t)
+	sid := "s1"
+	enq := func(attemptID, text string) (int, map[string]any) {
+		t.Helper()
+		resp := csrfPost(t, web.URL+"/vh/session/"+sid+"/queue", map[string]any{"text": text, "attemptId": attemptID})
+		defer resp.Body.Close()
+		var m map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+			t.Fatalf("decode %d: %v", resp.StatusCode, err)
+		}
+		return resp.StatusCode, m
+	}
+
+	if code, body := enq("att-a", "a"); code != 200 {
+		t.Fatalf("first admission: %d %v", code, body)
+	}
+	if code, body := enq("att-b", "b"); code != 200 {
+		t.Fatalf("second admission: %d %v", code, body)
+	}
+	// Cap (2) reached: a NEW attemptId is a definitive 429.
+	code, full := enq("att-c", "c")
+	if code != http.StatusTooManyRequests {
+		t.Fatalf("capacity rejection: %d %v, want 429", code, full)
+	}
+	if full["code"] != "queue_admission_full" {
+		t.Fatalf("capacity body: %v, want code queue_admission_full", full)
+	}
+	// A REPLAY of an already-receipted attempt still succeeds at capacity —
+	// dedupe must never be capacity-gated (a retry after a lost response is
+	// the exact recovery path 429 must not break).
+	code, replay := enq("att-a", "a")
+	if code != 200 || replay["replayed"] != true {
+		t.Fatalf("replay at capacity: %d replayed=%v, want 200 replayed=true", code, replay["replayed"])
+	}
+
+	// Exactly the two admitted items exist on the wire — the rejected third
+	// admission created nothing.
+	lr, err := http.Get(web.URL + "/vh/session/" + sid + "/queue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lr.Body.Close()
+	var list struct {
+		Items []QueueItem `json:"items"`
+	}
+	if err := json.NewDecoder(lr.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 2 {
+		t.Fatalf("list after 429: %d items, want 2", len(list.Items))
+	}
+}
+
+// 15. HTTP replay-after-removal (slice-1 review A2; queue_http.go
+// path_touched): after the client's item is REMOVED (operator dismiss /
+// retract-to-compose), a replay of the same attemptId returns the ORIGINAL
+// receipt (200, replayed:true) and does NOT resurrect the deleted item — the
+// list stays empty. This is the HTTP-level twin of the store-level
+// TestQueueAdmissionReplayAfterRemoval (line ~199): the receipt's answer is
+// honest custody history ("your attempt WAS admitted"), while queue
+// membership remains deletion-authoritative.
+func TestQueueHTTPReplayAfterRemoval(t *testing.T) {
+	web, _ := newQueueTestServer(t)
+	sid := "s1"
+	resp := csrfPost(t, web.URL+"/vh/session/"+sid+"/queue", map[string]any{"text": "m", "attemptId": "att-del"})
+	defer resp.Body.Close()
+	var enq struct {
+		Item     QueueItem `json:"item"`
+		Replayed bool      `json:"replayed"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&enq); err != nil {
+		t.Fatal(err)
+	}
+	if enq.Item.ID == "" {
+		t.Fatalf("enqueue returned no item id: %+v", enq)
+	}
+
+	// Remove the item over HTTP (pending/terminal removal path).
+	dr, err := http.NewRequest(http.MethodDelete, web.URL+"/vh/session/"+sid+"/queue/"+enq.Item.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dr.Header.Set(csrfHeader, "1")
+	dres, err := http.DefaultClient.Do(dr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dres.Body.Close()
+	if dres.StatusCode != 200 {
+		t.Fatalf("delete: %d, want 200", dres.StatusCode)
+	}
+
+	// Replay the SAME attemptId: the ORIGINAL receipt comes back (replayed:
+	// true, same item id) — the receipt is custody history, not resurrection.
+	rp := csrfPost(t, web.URL+"/vh/session/"+sid+"/queue", map[string]any{"text": "m", "attemptId": "att-del"})
+	defer rp.Body.Close()
+	var replay struct {
+		Item     QueueItem `json:"item"`
+		Replayed bool      `json:"replayed"`
+	}
+	if err := json.NewDecoder(rp.Body).Decode(&replay); err != nil {
+		t.Fatal(err)
+	}
+	if rp.StatusCode != 200 || !replay.Replayed {
+		t.Fatalf("replay after removal: %d replayed=%v, want 200 replayed=true (original receipt)", rp.StatusCode, replay.Replayed)
+	}
+	if replay.Item.ID != enq.Item.ID {
+		t.Fatalf("replay after removal echoed item id %q, want the original %q", replay.Item.ID, enq.Item.ID)
+	}
+
+	// The removed item is NOT resurrected: the queue stays empty.
+	lr, err := http.Get(web.URL + "/vh/session/" + sid + "/queue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lr.Body.Close()
+	var list struct {
+		Items []QueueItem `json:"items"`
+	}
+	if err := json.NewDecoder(lr.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 0 {
+		t.Fatalf("replay resurrected the removed item: %d items: %+v", len(list.Items), list.Items)
+	}
+}

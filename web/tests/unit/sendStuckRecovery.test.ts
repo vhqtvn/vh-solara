@@ -21,12 +21,13 @@
 //   4. uploadFile    (createAttachments) — hung → admission never settles →
 //                                          same stuck glow on attachment sends.
 //
-// enqueue already carries the fix shape for this class (12s AbortController,
-// queue.ts ENQUEUE_TIMEOUT_MS, tested in queue.test.ts). These tests pin the
-// same bounded-settles contract for the four remaining sites, using the same
+// enqueue already carried the armed-fetch fix (12s AbortController, queue.ts
+// ENQUEUE_TIMEOUT_MS, tested in queue.test.ts); slice 3 closed its remaining
+// body-read gap (see the D-F2 describe block below). These tests pin the
+// same bounded-settles contract for every guard-held site, using the same
 // fake-timer + abort-rejecting-fetch harness as the enqueue-timeout test.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { claimQueued, resolveQueued, clearQueueCache } from "../../src/queue";
+import { claimQueued, resolveQueued, clearQueueCache, enqueue, queueFor } from "../../src/queue";
 import { createQueueDrainer, type DrainDeps } from "../../src/queueDrain";
 import type { QueuedMessage } from "../../src/queue";
 import { createSession } from "../../src/sync/actions";
@@ -193,13 +194,14 @@ describe("stuck-send guard recovery — hung transport inside guard-held regions
   });
 });
 
-// Send-reliability slice 2 — the commit-review D-F2 follow-ups: the TWO sites
+// Send-reliability slice 2 — the commit-review D-F2 follow-ups: the sites
 // that read the response body AFTER the timer was cleared. Headers arriving
 // with a stalled body used to wedge the guard past the abort (the fetch
 // promise had already resolved, so the AbortController no longer covered the
-// body read). Both sites now read INSIDE the armed window: the aborting signal
+// body read). All sites now read INSIDE the armed window: the aborting signal
 // tears down the body reader too, the read rejects AbortError, and the site
-// settles to its no-custody contract value.
+// settles to its no-custody contract value. Slice 3 added enqueue (the third
+// site — both its error-path code probe and its success payload read).
 describe("stuck-send guard recovery — headers-arrived, body-stalled (D-F2)", () => {
   // A fetch whose PROMISE resolves immediately (headers arrived, res.ok) but
   // whose json() never settles on its own — it rejects AbortError only when
@@ -262,5 +264,66 @@ describe("stuck-send guard recovery — headers-arrived, body-stalled (D-F2)", (
     const settled = await assertSettles(p, FAR_PAST_EVERY_BOUND_MS);
     expect(settled).toBe(true);
     await expect(p).resolves.toBeNull();
+  });
+
+  // Send-reliability slice 3 — the THIRD body-hang site (T1C-F1 / T1D-F2,
+  // escalates to BLOCK at closeout): enqueue() read BOTH bodies (the error-path
+  // code probe AND the success payload) AFTER clearTimeout — the D-F2 hang
+  // class on the most load-bearing path (admission). Both reads now run inside
+  // the armed window (mirroring claimQueued/uploadFile); a stalled body
+  // settles enqueue to a TYPED error so the admission guard always releases.
+  it("enqueue settles to a typed outcome-unknown error when headers arrive but the body stalls — admission still releases", async () => {
+    const sid = "s-stuck-enqueue-body";
+    vi.stubGlobal("fetch", bodyHangsFetch());
+    vi.useFakeTimers();
+    try {
+      const p = enqueue(sid, { text: "stuck admission", attachments: [] });
+      p.catch(() => {});
+      // Pre-fix: readJSON ran after clearTimeout → a stalled success body
+      // wedged the admission (single-flight) forever → RED here.
+      const settled = await assertSettles(p, FAR_PAST_EVERY_BOUND_MS);
+      expect(settled).toBe(true);
+      // The honest classification for a body-stall abort is timeout (the
+      // admission outcome is UNKNOWN — the POST may have been admitted), never
+      // a parse "ambiguous": the signal fired, the reader was torn down.
+      await expect(p).rejects.toMatchObject({ name: "EnqueueError", code: "timeout" });
+      // Nothing was confirmed durable: the cache stays empty.
+      expect(queueFor(sid)).toHaveLength(0);
+    } finally {
+      clearQueueCache([sid]);
+    }
+  });
+
+  it("enqueue settles to a typed DEFINITIVE error when an error response's headers arrive but its body stalls", async () => {
+    // The status line alone proves non-admission (the local worker server
+    // answered 500); the body only refines the code. A stalled error body must
+    // still settle enqueue to the plain-status typed error — never wedge.
+    const sid = "s-stuck-enqueue-err-body";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: any) =>
+        Promise.resolve({
+          ok: false,
+          status: 500,
+          json: () =>
+            new Promise((_r, reject) => {
+              init?.signal?.addEventListener("abort", () =>
+                reject(new DOMException("aborted", "AbortError")),
+              );
+            }),
+        }),
+      ) as any,
+    );
+    vi.useFakeTimers();
+    try {
+      const p = enqueue(sid, { text: "stuck error body", attachments: [] });
+      p.catch(() => {});
+      const settled = await assertSettles(p, FAR_PAST_EVERY_BOUND_MS);
+      expect(settled).toBe(true);
+      await expect(p).rejects.toMatchObject({ name: "EnqueueError", code: "unknown", status: 500 });
+      expect(queueFor(sid)).toHaveLength(0);
+    } finally {
+      clearQueueCache([sid]);
+    }
   });
 });

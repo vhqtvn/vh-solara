@@ -32,6 +32,7 @@ import Icon from "../Icon";
 import { QueueChip } from "../QueueChip";
 import Select from "../Select";
 import ModelDialog from "../ModelDialog";
+import { SendStatus } from "./SendStatus";
 import type { ComposerAutocomplete } from "./createComposerAutocomplete";
 import type { Attachments } from "./createAttachments";
 import type { ComposerPaste } from "./createComposerPaste";
@@ -68,6 +69,10 @@ export interface ComposerProps {
   // send / abort
   send: () => Promise<void>;
   abort: () => void;
+  // Send-reliability slice 3: global stream status for SendStatus's
+  // server-custody line ("Queued — waiting for connection." while a session
+  // with queue items is on a known-down stream).
+  streamStatus: Accessor<string>;
   // refs owned by ChatView (autosize reads taRef/mirrorRef; createAttachments
   // reads fileInputRef). Forwarded as ref callbacks.
   refTa: (el: HTMLTextAreaElement) => void;
@@ -228,6 +233,20 @@ export function Composer(props: ComposerProps) {
               </For>
             </div>
           </Show>
+          {/* Send-action status (send-reliability slice 3): the readable
+              recovery surface for the states slice 2 made expressible —
+              upload/send progress, outcome-unknown + retry-same, definitive
+              rejections (composer retains the text), resolve-status-save
+              retries, and the server-custody line while disconnected. Lives
+              where the Send button's glow is: the glow stays as the glance
+              signal, this row is the readable text. */}
+          <SendStatus
+            sessionId={props.sessionId}
+            draft={props.draft}
+            send={props.send}
+            uploadProgress={props.att.uploadProgress}
+            streamStatus={props.streamStatus}
+          />
           <Show when={props.att.attachments().length > 0 || props.att.uploading()}>
             <div class="attach-row">
               <For each={props.att.attachments()}>
@@ -251,16 +270,36 @@ export function Composer(props: ComposerProps) {
                   // text, defeating S5. Reading orphan() inside JSX props/class
                   // /Show lets the Solid compiler wrap each read in a reactive
                   // effect so the orphan UI tracks the live present-token set.
+                  //
+                  // Send-reliability slice 3: a chip whose draft-flush upload
+                  // FAILED carries uploadFailed:true — render the error
+                  // affordance on it (badge + tip). The chip is retained in
+                  // place and BLOCKS sends that still own it (createSend).
                   const orphan = () => isInlineChipOrphan(a.url, props.att.presentInlineIds());
                   return (
                     <span
                       class="attach-chip"
-                      classList={{ orphan: orphan() }}
-                      data-tip={orphan() ? `${a.filename} (ref removed — won't be sent)` : a.filename}
+                      classList={{ orphan: orphan(), uploadFailed: !!a.uploadFailed }}
+                      data-tip={
+                        a.uploadFailed
+                          ? `${a.filename} — upload failed; the message will not send until it is removed or uploads successfully`
+                          : orphan()
+                            ? `${a.filename} (ref removed — won't be sent)`
+                            : a.filename
+                      }
                     >
                       <Icon name="paperclip" size={12} />
                       <span class="attach-name">{a.filename}</span>
-                      <Show when={orphan()}>
+                      <Show when={a.uploadFailed}>
+                        <span
+                          class="attach-orphan-badge"
+                          role="alert"
+                          title="Upload failed — remove this file or retry the send; messages including it are blocked"
+                        >
+                          upload failed
+                        </span>
+                      </Show>
+                      <Show when={orphan() && !a.uploadFailed}>
                         <span
                           class="attach-orphan-badge"
                           title="Reference removed from message — won't be uploaded or sent. Re-insert to restore."

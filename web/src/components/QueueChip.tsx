@@ -56,11 +56,15 @@ export function QueueChip(props: {
   const tip = (): string => {
     const q = props.q;
     if (q.state === "failed" || q.state === "unknown") {
+      // Send-reliability slice 3: honest outcome copy. `unknown` is NOT
+      // "interrupted" (which reads as "didn't send") — the outcome is UNKNOWN:
+      // the dispatch may have been delivered, so the operator is told to check
+      // the transcript before doing anything that could duplicate it.
       return q.detail
-        ? `${q.state === "failed" ? "Failed" : "Interrupted"}: ${q.detail}`
+        ? `${q.state === "failed" ? "Failed" : "Outcome unknown"}: ${q.detail}`
         : q.state === "failed"
           ? "Failed to send"
-          : "Send was interrupted";
+          : "Send outcome unknown — it may have been delivered; check the transcript before resending";
     }
     if (q.state === "dispatching") return "Sending…";
     return q.text;
@@ -69,7 +73,7 @@ export function QueueChip(props: {
     const q = props.q;
     if (q.state === "dispatching") return "Sending…";
     if (q.state === "failed") return "Failed";
-    if (q.state === "unknown") return "Unknown";
+    if (q.state === "unknown") return "Outcome unknown";
     return "";
   };
   return (

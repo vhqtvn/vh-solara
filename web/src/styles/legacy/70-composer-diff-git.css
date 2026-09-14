@@ -131,6 +131,11 @@
    never orphaned. Opacity (not a color swap) keeps it legible while clearly
    de-emphasized vs. a live chip. */
 .attach-chip.orphan { opacity: 0.55; }
+/* Send-reliability slice 3: a chip whose draft-flush upload FAILED
+   (uploadFailed:true). Retained in place (never silently dropped) and it
+   blocks sends that still own it — flag it as an error state: warn border +
+   full opacity (unlike the dim orphan, this NEEDS attention before send). */
+.attach-chip.uploadFailed { border-color: var(--warn); color: var(--fg); }
 .attach-orphan-badge {
   font-size: 10px;
   line-height: 1;

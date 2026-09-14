@@ -54,7 +54,13 @@ export type SendStage =
   | "uncertain" // outcome unknown (response loss / timeout / proxy 502); retained
   | "conflict" // definitive 409 (admission or resolve conflict); retained
   | "rejected" // definitive non-2xx rejection (incl. 429 queue_admission_full)
-  | "blocked"; // attachment failure halted admission before any send; retained
+  | "blocked" // attachment failure halted admission before any send; retained
+  // Send-reliability slice 3: the DISPATCH already produced a known terminal
+  // outcome, but the resolve WRITE (the status record) failed its bounded
+  // retries — "Message outcome recorded; status not saved." The message is NOT
+  // resendable from here; only the status save is retryable (a record, never a
+  // dispatch).
+  | "unsaved";
 
 // The operator-facing recovery action this record affords (Slice 3 renders it).
 //   retry-same — re-send the IDENTICAL prepared attempt (same attemptId +
@@ -63,8 +69,10 @@ export type SendStage =
 //   restore    — the payload is retained for restore-to-composer.
 //   check      — outcome unknown AND not safely retryable (e.g. session-create
 //               ambiguity): check before sending again.
+//   retry-save — stage "unsaved": retry the STATUS-SAVE write only (resolveQueued
+//               with the same terminal (state, detail) — a record, NOT a resend).
 //   none       — nothing to do (transient/preparing).
-export type SendRecovery = "none" | "retry-same" | "restore" | "check";
+export type SendRecovery = "none" | "retry-same" | "restore" | "check" | "retry-save";
 
 // The immutable prepared attempt: the EXACT enqueue input captured once at
 // first preparation. Every retry reuses it verbatim — no re-captured config,
@@ -95,6 +103,15 @@ export interface SendAction {
   payload?: PreparedSendPayload;
   recovery: SendRecovery;
   updatedAt: number;
+  // Send-reliability slice 3: true when this in-flight attempt is a RETRY of a
+  // retained uncertain admission (reused attemptId + verbatim payload) — the
+  // status surface renders "Retrying queue confirmation…" instead of a plain
+  // "Sending…". Set once by createSend at the reuse decision.
+  retry?: boolean;
+  // Stage "unsaved" only: what the Retry-status-save affordance re-records —
+  // the exact terminal (state, detail) of the dispatch outcome plus the queue
+  // item id. resolveQueued(idempotent record) consumes this verbatim.
+  retrySave?: { itemId: string; state: "sent" | "failed" | "unknown"; detail: string };
 }
 
 // Reactive store keyed by attemptId. Reads via sendActionsFor(ownerKey) are
@@ -170,7 +187,7 @@ export function sendActionsFor(ownerKey: string): SendAction[] {
  *  is additive (sendText snapshots it right before the enqueue POST). */
 export function updateSendAction(
   attemptId: string,
-  p: { stage?: SendStage; certainty?: SendCertainty; recovery?: SendRecovery; detail?: string; payload?: PreparedSendPayload },
+  p: { stage?: SendStage; certainty?: SendCertainty; recovery?: SendRecovery; detail?: string; payload?: PreparedSendPayload; retry?: boolean },
 ): void {
   patch(attemptId, p);
 }
@@ -234,6 +251,39 @@ export function markSendAttemptResolveConflict(attemptId: string, ownerKey: stri
     certainty: "definitive",
     detail,
     recovery: "check",
+    updatedAt: Date.now(),
+  });
+  mintedSeq.set(attemptId, ++seq);
+}
+
+/** queue.resolveQueued calls this when the resolve WRITE exhausts its bounded
+ *  retries (unrecorded): the dispatch already produced a KNOWN terminal outcome
+ *  that is visible locally (optimistic terminal), but the backend never
+ *  received the record. The message is NOT resendable from here — only the
+ *  status save is retryable (a record, never a dispatch).
+ *
+ *  UPSERT (same shape as markSendAttemptResolveConflict): an admitted attempt's
+ *  record is normally FINISHED by the time the drainer resolves it, so the id
+ *  may not be retained — in that case a minimal unsaved record is created
+ *  under `ownerKey` (the session id) so the "Retry status save" affordance is
+ *  still renderable (Slice 3). */
+export function markSendAttemptStatusUnsaved(
+  attemptId: string,
+  ownerKey: string,
+  save: { itemId: string; state: "sent" | "failed" | "unknown"; detail: string },
+): void {
+  if (getSendAction(attemptId)) {
+    patch(attemptId, { stage: "unsaved", certainty: "definitive", recovery: "retry-save", retrySave: save });
+    return;
+  }
+  setActions(attemptId, {
+    attemptId,
+    ownerKey,
+    stage: "unsaved",
+    certainty: "definitive",
+    detail: "queue status write failed after bounded retries",
+    recovery: "retry-save",
+    retrySave: save,
     updatedAt: Date.now(),
   });
   mintedSeq.set(attemptId, ++seq);
