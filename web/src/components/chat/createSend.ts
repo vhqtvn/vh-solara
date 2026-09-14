@@ -38,7 +38,7 @@ import {
   finishSendAttempt,
   getSendAction,
   mintSendAttempt,
-  transferSendAttempt,
+  transferOwnerSendAttempts,
   updateSendAction,
   type PreparedSendPayload,
 } from "../../lib/sendActionStatus";
@@ -267,6 +267,7 @@ export function createSend(deps: SendDependencies): SendController {
       updateSendAction(attempt.attemptId, {
         stage: "conflict", certainty: "definitive", recovery: "check",
         detail: `admission conflict: ${err.message}`,
+        conflictSource: "admission",
       });
       log.error("send", "enqueue admission conflict", { id, err: err.message });
       deps.pushNotification({
@@ -1053,12 +1054,25 @@ export function createSend(deps: SendDependencies): SendController {
         if (deps.input() === ownedText) deps.setInput(text);
         return;
       }
-      // EXPLICIT draft→live ownership transfer (send-reliability slice 2):
-      // the attempt was minted under the "draft" key (no session existed at
-      // tap); the live id is known now, and the two single-flight keys are
-      // distinct by design — transfer the action so the live view's status
-      // surface (Slice 3) and retry linkage find it under the live id.
-      if (attempt) transferSendAttempt(attempt.attemptId, id);
+      // EXPLICIT draft→live ownership transfer (send-reliability slice 2,
+      // widened to an owner SWEEP by the slice-3 F2 review finding): records
+      // minted under the "draft" key (no session existed at tap) are re-keyed
+      // to the live id now that it is known — the two single-flight keys are
+      // distinct by design, so the transfer must be explicit. Slice 2
+      // transferred only the IN-FLIGHT attempt; retained records from EARLIER
+      // draft taps (the reachable case: a create-outcome-unknown uncertain
+      // record, marked by ChatView.ensureSession) stayed stranded under
+      // "draft" — invisible in the destination session (SendStatus reads
+      // ownerKey = session id; findReusableSendAttempt is owner-scoped) and
+      // stale in the NEXT draft view. The sweep re-keys every
+      // still-draft-owned record: at materialization that is exactly the
+      // in-flight attempt plus retained uncertain records (mint-supersede
+      // already finished earlier preparing/blocked/rejected ones). Residual
+      // limitation (accepted): materializing WITHOUT a re-tap (the create
+      // landed; the operator clicks the session in the list) strands such
+      // records under "draft" — nothing links them to that session absent a
+      // create-time idempotency key (out of scope, brief §8).
+      transferOwnerSendAttempts("draft", id);
       // A re-tap once the live id exists is dropped at the LIVE key (the live
       // ChatView's memo reads it); the in-flight admission owns clearing on
       // its own success.

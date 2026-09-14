@@ -22,6 +22,9 @@
 //   resolve write failed           → "Message outcome recorded; status not
 //                                    saved." + Retry STATUS SAVE (a record,
 //                                    never a resend)
+//   status-save retry hit 409      → "Queue state conflict — showing server
+//                                    state." — dismissable, never a silent
+//                                    vanish (F3, slice-3 review)
 //
 // Honesty invariants:
 //   - An unconfirmed BROWSER draft is NEVER called "queued" — the custody line
@@ -41,6 +44,7 @@
 import { createSignal, For, Show, type Accessor } from "solid-js";
 import {
   finishSendAttempt,
+  markSendAttemptResolveConflict,
   sendActionsFor,
   type SendAction,
 } from "../../lib/sendActionStatus";
@@ -82,16 +86,24 @@ export function SendStatus(props: SendStatusProps) {
 
   // Retry STATUS SAVE (stage "unsaved"): re-records the already-known terminal
   // outcome via resolveQueued — a record, NEVER a resend (no prompt is ever
-  // POSTed). On a recorded/conflict outcome the record is finished (a conflict
-  // re-marks itself server-authoritative inside resolveQueued); on another
-  // unrecorded outcome the record re-marks itself and stays.
+  // POSTed). Outcome handling (F3, slice-3 review — the conflict must be
+  // VISIBLE, never a silent vanish): "recorded" finishes the row; "conflict"
+  // re-marks THIS record as the dismissible conflict state (resolveQueued
+  // already refreshed the queue cache to server truth and re-marked the
+  // linked record when the item carries an attemptId — marking here too
+  // covers the legacy unlinked shape and is an idempotent re-patch
+  // otherwise); "unrecorded" leaves the row retryable as-is.
   async function retrySave(rec: SendAction) {
     const save = rec.retrySave;
     if (!save || saveBusy()) return;
     setSaveBusy(rec.attemptId);
     try {
       const out = await resolveQueued(ownerKey(), save.itemId, save.state, save.detail);
-      if (out.kind !== "unrecorded") finishSendAttempt(rec.attemptId);
+      if (out.kind === "recorded") {
+        finishSendAttempt(rec.attemptId);
+      } else if (out.kind === "conflict") {
+        markSendAttemptResolveConflict(rec.attemptId, ownerKey(), out.detail || "queue_resolve_conflict");
+      }
     } finally {
       setSaveBusy(null);
     }
@@ -117,7 +129,13 @@ export function SendStatus(props: SendStatusProps) {
           ? "Queue confirmation unknown."
           : "Outcome unknown — check before sending again.";
       case "conflict":
-        return "Queue state conflict — check the queue.";
+        // F3 (slice-3 review): a conflict reached through the RESOLVE path
+        // (incl. a retrySave that hit 409 queue_resolve_conflict) has already
+        // refreshed the queue cache to server truth — say so; the admission
+        // flavor keeps the check-the-queue guidance.
+        return rec.conflictSource === "resolve"
+          ? "Queue state conflict — showing server state."
+          : "Queue state conflict — check the queue.";
       case "rejected":
       case "blocked":
         return "Not sent — kept in the composer.";
@@ -164,9 +182,13 @@ export function SendStatus(props: SendStatusProps) {
                       Retry send
                     </button>
                   </Show>
-                  {/* Retry STATUS SAVE — stage "unsaved" only. Re-records the
-                      known terminal outcome; NEVER resends the message. */}
-                  <Show when={rec.stage === "unsaved" && rec.retrySave}>
+                  {/* Retry STATUS SAVE — stage "unsaved" only, and never for a
+                      draft (F8, defense-in-depth: unsaved records are minted
+                      under a live session id by the resolve path, so a draft
+                      view — ownerKey "draft" — cannot legitimately hold one).
+                      Re-records the known terminal outcome; NEVER resends the
+                      message. */}
+                  <Show when={!props.draft() && rec.stage === "unsaved" && rec.retrySave}>
                     <button
                       type="button"
                       class="sendStatusBtn"

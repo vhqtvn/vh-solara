@@ -40,6 +40,14 @@ const HOLD_SESSION = "agenthold";
 const jsonCsrf = { "Content-Type": "application/json", "X-VH-CSRF": "1" };
 const csrf = { "X-VH-CSRF": "1" };
 
+// F6 (slice-3 review): per-run unique suffix for the API tests' attempt ids.
+// Per-item deletion does NOT clear the server's admission receipts (replay
+// after removal answers the original receipt — the TESTED contract), so FIXED
+// ids flip replayed:false→true on repeat runs against a reused fixture
+// server. Evaluated once per worker process; the serial suite (workers:1)
+// gets exactly one suffix per run, and a CI retry re-loads the file fresh.
+const RUN = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
 function apiUrl(sid: string, suffix = ""): string {
   return `/vh/session/${sid}/queue${suffix}?dir=${encodeURIComponent(demoDir)}`;
 }
@@ -66,7 +74,7 @@ test.afterEach(async ({ request }) => {
 });
 
 test("(a+b+c API) enqueue carries attemptId on the wire; the real envelope reports replayed; a replay creates exactly one item", async ({ request }) => {
-  const att = "att-e2e-envelope";
+  const att = `att-e2e-envelope-${RUN}`;
   const first = await request.post(apiUrl(SID), {
     headers: jsonCsrf,
     data: { text: "envelope probe", attemptId: att },
@@ -97,7 +105,7 @@ test("(a+b+c API) enqueue carries attemptId on the wire; the real envelope repor
 });
 
 test("(d API) admission conflict is an explicit definitive 409 — the FE surfaces a state, never a retry loop", async ({ request }) => {
-  const att = "att-e2e-conflict";
+  const att = `att-e2e-conflict-${RUN}`;
   const first = await request.post(apiUrl(SID), {
     headers: jsonCsrf,
     data: { text: "one", attemptId: att },
@@ -125,7 +133,7 @@ test("(d API) admission conflict is an explicit definitive 409 — the FE surfac
 test("(e API) resolve-conflict stops: 409 queue_resolve_conflict, stored truth preserved", async ({ request }) => {
   const enq = await request.post(apiUrl(SID), {
     headers: jsonCsrf,
-    data: { text: "resolve probe", attemptId: "att-e2e-resolve" },
+    data: { text: "resolve probe", attemptId: `att-e2e-resolve-${RUN}` },
   });
   const itemId = (await enq.json()).item.id;
   const claim = await request.post(apiUrl(SID, "/claim"), { headers: jsonCsrf, data: {} });

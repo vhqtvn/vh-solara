@@ -181,6 +181,30 @@ describe("SendStatus — retry taxonomy (never an unqualified Retry)", () => {
     expect(getSendAction("att-save-2")).toBeTruthy();
     r.unmount();
   });
+
+  it("F3: an unsaved retry that hits a RESOLVE CONFLICT surfaces the dismissible conflict row — never a silent vanish", async () => {
+    // Slice-3 review F3: when the unsaved record is linked by a real
+    // attemptId, the old retrySave finished the record on ANY non-unrecorded
+    // outcome — deleting the conflict record resolveQueued had just patched,
+    // so the row silently vanished. Now the conflict outcome is visible and
+    // honest: the row survives as a dismissible conflict state naming what
+    // the surface did (queue refreshed to server truth).
+    resolveQueuedMock.mockImplementation(async () => ({ kind: "conflict", detail: "server holds sent" } as const));
+    markSendAttemptStatusUnsaved("att-save-3", "s1", { itemId: "q-7", state: "failed", detail: "local fail" });
+    const send = vi.fn(async () => {});
+    const r = render(() => <SendStatus {...baseProps({ send })} />);
+    r.container.querySelector(".sendStatusBtn")!.click();
+    await vi.waitFor(() => expect(resolveQueuedMock).toHaveBeenCalledTimes(1));
+    // The user SEES the conflict — the row did not disappear.
+    await vi.waitFor(() => expect(r.container.textContent).toContain("Queue state conflict — showing server state."));
+    expect(r.container.querySelector(".sendStatusDismiss")).toBeTruthy();
+    expect(send).not.toHaveBeenCalled(); // still never a resend
+    // The record survives as the conflict state (server truth shown).
+    expect(getSendAction("att-save-3")).toBeTruthy();
+    expect(getSendAction("att-save-3")!.stage).toBe("conflict");
+    expect(getSendAction("att-save-3")!.conflictSource).toBe("resolve");
+    r.unmount();
+  });
 });
 
 describe("SendStatus — server custody line (never for an unconfirmed draft)", () => {

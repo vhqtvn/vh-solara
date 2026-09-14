@@ -236,10 +236,15 @@ export function __resetQueueAttemptSupportForTests(): void {
 // server is not known-legacy), it is sent with the payload; a slice-1 server
 // dedupes same-(attemptId,payload) replays and answers the ORIGINAL receipt
 // with `replayed: true`. The cache is UPSERTED by item id, so a replay never
-// produces a duplicate chip. After a session-queue cleanup/archive the replay
-// guarantee is over server-side (a replay is a fresh admission) — the client's
-// retries are user-driven re-taps, never an automatic loop, so no stale
-// attemptId is ever hammered.
+// produces a duplicate chip. Replay-guarantee span (TESTED —
+// TestQueueAdmissionReplayAfterRemoval / TestQueueHTTPReplayAfterRemoval in
+// pkg/web/queue_admission_test.go): a replay after PER-ITEM removal still
+// answers the original receipt (replayed:true) WITHOUT resurrecting the item
+// (the receipt log is independent of the item list); only session-queue
+// ARCHIVE (the receipt map is cleared with the store) ends the guarantee —
+// a post-archive replay is a fresh admission on the new store, never a
+// receipt answer. The client's retries are user-driven re-taps, never an
+// automatic loop, so no stale attemptId is ever hammered.
 export async function enqueue(sessionId: string, input: QueueInput): Promise<QueuedMessage> {
   const sendAttempt = !!input.attemptId && attemptSupport !== "legacy";
   const body = sendAttempt ? input : { ...input, attemptId: undefined };

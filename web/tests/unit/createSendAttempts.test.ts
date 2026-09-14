@@ -26,6 +26,7 @@ import { __resetSendSingleFlightForTests } from "../../src/lib/sendSingleFlight"
 import {
   __resetSendActionStatusForTests,
   getSendAction,
+  markOwnerSessionCreateUnknown,
   sendActionsFor,
 } from "../../src/lib/sendActionStatus";
 import { createSessionWithCertainty } from "../../src/sync/actions";
@@ -65,6 +66,10 @@ function harness(overrides: {
   ensureSession?: () => Promise<string | null>;
   curModel?: () => { vision?: boolean } | undefined;
   inlineFiles?: Map<string, File>;
+  /** Overrides the live-session id the deps report (F2: destination-session
+   *  retry linkage is owner-scoped, so the second harness must report the id
+   *  the first harness's draft materialized into). */
+  sessionId?: string;
 } = {}): Harness {
   const [input, setInput] = createSignal("");
   const [atts, setAtts] = createSignal<Attachment[]>([]);
@@ -79,7 +84,7 @@ function harness(overrides: {
   void file;
 
   const deps: SendDependencies = {
-    sessionId: () => "ses-1",
+    sessionId: () => overrides.sessionId ?? "ses-1",
     draft,
     ensureSession: overrides.ensureSession ?? (async () => "ses-1"),
     input,
@@ -365,6 +370,88 @@ describe("createSend slice 2 — immutable prepared attempts", () => {
     expect(getSendAction(attemptId)?.ownerKey).toBe("live-1");
     expect(sendActionsFor("draft")).toHaveLength(0);
     expect(sendActionsFor("live-1").map((a) => a.attemptId)).toContain(attemptId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F2 (slice-3 review) — the draft→live transfer is an owner SWEEP: retained
+// records from EARLIER draft taps must follow the user into the destination
+// session too, and a retry there must reuse the ORIGINAL attemptId.
+// ---------------------------------------------------------------------------
+describe("createSend — F2 draft→session migration of retained draft-owned records", () => {
+  it("a retained create-outcome-unknown record follows the draft's LATER materialization into the live session (owner sweep)", async () => {
+    // Two-tap arc: tap 1's session create outcome is UNKNOWN (ChatView marks
+    // the draft-owned record uncertain/check and restores the text); tap 2
+    // materializes the session. Slice 2's per-attempt transfer moved only the
+    // in-flight attempt — the tap-1 record stayed stranded under "draft",
+    // invisible in the destination session (SendStatus reads ownerKey =
+    // session id). The owner sweep re-keys EVERY still-draft-owned record.
+    let createCalls = 0;
+    const h = harness({
+      draft: () => true,
+      ensureSession: async () => {
+        createCalls += 1;
+        if (createCalls === 1) {
+          markOwnerSessionCreateUnknown("draft", "session create timed out");
+          return null;
+        }
+        return "live-1";
+      },
+      enqueue: async () => {
+        throw new Error("response lost");
+      },
+      fetchQueue: async () => [],
+    });
+    h.setInput("two taps");
+    await h.send(); // tap 1: create outcome unknown → retained uncertain/check
+
+    const orphan = sendActionsFor("draft").find((a) => a.stage === "uncertain" && a.recovery === "check");
+    expect(orphan).toBeDefined();
+    expect(orphan!.detail).toContain("session create timed out");
+
+    await h.send(); // tap 2 (text was restored by the tap-1 failure path)
+    expect(h.enqueueInputs).toHaveLength(1);
+    expect(h.enqueueInputs[0].id).toBe("live-1");
+
+    // THE F2 CRUX: the retained tap-1 record followed the user into the
+    // session — nothing remains under "draft", and the destination session's
+    // status surface (sendActionsFor(sessionId)) sees BOTH the migrated
+    // create-unknown record and the tap-2 enqueue-uncertain record.
+    expect(sendActionsFor("draft")).toHaveLength(0);
+    const live = sendActionsFor("live-1");
+    expect(live.map((a) => a.attemptId)).toContain(orphan!.attemptId);
+    expect(live.some((a) => a.stage === "uncertain" && a.recovery === "retry-same")).toBe(true);
+  });
+
+  it("a retry in the DESTINATION session reuses the draft-originated attemptId (owner-scoped linkage)", async () => {
+    // Part 1: the draft send's enqueue response is lost → an uncertain
+    // retry-same record transferred to live-1 (slice-2 linkage, now via the
+    // owner sweep).
+    const h1 = harness({
+      draft: () => true,
+      ensureSession: async () => "live-1",
+      enqueue: async () => {
+        throw new Error("response lost");
+      },
+      fetchQueue: async () => [],
+    });
+    h1.setInput("draft retry arc");
+    await h1.send();
+    const attemptId = h1.enqueueInputs[0].input.attemptId as string;
+    expect(getSendAction(attemptId)?.ownerKey).toBe("live-1");
+    expect(getSendAction(attemptId)?.recovery).toBe("retry-same");
+
+    // Part 2: the DESTINATION session's composer re-taps the same text. The
+    // retry linkage is owner-scoped — it MUST find the transferred record and
+    // reuse the SAME attemptId, so the server's admission dedupe protects the
+    // draft-originated arc (no fresh attemptId).
+    const h2 = harness({ sessionId: "live-1" });
+    h2.setInput("draft retry arc");
+    await h2.send();
+    expect(h2.enqueueInputs).toHaveLength(1);
+    expect(h2.enqueueInputs[0].input.attemptId).toBe(attemptId);
+    // Custody confirmed by the recorded enqueue → the action is finished.
+    expect(getSendAction(attemptId)).toBeUndefined();
   });
 });
 

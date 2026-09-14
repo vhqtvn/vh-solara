@@ -35,7 +35,10 @@
 // before the session exists) and is EXPLICITLY transferred to the live session
 // id once createSession resolves (createSend's draft→live single-flight handoff
 // — the two single-flight keys are distinct by design, so the transfer must be
-// explicit). All reads/writes are keyed by attemptId; UI queries by ownerKey.
+// explicit). The handoff sweeps EVERY still-draft-owned record, not just the
+// in-flight attempt (transferOwnerSendAttempts): retained records from earlier
+// draft taps must follow the user into the session too (F2, slice-3 review).
+// All reads/writes are keyed by attemptId; UI queries by ownerKey.
 //
 // In-memory only (module singleton, like sendSingleFlight): a reload re-fetches
 // server truth; unconfirmed browser attempts are NOT part of the durability
@@ -108,6 +111,12 @@ export interface SendAction {
   // status surface renders "Retrying queue confirmation…" instead of a plain
   // "Sending…". Set once by createSend at the reuse decision.
   retry?: boolean;
+  // Stage "conflict" provenance: "admission" (409 queue_admission_conflict —
+  // a conflicting admission exists; check the queue before sending again) vs
+  // "resolve" (409 queue_resolve_conflict — the queue cache has been
+  // refreshed to SERVER truth). Drives the operator-facing copy in
+  // SendStatus; undefined keeps the generic conflict copy.
+  conflictSource?: "admission" | "resolve";
   // Stage "unsaved" only: what the Retry-status-save affordance re-records —
   // the exact terminal (state, detail) of the dispatch outcome plus the queue
   // item id. resolveQueued(idempotent record) consumes this verbatim.
@@ -170,6 +179,37 @@ export function transferSendAttempt(attemptId: string, newOwnerKey: string): voi
   patch(attemptId, { ownerKey: newOwnerKey });
 }
 
+/** F2 (slice-3 review): re-key EVERY retained record owned by `fromOwnerKey`
+ *  to `toOwnerKey` — the draft→live materialization sweep. Slice 2's
+ *  per-attempt transferSendAttempt re-keyed only the IN-FLIGHT attempt;
+ *  retained records from EARLIER draft taps (a create-outcome-unknown
+ *  uncertain/check record is the reachable case) stayed stranded under
+ *  "draft": invisible in the destination session (SendStatus queries by the
+ *  session-id owner key) and stale in the NEXT draft view. At materialization
+ *  the retained draft-owned set is exactly the in-flight attempt plus
+ *  uncertain records — mint-supersede already finished earlier
+ *  preparing/blocked/rejected ones — so sweeping everything is safe. Residual
+ *  limitation (accepted): when the operator materializes the session WITHOUT
+ *  re-tapping (the create landed; they click the session in the list), no
+ *  client code observes the draft→session linkage — re-keying that arc needs
+ *  a session-create idempotency key (out of scope, brief §8). Returns the
+ *  number of records transferred. */
+export function transferOwnerSendAttempts(fromOwnerKey: string, toOwnerKey: string): number {
+  let n = 0;
+  setActions(
+    produce((map) => {
+      for (const a of Object.values(map)) {
+        if (a.ownerKey === fromOwnerKey) {
+          a.ownerKey = toOwnerKey;
+          a.updatedAt = Date.now();
+          n++;
+        }
+      }
+    }),
+  );
+  return n;
+}
+
 /** Read one action (undefined once finished). */
 export function getSendAction(attemptId: string): SendAction | undefined {
   return actions[attemptId];
@@ -187,7 +227,7 @@ export function sendActionsFor(ownerKey: string): SendAction[] {
  *  is additive (sendText snapshots it right before the enqueue POST). */
 export function updateSendAction(
   attemptId: string,
-  p: { stage?: SendStage; certainty?: SendCertainty; recovery?: SendRecovery; detail?: string; payload?: PreparedSendPayload; retry?: boolean },
+  p: { stage?: SendStage; certainty?: SendCertainty; recovery?: SendRecovery; detail?: string; payload?: PreparedSendPayload; retry?: boolean; conflictSource?: "admission" | "resolve" },
 ): void {
   patch(attemptId, p);
 }
@@ -241,7 +281,7 @@ export function markOwnerSessionCreateUnknown(ownerKey: string, detail: string):
  *  renderable (Slice 3). */
 export function markSendAttemptResolveConflict(attemptId: string, ownerKey: string, detail: string): void {
   if (getSendAction(attemptId)) {
-    patch(attemptId, { stage: "conflict", certainty: "definitive", recovery: "check", detail });
+    patch(attemptId, { stage: "conflict", certainty: "definitive", recovery: "check", detail, conflictSource: "resolve" });
     return;
   }
   setActions(attemptId, {
@@ -251,6 +291,7 @@ export function markSendAttemptResolveConflict(attemptId: string, ownerKey: stri
     certainty: "definitive",
     detail,
     recovery: "check",
+    conflictSource: "resolve",
     updatedAt: Date.now(),
   });
   mintedSeq.set(attemptId, ++seq);
