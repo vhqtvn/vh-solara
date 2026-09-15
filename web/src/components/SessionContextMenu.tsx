@@ -28,7 +28,7 @@ import {
   openDeleteConfirm,
 } from "../sessionMenu";
 import { displayName } from "../projectSettings";
-import { classifyHold } from "../lib/copyHold";
+import { classifyHold, HOLD_THRESHOLD_MS } from "../lib/copyHold";
 import { bindBackDismiss } from "../lib/backStack";
 import { layoutPx } from "../lib/zoom";
 import Icon from "./Icon";
@@ -243,8 +243,23 @@ export default function SessionContextMenu() {
     // irreversible Delete confirm; a tap opens the recoverable Archive confirm.
     // The Delete menu item was removed, so the long-press is the only delete
     // entry. Fresh per menu-open: <Items> mounts inside <Show>, so each open
-    // re-initializes this to 0 (no stale state across opens). See the button.
+    // re-initializes all of this (no stale state across opens). See the button.
     let archiveDownAt = 0;
+    // Early-trigger timer: opens the Delete confirm at the 450ms mark while
+    // the button is STILL PRESSED. archiveHoldFired marks the gesture
+    // consumed so the release click (see the button) opens nothing extra.
+    let archiveHoldTimer: number | undefined;
+    let archiveHoldFired = false;
+    const clearArchiveHoldTimer = () => {
+      if (archiveHoldTimer !== undefined) {
+        window.clearTimeout(archiveHoldTimer);
+        archiveHoldTimer = undefined;
+      }
+    };
+    // A pending hold timer must never outlive the menu: closing the menu
+    // unmounts <Items> (menu close, scrim tap, Escape, back-dismiss), and a
+    // surviving timer would pop the Delete confirm out of nowhere afterwards.
+    onCleanup(clearArchiveHoldTimer);
     return (
       <>
         {/* Pin sync error hint (dismissible). The mutation resolves AFTER the
@@ -477,29 +492,69 @@ export default function SessionContextMenu() {
         {/* Archive: a TAP opens the (recoverable) Archive confirm; a LONG-PRESS
             (hold) opens the IRREVERSIBLE Delete confirm — the standalone Delete
             menu item was removed, so the long-press is the only delete entry.
-            The hold wiring mirrors the Copy button (MessageRow.tsx): pointerdown
-            records the press time, click classifies via classifyHold. The
-            downAt===0 sentinel means a keyboard activation (Enter/Space) or
-            programmatic .click() classifies as "tap" → Archive (the safe
-            default). onContextMenu only preventDefaults (suppresses the native
-            menu on Android touch long-press); it performs NO action, so unlike
-            the Copy button there is no contextmenu/click double-fire to dedupe
+            The Delete confirm now opens the MOMENT the hold reaches
+            HOLD_THRESHOLD_MS (450ms) while the button is still pressed: pointer
+            down arms a timer; no release is needed. The click-time classifyHold
+            (web/src/lib/copyHold.ts) STAYS as the deterministic fallback: if
+            main-thread jank stalls the timer past 450ms, the release click still
+            classifies by elapsed wall-clock (hold → Delete) and cancels the
+            pending timer. This does NOT reintroduce the abandoned timer-race
+            classification (see copyHold.ts): there, a jank-stalled timer
+            CLASSIFIED the release and misread holds as taps; here the timer is
+            only a UX early-trigger — whichever path runs first consumes the
+            gesture (timer first → fired flag no-ops the release click; click
+            first → clearTimeout + classify), both use the same threshold and
+            clock, and exactly one dialog opens. When the timer fires,
+            openDeleteConfirm closes the menu (sessionMenu.ts), so the button
+            unmounts and the dialog overlay renders above the press: the release
+            click targets the down/up common ancestor (mouse) or the detached
+            captured button (touch implicit capture) — the overlay is never the
+            click target of the in-flight gesture, and the fired flag keeps this
+            button's own click handler a no-op regardless. The downAt===0
+            sentinel keeps keyboard activation (Enter/Space) and programmatic
+            .click() classified as "tap" → Archive (the safe default; no timer
+            is armed for them). Timer cleanup: pointerup, pointercancel,
+            pointerleave (drag-off must NOT Delete mid-hold), and blur cancel
+            it; menu close unmounts <Items> → onCleanup cancels it.
+            onContextMenu only preventDefaults (suppresses the native menu on
+            Android touch long-press); it performs NO action, so unlike the
+            Copy button there is no contextmenu/click double-fire to dedupe
             (shouldSkipAfterContextmenu's precondition — a prior contextmenu
-            action — never holds), and the synthesized hold-click opens Delete
-            exactly once. */}
+            action — never holds), and the fired flag makes any synthesized
+            hold-click a no-op. */}
         <button
           type="button"
           class="ctxm-item danger"
           onPointerDown={() => {
             archiveDownAt = Date.now();
+            archiveHoldFired = false;
+            clearArchiveHoldTimer();
+            archiveHoldTimer = window.setTimeout(() => {
+              archiveHoldTimer = undefined;
+              archiveHoldFired = true;
+              openDeleteConfirm(props.id, props.title);
+            }, HOLD_THRESHOLD_MS);
           }}
+          onPointerUp={clearArchiveHoldTimer}
+          onPointerCancel={clearArchiveHoldTimer}
+          onPointerLeave={clearArchiveHoldTimer}
           onClick={() => {
-            const cls = classifyHold(archiveDownAt, Date.now());
-            // Reset AFTER classifyHold consumed the value (mirrors MessageRow):
-            // the next gesture's pointerdown sets it again, and the downAt===0
+            const downAt = archiveDownAt;
+            // Reset AFTER capturing for classifyHold (mirrors MessageRow): the
+            // next gesture's pointerdown sets it again, and the downAt===0
             // sentinel keeps a keyboard activation safe.
             archiveDownAt = 0;
-            if (cls === "hold") {
+            clearArchiveHoldTimer();
+            if (archiveHoldFired) {
+              // The timer already opened the Delete confirm at 450ms; consume
+              // the release click so it opens nothing else.
+              archiveHoldFired = false;
+              return;
+            }
+            // Fallback path: the timer has not fired (fast tap, or jank stalled
+            // it past the click) — classify by elapsed wall-clock, which is
+            // load-independent and agrees with the timer's threshold.
+            if (classifyHold(downAt, Date.now()) === "hold") {
               openDeleteConfirm(props.id, props.title);
             } else {
               openArchiveConfirm(props.id, props.title);
@@ -508,6 +563,7 @@ export default function SessionContextMenu() {
           onContextMenu={(e) => e.preventDefault()}
           onBlur={() => {
             archiveDownAt = 0;
+            clearArchiveHoldTimer();
           }}
         >
           <Icon name="layers" size={14} /> Archive…
