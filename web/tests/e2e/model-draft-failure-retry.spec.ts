@@ -22,10 +22,14 @@ import { demoDir, projectUrl } from "./util";
 // evidence, so after reload the pick map is the only source that can produce
 // "low" — exactly the P1/migrateModelPick contract under test.
 //
-// Failure-mode fidelity: the 502 is a PAGE-LOCAL Playwright fulfillment — it
+// Failure-mode fidelity: the 500 is a PAGE-LOCAL Playwright fulfillment — it
 // proves the CLIENT-VISIBLE terminal non-2xx contract (dispatchQueuedItem
-// classifies non-2xx as `failed`, never repends), NOT the Go fixture's
-// PromptAsyncRejectBeforeCommit server internals.
+// classifies a definitive upstream non-2xx as `failed`, never repends), NOT
+// the Go fixture's PromptAsyncRejectBeforeCommit server internals. Deliberately
+// NOT a 502: send-reliability slice 2 reclassified proxy 502 as `unknown`
+// (the /oc proxy answers 502 on TRANSPORT failure to OpenCode —
+// pkg/web/server.go — so a 502 does not prove non-delivery); that contract is
+// pinned in tests/unit/createSendAttempts.test.ts.
 //
 // Serial-suite hygiene (workers:1 over ONE shared fixtureserver): the test owns
 // a FRESH ses_newN session and removes ALL of its residue in afterEach —
@@ -74,7 +78,7 @@ test.afterEach(async ({ request }) => {
 });
 
 test("explicit draft model/variant pick survives first-send materialization, a terminal failed send + reload, and governs the recovery resend", async ({ page }) => {
-  test.setTimeout(90_000); // full lifecycle: materialize + 502 + reload + recovery + streamed reply
+  test.setTimeout(90_000); // full lifecycle: materialize + failed send + reload + recovery + streamed reply
 
   // Block the PWA service worker for THIS test (registered before page.goto so
   // the SW script never loads; existing workers closed) — see header note.
@@ -84,10 +88,11 @@ test("explicit draft model/variant pick survives first-send materialization, a t
   }
 
   // Page-local interception of the SPA's dispatch POST. The FIRST POST is
-  // fulfilled 502 (terminal client-visible failure — the fixture never sees
-  // it); every later POST passes through. Counted at both the route layer and
-  // the page "request" event so a failure distinguishes "route never matched"
-  // from a genuine double-dispatch (ux.spec.ts pattern).
+  // fulfilled 500 (definitive upstream rejection — the terminal `failed`
+  // shape; the fixture never sees it); every later POST passes through.
+  // Counted at both the route layer and the page "request" event so a failure
+  // distinguishes "route never matched" from a genuine double-dispatch
+  // (ux.spec.ts pattern).
   const posts: { model?: { providerID?: string; modelID?: string }; variant?: string }[] = [];
   let routeSeen = 0;
   let pageSeen = 0;
@@ -108,9 +113,9 @@ test("explicit draft model/variant pick survives first-send materialization, a t
     }
     if (routeSeen === 1) {
       await route.fulfill({
-        status: 502,
+        status: 500,
         contentType: "text/plain",
-        body: "e2e: forced terminal client-visible failure (bad gateway)",
+        body: "e2e: forced terminal client-visible failure (definitive upstream rejection)",
       });
     } else {
       await route.continue();
@@ -168,7 +173,7 @@ test("explicit draft model/variant pick survives first-send materialization, a t
   sid = new URL(page.url()).searchParams.get("session")!;
 
   // TERMINAL FAILURE (B1 setup): the drainer claimed the item, POSTed, and our
-  // 502 resolves it `failed` — visible as a failed chip. The failure committed
+  // 500 resolves it `failed` — visible as a failed chip. The failure committed
   // NOTHING client-side: no user turn renders for the marker.
   const chip = page.locator(".queue-chip", { hasText: marker });
   await expect(chip).toHaveAttribute("data-state", "failed", { timeout: 15_000 });
