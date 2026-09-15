@@ -38,6 +38,14 @@ import ctxmStyles from "./SessionContextMenu.module.css";
 
 const copy = (text: string) => void navigator.clipboard?.writeText(text);
 
+// Slop radius for the Archive hold's pointermove drag-off cancel. More
+// tolerant than menuTriggers' zero-slop touchmove cancel (sessionMenu.ts)
+// because pointermove also fires for sub-pixel micro-jitter while the
+// pointer is effectively still — zero slop would abandon honest holds.
+// Local to this component on purpose: copyHold.ts keeps only the shared
+// 450ms threshold.
+const ARCHIVE_HOLD_SLOP_PX = 10;
+
 // Pin sync error → human label for the menu's retry hint. The action buttons
 // below (Pin/Unpin, Move up/down) double as the retry affordance: re-clicking
 // re-issues the mutation against the current authoritative state.
@@ -250,6 +258,13 @@ export default function SessionContextMenu() {
     // consumed so the release click (see the button) opens nothing extra.
     let archiveHoldTimer: number | undefined;
     let archiveHoldFired = false;
+    // Drag-off detection (the touch half — see the button's onPointerMove):
+    // pointerdown records the start client coords; a mid-gesture move beyond
+    // ARCHIVE_HOLD_SLOP_PX raises archiveHoldMoved, and the release click
+    // consumes it FIRST and opens nothing.
+    let archiveDownX = 0;
+    let archiveDownY = 0;
+    let archiveHoldMoved = false;
     const clearArchiveHoldTimer = () => {
       if (archiveHoldTimer !== undefined) {
         window.clearTimeout(archiveHoldTimer);
@@ -510,12 +525,37 @@ export default function SessionContextMenu() {
             click targets the down/up common ancestor (mouse) or the detached
             captured button (touch implicit capture) — the overlay is never the
             click target of the in-flight gesture, and the fired flag keeps this
-            button's own click handler a no-op regardless. The downAt===0
+            button's own click handler a no-op regardless.             The downAt===0
             sentinel keeps keyboard activation (Enter/Space) and programmatic
             .click() classified as "tap" → Archive (the safe default; no timer
-            is armed for them). Timer cleanup: pointerup, pointercancel,
-            pointerleave (drag-off must NOT Delete mid-hold), and blur cancel
-            it; menu close unmounts <Items> → onCleanup cancels it.
+            is armed for them).
+            An ABANDONED gesture — dragged off the button, or dragged beyond
+            ARCHIVE_HOLD_SLOP_PX while still pressed — must NEVER open the
+            destructive confirm, on either input modality. Two halves:
+            - Mouse: dragging off fires pointerleave, which (like
+              pointercancel and blur) resets archiveDownAt to 0 in addition
+              to clearing the timer. Without the reset, re-entering while
+              still pressed (no new pointerdown) and releasing ≥450ms after
+              the original down would classify via the STALE timestamp →
+              "hold" → Delete.
+            - Touch: implicit pointer capture suppresses pointerleave (the
+              finger can be visibly off the button with no leave event), so
+              the touch half is covered by onPointerMove: a move beyond the
+              slop radius cancels the timer, resets archiveDownAt, and sets
+              archiveHoldMoved — and the release click consumes the moved
+              flag FIRST and opens NOTHING (mirrors menuTriggers'
+              "moved = no action" in sessionMenu.ts). jsdom cannot emulate
+              implicit touch capture, so under test the pointermove slop
+              path — not pointerleave — is what stands in for real touch
+              drag-off.
+            CRITICAL: pointerup clears ONLY the timer and deliberately does
+            NOT reset archiveDownAt — pointerup fires immediately before
+            click, and the jank-fallback path (timer stalled, click arrives
+            with elapsed ≥450 → Delete) depends on the timestamp surviving
+            until click-time classification.
+            Timer cleanup: pointerup, pointercancel, pointerleave (drag-off
+            must NOT Delete mid-hold), pointermove beyond slop, and blur
+            cancel it; menu close unmounts <Items> → onCleanup cancels it.
             onContextMenu only preventDefaults (suppresses the native menu on
             Android touch long-press); it performs NO action, so unlike the
             Copy button there is no contextmenu/click double-fire to dedupe
@@ -525,9 +565,12 @@ export default function SessionContextMenu() {
         <button
           type="button"
           class="ctxm-item danger"
-          onPointerDown={() => {
+          onPointerDown={(e) => {
             archiveDownAt = Date.now();
+            archiveDownX = e.clientX;
+            archiveDownY = e.clientY;
             archiveHoldFired = false;
+            archiveHoldMoved = false;
             clearArchiveHoldTimer();
             archiveHoldTimer = window.setTimeout(() => {
               archiveHoldTimer = undefined;
@@ -535,16 +578,53 @@ export default function SessionContextMenu() {
               openDeleteConfirm(props.id, props.title);
             }, HOLD_THRESHOLD_MS);
           }}
+          // Clears ONLY the timer: archiveDownAt deliberately survives
+          // pointerup so the click that immediately follows can still
+          // classify the jank-fallback hold by elapsed wall-clock.
           onPointerUp={clearArchiveHoldTimer}
-          onPointerCancel={clearArchiveHoldTimer}
-          onPointerLeave={clearArchiveHoldTimer}
+          // Gesture abandoned — end it fully (mirrors onBlur): clear the
+          // timer AND reset the timestamp, so a re-entry + release (no new
+          // pointerdown) classifies via the downAt===0 sentinel, never off
+          // the stale pre-drag timestamp.
+          onPointerCancel={() => {
+            archiveDownAt = 0;
+            clearArchiveHoldTimer();
+          }}
+          onPointerLeave={() => {
+            archiveDownAt = 0;
+            clearArchiveHoldTimer();
+          }}
+          // Touch drag-off half (implicit capture keeps pointermove firing
+          // on this button while the finger is off it; pointerleave never
+          // comes). Guarded on the armed timer — the definition of "a hold
+          // gesture is actually active" — so a move onto the button BEFORE
+          // any pointerdown (plain hover) never arms or cancels anything.
+          // Beyond the slop radius: cancel the timer, reset the timestamp,
+          // raise the moved flag for the release click to consume.
+          onPointerMove={(e) => {
+            if (archiveHoldTimer === undefined) return;
+            const dx = e.clientX - archiveDownX;
+            const dy = e.clientY - archiveDownY;
+            if (dx * dx + dy * dy > ARCHIVE_HOLD_SLOP_PX * ARCHIVE_HOLD_SLOP_PX) {
+              archiveDownAt = 0;
+              archiveHoldMoved = true;
+              clearArchiveHoldTimer();
+            }
+          }}
           onClick={() => {
             const downAt = archiveDownAt;
             // Reset AFTER capturing for classifyHold (mirrors MessageRow): the
             // next gesture's pointerdown sets it again, and the downAt===0
             // sentinel keeps a keyboard activation safe.
             archiveDownAt = 0;
+            const moved = archiveHoldMoved;
+            archiveHoldMoved = false;
             clearArchiveHoldTimer();
+            // Dragged-off gesture opens NOTHING (mirrors menuTriggers'
+            // "moved = no action" in sessionMenu.ts). Consumed FIRST —
+            // before the fired flag and before classification — so an
+            // abandoned gesture can never reach either confirm.
+            if (moved) return;
             if (archiveHoldFired) {
               // The timer already opened the Delete confirm at 450ms; consume
               // the release click so it opens nothing else.

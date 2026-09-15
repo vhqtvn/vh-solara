@@ -13,8 +13,10 @@
 //                    gesture is consumed; the release click opens nothing
 //                    extra). openDeleteConfirm also closes the menu, so the
 //                    button unmounts under the still-pressed pointer.
-//   onClick       -> cancels any pending timer; no-op if archiveHoldFired;
-//                    otherwise classifyHold(archiveDownAt, now):
+//   onClick       -> cancels any pending timer; consumes the moved flag
+//                    FIRST (a dragged-off gesture opens NOTHING — not even
+//                    Archive); no-op if archiveHoldFired; otherwise
+//                    classifyHold(archiveDownAt, now):
 //                      - "tap"  (< HOLD_THRESHOLD_MS, OR downAt===0 keyboard
 //                                 sentinel) -> openArchiveConfirm (safe default)
 //                      - "hold" (>= HOLD_THRESHOLD_MS) -> openDeleteConfirm
@@ -25,9 +27,21 @@
 //                    whichever path runs first consumes the gesture, so the two
 //                    paths agree and exactly one dialog opens.
 //   cleanup       -> pointerup / pointercancel / pointerleave (drag-off) /
-//                    blur cancel the timer; menu close unmounts <Items> and
-//                    onCleanup cancels the timer (no Delete confirm pops after
-//                    the menu is gone).
+//                    blur cancel the timer; pointerleave, pointercancel, and
+//                    blur ALSO reset archiveDownAt (an abandoned gesture must
+//                    not leave a stale timestamp behind — otherwise a
+//                    re-entry + release, or a later keyboard Enter, would
+//                    classify off it as "hold" → Delete); pointermove beyond
+//                    ARCHIVE_HOLD_SLOP_PX mid-gesture does the same and sets
+//                    the moved flag (touch implicit capture suppresses
+//                    pointerleave entirely, so the slop path IS the touch
+//                    drag-off half — jsdom cannot emulate implicit capture,
+//                    which is why these pointermove tests are the real-touch
+//                    coverage); pointerup clears ONLY the timer (the
+//                    timestamp must survive until click classification —
+//                    the jank fallback depends on it); menu close unmounts
+//                    <Items> and onCleanup cancels the timer (no Delete
+//                    confirm pops after the menu is gone).
 //   onContextMenu -> preventDefault only (suppress the native menu on Android
 //                    touch long-press); it performs no action, so — unlike the
 //                    Copy button, whose contextmenu itself copies thinking —
@@ -110,6 +124,20 @@ function archiveDialog(container: HTMLElement): HTMLElement | null {
 }
 function deleteDialog(container: HTMLElement): HTMLElement | null {
   return container.querySelector('.dialog.confirm[aria-label="Confirm delete"]');
+}
+
+// jsdom (as of v25) does not implement window.PointerEvent, so
+// @testing-library's fireEvent.pointer* silently falls back to the generic
+// Event constructor and DROPS coordinate init — e.clientX reads undefined
+// and the slop math NaNs out. The slop-cancel tests need real coordinates,
+// so coord-carrying pointer events are dispatched as MouseEvent with the
+// pointer* type string (dispatch/listener matching is type-based, and
+// MouseEvent carries clientX/clientY). Real browsers always provide both
+// on PointerEvent; this shim only exists for the fake environment.
+function firePointerWithCoords(el: Element, type: string, x: number, y: number) {
+  el.dispatchEvent(
+    new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y }),
+  );
 }
 
 describe("SessionContextMenu Archive button — tap/hold (long-press → delete)", () => {
@@ -286,6 +314,182 @@ describe("SessionContextMenu Archive button — tap/hold (long-press → delete)
       // cancels it, so the Delete confirm cannot pop out of nowhere afterwards.
       expect(deleteDialog(container as unknown as HTMLElement)).toBeNull();
       expect(archiveDialog(container as unknown as HTMLElement)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ── F2: an abandoned gesture must never open Delete via a STALE timestamp.
+  // pointerleave/pointercancel clear the timer but (pre-fix) left
+  // archiveDownAt set, so a completed click much later classified as "hold". ──
+
+  it("F2 mouse re-entry: pointerdown → pointerleave → past threshold → click (no new pointerdown) opens Archive, never Delete", async () => {
+    putSession({ id: "s1", title: "Session One", time: { updated: 1 } });
+    const { container } = render(() => <SessionContextMenu />);
+    await openMenu(container as unknown as HTMLElement, "s1", "Session One");
+
+    vi.useFakeTimers({ now: clock });
+    try {
+      const btn = archiveButton(container as unknown as HTMLElement);
+      fireEvent.pointerDown(btn);
+      fireEvent.pointerLeave(btn); // dragged off before the threshold
+      await vi.advanceTimersByTimeAsync(HOLD_THRESHOLD_MS + 50);
+      // Re-enter while still pressed and release: NO new pointerdown fires,
+      // so the pre-fix bug classified this click off the STALE archiveDownAt
+      // (elapsed >= 450 -> "hold" -> Delete). pointerleave must have reset
+      // the timestamp: the downAt===0 sentinel -> "tap" -> Archive — the
+      // chosen safe default for a completed click.
+      fireEvent.click(btn);
+      expect(deleteDialog(container as unknown as HTMLElement)).toBeNull();
+      expect(archiveDialog(container as unknown as HTMLElement)).not.toBeNull();
+      // Exactly one dialog total.
+      expect(
+        (container as unknown as HTMLElement).querySelectorAll(".dialog.confirm").length,
+      ).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("F2 via pointercancel: pointerdown → pointercancel → past threshold → click opens Archive, never Delete", async () => {
+    putSession({ id: "s1", title: "Session One", time: { updated: 1 } });
+    const { container } = render(() => <SessionContextMenu />);
+    await openMenu(container as unknown as HTMLElement, "s1", "Session One");
+
+    vi.useFakeTimers({ now: clock });
+    try {
+      const btn = archiveButton(container as unknown as HTMLElement);
+      fireEvent.pointerDown(btn);
+      fireEvent.pointerCancel(btn); // e.g. browser takes over the gesture
+      await vi.advanceTimersByTimeAsync(HOLD_THRESHOLD_MS + 50);
+      // Same stale-timestamp shape as the re-entry case above: the cancel
+      // must reset archiveDownAt, so the late click classifies via the
+      // downAt===0 sentinel -> "tap" -> Archive, never Delete.
+      fireEvent.click(btn);
+      expect(deleteDialog(container as unknown as HTMLElement)).toBeNull();
+      expect(archiveDialog(container as unknown as HTMLElement)).not.toBeNull();
+      expect(
+        (container as unknown as HTMLElement).querySelectorAll(".dialog.confirm").length,
+      ).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ── F5: touch drag-off. Implicit pointer capture suppresses pointerleave
+  // for touch, so the finger can be visibly off the button with no leave
+  // event — the pointermove slop-cancel is the touch half. jsdom cannot
+  // emulate implicit capture; these pointermove tests ARE the coverage. ──
+
+  it("F5 slop: pointermove beyond ARCHIVE_HOLD_SLOP_PX cancels the hold — nothing opens past the threshold (touch drag-off shape)", async () => {
+    putSession({ id: "s1", title: "Session One", time: { updated: 1 } });
+    const { container } = render(() => <SessionContextMenu />);
+    await openMenu(container as unknown as HTMLElement, "s1", "Session One");
+
+    vi.useFakeTimers({ now: clock });
+    try {
+      const btn = archiveButton(container as unknown as HTMLElement);
+      firePointerWithCoords(btn, "pointerdown", 100, 100);
+      // Captured pointermove: 40px from the start — beyond the 10px slop
+      // radius — while the finger is (conceptually) off the button.
+      firePointerWithCoords(btn, "pointermove", 140, 100);
+      await vi.advanceTimersByTimeAsync(HOLD_THRESHOLD_MS * 2);
+      // The drag must NOT pop the Delete confirm at 450ms with the finger
+      // visibly off the button — and nothing else opens either.
+      expect(deleteDialog(container as unknown as HTMLElement)).toBeNull();
+      expect(archiveDialog(container as unknown as HTMLElement)).toBeNull();
+      expect(container.querySelector(".ctxm-menu")).not.toBeNull(); // menu intact
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("F5 slop tolerance: within-slop micro-jitter does NOT cancel — the timer still fires Delete at the threshold", async () => {
+    putSession({ id: "s1", title: "Session One", time: { updated: 1 } });
+    const { container } = render(() => <SessionContextMenu />);
+    await openMenu(container as unknown as HTMLElement, "s1", "Session One");
+
+    vi.useFakeTimers({ now: clock });
+    try {
+      const btn = archiveButton(container as unknown as HTMLElement);
+      firePointerWithCoords(btn, "pointerdown", 100, 100);
+      // 5px (3,4) from the start — within the 10px slop radius: an honest
+      // hold with micro-jitter must still reach the Delete confirm.
+      firePointerWithCoords(btn, "pointermove", 104, 103);
+      await vi.advanceTimersByTimeAsync(HOLD_THRESHOLD_MS);
+      expect(
+        container.querySelector('.dialog.confirm.danger[aria-label="Confirm delete"]'),
+      ).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("F5 moved-consumption: beyond-slop move then click opens NOTHING (not even Archive)", async () => {
+    putSession({ id: "s1", title: "Session One", time: { updated: 1 } });
+    const { container } = render(() => <SessionContextMenu />);
+    await openMenu(container as unknown as HTMLElement, "s1", "Session One");
+
+    vi.useFakeTimers({ now: clock });
+    try {
+      const btn = archiveButton(container as unknown as HTMLElement);
+      firePointerWithCoords(btn, "pointerdown", 100, 100);
+      firePointerWithCoords(btn, "pointermove", 100, 130); // 30px > slop
+      // Release click on the (still-captured) button: the moved flag must
+      // be consumed FIRST — without it, elapsed ~0 would classify "tap"
+      // and wrongly open the Archive confirm.
+      fireEvent.click(btn);
+      await vi.advanceTimersByTimeAsync(HOLD_THRESHOLD_MS * 2);
+      expect(deleteDialog(container as unknown as HTMLElement)).toBeNull();
+      expect(archiveDialog(container as unknown as HTMLElement)).toBeNull();
+      expect(container.querySelector(".ctxm-menu")).not.toBeNull(); // menu intact
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("F1 isolation: pointerdown → pointerup alone (no click/leave) opens nothing even at 2× the threshold", async () => {
+    putSession({ id: "s1", title: "Session One", time: { updated: 1 } });
+    const { container } = render(() => <SessionContextMenu />);
+    await openMenu(container as unknown as HTMLElement, "s1", "Session One");
+
+    vi.useFakeTimers({ now: clock });
+    try {
+      const btn = archiveButton(container as unknown as HTMLElement);
+      fireEvent.pointerDown(btn);
+      // pointerup clears ONLY the timer (the timestamp deliberately
+      // survives for the click's jank classification — but no click ever
+      // comes in this shape), so nothing may open afterwards.
+      fireEvent.pointerUp(btn);
+      await vi.advanceTimersByTimeAsync(HOLD_THRESHOLD_MS * 2);
+      expect(deleteDialog(container as unknown as HTMLElement)).toBeNull();
+      expect(archiveDialog(container as unknown as HTMLElement)).toBeNull();
+      expect(container.querySelector(".ctxm-menu")).not.toBeNull(); // menu intact
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("F7 closure: abandoned gesture (leave) then keyboard activation opens Archive, never Delete", async () => {
+    putSession({ id: "s1", title: "Session One", time: { updated: 1 } });
+    const { container } = render(() => <SessionContextMenu />);
+    await openMenu(container as unknown as HTMLElement, "s1", "Session One");
+
+    vi.useFakeTimers({ now: clock });
+    try {
+      const btn = archiveButton(container as unknown as HTMLElement);
+      fireEvent.pointerDown(btn);
+      fireEvent.pointerLeave(btn); // abandon — must reset the timestamp
+      await vi.advanceTimersByTimeAsync(HOLD_THRESHOLD_MS + 50);
+      // Keyboard Enter on the still-focused button: a click with NO
+      // pointerdown of its own (jsdom does not synthesize clicks from
+      // keydown, so the activation click is fired directly — same shape as
+      // the keyboard-sentinel test above). Pre-fix, the stale archiveDownAt
+      // classified this as "hold" -> Delete; with the leave reset, the
+      // downAt===0 sentinel applies -> "tap" -> Archive.
+      fireEvent.click(btn);
+      expect(archiveDialog(container as unknown as HTMLElement)).not.toBeNull();
+      expect(deleteDialog(container as unknown as HTMLElement)).toBeNull();
     } finally {
       vi.useRealTimers();
     }
