@@ -28,8 +28,14 @@ import { demoDir, projectUrl } from "./util";
 // the Go fixture's PromptAsyncRejectBeforeCommit server internals. Deliberately
 // NOT a 502: send-reliability slice 2 reclassified proxy 502 as `unknown`
 // (the /oc proxy answers 502 on TRANSPORT failure to OpenCode —
-// pkg/web/server.go — so a 502 does not prove non-delivery); that contract is
-// pinned in tests/unit/createSendAttempts.test.ts.
+// pkg/web/server.go — so a 502 does not prove non-delivery). The dispatch
+// classification locus is web/src/components/chat/createSend.ts
+// dispatchQueuedItem (the queued prompt_async POST seam), unit-pinned by
+// "queued DISPATCH (prompt_async POST) proxy 502 → outcome UNKNOWN with the
+// 'proxy 502 (outcome unknown)' detail — never failed" in
+// web/tests/unit/createSendAttempts.test.ts; that file's createSessionWithCertainty
+// block ("proxy 502 → outcome UNKNOWN (the session may exist)") pins the
+// separate SESSION-CREATE seam, not this dispatch contract.
 //
 // Serial-suite hygiene (workers:1 over ONE shared fixtureserver): the test owns
 // a FRESH ses_newN session and removes ALL of its residue in afterEach —

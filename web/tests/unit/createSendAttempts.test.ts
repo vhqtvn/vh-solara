@@ -16,7 +16,11 @@
 //     no retry;
 //   - draft→live ownership transfer of the attempt record;
 //   - createSessionWithCertainty classification (502/timeout = unknown,
-//     other statuses = definitive).
+//     other statuses = definitive);
+//   - dispatchQueuedItem DISPATCH classification (the queued prompt_async
+//     POST — a DIFFERENT seam from session-create): proxy 502 →
+//     outcome-unknown with the explicit "proxy 502 (outcome unknown)"
+//     detail; a definitive non-2xx (500) → terminal failed.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSignal } from "solid-js";
 import { createSend, type SendDependencies } from "../../src/components/chat/createSend";
@@ -45,6 +49,9 @@ const mem: Record<string, string> = {};
 
 interface Harness {
   send: ReturnType<typeof createSend>["send"];
+  // The queued-dispatch seam (drainer → prompt_async POST + classification).
+  // The send() tests never call it; the dispatch-path describe block does.
+  dispatchQueuedItem: ReturnType<typeof createSend>["dispatchQueuedItem"];
   input: () => string;
   setInput: (v: string) => void;
   atts: () => Attachment[];
@@ -140,9 +147,10 @@ function harness(overrides: {
     },
     draftKey: (sid) => `vh.draft.${sid}`,
   };
-  const { send } = createSend(deps);
+  const { send, dispatchQueuedItem } = createSend(deps);
   return {
     send,
+    dispatchQueuedItem,
     input,
     setInput,
     atts,
@@ -532,5 +540,51 @@ describe("createSessionWithCertainty — typed certainty classification", () => 
     const ok = await createSessionWithCertainty();
     expect(ok.id).toBe("new-ses-1");
     expect(ok.startedAt).toBeGreaterThanOrEqual(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// dispatchQueuedItem — DISPATCH-path outcome classification. A DIFFERENT seam
+// from createSessionWithCertainty above (session-create): this is the queued
+// prompt_async POST the drainer hands off, classified inside createSend.ts
+// dispatchQueuedItem. Mirrors the /oc catch-all proxy semantics
+// (pkg/web/server.go): 502 = TRANSPORT failure to OpenCode, which does NOT
+// prove the POST went undelivered → outcome-unknown, never failed; only a
+// definitive non-2xx proves non-delivery → terminal failed.
+// ---------------------------------------------------------------------------
+describe("createSend — dispatchQueuedItem dispatch-path classification (queued prompt_async POST)", () => {
+  const respondText = (status: number, body: string) =>
+    vi.fn(() => Promise.resolve({ ok: status >= 200 && status < 300, status, text: async () => body }));
+  const item = (): QueuedMessage => ({
+    id: "q-dispatch-1",
+    order: 1,
+    state: "dispatching",
+    text: "queued text",
+    attachments: [],
+    // Complete captured config (provider + model + agent) → the captured
+    // branch; the agent gate never runs.
+    sendConfig: { providerID: "p", modelID: "m", agent: "build" },
+    createdAt: 1,
+  });
+
+  it("queued DISPATCH (prompt_async POST) proxy 502 → outcome UNKNOWN with the 'proxy 502 (outcome unknown)' detail — never failed", async () => {
+    vi.stubGlobal("fetch", respondText(502, "upstream unreachable"));
+    const h = harness();
+    const out = await h.dispatchQueuedItem("ses-1", item(), new AbortController().signal);
+    expect(out.state).toBe("unknown");
+    expect(out.detail).toBe("proxy 502 (outcome unknown): upstream unreachable");
+    // The operator-facing surface mirrors the classification: an
+    // outcome-unknown notice, not a definitive failure notice.
+    expect(h.notes.some((n) => n.title === "Queued message send outcome unknown")).toBe(true);
+    expect(h.notes.some((n) => n.title === "Queued message failed to send")).toBe(false);
+  });
+
+  it("queued DISPATCH (prompt_async POST) definitive 500 → terminal failed — never unknown", async () => {
+    vi.stubGlobal("fetch", respondText(500, "500 upstream"));
+    const h = harness();
+    const out = await h.dispatchQueuedItem("ses-1", item(), new AbortController().signal);
+    expect(out.state).toBe("failed");
+    expect(out.detail).toBe("500 upstream");
+    expect(h.notes.some((n) => n.title === "Queued message failed to send")).toBe(true);
   });
 });

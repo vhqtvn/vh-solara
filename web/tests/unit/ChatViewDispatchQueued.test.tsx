@@ -8,7 +8,7 @@
 //   (a) real request/body construction (parts from text+attachments, model,
 //       agent, messageID threading);
 //   (b) 2xx -> {state:"sent"};
-//   (c) non-2xx -> {state:"failed", detail} (definitive rejection, never repend);
+//   (c) non-2xx -> {state:"failed", detail} (definitive rejection, never repend; except 502 -> {state:"unknown"}: proxy outcome-unknown carve-out, pinned in createSendAttempts.test.ts);
 //   (d) abort/network throw -> {state:"unknown"} (ambiguous, never repend).
 //
 // Driven through the public drain path: seed a pending item into the in-memory
