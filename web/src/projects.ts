@@ -86,10 +86,27 @@ export function selectProject(directory: string) {
   switchProject(directory);
 }
 
-// Recent projects from OpenCode (GET /project → known project directories,
-// most-recently-active first), so the switcher can offer a pick list instead of
-// only manual paths.
+// Recent projects for the switcher's "Recent (OpenCode)" pick list. TWO legs,
+// unioned by unionBridgedProjects (below):
+//   1. /oc/project — OpenCode's own project table (known project directories,
+//      most-recently-active first). The DURABLE leg: rows persist across
+//      daemon restarts.
+//   2. /vh/projects — the dirs the daemon currently has bridged (ANY client's
+//      bridge registers the dir). VOLATILE (empty after a daemon restart until
+//      clients reconnect per dir) but authoritative for cross-client
+//      visibility: a zero-commit git repo (vy-homestay repro class) gets NO
+//      /oc/project row — its OpenCode sessions bucket to the "global"
+//      projectID — so without this leg a dir bridged by one client would be
+//      invisible in Recent on every other client. The legs degrade
+//      independently (failure/empty → just the other leg); never throws.
 export async function fetchRecentProjects(): Promise<Project[]> {
+  const [recorded, bridged] = await Promise.all([fetchRecordedRecentProjects(), fetchBridgedDirs()]);
+  return unionBridgedProjects(recorded, bridged);
+}
+
+// Leg 1: OpenCode's recorded projects (GET /oc/project). Never throws: any
+// failure → [] (the union then degrades to the bridged leg alone).
+async function fetchRecordedRecentProjects(): Promise<Project[]> {
   try {
     const res = await fetch("/oc/project");
     if (!res.ok) {
@@ -117,6 +134,85 @@ export async function fetchRecentProjects(): Promise<Project[]> {
     log.warn("projects", "GET /project failed", e);
     return [];
   }
+}
+
+// Leg 2: bridged dirs (GET /vh/projects), reduced to the raw dir strings —
+// the payload item shape is ProjectEndpointItem (see the activity section
+// below) but only `dir` matters here. Never throws: failure/non-array → []
+// (the union degrades to the recorded leg alone — the pre-union behavior).
+// The daemon's synthetic default entry (dir "") is passed through and skipped
+// by the union. cache:'no-store' mirrors fetchProjectActivity: the dialog
+// refreshes recents on every open and a heuristic-cached GET would defeat it.
+async function fetchBridgedDirs(): Promise<string[]> {
+  try {
+    const resp = await fetch("/vh/projects", { cache: "no-store" });
+    const arr = resp.ok ? await resp.json() : [];
+    if (!Array.isArray(arr)) return [];
+    return arr.map((p: any) => (p && typeof p.dir === "string" ? p.dir : ""));
+  } catch (e) {
+    log.warn("projects", "GET /vh/projects (recents leg) failed", e);
+    return [];
+  }
+}
+
+// Union the daemon's bridged dirs into the recorded recents: any dir bridged
+// by ANY client of this worker becomes visible in every other client's Recent
+// list even when OpenCode never recorded a project row for it. PURE (no DOM,
+// no fetch) so it unit-tests in isolation, mirroring mergeProjectActivity.
+//
+// Dedupe rule (deliberate — pinned by projects-union.test.ts):
+//   - exact match after trailing-slash normalization → skip;
+//   - the bridged dir is a DESCENDANT of a recorded recent's directory
+//     (directory-boundary-aware: "/a/bc" is NOT under "/a/b") → skip. The
+//     /oc/project leg keys rows by worktree while /vh/projects carries the
+//     bridged dir verbatim, so a bridged SUBDIRECTORY of a listed worktree
+//     would otherwise render a near-duplicate row (the recorded row already
+//     covers that tree);
+//   - the bridged dir is an ANCESTOR of a recorded recent → KEEP. That is a
+//     genuinely broader scope OpenCode never recorded — exactly the visibility
+//     gap this union exists to close — so skipping it would re-hide bridged
+//     dirs.
+// Bridged-only rows have no updated timestamp, so they append AFTER the
+// recorded recents (which arrive most-recent-first), sorted by directory for
+// deterministic rendering. Name = basename(dir), the same fallback the
+// recorded leg uses when a project has no explicit name.
+export function unionBridgedProjects(recents: Project[], bridgedDirs: string[]): Project[] {
+  const recordedRecents = Array.isArray(recents) ? recents : [];
+  const recorded = new Set(
+    recordedRecents.map((p) => normalizeDir(p?.directory ?? "")).filter(Boolean),
+  );
+  const seen = new Set<string>(); // dedupe within the bridged payload itself
+  const added: Project[] = [];
+  for (const raw of Array.isArray(bridgedDirs) ? bridgedDirs : []) {
+    const dir = normalizeDir(typeof raw === "string" ? raw : "");
+    if (!dir || seen.has(dir)) continue; // "" (synthetic default) + self-dupes
+    seen.add(dir);
+    let covered = false;
+    for (const r of recorded) {
+      if (isDirUnder(dir, r)) {
+        covered = true;
+        break;
+      }
+    }
+    if (covered) continue;
+    added.push({ directory: dir, name: basename(dir) });
+  }
+  added.sort((a, b) => a.directory.localeCompare(b.directory, undefined, { sensitivity: "base" }));
+  return [...recordedRecents, ...added];
+}
+
+// Strip trailing slashes so "/work/repo/" and "/work/repo" compare equal (the
+// recorded leg strips them too; this keeps the union pure + caller-agnostic).
+function normalizeDir(dir: string): string {
+  return dir.replace(/\/+$/, "");
+}
+
+// True when `child` names the same directory as `parent` or one strictly
+// beneath it. Directory-boundary-aware: "/a/bc" is NOT under "/a/b". An empty
+// `parent` covers nothing ("" would otherwise prefix-match every path).
+function isDirUnder(child: string, parent: string): boolean {
+  if (!parent) return false;
+  return child === parent || child.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
 }
 
 // --- Project activity (cross-workspace root/running counts) ---
