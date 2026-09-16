@@ -520,6 +520,42 @@ func SetCompactionTTLsForTest(sentTTL, failedTTL, unknownTTL time.Duration) {
 	}
 }
 
+// queueClockOverride is a TEST-ONLY injectable clock for the queue store's
+// wall-clock reads (the CreatedAt/DispatchStartedAt/ResolvedAt stamps and the
+// List/Resolve recovery+compaction "now"). Never stored (or stored as a typed
+// nil) means "use time.Now" — the production behavior. Backed by atomic.Value
+// (not a plain var) so the test-time write and the mutation/List-time read can
+// never race under `go test -race`, mirroring staleDispatchThresholdOverride
+// and the compaction TTL overrides. Production code MUST NOT call
+// SetQueueClockForTest.
+var queueClockOverride atomic.Value // stores func() time.Time
+
+// queueNow returns the effective queue-store clock: the test override if one
+// is set, otherwise time.Now(). Every wall-clock read on the
+// sessionQueueStore mutation/List paths goes through here so tests can drive
+// timestamp RELATIONSHIPS (e.g. the resolve→compaction age) deterministically
+// instead of relying on wall-clock millisecond advancement — which coarse VM
+// clocks cannot guarantee. (Motivating flake: with 1ns test TTLs,
+// compactTerminalItemsLocked floors ttlMs to 0, so an item is purge-eligible
+// only when List's now is STRICTLY LATER in whole milliseconds than Resolve's
+// ResolvedAt stamp; a coarse CI clock returned the same millisecond for both
+// reads and the replay-after-compaction test flaked.)
+func queueNow() time.Time {
+	if f, ok := queueClockOverride.Load().(func() time.Time); ok && f != nil {
+		return f()
+	}
+	return time.Now()
+}
+
+// SetQueueClockForTest overrides the queue store's clock for the duration of
+// a test. TEST-ONLY: production code MUST NOT call this — production reads
+// the real wall clock. Pass nil to restore time.Now. Callers SHOULD
+// defer-restore (e.g. `defer SetQueueClockForTest(nil)`). Race-free (backed
+// by sync/atomic).
+func SetQueueClockForTest(now func() time.Time) {
+	queueClockOverride.Store(now) // a typed nil is fine; queueNow nil-checks
+}
+
 // compactTerminalItemsLocked removes expired and excess TERMINAL items
 // (sent/failed/unknown) from s.items. It NEVER touches pending or
 // dispatching — those represent unsent work or active dispatch that the
@@ -706,11 +742,11 @@ func (s *sessionQueueStore) List() ([]QueueItem, error) {
 	// drop entries, never the Attachments slice.
 	preMutation := make([]QueueItem, len(s.items))
 	copy(preMutation, s.items)
-	recoverChanged, err := s.recoverStaleDispatchingLocked(time.Now())
+	recoverChanged, err := s.recoverStaleDispatchingLocked(queueNow())
 	if err != nil {
 		return nil, err
 	}
-	compactChanged := s.compactTerminalItemsLocked(time.Now())
+	compactChanged := s.compactTerminalItemsLocked(queueNow())
 	if recoverChanged || compactChanged {
 		if err := s.persistAfterCompaction(compactChanged); err != nil {
 			// Roll back ALL in-memory mutations from recovery AND compaction
@@ -867,7 +903,7 @@ func (s *sessionQueueStore) EnqueueWithAttemptID(attemptID, text string, attachm
 		// the id tracks the actual dispatch wall-clock as closely as possible.
 		// Nothing reads OpencodeMsgID while the item is pending (the reconciler
 		// skips empty ids; the FE reads it off the claimed item).
-		CreatedAt: time.Now().UnixMilli(),
+		CreatedAt: queueNow().UnixMilli(),
 	}
 	s.items = append(s.items, item)
 	receiptRecorded := false
@@ -966,7 +1002,7 @@ func (s *sessionQueueStore) Claim() (QueueItem, bool, error) {
 			// (recoverStaleDispatchingLocked uses the timestamp;
 			// queue_msg_reconcile.go uses the id).
 			s.items[i].State = QueueDispatching
-			s.items[i].DispatchStartedAt = time.Now().UnixMilli()
+			s.items[i].DispatchStartedAt = queueNow().UnixMilli()
 			s.items[i].OpencodeMsgID = opencode.MintMessageID()
 			if err := s.save(); err != nil {
 				// Roll back the state, timestamp, AND correlation id so the
@@ -1063,9 +1099,9 @@ func (s *sessionQueueStore) Resolve(id string, target QueueItemState, detail str
 		copy(preSnapshot, s.items)
 		s.items[i].State = target
 		s.items[i].Detail = detail
-		s.items[i].ResolvedAt = time.Now().UnixMilli()
+		s.items[i].ResolvedAt = queueNow().UnixMilli()
 		resolved := s.items[i] // capture before compaction may shrink s.items
-		compactChanged := s.compactTerminalItemsLocked(time.Now())
+		compactChanged := s.compactTerminalItemsLocked(queueNow())
 		if err := s.persistAfterCompaction(compactChanged); err != nil {
 			s.items = preSnapshot
 			return QueueItem{}, err

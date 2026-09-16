@@ -606,9 +606,25 @@ func TestQueueCompactListArchivedGuardNoFreshFileDeletion(t *testing.T) {
 // branch: the receipt log keeps queue.json alive (and loadable) after the
 // item list empties, or the replay guarantee would silently die with the
 // first compaction pass.
+//
+// DETERMINISM (CI flake at d637aaa): the 1ns test TTLs floor to ttlMs=0
+// inside compactTerminalItemsLocked, so purge eligibility is "List's
+// compaction now is STRICTLY LATER in whole milliseconds than Resolve's
+// ResolvedAt stamp". On a coarse VM clock (the Actions runner) both
+// wall-clock reads could land on the same millisecond — age 0 is not
+// strictly greater, compaction (correctly, per the strict-> retention
+// semantics) kept the item, and the purge assertion below flaked. The
+// injected queue clock (SetQueueClockForTest) advances the resolve→List
+// relationship by one full millisecond BY CONSTRUCTION; the test no longer
+// depends on wall-clock advancement.
 func TestQueueCompactReplayAfterCompactionKeepsReceipt(t *testing.T) {
 	defer SetCompactionTTLsForTest(0, 0, 0)
 	SetCompactionTTLsForTest(1*time.Nanosecond, 1*time.Nanosecond, 1*time.Nanosecond)
+	// Injected queue clock: a fixed epoch (value arbitrary — taken from the
+	// CI failure log), advanced explicitly between lifecycle phases.
+	now := time.UnixMilli(1789575816144)
+	defer SetQueueClockForTest(nil)
+	SetQueueClockForTest(func() time.Time { return now })
 	s, root := newTestStore(t, "s1")
 
 	// Admit with an attempt id, claim, resolve sent — the full lifecycle.
@@ -620,6 +636,11 @@ func TestQueueCompactReplayAfterCompactionKeepsReceipt(t *testing.T) {
 	if _, err := s.Resolve(first.ID, QueueSent, "done"); err != nil {
 		t.Fatalf("resolve sent: %v", err)
 	}
+
+	// Advance the injected clock strictly past the resolve millisecond:
+	// ResolvedAt was stamped at `now`; List() below compacts at now+1ms, so
+	// age=1ms > ttlMs=0 deterministically purges the terminal item.
+	now = now.Add(time.Millisecond)
 
 	// List() with 1ns TTLs compacts the expired terminal item away.
 	got, err := s.List()
@@ -686,5 +707,38 @@ func TestQueueCompactEmptyQueueStillDeletesFileWithoutReceipts(t *testing.T) {
 	}
 	if _, err := os.Stat(queuePath(root, "s1")); !os.IsNotExist(err) {
 		t.Fatalf("legacy-only queue emptied by compaction should delete queue.json, got err=%v", err)
+	}
+}
+
+// 15. (CI-flake regression, d637aaa) Coarse-clock safety through List()'s OWN
+// compaction path: when Resolve's ResolvedAt stamp and List's compaction now
+// land on the SAME millisecond — exactly what a coarse VM clock produced in
+// CI — age==0 is NOT strictly greater than the floored 1ns TTL (ttlMs==0)
+// and the terminal item MUST survive. This pins the same strict `>` boundary
+// as TestQueueCompactTTLBoundary, but through List()'s internal path (not
+// runCompactionForTest) and with the coarse-clock condition CONSTRUCTED via
+// the injected queue clock rather than raced against the wall clock.
+func TestQueueCompactListSameMillisecondResolveSurvives(t *testing.T) {
+	defer SetCompactionTTLsForTest(0, 0, 0)
+	SetCompactionTTLsForTest(1*time.Nanosecond, 1*time.Nanosecond, 1*time.Nanosecond)
+	// Fixed clock: every queue timestamp read returns the same millisecond.
+	defer SetQueueClockForTest(nil)
+	SetQueueClockForTest(func() time.Time { return time.UnixMilli(1789575816144) })
+	s, _ := newTestStore(t, "s1")
+
+	first := mustEnqueueAttempt(t, s, "att-same-ms", "same millisecond")
+	if _, won, err := s.Claim(); err != nil || !won {
+		t.Fatalf("claim: won=%v err=%v", won, err)
+	}
+	if _, err := s.Resolve(first.ID, QueueSent, "done"); err != nil {
+		t.Fatalf("resolve sent: %v", err)
+	}
+	// List() compacts at the SAME injected millisecond as the resolve stamp.
+	got, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != first.ID {
+		t.Fatalf("same-millisecond resolve+List must keep the terminal item (strict > retention): %+v", got)
 	}
 }
