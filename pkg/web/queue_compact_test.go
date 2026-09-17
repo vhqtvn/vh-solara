@@ -2,7 +2,7 @@ package web
 
 // FIX-QUEUE-GC-5: automatic bounded compaction of terminal queue items.
 //
-// These 12 cases pin the retention contract:
+// These 15 cases pin the retention contract:
 //   - sent:    TTL 1h,  cap 50
 //   - failed:  TTL 7d,  cap 100
 //   - unknown: TTL 30d, cap 200
@@ -529,9 +529,10 @@ func TestQueueCompactEmptyQueueDeletesFile(t *testing.T) {
 	}
 }
 
-// TestQueueCompactListArchivedGuardNoFreshFileDeletion pins the b-F1 fix from
-// commit-review: List() now persists recovery+compaction, so it must carry the
-// same s.archived tombstone guard as Enqueue/Remove/Claim/Resolve. Without it,
+// 12. (b-F1 fix from commit-review) List()'s archived tombstone guard:
+// TestQueueCompactListArchivedGuardNoFreshFileDeletion pins that List(),
+// which persists recovery+compaction, carries the same s.archived tombstone
+// guard as Enqueue/Remove/Claim/Resolve. Without it,
 // a retained pointer to an archived store whose compaction empties its stale
 // in-memory items would call os.Remove(s.path) — and since the retained and
 // fresh stores hold DIFFERENT mutexes, the removal is not serialized against a
@@ -685,9 +686,24 @@ func TestQueueCompactReplayAfterCompactionKeepsReceipt(t *testing.T) {
 // 14. (send-reliability slice 1) Once the receipt log is ALSO empty, the
 // empty-queue delete branch fires again — receipts extend the file's life
 // only while replay guarantees remain outstanding.
+//
+// DETERMINISM (same exposure as test 13's CI flake at d637aaa): the 1ns
+// test TTLs floor to ttlMs=0, so the delete branch below requires List's
+// compaction now to be STRICTLY LATER in whole milliseconds than Resolve's
+// ResolvedAt stamp. On a coarse VM clock both wall-clock reads could land
+// on the same millisecond — age 0 is not strictly greater, the (correct,
+// per the strict-> retention semantics) compaction kept the item, and the
+// deletion assertion flaked. The injected queue clock advances the
+// resolve→List relationship by one full millisecond BY CONSTRUCTION; the
+// test no longer depends on wall-clock advancement.
 func TestQueueCompactEmptyQueueStillDeletesFileWithoutReceipts(t *testing.T) {
 	defer SetCompactionTTLsForTest(0, 0, 0)
 	SetCompactionTTLsForTest(1*time.Nanosecond, 1*time.Nanosecond, 1*time.Nanosecond)
+	// Injected queue clock: a fixed epoch (value arbitrary — mirrors test
+	// 13), advanced explicitly between lifecycle phases.
+	now := time.UnixMilli(1789575816144)
+	defer SetQueueClockForTest(nil)
+	SetQueueClockForTest(func() time.Time { return now })
 	root := t.TempDir()
 	qr := newQueueRegistry()
 	st := qr.store(root, "s1")
@@ -702,6 +718,12 @@ func TestQueueCompactEmptyQueueStillDeletesFileWithoutReceipts(t *testing.T) {
 	if _, err := st.Resolve(claimed.ID, QueueSent, "d"); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
+	// Advance the injected clock strictly past the resolve millisecond:
+	// ResolvedAt was stamped at `now`; List() below compacts at now+1ms, so
+	// age=1ms > ttlMs=0 deterministically purges the item — and with no
+	// receipts outstanding, persistAfterCompaction takes the os.Remove
+	// branch the final assertion pins.
+	now = now.Add(time.Millisecond)
 	if _, err := st.List(); err != nil {
 		t.Fatal(err)
 	}
