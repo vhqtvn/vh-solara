@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
@@ -585,6 +586,221 @@ func (f *FakeOpenCode) SeedDeepTreeSessions(nChildren, nGrandchildren int) {
 	}
 }
 
+// MultiProjectSpec are the workload volume knobs for SeedMultiProject — the
+// Phase-A1 multi-project contention fixture (measurement infrastructure only;
+// see tmp/agent-runs/multiproject-contention-20260918/brief.md §6). Every knob
+// is a size/count control on STATIC seeded transcripts: deterministic ids,
+// deterministic content, deterministic timestamps (fixed epoch base), so two
+// seedings with the same spec produce byte-identical data. A live event-rate
+// knob is deliberately NOT included — the demand classes this fixture exists
+// to measure (cold open, warm re-open, re-snapshot burst, bulk-vs-small) are
+// snapshot/bootstrap shapes, and live streaming is already drivable via the
+// existing simulatePrompt path when a later slice needs it.
+type MultiProjectSpec struct {
+	Projects        int // distinct project directories to populate (/work/mproj0..N-1)
+	SessionsPerProj int // ordinary root sessions per project (small text parts only)
+	BulkSessions    int // extra sessions per project, each carrying one BulkPartBytes part
+	TurnsPerSession int // completed user→assistant turns per ordinary session
+	SmallPartBytes  int // exact text length of each ordinary assistant part
+	BulkPartBytes   int // exact text length of each bulk session's single large part
+}
+
+// DefaultMultiProjectSpec is the Phase-A1 e2e default: 7 projects (the
+// operator's reported tab count), 3 ordinary + 2 bulk sessions per project
+// (one bulk stream per measured route so direct/tunnel bulk probes both start
+// message-cold), 6 turns/session of 2 KiB text (≈12 KiB accumulated assistant
+// text per session — the "tens of KB" streaming-scale class), and one ~600 KiB
+// poorly-compressible bulk part per bulk session (under the 1 MiB per-part
+// cap; large enough to dominate a loopback transfer).
+func DefaultMultiProjectSpec() MultiProjectSpec {
+	return MultiProjectSpec{
+		Projects:        7,
+		SessionsPerProj: 3,
+		BulkSessions:    2,
+		TurnsPerSession: 6,
+		SmallPartBytes:  2048,
+		BulkPartBytes:   600_000,
+	}
+}
+
+// mpEpochBase is the fixed timestamp base for all multi-project seeding.
+// Deterministic (NOT time.Now) so the same spec always yields identical JSON.
+const mpEpochBase = float64(1_750_000_000_000)
+
+// SeedMultiProject populates N genuinely distinct project directories with
+// deterministic session/message data — the multi-project substrate the
+// Phase-A1 contention measurement drives (removes the single-demoDir
+// concentration limitation: every project dir gets REAL sessions, not the
+// synthetic placeholder). MEASUREMENT/TEST helper only: appends to f.sessions
+// / f.messages under the lock, no live emit (same close-on-full rationale as
+// SeedFlatSessions). Sessions land in their own directory scope; the
+// consolidated demoDir listing is unchanged (handleSessionRoot filters by
+// directory).
+//
+// ID scheme (a stable contract the e2e measurement derives session ids from;
+// pinned by pkg/fixtures/multiproject_test.go):
+//
+//	dir i        → /work/mproj<i>
+//	ordinary s   → mp<i>_s<j>      (j = 0..SessionsPerProj-1)
+//	bulk s       → mp<i>_b<k>      (k = 0..BulkSessions-1)
+//	message m    → <sid>_u<t> / <sid>_a<t>   (user / assistant, t = 1..turns)
+//	part p       → <msgid>_p<x>
+//
+// Bulk part content is deterministic pseudo-random base64 (poorly
+// compressible — the wire keeps moving real bytes through z=1 gzip64), seeded
+// per (project, bulk index) with a fixed math/rand source: identical
+// in-process run-to-run (what the determinism unit test asserts);
+// cross-Go-version sequence stability is not guaranteed and not needed.
+//
+// Returns the populated directory list (may be shorter than spec.Projects if
+// knobs were clamped to 0).
+func (f *FakeOpenCode) SeedMultiProject(spec MultiProjectSpec) []string {
+	if spec.Projects <= 0 {
+		return nil
+	}
+	if spec.SessionsPerProj < 0 {
+		spec.SessionsPerProj = 0
+	}
+	if spec.BulkSessions < 0 {
+		spec.BulkSessions = 0
+	}
+	if spec.TurnsPerSession < 1 {
+		spec.TurnsPerSession = 1
+	}
+	if spec.SmallPartBytes < 1 {
+		spec.SmallPartBytes = 1
+	}
+	if spec.BulkPartBytes < 1 {
+		spec.BulkPartBytes = 1
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	dirs := make([]string, 0, spec.Projects)
+	for i := 0; i < spec.Projects; i++ {
+		dir := fmt.Sprintf("/work/mproj%d", i)
+		dirs = append(dirs, dir)
+		proj := fmt.Sprintf("mproj%d", i)
+		for j := 0; j < spec.SessionsPerProj; j++ {
+			sid := fmt.Sprintf("mp%d_s%d", i, j)
+			created := mpEpochBase - float64((i+1)*(j+2))*60_000
+			f.sessions = append(f.sessions, map[string]any{
+				"id": sid, "projectID": proj, "title": "Multi project " + strconv.Itoa(i) + " session " + strconv.Itoa(j),
+				"directory": dir,
+				"model":     map[string]any{"providerID": "fake", "id": "dummy", "variant": "default"},
+				"time":      map[string]any{"created": created, "updated": created + float64(spec.TurnsPerSession)*2_000},
+			})
+			f.messages[sid] = mpOrdinaryTranscript(sid, spec)
+		}
+		for b := 0; b < spec.BulkSessions; b++ {
+			sid := fmt.Sprintf("mp%d_b%d", i, b)
+			created := mpEpochBase - float64((i+1)*(b+2))*60_000
+			f.sessions = append(f.sessions, map[string]any{
+				"id": sid, "projectID": proj, "title": "Multi project " + strconv.Itoa(i) + " bulk " + strconv.Itoa(b),
+				"directory": dir,
+				"model":     map[string]any{"providerID": "fake", "id": "dummy", "variant": "default"},
+				"time":      map[string]any{"created": created, "updated": created + 2_000},
+			})
+			f.messages[sid] = mpBulkTranscript(sid, i, b, spec)
+		}
+	}
+	return dirs
+}
+
+// mpOrdinaryTranscript builds TurnsPerSession completed user→assistant turns
+// for one ordinary session. User parts are small (SmallPartBytes/4, clamped
+// to [128, 1024]); assistant parts are EXACTLY SmallPartBytes of
+// deterministic prose-like filler. Times ascend deterministically from
+// mpEpochBase.
+func mpOrdinaryTranscript(sid string, spec MultiProjectSpec) []messageWithParts {
+	userBytes := spec.SmallPartBytes / 4
+	if userBytes < 128 {
+		userBytes = 128
+	}
+	if userBytes > 1024 {
+		userBytes = 1024
+	}
+	out := make([]messageWithParts, 0, spec.TurnsPerSession*2)
+	for t := 1; t <= spec.TurnsPerSession; t++ {
+		tc := mpEpochBase + float64(t)*1_000
+		uid := fmt.Sprintf("%s_u%d", sid, t)
+		aid := fmt.Sprintf("%s_a%d", sid, t)
+		out = append(out, messageWithParts{
+			Info:  map[string]any{"id": uid, "sessionID": sid, "role": "user", "time": map[string]any{"created": tc, "completed": tc}},
+			Parts: []map[string]any{textPart(uid, sid, uid+"_p1", mpExactText("user turn "+strconv.Itoa(t)+" of "+sid, userBytes), tc)},
+		})
+		out = append(out, messageWithParts{
+			Info: map[string]any{"id": aid, "sessionID": sid, "role": "assistant", "agent": "build",
+				"time": map[string]any{"created": tc + 100, "completed": tc + 900}},
+			Parts: []map[string]any{
+				textPart(aid, sid, aid+"_p1", mpExactText("assistant turn "+strconv.Itoa(t)+" of "+sid, spec.SmallPartBytes), tc+100),
+			},
+		})
+	}
+	return out
+}
+
+// mpBulkTranscript builds one small user message + one assistant message whose
+// SINGLE text part is EXACTLY BulkPartBytes of deterministic pseudo-random
+// base64 — poorly compressible so a z=1 gzip64 snapshot still moves ~real
+// bytes on the wire (repeated prose would deflate ~10-1000x and hollow out
+// the bulk-vs-small contrast).
+func mpBulkTranscript(sid string, projectIdx, bulkIdx int, spec MultiProjectSpec) []messageWithParts {
+	tc := mpEpochBase
+	uid := sid + "_u1"
+	aid := sid + "_a1"
+	return []messageWithParts{
+		{
+			Info:  map[string]any{"id": uid, "sessionID": sid, "role": "user", "time": map[string]any{"created": tc, "completed": tc}},
+			Parts: []map[string]any{textPart(uid, sid, uid+"_p1", "stream the large artifact", 24)},
+		},
+		{
+			Info: map[string]any{"id": aid, "sessionID": sid, "role": "assistant", "agent": "build",
+				"time": map[string]any{"created": tc + 100, "completed": tc + 5_000}},
+			Parts: []map[string]any{
+				textPart(aid, sid, aid+"_p1", mpBulkText(projectIdx, bulkIdx, spec.BulkPartBytes), tc+100),
+			},
+		},
+	}
+}
+
+// mpExactText returns EXACTLY n bytes of deterministic, compressible,
+// prose-like ASCII (prefix + repeated filler, byte-truncated). All-ASCII so
+// byte truncation never splits a rune.
+func mpExactText(prefix string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(prefix)
+	const filler = "deterministic filler sentence for the multi-project contention fixture; "
+	for b.Len() < n {
+		b.WriteString(filler)
+	}
+	s := b.String()
+	if len(s) > n {
+		s = s[:n]
+	}
+	return s
+}
+
+// mpBulkText returns EXACTLY n chars of deterministic base64 (pseudo-random
+// bytes from a fixed-seed math/rand keyed by (projectIdx, bulkIdx), encoded,
+// truncated to n). Base64 of random bytes survives gzip at ~full size.
+func mpBulkText(projectIdx, bulkIdx, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	encLen := ((n + 3) / 4) * 4
+	raw := make([]byte, encLen/4*3)
+	rng := rand.New(rand.NewSource(int64(0xC0FFEE) + int64(projectIdx)*1009 + int64(bulkIdx)))
+	_, _ = rng.Read(raw) // math/rand Read never errors
+	s := base64.StdEncoding.EncodeToString(raw)
+	if len(s) > n {
+		s = s[:n]
+	}
+	return s
+}
+
 // SetPromptAsyncMode overrides the prompt_async response mode. TEST-ONLY: the
 // shared fixture defaults to PromptAsyncNormal (the faithful path). The e2e
 // queue-recovery test (tests/e2e) switches to CommitThenDropResponse to model
@@ -1055,10 +1271,29 @@ func (f *FakeOpenCode) handleSessionRoot(w http.ResponseWriter, r *http.Request)
 	// sessions live under the consolidated demoDir, so a request for that dir
 	// falls through to the full real set below (reproducing the everything-visible
 	// behavior the e2e suite relies on, now via an explicit project dir instead
-	// of the synthetic default-project/cwd). Any OTHER non-empty directory returns
-	// a synthetic per-directory session so the project switcher remains
-	// demoable/testable for dirs with no real sessions (e.g. /work/alpha).
+	// of the synthetic default-project/cwd). Any OTHER non-empty directory:
+	//   - if SeedMultiProject populated REAL sessions under that dir, serve THEM
+	//     (the Phase-A1 multi-project substrate — distinct dirs with genuinely
+	//     distinct session/message data, not placeholders);
+	//   - else return the synthetic per-directory placeholder so the project
+	//     switcher remains demoable/testable for dirs with no real sessions
+	//     (e.g. /work/alpha).
 	if dir := r.Header.Get("x-opencode-directory"); dir != "" && dir != demoDir {
+		f.mu.Lock()
+		wantArchived := r.URL.Query().Get("archived") == "true"
+		scoped := make([]map[string]any, 0, 4)
+		for _, s := range f.sessions {
+			if d, _ := s["directory"].(string); d == dir {
+				if id, _ := s["id"].(string); f.archived[id] == wantArchived {
+					scoped = append(scoped, f.withArchivedTime(s))
+				}
+			}
+		}
+		f.mu.Unlock()
+		if len(scoped) > 0 {
+			writeJSON(w, scoped)
+			return
+		}
 		base := dir
 		if i := strings.LastIndex(strings.TrimRight(dir, "/"), "/"); i >= 0 {
 			base = strings.TrimRight(dir, "/")[i+1:]
@@ -1075,6 +1310,14 @@ func (f *FakeOpenCode) handleSessionRoot(w http.ResponseWriter, r *http.Request)
 	wantArchived := r.URL.Query().Get("archived") == "true"
 	out := make([]map[string]any, 0, len(f.sessions))
 	for _, s := range f.sessions {
+		// The consolidated listing serves only the consolidated demoDir set:
+		// SeedMultiProject sessions belong to their OWN directory scope (served
+		// by the branch above) and must never leak into the demoDir/default
+		// listing. All New()-seeded sessions carry directory == demoDir, so
+		// this filter is a no-op unless multi-project seeding happened.
+		if d, _ := s["directory"].(string); d != "" && d != demoDir {
+			continue
+		}
 		id, _ := s["id"].(string)
 		if f.archived[id] == wantArchived {
 			out = append(out, f.withArchivedTime(s))
