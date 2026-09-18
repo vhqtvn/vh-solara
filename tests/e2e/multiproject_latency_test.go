@@ -91,13 +91,33 @@ const mpSSEDeadline = 60 * time.Second
 // --- self-bootstrapped cluster (controller with host pattern + daemon ref) ---
 
 // mpCluster is a StartCluster-shaped stack plus the retained controller
-// daemon (for the sever probe). Close() = Cluster.Close().
+// daemon (for the sever probe). tunnelLink is non-nil when the worker's WS
+// dial was pointed through a shaped link (Phase A1b); Close() tears it down
+// with the cluster.
 type mpCluster struct {
 	*Cluster
-	ctrl *server.Daemon
+	ctrl       *server.Daemon
+	tunnelLink *mpShapedLink
+}
+
+// Close tears down the cluster (and any shaped WS-leg link) — overrides the
+// embedded Cluster.Close for every mp caller.
+func (m *mpCluster) Close() {
+	if m.tunnelLink != nil {
+		m.tunnelLink.Close()
+	}
+	m.Cluster.Close()
 }
 
 func startMPCluster(t *testing.T) *mpCluster {
+	return startMPClusterShaped(t, nil)
+}
+
+// startMPClusterShaped boots the self-bootstrapped cluster; a non-nil
+// wsShaper places a user-space shaped link in front of the controller's
+// tunnel WS endpoint and points the worker agent's dial at it, so the whole
+// multiplexed tunnel crosses one shaped pipe (Phase-A1b placement).
+func startMPClusterShaped(t *testing.T, wsShaper *mpLinkConfig) *mpCluster {
 	t.Helper()
 	log.SetOutput(io.Discard) // agent/controller log verbosely; keep output clean
 
@@ -146,15 +166,28 @@ func startMPCluster(t *testing.T) *mpCluster {
 	}
 
 	// 4. Worker agent: dial the tunnel endpoint, proxy to the worker web port.
+	// With a shaper config, dial the shaped link in FRONT of the endpoint
+	// instead — the tunnel TCP conn then carries the cap (A1b placement).
+	dialAddr := daemonAddr
+	var tunnelLink *mpShapedLink
+	if wsShaper != nil {
+		link, err := startMPShapedLink(*wsShaper, daemonAddr)
+		if err != nil {
+			cancel()
+			t.Fatalf("mp shaped tunnel link: %v", err)
+		}
+		dialAddr = link.Addr()
+		tunnelLink = link
+	}
 	proxy := agent.NewProxy(webPort)
-	ag := agent.NewDaemon("ws://"+daemonAddr+"/vh-solara/ws", c.WorkerID, "worker", "test", nil, proxy)
+	ag := agent.NewDaemon("ws://"+dialAddr+"/vh-solara/ws", c.WorkerID, "worker", "test", nil, proxy)
 	go ag.Start()
 
 	if err := waitWorkerOnline(c, 15*time.Second); err != nil {
 		cancel()
 		t.Fatalf("mp worker did not come online: %v", err)
 	}
-	return &mpCluster{Cluster: c, ctrl: d}
+	return &mpCluster{Cluster: c, ctrl: d, tunnelLink: tunnelLink}
 }
 
 // severTunnel closes the CONTROLLER-side yamux session for this cluster's
@@ -268,6 +301,17 @@ type mpGetStat struct {
 	Note        string
 }
 
+// mpJSONClient is the one-shot-GET client. Package-level and shared between
+// the mp* tests, but its connection pool is SEPARATE from the SSE clients'
+// (DefaultTransport): the SSE probes (mpReadSSE) dirty-discard their pooled
+// conns after every stream (undrained bodies), so with a shared pool every
+// small GET rode a FRESH conn — paying the shaped link's burst-gated RTT each
+// time — while SSE opens rode the GETs' warmed conns. That made the two probe
+// classes measure different delay regimes. With this separate pool the small
+// class consistently measures the warm-pipeline regime (rate serialization +
+// queuing) on every route.
+var mpJSONClient = &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()}
+
 // mpGetJSON issues a one-shot GET on the route and decodes the JSON body into
 // out (nil out = skip decode).
 func mpGetJSON(route mpRoute, path string, out any) mpGetStat {
@@ -282,7 +326,7 @@ func mpGetJSON(route mpRoute, path string, out any) mpGetStat {
 	defer cancel()
 	req = req.WithContext(ctx)
 	start := time.Now()
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := mpJSONClient.Do(req)
 	if err != nil {
 		return mpGetStat{OK: false, Note: "do: " + err.Error()}
 	}
@@ -430,6 +474,30 @@ func mpBootstrapDirs(t *testing.T, c *Cluster, projects int) []mpDirInfo {
 		if len(inv.Sessions) != want {
 			t.Fatalf("/vh/sessions dir=%s: %d sessions, want %d", dir, len(inv.Sessions), want)
 		}
+		// F1 (A1 review advisory): pin the ID scheme exactly — every expected
+		// mp<i>_s<j>/mp<i>_b<k> id present, nothing else (catches a fixture ID
+		// drift before it silently corrupts the derived Selected/Bulk ids).
+		wantIDs := map[string]bool{}
+		for j := 0; j < spec.SessionsPerProj; j++ {
+			wantIDs[fmt.Sprintf("mp%d_s%d", i, j)] = true
+		}
+		for b := 0; b < spec.BulkSessions; b++ {
+			wantIDs[fmt.Sprintf("mp%d_b%d", i, b)] = true
+		}
+		gotIDs := map[string]bool{}
+		for _, s := range inv.Sessions {
+			if id, _ := s["id"].(string); id != "" {
+				gotIDs[id] = true
+			}
+		}
+		if len(gotIDs) != len(wantIDs) {
+			t.Fatalf("dir %s session id cardinality: got %d ids, want %d", dir, len(gotIDs), len(wantIDs))
+		}
+		for id := range wantIDs {
+			if !gotIDs[id] {
+				t.Fatalf("dir %s session id set mismatch: missing %q (got %v)", dir, id, gotIDs)
+			}
+		}
 		out = append(out, mpDirInfo{
 			Dir:      dir,
 			Selected: fmt.Sprintf("mp%d_s0", i),
@@ -459,7 +527,49 @@ type mpRow struct {
 	WallMs    float64 `json:"wall_ms"`
 }
 
-var mpRows []mpRow
+// mpRecorder owns ONE measurement run's rows (F3 fix: the old package-global
+// mpRows accumulated across runs under `go test -count>1` and would now be
+// shared by the A1 and A1b tests too). Each test constructs its own recorder;
+// the rows and the per-run report live and die with it.
+type mpRecorder struct {
+	rows             []mpRow
+	recoveryDeferred bool
+}
+
+func newMPRecorder() *mpRecorder { return &mpRecorder{} }
+
+// hasRow reports whether at least one recorded row matches.
+func (r *mpRecorder) hasRow(scenario, route string) bool {
+	for _, row := range r.rows {
+		if row.Scenario == scenario && row.Route == route {
+			return true
+		}
+	}
+	return false
+}
+
+// medOf returns the recorded total-ms median for (scenario, route, class).
+func (r *mpRecorder) medOf(scenario, route, class string) (float64, bool) {
+	for _, row := range r.rows {
+		if row.Scenario == scenario && row.Route == route && row.Class == class && row.N > 0 {
+			return row.TotMed, true
+		}
+	}
+	return 0, false
+}
+
+// maxOf returns the recorded total-ms MAX for (scenario, route, class) — the
+// tail. Under saturation a route's median can stay fair while its worst case
+// balloons: bulk-queue-scale head-of-line blocking shows up in the max first
+// (the A1b tail contrast).
+func (r *mpRecorder) maxOf(scenario, route, class string) (float64, bool) {
+	for _, row := range r.rows {
+		if row.Scenario == scenario && row.Route == route && row.Class == class && row.N > 0 {
+			return row.TotMax, true
+		}
+	}
+	return 0, false
+}
 
 func mpMinMaxMed(vals []float64) (mn, med, mx float64) {
 	if len(vals) == 0 {
@@ -470,19 +580,19 @@ func mpMinMaxMed(vals []float64) (mn, med, mx float64) {
 	return s[0], s[len(s)/2], s[len(s)-1]
 }
 
-func mpAddRow(t *testing.T, scenario, route string, projects int, class string, fbs, totals []float64, bytesMean int64, wallMs float64) {
+func (r *mpRecorder) add(t *testing.T, scenario, route string, projects int, class string, fbs, totals []float64, bytesMean int64, wallMs float64) {
 	t.Helper()
 	fbMin, fbMed, fbMax := mpMinMaxMed(fbs)
 	tMin, tMed, tMax := mpMinMaxMed(totals)
-	mpRows = append(mpRows, mpRow{
+	r.rows = append(r.rows, mpRow{
 		Scenario: scenario, Route: route, Projects: projects, Class: class, N: len(totals),
 		FBMin: fbMin, FBMed: fbMed, FBMax: fbMax,
 		TotMin: tMin, TotMed: tMed, TotMax: tMax,
 		BytesMean: bytesMean, WallMs: wallMs,
 	})
-	r := mpRows[len(mpRows)-1]
-	t.Logf("[%-8s %-6s p=%d %-7s] n=%d fb(min/med/max)=%.2f/%.2f/%.2fms total=%.2f/%.2f/%.2fms bytes_mean=%d wall=%.1fms",
-		scenario, route, projects, class, r.N, fbMin, fbMed, fbMax, tMin, tMed, tMax, bytesMean, wallMs)
+	row := r.rows[len(r.rows)-1]
+	t.Logf("[%-11s %-6s p=%d %-8s] n=%d fb(min/med/max)=%.2f/%.2f/%.2fms total=%.2f/%.2f/%.2fms bytes_mean=%d wall=%.1fms",
+		scenario, route, projects, class, row.N, fbMin, fbMed, fbMax, tMin, tMed, tMax, bytesMean, wallMs)
 }
 
 // --- the tab burst ---
@@ -499,7 +609,7 @@ func mpAddRow(t *testing.T, scenario, route string, projects int, class string, 
 // columns). Structural gates: every stream terminates, and every tree
 // stream's detail snapshot carries exactly the expected session count (data
 // correctness, not timing).
-func mpTabBurst(t *testing.T, c *Cluster, route mpRoute, dirs []mpDirInfo, scenario string, reps int) {
+func mpTabBurst(t *testing.T, rec *mpRecorder, c *Cluster, route mpRoute, dirs []mpDirInfo, scenario string, reps int) {
 	t.Helper()
 	if reps < 1 {
 		reps = 1
@@ -590,28 +700,76 @@ func mpTabBurst(t *testing.T, c *Cluster, route mpRoute, dirs []mpDirInfo, scena
 	wallMean /= float64(len(walls))
 	for _, class := range []string{"tree", "session"} {
 		a := agg[class]
-		mpAddRow(t, scenario, route.name, len(dirs), class, a.fbs, a.totals, a.bytes/int64(len(a.totals)), wallMean)
+		rec.add(t, scenario, route.name, len(dirs), class, a.fbs, a.totals, a.bytes/int64(len(a.totals)), wallMean)
 	}
 }
 
 // --- bulk-vs-small (head-of-line) probe ---
 
-// mpSmallSeries fires n SEQUENTIAL small one-shot snapshot GETs cycling the
-// given dirs (per-request latency probes on warm aggregators — the
-// interactive-traffic stand-in).
-func mpSmallSeries(route mpRoute, dirs []mpDirInfo, n int) ([]float64, []float64, bool) {
-	var fbs, totals []float64
+// mpSmallResult carries one small-probe series: alternating one-shot snapshot
+// GETs (class "small") and full tree-stream opens (class "treeopen" — the
+// other interactive shape; A1b added it so the probe covers both small-request
+// forms the SPA issues during bulk streaming).
+type mpSmallResult struct {
+	SnapFB, SnapTot []float64
+	TreeFB, TreeTot []float64
+	SnapBytesMean   int64 // mean bytes per snapshot-GET probe
+	TreeBytesMean   int64 // mean bytes per tree-open probe
+	OK              bool
+	Note            string
+}
+
+// mpSmallSeries fires n SEQUENTIAL small requests cycling the given dirs,
+// alternating /vh/snapshot GETs and tree-stream opens (per-request latency
+// probes on warm aggregators — the interactive-traffic stand-in).
+func mpSmallSeries(route mpRoute, dirs []mpDirInfo, n int) mpSmallResult {
+	var res mpSmallResult
+	var snapBytes, treeBytes int64
 	for i := 0; i < n; i++ {
 		d := dirs[i%len(dirs)]
-		var snap map[string]any
-		st := mpGetJSON(route, "/vh/snapshot?dir="+url.QueryEscape(d.Dir), &snap)
-		if !st.OK {
-			return fbs, totals, false
+		if i%2 == 0 {
+			var snap map[string]any
+			st := mpGetJSON(route, "/vh/snapshot?dir="+url.QueryEscape(d.Dir), &snap)
+			if !st.OK {
+				res.Note = fmt.Sprintf("snapshot probe %d: %+v (%s)", i, st, st.Note)
+				return res
+			}
+			res.SnapFB = append(res.SnapFB, st.FirstByteMs)
+			res.SnapTot = append(res.SnapTot, st.TotalMs)
+			snapBytes += st.Bytes
+		} else {
+			q := url.Values{}
+			q.Set("dir", d.Dir)
+			q.Set("z", "1")
+			q.Set("tree", "2")
+			var snapData string
+			st := mpReadSSE(route, q.Encode(), func(event, data string) bool {
+				if event == "snapshot" {
+					snapData = data
+				}
+				return event == "snapshot.complete"
+			})
+			if !st.OK {
+				res.Note = fmt.Sprintf("tree-open probe %d: %+v (%s)", i, st, st.Note)
+				return res
+			}
+			if cnt, ok := mpSnapshotSessionCount(snapData); !ok || cnt != d.Sessions {
+				res.Note = fmt.Sprintf("tree-open probe %d: sessions=%d (ok=%v), want %d", i, cnt, ok, d.Sessions)
+				return res
+			}
+			res.TreeFB = append(res.TreeFB, st.FirstByteMs)
+			res.TreeTot = append(res.TreeTot, st.TotalMs)
+			treeBytes += st.Bytes
 		}
-		fbs = append(fbs, st.FirstByteMs)
-		totals = append(totals, st.TotalMs)
 	}
-	return fbs, totals, true
+	if cnt := int64(len(res.SnapTot)); cnt > 0 {
+		res.SnapBytesMean = snapBytes / cnt
+	}
+	if cnt := int64(len(res.TreeTot)); cnt > 0 {
+		res.TreeBytesMean = treeBytes / cnt
+	}
+	res.OK = true
+	return res
 }
 
 // mpBulkProbe measures the head-of-line contrast on one route: small-request
@@ -619,7 +777,10 @@ func mpSmallSeries(route mpRoute, dirs []mpDirInfo, n int) ([]float64, []float64
 // poorly-compressible part, message-COLD — bulk sessions are never opened by
 // bursts) streams through a fresh session-stream open. Each route uses its
 // OWN bulk session (direct→b0, tunnel→b1) so both bulk transfers start cold.
-func mpBulkProbe(t *testing.T, c *Cluster, route mpRoute, dirs []mpDirInfo, bulkIdx int) {
+// label namespaces the scenario rows (A1: "bulk"; A1b: "cap20"/"cap5"):
+// <label>-base = idle smalls, <label>-during = smalls concurrent with the
+// bulk stream (plus the bulk row itself).
+func mpBulkProbe(t *testing.T, rec *mpRecorder, c *Cluster, route mpRoute, dirs []mpDirInfo, bulkIdx int, label string) {
 	t.Helper()
 	if len(dirs) < 2 {
 		t.Fatalf("bulk probe needs >=2 projects, got %d", len(dirs))
@@ -628,12 +789,21 @@ func mpBulkProbe(t *testing.T, c *Cluster, route mpRoute, dirs []mpDirInfo, bulk
 	bulkSid := dirs[0].Bulk[bulkIdx]
 	const probes = 10
 
+	// Busy-phase head start: the bulk stream's ~600 KiB part only reaches the
+	// wire after the session snapshot/hydrate ramp, and the shaped-link queue
+	// behind it builds over the first ~100ms. Probing from t=0 samples a link
+	// that is not yet saturated (at 20 Mbps the whole naive series finishes
+	// inside the ramp). Sleeping briefly past the ramp puts the small probes
+	// INSIDE the saturated window at both caps.
+	const bulkRampMs = 120 * time.Millisecond
+
 	// Idle baseline (no bulk in flight).
-	idleFB, idleTot, ok := mpSmallSeries(route, others, probes)
-	if !ok {
-		t.Fatalf("bulk probe %s: idle small series failed", route.name)
+	idle := mpSmallSeries(route, others, probes)
+	if !idle.OK {
+		t.Fatalf("bulk probe %s %s: idle small series failed: %s", label, route.name, idle.Note)
 	}
-	mpAddRow(t, "bulk-base", route.name, len(dirs), "small", idleFB, idleTot, 0, 0)
+	rec.add(t, label+"-base", route.name, len(dirs), "small", idle.SnapFB, idle.SnapTot, idle.SnapBytesMean, 0)
+	rec.add(t, label+"-base", route.name, len(dirs), "treeopen", idle.TreeFB, idle.TreeTot, idle.TreeBytesMean, 0)
 
 	// Busy: bulk stream + the same small series concurrently.
 	type bulkRes struct {
@@ -655,21 +825,25 @@ func mpBulkProbe(t *testing.T, c *Cluster, route mpRoute, dirs []mpDirInfo, bulk
 		}
 		bulkCh <- bulkRes{st, note}
 	}()
-	busyFB, busyTot, ok2 := mpSmallSeries(route, others, probes)
+	time.Sleep(bulkRampMs) // let the bulk stream saturate the shaped link first
+	busy := mpSmallSeries(route, others, probes)
 	br := <-bulkCh
-	if !ok2 {
-		t.Fatalf("bulk probe %s: busy small series failed", route.name)
+	if !busy.OK {
+		t.Fatalf("bulk probe %s %s: busy small series failed: %s", label, route.name, busy.Note)
 	}
 	if !br.st.OK {
-		t.Fatalf("bulk probe %s: bulk stream failed: %+v note=%q", route.name, br.st, br.note)
+		t.Fatalf("bulk probe %s %s: bulk stream failed: %+v note=%q", label, route.name, br.st, br.note)
 	}
-	mpAddRow(t, "bulk-small", route.name, len(dirs), "small", busyFB, busyTot, 0, br.st.TotalMs)
-	mpAddRow(t, "bulk-small", route.name, len(dirs), "bulk", []float64{br.st.FirstByteMs}, []float64{br.st.TotalMs}, br.st.Bytes, br.st.TotalMs)
+	rec.add(t, label+"-during", route.name, len(dirs), "small", busy.SnapFB, busy.SnapTot, busy.SnapBytesMean, br.st.TotalMs)
+	rec.add(t, label+"-during", route.name, len(dirs), "treeopen", busy.TreeFB, busy.TreeTot, busy.TreeBytesMean, br.st.TotalMs)
+	rec.add(t, label+"-during", route.name, len(dirs), "bulk", []float64{br.st.FirstByteMs}, []float64{br.st.TotalMs}, br.st.Bytes, br.st.TotalMs)
 
-	_, idleMed, _ := mpMinMaxMed(idleTot)
-	_, busyMed, _ := mpMinMaxMed(busyTot)
-	t.Logf("[bulk-contrast %-6s] small-request median: idle=%.2fms busy=%.2fms delta=%+.2fms (%.1fx); bulk total=%.2fms bytes=%d",
-		route.name, idleMed, busyMed, busyMed-idleMed, mpRatio(busyMed, idleMed), br.st.TotalMs, br.st.Bytes)
+	_, idleSnapMed, _ := mpMinMaxMed(idle.SnapTot)
+	_, busySnapMed, _ := mpMinMaxMed(busy.SnapTot)
+	_, idleTreeMed, _ := mpMinMaxMed(idle.TreeTot)
+	_, busyTreeMed, _ := mpMinMaxMed(busy.TreeTot)
+	t.Logf("[bulk-contrast %-5s %-6s] snapshot median: idle=%.2fms during=%.2fms (%.1fx); treeopen median: idle=%.2fms during=%.2fms (%.1fx); bulk total=%.2fms bytes=%d",
+		label, route.name, idleSnapMed, busySnapMed, mpRatio(busySnapMed, idleSnapMed), idleTreeMed, busyTreeMed, mpRatio(busyTreeMed, idleTreeMed), br.st.TotalMs, br.st.Bytes)
 }
 
 func mpRatio(a, b float64) float64 {
@@ -684,10 +858,13 @@ func mpRatio(a, b float64) float64 {
 // mpRecoveryProbe severs the controller-side tunnel, waits for the worker
 // agent's reconnect (redial after its backoff floor), then measures the
 // 7-project re-snapshot burst through the tunnel — the reconnect storm shape
-// (every tab's EventSource retries and re-snapshots). Best-effort: if the
-// worker does not come back online within the bound, the probe is DEFERRED
-// with a log line (never a timing-based failure).
-func mpRecoveryProbe(t *testing.T, m *mpCluster, dirs []mpDirInfo) {
+// (every tab's EventSource retries and re-snapshots). Best-effort on the
+// ENVIRONMENT (if the worker does not come back online within the bound, the
+// probe is DEFERRED with a loud log — never a timing-based failure), but
+// structurally gated on the OUTCOME (F5 fix): when the recovery path DID run,
+// the recovery rows must actually be recorded, so a green run proves the
+// recovery baseline instead of silently skipping it.
+func mpRecoveryProbe(t *testing.T, rec *mpRecorder, m *mpCluster, dirs []mpDirInfo) {
 	t.Helper()
 	severedAt := time.Now()
 	m.severTunnel(t)
@@ -703,26 +880,43 @@ func mpRecoveryProbe(t *testing.T, m *mpCluster, dirs []mpDirInfo) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	if err := waitWorkerOnline(m.Cluster, 45*time.Second); err != nil {
+		rec.recoveryDeferred = true
 		t.Logf("[recovery] DEFERRED: worker did not return online within 45s of tunnel sever: %v", err)
 		return
 	}
 	reconnectMs := float64(time.Since(severedAt).Microseconds()) / 1000.0
 	t.Logf("[recovery] tunnel severed → worker back online in %.2fms; measuring the %d-project re-snapshot burst through the tunnel", reconnectMs, len(dirs))
-	mpTabBurst(t, m.Cluster, mpTunnel(m.Cluster), dirs, "recovery", 1)
+	mpTabBurst(t, rec, m.Cluster, mpTunnel(m.Cluster), dirs, "recovery", 1)
+	// F5: a recovered worker whose burst ran MUST have produced recovery rows —
+	// otherwise the run stayed green without proving the recovery baseline.
+	if !rec.hasRow("recovery", "tunnel") {
+		t.Errorf("[recovery] worker recovered and the burst ran, but no recovery rows were recorded — recovery baseline not proven by this run")
+	}
 }
 
 // --- final report ---
 
-func mpReport(t *testing.T) {
+// printRows dumps the full row table (shared by the A1/A1b reports).
+func (r *mpRecorder) printRows(t *testing.T) {
 	t.Helper()
-	t.Logf("=== MULTI-PROJECT CONTENTION BASELINE (Phase A1) — %d rows ===", len(mpRows))
-	t.Logf("%-9s %-6s %-4s %-7s %3s %10s %22s %24s %10s %9s",
+	t.Logf("%-11s %-6s %-4s %-8s %3s %10s %22s %24s %10s %9s",
 		"scenario", "route", "proj", "class", "n", "", "first-byte ms (min/med/max)", "total ms (min/med/max)", "bytes_mean", "wall_ms")
-	for _, r := range mpRows {
-		t.Logf("%-9s %-6s %-4d %-7s %3d %10s %10.2f/%7.2f/%8.2f %10.2f/%7.2f/%8.2f %10d %9.1f",
-			r.Scenario, r.Route, r.Projects, r.Class, r.N, "",
-			r.FBMin, r.FBMed, r.FBMax, r.TotMin, r.TotMed, r.TotMax, r.BytesMean, r.WallMs)
+	for _, row := range r.rows {
+		t.Logf("%-11s %-6s %-4d %-8s %3d %10s %10.2f/%7.2f/%8.2f %10.2f/%7.2f/%8.2f %10d %9.1f",
+			row.Scenario, row.Route, row.Projects, row.Class, row.N, "",
+			row.FBMin, row.FBMed, row.FBMax, row.TotMin, row.TotMed, row.TotMax, row.BytesMean, row.WallMs)
 	}
+}
+
+// reportBaseline prints the Phase-A1 final report (rows + tunnel/direct
+// ratios) and honors the VH_MP_BASELINE_OUT structured dump.
+func (r *mpRecorder) reportBaseline(t *testing.T) {
+	t.Helper()
+	t.Logf("=== MULTI-PROJECT CONTENTION BASELINE (Phase A1) — %d rows ===", len(r.rows))
+	if r.recoveryDeferred {
+		t.Logf("[recovery] NOTE: this run's tunnel-sever recovery probe was DEFERRED (worker did not re-online in the bound) — the recovery baseline rows above are absent for this run, not proven.")
+	}
+	r.printRows(t)
 	// Route contrast per (scenario, projects, class): tunnel/direct total-median
 	// ratio. COLD rows come from DIFFERENT clusters (A: direct-cold, B:
 	// tunnel-cold) — the ratio is still the intended contrast: the same
@@ -734,11 +928,11 @@ func mpReport(t *testing.T) {
 		rt string
 	}
 	med := map[key]float64{}
-	for _, r := range mpRows {
-		if r.Class == "small" || r.Class == "bulk" {
+	for _, row := range r.rows {
+		if row.Class == "small" || row.Class == "bulk" || row.Class == "treeopen" {
 			continue
 		}
-		med[key{r.Scenario, r.Projects, r.Class, r.Route}] = r.TotMed
+		med[key{row.Scenario, row.Projects, row.Class, row.Route}] = row.TotMed
 	}
 	t.Logf("--- tunnel/direct total-median ratios (stream classes) ---")
 	for _, p := range []int{1, 3, 7} {
@@ -757,44 +951,53 @@ func mpReport(t *testing.T) {
 
 	// Optional structured dump for offline analysis (never committed):
 	if out := os.Getenv("VH_MP_BASELINE_OUT"); out != "" {
-		if err := os.MkdirAll(filepath.Dir(out), 0o755); err == nil {
-			b, err := json.MarshalIndent(mpRows, "", "  ")
-			if err == nil {
-				if err := os.WriteFile(out, b, 0o644); err == nil {
-					t.Logf("[baseline] wrote %d rows to %s", len(mpRows), out)
-				} else {
-					t.Logf("[baseline] write %s failed: %v", out, err)
-				}
-			}
-		} else {
-			t.Logf("[baseline] mkdir for %s failed: %v", out, err)
-		}
+		r.dumpJSON(t, "baseline", out)
 	}
+}
+
+// dumpJSON writes the rows as pretty JSON to out (best-effort, logged).
+func (r *mpRecorder) dumpJSON(t *testing.T, label, out string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+		t.Logf("[%s] mkdir for %s failed: %v", label, out, err)
+		return
+	}
+	b, err := json.MarshalIndent(r.rows, "", "  ")
+	if err != nil {
+		t.Logf("[%s] marshal failed: %v", label, err)
+		return
+	}
+	if err := os.WriteFile(out, b, 0o644); err != nil {
+		t.Logf("[%s] write %s failed: %v", label, out, err)
+		return
+	}
+	t.Logf("[%s] wrote %d rows to %s", label, len(r.rows), out)
 }
 
 // TestMultiProjectContentionBaseline is the Phase-A1 lane-3 measurement.
 // Serial by design (the package never runs parallel); runtime is dominated
 // by cluster boots (~7 including the warmup) and is targeted well under 90s.
 func TestMultiProjectContentionBaseline(t *testing.T) {
+	rec := newMPRecorder()
 	// Throwaway warmup pass: the FIRST burst of the process pays one-time
 	// costs (allocator, scheduler, yamux/diag paths, first hydrate) that have
 	// nothing to do with the measured contrast — especially the single-sample
 	// p=1 rows. Absorb them on a throwaway cluster so recorded rows start
 	// from a warm process. Its rows are recorded under scenario "warmup" for
-	// transparency but excluded from contrasts (mpReport skips non-contrast
-	// scenarios).
+	// transparency but excluded from contrasts (reportBaseline skips
+	// non-contrast scenarios).
 	mw := startMPCluster(t)
 	dirsW := mpBootstrapDirs(t, mw.Cluster, 1)
-	mpTabBurst(t, mw.Cluster, mpDirect(mw.Cluster), dirsW, "warmup", 1)
-	mpTabBurst(t, mw.Cluster, mpTunnel(mw.Cluster), dirsW, "warmup", 1)
+	mpTabBurst(t, rec, mw.Cluster, mpDirect(mw.Cluster), dirsW, "warmup", 1)
+	mpTabBurst(t, rec, mw.Cluster, mpTunnel(mw.Cluster), dirsW, "warmup", 1)
 	mw.Close()
 
 	for _, level := range []int{1, 3, 7} {
 		// Cluster A: direct COLD on a fresh substrate, then tunnel WARM.
 		ma := startMPCluster(t)
 		dirsA := mpBootstrapDirs(t, ma.Cluster, level)
-		mpTabBurst(t, ma.Cluster, mpDirect(ma.Cluster), dirsA, "cold", 1)
-		mpTabBurst(t, ma.Cluster, mpTunnel(ma.Cluster), dirsA, "warm", 3)
+		mpTabBurst(t, rec, ma.Cluster, mpDirect(ma.Cluster), dirsA, "cold", 1)
+		mpTabBurst(t, rec, ma.Cluster, mpTunnel(ma.Cluster), dirsA, "warm", 3)
 		ma.Close()
 
 		// Cluster B: tunnel COLD on a fresh substrate, then direct WARM.
@@ -802,14 +1005,14 @@ func TestMultiProjectContentionBaseline(t *testing.T) {
 		// sessions per route) and the tunnel-sever recovery probe.
 		mb := startMPCluster(t)
 		dirsB := mpBootstrapDirs(t, mb.Cluster, level)
-		mpTabBurst(t, mb.Cluster, mpTunnel(mb.Cluster), dirsB, "cold", 1)
-		mpTabBurst(t, mb.Cluster, mpDirect(mb.Cluster), dirsB, "warm", 3)
+		mpTabBurst(t, rec, mb.Cluster, mpTunnel(mb.Cluster), dirsB, "cold", 1)
+		mpTabBurst(t, rec, mb.Cluster, mpDirect(mb.Cluster), dirsB, "warm", 3)
 		if level == 7 {
-			mpBulkProbe(t, mb.Cluster, mpDirect(mb.Cluster), dirsB, 0)
-			mpBulkProbe(t, mb.Cluster, mpTunnel(mb.Cluster), dirsB, 1)
-			mpRecoveryProbe(t, mb, dirsB)
+			mpBulkProbe(t, rec, mb.Cluster, mpDirect(mb.Cluster), dirsB, 0, "bulk")
+			mpBulkProbe(t, rec, mb.Cluster, mpTunnel(mb.Cluster), dirsB, 1, "bulk")
+			mpRecoveryProbe(t, rec, mb, dirsB)
 		}
 		mb.Close()
 	}
-	mpReport(t)
+	rec.reportBaseline(t)
 }
