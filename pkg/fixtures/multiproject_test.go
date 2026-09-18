@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -32,29 +33,51 @@ func TestSeedMultiProjectDeterminism(t *testing.T) {
 		t.Fatalf("dirs differ between seedings: %v vs %v", d1, d2)
 	}
 
-	b1, err := json.Marshal(f1.sessions)
+	// Compare ONLY the mp-seeded subset: New()'s consolidated demo sessions
+	// carry time.Now()-derived timestamps, so a millisecond boundary between
+	// the two New() calls would make a whole-fixture comparison flake. The
+	// multi-project contract under test is the SEEDED data, which uses the
+	// fixed mpEpochBase.
+	mpSessions := func(f *FakeOpenCode) []map[string]any {
+		out := []map[string]any{}
+		for _, s := range f.sessions {
+			if id, _ := s["id"].(string); strings.HasPrefix(id, "mp") {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	mpMessages := func(f *FakeOpenCode) map[string][]messageWithParts {
+		out := map[string][]messageWithParts{}
+		for sid, msgs := range f.messages {
+			if strings.HasPrefix(sid, "mp") {
+				out[sid] = msgs
+			}
+		}
+		return out
+	}
+	b1, err := json.Marshal(mpSessions(f1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b2, err := json.Marshal(f2.sessions)
+	b2, err := json.Marshal(mpSessions(f2))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(b1, b2) {
-		t.Fatalf("sessions JSON differs between seedings (%d vs %d bytes)", len(b1), len(b2))
+		t.Fatalf("mp sessions JSON differs between seedings (%d vs %d bytes)", len(b1), len(b2))
 	}
-	// f.messages is a map — encoding/json sorts map keys, so marshal is
-	// deterministic for identical content.
-	m1, err := json.Marshal(f1.messages)
+	// maps marshal with sorted keys, so identical content → identical bytes.
+	m1, err := json.Marshal(mpMessages(f1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	m2, err := json.Marshal(f2.messages)
+	m2, err := json.Marshal(mpMessages(f2))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(m1, m2) {
-		t.Fatalf("messages JSON differs between seedings (%d vs %d bytes)", len(m1), len(m2))
+		t.Fatalf("mp messages JSON differs between seedings (%d vs %d bytes)", len(m1), len(m2))
 	}
 	// The e2e's bulk-vs-small contrast depends on bulk content NOT surviving
 	// gzip at prose-like ratios: assert the seeded bulk text is far less

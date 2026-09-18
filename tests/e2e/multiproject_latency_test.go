@@ -641,7 +641,6 @@ func mpBulkProbe(t *testing.T, c *Cluster, route mpRoute, dirs []mpDirInfo, bulk
 		note string
 	}
 	bulkCh := make(chan bulkRes, 1)
-	start := time.Now()
 	go func() {
 		q := url.Values{}
 		q.Set("sessions", bulkSid)
@@ -658,7 +657,6 @@ func mpBulkProbe(t *testing.T, c *Cluster, route mpRoute, dirs []mpDirInfo, bulk
 	}()
 	busyFB, busyTot, ok2 := mpSmallSeries(route, others, probes)
 	br := <-bulkCh
-	_ = start
 	if !ok2 {
 		t.Fatalf("bulk probe %s: busy small series failed", route.name)
 	}
