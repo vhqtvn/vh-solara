@@ -308,7 +308,9 @@ func (l *mpShapedLink) Close() {
 // first (order-balanced across caps, mirroring A1's cold/warm split). Each
 // cap boots its OWN cluster: fresh fixture, both bulk sessions cold per
 // route, shapers per cluster. Pass criteria stay STRUCTURAL (requests
-// succeed, correct bytes, test completes); no latency thresholds asserted.
+// succeed, correct bytes, test completes) with ONE added structural floor:
+// mpAssertShaperFloor proves the shaper actually shaped (a silently bypassed
+// shaper fails) — a lower bound on bulk completion, not a perf gate.
 // Serial by design; targeted well under 60s.
 func TestMultiProjectContentionShapedLink(t *testing.T) {
 	rec := newMPRecorder()
@@ -348,11 +350,63 @@ func TestMultiProjectContentionShapedLink(t *testing.T) {
 			mpTabBurst(t, rec, m.Cluster, route, dirs, cap.label+"-burst", 3)
 			mpBulkProbe(t, rec, m.Cluster, route, dirs, bulkIdx[route.name], cap.label)
 		}
+		mpAssertShaperFloor(t, rec, cap.label, cap.cfg.BytesPerSec)
 
 		dlink.Close()
 		m.Close()
 	}
 	rec.reportShaped(t)
+}
+
+// --- DEFER burn (A1b commit review): coarse cap-rate floor ---
+
+// mpShaperFloorFrac is the coarse "the shaper actually shaped" floor: each
+// cap's recorded bulk completion must be at least this fraction of
+// bulk-bytes/cap-rate, per route. Structural intent, not a perf gate: its
+// only job is to fail the test when the shaper is SILENTLY BYPASSED — on the
+// unshaped loopback the same ~600 KiB bulk stream completes in ~24 ms (A1
+// baseline bulk-during rows: 23.9/26.1 ms) versus floors of ~170 ms @20 Mbps
+// and ~680 ms @5 Mbps, so a bypass fails by an order of magnitude, never
+// marginally. Why 0.7 and not higher: the true minimum is
+// (bytes-burst)/rate (the bucket boots full at BurstBytes) with hydrate ramp
+// and burst-gated RTT on top, and measured shaped runs land at only
+// ~1.4-1.5× the floor — 0.7 stays generously below the physics while
+// remaining far above bypass speed. Deterministic-safe by direction: this is
+// a LOWER bound on duration, so a slower/loaded machine only pushes
+// completion further above the floor; the green direction cannot flake.
+const mpShaperFloorFrac = 0.7
+
+// bulkRowOf returns the recorded bulk row for (label-during, route) — the
+// ~600 KiB transfer whose completion time the cap-rate floor checks.
+func (r *mpRecorder) bulkRowOf(label, route string) (mpRow, bool) {
+	for _, row := range r.rows {
+		if row.Scenario == label+"-during" && row.Route == route && row.Class == "bulk" && row.N > 0 {
+			return row, true
+		}
+	}
+	return mpRow{}, false
+}
+
+// mpAssertShaperFloor checks the cap-rate floor for one cap across both
+// routes. A missing bulk row is itself a failure (the floor is unverifiable,
+// so a bypass cannot be excluded) — the outcome-gated style of the A1 F5 fix.
+func mpAssertShaperFloor(t *testing.T, rec *mpRecorder, label string, bytesPerSec int64) {
+	t.Helper()
+	for _, route := range []string{"direct", "tunnel"} {
+		row, ok := rec.bulkRowOf(label, route)
+		if !ok {
+			t.Errorf("[shaper-floor %s %s] no bulk row recorded — cap-rate floor unverifiable (shaper bypass cannot be excluded)", label, route)
+			continue
+		}
+		floorMs := mpShaperFloorFrac * float64(row.BytesMean) / float64(bytesPerSec) * 1000
+		if row.TotMed < floorMs {
+			t.Errorf("[shaper-floor %s %s] bulk completion %.2fms < floor %.2fms (%.2f×bytes/rate, %d bytes @ %d B/s) — the shaper did not shape this route (bypassed?)",
+				label, route, row.TotMed, floorMs, mpShaperFloorFrac, row.BytesMean, bytesPerSec)
+			continue
+		}
+		t.Logf("[shaper-floor %s %s] bulk completion %.2fms ≥ floor %.2fms (%.2f×%d bytes @ %d B/s) — shaper active on this route",
+			label, route, row.TotMed, floorMs, mpShaperFloorFrac, row.BytesMean, bytesPerSec)
+	}
 }
 
 // mpA1bVerdictBucket is the report-level (NOT asserted) contrast threshold: a
