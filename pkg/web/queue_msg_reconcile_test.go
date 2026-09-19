@@ -465,3 +465,120 @@ func stripCorrelationIDForTest(t *testing.T, s *sessionQueueStore, id string) er
 	}
 	return errors.New("not found")
 }
+
+// newStuckUnknownStoreRestartFenced is newStuckUnknownStore plus the restart
+// fence: the item was claimed (dispatching), the restart fence stamped it
+// (restart_fence.go), and the dispatch then aged out to `unknown` exactly as
+// production recovery does. The marker survives the resolve — which is the
+// production shape a restart-interrupted mid-dispatch item presents to the
+// reconciler.
+func newStuckUnknownStoreRestartFenced(t *testing.T, sid, text string) (*sessionQueueStore, QueueItem) {
+	t.Helper()
+	s, _ := newTestStore(t, sid)
+	mustEnqueue(t, s, text)
+	claimed, _, err := s.Claim()
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := s.fenceDispatchingForRestart(time.Now()); err != nil {
+		t.Fatalf("fenceDispatchingForRestart: %v", err)
+	}
+	if _, err := s.Resolve(claimed.ID, QueueUnknown, "stuck"); err != nil {
+		t.Fatalf("Resolve(unknown): %v", err)
+	}
+	return s, claimed
+}
+
+// TestReconcile_RestartFencedPersistent404UsesRestartDetail: a restart-fenced
+// item that exhausts the SAME 3×404 budget terminalizes with the
+// restart-specific explanation — the operator sees "interrupted by an
+// OpenCode restart", NOT the generic "may have failed before persisting"
+// guess. The budget and fail-closed semantics are IDENTICAL to the unfenced
+// path (attempt count still 3, state still unknown, never resent).
+func TestReconcile_RestartFencedPersistent404UsesRestartDetail(t *testing.T) {
+	s, it := newStuckUnknownStoreRestartFenced(t, "s1", "hello")
+	r := newFakeResolver()
+	r.setErr("s1", it.OpencodeMsgID, opencode.ErrMessageNotFound)
+
+	t0 := time.Unix(1000000, 0)
+	for i := 0; i < 3; i++ {
+		s.reconcileMessageIDs("s1", r.lookup, t0.Add(time.Duration(i)*(reconcileThreshold+time.Second)))
+	}
+	got := mustListItem(t, s, it.ID)
+	if !got.ReconcileTerminal {
+		t.Fatalf("fenced persistent 404 must still terminalize (budget unchanged)")
+	}
+	if got.ReconcileAttempts != reconcileMaxAttempts {
+		t.Fatalf("fenced item attempts = %d, want %d (fence must NOT weaken the detector)", got.ReconcileAttempts, reconcileMaxAttempts)
+	}
+	if got.State != QueueUnknown {
+		t.Fatalf("fenced terminal 404 must stay non-sent: got %q", got.State)
+	}
+	want := fmt.Sprintf(restartFenceTerminal404DetailFmt, reconcileMaxAttempts)
+	if got.Detail != want {
+		t.Fatalf("fenced terminal detail = %q,\nwant restart-specific: %q", got.Detail, want)
+	}
+}
+
+// TestReconcile_RestartFencedTransientExhaustionUsesRestartDetail: same pin
+// for the 5xx/transient exhaustion path (unreachable restart instance).
+func TestReconcile_RestartFencedTransientExhaustionUsesRestartDetail(t *testing.T) {
+	s, it := newStuckUnknownStoreRestartFenced(t, "s1", "hello")
+	r := newFakeResolver()
+	r.setErr("s1", it.OpencodeMsgID, &opencode.Error{Status: 502, Op: "GET", Body: "down"})
+
+	t0 := time.Unix(1000000, 0)
+	for i := 0; i < 3; i++ {
+		s.reconcileMessageIDs("s1", r.lookup, t0.Add(time.Duration(i)*(reconcileThreshold+time.Second)))
+	}
+	got := mustListItem(t, s, it.ID)
+	if !got.ReconcileTerminal {
+		t.Fatalf("fenced transient exhaustion must terminalize")
+	}
+	want := fmt.Sprintf(restartFenceTerminalTransientDetailFmt, reconcileMaxAttempts)
+	if got.Detail != want {
+		t.Fatalf("fenced transient detail = %q,\nwant restart-specific: %q", got.Detail, want)
+	}
+}
+
+// TestReconcile_RestartFencedExactMatchStillResolvesSent: the fence NEVER
+// blocks the heal — if OpenCode actually persisted under the minted id (the
+// 204 landed before the kill), the exact-match authority resolves the fenced
+// item to `sent` exactly as it would an unfenced one.
+func TestReconcile_RestartFencedExactMatchStillResolvesSent(t *testing.T) {
+	s, it := newStuckUnknownStoreRestartFenced(t, "s1", "hello")
+	r := newFakeResolver()
+	r.setBody("s1", it.OpencodeMsgID, "user")
+
+	s.reconcileMessageIDs("s1", r.lookup, time.Unix(1000000, 0))
+
+	got := mustListItem(t, s, it.ID)
+	if got.State != QueueSent {
+		t.Fatalf("fenced exact-match must resolve to sent: got %q", got.State)
+	}
+	if got.ReconcileTerminal {
+		t.Fatalf("healed item must not be reconcile-terminal")
+	}
+}
+
+// TestReconcile_Unfenced404KeepsGenericDetail: regression pin — WITHOUT the
+// fence marker, the persistent-404 terminal keeps the exact generic text
+// (the detector and its explanation for unrelated 404s are unchanged).
+func TestReconcile_Unfenced404KeepsGenericDetail(t *testing.T) {
+	s, it := newStuckUnknownStore(t, "s1", "hello")
+	r := newFakeResolver()
+	r.setErr("s1", it.OpencodeMsgID, opencode.ErrMessageNotFound)
+
+	t0 := time.Unix(1000000, 0)
+	for i := 0; i < 3; i++ {
+		s.reconcileMessageIDs("s1", r.lookup, t0.Add(time.Duration(i)*(reconcileThreshold+time.Second)))
+	}
+	got := mustListItem(t, s, it.ID)
+	if !got.ReconcileTerminal {
+		t.Fatalf("unfenced persistent 404 must terminalize (pre-fence behavior)")
+	}
+	want := fmt.Sprintf(reconcileTerminal404DetailFmt, reconcileMaxAttempts)
+	if got.Detail != want {
+		t.Fatalf("unfenced terminal detail = %q,\nwant exact GENERIC text: %q", got.Detail, want)
+	}
+}

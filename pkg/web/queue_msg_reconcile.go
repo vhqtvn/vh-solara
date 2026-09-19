@@ -259,18 +259,23 @@ func (s *sessionQueueStore) reconcileOne(c reconcileCandidate, sid string, resol
 		case errors.Is(err, opencode.ErrMessageNotFound):
 			// 404: definitive "not persisted" for this exact id. Fail-closed:
 			// count the attempt; a persistent 404 across the budget becomes
-			// TERMINAL (NEVER resend).
-			s.bumpReconcileAttempt(c.ID, reconcileTerminal404DetailFmt)
+			// TERMINAL (NEVER resend). A restart-fenced item (restart_fence.go)
+			// terminalizes with the restart-specific explanation; the budget
+			// and fail-closed semantics are IDENTICAL to the generic path.
+			s.bumpReconcileAttempt(c.ID, reconcileTerminal404DetailFmt, restartFenceTerminal404DetailFmt)
 		case isOpencodeStatus(err, http.StatusBadRequest):
 			// 400: caller bug (malformed/non-msg id). Stop immediately —
 			// retrying can't help; mark terminal so the reconciler never
-			// re-looks-up this id.
+			// re-looks-up this id. Deliberately NO restart variant: a 400
+			// is OpenCode POSITIVELY rejecting the id, which a restart
+			// kill does not explain.
 			vhlog.Warn("queue reconcile: OpenCode rejected message id (400) — caller bug; marking terminal", "sessionID", sid, "messageID", c.Mid, "err", err)
 			s.markReconcileTerminal(c.ID, reconcileTerminal400Detail)
 		default:
 			// 5xx / transport / malformed 200 body: retryable within the
-			// budget; exhaustion → terminal.
-			s.bumpReconcileAttempt(c.ID, reconcileTerminalTransientDetailFmt)
+			// budget; exhaustion → terminal (restart-fenced items get the
+			// restart-specific explanation).
+			s.bumpReconcileAttempt(c.ID, reconcileTerminalTransientDetailFmt, restartFenceTerminalTransientDetailFmt)
 		}
 		return
 	}
@@ -278,7 +283,7 @@ func (s *sessionQueueStore) reconcileOne(c reconcileCandidate, sid string, resol
 	var info reconcileMessageInfo
 	if err := json.Unmarshal(body, &info); err != nil {
 		vhlog.Warn("queue reconcile: malformed message body; treating as transient", "sessionID", sid, "messageID", c.Mid, "err", err)
-		s.bumpReconcileAttempt(c.ID, reconcileTerminalTransientDetailFmt)
+		s.bumpReconcileAttempt(c.ID, reconcileTerminalTransientDetailFmt, restartFenceTerminalTransientDetailFmt)
 		return
 	}
 	if info.Info.Role == "user" && info.Info.ID == c.Mid {
@@ -294,8 +299,9 @@ func (s *sessionQueueStore) reconcileOne(c reconcileCandidate, sid string, resol
 	}
 	// 200 but non-exact (wrong id / not a user message): the minted id did NOT
 	// map to the expected user message — fail-closed. NEVER match on
-	// text/time/latest-position.
-	s.bumpReconcileAttempt(c.ID, reconcileTerminalMismatchDetailFmt)
+	// text/time/latest-position. (Restart-fenced items get the restart-specific
+	// explanation at terminalization.)
+	s.bumpReconcileAttempt(c.ID, reconcileTerminalMismatchDetailFmt, restartFenceTerminalMismatchDetailFmt)
 }
 
 // isOpencodeStatus reports whether err is an *opencode.Error with the given HTTP
@@ -329,10 +335,14 @@ func reconcileEligible(it QueueItem, now time.Time) bool {
 // if the budget (reconcileMaxAttempts) is exhausted, marks it ReconcileTerminal
 // with detailFmt (a fmt.Sprintf format taking the final attempt count).
 // detailFmt is only applied at terminalization; non-terminal bumps persist just
-// the incremented counter. Re-checks eligibility under s.mu and no-ops if the
-// item is no longer eligible (resolved/removed/terminal/changed-state). Rolls
-// back the in-memory mutation on a save failure.
-func (s *sessionQueueStore) bumpReconcileAttempt(id string, detailFmt string) {
+// the incremented counter. TWO formats are supplied — genericDetailFmt and
+// restartDetailFmt — and the choice is made UNDER s.mu at mutation time from
+// the item's CURRENT RestartFenceAt marker (not from the reconcile snapshot),
+// so a restart fence landing between snapshot and mutation is still honored.
+// Re-checks eligibility under s.mu and no-ops if the item is no longer
+// eligible (resolved/removed/terminal/changed-state). Rolls back the in-memory
+// mutation on a save failure.
+func (s *sessionQueueStore) bumpReconcileAttempt(id string, genericDetailFmt, restartDetailFmt string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.archived {
@@ -353,6 +363,10 @@ func (s *sessionQueueStore) bumpReconcileAttempt(id string, detailFmt string) {
 		terminal := s.items[i].ReconcileAttempts >= reconcileMaxAttempts
 		if terminal {
 			s.items[i].ReconcileTerminal = true
+			detailFmt := genericDetailFmt
+			if s.items[i].RestartFenceAt != 0 {
+				detailFmt = restartDetailFmt
+			}
 			s.items[i].Detail = fmt.Sprintf(detailFmt, s.items[i].ReconcileAttempts)
 		}
 		if err := s.save(); err != nil {

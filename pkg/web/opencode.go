@@ -290,6 +290,13 @@ func (s *Server) handleOpenCodeRestart(w http.ResponseWriter, r *http.Request) {
 	// terminal for each aborted turn. Bounded (≈5s shared budget): an abort
 	// that fails or hangs never blocks the restart — the store-side
 	// interrupted-marker sweep (layer b) heals those turns instead.
+	//
+	// Queue restart fence (the queue-dispatch arm): durably mark every
+	// in-flight queue dispatch interrupted-by-restart BEFORE the process
+	// dies, so the item's eventual recovery/reconcile-terminal detail
+	// explains the restart instead of the generic persistent-404 text
+	// (restart_fence.go). Bounded local writes; failures log and proceed.
+	s.fenceInflightQueueDispatches()
 	s.abortInflightBeforeRestart(r.Context())
 	if err := s.restartOC(r.Context()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

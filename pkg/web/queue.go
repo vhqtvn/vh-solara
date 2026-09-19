@@ -170,6 +170,19 @@ type QueueItem struct {
 	// repeated 5xx) past the grace window is treated as TERMINAL for that id,
 	// NEVER an auto-resend trigger. omitempty for backward compatibility.
 	ReconcileTerminal bool `json:"reconcileTerminal,omitempty"`
+
+	// RestartFenceAt, when non-zero, records (ms epoch) that this item was in
+	// `dispatching` state when a UI-triggered OpenCode restart fence fired —
+	// the deterministic "this dispatch was interrupted by a restart" marker
+	// (restart_fence.go). It changes NO lifecycle behavior: stale-dispatch
+	// recovery, the reconciler's attempt budget, and the exact-match → sent
+	// heal run exactly as without it. It only selects the restart-specific
+	// detail texts (recovery + reconcile terminalization) so the operator
+	// sees "interrupted by an OpenCode restart" instead of the generic
+	// persistent-404 guess. omitempty for on-disk backward compatibility:
+	// a queue.json persisted before this field deserializes with
+	// RestartFenceAt==0 (unfenced — generic texts, pre-fence behavior).
+	RestartFenceAt int64 `json:"restartFenceAt,omitempty"`
 }
 
 // queueFile is the on-disk shape. Order is persisted so the monotonic commit
@@ -441,6 +454,13 @@ func (s *sessionQueueStore) recoverStaleDispatchingLocked(now time.Time) (change
 		s.items[i].State = QueueUnknown
 		s.items[i].ResolvedAt = nowMs
 		s.items[i].Detail = staleDispatchRecoveryDetail
+		if s.items[i].RestartFenceAt != 0 {
+			// Restart-fenced dispatch: the restart fence durably recorded
+			// that THIS dispatch was in flight when an OpenCode restart
+			// killed the process — prefer the restart-specific explanation
+			// over the generic interrupted-dispatch text (restart_fence.go).
+			s.items[i].Detail = restartFenceStaleRecoveryDetail
+		}
 		changed = true
 	}
 	return changed, nil

@@ -1102,6 +1102,11 @@ func (s *Server) handleRestartServer(w http.ResponseWriter, r *http.Request) {
 // permanently unmarked by the kill; turns the bounded abort sweep cannot
 // close are healed by the store-side interrupted-marker sweep after
 // reconnect.
+//
+// Queue restart fence (the queue-dispatch arm): in-flight queue dispatches
+// are durably marked interrupted-by-restart BEFORE the process dies, so the
+// item's eventual recovery/reconcile-terminal detail explains the restart
+// instead of the generic persistent-404 text (restart_fence.go).
 func (s *Server) handleRestartOpenCode(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1111,6 +1116,7 @@ func (s *Server) handleRestartOpenCode(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "OpenCode is not managed by this server", http.StatusNotImplemented)
 		return
 	}
+	s.fenceInflightQueueDispatches()
 	s.abortInflightBeforeRestart(r.Context())
 	if err := s.restartOC(r.Context()); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
