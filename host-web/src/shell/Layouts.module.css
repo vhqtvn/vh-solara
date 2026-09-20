@@ -227,6 +227,14 @@
   min-width: 0;
   flex: 1 1 auto;
 }
+/* First line of a row's text: the name + (for server-sourced rows) the sync
+ * badge, inline. */
+.rowLine {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
 .rowName {
   font-size: 12px;
   font-weight: 600;
@@ -234,6 +242,24 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* Server-sync badge — the row's OWNERSHIP marker: the worker catalog owns
+ * this name (server-wins merge), so the row is available on every device
+ * connected to the server and its rename/delete are disabled. GPU-cheap:
+ * plain border/bg (no mask/backdrop-filter/contain). */
+.syncBadge {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
 /* Subtitle: the tab title (tab scope, when it differs from the name) or the
  * workspace count (master scope). */
@@ -289,6 +315,30 @@
 .delBtn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+/* Server-owned rows (synced): rename/delete are DISABLED — the worker
+ * catalog owns the row and v1 has no server rename/delete (a local mutation
+ * would fork it locally and the server row would resurrect on refresh).
+ * Dimmed + no cursor/hover affordance; focus-visible kept so the disabled
+ * state stays discoverable. Defined after the base rules so the later
+ * equal-specificity rules win. */
+.actBtnDisabled,
+.actBtnDisabled:hover,
+.delBtnDisabled,
+.delBtnDisabled:hover {
+  color: var(--fg-dim);
+  border-color: var(--border);
+  cursor: default;
+  opacity: 0.55;
+}
+/* Blocked-load error (a server-sourced entry whose pane targets are not
+ * allowed on this device — the load is rejected whole). Same treatment as
+ * the row-level error. */
+.loadError {
+  font-size: 10px;
+  color: var(--warn);
+  line-height: 1.35;
+  padding: 2px 0;
 }
 /* Inline rename input — replaces the row's main button while editing
  * (the tabstrip's inline-rename treatment). */

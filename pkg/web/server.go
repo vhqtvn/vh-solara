@@ -177,6 +177,14 @@ type Server struct {
 	// pins_http.go (Phase 2 HTTP layer).
 	pins *PinStore
 
+	// namedLayouts is the worker-wide named tab-layout catalog (worker-scoped
+	// v1). Constructed once at NewServer from
+	// filepath.Join(stateBaseDir(), "named-layouts.json"); serves GET/PUT
+	// /vh/layouts with PER-ENTRY CAS upsert granularity (no whole-catalog
+	// replace, no SSE fan-out — pinned by the task card). See
+	// named_layouts.go (store) and named_layouts_http.go (HTTP layer).
+	namedLayouts *NamedLayoutStore
+
 	// labelsReg is the per-project root-session labels registry (groups +
 	// tags). Each project owns an independent LabelStore at
 	// <stateBaseDir>/projects/<projectKey>/labels.json with its own
@@ -527,6 +535,18 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		bgCancel()
 		return nil, fmt.Errorf("pins: init store: %w", err)
 	}
+	// Worker-wide named tab-layout catalog (worker-scoped v1). Same
+	// construction discipline as pins: built ONCE at server startup, grounded
+	// at stateBaseDir()/"named-layouts.json". A construction failure
+	// (permission, etc.) propagates to the caller; a missing or
+	// corrupt/schema-mismatched file is NOT an error (NewNamedLayoutStore
+	// returns a zero doc — see named_layouts.go).
+	namedLayoutsPath := filepath.Join(stateBaseDir(), "named-layouts.json")
+	namedLayoutStore, err := NewNamedLayoutStore(namedLayoutsPath)
+	if err != nil {
+		bgCancel()
+		return nil, fmt.Errorf("named-layouts: init store: %w", err)
+	}
 	// Per-project root-session labels: run the one-time worker-wide →
 	// per-project migration (idempotent, synchronous) BEFORE any store can be
 	// opened by labelsForDir. Migration reads the legacy
@@ -559,6 +579,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		views:                   newViewRegistry(),
 		queues:                  newQueueRegistry(),
 		pins:                    pinStore,
+		namedLayouts:            namedLayoutStore,
 		labelsReg:               newLabelRegistry(),
 		failFast:                map[string]struct{}{},
 		watcherOn:               map[string]bool{},
@@ -1587,6 +1608,13 @@ func (s *Server) Handler() http.Handler {
 	// guarded by the csrfGuard middleware wrapping every /vh/* route (no
 	// per-handler CSRF check needed). See pkg/web/pins_http.go.
 	mux.HandleFunc("/vh/pins", s.handlePins)
+	// Server-managed named tab layouts (worker-scoped v1): GET reads the
+	// worker-wide catalog, PUT applies a PER-ENTRY CAS upsert (one entry +
+	// required baseRevision per request — whole-catalog replace is a design
+	// violation). PUT is state-changing and is guarded by the csrfGuard
+	// middleware wrapping every /vh/* route (no per-handler CSRF check
+	// needed). No SSE fan-out in v1. See pkg/web/named_layouts_http.go.
+	mux.HandleFunc("/vh/layouts", s.handleNamedLayouts)
 	// Server-managed root-session labels (Slice 2): GET reads the worker-wide
 	// labels doc (groups + tags + per-root tag assignments), PUT applies a
 	// CAS-guarded replace. PUT is state-changing and is guarded by the

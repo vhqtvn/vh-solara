@@ -5,9 +5,12 @@ import {
   deleteNamedLayout,
   listMasterLayouts,
   listTabLayouts,
+  loadNamedLayout,
   normalizeLayoutName,
+  type TabLayoutEntry,
 } from "../dockview/namedLayouts";
 import { activeWorkspaceId, hostOps, panes, workspaces } from "../dockview/store";
+import { fetchCatalog, publishEntry } from "../state/namedLayoutCatalog";
 import { TABSTRIP_POPOVER_GROUP, usePopoverSurface } from "./popover";
 import s from "./Layouts.module.css";
 
@@ -53,8 +56,27 @@ import s from "./Layouts.module.css";
  */
 
 /** Auto-revert window for the master-load two-step confirm (ms) — the same
- *  ~3.5s the tabstrip's workspace-delete confirm uses. */
+ * ~3.5s the tabstrip's workspace-delete confirm uses. */
 const MASTER_CONFIRM_MS = 3500;
+
+/** A merged THIS-TAB row: the local row shape plus the server-sourced flag
+ *  (a row is "synced" when the worker catalog owns the name — server wins
+ *  name collisions in the view-merge, so a shadowed local entry never shows
+ *  as its own row). */
+interface MergedTabRow {
+  name: string;
+  tabTitle: string;
+  savedAt: number;
+  synced: boolean;
+}
+
+/** Sort helper: most-recent-first (savedAt desc; name asc tiebreak — the same
+ *  deterministic order namedLayouts' local lists use). */
+function byRecency(a: MergedTabRow, b: MergedTabRow): number {
+  return b.savedAt !== a.savedAt
+    ? b.savedAt - a.savedAt
+    : a.name.localeCompare(b.name);
+}
 
 export function Layouts() {
   let wrapEl: HTMLDivElement | undefined;
@@ -69,14 +91,45 @@ export function Layouts() {
   // while the popover is open are not tracked — single-tab posture, same as
   // the rest of the shell's popovers.)
   const [rev, setRev] = createSignal(0);
-  const tabList = createMemo(() => {
+
+  // ---- server catalog state (v1 layouts sync) -----------------------------
+  // Server entries are fetched ONLY when this popover opens or a publish
+  // completes — never at boot/module init, never into the boot arbitration
+  // (F3 hazard H2). This is a LIST-LEVEL overlay in this popover ONLY: the
+  // view-merge below NEVER writes back into the local store (F3 hazard H1 —
+  // shadowed local entries stay intact in vh-host:namedLayouts:v2, masked
+  // but never destroyed), and any fetch failure silently degrades to a
+  // local-only list (dev/unfolded posture).
+  const [serverEntries, setServerEntries] = createSignal<TabLayoutEntry[]>([]);
+  const refreshServerList = (): void => {
+    fetchCatalog().then((doc) => setServerEntries(doc ? doc.entries : []));
+  };
+
+  // VIEW-MERGE (F3 H1, server-wins): local rows first, then server rows
+  // OVERWRITE by name — the worker catalog owns the MERGED LIST on
+  // collisions. Read-only over the local store; no ordering is derived from
+  // revision/savedAt across stores (savedAt ordering is display-only, local
+  // to whatever rows the merge produced).
+  const tabList = createMemo<MergedTabRow[]>(() => {
     void rev();
-    return listTabLayouts();
+    const byName = new Map<string, MergedTabRow>();
+    for (const l of listTabLayouts()) {
+      byName.set(l.name, { name: l.name, tabTitle: l.tabTitle, savedAt: l.savedAt, synced: false });
+    }
+    for (const e of serverEntries()) {
+      byName.set(e.name, { name: e.name, tabTitle: e.tabTitle, savedAt: e.savedAt, synced: true });
+    }
+    return [...byName.values()].sort(byRecency);
   });
   const masterList = createMemo(() => {
     void rev();
     return listMasterLayouts();
   });
+
+  // Blocked-load error surface (server-sourced entry with unallowlisted
+  // targets — the load is rejected WHOLE, never silently opened).
+  const [loadError, setLoadError] = createSignal("");
+
 
   const surface = usePopoverSurface({
     id: "layouts",
@@ -84,12 +137,15 @@ export function Layouts() {
     anchor: () => wrapEl,
     // Reset on every open: This-tab scope, a cleared name, and the tab-title
     // prefilled with the CURRENT workspace's name (the natural default — the
-    // save is usually "this tab, titled as it is").
+    // save is usually "this tab, titled as it is"). The open ALSO refreshes
+    // the server catalog (the ONLY pull point — F3: never at boot).
     onOpen: () => {
       setScope("tab");
       setLayoutName("");
       setTabTitle(activeWsName());
+      setLoadError("");
       setRev((n) => n + 1);
+      refreshServerList();
     },
   });
 
@@ -135,8 +191,22 @@ export function Layouts() {
     if (!canSaveTab()) return; // aria-disabled guard — full no-op
     // The tab title is passed through; the storage layer owns the empty→name
     // fallback (an emptied title field saves as the layout's name).
-    const ok = hostOps()?.saveLayout?.(layoutName(), tabTitle()) ?? false;
+    const rawName = layoutName();
+    const ok = hostOps()?.saveLayout?.(rawName, tabTitle()) ?? false;
     if (ok) {
+      // PUBLISH to the worker catalog, fire-and-forget: the local save has
+      // already succeeded, so any server failure warns (inside the client)
+      // and degrades to a local-only row — the save itself never fails.
+      // The JUST-WRITTEN normalized entry is read back from the store so the
+      // wire payload is exactly the validated bytes storage kept (name
+      // trimmed/capped, tabTitle fallback applied). On success the merged
+      // list adopts the committed doc — the row gains its synced badge.
+      const saved = loadNamedLayout(rawName);
+      if (saved && saved.scope === "tab") {
+        void publishEntry(saved).then((doc) => {
+          if (doc) setServerEntries(doc.entries);
+        });
+      }
       // Clear the name; re-default the title to the current workspace's name
       // (the list refresh showing the entry + its title subtitle is the
       // confirmation). Same-name saves overwrite (documented in namedLayouts).
@@ -147,7 +217,34 @@ export function Layouts() {
   };
 
   // ---- row actions -----------------------------------------------------------
+  /** The server-sourced entry currently shown for `name` (undefined when the
+   *  row is local-only). By construction a row for name X is server-sourced
+   *  exactly when the fetched catalog holds X — the merge overwrote any
+   *  shadowed local entry, and the LOAD must take the SERVER bytes. */
+  const serverEntryFor = (name: string): TabLayoutEntry | undefined =>
+    serverEntries().find((e) => e.name === name);
+
   const doLoadTab = (name: string) => {
+    setLoadError("");
+    const serverEntry = serverEntryFor(name);
+    if (serverEntry) {
+      // Server-sourced row: the SERVER entry through the validated apply
+      // path (structural re-coerce + whole-entry target gate). A blocked
+      // load keeps the popover open and surfaces the error inline — panes
+      // are NEVER silently opened.
+      const res = hostOps()?.loadLayoutEntry?.(serverEntry);
+      if (!res) return; // no ops registered yet (cold window) — no-op
+      if (res.ok) {
+        surface.closePopover();
+        return;
+      }
+      setLoadError(
+        res.reason === "invalid-targets"
+          ? "Layout contains targets not allowed on this device"
+          : "This layout could not be loaded",
+      );
+      return;
+    }
     const id = hostOps()?.loadLayout?.(name);
     // Close on a successful instantiation: the new workspace activates (the
     // popover's result is the workspace, not more popover). A failed lookup
@@ -164,7 +261,10 @@ export function Layouts() {
     // Pure storage mutation (production posture, not the DEV bridge).
     // Single-tap delete is the deliberate default (a saved layout is a
     // re-creatable snapshot; the workspace-delete confirm is for
-    // non-recoverable state).
+    // non-recoverable state). Server-sourced rows never reach here — their
+    // × is disabled (v1 has no server delete; a local delete would only
+    // resurrect the row on the next refresh — the accepted deterministic
+    // server-owner outcome, F3 CC-H1-2).
     deleteNamedLayout(name);
     setRev((n) => n + 1);
   };
@@ -321,6 +421,7 @@ export function Layouts() {
                     name={entry.name}
                     tabTitle={entry.tabTitle}
                     savedAt={entry.savedAt}
+                    synced={entry.synced}
                     onLoad={doLoadTab}
                     onDelete={doDelete}
                     onRename={doRename}
@@ -330,6 +431,11 @@ export function Layouts() {
               <Show when={tabList().length === 0}>
                 <div class={s.empty} data-testid="layout-empty">
                   No saved layouts yet.
+                </div>
+              </Show>
+              <Show when={loadError()}>
+                <div class={s.loadError} data-testid="layout-load-error" role="alert">
+                  {loadError()}
                 </div>
               </Show>
             </Show>
@@ -392,18 +498,29 @@ function useRowState(onRename: (oldName: string, newName: string) => boolean) {
 }
 
 /** A THIS-TAB row: name (+ "→ tab:" subtitle when the title differs from the
- *  name) + relative time; actions Load (row main), ✎ rename, × delete. */
+ *  name) + relative time; actions Load (row main), ✎ rename, × delete.
+ *  A SERVER-SOURCED row (synced) carries the "synced" badge and its rename/
+ *  delete actions are DISABLED — the worker catalog owns the row (v1 has no
+ *  server rename/delete; a local mutation would fork it locally and the
+ *  server row would resurrect on the next refresh). */
 function TabRow(props: {
   name: string;
   tabTitle: string;
   savedAt: number;
+  synced?: boolean;
   onLoad(name: string): void;
   onDelete(name: string): void;
   onRename(oldName: string, newName: string): boolean;
 }) {
   const row = useRowState(props.onRename);
   return (
-    <div class={s.row} data-testid="layout-row" data-name={props.name} data-scope="tab">
+    <div
+      class={s.row}
+      data-testid="layout-row"
+      data-name={props.name}
+      data-scope="tab"
+      data-synced={props.synced ? "1" : "0"}
+    >
       <Show
         when={row.renaming()}
         fallback={
@@ -416,7 +533,18 @@ function TabRow(props: {
             onClick={() => props.onLoad(props.name)}
           >
             <span class={s.rowText}>
-              <span class={s.rowName}>{props.name}</span>
+              <span class={s.rowLine}>
+                <span class={s.rowName}>{props.name}</span>
+                <Show when={props.synced}>
+                  <span
+                    class={s.syncBadge}
+                    data-testid="layout-row-synced"
+                    title="Saved on this server — available on every device connected to it"
+                  >
+                    synced
+                  </span>
+                </Show>
+              </span>
               <Show when={props.tabTitle !== props.name}>
                 <span class={s.rowSub} data-testid="layout-row-tabtitle">
                   → tab: {props.tabTitle}
@@ -449,21 +577,27 @@ function TabRow(props: {
       <Show when={!row.renaming()}>
         <button
           type="button"
-          class={s.actBtn}
+          class={props.synced ? `${s.actBtn} ${s.actBtnDisabled}` : s.actBtn}
           aria-label={`Rename layout ${props.name}`}
-          title={`Rename ${props.name}`}
+          title={props.synced ? "Synced layout — managed on the server" : `Rename ${props.name}`}
           data-testid="layout-rename"
-          onClick={() => row.beginRename(props.name)}
+          disabled={props.synced}
+          onClick={() => {
+            if (!props.synced) row.beginRename(props.name);
+          }}
         >
           ✎
         </button>
         <button
           type="button"
-          class={s.delBtn}
+          class={props.synced ? `${s.delBtn} ${s.delBtnDisabled}` : s.delBtn}
           aria-label={`Delete layout ${props.name}`}
-          title={`Delete ${props.name}`}
+          title={props.synced ? "Synced layout — managed on the server" : `Delete ${props.name}`}
           data-testid="layout-delete"
-          onClick={() => props.onDelete(props.name)}
+          disabled={props.synced}
+          onClick={() => {
+            if (!props.synced) props.onDelete(props.name);
+          }}
         >
           ×
         </button>

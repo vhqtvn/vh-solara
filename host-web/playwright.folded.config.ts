@@ -1,7 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, devices } from "@playwright/test";
-
 // =============================================================================
 // FOLDED-POSTURE host-web e2e — the production-fold restore lane.
 //
@@ -46,9 +45,18 @@ const artifactRoot =
   process.env.PLAYWRIGHT_ARTIFACTS_DIR ??
   path.join(repoRoot, "tmp/agent-runs/host-web-folded");
 
+// STATE-DIR ISOLATION (conditional-modify per the task card): without this the
+// binary's worker state (named-layouts.json, pins.json, notes/, …) lands in
+// the OPERATOR'S REAL userConfigDir (~/.config/vh-solara) — the lane would
+// read/write real state and collide across reruns. Pinned to a repo-scoped,
+// gitignored dir (the lane's artifact root); the Go store MkdirAlls it on
+// first persist. Override for a one-off pristine run via VH_FOLDED_STATE_DIR.
+const stateDir =
+  process.env.VH_FOLDED_STATE_DIR ?? path.join(artifactRoot, "state");
+
 export default defineConfig({
   testDir: path.join(hostRoot, "tests/folded-e2e"),
-  testMatch: /folded-restore\.spec\.ts/,
+  testMatch: /(folded-restore|layouts-sync)\.spec\.ts/,
   // Serial: one real server, shared origin state (localStorage/SW) across a
   // context would leak between workers. Each TEST uses its own fresh context.
   fullyParallel: false,
@@ -79,8 +87,11 @@ export default defineConfig({
       // loopback target so the server STAYS UP decoupled (ocLife=failed) and
       // the embedded /app SPA renders its real shell with empty state — the
       // lane-8 precedent. Same-origin /app framing needs no --frame-ancestors
-      // (default frame-ancestors 'self' permits it).
-      command: `"${vhBin}" local-server --addr 127.0.0.1:${FOLDED_PORT} --opencode-url http://127.0.0.1:1`,
+      // (default frame-ancestors 'self' permits it). VH_STATE_DIR isolates the
+      // binary's worker state (see stateDir above) from the operator's real
+      // userConfigDir — REQUIRED since layouts-sync asserts server-persisted
+      // named-layouts.json content.
+      command: `VH_STATE_DIR="${stateDir}" "${vhBin}" local-server --addr 127.0.0.1:${FOLDED_PORT} --opencode-url http://127.0.0.1:1`,
       cwd: hostRoot,
       url: `${FOLDED_ORIGIN}/`,
       reuseExistingServer: !process.env.CI,

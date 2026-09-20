@@ -56,6 +56,7 @@
 // =============================================================================
 
 import type { SerializedDockview } from "dockview-core";
+import { coerceTabLayoutEntry } from "./layoutValidation";
 
 /** Versioned + namespaced storage key (v2 adds the scope discrimination + the
  *  tab-title/master-session fields). Separate from the workspace-set key
@@ -185,27 +186,15 @@ function migrateV1(parsed: Record<string, unknown> | null): NamedLayoutStore {
 
 /** Structural guard for ONE v2 store value. Returns the coerced entry or null
  *  (the caller drops the entry). The layout blobs stay opaque objects — the
- *  cold-restore pipeline re-validates them at consume time. */
+ *  cold-restore pipeline re-validates them at consume time. The TAB branch is
+ *  the shared coerceTabLayoutEntry (extracted to layoutValidation.ts so the
+ *  server-catalog client validates server data with the exact same checks);
+ *  the master branch stays local (v1 server scope is tab-only). */
 function coerceEntry(name: string, v: unknown): NamedLayoutEntry | null {
   if (typeof v !== "object" || v === null) return null;
   const e = v as Record<string, unknown>;
+  if (e.scope === "tab") return coerceTabLayoutEntry(name, v);
   if (typeof e.savedAt !== "number" || !Number.isFinite(e.savedAt)) return null;
-  if (e.scope === "tab") {
-    if (typeof e.layout !== "object" || e.layout === null) return null;
-    // tabTitle falls back to the name when absent/malformed (a v2 blob from a
-    // future variant that dropped it still loads sensibly).
-    const tabTitle =
-      typeof e.tabTitle === "string" && e.tabTitle.trim() !== ""
-        ? e.tabTitle
-        : name;
-    return {
-      scope: "tab",
-      name,
-      tabTitle,
-      layout: e.layout as SerializedDockview,
-      savedAt: e.savedAt,
-    };
-  }
   if (e.scope === "master") {
     if (typeof e.session !== "object" || e.session === null) return null;
     const s = e.session as Record<string, unknown>;

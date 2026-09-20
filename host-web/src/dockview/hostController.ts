@@ -14,7 +14,12 @@ import {
   runtimeServers,
 } from "../state/serverList";
 import { firstNeedsYouAtFor } from "./store";
-import { scheduleSave } from "./layoutPersistence";
+import { scheduleSave, type SavedLayout } from "./layoutPersistence";
+import {
+  buildTimeFleetOrigins,
+  coerceTabLayoutEntry,
+  validateServerLayoutTargets,
+} from "./layoutValidation";
 import {
   deleteNamedLayout,
   listTabLayouts,
@@ -22,6 +27,7 @@ import {
   loadNamedLayout,
   renameNamedLayout,
   saveTabLayout,
+  type TabLayoutEntry,
   // Aliased: the controller class has a saveMasterLayout METHOD (the HostOps
   // facet); the un-aliased name would shadow the module function that method
   // calls (typecheck-correct but a readability trap).
@@ -731,6 +737,46 @@ export class HostController implements HostOps {
   }
 
   /**
+   * Instantiate a SERVER-SOURCED tab-layout entry (the /vh/layouts catalog)
+   * as a NEW workspace — the validated apply path for the Layouts panel's
+   * server-sourced rows. Two gates BEFORE any workspace is created:
+   *
+   *  1. STRUCTURAL: the entry is re-coerced through the shared
+   *     coerceTabLayoutEntry (server bytes are untrusted; a malformed entry
+   *     is rejected, reason "invalid-entry").
+   *  2. TARGETS: every pane target is checked via validateServerLayoutTargets
+   *     against the BUILD-TIME fleet allowlist. Unlike a LOCAL load — where
+   *     the cold-restore pipeline drops invalid panes and restores the
+   *     survivors — a server entry with ANY unallowlisted target is BLOCKED
+   *     WHOLE (reason "invalid-targets"; the UI surfaces a visible error).
+   *     A server layout is never partially and never silently opened (F3
+   *     hazard H1: the load of a server-sourced row must take the SERVER
+   *     entry through a validated path — this is it).
+   *
+   * On success the flow is IDENTICAL to a local load: addWorkspace stages the
+   * layout for a fresh workspace id and its DockviewHost cold-restores it at
+   * mount through the existing persistence pipeline (fromJSON exactly once,
+   * before any iframe exists — the HARD RULE holds; pane ids re-minted). The
+   * workspace is named after the entry's tabTitle (falling back to its name).
+   * Never touches any live workspace's tree.
+   */
+  loadLayoutEntry(
+    entry: TabLayoutEntry,
+  ): { ok: true; id: string } | { ok: false; reason: "invalid-entry" | "invalid-targets" } {
+    const coerced = coerceTabLayoutEntry(entry.name, entry);
+    if (!coerced) return { ok: false, reason: "invalid-entry" };
+    const check = validateServerLayoutTargets(
+      coerced.layout as unknown as SavedLayout,
+      buildTimeFleetOrigins(),
+    );
+    if (!check.valid) return { ok: false, reason: "invalid-targets" };
+    return {
+      ok: true,
+      id: storeAddWorkspace(coerced.tabTitle || coerced.name, coerced.layout),
+    };
+  }
+
+  /**
    * DESTRUCTIVE session replace (scope "master"): re-create the whole saved
    * session as fresh cold-mounted workspaces and close every pre-existing
    * workspace. Sequence (order matters):
@@ -1040,6 +1086,7 @@ export class HostController implements HostOps {
     this.ops.overlaySwapTargets = (paneId) => this.overlaySwapTargets(paneId);
     this.ops.saveLayout = (name, tabTitle) => this.saveLayout(name, tabTitle);
     this.ops.loadLayout = (name) => this.loadLayout(name);
+    this.ops.loadLayoutEntry = (entry) => this.loadLayoutEntry(entry);
     this.ops.saveMasterLayout = (name) => this.saveMasterLayout(name);
     this.ops.loadMasterLayout = (name) => this.loadMasterLayout(name);
     this.ops.renameLayout = (name, newName) => this.renameLayout(name, newName);

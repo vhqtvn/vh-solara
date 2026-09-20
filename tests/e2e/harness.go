@@ -35,6 +35,10 @@ type Cluster struct {
 	WorkerVHURL   string // the worker's own --web vh server (loopback) — the pure-local path
 	WorkerID      string
 	APIToken      string
+	// HostPattern is the controller daemon's host-based provisioning pattern
+	// this cluster was started with ("" = none). Recorded for tests that
+	// route requests through the per-worker subdomain proxy.
+	HostPattern string
 
 	fakeSrv   *httptest.Server
 	workerSrv *httptest.Server
@@ -44,12 +48,41 @@ type Cluster struct {
 
 const ringCap = 1000
 
+// ClusterOption configures optional StartCluster behavior. The zero options
+// reproduce the historical StartCluster() behavior exactly.
+type ClusterOption func(*clusterOptions)
+
+type clusterOptions struct {
+	hostPattern string
+}
+
+// WithHostPattern sets the controller daemon's host-based provisioning
+// pattern (e.g. "$ID.localhost" — the daemon compiles it to an anchored
+// subdomain regex and routes matching Host headers to that worker through the
+// raw tunnel proxy). Default "" keeps host interception OFF.
+func WithHostPattern(pattern string) ClusterOption {
+	return func(o *clusterOptions) { o.hostPattern = pattern }
+}
+
 // StartCluster brings the whole stack up and waits until the worker is online.
+// It preserves the historical signature: identical to StartClusterWithOptions
+// with no options.
 func StartCluster() (*Cluster, error) {
+	return StartClusterWithOptions()
+}
+
+// StartClusterWithOptions is StartCluster with optional knobs. Every option
+// defaults to the historical StartCluster behavior.
+func StartClusterWithOptions(opts ...ClusterOption) (*Cluster, error) {
+	var cfg clusterOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	log.SetOutput(io.Discard) // the agent/controller log verbosely; keep test output clean
 
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &Cluster{WorkerID: "worker-e2e", APIToken: "e2e-token", cancel: cancel}
+	c := &Cluster{WorkerID: "worker-e2e", APIToken: "e2e-token", cancel: cancel, HostPattern: cfg.hostPattern}
 
 	// 1. Fake opencode.
 	c.Fake = fixtures.New()
@@ -80,7 +113,7 @@ func StartCluster() (*Cluster, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := server.NewDaemon(userAddr, daemonAddr, "")
+	d := server.NewDaemon(userAddr, daemonAddr, cfg.hostPattern)
 	d.APIToken = c.APIToken
 	go func() { _ = d.Start() }()
 	c.ControllerURL = "http://" + userAddr

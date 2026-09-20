@@ -1,12 +1,11 @@
 import type { DockviewApi, SerializedDockview } from "dockview-core";
 import {
-  hasRealFleetEnv,
   isFleetEntry,
   nextPaneId,
-  resolveBaseFleet,
   seedPaneSeq,
   type FleetEntry,
 } from "../state/mockData";
+import { buildTimeFleetOrigins } from "./layoutValidation";
 import { fractionsToSizes, sizesToFractions } from "./fractionMath";
 import { DIAG_VERSION, recordLayoutDiag } from "./layoutDiag";
 
@@ -1004,19 +1003,14 @@ function reIdLayoutPanels(layout: SavedLayout): SavedLayout {
 // Real-fleet mode tightens this with the origin-membership allowlist.
 function validRestoreIds(panels: SavedLayout["panels"]): Set<string> {
   // The origin allowlist is anchored to the BUILD-TIME VITE_SERVERS config
-  // (hasRealFleetEnv + resolveBaseFleet), NOT the runtime catalog. This keeps
-  // layout restore ORTHOGONAL to the runtime server list: adding/removing a
-  // runtime server never gates which panes restore. (Using isRealFleet()/
-  // resolveFleet() here would let the runtime catalog reshape the allowlist and
-  // drop restored panes that point at build-time-only servers — a behavior
-  // change this slice must NOT introduce.)
-  const fleetOrigins = hasRealFleetEnv()
-    ? new Set(
-        resolveBaseFleet()
-          .map((e) => safeOrigin(e.url))
-          .filter((o): o is string => o !== null),
-      )
-    : null;
+  // (buildTimeFleetOrigins in layoutValidation.ts — extracted from here so the
+  // server-layout load gate derives the SAME allowlist), NOT the runtime
+  // catalog. This keeps layout restore ORTHOGONAL to the runtime server list:
+  // adding/removing a runtime server never gates which panes restore. (Using
+  // isRealFleet()/resolveFleet() here would let the runtime catalog reshape
+  // the allowlist and drop restored panes that point at build-time-only
+  // servers — a behavior change this slice must NOT introduce.)
+  const fleetOrigins = buildTimeFleetOrigins();
   const valid = new Set<string>();
   for (const [id, st] of Object.entries(panels)) {
     const params = st?.params;
@@ -1698,7 +1692,9 @@ interface FloatingGroup {
   grid?: { root: GridNode; width?: number; height?: number; orientation?: string };
   position?: unknown;
 }
-interface SavedLayout {
+// Exported (type-only) so layoutValidation.ts's server-target gate can share
+// the exact shape the repair walker consumes — one structural mirror, not two.
+export interface SavedLayout {
   grid: { root: GridNode; width?: number; height?: number; orientation?: string };
   // The serialized panel value carries its own `id` — dockview's deserializer
   // names the recreated panel from it (the map key is a parallel index; the

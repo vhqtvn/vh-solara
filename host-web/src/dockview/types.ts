@@ -5,6 +5,8 @@
 // web UI. Panes are tiled by Dockview with `renderer: 'always'` so the iframe
 // element is never reparented/destroyed — only its geometry/visibility changes.
 
+import type { TabLayoutEntry } from "./namedLayouts";
+
 export type ViewKind = "chat" | "terminal" | "diff" | "sessions";
 
 /**
@@ -461,6 +463,24 @@ export interface HostOps {
    * loadMasterLayout). Returns the new workspace id, or null when no TAB
    * layout is saved under the name. */
   loadLayout?(name: string): string | null;
+  /**
+   * Instantiate a SERVER-SOURCED tab-layout entry (the /vh/layouts catalog)
+   * as a NEW workspace through the validated staged apply path. The entry is
+   * re-coerced (coerceTabLayoutEntry) and EVERY pane target is checked
+   * against the build-time fleet origin allowlist
+   * (validateServerLayoutTargets): unlike a LOCAL named-layout load — where
+   * the cold-restore pipeline drops invalid panes and restores the survivors
+   * — a server-sourced entry with ANY unallowlisted target is REJECTED WHOLE
+   * ({ok:false, reason:"invalid-targets"}), never partially and never
+   * silently opened (F3: server data is untrusted until validated; the UI
+   * surfaces a visible error). On success the entry instantiates exactly like
+   * a local load: staged for a fresh workspace id, cold-mounted via the same
+   * persistence pipeline, named after the entry's tabTitle. Returns
+   * {ok:false, reason:"invalid-entry"} when the entry fails structural
+   * coercion. */
+  loadLayoutEntry?(
+    entry: TabLayoutEntry,
+  ): { ok: true; id: string } | { ok: false; reason: "invalid-entry" | "invalid-targets" };
   /**
    * DESTRUCTIVE session replace (named layouts, scope "master"): closes every
    * existing workspace through the existing closeWorkspace path (explicit
