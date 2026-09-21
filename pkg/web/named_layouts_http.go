@@ -42,6 +42,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
@@ -60,9 +61,13 @@ const maxLayoutTabTitleLen = 80
 // maxLayoutJSONBytes caps a single entry's serialized layout payload. A
 // fractional dockview layout is a few KiB in practice; 256 KiB is a generous
 // ceiling that bounds the catalog file (≤100 entries × 256 KiB ≈ 25 MiB
-// worst case) while accepting any realistic document. Checked on the RAW
-// bytes (pre-parse) so an oversized payload never reaches the JSON decoder's
-// allocation path.
+// worst case) while accepting any realistic document. BYTE-based on purpose
+// (stored-bytes semantics): it bounds the STORED entry size on the raw
+// undecoded-interior bytes of the Layout field, checked POST-decode — the
+// outer PUT json.Decode in handleNamedLayoutsPut has already copied Layout
+// as a json.RawMessage by the time validateTabLayoutEntry measures it. The
+// request-level allocation bound is the 1 MiB http.MaxBytesReader wrapped
+// around r.Body in handleNamedLayoutsPut.
 const maxLayoutJSONBytes = 256 << 10
 
 // layoutsScopeTab is the only entry scope accepted in v1. The TS side models
@@ -152,7 +157,7 @@ func validateTabLayoutEntry(e *TabLayoutEntry) (code, message string) {
 	if e.Name == "" {
 		return "invalid_name", "entry.name must be non-empty (trim client-side before sending)"
 	}
-	if len(e.Name) > maxLayoutNameLen {
+	if utf8.RuneCountInString(e.Name) > maxLayoutNameLen {
 		return "invalid_name", "entry.name exceeds the 60-char cap"
 	}
 	if e.Name != strings.TrimSpace(e.Name) {
@@ -161,7 +166,7 @@ func validateTabLayoutEntry(e *TabLayoutEntry) (code, message string) {
 	if e.TabTitle == "" {
 		return "invalid_tab_title", "entry.tabTitle must be non-empty (apply the client-side name fallback before sending)"
 	}
-	if len(e.TabTitle) > maxLayoutTabTitleLen {
+	if utf8.RuneCountInString(e.TabTitle) > maxLayoutTabTitleLen {
 		return "invalid_tab_title", "entry.tabTitle exceeds the 80-char cap"
 	}
 	if e.TabTitle != strings.TrimSpace(e.TabTitle) {

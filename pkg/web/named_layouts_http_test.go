@@ -330,6 +330,56 @@ func TestLayoutsHTTPPutPerEntryIsolation(t *testing.T) {
 	}
 }
 
+// --- multibyte (F5): the name/tabTitle caps count RUNES, not bytes ---------
+
+// TestLayoutsHTTPPutMultibyteNameAtCapRoundTrips is THE F5 crux: a name of
+// exactly 60 CJK runes (180 UTF-8 bytes) and a tabTitle of exactly 80 CJK
+// runes (240 bytes) are AT-CAP in characters — the unit the TS client caps
+// in — but far over the cap in bytes. Under byte-length caps this PUT 400'd
+// (invalid_name: 180 > 60), silently breaking sync for every non-ASCII name;
+// under rune caps it must PUT 200 and GET back byte-exact.
+func TestLayoutsHTTPPutMultibyteNameAtCapRoundTrips(t *testing.T) {
+	_, web := newLayoutsTestServer(t)
+
+	// 60 runes / 180 bytes; 80 runes / 240 bytes.
+	name := strings.Repeat("世", maxLayoutNameLen)
+	title := strings.Repeat("題", maxLayoutTabTitleLen)
+
+	e := validEntry(name)
+	e["tabTitle"] = title
+	resp := layoutsPut(t, web.URL+"/vh/layouts", entryBody(0, e))
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("PUT at-cap multibyte: status %d, want 200. body: %s", resp.StatusCode, b)
+	}
+	r := decodeLayoutsResp(t, resp.Body)
+	if len(r.Entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(r.Entries))
+	}
+	if got := r.Entries[0].Name; got != name {
+		t.Fatalf("PUT response name not byte-exact: %d bytes, want %d bytes", len(got), len(name))
+	}
+	if got := r.Entries[0].TabTitle; got != title {
+		t.Fatalf("PUT response tabTitle not byte-exact: %d bytes, want %d bytes", len(got), len(title))
+	}
+
+	// The STORED catalog GETs back byte-exact too (not just the PUT echo).
+	get, err := http.Get(web.URL + "/vh/layouts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer get.Body.Close()
+	g := decodeLayoutsResp(t, get.Body)
+	if len(g.Entries) != 1 {
+		t.Fatalf("GET entries = %d, want 1", len(g.Entries))
+	}
+	if g.Entries[0].Name != name || g.Entries[0].TabTitle != title {
+		t.Fatalf("GET round-trip not byte-exact: name %d bytes (want %d), tabTitle %d bytes (want %d)",
+			len(g.Entries[0].Name), len(name), len(g.Entries[0].TabTitle), len(title))
+	}
+}
+
 // --- CSRF enforcement -------------------------------------------------------
 
 // TestLayoutsHTTPCSRFEnforced verifies PUT without X-VH-CSRF is rejected by
@@ -419,8 +469,10 @@ func TestLayoutsHTTPPut400(t *testing.T) {
 		{"empty_name", entryBody(0, with(validEntry("x"), "name", "")), "invalid_name"},
 		{"untrimmed_name", entryBody(0, with(validEntry("x"), "name", " padded ")), "invalid_name"},
 		{"oversized_name", entryBody(0, with(validEntry("x"), "name", strings.Repeat("n", maxLayoutNameLen+1))), "invalid_name"},
+		{"oversized_name_multibyte", entryBody(0, with(validEntry("x"), "name", strings.Repeat("世", 61))), "invalid_name"},
 		{"empty_tab_title", entryBody(0, with(validEntry("x"), "tabTitle", "")), "invalid_tab_title"},
 		{"oversized_tab_title", entryBody(0, with(validEntry("x"), "tabTitle", strings.Repeat("t", maxLayoutTabTitleLen+1))), "invalid_tab_title"},
+		{"oversized_tab_title_multibyte", entryBody(0, with(validEntry("x"), "tabTitle", strings.Repeat("題", 81))), "invalid_tab_title"},
 		{"negative_saved_at", entryBody(0, with(validEntry("x"), "savedAt", -1)), "invalid_saved_at"},
 		{"layout_not_object", entryBody(0, with(validEntry("x"), "layout", []any{1, 2})), "invalid_layout"},
 		{"layout_null", entryBody(0, with(validEntry("x"), "layout", nil)), "invalid_layout"},

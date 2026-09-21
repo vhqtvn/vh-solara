@@ -27,6 +27,12 @@ import * as H from "./util";
 //      /vh/layouts with its SPA fallback), the catalog is silently empty,
 //      local saves still succeed, the publish warns exactly once with
 //      "skipping server layout sync", and local rows remain listed + loadable.
+//   6. STRUCTURAL GATE (F3 hardening): a server entry whose layout is an
+//      object but NOT a restorable SavedLayout ({}), or a valid-shaped
+//      SavedLayout with ZERO panels, is BLOCKED at load with the visible
+//      invalid-entry error ("could not be loaded") — no empty workspace is
+//      created, the popover stays open (local saves cannot produce a
+//      zero-panel layout; REJECT is the ruling).
 //
 // UI paths drive the REAL production surface (popover → save/load); the DEV
 // bridge is used only for arrangement + reads (the suite's established
@@ -260,6 +266,58 @@ test.describe("named layouts sync (server catalog merge)", () => {
     // …and the poisoned url never reached an unsandboxed iframe.src.
     const srcs = await H.iframeSrcs(page);
     expect(srcs.some((src) => src.startsWith("javascript:"))).toBe(false);
+  });
+
+  test("server entry with a malformed ({} ) layout: load BLOCKED with the invalid-entry error, nothing opens", async ({ page }) => {
+    // layout: {} is an OBJECT, so both catalog-client guards accept it and
+    // the row lists — but it is not a restorable SavedLayout. Before the
+    // loadLayoutEntry structural gate this cold-restored as an EMPTY
+    // workspace; it must instead BLOCK with the visible invalid-entry
+    // error, no workspace created.
+    await page.route(SYNC_URL, (route) =>
+      fulfillDoc(route, 2, [
+        { scope: "tab", name: "blob", tabTitle: "blob tab", layout: {}, savedAt: Date.now() },
+      ]),
+    );
+    await openLayouts(page);
+    await expect(layoutRow(page, "blob")).toBeVisible();
+
+    const wsBefore = (await H.workspaces(page)).length;
+    await layoutRow(page, "blob").locator('[data-testid="layout-load"]').click();
+
+    const err = page.locator('[data-testid="layout-load-error"]');
+    await expect(err).toBeVisible();
+    await expect(err).toHaveText(/could not be loaded/i);
+    await expect(page.locator('[data-testid="layouts-popover"]')).toBeVisible();
+    expect((await H.workspaces(page)).length).toBe(wsBefore);
+  });
+
+  test("server entry with a valid SavedLayout shape but ZERO panels: load BLOCKED, nothing opens", async ({ page }) => {
+    // Valid SavedLayout structure (grid + panels objects) with panels
+    // emptied: passes isSavedLayout, passes the target gate trivially, and
+    // before the zero-panel gate cold-restored as an EMPTY workspace. Local
+    // saves can never produce this (canSaveTab requires >0 panes) — the
+    // REJECT ruling. Same blocked outcome as the malformed shape.
+    const zeroPane: Record<string, unknown> = {
+      ...onePaneLayout(H.serverUrl("srv-Z")),
+      panels: {},
+    };
+    await page.route(SYNC_URL, (route) =>
+      fulfillDoc(route, 2, [
+        { scope: "tab", name: "ghost", tabTitle: "ghost tab", layout: zeroPane, savedAt: Date.now() },
+      ]),
+    );
+    await openLayouts(page);
+    await expect(layoutRow(page, "ghost")).toBeVisible();
+
+    const wsBefore = (await H.workspaces(page)).length;
+    await layoutRow(page, "ghost").locator('[data-testid="layout-load"]').click();
+
+    const err = page.locator('[data-testid="layout-load-error"]');
+    await expect(err).toBeVisible();
+    await expect(err).toHaveText(/could not be loaded/i);
+    await expect(page.locator('[data-testid="layouts-popover"]')).toBeVisible();
+    expect((await H.workspaces(page)).length).toBe(wsBefore);
   });
 
   test("dev degradation: no backend → catalog silently empty; local saves work, warn once, stay loadable", async ({ page }) => {

@@ -1607,7 +1607,7 @@ function materializeNode(
 // ---- structural shape guards (so the walker is safe; fromJSON is the final
 //      authority on full validity, and applyColdRestoreForWorkspace catches any throw) ----
 
-function isSavedLayout(v: unknown): v is SavedLayout {
+export function isSavedLayout(v: unknown): v is SavedLayout {
   if (typeof v !== "object" || v === null) return false;
   const o = v as Record<string, unknown>;
   if (typeof o.grid !== "object" || o.grid === null) return false;

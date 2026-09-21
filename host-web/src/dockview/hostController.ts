@@ -14,7 +14,7 @@ import {
   runtimeServers,
 } from "../state/serverList";
 import { firstNeedsYouAtFor } from "./store";
-import { scheduleSave, type SavedLayout } from "./layoutPersistence";
+import { isSavedLayout, scheduleSave, type SavedLayout } from "./layoutPersistence";
 import {
   buildTimeFleetOrigins,
   coerceTabLayoutEntry,
@@ -743,7 +743,13 @@ export class HostController implements HostOps {
    *
    *  1. STRUCTURAL: the entry is re-coerced through the shared
    *     coerceTabLayoutEntry (server bytes are untrusted; a malformed entry
-   *     is rejected, reason "invalid-entry").
+   *     is rejected, reason "invalid-entry"), then the layout blob itself
+   *     must pass the cold-restore pipeline's isSavedLayout structural
+   *     guard AND carry at least one panel — an object that is not a
+   *     restorable SavedLayout (e.g. {}) or a zero-panel shape would
+   *     otherwise cold-restore as an EMPTY workspace; both are rejected
+   *     with reason "invalid-entry" (local saves cannot produce a
+   *     zero-panel layout — canSaveTab requires >0 panes).
    *  2. TARGETS: every pane target is checked via validateServerLayoutTargets
    *     against the BUILD-TIME fleet allowlist. Unlike a LOCAL load — where
    *     the cold-restore pipeline drops invalid panes and restores the
@@ -765,6 +771,10 @@ export class HostController implements HostOps {
   ): { ok: true; id: string } | { ok: false; reason: "invalid-entry" | "invalid-targets" } {
     const coerced = coerceTabLayoutEntry(entry.name, entry);
     if (!coerced) return { ok: false, reason: "invalid-entry" };
+    if (!isSavedLayout(coerced.layout)) return { ok: false, reason: "invalid-entry" };
+    if (Object.keys(coerced.layout.panels).length === 0) {
+      return { ok: false, reason: "invalid-entry" };
+    }
     const check = validateServerLayoutTargets(
       coerced.layout as unknown as SavedLayout,
       buildTimeFleetOrigins(),
