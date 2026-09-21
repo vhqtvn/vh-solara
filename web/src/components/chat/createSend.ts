@@ -34,10 +34,12 @@ import {
 } from "../../lib/inlineAttach";
 import { IGNORED, runSendSingleFlight } from "../../lib/sendSingleFlight";
 import {
+  attachmentsSubsetOfPayload,
   findReusableSendAttempt,
   finishSendAttempt,
   getSendAction,
   mintSendAttempt,
+  sendActionsFor,
   transferOwnerSendAttempts,
   updateSendAction,
   type PreparedSendPayload,
@@ -142,6 +144,11 @@ export type SendDependencies = {
 
 export type SendController = {
   send(): Promise<void>;
+  // Guarded SendStatus row-retry entry (sending-UX O2 defect fix): verbatim
+  // same-attempt replay of a retained uncertain admission — never silently
+  // sends edited composer contents. See retrySameMessage below for the exact
+  // eligibility/refusal semantics.
+  retrySameMessage(): Promise<void>;
   resendText(text: string, sessionId: string): Promise<boolean>;
   dispatchQueuedItem(
     sessionId: string,
@@ -698,7 +705,10 @@ export function createSend(deps: SendDependencies): SendController {
       : (() => {
           const ownerKey = wasDraft ? "draft" : deps.sessionId();
           const reusable = findReusableSendAttempt(ownerKey, text);
-          if (reusable?.payload && ownedAtts.every((a) => reusable.payload!.attachments.includes(a as never))) {
+          // attachmentsSubsetOfPayload (NOT a raw includes): the store proxies
+          // the retained payload on read, so an inline identity includes is
+          // always false for attachment-bearing payloads — see the helper.
+          if (reusable?.payload && attachmentsSubsetOfPayload(ownedAtts, reusable.payload)) {
             return { attemptId: reusable.attemptId, tapText: text, reuse: reusable.payload };
           }
           return { attemptId: mintSendAttempt(ownerKey).attemptId, tapText: text };
@@ -1097,6 +1107,100 @@ export function createSend(deps: SendDependencies): SendController {
     // in-flight send owns clearing on its own success).
   }
 
+  // Guarded row-retry entry (sending-UX O2 defect fix, bounded bug-fix slice).
+  //
+  // DEFECT being fixed: the SendStatus "Queue confirmation unknown." row's
+  // Retry send button routes through the GENERIC composer send (its prop
+  // signature is `() => Promise<void>` — no record identity), so an operator
+  // who EDITED the composer after the uncertain record appeared would silently
+  // enqueue their EDITED draft as a fresh message under a fresh attemptId —
+  // while the row's payload preview ("Will send: '<stored text>'") advertised
+  // a verbatim replay of the ORIGINAL (and the original admission stayed
+  // unknown, so BOTH messages could deliver). ChatView/Composer wire THIS
+  // method as the row's send entry; the composer's own Send button / Enter
+  // key keep the raw send(). Semantics:
+  //   (a) the composer still matches a retained uncertain retry-same attempt
+  //       (tapText equal + live attachments a subset of the payload's, per
+  //       identity — the SAME pure selection send() applies at its reuse
+  //       gate) → delegate to send(): today's behavior exactly (same
+  //       attemptId + verbatim payload; the tap-owned composer state clears
+  //       on success as always).
+  //   (b) the composer diverged from EVERY retained retry-same record (text
+  //       edited, or an attachment ADDED): the row's displayed payload is the
+  //       authority — replay the STORED verbatim payload under the SAME
+  //       attemptId and leave the composer UNTOUCHED (the operator's edit
+  //       stays visible for a fresh send under a fresh attemptId; nothing is
+  //       silently overwritten or swallowed). With MORE THAN ONE such record
+  //       the no-arg entry cannot know which row was tapped — refuse
+  //       (notification, no enqueue) rather than silently send a record the
+  //       operator did not select. With NONE, delegate to send() (stale-row
+  //       fallback: today's behavior).
+  // Subset-semantics coherence (slice-2 advisory): a chip the operator
+  // REMOVED after the attempt still passes the subset gate → (a) → the
+  // verbatim replay re-includes it, exactly as before; a chip ADDED after the
+  // attempt fails the subset gate → (b) → the replay sends the stored payload
+  // WITHOUT the added chip and the composer keeps it. In every branch what is
+  // sent is the STORED payload — composer additions never silently ride
+  // along.
+  // The replay reuses sendText's reuse branch (same classification on a
+  // second lost response: reconcile-first, the record stays uncertain and
+  // retryable) and runs inside the per-session single-flight, so a concurrent
+  // composer send drops it (IGNORED) exactly like a re-tap.
+  async function retrySameMessage(): Promise<void> {
+    if (deps.draft()) return send();
+    // Retry-same records live under live session ids (the draft→live owner
+    // sweep runs before the first enqueue ever resolves uncertainly), so a
+    // draft owner has nothing to guard — today's path unchanged.
+    const ownerKey = deps.sessionId();
+    const liveText = deps.input().trim();
+    const liveAtts = deps.attachments();
+    const reusable = findReusableSendAttempt(ownerKey, liveText);
+    if (reusable?.payload && attachmentsSubsetOfPayload(liveAtts, reusable.payload)) {
+      return send(); // (a) composer-matching retry: today's decision, unchanged
+    }
+    const candidates = sendActionsFor(ownerKey).filter(
+      (a) => a.stage === "uncertain" && a.recovery === "retry-same" && a.payload,
+    );
+    if (candidates.length === 0) return send(); // nothing to guard — today's behavior
+    if (candidates.length > 1) {
+      deps.pushNotification({
+        kind: "error", sessionID: ownerKey, title: "Retry unavailable — multiple unresolved sends",
+        detail: "More than one message has an unknown queue confirmation. Restore the exact text of the message you want to retry into the composer, or check the session queue.",
+      });
+      return;
+    }
+    const rec = candidates[0];
+    const payload = rec.payload!;
+    const attempt: SendAttemptRef = { attemptId: rec.attemptId, tapText: payload.tapText, reuse: payload };
+    // A reused attempt IS a retry — flag it so the status surface renders
+    // "Retrying queue confirmation…" (same as send()'s reuse branch).
+    updateSendAction(rec.attemptId, { retry: true });
+    await runSendSingleFlight(ownerKey, async () => {
+      // Agent: the payload's captured agent is the exact evidence-gated value
+      // the first attempt carried (sender-stamped, never re-resolved — F2
+      // snapshot semantics); the evidence gate is only a defensive fallback
+      // for a payload whose captured config lost it.
+      let agent = payload.sendConfig?.agent;
+      if (!agent) {
+        const ag = await deps.awaitAgent(ownerKey);
+        if (!ag.ok) {
+          log.error("send", "guarded retry aborted: agent unresolved", { id: ownerKey, reason: ag.reason });
+          deps.pushNotification({
+            kind: "error", sessionID: ownerKey, title: "Not sent — agent unresolved",
+            detail: `Agent evidence did not arrive (${ag.reason}); nothing was sent.`,
+          });
+          return;
+        }
+        agent = ag.agent;
+      }
+      // Verbatim replay under the SAME attemptId. sendText never touches the
+      // composer (its documented contract) and this caller deliberately owns
+      // NONE of the composer state: the operator's edited draft survives
+      // intact for a fresh send.
+      await sendText(payload.text, ownerKey, agent, new Set(), attempt);
+    });
+  }
+
   // retry() reuses sendText() to resend an OLD message; named resendText on the
   // public surface so ChatView's retry closure can call it without reaching
   // into the private sendText. Same evidence gate as send(): the session
@@ -1125,5 +1229,5 @@ export function createSend(deps: SendDependencies): SendController {
     return sendText(text, id, ag.agent, new Set(), { attemptId, tapText: text });
   }
 
-  return { send, resendText, dispatchQueuedItem };
+  return { send, retrySameMessage, resendText, dispatchQueuedItem };
 }

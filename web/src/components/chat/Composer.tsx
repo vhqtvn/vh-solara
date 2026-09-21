@@ -68,6 +68,14 @@ export interface ComposerProps {
   recovery: QueueRecovery;
   // send / abort
   send: () => Promise<void>;
+  // Guarded SendStatus row-retry entry (sending-UX O2 fix): createSend's
+  // retrySameMessage — verbatim same-attempt replay of a retained uncertain
+  // admission, immune to composer edits (an edited composer is left untouched
+  // while the STORED payload replays). Forwarded as SendStatus's `send` prop;
+  // the composer's own Send button / Enter key keep the raw `send`. Optional
+  // — absent it, SendStatus's row falls back to the raw composer send
+  // (today's behavior; minimal unit harnesses omit it).
+  retrySame?: () => Promise<void>;
   abort: () => void;
   // Send-reliability slice 3: global stream status for SendStatus's
   // server-custody line ("Queued — waiting for connection." while a session
@@ -247,11 +255,16 @@ export function Composer(props: ComposerProps) {
               rejections (composer retains the text), resolve-status-save
               retries, and the server-custody line while disconnected. Lives
               where the Send button's glow is: the glow stays as the glance
-              signal, this row is the readable text. */}
+              signal, this row is the readable text.
+              retrySame (guarded row-retry, sending-UX O2 fix): the row's
+              Retry send button consumes this INSTEAD of the raw composer
+              send, so a retry after a composer edit replays the row's STORED
+              payload verbatim (same attemptId) instead of silently sending
+              the edited draft as a fresh message. */}
           <SendStatus
             sessionId={props.sessionId}
             draft={props.draft}
-            send={props.send}
+            send={props.retrySame ?? props.send}
             uploadProgress={props.att.uploadProgress}
             streamStatus={props.streamStatus}
             sessions={props.sessions}

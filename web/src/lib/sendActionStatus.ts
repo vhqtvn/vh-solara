@@ -43,7 +43,7 @@
 // In-memory only (module singleton, like sendSingleFlight): a reload re-fetches
 // server truth; unconfirmed browser attempts are NOT part of the durability
 // guarantee (explicitly out of scope per the brief).
-import { createStore, produce } from "solid-js/store";
+import { createStore, produce, unwrap } from "solid-js/store";
 
 // How certain a recorded outcome is. "unknown" means outcome-unknown (transport
 // hang, response loss, proxy 502) — NEVER "failed, safe to resend".
@@ -263,6 +263,28 @@ export function findReusableSendAttempt(ownerKey: string, tapText: string): Send
   return sendActionsFor(ownerKey).find(
     (a) => a.stage === "uncertain" && a.recovery === "retry-same" && a.payload?.tapText === tapText,
   );
+}
+
+/** Identity-subset gate for the reuse paths: is every LIVE composer attachment
+ *  (raw objects, from the composer signal) one of the STORED payload's
+ *  attachments (per-object identity)? A chip REMOVED after the attempt still
+ *  passes (the stored superset replays verbatim); a chip ADDED after the
+ *  attempt fails (the operator is composing a new message).
+ *
+ *  WHY a helper instead of `payload.attachments.includes(live)` inline: the
+ *  store wraps nested objects in reactive proxies ON READ, so a proxied
+ *  element NEVER compares === to the raw live chip — the inline includes is
+ *  ALWAYS false for a payload with attachments (probe-confirmed; the reuse
+ *  gate in createSend silently never matched, minting fresh attemptIds for
+ *  attachment-bearing retries). unwrap() recovers the raw stored refs the
+ *  live chips are compared against; it is a no-op on a raw (non-store)
+ *  payload. */
+export function attachmentsSubsetOfPayload(
+  live: readonly unknown[],
+  payload: PreparedSendPayload,
+): boolean {
+  const stored = unwrap(payload).attachments as unknown[];
+  return live.every((a) => stored.includes(a));
 }
 
 /** ChatView.ensureSession calls this when createSession fails with UNKNOWN

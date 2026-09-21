@@ -1649,7 +1649,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // click-time), so a forward declaration bridges it. msgActions is assigned
   // synchronously right after createSend returns, before any user interaction.
   let msgActions: MessageActions;
-  const { send, resendText, dispatchQueuedItem } = createSend({
+  const { send, retrySameMessage, resendText, dispatchQueuedItem } = createSend({
     sessionId: () => props.sessionId,
     draft: () => !!props.draft,
     ensureSession,
@@ -1936,6 +1936,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         hist={hist}
         recovery={recovery}
         send={send}
+        retrySame={retrySameMessage}
         abort={msgActions.abort}
         streamStatus={() => state.status}
         sessions={() => state.sessions}
