@@ -43,6 +43,14 @@ type Daemon struct {
 	Proxy      *Proxy
 	WSUpgrader websocket.Upgrader
 
+	// tunnelDeflate is the controller-side permessage-deflate write policy
+	// for the worker tunnel WebSocket (Q4c experiment). Parsed once from
+	// tunnel.EnvTunnelDeflate in NewDaemon; off ⇒ the upgrader never offers
+	// compression in the handshake (byte-identical to the pre-knob build).
+	// Compression activates only when BOTH endpoints offer it, so any
+	// worker/controller version mix stays safe (uncompressed fallback).
+	tunnelDeflate tunnel.DeflatePolicy
+
 	updateMu  sync.Mutex
 	updateLog strings.Builder
 
@@ -58,7 +66,7 @@ func NewDaemon(addr, daemonAddr, hostPattern string) *Daemon {
 	registry := NewRegistry()
 	proxy := NewProxy(registry)
 
-	return &Daemon{
+	d := &Daemon{
 		Addr:        addr,
 		DaemonAddr:  daemonAddr,
 		HostPattern: hostPattern,
@@ -73,6 +81,19 @@ func NewDaemon(addr, daemonAddr, hostPattern string) *Daemon {
 			},
 		},
 	}
+
+	// Q4c: negotiated permessage-deflate for the worker tunnel WebSocket.
+	// Same env knob as the worker side (recommended pairing: identical policy
+	// both sides); default off = the upgrader never offers the extension and
+	// the handshake is byte-identical to the pre-knob build. An invalid value
+	// falls back to off with a loud log.
+	tunnelDeflate, derr := tunnel.DeflatePolicyFromEnv()
+	if derr != nil {
+		log.Printf("VH_TUNNEL_DEFLATE: %v — tunnel compression stays OFF", derr)
+	}
+	d.tunnelDeflate = tunnelDeflate
+	d.WSUpgrader.EnableCompression = tunnelDeflate.OfferCompression()
+	return d
 }
 
 // Start boots the HTTP server.
@@ -297,7 +318,7 @@ func (d *Daemon) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create yamux server session over the WebSocket
-	mux, err := tunnel.NewMuxTransportServer(conn)
+	mux, err := tunnel.NewMuxTransportServerWithDeflate(conn, d.tunnelDeflate)
 	if err != nil {
 		log.Printf("Failed to init yamux session: %v", err)
 		conn.Close()

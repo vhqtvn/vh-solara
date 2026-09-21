@@ -77,6 +77,19 @@ var reconnectIdleResetThreshold = 60 * time.Second
 
 // Start begins the reconnect and proxying loop.
 func (d *Daemon) Start() {
+	// Q4c: negotiated permessage-deflate policy for the tunnel WebSocket leg.
+	// Default off = handshake and frames byte-identical to the pre-knob
+	// build. Parsed once per Start; the knob is a per-endpoint env var so an
+	// operator can enable it on worker and controller independently
+	// (recommended pairing: the SAME policy on both sides). Compression is
+	// used only when BOTH endpoints offer it — an old controller paired with
+	// a new worker (or vice versa) simply stays uncompressed, so rolling
+	// deploys are safe. An invalid value falls back to off with a loud log.
+	deflate, derr := tunnel.DeflatePolicyFromEnv()
+	if derr != nil {
+		log.Printf("VH_TUNNEL_DEFLATE: %v — tunnel compression stays OFF", derr)
+	}
+
 	var backoff = reconnectFloor
 	// disconnectedAt brackets the current "no tunnel up" period. Initialized
 	// to process start so the idle-reset check is meaningful before the first
@@ -107,6 +120,10 @@ func (d *Daemon) Start() {
 		dialer := websocket.Dialer{
 			ReadBufferSize:  256 * 1024,
 			WriteBufferSize: 256 * 1024,
+			// Q4c: offer permessage-deflate only when the policy asks for
+			// it. off ⇒ no Sec-WebSocket-Extensions header in the handshake
+			// ⇒ dial byte-identical to the pre-knob build.
+			EnableCompression: deflate.OfferCompression(),
 		}
 		// PROBE 7: stamp dial attempt BEFORE the call so the snapshot can
 		// attribute a freeze to "worker is currently mid-dial" regardless of
@@ -164,7 +181,7 @@ func (d *Daemon) Start() {
 		diag.Default.Tunnel.LastConnectedAtNs.Store(now.UnixNano())
 		diag.Default.Tunnel.CurrentState.Store(diag.TunnelStateConnected)
 
-		d.handleTunnel(conn)
+		d.handleTunnel(conn, deflate)
 
 		// PROBE 7: tunnel session ended — stamp disconnect state + reset the
 		// disconnected-period window for the next failure-streak idle check.
@@ -186,9 +203,9 @@ func (d *Daemon) Start() {
 	}
 }
 
-func (d *Daemon) handleTunnel(conn *websocket.Conn) {
+func (d *Daemon) handleTunnel(conn *websocket.Conn, deflate tunnel.DeflatePolicy) {
 	// Create yamux client session over the WebSocket
-	mux, err := tunnel.NewMuxTransportClient(conn)
+	mux, err := tunnel.NewMuxTransportClientWithDeflate(conn, deflate)
 	if err != nil {
 		log.Printf("Failed to init yamux session: %v", err)
 		conn.Close()

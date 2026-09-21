@@ -100,10 +100,21 @@ type mpTokenBucket struct {
 	last   time.Time
 	rate   int64 // bytes/sec
 	cap    int64
+	taken  int64 // total bytes consumed (true wire bytes through this direction)
 }
 
 func newMPTokenBucket(rate, burst int64) *mpTokenBucket {
 	return &mpTokenBucket{tokens: burst, last: time.Now(), rate: rate, cap: burst}
+}
+
+// totalTaken returns the total bytes this bucket has admitted — the TRUE
+// wire-byte count for its direction (the Q4c deflate experiment compares
+// these totals across VH_TUNNEL_DEFLATE policies; note the recorded rows'
+// "bytes" are post-decompression application bytes, not wire bytes).
+func (b *mpTokenBucket) totalTaken() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.taken
 }
 
 func (b *mpTokenBucket) take(n int) {
@@ -122,6 +133,7 @@ func (b *mpTokenBucket) take(n int) {
 		b.last = now
 		if int64(n) <= b.tokens {
 			b.tokens -= int64(n)
+			b.taken += int64(n)
 			b.mu.Unlock()
 			return
 		}
@@ -351,6 +363,15 @@ func TestMultiProjectContentionShapedLink(t *testing.T) {
 			mpBulkProbe(t, rec, m.Cluster, route, dirs, bulkIdx[route.name], cap.label)
 		}
 		mpAssertShaperFloor(t, rec, cap.label, cap.cfg.BytesPerSec)
+
+		// Q4c rail: true wire bytes admitted by each shaped direction. The
+		// tunnel leg's totals are the on-the-wire (post-deflate) byte counts
+		// the VH_TUNNEL_DEFLATE experiment compares across policies — the
+		// recorder rows' bytes are post-decompression application bytes.
+		tbW2C, tbC2W := m.tunnelLink.toBackend.totalTaken(), m.tunnelLink.toClient.totalTaken()
+		dbW2C, dbC2W := dlink.toBackend.totalTaken(), dlink.toClient.totalTaken()
+		t.Logf("[wire %-5s] tunnel leg wire bytes: worker→ctrl=%d ctrl→worker=%d total=%d | direct leg: client→worker=%d worker→client=%d total=%d",
+			cap.label, tbW2C, tbC2W, tbW2C+tbC2W, dbW2C, dbC2W, dbW2C+dbC2W)
 
 		dlink.Close()
 		m.Close()
