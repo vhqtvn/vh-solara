@@ -20,10 +20,12 @@ import { demoDir, projectUrl } from "./util";
 // body is "{}"), rendering an operator-CONFIRMED linkage affordance. The crux
 // sequence, all through the real event model:
 //
-//   1. draft send → create response dropped → "Outcome unknown — check before
-//      sending again." renders in the STILL-DRAFT view (composer retained);
+//   1. draft send → create response dropped → "Session creation unconfirmed.
+//      Check possible sessions before sending again; another send may create
+//      another session." renders in the STILL-DRAFT view (composer retained);
 //   2. the session appears in the tree anyway (SSE — the A1 premise);
-//   3. the affordance renders: "A new session may be your last send — Open it";
+//   3. the affordance renders: "Possible sessions — timing is the only
+//      match. — Link and open it";
 //   4. the operator's real click re-keys the draft-owned records
 //      (transferOwnerSendAttempts — never silent) and navigates;
 //   5. the recovery row is now OWNER-SCOPED in the materialized session, with
@@ -136,9 +138,11 @@ test("(browser) create response lost → session lands via SSE → confirmed lin
   await page.locator(".composer-bar .send-btn").click();
 
   // (1) The honest create-unknown state renders in the STILL-DRAFT view, and
-  // the composer retained the text (no silent loss, no re-tap happened).
+  // the composer retained the text (no silent loss, no re-tap happened). O2
+  // slice 1: the create-specific row copy carries the duplicate-session
+  // warning the suppressed notification used to own.
   const unknownRow = page.locator(".sendStatusLine", {
-    hasText: "Outcome unknown — check before sending again.",
+    hasText: "Session creation unconfirmed.",
   });
   await expect(unknownRow).toBeVisible({ timeout: 15_000 });
   await expect(ta).not.toHaveValue("");
@@ -157,10 +161,11 @@ test("(browser) create response lost → session lands via SSE → confirmed lin
   // the fresh fixture server stamps EVERY seeded session's time.created at
   // boot (~1s before the POST), so the row honestly lists several in-window
   // candidates — the created session is addressed deterministically via its
-  // data-session-id (title "New session" → the generic "Open it (time)" copy).
+  // data-session-id (title "New session" → the generic "Link and open it
+  // (time)" copy).
   const linkRow = page.locator('.sendStatusLine[data-kind="create-link"]');
   await expect(linkRow).toBeVisible({ timeout: 10_000 });
-  await expect(linkRow).toContainText("A new session may be your last send");
+  await expect(linkRow).toContainText("Possible sessions — timing is the only match");
   const openBtn = linkRow.locator(`.sendStatusBtn[data-session-id="${createdId}"]`);
   await expect(openBtn).toBeVisible();
 
@@ -179,7 +184,7 @@ test("(browser) create response lost → session lands via SSE → confirmed lin
   // operator into the session (SendStatus reads ownerKey = session id). The
   // draft-view affordance itself is gone (a live view never renders it).
   const liveRow = page.locator(".sendStatusLine", {
-    hasText: "Outcome unknown — check before sending again.",
+    hasText: "Session creation unconfirmed.",
   });
   await expect(liveRow).toBeVisible({ timeout: 10_000 });
   await expect(page.locator('.sendStatusLine[data-kind="create-link"]')).toHaveCount(0);

@@ -3,7 +3,8 @@ import { type QueuedMessage } from "../queue";
 import Icon from "./Icon";
 
 // QueueChip renders a single queued-message pill in the composer's queue row,
-// plus — for recovered `unknown` items — a visible detail note.
+// plus — for terminal `failed`/`unknown` items with a detail — a visible
+// cause note (see the O2 single-owner note at the note's render site below).
 //
 // Extracted from ChatView (FIX-QUEUE-STUCK-2) so the terminal-state detail
 // surfacing is unit-testable in isolation (ChatView pulls in ~15 stateful
@@ -137,11 +138,23 @@ export function QueueChip(props: {
           </button>
         </Show>
       </span>
-      {/* Recovered `unknown` items: surface the backend Detail (the
-          duplicate-risk warning) visibly — not only in the data-tip tooltip —
-          so the operator understands why the item is in an ambiguous state. */}
-      <Show when={props.q.state === "unknown" && props.q.detail}>
-        <span class="queue-detail-note">{props.q.detail}</span>
+      {/* Terminal dispatch outcomes — O2 single-owner rule: the chip is the
+          ONE persistent owner of a dispatch outcome, so its cause is rendered
+          VISIBLY (not tooltip-only). This visibility is the precondition for
+          suppressing the covered notification-history entries ("Queued
+          message failed to send" / "…send outcome unknown" / "…send timed
+          out") — removing them any earlier would leave the cause homeless.
+          `unknown` additionally carries the standing check-transcript
+          instruction (the dispatch may have been delivered); a reconcile
+          give-up (reconcileTerminal) already ships its own "manual review
+          advised" detail, so the suffix is skipped there. */}
+      <Show when={(props.q.state === "unknown" || props.q.state === "failed") && props.q.detail}>
+        <span class="queue-detail-note">
+          {props.q.detail}
+          <Show when={props.q.state === "unknown" && !props.q.reconcileTerminal}>
+            {" — it may have been delivered; check the transcript before sending it again"}
+          </Show>
+        </span>
       </Show>
     </>
   );

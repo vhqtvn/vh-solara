@@ -48,6 +48,10 @@ import { awaitSendAgent, resolveAgentForSession } from "../../src/agents";
 import { setState } from "../../src/sync/store";
 import { createSend, type SendDependencies } from "../../src/components/chat/createSend";
 import { __resetSendSingleFlightForTests } from "../../src/lib/sendSingleFlight";
+import {
+  __resetSendActionStatusForTests,
+  sendActionsFor,
+} from "../../src/lib/sendActionStatus";
 import type { Attachment } from "../../src/components/chat/createAttachments";
 import type { DrainOutcome } from "../../src/queueDrain";
 
@@ -153,6 +157,7 @@ beforeEach(() => {
   fetchResponder = null;
   setInputSig("");
   __resetSendSingleFlightForTests();
+  __resetSendActionStatusForTests();
   setState("messages", reconcile({}));
   setState("messagesDelivered", reconcile({}));
   setState("messagesError", reconcile({}));
@@ -209,7 +214,7 @@ describe("(b) cold session with no evidence", () => {
     expect(enqueued[0].sendConfig.agent).not.toBe("coordination");
   });
 
-  it("timeout → NO enqueue, error surfaced, composer text preserved, default never sent", async () => {
+  it("timeout → NO enqueue, rejected row owns the refusal (O2 single-owner: no notification), composer text preserved, default never sent", async () => {
     await boot();
     vi.useFakeTimers();
     try {
@@ -224,15 +229,21 @@ describe("(b) cold session with no evidence", () => {
 
       expect(enqueued).toHaveLength(0); // the crux: nothing was enqueued
       expect(inputSig()).toBe("do not lose me"); // text preserved
-      const errors = notes.filter((n) => n.kind === "error");
-      expect(errors).toHaveLength(1);
-      expect(errors[0].title).toBe("Not sent — agent unresolved");
+      // O2 slice 1: the post-mint gate refusal gets a TERMINAL row
+      // disposition (reason "agent-unresolved" → "Not sent — choose an
+      // agent.") — the row owns the fact, so the notification is suppressed
+      // and no stale "Sending…" row remains.
+      expect(notes).toHaveLength(0);
+      const row = sendActionsFor("ses_gate").find((a) => a.stage === "rejected");
+      expect(row).toBeDefined();
+      expect(row!.reason).toBe("agent-unresolved");
+      expect(sendActionsFor("ses_gate").some((a) => a.stage === "preparing")).toBe(false);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("hydration error → same loud abort, no enqueue", async () => {
+  it("hydration error → same loud row-owned abort, no enqueue, no notification", async () => {
     await boot();
     const ctrl = createSend(makeDeps());
     setInputSig("still here");
@@ -244,7 +255,8 @@ describe("(b) cold session with no evidence", () => {
 
     expect(enqueued).toHaveLength(0);
     expect(inputSig()).toBe("still here");
-    expect(notes.some((n) => n.title === "Not sent — agent unresolved")).toBe(true);
+    expect(notes).toHaveLength(0);
+    expect(sendActionsFor("ses_gate").some((a) => a.stage === "rejected" && a.reason === "agent-unresolved")).toBe(true);
   });
 });
 
@@ -287,11 +299,13 @@ describe("dispatch-time guard (legacy items without sendConfig.agent)", () => {
 
       // Nothing was POSTed, so the item is NOT POST-ambiguous: it fails with a
       // pre-POST detail (dismissable / retract-to-compose), never the
-      // "may have reached OpenCode" unknown classification.
+      // "may have reached OpenCode" unknown classification. O2 single-owner:
+      // the failed queue chip visibly carries the detail — no notification.
       expect(out.state).toBe("failed");
       expect(out.detail).toContain("pre-POST");
       expect(fetchCalls).toHaveLength(0);
-      expect(notes.some((n) => n.title === "Queued message not sent — agent unresolved")).toBe(true);
+      expect(notes.some((n) => n.title === "Queued message not sent — agent unresolved")).toBe(false);
+      expect(notes).toHaveLength(0);
     } finally {
       vi.useRealTimers();
     }
@@ -346,7 +360,7 @@ describe("shell ('!') path gates the same way", () => {
     expect(fetchCalls[0].body.agent).toBe("supervisor");
   });
 
-  it("no evidence → shell NOT sent, text restored, error surfaced", async () => {
+  it("no evidence → shell NOT sent, text preserved, notification KEPT (shell carries no attempt row — O2 uncovered fallback)", async () => {
     await boot();
     vi.useFakeTimers();
     try {
@@ -358,8 +372,12 @@ describe("shell ('!') path gates the same way", () => {
       await p;
 
       expect(fetchCalls).toHaveLength(0);
-      expect(inputSig()).toBe("!rm -rf /tmp/oops"); // restored after the failed shell send
+      expect(inputSig()).toBe("!rm -rf /tmp/oops"); // never cleared on a refusal
+      // Shell commands carry NO queue attempt (isShell → attempt undefined),
+      // so no SendStatus row exists to own the refusal — the notification is
+      // the one honest surface and is PRESERVED (O2 dedup uncovered branch).
       expect(notes.some((n) => n.title === "Not sent — agent unresolved")).toBe(true);
+      expect(sendActionsFor("ses_gate")).toHaveLength(0);
     } finally {
       vi.useRealTimers();
     }
@@ -673,15 +691,17 @@ describe("D4: prompt history writes", () => {
 
     await ctrl.send();
 
-    expect(enqueued).toHaveLength(0);
-    expect(pushHistory).not.toHaveBeenCalled();
-    expect(inputSig()).toBe("queue me"); // preserved for retry
-    // Slice 2: a response-less enqueue rejection (plain Error — no HTTP
-    // status) is OUTCOME-UNKNOWN, not definitive failure: after the
-    // reconcile-first list check misses, the operator sees the
-    // outcome-unknown wording (never "failed, safe to resend").
-    expect(notes.some((n) => n.title === "Queue confirmation unknown")).toBe(true);
-  });
+      expect(enqueued).toHaveLength(0);
+      expect(pushHistory).not.toHaveBeenCalled();
+      expect(inputSig()).toBe("queue me"); // preserved for retry
+      // Slice 2 + O2 single-owner: a response-less enqueue rejection (plain
+      // Error — no HTTP status) is OUTCOME-UNKNOWN, not definitive failure:
+      // after the reconcile-first list check misses, the retained uncertain
+      // retry-same ROW owns the fact (the guarded Retry-same-message
+      // affordance) — the covered notification is suppressed.
+      expect(notes).toHaveLength(0);
+      expect(sendActionsFor("ses_gate").some((a) => a.stage === "uncertain" && a.recovery === "retry-same")).toBe(true);
+    });
 
   it("ordinary successful send → exactly ONE history write; an unchanged composer clears normally", async () => {
     await boot();

@@ -18,14 +18,14 @@
 //       sendActionStatus tests).
 //
 // The browser test drives the FULL user-visible recovery arc through the real
-// event model (type + click Send + click Retry send) against the real server:
-// the enqueue POST's response is LOST after the server processed it
+// event model (type + click Send + click Retry same message) against the real
+// server: the enqueue POST's response is LOST after the server processed it
 // (Playwright route.fetch() performs the real admission, then route.abort()
 // kills the browser's response), the reconcile LIST is equally blind → the
 // SPA settles to outcome-unknown, renders "Queue confirmation unknown." with
-// the payload-surfacing Retry send affordance, and the operator's re-tap
-// replays the SAME attemptId (server dedupes → exactly one item, exactly one
-// dispatch, composer cleared).
+// the payload-surfacing Retry-same-message affordance, and the operator's
+// re-tap replays the SAME attemptId (server dedupes → exactly one item,
+// exactly one dispatch, composer cleared).
 //
 // Serial-suite hygiene (workers:1, one shared fixtureserver): every test owns
 // + cleans its queue state; the browser test uses the agent-hold fixture
@@ -167,7 +167,8 @@ test("(e API) resolve-conflict stops: 409 queue_resolve_conflict, stored truth p
 // response is LOST after server admission settles to the honest
 // outcome-unknown state; the operator's Retry send replays the SAME
 // attemptId; the server dedupes to exactly one item and exactly one dispatch;
-// the composer clears and the status row resolves.
+// the status row resolves (a record-addressed row retry never modifies the
+// composer — O2 review A-F1).
 test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry send (same attemptId) recovers custody with no duplicate", async ({ page, request }) => {
   test.setTimeout(90_000);
 
@@ -246,12 +247,14 @@ test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry 
   expect(firstServerAdmission?.item?.attemptId).toBe(wireAttempts[0]);
 
   // The honest outcome-unknown state renders — readable text, payload
-  // surfacing, and the retry-SAME affordance (never an unqualified Retry).
+  // surfacing ("Same message:"), and the retry-SAME affordance (never an
+  // unqualified Retry).
   const statusRow = page.locator(".sendStatusLine", { hasText: "Queue confirmation unknown." });
   await expect(statusRow).toBeVisible({ timeout: 15_000 });
-  await expect(statusRow).toContainText("Will send:");
+  await expect(statusRow).toContainText("Check the queue, or retry this same message.");
+  await expect(statusRow).toContainText("Same message:");
   await expect(statusRow).toContainText("E2E RETRY SAME");
-  await expect(statusRow.locator(".sendStatusBtn", { hasText: "Retry send" })).toBeVisible();
+  await expect(statusRow.locator(".sendStatusBtn", { hasText: "Retry same message" })).toBeVisible();
 
   // The composed text is PRESERVED (no silent loss) and nothing dispatched.
   await expect(ta).toHaveValue("E2E RETRY SAME");
@@ -265,7 +268,7 @@ test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry 
     (r) => r.url().endsWith(`/vh/session/${HOLD_SESSION}/queue`) && r.request().method() === "POST",
     { timeout: 20_000 },
   );
-  await statusRow.locator(".sendStatusBtn", { hasText: "Retry send" }).click();
+  await statusRow.locator(".sendStatusBtn", { hasText: "Retry same message" }).click();
   const replayResp = await replayRespPromise;
   expect(replayResp.status()).toBe(200);
   // (b) the REAL envelope answers replayed:true for the same attemptId —
@@ -276,10 +279,14 @@ test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry 
   // The retry reused the SAME attemptId on the wire (no fresh attempt).
   expect(wireAttempts[wireAttempts.length - 1]).toBe(wireAttempts[0]);
 
-  // Custody confirmed → the composer clears and the unknown-status row
-  // resolves (user-visible recovery outcome).
-  await expect(ta).toHaveValue("");
+  // Custody confirmed → the unknown-status row resolves (user-visible
+  // recovery outcome). Record-addressed retry (O2 slice-1 review A-F1): a
+  // row retry NEVER modifies the composer — the replayed message's text
+  // intentionally remains for the operator to clear or edit for the next
+  // send (the row's own preview always advertised the stored payload, and
+  // the verbatim replay is what recovered custody).
   await expect(statusRow).toHaveCount(0);
+  await expect(ta).toHaveValue("E2E RETRY SAME");
 
   // (c) exactly ONE item server-side under this attemptId — no duplicate —
   // and exactly ONE downstream dispatch of the recovered message.

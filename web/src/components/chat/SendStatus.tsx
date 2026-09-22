@@ -1,34 +1,53 @@
 // Send-action status surface — send-reliability slice 3 (brief §4.4).
 //
 // Renders the operator-visible recovery states that slice 2 made expressible
-// in lib/sendActionStatus (typed certainty + recovery per attempt), plus the
-// server-custody line for a session whose queue holds messages while the
-// stream is down. Mounted by Composer where the Send button's glow lives —
-// the glow stays (a glance-level signal), but every state here is READABLE
-// TEXT, never glow-only.
+// in lib/sendActionStatus (typed certainty + recovery per attempt). Mounted
+// by Composer where the Send button's glow lives — the glow stays (a
+// glance-level signal), but every state here is READABLE TEXT, never
+// glow-only.
 //
-// Copy contract (normative, brief §4.4):
+// Copy contract (normative, O2 brief §3.6 — reason-specific where a typed
+// reason exists; see lineFor):
 //   preparing (uploads in flight) → "Uploading 1 of 2…"
 //   preparing / admitting          → "Sending…"
 //   admitting, reused attemptId    → "Retrying queue confirmation…"
-//   server custody + stream down   → "Queued — waiting for connection."
-//   admission response lost        → "Queue confirmation unknown." + retry
-//                                    THE SAME prepared enqueue (same
-//                                    attemptId; no reupload, no new session)
-//   ambiguous (session create /    → "Outcome unknown — check before sending
-//   upload / proxy-502 dispatch)      again." — NO unqualified Retry button
-//   definitive rejection           → persistent failure notice; the composer
-//                                    retains text + attachments (restore)
-//   resolve write failed           → "Message outcome recorded; status not
-//                                    saved." + Retry STATUS SAVE (a record,
-//                                    never a resend)
-//   status-save retry hit 409      → "Queue state conflict — showing server
-//                                    state." — dismissable, never a silent
-//                                    vanish (F3, slice-3 review)
+//   admission response lost        → "Queue confirmation unknown." + "Check
+//                                    the queue, or retry this same message."
+//                                    + the guarded Retry-same-message action
+//                                    (RECORD-ADDRESSED, O2 review A-F1: the
+//                                    row button carries its attemptId)
+//   session-create unknown         → "Session creation unconfirmed. Check
+//                                    possible sessions before sending again;
+//                                    another send may create another session."
+//   other ambiguity                → "Outcome unknown — check before sending
+//                                    again." — NO unqualified Retry button
+//   definitive rejection           → reason-specific ("Not queued — queue is
+//                                    full. Remove a queued message before
+//                                    trying again." / "Not sent — attachments
+//                                    are still uploading." / "Not sent —
+//                                    attachment upload was not confirmed.
+//                                    Review the attachment controls before
+//                                    trying again." / "Not sent — choose an
+//                                    agent." / "Session could not be
+//                                    created."); untyped fallback "Not sent —
+//                                    kept in the composer." The composer
+//                                    retains text + attachments (restore).
+//   conflict                       → "Queue status conflict — check the
+//                                    queue." (both flavors; no Refresh action
+//                                    that does not exist)
+//   resolve write failed           → "Message sent — status save
+//                                    unconfirmed." / "Send failed — status
+//                                    save unconfirmed." / "Send outcome
+//                                    unknown — status save unconfirmed." +
+//                                    Retry STATUS SAVE (a record, never a
+//                                    resend — "Does not resend the message.")
+//
+// Ownership (O2 brief §3.6/§4): there is NO server-custody sentence here —
+// "Queued — waiting for connection." was REMOVED (slice-1 review A-F2); the
+// queue container/QueueChip owns server custody and ConnectionToast owns
+// transport. SendStatus never calls browser uncertainty "queued".
 //
 // Honesty invariants:
-//   - An unconfirmed BROWSER draft is NEVER called "queued" — the custody line
-//     renders only for a non-draft session whose SERVER queue holds items.
 //   - A retry affordance that replays a verbatim attempt payload SURFACES what
 //     it will send (text + file names) — a retry re-includes chips the
 //     operator may have removed after the attempt (slice-2 advisory).
@@ -51,7 +70,7 @@ import {
   type CreateLinkCandidate,
   type SendAction,
 } from "../../lib/sendActionStatus";
-import { queueFor, resolveQueued } from "../../queue";
+import { resolveQueued } from "../../queue";
 import type { Session } from "../../types";
 import "./SendStatus.module.css";
 
@@ -59,16 +78,19 @@ export interface SendStatusProps {
   // Live session id ("" for a draft).
   sessionId: Accessor<string>;
   draft: Accessor<boolean>;
-  // Retry of an uncertain admission: the SAME composer send path (createSend
-  // re-tap linkage — same attemptId + verbatim payload when the text matches,
-  // a fresh attempt otherwise). Never a direct enqueue bypass.
-  send: () => Promise<void>;
+  // Record-addressed guarded retry of an uncertain admission (O2 slice-1
+  // review A-F1). In production ChatView/Composer wire createSend's GUARDED
+  // entry (retrySameMessage) here — never a direct enqueue bypass — and the
+  // row button invokes it WITH the displayed record's attemptId. The
+  // controller revalidates THAT exact record at click time (exists, still
+  // stage uncertain + recovery retry-same, owned by the current ownerKey)
+  // and replays ITS stored verbatim payload under ITS attemptId, leaving the
+  // composer untouched; a gone/finished record refuses loudly. Minimal unit
+  // harnesses may pass a plain send fn — the argument is ignored there.
+  send: (attemptId: string) => Promise<void>;
   // Ordinal upload progress (createAttachments.uploadProgress) for the
   // "Uploading 1 of 2…" copy; null when idle.
   uploadProgress: Accessor<{ done: number; total: number } | null>;
-  // Global stream status ("connecting" | "live" | "reconnecting") — the
-  // server-custody line keys off a known-down stream ("reconnecting").
-  streamStatus: Accessor<string>;
   // A1 create-linkage (send-defers study): the sync store's session map,
   // watched reactively for a session whose worker-stamped time.created falls
   // inside a draft-owned create-outcome-unknown record's create-attempt
@@ -91,22 +113,10 @@ function clip(s: string, n: number): string {
 export function SendStatus(props: SendStatusProps) {
   const ownerKey = () => (props.draft() ? "draft" : props.sessionId());
   const records = () => sendActionsFor(ownerKey());
-  // Server custody + stream down. NEVER for a draft: an unconfirmed browser
-  // draft is not "queued" (the word is reserved for server custody).
-  //
-  // A `state: "unknown"` item with `reconcileTerminal: true` is excluded: the
-  // backend has PERMANENTLY given up reconciling it (bumpReconcileAttempt in
-  // pkg/web/queue_msg_reconcile.go, after reconcileMaxAttempts) and already
-  // shows its own "manual review advised" warning via QueueChip. Counting it
-  // here would contradict that warning by claiming the message is still
-  // in-flight and "waiting for connection" — it is not; it will never be
-  // retried. A session whose ONLY visible items are terminal give-ups gets no
-  // custody line at all.
-  const custodyLine = () =>
-    !props.draft() &&
-    !!props.sessionId() &&
-    queueFor(props.sessionId()).some((m) => !(m.state === "unknown" && m.reconcileTerminal)) &&
-    props.streamStatus() === "reconnecting";
+  // (O2 §3.6/§4, slice-1 review A-F2: the server-custody line is GONE from
+  // this surface — the queue container/QueueChip owns server custody and
+  // ConnectionToast owns transport. An unconfirmed browser draft was never
+  // called "queued"; now nothing here claims custody at all.)
 
   const [saveBusy, setSaveBusy] = createSignal<string | null>(null);
 
@@ -166,9 +176,9 @@ export function SendStatus(props: SendStatusProps) {
     }
   }
 
-  // Per-stage primary copy (brief §4.4 matrix). Returned null means "nothing
-  // to render for this record" (admitted never appears — the record is
-  // finished on confirmation).
+  // Per-stage primary copy (O2 brief §3.6 copy matrix — normative). Returned
+  // null means "nothing to render for this record" (admitted never appears —
+  // the record is finished on confirmation).
   function lineFor(rec: SendAction): string | null {
     switch (rec.stage) {
       case "preparing": {
@@ -180,37 +190,58 @@ export function SendStatus(props: SendStatusProps) {
         return rec.retry ? "Retrying queue confirmation…" : "Sending…";
       case "uncertain":
         // Admission-response loss (recovery "retry-same") gets the dedicated
-        // copy + affordance; every other uncertainty (session create, upload,
-        // proxy-502 dispatch) is check-before-sending — never a blanket Retry.
-        return rec.recovery === "retry-same"
-          ? "Queue confirmation unknown."
-          : "Outcome unknown — check before sending again.";
+        // copy + affordance; the create-unknown shape (typed reason, set by
+        // markOwnerSessionCreateUnknown) carries the duplicate-session
+        // warning the suppressed notification used to own; every other
+        // uncertainty is check-before-sending — never a blanket Retry.
+        if (rec.recovery === "retry-same") return "Queue confirmation unknown.";
+        if (rec.reason === "session-create-unknown")
+          return "Session creation unconfirmed. Check possible sessions before sending again; another send may create another session.";
+        return "Outcome unknown — check before sending again.";
       case "conflict":
-        // F3 (slice-3 review): a conflict reached through the RESOLVE path
-        // (incl. a retrySave that hit 409 queue_resolve_conflict) has already
-        // refreshed the queue cache to server truth — say so; the admission
-        // flavor keeps the check-the-queue guidance.
-        return rec.conflictSource === "resolve"
-          ? "Queue state conflict — showing server state."
-          : "Queue state conflict — check the queue.";
+        // O2 §3.6: both conflict flavors converge on the actionable guidance
+        // — check the queue. (conflictSource stays recorded on the action for
+        // diagnostics, but "showing server state" made an implausible claim
+        // about what the surface did; no Refresh action exists to offer.)
+        return "Queue status conflict — check the queue.";
       case "rejected":
       case "blocked":
-        return "Not sent — kept in the composer.";
+        // Reason-specific copy (O2 §3.6): the covered notification is
+        // suppressed ONLY because its unique reason/advice is readable here.
+        // Untyped records (legacy/test-seeded) keep the generic fallback.
+        switch (rec.reason) {
+          case "queue-full":
+            return "Not queued — queue is full. Remove a queued message before trying again.";
+          case "attachments-uploading":
+            return "Not sent — attachments are still uploading.";
+          case "attachments-failed":
+            return "Not sent — attachment upload was not confirmed. Review the attachment controls before trying again.";
+          case "agent-unresolved":
+            return "Not sent — choose an agent.";
+          case "session-create-failed":
+            return "Session could not be created.";
+          default:
+            return "Not sent — kept in the composer.";
+        }
       case "unsaved":
-        return "Message outcome recorded; status not saved.";
+        // Save precision (O2 §3.6): name the KNOWN terminal outcome — the
+        // dispatch already produced it; only the status SAVE is unconfirmed.
+        switch (rec.retrySave?.state) {
+          case "sent":
+            return "Message sent — status save unconfirmed.";
+          case "failed":
+            return "Send failed — status save unconfirmed.";
+          default:
+            return "Send outcome unknown — status save unconfirmed.";
+        }
       default:
         return null;
     }
   }
 
   return (
-    <Show when={records().length > 0 || custodyLine()}>
+    <Show when={records().length > 0}>
       <div class="sendStatus" aria-live="polite" data-testid="send-status">
-        <Show when={custodyLine()}>
-          <div class="sendStatusLine" data-kind="custody">
-            Queued — waiting for connection.
-          </div>
-        </Show>
         <For each={records()}>
           {(rec) => {
             const line = () => lineFor(rec);
@@ -218,14 +249,27 @@ export function SendStatus(props: SendStatusProps) {
               <Show when={line()}>
                 <div class="sendStatusLine" data-kind={rec.stage} data-tip={rec.detail || undefined}>
                   <span class="sendStatusText">{line()}</span>
-                  {/* Retry send — ONLY for an uncertain ENQUEUE outcome whose
-                      replay is deduped server-side (recovery "retry-same").
-                      The affordance surfaces the verbatim payload it will
-                      send (text + files): a retry re-includes chips the
-                      operator may have removed after the attempt. */}
+                  {/* Retry-same affordance — ONLY for an uncertain ENQUEUE
+                      outcome whose replay is deduped server-side (recovery
+                      "retry-same"). O2 §3.6 copy: the guidance sentence names
+                      the two honest options (check the queue, or the guarded
+                      same-message retry), the preview says "Same message:"
+                      (never a bare "Retry" — it names WHAT will be sent: the
+                      verbatim payload text + files, including chips removed
+                      after the attempt). Attachment-only payloads show the
+                      file list without an empty text quote. RECORD-ADDRESSED
+                      (O2 review A-F1): the button carries THIS row's
+                      attemptId — the controller replays exactly the record
+                      the operator clicked, regardless of composer text. */}
                   <Show when={rec.stage === "uncertain" && rec.recovery === "retry-same"}>
                     <span class="sendStatusPayload">
-                      Will send: “{clip(rec.payload?.text ?? rec.payload?.tapText ?? "", 80)}”
+                      Check the queue, or retry this same message.
+                    </span>
+                    <span class="sendStatusPayload">
+                      Same message:{" "}
+                      <Show when={(rec.payload?.text ?? rec.payload?.tapText ?? "").length > 0}>
+                        “{clip(rec.payload?.text ?? rec.payload?.tapText ?? "", 80)}”{" "}
+                      </Show>
                       <Show when={(rec.payload?.files?.length ?? 0) > 0}>
                         {" "}+ {rec.payload!.files!.join(", ")}
                       </Show>
@@ -234,9 +278,9 @@ export function SendStatus(props: SendStatusProps) {
                       type="button"
                       class="sendStatusBtn"
                       data-tip="Re-queues the same message under the same attempt id — no duplicate if the first one landed"
-                      onClick={() => void props.send()}
+                      onClick={() => void props.send(rec.attemptId)}
                     >
-                      Retry send
+                      Retry same message
                     </button>
                   </Show>
                   {/* Retry STATUS SAVE — stage "unsaved" only, and never for a
@@ -250,7 +294,7 @@ export function SendStatus(props: SendStatusProps) {
                       type="button"
                       class="sendStatusBtn"
                       disabled={saveBusy() === rec.attemptId}
-                      data-tip="Re-records the outcome on the queue — does not send anything"
+                      data-tip="Re-records the outcome on the queue — does not resend the message"
                       onClick={() => void retrySave(rec)}
                     >
                       {saveBusy() === rec.attemptId ? "Saving status…" : "Retry status save"}
@@ -288,14 +332,17 @@ export function SendStatus(props: SendStatusProps) {
             Timing is the ONLY correlation signal (the create POST carries no
             client id), so nothing re-keys without this click; dismissing the
             uncertain row above (the ×) removes the affordance with it. Multiple
-            candidates are each listed honestly — one button per session. */}
+            candidates are each listed honestly — one button per session. O2
+            §3.6 copy: the header says timing is the only match signal; the
+            action is "Link and open" (never a bare "Open" — it names the
+            re-key + navigation it performs). */}
         <Show when={createCandidates().length > 0}>
           <div
             class="sendStatusLine"
             data-kind="create-link"
             data-tip="A session was created while your send's session-create was in flight — timing is the only match signal. Confirming moves this status there and opens it."
           >
-            <span class="sendStatusText">A new session may be your last send —</span>
+            <span class="sendStatusText">Possible sessions — timing is the only match.</span>
             <For each={createCandidates()}>
               {(c) => (
                 <button
@@ -304,7 +351,7 @@ export function SendStatus(props: SendStatusProps) {
                   data-session-id={c.id}
                   onClick={() => confirmCreateLink(c.id)}
                 >
-                  Open {candidateLabel(c)}
+                  Link and open {candidateLabel(c)}
                 </button>
               )}
             </For>

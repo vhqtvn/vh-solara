@@ -7,10 +7,12 @@
 //     (recovery retry-same, server-deduped replay); "Outcome unknown — check
 //     before sending again." (NO retry button) for every other uncertainty;
 //     "Retry status save" (a record, never a resend) for the unsaved stage,
-//   - the payload surfacing on retry-same (what a verbatim replay will send),
-//   - the server-custody line ("Queued — waiting for connection.") — rendered
-//     ONLY for a live session with server queue state on a known-down stream;
-//     an unconfirmed browser draft is NEVER called "queued",
+//   - the payload surfacing on retry-same (what a verbatim replay will send)
+//     and the RECORD-ADDRESSED retry wiring (the row button carries ITS
+//     attemptId — O2 slice-1 review A-F1),
+//   - that the server-custody sentence is GONE (O2 §3.6/§4, review A-F2):
+//     no queue state renders "Queued — waiting for connection." — the queue
+//     container/QueueChip owns custody;
 //   - the polite live region, and dismissal of retained records.
 //
 // The queue module is mocked (queueFor / resolveQueued) — the data-layer
@@ -39,9 +41,9 @@ import { queueFor, resolveQueued } from "../../src/queue";
 const queueForMock = vi.mocked(queueFor);
 const resolveQueuedMock = vi.mocked(resolveQueued);
 
-// Minimal-but-valid QueuedMessage builder for custody-line tests — only the
-// fields the custody-line predicate (and its reconcileTerminal exclusion)
-// actually inspects vary per call.
+// Minimal-but-valid QueuedMessage builder for the custody-line-gone cells —
+// only the fields the old custody predicate inspected vary per call (the
+// sentence must stay gone for EVERY one of them).
 function fakeQueueItem(over: Partial<QueuedMessage> = {}): QueuedMessage {
   return {
     id: "q1",
@@ -60,7 +62,6 @@ function baseProps(over: Partial<Parameters<typeof SendStatus>[0]> = {}) {
     draft: () => false,
     send: vi.fn(async () => {}),
     uploadProgress: () => null as { done: number; total: number } | null,
-    streamStatus: () => "live",
     ...over,
   };
 }
@@ -77,7 +78,7 @@ afterEach(() => {
 });
 
 describe("SendStatus — per-stage readable copy (brief §4.4)", () => {
-  it("renders nothing when there are no records and no custody line", () => {
+  it("renders nothing when there are no records", () => {
     const r = render(() => <SendStatus {...baseProps()} />);
     expect(r.container.querySelector(".sendStatus")).toBeNull();
     r.unmount();
@@ -124,7 +125,108 @@ describe("SendStatus — per-stage readable copy (brief §4.4)", () => {
     const a = mintSendAttempt("s1");
     updateSendAction(a.attemptId, { stage: "conflict", certainty: "definitive", recovery: "check", detail: "queue_resolve_conflict" });
     const r = render(() => <SendStatus {...baseProps()} />);
-    expect(r.container.textContent).toContain("Queue state conflict — check the queue.");
+    expect(r.container.textContent).toContain("Queue status conflict — check the queue.");
+    r.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// O2 slice 1 — reason-specific rejected/blocked copy. The covered
+// notification-history entries are suppressed ONLY because these strings
+// carry the unique reason/advice each notification used to own (the
+// single-owner rule: no fact left homeless).
+// ---------------------------------------------------------------------------
+describe("SendStatus — O2 reason-specific rejection copy", () => {
+  const reasonRow = (reason: Parameters<typeof updateSendAction>[1]["reason"], stage: "rejected" | "blocked" = "rejected") => {
+    const a = mintSendAttempt("s1");
+    updateSendAction(a.attemptId, { stage, certainty: "definitive", recovery: "restore", reason });
+    return a;
+  };
+
+  it("queue-full renders the capacity/removal advice the suppressed notification carried", () => {
+    reasonRow("queue-full");
+    const r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.textContent).toContain("Not queued — queue is full. Remove a queued message before trying again.");
+    r.unmount();
+  });
+
+  it("attachments-uploading (blocked) renders the wait instruction", () => {
+    reasonRow("attachments-uploading", "blocked");
+    const r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.textContent).toContain("Not sent — attachments are still uploading.");
+    r.unmount();
+  });
+
+  it("attachments-failed (blocked) renders the review-attachments advice", () => {
+    reasonRow("attachments-failed", "blocked");
+    const r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.textContent).toContain("Not sent — attachment upload was not confirmed. Review the attachment controls before trying again.");
+    r.unmount();
+  });
+
+  it("agent-unresolved renders the pick-an-agent instruction", () => {
+    reasonRow("agent-unresolved");
+    const r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.textContent).toContain("Not sent — choose an agent.");
+    r.unmount();
+  });
+
+  it("session-create-failed renders the create-specific cause", () => {
+    reasonRow("session-create-failed");
+    const r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.textContent).toContain("Session could not be created.");
+    r.unmount();
+  });
+
+  it("an untyped rejection keeps the generic fallback (legacy/test-seeded shape)", () => {
+    const a = mintSendAttempt("s1");
+    updateSendAction(a.attemptId, { stage: "rejected", certainty: "definitive", recovery: "restore" });
+    const r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.textContent).toContain("Not sent — kept in the composer.");
+    r.unmount();
+  });
+
+  it("a create-unknown record (markOwnerSessionCreateUnknown) carries the duplicate-session warning in the row", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const a = mintSendAttempt("draft");
+    vi.setSystemTime(2_000);
+    markOwnerSessionCreateUnknown("draft", "session create timed out", 1_000);
+    vi.useRealTimers();
+    const r = render(() => <SendStatus {...baseProps({ draft: () => true, sessionId: () => "" })} />);
+    expect(r.container.textContent).toContain(
+      "Session creation unconfirmed. Check possible sessions before sending again; another send may create another session.",
+    );
+    // No unqualified Retry on a create ambiguity (check-before-sending).
+    expect(r.container.querySelector(".sendStatusBtn")).toBeNull();
+    expect(a.stage).toBe("uncertain");
+    r.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// O2 slice 1 — status-save precision: the row NAMES the known terminal
+// outcome; only the SAVE is unconfirmed (retry-save is never a resend).
+// ---------------------------------------------------------------------------
+describe("SendStatus — O2 status-save copy precision", () => {
+  it("sent outcome → 'Message sent — status save unconfirmed.'", () => {
+    markSendAttemptStatusUnsaved("att-psent", "s1", { itemId: "q-1", state: "sent", detail: "ok" });
+    const r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.textContent).toContain("Message sent — status save unconfirmed.");
+    r.unmount();
+  });
+
+  it("failed outcome → 'Send failed — status save unconfirmed.'", () => {
+    markSendAttemptStatusUnsaved("att-pfail", "s1", { itemId: "q-2", state: "failed", detail: "boom" });
+    const r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.textContent).toContain("Send failed — status save unconfirmed.");
+    r.unmount();
+  });
+
+  it("unknown outcome → 'Send outcome unknown — status save unconfirmed.'", () => {
+    markSendAttemptStatusUnsaved("att-punk", "s1", { itemId: "q-3", state: "unknown", detail: "502" });
+    const r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.textContent).toContain("Send outcome unknown — status save unconfirmed.");
     r.unmount();
   });
 });
@@ -147,16 +249,37 @@ describe("SendStatus — retry taxonomy (never an unqualified Retry)", () => {
     const send = vi.fn(async () => {});
     const r = render(() => <SendStatus {...baseProps({ send })} />);
     expect(r.container.textContent).toContain("Queue confirmation unknown.");
-    // The verbatim payload is SURFACED (slice-2 advisory: a retry re-includes
-    // chips removed after the attempt — show what will be sent).
-    expect(r.container.textContent).toContain("Will send: “retry me”");
+    // O2 §3.6: the guidance sentence names the two honest options…
+    expect(r.container.textContent).toContain("Check the queue, or retry this same message.");
+    // …and the verbatim payload is SURFACED as "Same message:" (slice-2
+    // advisory: a retry re-includes chips removed after the attempt — show
+    // what will be sent).
+    expect(r.container.textContent).toContain("Same message: “retry me”");
     expect(r.container.textContent).toContain("notes.md");
     expect(r.container.textContent).toContain("shot.png");
     const btn = r.container.querySelector(".sendStatusBtn");
     expect(btn).toBeTruthy();
-    expect(btn!.textContent).toContain("Retry send");
+    expect(btn!.textContent).toContain("Retry same message");
     btn!.click();
     expect(send).toHaveBeenCalledTimes(1);
+    // RECORD-ADDRESSED (O2 review A-F1): the row button carries THIS record's
+    // attemptId — the controller replays exactly the clicked record.
+    expect(send).toHaveBeenCalledWith(a.attemptId);
+    r.unmount();
+  });
+
+  it("an attachment-only retry-same payload shows the file list without an empty text quote", () => {
+    const a = mintSendAttempt("s1");
+    updateSendAction(a.attemptId, {
+      stage: "uncertain",
+      certainty: "unknown",
+      recovery: "retry-same",
+      payload: { tapText: "", text: "", attachments: [], files: ["chart.png"] },
+    });
+    const r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.textContent).toContain("Same message:");
+    expect(r.container.textContent).toContain("chart.png");
+    expect(r.container.textContent).not.toContain("“”");
     r.unmount();
   });
 
@@ -170,13 +293,14 @@ describe("SendStatus — retry taxonomy (never an unqualified Retry)", () => {
     r.unmount();
   });
 
-  it("unsaved resolve-status shows 'Message outcome recorded; status not saved.' + Retry STATUS SAVE (a record, never a resend)", async () => {
+  it("unsaved resolve-status (sent) shows the precise save-unconfirmed copy + Retry STATUS SAVE (a record, never a resend)", async () => {
     markSendAttemptStatusUnsaved("att-save-1", "s1", { itemId: "q-9", state: "sent", detail: "dispatch ok" });
     const send = vi.fn(async () => {});
     const r = render(() => <SendStatus {...baseProps({ send })} />);
-    expect(r.container.textContent).toContain("Message outcome recorded; status not saved.");
+    expect(r.container.textContent).toContain("Message sent — status save unconfirmed.");
     const btn = r.container.querySelector(".sendStatusBtn")!;
     expect(btn.textContent).toContain("Retry status save");
+    expect(btn.getAttribute("data-tip")).toContain("does not resend the message");
     btn.click();
     await vi.waitFor(() => expect(resolveQueuedMock).toHaveBeenCalledTimes(1));
     // The retry re-records the SAME terminal outcome — it must NEVER touch the
@@ -184,7 +308,7 @@ describe("SendStatus — retry taxonomy (never an unqualified Retry)", () => {
     expect(resolveQueuedMock).toHaveBeenCalledWith("s1", "q-9", "sent", "dispatch ok");
     expect(send).not.toHaveBeenCalled();
     // Recorded → the retained record is finished (the row clears).
-    await vi.waitFor(() => expect(r.container.textContent).not.toContain("status not saved"));
+    await vi.waitFor(() => expect(r.container.textContent).not.toContain("status save unconfirmed"));
     expect(getSendAction("att-save-1")).toBeUndefined();
     r.unmount();
   });
@@ -195,7 +319,7 @@ describe("SendStatus — retry taxonomy (never an unqualified Retry)", () => {
     const r = render(() => <SendStatus {...baseProps()} />);
     r.container.querySelector(".sendStatusBtn")!.click();
     await vi.waitFor(() => expect(resolveQueuedMock).toHaveBeenCalledTimes(1));
-    await vi.waitFor(() => expect(r.container.textContent).toContain("status not saved"));
+    await vi.waitFor(() => expect(r.container.textContent).toContain("status save unconfirmed"));
     expect(getSendAction("att-save-2")).toBeTruthy();
     r.unmount();
   });
@@ -213,8 +337,9 @@ describe("SendStatus — retry taxonomy (never an unqualified Retry)", () => {
     const r = render(() => <SendStatus {...baseProps({ send })} />);
     r.container.querySelector(".sendStatusBtn")!.click();
     await vi.waitFor(() => expect(resolveQueuedMock).toHaveBeenCalledTimes(1));
-    // The user SEES the conflict — the row did not disappear.
-    await vi.waitFor(() => expect(r.container.textContent).toContain("Queue state conflict — showing server state."));
+    // The user SEES the conflict — the row did not disappear. O2 §3.6: both
+    // conflict flavors converge on the actionable check-the-queue guidance.
+    await vi.waitFor(() => expect(r.container.textContent).toContain("Queue status conflict — check the queue."));
     expect(r.container.querySelector(".sendStatusDismiss")).toBeTruthy();
     expect(send).not.toHaveBeenCalled(); // still never a resend
     // The record survives as the conflict state (server truth shown).
@@ -225,66 +350,55 @@ describe("SendStatus — retry taxonomy (never an unqualified Retry)", () => {
   });
 });
 
-describe("SendStatus — server custody line (never for an unconfirmed draft)", () => {
-  it("shows 'Queued — waiting for connection.' for a live session with queue state on a down stream", () => {
+// ---------------------------------------------------------------------------
+// O2 slice-1 review A-F2 — the server-custody line is GONE. The brief (§3.6
+// copy matrix + §4 ownership table) removed "Queued — waiting for
+// connection." from SendStatus: the queue container/QueueChip owns server
+// custody, ConnectionToast owns transport, and SendStatus no longer receives
+// stream state at all (the streamStatus prop chain was removed with the
+// line). These cells pin that no queue shape resurrects the sentence. The
+// chip-side terminal warning coverage (reconcile give-ups) lives in
+// QueueChip.test.tsx and is untouched by this removal.
+// ---------------------------------------------------------------------------
+describe("SendStatus — server custody line is GONE (O2 §3.6/§4: QueueChip owns custody)", () => {
+  it("renders NO custody line for a live session with a pending queue item (any queue state)", () => {
     queueForMock.mockImplementation(() => [fakeQueueItem({ state: "pending" })]);
-    const r = render(() => <SendStatus {...baseProps({ streamStatus: () => "reconnecting" })} />);
-    expect(r.container.textContent).toContain("Queued — waiting for connection.");
-    r.unmount();
-  });
-
-  it("NEVER calls a draft 'queued' (no custody line in draft mode even with queue-shaped state)", () => {
-    queueForMock.mockImplementation(() => [fakeQueueItem({ state: "pending" })]);
-    const r = render(() => (
-      <SendStatus {...baseProps({ draft: () => true, sessionId: () => "", streamStatus: () => "reconnecting" })} />
-    ));
-    expect(r.container.textContent).not.toContain("Queued");
-    r.unmount();
-  });
-
-  it("does not show the custody line while the stream is live", () => {
-    queueForMock.mockImplementation(() => [fakeQueueItem({ state: "pending" })]);
-    const r = render(() => <SendStatus {...baseProps({ streamStatus: () => "live" })} />);
-    expect(r.container.textContent).not.toContain("Queued — waiting");
-    r.unmount();
-  });
-
-  // Reconcile give-up (pkg/web/queue_msg_reconcile.go bumpReconcileAttempt):
-  // an `unknown` item marked reconcileTerminal is a PERMANENT give-up, not an
-  // in-flight message — QueueChip already renders its own "manual review
-  // advised" detail note, so the custody line must not contradict it by also
-  // claiming the message is still "waiting for connection".
-  it("does NOT show the custody line when the only visible item is a terminal reconcile give-up", () => {
-    queueForMock.mockImplementation(() => [
-      fakeQueueItem({ state: "unknown", reconcileTerminal: true, reconcileAttempts: 3, detail: "Reconcile terminal: …" }),
-    ]);
-    const r = render(() => <SendStatus {...baseProps({ streamStatus: () => "reconnecting" })} />);
+    const r = render(() => <SendStatus {...baseProps()} />);
     expect(r.container.textContent).not.toContain("Queued — waiting for connection.");
+    expect(r.container.querySelector('.sendStatusLine[data-kind="custody"]')).toBeNull();
     r.unmount();
   });
 
-  it("still shows the custody line for a non-terminal 'unknown' item (guards against over-suppressing)", () => {
-    queueForMock.mockImplementation(() => [fakeQueueItem({ state: "unknown", reconcileTerminal: false })]);
-    const r = render(() => <SendStatus {...baseProps({ streamStatus: () => "reconnecting" })} />);
-    expect(r.container.textContent).toContain("Queued — waiting for connection.");
-    r.unmount();
-  });
-
-  it("still shows the custody line for a plain in-flight 'dispatching' item", () => {
-    queueForMock.mockImplementation(() => [fakeQueueItem({ state: "dispatching" })]);
-    const r = render(() => <SendStatus {...baseProps({ streamStatus: () => "reconnecting" })} />);
-    expect(r.container.textContent).toContain("Queued — waiting for connection.");
-    r.unmount();
-  });
-
-  it("shows the custody line when a terminal give-up is mixed with a still-pending item", () => {
-    queueForMock.mockImplementation(() => [
+  it("renders NO custody line for unknown / dispatching / terminal-reconcile-give-up items — the predicate is gone entirely", () => {
+    // The old predicate excluded terminal give-ups and included non-terminal
+    // unknowns and in-flight dispatching; removal kills the whole sentence,
+    // so EVERY shape that used to render it now renders nothing.
+    const shapes: QueuedMessage[] = [
+      fakeQueueItem({ state: "unknown", reconcileTerminal: false }),
+      fakeQueueItem({ state: "dispatching" }),
+      fakeQueueItem({ state: "unknown", reconcileTerminal: true, reconcileAttempts: 3, detail: "Reconcile terminal: …" }),
       fakeQueueItem({ id: "q1", state: "unknown", reconcileTerminal: true }),
       fakeQueueItem({ id: "q2", state: "pending" }),
-    ]);
-    const r = render(() => <SendStatus {...baseProps({ streamStatus: () => "reconnecting" })} />);
-    expect(r.container.textContent).toContain("Queued — waiting for connection.");
-    r.unmount();
+    ];
+    for (const item of shapes) {
+      queueForMock.mockImplementation(() => [item]);
+      const r = render(() => <SendStatus {...baseProps()} />);
+      expect(r.container.textContent).not.toContain("Queued — waiting for connection.");
+      expect(r.container.querySelector('.sendStatusLine[data-kind="custody"]')).toBeNull();
+      r.unmount();
+    }
+  });
+
+  it("renders NO custody line for a draft (never called 'queued') and NOTHING at all for an empty queue", () => {
+    queueForMock.mockImplementation(() => [fakeQueueItem({ state: "pending" })]);
+    const r1 = render(() => <SendStatus {...baseProps({ draft: () => true, sessionId: () => "" })} />);
+    expect(r1.container.textContent).not.toContain("Queued");
+    r1.unmount();
+
+    queueForMock.mockImplementation(() => []);
+    const r2 = render(() => <SendStatus {...baseProps()} />);
+    expect(r2.container.querySelector(".sendStatus")).toBeNull();
+    r2.unmount();
   });
 });
 
@@ -353,9 +467,9 @@ describe("SendStatus — A1 create-linkage affordance (operator-confirmed, never
     ));
     const row = r.container.querySelector('.sendStatusLine[data-kind="create-link"]');
     expect(row).toBeTruthy();
-    expect(row!.textContent).toContain("A new session may be your last send");
+    expect(row!.textContent).toContain("Possible sessions — timing is the only match.");
     const btn = row!.querySelector(".sendStatusBtn")!;
-    expect(btn.textContent).toMatch(/^Open/); // "Open it (hh:mm)" — generic title stays generic
+    expect(btn.textContent).toMatch(/^Link and open/); // "Link and open it (hh:mm)" — generic title stays generic
     btn.click();
     // Confirm re-keyed the draft-owned record to the candidate session…
     expect(getSendAction(attemptId)?.ownerKey).toBe("s9");

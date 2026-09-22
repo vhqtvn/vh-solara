@@ -37,7 +37,6 @@
    the ACTION follow-up to the uncertain row it sits beside. */
 :global(.sendStatusLine[data-kind="uncertain"]),
 :global(.sendStatusLine[data-kind="unsaved"]),
-:global(.sendStatusLine[data-kind="custody"]),
 :global(.sendStatusLine[data-kind="create-link"]) {
   background: color-mix(in srgb, var(--warn) 16%, var(--bg-2));
 }

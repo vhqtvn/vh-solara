@@ -52,10 +52,13 @@ describe("QueueChip — recovered `unknown` detail surfacing", () => {
     const { container } = render(() => (
       <QueueChip q={item({ state: "unknown", detail: RECOVERY_DETAIL })} onRemove={onRemove} />
     ));
-    // The detail text is present in the rendered DOM (not only in data-tip).
+    // The detail text is present in the rendered DOM (not only in data-tip),
+    // verbatim as its lead — O2 appends the standing check-transcript
+    // instruction after it (the dispatch may have been delivered).
     const note = container.querySelector(".queue-detail-note");
     expect(note).toBeTruthy();
-    expect(note!.textContent).toBe(RECOVERY_DETAIL);
+    expect(note!.textContent).toContain(RECOVERY_DETAIL);
+    expect(note!.textContent).toContain("check the transcript before sending it again");
     // Visible: it is a real text node, surfaced as a sibling of the chip.
     expect(container.textContent).toContain(RECOVERY_DETAIL);
   });
@@ -74,15 +77,44 @@ describe("QueueChip — recovered `unknown` detail surfacing", () => {
     expect(container.querySelector(".queue-state")!.textContent).toBe("Outcome unknown");
   });
 
-  it("does NOT show the recovery detail for a `failed` item (only `unknown` surfaces recovery)", () => {
-    // A failed item may carry its own detail (the failure reason), but that is
-    // NOT the recovery note and is out of scope for STUCK-2: failed detail stays
-    // in the data-tip tooltip only. The visible recovery note must not appear.
+  it("shows the failure CAUSE visibly for a `failed` item (O2 single-owner prerequisite for suppressing the covered notification)", () => {
+    // O2 slice 1: the chip is the ONE persistent owner of a dispatch outcome,
+    // so its cause must be readable without hovering — the covered
+    // "Queued message failed to send" notification-history entry is
+    // suppressed only because this note exists.
     const { container } = render(() => (
-      <QueueChip q={item({ state: "failed", detail: "500 upstream" })} onRemove={vi.fn()} />
+      <QueueChip q={item({ state: "failed", detail: "pre-POST gate: agent unresolved (timeout) — nothing was sent" })} onRemove={vi.fn()} />
     ));
-    expect(container.querySelector(".queue-detail-note")).toBeNull();
-    expect(container.textContent).not.toContain("Recovery:");
+    const note = container.querySelector(".queue-detail-note");
+    expect(note).toBeTruthy();
+    expect(note!.textContent).toContain("pre-POST gate: agent unresolved");
+    // No unknown-style check-transcript suffix on a definitive failure.
+    expect(note!.textContent).not.toContain("check the transcript");
+  });
+
+  it("an `unknown` item's visible note appends the standing check-transcript instruction (non-reconcile-terminal)", () => {
+    const { container } = render(() => (
+      <QueueChip q={item({ state: "unknown", detail: "proxy 502 (outcome unknown): upstream unreachable" })} onRemove={vi.fn()} />
+    ));
+    const note = container.querySelector(".queue-detail-note");
+    expect(note!.textContent).toContain("proxy 502 (outcome unknown)");
+    expect(note!.textContent).toContain("it may have been delivered; check the transcript before sending it again");
+  });
+
+  it("a reconcile give-up (`unknown` + reconcileTerminal) keeps its own manual-review detail WITHOUT the check-transcript suffix", () => {
+    const { container } = render(() => (
+      <QueueChip
+        q={item({
+          state: "unknown",
+          reconcileTerminal: true,
+          detail: "Reconcile terminal: OpenCode was unreachable …; manual review advised.",
+        })}
+        onRemove={vi.fn()}
+      />
+    ));
+    const note = container.querySelector(".queue-detail-note");
+    expect(note!.textContent).toContain("Reconcile terminal");
+    expect(note!.textContent).not.toContain("check the transcript");
   });
 
   it("does NOT show the recovery detail for a `sent`-equivalent happy path (dispatching)", () => {

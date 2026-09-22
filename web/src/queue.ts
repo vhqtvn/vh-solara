@@ -71,6 +71,14 @@ export interface QueuedMessage {
   // stays "unknown" but it will never be retried or looked at again. An item
   // with this set is a terminal give-up, NOT still in flight: callers must
   // not treat it as "waiting" (e.g. the composer custody line).
+  // TRANSIENT shape (d-F1 note): bumpReconcileAttempt/markReconcileTerminal
+  // set this flag WITHOUT flipping State, and a stale-`dispatching` item is
+  // reconcile-eligible — so the backend can briefly hold
+  // `state: "dispatching"` + `reconcileTerminal: true` (List()-time
+  // stale-dispatching→unknown recovery self-heals it within one poll).
+  // Predicates keyed on `unknown && reconcileTerminal` therefore miss for at
+  // most one poll and fail safe in that window (an over-shown custody line,
+  // never suppressed custody info).
   reconcileTerminal?: boolean;
 }
 
@@ -547,11 +555,11 @@ export async function resolveQueued(
     // errors. The dispatch outcome IS known and visible (the optimistic
     // terminal state applied above + the knownOutcomes overlay), but the
     // backend never received the record. Surface the retryable status-save
-    // state — Slice 3 renders "Message outcome recorded; status not saved."
-    // with a Retry STATUS SAVE affordance (a record, never a resend). Linked
-    // by the item's attemptId when the item carries one (slice-1 servers); a
-    // synthetic id otherwise (the record still lands under the session's
-    // ownerKey so the status surface finds it).
+    // state — SendStatus renders the outcome-precise "…— status save
+    // unconfirmed." copy with a Retry STATUS SAVE affordance (a record, never
+    // a resend). Linked by the item's attemptId when the item carries one
+    // (slice-1 servers); a synthetic id otherwise (the record still lands
+    // under the session's ownerKey so the status surface finds it).
     const linked = (queues[sessionId] || []).find((m) => m.id === id);
     markSendAttemptStatusUnsaved(linked?.attemptId || `save-${id}`, sessionId, {
       itemId: id,

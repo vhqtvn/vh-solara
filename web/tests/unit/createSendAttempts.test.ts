@@ -29,6 +29,7 @@ import { EnqueueError, type QueuedMessage } from "../../src/queue";
 import { __resetSendSingleFlightForTests } from "../../src/lib/sendSingleFlight";
 import {
   __resetSendActionStatusForTests,
+  finishSendAttempt,
   getSendAction,
   markOwnerSessionCreateUnknown,
   sendActionsFor,
@@ -84,6 +85,9 @@ function harness(overrides: {
   /** Overrides the bounded agent evidence gate (guarded-retry cells: the
    *  defensive fallback when a stored payload lost its captured agent). */
   awaitAgent?: SendDependencies["awaitAgent"];
+  /** Overrides the sync tap-time resolver (post-mint gate cells: "pending"
+   *  forces the admission to wait on awaitAgent instead of a tap snapshot). */
+  resolveAgent?: SendDependencies["resolveAgent"];
 } = {}): Harness {
   const [input, setInput] = createSignal("");
   const [atts, setAtts] = createSignal<Attachment[]>([]);
@@ -108,7 +112,7 @@ function harness(overrides: {
     queueMode: () => true,
     selectionFor: () => ({ providerID: "p", modelID: "m" }),
     awaitAgent: overrides.awaitAgent ?? (async () => ({ ok: true, agent: "build" })),
-    resolveAgent: () => ({ state: "agent", agent: "build" }),
+    resolveAgent: overrides.resolveAgent ?? (() => ({ state: "agent", agent: "build" })),
     adoptDraftAgent: () => {},
     models: () => [{ name: "m" }],
     loadModels: async () => {},
@@ -195,7 +199,7 @@ afterEach(() => {
 // Attachment-failure blocking — the send pipeline halts BEFORE admission.
 // ---------------------------------------------------------------------------
 describe("createSend slice 2 — attachment-failure blocking", () => {
-  it("a FAILED INLINE attachment blocks admission: no enqueue, loud notification, text restored, action blocked", async () => {
+  it("a FAILED INLINE attachment blocks admission: no enqueue, blocked row with the review advice (NO duplicate notification), text restored", async () => {
     const h = harness({
       curModel: () => ({ vision: false }), // inline mode
     });
@@ -205,12 +209,17 @@ describe("createSend slice 2 — attachment-failure blocking", () => {
     // THE CRUX: admission halted before the queue — no partial send with a
     // dangling vh-attach: token.
     expect(h.enqueueInputs).toHaveLength(0);
-    expect(h.notes.some((n) => n.title === "Not sent — attachment upload failed")).toBe(true);
+    // O2 single-owner: the blocked row owns the fact (reason-specific copy);
+    // the covered notification-history entry is suppressed.
+    expect(h.notes.some((n) => n.title === "Not sent — attachment upload failed")).toBe(false);
+    expect(h.notes).toHaveLength(0);
+    const row = sendActionsFor("ses-1").find((a) => a.stage === "blocked");
+    expect(row).toBeDefined();
+    expect(row!.reason).toBe("attachments-failed");
     expect(h.input()).toBe(text); // restored for retry
-    expect(sendActionsFor("ses-1").some((a) => a.stage === "blocked")).toBe(true);
   });
 
-  it("a FAILED PENDING (flush) attachment blocks admission: no enqueue, chips retained", async () => {
+  it("a FAILED PENDING (flush) attachment blocks admission: no enqueue, chips retained, blocked row owns the reason", async () => {
     const chip: Attachment = { url: "pending:1", filename: "f.txt", mime: "text/plain", file: new File(["f"], "f.txt") };
     const h = harness({
       flush: async () => ({ failed: [chip] }),
@@ -219,20 +228,43 @@ describe("createSend slice 2 — attachment-failure blocking", () => {
     h.setInput("with a draft attachment");
     await h.send();
     expect(h.enqueueInputs).toHaveLength(0);
-    expect(h.notes.some((n) => n.title === "Not sent — attachment upload failed")).toBe(true);
+    expect(h.notes.some((n) => n.title === "Not sent — attachment upload failed")).toBe(false);
+    expect(h.notes).toHaveLength(0);
+    expect(sendActionsFor("ses-1").some((a) => a.stage === "blocked" && a.reason === "attachments-failed")).toBe(true);
     expect(h.input()).toBe("with a draft attachment");
     // The failed chip is RETAINED (never silently dropped).
     expect(h.atts()).toHaveLength(1);
-    expect(sendActionsFor("ses-1").some((a) => a.stage === "blocked")).toBe(true);
   });
 
-  it("an in-flight upload (uploading()) blocks admission before the flush", async () => {
+  it("an in-flight upload (uploading()) blocks admission before the flush; the blocked row owns the wait instruction", async () => {
     const h = harness({ uploading: () => true });
     h.setInput("wait for the upload");
     await h.send();
     expect(h.enqueueInputs).toHaveLength(0);
-    expect(h.notes.some((n) => n.title === "Not sent — attachment still uploading")).toBe(true);
+    expect(h.notes.some((n) => n.title === "Not sent — attachment still uploading")).toBe(false);
+    expect(h.notes).toHaveLength(0);
+    expect(sendActionsFor("ses-1").some((a) => a.stage === "blocked" && a.reason === "attachments-uploading")).toBe(true);
     expect(h.input()).toBe("wait for the upload");
+  });
+
+  // C-F1 (O2 slice-1 review): the attachment gates write the owning row only
+  // when an attempt record exists — shell sends ("!") carry NO attempt, so
+  // their blocked facts were suppressed with ZERO surface. The agent-gate
+  // pattern (if(attempt) row else notify) is mirrored at all four sites; this
+  // cell pins the reachable one (flush-failed shell send).
+  it("SHELL send ('!') with a failed upload chip: no attempt row exists, so the blocked gate surfaces a NOTIFICATION (never homeless)", async () => {
+    const chip: Attachment = { url: "pending:1", filename: "f.txt", mime: "text/plain", file: new File(["f"], "f.txt") };
+    const h = harness({ flush: async () => ({ failed: [chip] }) });
+    h.setAtts([chip]);
+    h.setInput("!deploy");
+    await h.send();
+    expect(h.enqueueInputs).toHaveLength(0);
+    // Shell owns no attempt record — the notification is the one honest
+    // surface for the blocked fact.
+    expect(h.notes.some((n) => n.title === "Not sent — attachment upload failed")).toBe(true);
+    expect(sendActionsFor("ses-1")).toHaveLength(0);
+    // The shell text is preserved for retry.
+    expect(h.input()).toBe("!deploy");
   });
 });
 
@@ -251,7 +283,10 @@ describe("createSend slice 2 — typed uncertainty + reconcile-first", () => {
     await h.send();
     expect(h.enqueueInputs).toHaveLength(1);
     expect(h.fetchQueueCalls).toBe(1); // reconcile-first ran
-    expect(h.notes.some((n) => n.title === "Queue confirmation unknown")).toBe(true);
+    // O2 single-owner: the uncertain ROW owns the fact (retry-same + the
+    // guarded Retry-same-message affordance) — no duplicate notification.
+    expect(h.notes.some((n) => n.title === "Queue confirmation unknown")).toBe(false);
+    expect(h.notes).toHaveLength(0);
     expect(h.input()).toBe("maybe queued?"); // preserved for the retry-same path
     const action = sendActionsFor("ses-1").find((a) => a.stage === "uncertain");
     expect(action).toBeDefined();
@@ -283,7 +318,7 @@ describe("createSend slice 2 — typed uncertainty + reconcile-first", () => {
     expect(getSendAction(firstAttemptId)).toBeUndefined();
   });
 
-  it("429 queue_admission_full → definitive rejection: NO reconcile, NO retry", async () => {
+  it("429 queue_admission_full → definitive rejection: NO reconcile, NO retry; the row owns the capacity advice", async () => {
     const h = harness({
       enqueue: async () => {
         throw new EnqueueError("enqueue failed (429 queue_admission_full)", "queue_admission_full", 429);
@@ -293,14 +328,18 @@ describe("createSend slice 2 — typed uncertainty + reconcile-first", () => {
     await h.send();
     expect(h.enqueueInputs).toHaveLength(1);
     expect(h.fetchQueueCalls).toBe(0); // hard stop — 429 is definitive
-    expect(h.notes.some((n) => n.title === "Message not queued — queue is full")).toBe(true);
+    // O2 single-owner: the rejected row's queue-full reason copy carries the
+    // removal advice the notification used to own — no duplicate entry.
+    expect(h.notes.some((n) => n.title === "Message not queued — queue is full")).toBe(false);
+    expect(h.notes).toHaveLength(0);
     expect(h.input()).toBe("no room");
     const action = sendActionsFor("ses-1").find((a) => a.stage === "rejected");
     expect(action?.certainty).toBe("definitive");
     expect(action?.recovery).toBe("restore");
+    expect(action?.reason).toBe("queue-full");
   });
 
-  it("409 queue_admission_conflict → explicit conflict state (never retry-forever)", async () => {
+  it("409 queue_admission_conflict → explicit conflict state (never retry-forever); the row owns the check-queue advice", async () => {
     const h = harness({
       enqueue: async () => {
         throw new EnqueueError("enqueue failed (409 queue_admission_conflict)", "queue_admission_conflict", 409);
@@ -309,8 +348,11 @@ describe("createSend slice 2 — typed uncertainty + reconcile-first", () => {
     h.setInput("conflicting");
     await h.send();
     expect(h.fetchQueueCalls).toBe(0);
-    expect(h.notes.some((n) => n.title === "Message not queued — admission conflict")).toBe(true);
-    expect(sendActionsFor("ses-1").some((a) => a.stage === "conflict")).toBe(true);
+    expect(h.notes.some((n) => n.title === "Message not queued — admission conflict")).toBe(false);
+    expect(h.notes).toHaveLength(0);
+    const row = sendActionsFor("ses-1").find((a) => a.stage === "conflict");
+    expect(row).toBeDefined();
+    expect(row!.conflictSource).toBe("admission");
   });
 });
 
@@ -472,15 +514,17 @@ describe("createSend — F2 draft→session migration of retained draft-owned re
 });
 
 // ---------------------------------------------------------------------------
-// Guarded row-retry (sending-UX O2 defect fix) — the SendStatus "Queue
-// confirmation unknown." row's Retry send button routes through the guarded
-// controller entry (retrySameMessage), NOT the raw composer send. The row's
-// contract is VERBATIM same-attempt replay; the defect was that an operator
-// who EDITED the composer after the uncertain record appeared got their EDIT
-// silently enqueued as a fresh message (fresh attemptId) under the row's
-// "Retry send" affordance.
+// Guarded row-retry (sending-UX O2 defect fix; RECORD-ADDRESSED since the
+// slice-1 review A-F1) — the SendStatus "Queue confirmation unknown." row's
+// Retry button routes through the guarded controller entry
+// (retrySameMessage) WITH the displayed record's attemptId, NOT the raw
+// composer send. The row's contract is VERBATIM same-attempt replay of the
+// CLICKED record; the original defects were that an operator who EDITED the
+// composer got the edit silently enqueued as a fresh message, and that with
+// two retained uncertain records the composer-text-matched selection could
+// replay the WRONG record from a row.
 // ---------------------------------------------------------------------------
-describe("createSend — guarded row-retry (retrySameMessage)", () => {
+describe("createSend — guarded row-retry (retrySameMessage, record-addressed)", () => {
   it("EDITED composer text: row retry replays the STORED verbatim payload under the SAME attemptId; the edit stays in the composer", async () => {
     let fail = true;
     const h = harness({
@@ -497,7 +541,7 @@ describe("createSend — guarded row-retry (retrySameMessage)", () => {
 
     h.setInput("edited draft — not what the row previews");
     fail = false;
-    await h.retrySameMessage(); // the ROW's Retry send entry
+    await h.retrySameMessage(attemptId); // the ROW's Retry entry, record-addressed
 
     // THE CRUX: the replay enqueued the STORED payload (byte-identical to the
     // first attempt, same attemptId) — NOT the edited composer text.
@@ -510,6 +554,74 @@ describe("createSend — guarded row-retry (retrySameMessage)", () => {
     expect(h.input()).toBe("edited draft — not what the row previews");
     // Custody confirmed → the retained action is finished (row disappears).
     expect(getSendAction(attemptId)).toBeUndefined();
+  });
+
+  it("TWO retained uncertain records: retry-by-attemptId on A enqueues ONLY A's payload under A's attemptId; B is untouched (the A-F1 crux)", async () => {
+    let fail = true;
+    const h = harness({
+      enqueue: async () => {
+        if (fail) throw new Error("response lost");
+        return { id: "q-r-multi" };
+      },
+      fetchQueue: async () => [],
+    });
+    h.setInput("message A");
+    await h.send(); // A: response lost → uncertain/retry-same
+    const idA = h.enqueueInputs[0].input.attemptId as string;
+    h.setInput("message B");
+    await h.send(); // B: response lost → uncertain/retry-same
+    const idB = h.enqueueInputs[1].input.attemptId as string;
+    expect(idA).not.toBe(idB);
+    expect(sendActionsFor("ses-1").filter((a) => a.stage === "uncertain" && a.recovery === "retry-same")).toHaveLength(2);
+
+    // The composer holds B's text — the OLD live-text-matched defect replayed
+    // B from A's row. The record-addressed entry replays the CLICKED record.
+    h.setInput("message B");
+    fail = false;
+    await h.retrySameMessage(idA);
+
+    expect(h.enqueueInputs).toHaveLength(3);
+    expect(h.enqueueInputs[2].input.attemptId).toBe(idA);
+    expect(h.enqueueInputs[2].input.text).toBe("message A");
+    // A's replay succeeded → A finished; B stays retained + untouched.
+    expect(getSendAction(idA)).toBeUndefined();
+    const recB = getSendAction(idB);
+    expect(recB?.stage).toBe("uncertain");
+    expect(recB?.recovery).toBe("retry-same");
+    expect(recB?.payload?.text).toBe("message B");
+    // A row retry never modifies the composer.
+    expect(h.input()).toBe("message B");
+  });
+
+  it("GONE record (unknown id): refuses loudly — no enqueue, notification, composer untouched", async () => {
+    const h = harness();
+    h.setInput("some draft text");
+    await h.retrySameMessage("att-does-not-exist");
+    expect(h.enqueueInputs).toHaveLength(0);
+    expect(h.notes.some((n) => n.title === "Retry unavailable — status changed")).toBe(true);
+    expect(h.input()).toBe("some draft text");
+  });
+
+  it("FINISHED record (custody confirmed / dismissed): refuses loudly — no enqueue, notification", async () => {
+    let fail = true;
+    const h = harness({
+      enqueue: async () => {
+        if (fail) throw new Error("response lost");
+        return { id: "q-r-fin" };
+      },
+      fetchQueue: async () => [],
+    });
+    h.setInput("will be confirmed");
+    await h.send();
+    const attemptId = h.enqueueInputs[0].input.attemptId as string;
+    finishSendAttempt(attemptId); // e.g. a reconcile confirmed custody, or the row was dismissed
+
+    fail = false;
+    await h.retrySameMessage(attemptId);
+
+    expect(h.enqueueInputs).toHaveLength(1); // no replay
+    expect(h.notes.some((n) => n.title === "Retry unavailable — status changed")).toBe(true);
+    expect(h.input()).toBe("will be confirmed");
   });
 
   it("ADDED attachment after the attempt (text unchanged): replay sends the stored payload WITHOUT the added chip; the composer keeps it", async () => {
@@ -530,7 +642,7 @@ describe("createSend — guarded row-retry (retrySameMessage)", () => {
 
     h.setAtts([a1, a2]); // operator ADDS a chip after the attempt
     fail = false;
-    await h.retrySameMessage();
+    await h.retrySameMessage(attemptId);
 
     expect(h.enqueueInputs).toHaveLength(2);
     expect(h.enqueueInputs[1].input.attemptId).toBe(attemptId);
@@ -540,12 +652,12 @@ describe("createSend — guarded row-retry (retrySameMessage)", () => {
       { url: "file://up/a.png", filename: "a.png", mime: "image/png" },
     ]);
     // The composer keeps both chips (the addition is the operator's next
-    // message, untouched).
+    // message, untouched — a row retry never modifies the composer).
     expect(h.atts()).toEqual([a1, a2]);
     expect(h.input()).toBe("with one file");
   });
 
-  it("UNCHANGED composer: row retry delegates to today's send path — same attemptId + byte-identical payload, composer cleared on success", async () => {
+  it("UNCHANGED composer: row retry replays VERBATIM under the SAME attemptId and never modifies the composer", async () => {
     let fail = true;
     const h = harness({
       enqueue: async () => {
@@ -559,19 +671,19 @@ describe("createSend — guarded row-retry (retrySameMessage)", () => {
     const attemptId = h.enqueueInputs[0].input.attemptId as string;
 
     fail = false;
-    await h.retrySameMessage(); // composer still holds the exact tap text
+    await h.retrySameMessage(attemptId); // composer still holds the exact tap text
 
-    // Today's composer-matching reuse, unchanged: same attemptId, verbatim
-    // payload…
+    // Record-addressed replay: same attemptId, verbatim payload…
     expect(h.enqueueInputs).toHaveLength(2);
     expect(h.enqueueInputs[1].input.attemptId).toBe(attemptId);
     expect(h.enqueueInputs[1].input).toEqual(h.enqueueInputs[0].input);
-    // …and the normal success clear applies (the tap-owned text is cleared).
-    expect(h.input()).toBe("");
+    // …and a row retry NEVER modifies the composer — even a matching one is
+    // left as-is for the operator to clear (no send()-delegation clear).
+    expect(h.input()).toBe("retry me unchanged");
     expect(getSendAction(attemptId)).toBeUndefined();
   });
 
-  it("REMOVED attachment after the attempt (text unchanged): subset match → verbatim replay re-includes the removed chip (slice-2 advisory, coherent)", async () => {
+  it("REMOVED attachment after the attempt: verbatim replay re-includes the removed chip (slice-2 advisory, coherent)", async () => {
     let fail = true;
     const a1: Attachment = { url: "file://up/a.png", filename: "a.png", mime: "image/png" };
     const a2: Attachment = { url: "file://up/b.png", filename: "b.png", mime: "image/png" };
@@ -589,7 +701,7 @@ describe("createSend — guarded row-retry (retrySameMessage)", () => {
 
     h.setAtts([a1]); // operator REMOVES b.png after the attempt
     fail = false;
-    await h.retrySameMessage();
+    await h.retrySameMessage(attemptId);
 
     expect(h.enqueueInputs).toHaveLength(2);
     expect(h.enqueueInputs[1].input.attemptId).toBe(attemptId);
@@ -597,45 +709,10 @@ describe("createSend — guarded row-retry (retrySameMessage)", () => {
     // payload preview advertises exactly this).
     expect(h.enqueueInputs[1].input.attachments).toHaveLength(2);
     expect(h.enqueueInputs[1].input.attachments.map((a: any) => a.filename)).toEqual(["a.png", "b.png"]);
-    // Success clear removes only the still-present owned chip (a.png); the
-    // removed one is not resurrected into the composer.
-    expect(h.atts()).toEqual([]);
-    expect(h.input()).toBe("");
-  });
-
-  it("NO retained uncertain record: the entry is a plain composer send (fresh attemptId) — today's behavior", async () => {
-    const h = harness();
-    h.setInput("plain fresh send");
-    await h.retrySameMessage();
-    expect(h.enqueueInputs).toHaveLength(1);
-    expect(h.enqueueInputs[0].input.text).toBe("plain fresh send");
-    expect(h.enqueueInputs[0].input.attemptId).toBeTruthy();
-    expect(h.input()).toBe("");
-  });
-
-  it("MULTIPLE uncertain records + diverged composer: refuses (no enqueue, no silent wrong-record send), notifies", async () => {
-    const h = harness({
-      enqueue: async () => {
-        throw new Error("response lost");
-      },
-      fetchQueue: async () => [],
-    });
-    h.setInput("first lost message");
-    await h.send();
-    h.setInput("second lost message");
-    await h.send();
-    // Two retained uncertain retry-same records (mint never supersedes
-    // uncertain records).
-    expect(sendActionsFor("ses-1").filter((a) => a.stage === "uncertain" && a.recovery === "retry-same")).toHaveLength(2);
-
-    h.setInput("a third, diverged draft");
-    await h.retrySameMessage();
-
-    // The no-arg row entry cannot know WHICH record was tapped — nothing is
-    // sent, and the refusal says why.
-    expect(h.enqueueInputs).toHaveLength(2);
-    expect(h.notes.some((n) => n.title === "Retry unavailable — multiple unresolved sends")).toBe(true);
-    expect(h.input()).toBe("a third, diverged draft");
+    // The composer is untouched: the still-present chip stays, the removed
+    // one is not resurrected into the composer.
+    expect(h.atts()).toEqual([a1]);
+    expect(h.input()).toBe("two files originally");
   });
 
   it("a replay whose response is lost AGAIN stays uncertain + retryable (reconcile-first re-runs); the edit is still preserved", async () => {
@@ -650,7 +727,7 @@ describe("createSend — guarded row-retry (retrySameMessage)", () => {
     const attemptId = h.enqueueInputs[0].input.attemptId as string;
 
     h.setInput("edited while uncertain");
-    await h.retrySameMessage(); // replay — response lost again
+    await h.retrySameMessage(attemptId); // replay — response lost again
 
     expect(h.enqueueInputs).toHaveLength(2);
     expect(h.enqueueInputs[1].input.attemptId).toBe(attemptId);
@@ -679,12 +756,126 @@ describe("createSend — guarded row-retry (retrySameMessage)", () => {
     // is total — but the guard must fail closed, never send without an agent).
     updateSendAction(attemptId, { payload: { ...rec!.payload!, sendConfig: {} } });
     h.setInput("edited before the gate refusal");
-    await h.retrySameMessage();
+    await h.retrySameMessage(attemptId);
 
     expect(h.enqueueInputs).toHaveLength(1); // no second enqueue
+    // PRESERVED notification (O2 dedup exception): the uncertain row cannot
+    // own the replay-refusal event without misrepresenting the admission
+    // state — this is the one honest surface for it.
     expect(h.notes.some((n) => n.title === "Not sent — agent unresolved")).toBe(true);
     expect(h.input()).toBe("edited before the gate refusal");
     expect(getSendAction(attemptId)?.recovery).toBe("retry-same"); // still retryable
+  });
+
+  // -------------------------------------------------------------------------
+  // O2 deferred C-F1/D-F1 — attachments-only replay silent no-op fix. The
+  // row-retry threads an EMPTY ownership set (it owns none of the composer
+  // state), so sendText's admission guard decides emptiness against THE
+  // PAYLOAD's attachments — an attachment-only stored payload (empty text)
+  // must not trip it: the Retry was silently inert (no enqueue, no
+  // notification) before the fix.
+  // -------------------------------------------------------------------------
+  it("ATTACHMENT-ONLY payload + diverged composer: row retry enqueues the STORED attachments under the SAME attemptId (was a silent no-op)", async () => {
+    let fail = true;
+    const a1: Attachment = { url: "file://up/only.png", filename: "only.png", mime: "image/png" };
+    const h = harness({
+      enqueue: async () => {
+        if (fail) throw new Error("response lost");
+        return { id: "q-ao" };
+      },
+      fetchQueue: async () => [],
+    });
+    h.setAtts([a1]);
+    h.setInput(""); // attachment-only: no text
+    await h.send(); // payload captured {text:"", attachments:[a1]}; response lost
+    const attemptId = h.enqueueInputs[0].input.attemptId as string;
+    expect(getSendAction(attemptId)?.recovery).toBe("retry-same");
+
+    // Diverge the composer (text edited, chip removed) — verbatim replay.
+    h.setInput("meanwhile I typed something else");
+    h.setAtts([]);
+    fail = false;
+    await h.retrySameMessage(attemptId);
+
+    // THE CRUX: the retry is NOT a silent no-op — the STORED attachment set
+    // replays verbatim under the SAME attemptId.
+    expect(h.enqueueInputs).toHaveLength(2);
+    expect(h.enqueueInputs[1].input.attemptId).toBe(attemptId);
+    expect(h.enqueueInputs[1].input.text).toBe("");
+    expect(h.enqueueInputs[1].input.attachments).toEqual([
+      { url: "file://up/only.png", filename: "only.png", mime: "image/png" },
+    ]);
+    // The diverged composer is untouched; custody confirmed → row finished.
+    expect(h.input()).toBe("meanwhile I typed something else");
+    expect(h.atts()).toEqual([]);
+    expect(getSendAction(attemptId)).toBeUndefined();
+  });
+
+  it("ATTACHMENT-ONLY payload + emptied composer: record-addressed replay still enqueues the STORED attachments (no silent no-op)", async () => {
+    let fail = true;
+    const a1: Attachment = { url: "file://up/solo.png", filename: "solo.png", mime: "image/png" };
+    const h = harness({
+      enqueue: async () => {
+        if (fail) throw new Error("response lost");
+        return { id: "q-ao2" };
+      },
+      fetchQueue: async () => [],
+    });
+    h.setAtts([a1]);
+    h.setInput("");
+    await h.send();
+    const attemptId = h.enqueueInputs[0].input.attemptId as string;
+
+    // Composer text is "" and the live chip set was emptied — the replay is
+    // decided against the STORED payload, never the live composer read.
+    h.setAtts([]);
+    fail = false;
+    await h.retrySameMessage(attemptId);
+
+    expect(h.enqueueInputs).toHaveLength(2);
+    expect(h.enqueueInputs[1].input.attemptId).toBe(attemptId);
+    expect(h.enqueueInputs[1].input.attachments).toEqual([
+      { url: "file://up/solo.png", filename: "solo.png", mime: "image/png" },
+    ]);
+    expect(getSendAction(attemptId)).toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------------
+  // O2 slice 1 — post-mint agent-gate refusals get a TERMINAL row disposition
+  // (no stale "Sending…" row) and the row owns the fact (notification
+  // suppressed; reason copy "Not sent — choose an agent.").
+  // -------------------------------------------------------------------------
+  it("post-mint agent-gate refusal (admission awaitAgent timeout) → terminal rejected row with reason agent-unresolved, NO notification, no stale preparing row", async () => {
+    const h = harness({
+      resolveAgent: () => ({ state: "pending" }), // no tap-time agent
+      awaitAgent: async () => ({ ok: false, reason: "timeout" }),
+    });
+    h.setInput("gate me");
+    await h.send();
+    expect(h.enqueueInputs).toHaveLength(0);
+    expect(h.notes).toHaveLength(0); // the row owns the refusal (O2 dedup)
+    const row = sendActionsFor("ses-1").find((a) => a.stage === "rejected");
+    expect(row).toBeDefined();
+    expect(row!.reason).toBe("agent-unresolved");
+    expect(row!.recovery).toBe("restore");
+    // No stale preparing row remains (the brief's contradiction-list fix).
+    expect(sendActionsFor("ses-1").some((a) => a.stage === "preparing")).toBe(false);
+    expect(h.input()).toBe("gate me"); // preserved
+  });
+
+  it("post-mint DRAFT agent-gate refusal (no tapAgent) → same terminal row disposition, no notification", async () => {
+    const h = harness({
+      draft: () => true,
+      ensureSession: async () => "live-draft-gate",
+      resolveAgent: () => ({ state: "pending" }),
+      awaitAgent: async () => ({ ok: false, reason: "timeout" }),
+    });
+    h.setInput("draft with no agent");
+    await h.send();
+    expect(h.enqueueInputs).toHaveLength(0);
+    expect(h.notes).toHaveLength(0);
+    expect(sendActionsFor("live-draft-gate").some((a) => a.stage === "rejected" && a.reason === "agent-unresolved")).toBe(true);
+    expect(sendActionsFor("draft")).toHaveLength(0); // swept to the live id first
   });
 });
 
@@ -793,24 +984,24 @@ describe("createSend — dispatchQueuedItem dispatch-path classification (queued
     createdAt: 1,
   });
 
-  it("queued DISPATCH (prompt_async POST) proxy 502 → outcome UNKNOWN with the 'proxy 502 (outcome unknown)' detail — never failed", async () => {
+  it("queued DISPATCH (prompt_async POST) proxy 502 → outcome UNKNOWN with the 'proxy 502 (outcome unknown)' detail — never failed; the unknown chip owns it (no notification)", async () => {
     vi.stubGlobal("fetch", respondText(502, "upstream unreachable"));
     const h = harness();
     const out = await h.dispatchQueuedItem("ses-1", item(), new AbortController().signal);
     expect(out.state).toBe("unknown");
     expect(out.detail).toBe("proxy 502 (outcome unknown): upstream unreachable");
-    // The operator-facing surface mirrors the classification: an
-    // outcome-unknown notice, not a definitive failure notice.
-    expect(h.notes.some((n) => n.title === "Queued message send outcome unknown")).toBe(true);
-    expect(h.notes.some((n) => n.title === "Queued message failed to send")).toBe(false);
+    // O2 single-owner: the queue item's unknown chip visibly carries the
+    // detail + the check-transcript instruction — the covered notification-
+    // history entry is suppressed (the classification lives in DrainOutcome).
+    expect(h.notes).toHaveLength(0);
   });
 
-  it("queued DISPATCH (prompt_async POST) definitive 500 → terminal failed — never unknown", async () => {
+  it("queued DISPATCH (prompt_async POST) definitive 500 → terminal failed — never unknown; the failed chip owns the cause (no notification)", async () => {
     vi.stubGlobal("fetch", respondText(500, "500 upstream"));
     const h = harness();
     const out = await h.dispatchQueuedItem("ses-1", item(), new AbortController().signal);
     expect(out.state).toBe("failed");
     expect(out.detail).toBe("500 upstream");
-    expect(h.notes.some((n) => n.title === "Queued message failed to send")).toBe(true);
+    expect(h.notes).toHaveLength(0);
   });
 });

@@ -39,7 +39,6 @@ import {
   finishSendAttempt,
   getSendAction,
   mintSendAttempt,
-  sendActionsFor,
   transferOwnerSendAttempts,
   updateSendAction,
   type PreparedSendPayload,
@@ -144,11 +143,12 @@ export type SendDependencies = {
 
 export type SendController = {
   send(): Promise<void>;
-  // Guarded SendStatus row-retry entry (sending-UX O2 defect fix): verbatim
-  // same-attempt replay of a retained uncertain admission — never silently
-  // sends edited composer contents. See retrySameMessage below for the exact
-  // eligibility/refusal semantics.
-  retrySameMessage(): Promise<void>;
+  // Guarded SendStatus row-retry entry (sending-UX O2 defect fix, RECORD-
+  // ADDRESSED per the O2 slice-1 review A-F1): takes the DISPLAYED row's
+  // attemptId, revalidates that exact record at click time, and replays ITS
+  // stored verbatim payload under ITS attemptId — or refuses loudly. See
+  // retrySameMessage below for the exact eligibility/refusal semantics.
+  retrySameMessage(attemptId: string): Promise<void>;
   resendText(text: string, sessionId: string): Promise<boolean>;
   dispatchQueuedItem(
     sessionId: string,
@@ -260,6 +260,15 @@ export function createSend(deps: SendDependencies): SendController {
   // and response-less failures RECONCILE FIRST (an authoritative list showing
   // an item admitted under our attemptId proves custody after all) before
   // being recorded as outcome-unknown.
+  //
+  // NOTIFICATION DEDUP (sending-UX O2 slice 1 — single-owner rule): every
+  // typed-attempt branch below FIRST writes the durable-for-this-view action
+  // record (with a typed `reason` where the O2 copy matrix defines
+  // reason-specific row copy), and the matching notification-history entry is
+  // SUPPRESSED — the SendStatus row is the one persistent owner of the fact.
+  // The no-attempt legacy branch keeps its notification (no retained owner
+  // exists to adopt the fact). Honesty rule: a covered notification is removed
+  // ONLY after its unique reason/advice is readable in the owning row.
   async function classifyAdmissionFailure(
     e: unknown,
     id: string,
@@ -270,41 +279,37 @@ export function createSend(deps: SendDependencies): SendController {
     if (attempt && err?.code === "queue_admission_conflict") {
       // Same attemptId, changed payload — an explicit conflict state, never
       // retry-forever. Immutable attempts make this unreachable in the normal
-      // flow; surface it if state ever diverges.
+      // flow; surface it if state ever diverges. The row copy ("Queue status
+      // conflict — check the queue.") carries the check-queue advice, so no
+      // duplicate notification (O2 dedup).
       updateSendAction(attempt.attemptId, {
         stage: "conflict", certainty: "definitive", recovery: "check",
         detail: `admission conflict: ${err.message}`,
         conflictSource: "admission",
       });
       log.error("send", "enqueue admission conflict", { id, err: err.message });
-      deps.pushNotification({
-        kind: "error", sessionID: id, title: "Message not queued — admission conflict",
-        detail: "The queue reports a conflicting admission for this message; open the session queue to check before sending again.",
-      });
       return false;
     }
     if (attempt && err?.code === "queue_admission_full") {
-      // 429 = hard user-visible error, no retry.
+      // 429 = hard user-visible error, no retry. The row's queue-full reason
+      // copy carries the capacity/removal advice ("Remove a queued message
+      // before trying again.") — the notification would duplicate it (O2 dedup).
       updateSendAction(attempt.attemptId, {
         stage: "rejected", certainty: "definitive", recovery: "restore", detail: err.message,
+        reason: "queue-full",
       });
       log.error("send", "enqueue rejected: queue full", { id, err: err.message });
-      deps.pushNotification({
-        kind: "error", sessionID: id, title: "Message not queued — queue is full",
-        detail: "This session's queue is at capacity; remove queued messages before sending again.",
-      });
       return false;
     }
     if (attempt && err && err.status !== undefined) {
       // Any other non-2xx WITH a response from the local worker server is a
-      // definitive rejection (this is NOT the /oc upstream proxy).
+      // definitive rejection (this is NOT the /oc upstream proxy). The typed
+      // attempt's rejected row (detail tooltip + fallback copy) owns the fact;
+      // only the no-attempt legacy branch below still notifies (O2 dedup).
       updateSendAction(attempt.attemptId, {
         stage: "rejected", certainty: "definitive", recovery: "restore", detail: err.message,
       });
       log.error("send", "enqueue failed", { id, err: err.message });
-      deps.pushNotification({
-        kind: "error", sessionID: id, title: "Could not queue message", detail: composedText.slice(0, 120),
-      });
       return false;
     }
     if (attempt) {
@@ -328,13 +333,16 @@ export function createSend(deps: SendDependencies): SendController {
         detail: err?.message ?? String(e),
       });
       log.error("send", "enqueue outcome unknown (reconcile did not confirm)", { id, err: String(e) });
-      deps.pushNotification({
-        kind: "error", sessionID: id, title: "Queue confirmation unknown",
-        detail: "The message may or may not be queued. Check the session queue before sending again; pressing Send again re-sends the same message.",
-      });
+      // The row owns the fact: "Queue confirmation unknown." + the guarded
+      // Retry-same-message affordance + its guidance. The old notification's
+      // blanket "pressing Send again re-sends the same message" instruction
+      // was too broad after composer edits — the guarded row action is the
+      // honest replacement (O2 dedup).
       return false;
     }
-    // No attempt context: preserve the legacy contract exactly.
+    // No attempt context: preserve the legacy contract exactly — there is no
+    // retained row to own the fact, so the notification STAYS (uncovered
+    // fallback; currently defensive-only, every caller threads an attempt).
     log.error("send", "enqueue failed", { id, err: String(e) });
     deps.pushNotification({
       kind: "error", sessionID: id, title: "Could not queue message", detail: composedText.slice(0, 120),
@@ -351,19 +359,37 @@ export function createSend(deps: SendDependencies): SendController {
   ): Promise<boolean> {
     const ownedNow = () =>
       owned ? deps.attachments().filter((a) => owned.has(a)) : deps.attachments();
-    const atts = ownedNow();
+    // Admission guard: refuse an EMPTY send. REUSE-AWARE (O2 deferred C-F1/
+    // D-F1 fix): the guarded row-retry (retrySameMessage branch b) threads an
+    // EMPTY ownership set — it deliberately owns none of the composer state —
+    // so the live intersection is empty BY CONSTRUCTION and an attachment-only
+    // stored payload (empty text) tripped this guard: the Retry was silently
+    // inert (no enqueue, no notification). When a reuse payload is present,
+    // emptiness is decided against THE PAYLOAD's attachments (the verbatim
+    // replay set — exactly what the next line enqueues), never the live
+    // composer read. The non-reuse path is unchanged.
+    const atts = attempt?.reuse ? attempt.reuse.attachments : ownedNow();
     if ((!text && atts.length === 0) || !id) return false;
     // An existing-session prompt MUST carry an agent: the SENDER stamps it and
     // every later message inherits it. An empty/omitted agent would let
     // opencode resolve the omitted field to its config default_agent server-
     // side — the silent-flip path (2026-08-16 / 2026-08-26 incidents). Refuse
-    // loudly instead; the caller keeps the composed text.
+    // loudly instead; the caller keeps the composed text. With a typed attempt
+    // the rejected row (reason "agent-unresolved") owns the refusal — the
+    // notification survives only for the no-attempt caller (O2 dedup).
     if (!agent) {
       log.error("send", "sendText refused: no resolved agent", { id });
-      deps.pushNotification({
-        kind: "error", sessionID: id, title: "Not sent — agent unresolved",
-        detail: "No agent evidence for this session; pick an agent before sending.",
-      });
+      if (attempt) {
+        updateSendAction(attempt.attemptId, {
+          stage: "rejected", certainty: "definitive", recovery: "restore",
+          detail: "no resolved agent", reason: "agent-unresolved",
+        });
+      } else {
+        deps.pushNotification({
+          kind: "error", sessionID: id, title: "Not sent — agent unresolved",
+          detail: "No agent evidence for this session; pick an agent before sending.",
+        });
+      }
       return false;
     }
     // IMMUTABLE PREPARED ATTEMPT (send-reliability slice 2): a retry of an
@@ -470,9 +496,10 @@ export function createSend(deps: SendDependencies): SendController {
       if (!ag.ok) {
         const msg = `pre-POST gate: agent unresolved (${ag.reason}) — nothing was sent`;
         log.error("send", "queued dispatch aborted: agent unresolved", { id, itemId: item.id, reason: ag.reason });
-        deps.pushNotification({
-          kind: "error", sessionID: id, title: "Queued message not sent — agent unresolved", detail: msg,
-        });
+        // O2 single-owner dedup: the item is terminally classified `failed`
+        // with this detail and the QueueChip renders the cause VISIBLY (the
+        // .queue-detail-note) — the notification-history entry would be a
+        // second persistent claim of the same fact.
         return { state: "failed", detail: msg };
       }
       config = captureConfig(id, ag.agent);
@@ -513,15 +540,15 @@ export function createSend(deps: SendDependencies): SendController {
       if (res.status === 502) {
         const msg = detail || "proxy 502";
         log.error("send", "queued POST hit proxy 502 (outcome unknown)", { id, itemId: item.id, detail: msg });
-        deps.pushNotification({
-          kind: "error", sessionID: id, title: "Queued message send outcome unknown",
-          detail: `${msg} — the message may still have been delivered; check the transcript before resending.`,
-        });
+        // O2 single-owner dedup: the unknown QueueChip visibly carries the
+        // detail AND the standing check-transcript instruction (the dispatch
+        // may have been delivered) — the covered notification is suppressed.
         return { state: "unknown", detail: `proxy 502 (outcome unknown): ${msg}` };
       }
       const msg = detail || `HTTP ${res.status}`;
       log.error("send", "queued POST rejected", { id, itemId: item.id, status: res.status, detail: msg });
-      deps.pushNotification({ kind: "error", sessionID: id, title: "Queued message failed to send", detail: msg });
+      // O2 single-owner dedup: the failed QueueChip visibly carries the cause
+      // (.queue-detail-note) — no duplicate persistent claim in history.
       return { state: "failed", detail: msg };
     } catch (e) {
       // Abort/timeout or network interruption — ambiguous, NEVER repend. The
@@ -529,12 +556,11 @@ export function createSend(deps: SendDependencies): SendController {
       // identical to one that never accepted the bytes), so re-dispatch risks
       // a duplicate and is explicitly forbidden by the operator's no-retry
       // policy. Classify as `unknown`; the queue chip persists the text +
-      // attachment metadata until the operator dismisses it.
+      // attachment metadata until the operator dismisses it (and visibly owns
+      // the detail + check-transcript instruction — O2 single-owner dedup).
       const aborted = signal.aborted || (e instanceof DOMException && e.name === "AbortError");
       const msg = aborted ? "dispatch timed out" : String(e);
-      const title = aborted ? "Queued message send timed out" : "Queued message send interrupted";
       log.error("send", "queued POST threw", { id, itemId: item.id, aborted, err: msg });
-      deps.pushNotification({ kind: "error", sessionID: id, title, detail: msg });
       return { state: "unknown", detail: msg };
     }
   }
@@ -646,11 +672,21 @@ export function createSend(deps: SendDependencies): SendController {
     // D2 transfer below) and the inline-resolve appending image parts — never
     // across an operator edit: additions made during any wait stay in the
     // composer, and explicit removals are honored (not resurrected).
+    const wasDraft = deps.draft();
     const ownedText = deps.input();
     const ownedAtts = deps.attachments();
     const owned = new Set<Attachment>(ownedAtts);
     const text = ownedText.trim();
-    if (!text && ownedAtts.length === 0) return;
+    // O2 C-F1/D-F1 (attachments-only replay): an attachment-only RETRY of a
+    // retained uncertain admission is NOT an empty send — the stored payload
+    // carries the attachments, and the row's Retry affordance was tapped with
+    // explicit intent. PURE lookup, and only in the otherwise-empty case: a
+    // genuinely empty tap (no retained retry-same record under this owner)
+    // still exits here before ANY state change, exactly as before.
+    if (!text && ownedAtts.length === 0) {
+      const earlyReuse = findReusableSendAttempt(wasDraft ? "draft" : deps.sessionId(), text);
+      if (!earlyReuse?.payload) return;
+    }
     // F2: ONE agent capture at tap, through the SAME resolver the composer's
     // agent Select renders. `tapAgent` is either the evidence-backed value
     // the composer DISPLAYED at the tap — sent EXACTLY, never re-resolved,
@@ -660,8 +696,8 @@ export function createSend(deps: SendDependencies): SendController {
     // pending→resolved transition displays that same first value once it
     // lands). For a DRAFT this snapshot is the config-default policy
     // (legitimate for a genuinely new session) and is ADOPTED as the
-    // materialized session's first evidence below.
-    const wasDraft = deps.draft();
+    // materialized session's first evidence below. (`wasDraft` was hoisted
+    // above the emptiness guard for the O2 reuse-aware early exit.)
     const tapResolution = deps.resolveAgent(deps.sessionId());
     const tapAgent =
       tapResolution.state === "agent" && tapResolution.agent ? tapResolution.agent : undefined;
@@ -714,13 +750,11 @@ export function createSend(deps: SendDependencies): SendController {
           return { attemptId: mintSendAttempt(ownerKey).attemptId, tapText: text };
         })();
     // Send-reliability slice 3: a reused attempt IS a retry of a retained
-    // uncertain admission — flag it so the status surface renders
-    // "Retrying queue confirmation…" instead of a plain "Sending…" while the
-    // same attemptId replays.
-    if (attempt?.reuse) {
-      updateSendAction(attempt.attemptId, { retry: true });
-    }
-
+    // uncertain admission — flagged INSIDE admission (moved from send()'s
+    // pre-flight position, O2 review a-F1) so the "Retrying queue
+    // confirmation…" copy only appears when the single-flight region was
+    // actually ACQUIRED; an IGNORED re-tap (a flight already in progress)
+    // must not flip the row when nothing is retrying.
     // ADMISSION (F4): everything from here on runs inside the per-session
     // send single-flight, engaged at TAP time — a re-tap during the (up to
     // 10s) agent gate wait is DROPPED (IGNORED) instead of spawning a
@@ -729,6 +763,7 @@ export function createSend(deps: SendDependencies): SendController {
     // re-taps never duplicate them. The composer stays EDITABLE throughout
     // (F1's ownership snapshot protects edits made during any wait).
     const admission = async (id: string): Promise<void> => {
+      if (attempt?.reuse) updateSendAction(attempt.attemptId, { retry: true });
       // D4 (round 2): pushHistory fires ONLY after successful admission —
       // enqueue confirmed (normal/draft→session path) or the shell POST
       // accepted (shell path); see the success sites below. A gate timeout,
@@ -749,10 +784,25 @@ export function createSend(deps: SendDependencies): SendController {
       if (wasDraft) {
         if (!tapAgent) {
           log.error("send", "draft send aborted: no agent resolved", { id });
-          deps.pushNotification({
-            kind: "error", sessionID: id, title: "Not sent — agent unresolved",
-            detail: "No agent selected for the new session; pick an agent before sending.",
-          });
+          // POST-MINT TERMINAL DISPOSITION (O2 slice 1 + brief contradiction
+          // list): this attempt was already minted, so a bare return would
+          // strand its row in "preparing" forever (a stale "Sending…"). The
+          // rejected row (reason "agent-unresolved" → "Not sent — choose an
+          // agent.") owns the refusal — no duplicate notification. SHELL
+          // commands carry NO attempt record, so their refusal keeps the
+          // notification (nothing else owns the fact — never leave it
+          // homeless).
+          if (attempt) {
+            updateSendAction(attempt.attemptId, {
+              stage: "rejected", certainty: "definitive", recovery: "restore",
+              detail: "no agent resolved for the new session", reason: "agent-unresolved",
+            });
+          } else {
+            deps.pushNotification({
+              kind: "error", sessionID: id, title: "Not sent — agent unresolved",
+              detail: "No agent selected for the new session; pick an agent before sending.",
+            });
+          }
           return;
         }
         sendAgent = tapAgent;
@@ -766,10 +816,22 @@ export function createSend(deps: SendDependencies): SendController {
         const ag = await deps.awaitAgent(deps.sessionId());
         if (!ag.ok) {
           log.error("send", "send aborted: agent unresolved", { id, reason: ag.reason });
-          deps.pushNotification({
-            kind: "error", sessionID: id, title: "Not sent — agent unresolved",
-            detail: `Agent evidence did not arrive (${ag.reason}); nothing was sent. Retry shortly or pick an agent.`,
-          });
+          // Same post-mint terminal disposition as the draft branch above —
+          // the rejected row owns the refusal, never a stale preparing row
+          // nor a duplicate notification (O2 single-owner rule). Shell sends
+          // (no attempt record) keep the notification — no row exists to
+          // adopt the fact.
+          if (attempt) {
+            updateSendAction(attempt.attemptId, {
+              stage: "rejected", certainty: "definitive", recovery: "restore",
+              detail: `agent evidence did not arrive (${ag.reason})`, reason: "agent-unresolved",
+            });
+          } else {
+            deps.pushNotification({
+              kind: "error", sessionID: id, title: "Not sent — agent unresolved",
+              detail: `Agent evidence did not arrive (${ag.reason}); nothing was sent. Retry shortly or pick an agent.`,
+            });
+          }
           return;
         }
         sendAgent = ag.agent;
@@ -791,12 +853,21 @@ export function createSend(deps: SendDependencies): SendController {
           updateSendAction(attempt.attemptId, {
             stage: "blocked", certainty: "definitive", recovery: "restore",
             detail: "an attachment upload is still in progress",
+            reason: "attachments-uploading",
+          });
+        } else {
+          // SHELL sends carry no attempt row (C-F1, O2 slice-1 review): the
+          // blocked row owns the fact only for a typed attempt — a shell send
+          // has no retained owner, so the notification is the one honest
+          // surface (the agent-gate pattern: if(attempt) row else notify).
+          deps.pushNotification({
+            kind: "error", sessionID: id, title: "Not sent — attachment still uploading",
+            detail: "Wait for the upload to finish, then send again.",
           });
         }
-        deps.pushNotification({
-          kind: "error", sessionID: id, title: "Not sent — attachment still uploading",
-          detail: "Wait for the upload to finish, then send again.",
-        });
+        // The blocked row's reason copy ("Not sent — attachments are still
+        // uploading.") carries the wait instruction — no duplicate
+        // notification (O2 single-owner rule).
         return;
       }
       // A draft may have queued attachments locally (no session existed at paste
@@ -857,12 +928,21 @@ export function createSend(deps: SendDependencies): SendController {
           updateSendAction(attempt.attemptId, {
             stage: "blocked", certainty: "definitive", recovery: "restore",
             detail: `${ownedFailedUploads.length} attachment upload(s) failed`,
+            reason: "attachments-failed",
+          });
+        } else {
+          // SHELL sends carry no attempt row (C-F1): no retained owner exists
+          // for the fact, so the notification surfaces it (agent-gate
+          // pattern).
+          deps.pushNotification({
+            kind: "error", sessionID: id, title: "Not sent — attachment upload failed",
+            detail: `${ownedFailedUploads.length} attachment(s) failed to upload and the message was not queued. Remove or retry them, then send again.`,
           });
         }
-        deps.pushNotification({
-          kind: "error", sessionID: id, title: "Not sent — attachment upload failed",
-          detail: `${ownedFailedUploads.length} attachment(s) failed to upload and the message was not queued. Remove or retry them, then send again.`,
-        });
+        // O2 single-owner dedup: the blocked row's reason copy ("Not sent —
+        // attachment upload was not confirmed. Review the attachment controls
+        // before trying again.") carries the advice; the attachment chips
+        // themselves own the per-file repair markers (uploadFailed badge).
         return;
       }
       // Shell commands (leading "!") dispatch directly against the live session —
@@ -940,12 +1020,21 @@ export function createSend(deps: SendDependencies): SendController {
             updateSendAction(attempt.attemptId, {
               stage: "blocked", certainty: "definitive", recovery: "restore",
               detail: `${r.failedIds.length} inline attachment upload(s) failed (${r.failedIds.join(", ")})`,
+              reason: "attachments-failed",
+            });
+          } else {
+            // Defensive mirror of the agent-gate pattern (C-F1): unreachable
+            // today — shell commands return above, before inline resolution —
+            // but a future no-attempt caller shape must not leave the fact
+            // homeless.
+            deps.pushNotification({
+              kind: "error", sessionID: id, title: "Not sent — attachment upload failed",
+              detail: `${r.failedIds.length} inline attachment(s) failed to upload and the message was not queued. Remove or retry them, then send again.`,
             });
           }
-          deps.pushNotification({
-            kind: "error", sessionID: id, title: "Not sent — attachment upload failed",
-            detail: `${r.failedIds.length} inline attachment(s) failed to upload and the message was not queued. Remove or retry them, then send again.`,
-          });
+          // Same O2 single-owner dedup as the flush-failed gate above: the
+          // blocked row's reason copy carries the review-attachments advice;
+          // the inline chips keep their per-token repair affordances.
           if (deps.input() === ownedText) deps.setInput(text);
           return;
         }
@@ -1045,21 +1134,30 @@ export function createSend(deps: SendDependencies): SendController {
         // made during the createSession wait survive, F1).
         const act = attempt ? getSendAction(attempt.attemptId) : undefined;
         if (act?.stage === "uncertain") {
-          deps.pushNotification({
-            kind: "error", sessionID: deps.sessionId(), title: "Session creation outcome unknown",
-            detail: `${act.detail || "The create request may have succeeded."} Check the session list before sending again — sending again may create another session.`,
-          });
+          // O2 single-owner dedup: markOwnerSessionCreateUnknown already
+          // typed this record reason "session-create-unknown" — the row copy
+          // ("Session creation unconfirmed. Check possible sessions before
+          // sending again; another send may create another session.") owns
+          // the duplicate-session warning the notification detail used to
+          // carry, and the create-link group below it owns the candidates.
         } else {
           if (attempt) {
             updateSendAction(attempt.attemptId, {
               stage: "rejected", certainty: "definitive", recovery: "restore",
               detail: "createSession failed (no session id)",
+              reason: "session-create-failed",
+            });
+          } else {
+            // SHELL sends carry no attempt row (C-F1): no retained owner
+            // exists for the fact, so the notification surfaces it (agent-gate
+            // pattern).
+            deps.pushNotification({
+              kind: "error", sessionID: deps.sessionId(), title: "Could not create session",
+              detail: "The message was kept in the composer; press Send again to retry.",
             });
           }
-          deps.pushNotification({
-            kind: "error", sessionID: deps.sessionId(), title: "Could not create session",
-            detail: "The message was kept in the composer; press Send again to retry.",
-          });
+          // The rejected row's reason copy ("Session could not be created.")
+          // owns the create-specific cause — no duplicate notification (O2).
         }
         if (deps.input() === ownedText) deps.setInput(text);
         return;
@@ -1107,75 +1205,72 @@ export function createSend(deps: SendDependencies): SendController {
     // in-flight send owns clearing on its own success).
   }
 
-  // Guarded row-retry entry (sending-UX O2 defect fix, bounded bug-fix slice).
+  // Guarded row-retry entry (sending-UX O2 defect fix; RECORD-ADDRESSED since
+  // the O2 slice-1 review A-F1).
   //
   // DEFECT being fixed: the SendStatus "Queue confirmation unknown." row's
-  // Retry send button routes through the GENERIC composer send (its prop
-  // signature is `() => Promise<void>` — no record identity), so an operator
-  // who EDITED the composer after the uncertain record appeared would silently
-  // enqueue their EDITED draft as a fresh message under a fresh attemptId —
-  // while the row's payload preview ("Will send: '<stored text>'") advertised
-  // a verbatim replay of the ORIGINAL (and the original admission stayed
-  // unknown, so BOTH messages could deliver). ChatView/Composer wire THIS
-  // method as the row's send entry; the composer's own Send button / Enter
-  // key keep the raw send(). Semantics:
-  //   (a) the composer still matches a retained uncertain retry-same attempt
-  //       (tapText equal + live attachments a subset of the payload's, per
-  //       identity — the SAME pure selection send() applies at its reuse
-  //       gate) → delegate to send(): today's behavior exactly (same
-  //       attemptId + verbatim payload; the tap-owned composer state clears
-  //       on success as always).
-  //   (b) the composer diverged from EVERY retained retry-same record (text
-  //       edited, or an attachment ADDED): the row's displayed payload is the
-  //       authority — replay the STORED verbatim payload under the SAME
-  //       attemptId and leave the composer UNTOUCHED (the operator's edit
-  //       stays visible for a fresh send under a fresh attemptId; nothing is
-  //       silently overwritten or swallowed). With MORE THAN ONE such record
-  //       the no-arg entry cannot know which row was tapped — refuse
-  //       (notification, no enqueue) rather than silently send a record the
-  //       operator did not select. With NONE, delegate to send() (stale-row
-  //       fallback: today's behavior).
-  // Subset-semantics coherence (slice-2 advisory): a chip the operator
-  // REMOVED after the attempt still passes the subset gate → (a) → the
-  // verbatim replay re-includes it, exactly as before; a chip ADDED after the
-  // attempt fails the subset gate → (b) → the replay sends the stored payload
-  // WITHOUT the added chip and the composer keeps it. In every branch what is
-  // sent is the STORED payload — composer additions never silently ride
-  // along.
-  // The replay reuses sendText's reuse branch (same classification on a
-  // second lost response: reconcile-first, the record stays uncertain and
-  // retryable) and runs inside the per-session single-flight, so a concurrent
+  // Retry button routed through the GENERIC composer send (its prop carried
+  // no record identity), so an operator who EDITED the composer after the
+  // uncertain record appeared silently enqueued their EDITED draft as a fresh
+  // message — and with TWO retained uncertain records the live-composer-text
+  // selection (findReusableSendAttempt) could replay the WRONG record's
+  // payload under a preview of another (row A's button replaying record B).
+  // ChatView/Composer wire THIS method as the row's send entry WITH the
+  // displayed row's attemptId; the composer's own Send button / Enter key
+  // keep the raw send() (their composer-text reuse semantics are unchanged).
+  //
+  // Record-addressed contract (revalidated AT CLICK TIME — the displayed
+  // record is the authority, never the live composer text):
+  //   valid   — a retained record for `attemptId` still exists, is still
+  //             owned by the CURRENT ownerKey (draft view: "draft"), is
+  //             still stage "uncertain" with recovery "retry-same", and
+  //             still carries its payload → replay THAT record's STORED
+  //             verbatim payload under ITS attemptId (same classification
+  //             on a second lost response: reconcile-first, the record
+  //             stays uncertain and retryable);
+  //   invalid — gone (finished/dismissed), re-owned, or no longer an
+  //             unresolved retry-same admission → REFUSE LOUDLY
+  //             (notification, no enqueue). Nothing is inferred from live
+  //             composer text, so the wrong-record/multi-candidate
+  //             ambiguity the no-arg entry suffered from cannot arise.
+  // The composer is NEVER modified by a row retry: the replay is always
+  // verbatim, and the operator's live draft (matching or edited) survives
+  // untouched for a fresh send. A chip REMOVED after the attempt is
+  // re-included by the verbatim replay (the row's payload preview advertises
+  // exactly this); a chip ADDED after the attempt never rides along.
+  // The replay runs inside the per-session single-flight, so a concurrent
   // composer send drops it (IGNORED) exactly like a re-tap.
-  async function retrySameMessage(): Promise<void> {
-    if (deps.draft()) return send();
-    // Retry-same records live under live session ids (the draft→live owner
-    // sweep runs before the first enqueue ever resolves uncertainly), so a
-    // draft owner has nothing to guard — today's path unchanged.
-    const ownerKey = deps.sessionId();
-    const liveText = deps.input().trim();
-    const liveAtts = deps.attachments();
-    const reusable = findReusableSendAttempt(ownerKey, liveText);
-    if (reusable?.payload && attachmentsSubsetOfPayload(liveAtts, reusable.payload)) {
-      return send(); // (a) composer-matching retry: today's decision, unchanged
-    }
-    const candidates = sendActionsFor(ownerKey).filter(
-      (a) => a.stage === "uncertain" && a.recovery === "retry-same" && a.payload,
-    );
-    if (candidates.length === 0) return send(); // nothing to guard — today's behavior
-    if (candidates.length > 1) {
+  async function retrySameMessage(attemptId: string): Promise<void> {
+    const ownerKey = deps.draft() ? "draft" : deps.sessionId();
+    const rec = getSendAction(attemptId);
+    if (
+      !rec ||
+      rec.ownerKey !== ownerKey ||
+      rec.stage !== "uncertain" ||
+      rec.recovery !== "retry-same" ||
+      !rec.payload
+    ) {
+      // PRESERVED (O2 dedup exception): the tapped row either no longer
+      // exists or no longer represents an unresolved retry-same admission —
+      // no retained row owns THIS refusal event, so an attention cue is the
+      // only honest surface for it. Never fall through to a fresh composer
+      // send from a row affordance.
+      log.error("send", "guarded retry refused: record not retryable", { id: ownerKey, attemptId });
       deps.pushNotification({
-        kind: "error", sessionID: ownerKey, title: "Retry unavailable — multiple unresolved sends",
-        detail: "More than one message has an unknown queue confirmation. Restore the exact text of the message you want to retry into the composer, or check the session queue.",
+        kind: "error", sessionID: ownerKey, title: "Retry unavailable — status changed",
+        detail: "Nothing was sent. This message is no longer waiting on an unknown queue confirmation; check the session queue.",
       });
       return;
     }
-    const rec = candidates[0];
-    const payload = rec.payload!;
-    const attempt: SendAttemptRef = { attemptId: rec.attemptId, tapText: payload.tapText, reuse: payload };
-    // A reused attempt IS a retry — flag it so the status surface renders
-    // "Retrying queue confirmation…" (same as send()'s reuse branch).
-    updateSendAction(rec.attemptId, { retry: true });
+    const payload = rec.payload;
+    const attempt: SendAttemptRef = { attemptId, tapText: payload.tapText, reuse: payload };
     await runSendSingleFlight(ownerKey, async () => {
+      // A reused attempt IS a retry — flag it so the status surface renders
+      // "Retrying queue confirmation…" (same as send()'s reuse branch).
+      // INSIDE the flight region (O2 review a-F1, matching send()): an
+      // IGNORED entry (a concurrent composer send holds the flight) must not
+      // flip the row when no replay is running.
+      updateSendAction(attemptId, { retry: true });
       // Agent: the payload's captured agent is the exact evidence-gated value
       // the first attempt carried (sender-stamped, never re-resolved — F2
       // snapshot semantics); the evidence gate is only a defensive fallback
@@ -1185,6 +1280,12 @@ export function createSend(deps: SendDependencies): SendController {
         const ag = await deps.awaitAgent(ownerKey);
         if (!ag.ok) {
           log.error("send", "guarded retry aborted: agent unresolved", { id: ownerKey, reason: ag.reason });
+          // PRESERVED (O2 dedup exception, stated deviation): the uncertain
+          // row cannot own this refusal — marking it rejected would
+          // misrepresent the ADMISSION state (still unknown, still retryable
+          // once an agent resolves), and its "Queue confirmation unknown."
+          // copy says nothing about why this replay attempt sent nothing.
+          // The notification is the only honest surface for the event.
           deps.pushNotification({
             kind: "error", sessionID: ownerKey, title: "Not sent — agent unresolved",
             detail: `Agent evidence did not arrive (${ag.reason}); nothing was sent.`,
@@ -1195,8 +1296,8 @@ export function createSend(deps: SendDependencies): SendController {
       }
       // Verbatim replay under the SAME attemptId. sendText never touches the
       // composer (its documented contract) and this caller deliberately owns
-      // NONE of the composer state: the operator's edited draft survives
-      // intact for a fresh send.
+      // NONE of the composer state: the operator's draft survives intact
+      // for a fresh send.
       await sendText(payload.text, ownerKey, agent, new Set(), attempt);
     });
   }

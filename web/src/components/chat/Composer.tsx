@@ -68,19 +68,17 @@ export interface ComposerProps {
   recovery: QueueRecovery;
   // send / abort
   send: () => Promise<void>;
-  // Guarded SendStatus row-retry entry (sending-UX O2 fix): createSend's
-  // retrySameMessage — verbatim same-attempt replay of a retained uncertain
-  // admission, immune to composer edits (an edited composer is left untouched
-  // while the STORED payload replays). Forwarded as SendStatus's `send` prop;
-  // the composer's own Send button / Enter key keep the raw `send`. Optional
-  // — absent it, SendStatus's row falls back to the raw composer send
-  // (today's behavior; minimal unit harnesses omit it).
-  retrySame?: () => Promise<void>;
+  // Guarded SendStatus row-retry entry (sending-UX O2 fix, RECORD-ADDRESSED
+  // per the slice-1 review A-F1): createSend's retrySameMessage — takes the
+  // DISPLAYED row's attemptId, revalidates that record at click time, and
+  // replays its stored verbatim payload under its attemptId, immune to
+  // composer edits (the composer is never modified by a row retry).
+  // Forwarded as SendStatus's `send` prop; the composer's own Send button /
+  // Enter key keep the raw `send`. Optional — absent it, SendStatus's row
+  // falls back to the raw composer send (today's behavior; minimal unit
+  // harnesses omit it).
+  retrySame?: (attemptId: string) => Promise<void>;
   abort: () => void;
-  // Send-reliability slice 3: global stream status for SendStatus's
-  // server-custody line ("Queued — waiting for connection." while a session
-  // with queue items is on a known-down stream).
-  streamStatus: Accessor<string>;
   // A1 create-linkage (send-defers study), forwarded to SendStatus: the sync
   // store's session map (watched reactively for a session whose time.created
   // lands inside a draft-owned create-unknown record's create-attempt window)
@@ -252,21 +250,22 @@ export function Composer(props: ComposerProps) {
           {/* Send-action status (send-reliability slice 3): the readable
               recovery surface for the states slice 2 made expressible —
               upload/send progress, outcome-unknown + retry-same, definitive
-              rejections (composer retains the text), resolve-status-save
-              retries, and the server-custody line while disconnected. Lives
-              where the Send button's glow is: the glow stays as the glance
-              signal, this row is the readable text.
+              rejections (composer retains the text), and resolve-status-save
+              retries. Lives where the Send button's glow is: the glow stays
+              as the glance signal, this row is the readable text. Server
+              custody is NOT rendered here (O2 §3.6/§4, review A-F2 — the
+              queue container/QueueChip owns it).
               retrySame (guarded row-retry, sending-UX O2 fix): the row's
               Retry send button consumes this INSTEAD of the raw composer
-              send, so a retry after a composer edit replays the row's STORED
-              payload verbatim (same attemptId) instead of silently sending
-              the edited draft as a fresh message. */}
+              send, WITH the displayed record's attemptId — the controller
+              replays exactly the record the operator clicked (stored payload
+              verbatim, same attemptId), never a composer-text-addressed
+              guess. */}
           <SendStatus
             sessionId={props.sessionId}
             draft={props.draft}
             send={props.retrySame ?? props.send}
             uploadProgress={props.att.uploadProgress}
-            streamStatus={props.streamStatus}
             sessions={props.sessions}
             openSession={props.openSession}
           />

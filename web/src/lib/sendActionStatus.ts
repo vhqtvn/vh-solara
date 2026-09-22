@@ -60,10 +60,27 @@ export type SendStage =
   | "blocked" // attachment failure halted admission before any send; retained
   // Send-reliability slice 3: the DISPATCH already produced a known terminal
   // outcome, but the resolve WRITE (the status record) failed its bounded
-  // retries — "Message outcome recorded; status not saved." The message is NOT
-  // resendable from here; only the status save is retryable (a record, never a
-  // dispatch).
+  // retries — "…— status save unconfirmed." (O2 copy precision names the known
+  // outcome: sent / failed / unknown). The message is NOT resendable from
+  // here; only the status save is retryable (a record, never a dispatch).
   | "unsaved";
+
+// Typed presentation reason (sending-UX O2 slice 1): which KNOWN cause put a
+// retained record into its stage — selects the reason-specific operator copy
+// in SendStatus (the O2 brief §3.6 copy matrix) so the COVERED notification-
+// history entry can be suppressed without leaving the fact homeless (the
+// single-owner rule: remove a notification ONLY after its unique reason is
+// readable in the owning row/chip). Closed vocabulary on purpose: every value
+// must have row copy; raw transport errors never become user copy (they stay
+// in the row/chip detail tooltip), and a record with NO reason renders the
+// generic fallback line.
+export type SendReason =
+  | "queue-full" // rejected: 429 queue_admission_full (capacity advice)
+  | "attachments-uploading" // blocked: an eager upload was still in flight
+  | "attachments-failed" // blocked: an inline/flush upload failed
+  | "agent-unresolved" // rejected: the agent evidence gate refused (post-mint)
+  | "session-create-failed" // rejected: createSession definitively failed
+  | "session-create-unknown"; // uncertain: the session-create OUTCOME is unknown
 
 // The operator-facing recovery action this record affords (Slice 3 renders it).
 //   retry-same — re-send the IDENTICAL prepared attempt (same attemptId +
@@ -102,6 +119,10 @@ export interface SendAction {
   stage: SendStage;
   certainty: SendCertainty;
   detail?: string;
+  // Typed presentation reason (O2 slice 1) — see SendReason. Set by createSend
+  // at the classification site (or markOwnerSessionCreateUnknown for the
+  // create-unknown shape) so SendStatus can render reason-specific copy.
+  reason?: SendReason;
   // Retained immutable payload (present from first enqueue preparation).
   payload?: PreparedSendPayload;
   recovery: SendRecovery;
@@ -237,7 +258,7 @@ export function sendActionsFor(ownerKey: string): SendAction[] {
  *  is additive (sendText snapshots it right before the enqueue POST). */
 export function updateSendAction(
   attemptId: string,
-  p: { stage?: SendStage; certainty?: SendCertainty; recovery?: SendRecovery; detail?: string; payload?: PreparedSendPayload; retry?: boolean; conflictSource?: "admission" | "resolve" },
+  p: { stage?: SendStage; certainty?: SendCertainty; recovery?: SendRecovery; detail?: string; payload?: PreparedSendPayload; retry?: boolean; conflictSource?: "admission" | "resolve"; reason?: SendReason },
 ): void {
   patch(attemptId, p);
 }
@@ -306,6 +327,11 @@ export function markOwnerSessionCreateUnknown(ownerKey: string, detail: string, 
         certainty: "unknown",
         recovery: "check",
         detail,
+        // O2 slice 1: the typed reason selects the create-specific row copy
+        // ("Session creation unconfirmed. … another send may create another
+        // session.") so the covered notification can be suppressed without
+        // leaving the duplicate-session warning homeless.
+        reason: "session-create-unknown",
         createAttempt: createStartedAt != null ? { start: createStartedAt, end: Date.now() } : undefined,
       });
     }

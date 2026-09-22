@@ -1938,7 +1938,6 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         send={send}
         retrySame={retrySameMessage}
         abort={msgActions.abort}
-        streamStatus={() => state.status}
         sessions={() => state.sessions}
         openSession={openLinkedSession}
         refTa={(el) => (taRef = el)}
