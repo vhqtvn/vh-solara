@@ -62,6 +62,16 @@ export interface QueuedMessage {
   resolvedAt?: number;
   // Failure / ambiguous detail for failed | unknown (diagnostics).
   detail?: string;
+  // Reconcile bookkeeping (pkg/web/queue_msg_reconcile.go): counts reconcile
+  // passes that failed to confirm an `unknown` item against OpenCode.
+  // Optional — absent on items that never entered reconcile.
+  reconcileAttempts?: number;
+  // Set once reconciliation has exhausted its bounded attempt budget
+  // (reconcileMaxAttempts) and PERMANENTLY given up on this item — `state`
+  // stays "unknown" but it will never be retried or looked at again. An item
+  // with this set is a terminal give-up, NOT still in flight: callers must
+  // not treat it as "waiting" (e.g. the composer custody line).
+  reconcileTerminal?: boolean;
 }
 
 // Input shape for enqueue (the backend issues id + order + state + createdAt).

@@ -13,7 +13,7 @@
 //     an unconfirmed browser draft is NEVER called "queued",
 //   - the polite live region, and dismissal of retained records.
 //
-// The queue module is mocked (hasQueueState / resolveQueued) — the data-layer
+// The queue module is mocked (queueFor / resolveQueued) — the data-layer
 // contracts themselves are pinned in queue.test.ts / sendStuckRecovery.test.ts.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@solidjs/testing-library";
@@ -27,16 +27,32 @@ import {
   sendActionsFor,
   updateSendAction,
 } from "../../src/lib/sendActionStatus";
+import type { QueuedMessage } from "../../src/queue";
 
 vi.mock("../../src/queue", () => ({
-  hasQueueState: vi.fn(() => false),
+  queueFor: vi.fn(() => []),
   resolveQueued: vi.fn(async () => ({ kind: "recorded" })),
 }));
 
-import { hasQueueState, resolveQueued } from "../../src/queue";
+import { queueFor, resolveQueued } from "../../src/queue";
 
-const hasQueueStateMock = vi.mocked(hasQueueState);
+const queueForMock = vi.mocked(queueFor);
 const resolveQueuedMock = vi.mocked(resolveQueued);
+
+// Minimal-but-valid QueuedMessage builder for custody-line tests — only the
+// fields the custody-line predicate (and its reconcileTerminal exclusion)
+// actually inspects vary per call.
+function fakeQueueItem(over: Partial<QueuedMessage> = {}): QueuedMessage {
+  return {
+    id: "q1",
+    order: 0,
+    state: "pending",
+    text: "hi",
+    attachments: [],
+    createdAt: 0,
+    ...over,
+  };
+}
 
 function baseProps(over: Partial<Parameters<typeof SendStatus>[0]> = {}) {
   return {
@@ -50,7 +66,7 @@ function baseProps(over: Partial<Parameters<typeof SendStatus>[0]> = {}) {
 }
 
 beforeEach(() => {
-  hasQueueStateMock.mockImplementation(() => false);
+  queueForMock.mockImplementation(() => []);
   resolveQueuedMock.mockImplementation(async () => ({ kind: "recorded" } as const));
 });
 
@@ -211,14 +227,14 @@ describe("SendStatus — retry taxonomy (never an unqualified Retry)", () => {
 
 describe("SendStatus — server custody line (never for an unconfirmed draft)", () => {
   it("shows 'Queued — waiting for connection.' for a live session with queue state on a down stream", () => {
-    hasQueueStateMock.mockImplementation(() => true);
+    queueForMock.mockImplementation(() => [fakeQueueItem({ state: "pending" })]);
     const r = render(() => <SendStatus {...baseProps({ streamStatus: () => "reconnecting" })} />);
     expect(r.container.textContent).toContain("Queued — waiting for connection.");
     r.unmount();
   });
 
   it("NEVER calls a draft 'queued' (no custody line in draft mode even with queue-shaped state)", () => {
-    hasQueueStateMock.mockImplementation(() => true);
+    queueForMock.mockImplementation(() => [fakeQueueItem({ state: "pending" })]);
     const r = render(() => (
       <SendStatus {...baseProps({ draft: () => true, sessionId: () => "", streamStatus: () => "reconnecting" })} />
     ));
@@ -227,9 +243,47 @@ describe("SendStatus — server custody line (never for an unconfirmed draft)", 
   });
 
   it("does not show the custody line while the stream is live", () => {
-    hasQueueStateMock.mockImplementation(() => true);
+    queueForMock.mockImplementation(() => [fakeQueueItem({ state: "pending" })]);
     const r = render(() => <SendStatus {...baseProps({ streamStatus: () => "live" })} />);
     expect(r.container.textContent).not.toContain("Queued — waiting");
+    r.unmount();
+  });
+
+  // Reconcile give-up (pkg/web/queue_msg_reconcile.go bumpReconcileAttempt):
+  // an `unknown` item marked reconcileTerminal is a PERMANENT give-up, not an
+  // in-flight message — QueueChip already renders its own "manual review
+  // advised" detail note, so the custody line must not contradict it by also
+  // claiming the message is still "waiting for connection".
+  it("does NOT show the custody line when the only visible item is a terminal reconcile give-up", () => {
+    queueForMock.mockImplementation(() => [
+      fakeQueueItem({ state: "unknown", reconcileTerminal: true, reconcileAttempts: 3, detail: "Reconcile terminal: …" }),
+    ]);
+    const r = render(() => <SendStatus {...baseProps({ streamStatus: () => "reconnecting" })} />);
+    expect(r.container.textContent).not.toContain("Queued — waiting for connection.");
+    r.unmount();
+  });
+
+  it("still shows the custody line for a non-terminal 'unknown' item (guards against over-suppressing)", () => {
+    queueForMock.mockImplementation(() => [fakeQueueItem({ state: "unknown", reconcileTerminal: false })]);
+    const r = render(() => <SendStatus {...baseProps({ streamStatus: () => "reconnecting" })} />);
+    expect(r.container.textContent).toContain("Queued — waiting for connection.");
+    r.unmount();
+  });
+
+  it("still shows the custody line for a plain in-flight 'dispatching' item", () => {
+    queueForMock.mockImplementation(() => [fakeQueueItem({ state: "dispatching" })]);
+    const r = render(() => <SendStatus {...baseProps({ streamStatus: () => "reconnecting" })} />);
+    expect(r.container.textContent).toContain("Queued — waiting for connection.");
+    r.unmount();
+  });
+
+  it("shows the custody line when a terminal give-up is mixed with a still-pending item", () => {
+    queueForMock.mockImplementation(() => [
+      fakeQueueItem({ id: "q1", state: "unknown", reconcileTerminal: true }),
+      fakeQueueItem({ id: "q2", state: "pending" }),
+    ]);
+    const r = render(() => <SendStatus {...baseProps({ streamStatus: () => "reconnecting" })} />);
+    expect(r.container.textContent).toContain("Queued — waiting for connection.");
     r.unmount();
   });
 });

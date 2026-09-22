@@ -51,7 +51,7 @@ import {
   type CreateLinkCandidate,
   type SendAction,
 } from "../../lib/sendActionStatus";
-import { hasQueueState, resolveQueued } from "../../queue";
+import { queueFor, resolveQueued } from "../../queue";
 import type { Session } from "../../types";
 import "./SendStatus.module.css";
 
@@ -93,10 +93,19 @@ export function SendStatus(props: SendStatusProps) {
   const records = () => sendActionsFor(ownerKey());
   // Server custody + stream down. NEVER for a draft: an unconfirmed browser
   // draft is not "queued" (the word is reserved for server custody).
+  //
+  // A `state: "unknown"` item with `reconcileTerminal: true` is excluded: the
+  // backend has PERMANENTLY given up reconciling it (bumpReconcileAttempt in
+  // pkg/web/queue_msg_reconcile.go, after reconcileMaxAttempts) and already
+  // shows its own "manual review advised" warning via QueueChip. Counting it
+  // here would contradict that warning by claiming the message is still
+  // in-flight and "waiting for connection" — it is not; it will never be
+  // retried. A session whose ONLY visible items are terminal give-ups gets no
+  // custody line at all.
   const custodyLine = () =>
     !props.draft() &&
     !!props.sessionId() &&
-    hasQueueState(props.sessionId()) &&
+    queueFor(props.sessionId()).some((m) => !(m.state === "unknown" && m.reconcileTerminal)) &&
     props.streamStatus() === "reconnecting";
 
   const [saveBusy, setSaveBusy] = createSignal<string | null>(null);
