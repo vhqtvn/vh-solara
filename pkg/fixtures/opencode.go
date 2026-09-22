@@ -148,6 +148,22 @@ type FakeOpenCode struct {
 	// hard-killed run stranded before the next run's first spec.
 	newHoldMu    sync.Mutex
 	newHoldBlock chan struct{}
+
+	// --- Phase A2 sustained multi-project workload controls (mpworkload.go) ---
+	// emitDroppedTotal counts fixture-subscriber overflows (emit's close-on-full
+	// fanout default branch) across the fixture's lifetime — the SEPARATE
+	// overflow axis the workload accounting reports (dropped_total /
+	// dropped_run) so e2e can reconcile emitted vs overflowed without
+	// conflating it with application-layer loss. Atomic; never read by the
+	// shipped binary.
+	emitDroppedTotal uint64
+	// mpWLmu guards the workload run registry below (deliberately NOT f.mu:
+	// run lifecycle never touches transcript state except via appendMessage /
+	// emit, which take f.mu themselves).
+	mpWLmu     sync.Mutex
+	mpRuns     map[uint64]*mpWorkloadRun
+	mpRunSeq   uint64
+	mpActiveID uint64
 }
 
 // agentHoldSessionID is the dedicated agent-evidence-hold session (lane-6
@@ -202,6 +218,7 @@ func New() *FakeOpenCode {
 		busy:           map[string]string{},
 		resetGen:       map[string]uint64{},
 		promptArrivals: map[string]int{},
+		mpRuns:         map[uint64]*mpWorkloadRun{},
 	}
 	now := float64(time.Now().UnixMilli())
 	f.sessions = []map[string]any{
@@ -1173,6 +1190,12 @@ func (f *FakeOpenCode) Handler() http.Handler {
 	mux.HandleFunc("/fixture/agent-hold/reset", f.handleFixtureAgentHoldReset)
 	mux.HandleFunc("/fixture/new-session-hold/arm", f.handleFixtureNewHoldArm)
 	mux.HandleFunc("/fixture/new-session-hold/release", f.handleFixtureNewHoldRelease)
+	mux.HandleFunc("/fixture/mp-seed", f.handleMPSeed)
+	mux.HandleFunc("/fixture/mp-workload/start", f.handleMPWorkloadStart)
+	mux.HandleFunc("/fixture/mp-workload/release", f.handleMPWorkloadRelease)
+	mux.HandleFunc("/fixture/mp-workload/status", f.handleMPWorkloadStatus)
+	mux.HandleFunc("/fixture/mp-workload/stop", f.handleMPWorkloadStop)
+	mux.HandleFunc("/fixture/mp-workload/reset", f.handleMPWorkloadReset)
 	mux.HandleFunc("/question/", f.handleQuestion)
 	mux.HandleFunc("/question", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -1968,6 +1991,9 @@ func (f *FakeOpenCode) emit(eventType string, props any) {
 		select {
 		case ch <- string(payload):
 		default:
+			// Overflow of the bounded subscriber channel: counted (Phase A2
+			// workload accounting) before the pre-existing close-on-full drop.
+			atomic.AddUint64(&f.emitDroppedTotal, 1)
 			close(ch)
 			delete(f.subs, id)
 		}
