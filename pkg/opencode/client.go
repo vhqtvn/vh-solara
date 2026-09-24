@@ -42,6 +42,13 @@ type Client struct {
 	// request; SetBaseURL takes the write side (rare — once per fresh-port
 	// restart).
 	mu sync.RWMutex
+
+	// listHint remembers, per adaptive-list path format, how many sessions
+	// the last full fetch returned, so the next fetch starts at a limit that
+	// already covers them (see listSessionsAdaptive). Guarded by listHintMu;
+	// lazily allocated so a zero-value Client works.
+	listHintMu sync.Mutex
+	listHint   map[string]int
 }
 
 // New builds a Client for the given base URL.
@@ -123,8 +130,16 @@ func (c *Client) ListSessions(ctx context.Context) ([]json.RawMessage, error) {
 // a format string with a single %d for the limit (e.g. "/session?limit=%d" or
 // "/session?archived=true&limit=%d"). It grows the limit while pages come back
 // full and stops once one isn't (everything fetched), bounded by sessionListMax.
+//
+// The starting limit comes from listStartLimit: twice the count the previous
+// fetch of the same pathFmt returned (never below sessionPageSize). Without it
+// every call re-walked 2000→4000→…, so a 16k-session project cost five
+// requests and ~47k serialized rows per fetch — and the tree reconcile repeats
+// that per project on a ticker. With the hint the steady state is ONE request;
+// growth past the hint still doubles until a page comes back not full, so
+// correctness never depends on the hint being current.
 func (c *Client) listSessionsAdaptive(ctx context.Context, pathFmt string) ([]json.RawMessage, error) {
-	limit := sessionPageSize
+	limit := c.listStartLimit(pathFmt)
 	for {
 		var out []json.RawMessage
 		if err := c.getJSON(ctx, fmt.Sprintf(pathFmt, limit), &out); err != nil {
@@ -134,10 +149,40 @@ func (c *Client) listSessionsAdaptive(ctx context.Context, pathFmt string) ([]js
 			if len(out) >= sessionListMax {
 				log.Printf("[opencode] WARNING: session list hit the %d backstop; some sessions may be missing", sessionListMax)
 			}
+			c.setListHint(pathFmt, len(out))
 			return out, nil // page not full → fetched everything
 		}
 		limit *= 2
+		if limit > sessionListMax {
+			limit = sessionListMax
+		}
 	}
+}
+
+// listStartLimit returns the first limit to request for pathFmt: 2× the last
+// observed count (headroom for growth between fetches), clamped to
+// [sessionPageSize, sessionListMax].
+func (c *Client) listStartLimit(pathFmt string) int {
+	c.listHintMu.Lock()
+	last := c.listHint[pathFmt]
+	c.listHintMu.Unlock()
+	limit := last * 2
+	if limit < sessionPageSize {
+		limit = sessionPageSize
+	}
+	if limit > sessionListMax {
+		limit = sessionListMax
+	}
+	return limit
+}
+
+func (c *Client) setListHint(pathFmt string, n int) {
+	c.listHintMu.Lock()
+	if c.listHint == nil {
+		c.listHint = map[string]int{}
+	}
+	c.listHint[pathFmt] = n
+	c.listHintMu.Unlock()
 }
 
 // ListQuestions returns the questions currently pending an answer (GET

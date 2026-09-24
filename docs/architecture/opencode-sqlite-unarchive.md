@@ -187,7 +187,8 @@ Two layers, complementary:
 vh-solara does **not**:
 
 - read or write any other OpenCode table (message / part / project / migration /
-  usage / ...);
+  usage / ...) — the one schema-level exception is the owned, self-retiring
+  session-list index described in [Session-list index](#session-list-index-second-coupling);
 - run migrations or checkpoints;
 - keep a long-lived second DB handle (the connection is short-lived per unarchive
   batch);
@@ -207,5 +208,59 @@ is **incorrect** — it conflates the *event* schema `UpdatedTime`, which wraps 
 `NullOr`, with the *request* schema `UpdatePayload`, which does not.)
 
 When that ships, retire `pkg/opencode/db.go`'s direct-write path in favor of a
-plain HTTP PATCH, delete this coupling doc, and remove the `modernc.org/sqlite`
-dependency.
+plain HTTP PATCH. Only delete this coupling doc and the `modernc.org/sqlite`
+dependency once the session-list index coupling below is retired too.
+
+## Session-list index (second coupling)
+
+> **validatedAgainst:** `opencode v1.18.31` — code: `pkg/opencode/session_index.go`,
+> wiring: `pkg/web/session_index.go` (opt-in via `EnableSessionListIndex`, called by
+> both daemons), trigger: `Aggregator.SetOnConnected` on the default aggregator.
+
+**Why.** OpenCode's instance-scoped session list (`GET /session`, `Session.list`)
+runs `SELECT * FROM session WHERE project_id = ? AND directory = ? ORDER BY
+time_updated DESC LIMIT ?`, and no OpenCode migration (through v1.18.31) indexes
+`time_updated`. SQLite builds a temp B-tree for the ORDER BY and, past
+`cache_size` (2 MB), spills it to `/var/tmp/etilqs_*`. At OpenCode's default
+`LIMIT 100` that is invisible; for vh-solara's whole-list fetches (10k–16k rows on
+large projects) one call wrote ~17 MB of sort scratch, and the aggregator's
+reconcile kept OpenCode's single JS thread pinned (diagnosed 2026-09-24 with perf +
+strace). `EXPLAIN QUERY PLAN` confirms an index on
+`session(project_id, directory, time_updated)` removes the temp B-tree.
+
+**What vh-solara does.** On every (re)attach to a serving — hence migrated —
+OpenCode process, it converges the DB (idempotent, non-fatal on any error):
+
+| upstream equivalent? | ours present? | action |
+|---|---|---|
+| yes | yes | `DROP` ours (upstream took over) |
+| yes | no | nothing |
+| no | no | `CREATE` ours |
+| no | yes, correct shape | nothing |
+| no | yes, drifted shape | `DROP` + `CREATE` ours |
+
+- **Ownership:** ours is named `vhsolara_session_project_dir_updated_idx`. Nothing
+  touches an index whose name differs, and the prefix means a future upstream
+  `CREATE INDEX` (no `IF NOT EXISTS`) can never collide with ours and fail
+  OpenCode's startup migration.
+- **"Upstream equivalent"** is structural (`PRAGMA index_list` / `index_xinfo`):
+  a non-partial index on `session`, not ours, whose leading key columns are exactly
+  `(project_id, directory, time_updated)`. Trailing extra columns are fine,
+  ASC/DESC is irrelevant, expression columns never count.
+- **Guards:** the same topology rule as unarchive (skipped when attached
+  externally via `--opencode-url` unless `VH_OPENCODE_DB_PATH` is set); refuses with
+  a `SchemaError` if any of the three columns disappeared; `VH_DISABLE_SESSION_INDEX=1`
+  turns it off entirely. Uses the same short-lived single-connection WAL handle
+  (`openDB`, `busy_timeout(5000)`).
+- **Why re-run on every attach:** OpenCode is detached and can be upgraded or
+  restarted independently; an upgrade may add an equivalent index (→ ours is
+  dropped) or rebuild the table (→ ours silently vanishes and is recreated).
+
+**Retirement.** Self-retiring by design: once OpenCode ships an equivalent index,
+the converge drops ours on the next attach. On an OpenCode version bump, re-check
+the `Session.list` query shape; if it changes columns or ordering, update
+`sessionListIndexCols` (the drift rule rebuilds ours).
+
+**Upstream.** Worth proposing an index on `session(project_id, directory,
+time_updated)` (plus `(directory, time_updated)` for the cross-project list) to
+sst/opencode, with the plan evidence above.

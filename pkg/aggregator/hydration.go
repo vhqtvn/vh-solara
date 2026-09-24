@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/state"
 )
@@ -136,16 +137,10 @@ func (a *Aggregator) hydrate(ctx context.Context) error {
 	// Runs AFTER a.store.Hydrate (which reconciled the live tree above) so the
 	// sweep walks the post-hydrate session set. Concurrent with the three
 	// enrichment GETs above (each takes s.mu independently); a failure leaves
-	// the snapshot stale until the next 5s tree-reconcile tick
-	// (runTreeReconcile refreshes it). Fetch is outside the store lock.
-	run("ArchivedSnapshot", func() error {
-		archived, err := a.client.ListArchivedSessions(ctx)
-		if err != nil {
-			return err
-		}
-		a.store.RefreshArchivedSnapshot(archived)
-		return nil
-	})
+	// the snapshot stale until the tree reconcile's next archived refresh
+	// (runTreeReconcile retries it on its next tick, because a failed refresh
+	// does not advance lastArchivedRefresh). Fetch is outside the store lock.
+	run("ArchivedSnapshot", func() error { return a.refreshArchivedSnapshot(ctx) })
 	wg.Wait()
 
 	// Successful hydrate complete: the store now holds the authoritative active-
@@ -166,4 +161,26 @@ func (a *Aggregator) hydrate(ctx context.Context) error {
 		cb()
 	}
 	return nil
+}
+
+// refreshArchivedSnapshot fetches OpenCode's archived-session list and rebuilds
+// the store's authoritative archived snapshot (+ orphan sweep), recording the
+// time of the successful refresh so runTreeReconcile can space its own
+// refreshes by archivedSnapshotInterval. The fetch runs outside any store lock.
+func (a *Aggregator) refreshArchivedSnapshot(ctx context.Context) error {
+	archived, err := a.client.ListArchivedSessions(ctx)
+	if err != nil {
+		return err
+	}
+	a.store.RefreshArchivedSnapshot(archived)
+	a.lastArchivedRefresh.Store(time.Now().UnixNano())
+	return nil
+}
+
+// archivedSnapshotDue reports whether the periodic archived refresh should run:
+// never refreshed yet, or the last success is at least archivedSnapshotInterval
+// old.
+func (a *Aggregator) archivedSnapshotDue() bool {
+	last := a.lastArchivedRefresh.Load()
+	return last == 0 || time.Since(time.Unix(0, last)) >= a.archivedSnapshotInterval
 }

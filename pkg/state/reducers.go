@@ -589,6 +589,10 @@ func (s *Store) upsertSessionLocked(props json.RawMessage) {
 		if _, ok := s.sessions[env.ID]; ok {
 			s.deleteSessionLocked(env.ID)
 		}
+		// Keep the authoritative archived snapshot current from the event
+		// itself, so the orphan sweep does not have to wait for the next
+		// (now infrequent) full ListArchivedSessions refresh.
+		s.noteArchivedLocked(env.ID)
 		return
 	}
 	// Archive tombstone (Issue 4 B-i): a session.updated / session.compacted

@@ -23,9 +23,9 @@ import "time"
 //     owns it (the cascade's own clear-on-success / re-record-on-failure owns
 //     the lifecycle), else clears if the store confirms the root resolved OOB.
 //   - runArchiveBackstop — the production ticker that calls
-//     reconcileArchiveFailures every archiveBackstopInterval (default 5s,
-//     matching the aggregator's tree-reconcile tick that refreshes the snapshot
-//     the backstop reads). Bound to bgCtx (Shutdown cancels) and tracked by
+//     reconcileArchiveFailures every archiveBackstopInterval (default 5s). It
+//     only reads in-memory store state, which the aggregator keeps current
+//     from archive events and its periodic snapshot refresh. Bound to bgCtx (Shutdown cancels) and tracked by
 //     bgWG (Shutdown awaits). Tests call reconcileArchiveFailures() directly for
 //     determinism and never depend on this ticker.
 //

@@ -98,8 +98,10 @@ func (a *Aggregator) runStatusReconcile(ctx context.Context) {
 // until ctx is cancelled.
 //
 // The poll interval is the per-instance field a.treeReconcileInterval
-// (default 5s, set in New / NewForDirectory). It mirrors statusReconcileInterval
-// as a per-instance field rather than the old package-global
+// (default defaultTreeReconcileInterval = 10s, set in New / NewForDirectory;
+// keep it well under the 30s archive tombstone TTL — see the field doc). It
+// mirrors statusReconcileInterval as a per-instance field rather than the old
+// package-global
 // TreeReconcileInterval: a global written by one test's goroutine would race a
 // lingering runTreeReconcile goroutine from another aggregator (or a prior
 // -count iteration) that reads it once at the top of this function. No test
@@ -134,20 +136,21 @@ func (a *Aggregator) runTreeReconcile(ctx context.Context) {
 			}
 		}
 		// Refresh the authoritative archived-ID snapshot + run the Defect-3
-		// orphan backstop sweep. The /session list fetched above (sessions)
-		// excludes archived entries, so the snapshot is derived from the
-		// archived-session fetch (ListArchivedSessions / /session?archived=true).
-		// Best-effort: a fetch error leaves the snapshot stale until the next
-		// tick. Fetch is outside the store lock; RefreshArchivedSnapshot takes
-		// the lock only for the in-memory rebuild + sweep.
-		archived, err := a.client.ListArchivedSessions(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
+		// orphan backstop sweep — but only every archivedSnapshotInterval, not
+		// every tick. OpenCode ignores ?archived=true and returns ALL of the
+		// project's sessions, so on 10k+-session projects this fetch was the
+		// bulk of the reconcile's cost (and kept OpenCode's single JS thread
+		// pinned). Between refreshes the snapshot stays current through
+		// session.updated archive events (store.noteArchivedLocked) and every
+		// hydrate. Best-effort: a fetch error does not advance
+		// lastArchivedRefresh, so the next tick retries.
+		if a.archivedSnapshotDue() {
+			if err := a.refreshArchivedSnapshot(ctx); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("[aggregator] archived snapshot fetch failed at reconcile: %v", err)
 			}
-			log.Printf("[aggregator] archived snapshot fetch failed at reconcile: %v", err)
-		} else {
-			a.store.RefreshArchivedSnapshot(archived)
 		}
 	}
 }

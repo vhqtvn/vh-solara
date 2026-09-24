@@ -264,7 +264,8 @@ func (e *TreeEmitter) buildNodeLocked(id string, loaded bool) (Node, bool) {
 // of the same function (read by IsOrphanFlagged for tests/diagnostics).
 //
 // The snapshot is the SOLE authority. It is rebuilt from OpenCode's
-// archived-session list on every hydrate + 5s reconcile (RefreshArchivedSnapshot)
+// archived-session list on every hydrate + periodic reconcile (RefreshArchivedSnapshot,
+// kept current between refreshes by archive events — noteArchivedLocked)
 // and survives a daemon restart. The in-memory tombstone (recentlyArchived) is
 // deliberately NOT consulted here: it is lost on restart AND RemoveSessions arms
 // it for BOTH the archive and the delete paths (delete.go cascades the whole

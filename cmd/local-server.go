@@ -158,6 +158,9 @@ with --opencode-url, or spawn a survivable detached instance with
 		// direct-DB unarchive guard can refuse fast in that topology (the local DB
 		// may not be the remote instance's). See pkg/opencode/db.go.
 		srv.SetExternalOpenCode(external)
+		// Converge OpenCode's session-list index on every (re)attach (see
+		// pkg/opencode/session_index.go). Opt-in here so tests never touch a real DB.
+		srv.EnableSessionListIndex()
 		// Expose the local OpenCode lifecycle at /vh/opencode/status so the
 		// operator can observe a failed OpenCode without local-server having
 		// died with it. Mirrors client-daemon's setupVHMode wiring.

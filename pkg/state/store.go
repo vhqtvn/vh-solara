@@ -1031,7 +1031,9 @@ type Store struct {
 	// archivedSnapshot is the AUTHORITATIVE cross-restart set of session IDs
 	// whose time.archived != 0 — rebuilt by RefreshArchivedSnapshot from
 	// OpenCode's archived-session list (e.g. ListArchivedSessions /
-	// /session?archived=true) on every hydrate + 5s reconcile, then consumed by
+	// /session?archived=true) on every hydrate + the aggregator's periodic
+	// archived refresh, extended between refreshes by session.updated archive
+	// events (noteArchivedLocked, additive only), then consumed by
 	// sweepOrphansLocked (the Defect-3 backstop) and — via
 	// isArchivedAuthoritativeLocked — by Slice 2's isOrphanLocked at emit time.
 	// It is the ONLY authority that survives a daemon restart: the tombstones
@@ -1475,7 +1477,7 @@ func (s *Store) IsRecentlyArchived(id string) bool {
 // 30s TTL) is a resurrection-guard, not an orphan authority: it is in-memory
 // and lost on daemon restart, so a fresh store cannot reconstruct it. The ONLY
 // cross-restart authority is OpenCode's archived-session list, captured here as
-// archivedSnapshot and rebuilt on every hydrate + 5s reconcile by
+// archivedSnapshot and rebuilt on every hydrate + periodic reconcile by
 // RefreshArchivedSnapshot. sweepOrphansLocked then flags live sessions whose
 // parentID chain terminates at a confirmed-archived parent — the Defect-3
 // backstop that makes the recurrence (a straggler left behind after a partial
@@ -1491,8 +1493,9 @@ func (s *Store) IsRecentlyArchived(id string) bool {
 // The HTTP fetch MUST happen OUTSIDE the store lock (the aggregator owns it);
 // this method takes s.mu only for the in-memory snapshot rebuild + sweep, so no
 // store lock is ever held across network I/O. Invoked by the aggregator at
-// hydrate (after Hydrate reconciles the live tree) and on each 5s tree-reconcile
-// tick (after ReconcileSessions). Idempotent: rebuilding the snapshot from the
+// hydrate (after Hydrate reconciles the live tree) and on the tree reconcile's
+// periodic archived refresh (every archivedSnapshotInterval rather than every
+// tick; runs after ReconcileSessions). Idempotent: rebuilding the snapshot from the
 // same input yields the same set, and the sweep re-evaluates every live session
 // each run (clearing stale flags when a parent leaves the snapshot, e.g. after a
 // legitimate un-archive).
@@ -1500,6 +1503,24 @@ func (s *Store) RefreshArchivedSnapshot(rawArchived []json.RawMessage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rebuildArchivedSnapshotLocked(rawArchived)
+	s.sweepOrphansLocked()
+}
+
+// noteArchivedLocked records id as archived in the authoritative snapshot from
+// a live event (a session.updated carrying time.archived != 0) and re-runs the
+// orphan sweep when that changes the set. It is ADDITIVE ONLY: an event with
+// archived=null never removes an id, because that is exactly the transient
+// clobber-revert shape (see the recentlyArchived tombstone). Removals (a
+// legitimate un-archive) arrive only through the full rebuild in
+// RefreshArchivedSnapshot — on every hydrate (the vh-solara unarchive flow
+// rehydrates) and on the aggregator's periodic archived refresh. This is what
+// lets that periodic refresh run rarely without leaving stragglers unflagged.
+// Caller holds s.mu.
+func (s *Store) noteArchivedLocked(id string) {
+	if id == "" || s.archivedSnapshot[id] {
+		return
+	}
+	s.archivedSnapshot[id] = true
 	s.sweepOrphansLocked()
 }
 
@@ -1617,7 +1638,7 @@ func (s *Store) chainTerminatesAtArchivedLocked(id string) bool {
 // "this session was archived". Distinct from the in-memory tombstone
 // (isRecentlyArchivedLocked): the tombstone is a 30s resurrection-guard lost on
 // daemon restart, whereas the snapshot is rebuilt from OpenCode's
-// archived-session list on every hydrate + 5s reconcile and so survives restart.
+// archived-session list on every hydrate + periodic reconcile and so survives restart.
 // Slice 2's isOrphanLocked consults this to classify a straggler whose archived
 // parent is gone from the live store, without duplicating the fetch. Caller
 // holds s.mu.

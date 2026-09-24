@@ -110,6 +110,9 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 	// the direct-DB unarchive guard can refuse fast in that topology (the
 	// local DB may not be the remote instance's). See pkg/opencode/db.go.
 	srv.SetExternalOpenCode(rt.external)
+	// Converge OpenCode's session-list index on every (re)attach (see
+	// pkg/opencode/session_index.go). Opt-in here so tests never touch a real DB.
+	srv.EnableSessionListIndex()
 	// Expose the worker-local OpenCode lifecycle at /vh/opencode/status
 	// so the controller/operator can observe a failed OpenCode THROUGH
 	// the tunnel without this worker having died with it.

@@ -144,6 +144,30 @@ func (a *Aggregator) SetOnHydrate(fn func()) {
 	a.seedMu.Unlock()
 }
 
+// SetOnConnected installs a callback fired once per OpenCode connection, right
+// after that connection's first successful hydrate (see the onConnected field
+// doc). Production wires it on the default aggregator only (pkg/web
+// EnableSessionListIndex, called by the daemons):
+// the default aggregator is process-lifetime and re-hydrates on every OpenCode
+// (re)start, which is exactly when OpenCode-side maintenance (the session-list
+// index converge) must re-run. Guarded by seedMu; safe to call before Run.
+func (a *Aggregator) SetOnConnected(fn func()) {
+	a.seedMu.Lock()
+	a.onConnected = fn
+	a.seedMu.Unlock()
+}
+
+// fireOnConnected invokes the onConnected callback, read under seedMu and
+// called outside it.
+func (a *Aggregator) fireOnConnected() {
+	a.seedMu.Lock()
+	cb := a.onConnected
+	a.seedMu.Unlock()
+	if cb != nil {
+		cb()
+	}
+}
+
 // AnyHydrateCompleted reports whether this aggregator has completed at least one
 // successful hydrate. Used by the web layer's reconcileQueuesForAgg as the
 // fail-closed gate: if false, the authoritative active-session set is not yet
@@ -272,6 +296,7 @@ func (a *Aggregator) Run(ctx context.Context) {
 					err := a.hydrate(ctx)
 					if err == nil {
 						log.Printf("[aggregator] hydrated; tailing events")
+						a.fireOnConnected()
 						break retryHydrate
 					}
 					logHydrateFailure(err)
@@ -282,6 +307,7 @@ func (a *Aggregator) Run(ctx context.Context) {
 			}
 		} else {
 			log.Printf("[aggregator] hydrated; tailing events")
+			a.fireOnConnected()
 		}
 
 		// streamErr is already set when the stream ended mid-retry; otherwise
