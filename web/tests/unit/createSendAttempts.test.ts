@@ -887,7 +887,9 @@ describe("createSend — guarded row-retry (retrySameMessage, record-addressed)"
 // composer): a retained attachment-only uncertain record must make an empty
 // tap a verbatim REPLAY of the stored payload (not a silent no-op), while a
 // genuinely empty tap with NO retained record must exit with zero state
-// change.
+// change. A retained nonempty text-only retry-same record, however, must
+// leave an empty send as a zero-mutation no-op; its stored payload is
+// replayed only through record-addressed retrySameMessage.
 // ---------------------------------------------------------------------------
 describe("createSend — c-F3 Enter-path early-reuse (empty-composer send())", () => {
   it("EMPTY composer + retained attachment-only uncertain record: send() replays the STORED payload under the SAME attemptId — never live state", async () => {
@@ -928,6 +930,53 @@ describe("createSend — c-F3 Enter-path early-reuse (empty-composer send())", (
     expect(h.input()).toBe("");
     expect(h.atts()).toEqual([]);
     expect(getSendAction(attemptId)).toBeUndefined();
+  });
+
+  it("EMPTY composer + retained text-only uncertain record: send() exits with ZERO state change; record-addressed Retry owns stored-text replay", async () => {
+    let fail = true;
+    const h = harness({
+      enqueue: async () => {
+        if (fail) throw new Error("response lost");
+        return { id: "q-ent-txt" };
+      },
+      fetchQueue: async () => [],
+    });
+    // Seed: a text-only attempt (no attachments) whose enqueue response was
+    // lost → a retained uncertain/retry-same record (tapText/text "stored
+    // enter text"; the composer is preserved per the uncertain contract).
+    h.setInput("stored enter text");
+    await h.send();
+    const attemptId = h.enqueueInputs[0].input.attemptId as string;
+    const seedReconcileCalls = h.fetchQueueCalls;
+    expect(getSendAction(attemptId)?.recovery).toBe("retry-same");
+
+    // EMPTY the composer completely, then tap send() (the Enter path). Unlike
+    // the attachment-only record above (stored tapText "" matches the empty
+    // tap), a text-only record's identity key is its NON-empty tapText — an
+    // empty tap carries no evidence of which retained record to replay, so
+    // the identity-gated design refuses it here; the guarded row Retry
+    // (retrySameMessage) owns stored-text replay, never the empty Enter tap.
+    h.setInput("");
+    h.setAtts([]);
+    fail = false;
+    await h.send();
+
+    // THE CRUX: the empty tap is a discrimination NO-OP — nothing enqueued
+    // (fail was flipped to false, so a replay WOULD have succeeded), no
+    // reconcile fetch, no freshly minted record, no notification…
+    expect(h.enqueueInputs).toHaveLength(1);
+    expect(h.fetchQueueCalls).toBe(seedReconcileCalls);
+    const retained = sendActionsFor("ses-1");
+    expect(retained).toHaveLength(1);
+    expect(retained[0].attemptId).toBe(attemptId);
+    expect(h.notes).toHaveLength(0);
+    // …and the retained record survives untouched for the row's Retry.
+    expect(retained[0].stage).toBe("uncertain");
+    expect(retained[0].recovery).toBe("retry-same");
+    expect(retained[0].payload?.text).toBe("stored enter text");
+    // The composer stays empty (nothing was restored into it either).
+    expect(h.input()).toBe("");
+    expect(h.atts()).toEqual([]);
   });
 
   it("EMPTY composer + NO retained record: send() exits with ZERO state change (no record minted, no enqueue, no reconcile)", async () => {

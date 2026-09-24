@@ -1176,10 +1176,13 @@ export function createSend(deps: SendDependencies): SendController {
       // still-draft-owned record: at materialization that is exactly the
       // in-flight attempt plus retained uncertain records (mint-supersede
       // already finished earlier preparing/blocked/rejected ones). Residual
-      // limitation (accepted): materializing WITHOUT a re-tap (the create
-      // landed; the operator clicks the session in the list) strands such
-      // records under "draft" — nothing links them to that session absent a
-      // create-time idempotency key (out of scope, brief §8).
+      // limitation (updated, A1 create-linkage): on PURE navigation (the
+      // create landed; the operator clicks the session in the list without
+      // re-tapping) the draft→session linkage IS now observed — reactively,
+      // by SendStatus's create-link affordance (createLinkCandidates), and
+      // a confirm runs this owner sweep before navigating. What remains
+      // deferred is a SILENT auto-re-key on pure navigation (needs a
+      // create-time idempotency key; brief §8, P2-API-011).
       transferOwnerSendAttempts("draft", id);
       // A re-tap once the live id exists is dropped at the LIVE key (the live
       // ChatView's memo reads it); the in-flight admission owns clearing on
