@@ -364,7 +364,10 @@ test("a slow enqueue does not erase text typed after Send (ownership guard)", as
   // A's enqueue eventually confirms durable custody: a queue chip appears (or,
   // if the session is idle and dispatches immediately, the message lands in the
   // transcript). Either proves A was confirmed while B sat in the composer.
-  await expect(page.locator(".queue-chip, .msg.user", { hasText: marker })).toBeVisible({ timeout: 10000 });
+  // .first(): both can be visible at once for a moment — the transcript row has
+  // landed while the chip still reads "Sending…" — which is still proof, but a
+  // strict locator would reject the two matches (CI flake).
+  await expect(page.locator(".queue-chip, .msg.user", { hasText: marker }).first()).toBeVisible({ timeout: 10000 });
 
   // The NEW draft B survives: the ownership guard saw input() !== snapText and
   // refused to clear. (Before the fix, the composer would be "" here.)

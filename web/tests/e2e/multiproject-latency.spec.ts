@@ -124,17 +124,39 @@ async function startRun(request: APIRequestContext, spec: unknown): Promise<RunS
   return body as RunSnap;
 }
 
+// pollDone waits for a released workload run to finish. It fails on a STALL
+// (no `emitted` progress for POLL_STALL_MS) or past a hard cap of 3× the
+// scenario's expected budget — not on a fixed deadline: the fixture's 1 ms
+// ticker drops ticks when emit fan-out falls behind, so a loaded CI runner
+// streams the same run several times slower while still making progress (CI:
+// the S5 filler was 93% done — 16.7k/18k events — at the old 40 s deadline).
+const POLL_STALL_MS = 15_000;
 async function pollDone(request: APIRequestContext, runID: number, timeoutMs: number): Promise<RunSnap> {
-  const deadline = Date.now() + timeoutMs;
+  const started = Date.now();
+  const hardCap = started + timeoutMs * 3;
+  let lastEmitted = -1;
+  let lastProgress = started;
   for (;;) {
     const res = await request.get(`/oc/fixture/mp-workload/status?run=${runID}`);
     const body = (await res.json()) as RunSnap;
-    if (body.state === "done") return body;
+    if (body.state === "done") {
+      const took = Date.now() - started;
+      if (took > timeoutMs) console.log(`[pollDone] run ${runID} took ${took}ms (> ${timeoutMs}ms budget; slow runner)`);
+      return body;
+    }
     if (body.state === "cancelled" || body.state === "reset") {
       throw new Error(`run ${runID} unexpectedly ${body.state}`);
     }
-    if (Date.now() > deadline) {
-      throw new Error(`run ${runID} not done after ${timeoutMs}ms (state=${body.state} emitted=${body.emitted})`);
+    const now = Date.now();
+    if (body.emitted !== lastEmitted) {
+      lastEmitted = body.emitted;
+      lastProgress = now;
+    }
+    if (now - lastProgress > POLL_STALL_MS) {
+      throw new Error(`run ${runID} stalled: no progress for ${POLL_STALL_MS}ms (state=${body.state} emitted=${body.emitted})`);
+    }
+    if (now > hardCap) {
+      throw new Error(`run ${runID} not done after ${now - started}ms, 3× its ${timeoutMs}ms budget (state=${body.state} emitted=${body.emitted})`);
     }
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -422,7 +444,8 @@ function summarizePage(col: any, chunkBytes: number, events: number) {
 }
 
 test("A2 seven-page sustained demand: fixture-driven browser attribution", async ({ page, request }) => {
-  test.setTimeout(150_000);
+  // Headroom for pollDone's slow-runner allowance (see POLL_STALL_MS).
+  test.setTimeout(300_000);
   const t0 = Date.now();
   const fleet: Page[] = [page];
   const runIDs: number[] = [];

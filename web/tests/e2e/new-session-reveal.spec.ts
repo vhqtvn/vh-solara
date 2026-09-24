@@ -130,6 +130,11 @@ async function draftSendMaterialize(page: import("@playwright/test").Page, marke
   // FRESH DRAFT (not the shared demo session): "Create session" opens the
   // draft composer WITHOUT creating a server session (ux.spec.ts pattern).
   const treeNew = page.locator(".tree-node", { hasText: "New session" });
+  // Count only after the tree snapshot has arrived: the fixture server is
+  // shared across the serial suite, so earlier tests' "New session" nodes
+  // exist too. Counting on a still-empty tree read 0, then all of them plus
+  // ours appeared (CI flake: expected 1, received 5).
+  await expect(page.locator(".tree-node", { hasText: "Demo session" }).first()).toBeVisible({ timeout: 10_000 });
   const before = await treeNew.count();
   await page.getByRole("button", { name: "Create session" }).click();
   await expect(page.locator(".composer")).toBeVisible();

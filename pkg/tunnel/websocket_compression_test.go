@@ -302,10 +302,38 @@ func (p *deflatePair) echoOnce(t *testing.T, payload []byte) []byte {
 // The echo having returned proves both directions crossed the wire.
 func (p *deflatePair) wireDelta(t *testing.T, payload []byte) (rx, tx int64, got []byte) {
 	t.Helper()
-	rx0, tx0 := p.listener.totals()
+	// Measure between two quiet points. yamux sends window updates / FIN acks
+	// asynchronously, so an unsettled sample attributed ~24 B frames to
+	// whichever window they happened to land in (locally part-append-suffix
+	// flipped between 185 and 209 B; CI saw small-frame-40b at 188 B).
+	rx0, tx0 := p.settledTotals()
 	got = p.echoOnce(t, payload)
-	rx1, tx1 := p.listener.totals()
+	// Settle the end too: this echo's own stream shutdown (yamux FIN / window
+	// update) can arrive just after echoOnce returns, so a plain sample
+	// counted it on some runs and not others.
+	rx1, tx1 := p.settledTotals()
 	return rx1 - rx0, tx1 - tx0, got
+}
+
+// settledTotals returns the listener's byte totals once they have stopped
+// changing for a quiet period (bounded, so a chatty link can't hang the test).
+func (p *deflatePair) settledTotals() (rx, tx int64) {
+	const quiet, maxWait = 50 * time.Millisecond, 2 * time.Second
+	rx, tx = p.listener.totals()
+	deadline := time.Now().Add(maxWait)
+	stableSince := time.Now()
+	for time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		r, x := p.listener.totals()
+		if r != rx || x != tx {
+			rx, tx, stableSince = r, x, time.Now()
+			continue
+		}
+		if time.Since(stableSince) >= quiet {
+			break
+		}
+	}
+	return rx, tx
 }
 
 // -------------------------------------------------------- payload classes ---
@@ -416,6 +444,15 @@ func TestTunnelDeflateNegotiationMatrix(t *testing.T) {
 	}
 }
 
+// echoFramingAllowance bounds the fixed wire overhead of one tiny echo on the
+// client→server direction: yamux SYN + data + FIN headers, their WS envelopes
+// (with masking) and the per-message deflate block overhead. Measured between
+// settled points it is a deterministic 124 B (a 40 B payload costs 164 B on the
+// wire); the older +128 budget was calibrated on an unsettled sample that
+// under-counted the stream shutdown, leaving 4 B of headroom. An actual
+// "exploded" frame would cost hundreds of bytes more, so 160 keeps the intent.
+const echoFramingAllowance = 160
+
 // TestTunnelDeflatePayloadClasses runs each payload class from the brief
 // through a negotiated all/all link and checks integrity + wire shrinkage
 // per class.
@@ -437,8 +474,8 @@ func TestTunnelDeflatePayloadClasses(t *testing.T) {
 			// Small frames carry fixed per-message framing (yamux SYN+FIN+data
 			// headers, WS envelopes, masking) — the assertion is that deflate
 			// doesn't EXPLODE a tiny message, not that it nets-positive saves.
-			if rx > n+128 {
-				t.Errorf("suffix wire bytes %d > payload %d + 128 framing — tiny compressed frame exploded", rx, n)
+			if rx > n+echoFramingAllowance {
+				t.Errorf("suffix wire bytes %d > payload %d + %d framing — tiny compressed frame exploded", rx, n, echoFramingAllowance)
 			}
 		}},
 		{"gzip64-snapshot", gz, func(t *testing.T, rx, n int64) {
@@ -464,9 +501,9 @@ func TestTunnelDeflatePayloadClasses(t *testing.T) {
 		{"small-frame-40b", randomBytes(40), func(t *testing.T, rx, n int64) {
 			// Tiny random frame under `all`: compressed frame must not
 			// EXPLODE (stored-block fallback keeps it near raw size); the
-			// fixed per-message framing is covered by the +128 allowance.
-			if rx > n+128 {
-				t.Errorf("40-byte frame wire bytes %d > %d + 128 framing — compressed tiny random frame exploded", rx, n)
+			// fixed per-message framing is covered by echoFramingAllowance.
+			if rx > n+echoFramingAllowance {
+				t.Errorf("40-byte frame wire bytes %d > %d + %d framing — compressed tiny random frame exploded", rx, n, echoFramingAllowance)
 			}
 		}},
 	}
