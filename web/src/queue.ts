@@ -70,15 +70,20 @@ export interface QueuedMessage {
   // (reconcileMaxAttempts) and PERMANENTLY given up on this item — `state`
   // stays "unknown" but it will never be retried or looked at again. An item
   // with this set is a terminal give-up, NOT still in flight: callers must
-  // not treat it as "waiting" (e.g. the composer custody line).
+  // not treat it as "waiting".
   // TRANSIENT shape (d-F1 note): bumpReconcileAttempt/markReconcileTerminal
   // set this flag WITHOUT flipping State, and a stale-`dispatching` item is
   // reconcile-eligible — so the backend can briefly hold
   // `state: "dispatching"` + `reconcileTerminal: true` (List()-time
   // stale-dispatching→unknown recovery self-heals it within one poll).
   // Predicates keyed on `unknown && reconcileTerminal` therefore miss for at
-  // most one poll and fail safe in that window (an over-shown custody line,
-  // never suppressed custody info).
+  // most one poll and fail safe in that window (a give-up can over-appear as
+  // still in flight; terminal info is delayed one poll, never suppressed).
+  // Remaining consumer: QueueChip's unknown-suffix predicate
+  // (`state === "unknown" && !reconcileTerminal`), which skips the
+  // "…may have been delivered" check-transcript suffix for give-ups — a
+  // give-up already carries its own "manual review advised" detail. (An
+  // earlier consumer, the composer custody line, was removed in 61ca3a9.)
   reconcileTerminal?: boolean;
 }
 

@@ -881,6 +881,73 @@ describe("createSend — guarded row-retry (retrySameMessage, record-addressed)"
 
 
 // ---------------------------------------------------------------------------
+// c-F3 — Enter-path (send()) early-reuse cells. The guarded row-retry cells
+// above cover retrySameMessage; the remaining coverage gap is send()'s OWN
+// early-reuse branch (the composer's Enter key / Send button with an EMPTY
+// composer): a retained attachment-only uncertain record must make an empty
+// tap a verbatim REPLAY of the stored payload (not a silent no-op), while a
+// genuinely empty tap with NO retained record must exit with zero state
+// change.
+// ---------------------------------------------------------------------------
+describe("createSend — c-F3 Enter-path early-reuse (empty-composer send())", () => {
+  it("EMPTY composer + retained attachment-only uncertain record: send() replays the STORED payload under the SAME attemptId — never live state", async () => {
+    let fail = true;
+    const a1: Attachment = { url: "file://up/enter-only.png", filename: "enter-only.png", mime: "image/png" };
+    const h = harness({
+      enqueue: async () => {
+        if (fail) throw new Error("response lost");
+        return { id: "q-ent" };
+      },
+      fetchQueue: async () => [],
+    });
+    // Seed: an attachment-only attempt whose enqueue response was lost → a
+    // retained uncertain/retry-same record (tapText "", attachments [a1]).
+    h.setAtts([a1]);
+    h.setInput("");
+    await h.send();
+    const attemptId = h.enqueueInputs[0].input.attemptId as string;
+    expect(getSendAction(attemptId)?.recovery).toBe("retry-same");
+
+    // EMPTY the composer completely, then tap send() (the Enter path) — the
+    // early-reuse branch must admit this as a REPLAY of the stored payload.
+    h.setInput("");
+    h.setAtts([]);
+    fail = false;
+    await h.send();
+
+    // THE CRUX: the STORED payload replayed under the SAME attemptId — the
+    // enqueue carries the stored chip set (byte-identical to the first
+    // attempt), NOT the (empty) live composer state.
+    expect(h.enqueueInputs).toHaveLength(2);
+    expect(h.enqueueInputs[1].input.attemptId).toBe(attemptId);
+    expect(h.enqueueInputs[1].input).toEqual(h.enqueueInputs[0].input);
+    expect(h.enqueueInputs[1].input.attachments).toEqual([
+      { url: "file://up/enter-only.png", filename: "enter-only.png", mime: "image/png" },
+    ]);
+    // The empty composer stays empty; custody confirmed → the row finishes.
+    expect(h.input()).toBe("");
+    expect(h.atts()).toEqual([]);
+    expect(getSendAction(attemptId)).toBeUndefined();
+  });
+
+  it("EMPTY composer + NO retained record: send() exits with ZERO state change (no record minted, no enqueue, no reconcile)", async () => {
+    const h = harness();
+    h.setInput("");
+    h.setAtts([]);
+    await h.send();
+    // The genuinely-empty tap returns inside the early-reuse guard BEFORE
+    // any state change: nothing enqueued, no reconcile fetch, no attempt
+    // record minted, no notification.
+    expect(h.enqueueInputs).toHaveLength(0);
+    expect(h.fetchQueueCalls).toBe(0);
+    expect(sendActionsFor("ses-1")).toHaveLength(0);
+    expect(h.notes).toHaveLength(0);
+    expect(h.input()).toBe("");
+  });
+});
+
+
+// ---------------------------------------------------------------------------
 // createSessionWithCertainty — 502/timeout are outcome-unknown, not proof of
 // non-creation (the /oc proxy 502s on transport failure).
 // ---------------------------------------------------------------------------

@@ -25,7 +25,8 @@
 // SPA settles to outcome-unknown, renders "Queue confirmation unknown." with
 // the payload-surfacing Retry-same-message affordance, and the operator's
 // re-tap replays the SAME attemptId (server dedupes → exactly one item,
-// exactly one dispatch, composer cleared).
+// exactly one dispatch, composer retained — a row retry never modifies the
+// composer).
 //
 // Serial-suite hygiene (workers:1, one shared fixtureserver): every test owns
 // + cleans its queue state; the browser test uses the agent-hold fixture
@@ -165,11 +166,11 @@ test("(e API) resolve-conflict stops: 409 queue_resolve_conflict, stored truth p
 
 // The full user-visible recovery arc (a+b+c+UI): a real send whose enqueue
 // response is LOST after server admission settles to the honest
-// outcome-unknown state; the operator's Retry send replays the SAME
+// outcome-unknown state; the operator's Retry same message replays the SAME
 // attemptId; the server dedupes to exactly one item and exactly one dispatch;
 // the status row resolves (a record-addressed row retry never modifies the
 // composer — O2 review A-F1).
-test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry send (same attemptId) recovers custody with no duplicate", async ({ page, request }) => {
+test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry same message (same attemptId) recovers custody with no duplicate", async ({ page, request }) => {
   test.setTimeout(90_000);
 
   // Deterministic agent evidence (same protocol as agent-hydration-send):

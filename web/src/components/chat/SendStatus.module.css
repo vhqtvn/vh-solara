@@ -43,7 +43,7 @@
 :global(.sendStatusLine[data-kind="conflict"]),
 :global(.sendStatusLine[data-kind="rejected"]),
 :global(.sendStatusLine[data-kind="blocked"]) {
-  background: color-mix(in srgb, var(--danger) 16%, var(--bg-2));
+  background: color-mix(in srgb, var(--danger, #e5484d) 16%, var(--bg-2));
 }
 
 :global(.sendStatusText) {

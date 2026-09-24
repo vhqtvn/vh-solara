@@ -14,7 +14,6 @@ import {
   mintSendAttempt,
   sendActionsFor,
   transferOwnerSendAttempts,
-  transferSendAttempt,
   updateSendAction,
   type PreparedSendPayload,
 } from "../../src/lib/sendActionStatus";
@@ -61,16 +60,6 @@ describe("sendActionStatus — mint/transfer/update/finish lifecycle", () => {
     const a4 = mintSendAttempt("s1");
     expect(getSendAction(a3.attemptId)).toBeDefined();
     expect(getSendAction(a4.attemptId)).toBeDefined();
-  });
-
-  it("transferSendAttempt moves the record to the live owner (draft→live)", () => {
-    const a = mintSendAttempt("draft");
-    transferSendAttempt(a.attemptId, "live-1");
-    expect(getSendAction(a.attemptId)?.ownerKey).toBe("live-1");
-    expect(sendActionsFor("draft")).toHaveLength(0);
-    expect(sendActionsFor("live-1")).toHaveLength(1);
-    // transfer of an unknown/finished id is a no-op (no throw)
-    transferSendAttempt("att-does-not-exist", "live-1");
   });
 
   it("updateSendAction patches stage/certainty/recovery/detail/payload; unknown id is a no-op", () => {
@@ -150,7 +139,7 @@ describe("sendActionStatus — session-create unknown marking", () => {
 });
 
 describe("sendActionStatus — resolve-conflict marking", () => {
-  it("marks a retained attempt conflict/definitive/check", () => {
+  it("marks a retained attempt conflict/definitive/check — and CLEARS a stale retrySave payload (D3)", () => {
     const a = mintSendAttempt("s1");
     updateSendAction(a.attemptId, { stage: "admitting" });
     markSendAttemptResolveConflict(a.attemptId, "s1", "server holds sent for item q1");
@@ -159,6 +148,20 @@ describe("sendActionStatus — resolve-conflict marking", () => {
     expect(got.certainty).toBe("definitive");
     expect(got.recovery).toBe("check");
     expect(got.detail).toBe("server holds sent for item q1");
+
+    // D3 hygiene: the reachable re-mark arc is an UNSAVED record (retrySave
+    // set) whose status-save retry itself hit a 409 (SendStatus.retrySave's
+    // conflict branch). The re-marked conflict record must NOT keep the stale
+    // retry-save payload — inert before (the affordance is gated on
+    // stage === "unsaved"), but the retained payload would misdescribe it.
+    const b = mintSendAttempt("s1"); // "conflict" is not superseded — a survives
+    markSendAttemptStatusUnsaved(b.attemptId, "s1", { itemId: "q1", state: "sent", detail: "ok" });
+    expect(getSendAction(b.attemptId)?.retrySave).toEqual({ itemId: "q1", state: "sent", detail: "ok" });
+    markSendAttemptResolveConflict(b.attemptId, "s1", "server holds failed for item q1");
+    const reGot = getSendAction(b.attemptId)!;
+    expect(reGot.stage).toBe("conflict");
+    expect(reGot.conflictSource).toBe("resolve");
+    expect(reGot.retrySave).toBeNull(); // THE D3 CRUX: stale payload cleared
   });
 
   it("UPSERTs a minimal conflict record for an un-minted attempt id (admitted attempts are finished before resolve)", () => {
@@ -296,7 +299,9 @@ describe("sendActionStatus — transferOwnerSendAttempts stage-agnostic owner sw
 
     // Mint the supersede-vulnerable stages one at a time, parking each OFF
     // "draft" so the next mint cannot finish it (mint-supersede clears
-    // same-owner preparing/blocked/rejected records).
+    // same-owner preparing/blocked/rejected records). Parking uses the sweep
+    // itself (transferOwnerSendAttempts) — the per-attempt transferSendAttempt
+    // helper was removed as consumer-free (D2 hygiene).
     const parked: string[] = [];
     for (const stage of ["blocked", "rejected", "uncertain"] as const) {
       const a = mintSendAttempt("draft");
@@ -306,7 +311,7 @@ describe("sendActionStatus — transferOwnerSendAttempts stage-agnostic owner sw
           ? { stage, certainty: "unknown", recovery: "check" }
           : { stage, certainty: "definitive", recovery: "restore" },
       );
-      transferSendAttempt(a.attemptId, "park");
+      expect(transferOwnerSendAttempts("draft", "park")).toBe(1);
       parked.push(a.attemptId);
     }
     // The upsert-shaped mint sites for conflict/unsaved (their REAL mint shape
@@ -317,7 +322,7 @@ describe("sendActionStatus — transferOwnerSendAttempts stage-agnostic owner sw
     // The preparing record is minted LAST (a later mint would supersede it).
     const prep = mintSendAttempt("draft");
     // Bring the parked records home.
-    for (const id of parked) transferSendAttempt(id, "draft");
+    expect(transferOwnerSendAttempts("park", "draft")).toBe(3);
 
     const ids = [prep.attemptId, ...parked, "att-conflict-draft", "att-unsaved-draft"];
     expect(new Set(ids).size).toBe(6);

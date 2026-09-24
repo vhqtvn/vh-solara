@@ -1628,9 +1628,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // A1 create-linkage confirm — the navigation half of the affordance's click
   // (SendStatus does the record re-key via transferOwnerSendAttempts BEFORE
   // calling this; the re-key never happens without the operator's click).
-  // openSessionChat semantics (SessionTree): select + jump to chat. The rail's
-  // narrow-tier drawer close is moot here — the affordance button lives in the
-  // composer, so the chat is already the revealed view when this can be hit.
+  // DUPLICATES SessionTree.openSessionChat (setSelectedId + setView("chat"))
+  // deliberately WITHOUT importing it: openSessionChat additionally closes
+  // the narrow-tier nav drawer, which is moot here — the affordance button
+  // lives in the composer, so the chat is already the revealed view when
+  // this can be hit (importing would add drawer-close behavior we don't
+  // want from the composer).
   function openLinkedSession(id: string) {
     setSelectedId(id);
     setView("chat");

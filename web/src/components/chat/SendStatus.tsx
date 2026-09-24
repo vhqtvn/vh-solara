@@ -60,7 +60,7 @@
 // sendStatus* prefix keeps the global namespace collision-free. No
 // mask/backdrop-filter/contain (Firefox/WebRender GPU rules — this is an
 // always-possible composer surface; keep it a cheap, fixed-height text row).
-import { createSignal, For, Show, type Accessor } from "solid-js";
+import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
 import {
   createLinkCandidates,
   finishSendAttempt,
@@ -125,10 +125,13 @@ export function SendStatus(props: SendStatusProps) {
   // the session map (props.sessions(): the SSE-delivered session lands there
   // while the draft view is still mounted, no re-tap needed). Draft-view only:
   // a live session's ownerKey is its own id and can never be "draft".
-  const createCandidates = () => {
+  // Memoized (D-hygiene): the when-check and the For below share ONE
+  // computation per reactive change instead of re-running the matcher twice
+  // per render.
+  const createCandidates = createMemo(() => {
     if (!props.draft() || !props.sessions || !props.openSession) return [];
     return createLinkCandidates(Object.values(props.sessions()), records());
-  };
+  });
 
   // A1 confirm — NEVER silent: the re-key runs only from the operator's click
   // on the affordance. The sweep drains EVERY still-draft-owned record (the
@@ -183,6 +186,9 @@ export function SendStatus(props: SendStatusProps) {
     switch (rec.stage) {
       case "preparing": {
         const p = props.uploadProgress();
+        // Display semantics: `done` counts COMPLETED uploads, so the shown
+        // index counts the file IN PROGRESS (done + 1), capped at total so
+        // the last file never reads "N+1 of N".
         if (p && p.total > 0) return `Uploading ${Math.min(p.done + 1, p.total)} of ${p.total}…`;
         return "Sending…";
       }

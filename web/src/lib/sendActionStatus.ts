@@ -140,8 +140,11 @@ export interface SendAction {
   conflictSource?: "admission" | "resolve";
   // Stage "unsaved" only: what the Retry-status-save affordance re-records —
   // the exact terminal (state, detail) of the dispatch outcome plus the queue
-  // item id. resolveQueued(idempotent record) consumes this verbatim.
-  retrySave?: { itemId: string; state: "sent" | "failed" | "unknown"; detail: string };
+  // item id. resolveQueued(idempotent record) consumes this verbatim. `null`
+  // is a WRITE-only hygiene value: markSendAttemptResolveConflict clears a
+  // stale payload when it re-marks a formerly-unsaved record as conflict
+  // (readers treat null exactly like absent).
+  retrySave?: { itemId: string; state: "sent" | "failed" | "unknown"; detail: string } | null;
   // A1 create-linkage (send-defers study): for a create-outcome-unknown record
   // (markOwnerSessionCreateUnknown), the [start, end] CLIENT-clock window (ms)
   // during which the session-create POST was in flight (start = when the POST
@@ -203,28 +206,24 @@ export function mintSendAttempt(ownerKey: string): SendAction {
   return action;
 }
 
-/** Explicit draft→live ownership transfer (the single-flight keys are distinct
- *  by design; this is the only way an attempt changes owner). No-op for an
- *  unknown/finished attempt. */
-export function transferSendAttempt(attemptId: string, newOwnerKey: string): void {
-  patch(attemptId, { ownerKey: newOwnerKey });
-}
-
 /** F2 (slice-3 review): re-key EVERY retained record owned by `fromOwnerKey`
  *  to `toOwnerKey` — the draft→live materialization sweep. Slice 2's
- *  per-attempt transferSendAttempt re-keyed only the IN-FLIGHT attempt;
- *  retained records from EARLIER draft taps (a create-outcome-unknown
- *  uncertain/check record is the reachable case) stayed stranded under
- *  "draft": invisible in the destination session (SendStatus queries by the
- *  session-id owner key) and stale in the NEXT draft view. At materialization
- *  the retained draft-owned set is exactly the in-flight attempt plus
- *  uncertain records — mint-supersede already finished earlier
- *  preparing/blocked/rejected ones — so sweeping everything is safe. Residual
- *  limitation (accepted): when the operator materializes the session WITHOUT
- *  re-tapping (the create landed; they click the session in the list), no
- *  client code observes the draft→session linkage — re-keying that arc needs
- *  a session-create idempotency key (out of scope, brief §8). Returns the
- *  number of records transferred. */
+ *  per-attempt re-key (transferSendAttempt, since removed as consumer-free)
+ *  moved only the IN-FLIGHT attempt; retained records from EARLIER draft
+ *  taps (a create-outcome-unknown uncertain/check record is the reachable
+ *  case) stayed stranded under "draft": invisible in the destination session
+ *  (SendStatus queries by the session-id owner key) and stale in the NEXT
+ *  draft view. At materialization the retained draft-owned set is exactly
+ *  the in-flight attempt plus uncertain records — mint-supersede already
+ *  finished earlier preparing/blocked/rejected ones — so sweeping everything
+ *  is safe. Residual limitation (updated, A1 create-linkage): on PURE
+ *  navigation (the create landed; the operator clicks the session in the
+ *  list without re-tapping) the draft→session linkage IS now observed —
+ *  reactively, by SendStatus's create-link affordance
+ *  (createLinkCandidates), and a confirm runs this owner sweep before
+ *  navigating. What remains deferred is a SILENT auto-re-key on pure
+ *  navigation (needs a create-time idempotency key; brief §8, P2-API-011).
+ *  Returns the number of records transferred. */
 export function transferOwnerSendAttempts(fromOwnerKey: string, toOwnerKey: string): number {
   let n = 0;
   setActions(
@@ -400,7 +399,13 @@ export function createLinkCandidates(
  *  renderable (Slice 3). */
 export function markSendAttemptResolveConflict(attemptId: string, ownerKey: string, detail: string): void {
   if (getSendAction(attemptId)) {
-    patch(attemptId, { stage: "conflict", certainty: "definitive", recovery: "check", detail, conflictSource: "resolve" });
+    // D3 hygiene: a formerly-"unsaved" record (retrySave set — e.g. the
+    // status save was retried and the retry ITSELF hit a 409) must not keep
+    // the stale retry-save payload on the re-marked conflict record. Inert
+    // before (the Retry-status-save affordance is gated on
+    // stage === "unsaved"), but a retained stale payload would misdescribe
+    // the record to any future reader.
+    patch(attemptId, { stage: "conflict", certainty: "definitive", recovery: "check", detail, conflictSource: "resolve", retrySave: null });
     return;
   }
   setActions(attemptId, {
