@@ -30,7 +30,11 @@ CREATE INDEX session_project_idx ON session (project_id);
 CREATE INDEX session_parent_idx ON session (parent_id);
 `
 
-const listQuery = `SELECT * FROM session WHERE project_id = 'p' AND directory = '/d' ORDER BY time_updated DESC LIMIT 32000`
+// listQuery is the shape OpenCode actually runs for a worktree-root instance
+// (path "" skips the directory filter); listQueryDir is the directory-filtered
+// variant. The index must serve both without a temp B-tree.
+const listQuery = `SELECT * FROM session WHERE project_id = 'p' ORDER BY time_updated DESC LIMIT 32000`
+const listQueryDir = `SELECT * FROM session WHERE project_id = 'p' AND directory = '/d' ORDER BY time_updated DESC LIMIT 32000`
 
 func newIndexDB(t *testing.T, extra string) (path string, db *sql.DB) {
 	t.Helper()
@@ -108,9 +112,11 @@ func TestSessionIndex_CreatesWhenAbsentAndFixesPlan(t *testing.T) {
 	if !indexNames(t, db)[sessionListIndexName] {
 		t.Fatalf("owned index not created")
 	}
-	plan := queryPlan(t, db, listQuery)
-	if strings.Contains(plan, "TEMP B-TREE") || !strings.Contains(plan, sessionListIndexName) {
-		t.Errorf("list query should use %s with no temp B-tree, plan:\n%s", sessionListIndexName, plan)
+	for _, q := range []string{listQuery, listQueryDir} {
+		plan := queryPlan(t, db, q)
+		if strings.Contains(plan, "TEMP B-TREE") || !strings.Contains(plan, sessionListIndexName) {
+			t.Errorf("list query should use %s with no temp B-tree\nquery: %s\nplan:\n%s", sessionListIndexName, q, plan)
+		}
 	}
 }
 
@@ -128,7 +134,7 @@ func TestSessionIndex_IdempotentKeep(t *testing.T) {
 func TestSessionIndex_DropsOursWhenUpstreamAppears(t *testing.T) {
 	path, db := newIndexDB(t, "")
 	converge(t, path)
-	if _, err := db.Exec(`CREATE INDEX session_project_directory_updated_idx ON session (project_id, directory, time_updated, id)`); err != nil {
+	if _, err := db.Exec(`CREATE INDEX session_project_updated_idx ON session (project_id, time_updated, id)`); err != nil {
 		t.Fatal(err)
 	}
 	if act := converge(t, path); act != IndexDroppedOurs {
@@ -138,7 +144,7 @@ func TestSessionIndex_DropsOursWhenUpstreamAppears(t *testing.T) {
 	if names[sessionListIndexName] {
 		t.Errorf("owned index should have been dropped")
 	}
-	if !names["session_project_directory_updated_idx"] {
+	if !names["session_project_updated_idx"] {
 		t.Errorf("upstream index must never be touched")
 	}
 	// And it stays converged: no re-creation while upstream covers it.
@@ -150,7 +156,7 @@ func TestSessionIndex_DropsOursWhenUpstreamAppears(t *testing.T) {
 // Upstream equivalent already present, ours never created → nothing to do.
 // DESC key direction still counts as equivalent.
 func TestSessionIndex_UpstreamPresentNoCreate(t *testing.T) {
-	path, db := newIndexDB(t, `CREATE INDEX up_idx ON session (project_id, directory, time_updated DESC);`)
+	path, db := newIndexDB(t, `CREATE INDEX up_idx ON session (project_id, time_updated DESC);`)
 	if act := converge(t, path); act != IndexUpstreamPresent {
 		t.Fatalf("action = %s, want %s", act, IndexUpstreamPresent)
 	}
@@ -163,11 +169,13 @@ func TestSessionIndex_UpstreamPresentNoCreate(t *testing.T) {
 // equivalents: ours is still created, and theirs are left untouched.
 func TestSessionIndex_NonEquivalentUpstreamStillCreatesOurs(t *testing.T) {
 	cases := map[string]string{
-		"missing-directory": `CREATE INDEX x_idx ON session (project_id, time_updated);`,
-		"wrong-order":       `CREATE INDEX x_idx ON session (directory, project_id, time_updated);`,
-		"partial":           `CREATE INDEX x_idx ON session (project_id, directory, time_updated) WHERE time_archived IS NULL;`,
-		"expression":        `CREATE INDEX x_idx ON session (project_id, lower(directory), time_updated);`,
-		"too-short":         `CREATE INDEX x_idx ON session (project_id, directory);`,
+		// A column between project_id and time_updated breaks the ORDER BY for
+		// the project-only query OpenCode actually runs.
+		"directory-in-middle": `CREATE INDEX x_idx ON session (project_id, directory, time_updated);`,
+		"wrong-order":         `CREATE INDEX x_idx ON session (time_updated, project_id);`,
+		"partial":             `CREATE INDEX x_idx ON session (project_id, time_updated) WHERE time_archived IS NULL;`,
+		"expression":          `CREATE INDEX x_idx ON session (project_id, (time_updated + 0));`,
+		"too-short":           `CREATE INDEX x_idx ON session (project_id);`,
 	}
 	for name, ddl := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -197,7 +205,7 @@ func TestSessionIndex_RecreatesDriftedOwned(t *testing.T) {
 
 // Converging never drops or alters an index it does not own.
 func TestSessionIndex_NeverTouchesForeignIndexes(t *testing.T) {
-	path, db := newIndexDB(t, `CREATE INDEX x_idx ON session (project_id, time_updated);`)
+	path, db := newIndexDB(t, `CREATE INDEX x_idx ON session (project_id, directory, time_updated);`)
 	before := indexNames(t, db)
 	converge(t, path)
 	converge(t, path)
@@ -212,7 +220,7 @@ func TestSessionIndex_NeverTouchesForeignIndexes(t *testing.T) {
 // A schema that lost a needed column refuses loudly and creates nothing.
 func TestSessionIndex_MissingColumnRefuses(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "opencode.db")
-	db := openTempDB(t, path, `CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, directory TEXT, time_archived INTEGER);`)
+	db := openTempDB(t, path, `CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, directory TEXT, time_archived INTEGER);`) // no time_updated
 	defer db.Close()
 	_, err := ensureSessionListIndexAt(context.Background(), path)
 	var se *SchemaError
@@ -247,5 +255,25 @@ func TestSessionIndex_ExternalTopologyGuard(t *testing.T) {
 	}
 	if !indexNames(t, db)[sessionListIndexName] {
 		t.Errorf("override path should have been converged")
+	}
+}
+
+// An earlier name of OUR index (retiredSessionIndexNames) is dropped and the
+// current one created — the upgrade path for DBs converged by the first version.
+func TestSessionIndex_MigratesRetiredOwnedIndex(t *testing.T) {
+	path, db := newIndexDB(t, `CREATE INDEX vhsolara_session_project_dir_updated_idx ON session (project_id, directory, time_updated);`)
+	if act := converge(t, path); act != IndexCreated {
+		t.Fatalf("action = %s, want %s", act, IndexCreated)
+	}
+	names := indexNames(t, db)
+	if names["vhsolara_session_project_dir_updated_idx"] {
+		t.Errorf("retired owned index should have been dropped")
+	}
+	if !names[sessionListIndexName] {
+		t.Errorf("current owned index should have been created")
+	}
+	// Stays converged.
+	if act := converge(t, path); act != IndexKept {
+		t.Errorf("follow-up action = %s, want %s", act, IndexKept)
 	}
 }

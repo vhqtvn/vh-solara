@@ -159,3 +159,55 @@ func TestReconcile_NoDriftReturnsEmpty(t *testing.T) {
 			result.Ghosts, result.ClobberedArchives)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Archived entries in the list (OpenCode v1.18.x returns them)
+// ---------------------------------------------------------------------------
+
+// A just-archived session that still appears in /session WITH time.archived
+// set is the expected archive, not a clobber-revert: it must not be reported
+// (and so not re-PATCHed on every tick of the tombstone window).
+func TestReconcile_ArchivedEntryInListNotClobbered(t *testing.T) {
+	s := New(64)
+	applySeq(t, s,
+		[2]string{"session.created", evSessionCreated("R", "")},
+	)
+	s.RemoveSessions([]string{"R"})
+
+	result := s.ReconcileSessions([]json.RawMessage{
+		sessInfo("R", "", 1700000000), // listed, but archived
+	})
+	if len(result.ClobberedArchives) != 0 {
+		t.Fatalf("archived entry must not count as a clobber, got %v", result.ClobberedArchives)
+	}
+}
+
+// An archived entry in the list must not keep a live store session from being
+// treated as a ghost either: only NON-archived entries are authoritative.
+func TestReconcile_ArchivedEntryInListIsNotLive(t *testing.T) {
+	s := New(64)
+	applySeq(t, s,
+		[2]string{"session.created", evSessionCreated("G", "")},
+	)
+	result := s.ReconcileSessions([]json.RawMessage{
+		sessInfo("G", "", 1700000000), // archived upstream, missed the event
+	})
+	if len(result.Ghosts) != 1 || result.Ghosts[0] != "G" {
+		t.Fatalf("store session archived upstream should be evicted as a ghost, got %v", result.Ghosts)
+	}
+}
+
+func TestHasLiveArchiveTombstones(t *testing.T) {
+	s := mustNew(t, withRecentArchiveTTL(DefaultConfig(64), 20*time.Millisecond))
+	if s.HasLiveArchiveTombstones() {
+		t.Fatal("fresh store has no tombstones")
+	}
+	s.RemoveSessions([]string{"R"})
+	if !s.HasLiveArchiveTombstones() {
+		t.Fatal("tombstone should be live right after archive")
+	}
+	time.Sleep(40 * time.Millisecond)
+	if s.HasLiveArchiveTombstones() {
+		t.Fatal("tombstone should have expired")
+	}
+}

@@ -1468,6 +1468,22 @@ func (s *Store) IsRecentlyArchived(id string) bool {
 	return s.isRecentlyArchivedLocked(id)
 }
 
+// HasLiveArchiveTombstones reports whether any archive-resurrection tombstone
+// is still inside its TTL (GCing expired ones). The aggregator's tree reconcile
+// uses it to run at its fast cadence only while a clobber-revert is possible;
+// with no live tombstone it can fall back to its slow idle cadence.
+func (s *Store) HasLiveArchiveTombstones() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	live := false
+	for id := range s.recentlyArchived {
+		if s.isRecentlyArchivedLocked(id) { // deletes expired entries
+			live = true
+		}
+	}
+	return live
+}
+
 // --- authoritative archived-ID snapshot + Defect-3 backstop sweep ---
 //
 // The live store CANNOT be the orphan authority: RemoveSessions drops an

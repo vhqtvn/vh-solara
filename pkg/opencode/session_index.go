@@ -7,18 +7,26 @@ package opencode
 // OpenCode's instance-scoped session list (`GET /session`, the `Session.list`
 // query) is
 //
-//	SELECT * FROM session WHERE project_id = ? AND directory = ?
+//	SELECT * FROM session WHERE project_id = ? [AND <path/directory filter>]
 //	ORDER BY time_updated DESC LIMIT ?
 //
-// and OpenCode ships no index on time_updated (none in any migration through
-// v1.18.31). SQLite therefore builds a temp B-tree for the ORDER BY; past
-// cache_size (2 MB) it spills to /var/tmp/etilqs_* temp files. At OpenCode's
-// default LIMIT 100 that is harmless, but vh-solara's aggregator fetches whole
-// session lists (10k–16k rows on large projects), and each such call wrote
-// ~17 MB of sort scratch and burned OpenCode's single JS thread. An index on
-// session(project_id, directory, time_updated) lets SQLite read rows already in
-// order and stop at LIMIT (verified with EXPLAIN QUERY PLAN: the temp B-tree
-// disappears).
+// For an instance at its worktree root OpenCode passes path "" — and because it
+// tests `path !== undefined`, the directory filter is then skipped entirely, so
+// the live query is just `WHERE project_id = ? ORDER BY time_updated DESC`.
+// OpenCode ships no index on time_updated (none in any migration through
+// v1.18.31), so SQLite builds a temp B-tree for the ORDER BY; past cache_size
+// (2 MB) it spills to /var/tmp/etilqs_* temp files. At OpenCode's default
+// LIMIT 100 that is harmless, but vh-solara's aggregator fetches whole session
+// lists (10k–16k rows on large projects), and each such call wrote ~17 MB of
+// sort scratch and burned OpenCode's single JS thread. An index on
+// session(project_id, time_updated) lets SQLite read rows already in order and
+// stop at LIMIT for every filter variant (project-only, + directory, + the
+// sub-path OR filter, + roots/start) — verified with EXPLAIN QUERY PLAN.
+//
+// (The first version indexed (project_id, directory, time_updated): correct for
+// the directory-filtered shape, but it cannot serve the project-only ORDER BY
+// that OpenCode actually runs. That name is kept in retiredSessionIndexNames so
+// the converge drops it.)
 //
 // CONVERGE, NOT JUST CREATE
 //
@@ -30,8 +38,8 @@ package opencode
 //     collide with ours and fail OpenCode's startup.
 //   - "Upstream equivalent" is decided structurally (PRAGMA index_list +
 //     index_xinfo), not by name: any NON-partial index on `session`, other than
-//     ours, whose leading KEY columns are exactly (project_id, directory,
-//     time_updated), in that order. Extra trailing key columns are fine;
+//     ours, whose leading KEY columns are exactly (project_id, time_updated), in
+//     that order. Extra trailing key columns are fine;
 //     ASC/DESC is irrelevant (SQLite scans an index both ways); an expression
 //     column never counts.
 //   - Rules, re-evaluated on every run:
@@ -63,7 +71,7 @@ const (
 	// sessionListIndexName is the index vh-solara owns. The vhsolara_ prefix is
 	// the ownership marker: nothing else in this package ever touches an index
 	// whose name does not match it exactly.
-	sessionListIndexName = "vhsolara_session_project_dir_updated_idx"
+	sessionListIndexName = "vhsolara_session_project_updated_idx"
 	// sessionIndexTimeout bounds one converge run (open + introspect + DDL).
 	// CREATE INDEX over ~40k session rows takes well under a second; the rest
 	// is headroom for busy_timeout waits while OpenCode holds the write lock.
@@ -72,7 +80,12 @@ const (
 
 // sessionListIndexCols are the leading key columns the OpenCode list query
 // needs, in order.
-var sessionListIndexCols = []string{"project_id", "directory", "time_updated"}
+var sessionListIndexCols = []string{"project_id", "time_updated"}
+
+// retiredSessionIndexNames are earlier names of OUR index (same vhsolara_
+// ownership prefix). Every converge drops them, so an upgrade migrates the DB
+// without an orphaned index left behind.
+var retiredSessionIndexNames = []string{"vhsolara_session_project_dir_updated_idx"}
 
 // IndexAction is the outcome of one EnsureSessionListIndex run.
 type IndexAction string
@@ -143,9 +156,25 @@ func ensureSessionListIndexAt(ctx context.Context, path string) (IndexAction, er
 		return "", fmt.Errorf("introspect session indexes in %s: %w", path, err)
 	}
 
+	// Drop our own retired index names first (ownership is by exact name).
+	retired := map[string]bool{}
+	for _, n := range retiredSessionIndexNames {
+		retired[n] = true
+	}
+	for _, sh := range shapes {
+		if retired[sh.name] {
+			if _, err := db.ExecContext(cctx, `DROP INDEX IF EXISTS "`+sh.name+`"`); err != nil {
+				return "", fmt.Errorf("drop retired %s: %w", sh.name, err)
+			}
+		}
+	}
+
 	var ours *indexShape
 	upstream := ""
 	for i := range shapes {
+		if retired[shapes[i].name] {
+			continue
+		}
 		sh := &shapes[i]
 		if sh.name == sessionListIndexName {
 			ours = sh

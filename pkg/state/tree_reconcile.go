@@ -66,6 +66,14 @@ func (s *Store) ReconcileSessions(rawSessions []json.RawMessage) TreeReconcileRe
 		if json.Unmarshal(raw, &env) != nil || env.ID == "" {
 			continue
 		}
+		// Archived entries are not live, exactly as in Hydrate. OpenCode
+		// v1.18.x's instance /session list returns archived sessions too, so
+		// without this every just-archived (tombstoned) session looked like a
+		// clobber-revert on each tick of its tombstone window and was
+		// needlessly re-PATCHed.
+		if env.archivedAt() {
+			continue
+		}
 		authoritative[env.ID] = true
 	}
 

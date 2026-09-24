@@ -35,7 +35,7 @@ func (c *listCounter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c.inner.ServeHTTP(w, r)
 }
 
-func runCountingAggregator(t *testing.T, tree, archived time.Duration) (*Aggregator, *listCounter, func()) {
+func runCountingAggregator(t *testing.T, tree, idle, archived time.Duration) (*Aggregator, *listCounter, func()) {
 	t.Helper()
 	fx := fixtures.New()
 	cnt := &listCounter{inner: fx.Handler()}
@@ -46,6 +46,7 @@ func runCountingAggregator(t *testing.T, tree, archived time.Duration) (*Aggrega
 
 	agg := New(oc.URL, 100)
 	agg.treeReconcileInterval = tree
+	agg.treeReconcileIdleInterval = idle // set before Run: read by the reconcile goroutine
 	agg.archivedSnapshotInterval = archived
 	agg.statusReconcileInterval = time.Hour
 
@@ -88,7 +89,7 @@ func waitLiveTicks(t *testing.T, cnt *listCounter, atLeast int64) {
 // Many tree ticks, long archived interval → the archived list is fetched once
 // (by hydrate), not once per tick.
 func TestTreeReconcile_ArchivedRefreshNotPerTick(t *testing.T) {
-	_, cnt, stop := runCountingAggregator(t, 5*time.Millisecond, time.Hour)
+	_, cnt, stop := runCountingAggregator(t, 5*time.Millisecond, 0, time.Hour)
 	defer stop()
 	waitLiveTicks(t, cnt, 12) // hydrate + ≥11 reconcile ticks
 	if got := cnt.archived.Load(); got != 1 {
@@ -99,7 +100,7 @@ func TestTreeReconcile_ArchivedRefreshNotPerTick(t *testing.T) {
 // Control: with a short archived interval the reconcile does refresh it
 // periodically (the gate is spacing, not disabling).
 func TestTreeReconcile_ArchivedRefreshStillPeriodic(t *testing.T) {
-	_, cnt, stop := runCountingAggregator(t, 5*time.Millisecond, 10*time.Millisecond)
+	_, cnt, stop := runCountingAggregator(t, 5*time.Millisecond, 0, 10*time.Millisecond)
 	defer stop()
 	end := time.Now().Add(5 * time.Second)
 	for cnt.archived.Load() < 3 {
@@ -146,4 +147,21 @@ func TestOnConnectedFiresOncePerConnection(t *testing.T) {
 	<-runDone
 	agg.Stop()
 	agg.waitColdSeed()
+}
+
+// With no live archive tombstone the reconcile skips its full /session fetch
+// until the idle interval elapses; a fresh archive (tombstone) brings the fast
+// cadence back so clobber-revert detection keeps its timing.
+func TestTreeReconcile_IdleUntilTombstone(t *testing.T) {
+	agg, cnt, stop := runCountingAggregator(t, 5*time.Millisecond, time.Hour, time.Hour)
+	defer stop()
+
+	base := cnt.live.Load()
+	time.Sleep(100 * time.Millisecond) // ~20 ticks, no tombstone
+	if got := cnt.live.Load(); got > base+1 {
+		t.Fatalf("idle reconcile still fetched /session every tick: %d -> %d", base, got)
+	}
+
+	agg.Store().RemoveSessions([]string{"other"}) // arms a live tombstone
+	waitLiveTicks(t, cnt, cnt.live.Load()+5)      // fast cadence resumes
 }

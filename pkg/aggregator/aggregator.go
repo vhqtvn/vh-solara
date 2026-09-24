@@ -200,6 +200,17 @@ type Aggregator struct {
 	// goroutine launch establishes the happens-before edge to the read.
 	treeReconcileInterval time.Duration
 
+	// treeReconcileIdleInterval is the spacing of FULL tree reconciles while no
+	// archive tombstone is live. The fast treeReconcileInterval exists for
+	// clobber-revert detection, which can only happen inside a tombstone's
+	// 30s window; outside it the reconcile only catches ghosts (a missed
+	// session.deleted), which is rare and not latency-critical. OpenCode
+	// v1.18.x's /session list returns EVERY session of the project (archived
+	// included — 10k-16k rows here), so running it every tick per project
+	// was a steady CPU load on OpenCode. Defaults to
+	// defaultTreeReconcileIdleInterval (2m). Per-instance like the others.
+	treeReconcileIdleInterval time.Duration
+
 	// archivedSnapshotInterval is the minimum spacing between the tree
 	// reconcile's full archived-snapshot refreshes (ListArchivedSessions →
 	// store.RefreshArchivedSnapshot). OpenCode ignores ?archived=true and
@@ -261,8 +272,9 @@ type olderPageInflight struct {
 
 // Reconcile cadence defaults (see the field docs on Aggregator).
 const (
-	defaultTreeReconcileInterval    = 10 * time.Second
-	defaultArchivedSnapshotInterval = 5 * time.Minute
+	defaultTreeReconcileInterval     = 10 * time.Second
+	defaultTreeReconcileIdleInterval = 2 * time.Minute
+	defaultArchivedSnapshotInterval  = 5 * time.Minute
 )
 
 // DESIGN NOTE: state.New panic-translates the unreachable validate() error because
@@ -274,14 +286,15 @@ const (
 // New builds an aggregator targeting an opencode server base URL.
 func New(baseURL string, ringCapacity int) *Aggregator {
 	return &Aggregator{
-		client:                   opencode.New(baseURL),
-		store:                    state.New(ringCapacity),
-		msgInflight:              map[string]chan struct{}{},
-		pageInflight:             map[string]*olderPageInflight{},
-		statusReconcileInterval:  60 * time.Second,
-		treeReconcileInterval:    defaultTreeReconcileInterval,
-		archivedSnapshotInterval: defaultArchivedSnapshotInterval,
-		hydrateRetryBase:         time.Second,
+		client:                    opencode.New(baseURL),
+		store:                     state.New(ringCapacity),
+		msgInflight:               map[string]chan struct{}{},
+		pageInflight:              map[string]*olderPageInflight{},
+		statusReconcileInterval:   60 * time.Second,
+		treeReconcileInterval:     defaultTreeReconcileInterval,
+		treeReconcileIdleInterval: defaultTreeReconcileIdleInterval,
+		archivedSnapshotInterval:  defaultArchivedSnapshotInterval,
+		hydrateRetryBase:          time.Second,
 	}
 }
 
@@ -291,14 +304,15 @@ func NewForDirectory(baseURL, directory string, ringCapacity int) *Aggregator {
 	c := opencode.New(baseURL)
 	c.Directory = directory
 	return &Aggregator{
-		client:                   c,
-		store:                    state.New(ringCapacity),
-		msgInflight:              map[string]chan struct{}{},
-		pageInflight:             map[string]*olderPageInflight{},
-		statusReconcileInterval:  60 * time.Second,
-		treeReconcileInterval:    defaultTreeReconcileInterval,
-		archivedSnapshotInterval: defaultArchivedSnapshotInterval,
-		hydrateRetryBase:         time.Second,
+		client:                    c,
+		store:                     state.New(ringCapacity),
+		msgInflight:               map[string]chan struct{}{},
+		pageInflight:              map[string]*olderPageInflight{},
+		statusReconcileInterval:   60 * time.Second,
+		treeReconcileInterval:     defaultTreeReconcileInterval,
+		treeReconcileIdleInterval: defaultTreeReconcileIdleInterval,
+		archivedSnapshotInterval:  defaultArchivedSnapshotInterval,
+		hydrateRetryBase:          time.Second,
 	}
 }
 

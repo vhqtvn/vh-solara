@@ -218,15 +218,22 @@ dependency once the session-list index coupling below is retired too.
 > both daemons), trigger: `Aggregator.SetOnConnected` on the default aggregator.
 
 **Why.** OpenCode's instance-scoped session list (`GET /session`, `Session.list`)
-runs `SELECT * FROM session WHERE project_id = ? AND directory = ? ORDER BY
-time_updated DESC LIMIT ?`, and no OpenCode migration (through v1.18.31) indexes
-`time_updated`. SQLite builds a temp B-tree for the ORDER BY and, past
+runs `SELECT * FROM session WHERE project_id = ? [AND <path/directory filter>]
+ORDER BY time_updated DESC LIMIT ?`. For a worktree-root instance OpenCode passes
+`path = ""` and tests `path !== undefined`, so the directory filter is skipped and
+the live query is just `WHERE project_id = ? ORDER BY time_updated DESC`. No
+OpenCode migration (through v1.18.31) indexes `time_updated`, and this list
+returns archived sessions too (all 10k–16k rows of a large project). SQLite builds a temp B-tree for the ORDER BY and, past
 `cache_size` (2 MB), spills it to `/var/tmp/etilqs_*`. At OpenCode's default
 `LIMIT 100` that is invisible; for vh-solara's whole-list fetches (10k–16k rows on
 large projects) one call wrote ~17 MB of sort scratch, and the aggregator's
 reconcile kept OpenCode's single JS thread pinned (diagnosed 2026-09-24 with perf +
 strace). `EXPLAIN QUERY PLAN` confirms an index on
-`session(project_id, directory, time_updated)` removes the temp B-tree.
+`session(project_id, time_updated)` removes the temp B-tree for every filter
+variant (project-only, + directory, + the sub-path `OR` filter, + roots/start).
+The first version indexed `(project_id, directory, time_updated)`, which cannot
+serve the project-only ordering; that name is in `retiredSessionIndexNames` and is
+dropped on converge.
 
 **What vh-solara does.** On every (re)attach to a serving — hence migrated —
 OpenCode process, it converges the DB (idempotent, non-fatal on any error):
@@ -239,13 +246,14 @@ OpenCode process, it converges the DB (idempotent, non-fatal on any error):
 | no | yes, correct shape | nothing |
 | no | yes, drifted shape | `DROP` + `CREATE` ours |
 
-- **Ownership:** ours is named `vhsolara_session_project_dir_updated_idx`. Nothing
+- **Ownership:** ours is named `vhsolara_session_project_updated_idx` (earlier
+  owned names listed in `retiredSessionIndexNames` are always dropped). Nothing
   touches an index whose name differs, and the prefix means a future upstream
   `CREATE INDEX` (no `IF NOT EXISTS`) can never collide with ours and fail
   OpenCode's startup migration.
 - **"Upstream equivalent"** is structural (`PRAGMA index_list` / `index_xinfo`):
   a non-partial index on `session`, not ours, whose leading key columns are exactly
-  `(project_id, directory, time_updated)`. Trailing extra columns are fine,
+  `(project_id, time_updated)`. Trailing extra columns are fine,
   ASC/DESC is irrelevant, expression columns never count.
 - **Guards:** the same topology rule as unarchive (skipped when attached
   externally via `--opencode-url` unless `VH_OPENCODE_DB_PATH` is set); refuses with
@@ -261,6 +269,12 @@ the converge drops ours on the next attach. On an OpenCode version bump, re-chec
 the `Session.list` query shape; if it changes columns or ordering, update
 `sessionListIndexCols` (the drift rule rebuilds ours).
 
-**Upstream.** Worth proposing an index on `session(project_id, directory,
-time_updated)` (plus `(directory, time_updated)` for the cross-project list) to
-sst/opencode, with the plan evidence above.
+**Upstream.** Worth proposing an index on `session(project_id, time_updated)`
+(plus `(directory, time_updated)` for the cross-project list) to sst/opencode,
+with the plan evidence above.
+
+**Related aggregator behaviour** (not DB coupling, but the reason the list is
+fetched so rarely now): the tree reconcile does a full `/session` fetch every 10 s
+only while an archive tombstone is live (clobber-revert window), otherwise once per
+`treeReconcileIdleInterval` (2 min); the archived snapshot refreshes every 5 min
+and is kept current from archive events in between.

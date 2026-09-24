@@ -111,12 +111,22 @@ func (a *Aggregator) runStatusReconcile(ctx context.Context) {
 func (a *Aggregator) runTreeReconcile(ctx context.Context) {
 	ticker := time.NewTicker(a.treeReconcileInterval)
 	defer ticker.Stop()
+	// Hydrate (run on connect) just fetched the full list, so the first idle
+	// full reconcile is due one idle interval from now.
+	lastFull := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
+		// Fast cadence only while a clobber-revert is possible (a live archive
+		// tombstone); otherwise one full reconcile per idle interval is enough
+		// to evict ghosts. See treeReconcileIdleInterval.
+		if !a.store.HasLiveArchiveTombstones() && time.Since(lastFull) < a.treeReconcileIdleInterval {
+			continue
+		}
+		lastFull = time.Now()
 		sessions, err := a.client.ListSessions(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
