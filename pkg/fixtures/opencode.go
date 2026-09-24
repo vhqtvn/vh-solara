@@ -1935,7 +1935,19 @@ func (f *FakeOpenCode) handleEvent(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
-		case payload := <-ch:
+		case payload, ok := <-ch:
+			if !ok {
+				// The subscriber channel was closed — on this fake that is
+				// emit's overflow close-on-full (or an explicit unsubscribe).
+				// End the SSE response so the client sees EOF and its
+				// reconnect+rehydrate path runs. Without this return the
+				// receive yields zero values forever: the handler spins
+				// writing empty "data: \n\n" frames (plus heartbeats), the
+				// connection looks alive to the idle-timeout client while
+				// delivering nothing, and every subscriber stays permanently
+				// wedged (the A2 cascade, CI run 36042537218).
+				return
+			}
 			fmt.Fprintf(w, "data: %s\n\n", payload)
 			fl.Flush()
 		case <-ticker.C:
