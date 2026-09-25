@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -43,6 +44,16 @@ func withIdleTimeout(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { idleTimeout = prev })
 }
 
+// withNoEventTimeout temporarily overrides the package-level noEventTimeout
+// for a test (SubscribeEvents's EVENT-level stall detector — the
+// live-but-content-free bound) and restores it on cleanup.
+func withNoEventTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := noEventTimeout
+	noEventTimeout = d
+	t.Cleanup(func() { noEventTimeout = prev })
+}
+
 // TestSubscribeEventsDeadButOpen is the regression test for the silent-freeze
 // bug: when OpenCode's SSE connection goes half-open (accepts the subscription
 // then sends nothing), SubscribeEvents must return within ~idleTimeout+slack
@@ -67,6 +78,150 @@ func TestSubscribeEventsDeadButOpen(t *testing.T) {
 	// And must not return faster than the idle timeout itself.
 	if elapsed < idleTimeout {
 		t.Fatalf("returned faster than idleTimeout: %v < %v", elapsed, idleTimeout)
+	}
+}
+
+// contentFreeEventServer accepts /event and then emits a continuous flow of
+// SSE frames that carry NO parseable event — the live-but-content-free
+// wedge. frameKind selects the poison: "empty-data" emits `data:` frames
+// with empty payloads (dispatch's data.Len()==0 early-out); "malformed"
+// emits data frames whose JSON does not unmarshal (dispatch's skip path).
+// Both are the 0e8ecdae incident shapes: bytes keep flowing, so the
+// byte-level idle timer keeps resetting, but the handler never sees an
+// event. Frames are flushed per tick so they actually hit the wire.
+func contentFreeEventServer(t *testing.T, frameKind string, interval time.Duration) *httptest.Server {
+	t.Helper()
+	frame := "data: {not json at all\n\n"
+	if frameKind == "empty-data" {
+		frame = "data:\n\n"
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/event", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		if fl != nil {
+			fl.Flush()
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				fmt.Fprint(w, frame)
+				if fl != nil {
+					fl.Flush()
+				}
+			}
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestSubscribeEventsLiveButContentFree is the client-side regression test
+// for the 0e8ecdae incident class at the PRODUCT client: a stream that keeps
+// delivering bytes (so the byte-level idle timer keeps resetting) but zero
+// parseable events must return a stall error within noEventTimeout instead
+// of wedging the store forever. The fixture side (a handler spinning on a
+// closed channel emitting empty data: frames) was fixed in 0e8ecdae; this
+// pins the same class at the client. Both incident shapes are covered:
+// empty-`data:` frames and malformed-JSON frames.
+func TestSubscribeEventsLiveButContentFree(t *testing.T) {
+	for _, kind := range []string{"empty-data", "malformed"} {
+		t.Run(kind, func(t *testing.T) {
+			// Event-level bound shrunk hard; byte-level idle timeout LONG so
+			// the ONLY detector that can fire is the event-level one — this
+			// proves liveness is no longer satisfied by bytes alone.
+			withIdleTimeout(t, 10*time.Second)
+			withNoEventTimeout(t, 150*time.Millisecond)
+			srv := contentFreeEventServer(t, kind, 20*time.Millisecond)
+			c := New(srv.URL)
+
+			// Guard deadline so a regression (re-)wedging the stream fails
+			// the test in seconds rather than hanging it forever; the
+			// wanted stall error must arrive well before it.
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			start := time.Now()
+			err := c.SubscribeEvents(ctx, func(Event) error { return nil })
+			elapsed := time.Since(start)
+
+			if err == nil {
+				t.Fatal("expected no-event stall error on live-but-content-free stream, got nil")
+			}
+			if !strings.Contains(err.Error(), "no parseable event") {
+				t.Fatalf("want the event-level stall error, got %v (guard ctx err: %v) after %v", err, ctx.Err(), elapsed)
+			}
+			if elapsed > 1*time.Second {
+				t.Fatalf("stall detection too slow: %v (want ~%v)", elapsed, noEventTimeout)
+			}
+			if elapsed < noEventTimeout {
+				t.Fatalf("returned before noEventTimeout: %v < %v", elapsed, noEventTimeout)
+			}
+		})
+	}
+}
+
+// TestSubscribeEventsHealthyStreamSurvivesEventBound is the false-positive
+// guard for the event-level bound: a stream that dispatches parseable events
+// regularly (the ~10s heartbeat cadence, scaled down to 40ms) must stay
+// connected well PAST noEventTimeout with no stall error, and bounded
+// malformed/empty frames interleaved between valid events must remain
+// tolerated (skip-and-continue) without ever tripping the detector.
+func TestSubscribeEventsHealthyStreamSurvivesEventBound(t *testing.T) {
+	withIdleTimeout(t, 10*time.Second)
+	withNoEventTimeout(t, 250*time.Millisecond)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/event", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		if fl != nil {
+			fl.Flush()
+		}
+		// One cycle every 40ms: a valid heartbeat-ish event, then a
+		// malformed-JSON frame, then an empty data frame — the bounded
+		// garbage the parser must keep tolerating around real events.
+		ticker := time.NewTicker(40 * time.Millisecond)
+		defer ticker.Stop()
+		for i := 0; ; i++ {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				fmt.Fprintf(w, "data: {\"type\":\"server.heartbeat\",\"properties\":{\"i\":%d}}\n\n", i)
+				fmt.Fprint(w, "data: {broken json\n\n")
+				fmt.Fprint(w, "data:\n\n")
+				if fl != nil {
+					fl.Flush()
+				}
+			}
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL)
+	var got atomic.Int64
+	// The run spans 600ms = 2.4x the 250ms event bound; the only acceptable
+	// end is the test's own deadline — NOT a stall error.
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	err := c.SubscribeEvents(ctx, func(ev Event) error {
+		got.Add(1)
+		return nil
+	})
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("healthy stream must outlive the event bound and end only at the test deadline; got %v", err)
+	}
+	if n := got.Load(); n < 5 {
+		t.Fatalf("expected a regular flow of dispatched events (≥5), got %d — malformed/empty frames must not suppress valid dispatches", n)
 	}
 }
 

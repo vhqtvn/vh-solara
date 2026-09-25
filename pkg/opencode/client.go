@@ -637,26 +637,51 @@ type Event struct {
 	IngestNano int64 `json:"-"`
 }
 
-// idleTimeout is how long SubscribeEvents tolerates receiving NO data before
-// declaring the OpenCode event stream dead-but-open (half-open TCP / stalled
-// peer). OpenCode emits a `server.heartbeat` SSE data frame roughly every
-// 10s (measured against a live `opencode serve`: server.connected followed
-// by server.heartbeat every ~10.0s), so 45s comfortably spans ~4 missed
-// heartbeats — long enough that a live-but-idle stream is never falsely
+// SubscribeEvents enforces a TWO-LEVEL liveness contract on the OpenCode
+// event stream:
+//
+//   - BYTE-level (idleTimeout): no bytes at all for idleTimeout → the stream
+//     is dead-but-open (half-open TCP / stalled peer). Any received line —
+//     heartbeat frames, `:` comments, even garbage — proves the connection
+//     itself is alive and resets this bound.
+//   - EVENT-level (noEventTimeout): bytes keep flowing but ZERO parseable
+//     events are dispatched for noEventTimeout → the stream is
+//     live-but-content-free. Every frame is empty `data:` or malformed JSON,
+//     so the byte-level bound never fires while the store still freezes —
+//     exactly the 0e8ecdae fixture incident (a handler spinning on a closed
+//     channel emitted empty data: frames that kept the idle timer fed
+//     forever). Only a dispatched event — one that survives json.Unmarshal —
+//     refreshes this bound.
+//
+// Both bounds return a stall error from SubscribeEvents, which routes into
+// the aggregator's reconnect+rehydrate loop (the client does not reconnect).
+// OpenCode emits a `server.heartbeat` SSE data frame roughly every 10s
+// (measured against a live `opencode serve`: server.connected followed by
+// server.heartbeat every ~10.0s), so 45s comfortably spans ~4 missed
+// heartbeats — long enough that a healthy-but-idle stream is never falsely
 // dropped, short enough that a wedged connection is returned to the
 // aggregator's reconnect loop in well under a minute.
 //
-// It is a package var purely so tests can shrink it for fast coverage; tests
-// in this package do not run in parallel. TCP keepalive is already active via
-// Go's default http transport (net.Dialer.KeepAlive 30s) as additional
-// defense-in-depth for true peer death.
+// Both are package vars purely so tests can shrink them for fast coverage;
+// tests in this package do not run in parallel. TCP keepalive is already
+// active via Go's default http transport (net.Dialer.KeepAlive 30s) as
+// additional defense-in-depth for true peer death.
 var idleTimeout = 45 * time.Second
+
+// noEventTimeout is the EVENT-level bound of the two-level liveness contract
+// above: how long SubscribeEvents tolerates a stream that keeps delivering
+// bytes but dispatches no parseable event. Same 45s rationale (~4 missed 10s
+// heartbeats); a sibling package var for the same test-shrink reason.
+var noEventTimeout = 45 * time.Second
 
 // SubscribeEvents opens GET /event and invokes handler for each event until
 // the context is cancelled, the stream ends, handler returns an error, or the
-// stream goes idle for longer than idleTimeout. It does not reconnect — the
-// caller (aggregator) owns the reconnect/re-hydrate loop, since OpenCode's
-// stream has no replay.
+// stream trips one of the two liveness bounds: no BYTES at all for
+// idleTimeout (dead-but-open TCP), or no DISPATCHED parseable event for
+// noEventTimeout (live-but-content-free — bytes flow but every frame is
+// empty or malformed, so the store still freezes without this second
+// bound). It does not reconnect — the caller (aggregator) owns the
+// reconnect/re-hydrate loop, since OpenCode's stream has no replay.
 //
 // The blocking bufio read is run in a per-line goroutine and the main loop
 // selects over {next line, ctx.Done, idle timer}. This makes a half-open
@@ -688,6 +713,14 @@ func (c *Client) SubscribeEvents(ctx context.Context, handler func(Event) error)
 	// Minimal SSE parse: accumulate `data:` lines until a blank line, then dispatch.
 	reader := bufio.NewReaderSize(resp.Body, 256*1024)
 	var data strings.Builder
+	// lastEventAt is the EVENT-level liveness clock: the moment the last
+	// parseable event was dispatched past this boundary. It is refreshed
+	// inside dispatch the instant a frame survives json.Unmarshal — empty
+	// `data:` frames and malformed JSON deliberately do NOT count (they are
+	// the live-but-content-free poison). time.Since on a time.Now pair uses
+	// Go's monotonic clock component, so wall-clock/NTP jumps cannot fake
+	// the age.
+	lastEventAt := time.Now()
 	dispatch := func() error {
 		if data.Len() == 0 {
 			return nil
@@ -698,6 +731,9 @@ func (c *Client) SubscribeEvents(ctx context.Context, handler func(Event) error)
 		if err := json.Unmarshal([]byte(raw), &ev); err != nil {
 			return nil // skip malformed frame, keep streaming
 		}
+		// A parseable event crossed the boundary: refresh event-level
+		// liveness (see lastEventAt above).
+		lastEventAt = time.Now()
 		// PROBE 1 (latency diagnostics): ingest boundary. Stamp a
 		// monotonic-derived ingest t0 the instant the envelope is decoded and
 		// BEFORE any handler/store processing begins. This is the first
@@ -745,11 +781,14 @@ func (c *Client) SubscribeEvents(ctx context.Context, handler func(Event) error)
 			readc <- readResult{line, err}
 		}()
 
-		// A fresh idle timer each iteration: it only fires if NO line
-		// arrives within idleTimeout. Any received byte/frame — including
-		// OpenCode's heartbeat data frames, or a `:` comment line — starts
-		// a new iteration and thus a fresh timer, so a live-but-idle stream
-		// is never falsely dropped.
+		// A fresh idle timer each iteration: the BYTE-level half of the
+		// two-level liveness contract. It only fires if NO line at all
+		// arrives within idleTimeout (dead-but-open TCP). Any received
+		// byte/frame — including OpenCode's heartbeat data frames, or a `:`
+		// comment line — starts a new iteration and thus a fresh timer, so
+		// a live-but-idle stream is never falsely dropped. Streams that
+		// keep sending bytes but no parseable events are the EVENT-level
+		// bound's job (the noEventTimeout check at the bottom of the loop).
 		idleTimer := time.NewTimer(idleTimeout)
 
 		var line string
@@ -791,6 +830,20 @@ func (c *Client) SubscribeEvents(ctx context.Context, handler func(Event) error)
 				return io.EOF
 			}
 			return readErr
+		}
+
+		// EVENT-level liveness (only reached while the stream is still
+		// open — read errors above have already returned): bytes are
+		// flowing, so the idle timer keeps resetting, but if NO parseable
+		// event has been dispatched for noEventTimeout the stream is
+		// live-but-content-free and the store is frozen behind it. Close
+		// the body (unblocking the reader goroutine) and surface a stall
+		// error in the same shape as the idle-timeout one, so the
+		// aggregator's reconnect+rehydrate loop fires instead of the
+		// subscription wedging forever.
+		if time.Since(lastEventAt) > noEventTimeout {
+			_ = resp.Body.Close()
+			return fmt.Errorf("subscribe /event: no parseable event for %v (live-but-content-free stream)", noEventTimeout)
 		}
 	}
 }
