@@ -40,12 +40,20 @@ func (coordinationFeature) Name() string { return "coordination" }
 
 func (coordinationFeature) Routes(svc Services) map[string]http.HandlerFunc {
 	h := coordHandlers{svc}
+	// The create-certainty protocol (Slice 1) rides the same feature: routes
+	// + contract live in session_create.go; registered here so server.go's
+	// route assembly stays untouched.
+	h2 := sessionCreateHandlers{svc}
 	return map[string]http.HandlerFunc{
 		"/vh/send":             h.send,
 		"/vh/spawn":            h.spawn,
 		"/vh/abort":            h.abort,
 		"/vh/answer-question":  h.answerQuestion,
 		"/vh/reply-permission": h.replyPermission,
+
+		"/vh/session/create":              h2.create,
+		"/vh/session/create/capabilities": h2.capabilities,
+		"/vh/session/create/receipt":      h2.receipt,
 	}
 }
 

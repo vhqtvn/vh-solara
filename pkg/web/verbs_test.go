@@ -119,6 +119,24 @@ type fakeOC struct {
 	// immediate-200 behavior.
 	abortHold    chan struct{}
 	abortReached chan struct{}
+
+	// createHold / createEntered (create-certainty Slice 1 test seam): when
+	// createHold is non-nil, the NEXT POST /session signals createEntered
+	// (non-blocking) and then blocks on <-createHold BEFORE responding — a
+	// one-shot seam (consumed by that create) so a DIFFERENT key's create
+	// proceeds normally while the first is held, letting the route tests
+	// observe 409 in_flight for the held key and concurrent progress for
+	// another. The test closes the channel to release. nil (default) = no
+	// hold, existing immediate behavior. Blocks OUTSIDE f.mu (abortHold
+	// discipline). createEntered is nil-safe: the signal is best-effort.
+	createHold    chan struct{}
+	createEntered chan struct{}
+
+	// uniqueCreateIDs: when true, POST /session returns DISTINCT ids
+	// ("new_sess<N>" by arrival order) so create-route tests can assert
+	// key/dir namespacing via distinct responses. Default false keeps the
+	// historical fixed "new_sess" for incumbent tests.
+	uniqueCreateIDs bool
 }
 
 func (f *fakeOC) handler() http.Handler {
@@ -128,12 +146,32 @@ func (f *fakeOC) handler() http.Handler {
 			f.mu.Lock()
 			f.creates++
 			cs := f.createStatus
+			id := "new_sess"
+			if f.uniqueCreateIDs {
+				id = "new_sess" + strconv.Itoa(f.creates)
+			}
+			var hold <-chan struct{}
+			var entered chan<- struct{}
+			if f.createHold != nil {
+				hold = f.createHold
+				f.createHold = nil // one-shot: only the next create holds
+				entered = f.createEntered
+			}
 			f.mu.Unlock()
 			if cs != 0 {
 				w.WriteHeader(cs)
 				return
 			}
-			w.Write([]byte(`{"id":"new_sess","title":"t"}`))
+			if entered != nil {
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+			}
+			if hold != nil {
+				<-hold
+			}
+			w.Write([]byte(`{"id":"` + id + `","title":"t"}`))
 			return
 		}
 		// GET /session (ListSessions) and GET /session?archived=true

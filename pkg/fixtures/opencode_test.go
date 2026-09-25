@@ -1051,3 +1051,307 @@ func TestHoldLatchesEscapeOnRequestContextDone(t *testing.T) {
 		})
 	}
 }
+
+// --- create-hold controls (create-certainty Slice 1) ---
+//
+// The create rider models TWO loss boundaries the recovery contract must keep
+// distinct (see CreateMode): delayed-response recovery (hold: committed +
+// withheld, deliverable on release — retry/recovery CAN resolve) versus
+// permanently-lost upstream id (drop: committed but never deliverable —
+// recovery must NOT fabricate). These tests pin the fixture mechanics: commit
+// ordering, one-shot consumption, reset/generation hygiene, and HTTP controls.
+
+// createResult carries a raw POST /session outcome. The package's postJSON
+// helper maps transport errors to a synthetic 502, which would erase the
+// hold/drop distinction — so the create tests surface the raw error instead.
+type createResult struct {
+	st   int
+	body []byte
+	err  error
+}
+
+// postSessionAsync issues POST /session on the test server client and returns
+// a channel carrying the raw outcome.
+func postSessionAsync(srv *httptest.Server) <-chan createResult {
+	ch := make(chan createResult, 1)
+	go func() {
+		resp, err := srv.Client().Post(srv.URL+"/session", "application/json", strings.NewReader("{}"))
+		if err != nil {
+			ch <- createResult{err: err}
+			return
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		ch <- createResult{st: resp.StatusCode, body: b}
+	}()
+	return ch
+}
+
+// sessionIDs fetches the current /session list ids (the committed set).
+func sessionIDs(t *testing.T, srv *httptest.Server) map[string]bool {
+	t.Helper()
+	resp, err := srv.Client().Get(srv.URL + "/session")
+	if err != nil {
+		t.Fatalf("GET /session: %v", err)
+	}
+	defer resp.Body.Close()
+	var rows []struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		t.Fatalf("decode /session: %v", err)
+	}
+	out := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		out[r.ID] = true
+	}
+	return out
+}
+
+// awaitCreateArrivals polls the race-free arrival counter until want creates
+// have arrived (or the deadline expires).
+func awaitCreateArrivals(f *FakeOpenCode, want int) bool {
+	deadline := time.Now().Add(2 * time.Second)
+	for f.CreateArrivals() < want && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	return f.CreateArrivals() >= want
+}
+
+// TestCreateModeDefaultIsFaithful pins the default: no mode armed, POST
+// /session responds immediately with the session JSON, arrivals are counted,
+// and nothing is held.
+func TestCreateModeDefaultIsFaithful(t *testing.T) {
+	f := New()
+	srv := startFixtureHTTP(t, f)
+	if f.CreateModeNow() != CreateNormal {
+		t.Fatalf("default mode want CreateNormal, got %v", f.CreateModeNow())
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-postSessionAsync(srv):
+			if r.err != nil || r.st != 200 {
+				t.Fatalf("faithful create %d: st=%d err=%v", i, r.st, r.err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("faithful create %d did not answer (something held it)", i)
+		}
+	}
+	if got := f.CreateArrivals(); got != 2 {
+		t.Fatalf("CreateArrivals want 2, got %d", got)
+	}
+}
+
+// TestCreateHoldCommitsThenDeliversOnRelease pins the DELAYED-RESPONSE
+// boundary: the session is committed (row + list visibility) while the
+// response is withheld; release delivers the exact id; the mode is one-shot.
+func TestCreateHoldCommitsThenDeliversOnRelease(t *testing.T) {
+	f := New()
+	f.SetCreateMode(CreateCommitThenHoldResponse)
+	srv := startFixtureHTTP(t, f)
+
+	res := postSessionAsync(srv)
+	if !awaitCreateArrivals(f, 1) {
+		t.Fatal("held create never arrived")
+	}
+	// Committed-but-withheld: the row is visible in /session BEFORE the
+	// response exists.
+	ids := sessionIDs(t, srv)
+	var heldID string
+	for id := range ids {
+		if strings.HasPrefix(id, "ses_new") {
+			heldID = id
+		}
+	}
+	if heldID == "" {
+		t.Fatal("held create did not commit a session row")
+	}
+	// The response is still withheld.
+	select {
+	case r := <-res:
+		t.Fatalf("hold released itself early: st=%d err=%v body=%s", r.st, r.err, r.body)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	f.ReleaseCreateHold()
+	select {
+	case r := <-res:
+		if r.err != nil || r.st != 200 {
+			t.Fatalf("released create: st=%d err=%v", r.st, r.err)
+		}
+		var s struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(r.body, &s); err != nil || s.ID != heldID {
+			t.Fatalf("released create must deliver the committed id %q, got %q (err=%v)", heldID, s.ID, err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("release did not deliver the withheld response")
+	}
+
+	// One-shot: the mode is consumed; the next create is faithful.
+	if f.CreateModeNow() != CreateNormal {
+		t.Fatalf("mode must be consumed one-shot, got %v", f.CreateModeNow())
+	}
+	select {
+	case r := <-postSessionAsync(srv):
+		if r.err != nil || r.st != 200 {
+			t.Fatalf("post-one-shot create: st=%d err=%v", r.st, r.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-one-shot create held — the mode leaked")
+	}
+}
+
+// TestCreateDropCommitsButNeverDeliversId pins the PERMANENTLY-LOST-id
+// boundary: the session commits (upstream side) but the caller NEVER receives
+// the id — the drop is a transport error, not a status.
+func TestCreateDropCommitsButNeverDeliversId(t *testing.T) {
+	f := New()
+	f.SetCreateMode(CreateCommitThenDropResponse)
+	srv := startFixtureHTTP(t, f)
+
+	select {
+	case r := <-postSessionAsync(srv):
+		if r.err == nil {
+			t.Fatalf("drop mode must produce a transport error, got st=%d body=%s", r.st, r.body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("drop-mode create never returned")
+	}
+	if got := f.CreateArrivals(); got != 1 {
+		t.Fatalf("CreateArrivals want 1, got %d", got)
+	}
+	// Upstream committed anyway — the row exists (this asymmetry is the whole
+	// point: commit-without-delivery).
+	ids := sessionIDs(t, srv)
+	found := false
+	for id := range ids {
+		if strings.HasPrefix(id, "ses_new") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("drop-mode create did not commit the session row")
+	}
+	if f.CreateModeNow() != CreateNormal {
+		t.Fatalf("drop mode must be one-shot, got %v", f.CreateModeNow())
+	}
+}
+
+// TestCreateHoldResetWhileHeldInvalidatesAndCleans is the serial-suite
+// hygiene crux: reset while a create is held must (a) unblock it with an
+// INVALIDATED (502) response — never the late id, (b) delete the hold-minted
+// session so the next test starts clean, and (c) leave faithful mode armed.
+func TestCreateHoldResetWhileHeldInvalidatesAndCleans(t *testing.T) {
+	f := New()
+	f.SetCreateMode(CreateCommitThenHoldResponse)
+	srv := startFixtureHTTP(t, f)
+
+	res := postSessionAsync(srv)
+	if !awaitCreateArrivals(f, 1) {
+		t.Fatal("held create never arrived")
+	}
+
+	f.ResetCreateHold()
+	select {
+	case r := <-res:
+		// Invalidated: an explicit 502, never a delivered id.
+		if r.err != nil || r.st != http.StatusBadGateway {
+			t.Fatalf("reset-invalidated hold: want 502, got st=%d err=%v body=%s", r.st, r.err, r.body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reset did not unblock the held create")
+	}
+
+	// The hold-minted session is gone (fixture side)…
+	ids := sessionIDs(t, srv)
+	for id := range ids {
+		if strings.HasPrefix(id, "ses_new") {
+			t.Fatalf("reset left a hold-minted session %q in the list", id)
+		}
+	}
+	// …mode is faithful, and the next serial create behaves normally.
+	if f.CreateModeNow() != CreateNormal {
+		t.Fatalf("reset must restore CreateNormal, got %v", f.CreateModeNow())
+	}
+	select {
+	case r := <-postSessionAsync(srv):
+		if r.err != nil || r.st != 200 {
+			t.Fatalf("post-reset create: st=%d err=%v", r.st, r.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-reset create did not answer")
+	}
+}
+
+// TestCreateHoldControlsViaHTTP pins the HTTP control surface Slice 2's
+// browser specs will drive: arm(?mode=drop) → dropped create; reset restores.
+func TestCreateHoldControlsViaHTTP(t *testing.T) {
+	f := New()
+	srv := startFixtureHTTP(t, f)
+
+	resp, err := srv.Client().Post(srv.URL+"/fixture/create-hold/arm?mode=drop", "", nil)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("arm via HTTP: resp=%v err=%v", resp, err)
+	}
+	resp.Body.Close()
+	if f.CreateModeNow() != CreateCommitThenDropResponse {
+		t.Fatalf("arm via HTTP: mode want drop, got %v", f.CreateModeNow())
+	}
+
+	select {
+	case r := <-postSessionAsync(srv):
+		if r.err == nil {
+			t.Fatalf("armed drop must lose the response, got st=%d", r.st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("armed create never returned")
+	}
+
+	resp, err = srv.Client().Post(srv.URL+"/fixture/create-hold/reset", "", nil)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("reset via HTTP: resp=%v err=%v", resp, err)
+	}
+	resp.Body.Close()
+	if f.CreateModeNow() != CreateNormal {
+		t.Fatalf("reset via HTTP: mode want CreateNormal, got %v", f.CreateModeNow())
+	}
+	// Release endpoint is safe to call unarmed (idempotent no-op).
+	resp, err = srv.Client().Post(srv.URL+"/fixture/create-hold/release", "", nil)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("release via HTTP (unarmed): resp=%v err=%v", resp, err)
+	}
+	resp.Body.Close()
+}
+
+// TestCreateHoldEscapesOnRequestContextDone pins the crash-safety escape: a
+// held create whose REQUEST dies (browser gone) returns from the handler via
+// ctx.Done — no goroutine strands on the latch (same contract as the
+// agent-hold/new-hold latches).
+func TestCreateHoldEscapesOnRequestContextDone(t *testing.T) {
+	f := New()
+	f.SetCreateMode(CreateCommitThenHoldResponse)
+	handler := f.Handler()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/session", strings.NewReader("{}")).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	served := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(rec, req)
+		close(served)
+	}()
+	if !awaitCreateArrivals(f, 1) {
+		t.Fatal("held create never arrived")
+	}
+	cancel()
+	select {
+	case <-served:
+		// Escaped the park on request death — the crash-safety contract.
+	case <-time.After(2 * time.Second):
+		t.Fatal("parked create did not return after request context cancel — goroutine stranded on the latch")
+	}
+	// Teardown hygiene still applies.
+	f.ResetCreateHold()
+}

@@ -77,6 +77,7 @@ type FakeOpenCode struct {
 	// event feed" rationale, on the busy/idle axis instead of the message axis.
 	resetGen        map[string]uint64 // sessionID -> generation, bumped on /fixture/reset
 	promptAsyncMode PromptAsyncMode   // test-only; default PromptAsyncNormal (see PromptAsyncMode doc)
+	createMode      CreateMode        // test-only; default CreateNormal (see CreateMode doc)
 
 	// --- test-only exact-GET seam for the reconcile in-flight-guard e2e test ---
 	//
@@ -149,6 +150,49 @@ type FakeOpenCode struct {
 	newHoldMu    sync.Mutex
 	newHoldBlock chan struct{}
 
+	// --- test-only create-hold controls (create-certainty Slice 1) ---
+	//
+	// While armed (SetCreateMode / POST /fixture/create-hold/arm), the NEXT
+	// POST /session commits the session normally (row + session.created emit —
+	// exactly the faithful path) and then, instead of responding faithfully:
+	//
+	//   - CreateCommitThenHoldResponse withholds the response until
+	//     ReleaseCreateHold (/fixture/create-hold/release). This is the
+	//     DELAYED-RESPONSE loss boundary: upstream COMMITTED and the id can
+	//     still reach the worker when released, so worker-side receipt
+	//     recovery CAN resolve it (the positive crux).
+	//   - CreateCommitThenDropResponse hijacks+closes the connection
+	//     (dropResponse). This is the PERMANENTLY-LOST-id boundary: upstream
+	//     committed but the worker can NEVER learn the id — recovery must NOT
+	//     fabricate one (the negative crux).
+	//
+	// The mode is ONE-SHOT: the next create consumes it and the mode returns
+	// to CreateNormal, so a leaked arm cannot hold a later serial test's
+	// second create. The hold blocks OUTSIDE f.mu (newHoldBlock discipline) so
+	// a held create never stalls the /session list, the SSE emit fan-out, or
+	// sibling requests; parked holds also escape on request-context
+	// cancellation.
+	//
+	// createGen (under f.mu) is the create-operation generation — the sibling
+	// of resetGen for the PRE-session window (a create has no session id yet,
+	// so the per-session resetGen cannot fence it). A held create captures the
+	// generation at commit time; ResetCreateHold bumps it, so a hold released
+	// by reset (teardown) delivers a 502 "invalidated" instead of a late id
+	// for a session the reset just deleted — "invalidate late responses".
+	//
+	// createArrivals (under f.mu) counts POST /session arrivals — race-free
+	// observability for "exactly one upstream create" / "lookup caused zero
+	// creates" assertions. createHeldIDs (under f.mu) records ids minted under
+	// a hold/drop mode since arm so ResetCreateHold can delete them and emit
+	// session.deleted (aggregator-store-clear discipline, same as the
+	// agent-hold reset).
+	createHoldMu    sync.Mutex
+	createHoldBlock chan struct{}
+	// f.mu-guarded:
+	createGen      uint64
+	createArrivals int
+	createHeldIDs  []string
+
 	// --- Phase A2 sustained multi-project workload controls (mpworkload.go) ---
 	// emitDroppedTotal counts fixture-subscriber overflows (emit's close-on-full
 	// fanout default branch) across the fixture's lifetime — the SEPARATE
@@ -202,6 +246,34 @@ const (
 	// message — the clean-rejection path (OpenCode never received the prompt).
 	// Defined for completeness/future tests; not exercised by the recovery slice.
 	PromptAsyncRejectBeforeCommit
+)
+
+// CreateMode selects how the fake's POST /session (create) handler responds
+// (create-certainty Slice 1). It models the TWO create loss boundaries the
+// recovery contract must keep distinct:
+//
+//   - delayed-response recovery: upstream committed, response withheld then
+//     delivered — retry/recovery CAN resolve the id (hold mode);
+//   - permanently-lost upstream id: upstream committed, response dropped —
+//     recovery must NEVER fabricate a successful receipt (drop mode).
+//
+// TEST-ONLY: production never switches mode (CreateNormal is the faithful
+// path). Mirrors PromptAsyncMode (sticky setter + one-shot consumption: the
+// next create consumes the mode).
+type CreateMode int
+
+const (
+	// CreateNormal is the faithful path: mint the session, emit
+	// session.created, return the session JSON immediately.
+	CreateNormal CreateMode = iota
+	// CreateCommitThenHoldResponse mints + emits the session, then WITHHOLDS
+	// the HTTP response until ReleaseCreateHold / /fixture/create-hold/release
+	// (or reset invalidates it). Models the delayed-response boundary.
+	CreateCommitThenHoldResponse
+	// CreateCommitThenDropResponse mints + emits the session, then DROPS the
+	// response (hijack+close). Models the permanently-lost-id boundary: the
+	// caller can never observe the id even though upstream committed.
+	CreateCommitThenDropResponse
 )
 
 // New returns a FakeOpenCode seeded with a small, deterministic dataset: two
@@ -836,6 +908,108 @@ func (f *FakeOpenCode) PromptAsyncModeNow() PromptAsyncMode {
 	return f.promptAsyncMode
 }
 
+// SetCreateMode arms the create-hold mode consumed by the NEXT POST /session
+// (one-shot; see CreateMode). TEST-ONLY: the default CreateNormal is the
+// faithful path and no shipped code calls this. Arming the hold mode installs
+// a fresh release latch (stale-latch hygiene mirrors handleFixtureNewHoldArm);
+// arming drop or normal releases any stale latch.
+func (f *FakeOpenCode) SetCreateMode(mode CreateMode) {
+	f.releaseCreateHoldLatch()
+	if mode == CreateCommitThenHoldResponse {
+		f.createHoldMu.Lock()
+		f.createHoldBlock = make(chan struct{})
+		f.createHoldMu.Unlock()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createMode = mode
+}
+
+// CreateModeNow returns the currently armed create mode (post-one-shot
+// consumption it is back to CreateNormal).
+func (f *FakeOpenCode) CreateModeNow() CreateMode {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.createMode
+}
+
+// CreateArrivals returns the total POST /session arrival count — the
+// race-free observable for "exactly one upstream create" and "the recovery
+// lookup caused ZERO creates" assertions. TEST-ONLY.
+func (f *FakeOpenCode) CreateArrivals() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.createArrivals
+}
+
+// releaseCreateHoldLatch closes any installed create-hold latch and disarms
+// it. Idempotent. Closing wakes every held create at once.
+func (f *FakeOpenCode) releaseCreateHoldLatch() {
+	f.createHoldMu.Lock()
+	ch := f.createHoldBlock
+	f.createHoldBlock = nil
+	f.createHoldMu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+// ReleaseCreateHold releases the create hold: held creates re-check the
+// create-generation and (absent a reset) deliver their withheld session JSON,
+// so the id finally reaches the caller — the delayed-response recovery
+// boundary. Idempotent (no-op when not held). TEST-ONLY.
+func (f *FakeOpenCode) ReleaseCreateHold() {
+	f.releaseCreateHoldLatch()
+}
+
+// ResetCreateHold is the serial-suite hygiene teardown for the create-hold
+// controls. Ordering matters: the create-generation is bumped and the held
+// sessions deleted UNDER f.mu BEFORE the latch closes, so a woken hold always
+// observes the new generation and answers 502 "invalidated" instead of
+// delivering a late id for a session this reset just removed. It also:
+//   - returns the mode to CreateNormal (disarms a pending one-shot arm);
+//   - unblocks every held create (latch close);
+//   - deletes the sessions minted under hold/drop since arm (rows, messages,
+//     busy, archived, resetGen) and emits session.deleted for each so the
+//     AGGREGATOR store forgets them too (same info-envelope shape as the
+//     agent-hold reset);
+//
+// TEST-ONLY. After this, sibling specs observe a clean fixture (no held
+// requests, no stray sessions, faithful mode).
+func (f *FakeOpenCode) ResetCreateHold() {
+	f.mu.Lock()
+	f.createMode = CreateNormal
+	f.createGen++
+	held := append([]string(nil), f.createHeldIDs...)
+	f.createHeldIDs = nil
+	del := make(map[string]bool, len(held))
+	for _, id := range held {
+		del[id] = true
+	}
+	filtered := f.sessions[:0]
+	for _, s := range f.sessions {
+		if id, _ := s["id"].(string); !del[id] {
+			filtered = append(filtered, s)
+		}
+	}
+	f.sessions = filtered
+	for _, id := range held {
+		delete(f.messages, id)
+		delete(f.busy, id)
+		delete(f.archived, id)
+		delete(f.resetGen, id)
+	}
+	f.mu.Unlock()
+	// Bump-before-close: every woken hold now reads the NEW generation and
+	// invalidates its late response.
+	f.releaseCreateHoldLatch()
+	for _, id := range held {
+		// Same info-envelope shape as the agent-hold reset (TranslatorV1's
+		// session.deleted arm parses {"info":{"id":...}}).
+		f.emit("session.deleted", map[string]any{"info": map[string]any{"id": id}})
+	}
+}
+
 // ArmReconcileGetBlock arms the test-only exact-GET blocker: while armed, every
 // GET /session/:sid/message/:mid blocks until ReleaseReconcileGetBlock is called.
 // TEST-ONLY and OFF BY DEFAULT — existing fixtures/tests never arm it, so their
@@ -1190,6 +1364,9 @@ func (f *FakeOpenCode) Handler() http.Handler {
 	mux.HandleFunc("/fixture/agent-hold/reset", f.handleFixtureAgentHoldReset)
 	mux.HandleFunc("/fixture/new-session-hold/arm", f.handleFixtureNewHoldArm)
 	mux.HandleFunc("/fixture/new-session-hold/release", f.handleFixtureNewHoldRelease)
+	mux.HandleFunc("/fixture/create-hold/arm", f.handleFixtureCreateHoldArm)
+	mux.HandleFunc("/fixture/create-hold/release", f.handleFixtureCreateHoldRelease)
+	mux.HandleFunc("/fixture/create-hold/reset", f.handleFixtureCreateHoldReset)
 	mux.HandleFunc("/fixture/mp-seed", f.handleMPSeed)
 	mux.HandleFunc("/fixture/mp-workload/start", f.handleMPWorkloadStart)
 	mux.HandleFunc("/fixture/mp-workload/release", f.handleMPWorkloadRelease)
@@ -1276,17 +1453,70 @@ func (f *FakeOpenCode) handleQuestion(w http.ResponseWriter, r *http.Request) {
 
 func (f *FakeOpenCode) handleSessionRoot(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
-		// Create a new session (powers the sidebar "New session" button).
+		// Create a new session (powers the sidebar "New session" button AND
+		// the create-certainty /vh/session/create route).
 		f.mu.Lock()
 		f.counter++
+		f.createArrivals++ // test-only observability (see createArrivals doc)
 		now := float64(time.Now().UnixMilli())
 		s := map[string]any{
 			"id": fmt.Sprintf("ses_new%d", f.counter), "projectID": "proj", "title": "New session",
 			"directory": demoDir, "time": map[string]any{"created": now, "updated": now},
 		}
 		f.sessions = append(f.sessions, s)
+		// Create-hold mode (create-certainty Slice 1): commit FIRST (row +
+		// emit below — the faithful path), then shape the RESPONSE per the
+		// armed mode. ONE-SHOT: this create consumes the mode, so a leaked arm
+		// cannot hold a later create. The generation fences reset-during-hold
+		// (see createGen doc).
+		mode := CreateNormal
+		gen := uint64(0)
+		if f.createMode != CreateNormal {
+			mode = f.createMode
+			f.createMode = CreateNormal // one-shot consumption
+			gen = f.createGen
+			f.createHeldIDs = append(f.createHeldIDs, s["id"].(string))
+		}
 		f.mu.Unlock()
 		f.emit("session.created", map[string]any{"info": s})
+		switch mode {
+		case CreateCommitThenDropResponse:
+			// Permanently-lost-id boundary: upstream committed (row + emit
+			// above) but the caller NEVER receives the id.
+			f.dropResponse(w)
+			return
+		case CreateCommitThenHoldResponse:
+			// Delayed-response boundary: upstream committed; withhold the
+			// response until released (or invalidated by reset / caller gone).
+			// Blocks OUTSIDE f.mu (newHoldBlock discipline).
+			f.createHoldMu.Lock()
+			block := f.createHoldBlock
+			f.createHoldMu.Unlock()
+			if block != nil {
+				select {
+				case <-block:
+				case <-r.Context().Done():
+					return // caller went away mid-hold; nothing to deliver
+				}
+			}
+			// block == nil here means release/reset already ran BEFORE this
+			// handler parked — fall through to the SAME generation check: a
+			// plain release (gen unchanged) still delivers; a reset (gen
+			// bumped, session deleted) invalidates.
+			f.mu.Lock()
+			invalidated := f.createGen != gen
+			f.mu.Unlock()
+			if invalidated {
+				// A reset bumped the generation (and deleted this session):
+				// the late id must NOT be delivered. An explicit error (not a
+				// silent drop) keeps the worker's unknown classification
+				// debuggable.
+				http.Error(w, "fixture: create hold invalidated by reset", http.StatusBadGateway)
+				return
+			}
+			writeJSON(w, s)
+			return
+		}
 		writeJSON(w, s)
 		return
 	}
@@ -2872,6 +3102,41 @@ func (f *FakeOpenCode) handleFixtureNewHoldArm(w http.ResponseWriter, r *http.Re
 func (f *FakeOpenCode) handleFixtureNewHoldRelease(w http.ResponseWriter, r *http.Request) {
 	f.releaseNewHoldLatch()
 	writeJSON(w, map[string]any{"released": "ses_new*"})
+}
+
+// handleFixtureCreateHoldArm arms the create-hold mode for the NEXT
+// POST /session (one-shot; see CreateMode). ?mode=hold (default) arms the
+// delayed-response boundary; ?mode=drop arms the permanently-lost-id
+// boundary. Idempotent: a stale latch from a crashed spec is released first
+// (newHoldArm discipline). TEST-ONLY — consumed by the Slice-2 browser crux;
+// the Slice-1 Go e2e uses SetCreateMode directly.
+func (f *FakeOpenCode) handleFixtureCreateHoldArm(w http.ResponseWriter, r *http.Request) {
+	mode := CreateCommitThenHoldResponse
+	if r.URL.Query().Get("mode") == "drop" {
+		mode = CreateCommitThenDropResponse
+	}
+	f.SetCreateMode(mode)
+	armed := "hold"
+	if mode == CreateCommitThenDropResponse {
+		armed = "drop"
+	}
+	writeJSON(w, map[string]any{"armed": armed})
+}
+
+// handleFixtureCreateHoldRelease releases the create hold: held creates
+// deliver their withheld session JSON (delayed-response recovery). Idempotent.
+// TEST-ONLY.
+func (f *FakeOpenCode) handleFixtureCreateHoldRelease(w http.ResponseWriter, r *http.Request) {
+	f.ReleaseCreateHold()
+	writeJSON(w, map[string]any{"released": "create"})
+}
+
+// handleFixtureCreateHoldReset is the afterEach hygiene teardown: unblock +
+// invalidate every held create, disarm the mode, delete hold-minted sessions,
+// and clear them from the aggregator store. TEST-ONLY.
+func (f *FakeOpenCode) handleFixtureCreateHoldReset(w http.ResponseWriter, r *http.Request) {
+	f.ResetCreateHold()
+	writeJSON(w, map[string]any{"reset": "create"})
 }
 
 func (f *FakeOpenCode) appendMessage(sessionID string, m messageWithParts) {

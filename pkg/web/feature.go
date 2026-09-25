@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"sync"
@@ -34,6 +35,12 @@ type Services struct {
 	// (unattended/automated spawning). Called only on the fresh-execution path of
 	// a fail_fast spawn's idempotent handler (so a replay never double-registers).
 	RegisterFailFast func(sessionID string)
+	// ShutdownCtx is the server's background-lifetime context (cancelled by
+	// Server.Shutdown). A feature that runs admitted work detached from the
+	// request context (browser-disconnect independence) binds that work here so
+	// shutdown still bounds it. nil-safe: features MUST tolerate nil (tests and
+	// bare constructions) by falling back to context.Background().
+	ShutdownCtx context.Context
 }
 
 // WithIdempotency runs fn unless the idempotency key replays a prior response (or
@@ -110,7 +117,7 @@ func defaultFeatures() []Feature {
 
 // services builds the Services value passed to features.
 func (s *Server) services() Services {
-	return Services{Agg: s.aggFor, ReqDir: reqDir, idem: s.idem, RegisterFailFast: s.registerFailFast}
+	return Services{Agg: s.aggFor, ReqDir: reqDir, idem: s.idem, RegisterFailFast: s.registerFailFast, ShutdownCtx: s.bgCtx}
 }
 
 // mountFeatures registers every feature's routes on the mux.
@@ -140,6 +147,12 @@ type idemEntry struct {
 	body    []byte
 	outcome string
 	at      time.Time
+	// payload is the caller-bound normalized request payload (create-certainty
+	// Slice 1). "" means UNBOUND: the entry replays for any payload (the
+	// incumbent spawn/send entries, and create-protocol rejection receipts, are
+	// unbound). A non-empty payload that no longer matches the caller's
+	// normalized payload is an identity conflict, not a replay.
+	payload string
 }
 
 func newIdemCache(ttl time.Duration) *idemCache {
@@ -159,11 +172,59 @@ func (c *idemCache) begin(key string) (entry idemEntry, replay bool, inflight bo
 	return idemEntry{}, false, false
 }
 
+// beginBound is begin plus payload identity binding (create-certainty Slice 1):
+// a completed unexpired entry replays only when its payload matches (or the
+// entry is unbound, payload ""); a mismatch is reported as a conflict for the
+// caller to reject WITHOUT execution. In-flight reporting is unchanged (the
+// in-flight request's payload is not recorded, so an honest in_flight beats a
+// speculative conflict). On neither replay/conflict/inflight the key is claimed
+// exactly as begin does — the caller MUST finish it.
+func (c *idemCache) beginBound(key, payload string) (entry idemEntry, replay, conflict, inflight bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.done[key]; ok && time.Since(e.at) < c.ttl {
+		if e.payload == "" || e.payload == payload {
+			return e, true, false, false
+		}
+		return e, false, true, false
+	}
+	if c.inflight[key] {
+		return idemEntry{}, false, false, true
+	}
+	c.inflight[key] = true
+	return idemEntry{}, false, false, false
+}
+
+// lookup is the RECOVERY-ONLY lookup primitive (create-certainty Slice 1): it
+// reports the completed unexpired entry for key and/or whether the key is
+// currently claimed in-flight. It never claims, never mutates, and — unlike
+// begin — carries NO execute-on-miss semantics: a miss is an honest miss. A
+// caller that turns a lookup miss into a side effect is violating the recovery
+// contract this primitive exists to enforce.
+func (c *idemCache) lookup(key string) (entry idemEntry, found bool, inflight bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.done[key]; ok && time.Since(e.at) < c.ttl {
+		return e, true, false
+	}
+	if c.inflight[key] {
+		return idemEntry{}, false, true
+	}
+	return idemEntry{}, false, false
+}
+
 func (c *idemCache) finish(key string, status int, body []byte, outcome string) {
+	c.finishPayload(key, "", status, body, outcome)
+}
+
+// finishPayload is finish plus the payload binding stored on the entry (see
+// idemEntry.payload). finish delegates here with the unbound "" payload so
+// incumbent spawn/send behavior is unchanged.
+func (c *idemCache) finishPayload(key, payload string, status int, body []byte, outcome string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.inflight, key)
-	c.done[key] = idemEntry{status: status, body: body, outcome: outcome, at: time.Now()}
+	c.done[key] = idemEntry{status: status, body: body, outcome: outcome, at: time.Now(), payload: payload}
 	for k, e := range c.done {
 		if time.Since(e.at) >= c.ttl {
 			delete(c.done, k)
