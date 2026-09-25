@@ -27,7 +27,8 @@
 //   3. Bounded receipt recovery: after an unknown/in-flight outcome, at most
 //      THREE non-overlapping receipt GETs with 3s individual bounds inside a
 //      12s overall window (schedule pinned: attempt 1 immediately, then 4s
-//      backoff — last attempt ends ≤11s). Exhaustion releases the UI guard
+//      backoffs ANCHORED TO THE BUDGET START — last attempt ends ≤11s even
+//      when every lookup runs its full 3s bound). Exhaustion releases the UI guard
 //      and retains the recoverable state; an explicit "Check again" gets a
 //      FRESH bounded budget, never a fresh execute. An operator re-tap
 //      COALESCES with the active budget — it piggybacks on the in-flight
@@ -265,8 +266,9 @@ export const CREATE_EXECUTE_BOUND_MS = 12_000;
 export const RECOVERY_LOOKUP_BOUND_MS = 3_000;
 export const RECOVERY_MAX_LOOKUPS = 3;
 export const RECOVERY_BACKOFF_MS = 4_000;
-/** The overall recovery window: with the pinned 0/4/8s schedule and 3s
- *  individual bounds the last lookup ends ≤11s — inside the 12s budget. */
+/** The overall recovery window: with the pinned 0/4/8s START-ANCHORED
+ *  schedule and 3s individual bounds the last lookup ends ≤11s — inside the
+ *  12s budget even in the every-lookup-aborts-at-its-bound worst case. */
 export const RECOVERY_WINDOW_MS = 12_000;
 
 type ReceiptOutcome =
@@ -366,23 +368,34 @@ function rejectCreateOp(opId: string, detail: string): void {
 }
 
 /** The bounded recovery runner: ≤ RECOVERY_MAX_LOOKUPS non-overlapping
- *  lookups (0/4/8s schedule, 3s bounds — all inside the 12s window). Stops
- *  early the moment the operation resolves/rejects/abandons elsewhere. Safe
- *  to fire-and-forget; never sends anything. Its lookups go through the
- *  shared in-flight registry so a concurrent re-tap piggybacks instead of
- *  issuing a parallel GET (review T1B-F1). */
+ *  lookups on the 0/4/8s schedule ANCHORED TO THE BUDGET START (B-F1: the
+ *  backoff targets budgetStart + (attempt-1)·RECOVERY_BACKOFF_MS, NOT one
+ *  backoff after the previous lookup's settle — settle-relative spacing let
+ *  full-bound 3s lookups drift to 0–3/7–10/14–17s, ending the third lookup
+ *  5s PAST the 12s window), 3s individual bounds — all inside the 12s
+ *  window. Stops early the moment the operation resolves/rejects/abandons
+ *  elsewhere. Safe to fire-and-forget; never sends anything. Its lookups go
+ *  through the shared in-flight registry so a concurrent re-tap piggybacks
+ *  instead of issuing a parallel GET (review T1B-F1). */
 async function runLookupBudget(opId: string): Promise<void> {
   const startEpoch = createEpoch;
   const op0 = opById(opId);
   if (!op0 || op0.recoveryActive) return; // one budget run at a time
   patchOp(opId, { recoveryActive: true, recoveryLookups: 0 });
+  const budgetStart = Date.now();
   try {
     for (let attempt = 1; attempt <= RECOVERY_MAX_LOOKUPS; attempt++) {
       const cur = opById(opId);
       if (!cur || createEpoch !== startEpoch) return;
       if (cur.state !== "unknown" && cur.state !== "sending") return; // resolved/abandoned elsewhere
       if (attempt > 1) {
-        await new Promise<void>((r) => setTimeout(r, RECOVERY_BACKOFF_MS));
+        // Start-anchored wait: attempt N is DUE at budgetStart +
+        // (N-1)·backoff regardless of when the previous lookup settled
+        // (4s spacing > the 3s lookup bound keeps them non-overlapping). A
+        // lookup that somehow outlives its slot only shortens this wait —
+        // never negative, so the budget adds no delay of its own.
+        const wait = budgetStart + (attempt - 1) * RECOVERY_BACKOFF_MS - Date.now();
+        if (wait > 0) await new Promise<void>((r) => setTimeout(r, wait));
         const after = opById(opId);
         if (!after || createEpoch !== startEpoch) return;
         if (after.state !== "unknown" && after.state !== "sending") return;

@@ -22,6 +22,8 @@ import {
   APP_SHELL_TITLE_MARK,
   CAPABILITY_TIMEOUT_MS,
   RECOVERY_BACKOFF_MS,
+  RECOVERY_LOOKUP_BOUND_MS,
+  RECOVERY_WINDOW_MS,
   __resetSessionCreateForTests,
   abandonCreateOp,
   beginDraftGeneration,
@@ -365,6 +367,52 @@ describe("runLookupBudget — ≤3 lookups, 3s bounds, 12s window, never a creat
     expect(f.posts()).toHaveLength(1); // the ONE execute, ever
   });
 
+  it("B-F1 worst case: every lookup aborts at its FULL 3s bound — start-anchored 0/4/8s windows, the third lookup COMPLETES inside the 12s budget", async () => {
+    // The discriminating schedule test: each receipt GET PARKS and settles
+    // only via its own 3s abort bound (the worst case). Settle-relative
+    // backoffs drift to windows 0–3/7–10/14–17s — the third lookup would
+    // END 5s PAST the 12s window; backoffs anchored to the budget START
+    // hold 0–3/4–7/8–11s. (The fast-settling test above cannot tell the
+    // two readings apart — its lookups settle in ~0ms.)
+    const windows: { start: number; end: number }[] = [];
+    const f = stubFetch((url, init) => {
+      if (url === CAP_URL) return CAP_MODERN;
+      if (url.startsWith(POST_URL) && (init?.method ?? "GET") === "POST") return receipt("unknown");
+      if (url.startsWith(RECEIPT_URL)) {
+        const start = Date.now();
+        return new Promise<RouteResult>((_res, rej) => {
+          init?.signal?.addEventListener("abort", () => {
+            windows.push({ start, end: Date.now() });
+            rej(new DOMException("aborted", "AbortError"));
+          });
+        });
+      }
+      return { status: 404, body: {} };
+    });
+    vi.useFakeTimers();
+    const p = modernCreateSession(1000);
+    await vi.advanceTimersByTimeAsync(0);
+    await p;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.gets()).toHaveLength(1); // attempt 1 is out and parked
+    // Run the whole budget past any 12s/17s horizon.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(f.gets()).toHaveLength(3); // exactly the budget's three
+    expect(windows).toHaveLength(3);
+    const t0 = windows[0].start; // attempt 1 issues immediately = budget start
+    // Every lookup respected its individual 3s bound…
+    for (const w of windows) expect(w.end - w.start).toBeLessThanOrEqual(RECOVERY_LOOKUP_BOUND_MS);
+    // …never overlapped…
+    expect(windows[1].start).toBeGreaterThanOrEqual(windows[0].end);
+    expect(windows[2].start).toBeGreaterThanOrEqual(windows[1].end);
+    // …the schedule is anchored to the BUDGET START (0/4/8s starts)…
+    expect(windows[1].start - t0).toBe(RECOVERY_BACKOFF_MS);
+    expect(windows[2].start - t0).toBe(RECOVERY_BACKOFF_MS * 2);
+    // …and the third lookup COMPLETES inside the 12s window.
+    expect(windows[2].end - t0).toBeLessThanOrEqual(RECOVERY_WINDOW_MS);
+    expect(f.posts()).toHaveLength(1); // recovery is still GET-only
+  });
+
   it("resolution mid-budget: the lookup resolves the EXACT id, records follow, probing stops", async () => {
     let n = 0;
     const f = stubFetch(
@@ -634,6 +682,98 @@ describe("certainty upgrade — scoped transfer + lifecycle", () => {
     expect(out.id).toBe("ses_m1");
     expect(f2.postKeys()).toHaveLength(1);
     expect(f2.postKeys()[0]).not.toBe(key1);
+  });
+
+  it("F2: abandon DURING a shared in-flight lookup — the later `created` still resolves the abandoned op's records honestly (resolved presentation + transfer), the op links, the pointer stays CLEARED, and the next send mints a FRESH key with its OWN POST", async () => {
+    // The reviewer's traced-safe interplay, pinned: the re-tap piggybacks on
+    // the parked shared lookup; the operator ABANDONS mid-await (the
+    // duplicate-risk acknowledgement); releasing the lookup as `created`
+    // must still surface the truth — the abandoned op's uncertain records
+    // get the session-create-resolved presentation and transfer onto the
+    // session — WITHOUT re-grabbing the cleared currentOp pointer (the
+    // fresh-key unblock is preserved for the next send).
+    let posts = 0;
+    const releasers: Array<(r: StubResp) => void> = [];
+    const f = stubFetch((url, init) => {
+      if (url === CAP_URL) return CAP_MODERN;
+      if (url.startsWith(POST_URL) && (init?.method ?? "GET") === "POST") {
+        // First POST (tap 1): unknown → the budget parks its first lookup.
+        // Any LATER POST is the post-abandon fresh-key send: created.
+        return ++posts === 1 ? receipt("unknown") : receipt("created", { sessionID: "ses_fresh" });
+      }
+      if (url.startsWith(RECEIPT_URL)) {
+        return new Promise<RouteResult>((res) => {
+          releasers.push((r: StubResp) => res(r));
+        });
+      }
+      return { status: 404, body: {} };
+    });
+    vi.useFakeTimers();
+    // Tap 1: POST unknown → the budget's first lookup goes out and PARKS.
+    const a1 = mintSendAttempt("draft");
+    const p1 = modernCreateSession(1000);
+    await vi.advanceTimersByTimeAsync(0);
+    await p1;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.gets()).toHaveLength(1);
+    expect(releasers).toHaveLength(1);
+    const opId = getSendAction(a1.attemptId)!.createOpId!;
+    expect(opId).toBeTruthy();
+
+    // The re-tap piggybacks on the parked shared lookup (zero new GETs).
+    const a2 = mintSendAttempt("draft");
+    const p2 = modernCreateSession(2000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.gets()).toHaveLength(1);
+
+    // ABANDON mid-await: the duplicate-risk acknowledgement path.
+    abandonCreateOp(opId);
+    expect(getCreateOp(opId)!.state).toBe("abandoned");
+    expect(isCurrentCreateOp(opId)).toBe(false);
+
+    // Release the shared lookup as `created` — both awaiters (the budget
+    // loop, then the piggybacked re-tap) observe the same receipt.
+    releasers[0](receipt("created", { sessionID: "ses_abandoned_resolved", replayed: true }));
+    await vi.advanceTimersByTimeAsync(0);
+    const out2 = await p2;
+    // The re-tap returns the now-KNOWN id (definitive — it continues in the
+    // recovered session; the acknowledged duplicate risk is the NEXT send).
+    expect(out2).toMatchObject({ id: "ses_abandoned_resolved", certainty: "definitive" });
+
+    // The abandoned op's UNCERTAIN record (tap 1's): the honest
+    // session-create-resolved presentation + transfer to the session.
+    const r1 = getSendAction(a1.attemptId)!;
+    expect(r1.stage).toBe("rejected");
+    expect(r1.reason).toBe("session-create-resolved");
+    expect(r1.ownerKey).toBe("ses_abandoned_resolved");
+    // The re-tap's still-PREPARING record (stamped for the same op): it is
+    // TRANSFERRED onto the session (the draft→live ownership step — not
+    // stranded under "draft"); its lifecycle continues in the caller, so it
+    // does not get the uncertain-records resolved patch.
+    const r2 = getSendAction(a2.attemptId)!;
+    expect(r2.ownerKey).toBe("ses_abandoned_resolved");
+    expect(r2.stage).toBe("preparing");
+
+    // The op ends LINKED with the exact id — and the CLEARED pointer stays
+    // cleared: the resolution must not re-grab the abandoned generation.
+    const op = getCreateOp(opId)!;
+    expect(op.state).toBe("linked");
+    expect(op.sessionId).toBe("ses_abandoned_resolved");
+    expect(op.recoveryActive).toBe(false);
+    expect(isCurrentCreateOp(opId)).toBe(false);
+    expect(draftResolvedCreateOp()).toBeUndefined(); // no hijack of the fresh draft view
+
+    // No further lookups once resolved; the budget is done.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(f.gets()).toHaveLength(1);
+
+    // The subsequent send: a FRESH key with its OWN POST (the abandon — not
+    // the later resolution — is what unblocked it).
+    const key1 = f.postKeys()[0];
+    const out3 = await modernCreateSession(3000);
+    expect(out3).toMatchObject({ id: "ses_fresh", certainty: "definitive" });
+    expect(f.posts()).toHaveLength(2);
+    expect(f.postKeys()[1]).not.toBe(key1);
   });
 
   it("beginDraftGeneration (newSession) retires the current operation pointer", async () => {
