@@ -91,12 +91,18 @@ No path re-keys a record back to "draft", so no conflict/unsaved-stage record ca
 
 ## Part 3: Open Items & Non-Goals (§8)
 
-The following reliability architecture requirements remain explicitly unmet rather than quietly removed:
+*(Updated 2026-09-25: §8/create-certainty program closure)*
 
-- **Durable session-create/upload true idempotency** (proxy create-receipts in `/oc`, modeled on `pkg/web` queue admission receipts).
-- **Upstream dispatch dedupe/custody contract.**
-- **Replayable claims / session ordering.**
-- **Browser-reload outbox** for unconfirmed attempts.
-- **Remaining non-guard fetch/body bounds.**
-- **Dedicated hung-socket e2e fixture knob.**
-- **Upload filename / overwrite safety.**
+**Create-certainty LANDED:**
+The A1/D1 pure-navigation stranding residual is KILLED for modern servers (auto-re-key on receipt recovery; create-link affordance remains for legacy + permanent-loss ambiguity).
+- **Fix-shape correction:** Create-receipts landed in the VERB layer (`/vh/session/create` + `WithIdempotency` + `idemCache`), NOT as `/oc` passthrough interception. Honest tradeoff recorded: `idemCache` is in-memory/10-min-TTL (weaker than queue admission receipts, adequate for the seconds-wide create window); recovery lookups are structurally non-executing (zero-creates-on-miss gate).
+- **Known accepted residuals:** In-memory create-op keys lost on reload; `idemCache` lost on daemon restart (client never re-POSTs ambiguous ops regardless).
+
+**§8 Status Dispositions:**
+- **LANDED:** Session-create idempotency (commits `872ea0d`, `8171438`, `4db7300`).
+- **LANDED:** Remaining non-guard fetch/body bounds (`8b50feb` — `fetchQueue`/`respondPermission`/`respondQuestion`/`/vh/abort`/`removeQueued` + attach uniqueness).
+- **LANDED:** Dedicated hung-socket e2e fixture knob (narrow `create-hold`/`drop` modes landed in `872ea0d`; worker-side paths were never fixture-reachable, deemed covered by unit bounds + the new modes).
+- **CLOSED:** Upstream dispatch dedupe/custody contract — superseded by claim-stamps-custody-pre-POST + reconciler + restart fence.
+- **CLOSED:** Replayable claims / session ordering — already-landed via claim-CAS + idempotent-monotonic resolve + FIFO single-flight drainer.
+- **PARKED:** Upload filename verbatim dedupe / overwrite safety + orphan GC. Rationale: very-low likelihood, disk-waste-only. Trigger: disk-pressure incident.
+- **PARKED:** Browser-reload outbox for unconfirmed attempts. Rationale: seconds-wide windows, self-healing via server queue + draft persistence; in-memory keys are brief-scoped. Trigger: a real lost-uncertain-after-reload incident.
