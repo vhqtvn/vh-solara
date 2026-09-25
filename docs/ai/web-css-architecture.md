@@ -118,15 +118,7 @@ Follow them when carving a region out of the legacy shards into a module.
    `.tooltip-text` stay scoped. UpdateToast: `.update-toast` is `:global` but
    `-text` / `-btn` stay scoped.
 
-7. **A 100%-`:global` module can still be worth migrating** — for
-   **concurrent-edit conflict isolation** and **locate-ability**, not just CSS
-   scoping. This rule was **reframed** from its original "zero scoping benefit →
-   leave it in `legacy.css`": a component whose classes are all `:global` (e.g.
-   `ProjectSwitcher`: all `proj-*` e2e-queried) still benefits from owning its
-   own module file, because multiple agents editing CSS concurrently no longer
-   fight over a shared shard and a reader can locate the component's rules
-   without grepping the whole legacy set. Do NOT force migrations that need
-   contortions — but do not reject a clean move solely on "it's all `:global`".
+7. **All-global component styles MUST use plain co-located `.css` (not `.module.css`).** A 100%-`:global` style block can still be worth migrating out of `legacy.css` for concurrent-edit conflict isolation and locate-ability, but it must be a plain `.css` file (exemplar: `Composer.css` / `SendStatus.css`, matching `EmptyState.css` / `ProjectSwitcher.css`). Pure-`:global` CSS modules imported only for side effects are tree-shaken from the production bundle by the pinned Vite (empty-locals css modules get `moduleSideEffects:false`). The production-bundle inclusion of these `.css` files is guarded by computed-style e2e assertions (e.g. `agent-hydration-send.spec.ts 4d`).
 
 8. **Shared keyframe references from modules use the bare global animation name.**
    This project's Vite/postcss-modules resolves bare names to global keyframes

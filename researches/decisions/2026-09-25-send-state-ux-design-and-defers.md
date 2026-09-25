@@ -46,7 +46,7 @@ Refine the accepted action-row model, not its reliability architecture. `SendSta
 | Unconditional retained-composer reassurance | `Your message is still in the composer.` only while ownership/content evidence supports it. |
 | Resolve retries exhausted | `Message sent [or failed/unknown] — status save unconfirmed.` |
 | `Retry send` | `Retry same message`, only for the exact controller-selected reuse record. |
-| `Will send: [80-character preview]` | `Same message: [compact preview]` plus `Show full message`; expansion shows verbatim text and all retained filenames. |
+| `Will send: [80-character preview]` | `Same message: [compact preview]` plus `Show full message`; expansion shows verbatim text and all retained filenames (full-text expansion renders ONLY when the 80-char clip actually truncated). |
 | No mismatch explanation | *[Superseded]* Originally `Composer changed. This action cannot retry the saved message.` Superseded by shipped record-addressed refusal: "Retry unavailable — status changed". |
 | `Queue state conflict — showing server state.` | `Queue status conflict — check the queue.` Do not introduce a Refresh action that does not exist. |
 | Failed QueueChip cause only in tooltip | Preserve `Failed` label and expose cause/instructions inline or through an explicit details control. |
@@ -58,9 +58,14 @@ Refine the accepted action-row model, not its reliability architecture. `SendSta
   *(Note: The custody-line removal from SendStatus described as pending in the original brief is DONE as of 61ca3a9.)*
 
 - **Slice 2: Compact hierarchy, static acknowledgment, mobile observation seams.**
-  **Status: PENDING.**
-  **Owner: send-state UX lane (coordination session)**
+  **Status: LANDED (Commit `0ed1be4`).**
   Scope includes: compact merged status line, static tap-ack replacing infinite pulse, severity stacking cap +N more, create-link candidate grouping, full-text payload expansion.
+  *(Note: The a11y restructure moved controls out of the live region; one visually-hidden memoized polite announcer mirrors primary texts + hidden-notices count. The code cites "brief §3.x" paths that no longer exist — this document now carries those shipped parameters; the code comments are self-contained.)*
+  **Shipped Parameters (formerly brief §3.x):**
+  - **Severity ladder order:** conflict > uncertain > unsaved > blocked/rejected; within-tier immutable attemptId order.
+  - **Cap N=2 for blocked/rejected:** inline expand-only "Show N more notices" (critical tiers + create-link never capped).
+  - **Create-link CANDIDATE_CAP=2:** newest-first with "Show all N possible sessions" expansion (44px stacked full-width targets, created-time + short-id labels, full id in tooltip).
+  - **Multi-record progress copy:** "N send actions in progress…".
 
 ---
 
