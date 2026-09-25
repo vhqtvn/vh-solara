@@ -208,8 +208,14 @@ beforeEach(() => {
   policy.loadedFollowup = "later";
   (globalThis as unknown as { EventSource?: unknown }).EventSource = MockEventSource;
   // fetch router: POST /oc/session → { id: NEW_ID } (the real createSession
-  // path); everything else (ack, queue, models) → generic ok {}.
+  // path); everything else (ack, queue, models) → generic ok {}. The
+  // create-certainty capability probe answers 404 (route-unsupported ⇒ the
+  // client's LEGACY lane), keeping this suite faithfully on the /oc/session
+  // create it exercises.
   (globalThis as any).fetch = vi.fn(async (url: any, init?: any) => {
+    if (String(url).includes("/vh/session/create")) {
+      return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+    }
     if (String(url).endsWith("/oc/session") && init?.method === "POST") {
       return { ok: true, status: 200, json: async () => ({ id: NEW_ID }), text: async () => "" };
     }

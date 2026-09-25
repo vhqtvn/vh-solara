@@ -32,6 +32,12 @@ import {
   transferOwnerSendAttempts,
   updateSendAction,
 } from "../../src/lib/sendActionStatus";
+import {
+  __resetSessionCreateForTests,
+  __seedCreateOpForTests,
+  isCurrentCreateOp,
+} from "../../src/lib/sessionCreateStatus";
+import { setProjectDirRaw } from "../../src/sync/store";
 import type { QueuedMessage } from "../../src/queue";
 
 vi.mock("../../src/queue", () => ({
@@ -89,6 +95,8 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   __resetSendActionStatusForTests();
+  __resetSessionCreateForTests();
+  setProjectDirRaw("");
   vi.clearAllMocks();
 });
 
@@ -819,6 +827,125 @@ describe("SendStatus — O2 slice 2: create-link candidate grouping (2 visible, 
     const row = r.container.querySelector('.sendStatusLine[data-kind="create-link"]')!;
     expect(row.querySelectorAll(".sendStatusBtn[data-session-id]")).toHaveLength(1);
     expect(row.querySelector(".sendStatusMore")).toBeNull();
+    r.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Create-certainty Slice 2 — the modern create-op UI states: "Checking
+// session creation." while the recovery budget runs, the Check-again /
+// Start-a-new-session-anyway affordances (with the two-step duplicate-risk
+// acknowledgement), the legacy no-affordances shape, the capability-
+// unavailable copy, and the resolved-create row.
+// ---------------------------------------------------------------------------
+describe("SendStatus — create-certainty Slice 2 modern states", () => {
+  const CC_DIR = "/cc-ui";
+
+  function seedModernUnknown(opOver: Record<string, unknown> = {}): { attemptId: string; opId: string } {
+    const opId = __seedCreateOpForTests(CC_DIR, opOver as any);
+    const a = mintSendAttempt("draft");
+    markOwnerSessionCreateUnknown("draft", "create outcome uncertain", 1_000, opId);
+    return { attemptId: a.attemptId, opId };
+  }
+
+  beforeEach(() => {
+    __resetSessionCreateForTests();
+    setProjectDirRaw(CC_DIR);
+  });
+
+  it("while the recovery budget runs, the primary line is 'Checking session creation.' (not the unconfirmed copy)", () => {
+    seedModernUnknown({ recoveryActive: true });
+    const r = render(() => <SendStatus {...baseProps({ draft: () => true, sessionId: () => "" })} />);
+    expect(r.container.textContent).toContain("Checking session creation.");
+    expect(r.container.textContent).not.toContain("Session creation unconfirmed.");
+    const row = r.container.querySelector(".sendStatusLine")!;
+    expect(row.textContent).not.toContain("Check again");
+    expect(row.textContent).not.toContain("Start a new session anyway");
+    r.unmount();
+  });
+
+  it("budget exhausted: the unconfirmed copy returns with Check again + Start a new session anyway", () => {
+    seedModernUnknown({});
+    const r = render(() => <SendStatus {...baseProps({ draft: () => true, sessionId: () => "" })} />);
+    expect(r.container.textContent).toContain(
+      "Session creation unconfirmed. Check possible sessions before sending again; another send may create another session.",
+    );
+    const row = r.container.querySelector(".sendStatusLine")!;
+    expect(row.textContent).toContain("Check again");
+    expect(row.textContent).toContain("Start a new session anyway");
+    r.unmount();
+  });
+
+  it("the duplicate-risk acknowledgement is TWO-STEP: first tap reveals the risk wording, confirm abandons", () => {
+    const { opId } = seedModernUnknown({});
+    const r = render(() => <SendStatus {...baseProps({ draft: () => true, sessionId: () => "" })} />);
+    const row = r.container.querySelector(".sendStatusLine")!;
+    // Step 1: reveal the risk wording.
+    (row.querySelector(".sendStatusMore") as HTMLElement).click();
+    expect(row.textContent).toContain("may still have created a session");
+    expect(row.textContent).toContain("Create new session anyway");
+    // Step 2: confirm → the op is abandoned (no longer current → affordances gone).
+    const confirm = Array.from(row.querySelectorAll(".sendStatusBtn")).find((b) =>
+      b.textContent!.includes("Create new session anyway"),
+    )!;
+    confirm.click();
+    expect(isCurrentCreateOp(opId)).toBe(false);
+    const after = r.container.querySelector(".sendStatusLine")!;
+    expect(after.textContent).toContain("Session creation unconfirmed."); // honest copy stays
+    expect(after.textContent).not.toContain("Check again");
+    r.unmount();
+  });
+
+  it("a LEGACY create-unknown record (no createOpId) keeps the copy WITHOUT modern affordances", () => {
+    seedCreateUnknown(1_000, 2_000); // no createOpId — the legacy shape
+    const r = render(() => <SendStatus {...baseProps({ draft: () => true, sessionId: () => "" })} />);
+    const row = r.container.querySelector(".sendStatusLine")!;
+    expect(row.textContent).toContain("Session creation unconfirmed.");
+    expect(row.textContent).not.toContain("Check again");
+    expect(row.textContent).not.toContain("Start a new session anyway");
+    r.unmount();
+  });
+
+  it("capability-unavailable (NO POST was sent) renders the retry-safe copy, never the duplicate-risk copy", () => {
+    const a = mintSendAttempt("draft");
+    updateSendAction(a.attemptId, {
+      stage: "rejected", certainty: "definitive", recovery: "restore",
+      detail: "capability check unavailable", reason: "capability-unavailable",
+    });
+    const r = render(() => <SendStatus {...baseProps({ draft: () => true, sessionId: () => "" })} />);
+    expect(r.container.textContent).toContain(
+      "Could not reach the server to create the session. Check the connection and try again.",
+    );
+    expect(r.container.textContent).not.toContain("Session creation unconfirmed.");
+    r.unmount();
+  });
+
+  it("a resolved record (certainty upgrade) renders 'Session was created — this message was not sent.'", () => {
+    const a = mintSendAttempt("ses_linked");
+    updateSendAction(a.attemptId, {
+      stage: "rejected", certainty: "definitive", recovery: "restore",
+      detail: "session created (ses_linked) — this message was not sent",
+      reason: "session-create-resolved",
+    });
+    const r = render(() => <SendStatus {...baseProps({ sessionId: () => "ses_linked" })} />);
+    expect(r.container.textContent).toContain("Session was created — this message was not sent.");
+    r.unmount();
+  });
+
+  it("the draft view's RESOLVED row: 'Session was created.' + operator-driven Open it; navigation only on click", () => {
+    __seedCreateOpForTests(CC_DIR, { state: "linked", sessionId: "ses_linked" });
+    const openSession = vi.fn();
+    const r = render(() => (
+      <SendStatus {...baseProps({ draft: () => true, sessionId: () => "", openSession })} />
+    ));
+    const row = r.container.querySelector('.sendStatusLine[data-kind="create-resolved"]')!;
+    expect(row.textContent).toContain("Session was created.");
+    expect(openSession).not.toHaveBeenCalled(); // never auto-navigates
+    (row.querySelector(".sendStatusBtn") as HTMLElement).click();
+    expect(openSession).toHaveBeenCalledWith("ses_linked");
+    // No timing-candidates row alongside the exact receipt (hidden by
+    // construction — its records left the draft owner).
+    expect(r.container.querySelector('.sendStatusLine[data-kind="create-link"]')).toBeNull();
     r.unmount();
   });
 });

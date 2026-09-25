@@ -1656,6 +1656,16 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     sessionId: () => props.sessionId,
     draft: () => !!props.draft,
     ensureSession,
+    // Create-certainty Slice 2 (§3.3): the ONE navigation of an uninterrupted
+    // draft send — extracted from the low-level create action so ownership
+    // transfer runs first (createSend: scoped modern transfer / legacy sweep)
+    // and navigation happens at most once, before the admission tail. Same
+    // gestures the old in-create navigation performed (setSelectedId flips
+    // draft→live + syncUrl; openSession reserves the message slot).
+    materializeSession: (id) => {
+      setSelectedId(id);
+      void openSession(id);
+    },
     input,
     setInput,
     readyToSend,

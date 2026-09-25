@@ -13,6 +13,15 @@ import { demoDir, projectUrl } from "./util";
 // "draft" forever (nothing observed the draft→session linkage on pure
 // navigation).
 //
+// Create-certainty Slice 2: this spec now pins the LEGACY lane explicitly.
+// The modern client feature-detects before any POST, so the spec intercepts
+// the capability probe and answers 404 (route-unsupported — the ladder's
+// legacy branch), keeping the create POST on the OLD /oc/session route this
+// spec's transport fault is armed against. The A1 create-link affordance IS
+// the legacy/ambiguity surface by design (the brief keeps it for legacy
+// servers + modern unrecoverable outcomes — pinned on the modern lane by
+// create-certainty.spec.ts's drop arc); its arc is unchanged.
+//
 // The fix under test: the create-unknown record now carries the create-attempt
 // window [POST-armed, mark-time], and the draft view's SendStatus reactively
 // correlates a session whose time.created falls inside it (± the generous
@@ -117,6 +126,15 @@ test("(browser) create response lost → session lands via SSE → confirmed lin
     }
   };
   await page.route("**/oc/session", createRouteHandler);
+
+  // Create-certainty Slice 2 — force the LEGACY lane: answer the capability
+  // probe with 404 (route-unsupported). Without this the modern client would
+  // POST /vh/session/create instead, and the /oc/session interception above
+  // would never see the create. The modern arcs live in
+  // create-certainty.spec.ts.
+  await page.route("**/vh/session/create/capabilities", async (route) => {
+    await route.fulfill({ status: 404, contentType: "application/json", body: "{}" });
+  });
 
   await page.goto(projectUrl("/"));
 

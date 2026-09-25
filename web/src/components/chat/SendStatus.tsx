@@ -73,6 +73,24 @@
 //                                    Retry STATUS SAVE (a record, never a
 //                                    resend — "Does not resend the message.")
 //
+// Create-certainty Slice 2 additions (the modern /vh/session/create client):
+//   create-unknown + recovery running → "Checking session creation." (the
+//                                    budget's lookups are reads; the
+//                                    unconfirmed copy returns on exhaustion)
+//   create-unknown + modern op       → "Check again" (a fresh bounded LOOKUP
+//                                    budget — never a create) and the
+//                                    TWO-STEP "Start a new session anyway"
+//                                    duplicate-risk acknowledgement
+//   capability check uncertain       → "Could not reach the server to create
+//                                    the session. Check the connection and
+//                                    try again." (NO POST was sent — retry
+//                                    is safe; never the duplicate-risk copy)
+//   create resolved via receipt      → "Session was created — this message
+//                                    was not sent." (session found ≠ message
+//                                    sent) + the draft view's resolved row
+//                                    ("Session was created." + operator-
+//                                    driven "Open it")
+//
 // Ownership (decision doc §1.2): NO server-custody sentence here — the queue
 // container/QueueChip owns server custody, ConnectionToast owns transport.
 // SendStatus never calls browser uncertainty "queued".
@@ -100,6 +118,13 @@ import {
   type CreateLinkCandidate,
   type SendAction,
 } from "../../lib/sendActionStatus";
+import {
+  abandonCreateOp,
+  checkCreateOpAgain,
+  draftResolvedCreateOp,
+  getCreateOp,
+  isCurrentCreateOp,
+} from "../../lib/sessionCreateStatus";
 import { resolveQueued } from "../../queue";
 import type { Session } from "../../types";
 import "./SendStatus.css";
@@ -192,6 +217,13 @@ export function SendStatus(props: SendStatusProps) {
   // of re-running per render; presentation grouping never mutates the store.
   const records = createMemo(() => sendActionsFor(ownerKey()));
 
+  // Create-certainty Slice 2 — the draft view's RESOLVED create operation
+  // (certainty upgrade, no operator confirmation needed to RESOLVE — the row
+  // only offers the operator-driven navigation; recovery never hijacks
+  // navigation itself). Declared BEFORE its consumers (announcerText/JSX)
+  // because memos evaluate eagerly at creation.
+  const draftResolved = createMemo(() => (props.draft() && props.openSession ? draftResolvedCreateOp() : undefined));
+
   const transientRecs = createMemo(() =>
     records().filter((r) => r.stage === "preparing" || r.stage === "admitting"),
   );
@@ -259,8 +291,15 @@ export function SendStatus(props: SendStatusProps) {
         // warning the suppressed notification used to own; every other
         // uncertainty is check-before-sending — never a blanket Retry.
         if (rec.recovery === "retry-same") return "Queue confirmation unknown.";
-        if (rec.reason === "session-create-unknown")
+        if (rec.reason === "session-create-unknown") {
+          // Create-certainty Slice 2: while the modern receipt-recovery
+          // budget is RUNNING, the primary line names what is happening
+          // (brief §3.3 "Checking session creation.") — the unconfirmed copy
+          // + its affordances return when the budget exhausts.
+          const op = getCreateOp(rec.createOpId);
+          if (op && op.recoveryActive) return "Checking session creation.";
           return "Session creation unconfirmed. Check possible sessions before sending again; another send may create another session.";
+        }
         return "Outcome unknown — check before sending again.";
       case "conflict":
         // O2 §3.6: both conflict flavors converge on the actionable guidance
@@ -284,6 +323,14 @@ export function SendStatus(props: SendStatusProps) {
             return "Not sent — choose an agent.";
           case "session-create-failed":
             return "Session could not be created.";
+          // Create-certainty Slice 2: NO create POST was sent (capability
+          // check uncertain) — retry is SAFE; never the duplicate-risk copy.
+          case "capability-unavailable":
+            return "Could not reach the server to create the session. Check the connection and try again.";
+          // Create-certainty Slice 2 (certainty upgrade): the create resolved
+          // via an exact receipt — "session found" is NOT "message sent".
+          case "session-create-resolved":
+            return "Session was created — this message was not sent.";
           default:
             return "Not sent — kept in the composer.";
         }
@@ -317,10 +364,21 @@ export function SendStatus(props: SendStatusProps) {
       if (l) parts.push(l);
     }
     if (hiddenNotices() > 0) parts.push(`Show ${hiddenNotices()} more notices`);
+    // Create-certainty Slice 2: the resolved-create row's primary mirrors too
+    // (it is a visible primary line, not a control).
+    const resolved = draftResolved();
+    if (resolved) parts.push("Session was created.");
     return parts.join(" ");
   });
 
   const [saveBusy, setSaveBusy] = createSignal<string | null>(null);
+
+  // Create-certainty Slice 2 — the modern unknown-create affordances. The
+  // "Start a new session anyway" acknowledgement is TWO-STEP inline (the
+  // first tap reveals the duplicate-risk wording + the confirm control; the
+  // fresh key is only minted after the explicit confirm). Keyed by op id so
+  // sibling rows never share an ack state.
+  const [ackOp, setAckOp] = createSignal<string | null>(null);
 
   // Bounded full-text payload expansion (per-record; the collapsed form stays
   // the compact preview). Keyed by attemptId so a row's expansion survives
@@ -406,7 +464,7 @@ export function SendStatus(props: SendStatusProps) {
   }
 
   return (
-    <Show when={records().length > 0}>
+    <Show when={records().length > 0 || draftResolved() !== undefined}>
       <div class="sendStatus" data-testid="send-status">
         {/* ONE dedicated polite announcer (the container itself is NOT a live
             region — controls and expandable details sit outside live
@@ -477,6 +535,63 @@ export function SendStatus(props: SendStatusProps) {
                     >
                       Retry same message
                     </button>
+                  </Show>
+                  {/* Create-certainty Slice 2 — the MODERN unknown-create
+                      affordances (only for this record's CURRENT create
+                      operation, only while no recovery budget is running).
+                      "Check again" re-runs a FRESH bounded receipt-lookup
+                      budget — a READ, never a create and never a resend.
+                      "Start a new session anyway" is the brief's explicit
+                      duplicate-risk acknowledgement: two-step inline confirm,
+                      and only the confirm abandons the operation (a fresh key
+                      is minted by the NEXT send). Legacy records (no
+                      createOpId) and old-generation operations keep the
+                      honest copy with no fresh affordances. */}
+                  <Show
+                    when={
+                      rec.stage === "uncertain" &&
+                      rec.reason === "session-create-unknown" &&
+                      rec.createOpId &&
+                      isCurrentCreateOp(rec.createOpId) &&
+                      !getCreateOp(rec.createOpId)?.recoveryActive
+                    }
+                  >
+                    <button
+                      type="button"
+                      class="sendStatusBtn"
+                      data-tip="Re-checks the server for this send's session-creation receipt — never creates a session"
+                      onClick={() => checkCreateOpAgain(rec.createOpId!)}
+                    >
+                      Check again
+                    </button>
+                    <Show
+                      when={ackOp() !== rec.createOpId}
+                      fallback={
+                        <>
+                          <span class="sendStatusPayload">
+                            That attempt may still have created a session — creating another one may duplicate it.
+                          </span>
+                          <button
+                            type="button"
+                            class="sendStatusBtn"
+                            data-tip="Abandons the unresolved attempt and creates a fresh session on your next send"
+                            onClick={() => {
+                              abandonCreateOp(rec.createOpId!);
+                              setAckOp(null);
+                            }}
+                          >
+                            Create new session anyway
+                          </button>
+                          <button type="button" class="sendStatusMore" onClick={() => setAckOp(null)}>
+                            Keep checking
+                          </button>
+                        </>
+                      }
+                    >
+                      <button type="button" class="sendStatusMore" onClick={() => setAckOp(rec.createOpId!)}>
+                        Start a new session anyway
+                      </button>
+                    </Show>
                   </Show>
                   {/* Retry STATUS SAVE — stage "unsaved" only, and never for a
                       draft (F8, defense-in-depth: unsaved records are minted
@@ -563,6 +678,34 @@ export function SendStatus(props: SendStatusProps) {
                 </button>
               </Show>
             </div>
+          </div>
+        </Show>
+        {/* Create-certainty Slice 2 — the CERTAINTY-UPGRADE row: this draft's
+            create operation resolved via an exact receipt (recovery or a
+            re-tap's lookup), so its records already followed the session
+            (operation-scoped, no operator confirmation). What remains in the
+            draft view is the pointer: the session exists and is linked —
+            navigation stays operator-driven ("Open it"); recovery never
+            hijacks it. Timing candidates for this operation are hidden by
+            construction (its records left the draft owner). */}
+        <Show when={draftResolved()}>
+          <div
+            class="sendStatusLine"
+            data-kind="create-resolved"
+            data-tip="The session-creation receipt was found — this draft's send statuses moved to that session."
+          >
+            <span class="sendStatusText">Session was created.</span>
+            <span class="sendStatusPayload">
+              The unconfirmed send&rsquo;s session was found — its statuses moved there.
+            </span>
+            <button
+              type="button"
+              class="sendStatusBtn"
+              data-tip={draftResolved()!.sessionId}
+              onClick={() => props.openSession!(draftResolved()!.sessionId)}
+            >
+              Open it
+            </button>
           </div>
         </Show>
         {/* The compact merged happy-path line — BELOW critical recovery (one

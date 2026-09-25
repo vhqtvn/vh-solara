@@ -80,7 +80,16 @@ export type SendReason =
   | "attachments-failed" // blocked: an inline/flush upload failed
   | "agent-unresolved" // rejected: the agent evidence gate refused (post-mint)
   | "session-create-failed" // rejected: createSession definitively failed
-  | "session-create-unknown"; // uncertain: the session-create OUTCOME is unknown
+  | "session-create-unknown" // uncertain: the session-create OUTCOME is unknown
+  // Create-certainty Slice 2: the capability check was UNCERTAIN, so NO
+  // create POST was ever sent — a retry-safe failure (check the connection
+  // and send again), never a duplicate-create risk.
+  | "capability-unavailable"
+  // Create-certainty Slice 2: the create operation RESOLVED via an exact
+  // receipt (the session exists and is linked) — but this attempt's message
+  // was never sent (admission never ran past the create). "Session found" is
+  // not "message sent".
+  | "session-create-resolved";
 
 // The operator-facing recovery action this record affords (Slice 3 renders it).
 //   retry-same — re-send the IDENTICAL prepared attempt (same attemptId +
@@ -155,6 +164,15 @@ export interface SendAction {
   // back by OpenCode). Consumed ONLY by the operator-confirmed linkage
   // affordance in SendStatus; records are NEVER auto-re-keyed on it.
   createAttempt?: { start: number; end: number };
+  // Create-certainty Slice 2: the id of the create OPERATION this record
+  // belongs to (lib/sessionCreateStatus). Set when a modern draft send's
+  // preparing record is stamped (the operation mints before the execute
+  // POST) and when an uncertain create mark carries the operation. Scopes the
+  // operation-scoped owner transfer (transferCreateOpRecords): only THIS
+  // operation's records follow the recovered session id; unrelated drafts'
+  // records are untouched. Absent on legacy records (legacy keeps the broad
+  // draft sweep).
+  createOpId?: string;
 }
 
 // Reactive store keyed by attemptId. Reads via sendActionsFor(ownerKey) are
@@ -316,8 +334,15 @@ export function attachmentsSubsetOfPayload(
  *  timestamp from CreateSessionOutcome.startedAt), the create-attempt window
  *  [createStartedAt, Date.now()] is recorded on the patched record so
  *  SendStatus's operator-confirmed linkage affordance can correlate it with a
- *  session that later appears (createLinkCandidates). */
-export function markOwnerSessionCreateUnknown(ownerKey: string, detail: string, createStartedAt?: number): void {
+ *  session that later appears (createLinkCandidates).
+ *
+ *  Create-certainty Slice 2: `createOpId` (from lib/sessionCreateStatus)
+ *  scopes this record to its create operation — the operation-scoped
+ *  transfer + the modern recovery affordances (Check again / Start a new
+ *  session anyway) key on it. Idempotent: records already marked uncertain
+ *  (a second mark from ChatView's legacy-shaped call) are not preparing and
+ *  are left untouched. */
+export function markOwnerSessionCreateUnknown(ownerKey: string, detail: string, createStartedAt?: number, createOpId?: string): void {
   for (const id of Object.keys(actions)) {
     const a = actions[id];
     if (a.ownerKey === ownerKey && a.stage === "preparing") {
@@ -332,9 +357,84 @@ export function markOwnerSessionCreateUnknown(ownerKey: string, detail: string, 
         // leaving the duplicate-session warning homeless.
         reason: "session-create-unknown",
         createAttempt: createStartedAt != null ? { start: createStartedAt, end: Date.now() } : undefined,
+        createOpId,
       });
     }
   }
+}
+
+/** Create-certainty Slice 2: a DEFINITIVE create-side failure that never
+ *  reached upstream — the capability check was uncertain (NO POST was sent;
+ *  retry-safe) or the modern protocol proved the rejection before execution.
+ *  Patches the owner's preparing records to a terminal rejected row so
+ *  createSend's generic failure mark does not clobber the specific reason. */
+export function markOwnerSessionCreateRejected(ownerKey: string, detail: string, reason: "capability-unavailable" | "session-create-failed"): void {
+  for (const id of Object.keys(actions)) {
+    const a = actions[id];
+    if (a.ownerKey === ownerKey && a.stage === "preparing") {
+      patch(id, { stage: "rejected", certainty: "definitive", recovery: "restore", detail, reason });
+    }
+  }
+}
+
+/** Create-certainty Slice 2: stamp the owner's (single, single-flight)
+ *  preparing records with their create operation id, BEFORE the execute POST
+ *  is awaited — so a later resolution (fresh receipt or recovery lookup) can
+ *  transfer exactly this operation's records. */
+export function stampDraftPreparingCreateOp(ownerKey: string, createOpId: string): void {
+  for (const id of Object.keys(actions)) {
+    const a = actions[id];
+    if (a.ownerKey === ownerKey && a.stage === "preparing" && !a.createOpId) {
+      patch(id, { createOpId });
+    }
+  }
+}
+
+/** Create-certainty Slice 2: the OPERATION-SCOPED draft→live re-key (the
+ *  modern counterpart of the legacy broad sweep transferOwnerSendAttempts).
+ *  Re-keys ONLY records belonging to `createOpId` that are still draft-owned:
+ *  unrelated drafts' and other operations' records are untouched, finished
+ *  records are not resurrected (they are already removed from the store),
+ *  and stage/certainty are preserved verbatim. Returns the number of records
+ *  transferred. */
+export function transferCreateOpRecords(createOpId: string, toOwnerKey: string): number {
+  let n = 0;
+  setActions(
+    produce((map) => {
+      for (const a of Object.values(map)) {
+        if (a.createOpId === createOpId && a.ownerKey === "draft") {
+          a.ownerKey = toOwnerKey;
+          a.updatedAt = Date.now();
+          n++;
+        }
+      }
+    }),
+  );
+  return n;
+}
+
+/** Create-certainty Slice 2 (certainty upgrade): the operation resolved via
+ *  an exact receipt — patch its still-uncertain create records to the
+ *  resolved presentation. The create-uncertainty annotation is RESOLVED
+ *  (stage rejected/definitive — the message definitively did not send);
+ *  "session found" is not "message sent", so the row says exactly that. The
+ *  subsequent transferCreateOpRecords(opId, sessionId) moves them onto the
+ *  session (done by the caller, in the same tick, before navigation). */
+export function markCreateOpRecordsResolved(createOpId: string, sessionId: string): void {
+  setActions(
+    produce((map) => {
+      for (const a of Object.values(map)) {
+        if (a.createOpId === createOpId && a.stage === "uncertain" && a.reason === "session-create-unknown") {
+          a.stage = "rejected";
+          a.certainty = "definitive";
+          a.recovery = "restore";
+          a.reason = "session-create-resolved";
+          a.detail = `session created (${sessionId}) — this message was not sent`;
+          a.updatedAt = Date.now();
+        }
+      }
+    }),
+  );
 }
 
 // A1 create-linkage (send-defers study): how far the WORKER clock (which stamps

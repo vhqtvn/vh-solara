@@ -34,6 +34,8 @@ import { resetLabelsScope } from "../labels";
 import { resetArchiveFailuresScope } from "../archiveFailures";
 import { ackSession } from "./orchestration";
 import { pushNotification } from "../notify";
+import { beginDraftGeneration, detectCreateSupport, modernCreateSession } from "../lib/sessionCreateStatus";
+import { markOwnerSessionCreateRejected } from "../lib/sendActionStatus";
 
 // Selecting any real session leaves draft mode.
 //
@@ -189,6 +191,11 @@ export async function openSession(id: string) {
 // "New session" no longer hits the server — it enters draft mode so an unused,
 // empty session is never created. The real session is created on first send.
 export function newSession() {
+  // Create-certainty Slice 2 (§3.2 identity): a new explicitly independent
+  // draft is a new draft GENERATION — the previous create operation (whatever
+  // its state) stops being this draft's operation and stays behind as honest
+  // unresolved metadata; the next send mints a fresh idempotency key.
+  beginDraftGeneration(projectDir());
   setSelectedIdRaw(null);
   setDraft(true);
   syncUrl(null);
@@ -211,12 +218,17 @@ const CREATE_SESSION_TIMEOUT_MS = 12000;
 //                malformed 2xx): the session was NOT created.
 //   unknown    — timeout / network failure / proxy 502: the session MAY exist;
 //                a re-send may create a SECOND session (the caller must tell
-//                the operator to check first — createSession has no
-//                idempotency key, a known unmet follow-up in the brief).
+//                the operator to check first — the LEGACY path has no
+//                idempotency key; the modern /vh/session/create protocol
+//                (create-certainty Slice 2) recovers via receipt lookup only).
 export type CreateSessionOutcome = {
   id: string | null;
   certainty: "definitive" | "unknown";
   detail?: string;
+  // Create-certainty Slice 2: true when NO create POST was sent because the
+  // capability check came back uncertain (the safety ladder) — a RETRY-SAFE
+  // failure that must never be presented as session-created-unknown.
+  capabilityUnavailable?: boolean;
   // A1 create-linkage (send-defers study): CLIENT clock (ms) at the moment the
   // create POST was armed — the START of the create-attempt window. On an
   // outcome-unknown result, ChatView.ensureSession hands this to
@@ -236,8 +248,49 @@ export async function createSession(): Promise<string | null> {
 }
 
 // The certainty-carrying variant ChatView.ensureSession uses.
+//
+// Create-certainty Slice 2 — the capability ladder runs BEFORE any POST:
+//   modern  → lib/sessionCreateStatus.modernCreateSession (idempotency key,
+//             receipt recovery, operation-scoped transfer);
+//   legacy  → the unchanged /oc/session flow below (today's behavior);
+//   uncertain → NO create POST may be sent (neither route): a retry-safe
+//             definitive failure, never session-created-unknown.
+//
+// NAVIGATION NOTE (§3.3): neither branch navigates anymore. The low-level
+// create action answers with the receipt; createSend applies ownership first
+// (modern: operation-scoped transfer; legacy: the broad draft sweep) and THEN
+// materializes the session (materializeSession: setSelectedId + openSession)
+// before the admission tail — receipt/ownership before navigation, at most
+// one navigation per uninterrupted send.
 export async function createSessionWithCertainty(): Promise<CreateSessionOutcome> {
   const startedAt = Date.now();
+  const support = await detectCreateSupport();
+  if (support === "modern") return modernCreateSession(startedAt);
+  if (support === "legacy") return legacyCreateSession(startedAt);
+  // Capability UNCERTAIN (401/403/auth-redirect/arbitrary HTML/malformed
+  // JSON/wrong version/502/network/timeout): nothing was sent on EITHER
+  // route — retry is safe, and the record must not claim create-unknown
+  // (no duplicate risk exists). Pre-mark the preparing record with the
+  // capability-specific reason; createSend's generic failure mark defers to
+  // an already-terminal record.
+  markOwnerSessionCreateRejected(
+    "draft",
+    "session-create capability check unavailable (nothing was sent)",
+    "capability-unavailable",
+  );
+  return {
+    id: null,
+    certainty: "definitive",
+    detail: "session-create capability check unavailable (nothing was sent; safe to retry)",
+    capabilityUnavailable: true,
+    startedAt,
+  };
+}
+
+// The LEGACY /oc/session flow, byte-compatible with the pre-Slice-2 behavior
+// (same classification, same 12s bound) except that it no longer navigates —
+// see createSessionWithCertainty's navigation note.
+async function legacyCreateSession(startedAt: number): Promise<CreateSessionOutcome> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), CREATE_SESSION_TIMEOUT_MS);
   try {
@@ -260,8 +313,6 @@ export async function createSessionWithCertainty(): Promise<CreateSessionOutcome
     }
     const sess = await res.json();
     if (sess?.id) {
-      setSelectedId(sess.id);
-      void openSession(sess.id);
       return { id: sess.id, certainty: "definitive", startedAt };
     }
     return { id: null, certainty: "definitive", detail: "session create response had no id", startedAt };

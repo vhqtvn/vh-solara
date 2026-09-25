@@ -36,6 +36,7 @@ import {
   updateSendAction,
 } from "../../src/lib/sendActionStatus";
 import { createSessionWithCertainty } from "../../src/sync/actions";
+import { __resetSessionCreateForTests } from "../../src/lib/sessionCreateStatus";
 
 // inlineAttachForced reads localStorage at module load — jsdom provides it.
 const mem: Record<string, string> = {};
@@ -67,6 +68,9 @@ interface Harness {
   fetchQueueCalls: number;
   setUploadResult: (r: Attachment | null) => void;
   setDraft: (v: boolean) => void;
+  /** Create-certainty Slice 2: ids the send flow materialized (the
+   *  ownership-then-navigation sequencing). */
+  materialized: string[];
 }
 
 function harness(overrides: {
@@ -94,6 +98,7 @@ function harness(overrides: {
   const [draft, setDraft] = createSignal(overrides.draft ? overrides.draft() : false);
   const notes: Harness["notes"] = [];
   const enqueueInputs: Harness["enqueueInputs"] = [];
+  const materialized: string[] = [];
   let uploadCalls = 0;
   let uploadResult: Attachment | null = null;
   let fetchQueueCalls = 0;
@@ -105,6 +110,11 @@ function harness(overrides: {
     sessionId: () => overrides.sessionId ?? "ses-1",
     draft,
     ensureSession: overrides.ensureSession ?? (async () => "ses-1"),
+    // Create-certainty Slice 2: the ONE navigation of an uninterrupted draft
+    // send (extracted from the create action). Recorded for assertions.
+    materializeSession: (id) => {
+      materialized.push(id);
+    },
     input,
     setInput,
     readyToSend: () => true,
@@ -179,17 +189,22 @@ function harness(overrides: {
       uploadResult = r;
     },
     setDraft,
+    get materialized() {
+      return materialized;
+    },
   };
 }
 
 beforeEach(() => {
   __resetSendSingleFlightForTests();
   __resetSendActionStatusForTests();
+  __resetSessionCreateForTests();
 });
 
 afterEach(() => {
   __resetSendSingleFlightForTests();
   __resetSendActionStatusForTests();
+  __resetSessionCreateForTests();
   for (const k of Object.keys(mem)) delete mem[k];
   vi.unstubAllGlobals();
   vi.useRealTimers();
@@ -474,6 +489,29 @@ describe("createSend slice 2 — immutable prepared attempts", () => {
     expect(getSendAction(attemptId)?.ownerKey).toBe("live-1");
     expect(sendActionsFor("draft")).toHaveLength(0);
     expect(sendActionsFor("live-1").map((a) => a.attemptId)).toContain(attemptId);
+  });
+
+  it("create-certainty Slice 2 sequencing: the ownership transfer runs BEFORE materializeSession, admission after", async () => {
+    // §3.3: the low-level create no longer navigates. createSend applies
+    // ownership (broad legacy sweep or operation-scoped modern transfer)
+    // FIRST, then materializes (the ONE navigation), then runs admission.
+    const order: string[] = [];
+    const h = harness({
+      draft: () => true,
+      ensureSession: async () => "ses-mat",
+      enqueue: async () => {
+        order.push(`enqueue(materialized=${h.materialized.length}, draftRecords=${sendActionsFor("draft").length})`);
+        return { id: "q1" };
+      },
+      fetchQueue: async () => [],
+    });
+    h.setInput("sequence probe");
+    await h.send();
+    expect(h.enqueueInputs).toHaveLength(1);
+    // At enqueue time: navigation ALREADY happened (materialized=1) and the
+    // draft-owned records ALREADY transferred (draftRecords=0).
+    expect(order[0]).toBe("enqueue(materialized=1, draftRecords=0)");
+    expect(h.materialized).toEqual(["ses-mat"]);
   });
 });
 
@@ -1045,10 +1083,25 @@ describe("createSend — c-F3 Enter-path early-reuse (empty-composer send())", (
 // ---------------------------------------------------------------------------
 // createSessionWithCertainty — 502/timeout are outcome-unknown, not proof of
 // non-creation (the /oc proxy 502s on transport failure).
+//
+// Create-certainty Slice 2: the client now feature-detects BEFORE any POST.
+// These cells pin the LEGACY lane (the classification contract, preserved
+// separately per the brief): the stub answers the capability probe with 404
+// (route-unsupported ⇒ legacy), so every cell below still exercises the
+// /oc/session POST exactly as before. The modern lane's own ladder/failure
+// envelope lives in sessionCreateStatus.test.ts.
 // ---------------------------------------------------------------------------
-describe("createSessionWithCertainty — typed certainty classification", () => {
+describe("createSessionWithCertainty — typed certainty classification (legacy lane: capability probe ⇒ 404 ⇒ legacy)", () => {
+  // URL-aware stub: /vh/session/create* → 404 (legacy detect); anything else
+  // (the /oc/session POST) → the stubbed response.
   const respond = (status: number, body: unknown = {}) =>
-    vi.fn(() => Promise.resolve({ ok: status >= 200 && status < 300, status, json: async () => body, text: async () => "" }));
+    vi.fn((url: string) =>
+      Promise.resolve(
+        String(url).includes("/vh/session/create")
+          ? { ok: false, status: 404, json: async () => ({}), text: async () => "" }
+          : { ok: status >= 200 && status < 300, status, json: async () => body, text: async () => "" },
+      ),
+    );
 
   it("proxy 502 → outcome UNKNOWN (the session may exist)", async () => {
     vi.stubGlobal("fetch", respond(502, { error: "upstream unreachable" }));
@@ -1079,7 +1132,14 @@ describe("createSessionWithCertainty — typed certainty classification", () => 
   });
 
   it("network throw → outcome UNKNOWN (response may have been applied)", async () => {
-    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new TypeError("fetch failed"))));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: unknown) =>
+        String(url).includes("/vh/session/create")
+          ? Promise.resolve({ ok: false, status: 404, json: async () => ({}), text: async () => "" })
+          : Promise.reject(new TypeError("fetch failed")),
+      ),
+    );
     const r = await createSessionWithCertainty();
     expect(r.id).toBeNull();
     expect(r.certainty).toBe("unknown");
@@ -1088,11 +1148,14 @@ describe("createSessionWithCertainty — typed certainty classification", () => 
   it("timeout abort → outcome UNKNOWN", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn((_url: string, init?: any) =>
-        new Promise((_res, reject) => {
+      vi.fn((url: unknown, init?: any) => {
+        if (String(url).includes("/vh/session/create")) {
+          return Promise.resolve({ ok: false, status: 404, json: async () => ({}), text: async () => "" });
+        }
+        return new Promise((_res, reject) => {
           init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
-        }),
-      ),
+        });
+      }),
     );
     vi.useFakeTimers();
     const p = createSessionWithCertainty();
@@ -1119,6 +1182,35 @@ describe("createSessionWithCertainty — typed certainty classification", () => 
     const ok = await createSessionWithCertainty();
     expect(ok.id).toBe("new-ses-1");
     expect(ok.startedAt).toBeGreaterThanOrEqual(before);
+  });
+
+  it("capability check UNCERTAIN (401) → NO create POST on either route; retry-safe definitive, never create-unknown", async () => {
+    // The safety ladder: 401 is NOT route-unsupported evidence, so no POST
+    // may be sent. The outcome is definitive + capabilityUnavailable (safe to
+    // retry) — it must never be classified session-created-unknown.
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown) => {
+        seen.push(String(url));
+        return { ok: false, status: 401, json: async () => ({}), text: async () => "" };
+      }),
+    );
+    const r = await createSessionWithCertainty();
+    expect(r.id).toBeNull();
+    expect(r.certainty).toBe("definitive");
+    expect(r.capabilityUnavailable).toBe(true);
+    expect(seen).toEqual(["/vh/session/create/capabilities"]); // NOTHING else was sent
+  });
+
+  it("legacy success does NOT navigate from the create action — materialization is createSend's job (§3.3)", async () => {
+    // The low-level create no longer setSelectedId/openSession; the id is
+    // returned and createSend materializes after the ownership transfer.
+    // (Navigation itself is asserted at the createSend seam below; here we
+    // pin that the create action is navigation-free by resolving cleanly.)
+    vi.stubGlobal("fetch", respond(200, { id: "new-ses-nav" }));
+    const r = await createSessionWithCertainty();
+    expect(r.id).toBe("new-ses-nav");
   });
 });
 

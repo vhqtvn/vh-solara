@@ -39,10 +39,12 @@ import {
   finishSendAttempt,
   getSendAction,
   mintSendAttempt,
+  transferCreateOpRecords,
   transferOwnerSendAttempts,
   updateSendAction,
   type PreparedSendPayload,
 } from "../../lib/sendActionStatus";
+import { modernCreateTransferTarget } from "../../lib/sessionCreateStatus";
 import type { Attachment } from "./createAttachments";
 import { EnqueueError, type QueuedMessage } from "../../queue";
 import type { DrainOutcome } from "../../queueDrain";
@@ -67,6 +69,12 @@ export type SendDependencies = {
   sessionId: Accessor<string>;
   draft: Accessor<boolean>;
   ensureSession: () => Promise<string | null>;
+  // Create-certainty Slice 2 (§3.3 navigation sequencing): materialize the
+  // draft's server session — setSelectedId + openSession. Extracted FROM the
+  // low-level create action (which no longer navigates) so ownership/receipt
+  // transfer runs FIRST and the uninterrupted send navigates AT MOST ONCE,
+  // after the transfer, before the admission tail.
+  materializeSession: (id: string) => void;
   // composer
   input: Accessor<string>;
   setInput: Setter<string>;
@@ -1132,19 +1140,25 @@ export function createSend(deps: SendDependencies): SendController {
         // Session creation did not produce an id. CERTAINTY matters
         // (send-reliability slice 2): ChatView.ensureSession marks the draft
         // attempt "uncertain" when the create's OUTCOME is unknown (timeout /
-        // proxy 502 — the session may exist; a re-send may create a SECOND
-        // session, so the operator is told to check). A definitive failure
-        // leaves the attempt in preparing → rejected here. Either way the
+        // proxy 502 / modern 202-unknown / in-flight — the session may exist;
+        // a re-send may create a SECOND session, so the operator is told to
+        // check). A definitive failure leaves the attempt in preparing →
+        // rejected here — UNLESS the modern flow already disposed of it
+        // (create-certainty Slice 2: capability-unavailable and proven
+        // pre-upstream rejections pre-mark their own terminal reason; the
+        // generic mark must not clobber the specific copy). Either way the
         // text is kept for retry — but only where we still own it (edits
         // made during the createSession wait survive, F1).
         const act = attempt ? getSendAction(attempt.attemptId) : undefined;
-        if (act?.stage === "uncertain") {
-          // O2 single-owner dedup: markOwnerSessionCreateUnknown already
-          // typed this record reason "session-create-unknown" — the row copy
-          // ("Session creation unconfirmed. Check possible sessions before
-          // sending again; another send may create another session.") owns
-          // the duplicate-session warning the notification detail used to
-          // carry, and the create-link group below it owns the candidates.
+        if (act && (act.stage === "uncertain" || act.stage === "rejected" || act.stage === "blocked")) {
+          // Already disposed of by the create path (modern uncertain/rejected
+          // pre-marks, or the legacy uncertain mark):
+          // - uncertain + reason "session-create-unknown": the row copy
+          //   ("Session creation unconfirmed. Check possible sessions before
+          //   sending again; another send may create another session.") owns
+          //   the duplicate-session warning (O2 single-owner dedup);
+          // - rejected + "capability-unavailable"/modern rejection: the
+          //   reason-specific copy owns the retry-safe advice.
         } else {
           if (attempt) {
             updateSendAction(attempt.attemptId, {
@@ -1167,28 +1181,28 @@ export function createSend(deps: SendDependencies): SendController {
         if (deps.input() === ownedText) deps.setInput(text);
         return;
       }
-      // EXPLICIT draft→live ownership transfer (send-reliability slice 2,
-      // widened to an owner SWEEP by the slice-3 F2 review finding): records
-      // minted under the "draft" key (no session existed at tap) are re-keyed
-      // to the live id now that it is known — the two single-flight keys are
-      // distinct by design, so the transfer must be explicit. Slice 2
-      // transferred only the IN-FLIGHT attempt; retained records from EARLIER
-      // draft taps (the reachable case: a create-outcome-unknown uncertain
-      // record, marked by ChatView.ensureSession) stayed stranded under
-      // "draft" — invisible in the destination session (SendStatus reads
-      // ownerKey = session id; findReusableSendAttempt is owner-scoped) and
-      // stale in the NEXT draft view. The sweep re-keys every
-      // still-draft-owned record: at materialization that is exactly the
-      // in-flight attempt plus retained uncertain records (mint-supersede
-      // already finished earlier preparing/blocked/rejected ones). Residual
-      // limitation (updated, A1 create-linkage): on PURE navigation (the
-      // create landed; the operator clicks the session in the list without
-      // re-tapping) the draft→session linkage IS now observed — reactively,
-      // by SendStatus's create-link affordance (createLinkCandidates), and
-      // a confirm runs this owner sweep before navigating. What remains
-      // deferred is a SILENT auto-re-key on pure navigation (needs a
-      // create-time idempotency key; brief §8, P2-API-011).
-      transferOwnerSendAttempts("draft", id);
+      // OWNERSHIP BEFORE NAVIGATION (create-certainty Slice 2, §3.3). The
+      // receipt/ownership transfer runs BEFORE the draft materializes, at
+      // most one navigation follows, and the admission tail runs under the
+      // live id:
+      //   - MODERN create (the operation resolved to exactly this id — fresh
+      //     receipt, recovery lookup, or a re-tap of a linked operation): the
+      //     OPERATION-SCOPED re-key — only this create operation's records
+      //     follow the session; unrelated drafts'/operations' records stay
+      //     untouched, finished records are never resurrected. The module
+      //     already ran this transfer at resolution time; re-running it here
+      //     is an idempotent sweep that catches the CURRENT tap's record.
+      //   - LEGACY create (no operation identity): the broad draft sweep,
+      //     unchanged (send-reliability slice 3, F2) — at materialization the
+      //     retained draft-owned set is exactly the in-flight attempt plus
+      //     uncertain records from earlier taps.
+      const modernOp = modernCreateTransferTarget(id);
+      if (modernOp) transferCreateOpRecords(modernOp, id);
+      else transferOwnerSendAttempts("draft", id);
+      // THEN navigation — exactly once, after ownership (the low-level create
+      // action no longer navigates; the draft ChatView unmounts here and the
+      // live view's memo reads the live id for the admission single-flight).
+      deps.materializeSession(id);
       // A re-tap once the live id exists is dropped at the LIVE key (the live
       // ChatView's memo reads it); the in-flight admission owns clearing on
       // its own success.
