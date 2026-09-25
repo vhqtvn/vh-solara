@@ -288,14 +288,14 @@ test.describe("lane 8: real SPA cross-origin iframe embed", () => {
 
   // ===========================================================================
   // GESTURE ROUND-TRIP (Slice 1 interaction model). The REAL production SPA's
-  // hostGesture.ts (web/src/hostGesture.ts) recognizes a double-Ctrl (desktop)
-  // / 3-finger-tap (mobile) gesture INSIDE the cross-origin iframe + forwards ONE
-  // closed {type:"host-gesture"} postMessage to the host. The host derives the
-  // source pane from event.source (the iframe's contentWindow) + opens its
-  // layout overlay anchored to that pane. This is the FIRST lane to prove the
-  // full gesture→overlay round-trip with the REAL SPA (the mock-content lane-7
-  // interaction-overlay spec proves the host side with a probe; this proves the
-  // SPA side emits for real).
+  // hostGesture.ts (web/src/hostGesture.ts) recognizes a triple COMPLETED
+  // bare-Ctrl (desktop) / 3-finger-tap (mobile) gesture INSIDE the cross-origin
+  // iframe + forwards ONE closed {type:"host-gesture"} postMessage to the host.
+  // The host derives the source pane from event.source (the iframe's
+  // contentWindow) + opens its layout overlay anchored to that pane. This is
+  // the FIRST lane to prove the full gesture→overlay round-trip with the REAL
+  // SPA (the mock-content lane-7 interaction-overlay spec proves the host side
+  // with a probe; this proves the SPA side emits for real).
   //
   // The gestures are driven via frame.evaluate dispatch (runs in the iframe's
   // REAL window context, hitting hostGesture.ts's REAL listeners) for CI
@@ -303,10 +303,11 @@ test.describe("lane 8: real SPA cross-origin iframe embed", () => {
   // Playwright is flaky. This still exercises the REAL recognizer + REAL
   // postMessage (origin-bound to the captured host) + REAL host routeMessage +
   // REAL overlay open. The only abstraction is the browser's hardware-event
-  // generation (a Playwright concern, not a product concern).
+  // generation (a Playwright concern, not a product concern) — synthetic
+  // dispatch proves the integration, NOT physical-keyboard reachability.
   // ===========================================================================
 
-  test("real SPA double-Ctrl gesture → host overlay opens for the source pane", async ({ page }) => {
+  test("real SPA triple bare-Ctrl gesture → host overlay opens for the source pane", async ({ page }) => {
     await page.goto("/");
     const frame = await firstRealFrame(page);
     await waitForSpaMounted(frame);
@@ -314,16 +315,44 @@ test.describe("lane 8: real SPA cross-origin iframe embed", () => {
     await waitForRealAlive(page, id);
     expect(await H.overlaySource(page), "overlay closed before the gesture").toBeNull();
 
-    // Drive a double bare-Ctrl inside the real SPA's window. The recognizer
-    // counts two non-repeated Control keydowns within 450ms → posts ONE
-    // {type:"host-gesture", gesture:"layout-overlay-request"} to the captured
-    // host origin (the handshake origin = localhost:5183, never '*').
+    // Drive completed bare-Ctrl presses (full Control down→up cycles) inside
+    // the real SPA's window. The release-qualified recognizer counts a tap
+    // only at its keyup and posts ONE {type:"host-gesture",
+    // gesture:"layout-overlay-request"} to the captured host origin (the
+    // handshake origin = localhost:5183, never '*') on the THIRD release.
+    // Synchronous dispatch keeps every release→keydown gap ~0ms, far inside
+    // the 450ms per-gap window.
+    //
+    // NEGATIVE first: TWO completed presses must NOT open the overlay (the
+    // reported abandon-repress double-press accident the release-qualified
+    // triple rejects). The trailing "a" keydown is the in-contract chain reset
+    // (any non-Control key resets): it terminates the two-tap chain for good,
+    // so the positive triple below must stand on its OWN three completed
+    // presses — no timing race with the 450ms gap between the two evaluates.
     await frame.evaluate(() => {
-      const fire = (key: string): void => {
-        window.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+      const tap = (): void => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "Control", bubbles: true }));
+        window.dispatchEvent(new KeyboardEvent("keyup", { key: "Control", bubbles: true }));
       };
-      fire("Control");
-      fire("Control");
+      tap();
+      tap();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+    });
+    // Give the real postMessage hop + host routing a beat to (not) land, then
+    // pin the negative.
+    await page.waitForTimeout(400);
+    expect(await H.overlaySource(page), "two completed presses → overlay stays closed").toBeNull();
+
+    // POSITIVE: a full fresh triple in one evaluate (all gaps ~0ms) → fires on
+    // the third qualifying RELEASE.
+    await frame.evaluate(() => {
+      const tap = (): void => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "Control", bubbles: true }));
+        window.dispatchEvent(new KeyboardEvent("keyup", { key: "Control", bubbles: true }));
+      };
+      tap();
+      tap();
+      tap();
     });
 
     // The host derived the source pane from event.source (this iframe's

@@ -10,11 +10,30 @@
 // gesture INSIDE the embedded SPA, and the SPA forwards ONE closed postMessage
 // intent to the host, which opens its layout overlay anchored to the source
 // pane. Two recognizers, ONE outbound gesture value:
-//   - DESKTOP: double bare-Ctrl (two presses of the Control key alone, no other
-//     key, within DOUBLE_CTRL_WINDOW_MS). Deliberately NOT Ctrl+something — a
-//     bare-Ctrl double-press is a discrete gesture that does not collide with
-//     any browser/spa shortcut (Ctrl+C, Ctrl+S, etc. all press a non-modifier
-//     key, which RESETS the sequence, so copy/save never triggers the overlay).
+//   - DESKTOP: triple COMPLETED bare-Ctrl (THREE full Control down→up cycles,
+//     firing on the THIRD RELEASE). Each press must be isolated — no other key
+//     down while Control is held, no other live modifier flag on the press
+//     itself — and each release→next-keydown gap must be <= CTRL_TAP_GAP_MS
+//     (a PER-GAP window, not a total deadline for the whole triple).
+//     Deliberately NOT Ctrl+something — a bare-Ctrl triple is a discrete
+//     gesture that does not collide with any browser/SPA shortcut (Ctrl+C,
+//     Ctrl+S, etc. press a non-modifier key, which RESETS the sequence, so
+//     copy/save never triggers the overlay). WHY release-qualified: a keydown
+//     cannot prove a press is "bare" — a chord's letter keydown lands while
+//     Control is still held, so a keydown-counting recognizer (the v1 double-
+//     Ctrl, removed after the operator reported accidental abandon-repress
+//     double presses firing the overlay) has already fired before the chord is
+//     revealed. Qualifying a tap only at its keyup means any chord is
+//     invalidated BEFORE the press can complete, and exactly TWO completed
+//     presses can never fire. Other modifiers (Shift/Alt/Meta) between or
+//     during presses now RESET the chain (v1 was deliberately inert toward
+//     them — this tightening is intentional: a chain one stray Shift away from
+//     completing is a false-fire waiting to happen). RESIDUAL RISKS (accepted,
+//     documented): NO hold-duration threshold — a long isolated hold still
+//     counts as one completed press; three abandoned bare presses within the
+//     gaps still activate (no recognizer can distinguish intention from an
+//     identical accepted sequence). See the recognizer section below for the
+//     full state machine.
 //   - MOBILE: 3-finger-tap (the ONLY mobile recognizer — the sequential
 //     triple-tap recognizer was REMOVED: any 3 quick taps within 500ms
 //     false-fired it during ordinary fast single-tap use; the operator
@@ -74,7 +93,16 @@
 
 import { isEmbedded } from "./embedded";
 
-const DOUBLE_CTRL_WINDOW_MS = 450;
+// Desktop triple bare-Ctrl: the MAXIMUM gap from one qualifying Control
+// RELEASE to the next Control keydown (inclusive, <=). A PER-GAP window, NOT a
+// total deadline for the whole triple — a late press simply starts a fresh
+// sequence. TUNABLE on-device if deliberate triples get rejected.
+const CTRL_TAP_GAP_MS = 450;
+// Desktop triple bare-Ctrl: completed isolated down→up cycles required,
+// firing on the THIRD qualifying release. Three (not two) deterministically
+// rejects the reported abandon-repress double-press accident while remaining
+// one deliberate gesture. Paired with CTRL_TAP_GAP_MS above.
+const CTRL_TAP_COUNT = 3;
 // 3-finger-tap: all three fingers down + lifted within this window of the
 // FIRST down (total first-down → last-up elapsed). Robust on real touch (counts
 // pointers, not per-tap timing). TUNABLE on-device.
@@ -97,7 +125,7 @@ export interface HostGestureMessage {
 /**
  * Install the embed-gated gesture recognizer + pane-activate forward. Captures
  * the host origin from the inbound handshake (same listener shape as
- * heartbeat.ts), recognizes the desktop double-Ctrl + mobile 3-finger-tap
+ * heartbeat.ts), recognizes the desktop triple bare-Ctrl + mobile 3-finger-tap
  * gestures (posting `{type:"host-gesture", gesture:"layout-overlay-request"}`),
  * and forwards a `{type:"host-gesture", gesture:"pane-activate"}` signal when
  * this document gains focus / receives a pointerdown (the cross-origin
@@ -139,7 +167,7 @@ export function startHostGesture(): (() => void) | undefined {
   // us via {type:'host-mode', mode:'keyboard-focus'|'normal'}). When active, the
   // 3-finger-tap gesture is SUPPRESSED (the operator is typing — a stray
   // multi-finger tap on non-interactive SPA content should not yank the
-  // layout). The double-Ctrl gesture is unaffected (a physical keyboard is
+  // layout). The triple-Ctrl gesture is unaffected (a physical keyboard is
   // attached; the operator is not tripping over a soft keyboard). See file
   // header for why the SPA cannot reliably infer this from its own
   // visualViewport.
@@ -263,48 +291,145 @@ export function startHostGesture(): (() => void) | undefined {
   document.addEventListener("focusin", onFocusInActivate, true);
   document.addEventListener("pointerdown", onPointerDownActivate, true);
 
-  // ---- desktop gesture: double bare-Ctrl ------------------------------------
-  // Count non-repeated keydown events where event.key === "Control"; two within
-  // DOUBLE_CTRL_WINDOW_MS → recognized. NO preventDefault/stopPropagation (the
-  // gesture must never disturb typing, IME, or browser shortcuts). Any
-  // intervening NON-modifier key resets the sequence (so Ctrl+C, Ctrl+S, etc.
-  // never trigger — the letter key resets). Modifier keys (Shift/Alt/Meta)
-  // between twoCtrls do NOT reset (they are inert for this recognizer). IME
-  // composition active → reset.
-  let lastCtrlAt = 0;
+  // ---- desktop gesture: triple COMPLETED bare-Ctrl ----------------------------
+  // THREE full Control down→up cycles, firing on the THIRD qualifying RELEASE
+  // (CTRL_TAP_COUNT). A qualifying TAP is an ISOLATED press: no other key down
+  // while Control is held, no other live modifier flag on the press itself,
+  // and the release→next-keydown gap within CTRL_TAP_GAP_MS.
+  //
+  // WHY RELEASE-QUALIFIED: a keydown cannot prove a press is "bare" — in a
+  // Ctrl+letter chord the letter's keydown lands while Control is still held,
+  // so a keydown-counting recognizer has already fired before the chord is
+  // revealed. Qualifying a tap only at its keyup means any chord is
+  // invalidated BEFORE the press can complete (the letter resets the chain AND
+  // abandons the pending press — its later Ctrl keyup finds nothing tracked
+  // and is an orphan that counts nothing).
+  //
+  // Resets/invalidations (all clear the completed-tap count AND any pending
+  // press):
+  //   - ANY non-Control keydown — Shift/Alt/Meta INCLUDED. This is an
+  //     INTENTIONAL TIGHTENING over the v1 double-Ctrl recognizer, which was
+  //     deliberately inert toward other modifiers: a pending chain one stray
+  //     Shift away from completing is a false-fire waiting to happen. Cost: a
+  //     legitimate triple-Ctrl with an accidental modifier in between must be
+  //     restarted.
+  //   - IME composition (isComposing / legacy keyCode 229).
+  //   - window blur (focus left this document mid-sequence — an abandoned
+  //     chain must not complete on a later press).
+  //   - A Control keydown carrying other live modifier flags (shiftKey/
+  //     altKey/metaKey — e.g. Ctrl+Shift pressed as one chord, or Shift
+  //     already held), and a Control KEYUP carrying them (modifier still held
+  //     at lift ⇒ the press was not isolated).
+  //   - A Control keydown while another Ctrl is already tracked (overlapping
+  //     left+right Ctrl — not isolated taps; the reset also abandons the
+  //     tracked press, so BOTH subsequent releases are orphans).
+  //   - A release→keydown gap > CTRL_TAP_GAP_MS: the late press starts a
+  //     FRESH sequence (the window is per-gap, not a whole-triple deadline).
+  // ev.repeat keydowns neither advance nor reset (held-Control auto-repeat is
+  // ignored). A Control keyup with no tracked qualifying down (orphan release)
+  // is ignored — it neither counts nor resets.
+  //
+  // RESIDUAL RISKS (accepted, documented — see also the file header): NO
+  // hold-duration threshold — a long isolated hold still counts as one
+  // completed press (an unmeasured duration cap would trade one false-fire
+  // class for another); three abandoned bare presses within the gaps still
+  // activate. NO preventDefault/stopPropagation anywhere — the gesture must
+  // never disturb typing, IME, or browser shortcuts.
+  let ctrlTaps = 0; // completed qualifying taps in the current chain
+  let lastCtrlReleaseAt = 0; // Date.now() of the last qualifying release (0 = none)
+  let ctrlPressActive = false; // a qualifying Ctrl keydown is held awaiting its keyup
+
+  const resetCtrlChain = (): void => {
+    // Also abandons any pending press: its eventual keyup finds nothing
+    // tracked and is ignored as an orphan (a chord's Ctrl release, an
+    // overlap-abandoned press, etc. must never complete a tap).
+    ctrlTaps = 0;
+    lastCtrlReleaseAt = 0;
+    ctrlPressActive = false;
+  };
+
   const onKeyDown = (ev: KeyboardEvent): void => {
     // IME composition active → reset (a composing key is not a discrete
     // keypress the gesture should chain on). keyCode 229 is the legacy
     // composition sentinel; isComposing is the modern signal.
     if (ev.isComposing || ev.keyCode === 229) {
-      lastCtrlAt = 0;
+      resetCtrlChain();
       return;
     }
     if (ev.key === "Control") {
-      if (ev.repeat) return; // an auto-repeated Control does not advance
-      const now = Date.now();
-      if (lastCtrlAt > 0 && now - lastCtrlAt <= DOUBLE_CTRL_WINDOW_MS) {
-        // Recognized: a second bare-Ctrl within the window. Reset BEFORE posting
-        // so a held/rapid sequence cannot stack recognitions.
-        lastCtrlAt = 0;
-        postOverlayRequest();
-      } else {
-        // First press (or a press outside the window) — start/extend the chain.
-        lastCtrlAt = now;
+      if (ev.repeat) return; // auto-repeated Control: neither advances nor resets
+      // A Ctrl press carrying other live modifier flags (Shift/Alt/Meta held
+      // when Control goes down) is not a BARE press — reject and reset.
+      if (ev.shiftKey || ev.altKey || ev.metaKey) {
+        resetCtrlChain();
+        return;
       }
+      // Overlapping Ctrl (a second Control down before the first lift — e.g.
+      // left+right): not isolated taps. Reset the chain and abandon the
+      // tracked press; both subsequent releases are orphans.
+      if (ctrlPressActive) {
+        resetCtrlChain();
+        return;
+      }
+      // Per-gap window: this keydown must land within CTRL_TAP_GAP_MS of the
+      // last qualifying RELEASE. A late press starts a fresh sequence (this is
+      // NOT a total deadline for the whole triple). A first press (no prior
+      // release) has no gap constraint.
+      if (lastCtrlReleaseAt > 0 && Date.now() - lastCtrlReleaseAt > CTRL_TAP_GAP_MS) {
+        ctrlTaps = 0;
+        lastCtrlReleaseAt = 0;
+      }
+      ctrlPressActive = true;
       return;
     }
-    // A modifier key (Shift/Alt/Meta) is inert here — it neither advances nor
-    // resets the bare-Ctrl chain (only a bare Control advances; only a non-
-    // modifier resets). This keeps a Ctrl modifier-chord from spuriously
-    // resetting a pending double-Ctrl.
-    if (ev.key === "Shift" || ev.key === "Alt" || ev.key === "Meta") return;
-    // Any other (non-modifier) key resets the chain. This is what makes Ctrl+C,
-    // Ctrl+S, arrow keys, etc. NOT trigger the overlay: the intervening letter
-    // / arrow / etc. clears lastCtrlAt before a second bare-Ctrl can chain.
-    lastCtrlAt = 0;
+    // Every OTHER key — non-modifiers AND Shift/Alt/Meta (the intentional
+    // tightening documented above) — resets the chain and abandons any
+    // pending press. This is what makes Ctrl+C, Ctrl+S, arrows, etc. never
+    // trigger the overlay: the intervening key clears the chain before the
+    // next bare-Ctrl can complete, and kills an in-flight press mid-chord.
+    resetCtrlChain();
+  };
+
+  const onKeyUp = (ev: KeyboardEvent): void => {
+    // Releases of other keys are irrelevant (resets happen on keydown).
+    if (ev.key !== "Control") return;
+    // An IME-composing release is not a discrete completed tap.
+    if (ev.isComposing || ev.keyCode === 229) {
+      resetCtrlChain();
+      return;
+    }
+    // Orphan release: no tracked qualifying down (chord-killed, overlap-
+    // abandoned, or simply unmatched). Ignored — neither counts nor resets.
+    if (!ctrlPressActive) return;
+    // Modifier flags live on the release itself (Shift/Alt/Meta still held at
+    // lift): the press was not isolated — disqualify, do not count.
+    if (ev.shiftKey || ev.altKey || ev.metaKey) {
+      resetCtrlChain();
+      return;
+    }
+    // A qualifying completed tap.
+    ctrlPressActive = false;
+    lastCtrlReleaseAt = Date.now();
+    ctrlTaps++;
+    if (ctrlTaps >= CTRL_TAP_COUNT) {
+      // Reset BEFORE posting so a held/rapid sequence cannot stack
+      // recognitions; the next activation needs a full fresh triple.
+      ctrlTaps = 0;
+      lastCtrlReleaseAt = 0;
+      postOverlayRequest();
+    }
   };
   window.addEventListener("keydown", onKeyDown, false);
+  window.addEventListener("keyup", onKeyUp, false);
+  // Focus left this document (operator switched panes/tabs mid-sequence): an
+  // abandoned chain must not complete on a later press. Unlike the activate
+  // forward's m0317 throttle story (where an UNRELIABLE blur stuck a pane),
+  // here a missed blur only fails to drop a chain — the cost is one stale
+  // triple, never a wedged pane — so blur is sound for the desktop chain.
+  const onBlurGesture = (): void => {
+    resetCtrlChain();
+  };
+  window.addEventListener("blur", onBlurGesture);
 
   // ---- mobile gesture: 3-finger-tap (the ONLY mobile recognizer) ------------
   // HARDENED with lift-distance gating (replaces both the removed sequential
@@ -397,6 +522,8 @@ export function startHostGesture(): (() => void) | undefined {
   return () => {
     window.removeEventListener("message", onMessage);
     window.removeEventListener("keydown", onKeyDown, false);
+    window.removeEventListener("keyup", onKeyUp, false);
+    window.removeEventListener("blur", onBlurGesture);
     window.removeEventListener("pointerdown", onDownThreeFinger, false);
     window.removeEventListener("pointerup", onUpThreeFinger, false);
     window.removeEventListener("pointercancel", onUpThreeFinger, false);

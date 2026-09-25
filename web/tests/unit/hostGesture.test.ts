@@ -2,13 +2,23 @@
 //
 // Host gesture recognizer (web/src/hostGesture.ts).
 //
-// Pins the desktop double-Ctrl + mobile 3-finger-tap (lift-distance-gated)
-// recognizers, the embed gate, the inbound source-guard, the captured-origin
-// outbound targeting (never '*'), the closed outbound payload (exactly
-// {type:"host-gesture", gesture:"layout-overlay-request"}, no extra fields),
-// and the keyboard-focus-mode suppression (driven by the host's
-// {type:'host-mode'} message). Uses fake timers (the recognizer keys its
-// windows on Date.now()).
+// Pins the desktop triple COMPLETED bare-Ctrl + mobile 3-finger-tap
+// (lift-distance-gated) recognizers, the embed gate, the inbound source-guard,
+// the captured-origin outbound targeting (never '*'), the closed outbound
+// payload (exactly {type:"host-gesture", gesture:"layout-overlay-request"},
+// no extra fields), and the keyboard-focus-mode suppression (driven by the
+// host's {type:'host-mode'} message). Uses fake timers (the recognizer keys
+// its windows on Date.now()).
+//
+// Desktop contract (release-qualified triple): a TAP is one full Control
+// down→up cycle with no other key and no other live modifier involved; the
+// recognizer fires ONLY on the THIRD qualifying keyup. Any other keydown —
+// Shift/Alt/Meta INCLUDED (an intentional tightening over the old recognizer,
+// which was inert toward them) — resets the chain AND abandons a pending
+// press (its later keyup is an orphan and counts nothing). The 450ms window
+// is the max gap from one qualifying RELEASE to the next Control keydown (per
+// gap, not a whole-triple deadline). NO hold-duration cap: a long isolated
+// hold still counts as one completed press (pinned below deliberately).
 //
 // The 3-finger-tap recognizer fires on ALL-LIFTED with per-finger movement
 // gating: 3 simultaneous touch pointers down → all 3 up, each within
@@ -48,18 +58,26 @@ function sendFromParent(
   window.dispatchEvent(ev);
 }
 
-/** Send a keydown with the given props (jsdom's KeyboardEvent does not expose
- *  repeat/isComposing/keyCode via the constructor for all keys, so set them). */
+/** Send a keydown/keyup with the given props (jsdom's KeyboardEvent does not
+ *  expose repeat/isComposing/keyCode via the constructor for all keys, so set
+ *  them; shift/alt/metaKey ARE constructor-settable modifier flags). */
 function sendKey(props: {
   key: string;
+  type?: "keydown" | "keyup";
   repeat?: boolean;
   isComposing?: boolean;
   keyCode?: number;
+  shiftKey?: boolean;
+  altKey?: boolean;
+  metaKey?: boolean;
 }): void {
-  const ev = new KeyboardEvent("keydown", {
+  const ev = new KeyboardEvent(props.type ?? "keydown", {
     key: props.key,
     bubbles: true,
     cancelable: true,
+    shiftKey: props.shiftKey ?? false,
+    altKey: props.altKey ?? false,
+    metaKey: props.metaKey ?? false,
   });
   if (props.repeat !== undefined) {
     Object.defineProperty(ev, "repeat", { value: props.repeat, configurable: true });
@@ -71,6 +89,21 @@ function sendKey(props: {
     Object.defineProperty(ev, "keyCode", { value: props.keyCode, configurable: true });
   }
   window.dispatchEvent(ev);
+}
+
+/** One COMPLETED bare-Ctrl tap: a full Control down→up cycle, dispatched at
+ *  the same fake-time instant (release→next-keydown gap 0ms — well inside the
+ *  450ms per-gap window). */
+function ctrlTap(): void {
+  sendKey({ key: "Control" });
+  sendKey({ key: "Control", type: "keyup" });
+}
+
+/** A full recognized desktop gesture: three completed bare-Ctrl taps. */
+function ctrlTriple(): void {
+  ctrlTap();
+  ctrlTap();
+  ctrlTap();
 }
 
 interface TapOpts {
@@ -188,10 +221,10 @@ function activateCount(posted: Posted[]): number {
 }
 
 // ---------------------------------------------------------------------------
-// DESKTOP: double bare-Ctrl
+// DESKTOP: triple COMPLETED bare-Ctrl (fires on the THIRD qualifying release)
 // ---------------------------------------------------------------------------
 
-describe("host gesture — desktop double-Ctrl", () => {
+describe("host gesture — desktop triple bare-Ctrl", () => {
   let parent: Window;
   let posted: Posted[];
   let dispose: (() => void) | undefined;
@@ -215,24 +248,36 @@ describe("host gesture — desktop double-Ctrl", () => {
     Object.defineProperty(window, "parent", { configurable: true, value: window });
   });
 
-  it("two bare-Ctrl within the window → posts one overlay-request", () => {
-    sendKey({ key: "Control" });
-    sendKey({ key: "Control" });
+  it("three completed bare-Ctrl presses → posts one overlay-request", () => {
+    ctrlTriple();
     expect(overlayCount(posted), "recognized → exactly one post").toBe(1);
     const msg = posted[0].msg;
     expect(msg.type, "closed type").toBe("host-gesture");
     expect(msg.gesture, "closed gesture value").toBe("layout-overlay-request");
   });
 
+  it("two completed presses → NO activation (the reported abandon-repress accident)", () => {
+    ctrlTap();
+    ctrlTap();
+    expect(overlayCount(posted), "exactly two presses can never fire").toBe(0);
+  });
+
+  it("the third keydown ALONE does not fire; the third qualifying RELEASE fires once", () => {
+    ctrlTap();
+    ctrlTap();
+    sendKey({ key: "Control" });
+    expect(overlayCount(posted), "third keydown alone → no fire (release-qualified)").toBe(0);
+    sendKey({ key: "Control", type: "keyup" });
+    expect(overlayCount(posted), "third release → exactly one post").toBe(1);
+  });
+
   it("targets the captured host origin (never '*')", () => {
-    sendKey({ key: "Control" });
-    sendKey({ key: "Control" });
+    ctrlTriple();
     expect(posted[0].origin, "origin-bound to handshake origin").toBe(HOST_ORIGIN);
   });
 
   it("posts a CLOSED payload — no extra fields leak", () => {
-    sendKey({ key: "Control" });
-    sendKey({ key: "Control" });
+    ctrlTriple();
     expect(posted.length).toBe(1);
     expect(Object.keys(posted[0].msg).sort(), "exactly {type, gesture}").toEqual([
       "gesture",
@@ -240,86 +285,210 @@ describe("host gesture — desktop double-Ctrl", () => {
     ]);
   });
 
-  it("two bare-Ctrl OUTSIDE the window (slow) → no recognition", () => {
-    sendKey({ key: "Control" });
-    // 600ms later (> 450ms window): the chain expired, this is a fresh first press.
-    vi.advanceTimersByTime(600);
-    sendKey({ key: "Control" });
-    expect(overlayCount(posted), "outside window → no recognition").toBe(0);
-    // A third quick press now completes a NEW chain (second+third within window).
-    sendKey({ key: "Control" });
-    expect(overlayCount(posted), "new chain completes").toBe(1);
+  it("a fresh sequence is required for a second activation (a 4th press starts over)", () => {
+    ctrlTriple();
+    expect(overlayCount(posted), "first triple recognized").toBe(1);
+    ctrlTap(); // press #4 — a fresh sequence's tap 1, NOT an instant re-fire
+    expect(overlayCount(posted), "4th press alone does not re-fire").toBe(1);
+    ctrlTap();
+    ctrlTap();
+    expect(overlayCount(posted), "fresh triple recognized again").toBe(2);
   });
 
-  it("auto-repeated Control does not advance the chain", () => {
-    sendKey({ key: "Control" });
-    // An auto-repeat keydown (held Control): ignored, does not count as the 2nd.
+  it("gap window: release→next-keydown gap of exactly 450ms chains; 451ms starts a fresh sequence", () => {
+    ctrlTap(); // release at t=0
+    vi.advanceTimersByTime(450);
+    ctrlTap(); // keydown at t=450 → gap 450 <= 450 → chains (tap 2)
+    vi.advanceTimersByTime(451);
+    ctrlTap(); // gap 451 > 450 → EXPIRED → this is fresh tap 1
+    expect(overlayCount(posted), "expired chain: only 1 completed fresh tap").toBe(0);
+    ctrlTap();
+    ctrlTap(); // fresh taps 2 + 3
+    expect(overlayCount(posted), "fresh sequence completes after expiry").toBe(1);
+  });
+
+  it("auto-repeated Control neither advances nor resets (held Ctrl repeats are ignored)", () => {
+    ctrlTap();
+    ctrlTap();
+    // An auto-repeat keydown between completed taps: ignored entirely.
     sendKey({ key: "Control", repeat: true });
-    expect(overlayCount(posted), "repeat ignored").toBe(0);
-    // A real (non-repeat) second press still completes within the window.
+    expect(overlayCount(posted), "repeat does not count as the 3rd press").toBe(0);
+    ctrlTap();
+    expect(overlayCount(posted), "real third press still completes").toBe(1);
+
+    // Auto-repeat DURING a held press: the press stays tracked and completes.
     sendKey({ key: "Control" });
-    expect(overlayCount(posted), "real second press completes").toBe(1);
+    sendKey({ key: "Control", repeat: true }); // repeat while held — no corruption
+    sendKey({ key: "Control", type: "keyup" }); // fresh-sequence tap 1
+    ctrlTap();
+    ctrlTap();
+    expect(overlayCount(posted), "held press with repeats completed normally").toBe(2);
   });
 
-  it("an intervening NON-modifier key resets the chain (Ctrl+C does not trigger)", () => {
-    sendKey({ key: "Control" });
-    // The 'c' (Ctrl+C) is a non-modifier keydown → resets the chain.
-    sendKey({ key: "c" });
-    sendKey({ key: "Control" });
-    expect(overlayCount(posted), "intervening letter reset → no recognition").toBe(0);
+  it("an intervening NON-modifier key resets the chain AND abandons a pending press (Ctrl+C never triggers)", () => {
+    ctrlTap(); // tap 1
+    sendKey({ key: "Control" }); // press 2 down
+    sendKey({ key: "c" }); // Ctrl+C chord: letter resets + abandons the pending press
+    sendKey({ key: "Control", type: "keyup" }); // must be an ORPHAN — counts nothing
+    ctrlTap(); // fresh tap 1
+    ctrlTap(); // fresh tap 2
+    // Correct: only 2 completed taps since the reset → no fire. A buggy impl
+    // that counted the chord's Ctrl release as a completed tap would fire here.
+    expect(overlayCount(posted), "chord release orphaned → only 2 fresh taps → no fire").toBe(0);
   });
 
-  it("an intervening modifier key (Shift/Alt/Meta) does NOT reset the chain", () => {
-    sendKey({ key: "Control" });
-    sendKey({ key: "Shift" });
-    sendKey({ key: "Control" });
-    expect(overlayCount(posted), "modifier between does not reset").toBe(1);
+  it("a third press completed by a CHORD is invalidated (letter down before Ctrl up)", () => {
+    ctrlTap();
+    ctrlTap(); // taps 1, 2
+    sendKey({ key: "Control" }); // 3rd press down
+    sendKey({ key: "s" }); // chord letter lands BEFORE the Ctrl release → reset
+    sendKey({ key: "Control", type: "keyup" }); // orphan — not a third qualifying release
+    expect(overlayCount(posted), "chord-completed press invalidated → no activation").toBe(0);
+  });
+
+  it.each(["Shift", "Alt", "Meta"] as const)(
+    "an intervening %s keydown RESETS the chain (deliberate tightening: the old recognizer was inert)",
+    (mod) => {
+      ctrlTap();
+      ctrlTap();
+      sendKey({ key: mod });
+      ctrlTap(); // fresh tap 1 (if %s were inert this would be tap 3 → fire)
+      expect(overlayCount(posted), `${mod} between presses resets → no fire`).toBe(0);
+    },
+  );
+
+  it("a modifier pressed DURING a pending press resets the chain (the chorded release is an orphan)", () => {
+    ctrlTap();
+    ctrlTap();
+    sendKey({ key: "Control" }); // 3rd press down (tracked)
+    sendKey({ key: "Shift" }); // modifier during the press → reset + abandon
+    sendKey({ key: "Control", type: "keyup" }); // orphan — must NOT count as tap 3
+    expect(overlayCount(posted), "modifier-during-press invalidated").toBe(0);
+    ctrlTap();
+    ctrlTap();
+    expect(overlayCount(posted), "two more taps = only fresh taps 1+2 → still no fire").toBe(0);
+    ctrlTap();
+    expect(overlayCount(posted), "a full fresh triple fires").toBe(1);
+  });
+
+  it("held modifier flags on the Ctrl KEYDOWN itself are rejected (Ctrl+Shift pressed as one chord)", () => {
+    ctrlTap();
+    ctrlTap();
+    sendKey({ key: "Control", shiftKey: true }); // not a BARE press → reset
+    sendKey({ key: "Control", type: "keyup", shiftKey: true }); // orphan either way
+    expect(overlayCount(posted), "chord-flagged keydown rejected").toBe(0);
+    ctrlTap();
+    expect(overlayCount(posted), "chain was reset → this is only fresh tap 2").toBe(0);
+  });
+
+  it("modifier flags on the Ctrl KEYUP disqualify the release (press not isolated at lift)", () => {
+    ctrlTap();
+    ctrlTap();
+    sendKey({ key: "Control" }); // clean keydown (tracked)
+    sendKey({ key: "Control", type: "keyup", altKey: true }); // Alt still held → disqualify
+    expect(overlayCount(posted), "modifier-flagged release does not complete tap 3").toBe(0);
+    ctrlTriple(); // recognizer not wedged — a full fresh triple fires
+    expect(overlayCount(posted), "fresh triple after disqualification").toBe(1);
+  });
+
+  it("overlapping Ctrl (second down before the first up) is rejected", () => {
+    ctrlTap();
+    ctrlTap();
+    sendKey({ key: "Control" }); // down #3a (tracked)
+    sendKey({ key: "Control" }); // down #3b while #3a held → overlap → reset + abandon
+    sendKey({ key: "Control", type: "keyup" }); // orphan
+    sendKey({ key: "Control", type: "keyup" }); // orphan
+    expect(overlayCount(posted), "overlapping Ctrl never completes isolated taps").toBe(0);
+  });
+
+  it("an orphan keyup (up without a tracked down) is ignored — neither counts nor resets", () => {
+    ctrlTap();
+    ctrlTap();
+    sendKey({ key: "Control", type: "keyup" }); // orphan release
+    expect(overlayCount(posted), "orphan keyup does not count as the 3rd tap").toBe(0);
+    ctrlTap(); // if the orphan had RESET the chain this could not fire
+    expect(overlayCount(posted), "orphan did not reset — third real tap fires").toBe(1);
   });
 
   it("IME composition active resets the chain", () => {
-    sendKey({ key: "Control" });
-    // A composing keydown resets.
+    ctrlTap();
+    ctrlTap();
     sendKey({ key: "a", isComposing: true });
-    sendKey({ key: "Control" });
+    ctrlTap();
     expect(overlayCount(posted), "composition reset → no recognition").toBe(0);
   });
 
   it("the legacy keyCode 229 composition sentinel resets the chain", () => {
-    sendKey({ key: "Control" });
+    ctrlTap();
+    ctrlTap();
     sendKey({ key: "x", keyCode: 229 });
-    sendKey({ key: "Control" });
+    ctrlTap();
     expect(overlayCount(posted), "keyCode 229 reset → no recognition").toBe(0);
+  });
+
+  it("window blur resets the chain (an abandoned mid-sequence chain cannot complete later)", () => {
+    ctrlTap();
+    ctrlTap();
+    window.dispatchEvent(new Event("blur"));
+    ctrlTap(); // fresh tap 1 — the pre-blur taps are gone
+    expect(overlayCount(posted), "blur reset → no recognition").toBe(0);
+    ctrlTap();
+    ctrlTap();
+    expect(overlayCount(posted), "a full fresh triple after blur fires").toBe(1);
+  });
+
+  it("a LONG isolated hold still counts as one completed press (NO duration cap — pinned residual risk)", () => {
+    // The contract deliberately has no hold-duration threshold. A 5s held Ctrl
+    // that lifts cleanly is a completed tap; future tuning must be deliberate
+    // (changing this test), not accidental.
+    sendKey({ key: "Control" });
+    vi.advanceTimersByTime(5000);
+    sendKey({ key: "Control", type: "keyup" }); // tap 1 despite the hold
+    ctrlTap();
+    ctrlTap();
+    expect(overlayCount(posted), "long hold counts → triple completes").toBe(1);
   });
 
   it("works while an editable element is focused (no host-focus suppression)", () => {
     // The desktop gesture is NOT suppressed by editable focus (a physical
-    // keyboard is attached). A double-Ctrl while typing still opens the overlay.
+    // keyboard is attached). A triple-Ctrl while typing still opens the overlay.
     const input = document.createElement("input");
     document.body.appendChild(input);
     input.focus();
-    sendKey({ key: "Control" });
-    sendKey({ key: "Control" });
-    expect(overlayCount(posted), "editable focus does not suppress double-Ctrl").toBe(1);
+    ctrlTriple();
+    expect(overlayCount(posted), "editable focus does not suppress triple-Ctrl").toBe(1);
     input.remove();
   });
 
-  it("no preventDefault/stopPropagation is called on the desktop gesture keys", () => {
-    // The recognizer must never disturb typing/shortcuts. Spy on the event.
-    const ev = new KeyboardEvent("keydown", { key: "Control", bubbles: true, cancelable: true });
-    const pd = vi.spyOn(ev, "preventDefault");
-    const sp = vi.spyOn(ev, "stopPropagation");
-    window.dispatchEvent(ev);
-    expect(pd, "no preventDefault").not.toHaveBeenCalled();
-    expect(sp, "no stopPropagation").not.toHaveBeenCalled();
+  it("no preventDefault/stopPropagation is called on any desktop gesture key event", () => {
+    // The recognizer must never disturb typing/shortcuts. Spy on both the
+    // keydown and the keyup of a full tap.
+    const kd = new KeyboardEvent("keydown", { key: "Control", bubbles: true, cancelable: true });
+    const ku = new KeyboardEvent("keyup", { key: "Control", bubbles: true, cancelable: true });
+    const pd1 = vi.spyOn(kd, "preventDefault");
+    const sp1 = vi.spyOn(kd, "stopPropagation");
+    const pd2 = vi.spyOn(ku, "preventDefault");
+    const sp2 = vi.spyOn(ku, "stopPropagation");
+    window.dispatchEvent(kd);
+    window.dispatchEvent(ku);
+    expect(pd1, "no preventDefault on keydown").not.toHaveBeenCalled();
+    expect(sp1, "no stopPropagation on keydown").not.toHaveBeenCalled();
+    expect(pd2, "no preventDefault on keyup").not.toHaveBeenCalled();
+    expect(sp2, "no stopPropagation on keyup").not.toHaveBeenCalled();
   });
 
-  it("idempotent-on-recognition: a rapid triple-Ctrl posts twice (no stacking within one pair)", () => {
-    // A double-Ctrl recognizes and resets; a second double-Ctrl recognizes again.
-    sendKey({ key: "Control" });
-    sendKey({ key: "Control" });
-    sendKey({ key: "Control" });
-    sendKey({ key: "Control" });
-    expect(overlayCount(posted), "two distinct recognitions").toBe(2);
+  it("the disposer removes the keydown, keyup AND blur listeners", () => {
+    const rm = vi.spyOn(window, "removeEventListener");
+    dispose?.();
+    dispose = undefined;
+    expect(rm).toHaveBeenCalledWith("keydown", expect.any(Function), false);
+    expect(rm).toHaveBeenCalledWith("keyup", expect.any(Function), false);
+    expect(rm).toHaveBeenCalledWith("blur", expect.any(Function));
+    rm.mockRestore();
+    // Functional: a full triple after dispose posts nothing.
+    ctrlTriple();
+    window.dispatchEvent(new Event("blur")); // removed blur listener must not crash
+    expect(overlayCount(posted), "disposed recognizer is inert").toBe(0);
   });
 });
 
@@ -348,15 +517,13 @@ describe("host gesture — embed gate + uncaptured origin", () => {
     Object.defineProperty(window, "parent", { configurable: true, get: () => parent });
     const dispose = startHostGesture();
     // NO handshake sent → hostOrigin is null → recognitions are dropped.
-    sendKey({ key: "Control" });
-    sendKey({ key: "Control" });
+    ctrlTriple();
     threeFingerDowns();
     threeFingerUps();
     expect(overlayCount(posted), "no post before handshake").toBe(0);
     // After the handshake lands, a new recognition posts.
     sendFromParent(parent, { type: "vh-host-handshake", nonce: "n" });
-    sendKey({ key: "Control" });
-    sendKey({ key: "Control" });
+    ctrlTriple();
     expect(overlayCount(posted), "posts after handshake").toBe(1);
     dispose?.();
   });
@@ -367,11 +534,10 @@ describe("host gesture — embed gate + uncaptured origin", () => {
     Object.defineProperty(window, "parent", { configurable: true, get: () => parent });
     const dispose = startHostGesture();
     // An alien source claims to be the host handshake → ignored (no origin
-    // captured), so a subsequent double-Ctrl still cannot post.
+    // captured), so a subsequent triple-Ctrl still cannot post.
     const alien = {} as Window;
     sendFromParent(alien, { type: "vh-host-handshake", nonce: "x" });
-    sendKey({ key: "Control" });
-    sendKey({ key: "Control" });
+    ctrlTriple();
     expect(overlayCount(posted), "alien handshake ignored → no captured origin").toBe(0);
     dispose?.();
   });
