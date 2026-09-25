@@ -33,6 +33,13 @@ import { QueueChip } from "../QueueChip";
 import Select from "../Select";
 import ModelDialog from "../ModelDialog";
 import { SendStatus } from "./SendStatus";
+// Side-effect import (repo CSS-arch rule 5): the send button's STATIC
+// sending state (.send-btn.sending:disabled) — the O2 slice-2 replacement for
+// the removed infinite pulse that used to live in
+// styles/legacy/70-composer-diff-git.css. A PLAIN stylesheet, not a css
+// module: pure-:global modules with no used locals are tree-shaken from the
+// production bundle (slice-2 review C-F1) — plain .css is always emitted.
+import "./Composer.css";
 import type { ComposerAutocomplete } from "./createComposerAutocomplete";
 import type { Attachments } from "./createAttachments";
 import type { ComposerPaste } from "./createComposerPaste";

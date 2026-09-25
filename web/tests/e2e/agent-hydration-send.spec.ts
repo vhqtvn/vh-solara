@@ -98,6 +98,39 @@ test("send while agent evidence is pending dispatches exactly once with the evid
   const sendBtn = page.locator(".composer-bar .send-btn");
   await expect(sendBtn).toHaveAttribute("aria-label", "Sending…", { timeout: 10000 });
 
+  // 4b. O2 slice 2 — STATIC tap acknowledgement: the former infinite
+  //     icon-opacity pulse is gone (no animation loop even without
+  //     prefers-reduced-motion); the disabled + dimmed button IS the ack.
+  await expect(sendBtn.locator(".icon")).toHaveCSS("animation-name", "none");
+  // 4c. O2 slice 2 — compact merged happy-path line: the parked preparing
+  //     record renders as ONE calm progress row (not a per-record ledger).
+  await expect(page.locator('.sendStatusLine[data-kind="progress"]')).toHaveText("Sending…");
+
+  // 4d. O2 slice-2 review C-F4 — production-bundle CSS-content guard. The
+  //     webServer serves the PRODUCTION-built SPA (fixture-web.sh runs
+  //     `npm run build`), so computed styles here prove the co-located
+  //     Composer.css/SendStatus.css actually REACHED the bundle: slice-2
+  //     review C-F1 found both former pure-:global css modules tree-shaken
+  //     from the built CSS (empty locals → moduleSideEffects:false), while
+  //     the JS carried the markup — every style below was inert and the
+  //     announcer rendered as visible duplicated raw status text.
+  //     (a) opacity 0.75 also proves the C-F2 specificity fix:
+  //         '.send-btn.sending:disabled' (0,3,0) beats the later-emitted
+  //         legacy '.send-btn:disabled { opacity: 0.45 }' (0,2,0) — component
+  //         CSS is emitted BEFORE the legacy shards (index.tsx imports App
+  //         before './styles/main.css'), so a same-specificity tie would
+  //         render 0.45.
+  await expect(sendBtn).toHaveCSS("opacity", "0.75");
+  //     (b) the polite announcer mirror is VISUALLY HIDDEN by SendStatus.css's
+  //         sr-only clip recipe (1px absolute clip box) — without the
+  //         stylesheet it is a visible duplicate of the status text.
+  const announcer = page.locator('[data-testid="send-status-announcer"]');
+  await expect(announcer).toHaveCSS("position", "absolute");
+  await expect(announcer).toHaveCSS("width", "1px");
+  await expect(announcer).toHaveCSS("height", "1px");
+  await expect(announcer).toHaveCSS("overflow", "hidden");
+  await expect(announcer).toHaveCSS("clip-path", "inset(50%)");
+
   // No dispatch while pending: still resolving after a bounded settle window
   // (any wrongful dispatch would have landed here), and ZERO prompt_async
   // requests left the browser.

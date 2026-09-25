@@ -1,0 +1,34 @@
+/* Composer (O2 slice 2) — co-located styles for composer chrome THIS slice
+   touched. A PLAIN stylesheet (NOT a css module), imported for side effects:
+   the slice-2 review C-F1 found the former pure-:global Composer.module.css
+   was TREE-SHAKEN from the production bundle (a css module whose locals are
+   unused resolves to moduleSideEffects:false under this repo's pinned Vite,
+   so Rollup drops it — the sending state never reached the built SPA). Plain
+   .css files are always emitted (repo exemplars: EmptyState.css /
+   ProjectSwitcher.css; docs/ai/web-css-architecture.md). Classes stay
+   globally named — e2e queries them by global selector (`.send-btn`,
+   `.composer-bar` — repo CSS-architecture rule 1); the composer* / send-btn*
+   prefixes keep the global namespace collision-free. Consumes global theme
+   tokens only — defines none.
+
+   Perf posture (Firefox/WebRender rules, AGENTS.md): NO animation loop here
+   by design — the former infinite icon-opacity pulse was removed (O2 slice 2
+   "static tap acknowledgement": the button is a tap acknowledgement, not a
+   status ledger; progress text belongs exclusively to SendStatus). Nothing
+   animated → nothing to guard with prefers-reduced-motion. */
+
+/* Static sending state: the single-flight guard already :disables the button
+   (.send-btn:disabled { opacity: 0.45 } in 70-composer-diff-git.css). The
+   sending state sits calmer-but-distinct between rest (1) and plain-disabled
+   (0.45) so the tap registration is visibly acknowledged with ZERO motion.
+   LOAD ORDER (slice-2 review C-F2): index.tsx imports App (→ this file)
+   BEFORE './styles/main.css', so component CSS is emitted FIRST and a
+   same-specificity selector would LOSE the tie to the later-emitted legacy
+   '.send-btn:disabled'. The :disabled in this selector raises specificity to
+   (0,3,0) > (0,2,0) so it wins regardless of emission order. The truthful
+   accessible name ("Sending…") carries the state for AT users; the
+   aria-label AND the computed opacity are e2e-asserted (the
+   production-bundle CSS guard, review C-F4). */
+.send-btn.sending:disabled {
+  opacity: 0.75;
+}

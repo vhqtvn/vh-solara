@@ -230,9 +230,15 @@ test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry 
   };
   await page.route(`**/vh/session/${HOLD_SESSION}/queue`, queueRouteHandler);
 
-  // Real user gesture: type + click Send through the real event model.
+  // Real user gesture: type + click Send through the real event model. The
+  // message is DELIBERATELY longer than the 80-char compact-preview bound so
+  // the same arc also proves the O2-slice-2 bounded full-text payload
+  // expansion (collapsed clip → "Show full message" → verbatim stored text).
+  const MSG =
+    "E2E RETRY SAME — full-text expansion probe. This stored message body is deliberately far longer than the eighty-character compact preview bound, so the collapsed Same-message quote is clipped and the Show-full-message affordance must render the stored text verbatim inline.";
+  const MSG_TAIL = "verbatim inline"; // unique to the FULL stored text
   const ta = page.getByPlaceholder(/Message/);
-  await ta.fill("E2E RETRY SAME");
+  await ta.fill(MSG);
   await page.locator(".composer-bar .send-btn").click();
 
   // (a) the wire carried an attemptId; the server admitted the item (the
@@ -249,16 +255,27 @@ test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry 
 
   // The honest outcome-unknown state renders — readable text, payload
   // surfacing ("Same message:"), and the retry-SAME affordance (never an
-  // unqualified Retry).
+  // unqualified Retry). O2 slice 2: the collapsed preview is the 80-char
+  // CLIP (tail absent); "Show full message" expands the verbatim stored
+  // text INLINE in the row (no new surface), and toggles back.
   const statusRow = page.locator(".sendStatusLine", { hasText: "Queue confirmation unknown." });
   await expect(statusRow).toBeVisible({ timeout: 15_000 });
   await expect(statusRow).toContainText("Check the queue, or retry this same message.");
   await expect(statusRow).toContainText("Same message:");
   await expect(statusRow).toContainText("E2E RETRY SAME");
+  await expect(statusRow).not.toContainText(MSG_TAIL);
+  const fullBtn = statusRow.locator(".sendStatusMore", { hasText: "Show full message" });
+  await expect(fullBtn).toBeVisible();
+  await fullBtn.click();
+  await expect(statusRow).toContainText(MSG_TAIL);
+  await expect(statusRow).toContainText(MSG);
+  await expect(
+    statusRow.locator(".sendStatusMore", { hasText: "Hide full message" }),
+  ).toBeVisible();
   await expect(statusRow.locator(".sendStatusBtn", { hasText: "Retry same message" })).toBeVisible();
 
   // The composed text is PRESERVED (no silent loss) and nothing dispatched.
-  await expect(ta).toHaveValue("E2E RETRY SAME");
+  await expect(ta).toHaveValue(MSG);
   expect(prompts).toHaveLength(0);
 
   // Recovery: restore transport (ONLY the queue route — the prompt_async
@@ -287,7 +304,7 @@ test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry 
   // send (the row's own preview always advertised the stored payload, and
   // the verbatim replay is what recovered custody).
   await expect(statusRow).toHaveCount(0);
-  await expect(ta).toHaveValue("E2E RETRY SAME");
+  await expect(ta).toHaveValue(MSG);
 
   // (c) exactly ONE item server-side under this attemptId — no duplicate —
   // and exactly ONE downstream dispatch of the recovered message.

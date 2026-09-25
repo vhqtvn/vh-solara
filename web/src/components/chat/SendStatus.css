@@ -1,0 +1,182 @@
+/* SendStatus (send-reliability slice 3 → O2 slice 2) — the composer's
+   readable send-action status surface: severity-ordered recovery rows, the
+   create-link candidate group, and ONE compact merged happy-path line. A
+   PLAIN stylesheet (NOT a css module), imported for side effects: the
+   slice-2 review C-F1 found the former pure-:global SendStatus.module.css
+   was TREE-SHAKEN from the production bundle (a css module whose locals are
+   unused resolves to moduleSideEffects:false under this repo's pinned Vite,
+   so Rollup drops it — every sendStatus* rule below was missing from the
+   built SPA, and the announcer rendered as visible duplicated raw text).
+   Plain .css files are always emitted (repo exemplars: EmptyState.css /
+   ProjectSwitcher.css; docs/ai/web-css-architecture.md). Classes stay
+   globally named — unit/e2e tests query them by name (repo CSS-architecture
+   rule); the sendStatus* prefix keeps the global namespace collision-free.
+   Consumes global theme tokens only — defines none.
+
+   Perf posture (Firefox/WebRender rules, AGENTS.md): this surface can be
+   present on every composer — NO mask-image, NO backdrop-filter, NO
+   per-element contain/content-visibility, no animated gradients. Flat flex
+   rows with plain text: cheap to composite. */
+
+.sendStatus {
+  position: relative; /* anchors the visually hidden announcer's clip box */
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px 4px 6px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--fg);
+}
+
+/* ONE dedicated polite announcer (O2 slice 2): a visually hidden mirror of
+   the primary texts. The container is NOT a live region — controls and
+   expandable details stay outside live regions. Standard sr-only clip shape
+   (a 1px static span — NOT a scroll-container mask; the WebRender guardrail
+   targets mask-image on scroll surfaces). The sr-only treatment is
+   e2e-asserted (production-bundle CSS guard, review C-F4). */
+.sendStatusAnnouncer {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.sendStatusLine {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 22px;
+  border-radius: 8px;
+  padding: 3px 8px;
+  background: color-mix(in srgb, var(--bg-2) 88%, var(--fg) 12%);
+}
+
+/* Certainty tinting: unknown/unsaved states lean warn (attention, NOT failure
+   — outcome-unknown must never look like "failed, safe to resend"); definitive
+   rejections lean err; transient progress stays neutral. Text contrast comes
+   from var(--fg) on the mixed background — readable, never glow-only. The A1
+   create-link affordance (data-kind="create-link") shares the warn tint: it is
+   the ACTION follow-up to the uncertain row it sits beside. */
+.sendStatusLine[data-kind="uncertain"],
+.sendStatusLine[data-kind="unsaved"],
+.sendStatusLine[data-kind="create-link"] {
+  background: color-mix(in srgb, var(--warn) 16%, var(--bg-2));
+}
+.sendStatusLine[data-kind="conflict"],
+.sendStatusLine[data-kind="rejected"],
+.sendStatusLine[data-kind="blocked"] {
+  background: color-mix(in srgb, var(--danger, #e5484d) 16%, var(--bg-2));
+}
+
+.sendStatusText {
+  color: var(--fg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* O2 slice 2 — the compact merged happy-path line sits BELOW recovery and is
+   deliberately calm: no tinted background, dimmed text. It is progress, not
+   a warning; recovery rows keep the attention-drawing tints. */
+.sendStatusLine[data-kind="progress"] {
+  background: transparent;
+  padding-inline: 2px;
+}
+.sendStatusLine[data-kind="progress"] .sendStatusText {
+  color: color-mix(in srgb, var(--fg) 72%, var(--bg-2));
+}
+
+.sendStatusPayload {
+  color: color-mix(in srgb, var(--fg) 72%, var(--bg-2));
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.sendStatusBtn {
+  flex: none;
+  font-size: 11.5px;
+  line-height: 1;
+  padding: 5px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--fg);
+  background: var(--bg-2);
+  color: var(--fg);
+  cursor: pointer;
+  /* Mobile-first hit target: ≥22px tall, generous padding. */
+  min-height: 22px;
+}
+.sendStatusBtn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* O2 slice 2 — inline progressive-disclosure control ("Show N more notices"
+   / "Show all N possible sessions" / "Show full message"). Cheap flat button;
+   no drawer, no modal. */
+.sendStatusMore {
+  flex: none;
+  align-self: flex-start;
+  font-size: 11.5px;
+  line-height: 1;
+  padding: 5px 9px;
+  min-height: 22px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* O2 slice 2 — expanded verbatim payload ("Show full message"): the full
+   stored text + all retained filenames, inline in the row (no new surface).
+   flex-basis 100% wraps it onto its own line inside the wrapping row. */
+.sendStatusFull {
+  flex-basis: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: color-mix(in srgb, var(--fg) 72%, var(--bg-2));
+  font-size: 11px;
+  border-inline-start: 2px solid var(--border);
+  padding: 2px 0 2px 8px;
+}
+
+/* O2 slice 2 — create-link candidate group (F5 fix): candidates are
+   VERTICALLY STACKED full-width ~44px touch targets with wrapping labels —
+   never a horizontal button ribbon that overflows narrow viewports. */
+.sendStatusCandidates {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: stretch;
+  padding-top: 2px;
+}
+.sendStatusCandidate {
+  width: 100%;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: normal;
+  text-align: start;
+  line-height: 1.35;
+}
+
+.sendStatusDismiss {
+  flex: none;
+  margin-left: auto;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: color-mix(in srgb, var(--fg) 65%, var(--bg-2));
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}

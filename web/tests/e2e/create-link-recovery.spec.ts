@@ -160,12 +160,28 @@ test("(browser) create response lost → session lands via SSE → confirmed lin
   // create-unknown record → the operator-confirmed linkage row renders. NOTE:
   // the fresh fixture server stamps EVERY seeded session's time.created at
   // boot (~1s before the POST), so the row honestly lists several in-window
-  // candidates — the created session is addressed deterministically via its
-  // data-session-id (title "New session" → the generic "Link and open it
-  // (time)" copy).
+  // candidates. O2 slice 2 GROUPS them: the newest TWO render as stacked
+  // targets; the rest sit behind an inline "Show all N possible sessions"
+  // disclosure (the F5 narrow-viewport row-width fix). The fault-minted
+  // session is the NEWEST, so it is visible even before expansion; it is
+  // addressed deterministically via its data-session-id (title "New session"
+  // → the generic "Link and open it (time, short-id)" copy).
   const linkRow = page.locator('.sendStatusLine[data-kind="create-link"]');
   await expect(linkRow).toBeVisible({ timeout: 10_000 });
   await expect(linkRow).toContainText("Possible sessions — timing is the only match");
+  // The adjacent explanation discloses the all-remaining-records sweep
+  // (decision-doc matrix: the create-link row covers ALL remaining draft
+  // recovery records).
+  await expect(linkRow).toContainText("Confirming moves this draft");
+  const candBtns = linkRow.locator(".sendStatusBtn[data-session-id]");
+  const expander = linkRow.locator(".sendStatusMore", { hasText: /Show all \d+ possible sessions/ });
+  await expect(expander).toBeVisible();
+  const n = Number((await expander.textContent())!.match(/Show all (\d+)/)![1]);
+  expect(await candBtns.count()).toBe(2); // grouping cap: the two newest only
+  // Expansion is inline progressive disclosure: every candidate becomes
+  // reachable without any drawer/modal.
+  await expander.click();
+  await expect(candBtns).toHaveCount(n);
   const openBtn = linkRow.locator(`.sendStatusBtn[data-session-id="${createdId}"]`);
   await expect(openBtn).toBeVisible();
 

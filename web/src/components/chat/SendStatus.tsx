@@ -1,21 +1,53 @@
-// Send-action status surface — send-reliability slice 3 (brief §4.4).
+// Send-status surface — O2 slice 2: compact merged happy path + severity-
+// ordered recovery (design contract: researches/decisions/2026-09-25-send-state-
+// ux-design-and-defers.md §1; richer per-choice detail in the O2 brief §3).
 //
-// Renders the operator-visible recovery states that slice 2 made expressible
-// in lib/sendActionStatus (typed certainty + recovery per attempt). Mounted
-// by Composer where the Send button's glow lives — the glow stays (a
-// glance-level signal), but every state here is READABLE TEXT, never
-// glow-only.
+// STRUCTURE (slice 2):
+//   - ONE compact transient line for the happy path (preparing/admitting
+//     records are AGGREGATED — never one row per record):
+//       1 active record → its own stage copy ("Uploading 1 of 2…" /
+//                         "Sending…" / "Retrying queue confirmation…")
+//       N active records → "N send actions in progress…" (the decision doc's
+//                         copy matrix — never an invented merged upload
+//                         denominator across records)
+//     It renders BELOW the recovery rows ("one compact transient line below
+//     critical recovery" — brief §3.1). Presentation grouping NEVER merges or
+//     deletes store records.
+//   - Recovery rows (uncertain/conflict/rejected/blocked/unsaved + the
+//     create-link group) stay FULL rows — the compact line is happy-path
+//     only. They render SEVERITY-ordered (brief §3.4 ladder, documented here
+//     because the decision doc names the tiers but not their order):
+//       conflict (0) > uncertain (1) > unsaved (2) > blocked/rejected (3)
+//     Within a tier the order is IMMUTABLE IDENTITY (attemptId), never
+//     updatedAt — a retry patch must not reshuffle rows under an operator's
+//     focus. The blocked/rejected tier is capped at SECONDARY_CAP initially
+//     visible rows with an inline "Show N more notices" disclosure (critical
+//     tiers are NEVER capped — "critical summaries never hidden by cap").
+//   - Create-link candidates: CANDIDATE_CAP visible, remainder behind
+//     "Show all N possible sessions" (vertically stacked ~44px targets —
+//     closes the F5 narrow-viewport row-width drop).
+//   - The uncertain retry-same payload preview gains bounded full-text
+//     expansion: collapsed = the 80-char compact preview; "Show full message"
+//     expands the verbatim stored text + all retained filenames INLINE in the
+//     row (no new surface).
 //
-// Copy contract (normative, O2 brief §3.6 — reason-specific where a typed
-// reason exists; see lineFor):
+// ARIA (slice 2): the container is NO LONGER a live region (row controls and
+// expandable details must not sit inside one). A single dedicated visually
+// hidden announcer span (aria-live="polite") mirrors the PRIMARY texts only —
+// compact line + visible recovery primary lines + the more-notices count.
+// It changes only on stage/severity transitions and materially changed
+// counts, so one state-transition batch yields ONE polite announcement, not
+// one per record; upload ordinals are discrete per-file completions (the
+// ordinal accessor, not a per-tick progress fraction); expanded payloads and
+// row controls never enter the mirror.
+//
+// Copy contract (normative, decision doc §1.3 matrix — unchanged by slice 2):
 //   preparing (uploads in flight) → "Uploading 1 of 2…"
 //   preparing / admitting          → "Sending…"
 //   admitting, reused attemptId    → "Retrying queue confirmation…"
 //   admission response lost        → "Queue confirmation unknown." + "Check
 //                                    the queue, or retry this same message."
-//                                    + the guarded Retry-same-message action
-//                                    (RECORD-ADDRESSED, O2 review A-F1: the
-//                                    row button carries its attemptId)
+//                                    + the guarded record-addressed Retry
 //   session-create unknown         → "Session creation unconfirmed. Check
 //                                    possible sessions before sending again;
 //                                    another send may create another session."
@@ -30,8 +62,7 @@
 //                                    trying again." / "Not sent — choose an
 //                                    agent." / "Session could not be
 //                                    created."); untyped fallback "Not sent —
-//                                    kept in the composer." The composer
-//                                    retains text + attachments (restore).
+//                                    kept in the composer."
 //   conflict                       → "Queue status conflict — check the
 //                                    queue." (both flavors; no Refresh action
 //                                    that does not exist)
@@ -42,24 +73,23 @@
 //                                    Retry STATUS SAVE (a record, never a
 //                                    resend — "Does not resend the message.")
 //
-// Ownership (O2 brief §3.6/§4): there is NO server-custody sentence here —
-// "Queued — waiting for connection." was REMOVED (slice-1 review A-F2); the
-// queue container/QueueChip owns server custody and ConnectionToast owns
-// transport. SendStatus never calls browser uncertainty "queued".
+// Ownership (decision doc §1.2): NO server-custody sentence here — the queue
+// container/QueueChip owns server custody, ConnectionToast owns transport.
+// SendStatus never calls browser uncertainty "queued".
 //
-// Honesty invariants:
-//   - A retry affordance that replays a verbatim attempt payload SURFACES what
-//     it will send (text + file names) — a retry re-includes chips the
-//     operator may have removed after the attempt (slice-2 advisory).
-//   - Polite live region (aria-live="polite") announces status changes.
+// Honesty invariants: a retry affordance that replays a verbatim attempt
+// payload SURFACES what it will send (text + file names, including chips
+// removed after the attempt); "Retry same message" stays RECORD-ADDRESSED
+// (the row button carries its attemptId — O2 slice-1 review A-F1).
 //
-// CSS: co-located SendStatus.module.css (CSS Modules). Every class is
-// :global in the module and applied as a LITERAL string here (repo CSS-arch
-// rule: test-queried classes stay :global — vitest does not process CSS
-// modules, so a `styles.X` lookup would be undefined in unit tests); the
-// sendStatus* prefix keeps the global namespace collision-free. No
-// mask/backdrop-filter/contain (Firefox/WebRender GPU rules — this is an
-// always-possible composer surface; keep it a cheap, fixed-height text row).
+// CSS: co-located SendStatus.css — a PLAIN stylesheet imported for side
+// effects (NOT a css module: pure-:global modules with no used locals are
+// tree-shaken from the production bundle — slice-2 review C-F1). Classes are
+// applied as LITERAL strings here (test-queried classes stay globally named
+// per the repo CSS-arch rule; the sendStatus* prefix keeps the global
+// namespace collision-free). No mask/backdrop-filter/contain
+// (Firefox/WebRender GPU rules — this is an always-possible composer surface;
+// keep it cheap flat DOM).
 import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
 import {
   createLinkCandidates,
@@ -72,7 +102,7 @@ import {
 } from "../../lib/sendActionStatus";
 import { resolveQueued } from "../../queue";
 import type { Session } from "../../types";
-import "./SendStatus.module.css";
+import "./SendStatus.css";
 
 export interface SendStatusProps {
   // Live session id ("" for a draft).
@@ -89,7 +119,8 @@ export interface SendStatusProps {
   // harnesses may pass a plain send fn — the argument is ignored there.
   send: (attemptId: string) => Promise<void>;
   // Ordinal upload progress (createAttachments.uploadProgress) for the
-  // "Uploading 1 of 2…" copy; null when idle.
+  // "Uploading 1 of 2…" copy; null when idle. Attributed to the single
+  // active record only — never merged across records (no false denominator).
   uploadProgress: Accessor<{ done: number; total: number } | null>;
   // A1 create-linkage (send-defers study): the sync store's session map,
   // watched reactively for a session whose worker-stamped time.created falls
@@ -110,78 +141,105 @@ function clip(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
 
+// Compact "Same message:" preview bound. The collapsed form is the existing
+// 80-char clip; "Show full message" appears only when the clip actually
+// truncated something (bounded expansion).
+const PREVIEW_CLIP = 80;
+// Blocked/rejected rows initially visible before the "Show N more notices"
+// disclosure (brief §3.4: "Initially show at most two blocked/rejected
+// rows"). Critical tiers (conflict/uncertain/unsaved + create-link) are
+// NEVER capped.
+const SECONDARY_CAP = 2;
+// Create-link candidate buttons initially visible before "Show all N
+// possible sessions" (brief §3.5: "Show two newest candidates initially").
+const CANDIDATE_CAP = 2;
+
+// Severity ladder for row ordering (brief §3.4): conflict first; create/
+// admission/other unknown next; status-save unconfirmed next; then blocked/
+// rejected. Actions-required before informational; transient summary is not
+// a row at all (it is the compact line, rendered below recovery).
+const SECONDARY_RANK = 3;
+function severityRank(stage: SendAction["stage"]): number {
+  switch (stage) {
+    case "conflict":
+      return 0;
+    case "uncertain":
+      return 1;
+    case "unsaved":
+      return 2;
+    case "rejected":
+    case "blocked":
+      return SECONDARY_RANK;
+    default:
+      return 4; // preparing/admitting never appear in the recovery list
+  }
+}
+
+function isRecoveryStage(stage: SendAction["stage"]): boolean {
+  return (
+    stage === "uncertain" ||
+    stage === "conflict" ||
+    stage === "rejected" ||
+    stage === "blocked" ||
+    stage === "unsaved"
+  );
+}
+
 export function SendStatus(props: SendStatusProps) {
   const ownerKey = () => (props.draft() ? "draft" : props.sessionId());
-  const records = () => sendActionsFor(ownerKey());
-  // (O2 §3.6/§4, slice-1 review A-F2: the server-custody line is GONE from
-  // this surface — the queue container/QueueChip owns server custody and
-  // ConnectionToast owns transport. An unconfirmed browser draft was never
-  // called "queued"; now nothing here claims custody at all.)
+  // Memoized (Solid discipline / brief §7): the merged-line and ordering
+  // computations below share ONE reactive derivation per store change instead
+  // of re-running per render; presentation grouping never mutates the store.
+  const records = createMemo(() => sendActionsFor(ownerKey()));
 
-  const [saveBusy, setSaveBusy] = createSignal<string | null>(null);
+  const transientRecs = createMemo(() =>
+    records().filter((r) => r.stage === "preparing" || r.stage === "admitting"),
+  );
+  const recoveryRecs = createMemo(() => records().filter((r) => isRecoveryStage(r.stage)));
 
-  // A1 create-linkage: candidate sessions for the draft's create-outcome-
-  // unknown record(s) — reactive over BOTH the record store (records()) and
-  // the session map (props.sessions(): the SSE-delivered session lands there
-  // while the draft view is still mounted, no re-tap needed). Draft-view only:
-  // a live session's ownerKey is its own id and can never be "draft".
-  // Memoized (D-hygiene): the when-check and the For below share ONE
-  // computation per reactive change instead of re-running the matcher twice
-  // per render.
-  const createCandidates = createMemo(() => {
-    if (!props.draft() || !props.sessions || !props.openSession) return [];
-    return createLinkCandidates(Object.values(props.sessions()), records());
+  // Severity-ordered recovery rows; within a tier, IMMUTABLE IDENTITY order
+  // (attemptId) — never updatedAt, so retry patches do not reshuffle rows
+  // under an operator's focus (brief §3.4).
+  const orderedRecovery = createMemo(() =>
+    [...recoveryRecs()].sort(
+      (a, b) =>
+        severityRank(a.stage) - severityRank(b.stage) ||
+        (a.attemptId < b.attemptId ? -1 : a.attemptId > b.attemptId ? 1 : 0),
+    ),
+  );
+
+  // Secondary-tier (blocked/rejected) stacking cap: the first SECONDARY_CAP
+  // secondary rows render; the rest wait behind an inline disclosure.
+  // Disclosure REVEALS rows — it never resolves or deletes them.
+  const [noticesExpanded, setNoticesExpanded] = createSignal(false);
+  const visibleRecovery = createMemo(() => {
+    if (noticesExpanded()) return orderedRecovery();
+    let secondary = 0;
+    return orderedRecovery().filter((r) => {
+      if (severityRank(r.stage) === SECONDARY_RANK) {
+        if (secondary >= SECONDARY_CAP) return false;
+        secondary++;
+      }
+      return true;
+    });
+  });
+  const hiddenNotices = createMemo(() => orderedRecovery().length - visibleRecovery().length);
+
+  // The compact merged happy-path line (ONE line, happy path only — recovery
+  // facts keep full rows). Multi-record copy per the decision-doc matrix:
+  // "N send actions in progress…" — the count means ACTION RECORDS, never
+  // attachments, and never a merged upload denominator.
+  const mergedLine = createMemo<string | null>(() => {
+    const ts = transientRecs();
+    if (ts.length === 0) return null;
+    if (ts.length === 1) return lineFor(ts[0]);
+    return `${ts.length} send actions in progress…`;
   });
 
-  // A1 confirm — NEVER silent: the re-key runs only from the operator's click
-  // on the affordance. The sweep drains EVERY still-draft-owned record (the
-  // study's C2 ride-along: a stale earlier record follows too instead of
-  // stranding under "draft"), then navigation runs (openSessionChat
-  // semantics via props).
-  function confirmCreateLink(id: string) {
-    transferOwnerSendAttempts("draft", id);
-    props.openSession!(id);
-  }
-
-  // Candidate label: always carries the created clock time (the correlation
-  // signal); the title only when it is not the generic create-time default
-  // ("New session" — every fresh create is titled that, so it identifies
-  // nothing).
-  function candidateLabel(c: CreateLinkCandidate): string {
-    const t = new Date(c.created).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    const title = c.title?.trim() ?? "";
-    const generic = title === "" || title === "New session";
-    return generic ? `it (${t})` : `“${clip(title, 24)}” (${t})`;
-  }
-
-  // Retry STATUS SAVE (stage "unsaved"): re-records the already-known terminal
-  // outcome via resolveQueued — a record, NEVER a resend (no prompt is ever
-  // POSTed). Outcome handling (F3, slice-3 review — the conflict must be
-  // VISIBLE, never a silent vanish): "recorded" finishes the row; "conflict"
-  // re-marks THIS record as the dismissible conflict state (resolveQueued
-  // already refreshed the queue cache to server truth and re-marked the
-  // linked record when the item carries an attemptId — marking here too
-  // covers the legacy unlinked shape and is an idempotent re-patch
-  // otherwise); "unrecorded" leaves the row retryable as-is.
-  async function retrySave(rec: SendAction) {
-    const save = rec.retrySave;
-    if (!save || saveBusy()) return;
-    setSaveBusy(rec.attemptId);
-    try {
-      const out = await resolveQueued(ownerKey(), save.itemId, save.state, save.detail);
-      if (out.kind === "recorded") {
-        finishSendAttempt(rec.attemptId);
-      } else if (out.kind === "conflict") {
-        markSendAttemptResolveConflict(rec.attemptId, ownerKey(), out.detail || "queue_resolve_conflict");
-      }
-    } finally {
-      setSaveBusy(null);
-    }
-  }
-
-  // Per-stage primary copy (O2 brief §3.6 copy matrix — normative). Returned
+  // Per-stage primary copy (decision-doc §1.3 matrix — normative). Returned
   // null means "nothing to render for this record" (admitted never appears —
-  // the record is finished on confirmation).
+  // the record is finished on confirmation). Shared by the recovery rows and
+  // the single-record merged line.
   function lineFor(rec: SendAction): string | null {
     switch (rec.stage) {
       case "preparing": {
@@ -245,10 +303,118 @@ export function SendStatus(props: SendStatusProps) {
     }
   }
 
+  // ONE polite announcer (slice 2): mirrors the visible PRIMARY texts only —
+  // compact line + visible recovery primary lines + the hidden-notices count.
+  // Payload previews, expanded full text, and controls never enter it, so a
+  // state-transition batch announces ONCE (batching by construction: the
+  // mirror string changes only when the summarized state changes).
+  const announcerText = createMemo(() => {
+    const parts: string[] = [];
+    const ml = mergedLine();
+    if (ml) parts.push(ml);
+    for (const r of visibleRecovery()) {
+      const l = lineFor(r);
+      if (l) parts.push(l);
+    }
+    if (hiddenNotices() > 0) parts.push(`Show ${hiddenNotices()} more notices`);
+    return parts.join(" ");
+  });
+
+  const [saveBusy, setSaveBusy] = createSignal<string | null>(null);
+
+  // Bounded full-text payload expansion (per-record; the collapsed form stays
+  // the compact preview). Keyed by attemptId so a row's expansion survives
+  // sibling reordering without remounting.
+  const [fullShown, setFullShown] = createSignal<ReadonlySet<string>>(new Set());
+  function toggleFull(attemptId: string) {
+    setFullShown((prev) => {
+      const next = new Set(prev);
+      if (next.has(attemptId)) next.delete(attemptId);
+      else next.add(attemptId);
+      return next;
+    });
+  }
+  const payloadText = (rec: SendAction) => rec.payload?.text ?? rec.payload?.tapText ?? "";
+
+  // A1 create-linkage: candidate sessions for the draft's create-outcome-
+  // unknown record(s) — reactive over BOTH the record store (records()) and
+  // the session map (props.sessions(): the SSE-delivered session lands there
+  // while the draft view is still mounted, no re-tap needed). Draft-view only:
+  // a live session's ownerKey is its own id and can never be "draft".
+  const createCandidates = createMemo(() => {
+    if (!props.draft() || !props.sessions || !props.openSession) return [];
+    return createLinkCandidates(Object.values(props.sessions()), records());
+  });
+
+  // Candidate grouping (slice 2, F5): the newest CANDIDATE_CAP candidates
+  // render as stacked full-width targets; the remainder sit behind an inline
+  // "Show all N possible sessions" disclosure (never a horizontal ribbon).
+  const [candidatesExpanded, setCandidatesExpanded] = createSignal(false);
+  const visibleCandidates = createMemo(() =>
+    candidatesExpanded() ? createCandidates() : createCandidates().slice(0, CANDIDATE_CAP),
+  );
+  const hiddenCandidates = createMemo(() =>
+    candidatesExpanded() ? 0 : Math.max(0, createCandidates().length - CANDIDATE_CAP),
+  );
+
+  // A1 confirm — NEVER silent: the re-key runs only from the operator's click
+  // on the affordance. The sweep drains EVERY still-draft-owned record (the
+  // study's C2 ride-along: a stale earlier record follows too instead of
+  // stranding under "draft"), then navigation runs (openSessionChat
+  // semantics via props).
+  function confirmCreateLink(id: string) {
+    transferOwnerSendAttempts("draft", id);
+    props.openSession!(id);
+  }
+
+  // Candidate label: carries the created clock time (the correlation signal)
+  // and a SHORT session id (candidate distinguishability — the full
+  // identifier stays in the button's data-tip); the title only when it is
+  // not the generic create-time default ("New session" — every fresh create
+  // is titled that, so it identifies nothing).
+  function candidateLabel(c: CreateLinkCandidate): string {
+    const t = new Date(c.created).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const id = clip(c.id, 12);
+    const title = c.title?.trim() ?? "";
+    const generic = title === "" || title === "New session";
+    return generic ? `it (${t}, ${id})` : `“${clip(title, 24)}” (${t}, ${id})`;
+  }
+
+  // Retry STATUS SAVE (stage "unsaved"): re-records the already-known terminal
+  // outcome via resolveQueued — a record, NEVER a resend (no prompt is ever
+  // POSTed). Outcome handling (F3, slice-3 review — the conflict must be
+  // VISIBLE, never a silent vanish): "recorded" finishes the row; "conflict"
+  // re-marks THIS record as the dismissible conflict state (resolveQueued
+  // already refreshed the queue cache to server truth and re-marked the
+  // linked record when the item carries an attemptId — marking here too
+  // covers the legacy unlinked shape and is an idempotent re-patch
+  // otherwise); "unrecorded" leaves the row retryable as-is.
+  async function retrySave(rec: SendAction) {
+    const save = rec.retrySave;
+    if (!save || saveBusy()) return;
+    setSaveBusy(rec.attemptId);
+    try {
+      const out = await resolveQueued(ownerKey(), save.itemId, save.state, save.detail);
+      if (out.kind === "recorded") {
+        finishSendAttempt(rec.attemptId);
+      } else if (out.kind === "conflict") {
+        markSendAttemptResolveConflict(rec.attemptId, ownerKey(), out.detail || "queue_resolve_conflict");
+      }
+    } finally {
+      setSaveBusy(null);
+    }
+  }
+
   return (
     <Show when={records().length > 0}>
-      <div class="sendStatus" aria-live="polite" data-testid="send-status">
-        <For each={records()}>
+      <div class="sendStatus" data-testid="send-status">
+        {/* ONE dedicated polite announcer (the container itself is NOT a live
+            region — controls and expandable details sit outside live
+            regions). Mirror of primary texts only; see announcerText. */}
+        <span class="sendStatusAnnouncer" aria-live="polite" data-testid="send-status-announcer">
+          {announcerText()}
+        </span>
+        <For each={visibleRecovery()}>
           {(rec) => {
             const line = () => lineFor(rec);
             return (
@@ -266,20 +432,43 @@ export function SendStatus(props: SendStatusProps) {
                       file list without an empty text quote. RECORD-ADDRESSED
                       (O2 review A-F1): the button carries THIS row's
                       attemptId — the controller replays exactly the record
-                      the operator clicked, regardless of composer text. */}
+                      the operator clicked, regardless of composer text.
+                      Slice 2: the preview gains BOUNDED full-text expansion —
+                      collapsed is the 80-char compact clip; "Show full
+                      message" (only when the clip truncated) expands the
+                      verbatim stored text + all retained filenames inline. */}
                   <Show when={rec.stage === "uncertain" && rec.recovery === "retry-same"}>
                     <span class="sendStatusPayload">
                       Check the queue, or retry this same message.
                     </span>
                     <span class="sendStatusPayload">
                       Same message:{" "}
-                      <Show when={(rec.payload?.text ?? rec.payload?.tapText ?? "").length > 0}>
-                        “{clip(rec.payload?.text ?? rec.payload?.tapText ?? "", 80)}”{" "}
+                      <Show when={payloadText(rec).length > 0}>
+                        “{clip(payloadText(rec), PREVIEW_CLIP)}”{" "}
                       </Show>
                       <Show when={(rec.payload?.files?.length ?? 0) > 0}>
                         {" "}+ {rec.payload!.files!.join(", ")}
                       </Show>
                     </span>
+                    <Show when={payloadText(rec).length > PREVIEW_CLIP}>
+                      <button
+                        type="button"
+                        class="sendStatusMore"
+                        aria-expanded={fullShown().has(rec.attemptId)}
+                        onClick={() => toggleFull(rec.attemptId)}
+                      >
+                        {fullShown().has(rec.attemptId) ? "Hide full message" : "Show full message"}
+                      </button>
+                    </Show>
+                    <Show when={fullShown().has(rec.attemptId)}>
+                      <span class="sendStatusFull">
+                        {payloadText(rec)}
+                        <Show when={(rec.payload?.files?.length ?? 0) > 0}>
+                          {" + "}
+                          {rec.payload!.files!.join(", ")}
+                        </Show>
+                      </span>
+                    </Show>
                     <button
                       type="button"
                       class="sendStatusBtn"
@@ -307,17 +496,9 @@ export function SendStatus(props: SendStatusProps) {
                     </button>
                   </Show>
                   {/* Dismiss — retained non-transient records only (the
-                      transient preparing/admitting rows are the live send's
-                      own progress; clearing them mid-flight would lie). */}
-                  <Show
-                    when={
-                      rec.stage === "uncertain" ||
-                      rec.stage === "conflict" ||
-                      rec.stage === "rejected" ||
-                      rec.stage === "blocked" ||
-                      rec.stage === "unsaved"
-                    }
-                  >
+                      compact transient line is the live send's own progress;
+                      clearing it mid-flight would lie). */}
+                  <Show when={isRecoveryStage(rec.stage)}>
                     <button
                       type="button"
                       class="sendStatusDismiss"
@@ -332,16 +513,26 @@ export function SendStatus(props: SendStatusProps) {
             );
           }}
         </For>
+        {/* Secondary-tier stacking cap disclosure (slice 2): reveals the
+            capped blocked/rejected rows inline — never resolves or deletes
+            them. Expand-only (collapsing recovered notices buys nothing and
+            costs a control). */}
+        <Show when={hiddenNotices() > 0}>
+          <button type="button" class="sendStatusMore" onClick={() => setNoticesExpanded(true)}>
+            Show {hiddenNotices()} more notices
+          </button>
+        </Show>
         {/* A1 create-linkage (send-defers study): the draft's
             create-outcome-unknown record + a session that appeared inside the
             create-attempt window → an operator-CONFIRMED linkage affordance.
             Timing is the ONLY correlation signal (the create POST carries no
             client id), so nothing re-keys without this click; dismissing the
-            uncertain row above (the ×) removes the affordance with it. Multiple
-            candidates are each listed honestly — one button per session. O2
-            §3.6 copy: the header says timing is the only match signal; the
-            action is "Link and open" (never a bare "Open" — it names the
-            re-key + navigation it performs). */}
+            uncertain row above (the ×) removes the affordance with it. O2
+            slice 2 grouping: header + adjacent all-remaining-records
+            explanation + the newest CANDIDATE_CAP candidates as stacked
+            full-width ~44px targets (no horizontal ribbon); the rest behind
+            "Show all N possible sessions". "Link and open" (never a bare
+            "Open") names the re-key + navigation it performs. */}
         <Show when={createCandidates().length > 0}>
           <div
             class="sendStatusLine"
@@ -349,18 +540,36 @@ export function SendStatus(props: SendStatusProps) {
             data-tip="A session was created while your send's session-create was in flight — timing is the only match signal. Confirming moves this status there and opens it."
           >
             <span class="sendStatusText">Possible sessions — timing is the only match.</span>
-            <For each={createCandidates()}>
-              {(c) => (
-                <button
-                  type="button"
-                  class="sendStatusBtn"
-                  data-session-id={c.id}
-                  onClick={() => confirmCreateLink(c.id)}
-                >
-                  Link and open {candidateLabel(c)}
+            <span class="sendStatusPayload">
+              Confirming moves this draft&rsquo;s remaining send statuses to that session, then opens it.
+            </span>
+            <div class="sendStatusCandidates">
+              <For each={visibleCandidates()}>
+                {(c) => (
+                  <button
+                    type="button"
+                    class="sendStatusBtn sendStatusCandidate"
+                    data-session-id={c.id}
+                    data-tip={c.id}
+                    onClick={() => confirmCreateLink(c.id)}
+                  >
+                    Link and open {candidateLabel(c)}
+                  </button>
+                )}
+              </For>
+              <Show when={hiddenCandidates() > 0}>
+                <button type="button" class="sendStatusMore" onClick={() => setCandidatesExpanded(true)}>
+                  Show all {createCandidates().length} possible sessions
                 </button>
-              )}
-            </For>
+              </Show>
+            </div>
+          </div>
+        </Show>
+        {/* The compact merged happy-path line — BELOW critical recovery (one
+            calm line; happy path only). */}
+        <Show when={mergedLine()}>
+          <div class="sendStatusLine" data-kind="progress">
+            <span class="sendStatusText">{mergedLine()}</span>
           </div>
         </Show>
       </div>

@@ -18,15 +18,18 @@
 // The queue module is mocked (queueFor / resolveQueued) — the data-layer
 // contracts themselves are pinned in queue.test.ts / sendStuckRecovery.test.ts.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createSignal } from "solid-js";
 import { cleanup, render } from "@solidjs/testing-library";
 import { SendStatus } from "../../src/components/chat/SendStatus";
 import {
   __resetSendActionStatusForTests,
+  finishSendAttempt,
   getSendAction,
   markOwnerSessionCreateUnknown,
   markSendAttemptStatusUnsaved,
   mintSendAttempt,
   sendActionsFor,
+  transferOwnerSendAttempts,
   updateSendAction,
 } from "../../src/lib/sendActionStatus";
 import type { QueuedMessage } from "../../src/queue";
@@ -66,6 +69,18 @@ function baseProps(over: Partial<Parameters<typeof SendStatus>[0]> = {}) {
   };
 }
 
+// Seeds one draft-owned create-outcome-unknown record with window
+// [start, end] (fake time owns the mark-time end), then restores real time.
+function seedCreateUnknown(start: number, end: number): string {
+  vi.useFakeTimers();
+  vi.setSystemTime(start);
+  const a = mintSendAttempt("draft");
+  vi.setSystemTime(end);
+  markOwnerSessionCreateUnknown("draft", "session create timed out", start);
+  vi.useRealTimers();
+  return a.attemptId;
+}
+
 beforeEach(() => {
   queueForMock.mockImplementation(() => []);
   resolveQueuedMock.mockImplementation(async () => ({ kind: "recorded" } as const));
@@ -100,6 +115,10 @@ describe("SendStatus — per-stage readable copy (brief §4.4)", () => {
     expect(r1.container.textContent).toContain("Sending…");
     r1.unmount();
 
+    // O2 slice 2: transient records MERGE into one line, so the retry copy is
+    // observed with the earlier admitting record finished (a lone retry is
+    // also the only production-reachable shape — single-flight).
+    finishSendAttempt(a.attemptId);
     const b = mintSendAttempt("s1");
     updateSendAction(b.attemptId, { stage: "admitting", retry: true });
     const r2 = render(() => <SendStatus {...baseProps()} />);
@@ -403,11 +422,16 @@ describe("SendStatus — server custody line is GONE (O2 §3.6/§4: QueueChip ow
 });
 
 describe("SendStatus — a11y + dismissal", () => {
-  it("is a polite live region", () => {
+  it("is announced by ONE dedicated polite announcer; the container itself is not a live region (O2 slice 2)", () => {
     const a = mintSendAttempt("s1");
     updateSendAction(a.attemptId, { stage: "admitting" });
     const r = render(() => <SendStatus {...baseProps()} />);
-    expect(r.container.querySelector(".sendStatus")!.getAttribute("aria-live")).toBe("polite");
+    // Controls/details must not sit inside a live region — only the hidden
+    // announcer mirror is polite.
+    expect(r.container.querySelector(".sendStatus")!.getAttribute("aria-live")).toBeNull();
+    const announcer = r.container.querySelector(".sendStatusAnnouncer")!;
+    expect(announcer.getAttribute("aria-live")).toBe("polite");
+    expect(announcer.textContent).toBe("Sending…");
     r.unmount();
   });
 
@@ -439,18 +463,6 @@ describe("SendStatus — a11y + dismissal", () => {
 describe("SendStatus — A1 create-linkage affordance (operator-confirmed, never silent)", () => {
   type SessionLike = { id: string; title?: string; time?: { created?: number } };
   const sessionsOf = (list: SessionLike[]) => () => Object.fromEntries(list.map((s) => [s.id, s]));
-
-  // Seeds one draft-owned create-outcome-unknown record with window
-  // [start, end] (fake time owns the mark-time end), then restores real time.
-  function seedCreateUnknown(start: number, end: number): string {
-    vi.useFakeTimers();
-    vi.setSystemTime(start);
-    const a = mintSendAttempt("draft");
-    vi.setSystemTime(end);
-    markOwnerSessionCreateUnknown("draft", "session create timed out", start);
-    vi.useRealTimers();
-    return a.attemptId;
-  }
 
   it("renders the affordance when a session's created time falls inside the create-unknown window; confirm re-keys + navigates", () => {
     const attemptId = seedCreateUnknown(1_000, 2_000);
@@ -566,6 +578,247 @@ describe("SendStatus — A1 create-linkage affordance (operator-confirmed, never
       />
     ));
     expect(r.container.querySelector('.sendStatusLine[data-kind="create-link"]')).toBeNull();
+    r.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// O2 slice 2 — compact hierarchy (decision doc §1.4 Slice 2 scope): the
+// merged happy-path line, the severity ladder + secondary-tier stacking cap,
+// the single batched announcer, bounded full-text expansion, and create-link
+// candidate grouping. The severity ladder (conflict > uncertain > unsaved >
+// blocked/rejected) and cap N=2 are documented in SendStatus.tsx.
+// ---------------------------------------------------------------------------
+describe("SendStatus — O2 slice 2: compact merged happy-path line", () => {
+  it("aggregates multiple transient records into ONE count line — no per-record rows, no false merged upload denominator", () => {
+    // Single-flight keeps concurrent transient records out of ordinary
+    // production reach; the public store API (mint under other owners + the
+    // owner sweep) assembles the multi-active shape the copy must handle.
+    mintSendAttempt("tmpA"); // preparing
+    const t2 = mintSendAttempt("s1");
+    updateSendAction(t2.attemptId, { stage: "admitting" });
+    transferOwnerSendAttempts("tmpA", "s1");
+    const r = render(() => (
+      <SendStatus {...baseProps({ uploadProgress: () => ({ done: 0, total: 3 }) })} />
+    ));
+    const lines = r.container.querySelectorAll(".sendStatusLine");
+    expect(lines).toHaveLength(1);
+    expect(lines[0].getAttribute("data-kind")).toBe("progress");
+    // Decision-doc copy matrix: "N send actions in progress…" for multiple
+    // active records (never an invented combined upload denominator).
+    expect(lines[0].textContent).toBe("2 send actions in progress…");
+    expect(r.container.textContent).not.toContain("Uploading");
+    r.unmount();
+  });
+
+  it("a single transient record keeps its own stage copy, rendered BELOW the recovery rows", () => {
+    const u = mintSendAttempt("s1");
+    updateSendAction(u.attemptId, { stage: "uncertain", certainty: "unknown", recovery: "check", detail: "x" });
+    const t = mintSendAttempt("s1"); // the uncertain record survives the mint
+    updateSendAction(t.attemptId, { stage: "admitting" });
+    const r = render(() => <SendStatus {...baseProps()} />);
+    const kinds = Array.from(r.container.querySelectorAll(".sendStatusLine")).map((el) =>
+      el.getAttribute("data-kind"),
+    );
+    expect(kinds).toEqual(["uncertain", "progress"]);
+    expect(r.container.querySelector('.sendStatusLine[data-kind="progress"]')!.textContent).toBe("Sending…");
+    r.unmount();
+  });
+});
+
+describe("SendStatus — O2 slice 2: severity-ordered stacking with a capped secondary tier", () => {
+  function seedRejected(owner: string): void {
+    const a = mintSendAttempt(owner);
+    updateSendAction(a.attemptId, { stage: "rejected", certainty: "definitive", recovery: "restore" });
+  }
+
+  it("orders rows conflict > uncertain > unsaved > blocked/rejected (actions-required first)", () => {
+    const unc = mintSendAttempt("s1");
+    updateSendAction(unc.attemptId, { stage: "uncertain", certainty: "unknown", recovery: "check" });
+    const conf = mintSendAttempt("s1");
+    updateSendAction(conf.attemptId, {
+      stage: "conflict",
+      certainty: "definitive",
+      recovery: "check",
+      detail: "queue_admission_conflict",
+    });
+    markSendAttemptStatusUnsaved("att-order-unsaved", "s1", { itemId: "q-1", state: "sent", detail: "ok" });
+    seedRejected("s1");
+    const r = render(() => <SendStatus {...baseProps()} />);
+    const kinds = Array.from(r.container.querySelectorAll(".sendStatusLine")).map((el) =>
+      el.getAttribute("data-kind"),
+    );
+    expect(kinds).toEqual(["conflict", "uncertain", "unsaved", "rejected"]);
+    r.unmount();
+  });
+
+  it("caps the blocked/rejected tier at 2 with an inline 'Show N more notices'; disclosure reveals — never deletes", () => {
+    // mint-supersede keeps ≤1 retained blocked/rejected record PER OWNER, so
+    // the overflow shape is assembled across owners + swept in (public API).
+    seedRejected("tmpA");
+    seedRejected("tmpB");
+    seedRejected("s1");
+    transferOwnerSendAttempts("tmpA", "s1");
+    transferOwnerSendAttempts("tmpB", "s1");
+    const r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.querySelectorAll('.sendStatusLine[data-kind="rejected"]')).toHaveLength(2);
+    const more = r.container.querySelector(".sendStatusMore")!;
+    expect(more.textContent).toContain("Show 1 more notices");
+    more.click();
+    expect(r.container.querySelectorAll('.sendStatusLine[data-kind="rejected"]')).toHaveLength(3);
+    // The rows were REVEALED, not re-created or resolved.
+    expect(sendActionsFor("s1")).toHaveLength(3);
+    r.unmount();
+  });
+
+  it("critical tiers are NEVER capped — four uncertain rows all render, no expander", () => {
+    for (let i = 0; i < 4; i++) {
+      const a = mintSendAttempt("s1");
+      updateSendAction(a.attemptId, {
+        stage: "uncertain",
+        certainty: "unknown",
+        recovery: "check",
+        detail: `u${i}`,
+      });
+    }
+    const r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.querySelectorAll('.sendStatusLine[data-kind="uncertain"]')).toHaveLength(4);
+    expect(r.container.textContent).not.toContain("more notices");
+    r.unmount();
+  });
+});
+
+describe("SendStatus — O2 slice 2: ONE polite announcer, batched by mirroring primary texts", () => {
+  it("the announcer carries the batch's primary texts once; payload expansion never re-announces", () => {
+    const long = "x".repeat(120);
+    const a = mintSendAttempt("s1");
+    updateSendAction(a.attemptId, {
+      stage: "uncertain",
+      certainty: "unknown",
+      recovery: "retry-same",
+      payload: { tapText: long, text: long, attachments: [], files: [] },
+    });
+    const r = render(() => <SendStatus {...baseProps()} />);
+    const ann = () => r.container.querySelector(".sendStatusAnnouncer")!.textContent;
+    // Primary line ONLY — no payload preview, no control text.
+    expect(ann()).toBe("Queue confirmation unknown.");
+    r.container.querySelector(".sendStatusMore")!.click(); // expand full text
+    expect(r.container.querySelector(".sendStatusFull")!.textContent).toBe(long);
+    expect(ann()).toBe("Queue confirmation unknown."); // unchanged → no announcement
+    r.unmount();
+  });
+
+  it("discrete upload-ordinal transitions (per file completion) update the announcer text", () => {
+    mintSendAttempt("s1");
+    const [prog, setProg] = createSignal<{ done: number; total: number } | null>({ done: 0, total: 2 });
+    const r = render(() => <SendStatus {...baseProps({ uploadProgress: prog })} />);
+    const ann = () => r.container.querySelector(".sendStatusAnnouncer")!.textContent;
+    expect(ann()).toBe("Uploading 1 of 2…");
+    setProg({ done: 1, total: 2 });
+    expect(ann()).toBe("Uploading 2 of 2…");
+    r.unmount();
+  });
+});
+
+describe("SendStatus — O2 slice 2: bounded full-text payload expansion", () => {
+  const LONG =
+    "Full-text expansion probe — this stored message body is deliberately far longer than the eighty-character compact preview bound, so the collapsed Same-message quote is clipped at exactly that bound and the remainder is reachable only through the inline expansion affordance.";
+
+  function seedRetrySame(text: string, files: string[] = []): string {
+    const a = mintSendAttempt("s1");
+    updateSendAction(a.attemptId, {
+      stage: "uncertain",
+      certainty: "unknown",
+      recovery: "retry-same",
+      detail: "enqueue timed out",
+      payload: { tapText: text, text, attachments: [], files },
+    });
+    return a.attemptId;
+  }
+
+  it("collapsed form is the compact clip; 'Show full message' expands verbatim text + filenames inline and toggles back", () => {
+    seedRetrySame(LONG, ["notes.md"]);
+    const r = render(() => <SendStatus {...baseProps()} />);
+    const row = r.container.querySelector('.sendStatusLine[data-kind="uncertain"]')!;
+    expect(row.textContent).toContain("Same message:");
+    expect(row.textContent).not.toContain("inline expansion affordance"); // clipped tail absent
+    const btn = row.querySelector(".sendStatusMore")!;
+    expect(btn.textContent).toBe("Show full message");
+    expect(btn.getAttribute("aria-expanded")).toBe("false");
+    btn.click();
+    expect(row.querySelector(".sendStatusFull")!.textContent).toContain(LONG);
+    expect(row.textContent).toContain("notes.md");
+    const btnAfter = row.querySelector(".sendStatusMore")!;
+    expect(btnAfter.textContent).toBe("Hide full message");
+    expect(btnAfter.getAttribute("aria-expanded")).toBe("true");
+    btnAfter.click();
+    expect(row.querySelector(".sendStatusFull")).toBeNull();
+    r.unmount();
+  });
+
+  it("no expander when the stored text fits the compact preview (bounded — nothing is hidden)", () => {
+    seedRetrySame("short message", ["chart.png"]);
+    const r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.querySelector(".sendStatusMore")).toBeNull();
+    expect(r.container.textContent).toContain("Same message: “short message”");
+    expect(r.container.textContent).toContain("chart.png");
+    r.unmount();
+  });
+});
+
+describe("SendStatus — O2 slice 2: create-link candidate grouping (2 visible, +k more)", () => {
+  type SessionLike = { id: string; title?: string; time?: { created?: number } };
+  const sessionsOf = (list: SessionLike[]) => () => Object.fromEntries(list.map((s) => [s.id, s]));
+
+  it("shows the two NEWEST candidates first; 'Show all N possible sessions' reveals the rest inline", () => {
+    seedCreateUnknown(1_000, 2_000);
+    const sessions: SessionLike[] = [
+      { id: "s-old1", title: "New session", time: { created: 1_100 } },
+      { id: "s-old2", title: "New session", time: { created: 1_200 } },
+      { id: "s-mid", title: "New session", time: { created: 1_300 } },
+      { id: "s-new1", title: "New session", time: { created: 1_400 } },
+      { id: "s-new2", title: "New session", time: { created: 1_500 } },
+    ];
+    const r = render(() => (
+      <SendStatus
+        {...baseProps({
+          draft: () => true,
+          sessionId: () => "",
+          sessions: sessionsOf(sessions),
+          openSession: () => {},
+        })}
+      />
+    ));
+    const row = r.container.querySelector('.sendStatusLine[data-kind="create-link"]')!;
+    let btns = Array.from(row.querySelectorAll(".sendStatusBtn[data-session-id]"));
+    expect(btns).toHaveLength(2);
+    // Newest-created first (createLinkCandidates order is preserved).
+    expect(btns.map((b) => b.getAttribute("data-session-id"))).toEqual(["s-new2", "s-new1"]);
+    // The adjacent explanation discloses the all-remaining-records sweep.
+    expect(row.textContent).toContain("Confirming moves this draft");
+    const more = row.querySelector(".sendStatusMore")!;
+    expect(more.textContent).toContain("Show all 5 possible sessions");
+    more.click();
+    btns = Array.from(row.querySelectorAll(".sendStatusBtn[data-session-id]"));
+    expect(btns).toHaveLength(5);
+    r.unmount();
+  });
+
+  it("a single candidate renders alone — no grouping chrome when nothing is hidden", () => {
+    seedCreateUnknown(1_000, 2_000);
+    const r = render(() => (
+      <SendStatus
+        {...baseProps({
+          draft: () => true,
+          sessionId: () => "",
+          sessions: sessionsOf([{ id: "s9", title: "New session", time: { created: 1_500 } }]),
+          openSession: () => {},
+        })}
+      />
+    ));
+    const row = r.container.querySelector('.sendStatusLine[data-kind="create-link"]')!;
+    expect(row.querySelectorAll(".sendStatusBtn[data-session-id]")).toHaveLength(1);
+    expect(row.querySelector(".sendStatusMore")).toBeNull();
     r.unmount();
   });
 });
