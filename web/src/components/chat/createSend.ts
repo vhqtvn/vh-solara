@@ -112,8 +112,10 @@ export type SendDependencies = {
   ) => Promise<unknown>;
   // Authoritative queue list (queue.ts fetchQueue) — injected for the
   // reconcile-first recovery path when an enqueue response is lost
-  // (send-reliability slice 2).
-  fetchQueue: (id: string) => Promise<QueuedMessage[]>;
+  // (send-reliability slice 2). Resolves null when the list could not be
+  // fetched in time (queue.ts bounds the GET; hygiene micro-slice §8 6a) —
+  // null means "list unavailable", never "empty list".
+  fetchQueue: (id: string) => Promise<QueuedMessage[] | null>;
   // True while an attachment upload is in flight (createAttachments'
   // `uploading`) — admission blocks on it (no partial send).
   uploading: Accessor<boolean>;
@@ -320,7 +322,10 @@ export function createSend(deps: SendDependencies): SendController {
       let confirmed = false;
       try {
         const items = await deps.fetchQueue(id);
-        confirmed = items.some((it) => it.attemptId === attempt.attemptId);
+        // items === null: the bounded list GET timed out / failed — no answer.
+        // Stay uncertain (confirmed stays false); never treat null as an empty
+        // authoritative list.
+        confirmed = !!items && items.some((it) => it.attemptId === attempt.attemptId);
       } catch {
         /* list unavailable — stay uncertain */
       }

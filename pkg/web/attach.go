@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -83,9 +84,7 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 	if name == "" || name == "." {
 		name = "file"
 	}
-	fname := time.Now().Format("20060102-150405") + "_" + name
-	dst := filepath.Join(dir, fname)
-	out, err := os.Create(dst)
+	out, dst, err := createUniqueAttach(dir, name, time.Now())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -126,6 +125,48 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		"mime":     mimeType,
 		"path":     filepath.ToSlash(rel),
 	})
+}
+
+// createUniqueAttach creates (O_EXCL — never truncates) the stored file for an
+// upload and returns the open handle plus its path.
+//
+// Same-second, same-basename uploads (two screenshot.png in one multi-select)
+// used to mint the IDENTICAL `<seconds-timestamp>_<name>` path, and os.Create
+// truncated on collision — both chips then referenced the second file's bytes
+// (a silent wrong-bytes correctness bug, not just waste). Fix: keep the
+// seconds-resolution base name for the overwhelmingly common first upload,
+// then bump a deterministic monotonic `_<N>` suffix while a same-named file
+// exists. O_EXCL makes the existence probe and the create one atomic syscall,
+// so concurrent uploads cannot race past the check. After 64 same-second
+// collisions (practically unreachable — it takes 64 identical-basename
+// uploads within one second) fall back to a nanosecond-stamped name, which is
+// distinct from every seconds-resolution base by construction; if even that
+// exists (clock skew / a pre-created name), the honest error surfaces as a
+// 500 — never a truncate.
+func createUniqueAttach(dir, name string, now time.Time) (*os.File, string, error) {
+	base := now.Format("20060102-150405") + "_" + name
+	const maxSuffix = 64
+	for i := 0; i < maxSuffix; i++ {
+		fname := base
+		if i > 0 {
+			fname = fmt.Sprintf("%s_%d", base, i)
+		}
+		dst := filepath.Join(dir, fname)
+		out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			return out, dst, nil
+		}
+		if !os.IsExist(err) {
+			return nil, "", err
+		}
+	}
+	nano := fmt.Sprintf("%s_%d", base, now.UnixNano())
+	dst := filepath.Join(dir, nano)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return nil, "", err
+	}
+	return out, dst, nil
 }
 
 // fileURL builds a file:// URL from an absolute path (forward slashes, escaped).

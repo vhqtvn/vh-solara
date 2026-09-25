@@ -33,6 +33,7 @@ import { resetTreeStore, clearUserToggled, applyTreeOpStore } from "./treeState"
 import { resetLabelsScope } from "../labels";
 import { resetArchiveFailuresScope } from "../archiveFailures";
 import { ackSession } from "./orchestration";
+import { pushNotification } from "../notify";
 
 // Selecting any real session leaves draft mode.
 //
@@ -279,6 +280,73 @@ export async function createSessionWithCertainty(): Promise<CreateSessionOutcome
   }
 }
 
+// Bounded timeout for the small JSON POSTs that carry turn input and recovery
+// actions (permission/question replies, /vh/abort) — send-reliability hygiene
+// micro-slice (§8 item 6b): a hung socket on the canonical permission reply
+// left the legacy fallback unreachable and the reply silently never landed
+// while the card was already optimistically cleared (turn stuck pending
+// input). All four are tiny request/response round-trips on the order of
+// milliseconds; 10s is a very generous bound. Mirrors the
+// CREATE_SESSION_TIMEOUT_MS AbortController precedent above.
+const REPLY_TIMEOUT_MS = 10000;
+
+// Typed outcome of a bounded POST (see postBounded). `kind` distinguishes the
+// outcomes callers must not conflate:
+//   ok       — a 2xx arrived.
+//   status   — a definitive non-2xx answer arrived (carries the status).
+//   timeout  — NO response within the bound: the outcome is UNKNOWN (the POST
+//              may have been applied upstream) — callers must NOT claim
+//              "failed" nor blindly re-issue an input-carrying reply.
+//   network  — the request failed without a response (may also have been
+//              applied). Kept distinct from timeout so legacy fallback
+//              behavior (fire on a network error) is preserved unchanged.
+type BoundedPostResult =
+  | { kind: "ok" }
+  | { kind: "status"; status: number }
+  | { kind: "timeout" }
+  | { kind: "network"; error: unknown };
+
+// postBounded POSTs JSON with an armed AbortController and NEVER throws — a
+// hung socket settles to `{ kind: "timeout" }` instead of a pending-forever
+// promise, and a network failure to `{ kind: "network" }`.
+async function postBounded(url: string, body: unknown, timeoutMs = REPLY_TIMEOUT_MS): Promise<BoundedPostResult> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    return res.ok ? { kind: "ok" } : { kind: "status", status: res.status };
+  } catch (e) {
+    const aborted = ctrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError");
+    return aborted ? { kind: "timeout" } : { kind: "network", error: e };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Surface a timed-out permission/question reply honestly (send-reliability
+// hygiene micro-slice). SEMANTICS: a timed-out reply is OUTCOME-UNKNOWN — the
+// POST may have been applied upstream, so this must NOT claim "failed", and
+// the card must NOT be restored as if unsent (a restored card invites a
+// SECOND reply for a request that may already be answered). The minimal
+// honest surface is one notification with outcome-unknown wording; the card
+// stays cleared and later server events reconcile the turn's real state.
+function replyOutcomeUnknown(kind: "Permission" | "Question", sessionID?: string): void {
+  pushNotification({
+    kind: "error",
+    sessionID,
+    title: `${kind} reply not confirmed`,
+    detail:
+      `The ${kind.toLowerCase()} reply was sent but no confirmation arrived — ` +
+      "it may still have been applied. The card was not restored; check the " +
+      "session's state before answering again.",
+  });
+}
+
 // Reply to a pending permission request: "once" | "always" | "reject".
 // Uses OpenCode's canonical permission-reply route (POST /permission/:id/reply
 // with {reply}); falls back to the legacy session-scoped route ({response}) for
@@ -290,39 +358,48 @@ export async function respondPermission(sessionID: string, permissionID: string,
     }),
   );
   log.debug("permission", "reply", { sessionID, permissionID, response });
-  try {
-    const res = await fetch(`/oc/permission/${encodeURIComponent(permissionID)}/reply`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reply: response }),
-    });
-    if (res.ok) return;
-    log.warn("permission", "canonical reply not ok → legacy route", { status: res.status });
-  } catch (e) {
-    log.warn("permission", "canonical reply threw → legacy route", e);
-    /* fall through to the legacy route */
-  }
-  const legacy = await fetch(
-    `/oc/session/${encodeURIComponent(sessionID)}/permissions/${encodeURIComponent(permissionID)}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ response }),
-    },
+  const canonical = await postBounded(
+    `/oc/permission/${encodeURIComponent(permissionID)}/reply`,
+    { reply: response },
   );
-  if (!legacy.ok) log.error("permission", "reply failed on both routes", { status: legacy.status });
+  if (canonical.kind === "ok") return;
+  if (canonical.kind === "timeout") {
+    // Outcome-unknown: the reply may have landed. Do NOT fall through to the
+    // legacy route (a second reply for the same request doubles the
+    // ambiguity) and do NOT restore the card — notify honestly.
+    replyOutcomeUnknown("Permission", sessionID);
+    return;
+  }
+  if (canonical.kind === "status") {
+    log.warn("permission", "canonical reply not ok → legacy route", { status: canonical.status });
+  } else {
+    log.warn("permission", "canonical reply threw → legacy route", canonical.error);
+  }
+  const legacy = await postBounded(
+    `/oc/session/${encodeURIComponent(sessionID)}/permissions/${encodeURIComponent(permissionID)}`,
+    { response },
+  );
+  if (legacy.kind === "ok") return;
+  if (legacy.kind === "timeout") {
+    replyOutcomeUnknown("Permission", sessionID);
+    return;
+  }
+  log.error("permission", "reply failed on both routes", {
+    status: legacy.kind === "status" ? legacy.status : String(legacy.kind),
+  });
 }
 
 // Reply to a pending question. `answers` is one array of chosen labels (or
 // custom strings) per question in the request.
 export async function respondQuestion(questionID: string, answers: string[][]) {
   log.debug("question", "reply", { questionID, answers });
-  const res = await fetch(`/oc/question/${encodeURIComponent(questionID)}/reply`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ answers }),
-  });
-  if (!res.ok) log.error("question", "reply failed", { status: res.status });
+  const res = await postBounded(`/oc/question/${encodeURIComponent(questionID)}/reply`, { answers });
+  if (res.kind === "ok") return;
+  if (res.kind === "timeout") {
+    replyOutcomeUnknown("Question");
+    return;
+  }
+  log.error("question", "reply failed", { status: res.kind === "status" ? res.status : String(res.kind) });
 }
 
 // Abort a session's turn and clear its working indicator. Exposed for the
@@ -334,14 +411,17 @@ export async function respondQuestion(questionID: string, answers: string[][]) {
 export async function abortSession(sessionID: string) {
   if (!sessionID) return;
   markSessionIdle(sessionID);
-  try {
-    await fetch("/vh/abort", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionID }),
-    });
-  } catch (e) {
-    log.warn("abort", "request failed", e);
+  const res = await postBounded("/vh/abort", { sessionID });
+  if (res.kind === "ok") return;
+  // Benign either way (the optimistic idle is already applied above and later
+  // server events reconcile) — warn-only, no notification: bounding just
+  // guarantees the floating promise always SETTLES (a hung socket used to
+  // leave it pending forever). A definitive non-2xx stays silent, matching
+  // the pre-bound behavior.
+  if (res.kind === "timeout") {
+    log.warn("abort", "request timed out (no confirmation)", { sessionID });
+  } else if (res.kind === "network") {
+    log.warn("abort", "request failed", res.error);
   }
 }
 

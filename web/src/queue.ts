@@ -193,32 +193,65 @@ function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// Bounded timeout for the queue LIST (send-reliability hygiene micro-slice,
+// §8 item 6a — the last real Send-wedge). The GET is awaited inside the
+// admission single-flight's reconcile-first path (createSend's
+// classifyAdmissionFailure), so an unbounded fetchQueue on a hung worker
+// socket left the single-flight key engaged FOREVER — the Send button wedged
+// until a page reload. On timeout or network failure fetchQueue resolves
+// null and NEVER throws: most callers are fire-and-forget `void` calls (a
+// throw there is an unhandled rejection), and the one awaited caller (the
+// admission reconcile) treats null as "list unavailable → stay uncertain".
+// 10s is generous for a local-worker file read. Mirrors the
+// ENQUEUE/CLAIM/RESOLVE AbortController precedent.
+const FETCH_QUEUE_TIMEOUT_MS = 10000;
+
 // fetchQueue replaces the cache for a session with the backend's authoritative
-// list. Idempotent; safe to call frequently.
+// list. Idempotent; safe to call frequently. Resolves null when the list
+// could not be fetched in time (timeout / network) — the cache is left
+// untouched (stale-but-honest beats a fabricated refresh) and callers treat
+// null as no-answer, never as an empty list.
 //
 // Reconcile: if the backend still reports a NON-terminal state (e.g.
 // dispatching) for an item whose dispatch already reached a known terminal
 // outcome (the resolve write failed), prefer the local outcome so the UI never
 // flips a known-terminal item back to a misleading dispatching. The overlay
 // entry is dropped once the backend catches up to terminal.
-export async function fetchQueue(sessionId: string): Promise<QueuedMessage[]> {
-  const res = await fetch(queueUrl(sessionId));
-  if (!res.ok) return queues[sessionId] || [];
-  const j = await readJSON(res);
-  const items: QueuedMessage[] = Array.isArray(j.items) ? j.items : [];
-  const reconciled = items.map((it) => {
-    const known = knownOutcomes.get(it.id);
-    if (!known) return it;
-    if (isTerminalStateFE(it.state)) {
-      // Backend caught up to terminal — drop the overlay; backend is authority.
-      knownOutcomes.delete(it.id);
-      return it;
-    }
-    // Backend still non-terminal but we KNOW the outcome — keep it honest.
-    return { ...it, state: known.state, detail: known.detail, resolvedAt: known.resolvedAt };
-  });
-  setQueues(sessionId, reconciled);
-  return reconciled;
+export async function fetchQueue(sessionId: string): Promise<QueuedMessage[] | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), FETCH_QUEUE_TIMEOUT_MS);
+  try {
+    const res = await fetch(queueUrl(sessionId), { signal: ctrl.signal });
+    if (!res.ok) return queues[sessionId] || [];
+    // Body read INSIDE the armed timeout window (the D-F2 hang class, same as
+    // enqueue/claim): headers arriving with a stalled body used to leave the
+    // read unarmed past any timer — inside the window the aborting signal
+    // tears the reader down too. readJSON swallows that rejection to `{}`, so
+    // consult the signal: if the abort fired, NO authoritative list arrived —
+    // resolve null rather than fabricating an empty-list refresh.
+    const j = await readJSON(res);
+    if (ctrl.signal.aborted) return null;
+    const items: QueuedMessage[] = Array.isArray(j.items) ? j.items : [];
+    const reconciled = items.map((it) => {
+      const known = knownOutcomes.get(it.id);
+      if (!known) return it;
+      if (isTerminalStateFE(it.state)) {
+        // Backend caught up to terminal — drop the overlay; backend is authority.
+        knownOutcomes.delete(it.id);
+        return it;
+      }
+      // Backend still non-terminal but we KNOW the outcome — keep it honest.
+      return { ...it, state: known.state, detail: known.detail, resolvedAt: known.resolvedAt };
+    });
+    setQueues(sessionId, reconciled);
+    return reconciled;
+  } catch {
+    // Network error OR abort/timeout (incl. a hung body after headers).
+    // Resolve null — never throw (see FETCH_QUEUE_TIMEOUT_MS above).
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // Bounded timeout for the enqueue POST. The backend enqueue is fast (atomic
@@ -386,20 +419,33 @@ export interface RemoveQueuedResult {
 // Returns a confirmed result so the caller knows whether the DELETE actually
 // took. The cache side effects are unchanged: a 2xx deletes from the cache, a
 // 404 reflects nothing (already gone), a 409 refreshes to dispatching truth.
-// A network throw surfaces as a non-removed result (the item's removability is
-// unknown) rather than propagating, so the caller can fail soft.
+// A network throw or TIMEOUT surfaces as a non-removed result (the DELETE's
+// outcome is unknown — it may have landed server-side) rather than
+// propagating, so the caller can fail soft: a retract never restores the
+// composer on an unconfirmed DELETE. Bounded (send-reliability hygiene
+// micro-slice, §8 item 6b): an unbounded DELETE hung the awaited retract path
+// silently (no guard, no completion). 10s mirrors the fetchQueue bound.
+const REMOVE_TIMEOUT_MS = 10000;
+
 export async function removeQueued(sessionId: string, id: string): Promise<RemoveQueuedResult> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), REMOVE_TIMEOUT_MS);
   let res: Response;
   try {
     res = await fetch(queueUrl(sessionId, `/${encodeURIComponent(id)}`), {
       method: "DELETE",
       headers: { "X-VH-CSRF": "1" },
+      signal: ctrl.signal,
     });
   } catch (e) {
-    // Network error / interruption — the item's removability is unknown. Do NOT
-    // touch the cache; surface as non-removed so a caller never takes a
-    // success-only side effect (e.g. restoring a draft) on an unconfirmed DELETE.
-    return { removed: false, reason: `network (${String(e)})` };
+    // Network error / interruption / timeout — the item's removability is
+    // unknown (the DELETE may have landed). Do NOT touch the cache; surface
+    // as non-removed so a caller never takes a success-only side effect
+    // (e.g. restoring a draft) on an unconfirmed DELETE.
+    const aborted = ctrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError");
+    return { removed: false, reason: aborted ? "timeout" : `network (${String(e)})` };
+  } finally {
+    clearTimeout(timer);
   }
   if (res.ok) {
     setQueues(produce((q) => {

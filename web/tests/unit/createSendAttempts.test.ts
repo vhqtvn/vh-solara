@@ -25,8 +25,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSignal } from "solid-js";
 import { createSend, type SendDependencies } from "../../src/components/chat/createSend";
 import type { Attachment } from "../../src/components/chat/createAttachments";
-import { EnqueueError, type QueuedMessage } from "../../src/queue";
-import { __resetSendSingleFlightForTests } from "../../src/lib/sendSingleFlight";
+import { EnqueueError, fetchQueue as realFetchQueue, type QueuedMessage } from "../../src/queue";
+import { __resetSendSingleFlightForTests, isSendInFlight } from "../../src/lib/sendSingleFlight";
 import {
   __resetSendActionStatusForTests,
   finishSendAttempt,
@@ -71,7 +71,7 @@ interface Harness {
 
 function harness(overrides: {
   enqueue?: (id: string, input: any) => Promise<unknown>;
-  fetchQueue?: (id: string) => Promise<QueuedMessage[]>;
+  fetchQueue?: (id: string) => Promise<QueuedMessage[] | null>;
   uploading?: () => boolean;
   flush?: (id: string) => Promise<{ failed: Attachment[] }>;
   draft?: () => boolean;
@@ -293,6 +293,52 @@ describe("createSend slice 2 — typed uncertainty + reconcile-first", () => {
     expect(action!.certainty).toBe("unknown");
     expect(action!.recovery).toBe("retry-same");
     expect(action!.payload?.tapText).toBe("maybe queued?");
+  });
+
+  it("CRUX (§8 6a): a HUNG queue-list during uncertain-admission recovery releases the Send single-flight — no wedge", async () => {
+    // The load-bearing bound (queue.ts FETCH_QUEUE_TIMEOUT_MS): the reconcile
+    // list GET is awaited INSIDE runSendSingleFlight, so pre-bound a hung
+    // worker socket held the guard forever (Send wedged until reload). Here
+    // the REAL queue.ts fetchQueue runs against a hung global fetch — the
+    // bound must abort it at 10s, resolve null (never throw), and the
+    // admission path must settle to the uncertain row with the guard RELEASED.
+    const h = harness({
+      enqueue: async () => {
+        throw new Error("offline"); // response-less failure → reconcile-first
+      },
+      fetchQueue: (id) => realFetchQueue(id), // the REAL bounded module fn
+    });
+    h.setInput("wedged?");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: any) =>
+        // Mirror native fetch: hangs; rejects with AbortError on abort.
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        }),
+      ),
+    );
+    vi.useFakeTimers();
+    try {
+      const p = h.send();
+      // While the list is hung the guard is legitimately engaged…
+      await vi.advanceTimersByTimeAsync(9999);
+      expect(isSendInFlight("ses-1")).toBe(true);
+      // …but at the 10s bound the abort fires, fetchQueue resolves null, the
+      // admission settles uncertain, and the single-flight key RELEASES —
+      // the crux: no permanent wedge.
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(p).resolves.toBeUndefined();
+      expect(isSendInFlight("ses-1")).toBe(false);
+      expect(h.fetchQueueCalls).toBe(1); // reconcile-first ran (through the real fn)
+      // Null list = "no answer": stays UNCERTAIN (retry-same), composer kept.
+      const action = sendActionsFor("ses-1").find((a) => a.stage === "uncertain");
+      expect(action).toBeDefined();
+      expect(action!.recovery).toBe("retry-same");
+      expect(h.input()).toBe("wedged?");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("response-less failure + reconcile HIT (list shows our attemptId) → custody confirmed, send reports success", async () => {

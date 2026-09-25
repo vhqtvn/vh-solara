@@ -1026,3 +1026,108 @@ describe("resolveWithRetry — byte-identical bodies across retries (slice 2)", 
     expect(bodies[0]).toBe(JSON.stringify({ state: "failed", detail: "HTTP 400: bad" }));
   });
 });
+
+// ---------------------------------------------------------------------------
+// Bounded fetchQueue + removeQueued (send-reliability hygiene micro-slice,
+// §8 item 6a/6b) — the hung-socket cells. Both settle via the landed
+// fake-timers + abort-listener pattern: a fetch that never resolves on its
+// own and rejects with AbortError when the caller signal fires.
+// ---------------------------------------------------------------------------
+
+// A fetch mock that hangs until the caller aborts (mirrors native fetch).
+function hangingFetch() {
+  return vi.fn((_url: string, init?: any) =>
+    new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+    }),
+  );
+}
+
+describe("fetchQueue — bounded list GET (§8 6a: the admission single-flight wedge)", () => {
+  it("a hung GET resolves null after 10s (NEVER throws), leaves the cache untouched", async () => {
+    const sid = "s-fq-hang";
+    touched.push(sid);
+    // Seed the cache so "untouched" is observable.
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(200, { items: [item("a", { text: "kept" })] }))));
+    await fetchQueue(sid);
+    expect(queueFor(sid)).toHaveLength(1);
+
+    vi.stubGlobal("fetch", hangingFetch());
+    vi.useFakeTimers();
+    try {
+      const p = fetchQueue(sid);
+      // Still pending just before the bound (no premature abort).
+      await vi.advanceTimersByTimeAsync(9999);
+      // At 10s the AbortController fires; fetchQueue must RESOLVE null — a
+      // throw here would be an unhandled rejection for every `void` caller.
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(p).resolves.toBeNull();
+      // Cache untouched — stale-but-honest, never a fabricated empty list.
+      expect(queueFor(sid)).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("headers arrive but the BODY stalls: the in-window body read aborts and settles null (D-F2 class)", async () => {
+    const sid = "s-fq-body";
+    touched.push(sid);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: any) =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            new Promise((_r, reject) => {
+              init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+            }),
+        } as unknown as Response),
+      ),
+    );
+    vi.useFakeTimers();
+    try {
+      const p = fetchQueue(sid);
+      await vi.advanceTimersByTimeAsync(10000);
+      await expect(p).resolves.toBeNull();
+      expect(queueFor(sid)).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a network error also resolves null (never rejects)", async () => {
+    const sid = "s-fq-net";
+    touched.push(sid);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new TypeError("Failed to fetch"))));
+    await expect(fetchQueue(sid)).resolves.toBeNull();
+  });
+});
+
+describe("removeQueued — bounded DELETE (§8 6b: retract's awaited removal)", () => {
+  it("a hung DELETE resolves removed:false (reason timeout) after 10s; cache untouched, no rejection", async () => {
+    const sid = "s-rm-hang";
+    touched.push(sid);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(200, { items: [item("a", { text: "chip" })] }))));
+    await fetchQueue(sid);
+
+    vi.stubGlobal("fetch", hangingFetch());
+    vi.useFakeTimers();
+    try {
+      const p = removeQueued(sid, "a");
+      await vi.advanceTimersByTimeAsync(9999);
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await p;
+      // Uncertain outcome, non-removed: the DELETE may have landed server-side,
+      // so a retract caller must NOT restore the composer — and NOT mark the
+      // item nonRemovable (that is the hard 409 dispatching signal).
+      expect(result.removed).toBe(false);
+      expect(result.nonRemovable).toBeUndefined();
+      expect(result.reason).toBe("timeout");
+      // Cache untouched: the chip stays (no success-only side effect).
+      expect(queueFor(sid).map((m) => m.id)).toEqual(["a"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
