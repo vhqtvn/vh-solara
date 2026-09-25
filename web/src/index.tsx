@@ -110,7 +110,7 @@ if (standalone === "code") {
   startTailListener();
   // Host gesture recognizer (no-op when standalone). Same embed gate +
   // captured-origin security pattern as the heartbeat/status/select bridges.
-  // When embedded, recognizes a double-Ctrl (desktop) / triple-tap (mobile)
+  // When embedded, recognizes a triple completed bare-Ctrl (desktop) / triple-tap (mobile)
   // gesture and forwards ONE closed postMessage intent
   // ({type:"host-gesture", gesture:"layout-overlay-request"}) so the host can
   // open its layout overlay anchored to the source pane. The host derives the

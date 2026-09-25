@@ -171,7 +171,7 @@ export type PaneToHost =
        * dir (closed non-negative integer; see PaneStatus.unreadCount). */
       unreadCount: number;
     }
-  // Layout-overlay gesture (double-Ctrl desktop / triple-tap mobile) + pane-
+  // Layout-overlay gesture (triple bare-Ctrl desktop / triple-tap mobile) + pane-
   // activate forward (cross-origin activation bridge). The SPA forwards ONE
   // closed intent when the operator gestures (overlay) or when the pane gains
   // focus / receives a pointerdown (activate); the host derives the source pane
@@ -390,7 +390,7 @@ export interface HostOps {
    *  pane (so the focus indicator + subsequent split/swap target it),
    *  then activates the overlay. Idempotent: a second open while already open
    *  re-anchors to the new source (no stacking). No-op when the pane is not in
-   *  the active workspace. The host-gesture router (double-Ctrl / triple-tap)
+   *  the active workspace. The host-gesture router (triple bare-Ctrl / triple-tap)
    *  and the DEV test bridge both route through this; there is no longer a
    *  statusbar Layout button (the statusbar was removed in its entirety). */
   openLayoutOverlay?(paneId: string): void;

@@ -153,7 +153,7 @@ export function Settings() {
   //
   // "Edit layout…" (FIRST — the most frequent action) restores a host-side,
   // production-capable, NO-GESTURE trigger for the layout overlay: since the
-  // statusbar removal (aa244b3) the overlay was gesture-only (double-Ctrl /
+  // statusbar removal (aa244b3) the overlay was gesture-only (triple bare-Ctrl /
   // triple-tap), leaving no fallback if gestures fail on a device. It routes
   // through the SAME production HostOps path the gesture does
   // (hostOps().openLayoutOverlay), anchored to the FOCUSED pane, and is

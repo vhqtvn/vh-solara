@@ -1058,7 +1058,7 @@ export function routeMessage(
       return { routed: true, paneId, accepted: true, reason: "accepted:non-heartbeat" };
     }
     case "host-gesture": {
-      // Layout-overlay gesture (double-Ctrl / triple-tap) + pane-activate forward
+      // Layout-overlay gesture (triple bare-Ctrl / triple-tap) + pane-activate forward
       // (cross-origin activation bridge). CLOSED payload: the message MUST be
       // exactly {type:"host-gesture", gesture: GESTURE} where GESTURE is one of
       // the closed set, with NO other fields (the host derives the source pane
