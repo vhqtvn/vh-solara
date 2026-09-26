@@ -48,6 +48,7 @@ import { broadcastTheme, postThemeTo } from "./themeTokens";
 import { customTheme, theme } from "./theme";
 import { adminOpen, diagLogOpen, embeddedViewId, isEmbeddedView, navOpen, ocLogsOpen, perfDiagOpen, setAdminOpen, setDiagLogOpen, setNavOpen, setOcLogsOpen, setPaletteOpen, setPerfDiagOpen, setSettingsOpen, setTermOpen, setView, settingsOpen, termOpen, view, VIEW_PREFIX } from "./ui";
 import { bindBackDismiss } from "./lib/backStack";
+import { startPoll } from "./lib/poll";
 import { projectDir } from "./sync";
 
 export default function App() {
@@ -123,8 +124,11 @@ export default function App() {
   // Consumer-registered embedded views: load on mount and refresh periodically
   // (registration can happen after the page loads), so they appear in the
   // view-switcher without a reload.
-  let viewsPoll: number | undefined;
-  let managedPoll: number | undefined;
+  // Both loops are single-flight + visibility-aware (lib/poll.ts): a hidden
+  // pane (background tab / host-hidden dockview pane) stops polling, and a slow
+  // tunnel can never stack overlapping requests.
+  let stopViewsPoll: (() => void) | undefined;
+  let stopManagedPoll: (() => void) | undefined;
   // An embedded view may ask for the theme on its own load timing.
   const onThemeRequest = (e: MessageEvent) => {
     const d = e.data as { source?: string; type?: string } | null;
@@ -143,9 +147,9 @@ export default function App() {
     window.addEventListener("message", onThemeRequest);
     installCodeFrameHost();
     void refreshViews();
-    viewsPoll = window.setInterval(() => void refreshViews(), 60000);
-    // Repo-declared managed projects: refresh on mount + poll alongside views.
-    void refreshManaged();
+    stopViewsPoll = startPoll(refreshViews, { intervalMs: 60000, immediate: false });
+    // Repo-declared managed projects: fetched + polled by the projectDir effect
+    // below (it runs on mount too).
     // Wire the hidden diagnostic-log capture (default-off ring buffer). No-op
     // capture until the operator enables it from the server-admin menu.
     startDiagCapture();
@@ -160,8 +164,8 @@ export default function App() {
     window.removeEventListener("blur", clearMod);
     document.removeEventListener("contextmenu", onContextMenu);
     window.removeEventListener("message", onThemeRequest);
-    clearInterval(viewsPoll);
-    clearInterval(managedPoll);
+    stopViewsPoll?.();
+    stopManagedPoll?.();
   });
   // Re-scope the managed view when the active project changes, and surface the
   // trust gate proactively when a project wants to run repo-declared commands.
@@ -170,11 +174,11 @@ export default function App() {
     // Re-scope both the embedded views and the managed-project panel to the
     // newly active project.
     void refreshViews();
-    void refreshManaged();
     void refreshProjectSettings();
     watchProjectSettings(); // re-point the live config watch at the active project
-    clearInterval(managedPoll);
-    managedPoll = window.setInterval(() => void refreshManaged(), 5000);
+    // Restart the managed poll for the new project (runs once immediately).
+    stopManagedPoll?.();
+    stopManagedPoll = startPoll(refreshManaged, { intervalMs: 5000 });
   });
   // If Notes gets hidden (global pref off + no per-project opt-in) while the
   // Notes tab is active, fall back to Chat so the user isn't stuck on a blank tab.

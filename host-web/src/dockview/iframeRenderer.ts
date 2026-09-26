@@ -12,6 +12,38 @@ import {
   unbindContentWindow,
 } from "./store";
 
+// ---- pane visibility pump -------------------------------------------------
+// `renderer: 'always'` keeps every pane mounted; hidden tabs and inactive
+// workspaces are hidden with `visibility: hidden`, which the cross-origin
+// iframe cannot observe (its document stays "visible"). So the host tells each
+// pane `{type:"vh-host-visibility", visible}` (web/src/paneVisibility.ts) and
+// the SPA pauses its polling loops while hidden. One shared 1s tick samples
+// every live renderer; a message is sent on change, on iframe load, and every
+// VIS_RESYNC_TICKS ticks as a resync (a pane that missed one self-heals).
+const VIS_TICK_MS = 1000;
+const VIS_RESYNC_TICKS = 10;
+const liveRenderers = new Set<IframeRenderer>();
+let visPump: ReturnType<typeof setInterval> | undefined;
+
+function ensureVisPump(): void {
+  if (visPump !== undefined || typeof window === "undefined") return;
+  visPump = setInterval(() => {
+    for (const r of liveRenderers) r.syncVisibility();
+    if (liveRenderers.size === 0) {
+      clearInterval(visPump);
+      visPump = undefined;
+    }
+  }, VIS_TICK_MS);
+}
+
+/** Is this iframe actually on screen (laid out, non-empty, not visibility-hidden)? */
+function iframeOnScreen(el: HTMLElement | undefined): boolean {
+  if (!el || !el.isConnected) return false;
+  const rect = el.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return false;
+  return getComputedStyle(el).visibility !== "hidden";
+}
+
 /**
  * Per-pane content renderer. Builds a CHROMELESS pane: a single cross-origin
  * <iframe> filling the slot + a thin focus border when active. NO title text,
@@ -43,6 +75,9 @@ export class IframeRenderer implements IContentRenderer {
   // control) can re-add a fresh iframe to PROVE a reload — never used by any
   // production path.
   private body!: HTMLElement;
+  // Last visibility sent to the pane (undefined = not yet sent for this load).
+  private visSent: boolean | undefined;
+  private visTicks = 0;
 
   constructor(private readonly ops: HostOps) {
     // Root container: body only (header removed — chromeless panes). This
@@ -141,8 +176,23 @@ export class IframeRenderer implements IContentRenderer {
       // host verifies the first post-load heartbeat carries it (constraint #4).
       noteIframeLoad(this.paneId);
       sendHandshake(this.paneId);
+      // A fresh document starts assuming "visible"; tell it the truth now.
+      this.visSent = undefined;
+      this.syncVisibility();
     });
     if (iframe.contentWindow) bindContentWindow(this.paneId, iframe.contentWindow);
+    liveRenderers.add(this);
+    ensureVisPump();
+  }
+
+  /** Sample on-screen visibility and tell the pane on change / periodic resync. */
+  syncVisibility(): void {
+    const visible = iframeOnScreen(this.iframe);
+    this.visTicks++;
+    if (visible === this.visSent && this.visTicks < VIS_RESYNC_TICKS) return;
+    this.visTicks = 0;
+    this.visSent = visible;
+    this.postToPane({ type: "vh-host-visibility", visible });
   }
 
   // ---- controller hooks ----------------------------------------------------
@@ -208,6 +258,7 @@ export class IframeRenderer implements IContentRenderer {
   }
 
   dispose(): void {
+    liveRenderers.delete(this);
     unbindContentWindow(this.paneId);
   }
 }

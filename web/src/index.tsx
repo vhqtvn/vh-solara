@@ -20,6 +20,7 @@ import { startHeartbeat } from "./heartbeat";
 import { startStatusEmitter } from "./statusEmitter";
 import { startSelectListener } from "./selectListener";
 import { startTailListener } from "./tailListener";
+import { startPaneVisibility } from "./paneVisibility";
 import { startHostGesture } from "./hostGesture";
 import { refreshProjectSettings } from "./projectSettings";
 import "./styles/main.css";
@@ -108,6 +109,11 @@ if (standalone === "code") {
   // {type:"status"} emission (its key now includes `following`). See
   // web/src/tailListener.ts.
   startTailListener();
+  // Pane visibility (document hidden OR host-hidden dockview pane): polling
+  // loops (lib/poll.ts) pause while the operator can't see this pane. The
+  // host posts {type:"vh-host-visibility",visible}; standalone it tracks only
+  // document.visibilityState. See web/src/paneVisibility.ts.
+  startPaneVisibility();
   // Host gesture recognizer (no-op when standalone). Same embed gate +
   // captured-origin security pattern as the heartbeat/status/select bridges.
   // When embedded, recognizes a triple completed bare-Ctrl (desktop) / 3-finger-tap (mobile)

@@ -210,7 +210,12 @@ export type HostToPane =
   // pane's configured origin (never '*'); the SPA source-guards
   // `ev.source === window.parent` before acting.
   | { type: "vh-host-tail"; following: boolean }
-  | { type: "host-mode"; mode: "keyboard-focus" | "normal" };
+  | { type: "host-mode"; mode: "keyboard-focus" | "normal" }
+  // Pane visibility (see iframeRenderer's visibility pump + the SPA's
+  // web/src/paneVisibility.ts): whether the pane is actually on screen (not a
+  // hidden dockview tab / inactive workspace). The SPA pauses its polling
+  // loops while hidden; live streams (and so status/badges) keep running.
+  | { type: "vh-host-visibility"; visible: boolean };
 
 // ---- document-liveness indicator (Q1-C) ------------------------------------
 // The on-screen per-pane indicator state derived from heartbeats. This is

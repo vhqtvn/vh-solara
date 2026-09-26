@@ -60,19 +60,22 @@ export { managed };
 const dirParam = (dir: string) => `?dir=${encodeURIComponent(dir)}`;
 
 // Fetch the active project's managed state. State "none" (no config) is a
-// normal result — we clear the signal so the UI shows nothing.
-export async function refreshManaged() {
+// normal result — we clear the signal so the UI shows nothing. Resolves false
+// on a failed/offline fetch so the poll loop (lib/poll.ts) backs off.
+export async function refreshManaged(): Promise<boolean> {
   const dir = projectDir();
   try {
     const res = await fetch("/vh/managed" + dirParam(dir));
     if (!res.ok) {
       setManaged(null);
-      return;
+      return false;
     }
     const p = (await res.json()) as ManagedProject;
     setManaged(p && p.state !== "none" ? p : null);
+    return true;
   } catch {
     /* offline — leave as-is */
+    return false;
   }
 }
 

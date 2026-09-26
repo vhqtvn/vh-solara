@@ -12,6 +12,7 @@ import { fetchSubtreeTodos, type SubtreeTodosResp } from "../subtreeTodos";
 import type { CurrentVerb } from "../sync";
 import { bindBackDismiss } from "../lib/backStack";
 import { layoutPx } from "../lib/zoom";
+import { startPoll } from "../lib/poll";
 import Icon from "./Icon";
 import Spinner from "./Spinner";
 
@@ -33,7 +34,9 @@ export default function ChatTasksStatus(props: {
   // while the session is open (mirrors the fetchQueue pattern above) — the
   // server is authoritative, and a 5s poll catches todo.updated events without
   // wiring a stream→component refetch signal. Stale responses from a prior
-  // session (or after unmount) are suppressed via a monotonic request id.
+  // session (or after unmount) are suppressed via a monotonic request id. The
+  // loop is single-flight + visibility-aware (lib/poll.ts): no overlapping
+  // requests on a slow tunnel, and no polling from a hidden pane.
   const [subtreeTodos, setSubtreeTodos] = createSignal<SubtreeTodosResp["data"] | null>(null);
   let todoPollReq = 0;
   createEffect(() => {
@@ -50,12 +53,12 @@ export default function ChatTasksStatus(props: {
         setSubtreeTodos(resp.data);
       } catch {
         if (myReq === todoPollReq) setSubtreeTodos(null);
+        return false; // back off
       }
     };
-    void poll();
-    const timer = setInterval(poll, 5000);
+    const stop = startPoll(poll, { intervalMs: 5000 });
     onCleanup(() => {
-      clearInterval(timer);
+      stop();
       todoPollReq++; // suppress any in-flight fetch from this run
     });
   });
