@@ -291,8 +291,8 @@ func TestQueueDispatchCommittedThenResponseLostRecoversUnknown(t *testing.T) {
 	}
 
 	t.Logf("FIX-QUEUE-STUCK-1 recovery contract verified end-to-end: item %s recovered to "+
-		"unknown after dropped dispatch (UserMessageCount=1, no redispatch; detail=%q)",
-		got.ID, got.Detail)
+		"unknown after dropped dispatch (UserMessageCount delta=%d, want 1 — no redispatch; detail=%q)",
+		got.ID, cluster.Fake.UserMessageCount(sid)-baseUserMsgs, got.Detail)
 }
 
 // TestQueueDispatchNormalModeCommitsAndKeepsDispatching is a guard test: in the
@@ -558,6 +558,15 @@ func TestQueueReconcileCommittedThenDroppedRecoversSent(t *testing.T) {
 	openProjectForDir(t, dir)
 	sid := fakeSessionForDir(dir)
 
+	// Baseline the fake's per-sid committed-message counter: sid
+	// "proj_rcov-sent" is FIXED (the dir leaf is constant; only the TempDir
+	// parent varies per run) while the fake is shared across the whole
+	// `go test` process, so under -count>1 re-runs the counter ACCUMULATES
+	// (one commit per iteration). The contract assertions below are about THIS
+	// run's commits — assert a DELTA of exactly 1, never an absolute count
+	// (which would fail every iteration after the first under -count>1).
+	baseUserMsgs := cluster.Fake.UserMessageCount(sid)
+
 	cluster.Fake.SetPromptAsyncMode(fixtures.PromptAsyncCommitThenDropResponse)
 	t.Cleanup(func() { cluster.Fake.SetPromptAsyncMode(fixtures.PromptAsyncNormal) })
 
@@ -569,10 +578,10 @@ func TestQueueReconcileCommittedThenDroppedRecoversSent(t *testing.T) {
 		t.Fatalf("commit-then-drop: dispatch returned 204; want dropped/error")
 	}
 
-	// The commit happened BEFORE the drop: exactly one user message under the
-	// minted id (the crux of the ambiguous-receipt window).
-	if got := cluster.Fake.UserMessageCount(sid); got != 1 {
-		t.Fatalf("after dispatch: UserMessageCount=%d want 1 (commit-before-drop)", got)
+	// The commit happened BEFORE the drop: exactly one user message (this
+	// run's) under the minted id (the crux of the ambiguous-receipt window).
+	if got := cluster.Fake.UserMessageCount(sid) - baseUserMsgs; got != 1 {
+		t.Fatalf("after dispatch: UserMessageCount delta=%d, want 1 (commit-before-drop)", got)
 	}
 
 	// Wait past the stale threshold so recovery fires on the next List().
@@ -597,9 +606,9 @@ func TestQueueReconcileCommittedThenDroppedRecoversSent(t *testing.T) {
 	}
 
 	// NO duplicate prompt: the reconciler only GETs (never re-dispatches), so
-	// the fake still has exactly one committed user message.
-	if got := cluster.Fake.UserMessageCount(sid); got != 1 {
-		t.Fatalf("after reconcile: UserMessageCount=%d want 1 (reconciler must NOT resend)", got)
+	// the fake still has exactly one committed user message (this run's).
+	if got := cluster.Fake.UserMessageCount(sid) - baseUserMsgs; got != 1 {
+		t.Fatalf("after reconcile: UserMessageCount delta=%d, want 1 (reconciler must NOT resend)", got)
 	}
 
 	t.Logf("Slice 6 crux verified end-to-end: delivered-but-stuck item %s auto-resolved to sent "+
