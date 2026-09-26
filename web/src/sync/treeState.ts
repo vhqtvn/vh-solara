@@ -78,13 +78,17 @@ const bump = (): void => {
 // expandTreeNode for each, so a persisted-expanded node's children are fetched
 // and land via subsequent node.children ops.
 //
-// Persistence key: `vh.tree.mode.v2` (the deleted proj=1 client's precedent key,
-// unused in tree=2 until now — NO collision with the legacy `vh.tree.expanded.v1`
-// Set<string>, which is retained read-only for one-time migration + rollback).
+// Persistence keys: `vh.tree.mode.v3` is the ACTIVE mode map. The
+// `vh.tree.mode.v2` key (the deleted proj=1 client's precedent, reused by
+// tree=2) is retained READ-ONLY as the one-time un-corruption-sweep source +
+// rollback copy, exactly as the legacy `vh.tree.expanded.v1` Set<string> is
+// retained read-only for its own migration + rollback — same precedent, one
+// more hop.
 export type TreeMode = "collapsed" | "filtered" | "expanded";
 export type TreeModeMap = Record<string, TreeMode>;
 
-const LS_MODE = "vh.tree.mode.v2";
+const LS_MODE = "vh.tree.mode.v2"; // PRE-SWEEP map — read-only migration source (retained for rollback)
+const LS_MODE_V3 = "vh.tree.mode.v3"; // ACTIVE mode map (post un-corruption sweep)
 const LS_EXPANDED_LEGACY = "vh.tree.expanded.v1"; // pre-mode Set<string> (retained for rollback)
 
 function isValidMode(v: unknown): v is TreeMode {
@@ -116,16 +120,75 @@ function migrateFromExpandedSet(arr: unknown): TreeModeMap {
   return out;
 }
 
+// ONE-TIME un-corruption sweep (v2 → v3 stock heal). For ~2 months before the
+// 499e327/8754294 establishment gate, cold-load ingestion read the never-seeded
+// activity "" as a settle and demoted persisted "filtered" entries to
+// "collapsed" (and materialized "collapsed") for genuinely-running branches —
+// spurious entries that never self-heal (a busy baseline seed fires no working
+// edge, so nothing ever re-promotes them; collapsed+working renders nothing).
+// The gate stopped NEW corruption generation; this sweep heals the accumulated
+// stock, once, at module init.
+//
+// Why DROP entries instead of repairing them per-entry: the flat {id: mode}
+// schema carries NO write provenance — a corrupted "collapsed" is byte-identical
+// to a deliberate user collapse — so per-entry discrimination is impossible.
+// Deletion is the only safe one-time surgery: an absent id resolves via the
+// implicit "filtered" render (a working branch re-reveals its working children)
+// or the UNGATED R4 absent-idle cold materialization (an idle branch re-collapses
+// at seed). The sweep can only DELETE entries; it never demotes anything.
+//
+// Entry classes: KEEP "expanded" (a persisted-expanded node rehydrates through
+// the existing backfill path — dropping it would re-trigger the P1-A backfill
+// fetch storm). DROP "collapsed" (the corrupted class) and "filtered" (the
+// stale accumulation, c-F1 — render-free either way: working → implicit
+// filtered, the same render; idle → R4 collapsed at seed).
+//
+// Accepted one-time false positive: a user who DELIBERATELY collapsed a RUNNING
+// branch sees it re-open ONCE after this migration; re-collapsing persists (the
+// establishment gate never demotes, and collapsed+working is a stable persisted
+// state — the user's re-collapse sticks).
+//
+// ROLLBACK: the v2 key is left byte-untouched in storage — a build that re-reads
+// v2 restores the old map verbatim (the LS_EXPANDED_LEGACY precedent) — and the
+// forward migration is idempotent on re-run (v3 present → direct read, no v2
+// access at all).
+function keepExpandedOnly(src: TreeModeMap): TreeModeMap {
+  const out: TreeModeMap = {};
+  for (const [id, mode] of Object.entries(src)) {
+    if (mode === "expanded") out[id] = mode;
+  }
+  return out;
+}
+
 // Module-init load (runs once at first import):
-//   1. If LS_MODE holds ANY value (even an empty map) → coerce + use it; do NOT
-//      re-migrate (an empty v2 is a valid "everything filtered" state).
-//   2. Else (LS_MODE absent) read the LEGACY LS_EXPANDED_LEGACY Set → migrate to
-//      "expanded" modes, persist the result under LS_MODE.
-//   3. The legacy key is RETAINED (never deleted) for rollback safety.
-// `treeModeMap` reads `localStorage.getItem` directly first to distinguish
-// "key absent" (→ migrate) from "key present but empty" (→ use as-is), which a
-// bare `loadVersioned` fallback cannot tell apart.
+//   1. If LS_MODE_V3 holds ANY value (even an empty map) → coerce + use it;
+//      do NOT read or write v2 (the idempotent forward path — a second load
+//      is a direct v3 hit).
+//   2. Else if LS_MODE (v2) holds ANY value (even an empty map) → coerce, run
+//      the ONE-TIME un-corruption sweep (keepExpandedOnly — see its docblock),
+//      persist the result under LS_MODE_V3, and leave the v2 key byte-untouched
+//      in storage (rollback copy).
+//   3. Else (both absent) read the LEGACY LS_EXPANDED_LEGACY Set → migrate to
+//      "expanded" modes → compose through the same sweep (identity on a v1 set
+//      — every entry is "expanded") → persist under LS_MODE_V3. v2 is never
+//      manufactured on this path; a rollback build falls back to its own v1
+//      migration, which reconstructs the same expanded set.
+//   The legacy keys (v1 AND v2) are RETAINED (never deleted) for rollback
+//   safety.
+// Direct `localStorage.getItem` reads distinguish "key absent" (→ migrate)
+// from "key present but empty" (→ use as-is), which a bare `loadVersioned`
+// fallback cannot tell apart.
 function loadInitialTreeModes(): TreeModeMap {
+  let raw3: string | null = null;
+  try {
+    raw3 = localStorage.getItem(LS_MODE_V3);
+  } catch {
+    raw3 = null;
+  }
+  if (raw3 != null) {
+    const loaded = loadVersioned<unknown>(LS_MODE_V3, 1, {}, (o) => o);
+    return coerceModeMap(loaded);
+  }
   let raw: string | null = null;
   try {
     raw = localStorage.getItem(LS_MODE);
@@ -134,13 +197,15 @@ function loadInitialTreeModes(): TreeModeMap {
   }
   if (raw != null) {
     const loaded = loadVersioned<unknown>(LS_MODE, 1, {}, (o) => o);
-    return coerceModeMap(loaded);
+    const swept = keepExpandedOnly(coerceModeMap(loaded));
+    saveVersioned(LS_MODE_V3, 1, swept);
+    return swept;
   }
   const legacy = loadVersioned<string[]>(LS_EXPANDED_LEGACY, 1, [], (o) =>
     Array.isArray(o) ? o : [],
   );
-  const migrated = migrateFromExpandedSet(legacy);
-  saveVersioned(LS_MODE, 1, migrated);
+  const migrated = keepExpandedOnly(migrateFromExpandedSet(legacy));
+  saveVersioned(LS_MODE_V3, 1, migrated);
   return migrated;
 }
 
@@ -163,7 +228,7 @@ export function modeOf(id: string): TreeMode {
 export function setNodeMode(id: string, mode: TreeMode): void {
   const next = { ...treeModeMap(), [id]: mode };
   setTreeModeMap(next);
-  saveVersioned(LS_MODE, 1, next);
+  saveVersioned(LS_MODE_V3, 1, next);
 }
 
 // BATCHED multi-node mode set: accumulates into ONE new map, ONE signal update,
@@ -175,7 +240,7 @@ export function setNodesMode(ids: Iterable<string>, mode: TreeMode): void {
   const next = { ...treeModeMap() };
   for (const id of ids) next[id] = mode;
   setTreeModeMap(next);
-  saveVersioned(LS_MODE, 1, next);
+  saveVersioned(LS_MODE_V3, 1, next);
 }
 
 // MIXED-MODE multi-node set: like setNodesMode but each id carries its OWN target
@@ -200,7 +265,7 @@ export function setNodeModes(changes: ReadonlyMap<string, TreeMode>): void {
   }
   if (!next) return; // every entry was already current — no write, no notify
   setTreeModeMap(next);
-  saveVersioned(LS_MODE, 1, next);
+  saveVersioned(LS_MODE_V3, 1, next);
 }
 
 // ---- transient userToggled (NOT persisted) ----------------------------------
@@ -573,6 +638,12 @@ export function seedTreeStore(nodes: TreeNode[]): void {
       // deferred demote fires when establishment lands (""→activity emits
       // node.facet{activity}). PROMOTE edges stay ungated (working implies the
       // reveal is wanted, and a promote is healable by a later settle).
+      // SCOPE: this gate protects EXPLICIT persisted entries only (a demote
+      // edge, or the explicit-"filtered" repair below). An ABSENT-mode idle
+      // node is NOT gated — it materializes "collapsed" via the ungated cold
+      // rule below regardless of establishment (fetch suppression must not
+      // depend on it; a collapsed absent node is healable by a later promote
+      // edge either way).
       if (target === "collapsed" && !activityEstablished(newNode)) target = undefined;
     }
     // The effective mode this node will hold AFTER applying the edge target (or
@@ -801,17 +872,17 @@ export function patchTreeAgent(id: string, agent: string): void {
 }
 
 // Clear the whole tree (project switch / epoch change / test reset). Also
-// clears the in-memory mode map + userToggled AND the persisted mode key so a
-// project switch does NOT carry stale mode toggles forward and tests do not
-// bleed across cases (reviewer advisory tier1_a-F1/tier1_c-F2): the mode map is
-// persisted, so a plain reset of in-memory is NOT enough on a true project
-// switch — the persisted key is cleared too so the next reload of the new
-// project does not rehydrate the old project's modes. The legacy v1 key is left
-// untouched (dead after first v2 write; retained for rollback).
+// clears the in-memory mode map + userToggled AND the persisted ACTIVE mode key
+// (v3) so a project switch does NOT carry stale mode toggles forward and tests
+// do not bleed across cases (reviewer advisory tier1_a-F1/tier1_c-F2): the mode
+// map is persisted, so a plain reset of in-memory is NOT enough on a true
+// project switch — the persisted key is cleared too so the next reload of the
+// new project does not rehydrate the old project's modes. The v2 and legacy v1
+// keys are left untouched (dead read-only rollback copies).
 export function resetTreeStore(): void {
   map = new Map();
   setTreeModeMap({});
-  saveVersioned(LS_MODE, 1, {});
+  saveVersioned(LS_MODE_V3, 1, {});
   setUserToggled(new Set<string>());
   invalidateAutoQueue(); // drop any candidates from the prior project/session-tree
   clearRankState(); // drop stale ranks from the prior project/session-tree

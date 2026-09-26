@@ -32,7 +32,7 @@ import type { TreeNode, TreeOp } from "../../src/sync/treeMap";
 
 // The persisted tree-mode localStorage key (mirrors treeState.ts). Used by the
 // auto-mutation tests to count mode-write side effects.
-const LS_MODE = "vh.tree.mode.v2";
+const LS_MODE = "vh.tree.mode.v3"; // the ACTIVE mode-map key (post v2→v3 un-corruption sweep)
 
 // Mock ONLY expandTreeNode (the fetch entrypoint) on the barrel; everything else
 // (selectedId/state, the real treeState store, selectors) stays live.

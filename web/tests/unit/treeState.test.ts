@@ -765,7 +765,7 @@ describe("auto-mutation: cold-load normalization + working edges", () => {
     expect(Object.prototype.hasOwnProperty.call(treeModeMapSignal(), "a")).toBe(false);
   });
 
-  it("(3) explicit 'filtered'-idle SURVIVES the cold-load seed (pre-hydration guard — resume regression)", () => {
+  it("(3) explicit 'filtered' on an UNESTABLISHED (activity:\"\") baseline SURVIVES the cold-load seed (establishment gate — resume regression)", () => {
     // REWRITTEN (resume regression, see the dedicated describe below): the §5
     // frontier can ship a genuinely-running node UNESTABLISHED — the server's
     // activity seed (SetActivityFromStatuses) races the snapshot capture, so
@@ -976,7 +976,7 @@ describe("resume regression: persisted explicit 'filtered' survives pre-hydratio
     resetExpandedForTest();
   });
 
-  it("R1: cold frontier ships pre-hydration idle — persisted explicit 'filtered' is NOT demoted", () => {
+  it("R1: cold frontier ships pre-hydration UNESTABLISHED (activity:\"\") — persisted explicit 'filtered' is NOT demoted", () => {
     setNodeMode("a", "filtered"); // the persisted pre-reload state (running sessions visible)
     // Cold baseline (oldMap empty); the frontier predates the activity seed →
     // the payload ships the never-seeded "" (NOT an explicit "idle").
@@ -993,12 +993,18 @@ describe("resume regression: persisted explicit 'filtered' survives pre-hydratio
     expect(modeOf("a")).toBe("filtered"); // busy+filtered: working children render immediately
   });
 
-  it("R3: a genuine settle after resume STILL demotes (the intended working→idle edge is intact)", async () => {
+  it("R3: established-idle repair → busy promotion → idle demotion all still fire (the transition machinery is intact)", async () => {
     setNodeMode("a", "filtered");
-    seedTreeStore([node({ id: "a" })]); // pre-hydration idle baseline — mode survives
-    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "busy" } }); // observed busy
+    // Helper default activity:"idle" is an ESTABLISHED cold baseline — the
+    // R10 repair fires NOW (filtered→collapsed at seed). This is NOT a
+    // pre-hydration survival case (those are R1/R2 with activity:"" — R9
+    // covers the deferred demote there); this test pins that the ordinary
+    // repair → promote → demote chain still works end-to-end.
+    seedTreeStore([node({ id: "a" })]);
+    expect(modeOf("a")).toBe("collapsed"); // the established-idle repair fired at seed
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "busy" } }); // observed busy edge
     await flush();
-    expect(modeOf("a")).toBe("filtered"); // no change while working
+    expect(modeOf("a")).toBe("filtered"); // promoted (collapsed→filtered)
     applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "idle" } }); // GENUINE settle
     expect(modeOf("a")).toBe("collapsed"); // demote edge preserved (synchronous, op path)
   });
@@ -1067,6 +1073,29 @@ describe("resume regression: persisted explicit 'filtered' survives pre-hydratio
     expect(modeOf("a")).toBe("filtered");
     applyTreeOpStore({ op: "node.upsert", data: { node: node({ id: "a", activity: "" }) } });
     expect(modeOf("a")).toBe("filtered"); // mid-hydrate rebuild — no repair/demote
+  });
+
+  it("R8c: node.children shipping a CHILD with activity:\"\" does not repair the child's explicit filtered mid-window", () => {
+    // node.children variant of R8: the op merges EACH child from server state,
+    // so a rebuilt CHILD can carry the never-seeded "" inside the hydrate
+    // window — the child's explicit "filtered" must survive exactly like the
+    // upsert-rebuilt parent's does (the establishment gate covers the whole
+    // op payload boundary, not just the parent id).
+    setNodeMode("c", "filtered");
+    seedTreeStore([
+      node({ id: "p", childCount: 1, loaded: true }),
+      busyNode({ id: "c", parentId: "p" }),
+    ]);
+    expect(modeOf("c")).toBe("filtered"); // established busy — filtered valid
+    applyTreeOpStore({
+      op: "node.children",
+      data: {
+        parentId: "p",
+        nodes: [node({ id: "c", parentId: "p", activity: "" })], // child rebuilt unestablished
+        hasMore: false,
+      },
+    });
+    expect(modeOf("c")).toBe("filtered"); // mid-hydrate child rebuild — no repair/demote
   });
 
   it("R9: establishment facet (idle) arriving after an unestablished observation fires the deferred demote", () => {

@@ -2,15 +2,19 @@
 //
 // tree mode persistence + migration + backfill (proj=1 4-state twisty model).
 //
-// The persisted mode map (vh.tree.mode.v2, Record<id, "collapsed"|"filtered"|
-// "expanded">) replaces the legacy binary expanded Set (vh.tree.expanded.v1).
-// These pin: (1) persist/rehydrate round-trip, (2) v1→v2 migration (members→
-// expanded, non-members→filtered default, malformed ignored, existing valid v2
-// wins over legacy, v1 key retained), (3) setNodesMode does ONE localStorage
-// write, (4) expandedButUnloadedIds reads mode==="expanded", (5) the stream
-// backfill fires a children fetch for a persisted-expanded unloaded node, (6)
-// reload does NOT flatten the tree (map re-fetched, modes survive), and (7)
-// clearUserToggled is wired into setSelectedId only on a real id change.
+// The ACTIVE persisted mode map is vh.tree.mode.v3 (Record<id, "collapsed"|
+// "filtered"|"expanded">). It replaced the pre-sweep vh.tree.mode.v2 map via a
+// ONE-TIME un-corruption sweep (drop explicit collapsed/filtered, keep
+// expanded; see the v2 → v3 describe below), which in turn replaced the legacy
+// binary expanded Set (vh.tree.expanded.v1). Both old keys are retained
+// read-only in storage (rollback copies). These pin: (1) persist/rehydrate
+// round-trip, (2) key migrations (v1 → v3 composed through the v2 coerce+sweep;
+// v2 → v3 sweep — malformed ignored, existing valid maps win over legacy, old
+// keys retained), (3) setNodesMode does ONE localStorage write, (4)
+// expandedButUnloadedIds reads mode==="expanded", (5) the stream backfill fires
+// a children fetch for a persisted-expanded unloaded node, (6) reload does NOT
+// flatten the tree (map re-fetched, modes survive), and (7) clearUserToggled is
+// wired into setSelectedId only on a real id change.
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import {
   seedTreeStore,
@@ -35,6 +39,7 @@ import { saveVersioned } from "../../src/lib/store";
 import type { TreeNode } from "../../src/sync/treeMap";
 
 const LS_MODE = "vh.tree.mode.v2";
+const LS_MODE_V3 = "vh.tree.mode.v3";
 const LS_LEGACY = "vh.tree.expanded.v1";
 
 // Full TreeNode seed (type-safe; mirrors treeState.test.ts node() helper).
@@ -61,16 +66,16 @@ function node(overrides: Partial<TreeNode> = {}): TreeNode {
 // ---------------------------------------------------------------------------
 // persist/rehydrate round-trip + setNodesMode one-write.
 // ---------------------------------------------------------------------------
-describe("mode map persist/rehydrate round-trip (vh.tree.mode.v2)", () => {
+describe("mode map persist/rehydrate round-trip (vh.tree.mode.v3)", () => {
   beforeEach(() => {
     localStorage.clear();
     resetTreeStore();
     resetExpandedForTest();
   });
 
-  it("setNodeMode persists the mode to localStorage (vh.tree.mode.v2)", () => {
+  it("setNodeMode persists the mode to localStorage (vh.tree.mode.v3, the ACTIVE key)", () => {
     setNodeMode("X", "expanded");
-    const raw = localStorage.getItem(LS_MODE);
+    const raw = localStorage.getItem(LS_MODE_V3);
     expect(raw).not.toBeNull();
     const env = JSON.parse(raw as string) as { v: number; data: Record<string, string> };
     expect(env.v).toBe(1);
@@ -80,7 +85,7 @@ describe("mode map persist/rehydrate round-trip (vh.tree.mode.v2)", () => {
   it("setNodeMode overwrite persists the new mode", () => {
     setNodeMode("X", "expanded");
     setNodeMode("X", "collapsed");
-    const env = JSON.parse(localStorage.getItem(LS_MODE) as string) as { data: Record<string, string> };
+    const env = JSON.parse(localStorage.getItem(LS_MODE_V3) as string) as { data: Record<string, string> };
     expect(env.data.X).toBe("collapsed");
   });
 
@@ -95,9 +100,9 @@ describe("mode map persist/rehydrate round-trip (vh.tree.mode.v2)", () => {
 
   it("resetTreeStore (project switch) clears the persisted mode key", () => {
     setNodeMode("X", "expanded");
-    expect(localStorage.getItem(LS_MODE)).toContain("expanded");
+    expect(localStorage.getItem(LS_MODE_V3)).toContain("expanded");
     resetTreeStore();
-    const env = JSON.parse(localStorage.getItem(LS_MODE) as string) as { data: Record<string, string> };
+    const env = JSON.parse(localStorage.getItem(LS_MODE_V3) as string) as { data: Record<string, string> };
     expect(env.data).toEqual({});
     expect(modeOf("X")).toBe("filtered");
   });
@@ -105,9 +110,9 @@ describe("mode map persist/rehydrate round-trip (vh.tree.mode.v2)", () => {
   it("setNodesMode does ONE localStorage write per call (batched, not N)", () => {
     const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
     setNodesMode(["a", "b", "c"], "expanded");
-    // A loop of setNodeMode would call setItem 3× for LS_MODE; the batched
-    // setNodesMode accumulates then writes ONCE.
-    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE);
+    // A loop of setNodeMode would call setItem 3× for the active key; the
+    // batched setNodesMode accumulates then writes ONCE.
+    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE_V3);
     expect(modeWrites).toHaveLength(1);
     setItemSpy.mockRestore();
   });
@@ -115,20 +120,23 @@ describe("mode map persist/rehydrate round-trip (vh.tree.mode.v2)", () => {
   it("setNodeMode does exactly one localStorage write per call", () => {
     const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
     setNodeMode("solo", "expanded");
-    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE);
+    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE_V3);
     expect(modeWrites).toHaveLength(1);
     setItemSpy.mockRestore();
   });
 });
 
 // ---------------------------------------------------------------------------
-// v1 → v2 migration (legacy expanded Set → mode map).
+// v1 → v3 migration (legacy expanded Set → mode map, composed through the
+// v2 coerce + un-corruption sweep). On this path the sweep is an identity
+// (every v1 entry is "expanded"), and v2 is never manufactured.
 // ---------------------------------------------------------------------------
-describe("v1 → v2 migration (vh.tree.expanded.v1 → vh.tree.mode.v2)", () => {
+describe("v1 → v3 migration (vh.tree.expanded.v1 → vh.tree.mode.v3, composed through the v2 coerce + sweep)", () => {
   beforeEach(() => {
-    // resetTreeStore writes an empty v2 map (its persisted-key clear). Clear
-    // localStorage AFTER it so the migration tests start with v2 ABSENT —
-    // otherwise loadInitialTreeModes sees an (empty) v2 key and skips migration.
+    // resetTreeStore writes an empty ACTIVE (v3) map (its persisted-key clear).
+    // Clear localStorage AFTER it so the migration tests start with v2/v3
+    // ABSENT — otherwise loadInitialTreeModes sees a (empty) v3 key and skips
+    // migration.
     resetTreeStore();
     resetExpandedForTest();
     localStorage.clear();
@@ -150,11 +158,14 @@ describe("v1 → v2 migration (vh.tree.expanded.v1 → vh.tree.mode.v2)", () => 
     // numbers / nulls skipped (no crash, no manufactured entry)
   });
 
-  it("an existing VALID v2 map wins over legacy migration (v2 not re-migrated)", () => {
-    saveVersioned(LS_MODE, 1, { X: "collapsed" }); // v2 present
+  it("an existing VALID v2 map wins over legacy migration (v2 read, legacy ignored)", () => {
+    // "expanded" is the one v2 mode class the un-corruption sweep KEEPS, so it
+    // is the honest probe for "v2 content was used": if the legacy Set had won
+    // instead, A (not X) would be the expanded one.
+    saveVersioned(LS_MODE, 1, { X: "expanded" }); // v2 present
     saveVersioned(LS_LEGACY, 1, ["A"]); // legacy present
     rehydrateExpandedForTest();
-    expect(modeOf("X")).toBe("collapsed"); // v2 content used
+    expect(modeOf("X")).toBe("expanded"); // v2 content used (kept by the sweep)
     expect(modeOf("A")).toBe("filtered"); // legacy IGNORED (v2 already present)
   });
 
@@ -165,17 +176,20 @@ describe("v1 → v2 migration (vh.tree.expanded.v1 → vh.tree.mode.v2)", () => 
     expect(modeOf("A")).toBe("filtered"); // not migrated (v2 present)
   });
 
-  it("the legacy v1 key is RETAINED after migration (rollback safety)", () => {
+  it("the legacy v1 key is RETAINED after migration; v2 is never manufactured (rollback safety)", () => {
     saveVersioned(LS_LEGACY, 1, ["A"]);
     rehydrateExpandedForTest();
     expect(localStorage.getItem(LS_LEGACY)).not.toBeNull(); // retained
-    expect(localStorage.getItem(LS_MODE)).not.toBeNull(); // v2 written
+    expect(localStorage.getItem(LS_MODE_V3)).not.toBeNull(); // v3 written
+    // v2 NOT manufactured on the v1 path: a rollback build re-runs its own v1
+    // migration and reconstructs the same expanded set.
+    expect(localStorage.getItem(LS_MODE)).toBeNull();
   });
 
-  it("migration persists the result under v2 so the next load is a direct hit", () => {
+  it("migration persists the result under v3 so the next load is a direct hit", () => {
     saveVersioned(LS_LEGACY, 1, ["A"]);
-    rehydrateExpandedForTest(); // migrates + persists v2
-    // Second rehydrate: v2 now present → direct read, legacy untouched.
+    rehydrateExpandedForTest(); // migrates + persists v3
+    // Second rehydrate: v3 now present → direct read, legacy untouched.
     rehydrateExpandedForTest();
     expect(modeOf("A")).toBe("expanded");
   });
@@ -186,6 +200,100 @@ describe("v1 → v2 migration (vh.tree.expanded.v1 → vh.tree.mode.v2)", () => 
     expect(modeOf("A")).toBe("expanded");
     expect(modeOf("B")).toBe("filtered"); // invalid mode dropped
     expect(modeOf("C")).toBe("filtered"); // non-string dropped
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v2 → v3 un-corruption sweep (one-time stock heal).
+// The cold-load corruption bug (fixed by 499e327, generalized by 8754294's
+// establishment gate) wrote spurious "collapsed" entries into the persisted v2
+// mode map for ~2 months before the fix — entries that never self-heal (a busy
+// baseline seed fires no working edge, so nothing re-promotes them). The gate
+// stopped NEW corruption; this sweep heals the accumulated stock: on module
+// init, a v2 map is coerced, its explicit "collapsed"/"filtered" entries are
+// DROPPED (the flat {id: mode} schema carries no write provenance — per-entry
+// discrimination is impossible), its "expanded" entries are KEPT (rehydrating
+// through the existing backfill path, avoiding the P1-A fetch storm), and the
+// result is persisted under the new active key v3. The v2 key is left
+// byte-untouched in storage (rollback copy); the forward migration is
+// idempotent (v3 present → direct read, no v2 access).
+// ---------------------------------------------------------------------------
+describe("v2 → v3 un-corruption sweep (vh.tree.mode.v2 → vh.tree.mode.v3)", () => {
+  beforeEach(() => {
+    // resetTreeStore writes an empty ACTIVE (v3) map (its persisted-key clear).
+    // Clear localStorage AFTER it so the sweep tests start with v2/v3 ABSENT —
+    // otherwise the module-init load sees a (empty) v3 key and takes the
+    // direct-read path, skipping the migration under test.
+    resetTreeStore();
+    resetExpandedForTest();
+    localStorage.clear();
+  });
+
+  it("M1: a corrupted v2 map migrates to v3 with ONLY the expanded entry kept", () => {
+    saveVersioned(LS_MODE, 1, { corruptedId: "collapsed", staleId: "filtered", keepId: "expanded" });
+    rehydrateExpandedForTest();
+    expect(modeOf("keepId")).toBe("expanded"); // kept
+    // corrupted (bug-written collapsed) + stale (filtered accumulation) dropped:
+    expect(modeOf("corruptedId")).toBe("filtered"); // absent → implicit fallback
+    expect(modeOf("staleId")).toBe("filtered"); // absent → implicit fallback
+    expect(treeModeMapSignal()).toEqual({ keepId: "expanded" });
+    // ...and the swept result is what persists under v3:
+    const env = JSON.parse(localStorage.getItem(LS_MODE_V3) as string) as {
+      data: Record<string, string>;
+    };
+    expect(env.data).toEqual({ keepId: "expanded" });
+  });
+
+  it("M2: after migration the v2 key is byte-unchanged in storage (rollback copy)", () => {
+    const v2bytes = JSON.stringify({ v: 1, data: { corruptedId: "collapsed", keepId: "expanded" } });
+    localStorage.setItem(LS_MODE, v2bytes);
+    rehydrateExpandedForTest();
+    expect(localStorage.getItem(LS_MODE)).toBe(v2bytes); // never rewritten by the sweep
+  });
+
+  it("M3: a second load with v3 present reads/writes NO v2 and leaves v3 unchanged (idempotent)", () => {
+    saveVersioned(LS_MODE, 1, { corruptedId: "collapsed", keepId: "expanded" });
+    rehydrateExpandedForTest(); // migrate once
+    const v3bytes = localStorage.getItem(LS_MODE_V3);
+    expect(v3bytes).not.toBeNull(); // the migration persisted its result
+    const getItemSpy = vi.spyOn(Storage.prototype, "getItem");
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
+    rehydrateExpandedForTest(); // second load: v3 present → direct hit
+    expect(getItemSpy.mock.calls.some((c) => c[0] === LS_MODE)).toBe(false); // no v2 READ
+    expect(setItemSpy.mock.calls.some((c) => c[0] === LS_MODE)).toBe(false); // no v2 WRITE
+    expect(setItemSpy.mock.calls.some((c) => c[0] === LS_MODE_V3)).toBe(false); // no v3 rewrite
+    expect(localStorage.getItem(LS_MODE_V3)).toBe(v3bytes); // v3 bytes unchanged
+    expect(modeOf("keepId")).toBe("expanded"); // state still correct
+    getItemSpy.mockRestore();
+    setItemSpy.mockRestore();
+  });
+
+  it("M4: v1-legacy-only storage (no v2) composes through to v3 (expanded kept)", () => {
+    saveVersioned(LS_LEGACY, 1, ["A", "B"]);
+    rehydrateExpandedForTest();
+    expect(modeOf("A")).toBe("expanded");
+    expect(modeOf("B")).toBe("expanded");
+    expect(localStorage.getItem(LS_MODE)).toBeNull(); // v2 never manufactured on the v1 path
+    const env = JSON.parse(localStorage.getItem(LS_MODE_V3) as string) as {
+      data: Record<string, string>;
+    };
+    expect(env.data).toEqual({ A: "expanded", B: "expanded" }); // composed output, expanded-only
+  });
+
+  it("M5: post-migration seed behavior unchanged (R4 materializes; dropped working entry stays implicit, no write-back)", () => {
+    saveVersioned(LS_MODE, 1, { droppedWorking: "collapsed", absentIdle: "collapsed" });
+    rehydrateExpandedForTest(); // both dropped by the sweep
+    expect(treeModeMapSignal()).toEqual({});
+    seedTreeStore([node({ id: "droppedWorking", activity: "busy" }), node({ id: "absentIdle" })]);
+    expect(modeOf("absentIdle")).toBe("collapsed"); // R4 absent-idle materialization intact
+    expect(treeModeMapSignal()["absentIdle"]).toBe("collapsed"); // materialized explicit
+    expect(modeOf("droppedWorking")).toBe("filtered"); // implicit filtered render
+    // no explicit mode written back for the dropped working entry on cold seed:
+    expect(Object.prototype.hasOwnProperty.call(treeModeMapSignal(), "droppedWorking")).toBe(false);
+    const env = JSON.parse(localStorage.getItem(LS_MODE_V3) as string) as {
+      data: Record<string, string>;
+    };
+    expect(env.data).toEqual({ absentIdle: "collapsed" }); // ONE write-back: only the R4 materialization
   });
 });
 
@@ -472,7 +580,7 @@ describe("auto-mutation cold-load normalization + write coalescing", () => {
     expect(modeOf("GHOST")).toBe("expanded"); // nonresident entry preserved untouched
   });
 
-  it("an explicit 'filtered'-idle resident id SURVIVES the cold seed (pre-hydration guard — resume regression)", () => {
+  it("an explicit 'filtered' on an UNESTABLISHED (activity:\"\") resident id SURVIVES the cold seed (establishment gate — resume regression)", () => {
     // RESUME REGRESSION: the frontier can ship a genuinely-running node
     // UNESTABLISHED (the server's activity seed races the capture — the
     // payload ships the never-seeded ""), and a cold-baseline
@@ -483,18 +591,18 @@ describe("auto-mutation cold-load normalization + write coalescing", () => {
     setNodeMode("A", "filtered");
     seedTreeStore([node({ id: "A", activity: "" })]);
     expect(modeOf("A")).toBe("filtered");
-    const env = JSON.parse(localStorage.getItem(LS_MODE) as string) as {
+    const env = JSON.parse(localStorage.getItem(LS_MODE_V3) as string) as {
       data: Record<string, string>;
     };
     expect(env.data.A).toBe("filtered"); // persisted bytes keep the user's mode
   });
 
-  it("RESUME STICKY REPLAY: a pre-hydration idle frontier must not corrupt localStorage across TWO reloads", () => {
+  it("RESUME STICKY REPLAY: a pre-hydration unestablished frontier must not corrupt localStorage across TWO reloads", () => {
     // Reload #1: the persisted map rehydrates {a: "filtered"} (running sessions
     // were visible under "a" before the reload). The frontier snapshot arrives
     // while the server's activity seed has NOT landed → "a" ships the
     // never-seeded "" (unestablished).
-    saveVersioned(LS_MODE, 1, { a: "filtered" });
+    saveVersioned(LS_MODE_V3, 1, { a: "filtered" });
     rehydrateExpandedForTest();
     seedTreeStore([node({ id: "a", activity: "" })]);
     expect(modeOf("a")).toBe("filtered"); // the guard (old code: demoted + persisted "collapsed")
@@ -504,14 +612,14 @@ describe("auto-mutation cold-load normalization + write coalescing", () => {
     // corrupted "collapsed" would stick FOREVER — with the guard it never
     // exists. Simulate the reload faithfully: map + in-memory modes reset, the
     // persisted bytes rehydrate (exactly what loadInitialTreeModes does).
-    const saved = localStorage.getItem(LS_MODE);
+    const saved = localStorage.getItem(LS_MODE_V3);
     resetTreeStore(); // clears map + modes + persists {} — as a fresh page start would
-    localStorage.setItem(LS_MODE, saved as string);
+    localStorage.setItem(LS_MODE_V3, saved as string);
     rehydrateExpandedForTest();
     expect(modeOf("a")).toBe("filtered"); // rehydrated from the persisted bytes
     seedTreeStore([node({ id: "a", activity: "busy" })]); // hydrated busy baseline
     expect(modeOf("a")).toBe("filtered"); // running children still visible
-    const env = JSON.parse(localStorage.getItem(LS_MODE) as string) as {
+    const env = JSON.parse(localStorage.getItem(LS_MODE_V3) as string) as {
       data: Record<string, string>;
     };
     expect(env.data.a).toBe("filtered");
@@ -525,9 +633,9 @@ describe("auto-mutation cold-load normalization + write coalescing", () => {
     const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
     // Re-seed: k goes idle→busy (known collapsed → filtered edge) AND a new idle
     // node "n" is cold-normalized to collapsed. Two DIFFERENT target modes, but
-    // ONE synchronous setNodeModes call → ONE LS_MODE write.
+    // ONE synchronous setNodeModes call → ONE active-key mode write.
     seedTreeStore([node({ id: "k", activity: "busy" }), node({ id: "n" })]);
-    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE);
+    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE_V3);
     expect(modeWrites).toHaveLength(1);
     expect(modeOf("k")).toBe("filtered");
     expect(modeOf("n")).toBe("collapsed");
@@ -542,7 +650,7 @@ describe("auto-mutation cold-load normalization + write coalescing", () => {
     applyTreeOpStore({ op: "node.facet", data: { id: "b", activity: "busy" } });
     applyTreeOpStore({ op: "node.facet", data: { id: "c", activity: "busy" } });
     await new Promise((r) => setTimeout(r, 0)); // flush
-    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE);
+    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE_V3);
     expect(modeWrites).toHaveLength(1); // ONE write for all three survivors
     expect(modeOf("a")).toBe("filtered");
     expect(modeOf("b")).toBe("filtered");
@@ -550,13 +658,13 @@ describe("auto-mutation cold-load normalization + write coalescing", () => {
     setItemSpy.mockRestore();
   });
 
-  it("a no-op seed (no qualifying changes) writes ZERO times to LS_MODE", () => {
+  it("a no-op seed (no qualifying changes) writes ZERO times to the active mode key", () => {
     seedTreeStore([node({ id: "k" })]); // cold → collapsed
     const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
     // Re-seed the SAME idle node: known + idle→idle (no edge) + already explicit
     // collapsed (no cold change) → empty change set → setNodeModes early-returns.
     seedTreeStore([node({ id: "k" })]);
-    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE);
+    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE_V3);
     expect(modeWrites).toHaveLength(0);
     setItemSpy.mockRestore();
   });
