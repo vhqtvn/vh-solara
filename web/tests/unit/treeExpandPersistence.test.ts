@@ -174,6 +174,11 @@ describe("v1 → v3 migration (vh.tree.expanded.v1 → vh.tree.mode.v3, composed
     saveVersioned(LS_LEGACY, 1, ["A"]);
     rehydrateExpandedForTest();
     expect(modeOf("A")).toBe("filtered"); // not migrated (v2 present)
+    // Persist side: the v2 tier WRITES v3 even when the v2 map is empty —
+    // the swept (empty) result lands under the active key.
+    expect(localStorage.getItem(LS_MODE_V3)).not.toBeNull(); // v3 written
+    const env = JSON.parse(localStorage.getItem(LS_MODE_V3) as string) as { data: Record<string, string> };
+    expect(env.data).toEqual({}); // empty map persisted
   });
 
   it("the legacy v1 key is RETAINED after migration; v2 is never manufactured (rollback safety)", () => {

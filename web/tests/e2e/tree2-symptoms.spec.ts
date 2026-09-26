@@ -154,7 +154,7 @@ test("(c) a collapsed node shows its agent chip and is right-clickable", async (
 // expanded across reload (the directive: "expand a node, reload → it stays
 // expanded; tree structure still re-fetched"). proj=1 4-state model (commit
 // a7f1f93) re-expressed that as a per-node persisted MODE under
-// `vh.tree.mode.v2` (collapsed | filtered | expanded); the legacy
+// `vh.tree.mode.v3` (collapsed | filtered | expanded); the legacy
 // `vh.tree.expanded.v1` Set is retained read-only for one-time migration only.
 // This test asserts the same stronger contract: reload preserves BOTH structure
 // AND the user's expanded mode.
@@ -175,7 +175,7 @@ test("(d) reload does not flatten the tree — structure preserved from the fron
   await demoRow.locator(".tree-twisty").click();
   await expect(page.locator(`.tree-node.sub[data-session-id="sub"]`)).toBeVisible({ timeout: 8000 });
 
-  // Reload. The persisted mode (vh.tree.mode.v2) rehydrates demo as "expanded",
+  // Reload. The persisted mode (vh.tree.mode.v3) rehydrates demo as "expanded",
   // so sub STAYS visible as a child. This is the inverted no-flatten guard: if
   // persistence were broken (demo reloaded to the idle default collapsed), sub
   // would disappear and this would fail. (The cold frontier ships demo loaded:false; a
