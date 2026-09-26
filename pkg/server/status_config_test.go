@@ -646,6 +646,325 @@ func TestFleetConfig_PutCanonicalizesFile(t *testing.T) {
 // hostInterceptor carve-out (worker-subdomain precedence)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Budgets block: decode/validation, effective echo, PUT merge, hot apply
+// ---------------------------------------------------------------------------
+
+func i64ptr(v int64) *int64 { return &v }
+func intptr(v int) *int     { return &v }
+
+// TestFleetConfig_BudgetsDecodeValidation pins the budgets-block contract
+// shared by the file load and the PUT body: absent block = nil (all
+// defaults), present-but-empty block = all defaults, per-field optionality,
+// positive-integer + ceiling validation with NAMING errors, strict decode
+// (unknown keys, wrong types) at the budgets level.
+func TestFleetConfig_BudgetsDecodeValidation(t *testing.T) {
+	valid := []struct {
+		name string
+		in   string
+		want *fleetBudgetsConfig
+	}{
+		{"absent block", `{"workers":[],"projects":[]}`, nil},
+		{"present but empty block", `{"workers":[],"projects":[],"budgets":{}}`, &fleetBudgetsConfig{}},
+		{"partial block", `{"workers":[],"projects":[],"budgets":{"max_response_bytes":8388608}}`,
+			&fleetBudgetsConfig{MaxResponseBytes: i64ptr(8388608)}},
+		{"full block", `{"workers":[],"projects":[],"budgets":{"max_response_bytes":8388608,"max_cumulative_bytes":104857600,"max_workers_per_refresh":256,"max_projects_per_worker":128}}`,
+			&fleetBudgetsConfig{MaxResponseBytes: i64ptr(8388608), MaxCumulativeBytes: i64ptr(104857600), MaxWorkersPerRefresh: intptr(256), MaxProjectsPerWorker: intptr(128)}},
+		{"ceiling boundary values", `{"workers":[],"projects":[],"budgets":{"max_response_bytes":67108864,"max_cumulative_bytes":536870912,"max_workers_per_refresh":4096,"max_projects_per_worker":4096}}`,
+			&fleetBudgetsConfig{MaxResponseBytes: i64ptr(67108864), MaxCumulativeBytes: i64ptr(536870912), MaxWorkersPerRefresh: intptr(4096), MaxProjectsPerWorker: intptr(4096)}},
+	}
+	for _, tc := range valid {
+		got, err := decodeStatusConfig([]byte(tc.in))
+		if err != nil {
+			t.Errorf("%s: decodeStatusConfig: unexpected error: %v", tc.name, err)
+			continue
+		}
+		if !reflect.DeepEqual(got.Budgets, tc.want) {
+			t.Errorf("%s: budgets = %+v, want %+v", tc.name, got.Budgets, tc.want)
+		}
+	}
+
+	invalid := []struct {
+		name   string
+		in     string
+		marker string
+	}{
+		{"zero response bytes", `{"workers":[],"projects":[],"budgets":{"max_response_bytes":0}}`, "budgets.max_response_bytes: must be a positive integer, got 0"},
+		{"negative cumulative", `{"workers":[],"projects":[],"budgets":{"max_cumulative_bytes":-5}}`, "budgets.max_cumulative_bytes: must be a positive integer, got -5"},
+		{"zero workers", `{"workers":[],"projects":[],"budgets":{"max_workers_per_refresh":0}}`, "budgets.max_workers_per_refresh: must be a positive integer, got 0"},
+		{"negative projects", `{"workers":[],"projects":[],"budgets":{"max_projects_per_worker":-1}}`, "budgets.max_projects_per_worker: must be a positive integer, got -1"},
+		{"response over ceiling", `{"workers":[],"projects":[],"budgets":{"max_response_bytes":68719476737}}`, "budgets.max_response_bytes: 68719476737 exceeds the ceiling 67108864 (64 MiB)"},
+		{"cumulative over ceiling", `{"workers":[],"projects":[],"budgets":{"max_cumulative_bytes":536870913}}`, "budgets.max_cumulative_bytes: 536870913 exceeds the ceiling 536870912 (512 MiB)"},
+		{"workers over ceiling", `{"workers":[],"projects":[],"budgets":{"max_workers_per_refresh":4097}}`, "budgets.max_workers_per_refresh: 4097 exceeds the ceiling 4096"},
+		{"projects over ceiling", `{"workers":[],"projects":[],"budgets":{"max_projects_per_worker":5000}}`, "budgets.max_projects_per_worker: 5000 exceeds the ceiling 4096"},
+		{"wrong type (string)", `{"workers":[],"projects":[],"budgets":{"max_response_bytes":"big"}}`, "max_response_bytes"},
+		{"wrong type (float)", `{"workers":[],"projects":[],"budgets":{"max_cumulative_bytes":1.5}}`, "max_cumulative_bytes"},
+		{"wrong type (bool)", `{"workers":[],"projects":[],"budgets":{"max_projects_per_worker":true}}`, "max_projects_per_worker"},
+		{"budgets wrong type (number)", `{"workers":[],"projects":[],"budgets":5}`, "invalid JSON"},
+		{"unknown key in budgets", `{"workers":[],"projects":[],"budgets":{"nope":1}}`, `unknown field "nope"`},
+	}
+	for _, tc := range invalid {
+		_, err := decodeStatusConfig([]byte(tc.in))
+		if err == nil {
+			t.Errorf("%s: decodeStatusConfig accepted invalid document %q", tc.name, tc.in)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.marker) {
+			t.Errorf("%s: error %q does not contain marker %q", tc.name, err.Error(), tc.marker)
+		}
+	}
+}
+
+// TestFleetConfig_GetEffectiveBudgets pins the GET budgets echo: the
+// EFFECTIVE block (overrides merged onto defaults) is always present —
+// defaults on an unconfigured daemon, merged values on a configured one —
+// so the operator can see exactly what governs the next refresh.
+func TestFleetConfig_GetEffectiveBudgets(t *testing.T) {
+	_, h1, session := newFleetConfigAuthDaemon(t, "")
+	rec := doFleetConfigGet(h1, withCookie(session))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET config: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	resp := decodeFleetConfig(t, rec)
+	wantDefault := fleetBudgetsWire{MaxResponseBytes: 4 << 20, MaxCumulativeBytes: 32 << 20, MaxWorkersPerRefresh: 128, MaxProjectsPerWorker: 64}
+	if resp.Budgets != wantDefault {
+		t.Fatalf("unconfigured budgets echo: want defaults %+v, got %+v", wantDefault, resp.Budgets)
+	}
+	t.Logf("effective budgets (defaults): %s", rec.Body.String())
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "status.jsonc")
+	seed := `{"workers":[],"projects":[],"budgets":{"max_response_bytes":8388608,"max_projects_per_worker":100}}`
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d2, h2, session2 := newFleetConfigAuthDaemon(t, "")
+	if err := d2.LoadStatusConfig(path); err != nil {
+		t.Fatalf("LoadStatusConfig: %v", err)
+	}
+	rec2 := doFleetConfigGet(h2, withCookie(session2))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("GET config (loaded): want 200, got %d", rec2.Code)
+	}
+	resp2 := decodeFleetConfig(t, rec2)
+	wantMerged := fleetBudgetsWire{MaxResponseBytes: 8388608, MaxCumulativeBytes: 32 << 20, MaxWorkersPerRefresh: 128, MaxProjectsPerWorker: 100}
+	if resp2.Budgets != wantMerged {
+		t.Fatalf("configured budgets echo: want merged %+v, got %+v", wantMerged, resp2.Budgets)
+	}
+	t.Logf("effective budgets (merged): %s", rec2.Body.String())
+}
+
+// TestFleetConfig_PutBudgetsMergeAndReplace pins the PUT merge semantics:
+// an ABSENT budgets block keeps the current file budgets verbatim (a dialog
+// save must never drop or mutate them), a PRESENT block replaces WHOLESALES
+// (its unset fields revert to defaults), and the canonical persist
+// round-trips (budgets-free documents stay byte-identical to the
+// pre-budgets canonical form).
+func TestFleetConfig_PutBudgetsMergeAndReplace(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "status.jsonc")
+	seed := `{"workers":[{"id":"alpha"}],"projects":[],"budgets":{"max_response_bytes":8388608}}` + "\n"
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, h, session := newFleetConfigAuthDaemon(t, "")
+	if err := d.LoadStatusConfig(path); err != nil {
+		t.Fatalf("LoadStatusConfig: %v", err)
+	}
+
+	// (i) PUT WITHOUT a budgets block — the dialog's exact body shape:
+	// rosters change, budgets ride along untouched.
+	rec := doFleetConfigPut(h, `{"workers":[{"id":"alpha"},{"id":"beta"}],"projects":[]}`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT without budgets: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	resp := decodeFleetConfig(t, rec)
+	if resp.Budgets.MaxResponseBytes != 8388608 {
+		t.Fatalf("absent-budgets PUT must keep the file budgets, got %+v", resp.Budgets)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKeep, err := json.MarshalIndent(&fleetStatusConfig{
+		Workers:  []fleetConfigWorker{{ID: "alpha"}, {ID: "beta"}},
+		Projects: []fleetConfigProject{},
+		Budgets:  &fleetBudgetsConfig{MaxResponseBytes: i64ptr(8388608)},
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKeep = append(wantKeep, '\n')
+	if string(got) != string(wantKeep) {
+		t.Fatalf("persisted file after absent-budgets PUT:\n got: %q\nwant: %q", got, wantKeep)
+	}
+
+	// (ii) PUT WITH a budgets block replaces wholesale: the response cap
+	// override reverts to the default, only the new field stays.
+	rec2 := doFleetConfigPut(h, `{"workers":[{"id":"alpha"}],"projects":[],"budgets":{"max_cumulative_bytes":104857600}}`, withCookie(session), withCSRF())
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("PUT with budgets: want 200, got %d (body=%q)", rec2.Code, rec2.Body.String())
+	}
+	resp2 := decodeFleetConfig(t, rec2)
+	wantReplaced := fleetBudgetsWire{MaxResponseBytes: 4 << 20, MaxCumulativeBytes: 104857600, MaxWorkersPerRefresh: 128, MaxProjectsPerWorker: 64}
+	if resp2.Budgets != wantReplaced {
+		t.Fatalf("present-budgets PUT must replace wholesale (unset → defaults): want %+v, got %+v", wantReplaced, resp2.Budgets)
+	}
+	wantReplace, err := json.MarshalIndent(&fleetStatusConfig{
+		Workers:  []fleetConfigWorker{{ID: "alpha"}},
+		Projects: []fleetConfigProject{},
+		Budgets:  &fleetBudgetsConfig{MaxCumulativeBytes: i64ptr(104857600)},
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantReplace = append(wantReplace, '\n')
+	got2, err := os.ReadFile(path)
+	if err != nil || string(got2) != string(wantReplace) {
+		t.Fatalf("persisted file after wholesale-replace PUT:\n got: %q (err %v)\nwant: %q", got2, err, wantReplace)
+	}
+
+	// (iii) Canonical round-trip: the persisted file reloads to exactly the
+	// running state, and the running state agrees with it.
+	rl, err := loadStatusConfigFile(path)
+	if err != nil {
+		t.Fatalf("reload persisted config: %v", err)
+	}
+	if !reflect.DeepEqual(rl.Budgets, &fleetBudgetsConfig{MaxCumulativeBytes: i64ptr(104857600)}) {
+		t.Fatalf("reloaded budgets differ: %+v", rl.Budgets)
+	}
+	if snap := d.statusCfg.snapshot(); !reflect.DeepEqual(snap.budgets, rl.Budgets) {
+		t.Fatalf("running budgets differ from file: running=%+v file=%+v", snap.budgets, rl.Budgets)
+	}
+
+	// (iv) A budgets-free config PUT persists byte-identically to the
+	// pre-budgets canonical form (the omitempty guarantee).
+	dir2 := t.TempDir()
+	path2 := filepath.Join(dir2, "status.jsonc")
+	if err := os.WriteFile(path2, []byte(`{"workers":[],"projects":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d2, h2, session2 := newFleetConfigAuthDaemon(t, "")
+	if err := d2.LoadStatusConfig(path2); err != nil {
+		t.Fatalf("LoadStatusConfig: %v", err)
+	}
+	if rec := doFleetConfigPut(h2, `{"workers":[{"id":"alpha"}],"projects":[]}`, withCookie(session2), withCSRF()); rec.Code != http.StatusOK {
+		t.Fatalf("budgets-free PUT: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	wantLegacy, err := json.MarshalIndent(&fleetStatusConfig{Workers: []fleetConfigWorker{{ID: "alpha"}}, Projects: []fleetConfigProject{}}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLegacy = append(wantLegacy, '\n')
+	got3, err := os.ReadFile(path2)
+	if err != nil || string(got3) != string(wantLegacy) {
+		t.Fatalf("budgets-free canonical persist:\n got: %q (err %v)\nwant: %q", got3, err, wantLegacy)
+	}
+	if strings.Contains(string(got3), "budgets") {
+		t.Fatalf("budgets-free persist must not mention budgets: %q", got3)
+	}
+}
+
+// TestFleetConfig_BudgetsHotApplyRollup is the budget hot-apply crux
+// (mirrors TestFleetConfig_PutLiveApplyRollupScope): a PUT carrying a
+// budgets block through the REAL handler chain (auth + CSRF + mux) must
+// change the budgets the NEXT rollup runs under — TTL is raised to a
+// minute, so only the config-generation invalidation can serve the new
+// generation. max_projects_per_worker: 1 against a two-project worker flips
+// it from ok to limited with the cap named in the detail.
+func TestFleetConfig_BudgetsHotApplyRollup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "status.jsonc")
+	seed := `{"workers":[{"id":"alpha"}],"projects":[]}` + "\n"
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d, fake := newFleetTestDaemon(t, "")
+	a, err := auth.New(context.Background(), auth.Config{Mode: auth.ModePassphrase, Passphrase: "secret"})
+	if err != nil {
+		t.Fatalf("auth.New: %v", err)
+	}
+	d.Auth = a
+	if err := d.LoadStatusConfig(path); err != nil {
+		t.Fatalf("LoadStatusConfig: %v", err)
+	}
+	fleetAddOnline(t, d.Registry, "alpha")
+	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/a", "/b"))
+	fake.setBody("alpha", "/vh/snapshot?dir=%2Fa", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("alpha", "/vh/snapshot?dir=%2Fb", fleetSnapBody(map[string]state.GateFacts{}))
+
+	svc := d.fleetStatusService()
+	svc.budgets.TTL = time.Minute // only the config-generation bump may invalidate
+
+	h := d.buildRootHandler()
+	session := loginPassphrase(t, h, "secret")
+
+	// 1. Baseline: default cap (64) — alpha acquires both projects, ok.
+	rec1 := doFleet(h, withCookie(session))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("baseline status: want 200, got %d (body=%q)", rec1.Code, rec1.Body.String())
+	}
+	resp1 := decodeFleet(t, rec1)
+	if w := workerEntry(t, resp1, "alpha"); w.Status != fleetWorkerOK {
+		t.Fatalf("baseline: alpha must be ok under default budgets, got %+v", w)
+	}
+	etag1 := rec1.Header().Get("ETag")
+	refreshes := svc.refreshCount()
+
+	// 2. PUT a budgets block through the REAL handler chain.
+	putBody := `{"workers":[{"id":"alpha"}],"projects":[],"budgets":{"max_projects_per_worker":1}}`
+	rec2 := doFleetConfigPut(h, putBody, withCookie(session), withCSRF())
+	t.Logf("PUT /vh/fleet/config (X-VH-CSRF: 1) body=%s -> %d: %s", putBody, rec2.Code, rec2.Body.String())
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("PUT budgets: want 200, got %d (body=%q)", rec2.Code, rec2.Body.String())
+	}
+	cfg2 := decodeFleetConfig(t, rec2)
+	if cfg2.Budgets.MaxProjectsPerWorker != 1 || cfg2.Budgets.MaxResponseBytes != 4<<20 {
+		t.Fatalf("PUT echo: want effective {1 project, default response cap}, got %+v", cfg2.Budgets)
+	}
+
+	// 3. The NEXT /vh/fleet/status — still deep inside the 1-minute TTL —
+	// runs a REFRESHED rollup under the NEW budget: alpha limited with the
+	// cap named, new ETag, exactly one extra refresh. This is the
+	// hot-apply proof through the real handler chain.
+	rec3 := doFleet(h, withCookie(session))
+	t.Logf("GET /vh/fleet/status after budget PUT -> %d: %s", rec3.Code, rec3.Body.String())
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("post-PUT status: want 200, got %d (body=%q)", rec3.Code, rec3.Body.String())
+	}
+	resp3 := decodeFleet(t, rec3)
+	w := workerEntry(t, resp3, "alpha")
+	if w.Status != fleetWorkerLimited {
+		t.Fatalf("alpha must be limited under the hot-applied budget, got %+v", w)
+	}
+	if want := "project count 2 > 1 cap"; w.Detail != want {
+		t.Fatalf("limited detail must name the hot-applied cap: want %q, got %q", want, w.Detail)
+	}
+	if resp3.Coverage.Complete || resp3.Overall != fleetOverallUnknown {
+		t.Fatalf("limited worker forces incomplete coverage / unknown overall: %+v %s", resp3.Coverage, resp3.Overall)
+	}
+	if etag3 := rec3.Header().Get("ETag"); etag3 == etag1 {
+		t.Fatalf("post-PUT ETag must differ from the pre-PUT generation (%q)", etag3)
+	}
+	if n := svc.refreshCount(); n != refreshes+1 {
+		t.Fatalf("budget apply must invalidate the rollup generation (refresh count %d → %d)", refreshes, n)
+	}
+
+	// 4. The file was persisted with the budgets block (reload agrees).
+	rl, err := loadStatusConfigFile(path)
+	if err != nil {
+		t.Fatalf("reload persisted config: %v", err)
+	}
+	if !reflect.DeepEqual(rl.Budgets, &fleetBudgetsConfig{MaxProjectsPerWorker: intptr(1)}) {
+		t.Fatalf("persisted budgets differ: %+v", rl.Budgets)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// hostInterceptor carve-out (worker-subdomain precedence)
+// ---------------------------------------------------------------------------
+
 // TestHostInterceptorFleetConfigRoutePrecedence pins the same property as
 // TestHostInterceptorFleetStatusRoutePrecedence (status_test.go) for the
 // config manage routes: a browser loaded from a per-worker subdomain (e.g.

@@ -939,6 +939,279 @@ func TestFleetStatus_AcquisitionClassification(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Budget defaults + limited/error detail (workers[].detail)
+// ---------------------------------------------------------------------------
+
+// TestFleetStatus_DefaultBudgetsRealFleetScale pins the Part-A defaults the
+// operator's real fleet forced (1 worker / 7 real dev projects tripped the
+// fixture-sized 1/8 MiB caps into status:"limited", observed_projects:0) —
+// and that the time budgets stay untouched by that retune.
+func TestFleetStatus_DefaultBudgetsRealFleetScale(t *testing.T) {
+	b := defaultFleetBudgets()
+	if b.MaxResponseBodyBytes != 4<<20 {
+		t.Errorf("MaxResponseBodyBytes: want 4 MiB, got %d", b.MaxResponseBodyBytes)
+	}
+	if b.MaxWorkerCumulativeBytes != 32<<20 {
+		t.Errorf("MaxWorkerCumulativeBytes: want 32 MiB, got %d", b.MaxWorkerCumulativeBytes)
+	}
+	if b.MaxWorkersPerRefresh != 128 || b.MaxProjectsPerWorker != 64 {
+		t.Errorf("count caps: want 128 workers / 64 projects, got %d/%d", b.MaxWorkersPerRefresh, b.MaxProjectsPerWorker)
+	}
+	if b.TTL != 5*time.Second || b.RefreshBudget != 3*time.Second || b.WorkerBudget != 2*time.Second {
+		t.Errorf("time budgets must stay untouched: %+v", b)
+	}
+}
+
+// TestFleetStatus_LimitedDetailResponseCap pins the per-response cap detail:
+// a snapshot body over the cap must name the ACTUAL sizes (recovered from
+// the transport error pair), the cap, and the fetch path — on both the
+// discovery path and a project snapshot path — and degrade honestly (cap +
+// path, no fabricated size) when the error text carries no parseable pair.
+func TestFleetStatus_LimitedDetailResponseCap(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	fleetAddOnline(t, d.Registry, "big")
+	fleetAddOnline(t, d.Registry, "odd")
+	fake.setBody("odd", "/vh/projects", fleetProjectsBody(""))
+	// odd's seam error carries the sentinel but no byte pair → fallback.
+	fake.setErr("odd", fmt.Errorf("worker odd: %w", ErrFetchResponseBodyTooLarge))
+	// big trips on the SNAPSHOT path (discovery succeeds), with the
+	// production wrap shape (status_transport.go): "worker X: …(N > M bytes)".
+	d.fetchWorkerJSON = func(ctx context.Context, workerID, path string, timeout time.Duration, maxBody int64) ([]byte, error) {
+		if workerID == "big" {
+			if path == "/vh/projects" {
+				return []byte(fleetProjectsBody("/deep-fake-detection")), nil
+			}
+			return nil, fmt.Errorf("worker big: %w (%d > %d bytes)", ErrFetchResponseBodyTooLarge, 5452595, 4194304)
+		}
+		return fake.fetch(ctx, workerID, path, timeout, maxBody)
+	}
+
+	rec := doFleet(d.buildRootHandler())
+	resp := decodeFleet(t, rec)
+	w := workerEntry(t, resp, "big")
+	if w.Status != fleetWorkerLimited {
+		t.Fatalf("big: want limited, got %+v", w)
+	}
+	want := "response 5.2 MiB > 4 MiB cap (/vh/snapshot?dir=%2Fdeep-fake-detection)"
+	if w.Detail != want {
+		t.Fatalf("big detail: want %q, got %q", want, w.Detail)
+	}
+	if n := len([]rune(w.Detail)); n > fleetDetailMaxRunes {
+		t.Fatalf("detail exceeds the %d-code-point ceiling: %d", fleetDetailMaxRunes, n)
+	}
+	// odd tripped on DISCOVERY: path /vh/projects, no parseable pair ⇒ the
+	// configured cap alone names the trip (never a fabricated size).
+	o := workerEntry(t, resp, "odd")
+	if o.Status != fleetWorkerLimited {
+		t.Fatalf("odd: want limited, got %+v", o)
+	}
+	if want := "response over 4 MiB cap (/vh/projects)"; o.Detail != want {
+		t.Fatalf("odd detail (fallback): want %q, got %q", want, o.Detail)
+	}
+	t.Logf("limited worker entries: %+v", resp.Workers)
+}
+
+// TestFleetStatus_LimitedDetailCumulative pins the cumulative-budget detail:
+// fixed-size bodies against a tiny budget trip AFTER the project whose
+// snapshot pushed the worker over — the observation that landed stays
+// counted (partial-observation semantics unchanged), and the detail names
+// the cumulative total, the budget, and that project's dir. A 300-rune dir
+// is truncated to 200 + ellipsis with the whole detail clamped ≤256 runes.
+func TestFleetStatus_LimitedDetailCumulative(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	fleetAddOnline(t, d.Registry, "w1")
+	// Fixed literals so the byte math is exact: discovery is 27 B, the /a
+	// snapshot 38 B — cumulative 65 after /a already exceeds the 38-B
+	// budget, so the trip names /a (whose observation still counts).
+	discovery := `[{"dir":"/a"},{"dir":"/b"}]`
+	snapA := `{"gate":{"s1":{"activity":"error"}}}`
+	fake.setBody("w1", "/vh/projects", discovery)
+	fake.setBody("w1", "/vh/snapshot?dir=%2Fa", snapA)
+	svc := d.fleetStatusService()
+	svc.budgets.MaxWorkerCumulativeBytes = 38
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	w := workerEntry(t, resp, "w1")
+	if w.Status != fleetWorkerLimited {
+		t.Fatalf("w1: want limited, got %+v", w)
+	}
+	want := fmt.Sprintf("cumulative %d B > 38 B budget after /a", len(discovery)+len(snapA))
+	if w.Detail != want {
+		t.Fatalf("cumulative detail: want %q, got %q", want, w.Detail)
+	}
+	// The observation that landed stays counted (partial-observation
+	// semantics unchanged): /a's error session still fires its condition
+	// despite the worker being limited (the gauge is a coverage-gated
+	// placeholder here, so the condition is the observable).
+	if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondSessionError || resp.Conditions[0].Count != 1 {
+		t.Fatalf("the tripping project's observation must stay counted: %v", resp.Conditions)
+	}
+
+	// Long-dir truncation: a 300-rune dir embeds as 200 runes + ellipsis,
+	// whole detail ≤ 256 code points.
+	long := strings.Repeat("x", 300)
+	d2, fake2 := newFleetTestDaemon(t, "")
+	fleetAddOnline(t, d2.Registry, "w2")
+	fake2.setBody("w2", "/vh/projects", `[{"dir":"`+long+`"}]`)
+	fake2.setBody("w2", "/vh/snapshot?dir="+long, `{"gate":{}}`)
+	d2.fleetStatusService().budgets.MaxWorkerCumulativeBytes = 1
+	resp2 := decodeFleet(t, doFleet(d2.buildRootHandler()))
+	w2 := workerEntry(t, resp2, "w2")
+	if w2.Status != fleetWorkerLimited {
+		t.Fatalf("w2: want limited, got %+v", w2)
+	}
+	if !strings.HasSuffix(w2.Detail, "budget after "+string([]rune(long)[:200])+"…") {
+		t.Fatalf("long-dir detail must truncate the dir to 200 runes + ellipsis, got %q", w2.Detail)
+	}
+	if n := len([]rune(w2.Detail)); n > fleetDetailMaxRunes {
+		t.Fatalf("detail exceeds the %d-code-point ceiling: %d (%q)", fleetDetailMaxRunes, n, w2.Detail)
+	}
+}
+
+// TestFleetStatus_LimitedDetailProjectCap pins the project-cap detail: more
+// discovered (post-roster-filter) projects than the cap ⇒ limited with
+// "project count N > M cap", while the in-cap projects still contribute.
+func TestFleetStatus_LimitedDetailProjectCap(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	fleetAddOnline(t, d.Registry, "many")
+	for _, dir := range []string{"/p1", "/p2", "/p3"} {
+		fake.setBody("many", "/vh/projects", fleetProjectsBody("/p1", "/p2", "/p3"))
+		fake.setBody("many", "/vh/snapshot?dir="+url.QueryEscape(dir), fleetSnapBody(map[string]state.GateFacts{
+			"s": fleetGF("error", false, false),
+		}))
+	}
+	d.fleetStatusService().budgets.MaxProjectsPerWorker = 2
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	w := workerEntry(t, resp, "many")
+	if w.Status != fleetWorkerLimited {
+		t.Fatalf("many: want limited, got %+v", w)
+	}
+	if want := "project count 3 > 2 cap"; w.Detail != want {
+		t.Fatalf("project-cap detail: want %q, got %q", want, w.Detail)
+	}
+	// Deterministic cap exclusion: the first two (sorted) projects still
+	// contributed their sessions (condition observable — the gauge is a
+	// coverage-gated placeholder while the worker is limited); the third
+	// was never fetched.
+	if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondSessionError || resp.Conditions[0].Count != 2 {
+		t.Fatalf("in-cap projects must still contribute: %v", resp.Conditions)
+	}
+	if n := fake.count("many"); n != 3 { // discovery + 2 snapshots
+		t.Fatalf("acquisition calls: want discovery + exactly 2 snapshots, got %d", n)
+	}
+}
+
+// TestFleetStatus_WorkerCapDetail pins the refresh worker-cap detail: in-scope
+// workers beyond MaxWorkersPerRefresh are limited with "worker count N > M
+// cap" naming the full in-scope count.
+func TestFleetStatus_WorkerCapDetail(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	applyFleetRosters(t, d, []string{"alpha", "beta"}, nil) // sorted scope
+	fleetAddOnline(t, d.Registry, "alpha")
+	fleetAddOnline(t, d.Registry, "beta")
+	for _, id := range []string{"alpha", "beta"} {
+		fake.setBody(id, "/vh/projects", fleetProjectsBody(""))
+		fake.setBody(id, "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{}))
+	}
+	d.fleetStatusService().budgets.MaxWorkersPerRefresh = 1
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	if w := workerEntry(t, resp, "alpha"); w.Status != fleetWorkerOK {
+		t.Fatalf("alpha (in cap): want ok, got %+v", w)
+	}
+	w := workerEntry(t, resp, "beta")
+	if w.Status != fleetWorkerLimited {
+		t.Fatalf("beta (beyond cap): want limited, got %+v", w)
+	}
+	if want := "worker count 2 > 1 cap"; w.Detail != want {
+		t.Fatalf("worker-cap detail: want %q, got %q", want, w.Detail)
+	}
+	if n := fake.count("beta"); n != 0 {
+		t.Fatalf("capped worker must not be acquired, got %d calls", n)
+	}
+}
+
+// TestFleetStatus_ErrorDetails pins the error-class details: malformed
+// discovery/snapshot bodies name "malformed response (<path>)", and a
+// generic fetch failure (non-2xx class) names the path plus the underlying
+// error — bounded by the detail ceiling.
+func TestFleetStatus_ErrorDetails(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	fleetAddOnline(t, d.Registry, "badjson")
+	fleetAddOnline(t, d.Registry, "badsnap")
+	fleetAddOnline(t, d.Registry, "http502")
+	fake.setBody("badjson", "/vh/projects", `{not json`)
+	fake.setBody("badsnap", "/vh/projects", fleetProjectsBody("/dir"))
+	fake.setBody("badsnap", "/vh/snapshot?dir=%2Fdir", `{"gate":`)
+	fake.setErr("http502", fmt.Errorf("worker http502: HTTP 502"))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	if w := workerEntry(t, resp, "badjson"); w.Status != fleetWorkerError || w.Detail != "malformed response (/vh/projects)" {
+		t.Fatalf("badjson: want error + malformed detail, got %+v", w)
+	}
+	if w := workerEntry(t, resp, "badsnap"); w.Status != fleetWorkerError || w.Detail != "malformed response (/vh/snapshot?dir=%2Fdir)" {
+		t.Fatalf("badsnap: want error + malformed detail, got %+v", w)
+	}
+	w := workerEntry(t, resp, "http502")
+	if w.Status != fleetWorkerError {
+		t.Fatalf("http502: want error, got %+v", w)
+	}
+	if want := "fetch failed (/vh/projects): worker http502: HTTP 502"; w.Detail != want {
+		t.Fatalf("http502 detail: want %q, got %q", want, w.Detail)
+	}
+}
+
+// TestFleetStatus_DetailAbsentOutsideLimitedOrError: ok/offline/missing/
+// timeout rows carry NO detail — including at the JSON level (omitempty:
+// the key is absent, not an empty string), keeping the watch payload
+// compact for the statuses that have nothing to name.
+func TestFleetStatus_DetailAbsentOutsideLimitedOrError(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	applyFleetRosters(t, d, []string{"alpha", "dead", "ghost", "wto"}, nil)
+	fleetAddOnline(t, d.Registry, "alpha")
+	fleetAddOnline(t, d.Registry, "dead")
+	fleetAddOnline(t, d.Registry, "wto")
+	d.Registry.MarkWorkerOffline("dead")
+	fake.setBody("alpha", "/vh/projects", fleetProjectsBody(""))
+	fake.setBody("alpha", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setErr("wto", &FetchTimeoutError{WorkerID: "wto", Stage: "read body", Cause: errors.New("i/o timeout")})
+
+	rec := doFleet(d.buildRootHandler())
+	resp := decodeFleet(t, rec)
+	for id, want := range map[string]string{
+		"alpha": fleetWorkerOK,
+		"dead":  fleetWorkerOffline,
+		"ghost": fleetWorkerMissing,
+		"wto":   fleetWorkerTimeout,
+	} {
+		if w := workerEntry(t, resp, id); w.Status != want || w.Detail != "" {
+			t.Fatalf("%s: want %s with empty detail, got %+v", id, want, w)
+		}
+	}
+	// JSON level: no "detail" key on any non-limited/error row.
+	var raw struct {
+		Workers []map[string]any `json:"workers"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw workers: %v", err)
+	}
+	for _, w := range raw.Workers {
+		st, _ := w["status"].(string)
+		switch st {
+		case fleetWorkerLimited, fleetWorkerError:
+			if v, ok := w["detail"].(string); !ok || v == "" {
+				t.Fatalf("%v row: limited/error must carry a non-empty detail", w)
+			}
+		default:
+			if _, exists := w["detail"]; exists {
+				t.Fatalf("%v row: status %q must NOT carry a detail key", w, st)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // ETag / generation semantics
 // ---------------------------------------------------------------------------
 

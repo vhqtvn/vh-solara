@@ -11,12 +11,24 @@ package server
 //
 //	{
 //	  "workers":  [{ "id": "build-box", "label": "Primary builder" }],
-//	  "projects": [{ "dir": "/srv/repos/service", "label": "Prod" }]
+//	  "projects": [{ "dir": "/srv/repos/service", "label": "Prod" }],
+//	  "budgets":  { "max_response_bytes": 8388608, "max_cumulative_bytes": 67108864 }  // optional
 //	}
 //
 // Semantics:
 //   - ids/dirs are the v1 authority; labels are INERT schema room (stored,
 //     echoed by GET, persisted — NOT consumed by the rollup yet).
+//   - budgets is an OPTIONAL top-level block; each of its four fields
+//     (max_response_bytes, max_cumulative_bytes, max_workers_per_refresh,
+//     max_projects_per_worker) is individually optional and overrides the
+//     default acquisition budgets for the rollup (hot-applied on the next
+//     generation — the holder-generation invalidation covers budgets exactly
+//     like rosters). Present values must be positive integers at or below
+//     sane ceilings (64 MiB / 512 MiB / 4096 / 4096). Time budgets are NOT
+//     configurable. GET echoes the EFFECTIVE budgets (defaults + overrides);
+//     a PUT with an ABSENT budgets block keeps the current file budgets
+//     (merge semantics — the v1 config dialog's {workers, projects} body is
+//     lossless); a PRESENT block replaces wholesale.
 //   - Reads (startup file load AND PUT body) accept the repo JSONC dialect
 //     (// and /* */ comments, trailing commas) via projectcfg.StripJSONC —
 //     the bounded reuse decision from the brief. Strict decoding
@@ -115,11 +127,65 @@ type fleetConfigProject struct {
 	Label string `json:"label,omitempty"`
 }
 
+// fleetBudgetsConfig is the OPTIONAL top-level "budgets" block of the
+// status config (file schema AND PUT body — shared decode). Every field is
+// individually optional (nil = fall back to the default); a nil/absent
+// block means all defaults. Pointers (not omitempty ints) so a PRESENT
+// zero/negative value is a validation error, never silently "unset".
+//
+// These override the rollup's acquisition budgets (hot-applied on the next
+// generation via the holder generation — the same invalidation the rosters
+// ride): per-response body cap, per-worker cumulative body budget, workers
+// per refresh, projects per worker. Time budgets are NOT configurable here.
+type fleetBudgetsConfig struct {
+	MaxResponseBytes     *int64 `json:"max_response_bytes,omitempty"`
+	MaxCumulativeBytes   *int64 `json:"max_cumulative_bytes,omitempty"`
+	MaxWorkersPerRefresh *int   `json:"max_workers_per_refresh,omitempty"`
+	MaxProjectsPerWorker *int   `json:"max_projects_per_worker,omitempty"`
+}
+
+// Budget ceilings — a present value must be a positive integer at or below
+// its ceiling (validation names the field and the ceiling). Ceilings stop a
+// typo or a hostile PUT from turning the "compact rollup" into an unbounded
+// one; they are not throughput claims.
+const (
+	fleetMaxResponseBytesCeiling   int64 = 64 << 20  // 64 MiB
+	fleetMaxCumulativeBytesCeiling int64 = 512 << 20 // 512 MiB
+	fleetMaxWorkersCeiling               = 4096
+	fleetMaxProjectsCeiling              = 4096
+)
+
 // fleetStatusConfig is the whole document, shared by the file, the PUT body,
-// and the effective-config responses.
+// and the effective-config responses. Budgets is nil when the block is
+// absent — canonical persist OMITS it then, so a budgets-free config stays
+// byte-identical to the pre-budgets canonical form.
 type fleetStatusConfig struct {
 	Workers  []fleetConfigWorker  `json:"workers"`
 	Projects []fleetConfigProject `json:"projects"`
+	Budgets  *fleetBudgetsConfig  `json:"budgets,omitempty"`
+}
+
+// fleetBudgetsWire is the EFFECTIVE budgets block echoed by GET/PUT
+// responses: overrides merged onto the defaults, concrete values (the
+// operator can see exactly what governs the next refresh). Always present
+// in fleetConfigResponse.
+type fleetBudgetsWire struct {
+	MaxResponseBytes     int64 `json:"max_response_bytes"`
+	MaxCumulativeBytes   int64 `json:"max_cumulative_bytes"`
+	MaxWorkersPerRefresh int   `json:"max_workers_per_refresh"`
+	MaxProjectsPerWorker int   `json:"max_projects_per_worker"`
+}
+
+// effectiveFleetBudgetsWire merges the configured overrides onto the DEFAULT
+// budgets (status.go defaultFleetBudgets) and renders the response shape.
+func effectiveFleetBudgetsWire(cfg *fleetBudgetsConfig) fleetBudgetsWire {
+	b := applyFleetBudgetOverrides(defaultFleetBudgets(), cfg)
+	return fleetBudgetsWire{
+		MaxResponseBytes:     b.MaxResponseBodyBytes,
+		MaxCumulativeBytes:   b.MaxWorkerCumulativeBytes,
+		MaxWorkersPerRefresh: b.MaxWorkersPerRefresh,
+		MaxProjectsPerWorker: b.MaxProjectsPerWorker,
+	}
 }
 
 // fleetConfigResponse is the GET / effective-config body.
@@ -128,6 +194,7 @@ type fleetConfigResponse struct {
 	Writable bool                 `json:"writable"`
 	Workers  []fleetConfigWorker  `json:"workers"`
 	Projects []fleetConfigProject `json:"projects"`
+	Budgets  fleetBudgetsWire     `json:"budgets"`
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +262,49 @@ func validateStatusConfig(cfg *fleetStatusConfig) error {
 	}
 	sort.Slice(cfg.Workers, func(i, j int) bool { return cfg.Workers[i].ID < cfg.Workers[j].ID })
 	sort.Slice(cfg.Projects, func(i, j int) bool { return cfg.Projects[i].Dir < cfg.Projects[j].Dir })
+	return validateFleetBudgetsConfig(cfg.Budgets)
+}
+
+// validateFleetBudgetsConfig enforces the budgets-block rules: every PRESENT
+// value must be a positive integer at or below its ceiling, with errors
+// naming the field (budgets.max_response_bytes: …) like the roster errors.
+// nil = absent block = all defaults = valid.
+func validateFleetBudgetsConfig(b *fleetBudgetsConfig) error {
+	if b == nil {
+		return nil
+	}
+	if v := b.MaxResponseBytes; v != nil {
+		if *v <= 0 {
+			return fmt.Errorf("budgets.max_response_bytes: must be a positive integer, got %d", *v)
+		}
+		if *v > fleetMaxResponseBytesCeiling {
+			return fmt.Errorf("budgets.max_response_bytes: %d exceeds the ceiling %d (%s)", *v, fleetMaxResponseBytesCeiling, fleetHumanBytes(fleetMaxResponseBytesCeiling))
+		}
+	}
+	if v := b.MaxCumulativeBytes; v != nil {
+		if *v <= 0 {
+			return fmt.Errorf("budgets.max_cumulative_bytes: must be a positive integer, got %d", *v)
+		}
+		if *v > fleetMaxCumulativeBytesCeiling {
+			return fmt.Errorf("budgets.max_cumulative_bytes: %d exceeds the ceiling %d (%s)", *v, fleetMaxCumulativeBytesCeiling, fleetHumanBytes(fleetMaxCumulativeBytesCeiling))
+		}
+	}
+	if v := b.MaxWorkersPerRefresh; v != nil {
+		if *v <= 0 {
+			return fmt.Errorf("budgets.max_workers_per_refresh: must be a positive integer, got %d", *v)
+		}
+		if *v > fleetMaxWorkersCeiling {
+			return fmt.Errorf("budgets.max_workers_per_refresh: %d exceeds the ceiling %d", *v, fleetMaxWorkersCeiling)
+		}
+	}
+	if v := b.MaxProjectsPerWorker; v != nil {
+		if *v <= 0 {
+			return fmt.Errorf("budgets.max_projects_per_worker: must be a positive integer, got %d", *v)
+		}
+		if *v > fleetMaxProjectsCeiling {
+			return fmt.Errorf("budgets.max_projects_per_worker: %d exceeds the ceiling %d", *v, fleetMaxProjectsCeiling)
+		}
+	}
 	return nil
 }
 
@@ -244,16 +354,44 @@ func persistStatusConfig(path string, cfg *fleetStatusConfig) error {
 // Holder: mutex-guarded current rosters on the Daemon
 // ---------------------------------------------------------------------------
 
+// cloneFleetBudgetsConfig deep-copies a budgets block (nil-safe). Holder
+// installs and snapshots never share pointer fields with caller-owned config.
+func cloneFleetBudgetsConfig(b *fleetBudgetsConfig) *fleetBudgetsConfig {
+	if b == nil {
+		return nil
+	}
+	out := &fleetBudgetsConfig{}
+	if b.MaxResponseBytes != nil {
+		v := *b.MaxResponseBytes
+		out.MaxResponseBytes = &v
+	}
+	if b.MaxCumulativeBytes != nil {
+		v := *b.MaxCumulativeBytes
+		out.MaxCumulativeBytes = &v
+	}
+	if b.MaxWorkersPerRefresh != nil {
+		v := *b.MaxWorkersPerRefresh
+		out.MaxWorkersPerRefresh = &v
+	}
+	if b.MaxProjectsPerWorker != nil {
+		v := *b.MaxProjectsPerWorker
+		out.MaxProjectsPerWorker = &v
+	}
+	return out
+}
+
 // statusConfigHolder is the daemon's fleet-status configuration state: the
-// current expected rosters plus the optional persistence path. Zero value =
-// unconfigured (empty rosters ⇒ discovered scope; writable=false). gen is
-// bumped on every roster change and is the rollup-cache invalidation signal
-// (see status.go: fleetGeneration.cfgGen).
+// current expected rosters, the optional budgets block, and the optional
+// persistence path. Zero value = unconfigured (empty rosters ⇒ discovered
+// scope; writable=false). gen is bumped on every config change (rosters OR
+// budgets) and is the rollup-cache invalidation signal (see status.go:
+// fleetGeneration.cfgGen — budget hot-apply rides the same generation).
 type statusConfigHolder struct {
 	mu       sync.Mutex
 	path     string // persistence path; "" = read-only (PUT refused with 409)
 	workers  []fleetConfigWorker
 	projects []fleetConfigProject
+	budgets  *fleetBudgetsConfig
 	gen      uint64
 }
 
@@ -263,6 +401,7 @@ type statusConfigSnapshot struct {
 	path     string
 	workers  []fleetConfigWorker
 	projects []fleetConfigProject
+	budgets  *fleetBudgetsConfig
 	gen      uint64
 }
 
@@ -292,6 +431,7 @@ func (h *statusConfigHolder) snapshot() statusConfigSnapshot {
 	snap := statusConfigSnapshot{path: h.path, gen: h.gen}
 	snap.workers = append([]fleetConfigWorker(nil), h.workers...)
 	snap.projects = append([]fleetConfigProject(nil), h.projects...)
+	snap.budgets = cloneFleetBudgetsConfig(h.budgets)
 	if snap.workers == nil {
 		snap.workers = []fleetConfigWorker{}
 	}
@@ -314,18 +454,19 @@ func (h *statusConfigHolder) writable() bool {
 }
 
 // setLoaded installs the startup config (--status-config): the persistence
-// path plus the rosters. Bumps gen so a pre-Start rollup generation can
-// never be mistaken for current.
+// path plus the rosters and budgets. Bumps gen so a pre-Start rollup
+// generation can never be mistaken for current.
 func (h *statusConfigHolder) setLoaded(path string, cfg *fleetStatusConfig) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.path = path
 	h.workers = append([]fleetConfigWorker(nil), cfg.Workers...)
 	h.projects = append([]fleetConfigProject(nil), cfg.Projects...)
+	h.budgets = cloneFleetBudgetsConfig(cfg.Budgets)
 	h.gen++
 }
 
-// applyValidated swaps already-validated rosters WITHOUT persistence and
+// applyValidated swaps an already-validated config WITHOUT persistence and
 // WITHOUT changing the path (test seam for driving the rollup through the
 // same holder the config file feeds; also the hook a future non-file source
 // would use). cfg must have passed validateStatusConfig.
@@ -334,24 +475,31 @@ func (h *statusConfigHolder) applyValidated(cfg *fleetStatusConfig) {
 	defer h.mu.Unlock()
 	h.workers = append([]fleetConfigWorker(nil), cfg.Workers...)
 	h.projects = append([]fleetConfigProject(nil), cfg.Projects...)
+	h.budgets = cloneFleetBudgetsConfig(cfg.Budgets)
 	h.gen++
 }
 
 // replaceAndPersist is the PUT path: atomically persist, then swap the
-// rosters (path unchanged). Serialized under mu, so concurrent PUTs cannot
+// config (path unchanged). Serialized under mu, so concurrent PUTs cannot
 // interleave tmp-file writes; a failed persist leaves the running state
-// untouched. cfg must have passed decodeStatusConfig.
+// untouched. An ABSENT budgets block in cfg merges with the current file
+// budgets under the same lock (PUT merge semantics — see the handler); a
+// present block replaces wholesale. cfg must have passed decodeStatusConfig.
 func (h *statusConfigHolder) replaceAndPersist(cfg *fleetStatusConfig) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.path == "" {
 		return errors.New("no persistence path configured") // defensive; the handler 409s first
 	}
+	if cfg.Budgets == nil {
+		cfg.Budgets = cloneFleetBudgetsConfig(h.budgets)
+	}
 	if err := persistStatusConfig(h.path, cfg); err != nil {
 		return err
 	}
 	h.workers = append([]fleetConfigWorker(nil), cfg.Workers...)
 	h.projects = append([]fleetConfigProject(nil), cfg.Projects...)
+	h.budgets = cloneFleetBudgetsConfig(cfg.Budgets)
 	h.gen++
 	return nil
 }
@@ -446,6 +594,13 @@ func (d *Daemon) handleFleetConfigPut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid fleet config: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Budgets MERGE semantics live INSIDE replaceAndPersist (under the
+	// holder lock, atomic with the persist): an absent budgets block in the
+	// PUT body keeps the currently configured file budgets verbatim (a
+	// dialog save must never drop or mutate them — the v1 config UI does
+	// not edit budgets, so its {workers, projects} body is lossless); a
+	// PRESENT block replaces wholesale (its own unset fields fall back to
+	// defaults).
 	if err := d.statusCfg.replaceAndPersist(cfg); err != nil {
 		http.Error(w, "fleet status config: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -453,13 +608,16 @@ func (d *Daemon) handleFleetConfigPut(w http.ResponseWriter, r *http.Request) {
 	writeFleetConfigResponse(w, http.StatusOK, d.statusCfg.snapshot())
 }
 
-// writeFleetConfigResponse renders the effective-config JSON.
+// writeFleetConfigResponse renders the effective-config JSON, including the
+// EFFECTIVE budgets (overrides merged onto the defaults — the operator sees
+// exactly what governs the next refresh, not just what was overridden).
 func writeFleetConfigResponse(w http.ResponseWriter, status int, snap statusConfigSnapshot) {
 	resp := fleetConfigResponse{
 		Schema:   1,
 		Writable: snap.path != "",
 		Workers:  snap.workers,
 		Projects: snap.projects,
+		Budgets:  effectiveFleetBudgetsWire(snap.budgets),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "private, no-cache")

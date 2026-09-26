@@ -82,6 +82,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -125,9 +126,16 @@ type fleetCondition struct {
 	Link  *string `json:"link"` // trusted worker-origin /app deep link, or null
 }
 
+// fleetWorkerEntry is one workers[] row. Detail (schema-additive) is set ONLY
+// for limited/error rows — it names WHAT tripped and WHERE (e.g. "response
+// 5.2 MiB > 4 MiB cap (/vh/snapshot?dir=…)" or "project count 71 > 64 cap"),
+// bounded to ~256 code points so the watch payload stays compact. Absent
+// (omitempty) for ok/offline/missing/timeout — those statuses have nothing
+// useful to name.
 type fleetWorkerEntry struct {
 	ID         string  `json:"id"`
 	Status     string  `json:"status"` // ok|offline|missing|timeout|error|limited
+	Detail     string  `json:"detail,omitempty"`
 	ObservedAt *string `json:"observed_at"`
 }
 
@@ -220,9 +228,16 @@ const (
 // Budgets
 // ---------------------------------------------------------------------------
 
-// fleetBudgets are the safety budgets from the contract. Unmeasured initial
-// values — not throughput claims; tune after S2 with real fleet numbers
-// (task-card open question). All fields are overridable in tests.
+// fleetBudgets are the safety budgets from the contract. The four
+// byte/count fields (MaxResponseBodyBytes, MaxWorkerCumulativeBytes,
+// MaxWorkersPerRefresh, MaxProjectsPerWorker) are CONFIG-OVERRIDABLE via the
+// status config file's optional "budgets" block (see status_config.go) and
+// are sourced per-refresh from the config snapshot (effectiveBudgets); the
+// time budgets (TTL/RefreshBudget/WorkerBudget) and the concurrency/staleness
+// fields are daemon-owned only. Defaults are sized for real fleets (operator
+// fleet: 1 worker, 7 real dev projects tripped the old fixture-sized 1/8 MiB
+// caps with status:"limited", observed_projects:0). All fields remain
+// overridable in tests via svc.budgets (config overrides win when set).
 type fleetBudgets struct {
 	TTL                      time.Duration // serve-generation validity window
 	RefreshBudget            time.Duration // total ctx bound for one refresh
@@ -243,10 +258,44 @@ func defaultFleetBudgets() fleetBudgets {
 		WorkerConcurrency:        8,
 		MaxWorkersPerRefresh:     128,
 		MaxProjectsPerWorker:     64,
-		MaxResponseBodyBytes:     1 << 20, // 1 MiB per response
-		MaxWorkerCumulativeBytes: 8 << 20, // 8 MiB cumulative per worker
+		MaxResponseBodyBytes:     4 << 20,  // 4 MiB per response (real session trees; was 1 MiB)
+		MaxWorkerCumulativeBytes: 32 << 20, // 32 MiB cumulative per worker (was 8 MiB)
 		MaxStalenessMS:           15000,
 	}
+}
+
+// applyFleetBudgetOverrides overlays the config file's optional budgets block
+// onto b: each field is replaced only when configured, so unset fields fall
+// back to the defaults b already carries. nil cfg = all defaults (block
+// absent). This is the single merge point shared by the rollup
+// (effectiveBudgets) and the GET /vh/fleet/config effective echo.
+func applyFleetBudgetOverrides(b fleetBudgets, cfg *fleetBudgetsConfig) fleetBudgets {
+	if cfg == nil {
+		return b
+	}
+	if cfg.MaxResponseBytes != nil {
+		b.MaxResponseBodyBytes = *cfg.MaxResponseBytes
+	}
+	if cfg.MaxCumulativeBytes != nil {
+		b.MaxWorkerCumulativeBytes = *cfg.MaxCumulativeBytes
+	}
+	if cfg.MaxWorkersPerRefresh != nil {
+		b.MaxWorkersPerRefresh = *cfg.MaxWorkersPerRefresh
+	}
+	if cfg.MaxProjectsPerWorker != nil {
+		b.MaxProjectsPerWorker = *cfg.MaxProjectsPerWorker
+	}
+	return b
+}
+
+// effectiveBudgets derives the budgets ONE refresh runs under: the service's
+// budgets (defaults, test-overridable) overlaid with the config snapshot's
+// overrides. Called from buildRollup with the SAME coherent snapshot that
+// fed the rosters, so a hot-applied budget change takes effect on the next
+// generation and a stale in-flight refresh can never publish over a newer
+// budget change (the cfgGen stamp covers budgets exactly like rosters).
+func (s *fleetStatusService) effectiveBudgets(snap statusConfigSnapshot) fleetBudgets {
+	return applyFleetBudgetOverrides(s.budgets, snap.budgets)
 }
 
 // ---------------------------------------------------------------------------
@@ -464,6 +513,7 @@ type fleetObservedProject struct {
 type fleetWorkerResult struct {
 	id         string
 	status     string
+	detail     string // limited/error WHY+WHERE (fleetWorkerEntry.Detail); "" otherwise
 	observedAt time.Time
 	projects   []fleetObservedProject
 	// discovered is the FULL /vh/projects discovery (every worker-reported
@@ -495,7 +545,7 @@ type fleetContributor struct {
 // then each project snapshot one at a time), so at most ONE fetch is in
 // flight per worker at any moment — by construction, not by semaphore.
 func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapshot) (fleetStatusResponse, fleetOptionsResponse) {
-	b := s.budgets
+	b := s.effectiveBudgets(snap)
 	fetch := s.fetcher()
 
 	summaries := s.d.Registry.Summaries()
@@ -553,11 +603,15 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 	}
 
 	// Worker cap: in-scope-but-not-acquired workers are reported `limited`
-	// and make coverage incomplete — never silently dropped.
+	// and make coverage incomplete — never silently dropped. The detail
+	// names the cap so the operator knows which budget to raise.
 	var cappedIDs []string
+	var cappedDetail string
 	if len(toAcquire) > b.MaxWorkersPerRefresh {
+		wantAcquire := len(toAcquire)
 		cappedIDs = toAcquire[b.MaxWorkersPerRefresh:]
 		toAcquire = toAcquire[:b.MaxWorkersPerRefresh]
+		cappedDetail = fmt.Sprintf("worker count %d > %d cap", wantAcquire, b.MaxWorkersPerRefresh)
 	}
 
 	// --- bounded acquisition ---------------------------------------------
@@ -579,14 +633,14 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 				acquired[i] = fleetWorkerResult{id: id, status: fleetWorkerTimeout}
 				return
 			}
-			acquired[i] = s.acquireWorker(ctx, id, refreshStart, fetch, projectSet)
+			acquired[i] = s.acquireWorker(ctx, id, refreshStart, fetch, projectSet, b)
 		}(i, id)
 	}
 	wg.Wait()
 
 	results = append(results, acquired...)
 	for _, id := range cappedIDs {
-		results = append(results, fleetWorkerResult{id: id, status: fleetWorkerLimited})
+		results = append(results, fleetWorkerResult{id: id, status: fleetWorkerLimited, detail: cappedDetail})
 	}
 	sort.Slice(results, func(i, j int) bool { return results[i].id < results[j].id })
 
@@ -779,7 +833,7 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 
 	workers := make([]fleetWorkerEntry, 0, len(results))
 	for _, r := range results {
-		e := fleetWorkerEntry{ID: r.id, Status: r.status}
+		e := fleetWorkerEntry{ID: r.id, Status: r.status, Detail: r.detail}
 		if r.status == fleetWorkerOK {
 			ts := r.observedAt.UTC().Format(time.RFC3339)
 			e.ObservedAt = &ts
@@ -908,8 +962,12 @@ func buildFleetOptions(now time.Time, results []fleetWorkerResult, summaries []W
 // excluded from acquisition, session counts, and every other rollup fold —
 // the operator asked for exactly these projects. The filter runs BEFORE the
 // per-worker project cap so out-of-scope dirs never consume it.
-func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string, refreshStart time.Time, fetch fleetJSONFetcher, projectSet map[string]bool) fleetWorkerResult {
-	b := s.budgets
+//
+// b is the refresh's effective budgets (defaults + config overrides, captured
+// by the caller from the same config snapshot that fed the rosters). Every
+// limited/error exit sets res.detail naming WHAT tripped and WHERE (bounded
+// by fleetClampDetail); timeout exits carry no detail by contract.
+func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string, refreshStart time.Time, fetch fleetJSONFetcher, projectSet map[string]bool, b fleetBudgets) fleetWorkerResult {
 	res := fleetWorkerResult{id: workerID}
 	limited := false
 	var cumulative int64
@@ -929,10 +987,22 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 		return fetch(ctx, workerID, path, remaining, b.MaxResponseBodyBytes)
 	}
 
+	// fetchFail classifies a failed fetch and records the limited/error
+	// detail (timeout stays detail-free by contract).
+	fetchFail := func(path string, err error) {
+		res.status = classifyFetchErr(err)
+		switch res.status {
+		case fleetWorkerLimited: // body over the per-response cap
+			res.detail = fleetResponseCapDetail(err, path, b.MaxResponseBodyBytes)
+		case fleetWorkerError:
+			res.detail = fleetClampDetail(fmt.Sprintf("fetch failed (%s): %v", fleetTruncRunes(path, fleetDetailPathMaxRunes), err))
+		}
+	}
+
 	// 1. Project discovery (instantiated aggregators only).
 	body, err := fetchBounded("/vh/projects")
 	if err != nil {
-		res.status = classifyFetchErr(err)
+		fetchFail("/vh/projects", err)
 		return res
 	}
 	var projects []struct {
@@ -940,6 +1010,7 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 	}
 	if err := json.Unmarshal(body, &projects); err != nil {
 		res.status = fleetWorkerError // malformed ⇒ error, not limited
+		res.detail = fleetMalformedDetail("/vh/projects")
 		return res
 	}
 	cumulative += int64(len(body))
@@ -962,6 +1033,7 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 		projects = inScope
 	}
 	if len(projects) > b.MaxProjectsPerWorker {
+		res.detail = fleetClampDetail(fmt.Sprintf("project count %d > %d cap", len(projects), b.MaxProjectsPerWorker))
 		projects = projects[:b.MaxProjectsPerWorker]
 		limited = true // deterministic cap exclusion, never silent truncation
 	}
@@ -974,7 +1046,7 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 		}
 		body, err := fetchBounded(path)
 		if err != nil {
-			res.status = classifyFetchErr(err)
+			fetchFail(path, err)
 			return res
 		}
 		var snap struct {
@@ -982,6 +1054,7 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 		}
 		if err := json.Unmarshal(body, &snap); err != nil {
 			res.status = fleetWorkerError
+			res.detail = fleetMalformedDetail(path)
 			return res
 		}
 		cumulative += int64(len(body))
@@ -989,6 +1062,9 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 		if cumulative > b.MaxWorkerCumulativeBytes {
 			// This project's observation is real and stays; further fetches stop.
 			res.status = fleetWorkerLimited
+			res.detail = fleetClampDetail(fmt.Sprintf("cumulative %s > %s budget after %s",
+				fleetHumanBytes(cumulative), fleetHumanBytes(b.MaxWorkerCumulativeBytes),
+				fleetTruncRunes(p.Dir, fleetDetailDirMaxRunes)))
 			return res
 		}
 	}
@@ -1000,6 +1076,111 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 	res.status = fleetWorkerOK
 	res.observedAt = time.Now()
 	return res
+}
+
+// ---------------------------------------------------------------------------
+// Limited/error detail helpers (workers[].detail)
+// ---------------------------------------------------------------------------
+
+// Detail budgets: the watch payload stays compact, so an embedded path/dir
+// is truncated to ~200 code points and the WHOLE detail to ~256 (producers
+// build short strings; the clamps are hard guarantees, "~" slack included).
+const (
+	fleetDetailPathMaxRunes = 200
+	fleetDetailDirMaxRunes  = 200
+	fleetDetailMaxRunes     = 256
+)
+
+// fleetTruncRunes truncates s to at most max Unicode code points, appending
+// an ellipsis when truncation occurred (dirs/paths can be arbitrary-length
+// operator or worker-controlled strings).
+func fleetTruncRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
+}
+
+// fleetClampDetail bounds a whole detail string to the total ceiling.
+func fleetClampDetail(s string) string {
+	r := []rune(s)
+	if len(r) <= fleetDetailMaxRunes {
+		return s
+	}
+	return string(r[:fleetDetailMaxRunes-1]) + "…"
+}
+
+// fleetMalformedDetail names a JSON decode failure: what came back was not
+// the expected document shape.
+func fleetMalformedDetail(path string) string {
+	return fleetClampDetail("malformed response (" + fleetTruncRunes(path, fleetDetailPathMaxRunes) + ")")
+}
+
+// fleetResponseCapDetail names a per-response body-cap trip:
+// "response 5.2 MiB > 4 MiB cap (/vh/snapshot?dir=…)". The actual byte pair
+// is recovered from the transport error text — FetchWorkerJSONBounded wraps
+// ErrFetchResponseBodyTooLarge as "(N > M bytes)" (status_transport.go, the
+// single production wrap site). A seam error without that shape degrades to
+// naming the configured cap alone — still honest, still names the trip.
+func fleetResponseCapDetail(err error, path string, cap int64) string {
+	tp := fleetTruncRunes(path, fleetDetailPathMaxRunes)
+	if got, _, ok := fleetParseOversizePair(err); ok {
+		return fleetClampDetail(fmt.Sprintf("response %s > %s cap (%s)", fleetHumanBytes(got), fleetHumanBytes(cap), tp))
+	}
+	return fleetClampDetail(fmt.Sprintf("response over %s cap (%s)", fleetHumanBytes(cap), tp))
+}
+
+// fleetParseOversizePair extracts the (got, cap) byte counts embedded in a
+// production ErrFetchResponseBodyTooLarge wrap: "…(999 > 998 bytes)". ok=false
+// for any other shape; callers must have checked errors.Is first (or accept
+// the boolean verdict alone).
+func fleetParseOversizePair(err error) (got, cap int64, ok bool) {
+	s := err.Error()
+	const suffix = " bytes)"
+	if !strings.HasSuffix(s, suffix) {
+		return 0, 0, false
+	}
+	open := strings.LastIndex(s, "(")
+	if open < 0 {
+		return 0, 0, false
+	}
+	parts := strings.SplitN(s[open+1:len(s)-len(suffix)], ">", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	var err1, err2 error
+	if got, err1 = strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64); err1 != nil {
+		return 0, 0, false
+	}
+	if cap, err2 = strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64); err2 != nil {
+		return 0, 0, false
+	}
+	return got, cap, true
+}
+
+// fleetHumanBytes renders a byte count compactly for detail strings: whole
+// units when evenly divisible, one decimal otherwise (5.2 MiB, 32 MiB, 512 B).
+func fleetHumanBytes(n int64) string {
+	switch {
+	case n >= 1<<20:
+		v := float64(n) / (1 << 20)
+		if v == float64(int64(v)) {
+			return fmt.Sprintf("%d MiB", int64(v))
+		}
+		return fmt.Sprintf("%.1f MiB", v)
+	case n >= 1<<10:
+		v := float64(n) / (1 << 10)
+		if v == float64(int64(v)) {
+			return fmt.Sprintf("%d KiB", int64(v))
+		}
+		return fmt.Sprintf("%.1f KiB", v)
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
 }
 
 // classifyFetchErr maps an acquisition error to the worker status enum.
