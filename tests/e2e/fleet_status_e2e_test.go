@@ -17,9 +17,11 @@ package e2e
 // known_overall. It also exercises ETag/304 over real HTTP.
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 )
 
 func TestE2E_FleetStatusRollupThroughRealTunnel(t *testing.T) {
@@ -147,5 +149,48 @@ func TestE2E_FleetStatusRollupThroughRealTunnel(t *testing.T) {
 	}
 	if resp3.Header.Get("ETag") != etag {
 		t.Fatalf("same-generation ETag must be stable")
+	}
+}
+
+// TestE2E_FleetStatusLeanGatesThroughRealTunnel proves the LEAN acquisition
+// leg end to end against the SHARED cluster's real stack: the worker's REAL
+// pkg/web /vh/gates handler (session-cookie family, default project ""),
+// fetched through the production transport (Proxy.FetchWorkerJSONBounded →
+// yamux tunnel → agent raw-proxy → worker web server) with the z=1 gzip64
+// opt-in. The shared-cluster rollup above already ACQUIRES through this
+// endpoint (the controller tries lean first); this test pins the endpoint's
+// wire contract directly: schema 1, one entry for the default project, and
+// a gate map (raw or envelope-decoded — the fixture's small fleet stays
+// under the compress threshold) that is valid JSON.
+func TestE2E_FleetStatusLeanGatesThroughRealTunnel(t *testing.T) {
+	w, ok := cluster.Daemon.Registry.GetWorker(cluster.WorkerID)
+	if !ok {
+		t.Fatalf("shared-cluster worker %s not registered", cluster.WorkerID)
+	}
+	if tr, _ := cluster.Daemon.Registry.WorkerTransport(cluster.WorkerID); tr == nil || tr.IsClosed() {
+		t.Fatalf("shared-cluster worker %s not online", cluster.WorkerID)
+	}
+	body, err := cluster.Daemon.Proxy.FetchWorkerJSONBounded(context.Background(), w, "/vh/gates?z=1&dir=", 5*time.Second, 4<<20)
+	if err != nil {
+		t.Fatalf("real-stack lean gates fetch: %v", err)
+	}
+	var lean struct {
+		Schema   int `json:"schema"`
+		Projects []struct {
+			Dir  string          `json:"dir"`
+			Gate json.RawMessage `json:"gate"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal(body, &lean); err != nil {
+		t.Fatalf("lean gates body is not JSON (envelope decode broken?): %v (%q)", err, body)
+	}
+	if lean.Schema != 1 {
+		t.Fatalf("lean gates schema: want 1, got %d", lean.Schema)
+	}
+	if len(lean.Projects) != 1 || lean.Projects[0].Dir != "" {
+		t.Fatalf("lean gates projects: want exactly the default project, got %+v", lean.Projects)
+	}
+	if lean.Projects[0].Gate == nil {
+		t.Fatalf("default project entry must carry a gate object (may be empty), got nil")
 	}
 }

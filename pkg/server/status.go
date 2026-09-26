@@ -38,9 +38,13 @@ package server
 //     invalidated INSTANTLY by registry membership/liveness changes — the
 //     tunnel-WS close path calls MarkWorkerOffline which bumps the registry
 //     generation, so a stale generation is never served (and never 304s).
-//   - Acquisition per worker: /vh/projects discovery, then ONE tree-only
-//     /vh/snapshot per discovered project (one snapshot = ONE project — the
-//     rollup fans out across projects and aggregates). The optional project
+//   - Acquisition per worker: /vh/projects discovery, then ONE batched lean
+//     /vh/gates?z=1 request covering every in-scope project (the rollup
+//     consumes only the gate map per project — the worker returns exactly
+//     that, gzipped, no session-tree marshaling). On ANY lean failure (404
+//     from an old worker, non-2xx, malformed, timeout, cap trip) the
+//     acquisition falls back to ONE tree-only /vh/snapshot per in-scope
+//     project (z=1) — the pre-lean path, unchanged. The optional project
 //     roster from the status config file (--status-config; see
 //     status_config.go) intersects discovery with the configured dirs
 //     (unconfigured dirs are excluded everywhere) and turns a configured dir
@@ -49,7 +53,8 @@ package server
 //     acquired; otherwise absence stays unknown, never missing. Every fetch
 //     goes
 //     through Proxy.FetchWorkerJSONBounded (bounded open/handshake/head/body,
-//     cap-plus-one excess detection) with the worker transport snapshotted
+//     cap-plus-one excess detection — on DECODED bytes for gzip64 envelopes)
+//     with the worker transport snapshotted
 //     via Registry.WorkerTransport — NEVER the unlocked Worker.Transport read
 //     (pre-existing race, follow-up card task-2026-09-26t02-55-05).
 //   - Tunnel-closed/offline workers are reported `offline` with NO fan-out
@@ -82,7 +87,6 @@ import (
 	"net/url"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -230,13 +234,15 @@ const (
 
 // fleetBudgets are the safety budgets from the contract. The four
 // byte/count fields (MaxResponseBodyBytes, MaxWorkerCumulativeBytes,
-// MaxWorkersPerRefresh, MaxProjectsPerWorker) are CONFIG-OVERRIDABLE via the
+// MaxWorkersPerRefresh, MaxProjectsPerWorker) AND the two time fields
+// (RefreshBudget, WorkerBudget, in ms) are CONFIG-OVERRIDABLE via the
 // status config file's optional "budgets" block (see status_config.go) and
 // are sourced per-refresh from the config snapshot (effectiveBudgets); the
-// time budgets (TTL/RefreshBudget/WorkerBudget) and the concurrency/staleness
-// fields are daemon-owned only. Defaults are sized for real fleets (operator
-// fleet: 1 worker, 7 real dev projects tripped the old fixture-sized 1/8 MiB
-// caps with status:"limited", observed_projects:0). All fields remain
+// remaining fields (TTL and the concurrency/staleness knobs) are
+// daemon-owned only. Defaults are sized for real fleets on WAN tunnels
+// (operator fleet: 1 worker, 7 real dev projects, ~83 ms RTT link — the
+// original 3 s/2 s budgets timed the acquisition out at ~3/7 projects when
+// each snapshot crossed the tunnel uncompressed). All fields remain
 // overridable in tests via svc.budgets (config overrides win when set).
 type fleetBudgets struct {
 	TTL                      time.Duration // serve-generation validity window
@@ -245,16 +251,16 @@ type fleetBudgets struct {
 	WorkerConcurrency        int           // max workers fetched concurrently per refresh
 	MaxWorkersPerRefresh     int           // worker cap; in-scope workers beyond it are `limited`
 	MaxProjectsPerWorker     int           // project cap; more projects ⇒ worker `limited`
-	MaxResponseBodyBytes     int64         // per-response body cap (cap-plus-one detection)
-	MaxWorkerCumulativeBytes int64         // cumulative body budget per worker per refresh
+	MaxResponseBodyBytes     int64         // per-response body cap (cap-plus-one detection; DECODED bytes for gzip64)
+	MaxWorkerCumulativeBytes int64         // cumulative body budget per worker per refresh (decoded bytes)
 	MaxStalenessMS           int64         // client display-age ceiling surfaced in the response
 }
 
 func defaultFleetBudgets() fleetBudgets {
 	return fleetBudgets{
 		TTL:                      5 * time.Second,
-		RefreshBudget:            3 * time.Second,
-		WorkerBudget:             2 * time.Second,
+		RefreshBudget:            15 * time.Second,
+		WorkerBudget:             10 * time.Second,
 		WorkerConcurrency:        8,
 		MaxWorkersPerRefresh:     128,
 		MaxProjectsPerWorker:     64,
@@ -284,6 +290,12 @@ func applyFleetBudgetOverrides(b fleetBudgets, cfg *fleetBudgetsConfig) fleetBud
 	}
 	if cfg.MaxProjectsPerWorker != nil {
 		b.MaxProjectsPerWorker = *cfg.MaxProjectsPerWorker
+	}
+	if cfg.RefreshBudgetMS != nil {
+		b.RefreshBudget = time.Duration(*cfg.RefreshBudgetMS) * time.Millisecond
+	}
+	if cfg.WorkerBudgetMS != nil {
+		b.WorkerBudget = time.Duration(*cfg.WorkerBudgetMS) * time.Millisecond
 	}
 	return b
 }
@@ -954,14 +966,17 @@ func buildFleetOptions(now time.Time, results []fleetWorkerResult, summaries []W
 }
 
 // acquireWorker performs one worker's sequential acquisition: /vh/projects
-// discovery, then ONE tree-only /vh/snapshot per in-scope project (one
-// snapshot covers exactly ONE project — the multi-project fan-out the rollup
-// must do per worker). Sequential by design: at most one in-flight fetch per
-// worker (D2 cap). projectSet (non-nil in expected project mode) INTERSECTS
-// discovery with the configured roster: discovered-but-unconfigured dirs are
-// excluded from acquisition, session counts, and every other rollup fold —
-// the operator asked for exactly these projects. The filter runs BEFORE the
-// per-worker project cap so out-of-scope dirs never consume it.
+// discovery, then (new-worker fast path) ONE batched /vh/gates request
+// covering every in-scope project — falling back, on ANY lean failure, to
+// ONE tree-only /vh/snapshot per in-scope project (the pre-lean acquisition
+// path, unchanged including its partial-observation semantics). Sequential
+// by design: at most one in-flight fetch per worker (D2 cap), so the tunnel
+// keeps its bandwidth for live UI streams. projectSet (non-nil in expected
+// project mode) INTERSECTS discovery with the configured roster:
+// discovered-but-unconfigured dirs are excluded from acquisition, session
+// counts, and every other rollup fold — the operator asked for exactly
+// these projects. The filter runs BEFORE the per-worker project cap so
+// out-of-scope dirs never consume it.
 //
 // b is the refresh's effective budgets (defaults + config overrides, captured
 // by the caller from the same config snapshot that fed the rosters). Every
@@ -1005,9 +1020,7 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 		fetchFail("/vh/projects", err)
 		return res
 	}
-	var projects []struct {
-		Dir string `json:"dir"`
-	}
+	var projects []fleetDiscoveredProject
 	if err := json.Unmarshal(body, &projects); err != nil {
 		res.status = fleetWorkerError // malformed ⇒ error, not limited
 		res.detail = fleetMalformedDetail("/vh/projects")
@@ -1022,9 +1035,7 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 		res.discovered = append(res.discovered, p.Dir)
 	}
 	if projectSet != nil {
-		inScope := make([]struct {
-			Dir string `json:"dir"`
-		}, 0, len(projects))
+		inScope := make([]fleetDiscoveredProject, 0, len(projects))
 		for _, p := range projects {
 			if projectSet[p.Dir] {
 				inScope = append(inScope, p)
@@ -1038,11 +1049,57 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 		limited = true // deterministic cap exclusion, never silent truncation
 	}
 
-	// 2. One tree-only snapshot per project (no sessions param ⇒ no messages).
+	// 2. Lean batched gate fetch (new-worker fast path): ONE /vh/gates?z=1
+	// request covering the whole (capped, roster-filtered) project list —
+	// the rollup consumes ONLY the gate map per project, so the worker
+	// returns exactly that (no session/message marshaling). On a WAN tunnel
+	// (~83 ms RTT observed) the fallback's s+1 sequential full snapshots
+	// (~5.9 MB raw for the operator's 7-project roster) cannot fit any sane
+	// per-worker budget; ONE lean response (even gzipped, ~10:1 smaller)
+	// does. ANY lean failure — 404 from an old worker, non-2xx, malformed
+	// body, timeout, cap trip — falls back to today's per-project snapshot
+	// path below UNCHANGED: deterministic version-skew tolerance (a NEW
+	// controller against an OLD worker costs one extra round trip per
+	// refresh), and no partial lean state ever leaks into the rollup.
+	if len(projects) > 0 {
+		if gates, bodyLen, ok := fetchLeanGates(fetchBounded, projects); ok {
+			for _, p := range projects {
+				// A requested dir the worker omitted (project closed between
+				// discovery and gates, or a worker bug) observes as an EMPTY
+				// gate — the same value the fallback's /vh/snapshot would
+				// have returned for a vanished dir, keeping observed_projects
+				// semantics identical on both paths.
+				res.projects = append(res.projects, fleetObservedProject{dir: p.Dir, gate: gates[p.Dir]})
+			}
+			cumulative += bodyLen
+			if cumulative > b.MaxWorkerCumulativeBytes {
+				// The batch's observations are real and stay; further fetches stop.
+				res.status = fleetWorkerLimited
+				res.detail = fleetClampDetail(fmt.Sprintf("cumulative %s > %s budget after %s",
+					fleetHumanBytes(cumulative), fleetHumanBytes(b.MaxWorkerCumulativeBytes),
+					fleetTruncRunes(projects[len(projects)-1].Dir, fleetDetailDirMaxRunes)))
+				return res
+			}
+			if limited {
+				res.status = fleetWorkerLimited
+				return res
+			}
+			res.status = fleetWorkerOK
+			res.observedAt = time.Now()
+			return res
+		}
+	}
+
+	// 3. Fallback (old workers / lean failure): one tree-only snapshot per
+	// project (no sessions param ⇒ no messages), z=1 to gzip64 the big tree
+	// payloads — honored by every current worker; an even older worker that
+	// ignores z=1 serves raw JSON, which the transport passes through
+	// unchanged (envelope decode is opt-in), so the request stays safe
+	// against any worker version.
 	for _, p := range projects {
-		path := "/vh/snapshot"
+		path := "/vh/snapshot?z=1"
 		if p.Dir != "" {
-			path += "?dir=" + url.QueryEscape(p.Dir)
+			path += "&dir=" + url.QueryEscape(p.Dir)
 		}
 		body, err := fetchBounded(path)
 		if err != nil {
@@ -1076,6 +1133,50 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 	res.status = fleetWorkerOK
 	res.observedAt = time.Now()
 	return res
+}
+
+// fleetDiscoveredProject is one /vh/projects discovery entry (the rollup
+// reads only the dir).
+type fleetDiscoveredProject struct {
+	Dir string `json:"dir"`
+}
+
+// fetchLeanGates tries the worker's lean batched gate endpoint
+// (GET /vh/gates?z=1&dir=…, pkg/web server.go handleFleetGates) for exactly
+// the (already capped, roster-filtered) project list and returns the
+// per-dir gate maps plus the decoded response length (for the cumulative
+// byte budget). ok=false means "lean unavailable or broken — use the
+// fallback": a fetch error of ANY class (404/non-2xx, timeout, cap trip)
+// or a malformed/unexpected-schema body routes back to the per-project
+// snapshot path; the lean attempt itself never fails the worker.
+func fetchLeanGates(fetch func(path string) ([]byte, error), projects []fleetDiscoveredProject) (map[string]map[string]state.GateFacts, int64, bool) {
+	var sb strings.Builder
+	sb.WriteString("/vh/gates?z=1")
+	for _, p := range projects {
+		sb.WriteString("&dir=" + url.QueryEscape(p.Dir))
+	}
+	body, err := fetch(sb.String())
+	if err != nil {
+		return nil, 0, false
+	}
+	var lean struct {
+		Schema   int `json:"schema"`
+		Projects []struct {
+			Dir  string                     `json:"dir"`
+			Gate map[string]state.GateFacts `json:"gate"`
+		} `json:"projects"`
+	}
+	// projects absent (null) or a schema we do not speak ⇒ malformed ⇒
+	// fallback; entries for dirs we did not request are ignored by
+	// construction (the caller looks its own dirs up in the map).
+	if err := json.Unmarshal(body, &lean); err != nil || lean.Schema != 1 || lean.Projects == nil {
+		return nil, 0, false
+	}
+	gates := make(map[string]map[string]state.GateFacts, len(lean.Projects))
+	for _, p := range lean.Projects {
+		gates[p.Dir] = p.Gate
+	}
+	return gates, int64(len(body)), true
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,44 +1223,19 @@ func fleetMalformedDetail(path string) string {
 
 // fleetResponseCapDetail names a per-response body-cap trip:
 // "response 5.2 MiB > 4 MiB cap (/vh/snapshot?dir=…)". The actual byte pair
-// is recovered from the transport error text — FetchWorkerJSONBounded wraps
-// ErrFetchResponseBodyTooLarge as "(N > M bytes)" (status_transport.go, the
-// single production wrap site). A seam error without that shape degrades to
-// naming the configured cap alone — still honest, still names the trip.
+// is read STRUCTURED from the transport's FetchResponseTooLargeError via
+// errors.As (the a-F2/d-F3 text scan on "(N > M bytes)" is retired). Got
+// quotes the bytes the cap governs — DECODED size for a gzip64 envelope
+// response (status_transport.go says which), raw size otherwise. A seam
+// error without the structured pair degrades to naming the configured cap
+// alone — still honest, still names the trip, never a fabricated size.
 func fleetResponseCapDetail(err error, path string, cap int64) string {
 	tp := fleetTruncRunes(path, fleetDetailPathMaxRunes)
-	if got, _, ok := fleetParseOversizePair(err); ok {
-		return fleetClampDetail(fmt.Sprintf("response %s > %s cap (%s)", fleetHumanBytes(got), fleetHumanBytes(cap), tp))
+	var ovs *FetchResponseTooLargeError
+	if errors.As(err, &ovs) {
+		return fleetClampDetail(fmt.Sprintf("response %s > %s cap (%s)", fleetHumanBytes(ovs.Got), fleetHumanBytes(cap), tp))
 	}
 	return fleetClampDetail(fmt.Sprintf("response over %s cap (%s)", fleetHumanBytes(cap), tp))
-}
-
-// fleetParseOversizePair extracts the (got, cap) byte counts embedded in a
-// production ErrFetchResponseBodyTooLarge wrap: "…(999 > 998 bytes)". ok=false
-// for any other shape; callers must have checked errors.Is first (or accept
-// the boolean verdict alone).
-func fleetParseOversizePair(err error) (got, cap int64, ok bool) {
-	s := err.Error()
-	const suffix = " bytes)"
-	if !strings.HasSuffix(s, suffix) {
-		return 0, 0, false
-	}
-	open := strings.LastIndex(s, "(")
-	if open < 0 {
-		return 0, 0, false
-	}
-	parts := strings.SplitN(s[open+1:len(s)-len(suffix)], ">", 2)
-	if len(parts) != 2 {
-		return 0, 0, false
-	}
-	var err1, err2 error
-	if got, err1 = strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64); err1 != nil {
-		return 0, 0, false
-	}
-	if cap, err2 = strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64); err2 != nil {
-		return 0, 0, false
-	}
-	return got, cap, true
 }
 
 // fleetHumanBytes renders a byte count compactly for detail strings: whole

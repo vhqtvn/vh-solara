@@ -721,51 +721,7 @@ func (s *Store) materializeSnapshot(c snapshotCapture) Snapshot {
 	// (not s.sessions) — order is nondeterministic here exactly as it was in the
 	// prior map iteration; parity is set-equality of elements.
 	for sid, sc := range sessions {
-		act := sc.activity
-		if act == "" {
-			act = ActivityIdle // a never-touched session renders idle
-		}
-		// hasMsg is the "some message state exists" predicate (live tail OR a
-		// history hydrate). It feeds BOTH wire aliases during the
-		// alias-during-transition (L-03): `hydrated` (retained) and `hasMessages`
-		// (the exact name the SPA migrates to). Computed once and assigned to
-		// both so the two wire fields provably carry the same value.
-		hasMsg := sc.msgLoaded || sc.hasMessages
-		snap.Gate[sid] = GateFacts{
-			Activity: act,
-			// We have message state (live events OR a history hydrate) iff
-			// msgLoaded or a messages entry exists. When false, the message-
-			// derived fields below are "not yet known", which a cold/un-opened
-			// session after a restart can't be distinguished from in-flight
-			// without this.
-			Hydrated: hasMsg,
-			// HasMessages is the alias of Hydrated — same value, exact name.
-			HasMessages: hasMsg,
-			// MessagesLoaded is the STRICT "full history fetched AND resident"
-			// gate, derived from BOTH the msgLoaded fetch memo AND the actual
-			// resident parts (msgResident). It is false when the newest
-			// completed assistant has zero resident parts — UNLESS that exact
-			// empty newest was confirmed as source-truth by a second reconcile
-			// (confirmedEmptyNewest), in which case it is admitted. An
-			// unconfirmed zero-parts newest triggers an open-path re-fetch
-			// instead of lying "loaded". Mirrors the busyCount retirement
-			// (c4c4ef1): derive from source, not the latch alone. See
-			// IsMessagesLoaded / latestAssistantResidentLocked.
-			MessagesLoaded:         sc.msgLoaded && sc.msgResident,
-			LastAssistantCompleted: sc.hasAssistant && sc.lastAsstCompleted,
-			LastAssistantEmpty:     sc.lastAsstEmpty,
-			FinishReason:           sc.lastFinish,
-			SubtreeBusy:            subtreeBusy[sid],
-			PendingQuestion:        sc.hasQuestions,
-			PendingPermission:      sc.hasPerms,
-			PermissionBlocked:      sc.permBlocked,
-			// PermissionWasBlocked is the alias of PermissionBlocked — same value,
-			// exact name (L-09).
-			PermissionWasBlocked: sc.permBlocked,
-			// Tokens is the private byte copy captured above — assigned directly
-			// (no aliasing; see the doc comment's copy invariant).
-			Tokens: sc.lastTokens,
-		}
+		snap.Gate[sid] = gateFactsFromScalars(sc, subtreeBusy[sid])
 		if sc.lastAgent != "" {
 			snap.LastAgents[sid] = sc.lastAgent
 		}
@@ -862,6 +818,93 @@ func (s *Store) materializeSnapshot(c snapshotCapture) Snapshot {
 		snap.MessageWindows[sid] = meta
 	}
 	return snap
+}
+
+// gateFactsFromScalars composes one session's GateFacts from the captured
+// per-session scalars plus the session's subtreeBusy fact. It is the SINGLE
+// derivation shared by Snapshot materialization (snap.Gate) and the lean
+// GateFacts() accessor, so the two projections cannot drift.
+func gateFactsFromScalars(sc snapSessionCap, subtreeBusy bool) GateFacts {
+	act := sc.activity
+	if act == "" {
+		act = ActivityIdle // a never-touched session renders idle
+	}
+	// hasMsg is the "some message state exists" predicate (live tail OR a
+	// history hydrate). It feeds BOTH wire aliases during the
+	// alias-during-transition (L-03): `hydrated` (retained) and `hasMessages`
+	// (the exact name the SPA migrates to). Computed once and assigned to
+	// both so the two wire fields provably carry the same value.
+	hasMsg := sc.msgLoaded || sc.hasMessages
+	return GateFacts{
+		Activity: act,
+		// We have message state (live events OR a history hydrate) iff
+		// msgLoaded or a messages entry exists. When false, the message-
+		// derived fields below are "not yet known", which a cold/un-opened
+		// session after a restart can't be distinguished from in-flight
+		// without this.
+		Hydrated: hasMsg,
+		// HasMessages is the alias of Hydrated — same value, exact name.
+		HasMessages: hasMsg,
+		// MessagesLoaded is the STRICT "full history fetched AND resident"
+		// gate, derived from BOTH the msgLoaded fetch memo AND the actual
+		// resident parts (msgResident). It is false when the newest
+		// completed assistant has zero resident parts — UNLESS that exact
+		// empty newest was confirmed as source-truth by a second reconcile
+		// (confirmedEmptyNewest), in which case it is admitted. An
+		// unconfirmed zero-parts newest triggers an open-path re-fetch
+		// instead of lying "loaded". Mirrors the busyCount retirement
+		// (c4c4ef1): derive from source, not the latch alone. See
+		// IsMessagesLoaded / latestAssistantResidentLocked.
+		MessagesLoaded:         sc.msgLoaded && sc.msgResident,
+		LastAssistantCompleted: sc.hasAssistant && sc.lastAsstCompleted,
+		LastAssistantEmpty:     sc.lastAsstEmpty,
+		FinishReason:           sc.lastFinish,
+		SubtreeBusy:            subtreeBusy,
+		PendingQuestion:        sc.hasQuestions,
+		PendingPermission:      sc.hasPerms,
+		PermissionBlocked:      sc.permBlocked,
+		// PermissionWasBlocked is the alias of PermissionBlocked — same value,
+		// exact name (L-09).
+		PermissionWasBlocked: sc.permBlocked,
+		// Tokens is the caller's private byte copy — assigned directly (no
+		// aliasing; see the capture-phase copy invariant).
+		Tokens: sc.lastTokens,
+	}
+}
+
+// GateFacts returns the per-session gate facts for EVERY session in the store
+// — exactly the values a full Snapshot(messagesFor=nil)'s Gate map carries
+// (same shared derivation, gateFactsFromScalars) — WITHOUT materializing
+// sessions, messages, todos, or any other snapshot facet. This is the lean
+// source behind the worker's GET /vh/gates endpoint: the controller's fleet
+// rollup consumes ONLY the gate map per project, so it must not pay the
+// multi-megabyte session/message marshaling a full snapshot incurs.
+//
+// Locking: one RLock span for the whole capture (latestAssistantResidentLocked
+// is read-only under RLock — see its doc). Unlike Snapshot it takes NO write
+// lock: there is no buffered-delta flush to run (deltas affect message
+// materialization, not the gate scalars).
+func (s *Store) GateFacts() map[string]GateFacts {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]GateFacts, len(s.sessions))
+	for sid, se := range s.sessions {
+		out[sid] = gateFactsFromScalars(snapSessionCap{
+			hasAssistant:      se.hasAssistant,
+			lastAsstCompleted: se.lastAsstCompleted,
+			lastAsstEmpty:     se.lastAsstEmpty,
+			lastFinish:        se.lastFinish,
+			lastTokens:        append([]byte(nil), se.lastTokens...),
+			msgLoaded:         s.msgLoaded[sid],
+			msgResident:       s.latestAssistantResidentLocked(sid),
+			hasMessages:       s.messages[sid] != nil,
+			hasQuestions:      len(s.questions[sid]) > 0,
+			hasPerms:          len(s.perms[sid]) > 0,
+			permBlocked:       s.permBlocked[sid],
+			activity:          s.activity[sid],
+		}, s.subtreeBusyCount[sid] > 0)
+	}
+	return out
 }
 
 // SnapshotWithTree captures BOTH the detail Snapshot AND the tree TreeSnapshot

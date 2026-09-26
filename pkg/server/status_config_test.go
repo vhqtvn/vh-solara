@@ -499,7 +499,7 @@ func TestFleetConfig_PutLiveApplyRollupScope(t *testing.T) {
 	}
 	fleetAddOnline(t, d.Registry, "alpha")
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody(""))
-	fake.setBody("alpha", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("alpha", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{}))
 
 	svc := d.fleetStatusService()
 	svc.budgets.TTL = time.Minute // only the config-generation bump may invalidate
@@ -670,8 +670,10 @@ func TestFleetConfig_BudgetsDecodeValidation(t *testing.T) {
 			&fleetBudgetsConfig{MaxResponseBytes: i64ptr(8388608)}},
 		{"full block", `{"workers":[],"projects":[],"budgets":{"max_response_bytes":8388608,"max_cumulative_bytes":104857600,"max_workers_per_refresh":256,"max_projects_per_worker":128}}`,
 			&fleetBudgetsConfig{MaxResponseBytes: i64ptr(8388608), MaxCumulativeBytes: i64ptr(104857600), MaxWorkersPerRefresh: intptr(256), MaxProjectsPerWorker: intptr(128)}},
-		{"ceiling boundary values", `{"workers":[],"projects":[],"budgets":{"max_response_bytes":67108864,"max_cumulative_bytes":536870912,"max_workers_per_refresh":4096,"max_projects_per_worker":4096}}`,
-			&fleetBudgetsConfig{MaxResponseBytes: i64ptr(67108864), MaxCumulativeBytes: i64ptr(536870912), MaxWorkersPerRefresh: intptr(4096), MaxProjectsPerWorker: intptr(4096)}},
+		{"time budgets", `{"workers":[],"projects":[],"budgets":{"refresh_budget_ms":20000,"worker_budget_ms":8000}}`,
+			&fleetBudgetsConfig{RefreshBudgetMS: intptr(20000), WorkerBudgetMS: intptr(8000)}},
+		{"ceiling boundary values", `{"workers":[],"projects":[],"budgets":{"max_response_bytes":67108864,"max_cumulative_bytes":536870912,"max_workers_per_refresh":4096,"max_projects_per_worker":4096,"refresh_budget_ms":120000,"worker_budget_ms":60000}}`,
+			&fleetBudgetsConfig{MaxResponseBytes: i64ptr(67108864), MaxCumulativeBytes: i64ptr(536870912), MaxWorkersPerRefresh: intptr(4096), MaxProjectsPerWorker: intptr(4096), RefreshBudgetMS: intptr(120000), WorkerBudgetMS: intptr(60000)}},
 	}
 	for _, tc := range valid {
 		got, err := decodeStatusConfig([]byte(tc.in))
@@ -697,6 +699,12 @@ func TestFleetConfig_BudgetsDecodeValidation(t *testing.T) {
 		{"cumulative over ceiling", `{"workers":[],"projects":[],"budgets":{"max_cumulative_bytes":536870913}}`, "budgets.max_cumulative_bytes: 536870913 exceeds the ceiling 536870912 (512 MiB)"},
 		{"workers over ceiling", `{"workers":[],"projects":[],"budgets":{"max_workers_per_refresh":4097}}`, "budgets.max_workers_per_refresh: 4097 exceeds the ceiling 4096"},
 		{"projects over ceiling", `{"workers":[],"projects":[],"budgets":{"max_projects_per_worker":5000}}`, "budgets.max_projects_per_worker: 5000 exceeds the ceiling 4096"},
+		{"zero refresh budget", `{"workers":[],"projects":[],"budgets":{"refresh_budget_ms":0}}`, "budgets.refresh_budget_ms: must be a positive integer (milliseconds), got 0"},
+		{"negative worker budget", `{"workers":[],"projects":[],"budgets":{"worker_budget_ms":-100}}`, "budgets.worker_budget_ms: must be a positive integer (milliseconds), got -100"},
+		{"refresh budget over ceiling", `{"workers":[],"projects":[],"budgets":{"refresh_budget_ms":120001}}`, "budgets.refresh_budget_ms: 120001 exceeds the ceiling 120000 (2m0s)"},
+		{"worker budget over ceiling", `{"workers":[],"projects":[],"budgets":{"worker_budget_ms":60001}}`, "budgets.worker_budget_ms: 60001 exceeds the ceiling 60000 (1m0s)"},
+		{"time budget wrong type (string)", `{"workers":[],"projects":[],"budgets":{"refresh_budget_ms":"slow"}}`, "refresh_budget_ms"},
+		{"time budget wrong type (float)", `{"workers":[],"projects":[],"budgets":{"worker_budget_ms":1.5}}`, "worker_budget_ms"},
 		{"wrong type (string)", `{"workers":[],"projects":[],"budgets":{"max_response_bytes":"big"}}`, "max_response_bytes"},
 		{"wrong type (float)", `{"workers":[],"projects":[],"budgets":{"max_cumulative_bytes":1.5}}`, "max_cumulative_bytes"},
 		{"wrong type (bool)", `{"workers":[],"projects":[],"budgets":{"max_projects_per_worker":true}}`, "max_projects_per_worker"},
@@ -726,7 +734,7 @@ func TestFleetConfig_GetEffectiveBudgets(t *testing.T) {
 		t.Fatalf("GET config: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
 	}
 	resp := decodeFleetConfig(t, rec)
-	wantDefault := fleetBudgetsWire{MaxResponseBytes: 4 << 20, MaxCumulativeBytes: 32 << 20, MaxWorkersPerRefresh: 128, MaxProjectsPerWorker: 64}
+	wantDefault := fleetBudgetsWire{MaxResponseBytes: 4 << 20, MaxCumulativeBytes: 32 << 20, MaxWorkersPerRefresh: 128, MaxProjectsPerWorker: 64, RefreshBudgetMS: 15000, WorkerBudgetMS: 10000}
 	if resp.Budgets != wantDefault {
 		t.Fatalf("unconfigured budgets echo: want defaults %+v, got %+v", wantDefault, resp.Budgets)
 	}
@@ -747,7 +755,7 @@ func TestFleetConfig_GetEffectiveBudgets(t *testing.T) {
 		t.Fatalf("GET config (loaded): want 200, got %d", rec2.Code)
 	}
 	resp2 := decodeFleetConfig(t, rec2)
-	wantMerged := fleetBudgetsWire{MaxResponseBytes: 8388608, MaxCumulativeBytes: 32 << 20, MaxWorkersPerRefresh: 128, MaxProjectsPerWorker: 100}
+	wantMerged := fleetBudgetsWire{MaxResponseBytes: 8388608, MaxCumulativeBytes: 32 << 20, MaxWorkersPerRefresh: 128, MaxProjectsPerWorker: 100, RefreshBudgetMS: 15000, WorkerBudgetMS: 10000}
 	if resp2.Budgets != wantMerged {
 		t.Fatalf("configured budgets echo: want merged %+v, got %+v", wantMerged, resp2.Budgets)
 	}
@@ -806,7 +814,7 @@ func TestFleetConfig_PutBudgetsMergeAndReplace(t *testing.T) {
 		t.Fatalf("PUT with budgets: want 200, got %d (body=%q)", rec2.Code, rec2.Body.String())
 	}
 	resp2 := decodeFleetConfig(t, rec2)
-	wantReplaced := fleetBudgetsWire{MaxResponseBytes: 4 << 20, MaxCumulativeBytes: 104857600, MaxWorkersPerRefresh: 128, MaxProjectsPerWorker: 64}
+	wantReplaced := fleetBudgetsWire{MaxResponseBytes: 4 << 20, MaxCumulativeBytes: 104857600, MaxWorkersPerRefresh: 128, MaxProjectsPerWorker: 64, RefreshBudgetMS: 15000, WorkerBudgetMS: 10000}
 	if resp2.Budgets != wantReplaced {
 		t.Fatalf("present-budgets PUT must replace wholesale (unset → defaults): want %+v, got %+v", wantReplaced, resp2.Budgets)
 	}
@@ -891,8 +899,8 @@ func TestFleetConfig_BudgetsHotApplyRollup(t *testing.T) {
 	}
 	fleetAddOnline(t, d.Registry, "alpha")
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/a", "/b"))
-	fake.setBody("alpha", "/vh/snapshot?dir=%2Fa", fleetSnapBody(map[string]state.GateFacts{}))
-	fake.setBody("alpha", "/vh/snapshot?dir=%2Fb", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("alpha", "/vh/snapshot?z=1&dir=%2Fa", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("alpha", "/vh/snapshot?z=1&dir=%2Fb", fleetSnapBody(map[string]state.GateFacts{}))
 
 	svc := d.fleetStatusService()
 	svc.budgets.TTL = time.Minute // only the config-generation bump may invalidate
@@ -957,6 +965,92 @@ func TestFleetConfig_BudgetsHotApplyRollup(t *testing.T) {
 		t.Fatalf("reload persisted config: %v", err)
 	}
 	if !reflect.DeepEqual(rl.Budgets, &fleetBudgetsConfig{MaxProjectsPerWorker: intptr(1)}) {
+		t.Fatalf("persisted budgets differ: %+v", rl.Budgets)
+	}
+}
+
+// TestFleetConfig_TimeBudgetsHotApplyRollup is the TIME-budget hot-apply
+// crux (mirrors TestFleetConfig_BudgetsHotApplyRollup): a PUT carrying
+// worker_budget_ms through the REAL handler chain (auth + CSRF + mux) must
+// change the per-worker time budget the NEXT rollup runs under. A 1 ms
+// worker budget against a seam paced at 25 ms per fetch makes the worker
+// trip the per-worker end-to-end budget pre-check deterministically —
+// status timeout, no detail (timeout exits carry none by contract).
+func TestFleetConfig_TimeBudgetsHotApplyRollup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "status.jsonc")
+	seed := `{"workers":[{"id":"alpha"}],"projects":[]}` + "\n"
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d, fake := newFleetTestDaemon(t, "")
+	a, err := auth.New(context.Background(), auth.Config{Mode: auth.ModePassphrase, Passphrase: "secret"})
+	if err != nil {
+		t.Fatalf("auth.New: %v", err)
+	}
+	d.Auth = a
+	if err := d.LoadStatusConfig(path); err != nil {
+		t.Fatalf("LoadStatusConfig: %v", err)
+	}
+	fleetAddOnline(t, d.Registry, "alpha")
+	fake.setBody("alpha", "/vh/projects", fleetProjectsBody(""))
+	fake.setBody("alpha", fleetGatesPath(""), fleetGatesBody(map[string]map[string]state.GateFacts{
+		"": {"s1": fleetGF("idle", false, false)},
+	}))
+	// Pace every fetch at 25 ms so a 1 ms worker budget trips the pre-check
+	// deterministically (elapsed ≫ budget by the second fetch), while the
+	// default 10 s baseline stays nowhere near tripping.
+	paced := func(ctx context.Context, workerID, p string, timeout time.Duration, maxBody int64) ([]byte, error) {
+		time.Sleep(25 * time.Millisecond)
+		return fake.fetch(ctx, workerID, p, timeout, maxBody)
+	}
+	d.fetchWorkerJSON = paced
+
+	svc := d.fleetStatusService()
+	svc.budgets.TTL = time.Minute // only the config-generation bump may invalidate
+
+	h := d.buildRootHandler()
+	session := loginPassphrase(t, h, "secret")
+
+	// 1. Baseline under the WAN-scale defaults: alpha ok via the lean path.
+	resp1 := decodeFleet(t, doFleet(h, withCookie(session)))
+	if w := workerEntry(t, resp1, "alpha"); w.Status != fleetWorkerOK {
+		t.Fatalf("baseline: alpha must be ok under default time budgets, got %+v", w)
+	}
+	refreshes := svc.refreshCount()
+
+	// 2. PUT a worker_budget_ms of 1 through the REAL handler chain.
+	putBody := `{"workers":[{"id":"alpha"}],"projects":[],"budgets":{"worker_budget_ms":1}}`
+	rec2 := doFleetConfigPut(h, putBody, withCookie(session), withCSRF())
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("PUT time budgets: want 200, got %d (body=%q)", rec2.Code, rec2.Body.String())
+	}
+	cfg2 := decodeFleetConfig(t, rec2)
+	if cfg2.Budgets.WorkerBudgetMS != 1 || cfg2.Budgets.RefreshBudgetMS != 15000 {
+		t.Fatalf("PUT echo: want effective {worker 1 ms, refresh 15000 ms default}, got %+v", cfg2.Budgets)
+	}
+
+	// 3. The NEXT status GET — still deep inside the 1-minute TTL — runs a
+	// REFRESHED rollup under the 1 ms worker budget: alpha times out.
+	resp3 := decodeFleet(t, doFleet(h, withCookie(session)))
+	w := workerEntry(t, resp3, "alpha")
+	if w.Status != fleetWorkerTimeout || w.Detail != "" || w.ObservedAt != nil {
+		t.Fatalf("alpha must be detail-free timeout under the hot-applied 1 ms budget, got %+v", w)
+	}
+	if resp3.Coverage.Complete || resp3.Overall != fleetOverallUnknown {
+		t.Fatalf("timed-out worker forces incomplete/unknown: %+v %s", resp3.Coverage, resp3.Overall)
+	}
+	if n := svc.refreshCount(); n != refreshes+1 {
+		t.Fatalf("time-budget apply must invalidate the rollup generation (%d → %d)", refreshes, n)
+	}
+
+	// 4. The file was persisted with the time budgets (reload agrees).
+	rl, err := loadStatusConfigFile(path)
+	if err != nil {
+		t.Fatalf("reload persisted config: %v", err)
+	}
+	if !reflect.DeepEqual(rl.Budgets, &fleetBudgetsConfig{WorkerBudgetMS: intptr(1)}) {
 		t.Fatalf("persisted budgets differ: %+v", rl.Budgets)
 	}
 }

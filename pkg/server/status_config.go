@@ -12,23 +12,24 @@ package server
 //	{
 //	  "workers":  [{ "id": "build-box", "label": "Primary builder" }],
 //	  "projects": [{ "dir": "/srv/repos/service", "label": "Prod" }],
-//	  "budgets":  { "max_response_bytes": 8388608, "max_cumulative_bytes": 67108864 }  // optional
+//	  "budgets":  { "max_response_bytes": 8388608, "refresh_budget_ms": 20000 }  // optional
 //	}
 //
 // Semantics:
 //   - ids/dirs are the v1 authority; labels are INERT schema room (stored,
 //     echoed by GET, persisted — NOT consumed by the rollup yet).
-//   - budgets is an OPTIONAL top-level block; each of its four fields
+//   - budgets is an OPTIONAL top-level block; each of its six fields
 //     (max_response_bytes, max_cumulative_bytes, max_workers_per_refresh,
-//     max_projects_per_worker) is individually optional and overrides the
-//     default acquisition budgets for the rollup (hot-applied on the next
-//     generation — the holder-generation invalidation covers budgets exactly
-//     like rosters). Present values must be positive integers at or below
-//     sane ceilings (64 MiB / 512 MiB / 4096 / 4096). Time budgets are NOT
-//     configurable. GET echoes the EFFECTIVE budgets (defaults + overrides);
-//     a PUT with an ABSENT budgets block keeps the current file budgets
-//     (merge semantics — the v1 config dialog's {workers, projects} body is
-//     lossless); a PRESENT block replaces wholesale.
+//     max_projects_per_worker, refresh_budget_ms, worker_budget_ms) is
+//     individually optional and overrides the default acquisition budgets
+//     for the rollup (hot-applied on the next generation — the
+//     holder-generation invalidation covers budgets exactly like rosters).
+//     Present values must be positive integers at or below sane ceilings
+//     (64 MiB / 512 MiB / 4096 / 4096 / 120000 ms / 60000 ms). GET echoes
+//     the EFFECTIVE budgets (defaults + overrides); a PUT with an ABSENT
+//     budgets block keeps the current file budgets (merge semantics — the
+//     v1 config dialog's {workers, projects} body is lossless); a PRESENT
+//     block replaces wholesale.
 //   - Reads (startup file load AND PUT body) accept the repo JSONC dialect
 //     (// and /* */ comments, trailing commas) via projectcfg.StripJSONC —
 //     the bounded reuse decision from the brief. Strict decoding
@@ -95,6 +96,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/projectcfg"
 )
@@ -135,24 +137,33 @@ type fleetConfigProject struct {
 //
 // These override the rollup's acquisition budgets (hot-applied on the next
 // generation via the holder generation — the same invalidation the rosters
-// ride): per-response body cap, per-worker cumulative body budget, workers
-// per refresh, projects per worker. Time budgets are NOT configurable here.
+// ride): per-response body cap, per-worker cumulative byte budget, workers
+// per refresh, projects per worker, and the two TIME budgets (refresh =
+// total ctx bound for one refresh; worker = per-worker end-to-end bound
+// including queue wait), both in milliseconds.
 type fleetBudgetsConfig struct {
 	MaxResponseBytes     *int64 `json:"max_response_bytes,omitempty"`
 	MaxCumulativeBytes   *int64 `json:"max_cumulative_bytes,omitempty"`
 	MaxWorkersPerRefresh *int   `json:"max_workers_per_refresh,omitempty"`
 	MaxProjectsPerWorker *int   `json:"max_projects_per_worker,omitempty"`
+	RefreshBudgetMS      *int   `json:"refresh_budget_ms,omitempty"`
+	WorkerBudgetMS       *int   `json:"worker_budget_ms,omitempty"`
 }
 
 // Budget ceilings — a present value must be a positive integer at or below
 // its ceiling (validation names the field and the ceiling). Ceilings stop a
 // typo or a hostile PUT from turning the "compact rollup" into an unbounded
-// one; they are not throughput claims.
+// one; they are not throughput claims. The time ceilings bound the worst
+// case a refresh may wait (2 min total / 1 min per worker) — deliberately
+// tens-of-seconds scale, not minutes-per-worker, because the waiter cap in
+// serve() scales with RefreshBudget.
 const (
 	fleetMaxResponseBytesCeiling   int64 = 64 << 20  // 64 MiB
 	fleetMaxCumulativeBytesCeiling int64 = 512 << 20 // 512 MiB
 	fleetMaxWorkersCeiling               = 4096
 	fleetMaxProjectsCeiling              = 4096
+	fleetMaxRefreshBudgetMS              = 120000 // 2 min total per refresh
+	fleetMaxWorkerBudgetMS               = 60000  // 1 min per worker per refresh
 )
 
 // fleetStatusConfig is the whole document, shared by the file, the PUT body,
@@ -174,6 +185,8 @@ type fleetBudgetsWire struct {
 	MaxCumulativeBytes   int64 `json:"max_cumulative_bytes"`
 	MaxWorkersPerRefresh int   `json:"max_workers_per_refresh"`
 	MaxProjectsPerWorker int   `json:"max_projects_per_worker"`
+	RefreshBudgetMS      int64 `json:"refresh_budget_ms"`
+	WorkerBudgetMS       int64 `json:"worker_budget_ms"`
 }
 
 // effectiveFleetBudgetsWire merges the configured overrides onto the DEFAULT
@@ -185,6 +198,8 @@ func effectiveFleetBudgetsWire(cfg *fleetBudgetsConfig) fleetBudgetsWire {
 		MaxCumulativeBytes:   b.MaxWorkerCumulativeBytes,
 		MaxWorkersPerRefresh: b.MaxWorkersPerRefresh,
 		MaxProjectsPerWorker: b.MaxProjectsPerWorker,
+		RefreshBudgetMS:      b.RefreshBudget.Milliseconds(),
+		WorkerBudgetMS:       b.WorkerBudget.Milliseconds(),
 	}
 }
 
@@ -305,6 +320,22 @@ func validateFleetBudgetsConfig(b *fleetBudgetsConfig) error {
 			return fmt.Errorf("budgets.max_projects_per_worker: %d exceeds the ceiling %d", *v, fleetMaxProjectsCeiling)
 		}
 	}
+	if v := b.RefreshBudgetMS; v != nil {
+		if *v <= 0 {
+			return fmt.Errorf("budgets.refresh_budget_ms: must be a positive integer (milliseconds), got %d", *v)
+		}
+		if *v > fleetMaxRefreshBudgetMS {
+			return fmt.Errorf("budgets.refresh_budget_ms: %d exceeds the ceiling %d (%s)", *v, fleetMaxRefreshBudgetMS, time.Duration(fleetMaxRefreshBudgetMS)*time.Millisecond)
+		}
+	}
+	if v := b.WorkerBudgetMS; v != nil {
+		if *v <= 0 {
+			return fmt.Errorf("budgets.worker_budget_ms: must be a positive integer (milliseconds), got %d", *v)
+		}
+		if *v > fleetMaxWorkerBudgetMS {
+			return fmt.Errorf("budgets.worker_budget_ms: %d exceeds the ceiling %d (%s)", *v, fleetMaxWorkerBudgetMS, time.Duration(fleetMaxWorkerBudgetMS)*time.Millisecond)
+		}
+	}
 	return nil
 }
 
@@ -376,6 +407,14 @@ func cloneFleetBudgetsConfig(b *fleetBudgetsConfig) *fleetBudgetsConfig {
 	if b.MaxProjectsPerWorker != nil {
 		v := *b.MaxProjectsPerWorker
 		out.MaxProjectsPerWorker = &v
+	}
+	if b.RefreshBudgetMS != nil {
+		v := *b.RefreshBudgetMS
+		out.RefreshBudgetMS = &v
+	}
+	if b.WorkerBudgetMS != nil {
+		v := *b.WorkerBudgetMS
+		out.WorkerBudgetMS = &v
 	}
 	return out
 }

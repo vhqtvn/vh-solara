@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -141,6 +142,45 @@ func fleetSnapBody(gate map[string]state.GateFacts) string {
 	return string(b)
 }
 
+// fleetGatesPath mirrors fetchLeanGates's request construction (z first,
+// then one dir param per project in sorted order) so tests key scripted
+// bodies by the EXACT path the rollup fetches.
+func fleetGatesPath(dirs ...string) string {
+	var sb strings.Builder
+	sb.WriteString("/vh/gates?z=1")
+	for _, d := range dirs {
+		sb.WriteString("&dir=" + url.QueryEscape(d))
+	}
+	return sb.String()
+}
+
+// fleetGatesBody builds a lean /vh/gates response body (schema 1, one entry
+// per dir, sorted by dir — the worker's deterministic order). A nil gate map
+// renders as null; use map[string]state.GateFacts{} for an empty project.
+func fleetGatesBody(gates map[string]map[string]state.GateFacts) string {
+	type entry struct {
+		Dir  string                     `json:"dir"`
+		Gate map[string]state.GateFacts `json:"gate"`
+	}
+	dirs := make([]string, 0, len(gates))
+	for d := range gates {
+		dirs = append(dirs, d)
+	}
+	sort.Strings(dirs)
+	entries := make([]entry, 0, len(dirs))
+	for _, d := range dirs {
+		entries = append(entries, entry{Dir: d, Gate: gates[d]})
+	}
+	b, err := json.Marshal(struct {
+		Schema   int     `json:"schema"`
+		Projects []entry `json:"projects"`
+	}{Schema: 1, Projects: entries})
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
 func fleetProjectsBody(dirs ...string) string {
 	type pi struct {
 		Dir string `json:"dir"`
@@ -228,14 +268,14 @@ func TestFleetStatus_RollupPrecedenceAndGauge(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "beta")
 
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("", "/repo"))
-	fake.setBody("alpha", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{
+	fake.setBody("alpha", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{
 		"s1": fleetGF("idle", true, false), // permission pending
 	}))
-	fake.setBody("alpha", "/vh/snapshot?dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{
+	fake.setBody("alpha", "/vh/snapshot?z=1&dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{
 		"s2": fleetGF("busy", false, false),
 	}))
 	fake.setBody("beta", "/vh/projects", fleetProjectsBody(""))
-	fake.setBody("beta", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{
+	fake.setBody("beta", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{
 		"s3": fleetGF("error", false, false),
 		"s4": fleetGF("retry", false, true), // question pending + retry
 	}))
@@ -403,15 +443,15 @@ func TestFleetStatus_HostileWorkerIDNilLink(t *testing.T) {
 	// One linkable condition per worker: permission pending (valid ID),
 	// question pending (/ in ID), session error (# in ID).
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody(""))
-	fake.setBody("alpha", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{
+	fake.setBody("alpha", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{
 		"a": fleetGF("idle", true, false),
 	}))
 	fake.setBody("evil.example.com/x", "/vh/projects", fleetProjectsBody(""))
-	fake.setBody("evil.example.com/x", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{
+	fake.setBody("evil.example.com/x", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{
 		"q1": fleetGF("idle", false, true),
 	}))
 	fake.setBody("beta#evil.example.com", "/vh/projects", fleetProjectsBody(""))
-	fake.setBody("beta#evil.example.com", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{
+	fake.setBody("beta#evil.example.com", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{
 		"e1": fleetGF("error", false, false),
 	}))
 
@@ -441,7 +481,7 @@ func TestFleetStatus_IncompleteCoverageUnknownNeverSilentNominal(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "w1")
 	fleetAddOnline(t, d.Registry, "w2")
 	fake.setBody("w1", "/vh/projects", fleetProjectsBody(""))
-	fake.setBody("w1", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{
+	fake.setBody("w1", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{
 		"a": fleetGF("idle", false, false), // healthy
 	}))
 	fake.setErr("w2", &FetchTimeoutError{WorkerID: "w2", Stage: "read body", Cause: errors.New("i/o deadline reached")})
@@ -524,7 +564,7 @@ func TestFleetStatus_OfflineNoFanout(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "dead")
 	d.Registry.MarkWorkerOffline("dead") // closes transport, Status=offline, bumps gen
 	fake.setBody("live", "/vh/projects", fleetProjectsBody(""))
-	fake.setBody("live", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("live", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{}))
 
 	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
 	if n := fake.count("dead"); n != 0 {
@@ -564,7 +604,7 @@ func TestFleetStatus_RosterExpectedMode(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "alpha")
 	fleetAddOnline(t, d.Registry, "gamma") // registered but NOT in roster
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody(""))
-	fake.setBody("alpha", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("alpha", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{}))
 
 	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
 	if resp.Coverage.Mode != "expected" || !resp.Coverage.InventoryKnown {
@@ -613,7 +653,7 @@ func TestFleetStatus_ProjectRosterScopesAcquisition(t *testing.T) {
 	// Discovery reports the unconfigured "" project AND "/repo"; only the
 	// /repo snapshot is scripted (the bare /vh/snapshot would fail the fake).
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("", "/repo"))
-	fake.setBody("alpha", "/vh/snapshot?dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{
+	fake.setBody("alpha", "/vh/snapshot?z=1&dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{
 		"r1": fleetGF("busy", false, false), // the ONLY session that may count
 	}))
 
@@ -621,8 +661,8 @@ func TestFleetStatus_ProjectRosterScopesAcquisition(t *testing.T) {
 	if w := workerEntry(t, resp, "alpha"); w.Status != fleetWorkerOK {
 		t.Fatalf("alpha: want ok (unconfigured dir must not be fetched), got %+v", w)
 	}
-	if n := fake.count("alpha"); n != 2 {
-		t.Fatalf("acquisition must be discovery + exactly ONE in-scope snapshot, got %d calls", n)
+	if n := fake.count("alpha"); n != 3 {
+		t.Fatalf("acquisition must be discovery + one failed lean attempt (no /vh/gates body scripted) + exactly ONE in-scope snapshot, got %d calls", n)
 	}
 	if resp.Coverage.ProjectScope != "expected" || resp.Coverage.RequiredProjects != 2 || resp.Coverage.ObservedProjects != 1 || resp.Coverage.UnknownProjects != 1 {
 		t.Fatalf("project coverage: want expected 2/1/1 (\"  /repo \" and \"/repo\" are distinct dirs; only \"/repo\" is instantiated), got %+v", resp.Coverage)
@@ -651,14 +691,14 @@ func TestFleetStatus_ProjectRosterScopesAcquisition(t *testing.T) {
 // whitespace on both sides (" /repo") matches verbatim — in scope, fetched,
 // satisfied.
 func TestFleetStatus_ProjectRosterVerbatimMatch(t *testing.T) {
-	snapPath := "/vh/snapshot?dir=" + url.QueryEscape(" /repo")
+	snapPath := "/vh/snapshot?z=1&dir=" + url.QueryEscape(" /repo")
 
 	// (i) whitespace-bearing configured dir vs whitespace-free worker dir.
 	d, fake := newFleetTestDaemon(t, "")
 	applyFleetRosters(t, d, nil, []string{" /repo"})
 	fleetAddOnline(t, d.Registry, "alpha")
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/repo"))
-	// No "/vh/snapshot?dir=%2Frepo" body is scripted: fetching it would be
+	// No "/vh/snapshot?z=1&dir=%2Frepo" body is scripted: fetching it would be
 	// the trim bug (the fake errors on unexpected fetches).
 
 	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
@@ -691,8 +731,8 @@ func TestFleetStatus_ProjectRosterVerbatimMatch(t *testing.T) {
 	if w := workerEntry(t, resp2, "alpha"); w.Status != fleetWorkerOK {
 		t.Fatalf("(ii) alpha: want ok, got %+v", w)
 	}
-	if n := fake2.count("alpha"); n != 2 {
-		t.Fatalf("(ii) acquisition calls: want discovery + the one verbatim-matched snapshot, got %d", n)
+	if n := fake2.count("alpha"); n != 3 {
+		t.Fatalf("(ii) acquisition calls: want discovery + failed lean attempt + the one verbatim-matched snapshot, got %d", n)
 	}
 	if resp2.Coverage.RequiredProjects != 1 || resp2.Coverage.ObservedProjects != 1 || resp2.Coverage.UnknownProjects != 0 {
 		t.Fatalf("(ii) project coverage: want 1/1/0 (verbatim match works both ways), got %+v", resp2.Coverage)
@@ -715,7 +755,7 @@ func TestFleetStatus_ProjectMissingCondition(t *testing.T) {
 	applyFleetRosters(t, d, nil, []string{"/missing", "/hosted"}) // sorted → [/hosted /missing]
 	fleetAddOnline(t, d.Registry, "alpha")
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/hosted"))
-	fake.setBody("alpha", "/vh/snapshot?dir=%2Fhosted", fleetSnapBody(map[string]state.GateFacts{
+	fake.setBody("alpha", "/vh/snapshot?z=1&dir=%2Fhosted", fleetSnapBody(map[string]state.GateFacts{
 		"s1": fleetGF("idle", false, false), // healthy: no session-tier conditions
 	}))
 
@@ -756,10 +796,10 @@ func TestFleetStatus_ProjectFleetWideSatisfaction(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "alpha")
 	fleetAddOnline(t, d.Registry, "beta")
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/shared"))
-	fake.setBody("alpha", "/vh/snapshot?dir=%2Fshared", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("alpha", "/vh/snapshot?z=1&dir=%2Fshared", fleetSnapBody(map[string]state.GateFacts{}))
 	fake.setBody("beta", "/vh/projects", fleetProjectsBody("/shared", "/only-beta"))
-	fake.setBody("beta", "/vh/snapshot?dir=%2Fshared", fleetSnapBody(map[string]state.GateFacts{}))
-	fake.setBody("beta", "/vh/snapshot?dir=%2Fonly-beta", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("beta", "/vh/snapshot?z=1&dir=%2Fshared", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("beta", "/vh/snapshot?z=1&dir=%2Fonly-beta", fleetSnapBody(map[string]state.GateFacts{}))
 
 	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
 	if resp.Coverage.ObservedProjects != 2 || resp.Coverage.RequiredProjects != 2 || resp.Coverage.UnknownProjects != 0 {
@@ -829,7 +869,7 @@ func TestFleetStatus_EmptyProjectRosterDiscoveredScope(t *testing.T) {
 	applyFleetRosters(t, d, []string{"alpha"}, nil) // worker-expected mode…
 	fleetAddOnline(t, d.Registry, "alpha")
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/any"))
-	fake.setBody("alpha", "/vh/snapshot?dir=%2Fany", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("alpha", "/vh/snapshot?z=1&dir=%2Fany", fleetSnapBody(map[string]state.GateFacts{}))
 
 	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
 	if resp.Coverage.Mode != "expected" || resp.Coverage.ProjectScope != "instantiated" {
@@ -860,7 +900,7 @@ func TestFleetStatus_ProjectMissingConditionOrder(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "dead")
 	d.Registry.MarkWorkerOffline("dead") // ⇒ worker_down
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/alpha-proj"))
-	fake.setBody("alpha", "/vh/snapshot?dir=%2Falpha-proj", fleetSnapBody(map[string]state.GateFacts{
+	fake.setBody("alpha", "/vh/snapshot?z=1&dir=%2Falpha-proj", fleetSnapBody(map[string]state.GateFacts{
 		"s1": fleetGF("idle", true, false),   // permission_pending
 		"s2": fleetGF("idle", false, true),   // question_pending
 		"s3": fleetGF("error", false, false), // session_error
@@ -942,10 +982,14 @@ func TestFleetStatus_AcquisitionClassification(t *testing.T) {
 // Budget defaults + limited/error detail (workers[].detail)
 // ---------------------------------------------------------------------------
 
-// TestFleetStatus_DefaultBudgetsRealFleetScale pins the Part-A defaults the
-// operator's real fleet forced (1 worker / 7 real dev projects tripped the
-// fixture-sized 1/8 MiB caps into status:"limited", observed_projects:0) —
-// and that the time budgets stay untouched by that retune.
+// TestFleetStatus_DefaultBudgetsRealFleetScale pins the WAN-scale defaults:
+// the byte/count retune the operator's real fleet forced (1 worker / 7 real
+// dev projects tripped the fixture-sized 1/8 MiB caps into status:"limited",
+// observed_projects:0) PLUS the WAN time retune (the original 3 s/2 s
+// budgets timed the same fleet's acquisition out at ~3/7 projects over an
+// ~83 ms RTT tunnel — ~5.9 MB of sequential snapshots cannot fit 2 s; the
+// lean /vh/gates path typically needs well under 1 s, and these budgets
+// bound its worst case with headroom for larger rosters and slower links).
 func TestFleetStatus_DefaultBudgetsRealFleetScale(t *testing.T) {
 	b := defaultFleetBudgets()
 	if b.MaxResponseBodyBytes != 4<<20 {
@@ -957,31 +1001,35 @@ func TestFleetStatus_DefaultBudgetsRealFleetScale(t *testing.T) {
 	if b.MaxWorkersPerRefresh != 128 || b.MaxProjectsPerWorker != 64 {
 		t.Errorf("count caps: want 128 workers / 64 projects, got %d/%d", b.MaxWorkersPerRefresh, b.MaxProjectsPerWorker)
 	}
-	if b.TTL != 5*time.Second || b.RefreshBudget != 3*time.Second || b.WorkerBudget != 2*time.Second {
-		t.Errorf("time budgets must stay untouched: %+v", b)
+	if b.TTL != 5*time.Second {
+		t.Errorf("TTL: want 5s (daemon-owned, unchanged), got %v", b.TTL)
+	}
+	if b.RefreshBudget != 15*time.Second || b.WorkerBudget != 10*time.Second {
+		t.Errorf("time budgets: want WAN-scale 15s refresh / 10s worker, got %v/%v", b.RefreshBudget, b.WorkerBudget)
 	}
 }
 
 // TestFleetStatus_LimitedDetailResponseCap pins the per-response cap detail:
-// a snapshot body over the cap must name the ACTUAL sizes (recovered from
-// the transport error pair), the cap, and the fetch path — on both the
+// a snapshot body over the cap must name the ACTUAL sizes (read STRUCTURED
+// from the transport's FetchResponseTooLargeError via errors.As — the
+// a-F2/d-F3 text scan is retired), the cap, and the fetch path — on both the
 // discovery path and a project snapshot path — and degrade honestly (cap +
-// path, no fabricated size) when the error text carries no parseable pair.
+// path, no fabricated size) when the seam error carries no structured pair.
 func TestFleetStatus_LimitedDetailResponseCap(t *testing.T) {
 	d, fake := newFleetTestDaemon(t, "")
 	fleetAddOnline(t, d.Registry, "big")
 	fleetAddOnline(t, d.Registry, "odd")
 	fake.setBody("odd", "/vh/projects", fleetProjectsBody(""))
-	// odd's seam error carries the sentinel but no byte pair → fallback.
+	// odd's seam error carries the sentinel but no structured pair → fallback.
 	fake.setErr("odd", fmt.Errorf("worker odd: %w", ErrFetchResponseBodyTooLarge))
 	// big trips on the SNAPSHOT path (discovery succeeds), with the
-	// production wrap shape (status_transport.go): "worker X: …(N > M bytes)".
+	// production structured error (status_transport.go FetchResponseTooLargeError).
 	d.fetchWorkerJSON = func(ctx context.Context, workerID, path string, timeout time.Duration, maxBody int64) ([]byte, error) {
 		if workerID == "big" {
 			if path == "/vh/projects" {
 				return []byte(fleetProjectsBody("/deep-fake-detection")), nil
 			}
-			return nil, fmt.Errorf("worker big: %w (%d > %d bytes)", ErrFetchResponseBodyTooLarge, 5452595, 4194304)
+			return nil, &FetchResponseTooLargeError{WorkerID: "big", Got: 5452595, Cap: 4194304}
 		}
 		return fake.fetch(ctx, workerID, path, timeout, maxBody)
 	}
@@ -992,7 +1040,7 @@ func TestFleetStatus_LimitedDetailResponseCap(t *testing.T) {
 	if w.Status != fleetWorkerLimited {
 		t.Fatalf("big: want limited, got %+v", w)
 	}
-	want := "response 5.2 MiB > 4 MiB cap (/vh/snapshot?dir=%2Fdeep-fake-detection)"
+	want := "response 5.2 MiB > 4 MiB cap (/vh/snapshot?z=1&dir=%2Fdeep-fake-detection)"
 	if w.Detail != want {
 		t.Fatalf("big detail: want %q, got %q", want, w.Detail)
 	}
@@ -1026,7 +1074,7 @@ func TestFleetStatus_LimitedDetailCumulative(t *testing.T) {
 	discovery := `[{"dir":"/a"},{"dir":"/b"}]`
 	snapA := `{"gate":{"s1":{"activity":"error"}}}`
 	fake.setBody("w1", "/vh/projects", discovery)
-	fake.setBody("w1", "/vh/snapshot?dir=%2Fa", snapA)
+	fake.setBody("w1", "/vh/snapshot?z=1&dir=%2Fa", snapA)
 	svc := d.fleetStatusService()
 	svc.budgets.MaxWorkerCumulativeBytes = 38
 
@@ -1053,7 +1101,7 @@ func TestFleetStatus_LimitedDetailCumulative(t *testing.T) {
 	d2, fake2 := newFleetTestDaemon(t, "")
 	fleetAddOnline(t, d2.Registry, "w2")
 	fake2.setBody("w2", "/vh/projects", `[{"dir":"`+long+`"}]`)
-	fake2.setBody("w2", "/vh/snapshot?dir="+long, `{"gate":{}}`)
+	fake2.setBody("w2", "/vh/snapshot?z=1&dir="+long, `{"gate":{}}`)
 	d2.fleetStatusService().budgets.MaxWorkerCumulativeBytes = 1
 	resp2 := decodeFleet(t, doFleet(d2.buildRootHandler()))
 	w2 := workerEntry(t, resp2, "w2")
@@ -1076,7 +1124,7 @@ func TestFleetStatus_LimitedDetailProjectCap(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "many")
 	for _, dir := range []string{"/p1", "/p2", "/p3"} {
 		fake.setBody("many", "/vh/projects", fleetProjectsBody("/p1", "/p2", "/p3"))
-		fake.setBody("many", "/vh/snapshot?dir="+url.QueryEscape(dir), fleetSnapBody(map[string]state.GateFacts{
+		fake.setBody("many", "/vh/snapshot?z=1&dir="+url.QueryEscape(dir), fleetSnapBody(map[string]state.GateFacts{
 			"s": fleetGF("error", false, false),
 		}))
 	}
@@ -1097,8 +1145,8 @@ func TestFleetStatus_LimitedDetailProjectCap(t *testing.T) {
 	if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondSessionError || resp.Conditions[0].Count != 2 {
 		t.Fatalf("in-cap projects must still contribute: %v", resp.Conditions)
 	}
-	if n := fake.count("many"); n != 3 { // discovery + 2 snapshots
-		t.Fatalf("acquisition calls: want discovery + exactly 2 snapshots, got %d", n)
+	if n := fake.count("many"); n != 4 { // discovery + failed lean attempt + 2 snapshots
+		t.Fatalf("acquisition calls: want discovery + failed lean attempt + exactly 2 snapshots, got %d", n)
 	}
 }
 
@@ -1112,7 +1160,7 @@ func TestFleetStatus_WorkerCapDetail(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "beta")
 	for _, id := range []string{"alpha", "beta"} {
 		fake.setBody(id, "/vh/projects", fleetProjectsBody(""))
-		fake.setBody(id, "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{}))
+		fake.setBody(id, "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{}))
 	}
 	d.fleetStatusService().budgets.MaxWorkersPerRefresh = 1
 
@@ -1143,14 +1191,14 @@ func TestFleetStatus_ErrorDetails(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "http502")
 	fake.setBody("badjson", "/vh/projects", `{not json`)
 	fake.setBody("badsnap", "/vh/projects", fleetProjectsBody("/dir"))
-	fake.setBody("badsnap", "/vh/snapshot?dir=%2Fdir", `{"gate":`)
+	fake.setBody("badsnap", "/vh/snapshot?z=1&dir=%2Fdir", `{"gate":`)
 	fake.setErr("http502", fmt.Errorf("worker http502: HTTP 502"))
 
 	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
 	if w := workerEntry(t, resp, "badjson"); w.Status != fleetWorkerError || w.Detail != "malformed response (/vh/projects)" {
 		t.Fatalf("badjson: want error + malformed detail, got %+v", w)
 	}
-	if w := workerEntry(t, resp, "badsnap"); w.Status != fleetWorkerError || w.Detail != "malformed response (/vh/snapshot?dir=%2Fdir)" {
+	if w := workerEntry(t, resp, "badsnap"); w.Status != fleetWorkerError || w.Detail != "malformed response (/vh/snapshot?z=1&dir=%2Fdir)" {
 		t.Fatalf("badsnap: want error + malformed detail, got %+v", w)
 	}
 	w := workerEntry(t, resp, "http502")
@@ -1174,7 +1222,7 @@ func TestFleetStatus_DetailAbsentOutsideLimitedOrError(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "wto")
 	d.Registry.MarkWorkerOffline("dead")
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody(""))
-	fake.setBody("alpha", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("alpha", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{}))
 	fake.setErr("wto", &FetchTimeoutError{WorkerID: "wto", Stage: "read body", Cause: errors.New("i/o timeout")})
 
 	rec := doFleet(d.buildRootHandler())
@@ -1222,7 +1270,7 @@ func TestFleetStatus_ETagStableWithinGeneration(t *testing.T) {
 	d, fake := newFleetTestDaemon(t, "")
 	fleetAddOnline(t, d.Registry, "w1")
 	fake.setBody("w1", "/vh/projects", fleetProjectsBody(""))
-	fake.setBody("w1", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("w1", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{}))
 	h := d.buildRootHandler()
 
 	rec1 := doFleet(h)
@@ -1268,7 +1316,7 @@ func TestFleetStatus_LivenessInvalidationNoStale304(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "w2")
 	for _, id := range []string{"w1", "w2"} {
 		fake.setBody(id, "/vh/projects", fleetProjectsBody(""))
-		fake.setBody(id, "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{}))
+		fake.setBody(id, "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{}))
 	}
 	h := d.buildRootHandler()
 
@@ -1478,7 +1526,7 @@ func TestHostInterceptorFleetStatusRoutePrecedence(t *testing.T) {
 	// request (the proxy path would 502 before any fetcher call).
 	fleetAddOnline(t, d.Registry, "live")
 	fake.setBody("live", "/vh/projects", fleetProjectsBody(""))
-	fake.setBody("live", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("live", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{}))
 
 	h := d.buildRootHandler()
 	session := loginPassphrase(t, h, "secret")
@@ -1526,7 +1574,7 @@ func TestFleetStatus_SinceContinuity(t *testing.T) {
 	fake.setBody("w1", "/vh/projects", fleetProjectsBody(""))
 	pending := fleetSnapBody(map[string]state.GateFacts{"s1": fleetGF("idle", true, false)})
 	cleared := fleetSnapBody(map[string]state.GateFacts{"s1": fleetGF("idle", false, false)})
-	fake.setBody("w1", "/vh/snapshot", pending)
+	fake.setBody("w1", "/vh/snapshot?z=1", pending)
 
 	svc := d.fleetStatusService()
 	snap := d.statusCfg.snapshot()
@@ -1545,13 +1593,13 @@ func TestFleetStatus_SinceContinuity(t *testing.T) {
 		t.Fatalf("gen2 (continuous): since must persist, got %s", got)
 	}
 
-	fake.setBody("w1", "/vh/snapshot", cleared)
+	fake.setBody("w1", "/vh/snapshot?z=1", cleared)
 	r3, _ := svc.buildRollup(t0.Add(6*time.Second), snap)
 	if len(r3.Conditions) != 0 {
 		t.Fatalf("gen3 (condition gone): want no conditions, got %+v", r3.Conditions)
 	}
 
-	fake.setBody("w1", "/vh/snapshot", pending)
+	fake.setBody("w1", "/vh/snapshot?z=1", pending)
 	r4, _ := svc.buildRollup(t0.Add(9*time.Second), snap)
 	if got := *r4.Conditions[0].Since; got != "2026-09-26T10:00:09Z" {
 		t.Fatalf("gen4 (reappeared): since must RESET to the new birth time, got %s", got)
@@ -1595,5 +1643,228 @@ func TestFleetSummaryLengthCap(t *testing.T) {
 		if n := len([]rune(got)); n > 30 {
 			t.Errorf("fleetSummary(%v,%q,%d) = %q exceeds 30 code points (%d)", c.complete, c.kind, c.count, got, n)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Lean /vh/gates acquisition (WAN-scale fast path) + deterministic fallback
+// ---------------------------------------------------------------------------
+
+// wanDirs is the operator's real 7-project roster shape (sizes from the
+// settled diagnosis: ~5.9 MB of raw snapshots over an ~83 ms RTT tunnel).
+var wanDirs = []string{
+	"/srv/deep-fake-detection",
+	"/srv/vh-agent-harness",
+	"/srv/vh-solara",
+	"/srv/vh-video-maker",
+	"/srv/workers-a",
+	"/srv/workers-b",
+	"/srv/workers-c",
+}
+
+// TestFleetStatus_LeanGatesWANScaleWithinBudget is the WAN crux: with the
+// OLD per-worker budget (2 s — the value the operator's fleet timed out
+// under) and a per-fetch WAN-scale delay, the lean path (discovery + ONE
+// batched /vh/gates fetch) completes 7/7 projects ok, while a worker
+// WITHOUT the lean endpoint (the fallback's s+1 sequential snapshots) times
+// out mid-roster — the exact before/after contrast this slice exists for.
+func TestFleetStatus_LeanGatesWANScaleWithinBudget(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	applyFleetRosters(t, d, []string{"lean", "legacy"}, wanDirs)
+	fleetAddOnline(t, d.Registry, "lean")
+	fleetAddOnline(t, d.Registry, "legacy")
+
+	// A WAN-paced seam: every fetch costs 250 ms of wall clock (RTT +
+	// payload). The fake still exact-path-keys bodies, so an unexpected
+	// fetch (e.g. a snapshot against the lean worker) fails loudly.
+	const pace = 250 * time.Millisecond
+	delay := func(ctx context.Context, workerID, path string, timeout time.Duration, maxBody int64) ([]byte, error) {
+		select {
+		case <-time.After(pace):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return fake.fetch(ctx, workerID, path, timeout, maxBody)
+	}
+	d.fetchWorkerJSON = delay
+
+	// lean worker: discovery + ONE lean response covering all 7 dirs.
+	dirs := append([]string(nil), wanDirs...)
+	sort.Strings(dirs)
+	fake.setBody("lean", "/vh/projects", fleetProjectsBody(dirs...))
+	fake.setBody("lean", fleetGatesPath(dirs...), fleetGatesBody(map[string]map[string]state.GateFacts{
+		"/srv/deep-fake-detection": {
+			"s-perm": fleetGF("idle", true, false),  // permission pending
+			"s-idle": fleetGF("idle", false, false), // healthy
+		},
+		"/srv/vh-solara":        {"s-busy": fleetGF("busy", false, false)},
+		"/srv/vh-agent-harness": {"s-err": fleetGF("error", false, false)},
+		"/srv/vh-video-maker":   {"s-retry": fleetGF("retry", false, false)},
+		"/srv/workers-a":        {},
+		"/srv/workers-b":        {},
+		"/srv/workers-c":        {},
+	}))
+
+	// legacy worker (no lean endpoint): discovery + 7 snapshot bodies.
+	fake.setBody("legacy", "/vh/projects", fleetProjectsBody(dirs...))
+	for _, dir := range dirs {
+		fake.setBody("legacy", "/vh/snapshot?z=1&dir="+url.QueryEscape(dir), fleetSnapBody(map[string]state.GateFacts{}))
+	}
+
+	// Pin the OLD per-worker budget — the one the operator's fleet died
+	// under. Lean needs 2×pace = 500 ms ≪ 2 s; the fallback needs 8×pace
+	// = 2 s and trips the budget mid-roster (the observed 2/7 failure).
+	svc := d.fleetStatusService()
+	svc.budgets.WorkerBudget = 2 * time.Second
+	svc.budgets.RefreshBudget = 15 * time.Second
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	w := workerEntry(t, resp, "lean")
+	if w.Status != fleetWorkerOK || w.ObservedAt == nil {
+		t.Fatalf("lean worker: want ok + observed_at within the 2s budget, got %+v", w)
+	}
+	if n := fake.count("lean"); n != 2 {
+		t.Fatalf("lean acquisition must be exactly discovery + ONE gates fetch, got %d calls", n)
+	}
+	// All 7 configured dirs observed fleet-wide (from the lean worker
+	// alone), gate-driven conditions intact.
+	if resp.Coverage.RequiredProjects != 7 || resp.Coverage.ObservedProjects != 7 || resp.Coverage.UnknownProjects != 0 {
+		t.Fatalf("project coverage: want 7/7/0, got %+v", resp.Coverage)
+	}
+	kinds := map[string]int{}
+	for _, c := range resp.Conditions {
+		kinds[c.Kind] = c.Count
+	}
+	if kinds[fleetCondPermissionPending] != 1 || kinds[fleetCondSessionError] != 1 || kinds[fleetCondSessionRetry] != 1 {
+		t.Fatalf("gate-driven conditions: want perm=1 err=1 retry=1, got %v (conditions %+v)", kinds, resp.Conditions)
+	}
+	// The legacy worker timed out mid-roster under the SAME budget — the
+	// fallback path cannot fit it (the before picture).
+	lw := workerEntry(t, resp, "legacy")
+	if lw.Status != fleetWorkerTimeout || lw.Detail != "" {
+		t.Fatalf("legacy worker: want detail-free timeout under the 2s budget, got %+v", lw)
+	}
+	if resp.Coverage.Complete || resp.Overall != fleetOverallUnknown {
+		t.Fatalf("legacy timeout must force incomplete/unknown: %+v %s", resp.Coverage, resp.Overall)
+	}
+}
+
+// TestFleetStatus_LeanUnsupportedFallsBackToSnapshots pins the version-skew
+// contract: a worker whose lean endpoint 404s (an OLD worker during rollout)
+// is acquired through today's per-project snapshot path UNCHANGED — the
+// rollup is identical to a pure-legacy run, including the
+// partial-observation semantics (a mid-roster cap trip keeps the projects
+// already observed).
+func TestFleetStatus_LeanUnsupportedFallsBackToSnapshots(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	applyFleetRosters(t, d, []string{"old"}, []string{"/a", "/b"})
+	fleetAddOnline(t, d.Registry, "old")
+
+	gatesAttempts := 0
+	d.fetchWorkerJSON = func(ctx context.Context, workerID, path string, timeout time.Duration, maxBody int64) ([]byte, error) {
+		if strings.HasPrefix(path, "/vh/gates") {
+			gatesAttempts++
+			// The production transport renders a non-2xx exactly like this.
+			return nil, fmt.Errorf("worker old: HTTP 404")
+		}
+		// /b trips the per-response cap MID-ROSTER — after /a's observation
+		// landed (the partial-observation pin below reads /a's session).
+		if path == "/vh/snapshot?z=1&dir=%2Fb" {
+			return nil, &FetchResponseTooLargeError{WorkerID: "old", Got: 4194305, Cap: 4194304}
+		}
+		return fake.fetch(ctx, workerID, path, timeout, maxBody)
+	}
+	fake.setBody("old", "/vh/projects", fleetProjectsBody("/a", "/b"))
+	fake.setBody("old", "/vh/snapshot?z=1&dir=%2Fa", fleetSnapBody(map[string]state.GateFacts{
+		"s1": fleetGF("error", false, false),
+	}))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	if gatesAttempts != 1 {
+		t.Fatalf("lean endpoint must be attempted exactly once per refresh, got %d", gatesAttempts)
+	}
+	w := workerEntry(t, resp, "old")
+	if w.Status != fleetWorkerLimited {
+		t.Fatalf("old worker: want limited (the /b cap trip), got %+v", w)
+	}
+	if want := "response 4.0 MiB > 4 MiB cap (/vh/snapshot?z=1&dir=%2Fb)"; w.Detail != want {
+		t.Fatalf("fallback detail: want %q, got %q", want, w.Detail)
+	}
+	// Partial-observation semantics pinned THROUGH the fallback: /a's
+	// observation (fetched before the failure) still fires its condition.
+	if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondSessionError || resp.Conditions[0].Count != 1 {
+		t.Fatalf("partial observation must survive the fallback: %v", resp.Conditions)
+	}
+	if resp.Coverage.ObservedProjects != 1 || resp.Coverage.UnknownProjects != 1 {
+		t.Fatalf("project coverage: want 1 observed / 1 unknown, got %+v", resp.Coverage)
+	}
+}
+
+// TestFleetStatus_LeanMalformedFallsBack: every malformed / unexpected-shape
+// lean body routes to the snapshot fallback (never a worker error from the
+// lean attempt itself), and the fallback then serves the worker ok.
+func TestFleetStatus_LeanMalformedFallsBack(t *testing.T) {
+	for name, body := range map[string]string{
+		"not json":            `{not json`,
+		"wrong schema":        `{"schema":2,"projects":[]}`,
+		"schema absent":       `{"projects":[]}`,
+		"projects null":       `{"schema":1}`,
+		"projects wrong kind": `[]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			d, fake := newFleetTestDaemon(t, "")
+			applyFleetRosters(t, d, []string{"w"}, []string{"/a"})
+			fleetAddOnline(t, d.Registry, "w")
+			fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+			fake.setBody("w", fleetGatesPath("/a"), body)
+			fake.setBody("w", "/vh/snapshot?z=1&dir=%2Fa", fleetSnapBody(map[string]state.GateFacts{
+				"s1": fleetGF("idle", true, false),
+			}))
+
+			resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+			if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
+				t.Fatalf("malformed lean (%s) must fall back to snapshots and end ok, got %+v", name, w)
+			}
+			if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondPermissionPending {
+				t.Fatalf("fallback observation must drive conditions, got %v", got)
+			}
+			if n := fake.count("w"); n != 3 {
+				t.Fatalf("calls: want discovery + failed lean + 1 snapshot, got %d", n)
+			}
+		})
+	}
+}
+
+// TestFleetStatus_LeanOmittedDirObservedEmpty pins the omission semantics: a
+// requested dir the worker's lean response omits (project closed between
+// discovery and gates, or a worker bug) observes as an EMPTY gate — the same
+// value the snapshot fallback would return for a vanished dir — so
+// observed_projects stays identical across the two acquisition paths and
+// absence is never fabricated as project_missing from a stale lean race.
+func TestFleetStatus_LeanOmittedDirObservedEmpty(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	applyFleetRosters(t, d, []string{"w"}, []string{"/a", "/vanished"})
+	fleetAddOnline(t, d.Registry, "w")
+	fake.setBody("w", "/vh/projects", fleetProjectsBody("/a", "/vanished"))
+	// The lean response carries ONLY /a — /vanished is omitted.
+	fake.setBody("w", fleetGatesPath("/a", "/vanished"), fleetGatesBody(map[string]map[string]state.GateFacts{
+		"/a": {"s1": fleetGF("busy", false, false)},
+	}))
+	// No snapshot bodies are scripted: any fallback fetch fails the fake.
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
+		t.Fatalf("worker: want ok via the lean path alone, got %+v", w)
+	}
+	if n := fake.count("w"); n != 2 {
+		t.Fatalf("calls: want discovery + lean only, got %d", n)
+	}
+	if resp.Coverage.ObservedProjects != 2 || resp.Coverage.UnknownProjects != 0 {
+		t.Fatalf("omitted dir must still count observed (empty gate), got %+v", resp.Coverage)
+	}
+	// Only /a's session counts; /vanished contributes an empty gate (0
+	// sessions) — gauge 1/1 busy over complete coverage.
+	if !resp.Gauge.Available || resp.Gauge.Label != "1/1 busy" {
+		t.Fatalf("gauge: want available 1/1 busy, got %+v", resp.Gauge)
 	}
 }

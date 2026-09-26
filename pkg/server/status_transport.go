@@ -36,12 +36,16 @@ package server
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -51,8 +55,31 @@ import (
 
 // ErrFetchResponseBodyTooLarge is returned when the worker's response body
 // exceeds the caller's byte cap. Detected by reading cap+1 bytes (explicit
-// excess detection) — never by silently truncating at the cap.
+// excess detection) — never by silently truncating at the cap. For gzip64
+// envelope responses the cap counts DECODED bytes (the size the caller
+// actually consumes); the structured FetchResponseTooLargeError says which
+// bytes its Got measures.
 var ErrFetchResponseBodyTooLarge = errors.New("response body exceeds cap")
+
+// FetchResponseTooLargeError is the structured form of a per-response
+// body-cap trip: it carries the measured (Got, Cap) byte pair so callers
+// read the numbers via errors.As instead of parsing the error TEXT (the
+// retired a-F2/d-F3 text-scan, fleetParseOversizePair). Got is the size the
+// cap governs — the raw body length for plain responses, the DECODED length
+// for gzip64 envelopes. Like the plain wrap it satisfies
+// errors.Is(err, ErrFetchResponseBodyTooLarge) via Unwrap.
+type FetchResponseTooLargeError struct {
+	WorkerID string
+	Got      int64
+	Cap      int64
+}
+
+func (e *FetchResponseTooLargeError) Error() string {
+	// %s, not %w: Sprintf cannot wrap; errors.Is/As travel via Unwrap.
+	return fmt.Sprintf("worker %s: %s (%d > %d bytes)", e.WorkerID, ErrFetchResponseBodyTooLarge, e.Got, e.Cap)
+}
+
+func (e *FetchResponseTooLargeError) Unwrap() error { return ErrFetchResponseBodyTooLarge }
 
 // FetchTimeoutError marks a bounded-fetch failure caused by a deadline
 // firing at a specific stage (stream open, handshake, response head, body).
@@ -226,10 +253,27 @@ func (p *Proxy) FetchWorkerJSONBounded(ctx context.Context, worker *Worker, path
 	}
 
 	// --- Stage 3: bounded HTTP exchange ---------------------------------
+	// gzip64 opt-in: the worker serves /vh/snapshot and /vh/gates bodies as
+	// {"encoding":"gzip64","data":"<base64(gzip(json))>"} when the request
+	// carries z=1 AND the payload clears the worker-side threshold (the same
+	// wantsCompress opt-in the SPA uses). The envelope is self-describing,
+	// but this helper only DECODES when the request opted in — a worker that
+	// envelopes unasked gets its bytes passed through raw (the JSON caller
+	// then reports them honestly as malformed).
+	gzip64 := fetchWantsGzip64(path)
+
 	// The wire cap bounds TOTAL bytes read from the stream for the whole
 	// exchange (head + framing + body): a fast-sending peer cannot push
-	// unbounded header/body bytes inside the deadline window.
-	wire := &budgetReader{r: stream.Raw(), budget: fetchHeadWireBudget + maxBodyBytes + 1}
+	// unbounded header/body bytes inside the deadline window. With the
+	// gzip64 opt-in the body may be an envelope: base64 inflates the gzip
+	// stream by up to 4/3 over the decoded size, so the wire body budget
+	// admits that overhead — an envelope whose DECODED size is within the
+	// cap must never be rejected on wire size.
+	bodyWireCap := maxBodyBytes
+	if gzip64 {
+		bodyWireCap = maxBodyBytes + maxBodyBytes/3 + gzip64WireSlack
+	}
+	wire := &budgetReader{r: stream.Raw(), budget: fetchHeadWireBudget + bodyWireCap + 1}
 	br := bufio.NewReaderSize(wire, 16<<10)
 
 	req := "GET " + path + " HTTP/1.1\r\nHost: " + worker.ID + "\r\nConnection: close\r\n\r\n"
@@ -247,12 +291,29 @@ func (p *Proxy) FetchWorkerJSONBounded(ctx context.Context, worker *Worker, path
 	}
 
 	// --- Stage 4: body with cap-plus-one excess detection ---------------
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+	// Plain responses: the cap governs the raw body bytes (read cap+1,
+	// reject past the cap — explicit excess detection, never truncation).
+	// gzip64 envelopes (only when the request opted in): the cap governs the
+	// DECODED bytes — the wire envelope (already bounded above) is decoded
+	// through a cap+1 output limit, so a decompression-bomb envelope costs
+	// at most cap+1 bytes of allocation and an oversize payload is rejected
+	// with the DECODED (got, cap) pair.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, bodyWireCap+1))
 	if err != nil {
 		return nil, fetchStageErr(worker.ID, "read body", err)
 	}
+	if gzip64 && isGzip64Envelope(body) {
+		decoded, err := decodeGzip64Body(body, maxBodyBytes+1)
+		if err != nil {
+			return nil, fetchStageErr(worker.ID, "decode gzip64 body", err)
+		}
+		if int64(len(decoded)) > maxBodyBytes {
+			return nil, &FetchResponseTooLargeError{WorkerID: worker.ID, Got: int64(len(decoded)), Cap: maxBodyBytes}
+		}
+		return decoded, nil
+	}
 	if int64(len(body)) > maxBodyBytes {
-		return nil, fmt.Errorf("worker %s: %w (%d > %d bytes)", worker.ID, ErrFetchResponseBodyTooLarge, len(body), maxBodyBytes)
+		return nil, &FetchResponseTooLargeError{WorkerID: worker.ID, Got: int64(len(body)), Cap: maxBodyBytes}
 	}
 	return body, nil
 }
@@ -318,6 +379,76 @@ func trimTrailingCR(b []byte) []byte {
 		return b[:n-1]
 	}
 	return b
+}
+
+// gzip64WireSlack covers the constant gzip64-envelope overhead (JSON envelope
+// keys, quoting, and base64 padding) on top of the 4/3 base64 expansion of
+// the gzip stream, when sizing the wire body budget for an opted-in fetch.
+const gzip64WireSlack int64 = 4 << 10
+
+// fetchWantsGzip64 reports whether the (server-authored) request path opted
+// into the worker's gzip64 response envelope via the z=1 query flag — the
+// same opt-in wantsCompress serves on the worker side. Query values are
+// percent-encoded by construction (the fleet path builder escapes every dir
+// param), so this is a plain parse, not a substring scan; an unparseable
+// path simply does not opt in.
+func fetchWantsGzip64(path string) bool {
+	u, err := url.Parse(path)
+	if err != nil {
+		return false
+	}
+	return u.Query().Get("z") == "1"
+}
+
+// isGzip64Envelope reports whether body carries EXACTLY the worker's gzip64
+// envelope — a top-level JSON object with precisely two keys,
+// encoding=="gzip64" and a non-empty string data. Strict two-key matching
+// keeps a legitimate JSON endpoint whose object happens to carry an
+// "encoding" field from being misdecoded.
+func isGzip64Envelope(body []byte) bool {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return false
+	}
+	if len(obj) != 2 {
+		return false
+	}
+	encRaw, okEnc := obj["encoding"]
+	dataRaw, okData := obj["data"]
+	if !okEnc || !okData {
+		return false
+	}
+	var enc string
+	if json.Unmarshal(encRaw, &enc) != nil || enc != "gzip64" {
+		return false
+	}
+	var data string
+	return json.Unmarshal(dataRaw, &data) == nil && data != ""
+}
+
+// decodeGzip64Body reverses the worker's gzip64 envelope (base64 → gzip →
+// raw JSON), producing at most limit bytes of DECODED output — the bound
+// that makes a decompression-bomb envelope cost at most limit bytes of
+// allocation. A corrupt envelope returns an error (the caller classifies it
+// as a fetch error), never a body-cap trip.
+func decodeGzip64Body(body []byte, limit int64) ([]byte, error) {
+	var env struct {
+		Encoding string `json:"encoding"`
+		Data     string `json:"data"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("envelope not JSON: %w", err)
+	}
+	z, err := base64.StdEncoding.DecodeString(env.Data)
+	if err != nil {
+		return nil, fmt.Errorf("base64: %w", err)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(z))
+	if err != nil {
+		return nil, fmt.Errorf("gzip header: %w", err)
+	}
+	defer zr.Close()
+	return io.ReadAll(io.LimitReader(zr, limit))
 }
 
 // validFetchPath guards the request line against CRLF injection; paths are

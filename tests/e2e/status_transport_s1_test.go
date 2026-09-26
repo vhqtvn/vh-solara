@@ -43,7 +43,10 @@ package e2e
 //     residual is bounded, and everything drains when the session closes.
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -686,5 +689,113 @@ func TestS1BoundedFetch_RealStackHappyPath(t *testing.T) {
 	}
 	if _, ok := m["probes"]; !ok {
 		t.Fatalf("real-stack bounded fetch: diag snapshot missing top-level \"probes\" key: %q", body)
+	}
+}
+
+// s1Gzip64Envelope builds the worker's gzip64 envelope shape
+// ({"encoding":"gzip64","data":"<base64(gzip(raw))>"}) exactly as
+// pkg/web maybeCompressSnapshot produces it.
+func s1Gzip64Envelope(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	var z bytes.Buffer
+	gw := gzip.NewWriter(&z)
+	if _, err := gw.Write(raw); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	out, err := json.Marshal(struct {
+		Encoding string `json:"encoding"`
+		Data     string `json:"data"`
+	}{Encoding: "gzip64", Data: base64.StdEncoding.EncodeToString(z.Bytes())})
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	return out
+}
+
+// TestS1BoundedFetch_Gzip64EnvelopeDecodedCap pins the gzip64 leg of the
+// lean fleet acquisition through the REAL yamux transport (healthy-relay
+// peer → a local server that answers with worker-shaped envelopes):
+//
+//   - an opted-in (z=1) fetch of an envelope whose DECODED size is within
+//     the cap returns the exact decoded bytes;
+//   - an envelope whose WIRE size is far under the cap but whose DECODED
+//     size exceeds it is rejected by the DECODED cap-plus-one sentinel with
+//     the structured FetchResponseTooLargeError quoting decoded bytes —
+//     the decompression-bomb bound (a zip bomb costs at most cap+1 bytes
+//     of allocation, never the bomb's full size);
+//   - a NON-opted-in fetch passes the envelope through raw (opt-in gating:
+//     a worker that envelopes unasked is not silently decoded).
+func TestS1BoundedFetch_Gzip64EnvelopeDecodedCap(t *testing.T) {
+	d := startS1Daemon(t)
+
+	const cap128 = 128 << 10
+	under := bytes.Repeat([]byte(`{"k":"s1-under","n":1},`), 2048) // ~64 KiB decoded
+	over := bytes.Repeat([]byte(`{"k":"s1-over","n":1},`), 8192)   // ~256 KiB decoded
+	envUnder := s1Gzip64Envelope(t, under)
+	envOver := s1Gzip64Envelope(t, over)
+	if len(envOver) >= cap128 {
+		t.Fatalf("fixture: over-cap envelope must be wire-SMALL (%d B >= %d B cap) — only the decoded cap can trip", len(envOver), cap128)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/under.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(envUnder)
+	})
+	mux.HandleFunc("/over.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(envOver)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	peer := connectS1Peer(t, d, srv.Listener.Addr().String())
+	defer peer.close()
+	peer.hangNext.Store(0)
+	peer.script.Store(s1ScriptHealthy)
+	worker := waitS1Worker(t, d, s1PeerID)
+
+	// A: opted-in, decoded within cap → exact decoded bytes back.
+	body, err := d.Proxy.FetchWorkerJSONBounded(context.Background(), worker, "/under.json?z=1", s1Bound, cap128)
+	if err != nil {
+		t.Fatalf("under-cap envelope fetch: %v", err)
+	}
+	if !bytes.Equal(body, under) {
+		t.Fatalf("under-cap envelope: decoded body mismatch (%d B vs %d B raw)", len(body), len(under))
+	}
+
+	// B: wire-small / decoded-oversize → decoded cap trip with the
+	// structured pair (Got = cap+1 sentinel, Cap = the configured cap).
+	_, err = d.Proxy.FetchWorkerJSONBounded(context.Background(), worker, "/over.json?z=1", s1Bound, cap128)
+	if err == nil {
+		t.Fatalf("decoded-oversize envelope: expected cap error, got success")
+	}
+	if !errors.Is(err, server.ErrFetchResponseBodyTooLarge) {
+		t.Fatalf("decoded-oversize envelope: want ErrFetchResponseBodyTooLarge, got %v", err)
+	}
+	var ovs *server.FetchResponseTooLargeError
+	if !errors.As(err, &ovs) {
+		t.Fatalf("decoded-oversize envelope: want structured FetchResponseTooLargeError, got %T %v", err, err)
+	}
+	if ovs.Got != cap128+1 || ovs.Cap != cap128 {
+		t.Fatalf("decoded cap pair: want (got=%d cap=%d) — decoded-byte semantics — got (%d %d)", cap128+1, cap128, ovs.Got, ovs.Cap)
+	}
+
+	// C: no opt-in → the envelope bytes pass through RAW (never decoded).
+	bodyRaw, err := d.Proxy.FetchWorkerJSONBounded(context.Background(), worker, "/over.json", s1Bound, cap128)
+	if err != nil {
+		t.Fatalf("non-opted-in envelope fetch: %v", err)
+	}
+	if !bytes.Equal(bodyRaw, envOver) {
+		t.Fatalf("non-opted-in fetch must pass the envelope through verbatim (%d B vs %d B)", len(bodyRaw), len(envOver))
+	}
+
+	// The session is still healthy after the contained trip.
+	after, err := d.Proxy.FetchWorkerJSONBounded(context.Background(), worker, "/under.json?z=1", s1Bound, cap128)
+	if err != nil || !bytes.Equal(after, under) {
+		t.Fatalf("post-trip fetch must succeed: err=%v", err)
 	}
 }

@@ -1588,6 +1588,13 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("/vh/snapshot", s.handleSnapshot)
 	mux.HandleFunc("/vh/projects", s.handleProjects)
+	// Lean fleet-rollup acquisition endpoint (GET-only → no CSRF exception
+	// needed): the controller's /vh/fleet/status rollup consumes ONLY the
+	// per-project gate map, and a full /vh/snapshot per project ships
+	// megabytes of session/message JSON the rollup never reads (measured
+	// ~5.9 MB across 7 real projects, timing out a WAN-tunnel refresh). One
+	// batched request returns only the gate facts. See handleFleetGates.
+	mux.HandleFunc("/vh/gates", s.handleFleetGates)
 	mux.HandleFunc("/vh/views", s.handleViews)
 	mux.HandleFunc("/vh/managed", s.handleManaged)
 	mux.HandleFunc("/vh/project-settings", s.handleProjectSettings)
@@ -2122,6 +2129,125 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	// and-suspenders guard against intermediaries that ignore Cache-Control.)
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSONResp(w, out)
+}
+
+// maxFleetGatesRequestDirs bounds how many explicit ?dir= params one
+// GET /vh/gates request may carry. It mirrors the fleet rollup's per-worker
+// project cap (64) with generous headroom for a raised operator override;
+// beyond it the request is rejected politely (400) and the controller falls
+// back to its per-project snapshot path. The bound keeps a hostile client
+// from making ONE request fan out gate materialization across an unbounded
+// dir list.
+const maxFleetGatesRequestDirs = 256
+
+// fleetGatesProject is one entry of the GET /vh/gates response: exactly the
+// dir + gate pair the controller's rollup folds (it reads nothing else from
+// a snapshot).
+type fleetGatesProject struct {
+	Dir  string                     `json:"dir"`
+	Gate map[string]state.GateFacts `json:"gate"`
+}
+
+// handleFleetGates serves GET /vh/gates — the LEAN fleet-rollup acquisition
+// endpoint. The controller's GET /vh/fleet/status rollup consumes only the
+// per-project `gate` map; fetching a full /vh/snapshot per project moves the
+// whole session tree (sessions/messages/agent rows the rollup never reads —
+// measured ~5.9 MB raw across 7 real projects) over the WAN tunnel, which
+// blew the per-worker time budget (observed bason: timeout at 2/7 projects
+// on an ~83 ms RTT link). This endpoint returns, for the REQUESTED dirs
+// (repeated ?dir= query params; no params = every live project), exactly
+// {schema:1, projects:[{dir, gate}]} marshaled from the store's lean
+// GateFacts() accessor — no snapshot marshaling of sessions at all.
+//
+// Contract:
+//   - GET only (405 otherwise); auth-gated like every other /vh/* route
+//     (Auth.Middleware wraps the whole mux — same session-cookie family as
+//     /vh/projects and /vh/snapshot).
+//   - Explicit dirs: an entry is returned ONLY for dirs with a LIVE
+//     aggregator (aggForExisting semantics — this handler never OPENS a
+//     project, fires managed hooks, or grows the aggregator map). A
+//     requested dir absent from the response means "not instantiated"; the
+//     controller treats discovery-just-saw-it omissions as an empty
+//     observation (the same value /vh/snapshot would have returned by
+//     instantiating an empty aggregator — parity, without the side effect).
+//   - More than maxFleetGatesRequestDirs dirs → 400 naming the cap.
+//   - `z=1` opts into the same gzip64 envelope as /vh/snapshot
+//     (maybeCompressSnapshot + the 2 KiB threshold): the gate JSON of a
+//     real fleet is highly repetitive and compresses ~10:1.
+func (s *Server) handleFleetGates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dirs := r.URL.Query()["dir"]
+	if len(dirs) > maxFleetGatesRequestDirs {
+		http.Error(w, fmt.Sprintf("too many dir params: %d > %d cap", len(dirs), maxFleetGatesRequestDirs), http.StatusBadRequest)
+		return
+	}
+
+	// Snapshot the live aggregator set under aggMu, then materialize gates
+	// OUTSIDE the lock (each Store.GateFacts takes its own RLock — no nested
+	// locking with aggMu). aggForExisting semantics: existing aggregators
+	// only, never created.
+	s.aggMu.Lock()
+	type entry struct {
+		dir string
+		agg *aggregator.Aggregator
+	}
+	live := make([]entry, 0, len(s.aggs))
+	for dir, a := range s.aggs {
+		live = append(live, entry{dir, a})
+	}
+	s.aggMu.Unlock()
+	byDir := make(map[string]*aggregator.Aggregator, len(live))
+	for _, e := range live {
+		byDir[e.dir] = e.agg
+	}
+
+	var want []string
+	if len(dirs) == 0 {
+		// No dir params: every live project (the worker decides scope).
+		want = make([]string, 0, len(live))
+		for _, e := range live {
+			want = append(want, e.dir)
+		}
+	} else {
+		// Dedupe preserving first occurrence (discovery output is unique;
+		// defensive only).
+		seen := make(map[string]bool, len(dirs))
+		want = make([]string, 0, len(dirs))
+		for _, d := range dirs {
+			if seen[d] {
+				continue
+			}
+			seen[d] = true
+			want = append(want, d)
+		}
+	}
+
+	out := make([]fleetGatesProject, 0, len(want))
+	for _, d := range want {
+		a := byDir[d]
+		if a == nil {
+			continue // not instantiated: omitted, never fabricated
+		}
+		out = append(out, fleetGatesProject{Dir: d, Gate: a.Store().GateFacts()})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Dir < out[j].Dir })
+	b, err := json.Marshal(struct {
+		Schema   int                 `json:"schema"`
+		Projects []fleetGatesProject `json:"projects"`
+	}{Schema: 1, Projects: out})
+	if err != nil {
+		vhlog.Error("gates: marshal failed", "err", err)
+		http.Error(w, "gates marshal failed", http.StatusInternalServerError)
+		return
+	}
+	// State-like GET (fresh gate facts every call) + the shared z=1 gzip64
+	// opt-in, identical to /vh/snapshot's tail.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(maybeCompressSnapshot(b, wantsCompress(r)))
 }
 
 // handleRunningSessions aggregates how many sessions are currently running ACROSS ALL

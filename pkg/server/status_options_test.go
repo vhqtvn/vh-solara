@@ -67,10 +67,10 @@ func TestFleetOptions_ShapeDiscoveredMode(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "alpha")
 	fleetAddOnline(t, d.Registry, "beta")
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("", "/repo"))
-	fake.setBody("alpha", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{}))
-	fake.setBody("alpha", "/vh/snapshot?dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("alpha", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("alpha", "/vh/snapshot?z=1&dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{}))
 	fake.setBody("beta", "/vh/projects", fleetProjectsBody("/repo"))
-	fake.setBody("beta", "/vh/snapshot?dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("beta", "/vh/snapshot?z=1&dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{}))
 
 	h := d.buildRootHandler()
 
@@ -149,7 +149,7 @@ func TestFleetOptions_ExpectedModeUnion(t *testing.T) {
 	// /repo is acquired (the fake errors on any unexpected snapshot fetch,
 	// so alpha staying ok also proves /other was never fetched).
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/other", "/repo"))
-	fake.setBody("alpha", "/vh/snapshot?dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("alpha", "/vh/snapshot?z=1&dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{}))
 
 	h := d.buildRootHandler()
 	rec := doFleetOptions(h)
@@ -216,7 +216,7 @@ func TestHostInterceptorFleetOptionsRoutePrecedence(t *testing.T) {
 	d.Registry.AddWorker(&Worker{ID: "abc", Name: "abc-worker", Status: "online", Version: "v1"})
 	fleetAddOnline(t, d.Registry, "live")
 	fake.setBody("live", "/vh/projects", fleetProjectsBody("/x"))
-	fake.setBody("live", "/vh/snapshot?dir=%2Fx", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("live", "/vh/snapshot?z=1&dir=%2Fx", fleetSnapBody(map[string]state.GateFacts{}))
 
 	h := d.buildRootHandler()
 	session := loginPassphrase(t, h, "secret")
