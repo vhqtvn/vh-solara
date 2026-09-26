@@ -125,6 +125,15 @@ func TestReconcileInFlightGuardSingleFlightsConcurrentPasses(t *testing.T) {
 	openProjectForDir(t, dir) // the reconcile uses aggForExisting(dir); open it first
 	sid := fakeSessionForDir(dir)
 
+	// Baseline the fake's per-sid committed-message counter: sid
+	// "proj_rcov-race" is FIXED (the dir leaf is constant; only the TempDir
+	// parent varies per run) while the fake is shared across the whole
+	// `go test` process, so under -count>1 re-runs the counter ACCUMULATES
+	// (one commit per iteration). The contract assertions below are about THIS
+	// run's commits — assert a DELTA of exactly 1, never an absolute count
+	// (which would fail every iteration after the first under -count>1).
+	baseUserMsgs := cluster.Fake.UserMessageCount(sid)
+
 	cluster.Fake.SetPromptAsyncMode(fixtures.PromptAsyncCommitThenDropResponse)
 	t.Cleanup(func() { cluster.Fake.SetPromptAsyncMode(fixtures.PromptAsyncNormal) })
 
@@ -181,9 +190,9 @@ func TestReconcileInFlightGuardSingleFlightsConcurrentPasses(t *testing.T) {
 		t.Fatalf("item id drifted: enqueue=%s list=%s", itemID, items[0].ID)
 	}
 	// NO re-dispatch: the reconciler only GETs + Resolve()s, so the fake still has
-	// exactly one committed user message for this session.
-	if got := cluster.Fake.UserMessageCount(sid); got != 1 {
-		t.Fatalf("after reconcile: UserMessageCount=%d want 1 (reconciler must NOT re-dispatch)", got)
+	// exactly one committed user message (this run's) for this session.
+	if got := cluster.Fake.UserMessageCount(sid) - baseUserMsgs; got != 1 {
+		t.Fatalf("after reconcile: UserMessageCount delta=%d, want 1 (reconciler must NOT re-dispatch)", got)
 	}
 	// No second exact-GET sneaked in after release either: pass1 already owned the
 	// only lookup for this eligible item.
@@ -192,8 +201,8 @@ func TestReconcileInFlightGuardSingleFlightsConcurrentPasses(t *testing.T) {
 	}
 
 	t.Logf("CRUX verified under -race: overlapping reconcile passes single-flighted by the guard "+
-		"(exactly 1 exact-GET for item %s under minted id %s; UserMessageCount=1, no re-dispatch)",
-		itemID, opencodeMsgID)
+		"(exactly 1 exact-GET for item %s under minted id %s; UserMessageCount delta=%d, want 1 — no re-dispatch)",
+		itemID, opencodeMsgID, cluster.Fake.UserMessageCount(sid)-baseUserMsgs)
 }
 
 // TestReconcileInFlightGuardReleasesAfterCompletion proves the guard does not
@@ -214,6 +223,16 @@ func TestReconcileInFlightGuardReleasesAfterCompletion(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "rcov-race-rel")
 	openProjectForDir(t, dir)
 	sid := fakeSessionForDir(dir)
+
+	// Baseline the fake's per-sid committed-message counter: sid
+	// "proj_rcov-race-rel" is FIXED (the dir leaf is constant; only the
+	// TempDir parent varies per run) while the fake is shared across the
+	// whole `go test` process, so under -count>1 re-runs the counter
+	// ACCUMULATES (two commits per iteration, one per item). The contract
+	// assertions below are about THIS run's commits — assert a DELTA of
+	// exactly 2, never an absolute count (which would fail every iteration
+	// after the first under -count>1).
+	baseUserMsgs := cluster.Fake.UserMessageCount(sid)
 
 	cluster.Fake.SetPromptAsyncMode(fixtures.PromptAsyncCommitThenDropResponse)
 	t.Cleanup(func() { cluster.Fake.SetPromptAsyncMode(fixtures.PromptAsyncNormal) })
@@ -249,8 +268,8 @@ func TestReconcileInFlightGuardReleasesAfterCompletion(t *testing.T) {
 	}
 	cluster.Fake.ReleaseReconcileGetBlock()
 
-	// Both items resolve to sent; no duplicate dispatch (exactly two user messages,
-	// one per item — the reconciler never re-dispatches).
+	// Both items resolve to sent; no duplicate dispatch (exactly two user
+	// messages (this run's), one per item — the reconciler never re-dispatches).
 	items, ok := pollQueue(t, sid, dir, 5*time.Second, func(items []queueItemView) (bool, string) {
 		sent := 0
 		for _, it := range items {
@@ -263,11 +282,11 @@ func TestReconcileInFlightGuardReleasesAfterCompletion(t *testing.T) {
 	if !ok {
 		t.Fatalf("items did not both resolve to sent; last=%+v", items)
 	}
-	if got := cluster.Fake.UserMessageCount(sid); got != 2 {
-		t.Fatalf("after both reconciles: UserMessageCount=%d want 2 (one per item; reconciler never re-dispatches)", got)
+	if got := cluster.Fake.UserMessageCount(sid) - baseUserMsgs; got != 2 {
+		t.Fatalf("after both reconciles: UserMessageCount delta=%d, want 2 (one per item; reconciler never re-dispatches)", got)
 	}
 
 	t.Logf("guard release verified: sentinel Delete'd on completion — a later List for the same "+
-		"(%s,%s) admitted a fresh reconcile pass (A=%s, B=%s both sent; UserMessageCount=2)",
-		dir, sid, itemA, itemB)
+		"(%s,%s) admitted a fresh reconcile pass (A=%s, B=%s both sent; UserMessageCount delta=%d, want 2 — one per item)",
+		dir, sid, itemA, itemB, cluster.Fake.UserMessageCount(sid)-baseUserMsgs)
 }
