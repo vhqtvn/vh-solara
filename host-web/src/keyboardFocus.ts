@@ -126,7 +126,7 @@ function applyOpen(height: number, offsetTop: number): void {
   keyboardOpen = true;
   applyGeometry(height, offsetTop);
   maximizeActive();
-  // Tell the embedded SPA focus-mode is active so it suppresses its triple-tap
+  // Tell the embedded SPA focus-mode is active so it suppresses its 3-finger-tap
   // layout gesture while the operator is typing. See web/src/hostGesture.ts for
   // why the SPA cannot infer this from its own visualViewport (the host shrinks
   // the iframe element, so the iframe's own vv/innerHeight ratio stays ~1.0).

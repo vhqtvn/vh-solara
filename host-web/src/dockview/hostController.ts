@@ -577,7 +577,7 @@ export class HostController implements HostOps {
    * pane (so the focus indicator + subsequent split target it), then activates
    * the overlay state. Idempotent: a second open while already open re-anchors
    * (the store signal just swaps). No-op when the pane is not in THIS
-   * workspace. The host-gesture router (triple bare-Ctrl / triple-tap, forwarded by
+   * workspace. The host-gesture router (triple bare-Ctrl / 3-finger-tap, forwarded by
    * the embedded SPA) and the DEV test bridge both route through this; there is
    * no longer a statusbar Layout button (the statusbar was removed in its
    * entirety).

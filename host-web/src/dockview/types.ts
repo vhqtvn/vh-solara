@@ -171,7 +171,7 @@ export type PaneToHost =
        * dir (closed non-negative integer; see PaneStatus.unreadCount). */
       unreadCount: number;
     }
-  // Layout-overlay gesture (triple bare-Ctrl desktop / triple-tap mobile) + pane-
+  // Layout-overlay gesture (triple bare-Ctrl desktop / 3-finger-tap mobile) + pane-
   // activate forward (cross-origin activation bridge). The SPA forwards ONE
   // closed intent when the operator gestures (overlay) or when the pane gains
   // focus / receives a pointerdown (activate); the host derives the source pane
@@ -190,7 +190,7 @@ export type PaneToHost =
 // change (setSelectedId/switchProject) — the iframe src + element are NEVER
 // touched. Origin-scoped to the pane's configured origin (never '*'). The
 // `host-mode` signal tells the SPA when the host's soft-keyboard focus-mode is
-// active so the SPA can suppress its triple-tap layout gesture while the
+// active so the SPA can suppress its 3-finger-tap layout gesture while the
 // operator is typing (see web/src/hostGesture.ts + keyboardFocus.ts). All four
 // are host→pane (the SPA source-guards `ev.source === window.parent` before
 // acting on any of them).
@@ -390,7 +390,7 @@ export interface HostOps {
    *  pane (so the focus indicator + subsequent split/swap target it),
    *  then activates the overlay. Idempotent: a second open while already open
    *  re-anchors to the new source (no stacking). No-op when the pane is not in
-   *  the active workspace. The host-gesture router (triple bare-Ctrl / triple-tap)
+   *  the active workspace. The host-gesture router (triple bare-Ctrl / 3-finger-tap)
    *  and the DEV test bridge both route through this; there is no longer a
    *  statusbar Layout button (the statusbar was removed in its entirety). */
   openLayoutOverlay?(paneId: string): void;
