@@ -1,6 +1,6 @@
 package server
 
-// status.go — GET /api/fleet/status: the compact fleet-status rollup API.
+// status.go — GET /vh/fleet/status: the compact fleet-status rollup API.
 //
 // STANDING CAVEAT (task card task-2026-09-25-…-compact-readonly-fleet-status-
 // rollup-api-controller; contract in tmp/agent-runs/watch-status-20260922/
@@ -53,9 +53,15 @@ package server
 //
 // Auth: registered on userMux, inside Auth.Middleware + csrfGuard — the same
 // session-cookie family as GET /api/workers. GET-only, so no X-VH-CSRF
-// requirement (csrfGuard gates unsafe /api/ methods only). The mutation-
-// capable coordination bearer does NOT reach this endpoint (coordFront routes
-// only /api/coord/*).
+// requirement (csrfGuard gates unsafe /api/ methods only, and this /vh/ path
+// is outside /api/ entirely). Under /vh/*, auth's isAPIRequest classifies the
+// request as an API call, so an unauthenticated GET gets a clean 401 — never
+// the 303→/auth/login browser redirect (an improvement for non-browser
+// consumers: no Accept header needed). The mutation-capable coordination
+// bearer does NOT reach this endpoint (coordFront routes only /api/coord/*).
+// hostInterceptor carves this path out (exactly like /vh/diag/latency), so
+// the controller serves it even on worker subdomains instead of proxying
+// down to a worker that has no /vh/fleet/* route.
 
 import (
 	"context"
@@ -1021,7 +1027,7 @@ func ifNoneMatchMatches(header, etag string) bool {
 // HTTP handler
 // ---------------------------------------------------------------------------
 
-// handleFleetStatus serves GET /api/fleet/status from the daemon-owned
+// handleFleetStatus serves GET /vh/fleet/status from the daemon-owned
 // generation cache. Response headers: ETag + Cache-Control: private, no-cache
 // on BOTH 200 and 304. A 304 never advances observation time — it returns the
 // current generation's validator only.

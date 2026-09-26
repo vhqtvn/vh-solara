@@ -1,6 +1,6 @@
 package e2e
 
-// fleet_status_e2e_test.go — lane-3 proof for GET /api/fleet/status (S2 of
+// fleet_status_e2e_test.go — lane-3 proof for GET /vh/fleet/status (S2 of
 // task-2026-09-25-…-compact-readonly-fleet-status-rollup-api-controller).
 //
 // This drives the endpoint through the SHARED cluster's REAL stack end to
@@ -24,11 +24,11 @@ import (
 
 func TestE2E_FleetStatusRollupThroughRealTunnel(t *testing.T) {
 	// 1. First GET: full rollup through the real tunnel.
-	resp, body, err := cluster.Do(http.MethodGet, "/api/fleet/status", "", "", nil)
+	resp, body, err := cluster.Do(http.MethodGet, "/vh/fleet/status", "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("GET /api/fleet/status -> %d: %s", resp.StatusCode, body)
+	t.Logf("GET /vh/fleet/status -> %d: %s", resp.StatusCode, body)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("fleet status: want 200, got %d: %s", resp.StatusCode, body)
 	}
@@ -126,7 +126,7 @@ func TestE2E_FleetStatusRollupThroughRealTunnel(t *testing.T) {
 	}
 
 	// 2. Same generation: If-None-Match must 304 with the same validator.
-	resp2, _, err := cluster.Do(http.MethodGet, "/api/fleet/status", "", "", map[string]string{"If-None-Match": etag})
+	resp2, _, err := cluster.Do(http.MethodGet, "/vh/fleet/status", "", "", map[string]string{"If-None-Match": etag})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestE2E_FleetStatusRollupThroughRealTunnel(t *testing.T) {
 	}
 
 	// 3. Plain re-GET within the TTL returns the identical bytes.
-	resp3, body3, err := cluster.Do(http.MethodGet, "/api/fleet/status", "", "", nil)
+	resp3, body3, err := cluster.Do(http.MethodGet, "/vh/fleet/status", "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

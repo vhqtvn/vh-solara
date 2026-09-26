@@ -16,7 +16,7 @@ var serverWorkerSecret string
 var serverAPIToken string
 
 // serverStatusWorkers is the optional expected-fleet roster for
-// GET /api/fleet/status (--status-worker, repeatable). Empty = the rollup
+// GET /vh/fleet/status (--status-worker, repeatable). Empty = the rollup
 // reports the explicitly-discovered scope instead.
 var serverStatusWorkers []string
 
@@ -51,7 +51,7 @@ func init() {
 	serverCmd.Flags().StringVar(&hostPattern, "host-pattern", "", "Host template to extract/build worker URLs (e.g., '$ID.example.com')")
 	serverCmd.Flags().StringVar(&serverWorkerSecret, "worker-secret", "", "Shared secret required from workers on registration via X-VH-Worker-Secret (prefer the VH_WORKER_SECRET env var); empty = open registration")
 	serverCmd.Flags().StringVar(&serverAPIToken, "api-token", "", "Bearer token required on the cross-worker coordination API /api/workers/{id}/sessions|events (prefer the VH_API_TOKEN env var); empty = open")
-	serverCmd.Flags().StringArrayVar(&serverStatusWorkers, "status-worker", nil, "Expected fleet-status worker ID for GET /api/fleet/status (repeatable; blank entries ignored). When set, the rollup scopes to exactly these IDs and IDs never registered are reported 'missing'. Unset = discovered scope.")
+	serverCmd.Flags().StringArrayVar(&serverStatusWorkers, "status-worker", nil, "Expected fleet-status worker ID for GET /vh/fleet/status (repeatable; blank entries ignored). When set, the rollup scopes to exactly these IDs and IDs never registered are reported 'missing'. Unset = discovered scope.")
 	registerAuthFlags(serverCmd, &serverAuth)
 	rootCmd.AddCommand(serverCmd)
 }

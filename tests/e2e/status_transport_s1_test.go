@@ -5,7 +5,7 @@ package e2e
 //
 // Mission: prove (or refute) transport containment for controller→worker
 // HTTP-over-yamux fetches through the REAL multiplexed transport, as the gate
-// for the future GET /api/fleet/status endpoint. The endpoint itself is NOT
+// for the future GET /vh/fleet/status endpoint. The endpoint itself is NOT
 // implemented here.
 //
 // What "real" means in this file:

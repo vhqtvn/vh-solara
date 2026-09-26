@@ -44,7 +44,7 @@ type Daemon struct {
 	WSUpgrader websocket.Upgrader
 
 	// StatusWorkerRoster is the optional expected-fleet roster for
-	// GET /api/fleet/status, fed by the repeatable --status-worker flag.
+	// GET /vh/fleet/status, fed by the repeatable --status-worker flag.
 	// Empty/whitespace entries are ignored; a non-empty normalized set
 	// switches the rollup to "expected" coverage mode (scope = exactly these
 	// IDs; workers beyond it are excluded, IDs never registered are
@@ -78,7 +78,7 @@ type Daemon struct {
 	fetchWorkerJSON fleetJSONFetcher
 
 	// fleetOnce/fleetStatus lazily create the daemon-owned fleet-status
-	// service (immutable-generation cache for GET /api/fleet/status; see
+	// service (immutable-generation cache for GET /vh/fleet/status; see
 	// status.go). NewDaemon pre-creates it; the lazy path covers Daemons
 	// built as literals.
 	fleetOnce   sync.Once
@@ -129,7 +129,7 @@ func NewDaemon(addr, daemonAddr, hostPattern string) *Daemon {
 	d.tunnelDeflate = tunnelDeflate
 	d.WSUpgrader.EnableCompression = tunnelDeflate.OfferCompression()
 
-	// Daemon-owned fleet-status rollup cache (GET /api/fleet/status). Created
+	// Daemon-owned fleet-status rollup cache (GET /vh/fleet/status). Created
 	// eagerly so the service exists before the first request can race the
 	// lazy path; see status.go.
 	d.fleetStatus = newFleetStatusService(d)
@@ -177,14 +177,20 @@ func (d *Daemon) buildRootHandler() http.Handler {
 	userMux.HandleFunc("POST /api/workers/{id}/kill", d.handleKillWorker)
 	userMux.HandleFunc("GET /{$}", d.handleUIPage)
 
-	// Compact fleet-status rollup (watch/bridge-facing, schema:1). Joins the
-	// GET /api/workers session-cookie auth family: registered on userMux, so
-	// Auth.Middleware gates it and csrfGuard exempts it (GET-only — the guard
-	// requires X-VH-CSRF only on unsafe /api/ methods). GET-only by pattern,
-	// so other methods get the mux's 405. Served from the daemon-owned
+	// Compact fleet-status rollup (watch/bridge-facing, schema:1). Auth-gated
+	// by Auth.Middleware as part of the userMux chain (session-cookie family).
+	// GET-only by pattern, so other methods get the mux's 405 and no
+	// X-VH-CSRF exception is needed (csrfGuard requires the header only on
+	// unsafe methods under /api/, which this /vh/ path is outside). Under
+	// /vh/*, auth's isAPIRequest classifies the request as an API call, so an
+	// unauthenticated GET gets a clean 401 — never a 303→/auth/login browser
+	// redirect (better for the watch/bridge's non-browser consumers).
+	// hostInterceptor special-cases this path (see below) to fall through to
+	// userMux even on a worker subdomain, so the fleet-wide rollup is served
+	// by the controller everywhere. Served from the daemon-owned
 	// immutable-generation cache (see status.go): bounded lazy refresh,
 	// registry-liveness invalidation, strong ETag stable within a generation.
-	userMux.HandleFunc("GET /api/fleet/status", d.handleFleetStatus)
+	userMux.HandleFunc("GET /vh/fleet/status", d.handleFleetStatus)
 
 	// Latency diagnostics — AGGREGATED global view. The controller merges its
 	// own probes (diag.Default) with every connected worker's snapshot fetched
@@ -296,17 +302,21 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 			host = host[:idx]
 		}
 
-		// Route precedence: the aggregated /vh/diag/latency is CONTROLLER-OWNED
-		// and must be served by the aggregator even when the browser's host is a
-		// per-worker subdomain (e.g. "workerID.controller.example.com"). Without
-		// this carve-out the hostInterceptor would proxy the request down to that
-		// worker, returning a single-worker snapshot and forcing the operator to
-		// re-fetch per project. Falling through to `next` (the userMux chain)
-		// serves the global aggregator regardless of host. Per-worker
-		// /vh/diag/latency remains reachable on the worker for the aggregator's
-		// own fan-out (which goes through the tunnel via Proxy.FetchWorkerSnapshot,
-		// not through this hostInterceptor).
-		if r.URL.Path == "/vh/diag/latency" {
+		// Route precedence: the aggregated /vh/diag/latency and the fleet-wide
+		// /vh/fleet/status are CONTROLLER-OWNED and must be served by the
+		// controller even when the browser's host is a per-worker subdomain
+		// (e.g. "workerID.controller.example.com"). Without this carve-out the
+		// hostInterceptor would proxy the request down to that worker,
+		// returning a single-worker diag snapshot and forcing the operator to
+		// re-fetch per project, or a 404 for fleet status (the worker has no
+		// /vh/fleet/* route — the rollup fans out through the tunnel via
+		// Proxy.FetchWorkerJSONBounded, not through this hostInterceptor).
+		// Falling through to `next` (the userMux chain) serves the global
+		// controller-owned view regardless of host. Per-worker
+		// /vh/diag/latency remains reachable on the worker for the
+		// aggregator's own fan-out (which goes through the tunnel via
+		// Proxy.FetchWorkerSnapshot, not through this hostInterceptor).
+		if r.URL.Path == "/vh/diag/latency" || r.URL.Path == "/vh/fleet/status" {
 			next.ServeHTTP(w, r)
 			return
 		}

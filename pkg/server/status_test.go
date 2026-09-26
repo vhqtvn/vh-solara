@@ -1,6 +1,6 @@
 package server
 
-// status_test.go — lane-1 co-located tests for GET /api/fleet/status (the
+// status_test.go — lane-1 co-located tests for GET /vh/fleet/status (the
 // S2 slice of task card task-2026-09-25-…-compact-readonly-fleet-status-
 // rollup-api-controller). These tests drive the rollup through the REAL
 // handler + generation cache with the acquisition seam faked (fetchWorkerJSON)
@@ -166,7 +166,7 @@ func newFleetTestDaemon(t *testing.T, hostPattern string) (*Daemon, *fleetFake) 
 }
 
 func doFleet(h http.Handler, opts ...func(*http.Request)) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodGet, "/api/fleet/status", nil)
+	req := httptest.NewRequest(http.MethodGet, "/vh/fleet/status", nil)
 	for _, o := range opts {
 		o(req)
 	}
@@ -187,7 +187,7 @@ func decodeFleet(t *testing.T, rec *httptest.ResponseRecorder) fleetStatusRespon
 	t.Helper()
 	var resp fleetStatusResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode /api/fleet/status body: %v (body=%q)", err, rec.Body.String())
+		t.Fatalf("decode /vh/fleet/status body: %v (body=%q)", err, rec.Body.String())
 	}
 	return resp
 }
@@ -242,7 +242,7 @@ func TestFleetStatus_RollupPrecedenceAndGauge(t *testing.T) {
 	h := d.buildRootHandler()
 	rec := doFleet(h)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /api/fleet/status: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
+		t.Fatalf("GET /vh/fleet/status: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
 	}
 	resp := decodeFleet(t, rec)
 
@@ -787,11 +787,15 @@ func TestFleetStatus_ConcurrentRequestsCoalesce(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestFleetStatus_AuthSessionFamily pins the endpoint's security posture:
-// registered on userMux behind Auth.Middleware (same family as
-// GET /api/workers). Unauthenticated API calls get the middleware's 401
-// challenge, browser navigations the login redirect; an authenticated session
-// gets 200; POST is 405 (GET-only pattern) once past the CSRF guard, and 403
-// from csrfGuard when the header is missing on the unsafe method.
+// registered on userMux behind Auth.Middleware (same session-cookie family
+// as GET /api/workers). Under /vh/*, auth's isAPIRequest classifies EVERY
+// unauthenticated request as an API call — browser-shaped GETs included — so
+// they get the middleware's clean 401 challenge, never the 303→/auth/login
+// redirect the old /api/… browser-shaped path had (deliberate improvement
+// for the watch/bridge's non-browser consumers: no Accept header needed).
+// An authenticated session gets 200; POST is 405 (GET-only pattern) — and,
+// unlike /api/ paths, csrfGuard does not intercept the unsafe method first
+// (it gates /api/ only), so the 405 fires with or without X-VH-CSRF.
 func TestFleetStatus_AuthSessionFamily(t *testing.T) {
 	d, _ := newFleetTestDaemon(t, "")
 	a, err := auth.New(context.Background(), auth.Config{Mode: auth.ModePassphrase, Passphrase: "secret"})
@@ -804,19 +808,24 @@ func TestFleetStatus_AuthSessionFamily(t *testing.T) {
 
 	// 1. Unauthenticated, API-shaped (Accept: application/json) → 401.
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/fleet/status", nil)
+	req := httptest.NewRequest(http.MethodGet, "/vh/fleet/status", nil)
 	req.Header.Set("Accept", "application/json")
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated API GET: want 401, got %d", rec.Code)
 	}
 
-	// 2. Unauthenticated browser navigation → login redirect (middleware
-	// behavior retained, not a fabricated 401).
+	// 2. Unauthenticated browser-shaped GET (no Accept header) → 401 too:
+	// /vh/* is in isAPIRequest's API class, so the middleware challenges
+	// instead of redirecting to /auth/login (the deliberate auth-behavior
+	// change of moving off the /api/ browser path).
 	rec2 := httptest.NewRecorder()
-	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/api/fleet/status", nil))
-	if rec2.Code != http.StatusSeeOther || !strings.Contains(rec2.Header().Get("Location"), "/auth/login") {
-		t.Fatalf("unauthenticated browser GET: want 303 → /auth/login, got %d %q", rec2.Code, rec2.Header().Get("Location"))
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/vh/fleet/status", nil))
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated browser-shaped GET: want 401 (/vh/* is API class), got %d %q", rec2.Code, rec2.Header().Get("Location"))
+	}
+	if loc := rec2.Header().Get("Location"); loc != "" {
+		t.Fatalf("unauthenticated browser-shaped GET: must NOT redirect, got Location %q", loc)
 	}
 
 	// 3. Authenticated GET → 200 (fresh rollup of an empty fleet).
@@ -828,23 +837,100 @@ func TestFleetStatus_AuthSessionFamily(t *testing.T) {
 	// 4. GET needs no X-VH-CSRF (read-only): already proven by (3) — no CSRF
 	// header was sent.
 
-	// 5. Authenticated POST without X-VH-CSRF → 403 (csrfGuard, inside auth).
+	// 5. Authenticated POST without X-VH-CSRF → 405 (GET-only route).
+	// csrfGuard gates unsafe methods under /api/ only, so it does not fire
+	// here; the userMux method pattern answers 405 directly.
 	rec5 := httptest.NewRecorder()
-	req5 := httptest.NewRequest(http.MethodPost, "/api/fleet/status", nil)
+	req5 := httptest.NewRequest(http.MethodPost, "/vh/fleet/status", nil)
 	req5.AddCookie(session)
 	h.ServeHTTP(rec5, req5)
-	if rec5.Code != http.StatusForbidden {
-		t.Fatalf("authenticated POST without CSRF: want 403, got %d", rec5.Code)
+	if rec5.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("authenticated POST without CSRF: want 405 (GET-only route, outside csrfGuard), got %d", rec5.Code)
 	}
 
-	// 6. Authenticated POST with X-VH-CSRF → 405 from the GET-only route.
+	// 6. Authenticated POST with X-VH-CSRF → still 405 from the GET-only
+	// route (the header is irrelevant outside /api/).
 	rec6 := httptest.NewRecorder()
-	req6 := httptest.NewRequest(http.MethodPost, "/api/fleet/status", nil)
+	req6 := httptest.NewRequest(http.MethodPost, "/vh/fleet/status", nil)
 	req6.AddCookie(session)
 	req6.Header.Set("X-VH-CSRF", "1")
 	h.ServeHTTP(rec6, req6)
 	if rec6.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("authenticated POST with CSRF: want 405 (GET-only route), got %d", rec6.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// hostInterceptor carve-out (worker-subdomain precedence)
+// ---------------------------------------------------------------------------
+
+// TestHostInterceptorFleetStatusRoutePrecedence pins the critical property
+// (mirroring the TestHostInterceptorDiagLatencyRoutePrecedence precedent): a
+// browser loaded from a per-worker subdomain (e.g. "workerID.controller.host")
+// hitting `/vh/fleet/status` MUST be served by the CONTROLLER's fleet rollup,
+// NOT proxied down to that worker through hostInterceptor. The worker has no
+// /vh/fleet/* route, so a proxied request would 404 at the worker (or 502
+// before leaving the controller when the transport is dead) — the rollup is
+// controller-owned and must answer from every host.
+//
+// We build the full controller chain (auth + csrfGuard + hostInterceptor +
+// userMux) with passphrase auth, register "abc" as an online worker with NO
+// real transport (so the proxy path would 502), plus a genuinely online
+// "live" worker whose acquisition is served by the injected fake. A request
+// with Host "abc.controller.test" must get the rollup body (200, schema 1)
+// with the fake seam exercised — proving the carve-out fired BEFORE
+// hostInterceptor's pattern match. If the carve-out fails the request reaches
+// HandleWorkerDirect → handleRawProxy → 502 on the nil transport; we assert
+// against that specifically.
+func TestHostInterceptorFleetStatusRoutePrecedence(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "$ID.controller.test")
+	a, err := auth.New(context.Background(), auth.Config{Mode: auth.ModePassphrase, Passphrase: "secret"})
+	if err != nil {
+		t.Fatalf("auth.New: %v", err)
+	}
+	d.Auth = a
+	// Register an online worker WITHOUT a real transport. If the carve-out
+	// fails, the request reaches HandleWorkerDirect → handleRawProxy, which
+	// returns 502 on the nil transport. The carve-out means we never get
+	// there, so we want a 200 rollup, not a 502.
+	d.Registry.AddWorker(&Worker{ID: "abc", Name: "abc-worker", Status: "online", Version: "v1"})
+	// A genuinely online worker (real yamux pair so Summaries reports it
+	// online) whose acquisition runs through the injected fake — the fake
+	// being called is the proof that the CONTROLLER's rollup handled the
+	// request (the proxy path would 502 before any fetcher call).
+	fleetAddOnline(t, d.Registry, "live")
+	fake.setBody("live", "/vh/projects", fleetProjectsBody(""))
+	fake.setBody("live", "/vh/snapshot", fleetSnapBody(map[string]state.GateFacts{}))
+
+	h := d.buildRootHandler()
+	session := loginPassphrase(t, h, "secret")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/vh/fleet/status", nil)
+	req.Host = "abc.controller.test"
+	req.AddCookie(session)
+	h.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusBadGateway {
+		t.Fatalf("hostInterceptor proxied /vh/fleet/status to the worker (502) — carve-out missing or broken")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200 fleet rollup, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if n := fake.count("live"); n == 0 {
+		t.Fatalf("rollup acquisition never ran — request did not reach the controller's fleet-status handler (carve-out broken?)")
+	}
+	resp := decodeFleet(t, rec)
+	if resp.Schema != 1 {
+		t.Fatalf("response is not the fleet rollup (schema %d)", resp.Schema)
+	}
+	// abc: registry-online but nil transport ⇒ Summaries offline ⇒ reported
+	// offline with NO fan-out (only "live" was acquired).
+	if w := workerEntry(t, resp, "abc"); w.Status != fleetWorkerOffline {
+		t.Fatalf("nil-transport worker abc: want offline in rollup, got %+v", w)
+	}
+	if w := workerEntry(t, resp, "live"); w.Status != fleetWorkerOK {
+		t.Fatalf("online worker live: want ok in rollup, got %+v", w)
 	}
 }
 

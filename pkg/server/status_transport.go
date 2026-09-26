@@ -3,7 +3,7 @@ package server
 // status_transport.go — S1 evidence-gate bounded worker-JSON fetch.
 //
 // Context (task card task-2026-09-25-…-compact-readonly-fleet-status-rollup):
-// before any GET /api/fleet/status endpoint work, slice S1 must prove that a
+// before any GET /vh/fleet/status endpoint work, slice S1 must prove that a
 // controller→worker HTTP-over-yamux fetch can be CONTAINED — bounded stream
 // open, bounded handshake, bounded header+body reads, bounded allocation —
 // without closing the shared tunnel and while unrelated streams on the same
