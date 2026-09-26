@@ -137,6 +137,14 @@ func TestQueueDispatchCommittedThenResponseLostRecoversUnknown(t *testing.T) {
 
 	sid := "qreco"
 	dir := t.TempDir()
+	// Baseline the fake's per-sid committed-message counter: sid "qreco" is
+	// FIXED while the fake is shared across the whole `go test` process, so
+	// under -count>1 re-runs the counter ACCUMULATES (one commit per
+	// iteration). The contract assertions below are about THIS run's commits —
+	// assert a DELTA of exactly 1, never an absolute count (which would fail
+	// every iteration after the first under -count>1; CI uses count=1, but the
+	// verification battery re-runs with -count=10).
+	baseUserMsgs := cluster.Fake.UserMessageCount(sid)
 
 	// Switch the fake to commit-then-drop and restore the faithful (Normal)
 	// mode on exit — the shared fake backs every session in the cluster.
@@ -215,8 +223,8 @@ func TestQueueDispatchCommittedThenResponseLostRecoversUnknown(t *testing.T) {
 	// 4. Prove the commit happened BEFORE the drop: by the time the dispatch
 	//    call returned (with error), the user message is already durably
 	//    recorded. This is the crux of the ambiguous-receipt window.
-	if got := cluster.Fake.UserMessageCount(sid); got != 1 {
-		t.Fatalf("after dispatch: UserMessageCount=%d, want 1 (commit-before-drop)", got)
+	if got := cluster.Fake.UserMessageCount(sid) - baseUserMsgs; got != 1 {
+		t.Fatalf("after dispatch: UserMessageCount delta=%d, want 1 (commit-before-drop)", got)
 	}
 
 	// 5. Do NOT resolve (browser crash / network loss simulation) — the item is
@@ -276,10 +284,10 @@ func TestQueueDispatchCommittedThenResponseLostRecoversUnknown(t *testing.T) {
 		t.Fatalf("recovery: ResolvedAt not set on recovered item")
 	}
 	// 11. NO redispatch: recovery NEVER re-issues the prompt, so the fake still
-	//     has exactly one committed user message. If this is 2, recovery
-	//     double-dispatched — a bug in the fix, fail loudly.
-	if got := cluster.Fake.UserMessageCount(sid); got != 1 {
-		t.Fatalf("after recovery: UserMessageCount=%d, want 1 (recovery must NOT redispatch)", got)
+	//     has exactly one committed user message (this run's). If the delta is
+	//     2, recovery double-dispatched — a bug in the fix, fail loudly.
+	if got := cluster.Fake.UserMessageCount(sid) - baseUserMsgs; got != 1 {
+		t.Fatalf("after recovery: UserMessageCount delta=%d, want 1 (recovery must NOT redispatch)", got)
 	}
 
 	t.Logf("FIX-QUEUE-STUCK-1 recovery contract verified end-to-end: item %s recovered to "+
@@ -296,7 +304,23 @@ func TestQueueDispatchCommittedThenResponseLostRecoversUnknown(t *testing.T) {
 func TestQueueDispatchNormalModeCommitsAndKeepsDispatching(t *testing.T) {
 	// Shorten the threshold but recover AFTER a sleep that is SHORTER than it,
 	// proving the in-flight window is left alone.
-	const testThreshold = 400 * time.Millisecond
+	//
+	// Margin arithmetic (why 2s, not 400ms): the stale clock starts at the
+	// CLAIM-time DispatchStartedAt stamp (pkg/web/queue.go Claim), NOT at the
+	// dispatch response — so elapsed at the assertion List is the sleep PLUS
+	// the whole claim→dispatch→list round-trip chain (claim's atomic disk
+	// save, the /oc/ proxy hop, list's disk load) PLUS any CI-load stalls.
+	// With threshold=400ms and sleep=200ms the RTT margin was only 200ms;
+	// measured RTTs eat ~25ms of it on an IDLE machine, and saturated CI
+	// runners (`go test ./...` runs packages in parallel) can inflate the
+	// chain past the margin, making recovery fire legitimately and this guard
+	// flake (observed in CI: "got \"unknown\""). threshold=2s with the
+	// half-threshold sleep leaves ~1s of headroom (~40× the observed idle
+	// chain) while keeping the guard sensitive to any recovery that fires
+	// before 50% of the threshold. (TestQueueRestartFence_* keeps the full
+	// production 30s threshold for its stay-dispatching check for the same
+	// reason.)
+	const testThreshold = 2 * time.Second
 	web.SetStaleDispatchThresholdForTest(testThreshold)
 	t.Cleanup(func() { web.SetStaleDispatchThresholdForTest(0) })
 
