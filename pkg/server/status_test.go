@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -589,6 +590,306 @@ func TestFleetStatus_RosterExpectedMode(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Project roster (--status-project): acquisition filter + project_missing
+// ---------------------------------------------------------------------------
+
+// TestFleetStatus_ProjectRosterScopesAcquisition pins the filter effect:
+// with a configured project roster, per-worker discovery is INTERSECTED with
+// it — a discovered-but-unconfigured dir is never fetched (the fake has no
+// body for its snapshot, so an unfiltered rollup would error the whole
+// worker), never counted, and the roster normalizes blank/dedupe/sort only:
+// entries are stored VERBATIM, so "  /repo " and "/repo" are two DISTINCT
+// configured dirs (no trim — commit-review F2).
+func TestFleetStatus_ProjectRosterScopesAcquisition(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	d.StatusProjectRoster = []string{"  /repo ", "", "/repo", "  /repo "} // blank dropped, dedupe on the verbatim string, NO trim → ["  /repo ", "/repo"]
+	fleetAddOnline(t, d.Registry, "alpha")
+	// Discovery reports the unconfigured "" project AND "/repo"; only the
+	// /repo snapshot is scripted (the bare /vh/snapshot would fail the fake).
+	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("", "/repo"))
+	fake.setBody("alpha", "/vh/snapshot?dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{
+		"r1": fleetGF("busy", false, false), // the ONLY session that may count
+	}))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	if w := workerEntry(t, resp, "alpha"); w.Status != fleetWorkerOK {
+		t.Fatalf("alpha: want ok (unconfigured dir must not be fetched), got %+v", w)
+	}
+	if n := fake.count("alpha"); n != 2 {
+		t.Fatalf("acquisition must be discovery + exactly ONE in-scope snapshot, got %d calls", n)
+	}
+	if resp.Coverage.ProjectScope != "expected" || resp.Coverage.RequiredProjects != 2 || resp.Coverage.ObservedProjects != 1 || resp.Coverage.UnknownProjects != 1 {
+		t.Fatalf("project coverage: want expected 2/1/1 (\"  /repo \" and \"/repo\" are distinct dirs; only \"/repo\" is instantiated), got %+v", resp.Coverage)
+	}
+	if !resp.Gauge.Available || resp.Gauge.Value != 1 || resp.Gauge.Label != "1/1 busy" {
+		t.Fatalf("gauge: want available 1 \"1/1 busy\" (only the configured project counts), got %+v", resp.Gauge)
+	}
+	if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondProjectMissing {
+		t.Fatalf("conditions: want [project_missing] (\"  /repo \" configured but not instantiated anywhere), got %v", got)
+	}
+	if resp.Conditions[0].Count != 1 {
+		t.Fatalf("project_missing count: want 1 (only \"  /repo \" is missing), got %d", resp.Conditions[0].Count)
+	}
+	if resp.Overall != fleetOverallDegraded || resp.KnownOverall != fleetOverallDegraded {
+		t.Fatalf("overall/known: want degraded/degraded (complete worker coverage + one configured dir not running), got %s/%s", resp.Overall, resp.KnownOverall)
+	}
+}
+
+// TestFleetStatus_ProjectRosterVerbatimMatch pins the F2 contract fix: a
+// configured --status-project dir matches the worker-reported dir by exact
+// VERBATIM string equality — no trimming on either side. Case (i): a
+// whitespace-bearing configured dir (" /repo") against a whitespace-free
+// worker-reported dir ("/repo") is NO match — the dir is out of scope
+// (never fetched), and the configured dir counts toward missing once the
+// only online worker was completely acquired. Case (ii): the same
+// whitespace on both sides (" /repo") matches verbatim — in scope, fetched,
+// satisfied.
+func TestFleetStatus_ProjectRosterVerbatimMatch(t *testing.T) {
+	snapPath := "/vh/snapshot?dir=" + url.QueryEscape(" /repo")
+
+	// (i) whitespace-bearing configured dir vs whitespace-free worker dir.
+	d, fake := newFleetTestDaemon(t, "")
+	d.StatusProjectRoster = []string{" /repo"}
+	fleetAddOnline(t, d.Registry, "alpha")
+	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/repo"))
+	// No "/vh/snapshot?dir=%2Frepo" body is scripted: fetching it would be
+	// the trim bug (the fake errors on unexpected fetches).
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	if w := workerEntry(t, resp, "alpha"); w.Status != fleetWorkerOK {
+		t.Fatalf("(i) alpha: want ok (whitespace-free dir must NOT be fetched), got %+v", w)
+	}
+	if n := fake.count("alpha"); n != 1 {
+		t.Fatalf("(i) acquisition calls: want discovery only (no snapshot for the unmatched dir), got %d", n)
+	}
+	if resp.Coverage.RequiredProjects != 1 || resp.Coverage.ObservedProjects != 0 || resp.Coverage.UnknownProjects != 1 {
+		t.Fatalf("(i) project coverage: want 1/0/1 (no verbatim match ⇒ unknown), got %+v", resp.Coverage)
+	}
+	if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondProjectMissing {
+		t.Fatalf("(i) conditions: want [project_missing] (the verbatim dir counts toward missing), got %v", got)
+	}
+	if resp.Conditions[0].Count != 1 || resp.KnownOverall != fleetOverallDegraded {
+		t.Fatalf("(i) project_missing: want count=1 known=degraded, got count=%d known=%s", resp.Conditions[0].Count, resp.KnownOverall)
+	}
+
+	// (ii) the same whitespace on both sides: verbatim match.
+	d2, fake2 := newFleetTestDaemon(t, "")
+	d2.StatusProjectRoster = []string{" /repo"}
+	fleetAddOnline(t, d2.Registry, "alpha")
+	fake2.setBody("alpha", "/vh/projects", fleetProjectsBody(" /repo"))
+	fake2.setBody("alpha", snapPath, fleetSnapBody(map[string]state.GateFacts{
+		"s1": fleetGF("idle", false, false),
+	}))
+
+	resp2 := decodeFleet(t, doFleet(d2.buildRootHandler()))
+	if w := workerEntry(t, resp2, "alpha"); w.Status != fleetWorkerOK {
+		t.Fatalf("(ii) alpha: want ok, got %+v", w)
+	}
+	if n := fake2.count("alpha"); n != 2 {
+		t.Fatalf("(ii) acquisition calls: want discovery + the one verbatim-matched snapshot, got %d", n)
+	}
+	if resp2.Coverage.RequiredProjects != 1 || resp2.Coverage.ObservedProjects != 1 || resp2.Coverage.UnknownProjects != 0 {
+		t.Fatalf("(ii) project coverage: want 1/1/0 (verbatim match works both ways), got %+v", resp2.Coverage)
+	}
+	if got := condKinds(resp2); len(got) != 0 {
+		t.Fatalf("(ii) conditions: want none (dir satisfied), got %v", got)
+	}
+	if resp2.Overall != fleetOverallNominal {
+		t.Fatalf("(ii) overall: want nominal, got %s", resp2.Overall)
+	}
+}
+
+// TestFleetStatus_ProjectMissingCondition pins the headline semantics: a
+// configured dir instantiated on no online worker is a project_missing
+// condition (count = missing dirs, null link — no valid mapping to a
+// nonexistent project) and — with worker coverage complete — contributes
+// degraded to BOTH known_overall and overall.
+func TestFleetStatus_ProjectMissingCondition(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "$ID.example.test")
+	d.StatusProjectRoster = []string{"/missing", "/hosted"} // normalized+sorted → [/hosted /missing]
+	fleetAddOnline(t, d.Registry, "alpha")
+	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/hosted"))
+	fake.setBody("alpha", "/vh/snapshot?dir=%2Fhosted", fleetSnapBody(map[string]state.GateFacts{
+		"s1": fleetGF("idle", false, false), // healthy: no session-tier conditions
+	}))
+
+	rec := doFleet(d.buildRootHandler())
+	resp := decodeFleet(t, rec)
+	t.Logf("rollup JSON: %s", rec.Body.String())
+
+	if !resp.Coverage.Complete {
+		t.Fatalf("the only in-scope worker was acquired ok — coverage must be complete: %+v", resp.Coverage)
+	}
+	if resp.Coverage.ProjectScope != "expected" || resp.Coverage.RequiredProjects != 2 || resp.Coverage.ObservedProjects != 1 || resp.Coverage.UnknownProjects != 1 {
+		t.Fatalf("project coverage: want expected 2/1/1, got %+v", resp.Coverage)
+	}
+	if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondProjectMissing {
+		t.Fatalf("conditions: want exactly [project_missing], got %v", got)
+	}
+	c := resp.Conditions[0]
+	if c.Count != 1 || c.Label != "1 project not running" || c.Link != nil {
+		t.Fatalf("project_missing condition: want count=1 label=%q link=nil, got %+v", "1 project not running", c)
+	}
+	if c.Since == nil {
+		t.Fatalf("project_missing must carry since on first generation (mirrors worker_missing continuity)")
+	}
+	if resp.KnownOverall != fleetOverallDegraded || resp.Overall != fleetOverallDegraded {
+		t.Fatalf("overall/known: want degraded/degraded (complete coverage + confirmed missing project), got %s/%s", resp.Overall, resp.KnownOverall)
+	}
+	if resp.Summary != "1 project not running" {
+		t.Fatalf("summary: want %q, got %q", "1 project not running", resp.Summary)
+	}
+}
+
+// TestFleetStatus_ProjectFleetWideSatisfaction: a configured dir hosted by
+// TWO workers counts ONCE (fleet-wide satisfaction, not per-worker) —
+// observed_projects is the distinct configured-dir count.
+func TestFleetStatus_ProjectFleetWideSatisfaction(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	d.StatusProjectRoster = []string{"/only-beta", "/shared"} // → [/shared /only-beta]
+	fleetAddOnline(t, d.Registry, "alpha")
+	fleetAddOnline(t, d.Registry, "beta")
+	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/shared"))
+	fake.setBody("alpha", "/vh/snapshot?dir=%2Fshared", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("beta", "/vh/projects", fleetProjectsBody("/shared", "/only-beta"))
+	fake.setBody("beta", "/vh/snapshot?dir=%2Fshared", fleetSnapBody(map[string]state.GateFacts{}))
+	fake.setBody("beta", "/vh/snapshot?dir=%2Fonly-beta", fleetSnapBody(map[string]state.GateFacts{}))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	if resp.Coverage.ObservedProjects != 2 || resp.Coverage.RequiredProjects != 2 || resp.Coverage.UnknownProjects != 0 {
+		t.Fatalf("project coverage: /shared on both workers counts once — want 2/2/0, got %+v", resp.Coverage)
+	}
+	if got := condKinds(resp); len(got) != 0 {
+		t.Fatalf("conditions: fleet-wide satisfaction ⇒ no project_missing, got %v", got)
+	}
+	if resp.Overall != fleetOverallNominal || resp.KnownOverall != fleetOverallNominal {
+		t.Fatalf("overall/known: want nominal/nominal, got %s/%s", resp.Overall, resp.KnownOverall)
+	}
+}
+
+// TestFleetStatus_ProjectMissingSuppressedOnTimeout pins the honesty rule: a
+// configured project on a worker whose acquisition timed out (or errored, or
+// was capped) must NOT be declared missing — absence is unknown while any
+// online worker's view is incomplete. Coverage incomplete ⇒ overall unknown.
+func TestFleetStatus_ProjectMissingSuppressedOnTimeout(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	d.StatusProjectRoster = []string{"/gone"}
+	fleetAddOnline(t, d.Registry, "w1")
+	fake.setErr("w1", &FetchTimeoutError{WorkerID: "w1", Stage: "read body", Cause: errors.New("i/o deadline reached")})
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	if got := condKinds(resp); len(got) != 0 {
+		t.Fatalf("timed-out worker: absence is UNKNOWN — no conditions allowed, got %v", got)
+	}
+	if resp.Coverage.Complete {
+		t.Fatalf("coverage must be incomplete when the online worker timed out: %+v", resp.Coverage)
+	}
+	if resp.Coverage.RequiredProjects != 1 || resp.Coverage.ObservedProjects != 0 || resp.Coverage.UnknownProjects != 1 {
+		t.Fatalf("project coverage: want 1/0/1, got %+v", resp.Coverage)
+	}
+	if resp.Overall != fleetOverallUnknown || resp.KnownOverall != fleetOverallNominal {
+		t.Fatalf("overall/known: want unknown/nominal, got %s/%s", resp.Overall, resp.KnownOverall)
+	}
+}
+
+// TestFleetStatus_ProjectMissingAllOfflineUnknown pins the second honesty
+// rule: with ALL in-scope workers offline/down there is zero evidence, so
+// projects are unknown, never missing — worker_down still fires, but
+// project_missing must not.
+func TestFleetStatus_ProjectMissingAllOfflineUnknown(t *testing.T) {
+	d, _ := newFleetTestDaemon(t, "")
+	d.StatusProjectRoster = []string{"/gone"}
+	fleetAddOnline(t, d.Registry, "dead")
+	d.Registry.MarkWorkerOffline("dead")
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondWorkerDown {
+		t.Fatalf("conditions: want exactly [worker_down], got %v", got)
+	}
+	if resp.Overall != fleetOverallUnknown || resp.KnownOverall != fleetOverallDegraded {
+		t.Fatalf("overall/known: want unknown/degraded (worker down, projects unknown), got %s/%s", resp.Overall, resp.KnownOverall)
+	}
+	if resp.Coverage.ObservedProjects != 0 || resp.Coverage.UnknownProjects != 1 {
+		t.Fatalf("project coverage: want observed=0 unknown=1, got %+v", resp.Coverage)
+	}
+}
+
+// TestFleetStatus_EmptyProjectRosterDiscoveredScope: without a project
+// roster the project axis stays discovered/instantiated with zero project
+// counts — including when a WORKER roster is configured (worker-expected
+// never implies project-expected; the axes are independent).
+func TestFleetStatus_EmptyProjectRosterDiscoveredScope(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	d.StatusWorkerRoster = []string{"alpha"} // worker-expected mode…
+	fleetAddOnline(t, d.Registry, "alpha")
+	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/any"))
+	fake.setBody("alpha", "/vh/snapshot?dir=%2Fany", fleetSnapBody(map[string]state.GateFacts{}))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	if resp.Coverage.Mode != "expected" || resp.Coverage.ProjectScope != "instantiated" {
+		t.Fatalf("coverage: want worker-expected + project-instantiated, got %+v", resp.Coverage)
+	}
+	if resp.Coverage.RequiredProjects != 0 || resp.Coverage.ObservedProjects != 0 || resp.Coverage.UnknownProjects != 0 {
+		t.Fatalf("no project roster ⇒ zero project counts, got %+v", resp.Coverage)
+	}
+	if got := condKinds(resp); len(got) != 0 {
+		t.Fatalf("conditions: none expected (discovered project scope unchanged), got %v", got)
+	}
+	if resp.Overall != fleetOverallNominal {
+		t.Fatalf("overall: want nominal, got %s", resp.Overall)
+	}
+}
+
+// TestFleetStatus_ProjectMissingConditionOrder pins the full display-priority
+// order with project_missing present, inserted in the worker tier after
+// worker_missing: permission_pending > question_pending > worker_down >
+// worker_missing > project_missing > session_error > session_retry. The
+// offline `dead` and never-registered `ghost` do NOT suppress project_missing
+// (only incomplete ONLINE acquisitions do — absence on reachable workers is
+// confirmed), and coverage is incomplete ⇒ overall unknown / known degraded.
+func TestFleetStatus_ProjectMissingConditionOrder(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	d.StatusWorkerRoster = []string{"alpha", "dead", "ghost"} // ghost never registered ⇒ worker_missing
+	d.StatusProjectRoster = []string{"/gone", "/alpha-proj"}
+	fleetAddOnline(t, d.Registry, "alpha")
+	fleetAddOnline(t, d.Registry, "dead")
+	d.Registry.MarkWorkerOffline("dead") // ⇒ worker_down
+	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/alpha-proj"))
+	fake.setBody("alpha", "/vh/snapshot?dir=%2Falpha-proj", fleetSnapBody(map[string]state.GateFacts{
+		"s1": fleetGF("idle", true, false),   // permission_pending
+		"s2": fleetGF("idle", false, true),   // question_pending
+		"s3": fleetGF("error", false, false), // session_error
+		"s4": fleetGF("retry", false, false), // session_retry
+	}))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	want := []string{
+		fleetCondPermissionPending, fleetCondQuestionPending,
+		fleetCondWorkerDown, fleetCondWorkerMissing, fleetCondProjectMissing,
+		fleetCondSessionError, fleetCondSessionRetry,
+	}
+	got := condKinds(resp)
+	if len(got) != len(want) {
+		t.Fatalf("conditions: want %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("conditions order: want %v, got %v", want, got)
+		}
+	}
+	for _, c := range resp.Conditions {
+		if c.Kind == fleetCondProjectMissing {
+			if c.Count != 1 || c.Link != nil || c.Since == nil || c.Label != "1 project not running" {
+				t.Fatalf("project_missing condition: want count=1 since≠nil link=nil, got %+v", c)
+			}
+		}
+	}
+	if resp.Overall != fleetOverallUnknown || resp.KnownOverall != fleetOverallDegraded {
+		t.Fatalf("overall/known: want unknown/degraded (offline+missing workers), got %s/%s", resp.Overall, resp.KnownOverall)
+	}
+}
+
 // TestFleetStatus_EmptyDiscoveryUnknown: an empty discovered fleet (nobody
 // ever connected) is explicitly INCOMPLETE — overall unknown, zero counts,
 // never nominal.
@@ -998,6 +1299,11 @@ func TestFleetSummaryLengthCap(t *testing.T) {
 		{false, fleetCondQuestionPending, 1, "Unknown; 1 question"},
 		{true, fleetCondPermissionPending, 1, "1 permission pending"},
 		{true, fleetCondSessionError, 3, "3 session errors"},
+		// project_missing phrases: n==1 fits the full short form exactly;
+		// n>1 overflows it and degrades to the bare kind word.
+		{false, fleetCondProjectMissing, 1, "Unknown; 1 project not running"},
+		{false, fleetCondProjectMissing, 2, "Unknown; projects not running"},
+		{true, fleetCondProjectMissing, 2, "2 projects not running"},
 		// Huge counts overflow the phrase forms → deterministic fallbacks.
 		{false, fleetCondSessionError, 1000000000, "Unknown; 1000000000 errors"},
 		{false, fleetCondWorkerDown, 1000000000, "Unknown; workers down"},

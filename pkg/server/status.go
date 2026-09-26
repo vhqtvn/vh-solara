@@ -20,7 +20,8 @@ package server
 //     nominal. Confirmed severity stays visible in known_overall.
 //   - `conditions[]`: server-owned display-priority order
 //     permission_pending > question_pending > worker_down | worker_missing >
-//     session_error | session_retry; each {kind,count,since,label,link}.
+//     project_missing > session_error | session_retry; each
+//     {kind,count,since,label,link}.
 //     `since` is the first CONTINUOUSLY observed controller time for the
 //     current contributors (continuity tracked across published generations;
 //     reset on loss of evidence). `link` is a trusted worker-origin
@@ -39,7 +40,13 @@ package server
 //     generation, so a stale generation is never served (and never 304s).
 //   - Acquisition per worker: /vh/projects discovery, then ONE tree-only
 //     /vh/snapshot per discovered project (one snapshot = ONE project — the
-//     rollup fans out across projects and aggregates). Every fetch goes
+//     rollup fans out across projects and aggregates). The optional
+//     --status-project roster intersects discovery with the configured dirs
+//     (unconfigured dirs are excluded everywhere) and turns a configured dir
+//     instantiated on no online worker into a project_missing condition —
+//     declared only when every in-scope online worker was completely
+//     acquired; otherwise absence stays unknown, never missing. Every fetch
+//     goes
 //     through Proxy.FetchWorkerJSONBounded (bounded open/handshake/head/body,
 //     cap-plus-one excess detection) with the worker transport snapshotted
 //     via Registry.WorkerTransport — NEVER the unlocked Worker.Transport read
@@ -92,13 +99,21 @@ type fleetGauge struct {
 }
 
 type fleetCoverage struct {
-	Mode            string `json:"mode"`            // expected|discovered
-	InventoryKnown  bool   `json:"inventory_known"` // true iff an explicit roster is configured
-	Complete        bool   `json:"complete"`        // every in-scope acquisition succeeded
-	ProjectScope    string `json:"project_scope"`   // "instantiated" in v1 (see /vh/projects)
+	Mode            string `json:"mode"`            // expected|discovered (WORKER scope)
+	InventoryKnown  bool   `json:"inventory_known"` // true iff an explicit worker roster is configured
+	Complete        bool   `json:"complete"`        // every in-scope worker acquisition succeeded
+	ProjectScope    string `json:"project_scope"`   // "expected" iff a project roster is configured, else "instantiated" (see /vh/projects)
 	RequiredWorkers int    `json:"required_workers"`
 	ObservedWorkers int    `json:"observed_workers"`
 	UnknownWorkers  int    `json:"unknown_workers"`
+	// Project counts mirror the worker triad but apply ONLY in expected
+	// project mode (all zero in discovered/instantiated mode — no project
+	// expectation is configured). Observed counts a configured dir ONCE no
+	// matter how many workers host it (fleet-wide satisfaction); unknown
+	// includes both confirmed-missing and not-yet-decidable dirs.
+	RequiredProjects int `json:"required_projects"`
+	ObservedProjects int `json:"observed_projects"`
+	UnknownProjects  int `json:"unknown_projects"`
 }
 
 type fleetCondition struct {
@@ -135,6 +150,7 @@ const (
 	fleetCondQuestionPending   = "question_pending"
 	fleetCondWorkerDown        = "worker_down"
 	fleetCondWorkerMissing     = "worker_missing"
+	fleetCondProjectMissing    = "project_missing"
 	fleetCondSessionError      = "session_error"
 	fleetCondSessionRetry      = "session_retry"
 )
@@ -144,6 +160,7 @@ var fleetConditionOrder = []string{
 	fleetCondQuestionPending,
 	fleetCondWorkerDown,
 	fleetCondWorkerMissing,
+	fleetCondProjectMissing,
 	fleetCondSessionError,
 	fleetCondSessionRetry,
 }
@@ -403,6 +420,22 @@ func (s *fleetStatusService) buildRollup(now time.Time) fleetStatusResponse {
 
 	summaries := s.d.Registry.Summaries()
 	roster := normalizeFleetRoster(s.d.StatusWorkerRoster)
+	// Project roster (--status-project): a non-empty normalized set switches
+	// the PROJECT scope to "expected" — per-worker discovery is intersected
+	// with exactly these dirs (VERBATIM exact match: entries keep their
+	// configured spelling, whitespace included — no trimming), and a
+	// configured dir instantiated on no online worker is a project_missing
+	// condition. Empty = discovered/instantiated project scope (current
+	// behavior, unchanged).
+	projectRoster := normalizeProjectRoster(s.d.StatusProjectRoster)
+	expectedProjects := len(projectRoster) > 0
+	var projectSet map[string]bool
+	if expectedProjects {
+		projectSet = make(map[string]bool, len(projectRoster))
+		for _, dir := range projectRoster {
+			projectSet[dir] = true
+		}
+	}
 	byID := make(map[string]bool, len(summaries))
 	online := make(map[string]bool, len(summaries))
 	for _, ws := range summaries {
@@ -466,7 +499,7 @@ func (s *fleetStatusService) buildRollup(now time.Time) fleetStatusResponse {
 				acquired[i] = fleetWorkerResult{id: id, status: fleetWorkerTimeout}
 				return
 			}
-			acquired[i] = s.acquireWorker(ctx, id, refreshStart, fetch)
+			acquired[i] = s.acquireWorker(ctx, id, refreshStart, fetch, projectSet)
 		}(i, id)
 	}
 	wg.Wait()
@@ -481,6 +514,7 @@ func (s *fleetStatusService) buildRollup(now time.Time) fleetStatusResponse {
 	var totalSessions, busyOrRetry int
 	permC, questC, errC, retryC := []fleetContributor{}, []fleetContributor{}, []fleetContributor{}, []fleetContributor{}
 	downIDs, missingIDs := []string{}, []string{}
+	observedProjectDirs := map[string]bool{} // dirs CONFIRMED instantiated this generation (successful snapshots only)
 	observed := 0
 	for _, r := range results {
 		switch r.status {
@@ -492,6 +526,7 @@ func (s *fleetStatusService) buildRollup(now time.Time) fleetStatusResponse {
 			missingIDs = append(missingIDs, r.id)
 		}
 		for _, p := range r.projects {
+			observedProjectDirs[p.dir] = true
 			sids := make([]string, 0, len(p.gate))
 			for sid := range p.gate {
 				sids = append(sids, sid)
@@ -529,7 +564,44 @@ func (s *fleetStatusService) buildRollup(now time.Time) fleetStatusResponse {
 	// all force incomplete).
 	complete := required > 0 && observed == required
 
-	known := fleetKnownOverall(len(downIDs) > 0, len(missingIDs) > 0,
+	// --- project roster fold (expected project mode only) ------------------
+	// A configured dir counts observed ONCE fleet-wide (any worker hosting
+	// it satisfies it — dirs are collected across workers into one set).
+	observedProjects := 0
+	for _, dir := range projectRoster {
+		if observedProjectDirs[dir] {
+			observedProjects++
+		}
+	}
+	// Honesty gate for absence: a configured dir may be declared missing only
+	// when EVERY in-scope ONLINE worker was completely acquired (status ok)
+	// and at least one online worker exists. An incomplete acquisition
+	// (timeout/error/limited) or an all-offline/all-missing fleet leaves
+	// absence UNKNOWN, never missing — mirroring how worker `missing` never
+	// claims from stale evidence. Offline/missing workers do not block the
+	// declaration: a dir instantiated on no ONLINE worker is not running
+	// anywhere reachable, and their own down/missing conditions already
+	// surface why.
+	onlineAcquired, onlineOK := 0, 0
+	for _, r := range results {
+		switch r.status {
+		case fleetWorkerOK:
+			onlineAcquired++
+			onlineOK++
+		case fleetWorkerTimeout, fleetWorkerError, fleetWorkerLimited:
+			onlineAcquired++ // was online when the refresh ran; acquisition incomplete
+		}
+	}
+	var missingProjectDirs []string
+	if expectedProjects && onlineAcquired > 0 && onlineAcquired == onlineOK {
+		for _, dir := range projectRoster { // roster sorted ⇒ deterministic order
+			if !observedProjectDirs[dir] {
+				missingProjectDirs = append(missingProjectDirs, dir)
+			}
+		}
+	}
+
+	known := fleetKnownOverall(len(downIDs) > 0, len(missingIDs) > 0, len(missingProjectDirs) > 0,
 		len(errC) > 0, len(permC) > 0, len(questC) > 0, len(retryC) > 0)
 	overall := known
 	if !complete {
@@ -569,6 +641,10 @@ func (s *fleetStatusService) buildRollup(now time.Time) fleetStatusResponse {
 		newAgg(fleetCondQuestionPending, len(questC), questC, "quest", pluralCount(len(questC), "question pending", "questions pending"), true),
 		workerAgg(fleetCondWorkerDown, downIDs, "down", pluralCount(len(downIDs), "worker down", "workers down")),
 		workerAgg(fleetCondWorkerMissing, missingIDs, "missing", pluralCount(len(missingIDs), "worker missing", "workers missing")),
+		// project_missing rides the worker (infrastructure) tier, after
+		// worker_missing; link stays null — there is no valid /app mapping
+		// for a project that is not running anywhere.
+		workerAgg(fleetCondProjectMissing, missingProjectDirs, "pmissing", pluralCount(len(missingProjectDirs), "project not running", "projects not running")),
 		newAgg(fleetCondSessionError, len(errC), errC, "err", pluralCount(len(errC), "session error", "session errors"), true),
 		newAgg(fleetCondSessionRetry, len(retryC), retryC, "retry", pluralCount(len(retryC), "session retrying", "sessions retrying"), true),
 	}
@@ -631,6 +707,17 @@ func (s *fleetStatusService) buildRollup(now time.Time) fleetStatusResponse {
 		workers = append(workers, e)
 	}
 
+	// Project coverage fields: expected mode turns the scope "expected" and
+	// exposes the required/observed/unknown triad (mirroring the worker
+	// shape); discovered mode keeps "instantiated" with zero counts (no
+	// project expectation is configured).
+	projectScope := "instantiated"
+	requiredProjects := 0
+	if expectedProjects {
+		projectScope = "expected"
+		requiredProjects = len(projectRoster)
+	}
+
 	return fleetStatusResponse{
 		Schema:       1,
 		Overall:      overall,
@@ -638,13 +725,16 @@ func (s *fleetStatusService) buildRollup(now time.Time) fleetStatusResponse {
 		Summary:      summary,
 		Gauge:        gauge,
 		Coverage: fleetCoverage{
-			Mode:            mode,
-			InventoryKnown:  inventoryKnown,
-			Complete:        complete,
-			ProjectScope:    "instantiated",
-			RequiredWorkers: required,
-			ObservedWorkers: observed,
-			UnknownWorkers:  required - observed,
+			Mode:             mode,
+			InventoryKnown:   inventoryKnown,
+			Complete:         complete,
+			ProjectScope:     projectScope,
+			RequiredWorkers:  required,
+			ObservedWorkers:  observed,
+			UnknownWorkers:   required - observed,
+			RequiredProjects: requiredProjects,
+			ObservedProjects: observedProjects,
+			UnknownProjects:  requiredProjects - observedProjects,
 		},
 		Conditions:     conditions,
 		Workers:        workers,
@@ -654,11 +744,15 @@ func (s *fleetStatusService) buildRollup(now time.Time) fleetStatusResponse {
 }
 
 // acquireWorker performs one worker's sequential acquisition: /vh/projects
-// discovery, then ONE tree-only /vh/snapshot per discovered project (one
+// discovery, then ONE tree-only /vh/snapshot per in-scope project (one
 // snapshot covers exactly ONE project — the multi-project fan-out the rollup
 // must do per worker). Sequential by design: at most one in-flight fetch per
-// worker (D2 cap).
-func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string, refreshStart time.Time, fetch fleetJSONFetcher) fleetWorkerResult {
+// worker (D2 cap). projectSet (non-nil in expected project mode) INTERSECTS
+// discovery with the configured roster: discovered-but-unconfigured dirs are
+// excluded from acquisition, session counts, and every other rollup fold —
+// the operator asked for exactly these projects. The filter runs BEFORE the
+// per-worker project cap so out-of-scope dirs never consume it.
+func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string, refreshStart time.Time, fetch fleetJSONFetcher, projectSet map[string]bool) fleetWorkerResult {
 	b := s.budgets
 	res := fleetWorkerResult{id: workerID}
 	limited := false
@@ -694,6 +788,17 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 	}
 	cumulative += int64(len(body))
 	sort.Slice(projects, func(i, j int) bool { return projects[i].Dir < projects[j].Dir })
+	if projectSet != nil {
+		inScope := make([]struct {
+			Dir string `json:"dir"`
+		}, 0, len(projects))
+		for _, p := range projects {
+			if projectSet[p.Dir] {
+				inScope = append(inScope, p)
+			}
+		}
+		projects = inScope
+	}
 	if len(projects) > b.MaxProjectsPerWorker {
 		projects = projects[:b.MaxProjectsPerWorker]
 		limited = true // deterministic cap exclusion, never silent truncation
@@ -810,11 +915,11 @@ func (s *fleetStatusService) reapSince(prefix string) {
 // ---------------------------------------------------------------------------
 
 // fleetKnownOverall folds CONFIRMED facts into severity (the coverage axis is
-// deliberately absent): down/missing/error ⇒ degraded; pending permission/
-// question or retry ⇒ attention; else nominal (no known condition — not
-// confirmed health).
-func fleetKnownOverall(down, missing, sessionErr, perm, quest, retry bool) string {
-	if down || missing || sessionErr {
+// deliberately absent): down/missing/project-missing/error ⇒ degraded (a
+// required thing is absent); pending permission/question or retry ⇒
+// attention; else nominal (no known condition — not confirmed health).
+func fleetKnownOverall(down, missing, projectMissing, sessionErr, perm, quest, retry bool) string {
+	if down || missing || projectMissing || sessionErr {
 		return fleetOverallDegraded
 	}
 	if perm || quest || retry {
@@ -842,6 +947,8 @@ func fleetKindWord(kind string) string {
 		return "workers down"
 	case fleetCondWorkerMissing:
 		return "missing"
+	case fleetCondProjectMissing:
+		return "projects not running"
 	case fleetCondSessionError:
 		return "errors"
 	case fleetCondSessionRetry:
@@ -860,6 +967,8 @@ func fleetSingularWord(kind string) string {
 		return "worker down"
 	case fleetCondWorkerMissing:
 		return "missing"
+	case fleetCondProjectMissing:
+		return "project not running"
 	case fleetCondSessionError:
 		return "error"
 	case fleetCondSessionRetry:
@@ -914,6 +1023,7 @@ func conditionPhrase(kind string, singular bool) string {
 		fleetCondQuestionPending:   {"question pending", "questions pending"},
 		fleetCondWorkerDown:        {"worker down", "workers down"},
 		fleetCondWorkerMissing:     {"worker missing", "workers missing"},
+		fleetCondProjectMissing:    {"project not running", "projects not running"},
 		fleetCondSessionError:      {"session error", "session errors"},
 		fleetCondSessionRetry:      {"session retrying", "sessions retrying"},
 	}
@@ -983,8 +1093,10 @@ func (s *fleetStatusService) workerAppLink(workerID, dir, session string) *strin
 	return &u
 }
 
-// normalizeFleetRoster trims, drops empties, dedupes and sorts the configured
-// --status-worker IDs. A non-empty result switches coverage to expected mode.
+// normalizeFleetRoster trims, drops empties, dedupes and sorts a configured
+// WORKER roster (--status-worker IDs). It is NOT used for --status-project:
+// those dirs go through normalizeProjectRoster's verbatim handling. A
+// non-empty result switches the worker axis to expected mode.
 func normalizeFleetRoster(raw []string) []string {
 	seen := make(map[string]bool, len(raw))
 	out := make([]string, 0, len(raw))
@@ -995,6 +1107,28 @@ func normalizeFleetRoster(raw []string) []string {
 		}
 		seen[id] = true
 		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// normalizeProjectRoster normalizes a configured PROJECT roster
+// (--status-project dirs). Whitespace-only entries are dropped as blank
+// (flag help: "blank entries ignored"), but every non-blank entry is stored
+// VERBATIM — a roster entry matches a worker-reported dir by exact string
+// equality, so surrounding whitespace is significant on BOTH sides (no
+// TrimSpace, no path canonicalization; commit-review F2). Dedupes on the
+// verbatim string and sorts. A non-empty result switches the project axis
+// to expected mode.
+func normalizeProjectRoster(raw []string) []string {
+	seen := make(map[string]bool, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, dir := range raw {
+		if strings.TrimSpace(dir) == "" || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		out = append(out, dir)
 	}
 	sort.Strings(out)
 	return out

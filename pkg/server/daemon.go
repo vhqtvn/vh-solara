@@ -52,6 +52,19 @@ type Daemon struct {
 	// at startup, before the first request; not mutated afterwards.
 	StatusWorkerRoster []string
 
+	// StatusProjectRoster is the optional expected-project roster for
+	// GET /vh/fleet/status, fed by the repeatable --status-project flag.
+	// Empty/whitespace entries are ignored; a non-empty normalized set
+	// switches coverage.project_scope to "expected" (per-worker /vh/projects
+	// discovery is intersected with exactly these dirs — unconfigured dirs
+	// are excluded from acquisition and counts; a configured dir
+	// instantiated on no online worker is a project_missing condition, only
+	// ever declared from complete acquisitions of all online workers).
+	// Entries must match the worker-reported dir spelling exactly. Empty =
+	// discovered/instantiated project scope (current behavior). Set once at
+	// startup, before the first request; not mutated afterwards.
+	StatusProjectRoster []string
+
 	// tunnelDeflate is the controller-side permessage-deflate write policy
 	// for the worker tunnel WebSocket (Q4c experiment). Parsed once from
 	// tunnel.EnvTunnelDeflate in NewDaemon; off ⇒ the upgrader never offers
