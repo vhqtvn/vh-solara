@@ -1259,7 +1259,7 @@ func TestFleetStatus_SinceContinuity(t *testing.T) {
 	snap := d.statusCfg.snapshot()
 	t0 := time.Date(2026, 9, 26, 10, 0, 0, 0, time.UTC)
 
-	r1 := svc.buildRollup(t0, snap)
+	r1, _ := svc.buildRollup(t0, snap)
 	if len(r1.Conditions) != 1 || r1.Conditions[0].Kind != fleetCondPermissionPending || r1.Conditions[0].Since == nil {
 		t.Fatalf("gen1: want one permission_pending with since, got %+v", r1.Conditions)
 	}
@@ -1267,19 +1267,19 @@ func TestFleetStatus_SinceContinuity(t *testing.T) {
 		t.Fatalf("gen1 since: want birth time, got %s", got)
 	}
 
-	r2 := svc.buildRollup(t0.Add(3*time.Second), snap)
+	r2, _ := svc.buildRollup(t0.Add(3*time.Second), snap)
 	if got := *r2.Conditions[0].Since; got != "2026-09-26T10:00:00Z" {
 		t.Fatalf("gen2 (continuous): since must persist, got %s", got)
 	}
 
 	fake.setBody("w1", "/vh/snapshot", cleared)
-	r3 := svc.buildRollup(t0.Add(6*time.Second), snap)
+	r3, _ := svc.buildRollup(t0.Add(6*time.Second), snap)
 	if len(r3.Conditions) != 0 {
 		t.Fatalf("gen3 (condition gone): want no conditions, got %+v", r3.Conditions)
 	}
 
 	fake.setBody("w1", "/vh/snapshot", pending)
-	r4 := svc.buildRollup(t0.Add(9*time.Second), snap)
+	r4, _ := svc.buildRollup(t0.Add(9*time.Second), snap)
 	if got := *r4.Conditions[0].Since; got != "2026-09-26T10:00:09Z" {
 		t.Fatalf("gen4 (reappeared): since must RESET to the new birth time, got %s", got)
 	}

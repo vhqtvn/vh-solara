@@ -206,6 +206,15 @@ func (d *Daemon) buildRootHandler() http.Handler {
 	userMux.HandleFunc("GET /vh/fleet/config", d.handleFleetConfigGet)
 	userMux.HandleFunc("PUT /vh/fleet/config", d.handleFleetConfigPut)
 
+	// Config-UI picker feed (GET /vh/fleet/config/options; see
+	// status_config.go): known workers + worker-reported project dirs
+	// derived from the CURRENT rollup generation (status.go:
+	// fleetGeneration.options) — no extra acquisition. Same auth family;
+	// read-only/CSRF-exempt like the config GET; carved out of the
+	// worker-subdomain proxy below for the same reason (the worker would
+	// serve its SPA shell for this /vh/ path).
+	userMux.HandleFunc("GET /vh/fleet/config/options", d.handleFleetOptionsGet)
+
 	// Latency diagnostics — AGGREGATED global view. The controller merges its
 	// own probes (diag.Default) with every connected worker's snapshot fetched
 	// through the yamux tunnel, returning one envelope so the SPA's Performance
@@ -317,8 +326,8 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 		}
 
 		// Route precedence: the aggregated /vh/diag/latency and the fleet-wide
-		// /vh/fleet/status + /vh/fleet/config are CONTROLLER-OWNED and must be
-		// served by the controller even when the browser's host is a
+		// /vh/fleet/status + /vh/fleet/config family are CONTROLLER-OWNED and
+		// must be served by the controller even when the browser's host is a
 		// per-worker subdomain (e.g. "workerID.controller.example.com").
 		// Without this carve-out the hostInterceptor would proxy the request
 		// down to that worker, returning a single-worker diag snapshot and
@@ -331,13 +340,15 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 		// X-VH-CSRF check (status_config.go) still applies. The SPA is served
 		// from worker subdomains in this deployment, and the worker's
 		// catch-all route would answer /vh/fleet/config with the SPA shell
-		// (200 text/html), which the config pane cannot parse.
+		// (200 text/html), which the config pane cannot parse; ditto the
+		// /vh/fleet/config/options picker feed.
 		// Falling through to `next` (the userMux chain) serves the global
 		// controller-owned view regardless of host. Per-worker
 		// /vh/diag/latency remains reachable on the worker for the
 		// aggregator's own fan-out (which goes through the tunnel via
 		// Proxy.FetchWorkerSnapshot, not through this hostInterceptor).
-		if r.URL.Path == "/vh/diag/latency" || r.URL.Path == "/vh/fleet/status" || r.URL.Path == "/vh/fleet/config" {
+		if r.URL.Path == "/vh/diag/latency" || r.URL.Path == "/vh/fleet/status" ||
+			r.URL.Path == "/vh/fleet/config" || r.URL.Path == "/vh/fleet/config/options" {
 			next.ServeHTTP(w, r)
 			return
 		}

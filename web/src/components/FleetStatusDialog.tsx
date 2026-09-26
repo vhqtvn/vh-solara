@@ -52,6 +52,64 @@ interface FleetConfigResponse {
   projects?: { dir?: string; label?: string }[];
 }
 
+// Mirror of pkg/server buildFleetOptions (GET /vh/fleet/config/options):
+// the add-row picker feed derived from the current rollup generation.
+// workers[].status: rollup statuses (ok|offline|missing|timeout|error|
+// limited) plus "online" (registry-connected worker outside the expected
+// roster — the prime add candidate). projects[].workers: hosting worker ids.
+interface FleetOptionsResponse {
+  schema?: number;
+  generated_at?: string;
+  workers?: { id?: string; status?: string }[];
+  projects?: { dir?: string; workers?: string[] }[];
+}
+
+// One picker suggestion: primary text (worker id / project dir), secondary
+// hint (rollup status word / hosting workers), and a status-dot tier.
+interface Sugg {
+  main: string;
+  sub: string;
+  dot: "ok" | "warn" | "dim" | "";
+}
+
+const MAX_SUGGESTIONS = 8;
+
+// Operator-friendly status hints for the worker picker's secondary line.
+function workerStatusHint(status: string): string {
+  switch (status) {
+    case "ok":
+      return "ok";
+    case "online":
+      return "connected — not in roster";
+    case "offline":
+      return "offline";
+    case "missing":
+      return "configured, not seen";
+    case "timeout":
+      return "acquisition timeout";
+    case "error":
+      return "acquisition error";
+    case "limited":
+      return "capped (limited)";
+    default:
+      return status;
+  }
+}
+
+function workerDotTier(status: string): Sugg["dot"] {
+  switch (status) {
+    case "ok":
+    case "online":
+      return "ok";
+    case "missing":
+    case "timeout":
+    case "error":
+      return "warn";
+    default:
+      return "dim";
+  }
+}
+
 const MAX_LABEL_CP = 64; // maxFleetConfigLabelRunes mirror (code points, not bytes)
 // validWorkerHostLabel mirror: non-empty ASCII letters/digits/'.'/'_'/'-' only
 // (the id is substituted into configured HostPattern deep links server-side).
@@ -207,12 +265,124 @@ export default function FleetStatusDialog(props: { onClose: () => void }) {
   const removeWorker = (i: number) => setWorkers((p) => p.filter((_, idx) => idx !== i));
   const removeProject = (i: number) => setProjects((p) => p.filter((_, idx) => idx !== i));
 
+  // --- Add-from-fleet pickers (GET /vh/fleet/config/options) ---------------
+  // Enhancement, NOT a dependency: the feed is fetched ONCE on open, beside
+  // the config GET. Any failure just leaves the pickers suggestion-less (+
+  // the subtle footer hint) — the free-typed flow is untouched, because
+  // expected mode exists precisely to add things that are currently
+  // down/absent, which by definition have no live suggestion.
+  const [options, setOptions] = createSignal<FleetOptionsResponse | null>(null);
+  const [optionsFailed, setOptionsFailed] = createSignal(false);
+
+  async function loadOptions(): Promise<void> {
+    try {
+      const r = await fetch("/vh/fleet/config/options");
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const parsed = JSON.parse(await r.text()) as FleetOptionsResponse;
+      // Shape guard: a non-options JSON body (misroute/proxy fallback) must
+      // degrade to "no suggestions", never render garbage rows.
+      if (!Array.isArray(parsed?.workers) || !Array.isArray(parsed?.projects)) {
+        throw new Error("unexpected options shape");
+      }
+      setOptions(parsed);
+    } catch {
+      setOptionsFailed(true);
+    }
+  }
+  onMount(() => void loadOptions());
+
+  const workerSugg = (q: string): Sugg[] =>
+    (options()?.workers ?? [])
+      .filter((w) => (w.id ?? "").toLowerCase().includes(q.trim().toLowerCase()))
+      .slice(0, MAX_SUGGESTIONS)
+      .map((w): Sugg => ({
+        main: w.id ?? "",
+        sub: workerStatusHint(w.status ?? ""),
+        dot: workerDotTier(w.status ?? ""),
+      }));
+
+  const projectSugg = (q: string): Sugg[] =>
+    (options()?.projects ?? [])
+      .filter((p) => (p.dir ?? "").toLowerCase().includes(q.trim().toLowerCase()))
+      .slice(0, MAX_SUGGESTIONS)
+      .map((p): Sugg => ({
+        main: p.dir ?? "",
+        sub: (p.workers ?? []).length > 0 ? `on ${(p.workers ?? []).join(", ")}` : "",
+        dot: "",
+      }));
+
+  // One open picker at a time (section + row index); pickIdx is the
+  // keyboard-active suggestion (-1 = none). Reset on pick, blur, Escape, or
+  // input. Suggestions render INLINE under the row (a full-width flex child,
+  // like the row error line) — no portal, no fixed positioning, so nothing
+  // can be clipped by the dialog-body scroll and the cost is plain blocks.
+  const [openPick, setOpenPick] = createSignal<{ kind: "worker" | "project"; i: number } | null>(null);
+  const [pickIdx, setPickIdx] = createSignal(-1);
+  const isOpen = (kind: "worker" | "project", i: number) =>
+    openPick()?.kind === kind && openPick()?.i === i;
+
+  function pickSuggestion(kind: "worker" | "project", i: number, s: Sugg): void {
+    if (kind === "worker") setWorker(i, "id", s.main);
+    else setProject(i, "dir", s.main);
+    setOpenPick(null);
+    setPickIdx(-1);
+  }
+
+  const closePick = (kind: "worker" | "project", i: number) => {
+    if (isOpen(kind, i)) {
+      setOpenPick(null);
+      setPickIdx(-1);
+    }
+  };
+
+  // Keyboard: ↑/↓ cycle the active suggestion (opening a closed picker),
+  // Enter picks the active one. Escape is deliberately NOT handled here:
+  // Solid delegates keydown to the document root, so a stopPropagation in
+  // this handler could not outrank the dialog's own document-level Escape
+  // listener anyway — instead the dialog handler (onKey below) owns the
+  // layering: one Escape closes an open picker, the next closes the dialog.
+  function onPickKey(
+    e: KeyboardEvent,
+    kind: "worker" | "project",
+    i: number,
+    list: () => Sugg[],
+  ): void {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp" && e.key !== "Enter") return;
+    const sugg = list();
+    if (sugg.length === 0) return;
+    if (e.key === "Enter") {
+      const idx = pickIdx();
+      if (isOpen(kind, i) && idx >= 0 && idx < sugg.length) {
+        e.preventDefault();
+        pickSuggestion(kind, i, sugg[idx]);
+      }
+      return;
+    }
+    e.preventDefault();
+    if (!isOpen(kind, i)) {
+      setOpenPick({ kind, i });
+      setPickIdx(0);
+      return;
+    }
+    const n = sugg.length;
+    setPickIdx((p) => (e.key === "ArrowDown" ? (p + 1) % n : p <= 0 ? n - 1 : p - 1));
+  }
+
   // Browser back closes the dialog (mobile/PWA posture); Esc and the overlay
   // click close it too. The admin menu stays mounted behind (its dismiss
   // guard reads fleetOpen, which stays true until the menu unmounts us).
+  // Escape is LAYERED: an open suggestion picker closes first; only a second
+  // Escape reaches the dialog itself.
   useBackEntry(props.onClose, "fleetcfg");
   const onKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape") props.onClose();
+    if (e.key === "Escape") {
+      if (openPick()) {
+        setOpenPick(null);
+        setPickIdx(-1);
+        return;
+      }
+      props.onClose();
+    }
   };
   onMount(() => document.addEventListener("keydown", onKey));
   onCleanup(() => document.removeEventListener("keydown", onKey));
@@ -293,8 +463,16 @@ export default function FleetStatusDialog(props: { onClose: () => void }) {
                           placeholder="worker id (e.g. build-box)"
                           value={w().id}
                           onInput={(e) => setWorker(i, "id", e.currentTarget.value)}
+                          onFocus={() => {
+                            setOpenPick({ kind: "worker", i });
+                            setPickIdx(-1);
+                          }}
+                          onBlur={() => closePick("worker", i)}
+                          onKeyDown={(e) => onPickKey(e, "worker", i, () => workerSugg(w().id))}
                           spellcheck={false}
                           aria-label={`Worker ${i + 1} id`}
+                          aria-autocomplete="list"
+                          aria-expanded={isOpen("worker", i)}
                         />
                         <input
                           class={styles.inLabel}
@@ -313,6 +491,39 @@ export default function FleetStatusDialog(props: { onClose: () => void }) {
                         >
                           <Icon name="x" size={13} />
                         </button>
+                        <Show when={isOpen("worker", i) && workerSugg(w().id).length > 0}>
+                          <div class={styles.picks} role="listbox" aria-label={`Known workers (row ${i + 1})`}>
+                            <Index each={workerSugg(w().id)}>
+                              {(s, si) => (
+                                <button
+                                  type="button"
+                                  role="option"
+                                  aria-selected={pickIdx() === si}
+                                  class={styles.pick}
+                                  classList={{ [styles.pickActive]: pickIdx() === si }}
+                                  // Keep the input's focus so the click lands
+                                  // before any blur-close could race it.
+                                  onMouseDown={(e) => e.preventDefault()}
+                                  onClick={() => pickSuggestion("worker", i, s())}
+                                >
+                                  <span
+                                    classList={{
+                                      [styles.pickDot]: s().dot !== "",
+                                      [styles.pickDotOk]: s().dot === "ok",
+                                      [styles.pickDotWarn]: s().dot === "warn",
+                                      [styles.pickDotDim]: s().dot === "dim",
+                                    }}
+                                    aria-hidden="true"
+                                  />
+                                  <span class={styles.pickMain}>{s().main}</span>
+                                  <Show when={s().sub}>
+                                    <span class={styles.pickSub}>{s().sub}</span>
+                                  </Show>
+                                </button>
+                              )}
+                            </Index>
+                          </div>
+                        </Show>
                       </Show>
                       <Show when={workerErrors()[i]}>
                         <span class={styles.rowErr}>⚠ {workerErrors()[i]}</span>
@@ -358,8 +569,16 @@ export default function FleetStatusDialog(props: { onClose: () => void }) {
                           placeholder="/path/to/project (verbatim)"
                           value={p().dir}
                           onInput={(e) => setProject(i, "dir", e.currentTarget.value)}
+                          onFocus={() => {
+                            setOpenPick({ kind: "project", i });
+                            setPickIdx(-1);
+                          }}
+                          onBlur={() => closePick("project", i)}
+                          onKeyDown={(e) => onPickKey(e, "project", i, () => projectSugg(p().dir))}
                           spellcheck={false}
                           aria-label={`Project ${i + 1} dir`}
+                          aria-autocomplete="list"
+                          aria-expanded={isOpen("project", i)}
                         />
                         <input
                           class={styles.inLabel}
@@ -378,6 +597,28 @@ export default function FleetStatusDialog(props: { onClose: () => void }) {
                         >
                           <Icon name="x" size={13} />
                         </button>
+                        <Show when={isOpen("project", i) && projectSugg(p().dir).length > 0}>
+                          <div class={styles.picks} role="listbox" aria-label={`Observed project dirs (row ${i + 1})`}>
+                            <Index each={projectSugg(p().dir)}>
+                              {(s, si) => (
+                                <button
+                                  type="button"
+                                  role="option"
+                                  aria-selected={pickIdx() === si}
+                                  class={styles.pick}
+                                  classList={{ [styles.pickActive]: pickIdx() === si }}
+                                  onMouseDown={(e) => e.preventDefault()}
+                                  onClick={() => pickSuggestion("project", i, s())}
+                                >
+                                  <span class={styles.pickMain}>{s().main}</span>
+                                  <Show when={s().sub}>
+                                    <span class={styles.pickSub}>{s().sub}</span>
+                                  </Show>
+                                </button>
+                              )}
+                            </Index>
+                          </div>
+                        </Show>
                       </Show>
                       <Show when={projectErrors()[i]}>
                         <span class={styles.rowErr}>⚠ {projectErrors()[i]}</span>
@@ -398,6 +639,9 @@ export default function FleetStatusDialog(props: { onClose: () => void }) {
             </Show>
             <div class={styles.footHint}>
               Saving rewrites the config file as JSON — hand-written comments are not kept.
+              <Show when={optionsFailed()}>
+                {" "}Live fleet suggestions are unavailable — type ids manually.
+              </Show>
             </div>
             <div class={styles.footBtns}>
               <button type="button" class="btn" onClick={() => void load()} disabled={loading() || saving()}>

@@ -144,6 +144,31 @@ type fleetStatusResponse struct {
 	MaxStalenessMS int64              `json:"max_staleness_ms"`
 }
 
+// fleetOptionsResponse is the GET /vh/fleet/config/options picker feed —
+// config-UI-ONLY (the /vh/fleet/status watch payload stays compact by
+// design). Built INSIDE buildRollup from the same refresh's results, so it
+// rides the same immutable generation: identical staleness semantics, zero
+// extra acquisition (see buildFleetOptions).
+type fleetOptionsResponse struct {
+	Schema      int                   `json:"schema"`
+	GeneratedAt string                `json:"generated_at"`
+	Workers     []fleetOptionsWorker  `json:"workers"`
+	Projects    []fleetOptionsProject `json:"projects"`
+}
+
+// fleetOptionsWorker is one known worker for the pane's add-worker picker.
+type fleetOptionsWorker struct {
+	ID     string `json:"id"`
+	Status string `json:"status"` // rollup status (ok|offline|missing|timeout|error|limited) or "online"
+}
+
+// fleetOptionsProject is one worker-REPORTED project dir for the add-project
+// picker. Workers lists the hosting worker ids (sorted; [] never null).
+type fleetOptionsProject struct {
+	Dir     string   `json:"dir"`
+	Workers []string `json:"workers"`
+}
+
 // Condition kinds in the server-owned display-priority order. Exactly this
 // order in conditions[]; at most one aggregate per kind; nonzero counts only.
 const (
@@ -175,6 +200,13 @@ const (
 	fleetWorkerError   = "error"
 	fleetWorkerLimited = "limited"
 )
+
+// fleetWorkerOnline is an OPTIONS-FEED-ONLY status (never in the rollup's
+// workers[]): a registry worker connected while the rollup runs in expected
+// (roster) scope — the tunnel is up, but the worker is outside the configured
+// roster and was therefore never acquired. The config picker surfaces it so
+// the operator can add exactly this worker.
+const fleetWorkerOnline = "online"
 
 // Overall enum values.
 const (
@@ -236,9 +268,12 @@ type fleetJSONFetcher func(ctx context.Context, workerID, path string, timeout t
 // PUT /vh/fleet/config — and the generation is equally stale; it also stops
 // an in-flight refresh started BEFORE a config swap from publishing over
 // the newer config: its stamp can never match the live generation again).
+// options is the GET /vh/fleet/config/options picker feed marshaled from the
+// SAME refresh — a second view of one generation, not a second acquisition.
 type fleetGeneration struct {
 	body        []byte
 	etag        string
+	options     []byte
 	publishedAt time.Time
 	regGen      uint64
 	cfgGen      uint64
@@ -347,10 +382,15 @@ func (s *fleetStatusService) refresh(done chan struct{}, regGen uint64) {
 	// captured together, so the published generation is stamped with exactly
 	// the config it was built from (no read-then-stamp race).
 	snap := s.d.statusCfg.snapshot()
-	resp := s.buildRollup(time.Now().UTC(), snap)
+	resp, opts := s.buildRollup(time.Now().UTC(), snap)
 	body, err := json.Marshal(resp)
 	if err != nil {
 		// Cannot happen (plain structs), but fail honest rather than serve nil.
+		s.publishFallback(regGen, snap.gen)
+		return
+	}
+	optBody, err := json.Marshal(opts)
+	if err != nil {
 		s.publishFallback(regGen, snap.gen)
 		return
 	}
@@ -358,6 +398,7 @@ func (s *fleetStatusService) refresh(done chan struct{}, regGen uint64) {
 	s.cur = &fleetGeneration{
 		body:        body,
 		etag:        fleetETag(body),
+		options:     optBody,
 		publishedAt: time.Now().UTC(),
 		regGen:      regGen,
 		cfgGen:      snap.gen,
@@ -385,10 +426,21 @@ func (s *fleetStatusService) publishFallback(regGen, cfgGen uint64) {
 	if err != nil {
 		body = []byte(`{"schema":1,"overall":"unknown"}`)
 	}
+	optResp := fleetOptionsResponse{
+		Schema:      1,
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		Workers:     []fleetOptionsWorker{},
+		Projects:    []fleetOptionsProject{},
+	}
+	optBody, err := json.Marshal(optResp)
+	if err != nil {
+		optBody = []byte(`{"schema":1,"workers":[],"projects":[]}`)
+	}
 	s.mu.Lock()
 	s.cur = &fleetGeneration{
 		body:        body,
 		etag:        fleetETag(body),
+		options:     optBody,
 		publishedAt: time.Now().UTC(),
 		regGen:      regGen,
 		cfgGen:      cfgGen,
@@ -414,6 +466,12 @@ type fleetWorkerResult struct {
 	status     string
 	observedAt time.Time
 	projects   []fleetObservedProject
+	// discovered is the FULL /vh/projects discovery (every worker-reported
+	// dir, captured BEFORE the expected-roster filter and every cap) — the
+	// suggestion knowledge behind fleetOptionsResponse. A dir being here
+	// means the worker reports it instantiated; it is NOT an acquisition
+	// claim (that is what projects/ carries).
+	discovered []string
 }
 
 // fleetContributor identifies one session-level condition contributor.
@@ -424,17 +482,19 @@ type fleetContributor struct {
 }
 
 // buildRollup snapshots the registry, acquires every in-scope online worker
-// within the budgets, and folds the observations into the wire response.
-// (The registry-generation stamp is applied by the caller in refresh().) The
-// expected rosters come from the ONE config snapshot the caller captured —
-// snap — so a concurrent PUT /vh/fleet/config can never half-apply (worker
-// roster from one config, project roster from another).
+// within the budgets, and folds the observations into the wire response —
+// plus, from the SAME results, the /vh/fleet/config/options picker feed
+// (see buildFleetOptions). (The registry-generation stamp is applied by the
+// caller in refresh().) The expected rosters come from the ONE config
+// snapshot the caller captured — snap — so a concurrent PUT /vh/fleet/config
+// can never half-apply (worker roster from one config, project roster from
+// another).
 //
 // Per-worker in-flight cap: this function runs ONLY inside the single-flight
 // refresh goroutine, and per-worker acquisition is sequential (discovery,
 // then each project snapshot one at a time), so at most ONE fetch is in
 // flight per worker at any moment — by construction, not by semaphore.
-func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapshot) fleetStatusResponse {
+func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapshot) (fleetStatusResponse, fleetOptionsResponse) {
 	b := s.budgets
 	fetch := s.fetcher()
 
@@ -760,6 +820,82 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 		Workers:        workers,
 		GeneratedAt:    now.Format(time.RFC3339),
 		MaxStalenessMS: b.MaxStalenessMS,
+	}, buildFleetOptions(now, results, summaries)
+}
+
+// buildFleetOptions folds the SAME refresh's worker results + registry
+// summaries into the config-picker feed (GET /vh/fleet/config/options).
+// Called only from buildRollup — one acquisition, two payloads, one
+// generation: options and rollup can never disagree about what was observed.
+//
+// Deliberate deviations from the naive "pass through the rollup" derivation,
+// both in service of the picker's purpose (suggesting things worth ADDING to
+// the rosters):
+//   - workers = rollup results ∪ REGISTRY SUMMARIES. In expected (roster)
+//     mode a connected-but-unrostered worker never enters rollup scope —
+//     exactly the worker the operator most wants to pin. Such a worker gets
+//     status "online" (fleetWorkerOnline: tunnel up, never acquired — NOT
+//     "ok", which would claim an acquisition that did not happen). Rollup
+//     statuses pass through verbatim otherwise, including "missing" (a
+//     roster worker the registry has never seen).
+//   - projects derive from per-worker DISCOVERY (every worker-reported dir,
+//     including dirs the expected-project roster excluded from acquisition
+//     and dirs past budget caps), not from acquired snapshots — in expected
+//     project mode the dirs most worth suggesting are precisely the ones the
+//     roster filter excludes. Hosting worker ids are trivially available
+//     (the reporting worker is known), so the feed carries them rather than
+//     a bare count.
+//
+// Offline/missing/timeout/error workers contribute no dirs (no discovery ran
+// for them) — honest: nothing was reported.
+func buildFleetOptions(now time.Time, results []fleetWorkerResult, summaries []WorkerSummary) fleetOptionsResponse {
+	statusByID := make(map[string]string, len(results)+len(summaries))
+	for _, r := range results {
+		statusByID[r.id] = r.status
+	}
+	for _, ws := range summaries {
+		if _, ok := statusByID[ws.ID]; !ok {
+			if ws.Online {
+				statusByID[ws.ID] = fleetWorkerOnline
+			} else {
+				statusByID[ws.ID] = fleetWorkerOffline
+			}
+		}
+	}
+	workers := make([]fleetOptionsWorker, 0, len(statusByID))
+	for id, st := range statusByID {
+		workers = append(workers, fleetOptionsWorker{ID: id, Status: st})
+	}
+	sort.Slice(workers, func(i, j int) bool { return workers[i].ID < workers[j].ID })
+
+	hostsByDir := map[string]map[string]bool{}
+	for _, r := range results {
+		for _, dir := range r.discovered {
+			if hostsByDir[dir] == nil {
+				hostsByDir[dir] = map[string]bool{}
+			}
+			hostsByDir[dir][r.id] = true
+		}
+	}
+	dirs := make([]string, 0, len(hostsByDir))
+	for dir := range hostsByDir {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+	projects := make([]fleetOptionsProject, 0, len(dirs))
+	for _, dir := range dirs {
+		hosts := make([]string, 0, len(hostsByDir[dir]))
+		for id := range hostsByDir[dir] {
+			hosts = append(hosts, id)
+		}
+		sort.Strings(hosts)
+		projects = append(projects, fleetOptionsProject{Dir: dir, Workers: hosts})
+	}
+	return fleetOptionsResponse{
+		Schema:      1,
+		GeneratedAt: now.Format(time.RFC3339),
+		Workers:     workers,
+		Projects:    projects,
 	}
 }
 
@@ -808,6 +944,12 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 	}
 	cumulative += int64(len(body))
 	sort.Slice(projects, func(i, j int) bool { return projects[i].Dir < projects[j].Dir })
+	// Record the FULL discovery (pre-roster-filter, pre-cap) for the config
+	// picker feed: every dir the worker itself reports as instantiated.
+	// Suggestion knowledge only — acquisition claims live in res.projects.
+	for _, p := range projects {
+		res.discovered = append(res.discovered, p.Dir)
+	}
 	if projectSet != nil {
 		inScope := make([]struct {
 			Dir string `json:"dir"`

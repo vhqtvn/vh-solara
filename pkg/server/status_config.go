@@ -57,12 +57,20 @@ package server
 //	                       not silent acceptance). 400 + precise error on
 //	                       an invalid body. 200 with the effective config
 //	                       on success.
+//	GET /vh/fleet/config/options → {"schema":1,"generated_at":…,
+//	                       "workers":[{id,status}],
+//	                       "projects":[{dir,workers:[host ids]}]} — the
+//	                       add-row picker feed, derived from the CURRENT
+//		/vh/fleet/status rollup generation (status.go:
+//		fleetGeneration.options) with no extra worker acquisition.
 //
-// hostInterceptor carves /vh/fleet/config out of the worker-subdomain proxy
-// (daemon.go): the manage surface is controller-owned and must answer from
-// every host the SPA is served on — the worker has no /vh/fleet/config route,
-// and its catch-all would serve the SPA shell (200 text/html) instead. See
-// TestHostInterceptorFleetConfigRoutePrecedence (status_config_test.go).
+// hostInterceptor carves the /vh/fleet/config family out of the
+// worker-subdomain proxy (daemon.go): the manage surface is
+// controller-owned and must answer from every host the SPA is served on —
+// the worker has no /vh/fleet/config route, and its catch-all would serve
+// the SPA shell (200 text/html) instead. See
+// TestHostInterceptorFleetConfigRoutePrecedence (status_config_test.go) and
+// TestHostInterceptorFleetOptionsRoutePrecedence (status_options_test.go).
 
 import (
 	"bytes"
@@ -372,6 +380,31 @@ func (d *Daemon) LoadStatusConfig(path string) error {
 // only; GET carries no state change).
 func (d *Daemon) handleFleetConfigGet(w http.ResponseWriter, r *http.Request) {
 	writeFleetConfigResponse(w, http.StatusOK, d.statusCfg.snapshot())
+}
+
+// handleFleetOptionsGet serves GET /vh/fleet/config/options — the add-row
+// picker feed for the config pane: every known worker (rollup status, plus
+// registry-connected workers outside an expected roster as "online") and
+// every worker-REPORTED project dir (discovery-level, with hosting worker
+// ids). Derived from the SAME cached rollup generation /vh/fleet/status
+// serves (status.go: fleetGeneration.options, built by buildFleetOptions
+// inside the refresh) — identical staleness semantics, ZERO extra worker
+// acquisition.
+//
+// Read-only and CSRF-exempt like the config GET (repo convention). Not
+// ETagged: the pane fetches it once per dialog open, so conditional-request
+// machinery would be dead weight; Cache-Control matches the family.
+func (d *Daemon) handleFleetOptionsGet(w http.ResponseWriter, r *http.Request) {
+	svc := d.fleetStatusService()
+	gen, err := svc.serve(r.Context())
+	if err != nil {
+		http.Error(w, "fleet options unavailable: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "private, no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(gen.options)
 }
 
 // handleFleetConfigPut serves PUT /vh/fleet/config — the live manage verb.

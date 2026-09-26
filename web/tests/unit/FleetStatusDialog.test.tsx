@@ -15,6 +15,10 @@
 //   • non-JSON body hardening: a 200 HTML body (misrouted proxy / worker SPA
 //     fallback) becomes a clean not-JSON load error — never a raw JSON.parse
 //     exception message; an error status still reports the HTTP code.
+//   • add-from-fleet pickers: GET /vh/fleet/config/options feeds worker/
+//     project suggestions (status hint / hosting workers), picking fills the
+//     row and rides the Save PUT, keyboard ArrowDown/Enter/Escape work, and
+//     an options-fetch failure never breaks the free-typed flow.
 //   • AdminMenu wiring: the "Fleet status" entry opens the dialog while the
 //     menu stays mounted.
 //
@@ -63,13 +67,25 @@ interface Call {
   init?: RequestInit;
 }
 
-// Router-style fetch stub: GET /vh/fleet/config serves `get`; PUT serves
-// `put`. Every call is recorded for method/header/body assertions.
-function stubFleet(get: unknown, put?: { status: number; text?: string; body?: unknown }) {
+// Router-style fetch stub: GET /vh/fleet/config/options serves `opts` (when
+// given; default: an empty valid envelope so pickers stay suggestion-less);
+// GET /vh/fleet/config serves `get`; PUT serves `put`. The OPTIONS url must
+// be matched FIRST — it contains the config url as a substring. Every call
+// is recorded for method/header/body assertions; options calls are kept out
+// of the config get/put counters.
+function stubFleet(
+  get: unknown,
+  put?: { status: number; text?: string; body?: unknown },
+  opts?: { body?: unknown; fail?: boolean },
+) {
   const calls: Call[] = [];
   const mock = vi.fn((url: string, init?: RequestInit) => {
     calls.push({ url, init });
     const method = init?.method ?? "GET";
+    if (url.includes("/vh/fleet/config/options") && method === "GET") {
+      if (opts?.fail) return Promise.reject(new Error("network down"));
+      return Promise.resolve(respJson(opts?.body ?? { schema: 1, workers: [], projects: [] }));
+    }
     if (url.includes("/vh/fleet/config") && method === "PUT" && put) {
       return put.body !== undefined
         ? Promise.resolve(respJson(put.body, put.status >= 200 && put.status < 300, put.status))
@@ -82,7 +98,9 @@ function stubFleet(get: unknown, put?: { status: number; text?: string; body?: u
   });
   vi.stubGlobal("fetch", mock);
   const fleetCalls = () =>
-    calls.filter((c) => c.url.includes("/vh/fleet/config"));
+    calls.filter(
+      (c) => c.url.includes("/vh/fleet/config") && !c.url.includes("/vh/fleet/config/options"),
+    );
   const puts = () => fleetCalls().filter((c) => c.init?.method === "PUT");
   const gets = () => fleetCalls().filter((c) => (c.init?.method ?? "GET") === "GET");
   return { calls, puts, gets };
@@ -326,6 +344,144 @@ describe("FleetStatusDialog — non-JSON response hardening", () => {
     await waitFor(() =>
       expect(document.body.textContent).toContain("Couldn't load the fleet config (HTTP 404)."),
     );
+  });
+});
+
+// Options feed for the picker tests — mirrors the server's
+// buildFleetOptions output shape (see status_options_test.go for the lane-1
+// side of the contract).
+const OPTS = {
+  schema: 1,
+  generated_at: "2026-09-26T19:30:36Z",
+  workers: [
+    { id: "gpu-box", status: "ok" },
+    { id: "old-box", status: "offline" },
+    { id: "nw-1", status: "online" },
+  ],
+  projects: [{ dir: "/srv/gpu/model-lab", workers: ["gpu-box"] }],
+};
+
+describe("FleetStatusDialog — add-from-fleet pickers (GET /vh/fleet/config/options)", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("worker suggestions come from the options feed; picking one fills the row and rides the Save PUT", async () => {
+    const { puts } = stubFleet(CFG_EMPTY_WRITABLE, { status: 200, body: CFG_EMPTY_WRITABLE }, { body: OPTS });
+    render(() => <FleetStatusDialog onClose={() => {}} />);
+
+    await waitFor(() => expect(btn("Add worker")).toBeTruthy());
+    btn("Add worker")!.click();
+    const input = await waitFor(() => inputByLabel("Worker 1 id"));
+    input.focus(); // opens the picker (onFocus)
+    setInput(input, "gpu");
+
+    // Filtered suggestion: only "gpu-box" matches "gpu", with its status hint.
+    const sugg = await waitFor(() => {
+      const b = btnIncluding("gpu-box");
+      expect(b).toBeTruthy();
+      return b!;
+    });
+    expect(sugg.textContent).toContain("ok");
+
+    sugg.click();
+    await waitFor(() => expect(inputByLabel("Worker 1 id").value).toBe("gpu-box"));
+
+    btn("Save")!.click();
+    await waitFor(() => expect(puts().length).toBe(1));
+    expect(JSON.parse(puts()[0].init!.body as string)).toEqual({
+      workers: [{ id: "gpu-box" }],
+      projects: [],
+    });
+  });
+
+  it("keyboard: ArrowDown highlights, Enter picks; Escape closes the picker without closing the dialog", async () => {
+    const onClose = vi.fn();
+    stubFleet(CFG_EMPTY_WRITABLE, undefined, { body: OPTS });
+    render(() => <FleetStatusDialog onClose={onClose} />);
+
+    await waitFor(() => expect(btn("Add worker")).toBeTruthy());
+    btn("Add worker")!.click();
+    const input = await waitFor(() => inputByLabel("Worker 1 id"));
+    input.focus();
+    setInput(input, "old");
+    await waitFor(() => expect(btnIncluding("old-box")).toBeTruthy());
+
+    // ArrowDown highlights the first suggestion (aria-selected).
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+    const active = document.querySelector('button[role="option"][aria-selected="true"]');
+    expect(active?.textContent).toContain("old-box");
+
+    // Escape while the picker is open closes the PICKER layer first — the
+    // dialog's document-level handler owns the layering (Solid delegates
+    // keydown to the document root, so element-level stopPropagation could
+    // not outrank it); the dialog stays open.
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await waitFor(() => expect(btnIncluding("old-box")).toBeUndefined());
+    expect(onClose).not.toHaveBeenCalled();
+    expect(document.querySelector('.dialog[aria-label="Fleet status"]')).toBeTruthy();
+
+    // Reopen via ArrowDown, then Enter picks the highlighted suggestion.
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+    await waitFor(() => expect(btnIncluding("old-box")).toBeTruthy());
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await waitFor(() => expect(inputByLabel("Worker 1 id").value).toBe("old-box"));
+
+    // With no picker open, Escape bubbles on to the dialog and closes it.
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+  });
+
+  it("options-fetch failure leaves the dialog fully functional (blind free-typed add still saves)", async () => {
+    const { puts } = stubFleet(CFG_EMPTY_WRITABLE, { status: 200, body: CFG_EMPTY_WRITABLE }, { fail: true });
+    render(() => <FleetStatusDialog onClose={() => {}} />);
+
+    await waitFor(() => expect(btn("Add worker")).toBeTruthy());
+    btn("Add worker")!.click();
+    const input = await waitFor(() => inputByLabel("Worker 1 id"));
+    input.focus(); // picker opens but has nothing to offer — no crash
+    setInput(input, "manual-box");
+
+    btn("Save")!.click();
+    await waitFor(() => expect(puts().length).toBe(1));
+    expect(JSON.parse(puts()[0].init!.body as string)).toEqual({
+      workers: [{ id: "manual-box" }],
+      projects: [],
+    });
+    // The subtle hint renders; no suggestion UI ever appeared.
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("Live fleet suggestions are unavailable"),
+    );
+    expect(document.querySelector('div[role="listbox"]')).toBeNull();
+  });
+
+  it("project suggestions offer observed dirs with hosting workers as secondary text", async () => {
+    const { puts } = stubFleet(CFG_EMPTY_WRITABLE, { status: 200, body: CFG_EMPTY_WRITABLE }, { body: OPTS });
+    render(() => <FleetStatusDialog onClose={() => {}} />);
+
+    await waitFor(() => expect(btn("Add project")).toBeTruthy());
+    btn("Add project")!.click();
+    const input = await waitFor(() => inputByLabel("Project 1 dir"));
+    input.focus();
+    setInput(input, "/srv");
+
+    const sugg = await waitFor(() => {
+      const b = btnIncluding("/srv/gpu/model-lab");
+      expect(b).toBeTruthy();
+      return b!;
+    });
+    expect(sugg.textContent).toContain("on gpu-box");
+
+    sugg.click();
+    await waitFor(() => expect(inputByLabel("Project 1 dir").value).toBe("/srv/gpu/model-lab"));
+
+    btn("Save")!.click();
+    await waitFor(() => expect(puts().length).toBe(1));
+    expect(JSON.parse(puts()[0].init!.body as string)).toEqual({
+      workers: [],
+      projects: [{ dir: "/srv/gpu/model-lab" }],
+    });
   });
 });
 

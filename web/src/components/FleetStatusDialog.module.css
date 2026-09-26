@@ -167,6 +167,77 @@
   line-height: 1.4;
 }
 
+/* Add-from-fleet pickers (GET /vh/fleet/config/options): the suggestion
+ * list renders INLINE under its row — a full-width flex child like .rowErr,
+ * NOT a portaled/fixed popup — so it is never clipped by the dialog-body
+ * scroll and costs nothing on the compositor (plain blocks; NO
+ * mask-image, NO backdrop-filter, NO contain — the WebRender rules at the
+ * top of this file). */
+.picks {
+  flex: 1 0 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 176px;
+  overflow-y: auto;
+  background: var(--bg-elev, var(--bg-2));
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 3px;
+  margin: 2px 0;
+}
+.pick {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--fg);
+  background: none;
+  border: none;
+  border-radius: 5px;
+  padding: 4px 6px;
+  cursor: pointer;
+  text-align: left;
+  min-width: 0;
+}
+.pick:hover,
+.pickActive {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.pickMain {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.pickSub {
+  margin-left: auto;
+  flex: 0 1 auto;
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Status dot (worker suggestions): green for ok/online, warn for
+ * missing/timeout/error, dim for offline/limited. */
+.pickDot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+.pickDotOk {
+  background: var(--ok, var(--accent));
+}
+.pickDotWarn {
+  background: var(--warn);
+}
+.pickDotDim {
+  background: var(--fg-dim);
+}
+
 /* Read-only rows (writable:false): plain text, no inputs. */
 .roMain {
   flex: 2 1 150px;
