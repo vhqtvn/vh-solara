@@ -102,6 +102,21 @@ func (r *Registry) GetWorker(workerID string) (*Worker, bool) {
 	return w, exists
 }
 
+// WorkerTransport returns the worker's current transport, read under the
+// registry lock so it cannot race with MarkWorkerOffline's Transport=nil
+// write when the worker disconnects mid-use. The returned transport is a
+// snapshot: it may already be closed — callers must still check IsClosed
+// (or handle the resulting stream errors).
+func (r *Registry) WorkerTransport(workerID string) (*tunnel.MuxTransport, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	w, exists := r.workers[workerID]
+	if !exists {
+		return nil, false
+	}
+	return w.Transport, true
+}
+
 // ListWorkers returns a snapshot of all workers currently registered.
 func (r *Registry) ListWorkers() []*Worker {
 	r.mu.RLock()

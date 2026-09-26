@@ -39,6 +39,12 @@ type Cluster struct {
 	// this cluster was started with ("" = none). Recorded for tests that
 	// route requests through the per-worker subdomain proxy.
 	HostPattern string
+	// Daemon is the real controller daemon instance behind ControllerURL.
+	// Exposed for tests that need direct access to the controller-side
+	// Registry/Proxy (e.g. the S1 bounded-fetch transport-containment
+	// tests, which call Proxy.FetchWorkerJSONBounded against the real
+	// tunnel). Always set before StartCluster returns.
+	Daemon *server.Daemon
 
 	fakeSrv   *httptest.Server
 	workerSrv *httptest.Server
@@ -115,6 +121,7 @@ func StartClusterWithOptions(opts ...ClusterOption) (*Cluster, error) {
 	}
 	d := server.NewDaemon(userAddr, daemonAddr, cfg.hostPattern)
 	d.APIToken = c.APIToken
+	c.Daemon = d
 	go func() { _ = d.Start() }()
 	c.ControllerURL = "http://" + userAddr
 	if err := waitHTTP(c.ControllerURL+"/api/coord/workers", c.APIToken, 200, 10*time.Second); err != nil {
