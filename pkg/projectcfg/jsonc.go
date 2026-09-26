@@ -1,5 +1,12 @@
 package projectcfg
 
+// StripJSONC is the exported form of stripJSONC, shared cross-package so the
+// JSONC dialect stays defined in exactly one place (bounded reuse per the
+// fleet-status config brief: prefer exporting the one tested preprocessor
+// over a third private copy). pkg/server's status-config loader
+// (pkg/server/status_config.go) reads the same dialect.
+func StripJSONC(b []byte) []byte { return stripJSONC(b) }
+
 // stripJSONC removes JSONC comments (// line and /* block */) and trailing
 // commas from b, leaving valid JSON. String literals are respected so a "//"
 // inside a string is preserved. It is a small, dependency-free preprocessor;

@@ -43,27 +43,14 @@ type Daemon struct {
 	Proxy      *Proxy
 	WSUpgrader websocket.Upgrader
 
-	// StatusWorkerRoster is the optional expected-fleet roster for
-	// GET /vh/fleet/status, fed by the repeatable --status-worker flag.
-	// Empty/whitespace entries are ignored; a non-empty normalized set
-	// switches the rollup to "expected" coverage mode (scope = exactly these
-	// IDs; workers beyond it are excluded, IDs never registered are
-	// "missing"). Empty = discovered scope (whoever is registered). Set once
-	// at startup, before the first request; not mutated afterwards.
-	StatusWorkerRoster []string
-
-	// StatusProjectRoster is the optional expected-project roster for
-	// GET /vh/fleet/status, fed by the repeatable --status-project flag.
-	// Empty/whitespace entries are ignored; a non-empty normalized set
-	// switches coverage.project_scope to "expected" (per-worker /vh/projects
-	// discovery is intersected with exactly these dirs — unconfigured dirs
-	// are excluded from acquisition and counts; a configured dir
-	// instantiated on no online worker is a project_missing condition, only
-	// ever declared from complete acquisitions of all online workers).
-	// Entries must match the worker-reported dir spelling exactly. Empty =
-	// discovered/instantiated project scope (current behavior). Set once at
-	// startup, before the first request; not mutated afterwards.
-	StatusProjectRoster []string
+	// statusCfg is the fleet-status configuration holder (see
+	// status_config.go): the mutex-guarded expected worker/project rosters
+	// for GET /vh/fleet/status plus the optional persistence path
+	// (--status-config). Zero value = no config loaded (discovered scope,
+	// config management disabled / PUT refused). The rollup re-reads a
+	// coherent snapshot on every refresh, so a live config apply (PUT
+	// /vh/fleet/config) takes effect on the next rollup generation.
+	statusCfg statusConfigHolder
 
 	// tunnelDeflate is the controller-side permessage-deflate write policy
 	// for the worker tunnel WebSocket (Q4c experiment). Parsed once from
@@ -205,6 +192,19 @@ func (d *Daemon) buildRootHandler() http.Handler {
 	// registry-liveness invalidation, strong ETag stable within a generation.
 	userMux.HandleFunc("GET /vh/fleet/status", d.handleFleetStatus)
 
+	// Fleet-status configuration manage API (GET/PUT /vh/fleet/config; see
+	// status_config.go) — same session-cookie auth family as the rollup
+	// route above (the whole userMux chain is auth-gated). GET is read-only:
+	// no X-VH-CSRF requirement (repo convention — csrfGuard gates unsafe
+	// methods only). PUT is a MUTATION on a /vh/ path, OUTSIDE csrfGuard's
+	// /api/ scope, so the X-VH-CSRF check is enforced IN the handler (403
+	// without the header, mirroring the guard). No hostInterceptor carve-out
+	// in v1: the manage surface is served from the controller origin only —
+	// on a worker subdomain the interceptor proxies the request down to the
+	// worker, which has no /vh/fleet/config route (404 there).
+	userMux.HandleFunc("GET /vh/fleet/config", d.handleFleetConfigGet)
+	userMux.HandleFunc("PUT /vh/fleet/config", d.handleFleetConfigPut)
+
 	// Latency diagnostics — AGGREGATED global view. The controller merges its
 	// own probes (diag.Default) with every connected worker's snapshot fetched
 	// through the yamux tunnel, returning one envelope so the SPA's Performance
@@ -329,6 +329,11 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 		// /vh/diag/latency remains reachable on the worker for the
 		// aggregator's own fan-out (which goes through the tunnel via
 		// Proxy.FetchWorkerSnapshot, not through this hostInterceptor).
+		//
+		// NOTE: /vh/fleet/config (GET/PUT) is deliberately NOT in this
+		// carve-out in v1 — the config manage surface is controller-origin
+		// only; a worker-subdomain request for it proxies to the worker and
+		// 404s there (see status_config.go).
 		if r.URL.Path == "/vh/diag/latency" || r.URL.Path == "/vh/fleet/status" {
 			next.ServeHTTP(w, r)
 			return

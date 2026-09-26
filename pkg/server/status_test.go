@@ -551,13 +551,16 @@ func TestFleetStatus_OfflineNoFanout(t *testing.T) {
 	}
 }
 
-// TestFleetStatus_RosterExpectedMode pins --status-worker semantics:
-// normalization (trim/dedupe/drop-blank), expected scope excludes unlisted
-// workers (no fan-out to them), never-registered IDs are missing, and the
-// roster turns inventory_known on. ghost missing ⇒ degraded known severity.
+// TestFleetStatus_RosterExpectedMode pins the config-file worker-roster
+// semantics: a non-empty roster turns expected mode on (inventory_known),
+// the expected scope excludes unlisted workers (no fan-out to them),
+// never-registered IDs are missing, and the rollup scope is SORTED
+// regardless of file order. Blank/whitespace/duplicate ids are rejected at
+// the config boundary itself (status_config_test.go), so the seam here
+// feeds a validated roster. ghost missing ⇒ degraded known severity.
 func TestFleetStatus_RosterExpectedMode(t *testing.T) {
 	d, fake := newFleetTestDaemon(t, "")
-	d.StatusWorkerRoster = []string{"beta", "  alpha ", "", "beta"} // normalized → [alpha beta]
+	applyFleetRosters(t, d, []string{"beta", "alpha"}, nil) // unsorted input → scope [alpha beta]
 	fleetAddOnline(t, d.Registry, "alpha")
 	fleetAddOnline(t, d.Registry, "gamma") // registered but NOT in roster
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody(""))
@@ -591,19 +594,21 @@ func TestFleetStatus_RosterExpectedMode(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Project roster (--status-project): acquisition filter + project_missing
+// Project roster (status config): acquisition filter + project_missing
 // ---------------------------------------------------------------------------
 
 // TestFleetStatus_ProjectRosterScopesAcquisition pins the filter effect:
 // with a configured project roster, per-worker discovery is INTERSECTED with
 // it — a discovered-but-unconfigured dir is never fetched (the fake has no
 // body for its snapshot, so an unfiltered rollup would error the whole
-// worker), never counted, and the roster normalizes blank/dedupe/sort only:
-// entries are stored VERBATIM, so "  /repo " and "/repo" are two DISTINCT
-// configured dirs (no trim — commit-review F2).
+// worker), never counted, and the config boundary stores entries VERBATIM:
+// "  /repo " and "/repo" are two DISTINCT configured dirs (no trim —
+// commit-review F2; blank/duplicate entries are rejected at the config
+// boundary itself, see status_config_test.go).
 func TestFleetStatus_ProjectRosterScopesAcquisition(t *testing.T) {
 	d, fake := newFleetTestDaemon(t, "")
-	d.StatusProjectRoster = []string{"  /repo ", "", "/repo", "  /repo "} // blank dropped, dedupe on the verbatim string, NO trim → ["  /repo ", "/repo"]
+	// Both dirs are valid non-blank entries, stored VERBATIM → ["  /repo ", "/repo"]
+	applyFleetRosters(t, d, nil, []string{"  /repo ", "/repo"})
 	fleetAddOnline(t, d.Registry, "alpha")
 	// Discovery reports the unconfigured "" project AND "/repo"; only the
 	// /repo snapshot is scripted (the bare /vh/snapshot would fail the fake).
@@ -637,8 +642,8 @@ func TestFleetStatus_ProjectRosterScopesAcquisition(t *testing.T) {
 }
 
 // TestFleetStatus_ProjectRosterVerbatimMatch pins the F2 contract fix: a
-// configured --status-project dir matches the worker-reported dir by exact
-// VERBATIM string equality — no trimming on either side. Case (i): a
+// configured project dir matches the worker-reported dir by exact VERBATIM
+// string equality — no trimming on either side. Case (i): a
 // whitespace-bearing configured dir (" /repo") against a whitespace-free
 // worker-reported dir ("/repo") is NO match — the dir is out of scope
 // (never fetched), and the configured dir counts toward missing once the
@@ -650,7 +655,7 @@ func TestFleetStatus_ProjectRosterVerbatimMatch(t *testing.T) {
 
 	// (i) whitespace-bearing configured dir vs whitespace-free worker dir.
 	d, fake := newFleetTestDaemon(t, "")
-	d.StatusProjectRoster = []string{" /repo"}
+	applyFleetRosters(t, d, nil, []string{" /repo"})
 	fleetAddOnline(t, d.Registry, "alpha")
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/repo"))
 	// No "/vh/snapshot?dir=%2Frepo" body is scripted: fetching it would be
@@ -675,7 +680,7 @@ func TestFleetStatus_ProjectRosterVerbatimMatch(t *testing.T) {
 
 	// (ii) the same whitespace on both sides: verbatim match.
 	d2, fake2 := newFleetTestDaemon(t, "")
-	d2.StatusProjectRoster = []string{" /repo"}
+	applyFleetRosters(t, d2, nil, []string{" /repo"})
 	fleetAddOnline(t, d2.Registry, "alpha")
 	fake2.setBody("alpha", "/vh/projects", fleetProjectsBody(" /repo"))
 	fake2.setBody("alpha", snapPath, fleetSnapBody(map[string]state.GateFacts{
@@ -707,7 +712,7 @@ func TestFleetStatus_ProjectRosterVerbatimMatch(t *testing.T) {
 // degraded to BOTH known_overall and overall.
 func TestFleetStatus_ProjectMissingCondition(t *testing.T) {
 	d, fake := newFleetTestDaemon(t, "$ID.example.test")
-	d.StatusProjectRoster = []string{"/missing", "/hosted"} // normalized+sorted → [/hosted /missing]
+	applyFleetRosters(t, d, nil, []string{"/missing", "/hosted"}) // sorted → [/hosted /missing]
 	fleetAddOnline(t, d.Registry, "alpha")
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/hosted"))
 	fake.setBody("alpha", "/vh/snapshot?dir=%2Fhosted", fleetSnapBody(map[string]state.GateFacts{
@@ -747,7 +752,7 @@ func TestFleetStatus_ProjectMissingCondition(t *testing.T) {
 // observed_projects is the distinct configured-dir count.
 func TestFleetStatus_ProjectFleetWideSatisfaction(t *testing.T) {
 	d, fake := newFleetTestDaemon(t, "")
-	d.StatusProjectRoster = []string{"/only-beta", "/shared"} // → [/shared /only-beta]
+	applyFleetRosters(t, d, nil, []string{"/only-beta", "/shared"}) // → [/shared /only-beta]
 	fleetAddOnline(t, d.Registry, "alpha")
 	fleetAddOnline(t, d.Registry, "beta")
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/shared"))
@@ -774,7 +779,7 @@ func TestFleetStatus_ProjectFleetWideSatisfaction(t *testing.T) {
 // online worker's view is incomplete. Coverage incomplete ⇒ overall unknown.
 func TestFleetStatus_ProjectMissingSuppressedOnTimeout(t *testing.T) {
 	d, fake := newFleetTestDaemon(t, "")
-	d.StatusProjectRoster = []string{"/gone"}
+	applyFleetRosters(t, d, nil, []string{"/gone"})
 	fleetAddOnline(t, d.Registry, "w1")
 	fake.setErr("w1", &FetchTimeoutError{WorkerID: "w1", Stage: "read body", Cause: errors.New("i/o deadline reached")})
 
@@ -799,7 +804,7 @@ func TestFleetStatus_ProjectMissingSuppressedOnTimeout(t *testing.T) {
 // project_missing must not.
 func TestFleetStatus_ProjectMissingAllOfflineUnknown(t *testing.T) {
 	d, _ := newFleetTestDaemon(t, "")
-	d.StatusProjectRoster = []string{"/gone"}
+	applyFleetRosters(t, d, nil, []string{"/gone"})
 	fleetAddOnline(t, d.Registry, "dead")
 	d.Registry.MarkWorkerOffline("dead")
 
@@ -821,7 +826,7 @@ func TestFleetStatus_ProjectMissingAllOfflineUnknown(t *testing.T) {
 // never implies project-expected; the axes are independent).
 func TestFleetStatus_EmptyProjectRosterDiscoveredScope(t *testing.T) {
 	d, fake := newFleetTestDaemon(t, "")
-	d.StatusWorkerRoster = []string{"alpha"} // worker-expected mode…
+	applyFleetRosters(t, d, []string{"alpha"}, nil) // worker-expected mode…
 	fleetAddOnline(t, d.Registry, "alpha")
 	fake.setBody("alpha", "/vh/projects", fleetProjectsBody("/any"))
 	fake.setBody("alpha", "/vh/snapshot?dir=%2Fany", fleetSnapBody(map[string]state.GateFacts{}))
@@ -850,8 +855,7 @@ func TestFleetStatus_EmptyProjectRosterDiscoveredScope(t *testing.T) {
 // confirmed), and coverage is incomplete ⇒ overall unknown / known degraded.
 func TestFleetStatus_ProjectMissingConditionOrder(t *testing.T) {
 	d, fake := newFleetTestDaemon(t, "")
-	d.StatusWorkerRoster = []string{"alpha", "dead", "ghost"} // ghost never registered ⇒ worker_missing
-	d.StatusProjectRoster = []string{"/gone", "/alpha-proj"}
+	applyFleetRosters(t, d, []string{"alpha", "dead", "ghost"}, []string{"/gone", "/alpha-proj"}) // ghost never registered ⇒ worker_missing
 	fleetAddOnline(t, d.Registry, "alpha")
 	fleetAddOnline(t, d.Registry, "dead")
 	d.Registry.MarkWorkerOffline("dead") // ⇒ worker_down
@@ -1252,9 +1256,10 @@ func TestFleetStatus_SinceContinuity(t *testing.T) {
 	fake.setBody("w1", "/vh/snapshot", pending)
 
 	svc := d.fleetStatusService()
+	snap := d.statusCfg.snapshot()
 	t0 := time.Date(2026, 9, 26, 10, 0, 0, 0, time.UTC)
 
-	r1 := svc.buildRollup(t0)
+	r1 := svc.buildRollup(t0, snap)
 	if len(r1.Conditions) != 1 || r1.Conditions[0].Kind != fleetCondPermissionPending || r1.Conditions[0].Since == nil {
 		t.Fatalf("gen1: want one permission_pending with since, got %+v", r1.Conditions)
 	}
@@ -1262,19 +1267,19 @@ func TestFleetStatus_SinceContinuity(t *testing.T) {
 		t.Fatalf("gen1 since: want birth time, got %s", got)
 	}
 
-	r2 := svc.buildRollup(t0.Add(3 * time.Second))
+	r2 := svc.buildRollup(t0.Add(3*time.Second), snap)
 	if got := *r2.Conditions[0].Since; got != "2026-09-26T10:00:00Z" {
 		t.Fatalf("gen2 (continuous): since must persist, got %s", got)
 	}
 
 	fake.setBody("w1", "/vh/snapshot", cleared)
-	r3 := svc.buildRollup(t0.Add(6 * time.Second))
+	r3 := svc.buildRollup(t0.Add(6*time.Second), snap)
 	if len(r3.Conditions) != 0 {
 		t.Fatalf("gen3 (condition gone): want no conditions, got %+v", r3.Conditions)
 	}
 
 	fake.setBody("w1", "/vh/snapshot", pending)
-	r4 := svc.buildRollup(t0.Add(9 * time.Second))
+	r4 := svc.buildRollup(t0.Add(9*time.Second), snap)
 	if got := *r4.Conditions[0].Since; got != "2026-09-26T10:00:09Z" {
 		t.Fatalf("gen4 (reappeared): since must RESET to the new birth time, got %s", got)
 	}

@@ -40,8 +40,9 @@ package server
 //     generation, so a stale generation is never served (and never 304s).
 //   - Acquisition per worker: /vh/projects discovery, then ONE tree-only
 //     /vh/snapshot per discovered project (one snapshot = ONE project — the
-//     rollup fans out across projects and aggregates). The optional
-//     --status-project roster intersects discovery with the configured dirs
+//     rollup fans out across projects and aggregates). The optional project
+//     roster from the status config file (--status-config; see
+//     status_config.go) intersects discovery with the configured dirs
 //     (unconfigured dirs are excluded everywhere) and turns a configured dir
 //     instantiated on no online worker into a project_missing condition —
 //     declared only when every in-scope online worker was completely
@@ -230,12 +231,17 @@ type fleetJSONFetcher func(ctx context.Context, workerID, path string, timeout t
 // served to every request in this generation; etag is the strong hash of those
 // bytes; regGen is the Registry.Generation the rollup was built under (a
 // mismatch with the live generation means the body is stale and must never be
-// served — nor 304'd).
+// served — nor 304'd); cfgGen is the status-config holder generation it was
+// built under (a mismatch means the expected rosters changed underneath —
+// PUT /vh/fleet/config — and the generation is equally stale; it also stops
+// an in-flight refresh started BEFORE a config swap from publishing over
+// the newer config: its stamp can never match the live generation again).
 type fleetGeneration struct {
 	body        []byte
 	etag        string
 	publishedAt time.Time
 	regGen      uint64
+	cfgGen      uint64
 }
 
 // fleetStatusService is the daemon-owned rollup cache. Where the cache lives:
@@ -273,10 +279,11 @@ func (s *fleetStatusService) refreshCount() int {
 }
 
 // serve returns the current valid generation, refreshing if the cache is
-// empty, past TTL, or invalidated by a registry generation change. Concurrent
-// callers coalesce onto one service-owned refresh (the refresh context is
-// owned by the service, not the first caller). rctx bounds how long the
-// caller is willing to wait.
+// empty, past TTL, or invalidated by a registry generation change OR a
+// status-config generation change (a live config apply via PUT
+// /vh/fleet/config). Concurrent callers coalesce onto one service-owned
+// refresh (the refresh context is owned by the service, not the first
+// caller). rctx bounds how long the caller is willing to wait.
 func (s *fleetStatusService) serve(rctx context.Context) (*fleetGeneration, error) {
 	// Bounded loop: each iteration either returns a valid generation or waits
 	// for exactly one refresh. A registry generation that churns across
@@ -285,7 +292,8 @@ func (s *fleetStatusService) serve(rctx context.Context) (*fleetGeneration, erro
 	for i := 0; i < 3; i++ {
 		s.mu.Lock()
 		regGen := s.d.Registry.Generation()
-		if s.cur != nil && s.cur.regGen == regGen && time.Since(s.cur.publishedAt) < s.budgets.TTL {
+		cfgGen := s.d.statusCfg.generation()
+		if s.cur != nil && s.cur.regGen == regGen && s.cur.cfgGen == cfgGen && time.Since(s.cur.publishedAt) < s.budgets.TTL {
 			gen := s.cur
 			s.mu.Unlock()
 			return gen, nil
@@ -322,8 +330,11 @@ func (s *fleetStatusService) refresh(done chan struct{}, regGen uint64) {
 		if r := recover(); r != nil {
 			// A panic mid-build must not strand waiters: publish an honest
 			// all-unknown generation (empty coverage, no observations) and
-			// let the deferred close wake everyone.
-			s.publishFallback(regGen)
+			// let the deferred close wake everyone. Stamping the CURRENT
+			// config generation is deliberate: if a config swap raced the
+			// panic, the fallback mismatches the live generation and the
+			// next request re-refreshes (never serves over newer config).
+			s.publishFallback(regGen, s.d.statusCfg.generation())
 		}
 		s.mu.Lock()
 		s.refreshCh = nil
@@ -332,11 +343,15 @@ func (s *fleetStatusService) refresh(done chan struct{}, regGen uint64) {
 		close(done)
 	}()
 
-	resp := s.buildRollup(time.Now().UTC())
+	// ONE coherent config snapshot for the whole build: rosters and cfgGen
+	// captured together, so the published generation is stamped with exactly
+	// the config it was built from (no read-then-stamp race).
+	snap := s.d.statusCfg.snapshot()
+	resp := s.buildRollup(time.Now().UTC(), snap)
 	body, err := json.Marshal(resp)
 	if err != nil {
 		// Cannot happen (plain structs), but fail honest rather than serve nil.
-		s.publishFallback(regGen)
+		s.publishFallback(regGen, snap.gen)
 		return
 	}
 	s.mu.Lock()
@@ -345,6 +360,7 @@ func (s *fleetStatusService) refresh(done chan struct{}, regGen uint64) {
 		etag:        fleetETag(body),
 		publishedAt: time.Now().UTC(),
 		regGen:      regGen,
+		cfgGen:      snap.gen,
 	}
 	s.mu.Unlock()
 }
@@ -352,7 +368,7 @@ func (s *fleetStatusService) refresh(done chan struct{}, regGen uint64) {
 // publishFallback publishes a minimal honest generation: schema 1, unknown
 // overall, empty discovered coverage. Used when a refresh fails so hard there
 // are no observations at all.
-func (s *fleetStatusService) publishFallback(regGen uint64) {
+func (s *fleetStatusService) publishFallback(regGen, cfgGen uint64) {
 	resp := fleetStatusResponse{
 		Schema:         1,
 		Overall:        fleetOverallUnknown,
@@ -375,6 +391,7 @@ func (s *fleetStatusService) publishFallback(regGen uint64) {
 		etag:        fleetETag(body),
 		publishedAt: time.Now().UTC(),
 		regGen:      regGen,
+		cfgGen:      cfgGen,
 	}
 	s.mu.Unlock()
 }
@@ -408,26 +425,29 @@ type fleetContributor struct {
 
 // buildRollup snapshots the registry, acquires every in-scope online worker
 // within the budgets, and folds the observations into the wire response.
-// (The registry-generation stamp is applied by the caller in refresh().)
+// (The registry-generation stamp is applied by the caller in refresh().) The
+// expected rosters come from the ONE config snapshot the caller captured —
+// snap — so a concurrent PUT /vh/fleet/config can never half-apply (worker
+// roster from one config, project roster from another).
 //
 // Per-worker in-flight cap: this function runs ONLY inside the single-flight
 // refresh goroutine, and per-worker acquisition is sequential (discovery,
 // then each project snapshot one at a time), so at most ONE fetch is in
 // flight per worker at any moment — by construction, not by semaphore.
-func (s *fleetStatusService) buildRollup(now time.Time) fleetStatusResponse {
+func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapshot) fleetStatusResponse {
 	b := s.budgets
 	fetch := s.fetcher()
 
 	summaries := s.d.Registry.Summaries()
-	roster := normalizeFleetRoster(s.d.StatusWorkerRoster)
-	// Project roster (--status-project): a non-empty normalized set switches
-	// the PROJECT scope to "expected" — per-worker discovery is intersected
-	// with exactly these dirs (VERBATIM exact match: entries keep their
-	// configured spelling, whitespace included — no trimming), and a
-	// configured dir instantiated on no online worker is a project_missing
-	// condition. Empty = discovered/instantiated project scope (current
-	// behavior, unchanged).
-	projectRoster := normalizeProjectRoster(s.d.StatusProjectRoster)
+	roster := normalizeFleetRoster(snap.workerIDs())
+	// Project roster (status config file, --status-config): a non-empty
+	// normalized set switches the PROJECT scope to "expected" — per-worker
+	// discovery is intersected with exactly these dirs (VERBATIM exact match:
+	// entries keep their configured spelling, whitespace included — no
+	// trimming), and a configured dir instantiated on no online worker is a
+	// project_missing condition. Empty = discovered/instantiated project
+	// scope (current behavior, unchanged).
+	projectRoster := normalizeProjectRoster(snap.projectDirs())
 	expectedProjects := len(projectRoster) > 0
 	var projectSet map[string]bool
 	if expectedProjects {
@@ -1094,9 +1114,11 @@ func (s *fleetStatusService) workerAppLink(workerID, dir, session string) *strin
 }
 
 // normalizeFleetRoster trims, drops empties, dedupes and sorts a configured
-// WORKER roster (--status-worker IDs). It is NOT used for --status-project:
-// those dirs go through normalizeProjectRoster's verbatim handling. A
-// non-empty result switches the worker axis to expected mode.
+// WORKER roster (status-config worker ids — already validated non-blank,
+// host-label-safe, and unique at the config boundary, so this is a defensive
+// no-op besides the sort). It is NOT used for project dirs: those go through
+// normalizeProjectRoster's verbatim handling. A non-empty result switches the
+// worker axis to expected mode.
 func normalizeFleetRoster(raw []string) []string {
 	seen := make(map[string]bool, len(raw))
 	out := make([]string, 0, len(raw))
@@ -1113,13 +1135,13 @@ func normalizeFleetRoster(raw []string) []string {
 }
 
 // normalizeProjectRoster normalizes a configured PROJECT roster
-// (--status-project dirs). Whitespace-only entries are dropped as blank
-// (flag help: "blank entries ignored"), but every non-blank entry is stored
-// VERBATIM — a roster entry matches a worker-reported dir by exact string
-// equality, so surrounding whitespace is significant on BOTH sides (no
-// TrimSpace, no path canonicalization; commit-review F2). Dedupes on the
-// verbatim string and sorts. A non-empty result switches the project axis
-// to expected mode.
+// (status-config project dirs). Whitespace-only entries would be dropped as
+// blank (config validation already rejects them at the boundary), but every
+// non-blank entry is stored VERBATIM — a roster entry matches a
+// worker-reported dir by exact string equality, so surrounding whitespace is
+// significant on BOTH sides (no TrimSpace, no path canonicalization;
+// commit-review F2). Dedupes on the verbatim string and sorts. A non-empty
+// result switches the project axis to expected mode.
 func normalizeProjectRoster(raw []string) []string {
 	seen := make(map[string]bool, len(raw))
 	out := make([]string, 0, len(raw))
