@@ -22,6 +22,7 @@ package cmd
 // the real thing and ocCmdlineMatches sees through it.
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -318,6 +319,12 @@ func (sc *ocLockScenario) waitReport(name string, d time.Duration) ocStarterRepo
 
 // alivePids returns the alive pids recorded with the given suffix
 // (".fake" for fake opencodes, ".gchild" for fd-retaining grandchildren).
+// Zombie-aware: an exited-but-unreaped pid (state Z) holds no lock, has no
+// cmdline, and cannot run — it is NOT a leftover child, only a reap the
+// reparenting init has not got to yet. Counting it (signal-0 existence)
+// made the post-kill orphan assertions race pid-1 reap latency — the
+// 2026-09-27 CI racehammer flake ("cleanup left 1 children" + the sweep's
+// "failed cmdline identity revalidation" for the same pid).
 func (sc *ocLockScenario) alivePids(suffix string) []int {
 	ents, _ := os.ReadDir(sc.pidsDir)
 	var pids []int
@@ -325,7 +332,7 @@ func (sc *ocLockScenario) alivePids(suffix string) []int {
 		if !strings.HasSuffix(e.Name(), suffix) {
 			continue
 		}
-		if pid, err := strconv.Atoi(strings.TrimSuffix(e.Name(), suffix)); err == nil && ocProcessAlive(pid) {
+		if pid, err := strconv.Atoi(strings.TrimSuffix(e.Name(), suffix)); err == nil && ocProcessRunning(pid) {
 			pids = append(pids, pid)
 		}
 	}
@@ -424,9 +431,42 @@ func ocSweepIsGrandchild(pid int) bool {
 	return strings.TrimSpace(ocProcCmdlineArgs(pid)) == "sleep 3000"
 }
 
+// ocProcState returns the /proc/<pid>/stat state character ('R', 'S', 'D',
+// 'Z', …) or 0 when the pid is gone or unreadable. The test scaffolding's
+// zombie-aware companion to ocProcCmdlineArgs: aliveness-by-state rather
+// than signal-0 existence, which holds for zombies too. Production needs no
+// twin — ocCmdlineMatches already classifies a zombie's empty cmdline as
+// recycled (documented at opencode_detached.go), so only the scaffolding's
+// leftover counts and death waits were conflating "exists" with "running".
+func ocProcState(pid int) byte {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	// stat layout: "pid (comm) state ppid …" — comm may itself contain ')'
+	// and spaces, so the state char sits two bytes after the LAST ')'.
+	if i := bytes.LastIndexByte(b, ')'); i >= 0 && i+2 < len(b) {
+		return b[i+2]
+	}
+	return 0
+}
+
+// ocProcessRunning reports whether the pid exists and has NOT exited:
+// missing/unreadable and zombie/dead states (Z, X) are not running. This is
+// the leftover-child notion every count and death-wait below asserts — the
+// no-orphans proof must survive, but prove it about RUNNING children, not
+// about reap latency.
+func ocProcessRunning(pid int) bool {
+	switch ocProcState(pid) {
+	case 0, 'Z', 'X', 'x':
+		return false
+	}
+	return true
+}
+
 func waitPidDead(pid int, d time.Duration) bool {
 	deadline := time.Now().Add(d)
-	for ocProcessAlive(pid) {
+	for ocProcessRunning(pid) {
 		if time.Now().After(deadline) {
 			return false
 		}
@@ -672,6 +712,63 @@ func TestOCSpawnRacehammer(t *testing.T) {
 		if got := len(sc.alivePids(".fake")); got != 0 {
 			t.Fatalf("rep %d: cleanup left %d children", i, got)
 		}
+	}
+}
+
+// TestOCLeftoverCountsIgnoreUnreapedZombies — regression for the 2026-09-27
+// CI failure of TestOCSpawnRacehammer ("rep 5: cleanup left 1 children" plus
+// the sweep's "failed /proc cmdline identity revalidation — recycled or
+// gone"). Root-cause shape: the SIGKILLed fake releases its flock the moment
+// it EXITS (kernel closes fds), so waitOwnerFree returns while the reparented
+// orphan can still be an unreaped ZOMBIE — and signal-0 aliveness holds for a
+// zombie while its /proc cmdline already reads back empty. A leftover count
+// that treats that zombie as a live child is a timing flake against pid-1
+// reap latency, which CI load loses. The invariant this pins: exited counts
+// as gone; only a RUNNING recorded pid is a leftover child.
+func TestOCLeftoverCountsIgnoreUnreapedZombies(t *testing.T) {
+	sc := newOCLockScenario(t)
+
+	// A guaranteed zombie: OUR child that exits while we deliberately do
+	// not reap it. The test process is its living parent, so it stays a
+	// zombie for exactly as long as we choose — no init-reap timing
+	// involved, the red/green of this test is deterministic.
+	z := exec.Command("sleep", "0.02")
+	if err := z.Start(); err != nil {
+		t.Fatal(err)
+	}
+	zPid := z.Process.Pid
+	t.Cleanup(func() { _ = z.Wait() }) // reap after the assertions: no leak
+
+	// Deterministic zombie predicate: the state char itself. Waiting on
+	// "cmdline empty + signal-0 alive" instead is subtly flaky — during
+	// the kernel's mid-exit window (exit_mm already ran, state not yet Z)
+	// a live-state task reads back an EMPTY cmdline, and a 10ms poll
+	// phase-locked to a 20ms sleep hits that window often. 'Z' persists
+	// until someone reaps, and nobody does (the test process is the living
+	// parent and deliberately does not Wait), so this cannot miss.
+	deadline := time.Now().Add(5 * time.Second)
+	for ocProcState(zPid) != 'Z' {
+		if time.Now().After(deadline) {
+			t.Fatalf("child %d never became a zombie (state=%c alive=%v)", zPid, ocProcState(zPid), ocProcessAlive(zPid))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Supporting evidence (the CI observation's fingerprint, and the
+	// falsifier for the recycled-pid alternative): signal-0 aliveness
+	// holds while the cmdline is already gone.
+	if !ocProcessAlive(zPid) || ocProcCmdlineArgs(zPid) != "" {
+		t.Fatalf("zombie %d signature mismatch: alive=%v cmdline=%q", zPid, ocProcessAlive(zPid), ocProcCmdlineArgs(zPid))
+	}
+
+	// THE CI shape: the exited-but-unreaped pid recorded as a leftover
+	// candidate must not count as a live child, and waiting for its death
+	// must succeed without waiting out pid-1's reap.
+	_ = os.WriteFile(filepath.Join(sc.pidsDir, fmt.Sprintf("%d.fake", zPid)), []byte("zombie"), 0o644)
+	if got := len(sc.alivePids(".fake")); got != 0 {
+		t.Fatalf("unreaped zombie counted as a live leftover child: alivePids=%d (pid %d) — the 2026-09-27 racehammer CI flake shape", got, zPid)
+	}
+	if !waitPidDead(zPid, 100*time.Millisecond) {
+		t.Fatal("waitPidDead treated an exited-but-unreaped zombie as alive")
 	}
 }
 
