@@ -43,6 +43,15 @@ type Daemon struct {
 	Proxy      *Proxy
 	WSUpgrader websocket.Upgrader
 
+	// StatusWorkerRoster is the optional expected-fleet roster for
+	// GET /api/fleet/status, fed by the repeatable --status-worker flag.
+	// Empty/whitespace entries are ignored; a non-empty normalized set
+	// switches the rollup to "expected" coverage mode (scope = exactly these
+	// IDs; workers beyond it are excluded, IDs never registered are
+	// "missing"). Empty = discovered scope (whoever is registered). Set once
+	// at startup, before the first request; not mutated afterwards.
+	StatusWorkerRoster []string
+
 	// tunnelDeflate is the controller-side permessage-deflate write policy
 	// for the worker tunnel WebSocket (Q4c experiment). Parsed once from
 	// tunnel.EnvTunnelDeflate in NewDaemon; off ⇒ the upgrader never offers
@@ -59,6 +68,32 @@ type Daemon struct {
 	// (no real yamux session required). nil in production — handleDiagAggregate
 	// then falls back to d.Proxy.FetchWorkerSnapshot.
 	fetchWorkerDiag workerDiagFetcher
+
+	// fetchWorkerJSON, when non-nil, overrides the production bounded
+	// worker-JSON fetcher used by the fleet-status rollup (see status.go).
+	// Tests set this to inject scripted /vh/projects + /vh/snapshot
+	// responses without a real yamux session. nil in production — the rollup
+	// then acquires through Proxy.FetchWorkerJSONBounded (the S1
+	// transport-containment seam).
+	fetchWorkerJSON fleetJSONFetcher
+
+	// fleetOnce/fleetStatus lazily create the daemon-owned fleet-status
+	// service (immutable-generation cache for GET /api/fleet/status; see
+	// status.go). NewDaemon pre-creates it; the lazy path covers Daemons
+	// built as literals.
+	fleetOnce   sync.Once
+	fleetStatus *fleetStatusService
+}
+
+// fleetStatusService returns (creating once) the daemon-owned fleet-status
+// rollup service.
+func (d *Daemon) fleetStatusService() *fleetStatusService {
+	d.fleetOnce.Do(func() {
+		if d.fleetStatus == nil {
+			d.fleetStatus = newFleetStatusService(d)
+		}
+	})
+	return d.fleetStatus
 }
 
 // NewDaemon initialises a new server daemon.
@@ -93,6 +128,11 @@ func NewDaemon(addr, daemonAddr, hostPattern string) *Daemon {
 	}
 	d.tunnelDeflate = tunnelDeflate
 	d.WSUpgrader.EnableCompression = tunnelDeflate.OfferCompression()
+
+	// Daemon-owned fleet-status rollup cache (GET /api/fleet/status). Created
+	// eagerly so the service exists before the first request can race the
+	// lazy path; see status.go.
+	d.fleetStatus = newFleetStatusService(d)
 	return d
 }
 
@@ -136,6 +176,15 @@ func (d *Daemon) buildRootHandler() http.Handler {
 	userMux.HandleFunc("DELETE /api/workers", d.handleCleanupWorkers)
 	userMux.HandleFunc("POST /api/workers/{id}/kill", d.handleKillWorker)
 	userMux.HandleFunc("GET /{$}", d.handleUIPage)
+
+	// Compact fleet-status rollup (watch/bridge-facing, schema:1). Joins the
+	// GET /api/workers session-cookie auth family: registered on userMux, so
+	// Auth.Middleware gates it and csrfGuard exempts it (GET-only — the guard
+	// requires X-VH-CSRF only on unsafe /api/ methods). GET-only by pattern,
+	// so other methods get the mux's 405. Served from the daemon-owned
+	// immutable-generation cache (see status.go): bounded lazy refresh,
+	// registry-liveness invalidation, strong ETag stable within a generation.
+	userMux.HandleFunc("GET /api/fleet/status", d.handleFleetStatus)
 
 	// Latency diagnostics — AGGREGATED global view. The controller merges its
 	// own probes (diag.Default) with every connected worker's snapshot fetched

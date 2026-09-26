@@ -301,6 +301,7 @@ func safeRatio(a, b float64) float64 {
 //   - the frame now carries a `partial` block (mode=tree-stream-1-frontier),
 //   - the in-frame session set is FRONTIER-sized (≪ full dir count),
 //   - the raw frame bytes are ≤ 300 KB (DoD §1, measured through the tunnel),
+//
 // and measures worker-direct vs through-tunnel wall-clock + yamux durations.
 //
 // Skipped unless VH_TUNNEL_GATE=1. LOOPBACK CAVEAT applies (see file doc):
@@ -411,7 +412,7 @@ func TestStream1DeepTreePartialTunnel(t *testing.T) {
 	if os.Getenv("VH_TUNNEL_GATE") == "" {
 		t.Skip("set VH_TUNNEL_GATE=1 to run the deep-tree partial-frame tunnel test")
 	}
-	const dir = "/work/demo" // fixtures.DemoDir() default
+	const dir = "/work/demo"      // fixtures.DemoDir() default
 	const byteBudget = 300 * 1024 // DoD §1: ≤300 KB raw
 
 	c, err := StartCluster()

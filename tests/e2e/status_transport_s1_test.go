@@ -314,6 +314,55 @@ func assertBoundedFail(t *testing.T, label string, err error, dur time.Duration,
 	}
 }
 
+// s1Watchdog bounds how long any single deliberately-stalled fetch (or its
+// result receive) may take before the subtest FAILS FAST (B2 rider from the
+// S1 commit review, binding on this file): if the bounded-fetch containment
+// ever regresses (deadline mechanism broken, stream never errors), the test
+// must fail in seconds — not hang until the global go-test timeout. Comfortably
+// above the asserted bound slop (s1Bound*2+750ms) so a slow-but-contained
+// fetch never trips it.
+const s1Watchdog = 8 * time.Second
+
+// fetchWatched runs one fetch under the no-hang watchdog and fails the test
+// fast if it neither returns nor is contained within s1Watchdog.
+func fetchWatched(t *testing.T, fetch func(context.Context) ([]byte, error, time.Duration), ctx context.Context, label string) ([]byte, error, time.Duration) {
+	t.Helper()
+	type result struct {
+		b   []byte
+		err error
+		dur time.Duration
+	}
+	done := make(chan result, 1)
+	go func() {
+		b, err, dur := fetch(ctx)
+		done <- result{b, err, dur}
+	}()
+	select {
+	case r := <-done:
+		return r.b, r.err, r.dur
+	case <-time.After(s1Watchdog):
+		t.Fatalf("%s: fetch did not settle within %v watchdog — bounded-fetch containment regressed (B2)", label, s1Watchdog)
+		return nil, nil, 0
+	}
+}
+
+// watchdogErr runs fn (a single deliberately-stalled direct call) under the
+// no-hang watchdog and fails the test fast if it does not settle, returning
+// fn's error otherwise. Same B2 contract as fetchWatched, for call sites that
+// don't go through the shared `fetch` closure.
+func watchdogErr(t *testing.T, bound time.Duration, label string, fn func() error) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(bound):
+		t.Fatalf("%s: call did not settle within %v watchdog — bounded-fetch containment regressed (B2)", label, bound)
+		return nil
+	}
+}
+
 // TestS1BoundedFetch_ContainmentThroughRealYamux drives the bounded-fetch
 // helper against a private real controller daemon + a real-tunnel scripted
 // adversarial peer. Phases run sequentially against one peer session; the
@@ -377,8 +426,10 @@ func TestS1BoundedFetch_ContainmentThroughRealYamux(t *testing.T) {
 			t.Fatalf("peer never observed the hung stream")
 		}
 
-		// Sibling fetch on the SAME tunnel while stream #1 is stalled.
-		sibBody, sibErr, sibDur := fetch(context.Background())
+		// Sibling fetch on the SAME tunnel while stream #1 is stalled. Under
+		// the B2 watchdog: a regression that wedges sibling streams on a
+		// stalled session must fail fast here, not hang the suite.
+		sibBody, sibErr, sibDur := fetchWatched(t, fetch, context.Background(), "sibling fetch")
 		if sibErr != nil {
 			t.Fatalf("sibling fetch on same stalled tunnel failed: %v (after %v)", sibErr, sibDur)
 		}
@@ -386,11 +437,18 @@ func TestS1BoundedFetch_ContainmentThroughRealYamux(t *testing.T) {
 			t.Fatalf("sibling fetch: body mismatch: %q", sibBody)
 		}
 
-		r := <-done
+		// B2: the deliberately-stalled never-ack fetch must settle at its
+		// bound — never park the subtest on a bare receive.
+		var r result
+		select {
+		case r = <-done:
+		case <-time.After(s1Watchdog):
+			t.Fatalf("never-ack fetch did not settle within %v watchdog — bounded-fetch containment regressed (B2)", s1Watchdog)
+		}
 		assertBoundedFail(t, "never-ack fetch", r.err, r.dur, s1Bound)
 
 		// And the tunnel is STILL usable after the contained failure.
-		after, afterErr, _ := fetch(context.Background())
+		after, afterErr, _ := fetchWatched(t, fetch, context.Background(), "post-failure fetch")
 		if afterErr != nil || string(after) != helloBody {
 			t.Fatalf("post-failure fetch: err=%v body=%q", afterErr, after)
 		}
@@ -403,7 +461,7 @@ func TestS1BoundedFetch_ContainmentThroughRealYamux(t *testing.T) {
 		g0 := runtime.NumGoroutine()
 		for i := 0; i < 3; i++ {
 			peer.hangNext.Store(1)
-			_, err, dur := fetch(context.Background())
+			_, err, dur := fetchWatched(t, fetch, context.Background(), fmt.Sprintf("stalled fetch #%d", i))
 			if err == nil {
 				t.Fatalf("stalled fetch #%d unexpectedly succeeded", i)
 			}
@@ -412,7 +470,7 @@ func TestS1BoundedFetch_ContainmentThroughRealYamux(t *testing.T) {
 			}
 		}
 		peer.hangNext.Store(0)
-		if body, err, _ := fetch(context.Background()); err != nil || string(body) != helloBody {
+		if body, err, _ := fetchWatched(t, fetch, context.Background(), "post-stall healthy fetch"); err != nil || string(body) != helloBody {
 			t.Fatalf("healthy fetch after repeated stalls: err=%v", err)
 		}
 		g1 := runtime.NumGoroutine()
@@ -426,14 +484,14 @@ func TestS1BoundedFetch_ContainmentThroughRealYamux(t *testing.T) {
 	t.Run("stalled_response_head_bounded", func(t *testing.T) {
 		peer.hangNext.Store(0)
 		peer.script.Store(s1ScriptAckThenHang)
-		_, err, dur := fetch(context.Background())
+		_, err, dur := fetchWatched(t, fetch, context.Background(), "stalled head")
 		assertBoundedFail(t, "stalled head", err, dur, s1Bound)
 	})
 
 	t.Run("stalled_body_bounded", func(t *testing.T) {
 		peer.hangNext.Store(0)
 		peer.script.Store(s1ScriptStallBody)
-		_, err, dur := fetch(context.Background())
+		_, err, dur := fetchWatched(t, fetch, context.Background(), "stalled body")
 		assertBoundedFail(t, "stalled body", err, dur, s1Bound)
 	})
 
@@ -533,7 +591,10 @@ func TestS1BoundedFetch_ContainmentThroughRealYamux(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), openBound)
 		defer cancel()
 		start := time.Now()
-		_, err := proxy.FetchWorkerJSONBounded(ctx, worker, "/hello.json", 5*time.Second, s1BodyCap)
+		err := watchdogErr(t, s1Watchdog, "backlog-full fetch", func() error {
+			_, err := proxy.FetchWorkerJSONBounded(ctx, worker, "/hello.json", 5*time.Second, s1BodyCap)
+			return err
+		})
 		dur := time.Since(start)
 		if err == nil {
 			t.Fatalf("backlog-full fetch: expected error, got success after %v", dur)
@@ -558,7 +619,10 @@ func TestS1BoundedFetch_ContainmentThroughRealYamux(t *testing.T) {
 		// CONSTANT, not an unbounded per-attempt growth.
 		gAfterFirst := runtime.NumGoroutine()
 		ctx2, cancel2 := context.WithTimeout(context.Background(), openBound)
-		_, err2 := proxy.FetchWorkerJSONBounded(ctx2, worker, "/hello.json", 5*time.Second, s1BodyCap)
+		err2 := watchdogErr(t, s1Watchdog, "backlog-full fetch #2", func() error {
+			_, err := proxy.FetchWorkerJSONBounded(ctx2, worker, "/hello.json", 5*time.Second, s1BodyCap)
+			return err
+		})
 		cancel2()
 		if err2 == nil || !os.IsTimeout(err2) {
 			t.Fatalf("backlog-full fetch #2: want timeout error, got %v", err2)

@@ -57,7 +57,10 @@ var ErrFetchResponseBodyTooLarge = errors.New("response body exceeds cap")
 // FetchTimeoutError marks a bounded-fetch failure caused by a deadline
 // firing at a specific stage (stream open, handshake, response head, body).
 // It satisfies the timeout interface so callers can classify it with
-// os.IsTimeout without unwrapping.
+// os.IsTimeout without unwrapping. Timeout() covers BOTH deadline expiry and
+// context cancellation — either way the fetch ran out of its time budget at
+// that stage (the Cause distinguishes them: "i/o deadline reached" vs a
+// context.Canceled/DeadlineExceeded).
 type FetchTimeoutError struct {
 	WorkerID string
 	Stage    string
@@ -104,6 +107,12 @@ const (
 // The pair resolves as soon as the backlog drains or the session closes; it
 // does not grow per call beyond that one pair.
 //
+// Total worst-case wall-clock cost is ~2× timeout unless ctx clamps it
+// tighter: the stream-open race is bounded by `timeout`, and every subsequent
+// stage is bounded by one absolute deadline at now+timeout (clamped to the
+// ctx deadline when earlier). The two windows overlap only in the pathological
+// case where the open resolves just before the timer fires.
+//
 // Read-only: this function mutates no controller state; it opens one stream,
 // performs one GET, and closes the stream.
 func (p *Proxy) FetchWorkerJSONBounded(ctx context.Context, worker *Worker, path string, timeout time.Duration, maxBodyBytes int64) ([]byte, error) {
@@ -132,6 +141,13 @@ func (p *Proxy) FetchWorkerJSONBounded(ctx context.Context, worker *Worker, path
 	}
 	if err := validFetchPath(path); err != nil {
 		return nil, fmt.Errorf("worker %s: %w", worker.ID, err)
+	}
+	// A3: worker.ID is interpolated into the Host header below (and error
+	// strings); guard it against CR/LF the same way validFetchPath guards
+	// the request-line path. IDs come from worker registration, so this keeps
+	// the primitive honest by construction rather than trusting the registrar.
+	if strings.ContainsAny(worker.ID, "\r\n") {
+		return nil, fmt.Errorf("invalid worker ID %q: CR/LF not allowed", worker.ID)
 	}
 	if maxBodyBytes < 0 {
 		return nil, fmt.Errorf("worker %s: negative body cap", worker.ID)
@@ -265,16 +281,16 @@ func (b *budgetReader) Read(p []byte) (int, error) {
 	n, err := b.r.Read(p)
 	b.consumed += int64(n)
 	if b.consumed > b.budget {
-		return n, fmt.Errorf("response exceeds wire budget of %d bytes", b.budget)
+		return 0, fmt.Errorf("response exceeds wire budget of %d bytes", b.budget)
 	}
 	return n, err
 }
 
 // readACKLine reads one newline-terminated ACK line (the peer's WriteJSON
-// appends '\n') of at most cap bytes. Bounds the ACK allocation independently
+// appends '\n') of at most limit bytes. Bounds the ACK allocation independently
 // of json.Decoder's internal buffering.
-func readACKLine(r io.Reader, cap int64) ([]byte, error) {
-	lr := io.LimitReader(r, cap+1)
+func readACKLine(r io.Reader, limit int64) ([]byte, error) {
+	lr := io.LimitReader(r, limit+1)
 	var line []byte
 	one := make([]byte, 1)
 	for {
@@ -291,8 +307,8 @@ func readACKLine(r io.Reader, cap int64) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if int64(len(line)) > cap {
-			return nil, fmt.Errorf("ack line exceeds %d bytes", cap)
+		if int64(len(line)) > limit {
+			return nil, fmt.Errorf("ack line exceeds %d bytes", limit)
 		}
 	}
 }
