@@ -765,14 +765,19 @@ describe("auto-mutation: cold-load normalization + working edges", () => {
     expect(Object.prototype.hasOwnProperty.call(treeModeMapSignal(), "a")).toBe(false);
   });
 
-  it("(3) explicit 'filtered'-idle is REPAIRED to 'collapsed' on cold load (absolute invariant)", () => {
-    // Under the ABSOLUTE invariant, an idle node is NEVER in "filtered". A stale
-    // explicit persisted "filtered"+idle entry is repaired to "collapsed" at seed
-    // time (merged into the same batched setNodeModes as the absent-idle rule).
+  it("(3) explicit 'filtered'-idle SURVIVES the cold-load seed (pre-hydration guard — resume regression)", () => {
+    // REWRITTEN (resume regression, see the dedicated describe below): the §5
+    // frontier can ship a genuinely-running node IDLE — the server's activity
+    // seed (SetActivityFromStatuses) races the snapshot capture, and a cold
+    // baseline demotion is UNHEALABLE (the next busy observation after a reload
+    // is also a baseline — no edge fires, so a corrupted "collapsed" sticks
+    // forever). The absolute invariant therefore does NOT repair an explicit
+    // "filtered" on a cold baseline. The known-node re-seed repair still fires
+    // (R5 below); the absent-idle materialization still fires (test 1 above).
     setNodeMode("a", "filtered");
     seedTreeStore([node({ id: "a" })]);
-    expect(modeOf("a")).toBe("collapsed");
-    expect(treeModeMapSignal()["a"]).toBe("collapsed"); // materialized explicit
+    expect(modeOf("a")).toBe("filtered"); // survives — never demoted
+    expect(treeModeMapSignal()["a"]).toBe("filtered"); // still the explicit entry
   });
 
   it("(4) explicit 'collapsed'+working on FIRST observation stays collapsed (not an edge)", () => {
@@ -834,9 +839,11 @@ describe("auto-mutation: cold-load normalization + working edges", () => {
   });
 
   it("(6d) a stale idle+filtered entry is repaired synchronously by ANY op touching the node (no edge needed)", () => {
-    // Simulate a stale v2 re-entry: manually set an invalid idle+filtered state.
-    setNodeMode("a", "filtered");
-    seedTreeStore([node({ id: "a" })]); // cold-load REPAIRS it to collapsed
+    // Establish an idle resident node whose mode is explicit collapsed. (The
+    // cold seed materializes absent-idle → collapsed; the pre-hydration guard
+    // only protects an EXPLICIT persisted "filtered", which no longer repairs
+    // at cold load — see the resume-regression describe.)
+    seedTreeStore([node({ id: "a" })]);
     expect(modeOf("a")).toBe("collapsed");
     // Re-introduce the invalid state (simulating stale localStorage rehydration):
     setNodeMode("a", "filtered");
@@ -937,5 +944,82 @@ describe("auto-mutation: cold-load normalization + working edges", () => {
       return dispose;
     });
     dispose();
+  });
+});
+
+// ---- RESUME REGRESSION: persisted explicit "filtered" survives cold load -----
+// Bug class: on PWA reload the frontier snapshot can ship a genuinely-running
+// node IDLE (pre-hydration) — the server's activity seed (SetActivityFromStatuses,
+// fanned out CONCURRENTLY with the capture by the aggregator's hydrate) may not
+// have landed when the snapshot was taken, and the per-connection tree emitter
+// only facets KNOWN nodes, so the client cannot distinguish "idle" from "not yet
+// hydrated" in the payload. seedTreeStore's ABSOLUTE invariant used to demote a
+// persisted explicit "filtered" to "collapsed" from that single UNESTABLISHED
+// observation and PERSIST the demotion via setNodeModes (self-corrupting
+// persistence). The corruption then STUCK: the next reload's correctly-hydrated
+// busy frontier is a BASELINE (oldMap empty → no edge fires — tests 4/10), and
+// collapsed+working renders nothing — "running sessions randomly disappear on
+// resume". Fix boundary: the seed path never demotes an EXPLICIT "filtered" on a
+// cold baseline (id not in oldMap). The absent-idle materialization (cold-load
+// lazy-frontier fetch suppression) and the known-node repair/demote edges are
+// UNCHANGED.
+describe("resume regression: persisted explicit 'filtered' survives pre-hydration cold load", () => {
+  beforeEach(() => {
+    resetTreeStore();
+    resetExpandedForTest();
+  });
+
+  it("R1: cold frontier ships pre-hydration idle — persisted explicit 'filtered' is NOT demoted", () => {
+    setNodeMode("a", "filtered"); // the persisted pre-reload state (running sessions visible)
+    seedTreeStore([node({ id: "a" })]); // cold baseline (oldMap empty); node ships idle pre-hydration
+    expect(modeOf("a")).toBe("filtered"); // survives the cold load
+    expect(treeModeMapSignal()["a"]).toBe("filtered"); // explicit entry intact, never rewritten
+  });
+
+  it("R2: the true working state arriving LATE via a stream facet needs NO mode write (busy+filtered valid)", async () => {
+    setNodeMode("a", "filtered");
+    seedTreeStore([node({ id: "a" })]); // pre-hydration idle baseline — mode survives
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "busy" } }); // hydration lands
+    await flush();
+    expect(modeOf("a")).toBe("filtered"); // busy+filtered: working children render immediately
+  });
+
+  it("R3: a genuine settle after resume STILL demotes (the intended working→idle edge is intact)", async () => {
+    setNodeMode("a", "filtered");
+    seedTreeStore([node({ id: "a" })]); // pre-hydration idle baseline — mode survives
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "busy" } }); // observed busy
+    await flush();
+    expect(modeOf("a")).toBe("filtered"); // no change while working
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "idle" } }); // GENUINE settle
+    expect(modeOf("a")).toBe("collapsed"); // demote edge preserved (synchronous, op path)
+  });
+
+  it("R4: absent-idle cold materialization is UNCHANGED (lazy-frontier fetch suppression intact)", () => {
+    // No explicit entry: the cold rule materializes explicit "collapsed" so the
+    // lazy-frontier effect (filtered/temp/expanded fetch children of unloaded
+    // nodes) stays quiet for idle unloaded nodes at cold load.
+    seedTreeStore([node({ id: "a" })]);
+    expect(modeOf("a")).toBe("collapsed");
+    expect(treeModeMapSignal()["a"]).toBe("collapsed");
+  });
+
+  it("R5: the known-node repair on RE-SEED is unchanged (established observations still reconcile)", () => {
+    setNodeMode("a", "filtered");
+    seedTreeStore([busyNode({ id: "a" })]); // baseline: working → explicit filtered preserved
+    expect(modeOf("a")).toBe("filtered");
+    seedTreeStore([node({ id: "a" })]); // re-seed: KNOWN node settles idle → demote edge fires
+    expect(modeOf("a")).toBe("collapsed");
+  });
+
+  it("R6 (self-heal audit): a map ALREADY corrupted to 'collapsed' heals via an OBSERVED idle→busy edge, never via a busy baseline seed", async () => {
+    // Simulate a localStorage map already corrupted by the old bug.
+    setNodeMode("a", "collapsed");
+    seedTreeStore([busyNode({ id: "a" })]); // reload: frontier correctly ships busy — BASELINE
+    expect(modeOf("a")).toBe("collapsed"); // NOT healed by a baseline (no edge fires)
+    // A live observed settle→restart cycle promotes it back (the promote edge):
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "idle" } }); // observed idle
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "busy" } }); // observed busy edge
+    await flush();
+    expect(modeOf("a")).toBe("filtered"); // healed by the promote edge (test 5's contract)
   });
 });

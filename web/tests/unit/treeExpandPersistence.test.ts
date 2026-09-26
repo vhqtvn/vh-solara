@@ -437,10 +437,11 @@ describe("stream backfill fires GET /vh/tree/children after the frontier seed", 
 // Pins: (1) modeOf stays "filtered" for a genuinely-absent id; (2) cold
 // normalization materializes collapsed ONLY for resident absent-idle ids;
 // (3) nonresident persisted entries are ignored by cold-norm (preserved, not
-// dropped); (4) explicit filtered-idle is REPAIRED to collapsed (absolute
-// invariant); (5) ONE localStorage write per seed regardless of how many mixed
-// (cold + edge) target changes; (6) ONE write per microtask flush regardless of
-// candidate count; (7) a no-op seed writes ZERO times.
+// dropped); (4) an explicit filtered-idle entry SURVIVES the cold seed
+// (pre-hydration guard — resume regression); (5) ONE localStorage write per
+// seed regardless of how many mixed (cold + edge) target changes; (6) ONE
+// write per microtask flush regardless of candidate count; (7) a no-op seed
+// writes ZERO times.
 // ---------------------------------------------------------------------------
 describe("auto-mutation cold-load normalization + write coalescing", () => {
   beforeEach(() => {
@@ -471,13 +472,47 @@ describe("auto-mutation cold-load normalization + write coalescing", () => {
     expect(modeOf("GHOST")).toBe("expanded"); // nonresident entry preserved untouched
   });
 
-  it("an explicit 'filtered'-idle resident id is REPAIRED to 'collapsed' (absolute invariant)", () => {
-    // Under the absolute invariant, an idle node is NEVER in "filtered". A stale
-    // explicit persisted "filtered"+idle entry is repaired to "collapsed" at seed
-    // (merged into the same batched setNodeModes as the absent-idle rule).
+  it("an explicit 'filtered'-idle resident id SURVIVES the cold seed (pre-hydration guard — resume regression)", () => {
+    // RESUME REGRESSION: the frontier can ship a genuinely-running node idle
+    // (the server's activity seed races the capture), and a cold-baseline
+    // demotion is unhealable (the next busy observation after a reload is also
+    // a baseline — no edge fires). The absolute invariant therefore does NOT
+    // repair an explicit "filtered" on a cold baseline — and localStorage is
+    // never rewritten with the corruption.
     setNodeMode("A", "filtered");
     seedTreeStore([node({ id: "A" })]);
-    expect(modeOf("A")).toBe("collapsed");
+    expect(modeOf("A")).toBe("filtered");
+    const env = JSON.parse(localStorage.getItem(LS_MODE) as string) as {
+      data: Record<string, string>;
+    };
+    expect(env.data.A).toBe("filtered"); // persisted bytes keep the user's mode
+  });
+
+  it("RESUME STICKY REPLAY: a pre-hydration idle frontier must not corrupt localStorage across TWO reloads", () => {
+    // Reload #1: the persisted map rehydrates {a: "filtered"} (running sessions
+    // were visible under "a" before the reload). The frontier snapshot arrives
+    // while the server's activity seed has NOT landed → "a" ships idle.
+    saveVersioned(LS_MODE, 1, { a: "filtered" });
+    rehydrateExpandedForTest();
+    seedTreeStore([node({ id: "a" })]);
+    expect(modeOf("a")).toBe("filtered"); // the guard (old code: demoted + persisted "collapsed")
+
+    // Reload #2: activity long seeded server-side; the frontier ships the TRUE
+    // busy state. A cold busy baseline is NOT an edge (tests 4/10), so a
+    // corrupted "collapsed" would stick FOREVER — with the guard it never
+    // exists. Simulate the reload faithfully: map + in-memory modes reset, the
+    // persisted bytes rehydrate (exactly what loadInitialTreeModes does).
+    const saved = localStorage.getItem(LS_MODE);
+    resetTreeStore(); // clears map + modes + persists {} — as a fresh page start would
+    localStorage.setItem(LS_MODE, saved as string);
+    rehydrateExpandedForTest();
+    expect(modeOf("a")).toBe("filtered"); // rehydrated from the persisted bytes
+    seedTreeStore([node({ id: "a", activity: "busy" })]); // hydrated busy baseline
+    expect(modeOf("a")).toBe("filtered"); // running children still visible
+    const env = JSON.parse(localStorage.getItem(LS_MODE) as string) as {
+      data: Record<string, string>;
+    };
+    expect(env.data.a).toBe("filtered");
   });
 
   it("ONE localStorage write per seed regardless of mixed cold + edge target changes", () => {

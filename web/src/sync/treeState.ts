@@ -506,14 +506,28 @@ export function treeChildrenOf(parentId: string): TreeNode[] {
 //     true→false+filtered→collapsed); any other combination is a no-op.
 //   - if the id is NEW (not in the previous map → a baseline, no edge fires):
 //     a working node is left ABSENT so modeOf() returns the implicit "filtered"
-//     fallback (so its working children reveal immediately).
-//   - ABSOLUTE INVARIANT (every resident node, regardless of edge): an idle node
-//     is NEVER in "filtered". Any resident node where !working(node) &&
-//     modeOf(id)==="filtered" (covering BOTH absent-fallback-filtered-idle AND
-//     explicit-persisted-filtered-idle) is materialized/repaired as explicit
-//     "collapsed". This subsumes the former absent-idle→collapsed cold rule AND
-//     repairs stale/reintroduced explicit filtered+idle entries. Working nodes
-//     in "filtered" (absent or explicit) are left as-is (working+filtered valid).
+//     fallback (so its working children reveal immediately); an idle node with
+//     NO explicit entry is materialized as explicit "collapsed" (the cold rule
+//     that keeps the lazy-frontier effect from fetching children of every idle
+//     unloaded node at load).
+//   - ABSOLUTE INVARIANT (established observations only): an idle KNOWN node is
+//     never left in "filtered" — it is repaired/materialized to explicit
+//     "collapsed". PRE-HYDRATION GUARD (resume regression): an idle node with an
+//     EXPLICIT persisted "filtered" whose id is NOT in the previous map (a COLD
+//     baseline — the page just loaded) is left UNTOUCHED. The frontier snapshot
+//     can ship a genuinely-running node idle: the server's activity seed
+//     (SetActivityFromStatuses) is fanned out CONCURRENTLY with the capture by
+//     the aggregator's hydrate, so the snapshot may predate it, and the payload
+//     is indistinguishable from genuine idleness. A cold-baseline demotion is
+//     also UNHEALABLE: the next busy observation after a reload is another
+//     baseline (no edge fires), so a demoted "collapsed" sticks forever while
+//     collapsed+working renders nothing — the "persisted filtered randomly
+//     demotes to collapsed on resume" bug. Keeping the explicit entry is always
+//     safe: idle+filtered renders identically to collapsed (no working children
+//     exist), and once the true working state lands — via a live facet OR the
+//     next snapshot — busy+filtered reveals the working children with no mode
+//     write at all. Working nodes in "filtered" (absent or explicit) are left
+//     as-is (working+filtered valid).
 // Explicit persisted entries are otherwise preserved (collapsed stays collapsed,
 // expanded stays expanded), subject only to a genuine transition edge. IDs
 // persisted but not resident in the snapshot are ignored. The complete change
@@ -527,6 +541,7 @@ export function seedTreeStore(nodes: TreeNode[]): void {
   const oldMap = map;
   const newMap = seedTree(nodes);
   const changes = new Map<string, TreeMode>();
+  const modeMapNow = treeModeMap();
   for (const [id, newNode] of newMap) {
     // Compute any genuine working() transition edge target first (may be
     // undefined for baselines / no-edge / expanded cases).
@@ -542,8 +557,17 @@ export function seedTreeStore(nodes: TreeNode[]): void {
     const effective = target ?? modeOf(id);
     if (!working(newNode) && effective === "filtered") {
       // ABSOLUTE invariant: idle + filtered → collapsed. Covers absent-idle
-      // (materialize collapsed) AND explicit-filtered-idle (repair to collapsed).
-      changes.set(id, "collapsed");
+      // (materialize collapsed) AND explicit-filtered-idle (repair to
+      // collapsed) — but ONLY for ESTABLISHED observations (ids known in the
+      // previous map) or the absent-fallback. An EXPLICIT persisted "filtered"
+      // on a COLD baseline is guarded: the frontier may ship a genuinely-
+      // running node idle before the server's activity seed lands (see the
+      // header), and demoting it would persist an unhealable corruption.
+      const coldBaselineExplicitFiltered =
+        modeMapNow[id] === "filtered" && !oldMap.has(id);
+      if (!coldBaselineExplicitFiltered) {
+        changes.set(id, "collapsed");
+      }
     } else if (target) {
       // Genuine edge (false→true+collapsed→filtered): apply the promotion.
       changes.set(id, target);
