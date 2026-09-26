@@ -198,10 +198,11 @@ func (d *Daemon) buildRootHandler() http.Handler {
 	// no X-VH-CSRF requirement (repo convention — csrfGuard gates unsafe
 	// methods only). PUT is a MUTATION on a /vh/ path, OUTSIDE csrfGuard's
 	// /api/ scope, so the X-VH-CSRF check is enforced IN the handler (403
-	// without the header, mirroring the guard). No hostInterceptor carve-out
-	// in v1: the manage surface is served from the controller origin only —
-	// on a worker subdomain the interceptor proxies the request down to the
-	// worker, which has no /vh/fleet/config route (404 there).
+	// without the header, mirroring the guard). hostInterceptor carves this
+	// path out too (see below): the manage surface must answer from every
+	// host the SPA is served on — including worker subdomains — because the
+	// worker has no /vh/fleet/config route and its catch-all would serve the
+	// SPA shell (200 text/html) that the pane cannot parse.
 	userMux.HandleFunc("GET /vh/fleet/config", d.handleFleetConfigGet)
 	userMux.HandleFunc("PUT /vh/fleet/config", d.handleFleetConfigPut)
 
@@ -316,25 +317,27 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 		}
 
 		// Route precedence: the aggregated /vh/diag/latency and the fleet-wide
-		// /vh/fleet/status are CONTROLLER-OWNED and must be served by the
-		// controller even when the browser's host is a per-worker subdomain
-		// (e.g. "workerID.controller.example.com"). Without this carve-out the
-		// hostInterceptor would proxy the request down to that worker,
-		// returning a single-worker diag snapshot and forcing the operator to
-		// re-fetch per project, or a 404 for fleet status (the worker has no
-		// /vh/fleet/* route — the rollup fans out through the tunnel via
-		// Proxy.FetchWorkerJSONBounded, not through this hostInterceptor).
+		// /vh/fleet/status + /vh/fleet/config are CONTROLLER-OWNED and must be
+		// served by the controller even when the browser's host is a
+		// per-worker subdomain (e.g. "workerID.controller.example.com").
+		// Without this carve-out the hostInterceptor would proxy the request
+		// down to that worker, returning a single-worker diag snapshot and
+		// forcing the operator to re-fetch per project, or a 404 for fleet
+		// status (the worker has no /vh/fleet/* route — the rollup fans out
+		// through the tunnel via Proxy.FetchWorkerJSONBounded, not through
+		// this hostInterceptor). The config carve-out is path-based and
+		// method-agnostic: both GET and PUT fall through to userMux, which
+		// enforces the method patterns (405 otherwise) — and PUT's in-handler
+		// X-VH-CSRF check (status_config.go) still applies. The SPA is served
+		// from worker subdomains in this deployment, and the worker's
+		// catch-all route would answer /vh/fleet/config with the SPA shell
+		// (200 text/html), which the config pane cannot parse.
 		// Falling through to `next` (the userMux chain) serves the global
 		// controller-owned view regardless of host. Per-worker
 		// /vh/diag/latency remains reachable on the worker for the
 		// aggregator's own fan-out (which goes through the tunnel via
 		// Proxy.FetchWorkerSnapshot, not through this hostInterceptor).
-		//
-		// NOTE: /vh/fleet/config (GET/PUT) is deliberately NOT in this
-		// carve-out in v1 — the config manage surface is controller-origin
-		// only; a worker-subdomain request for it proxies to the worker and
-		// 404s there (see status_config.go).
-		if r.URL.Path == "/vh/diag/latency" || r.URL.Path == "/vh/fleet/status" {
+		if r.URL.Path == "/vh/diag/latency" || r.URL.Path == "/vh/fleet/status" || r.URL.Path == "/vh/fleet/config" {
 			next.ServeHTTP(w, r)
 			return
 		}

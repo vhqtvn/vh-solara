@@ -61,6 +61,21 @@ function labelTooLong(s: string): boolean {
   return [...s].length > MAX_LABEL_CP;
 }
 
+// Parse a config response body defensively: a 200 whose body is NOT JSON
+// (an HTML page or plain text — e.g. a misrouted proxy or the worker's SPA
+// fallback) must surface as a clean, honest load error, never as a raw
+// "JSON.parse: unexpected character …" exception message. Well-formed error
+// paths are unaffected: non-2xx statuses short-circuit before this (the
+// !r.ok branches), and 409/400 bodies are read as text elsewhere.
+async function parseConfigResponse(r: Response): Promise<FleetConfigResponse> {
+  const text = await r.text();
+  try {
+    return JSON.parse(text) as FleetConfigResponse;
+  } catch {
+    throw new Error(`Unexpected response from server (not JSON; HTTP ${r.status})`);
+  }
+}
+
 // Per-row error strings indexed like the draft arrays; undefined = row OK.
 // Mirrors validateStatusConfig: the LATER occurrence of a duplicate is the
 // flagged one (the server reports workers[i]/projects[i] at the second index).
@@ -135,7 +150,7 @@ export default function FleetStatusDialog(props: { onClose: () => void }) {
         setLoadError(`HTTP ${r.status}`);
         return;
       }
-      applyConfig((await r.json()) as FleetConfigResponse);
+      applyConfig(await parseConfigResponse(r));
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
     } finally {

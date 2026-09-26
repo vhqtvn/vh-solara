@@ -12,6 +12,9 @@
 //     feedback and disables Save without issuing a PUT.
 //   • remove-row flow PUTs the roster without the removed entry.
 //   • GET writable:false renders read-only rows + hint, no inputs, Save off.
+//   • non-JSON body hardening: a 200 HTML body (misrouted proxy / worker SPA
+//     fallback) becomes a clean not-JSON load error — never a raw JSON.parse
+//     exception message; an error status still reports the HTTP code.
 //   • AdminMenu wiring: the "Fleet status" entry opens the dialog while the
 //     menu stays mounted.
 //
@@ -283,6 +286,46 @@ describe("FleetStatusDialog — read-only posture (writable:false)", () => {
       expect(document.body.textContent).toContain("No workers configured");
       expect(document.body.textContent).toContain("No projects configured");
     });
+  });
+});
+
+describe("FleetStatusDialog — non-JSON response hardening", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("a 200 HTML body (misrouted proxy / worker SPA fallback) surfaces a clean not-JSON error, not a raw parse exception", async () => {
+    // The operator regression this guards: with the SPA served from a worker
+    // subdomain, /vh/fleet/config was proxied to the worker, whose catch-all
+    // answers unknown /vh/* paths with the SPA shell — 200, text/html,
+    // unparseable. The pane must say so honestly instead of leaking the
+    // browser's raw "JSON.parse: unexpected character …" exception message.
+    const html = "<!DOCTYPE html><html><body>spa shell</body></html>";
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(respText(html, 200))));
+    render(() => <FleetStatusDialog onClose={() => {}} />);
+
+    await waitFor(() =>
+      expect(document.body.textContent).toContain(
+        "Couldn't load the fleet config (Unexpected response from server (not JSON; HTTP 200)).",
+      ),
+    );
+    // The raw parser message must NOT leak into the UI.
+    expect(document.body.textContent).not.toContain("JSON.parse");
+    // The error posture offers Retry and renders no rows/inputs.
+    expect(btn("Retry")).toBeTruthy();
+    expect(document.querySelectorAll("input").length).toBe(0);
+  });
+
+  it("a non-JSON body on an error status still reports the HTTP code (no behavior change)", async () => {
+    // !ok short-circuits before any body parse — a plain-text 404 (e.g. a
+    // dead proxy) keeps the existing "HTTP <status>" error.
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(respText("not found", 404))));
+    render(() => <FleetStatusDialog onClose={() => {}} />);
+
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("Couldn't load the fleet config (HTTP 404)."),
+    );
   });
 });
 

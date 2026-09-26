@@ -58,10 +58,11 @@ package server
 //	                       an invalid body. 200 with the effective config
 //	                       on success.
 //
-// No hostInterceptor carve-out for these two routes in v1: the manage
-// surface is served from the CONTROLLER origin only; on a worker subdomain
-// the interceptor proxies the request down to the worker, which has no
-// /vh/fleet/config route (404 there). See hostInterceptor in daemon.go.
+// hostInterceptor carves /vh/fleet/config out of the worker-subdomain proxy
+// (daemon.go): the manage surface is controller-owned and must answer from
+// every host the SPA is served on — the worker has no /vh/fleet/config route,
+// and its catch-all would serve the SPA shell (200 text/html) instead. See
+// TestHostInterceptorFleetConfigRoutePrecedence (status_config_test.go).
 
 import (
 	"bytes"

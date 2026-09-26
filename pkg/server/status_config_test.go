@@ -55,6 +55,12 @@ func withCSRF() func(*http.Request) {
 	return func(r *http.Request) { r.Header.Set(csrfHeader, "1") }
 }
 
+// withHost pins the request's Host header — the hostInterceptor's routing
+// input (a per-worker subdomain that matches the daemon's HostPattern).
+func withHost(host string) func(*http.Request) {
+	return func(r *http.Request) { r.Host = host }
+}
+
 func doFleetConfigGet(h http.Handler, opts ...func(*http.Request)) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodGet, "/vh/fleet/config", nil)
 	for _, o := range opts {
@@ -633,5 +639,62 @@ func TestFleetConfig_PutCanonicalizesFile(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Name() != "status.jsonc" {
 		t.Fatalf("atomic persist must leave only the config file in the dir, got %d entries", len(entries))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// hostInterceptor carve-out (worker-subdomain precedence)
+// ---------------------------------------------------------------------------
+
+// TestHostInterceptorFleetConfigRoutePrecedence pins the same property as
+// TestHostInterceptorFleetStatusRoutePrecedence (status_test.go) for the
+// config manage routes: a browser loaded from a per-worker subdomain (e.g.
+// "workerID.controller.host") hitting GET/PUT /vh/fleet/config MUST be served
+// by the CONTROLLER, NOT proxied down to that worker. The worker has no
+// /vh/fleet/config route and its catch-all serves the SPA shell (200
+// text/html) — the exact body the config pane cannot parse (the operator
+// regression this test guards).
+//
+// Full controller chain (auth + csrfGuard + hostInterceptor + userMux) with
+// HostPattern set and "abc" registered as an online worker with NO transport:
+// if the carve-out fails, the request reaches HandleWorkerDirect →
+// handleRawProxy → 502 on the nil transport; every assertion below is framed
+// against that. The carve-out is path-based and method-agnostic, so BOTH the
+// GET (200 config envelope) and the PUT (CSRF + auth → the real handler's
+// 409 unwritable refusal on this daemon — routing is the point, not
+// semantics) must come from the controller's handlers.
+func TestHostInterceptorFleetConfigRoutePrecedence(t *testing.T) {
+	d, h, session := newFleetConfigAuthDaemon(t, "$ID.controller.test")
+	d.Registry.AddWorker(&Worker{ID: "abc", Name: "abc-worker", Status: "online", Version: "v1"})
+
+	// GET on the subdomain host: the controller answers with the config
+	// envelope (200 JSON) — not a 502 proxied rejection, and not the
+	// worker's non-JSON 404/SPA-fallback body.
+	rec := doFleetConfigGet(h, withCookie(session), withHost("abc.controller.test"))
+	if rec.Code == http.StatusBadGateway {
+		t.Fatalf("hostInterceptor proxied GET /vh/fleet/config to the worker (502) — carve-out missing or broken")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200 config on a worker subdomain, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type: want application/json (controller handler), got %q", ct)
+	}
+	resp := decodeFleetConfig(t, rec)
+	if resp.Schema != 1 {
+		t.Fatalf("response is not the fleet config envelope (schema %d)", resp.Schema)
+	}
+
+	// PUT (CSRF + auth) on the subdomain host: reaches the CONTROLLER's
+	// handleFleetConfigPut. This daemon is unwritable (no --status-config),
+	// so the honest refusal is 409 — produced only by the real handler's
+	// writable check, well after the carve-out. A broken carve-out would
+	// 502 on the nil transport before any handler logic runs.
+	rec2 := doFleetConfigPut(h, `{"workers":[],"projects":[]}`, withCookie(session), withCSRF(), withHost("abc.controller.test"))
+	if rec2.Code == http.StatusBadGateway {
+		t.Fatalf("hostInterceptor proxied PUT /vh/fleet/config to the worker (502) — carve-out missing or broken")
+	}
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("PUT on a worker subdomain: want 409 from the controller handler (unwritable daemon), got %d (body=%q)", rec2.Code, rec2.Body.String())
 	}
 }
