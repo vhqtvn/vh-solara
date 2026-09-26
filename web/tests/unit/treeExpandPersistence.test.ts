@@ -473,14 +473,15 @@ describe("auto-mutation cold-load normalization + write coalescing", () => {
   });
 
   it("an explicit 'filtered'-idle resident id SURVIVES the cold seed (pre-hydration guard — resume regression)", () => {
-    // RESUME REGRESSION: the frontier can ship a genuinely-running node idle
-    // (the server's activity seed races the capture), and a cold-baseline
+    // RESUME REGRESSION: the frontier can ship a genuinely-running node
+    // UNESTABLISHED (the server's activity seed races the capture — the
+    // payload ships the never-seeded ""), and a cold-baseline
     // demotion is unhealable (the next busy observation after a reload is also
-    // a baseline — no edge fires). The absolute invariant therefore does NOT
-    // repair an explicit "filtered" on a cold baseline — and localStorage is
-    // never rewritten with the corruption.
+    // a baseline — no edge fires). The establishment gate therefore does NOT
+    // repair an explicit "filtered" on an unestablished observation — and
+    // localStorage is never rewritten with the corruption.
     setNodeMode("A", "filtered");
-    seedTreeStore([node({ id: "A" })]);
+    seedTreeStore([node({ id: "A", activity: "" })]);
     expect(modeOf("A")).toBe("filtered");
     const env = JSON.parse(localStorage.getItem(LS_MODE) as string) as {
       data: Record<string, string>;
@@ -491,10 +492,11 @@ describe("auto-mutation cold-load normalization + write coalescing", () => {
   it("RESUME STICKY REPLAY: a pre-hydration idle frontier must not corrupt localStorage across TWO reloads", () => {
     // Reload #1: the persisted map rehydrates {a: "filtered"} (running sessions
     // were visible under "a" before the reload). The frontier snapshot arrives
-    // while the server's activity seed has NOT landed → "a" ships idle.
+    // while the server's activity seed has NOT landed → "a" ships the
+    // never-seeded "" (unestablished).
     saveVersioned(LS_MODE, 1, { a: "filtered" });
     rehydrateExpandedForTest();
-    seedTreeStore([node({ id: "a" })]);
+    seedTreeStore([node({ id: "a", activity: "" })]);
     expect(modeOf("a")).toBe("filtered"); // the guard (old code: demoted + persisted "collapsed")
 
     // Reload #2: activity long seeded server-side; the frontier ships the TRUE

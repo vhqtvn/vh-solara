@@ -144,6 +144,23 @@ export function working(node: TreeNode): boolean {
   );
 }
 
+// activityEstablished — payload truth distinguishing an ESTABLISHED activity
+// observation ("idle" | "busy" | "retry" | "error") from a never-seeded one
+// (activity === ""). The WIRE distinguishes them: Node.Activity carries NO
+// omitempty (pkg/state/tree_node.go), so a mid-hydrate frontier or a rebuilt
+// node ships activity:"" while every tree-known session holds an explicit
+// value after the first statuses observation (SetActivityFromStatuses).
+// working() CONFLATES "" with "idle" (both read non-working) — that
+// conflation is the defect this predicate exists to gate: a demote decision
+// must not fire against a pre-hydration observation, because the
+// establishment facet (""→idle/busy, emitted as node.facet{activity}) arrives
+// as a later ESTABLISHED observation and the demote fires THEN (deferred,
+// never lost). PURE; complements working() WITHOUT changing its semantics or
+// its edge table (autoTreeModeForWorkingTransition below).
+export function activityEstablished(node: TreeNode): boolean {
+  return node.activity !== "";
+}
+
 // autoTreeModeForWorkingTransition — the QUALIFIED auto-mutation decision for a
 // persisted tree mode given a node's working() transition (previousWorking →
 // currentWorking). Encodes ONLY the two edges that auto-mutate the persisted

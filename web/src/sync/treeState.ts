@@ -31,9 +31,11 @@ import {
 import { loadVersioned, saveVersioned } from "../lib/store";
 // VALUE imports from treeSelectors are SAFE here: treeSelectors imports from
 // treeState only as TYPE (`import type { TreeMode }`), so there is no runtime
-// circular dependency. We pull the single working() predicate + the pure
-// transition helper so ingestion can detect working edges.
-import { working, autoTreeModeForWorkingTransition } from "./treeSelectors";
+// circular dependency. We pull the single working() predicate, the
+// activityEstablished payload-truth gate (demote decisions must not fire
+// against a never-seeded "" observation), and the pure transition helper so
+// ingestion can detect working edges.
+import { working, autoTreeModeForWorkingTransition, activityEstablished } from "./treeSelectors";
 
 // Module-authority flat map. Mutated IN PLACE by the mutators; the `version`
 // signal is what notifies Solid (the "mutable + version" pattern). Readers MUST
@@ -503,31 +505,44 @@ export function treeChildrenOf(parentId: string): TreeNode[] {
 //   - if the id was RESIDENT in the PREVIOUS map (a known node), compute the old
 //     →new working() transition against its CURRENT persisted mode and collect
 //     the qualifying edge decision (false→true+collapsed→filtered, or
-//     true→false+filtered→collapsed); any other combination is a no-op.
+//     true→false+filtered→collapsed); any other combination is a no-op. A
+//     DEMOTE edge computed from an UNESTABLISHED observation is suppressed
+//     (ESTABLISHMENT GATE below).
 //   - if the id is NEW (not in the previous map → a baseline, no edge fires):
 //     a working node is left ABSENT so modeOf() returns the implicit "filtered"
 //     fallback (so its working children reveal immediately); an idle node with
 //     NO explicit entry is materialized as explicit "collapsed" (the cold rule
 //     that keeps the lazy-frontier effect from fetching children of every idle
-//     unloaded node at load).
-//   - ABSOLUTE INVARIANT (established observations only): an idle KNOWN node is
-//     never left in "filtered" — it is repaired/materialized to explicit
-//     "collapsed". PRE-HYDRATION GUARD (resume regression): an idle node with an
-//     EXPLICIT persisted "filtered" whose id is NOT in the previous map (a COLD
-//     baseline — the page just loaded) is left UNTOUCHED. The frontier snapshot
-//     can ship a genuinely-running node idle: the server's activity seed
+//     unloaded node at load — UNGATED: fetch suppression must not depend on
+//     establishment).
+//   - ABSOLUTE INVARIANT (established observations only): an idle node is never
+//     left in "filtered" — it is repaired/materialized to explicit "collapsed".
+//     ESTABLISHMENT GATE (payload truth; generalizes 499e327's
+//     coldBaselineExplicitFiltered oldMap heuristic): the repair/demote of an
+//     EXPLICIT persisted "filtered" fires ONLY when the observation is
+//     ESTABLISHED (activityEstablished — the payload's activity is a real
+//     idle|busy|retry|error, not the never-seeded "" the wire ships for a
+//     mid-hydrate frontier or a rebuilt node). working() CONFLATES "" with
+//     "idle" (both read non-working) — that conflation is exactly what made a
+//     pre-hydration observation look like a settle. The frontier snapshot can
+//     ship a genuinely-running node unestablished: the server's activity seed
 //     (SetActivityFromStatuses) is fanned out CONCURRENTLY with the capture by
-//     the aggregator's hydrate, so the snapshot may predate it, and the payload
-//     is indistinguishable from genuine idleness. A cold-baseline demotion is
-//     also UNHEALABLE: the next busy observation after a reload is another
+//     the aggregator's hydrate, so the snapshot may predate it — the payload
+//     ships activity:"", whose EFFECT through working() is indistinguishable
+//     from genuine idleness. A demotion from such an observation is UNHEALABLE
+//     on a cold baseline: the next busy observation after a reload is another
 //     baseline (no edge fires), so a demoted "collapsed" sticks forever while
 //     collapsed+working renders nothing — the "persisted filtered randomly
-//     demotes to collapsed on resume" bug. Keeping the explicit entry is always
-//     safe: idle+filtered renders identically to collapsed (no working children
-//     exist), and once the true working state lands — via a live facet OR the
-//     next snapshot — busy+filtered reveals the working children with no mode
-//     write at all. Working nodes in "filtered" (absent or explicit) are left
-//     as-is (working+filtered valid).
+//     demotes to collapsed on resume" bug. The gate covers EVERY path (cold
+//     baseline, daemon-restart re-seed of a KNOWN node, mid-hydrate op-path
+//     rebuild), and the deferred demote fires naturally once establishment
+//     lands (""→activity emits node.facet{activity} — an established
+//     observation). Keeping an explicit "filtered" under an unestablished
+//     observation is RENDER-safe but not FETCH-neutral: a mounted filtered
+//     branch with unloaded known descendants still lazy-fetches children once
+//     per mount — a bounded cost accepted over unhealable demotion. Working
+//     nodes in "filtered" (absent or explicit) are left as-is
+//     (working+filtered valid).
 // Explicit persisted entries are otherwise preserved (collapsed stays collapsed,
 // expanded stays expanded), subject only to a genuine transition edge. IDs
 // persisted but not resident in the snapshot are ignored. The complete change
@@ -551,21 +566,32 @@ export function seedTreeStore(nodes: TreeNode[]): void {
       const curWorking = working(newNode);
       const persisted = modeOf(id);
       target = autoTreeModeForWorkingTransition(prevWorking, curWorking, persisted);
+      // ESTABLISHMENT GATE (demote only): a demote edge (true→false +
+      // filtered→collapsed) computed from an UNESTABLISHED observation
+      // (activity === "") is not a real settle — the re-seed may predate the
+      // server's activity seed (daemon restart / reconnect). Suppress it; the
+      // deferred demote fires when establishment lands (""→activity emits
+      // node.facet{activity}). PROMOTE edges stay ungated (working implies the
+      // reveal is wanted, and a promote is healable by a later settle).
+      if (target === "collapsed" && !activityEstablished(newNode)) target = undefined;
     }
     // The effective mode this node will hold AFTER applying the edge target (or
     // its current persisted mode / absent-fallback if no edge fires).
     const effective = target ?? modeOf(id);
     if (!working(newNode) && effective === "filtered") {
       // ABSOLUTE invariant: idle + filtered → collapsed. Covers absent-idle
-      // (materialize collapsed) AND explicit-filtered-idle (repair to
-      // collapsed) — but ONLY for ESTABLISHED observations (ids known in the
-      // previous map) or the absent-fallback. An EXPLICIT persisted "filtered"
-      // on a COLD baseline is guarded: the frontier may ship a genuinely-
-      // running node idle before the server's activity seed lands (see the
-      // header), and demoting it would persist an unhealable corruption.
-      const coldBaselineExplicitFiltered =
-        modeMapNow[id] === "filtered" && !oldMap.has(id);
-      if (!coldBaselineExplicitFiltered) {
+      // (materialize collapsed — UNGATED: cold-load lazy-frontier fetch
+      // suppression must not depend on establishment) AND
+      // explicit-filtered-idle (repair to collapsed). ESTABLISHMENT GATE
+      // (replaces 499e327's coldBaselineExplicitFiltered oldMap heuristic with
+      // payload truth): an EXPLICIT persisted "filtered" observed UNESTABLISHED
+      // (activity === "" — a mid-hydrate frontier OR a daemon-restart re-seed
+      // of a KNOWN node) is left UNTOUCHED; see the header. Once establishment
+      // lands, busy+filtered needs no write at all and idle+filtered repairs
+      // then — an explicit "idle" payload on a cold baseline IS established
+      // and repairs (the stale-filtered tradeoff c-F1 ages out).
+      const explicitFiltered = modeMapNow[id] === "filtered";
+      if (!explicitFiltered || activityEstablished(newNode)) {
         changes.set(id, "collapsed");
       }
     } else if (target) {
@@ -602,6 +628,17 @@ export function seedTreeStore(nodes: TreeNode[]): void {
 //     is collapsed BEFORE callers observe post-op state. This subsumes the
 //     former absent-idle→collapsed cold rule, repairs stale/reintroduced
 //     explicit filtered+idle entries, and applies the demotion edge synchronously.
+//     ESTABLISHMENT GATE: the EXPLICIT-"filtered" repair (and the demote edge
+//     it applies) is skipped when the post-op node is UNESTABLISHED
+//     (activity === ""); the absent-fallback materialization stays UNGATED
+//     (cold-load fetch suppression must not depend on establishment).
+//     ASYMMETRY NOTE (why an op can even carry an unestablished node): facet
+//     ops carry EXPLICIT activity strings (presence drives the merge, and the
+//     server only emits a real idle|busy|retry|error — "" is never a facet
+//     value), so a facet observation is always established. node.upsert and
+//     node.children REBUILD the node from server state and CAN ship
+//     activity:"" mid-hydrate (the same aggregator race as the seed path) —
+//     those are the rebuild ops the establishment gate here protects.
 //
 // affectedIdsOfOp extracts the op payload boundary: upsert→[node.id];
 // remove→[] (removed ids drop, no transition possible — descendants removed by
@@ -612,6 +649,11 @@ export function applyTreeOpStore(op: TreeOp): void {
   const affectedIds = affectedIdsOfOp(op);
   const before = new Map<string, TreeNode | undefined>();
   for (const id of affectedIds) before.set(id, map.get(id));
+  // Snapshot the persisted mode map BEFORE the loop: the establishment gate
+  // below must distinguish an EXPLICIT "filtered" (repair candidate) from the
+  // absent-fallback (materialization candidate). setNodeModes runs only after
+  // the loop, so this snapshot stays accurate throughout.
+  const modeMapNow = treeModeMap();
   // Capture the ids a node.remove will drop (the node + its loaded descendants)
   // BEFORE applyOp so presentation ranks can be cleaned up afterwards (deletion
   // reconcile). For every other op this is empty.
@@ -659,8 +701,19 @@ export function applyTreeOpStore(op: TreeOp): void {
     // and the demotion edge (true→false + filtered → collapsed, applied here
     // rather than via a queued candidate). A promotion candidate enqueued above
     // is for a WORKING node, so this check does not conflict with it.
+    // ESTABLISHMENT GATE: the absent-fallback materialization is UNGATED
+    // (cold-load fetch suppression must not depend on establishment — a
+    // collapsed absent node is healable by a later promote edge either way);
+    // the EXPLICIT-"filtered" repair (and the demote edge it applies) fires
+    // only for an ESTABLISHED observation — node.upsert/node.children rebuild
+    // from server state and can ship activity:"" mid-hydrate (ASYMMETRY NOTE
+    // above). The suppressed demote is deferred, never lost: establishment
+    // lands as node.facet{activity} (always explicit) and reconciles here.
     if (!working(after) && modeOf(id) === "filtered") {
-      syncChanges.set(id, "collapsed");
+      const explicitFiltered = modeMapNow[id] === "filtered";
+      if (!explicitFiltered || activityEstablished(after)) {
+        syncChanges.set(id, "collapsed");
+      }
     }
   }
   // RANK: reparent (node.move) reconciles by (re)placing the moved node at the

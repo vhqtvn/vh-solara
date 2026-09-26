@@ -16,6 +16,7 @@ import {
   selectedPathIds,
   strictAncestors,
   working,
+  activityEstablished,
   effectiveTreeMode,
   childrenForState,
   sameChildIds,
@@ -244,6 +245,30 @@ describe("working — single working predicate (server rollups + self activity)"
     // by the subtreeNeedsInput rollup. A self-pendingInput idle node is not
     // "working" by this predicate (it shows a needs-input dot, not a ring).
     expect(working(node({ activity: "idle", flags: { ...node().flags, pendingInput: true } }))).toBe(false);
+  });
+});
+
+// activityEstablished — payload truth for the demote gate: the wire's
+// never-omitempty Activity zero value ("") is an UNESTABLISHED observation,
+// distinct from every explicit state. working() CONFLATES "" with "idle";
+// this predicate is what lets ingestion tell them apart.
+describe("activityEstablished — payload-truth establishment predicate", () => {
+  it("false for the never-seeded \"\" (mid-hydrate frontier / rebuilt node)", () => {
+    expect(activityEstablished(node({ activity: "" }))).toBe(false);
+  });
+  it("true for every explicit activity state (idle included)", () => {
+    expect(activityEstablished(node({ activity: "idle" }))).toBe(true);
+    expect(activityEstablished(node({ activity: "busy" }))).toBe(true);
+    expect(activityEstablished(node({ activity: "retry" }))).toBe(true);
+    expect(activityEstablished(node({ activity: "error" }))).toBe(true);
+  });
+  it("ORTHOGONAL to working(): \"\" and \"idle\" both read non-working, only one is established", () => {
+    // The conflation this predicate exists to break: both are working()===false,
+    // but only the explicit "idle" may ground a demote decision.
+    expect(working(node({ activity: "" }))).toBe(false);
+    expect(working(node({ activity: "idle" }))).toBe(false);
+    expect(activityEstablished(node({ activity: "" }))).toBe(false);
+    expect(activityEstablished(node({ activity: "idle" }))).toBe(true);
   });
 });
 

@@ -208,7 +208,13 @@ export interface Question {
   [k: string]: unknown;
 }
 
-export type Activity = "idle" | "busy" | "retry" | "error";
+// SELF activity of a tree node. "" is the WIRE's never-seeded value: Go's
+// Node.Activity has NO omitempty (pkg/state/tree_node.go), so a mid-hydrate
+// frontier/rebuilt node serializes the zero value. Established observations
+// carry one of the four real states; use activityEstablished (treeSelectors)
+// to distinguish before making a demote decision off working(), which CONFLATES
+// "" with "idle".
+export type Activity = "idle" | "busy" | "retry" | "error" | "";
 
 export interface Permission {
   id: string;
