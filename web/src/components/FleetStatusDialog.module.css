@@ -1,0 +1,201 @@
+/* Fleet-status config dialog (AdminMenu → "Fleet status") — manages the
+ * expected worker/project rosters via GET/PUT /vh/fleet/config.
+ *
+ * Scoped; consumes foundation tokens only (web/src/styles/foundation/
+ * tokens.css). The dialog chrome (.dialog / .dialog-head / .dialog-body /
+ * .dialog-title / .icon-btn / .btn / .btn-primary) is the shared GLOBAL base;
+ * this module owns only the fleet-pane internals plus the overlay lift.
+ *
+ * PERF (AGENTS.md → "Web frontend performance — Firefox/WebRender"): the
+ * dialog body is a scroll container (global .dialog-body). The following
+ * patterns pin WebRender to ~99°C on a scrolling surface and are
+ * DELIBERATELY absent here:
+ *   - NO mask-image / -webkit-mask
+ *   - NO backdrop-filter: blur
+ *   - NO contain: paint / content-visibility: auto
+ */
+
+/* Lift above the admin popup (z-index 60, var(--z-popover)) this dialog is
+ * launched from — same lift as .ocu-overlay / .rocd-overlay, kept scoped
+ * because only this component uses it. */
+.overlay {
+  z-index: var(--z-modal);
+}
+
+/* Slightly narrower than the 560px base .dialog — this is a small roster
+ * editor, not a document surface. Full-bleed on mobile via the global
+ * .dialog media query. */
+.dialog {
+  width: 480px;
+}
+
+.status {
+  font-size: 12.5px;
+  color: var(--fg-dim);
+  padding: 8px 2px;
+}
+.err {
+  font-size: 12.5px;
+  color: var(--warn);
+  padding: 4px 2px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.ok {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ok, var(--accent));
+  padding: 4px 2px;
+}
+
+/* The writable:false hint — quiet, but unmissable above the rosters. */
+.off {
+  font-size: 12.5px;
+  color: var(--fg-dim);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 2px 0 8px;
+  line-height: 1.5;
+}
+.off code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.secHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 10px 0 6px;
+}
+.secTitle {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--fg-strong);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.addBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--accent);
+  background: none;
+  border: 1px dashed var(--border);
+  border-radius: 7px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.addBtn:hover {
+  border-color: var(--accent);
+}
+
+.empty {
+  font-size: 12px;
+  color: var(--fg-dim);
+  padding: 2px 2px 6px;
+  line-height: 1.5;
+}
+
+/* One roster row: main value (id/dir) + optional label + remove. Flex-wrap
+ * keeps it mobile-first — inputs share the line while they fit and stack
+ * (main first, label, then remove) when narrow. */
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+}
+.rowBad .inMain,
+.rowBad .inLabel {
+  border-color: var(--warn);
+}
+.inMain {
+  flex: 2 1 150px;
+}
+.inLabel {
+  flex: 1 1 110px;
+}
+.inMain,
+.inLabel {
+  font: inherit;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 5px 8px;
+  min-width: 0;
+}
+.inMain:focus-visible,
+.inLabel:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+}
+.inMain {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.rm {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  color: var(--fg-dim);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  cursor: pointer;
+}
+.rm:hover {
+  border-color: var(--danger, var(--warn));
+  color: var(--fg);
+}
+.rowErr {
+  flex: 1 0 100%;
+  font-size: 11.5px;
+  color: var(--warn);
+  line-height: 1.4;
+}
+
+/* Read-only rows (writable:false): plain text, no inputs. */
+.roMain {
+  flex: 2 1 150px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--fg);
+  word-break: break-all;
+}
+.roLabel {
+  flex: 1 1 110px;
+  font-size: 12px;
+  color: var(--fg-dim);
+  word-break: break-word;
+}
+
+.foot {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border-top: 1px solid var(--border);
+}
+.footHint {
+  font-size: 11.5px;
+  color: var(--fg-dim);
+  line-height: 1.4;
+}
+.footBtns {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

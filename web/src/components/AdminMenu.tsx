@@ -4,6 +4,7 @@ import { dismiss } from "../lib/a11y";
 import { perfDiagEnabled } from "../prefs";
 import { setDiagLogOpen, setOcLogsOpen, setPerfDiagOpen } from "../ui";
 import Icon from "./Icon";
+import FleetStatusDialog from "./FleetStatusDialog";
 import OpenCodeUpdateDialog from "./OpenCodeUpdateDialog";
 import RestartOpenCodeDialog from "./RestartOpenCodeDialog";
 
@@ -32,6 +33,7 @@ export default function AdminMenu(props: { onClose: () => void }) {
 
   const [updateOpen, setUpdateOpen] = createSignal(false);
   const [restartOpen, setRestartOpen] = createSignal(false);
+  const [fleetOpen, setFleetOpen] = createSignal(false);
   const [reloading, setReloading] = createSignal(false);
   const [reloadedAt, setReloadedAt] = createSignal(0);
   const [confirmReset, setConfirmReset] = createSignal(false);
@@ -54,7 +56,7 @@ export default function AdminMenu(props: { onClose: () => void }) {
       role="dialog"
       aria-label="Server admin"
       use:dismiss={() => {
-        if (!updateOpen() && !restartOpen()) props.onClose();
+        if (!updateOpen() && !restartOpen() && !fleetOpen()) props.onClose();
       }}
     >
       <div class="admin-head">Server admin</div>
@@ -114,6 +116,14 @@ export default function AdminMenu(props: { onClose: () => void }) {
         <span class="admin-ok">✓ rebuilt from OpenCode</span>
       </Show>
 
+      {/* Fleet status config — the manage UI for the expected worker/project
+          rosters (GET/PUT /vh/fleet/config). Opens a centered portaled dialog
+          hosting FleetStatusDialog; the menu stays mounted under it (the
+          dismiss guard above knows about it), same as Update/Restart. */}
+      <button type="button" class="admin-btn" onClick={() => setFleetOpen(true)}>
+        <Icon name="layers" size={14} /> Fleet status
+      </button>
+
       {/* --- Diagnostics --- */}
       <div class="admin-section-head">Diagnostics</div>
       <button type="button" class="admin-btn" onClick={() => (props.onClose(), setOcLogsOpen(true))}>
@@ -163,6 +173,9 @@ export default function AdminMenu(props: { onClose: () => void }) {
           onClose={() => setRestartOpen(false)}
           onRestarted={() => void refetchVer()}
         />
+      </Show>
+      <Show when={fleetOpen()}>
+        <FleetStatusDialog onClose={() => setFleetOpen(false)} />
       </Show>
     </div>
   );
