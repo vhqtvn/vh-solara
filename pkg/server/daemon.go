@@ -15,6 +15,7 @@ import (
 	"github.com/vhqtvn/vh-solara/pkg/auth"
 	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 	"github.com/vhqtvn/vh-solara/pkg/tunnel"
+	"github.com/vhqtvn/vh-solara/pkg/version"
 )
 
 // Daemon is the main controller server.
@@ -32,6 +33,14 @@ type Daemon struct {
 	// registration (the historical behavior; only safe when the registration
 	// listener isn't reachable by untrusted parties).
 	RegSecret string
+
+	// Version is this controller's build version, advertised to workers in
+	// the X-VH-Controller-Version dial-response header so they can enforce
+	// their own floor (see pkg/version). cmd/server.go sets it from
+	// cmd.Version (pkg cannot import cmd). NewDaemon defaults it to "dev"
+	// (unparseable ⇒ allowed by workers, matching a plain `go build`);
+	// Daemons built as literals get the same fallback at the header-set site.
+	Version string
 
 	// APIToken, when non-empty, is the bearer token required on the cross-worker
 	// coordination API (/api/workers/{id}/sessions|events). Empty = open (only
@@ -105,6 +114,7 @@ func NewDaemon(addr, daemonAddr, hostPattern string) *Daemon {
 		Addr:        addr,
 		DaemonAddr:  daemonAddr,
 		HostPattern: hostPattern,
+		Version:     "dev",
 
 		Registry: registry,
 		Proxy:    proxy,
@@ -402,7 +412,42 @@ func (d *Daemon) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	conn, err := d.WSUpgrader.Upgrade(w, r, nil)
+	// Worker version boundary (fail-safe). DELIBERATE INVERSION of this
+	// repo's two version-mix precedents — permessage-deflate negotiation
+	// (Q4c: any mix degrades to uncompressed) and lean-gates acquisition
+	// (fallback to full /vh/gates on old workers) are both graceful-
+	// degradation designs; this boundary instead REFUSES an incompatible
+	// mix outright, with NO legacy compatibility path. Operator directive,
+	// controller-first rollout (fleet-status program, slice 1): once this
+	// controller is deployed, pre-floor workers must not connect.
+	//
+	// Fail-open for non-release builds: a worker version that isn't a clean
+	// semver ("dev", "test", make's "<tag>+dev" stamp) is allowed — the
+	// operator deploys locally-built untagged binaries, and refusing them
+	// would break their own deployment. A missing header (pre-boundary
+	// worker) or a clean version below the floor is refused with a reason
+	// naming the floor; see pkg/version for the full posture. Ordered
+	// strictly AFTER the secret guard above (auth before compatibility).
+	workerVer := r.Header.Get(version.HeaderWorkerVersion)
+	if reason := version.WorkerRefusalReason(workerVer); reason != "" {
+		log.Printf("Rejected worker dial from %s: %s", r.RemoteAddr, reason)
+		http.Error(w, reason, http.StatusUpgradeRequired)
+		return
+	}
+
+	// Advertise this controller's version so the worker can enforce its own
+	// floor. Absent header ⇒ pre-boundary controller ⇒ worker refuses.
+	// NOTE: the header MUST ride Upgrade's responseHeader argument — gorilla
+	// hijacks the connection and writes the 101 response itself, so headers
+	// Set on w before Upgrade never reach the wire.
+	cv := d.Version
+	if cv == "" {
+		cv = "dev" // Daemons built as literals (tests) — same fail-open shape
+	}
+	upgradeHeader := http.Header{}
+	upgradeHeader.Set(version.HeaderControllerVersion, cv)
+
+	conn, err := d.WSUpgrader.Upgrade(w, r, upgradeHeader)
 	if err != nil {
 		log.Printf("Failed to upgrade WS: %v", err)
 		return

@@ -63,9 +63,13 @@ var clientDaemonCmd = &cobra.Command{
 		// Mode owner: select and start the web UI backend per --web.
 		rt.setupWebMode()
 
-		// Runtime owner: wire the controller-tunnel agent daemon.
+		// Runtime owner: wire the controller-tunnel agent daemon. Pass the
+		// REAL build version (cmd.Version, ldflags-stamped): it rides both
+		// the X-VH-Worker-Version dial header (the controller's version
+		// floor check) and RegisterMessage.Version (so the dashboard shows
+		// true worker versions). Was a hardcoded "0.1.0" placeholder.
 		proxy := agent.NewProxy(rt.webPort)
-		daemon := agent.NewDaemon(daemonController, rt.workerID, rt.workerName, "0.1.0", rt.headerMap, proxy)
+		daemon := agent.NewDaemon(daemonController, rt.workerID, rt.workerName, Version, rt.headerMap, proxy)
 
 		// Teardown + health owners.
 		rt.attachKillFunc(daemon)

@@ -27,6 +27,10 @@ var serverCmd = &cobra.Command{
 	Short: "Run the central controller server",
 	Run: func(cmd *cobra.Command, args []string) {
 		daemon := server.NewDaemon(serverAddr, daemonAddr, hostPattern)
+		// Advertise the controller's real build version on the worker dial
+		// response (X-VH-Controller-Version) so workers can enforce their
+		// own version floor; see pkg/version.
+		daemon.Version = Version
 		a, err := buildAuth(serverAddr, &serverAuth)
 		if err != nil {
 			log.Fatalf("Auth setup failed: %v", err)

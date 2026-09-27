@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/hashicorp/yamux"
 	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 	"github.com/vhqtvn/vh-solara/pkg/tunnel"
+	"github.com/vhqtvn/vh-solara/pkg/version"
 )
 
 // Daemon coordinates the worker side: connecting back to the server and proxying requests.
@@ -115,7 +117,18 @@ func (d *Daemon) Start() {
 			for k, v := range d.Headers {
 				dialHeaders.Set(k, v)
 			}
+		} else {
+			dialHeaders = make(http.Header)
 		}
+		// Version boundary (fail-safe; see pkg/version): advertise this
+		// worker's build version and its controller floor on the dial. A
+		// controller enforcing its own floor refuses pre-floor workers
+		// before the upgrade (HTTP 426 + reason — surfaced in the dial-
+		// failure log below). X-VH-Min-Controller is advisory/diagnostic:
+		// the authoritative floor lives in the shared pkg/version constants
+		// both sides compile in.
+		dialHeaders.Set(version.HeaderWorkerVersion, d.Version)
+		dialHeaders.Set(version.HeaderMinController, version.MinControllerVersion)
 
 		dialer := websocket.Dialer{
 			ReadBufferSize:  256 * 1024,
@@ -129,14 +142,58 @@ func (d *Daemon) Start() {
 		// attribute a freeze to "worker is currently mid-dial" regardless of
 		// whether this attempt succeeds.
 		diag.Default.Tunnel.DialAttempts.Inc()
-		conn, _, err := dialer.Dial(d.ControllerURL, dialHeaders)
-		if err != nil {
+		conn, resp, err := dialer.Dial(d.ControllerURL, dialHeaders)
+		// Controller version boundary (fail-safe): this deliberately INVERTS
+		// the repo's graceful-degradation version-mix precedents
+		// (permessage-deflate negotiation, lean-gates fallback) — a
+		// controller that doesn't advertise a sufficient version in the dial
+		// response is REFUSED, with no legacy compatibility path (operator
+		// directive, controller-first rollout). Fail-open for non-release
+		// builds: a non-clean-semver version ("dev", "test", make's
+		// "<tag>+dev") is allowed — the operator deploys locally-built
+		// untagged binaries. An absent header means a pre-boundary
+		// controller; a clean version below the floor is too old. In both
+		// cases close and let the reconnect loop retry — this is NOT
+		// TypeFatalDuplicate's log.Fatalf: retry is wanted, not process exit.
+		refused := false
+		if err == nil {
+			controllerVer := resp.Header.Get(version.HeaderControllerVersion)
+			if reason := version.ControllerRefusalReason(controllerVer); reason != "" {
+				log.Printf("Refusing controller at %s: %s — closing tunnel, will retry", d.ControllerURL, reason)
+				conn.Close()
+				refused = true
+			}
+		}
+		if err != nil || refused {
 			// PROBE 7: record the failure + the backoff we're about to sleep.
 			diag.Default.Tunnel.DialFailures.Inc()
+			// Surface the controller's refusal (or any HTTP error answer) in
+			// the worker log: gorilla returns the *http.Response on a
+			// handshake failure (its body "does not need to be closed by the
+			// application" per DialContext docs — we only read a bounded
+			// snippet). Without this, a 426 version-floor refusal is an
+			// opaque "bad handshake". (Skipped for the worker-side version
+			// refusal above — the reason is already logged, and the 101
+			// response carries nothing useful.)
+			why := "controller version refused (see reason above)"
+			if err != nil {
+				why = err.Error()
+				if resp != nil {
+					snippet := ""
+					if resp.Body != nil {
+						b, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+						snippet = strings.TrimSpace(string(b))
+					}
+					why = fmt.Sprintf("%s [HTTP %s]", why, resp.Status)
+					if snippet != "" {
+						why = fmt.Sprintf("%s controller said: %q", why, snippet)
+					}
+				}
+			}
 			// B2 (idle reset): if it has been a long time since we entered the
 			// current disconnected period, snap backoff to the floor. Handles
-			// the overnight-idle case where backoff had previously climbed to
-			// the cap during an active failure streak and the operator just
+			// the overnight-idle case where backoff had previously climbed to the
+			// cap during an active failure streak and the operator just
 			// returned. Without this the worker would keep sleeping at the cap
 			// (5s) for as long as failures continue; with it the next attempt
 			// is at the floor (1s) once the threshold has elapsed.
@@ -154,7 +211,7 @@ func (d *Daemon) Start() {
 				diag.Default.Tunnel.IdleResets.Inc()
 			}
 			diag.Default.Tunnel.LastBackoffNs.Store(int64(backoff))
-			log.Printf("Dial failed: %v (sleeping %v)", err, backoff)
+			log.Printf("Dial failed: %v (sleeping %v)", why, backoff)
 			select {
 			case <-time.After(backoff):
 			case <-d.ctx.Done():

@@ -64,6 +64,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/vhqtvn/vh-solara/pkg/server"
 	"github.com/vhqtvn/vh-solara/pkg/tunnel"
+	"github.com/vhqtvn/vh-solara/pkg/version"
 )
 
 // --- S1 bounds used across the phases -------------------------------------
@@ -140,7 +141,12 @@ func startS1Daemon(t *testing.T) *server.Daemon {
 // streams from the scripted handler.
 func connectS1Peer(t *testing.T, d *server.Daemon, helloAddr string) *s1Peer {
 	t.Helper()
-	conn, _, err := websocket.DefaultDialer.Dial("ws://"+d.DaemonAddr+"/vh-solara/ws", nil)
+	// Version boundary: the controller's handleWorkerWS now refuses dials
+	// without an allowed X-VH-Worker-Version. The peer reports "test"
+	// (unparseable ⇒ fail-open allowed), matching its RegisterMessage.
+	dialHdr := http.Header{}
+	dialHdr.Set(version.HeaderWorkerVersion, "test")
+	conn, _, err := websocket.DefaultDialer.Dial("ws://"+d.DaemonAddr+"/vh-solara/ws", dialHdr)
 	if err != nil {
 		t.Fatalf("peer dial: %v", err)
 	}
