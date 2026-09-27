@@ -61,6 +61,22 @@ type Daemon struct {
 	// /vh/fleet/config) takes effect on the next rollup generation.
 	statusCfg statusConfigHolder
 
+	// notifyStore is the push-notification token registry holder (see
+	// notify_store.go): file-backed (--notify-store), mutex-guarded,
+	// generation-stamped. Zero value = registry disabled — every
+	// /vh/notify/* handler then answers the honest 409 posture naming the
+	// flag. Entries are created/managed via the notify HTTP family
+	// (notify_http.go); S2's sender will consume snapshots.
+	notifyStore notifyStoreHolder
+
+	// notifyTransport is the configured push transport (see
+	// notify_transport.go): an *FCMNotifier built from
+	// --notify-fcm-credentials, a nullNotifier when the flag is unset, or
+	// a future additional transport. nil = disabled posture (literal-
+	// built Daemons); handlers resolve it through notifySender(). Set
+	// before Start (cmd/server.go: SetNotifyTransport).
+	notifyTransport Notifier
+
 	// tunnelDeflate is the controller-side permessage-deflate write policy
 	// for the worker tunnel WebSocket (Q4c experiment). Parsed once from
 	// tunnel.EnvTunnelDeflate in NewDaemon; off ⇒ the upgrader never offers
@@ -225,6 +241,26 @@ func (d *Daemon) buildRootHandler() http.Handler {
 	// serve its SPA shell for this /vh/ path).
 	userMux.HandleFunc("GET /vh/fleet/config/options", d.handleFleetOptionsGet)
 
+	// Push-notification family (/vh/notify/*; see notify_http.go +
+	// notify_store.go + notify_transport.go): the companion-app token
+	// registry (enroll/list/revoke/patch) and the test-send verb. Same
+	// session-cookie auth family as the fleet routes above (the whole
+	// userMux chain is auth-gated; API-class /vh/* means unauthenticated
+	// requests get a clean 401). Mutations (POST/DELETE/PATCH) carry the
+	// in-handler X-VH-CSRF check — the same /vh/-mutation convention as
+	// PUT /vh/fleet/config, since the controller csrfGuard only gates
+	// unsafe methods under /api/. GET /vh/notify/tokens is read-only and
+	// CSRF-exempt. The whole /vh/notify/ prefix is carved out of the
+	// worker-subdomain proxy below (controller-owned family). Disabled
+	// postures are honest 409s: no --notify-store ⇒ every endpoint names
+	// the flag; no --notify-fcm-credentials ⇒ test-send names the flag
+	// (the registry still works — tokens can be enrolled before creds).
+	userMux.HandleFunc("POST /vh/notify/tokens", d.handleNotifyTokenCreate)
+	userMux.HandleFunc("GET /vh/notify/tokens", d.handleNotifyTokenList)
+	userMux.HandleFunc("DELETE /vh/notify/tokens/{id}", d.handleNotifyTokenDelete)
+	userMux.HandleFunc("PATCH /vh/notify/tokens/{id}", d.handleNotifyTokenPatch)
+	userMux.HandleFunc("POST /vh/notify/test", d.handleNotifyTest)
+
 	// Latency diagnostics — AGGREGATED global view. The controller merges its
 	// own probes (diag.Default) with every connected worker's snapshot fetched
 	// through the yamux tunnel, returning one envelope so the SPA's Performance
@@ -335,10 +371,11 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 			host = host[:idx]
 		}
 
-		// Route precedence: the aggregated /vh/diag/latency and the fleet-wide
-		// /vh/fleet/status + /vh/fleet/config family are CONTROLLER-OWNED and
-		// must be served by the controller even when the browser's host is a
-		// per-worker subdomain (e.g. "workerID.controller.example.com").
+		// Route precedence: the aggregated /vh/diag/latency, the fleet-wide
+		// /vh/fleet/status + /vh/fleet/config family, and the whole
+		// /vh/notify/ push-notification family are CONTROLLER-OWNED and
+		// must be served by the controller even when the browser's host is
+		// a per-worker subdomain (e.g. "workerID.controller.example.com").
 		// Without this carve-out the hostInterceptor would proxy the request
 		// down to that worker, returning a single-worker diag snapshot and
 		// forcing the operator to re-fetch per project, or a 404 for fleet
@@ -351,14 +388,21 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 		// from worker subdomains in this deployment, and the worker's
 		// catch-all route would answer /vh/fleet/config with the SPA shell
 		// (200 text/html), which the config pane cannot parse; ditto the
-		// /vh/fleet/config/options picker feed.
+		// /vh/fleet/config/options picker feed. The /vh/notify/ carve-out is
+		// a PREFIX (the family has /vh/notify/tokens/{id} subpaths): workers
+		// have no /vh/notify/ routes (new controller-owned family), so their
+		// catch-all would likewise serve the unparseable SPA shell — same
+		// carve-out list discipline as /vh/fleet/*, with the same
+		// method-agnostic fall-through (methods enforced by userMux
+		// patterns; mutations keep their in-handler CSRF checks).
 		// Falling through to `next` (the userMux chain) serves the global
 		// controller-owned view regardless of host. Per-worker
 		// /vh/diag/latency remains reachable on the worker for the
 		// aggregator's own fan-out (which goes through the tunnel via
 		// Proxy.FetchWorkerSnapshot, not through this hostInterceptor).
 		if r.URL.Path == "/vh/diag/latency" || r.URL.Path == "/vh/fleet/status" ||
-			r.URL.Path == "/vh/fleet/config" || r.URL.Path == "/vh/fleet/config/options" {
+			r.URL.Path == "/vh/fleet/config" || r.URL.Path == "/vh/fleet/config/options" ||
+			strings.HasPrefix(r.URL.Path, "/vh/notify/") {
 			next.ServeHTTP(w, r)
 			return
 		}

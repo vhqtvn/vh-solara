@@ -22,6 +22,20 @@ var serverAPIToken string
 // (discovered scope; PUT /vh/fleet/config answers 409).
 var serverStatusConfig string
 
+// serverNotifyStore is the optional push-notification token registry file
+// path (--notify-store): the JSON file holding the companion-app device
+// tokens managed via /vh/notify/tokens (see pkg/server/notify_store.go).
+// Unset = the whole /vh/notify/ family answers 409 (notifications
+// disabled). A set-but-invalid file fails startup.
+var serverNotifyStore string
+
+// serverNotifyFCMCreds is the optional Google service-account JSON path
+// (--notify-fcm-credentials) used to send FCM push notifications (see
+// pkg/server/notify_transport.go). Unset = no transport configured (the
+// registry still works; POST /vh/notify/test answers 409). A set-but-
+// invalid file fails startup.
+var serverNotifyFCMCreds string
+
 var serverCmd = &cobra.Command{
 	Use:   "server",
 	Short: "Run the central controller server",
@@ -52,6 +66,27 @@ var serverCmd = &cobra.Command{
 				log.Fatalf("--status-config: %v", err)
 			}
 		}
+		// Same discipline for the notification registry: set-but-bad fails
+		// startup (LoadNotifyStore names the path and reason); unset leaves
+		// the family in the honest 409 disabled posture.
+		if serverNotifyStore != "" {
+			if err := daemon.LoadNotifyStore(serverNotifyStore); err != nil {
+				log.Fatalf("--notify-store: %v", err)
+			}
+		}
+		// Push transport wiring: FCM credentials when provided, the null
+		// (disabled) transport otherwise. Credential load/parse failure is
+		// a STARTUP FAILURE naming the path and reason — never a silent
+		// null transport that would turn every test-send into a mystery.
+		notifier := server.NewNullNotifier()
+		if serverNotifyFCMCreds != "" {
+			fcm, err := server.NewFCMNotifierFromFile(serverNotifyFCMCreds)
+			if err != nil {
+				log.Fatalf("--notify-fcm-credentials: %v", err)
+			}
+			notifier = fcm
+		}
+		daemon.SetNotifyTransport(notifier)
 		if err := daemon.Start(); err != nil {
 			log.Fatalf("Server failed: %v", err)
 		}
@@ -65,6 +100,8 @@ func init() {
 	serverCmd.Flags().StringVar(&serverWorkerSecret, "worker-secret", "", "Shared secret required from workers on registration via X-VH-Worker-Secret (prefer the VH_WORKER_SECRET env var); empty = open registration")
 	serverCmd.Flags().StringVar(&serverAPIToken, "api-token", "", "Bearer token required on the cross-worker coordination API /api/workers/{id}/sessions|events (prefer the VH_API_TOKEN env var); empty = open")
 	serverCmd.Flags().StringVar(&serverStatusConfig, "status-config", "", "Path to the fleet-status config JSONC file: the expected workers/projects rosters for GET /vh/fleet/status, managed live via PUT /vh/fleet/config (the file is rewritten as canonical JSON on save; comments allowed on read). A set-but-invalid file fails startup. Unset = config management disabled (discovered scope).")
+	serverCmd.Flags().StringVar(&serverNotifyStore, "notify-store", "", "Path to the push-notification token registry JSON file for the companion app, managed via POST/GET/PATCH/DELETE /vh/notify/tokens (rewritten as canonical JSON on change). A set-but-invalid file fails startup. Unset = the /vh/notify/ endpoints answer 409 (notifications disabled).")
+	serverCmd.Flags().StringVar(&serverNotifyFCMCreds, "notify-fcm-credentials", "", "Path to the Google service-account JSON (client_email, private_key, project_id) used to send FCM push notifications via POST /vh/notify/test. A set-but-invalid file fails startup. Unset = no transport configured (test-send answers 409; the token registry still works).")
 	registerAuthFlags(serverCmd, &serverAuth)
 	rootCmd.AddCommand(serverCmd)
 }
