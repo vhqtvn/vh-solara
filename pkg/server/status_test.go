@@ -130,8 +130,32 @@ func fleetAddOnline(t *testing.T, reg *Registry, id string) {
 	})
 }
 
+// fleetGF builds one scripted gate fact the way a REAL slice-2 worker
+// derives it for a SELECTED root: fleet_selected=true, self-inclusive
+// subtree busy for own busy/retry, and the per-kind/union subtree pending
+// counts agreeing with the self-only booleans (a root holding the pending
+// input itself contributes 1 to its own subtree counts). Workers that fold
+// DESCENDANT waits emit larger subtree ints on the root — the
+// descendant-wait tests script those directly.
 func fleetGF(activity string, perm, quest bool) state.GateFacts {
-	return state.GateFacts{Activity: activity, PendingPermission: perm, PendingQuestion: quest}
+	sel := true
+	gf := state.GateFacts{
+		Activity:          activity,
+		PendingPermission: perm,
+		PendingQuestion:   quest,
+		FleetSelected:     &sel,
+		SubtreeBusy:       activity == "busy" || activity == "retry",
+	}
+	if perm {
+		gf.SubtreePendingPermission = 1
+	}
+	if quest {
+		gf.SubtreePendingQuestion = 1
+	}
+	if perm || quest {
+		gf.SubtreePendingInput = 1
+	}
+	return gf
 }
 
 func fleetSnapBody(gate map[string]state.GateFacts) string {
@@ -154,9 +178,10 @@ func fleetGatesPath(dirs ...string) string {
 	return sb.String()
 }
 
-// fleetGatesBody builds a lean /vh/gates response body (schema 1, one entry
-// per dir, sorted by dir — the worker's deterministic order). A nil gate map
-// renders as null; use map[string]state.GateFacts{} for an empty project.
+// fleetGatesBody builds a lean /vh/gates response body (schema 1 + the
+// fleet_selection capability marker, one entry per dir, sorted by dir — the
+// worker's deterministic order). A nil gate map renders as null; use
+// map[string]state.GateFacts{} for an empty project.
 func fleetGatesBody(gates map[string]map[string]state.GateFacts) string {
 	type entry struct {
 		Dir  string                     `json:"dir"`
@@ -172,9 +197,10 @@ func fleetGatesBody(gates map[string]map[string]state.GateFacts) string {
 		entries = append(entries, entry{Dir: d, Gate: gates[d]})
 	}
 	b, err := json.Marshal(struct {
-		Schema   int     `json:"schema"`
-		Projects []entry `json:"projects"`
-	}{Schema: 1, Projects: entries})
+		Schema         int     `json:"schema"`
+		FleetSelection string  `json:"fleet_selection"`
+		Projects       []entry `json:"projects"`
+	}{Schema: 1, FleetSelection: state.FleetSelectionRootUnarchivedV1, Projects: entries})
 	if err != nil {
 		panic(err)
 	}
@@ -1070,9 +1096,11 @@ func TestFleetStatus_LimitedDetailCumulative(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "w1")
 	// Fixed literals so the byte math is exact: discovery is 27 B, the /a
 	// snapshot 38 B — cumulative 65 after /a already exceeds the 38-B
-	// budget, so the trip names /a (whose observation still counts).
+	// budget, so the trip names /a (whose observation still counts). The
+	// raw literal carries fleet_selected (gauge-semantics fold: only
+	// selected roots count, so an untagged session would fold as nothing).
 	discovery := `[{"dir":"/a"},{"dir":"/b"}]`
-	snapA := `{"gate":{"s1":{"activity":"error"}}}`
+	snapA := `{"gate":{"s1":{"activity":"error","fleet_selected":true}}}`
 	fake.setBody("w1", "/vh/projects", discovery)
 	fake.setBody("w1", "/vh/snapshot?z=1&dir=%2Fa", snapA)
 	svc := d.fleetStatusService()
@@ -1634,6 +1662,11 @@ func TestFleetSummaryLengthCap(t *testing.T) {
 		{false, fleetCondSessionError, 1000000000, "Unknown; 1000000000 errors"},
 		{false, fleetCondWorkerDown, 1000000000, "Unknown; workers down"},
 		{true, fleetCondWorkerDown, 1000000000, "1000000000 workers down"},
+		// session_done is informational and only leads the summary when NO
+		// higher-priority condition applies ("N finished" fits any sane N).
+		{true, fleetCondSessionDone, 1, "1 finished"},
+		{true, fleetCondSessionDone, 3, "3 finished"},
+		{false, fleetCondSessionDone, 2, "Unknown; 2 finished"},
 	}
 	for _, c := range cases {
 		got := fleetSummary(c.complete, c.kind, c.count)
@@ -1867,4 +1900,474 @@ func TestFleetStatus_LeanOmittedDirObservedEmpty(t *testing.T) {
 	if !resp.Gauge.Available || resp.Gauge.Label != "1/1 busy" {
 		t.Fatalf("gauge: want available 1/1 busy, got %+v", resp.Gauge)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Gauge semantics: selected population, descendant waits, session_done,
+// projects[] (fleet-status program, slice 2)
+// ---------------------------------------------------------------------------
+
+// fleetDoneGF builds a selected root's gate facts for session_done matrix
+// cases: idle + hydrated + latest assistant completed + finish "stop" by
+// default, with each conjunct individually overridable.
+func fleetDoneGF() state.GateFacts {
+	gf := fleetGF("idle", false, false)
+	gf.Hydrated = true
+	gf.HasMessages = true
+	gf.LastAssistantCompleted = true
+	gf.FinishReason = "stop"
+	return gf
+}
+
+// TestFleetStatus_DescendantPendingSurfacesOnRoot pins the descendant-wait
+// contract through the LEAN path: the wire carries ONLY the selected root
+// (its waiting children never cross the tunnel), but the root's subtree
+// pending counts surface their waits — two waiting children report TWO
+// permission-pending sessions against ONE pending root, and the condition's
+// deep link/since key is the ROOT (the child identities are deliberately not
+// on the wire).
+func TestFleetStatus_DescendantPendingSurfacesOnRoot(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "$ID.example.test")
+	fleetAddOnline(t, d.Registry, "w")
+	root := fleetGF("idle", false, false)
+	root.SubtreePendingPermission = 2 // two descendant sessions waiting on permissions
+	root.SubtreePendingInput = 2
+	fake.setBody("w", "/vh/projects", fleetProjectsBody("/repo"))
+	fake.setBody("w", fleetGatesPath("/repo"), fleetGatesBody(map[string]map[string]state.GateFacts{
+		"/repo": {"root-s1": root},
+	}))
+
+	h := d.buildRootHandler()
+	resp := decodeFleet(t, doFleet(h))
+	if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondPermissionPending {
+		t.Fatalf("conditions: want [permission_pending], got %v", got)
+	}
+	c := resp.Conditions[0]
+	if c.Count != 2 {
+		t.Fatalf("permission_pending count: want 2 pending SESSIONS (summed over the root's subtree), got %d", c.Count)
+	}
+	if c.Label != "2 permissions pending" {
+		t.Fatalf("label: want %q, got %q", "2 permissions pending", c.Label)
+	}
+	if c.Link == nil || *c.Link != "https://w.example.test/app?dir=%2Frepo&session=root-s1" {
+		t.Fatalf("link must deep-link the ROOT (children are not on the wire), got %v", c.Link)
+	}
+	// The root is not busy: gauge 0/1 over the selected population.
+	if !resp.Gauge.Available || resp.Gauge.Label != "0/1 busy" {
+		t.Fatalf("gauge: want 0/1 busy, got %+v", resp.Gauge)
+	}
+	// projects[]: one pending root (not two pending sessions).
+	if len(resp.Projects) != 1 {
+		t.Fatalf("projects: want the /repo row, got %+v", resp.Projects)
+	}
+	if p := resp.Projects[0]; p.Dir != "/repo" || p.Sessions != 1 || p.Pending != 1 || p.Busy != 0 {
+		t.Fatalf("project row: want dir=/repo sessions=1 pending=1 busy=0, got %+v", p)
+	}
+}
+
+// TestFleetStatus_SelectedFoldSnapshotPath pins the SAME selected-population
+// fold through the SNAPSHOT fallback: children and archived roots arrive in
+// the complete gate map and are filtered by fleet_selected at the fold; a
+// nil fleet_selected (pre-selection producer) is excluded — the documented
+// residual treatment. Also pins the busy belt: a root whose own activity is
+// busy counts busy even if the producer left subtree_busy unset.
+func TestFleetStatus_SelectedFoldSnapshotPath(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	fleetAddOnline(t, d.Registry, "w")
+	selTrue := true
+	selFalse := false
+	fake.setBody("w", "/vh/projects", fleetProjectsBody("/repo"))
+	// No lean body scripted → the lean attempt fails → snapshot fallback.
+	fake.setBody("w", "/vh/snapshot?z=1&dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{
+		"root-busy":       {Activity: "busy", FleetSelected: &selTrue},  // busy root (belt: no subtree_busy)
+		"root-idle":       fleetGF("idle", false, false),                // selected, idle
+		"child-busy":      {Activity: "busy", FleetSelected: &selFalse}, // child: not in the fold population
+		"arch-root":       {Activity: "idle", FleetSelected: &selFalse}, // archived root: excluded
+		"legacy-untagged": {Activity: "busy"},                           // nil fleet_selected: excluded (residual)
+	}))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
+		t.Fatalf("worker: want ok via fallback, got %+v", w)
+	}
+	// Selected roots: root-busy + root-idle = 2; busy = 1 (root-busy).
+	if !resp.Gauge.Available || resp.Gauge.Label != "1/2 busy" {
+		t.Fatalf("gauge: want 1/2 busy (children/archived/untagged excluded; own-busy belt), got %+v", resp.Gauge)
+	}
+	if got := condKinds(resp); len(got) != 0 {
+		t.Fatalf("conditions: none expected (the busy child is not itself a condition), got %v", got)
+	}
+	// projects[] folds the same population: sessions=2, busy=1.
+	if len(resp.Projects) != 1 || resp.Projects[0].Sessions != 2 || resp.Projects[0].Busy != 1 {
+		t.Fatalf("projects: want /repo sessions=2 busy=1, got %+v", resp.Projects)
+	}
+	if resp.ProjectsTotal != 1 || resp.ProjectsOmit != 0 {
+		t.Fatalf("projects totals: want 1/0, got %d/%d", resp.ProjectsTotal, resp.ProjectsOmit)
+	}
+}
+
+// TestFleetStatus_SessionDoneMatrix pins the finished-session predicate
+// (every conjunct), its LAST display-priority slot (below session_retry),
+// its informational severity (never attention/degraded — a done-only fleet
+// is nominal), and the since-continuity reset on OBSERVED resumed work.
+func TestFleetStatus_SessionDoneMatrix(t *testing.T) {
+	// Negative clauses: each mutates exactly one conjunct of the predicate.
+	neg := map[string]func(g state.GateFacts) state.GateFacts{
+		"activity busy":   func(g state.GateFacts) state.GateFacts { g.Activity = "busy"; return g },
+		"activity retry":  func(g state.GateFacts) state.GateFacts { g.Activity = "retry"; return g },
+		"not hydrated":    func(g state.GateFacts) state.GateFacts { g.Hydrated = false; return g },
+		"not completed":   func(g state.GateFacts) state.GateFacts { g.LastAssistantCompleted = false; return g },
+		"finish length":   func(g state.GateFacts) state.GateFacts { g.FinishReason = "length"; return g },
+		"finish empty":    func(g state.GateFacts) state.GateFacts { g.FinishReason = ""; return g },
+		"subtree busy":    func(g state.GateFacts) state.GateFacts { g.SubtreeBusy = true; return g },
+		"subtree pending": func(g state.GateFacts) state.GateFacts { g.SubtreePendingInput = 1; return g },
+	}
+	for name, mutate := range neg {
+		t.Run(name, func(t *testing.T) {
+			d, fake := newFleetTestDaemon(t, "")
+			fleetAddOnline(t, d.Registry, "w")
+			fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+			fake.setBody("w", fleetGatesPath("/a"), fleetGatesBody(map[string]map[string]state.GateFacts{
+				"/a": {"s1": mutate(fleetDoneGF())},
+			}))
+			resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+			for _, c := range resp.Conditions {
+				if c.Kind == fleetCondSessionDone {
+					t.Fatalf("negative clause %q: session_done must NOT fire, got %+v", name, c)
+				}
+			}
+			// Done never ADDS severity — the only permitted conditions are
+			// the ones the mutation itself legitimately creates (busy/retry).
+			for _, c := range resp.Conditions {
+				if c.Kind != fleetCondSessionRetry {
+					t.Fatalf("negative clause %q: unexpected condition %+v", name, c)
+				}
+			}
+		})
+	}
+
+	// Positive + priority slot + informational severity.
+	t.Run("positive", func(t *testing.T) {
+		d, fake := newFleetTestDaemon(t, "$ID.example.test")
+		fleetAddOnline(t, d.Registry, "w")
+		done1 := fleetDoneGF()
+		done2 := fleetDoneGF()
+		fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+		fake.setBody("w", fleetGatesPath("/a"), fleetGatesBody(map[string]map[string]state.GateFacts{
+			"/a": {
+				"done-1":  done1,
+				"done-2":  done2,
+				"retry-1": fleetGF("retry", false, false),
+			},
+		}))
+		resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+		want := []string{fleetCondSessionRetry, fleetCondSessionDone}
+		got := condKinds(resp)
+		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+			t.Fatalf("conditions: want %v (done LAST), got %v", want, got)
+		}
+		for _, c := range resp.Conditions {
+			if c.Kind == fleetCondSessionDone {
+				if c.Count != 2 || c.Label != "2 finished" || c.Since == nil {
+					t.Fatalf("session_done: want count=2 label=\"2 finished\" since≠nil, got %+v", c)
+				}
+				if c.Link == nil || *c.Link != "https://w.example.test/app?dir=%2Fa&session=done-1" {
+					t.Fatalf("session_done link: got %v", c.Link)
+				}
+			}
+		}
+		// A retrying root keeps attention severity; done adds nothing.
+		if resp.KnownOverall != fleetOverallAttention {
+			t.Fatalf("known_overall: want attention (retry only — done is informational), got %s", resp.KnownOverall)
+		}
+		if resp.Summary != "1 session retrying" {
+			t.Fatalf("summary must lead with the higher-priority condition, got %q", resp.Summary)
+		}
+		// A done root is not busy: gauge 1/3 (only retry-1).
+		if resp.Gauge.Label != "1/3 busy" {
+			t.Fatalf("gauge: want 1/3 busy, got %+v", resp.Gauge)
+		}
+		// projects[] row carries the done count.
+		if len(resp.Projects) != 1 || resp.Projects[0].Done != 2 {
+			t.Fatalf("projects: want /a done=2, got %+v", resp.Projects)
+		}
+	})
+
+	// Done-only fleet: nominal severity, done-led summary.
+	t.Run("done only", func(t *testing.T) {
+		d, fake := newFleetTestDaemon(t, "")
+		fleetAddOnline(t, d.Registry, "w")
+		fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+		fake.setBody("w", fleetGatesPath("/a"), fleetGatesBody(map[string]map[string]state.GateFacts{
+			"/a": {"done-1": fleetDoneGF(), "done-2": fleetDoneGF()},
+		}))
+		resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+		if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondSessionDone {
+			t.Fatalf("conditions: want [session_done], got %v", got)
+		}
+		if resp.Overall != fleetOverallNominal || resp.KnownOverall != fleetOverallNominal {
+			t.Fatalf("done-only fleet: want nominal/nominal (informational), got %s/%s", resp.Overall, resp.KnownOverall)
+		}
+		if resp.Summary != "2 finished" {
+			t.Fatalf("summary: want done-led %q, got %q", "2 finished", resp.Summary)
+		}
+		if resp.Gauge.Label != "0/2 busy" {
+			t.Fatalf("gauge: a done root is not busy, got %+v", resp.Gauge)
+		}
+	})
+}
+
+// TestFleetStatus_SessionDoneSinceResetsOnResume pins the done continuity:
+// `since` survives consecutive done generations, disappears when OBSERVED
+// resumed work makes the root ineligible (busy ⇒ not done), and RESETS when
+// the done state reappears — the existing tracker semantics applied to the
+// done contributor key. (A busy→done cycle BETWEEN polls is unobservable
+// and deliberately not promised.)
+func TestFleetStatus_SessionDoneSinceResetsOnResume(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	fleetAddOnline(t, d.Registry, "w")
+	fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+	done := fleetGatesBody(map[string]map[string]state.GateFacts{"/a": {"s1": fleetDoneGF()}})
+	busy := fleetGatesBody(map[string]map[string]state.GateFacts{"/a": {"s1": fleetGF("busy", false, false)}})
+	fake.setBody("w", fleetGatesPath("/a"), done)
+
+	svc := d.fleetStatusService()
+	snap := d.statusCfg.snapshot()
+	t0 := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+
+	doneCond := func(r fleetStatusResponse) fleetCondition {
+		t.Helper()
+		for _, c := range r.Conditions {
+			if c.Kind == fleetCondSessionDone {
+				return c
+			}
+		}
+		t.Fatalf("no session_done condition in %+v", r.Conditions)
+		return fleetCondition{}
+	}
+
+	r1, _ := svc.buildRollup(t0, snap)
+	if got := *doneCond(r1).Since; got != "2026-09-27T12:00:00Z" {
+		t.Fatalf("gen1 since: want birth, got %s", got)
+	}
+	r2, _ := svc.buildRollup(t0.Add(3*time.Second), snap)
+	if got := *doneCond(r2).Since; got != "2026-09-27T12:00:00Z" {
+		t.Fatalf("gen2 (continuous done): since must persist, got %s", got)
+	}
+	fake.setBody("w", fleetGatesPath("/a"), busy)
+	r3, _ := svc.buildRollup(t0.Add(6*time.Second), snap)
+	for _, c := range r3.Conditions {
+		if c.Kind == fleetCondSessionDone {
+			t.Fatalf("gen3 (observed resume): done must vanish, got %+v", c)
+		}
+	}
+	fake.setBody("w", fleetGatesPath("/a"), done)
+	r4, _ := svc.buildRollup(t0.Add(9*time.Second), snap)
+	if got := *doneCond(r4).Since; got != "2026-09-27T12:00:09Z" {
+		t.Fatalf("gen4 (done reappeared): since must RESET, got %s", got)
+	}
+}
+
+// applyFleetProjectsWithLabels installs a project roster carrying LABELS
+// through the same validated path a config file takes.
+func applyFleetProjectsWithLabels(t *testing.T, d *Daemon, projects []fleetConfigProject) {
+	t.Helper()
+	cfg := &fleetStatusConfig{Projects: projects}
+	if err := validateStatusConfig(cfg); err != nil {
+		t.Fatalf("labeled roster must be a valid config: %v", err)
+	}
+	d.statusCfg.applyValidated(cfg)
+}
+
+// TestFleetStatus_ProjectsRows pins the projects[] contract: config-roster
+// labels (omitted for unlabelled dirs), severity→busy→dir ordering (done is
+// informational and never outranks a problem or busy row), same-dir
+// multi-worker aggregation into ONE row, the 16-row presentation cap with
+// omission accounting, totals folded BEFORE truncation, and complete:false
+// when an in-scope worker's acquisition is incomplete.
+func TestFleetStatus_ProjectsRows(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	applyFleetProjectsWithLabels(t, d, []fleetConfigProject{
+		{Dir: "/perm", Label: "Perm project"},
+		{Dir: "/busy"},
+		{Dir: "/done", Label: "Done project"},
+		{Dir: "/shared", Label: "Shared"},
+		{Dir: "/idle"},
+	})
+	fleetAddOnline(t, d.Registry, "alpha")
+	fleetAddOnline(t, d.Registry, "beta")
+
+	permRoot := fleetGF("idle", false, false)
+	permRoot.SubtreePendingPermission = 1
+	permRoot.SubtreePendingInput = 1
+	busyRoot := fleetGF("busy", false, false)
+	lean := func(m map[string]map[string]state.GateFacts) string { return fleetGatesBody(m) }
+	alphaDirs := []string{"/perm", "/busy", "/done", "/shared", "/idle"}
+	sort.Strings(alphaDirs) // discovery is sorted; the lean path key mirrors it
+	fake.setBody("alpha", "/vh/projects", fleetProjectsBody(alphaDirs...))
+	fake.setBody("alpha", fleetGatesPath(alphaDirs...), lean(map[string]map[string]state.GateFacts{
+		"/perm":   {"p1": permRoot},
+		"/busy":   {"b1": busyRoot, "b2": busyRoot},
+		"/done":   {"d1": fleetDoneGF(), "d2": fleetDoneGF(), "d3": fleetDoneGF()},
+		"/shared": {"sh1": fleetGF("idle", false, false)},
+		"/idle":   {},
+	}))
+	// beta hosts the SAME /shared dir: its roots fold into the SAME row.
+	fake.setBody("beta", "/vh/projects", fleetProjectsBody("/shared"))
+	fake.setBody("beta", fleetGatesPath("/shared"), lean(map[string]map[string]state.GateFacts{
+		"/shared": {"sh2": fleetGF("idle", false, false)},
+	}))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	rows := resp.Projects
+	if len(rows) != 5 {
+		t.Fatalf("projects: want 5 rows, got %+v", rows)
+	}
+	// Order: /perm first (problem severity), then busy desc (/busy), then
+	// dir ascending among the quiet rows (/done < /idle < /shared).
+	wantDirs := []string{"/perm", "/busy", "/done", "/idle", "/shared"}
+	for i, want := range wantDirs {
+		if rows[i].Dir != want {
+			t.Fatalf("projects order: want %v, got %v", wantDirs, dirsOf(rows))
+		}
+	}
+	// Labels from the config roster; unlabelled dirs omit the key.
+	if rows[0].Label != "Perm project" || rows[2].Label != "Done project" {
+		t.Fatalf("labels: got %+v", rows)
+	}
+	if rows[1].Label != "" || rows[3].Label != "" {
+		t.Fatalf("unlabelled dirs must omit the label, got %+v", rows)
+	}
+	if rows[4].Label != "Shared" {
+		t.Fatalf("/shared label: got %+v", rows[4])
+	}
+	// Row counts: perm (1 pending root), busy (2 busy roots), done (3 done),
+	// shared (2 sessions across TWO workers, one row), idle (empty acquired).
+	if r := rows[0]; r.Sessions != 1 || r.Pending != 1 || r.Busy != 0 {
+		t.Fatalf("/perm row: %+v", r)
+	}
+	if r := rows[1]; r.Sessions != 2 || r.Busy != 2 {
+		t.Fatalf("/busy row: %+v", r)
+	}
+	if r := rows[2]; r.Sessions != 3 || r.Done != 3 || r.Busy != 0 {
+		t.Fatalf("/done row: %+v", r)
+	}
+	if r := rows[4]; r.Sessions != 2 || r.Complete != true {
+		t.Fatalf("/shared row: same-dir multi-worker sums into one complete row, got %+v", r)
+	}
+	if r := rows[3]; r.Sessions != 0 {
+		t.Fatalf("/idle row: genuinely empty acquired project stays present, got %+v", r)
+	}
+	if resp.ProjectsTotal != 5 || resp.ProjectsOmit != 0 {
+		t.Fatalf("totals: want 5/0, got %d/%d", resp.ProjectsTotal, resp.ProjectsOmit)
+	}
+	// Done (3 sessions, 3 finished) does NOT outrank the busy row (2 busy)
+	// or the problem row — severity first, then busy desc, then dir.
+	if resp.Gauge.Label != "2/8 busy" {
+		t.Fatalf("gauge: want 2/8 busy over ALL selected roots (1+2+3+2), got %+v", resp.Gauge)
+	}
+
+	// Incomplete acquisition ⇒ every row complete=false (an unobserved
+	// worker could contribute to any dir), totals still present.
+	d2, fake2 := newFleetTestDaemon(t, "")
+	applyFleetProjectsWithLabels(t, d2, []fleetConfigProject{{Dir: "/a", Label: "A"}})
+	fleetAddOnline(t, d2.Registry, "ok")
+	fleetAddOnline(t, d2.Registry, "down")
+	d2.Registry.MarkWorkerOffline("down")
+	fake2.setBody("ok", "/vh/projects", fleetProjectsBody("/a"))
+	fake2.setBody("ok", fleetGatesPath("/a"), lean(map[string]map[string]state.GateFacts{
+		"/a": {"s1": fleetGF("idle", false, false)},
+	}))
+	resp2 := decodeFleet(t, doFleet(d2.buildRootHandler()))
+	if len(resp2.Projects) != 1 || resp2.Projects[0].Complete {
+		t.Fatalf("incomplete refresh: row must be complete=false, got %+v", resp2.Projects)
+	}
+}
+
+// TestFleetStatus_ProjectsCapAndOmission pins the presentation caps: 17
+// observed dirs render 16 rows with projects_total=17 / projects_omitted=1,
+// and the omitted row's SESSIONS still count in the gauge (totals fold
+// before truncation). Ordering note: with no problem conditions anywhere,
+// the busy row sorts FIRST (busy descending), so the lexically-greatest
+// dir is the one the cap drops.
+func TestFleetStatus_ProjectsCapAndOmission(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	fleetAddOnline(t, d.Registry, "w")
+	dirs := make([]string, 17)
+	gates := map[string]map[string]state.GateFacts{}
+	for i := range dirs {
+		dirs[i] = fmt.Sprintf("/p%02d", i)
+		gates[dirs[i]] = map[string]state.GateFacts{}
+	}
+	// /p16 carries the fleet's only busy root → sorts first, never truncated.
+	gates["/p16"] = map[string]state.GateFacts{"busy": fleetGF("busy", false, false)}
+	// /p15 is the row the cap WILL drop; give it two idle roots so its
+	// sessions must still appear in the gauge denominator (pre-truncation
+	// folding), and /p00 one idle root as the control.
+	gates["/p15"] = map[string]state.GateFacts{"i1": fleetGF("idle", false, false), "i2": fleetGF("idle", false, false)}
+	gates["/p00"] = map[string]state.GateFacts{"i0": fleetGF("idle", false, false)}
+	fake.setBody("w", "/vh/projects", fleetProjectsBody(dirs...))
+	fake.setBody("w", fleetGatesPath(dirs...), fleetGatesBody(gates))
+
+	rec := doFleet(d.buildRootHandler())
+	resp := decodeFleet(t, rec)
+	if len(resp.Projects) != fleetProjectsMaxRows {
+		t.Fatalf("rows: want the %d-row cap, got %d", fleetProjectsMaxRows, len(resp.Projects))
+	}
+	if resp.ProjectsTotal != 17 || resp.ProjectsOmit != 1 {
+		t.Fatalf("omission accounting: want 17/1, got %d/%d", resp.ProjectsTotal, resp.ProjectsOmit)
+	}
+	if resp.Projects[0].Dir != "/p16" {
+		t.Fatalf("the busy row sorts first (busy desc), got %q", resp.Projects[0].Dir)
+	}
+	if resp.Projects[15].Dir != "/p14" {
+		t.Fatalf("the cap drops the sorted tail (/p15), last kept row %q", resp.Projects[15].Dir)
+	}
+	if resp.Gauge.Label != "1/4 busy" {
+		t.Fatalf("gauge must fold BEFORE truncation (the omitted /p15 roots count), got %+v", resp.Gauge)
+	}
+	// JSON level: projects is always an array (never null), even here, and
+	// the totals keys ride the same object.
+	var raw struct {
+		Projects []json.RawMessage `json:"projects"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil || raw.Projects == nil {
+		t.Fatalf("projects must serialize as [], got %s", rec.Body.String())
+	}
+}
+
+// TestFleetStatus_LeanMarkerValidation pins the capability validation: a
+// lean response that ADVERTISES root_unarchived_v1 but carries an untagged
+// gate entry is a producer bug — malformed, not supported-zero — and routes
+// to the snapshot fallback (which serves the worker ok and drives conditions
+// from its own complete gate map).
+func TestFleetStatus_LeanMarkerValidation(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	fleetAddOnline(t, d.Registry, "w")
+	fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+	// Marker advertised; the entry lacks fleet_selected.
+	fake.setBody("w", fleetGatesPath("/a"), `{"schema":1,"fleet_selection":"root_unarchived_v1","projects":[{"dir":"/a","gate":{"s1":{"activity":"idle"}}}]}`)
+	fake.setBody("w", "/vh/snapshot?z=1&dir=%2Fa", fleetSnapBody(map[string]state.GateFacts{
+		"s1": fleetGF("idle", true, false),
+	}))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
+		t.Fatalf("marker-violating lean must fall back and end ok, got %+v", w)
+	}
+	if n := fake.count("w"); n != 3 {
+		t.Fatalf("calls: want discovery + rejected lean + 1 snapshot, got %d", n)
+	}
+	if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondPermissionPending {
+		t.Fatalf("fallback observation must drive conditions, got %v", got)
+	}
+}
+
+// dirsOf is a debug helper for projects-order failure messages.
+func dirsOf(rows []fleetProjectRow) []string {
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.Dir)
+	}
+	return out
 }

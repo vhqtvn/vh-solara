@@ -68,6 +68,20 @@ describe("wire-field aliases: hasMessages / permissionWasBlocked / runningRoots 
     expect(typesTs).toContain("hydrated?: boolean;"); // retained on the wire
   });
 
+  // ---- fleet-watch additive gate fields (gauge-semantics slice) ----
+
+  it("GateFacts declares the additive fleet projection fields (fleet_selected + subtree pending counts)", () => {
+    // Additive schema-1 wire fields, declared optional with the EXACT wire
+    // spellings (snake_case, matching the Go tags). Ordinary snapshots stay
+    // complete — children carry fleet_selected:false — so the SPA's
+    // existing gate consumers must tolerate (and the DTO must document)
+    // these fields without reading them yet.
+    expect(typesTs).toContain("fleet_selected?: boolean;");
+    expect(typesTs).toContain("subtree_pending_permission?: number;");
+    expect(typesTs).toContain("subtree_pending_question?: number;");
+    expect(typesTs).toContain("subtree_pending_input?: number;");
+  });
+
   // ---- L-10: running -> runningRoots (/vh/projects) ----
 
   it("ProjectEndpointItem declares BOTH the new `runningRoots` and the retained `running` (compat)", () => {

@@ -16,8 +16,10 @@ package server
 //	}
 //
 // Semantics:
-//   - ids/dirs are the v1 authority; labels are INERT schema room (stored,
-//     echoed by GET, persisted — NOT consumed by the rollup yet).
+//   - ids/dirs are the v1 authority; labels are display room (stored,
+//     echoed by GET, persisted — and, since the gauge-semantics slice,
+//     CONSUMED by the rollup's projects[] rows as the per-dir display
+//     label; they still influence NO scope, severity, or budget decision).
 //   - budgets is an OPTIONAL top-level block; each of its six fields
 //     (max_response_bytes, max_cumulative_bytes, max_workers_per_refresh,
 //     max_projects_per_worker, refresh_budget_ms, worker_budget_ms) is
@@ -102,7 +104,8 @@ import (
 )
 
 // maxFleetConfigLabelRunes is the label ceiling: free text, ≤64 Unicode code
-// points (runes, not bytes). Labels are inert display room in v1.
+// points (runes, not bytes). Labels are display room (the rollup's projects[]
+// rows render them verbatim; they drive no scope/severity decision).
 const maxFleetConfigLabelRunes = 64
 
 // maxFleetConfigBodyBytes caps a PUT request body (a config document is a

@@ -61,6 +61,20 @@ export interface GateFacts {
   // currently read either name; declared so future reads adopt the exact one.)
   permissionWasBlocked?: boolean;
   activity?: string;
+  // Fleet-watch projection (gauge-semantics slice; ADDITIVE schema-1 gate
+  // fields, snake_case on the wire exactly as the Go tags spell them):
+  // fleet_selected is the tri-state "effective root + unarchived" flag the
+  // fleet rollup folds on (nil = the producing daemon predates the
+  // projection); the subtree_pending_* counts are the per-kind/union
+  // pending SESSION counts over the session's subtree (inclusive of self) —
+  // a subagent child's wait surfaces on its root. The SPA does not read
+  // these yet (ordinary snapshots stay complete; the watch UI is future
+  // work); declared so the wire contract is documented where the rest of
+  // GateFacts lives.
+  fleet_selected?: boolean;
+  subtree_pending_permission?: number;
+  subtree_pending_question?: number;
+  subtree_pending_input?: number;
   [k: string]: unknown;
 }
 

@@ -66,4 +66,35 @@ func TestGateFactsLeanParityWithSnapshot(t *testing.T) {
 	if g := lean["grand"]; g.Activity != ActivityRetry {
 		t.Errorf("grand: want retry, got %+v", g)
 	}
+
+	// --- fleet-selection enrichment (gauge-semantics slice) ---
+	// The shared derivation stamps the SAME selection/pending facts on both
+	// paths (DeepEqual above already covers them); spot-pin the load-bearing
+	// values so a drift is readable, and pin the filtered-subset contract:
+	// GateFactsFleetSelected is exactly the selected subset of the complete
+	// map — root is the only selected session here (child/idle1/err/grand are
+	// resident children; every session is unarchived).
+	if g := lean["root"]; g.FleetSelected == nil || !*g.FleetSelected {
+		t.Errorf("root: want fleet_selected=true, got %+v", g)
+	}
+	for _, sid := range []string{"child", "idle1", "err", "grand"} {
+		if g := lean[sid]; g.FleetSelected == nil || *g.FleetSelected {
+			t.Errorf("%s: want fleet_selected=false (resident child), got %+v", sid, g)
+		}
+	}
+	// root's subtree holds BOTH kinds: its own question + idle1's permission.
+	if g := lean["root"]; g.SubtreePendingPermission != 1 || g.SubtreePendingQuestion != 1 || g.SubtreePendingInput != 2 {
+		t.Errorf("root: want subtree perm=1 quest=1 union=2, got %+v", g)
+	}
+	if g := lean["idle1"]; g.SubtreePendingPermission != 1 || g.SubtreePendingInput != 1 {
+		t.Errorf("idle1: want subtree perm=1 union=1, got %+v", g)
+	}
+
+	filt := s.GateFactsFleetSelected()
+	if len(filt) != 1 {
+		t.Fatalf("filtered lean map: want exactly [root], got %d entries", len(filt))
+	}
+	if !reflect.DeepEqual(filt["root"], lean["root"]) {
+		t.Fatalf("filtered root entry drifted from the complete lean entry:\n filt=%+v\n lean=%+v", filt["root"], lean["root"])
+	}
 }

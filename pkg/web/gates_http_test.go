@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -115,14 +116,18 @@ func TestFleetGatesHandlerContract(t *testing.T) {
 
 // TestFleetGatesGateParityWithSnapshot pins the load-bearing property: the
 // gate map /vh/gates serves for a project carries EXACTLY the values the
-// same project's /vh/snapshot carries in its gate field — the rollup's fold
-// must not depend on which acquisition path ran.
+// same project's /vh/snapshot carries in its gate field — restricted to the
+// fleet-watch SELECTED population. The rollup's fold must not depend on
+// which acquisition path ran: the lean response IS the snapshot's gate map
+// filtered to fleet_selected=true, entry-for-entry (full GateFacts equality,
+// not just the legacy four fields).
 func TestFleetGatesGateParityWithSnapshot(t *testing.T) {
 	_, web := newGatesTestServer(t, 4)
 
 	_, gatesBody := getGates(t, web, "?dir=")
 	var gates struct {
-		Projects []struct {
+		FleetSelection string `json:"fleet_selection"`
+		Projects       []struct {
 			Gate map[string]state.GateFacts `json:"gate"`
 		} `json:"projects"`
 	}
@@ -132,7 +137,116 @@ func TestFleetGatesGateParityWithSnapshot(t *testing.T) {
 	if len(gates.Projects) != 1 {
 		t.Fatalf("want the default project entry, got %+v", gates.Projects)
 	}
+	if gates.FleetSelection != state.FleetSelectionRootUnarchivedV1 {
+		t.Fatalf("lean fleet_selection marker: want %q, got %q", state.FleetSelectionRootUnarchivedV1, gates.FleetSelection)
+	}
 
+	snapResp, err := http.Get(web.URL + "/vh/snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapResp.Body.Close()
+	snapBody, err := io.ReadAll(snapResp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snap struct {
+		FleetSelection string                     `json:"fleet_selection"`
+		Gate           map[string]state.GateFacts `json:"gate"`
+	}
+	if err := json.Unmarshal(snapBody, &snap); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if snap.FleetSelection != state.FleetSelectionRootUnarchivedV1 {
+		t.Fatalf("snapshot fleet_selection marker: want %q, got %q", state.FleetSelectionRootUnarchivedV1, snap.FleetSelection)
+	}
+
+	// Project the snapshot's COMPLETE map to its selected subset — the exact
+	// population the lean endpoint must serve.
+	want := map[string]state.GateFacts{}
+	for sid, gf := range snap.Gate {
+		if gf.FleetSelected != nil && *gf.FleetSelected {
+			want[sid] = gf
+		}
+	}
+	if len(want) == 0 {
+		t.Fatal("fixture must contain at least one selected root for the parity assertion")
+	}
+	if len(want) != len(gates.Projects[0].Gate) {
+		t.Fatalf("selected cardinality mismatch: gates=%d snapshot-selected=%d (snapshot total=%d)", len(gates.Projects[0].Gate), len(want), len(snap.Gate))
+	}
+	for sid, gf := range want {
+		other, ok := gates.Projects[0].Gate[sid]
+		if !ok {
+			t.Fatalf("selected session %q missing from /vh/gates gate", sid)
+		}
+		if !reflect.DeepEqual(gf, other) {
+			t.Fatalf("session %q gate drift:\n snapshot=%+v\n gates=%+v", sid, gf, other)
+		}
+	}
+}
+
+// TestFleetGatesSelectedRootsOnly pins the selected-only population through
+// the REAL worker stack (fake OpenCode → aggregator → /vh/gates + /vh/
+// snapshot): subagent children and archived sessions never cross the lean
+// wire, while the snapshot stays COMPLETE (children present with
+// fleet_selected=false) — the ordinary SPA consumers are untouched by the
+// fleet fold's narrowed population.
+func TestFleetGatesSelectedRootsOnly(t *testing.T) {
+	fake := newFake()
+	fake.sessions = []string{
+		`{"id":"r1","title":"Root one","time":{"updated":1}}`,
+		`{"id":"sub1","parentID":"r1","title":"Subagent","time":{"updated":1}}`,
+		`{"id":"r2","title":"Root two","time":{"updated":1}}`,
+		`{"id":"arch1","title":"Archived root","time":{"updated":1,"archived":2}}`,
+	}
+	ocSrv := httptest.NewServer(fake.handler())
+	t.Cleanup(ocSrv.Close)
+	agg := aggregator.New(ocSrv.URL, 1000)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go agg.Run(ctx)
+	waitFor(t, func() bool { return len(agg.Store().SessionIDs()) >= 3 }, "hydrate sessions (archived root is deleted from the live store)")
+
+	srv, err := NewServer(agg, ocSrv.URL, 1000)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	web := httptest.NewServer(srv.Handler())
+	t.Cleanup(web.Close)
+
+	code, body := getGates(t, web, "?dir=")
+	if code != http.StatusOK {
+		t.Fatalf("GET /vh/gates: want 200, got %d (body=%q)", code, body)
+	}
+	var resp struct {
+		FleetSelection string `json:"fleet_selection"`
+		Projects       []struct {
+			Gate map[string]state.GateFacts `json:"gate"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode gates: %v (body=%q)", err, body)
+	}
+	if resp.FleetSelection != state.FleetSelectionRootUnarchivedV1 {
+		t.Fatalf("fleet_selection marker: want %q, got %q", state.FleetSelectionRootUnarchivedV1, resp.FleetSelection)
+	}
+	if len(resp.Projects) != 1 {
+		t.Fatalf("want the default project, got %+v", resp.Projects)
+	}
+	gate := resp.Projects[0].Gate
+	if len(gate) != 2 || gate["r1"].Activity == "" || gate["r2"].Activity == "" {
+		t.Fatalf("lean gate must carry EXACTLY the selected roots {r1,r2}, got %d entries", len(gate))
+	}
+	for sid, gf := range gate {
+		if gf.FleetSelected == nil || !*gf.FleetSelected {
+			t.Fatalf("lean entry %s must carry fleet_selected=true, got %+v", sid, gf)
+		}
+	}
+
+	// The snapshot stays COMPLETE: the child is present (selected=false);
+	// the archived root left the live store (deleted by the archive funnel —
+	// absent, not merely unselected).
 	snapResp, err := http.Get(web.URL + "/vh/snapshot")
 	if err != nil {
 		t.Fatal(err)
@@ -148,19 +262,24 @@ func TestFleetGatesGateParityWithSnapshot(t *testing.T) {
 	if err := json.Unmarshal(snapBody, &snap); err != nil {
 		t.Fatalf("decode snapshot: %v", err)
 	}
-	if len(snap.Gate) != len(gates.Projects[0].Gate) {
-		t.Fatalf("gate cardinality mismatch: gates=%d snapshot=%d", len(gates.Projects[0].Gate), len(snap.Gate))
+	if len(snap.Gate) != 3 {
+		t.Fatalf("snapshot gate must stay complete (r1,sub1,r2), got %d: %v", len(snap.Gate), keysOf(snap.Gate))
 	}
-	for sid, gf := range snap.Gate {
-		other, ok := gates.Projects[0].Gate[sid]
-		if !ok {
-			t.Fatalf("session %q missing from /vh/gates gate", sid)
-		}
-		if gf.Activity != other.Activity || gf.PendingPermission != other.PendingPermission ||
-			gf.PendingQuestion != other.PendingQuestion || gf.SubtreeBusy != other.SubtreeBusy {
-			t.Fatalf("session %q gate drift: snapshot=%+v gates=%+v", sid, gf, other)
-		}
+	if gf := snap.Gate["sub1"]; gf.FleetSelected == nil || *gf.FleetSelected {
+		t.Fatalf("snapshot child entry must carry fleet_selected=false, got %+v", gf)
 	}
+	if _, ok := snap.Gate["arch1"]; ok {
+		t.Fatal("archived root must be deleted from the live store (absent from the snapshot), not merely unselected")
+	}
+}
+
+// keysOf is a tiny debug helper for gate-map failure messages.
+func keysOf(m map[string]state.GateFacts) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 // TestFleetGatesRequestBound pins the politeness bound: more than

@@ -20,13 +20,25 @@ package server
 //     nominal. Confirmed severity stays visible in known_overall.
 //   - `conditions[]`: server-owned display-priority order
 //     permission_pending > question_pending > worker_down | worker_missing >
-//     project_missing > session_error | session_retry; each
-//     {kind,count,since,label,link}.
-//     `since` is the first CONTINUOUSLY observed controller time for the
-//     current contributors (continuity tracked across published generations;
-//     reset on loss of evidence). `link` is a trusted worker-origin
-//     /app?dir=…&session=… URL built from the configured HostPattern (null
-//     when no mapping exists) — never from the request Host.
+//     project_missing > session_error | session_retry > session_done; each
+//     {kind,count,since,label,link}. Pending conditions count pending
+//     SESSIONS summed over SELECTED roots (a root's subtree_pending_*
+//     surfaces its descendants' waits); session_done is informational-only
+//     ("N finished", never a severity input). `since` is the first
+//     CONTINUOUSLY observed controller time for the current contributors
+//     (continuity tracked across published generations; reset on loss of
+//     evidence). `link` is a trusted worker-origin /app?dir=…&session=… URL
+//     built from the configured HostPattern (null when no mapping exists)
+//     — never from the request Host.
+//   - FOLD POPULATION (gauge semantics): every fold — gauge, session-tier
+//     conditions, projects[] — operates on SELECTED sessions only: effective
+//     root+unarchived, identified by the worker-side gate fact
+//     fleet_selected. The lean /vh/gates path is pre-filtered by the worker;
+//     the snapshot fallback carries the complete map and the fold filters it
+//     by the same field (identical populations on both paths). The gauge is
+//     busy selected roots / selected roots ("N/M busy"); `projects[]` is a
+//     bounded per-dir breakdown (≤16 rows / 8 KiB, omission-accounted) with
+//     config-roster labels.
 //   - `summary`: server-authored English, ≤30 Unicode code points.
 //   - `gauge`: {value 0-1, label, available} — available=false distinguishes
 //     "unknown" from a real zero.
@@ -99,7 +111,7 @@ import (
 // ---------------------------------------------------------------------------
 
 type fleetGauge struct {
-	Value     float64 `json:"value"`     // busy-or-retry sessions / total sessions, clamped 0-1
+	Value     float64 `json:"value"`     // busy selected roots / selected roots, clamped 0-1
 	Available bool    `json:"available"` // false = value is a placeholder (coverage incomplete)
 	Label     string  `json:"label"`
 }
@@ -143,6 +155,28 @@ type fleetWorkerEntry struct {
 	ObservedAt *string `json:"observed_at"`
 }
 
+// fleetProjectRow is one projects[] row: the per-directory aggregate over
+// every in-scope worker/project observation of that EXACT dir (the same dir
+// hosted on two workers is ONE row; its roots stay distinct contributors to
+// the fleet totals). Sessions counts SELECTED roots; Busy counts roots whose
+// subtree is busy (own busy/retry included — counted once); Done counts
+// session_done roots; Pending counts roots with union subtree pending > 0.
+// Label comes from the status-config project roster (omitted for
+// unlabelled/unconfigured dirs). Complete is false when the displayed counts
+// are known-partial contributions (any in-scope worker's acquisition was
+// incomplete or the worker is offline/missing — an unobserved worker could
+// contribute to this dir); coverage/conditions describe the missing scope
+// separately.
+type fleetProjectRow struct {
+	Dir      string `json:"dir"`
+	Label    string `json:"label,omitempty"`
+	Sessions int    `json:"sessions"`
+	Busy     int    `json:"busy"`
+	Done     int    `json:"done"`
+	Pending  int    `json:"pending"`
+	Complete bool   `json:"complete"`
+}
+
 type fleetStatusResponse struct {
 	Schema         int                `json:"schema"`
 	Overall        string             `json:"overall"`       // degraded|attention|nominal|unknown
@@ -152,6 +186,9 @@ type fleetStatusResponse struct {
 	Coverage       fleetCoverage      `json:"coverage"`
 	Conditions     []fleetCondition   `json:"conditions"`
 	Workers        []fleetWorkerEntry `json:"workers"`
+	Projects       []fleetProjectRow  `json:"projects"`
+	ProjectsTotal  int                `json:"projects_total"`   // candidate observed rows before presentation caps
+	ProjectsOmit   int                `json:"projects_omitted"` // candidate rows not returned (cap-excluded)
 	GeneratedAt    string             `json:"generated_at"`
 	MaxStalenessMS int64              `json:"max_staleness_ms"`
 }
@@ -183,6 +220,9 @@ type fleetOptionsProject struct {
 
 // Condition kinds in the server-owned display-priority order. Exactly this
 // order in conditions[]; at most one aggregate per kind; nonzero counts only.
+// session_done is INFORMATIONAL and strictly LAST: below session_retry, never
+// independently attention/degraded, and never the known_overall severity
+// input — it surfaces finished sessions for the watch face, it does not page.
 const (
 	fleetCondPermissionPending = "permission_pending"
 	fleetCondQuestionPending   = "question_pending"
@@ -191,6 +231,7 @@ const (
 	fleetCondProjectMissing    = "project_missing"
 	fleetCondSessionError      = "session_error"
 	fleetCondSessionRetry      = "session_retry"
+	fleetCondSessionDone       = "session_done"
 )
 
 var fleetConditionOrder = []string{
@@ -201,7 +242,21 @@ var fleetConditionOrder = []string{
 	fleetCondProjectMissing,
 	fleetCondSessionError,
 	fleetCondSessionRetry,
+	fleetCondSessionDone,
 }
+
+// Presentation caps for projects[]: at most 16 rows and at most 8 KiB of
+// encoded projects array (brackets, commas, and JSON escaping included).
+// Truncation stops at the first row that would exceed either bound and
+// preserves the sorted prefix; fleet totals/conditions are computed BEFORE
+// truncation, so presentation omissions never change the gauge or coverage.
+// Directory identities and labels are never themselves truncated into
+// misleading identities — whole rows are omitted, accounted for by
+// projects_omitted.
+const (
+	fleetProjectsMaxRows         = 16
+	fleetProjectsMaxEncodedBytes = 8 << 10
+)
 
 // Worker status enum (workers[].status).
 const (
@@ -480,6 +535,7 @@ func (s *fleetStatusService) publishFallback(regGen, cfgGen uint64) {
 		Coverage:       fleetCoverage{Mode: "discovered", InventoryKnown: false, Complete: false, ProjectScope: "instantiated"},
 		Conditions:     []fleetCondition{},
 		Workers:        []fleetWorkerEntry{},
+		Projects:       []fleetProjectRow{},
 		GeneratedAt:    time.Now().UTC().Format(time.RFC3339),
 		MaxStalenessMS: s.budgets.MaxStalenessMS,
 	}
@@ -657,11 +713,35 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 	sort.Slice(results, func(i, j int) bool { return results[i].id < results[j].id })
 
 	// --- fold observations ------------------------------------------------
-	var totalSessions, busyOrRetry int
-	permC, questC, errC, retryC := []fleetContributor{}, []fleetContributor{}, []fleetContributor{}, []fleetContributor{}
+	// The fold operates on the SELECTED population only: effective
+	// root+unarchived sessions, identified by the worker-side gate fact
+	// fleet_selected (nil = the producer predates fleet selection → excluded;
+	// the tunnel version boundary makes that unreachable in practice — see
+	// the design note in fetchLeanGates). The lean path is pre-filtered by
+	// the worker; the snapshot fallback carries the complete map and is
+	// filtered HERE by the same field, so both acquisition paths fold an
+	// identical population. A selected root's SUBTREE pending counts surface
+	// its descendants' waits (a child's pending permission contributes to its
+	// root's permission_pending — subagent signals must not vanish), while
+	// session_error/session_retry stay the root's OWN activity facts.
+	var selectedRoots, busyRoots int
+	var permCount, questCount int // summed per-kind pending SESSION counts
+	permC, questC, errC, retryC, doneC := []fleetContributor{}, []fleetContributor{}, []fleetContributor{}, []fleetContributor{}, []fleetContributor{}
 	downIDs, missingIDs := []string{}, []string{}
 	observedProjectDirs := map[string]bool{} // dirs CONFIRMED instantiated this generation (successful snapshots only)
 	observed := 0
+
+	// Per-dir project rows (aggregated across workers; labels from the SAME
+	// config snapshot that fed the rosters — a hot label edit rides the next
+	// generation via the cfgGen stamp, exactly like the rosters).
+	projectLabels := make(map[string]string, len(snap.projects))
+	for _, p := range snap.projects {
+		if p.Label != "" {
+			projectLabels[p.Dir] = p.Label
+		}
+	}
+	projRows := map[string]*fleetProjFold{}
+	projOrder := []string{} // first-observation order; sorted before presentation
 	for _, r := range results {
 		switch r.status {
 		case fleetWorkerOK:
@@ -673,6 +753,12 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 		}
 		for _, p := range r.projects {
 			observedProjectDirs[p.dir] = true
+			row := projRows[p.dir]
+			if row == nil {
+				row = &fleetProjFold{dir: p.dir}
+				projRows[p.dir] = row
+				projOrder = append(projOrder, p.dir)
+			}
 			sids := make([]string, 0, len(p.gate))
 			for sid := range p.gate {
 				sids = append(sids, sid)
@@ -680,23 +766,53 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 			sort.Strings(sids)
 			for _, sid := range sids {
 				gf := p.gate[sid]
-				totalSessions++
-				switch gf.Activity {
-				case "busy", "retry":
-					busyOrRetry++
+				if gf.FleetSelected == nil || !*gf.FleetSelected {
+					continue // child, archived, or pre-selection producer: not in the fold population
+				}
+				selectedRoots++
+				// Busy = the root's subtree is busy (inclusive of own
+				// busy/retry — the worker's subtree_busy is self-inclusive).
+				// The own-activity disjuncts are a belt for observations whose
+				// producer sets activity without subtree_busy; a real worker
+				// always has subtree_busy ⊇ own busy/retry, so the OR is
+				// redundant there and costs nothing here.
+				busy := gf.SubtreeBusy || gf.Activity == "busy" || gf.Activity == "retry"
+				if busy {
+					busyRoots++
+				}
+				row.sessions++
+				if busy {
+					row.busy++
+				}
+				if gf.SubtreePendingPermission > 0 {
+					row.hasPerm = true
+				}
+				if gf.SubtreePendingQuestion > 0 {
+					row.hasQuest = true
+				}
+				if gf.SubtreePendingInput > 0 {
+					row.pending++
 				}
 				c := fleetContributor{worker: r.id, dir: p.dir, session: sid}
-				if gf.PendingPermission {
+				if gf.SubtreePendingPermission > 0 {
 					permC = append(permC, c)
+					permCount += gf.SubtreePendingPermission
 				}
-				if gf.PendingQuestion {
+				if gf.SubtreePendingQuestion > 0 {
 					questC = append(questC, c)
+					questCount += gf.SubtreePendingQuestion
 				}
 				if gf.Activity == "error" {
 					errC = append(errC, c)
+					row.hasErr = true
 				}
 				if gf.Activity == "retry" {
 					retryC = append(retryC, c)
+					row.hasRetry = true
+				}
+				if fleetSessionDone(gf) {
+					doneC = append(doneC, c)
+					row.done++
 				}
 			}
 		}
@@ -783,8 +899,8 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 	}
 
 	aggs := []condAgg{
-		newAgg(fleetCondPermissionPending, len(permC), permC, "perm", pluralCount(len(permC), "permission pending", "permissions pending"), true),
-		newAgg(fleetCondQuestionPending, len(questC), questC, "quest", pluralCount(len(questC), "question pending", "questions pending"), true),
+		newAgg(fleetCondPermissionPending, permCount, permC, "perm", pluralCount(permCount, "permission pending", "permissions pending"), true),
+		newAgg(fleetCondQuestionPending, questCount, questC, "quest", pluralCount(questCount, "question pending", "questions pending"), true),
 		workerAgg(fleetCondWorkerDown, downIDs, "down", pluralCount(len(downIDs), "worker down", "workers down")),
 		workerAgg(fleetCondWorkerMissing, missingIDs, "missing", pluralCount(len(missingIDs), "worker missing", "workers missing")),
 		// project_missing rides the worker (infrastructure) tier, after
@@ -793,6 +909,15 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 		workerAgg(fleetCondProjectMissing, missingProjectDirs, "pmissing", pluralCount(len(missingProjectDirs), "project not running", "projects not running")),
 		newAgg(fleetCondSessionError, len(errC), errC, "err", pluralCount(len(errC), "session error", "session errors"), true),
 		newAgg(fleetCondSessionRetry, len(retryC), retryC, "retry", pluralCount(len(retryC), "session retrying", "sessions retrying"), true),
+		// session_done: informational LAST-priority condition ("N finished").
+		// Since-continuity rides the existing tracker keyed worker+dir+root:
+		// an observed resume (busy/retry, pending, unfinished/latest-message
+		// change, ineligibility) removes the done contributor and RESETS its
+		// continuity; a later positive observation starts a fresh since. A
+		// busy→done→busy cycle BETWEEN polls is unobservable at this polling
+		// cadence (no completion-instance identity) — the honesty limit the
+		// gauge brief records.
+		newAgg(fleetCondSessionDone, len(doneC), doneC, "done", pluralCount(len(doneC), "finished", "finished"), true),
 	}
 
 	conditions := make([]fleetCondition, 0, len(aggs))
@@ -823,12 +948,16 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 	// --- summary / gauge ---------------------------------------------------
 	summary := fleetSummary(complete, topKind, topCount)
 
+	// Gauge denominator = SELECTED root+unarchived sessions (M); numerator =
+	// busy selected roots, child activity included via the worker's
+	// self-inclusive subtree_busy (N). available semantics unchanged: only a
+	// COMPLETE supported acquisition yields a real value.
 	gauge := fleetGauge{Value: 0, Available: false, Label: "Coverage incomplete"}
 	if complete {
-		if totalSessions == 0 {
+		if selectedRoots == 0 {
 			gauge = fleetGauge{Value: 0, Available: true, Label: "No sessions"}
 		} else {
-			v := float64(busyOrRetry) / float64(totalSessions)
+			v := float64(busyRoots) / float64(selectedRoots)
 			if v < 0 {
 				v = 0
 			}
@@ -838,7 +967,7 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 			gauge = fleetGauge{
 				Value:     v,
 				Available: true,
-				Label:     fmt.Sprintf("%d/%d busy", busyOrRetry, totalSessions),
+				Label:     fmt.Sprintf("%d/%d busy", busyRoots, selectedRoots),
 			}
 		}
 	}
@@ -864,6 +993,8 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 		requiredProjects = len(projectRoster)
 	}
 
+	projects, projectsTotal, projectsOmitted := buildFleetProjects(projOrder, projRows, projectLabels, complete)
+
 	return fleetStatusResponse{
 		Schema:       1,
 		Overall:      overall,
@@ -884,9 +1015,130 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 		},
 		Conditions:     conditions,
 		Workers:        workers,
+		Projects:       projects,
+		ProjectsTotal:  projectsTotal,
+		ProjectsOmit:   projectsOmitted,
 		GeneratedAt:    now.Format(time.RFC3339),
 		MaxStalenessMS: b.MaxStalenessMS,
 	}, buildFleetOptions(now, results, summaries)
+}
+
+// fleetProjFold is the per-dir fold accumulator behind one projects[] row:
+// counts over the dir's SELECTED roots across every contributing worker
+// observation. hasPerm/hasQuest/hasErr/hasRetry feed the row's
+// problem-severity sort rank only (the row shape itself exposes
+// sessions/busy/done/pending).
+type fleetProjFold struct {
+	dir      string
+	sessions int
+	busy     int
+	done     int
+	pending  int
+	hasPerm  bool
+	hasQuest bool
+	hasErr   bool
+	hasRetry bool
+}
+
+// buildFleetProjects renders the projects[] presentation: sort the candidate
+// rows (highest problem-condition severity first — permission > question >
+// error > retry; done deliberately does NOT outrank a problem or busy row —
+// then busy descending, then exact dir ascending), then apply the two
+// presentation caps (fleetProjectsMaxRows / fleetProjectsMaxEncodedBytes,
+// the latter on the encoded array including brackets and escaping).
+// Truncation stops at the first row that would exceed either bound and
+// preserves the sorted prefix; candidates are counted BEFORE truncation so
+// projects_total/projects_omitted account for every observed row. Fleet
+// totals/conditions/gauge were folded before this runs — presentation
+// omissions never change them. Rows for genuinely empty acquired projects
+// are included; wholly unobserved dirs are absent (coverage describes them).
+//
+// complete is the REFRESH-level acquisition completeness: a row is marked
+// complete=false whenever any in-scope worker was not fully acquired
+// (offline/missing/timeout/error/limited) — an unobserved worker could
+// contribute to any dir, so the row's counts are known-partial contributions.
+func buildFleetProjects(order []string, rows map[string]*fleetProjFold, labels map[string]string, complete bool) ([]fleetProjectRow, int, int) {
+	// Sort the FOLDS (they carry the severity flags), then render.
+	folds := make([]*fleetProjFold, 0, len(order))
+	for _, dir := range order {
+		if f := rows[dir]; f != nil {
+			folds = append(folds, f)
+		}
+	}
+	// Severity rank: 0 perm … 3 retry, 4 none. Done is informational and
+	// never raises a row's rank.
+	rank := func(f *fleetProjFold) int {
+		switch {
+		case f.hasPerm:
+			return 0
+		case f.hasQuest:
+			return 1
+		case f.hasErr:
+			return 2
+		case f.hasRetry:
+			return 3
+		default:
+			return 4
+		}
+	}
+	sort.SliceStable(folds, func(i, j int) bool {
+		ri, rj := rank(folds[i]), rank(folds[j])
+		if ri != rj {
+			return ri < rj
+		}
+		if folds[i].busy != folds[j].busy {
+			return folds[i].busy > folds[j].busy
+		}
+		return folds[i].dir < folds[j].dir
+	})
+
+	out := make([]fleetProjectRow, 0, len(folds))
+	encoded := 2 // the array's [ and ]
+	for _, f := range folds {
+		if len(out) >= fleetProjectsMaxRows {
+			break
+		}
+		r := fleetProjectRow{
+			Dir:      f.dir,
+			Label:    labels[f.dir],
+			Sessions: f.sessions,
+			Busy:     f.busy,
+			Done:     f.done,
+			Pending:  f.pending,
+			Complete: complete,
+		}
+		b, err := json.Marshal(r)
+		if err != nil {
+			// Plain struct with string/int/bool fields: unreachable; treat
+			// the row as oversized rather than fail the rollup.
+			continue
+		}
+		add := len(b)
+		if len(out) > 0 {
+			add++ // separating comma
+		}
+		if encoded+add > fleetProjectsMaxEncodedBytes {
+			break
+		}
+		encoded += add
+		out = append(out, r)
+	}
+	if out == nil {
+		out = []fleetProjectRow{} // always serialize as [], never null
+	}
+	return out, len(folds), len(folds) - len(out)
+}
+
+// fleetSessionDone is the finished-session predicate over a SELECTED root's
+// gate facts (the caller has already checked fleet_selected): idle, hydrated
+// (some message state — NOT the stricter messagesLoaded), latest assistant
+// turn completed with finish_reason "stop" (the conservative product
+// definition — tool-call/length termination is not a normally-finished
+// session), and a quiescent subtree (no busy/retry anywhere below, no
+// pending input anywhere below). Informational only: never a severity input.
+func fleetSessionDone(gf state.GateFacts) bool {
+	return gf.Activity == "idle" && gf.Hydrated && gf.LastAssistantCompleted &&
+		gf.FinishReason == "stop" && !gf.SubtreeBusy && gf.SubtreePendingInput == 0
 }
 
 // buildFleetOptions folds the SAME refresh's worker results + registry
@@ -1149,6 +1401,17 @@ type fleetDiscoveredProject struct {
 // fallback": a fetch error of ANY class (404/non-2xx, timeout, cap trip)
 // or a malformed/unexpected-schema body routes back to the per-project
 // snapshot path; the lean attempt itself never fails the worker.
+//
+// Fleet-selection validation: a worker that advertises the
+// root_unarchived_v1 capability must tag every nonempty gate entry with the
+// fleet_selected tri-state — an advertised-but-untagged entry is a producer
+// bug (malformed, not supported-zero) and routes to the fallback like any
+// other malformed body. An envelope with NO marker is accepted as-is
+// (operator amendment: the slice-1 tunnel version boundary floors worker
+// versions at 1.67.0, and controller+worker ship as one binary — a
+// marker-less lean response from a boundary-passing worker is not a state
+// this fleet models; the fold's nil-fleet_selected → excluded filter is the
+// documented residual treatment, see buildRollup).
 func fetchLeanGates(fetch func(path string) ([]byte, error), projects []fleetDiscoveredProject) (map[string]map[string]state.GateFacts, int64, bool) {
 	var sb strings.Builder
 	sb.WriteString("/vh/gates?z=1")
@@ -1160,8 +1423,9 @@ func fetchLeanGates(fetch func(path string) ([]byte, error), projects []fleetDis
 		return nil, 0, false
 	}
 	var lean struct {
-		Schema   int `json:"schema"`
-		Projects []struct {
+		Schema         int    `json:"schema"`
+		FleetSelection string `json:"fleet_selection"`
+		Projects       []struct {
 			Dir  string                     `json:"dir"`
 			Gate map[string]state.GateFacts `json:"gate"`
 		} `json:"projects"`
@@ -1170,6 +1434,24 @@ func fetchLeanGates(fetch func(path string) ([]byte, error), projects []fleetDis
 	// fallback; entries for dirs we did not request are ignored by
 	// construction (the caller looks its own dirs up in the map).
 	if err := json.Unmarshal(body, &lean); err != nil || lean.Schema != 1 || lean.Projects == nil {
+		return nil, 0, false
+	}
+	switch lean.FleetSelection {
+	case "":
+		// No capability marker: accepted (see the doc comment).
+	case state.FleetSelectionRootUnarchivedV1:
+		// Advertised capability: every nonempty gate map must carry the
+		// selection tri-state on every entry.
+		for _, p := range lean.Projects {
+			for _, gf := range p.Gate {
+				if gf.FleetSelected == nil {
+					return nil, 0, false
+				}
+			}
+		}
+	default:
+		// An unknown selection vocabulary version: we cannot interpret these
+		// entries — treat like any other unexpected shape and fall back.
 		return nil, 0, false
 	}
 	gates := make(map[string]map[string]state.GateFacts, len(lean.Projects))
@@ -1372,6 +1654,8 @@ func fleetKindWord(kind string) string {
 		return "errors"
 	case fleetCondSessionRetry:
 		return "retrying"
+	case fleetCondSessionDone:
+		return "finished"
 	}
 	return "issues"
 }
@@ -1392,6 +1676,8 @@ func fleetSingularWord(kind string) string {
 		return "error"
 	case fleetCondSessionRetry:
 		return "retrying"
+	case fleetCondSessionDone:
+		return "finished"
 	}
 	return "issue"
 }
@@ -1445,6 +1731,7 @@ func conditionPhrase(kind string, singular bool) string {
 		fleetCondProjectMissing:    {"project not running", "projects not running"},
 		fleetCondSessionError:      {"session error", "session errors"},
 		fleetCondSessionRetry:      {"session retrying", "sessions retrying"},
+		fleetCondSessionDone:       {"finished", "finished"},
 	}
 	p, ok := pairs[kind]
 	if !ok {

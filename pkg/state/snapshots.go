@@ -480,6 +480,12 @@ type snapshotCapture struct {
 	// list); captured here under the same lock as the message lists so the
 	// (list, flag) pair the projector consumes is consistent.
 	historyExhausted map[string]bool
+	// fleet is the fleet-watch projection for EVERY live session (selected
+	// flag + per-kind subtree pending counts), captured under the same lock as
+	// the per-session scalars so a gate entry and its aggregates cohere.
+	// Computed by computeFleetAggregatesLocked; entries may be absent for
+	// malformed cyclic topologies (readers treat missing as zero/unselected).
+	fleet map[string]fleetNodeAgg
 }
 
 // captureSnapshotLocked is the CAPTURE PHASE of Snapshot. Caller MUST hold s.mu
@@ -675,6 +681,7 @@ func (s *Store) captureSnapshotLocked(messagesFor map[string]bool) snapshotCaptu
 		statuses:         statuses,
 		messages:         messages,
 		historyExhausted: historyExhausted,
+		fleet:            s.computeFleetAggregatesLocked(),
 	}
 }
 
@@ -715,13 +722,18 @@ func (s *Store) materializeSnapshot(c snapshotCapture) Snapshot {
 		Gate:           map[string]GateFacts{},
 		LastAgents:     map[string]string{},
 		CurrentVerbs:   map[string]VerbFacet{},
+		// Fleet-watch capability marker: every gate entry below carries the
+		// fleet_selected tri-state + subtree pending counts (additive; see
+		// GateFacts). Set for BOTH the full and partial capture paths — the
+		// marker rides the one materialization both share.
+		FleetSelection: FleetSelectionRootUnarchivedV1,
 	}
 
 	// Per-session gate facts + facets. Iterating the captured `sessions` map
-	// (not s.sessions) — order is nondeterministic here exactly as it was in the
-	// prior map iteration; parity is set-equality of elements.
+	// (not s.sessions) — order is nondeterministic here exactly as it was in
+	// the prior map iteration; parity is set-equality of elements.
 	for sid, sc := range sessions {
-		snap.Gate[sid] = gateFactsFromScalars(sc, subtreeBusy[sid])
+		snap.Gate[sid] = gateFactsFromScalars(sc, subtreeBusy[sid], c.fleet[sid])
 		if sc.lastAgent != "" {
 			snap.LastAgents[sid] = sc.lastAgent
 		}
@@ -821,10 +833,11 @@ func (s *Store) materializeSnapshot(c snapshotCapture) Snapshot {
 }
 
 // gateFactsFromScalars composes one session's GateFacts from the captured
-// per-session scalars plus the session's subtreeBusy fact. It is the SINGLE
+// per-session scalars plus the session's subtreeBusy fact and fleet-watch
+// projection (selection + subtree pending counts). It is the SINGLE
 // derivation shared by Snapshot materialization (snap.Gate) and the lean
 // GateFacts() accessor, so the two projections cannot drift.
-func gateFactsFromScalars(sc snapSessionCap, subtreeBusy bool) GateFacts {
+func gateFactsFromScalars(sc snapSessionCap, subtreeBusy bool, agg fleetNodeAgg) GateFacts {
 	act := sc.activity
 	if act == "" {
 		act = ActivityIdle // a never-touched session renders idle
@@ -866,6 +879,14 @@ func gateFactsFromScalars(sc snapSessionCap, subtreeBusy bool) GateFacts {
 		// PermissionWasBlocked is the alias of PermissionBlocked — same value,
 		// exact name (L-09).
 		PermissionWasBlocked: sc.permBlocked,
+		// Fleet-watch projection: tri-state selection (pointer always set
+		// here; omitempty only drops a nil on the wire) plus the per-kind and
+		// union subtree pending SESSION counts, inclusive of self. Zero counts
+		// are omitted by the field tags (capability contract: default zero).
+		FleetSelected:            &agg.selected,
+		SubtreePendingPermission: agg.permPending,
+		SubtreePendingQuestion:   agg.questPending,
+		SubtreePendingInput:      agg.unionPending,
 		// Tokens is the caller's private byte copy — assigned directly (no
 		// aliasing; see the capture-phase copy invariant).
 		Tokens: sc.lastTokens,
@@ -878,7 +899,10 @@ func gateFactsFromScalars(sc snapSessionCap, subtreeBusy bool) GateFacts {
 // sessions, messages, todos, or any other snapshot facet. This is the lean
 // source behind the worker's GET /vh/gates endpoint: the controller's fleet
 // rollup consumes ONLY the gate map per project, so it must not pay the
-// multi-megabyte session/message marshaling a full snapshot incurs.
+// multi-megabyte session/message marshaling a full snapshot incurs. Entries
+// carry the fleet-watch fields (fleet_selected + subtree pending counts);
+// callers that want only the selected population use
+// GateFactsFleetSelected.
 //
 // Locking: one RLock span for the whole capture (latestAssistantResidentLocked
 // is read-only under RLock — see its doc). Unlike Snapshot it takes NO write
@@ -887,6 +911,7 @@ func gateFactsFromScalars(sc snapSessionCap, subtreeBusy bool) GateFacts {
 func (s *Store) GateFacts() map[string]GateFacts {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	fleet := s.computeFleetAggregatesLocked()
 	out := make(map[string]GateFacts, len(s.sessions))
 	for sid, se := range s.sessions {
 		out[sid] = gateFactsFromScalars(snapSessionCap{
@@ -902,9 +927,150 @@ func (s *Store) GateFacts() map[string]GateFacts {
 			hasPerms:          len(s.perms[sid]) > 0,
 			permBlocked:       s.permBlocked[sid],
 			activity:          s.activity[sid],
-		}, s.subtreeBusyCount[sid] > 0)
+		}, s.subtreeBusyCount[sid] > 0, fleet[sid])
 	}
 	return out
+}
+
+// GateFactsFleetSelected returns the lean gate facts for the SELECTED
+// population only — effective root+unarchived sessions (see
+// computeFleetAggregatesLocked). This is the accessor GET /vh/gates serves:
+// the wire stays lean (subagent children and archived sessions never cross
+// the tunnel on this path) while the selected roots still carry their
+// subtree-aggregated pending counts, so a descendant's wait surfaces on its
+// root (subagent signals must not vanish when the fold population narrows).
+// The returned entries are value-identical to GateFacts()'s for the same
+// sessions (one shared derivation; the subset relation is pinned by tests).
+func (s *Store) GateFactsFleetSelected() map[string]GateFacts {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	fleet := s.computeFleetAggregatesLocked()
+	out := make(map[string]GateFacts, len(s.rootIDs))
+	for sid, se := range s.sessions {
+		agg := fleet[sid]
+		if !agg.selected {
+			continue
+		}
+		out[sid] = gateFactsFromScalars(snapSessionCap{
+			hasAssistant:      se.hasAssistant,
+			lastAsstCompleted: se.lastAsstCompleted,
+			lastAsstEmpty:     se.lastAsstEmpty,
+			lastFinish:        se.lastFinish,
+			lastTokens:        append([]byte(nil), se.lastTokens...),
+			msgLoaded:         s.msgLoaded[sid],
+			msgResident:       s.latestAssistantResidentLocked(sid),
+			hasMessages:       s.messages[sid] != nil,
+			hasQuestions:      len(s.questions[sid]) > 0,
+			hasPerms:          len(s.perms[sid]) > 0,
+			permBlocked:       s.permBlocked[sid],
+			activity:          s.activity[sid],
+		}, s.subtreeBusyCount[sid] > 0, agg)
+	}
+	return out
+}
+
+// fleetNodeAgg is one session's fleet-watch projection: the selected flag
+// (effective root + not archived under any authority) and the subtree pending
+// SESSION counts (inclusive of self). Computed READ-TIME under one lock span
+// by computeFleetAggregatesLocked — deliberately NO new maintained indexes
+// (the store's union-only subtreePendingInput index cannot supply per-kind
+// counts, and adding maintained counters would expand every lifecycle
+// writer's obligations; see the gauge brief's O1-vs-O2 debate).
+type fleetNodeAgg struct {
+	selected     bool
+	permPending  int
+	questPending int
+	unionPending int
+}
+
+// computeFleetAggregatesLocked derives the fleet-watch projection for every
+// live session under one coherent store observation. Caller holds s.mu (read
+// or write).
+//
+// Per-kind counts: ONE memoized post-order traversal over the children
+// forest (rootIDs → descendants), summing each node's own pending booleans
+// into its ancestors' per-kind counters. Cycle-safe (a malformed parent cycle
+// terminates; its members are never reachable from rootIDs and therefore get
+// no aggregate entry — readers treat missing as zero/unselected, pinning the
+// existing no-root behavior instead of inventing a topology repair). The
+// union count is derived in the same traversal (self perm-or-quest) so
+// per-kind and union facts share one topology observation; its equivalence
+// to the maintained subtreePendingInput index is differential-tested.
+//
+// Selection: the predicate REUSES the store's established tree/archive
+// authorities verbatim — effectiveParentOfLocked (root collapse),
+// isArchivedLocked (own-info time.archived), isArchivedAuthoritativeLocked
+// (authoritative snapshot membership), chainTerminatesAtArchivedLocked (the
+// §9.1 archived-chain orphan rule) — rather than reconstructing them from
+// JSON timestamps. A resident child of a live root is never selected
+// (it is not an effective root), but its pending input still reaches its
+// root through the counts above.
+func (s *Store) computeFleetAggregatesLocked() map[string]fleetNodeAgg {
+	agg := make(map[string]fleetNodeAgg, len(s.sessions))
+	inProgress := map[string]bool{}
+	var visit func(id string)
+	visit = func(id string) {
+		if _, done := agg[id]; done {
+			return
+		}
+		if inProgress[id] {
+			return // malformed cycle: terminate, do not repair
+		}
+		inProgress[id] = true
+		var a fleetNodeAgg
+		if len(s.perms[id]) > 0 {
+			a.permPending = 1
+		}
+		if len(s.questions[id]) > 0 {
+			a.questPending = 1
+		}
+		if a.permPending > 0 || a.questPending > 0 {
+			a.unionPending = 1
+		}
+		for _, cid := range s.children[id] {
+			visit(cid)
+			ca := agg[cid] // zero value if a cycle guard skipped it
+			a.permPending += ca.permPending
+			a.questPending += ca.questPending
+			a.unionPending += ca.unionPending
+		}
+		agg[id] = a
+	}
+	for _, r := range s.rootIDs {
+		visit(r)
+	}
+	// Selection pass over every live session (independent of the traversal:
+	// non-roots and cycle members get entries too, selected=false).
+	for sid, se := range s.sessions {
+		a := agg[sid]
+		a.selected = s.fleetSelectedLocked(sid, se)
+		agg[sid] = a
+	}
+	return agg
+}
+
+// fleetSelectedLocked reports whether id is in the fleet watch's selected
+// population: an EFFECTIVE root (raw parentID empty, or pointing at a session
+// absent from the live store — effectiveParentOfLocked's orphan-inclusive
+// collapse) that is not archived under any of the three archive authorities.
+// Reuses the established predicates; caller holds s.mu.
+func (s *Store) fleetSelectedLocked(id string, se *sessionEntry) bool {
+	if se == nil {
+		return false
+	}
+	if s.effectiveParentOfLocked(se.parentID) != "" {
+		return false // a resident child of a live parent is never a selected root
+	}
+	if isArchivedLocked(s, id) {
+		return false // own-info time.archived
+	}
+	if s.isArchivedAuthoritativeLocked(id) {
+		return false // authoritative archived-ID snapshot membership
+	}
+	if s.chainTerminatesAtArchivedLocked(id) {
+		return false // archived-ancestor chain (the §9.1 orphan rule)
+	}
+	return true
 }
 
 // SnapshotWithTree captures BOTH the detail Snapshot AND the tree TreeSnapshot
@@ -1048,6 +1214,10 @@ func (s *Store) capturePartialDetailLocked(frontier map[string]bool) snapshotCap
 		activity:    activity,
 		unread:      unread,
 		perms:       perms,
+		// Fleet aggregates for ALL sessions (the partial frame's frontier gate
+		// entries get the same selection/pending facts a full snapshot's do —
+		// one shared derivation, no per-path eligibility logic).
+		fleet: s.computeFleetAggregatesLocked(),
 		// todos, statuses, messages intentionally nil (omitted).
 	}
 }

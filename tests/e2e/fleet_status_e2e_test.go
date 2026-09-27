@@ -19,7 +19,10 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -105,7 +108,10 @@ func TestE2E_FleetStatusRollupThroughRealTunnel(t *testing.T) {
 	}
 	// Conditions (fixture state may or may not have pending gates): any
 	// present must be in the display-priority order and carry a since.
-	order := map[string]int{"permission_pending": 0, "question_pending": 1, "worker_down": 2, "worker_missing": 3, "session_error": 4, "session_retry": 5}
+	// The whitelist covers EVERY schema-1 kind incl. the gauge-semantics
+	// additions (project_missing was historically absent from this map —
+	// an unknown kind would have fatalf'd; session_done rides last).
+	order := map[string]int{"permission_pending": 0, "question_pending": 1, "worker_down": 2, "worker_missing": 3, "project_missing": 4, "session_error": 5, "session_retry": 6, "session_done": 7}
 	last := -1
 	for _, c := range status.Conditions {
 		rank, ok := order[c.Kind]
@@ -192,5 +198,144 @@ func TestE2E_FleetStatusLeanGatesThroughRealTunnel(t *testing.T) {
 	}
 	if lean.Projects[0].Gate == nil {
 		t.Fatalf("default project entry must carry a gate object (may be empty), got nil")
+	}
+}
+
+// TestE2E_FleetStatusSelectedPopulationParity is the gauge-semantics crux
+// through the REAL stack: the worker's lean /vh/gates serves ONLY the
+// selected population (effective root+unarchived, fleet_selected tagged,
+// capability marker advertised), never a subagent child, and the
+// controller's rollup gauge denominator equals exactly that population
+// summed over discovery — the fold and the worker agree end to end.
+func TestE2E_FleetStatusSelectedPopulationParity(t *testing.T) {
+	w, ok := cluster.Daemon.Registry.GetWorker(cluster.WorkerID)
+	if !ok {
+		t.Fatalf("shared-cluster worker %s not registered", cluster.WorkerID)
+	}
+	fetch := func(path string) []byte {
+		t.Helper()
+		body, err := cluster.Daemon.Proxy.FetchWorkerJSONBounded(context.Background(), w, path, 5*time.Second, 4<<20)
+		if err != nil {
+			t.Fatalf("real-stack fetch %s: %v", path, err)
+		}
+		return body
+	}
+
+	// 1. Discovery (the rollup's own scope source).
+	var dirs []struct {
+		Dir string `json:"dir"`
+	}
+	if err := json.Unmarshal(fetch("/vh/projects"), &dirs); err != nil {
+		t.Fatalf("discovery not JSON: %v", err)
+	}
+
+	// 2. Lean gates for exactly the discovered dirs (the rollup's request
+	// shape) + the default project's snapshot for the child-exclusion proof.
+	var sb strings.Builder
+	sb.WriteString("/vh/gates?z=1")
+	for _, d := range dirs {
+		sb.WriteString("&dir=" + url.QueryEscape(d.Dir))
+	}
+	var lean struct {
+		Schema         int    `json:"schema"`
+		FleetSelection string `json:"fleet_selection"`
+		Projects       []struct {
+			Dir  string                     `json:"dir"`
+			Gate map[string]json.RawMessage `json:"gate"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal(fetch(sb.String()), &lean); err != nil {
+		t.Fatalf("lean gates not JSON: %v", err)
+	}
+	if lean.FleetSelection != "root_unarchived_v1" {
+		t.Fatalf("real lean fleet_selection marker: want root_unarchived_v1, got %q", lean.FleetSelection)
+	}
+	selectedTotal := 0
+	for _, p := range lean.Projects {
+		for sid, raw := range p.Gate {
+			var gf struct {
+				FleetSelected *bool `json:"fleet_selected"`
+			}
+			if err := json.Unmarshal(raw, &gf); err != nil {
+				t.Fatalf("gate entry %s not JSON: %v", sid, err)
+			}
+			if gf.FleetSelected == nil || !*gf.FleetSelected {
+				t.Fatalf("lean entry %s/%s must carry fleet_selected=true (the endpoint is selected-only)", p.Dir, sid)
+			}
+			selectedTotal++
+		}
+	}
+	if selectedTotal == 0 {
+		t.Fatal("fixture must hold at least one selected root for the parity proof")
+	}
+
+	// 3. Child exclusion: every NON-ROOT session of the default project's
+	// complete snapshot (resident parent per its own info.parentID) is
+	// absent from the default project's lean map.
+	var snap struct {
+		Sessions []struct {
+			ID       string `json:"id"`
+			ParentID string `json:"parentID"`
+		}
+		Gate map[string]json.RawMessage `json:"gate"`
+	}
+	if err := json.Unmarshal(fetch("/vh/snapshot?z=1"), &snap); err != nil {
+		t.Fatalf("snapshot not JSON: %v", err)
+	}
+	liveIDs := map[string]bool{}
+	for _, s := range snap.Sessions {
+		liveIDs[s.ID] = true
+	}
+	var leanDefault map[string]json.RawMessage
+	for _, p := range lean.Projects {
+		if p.Dir == "" {
+			leanDefault = p.Gate
+		}
+	}
+	if leanDefault == nil {
+		t.Fatal("lean response must carry the default project entry")
+	}
+	children := 0
+	for _, s := range snap.Sessions {
+		if s.ParentID != "" && liveIDs[s.ParentID] {
+			children++
+			if _, ok := leanDefault[s.ID]; ok {
+				t.Fatalf("child %s (parent %s resident) must NEVER appear in the selected-only lean map", s.ID, s.ParentID)
+			}
+		}
+	}
+	if children == 0 {
+		t.Log("note: default project holds no resident children right now (shared fixture state) — child exclusion unexercised this run")
+	}
+
+	// 4. The controller's gauge denominator == the worker-selected
+	// population summed over the SAME discovery (the fold and the worker
+	// agree through the real tunnel).
+	resp, body, err := cluster.Do(http.MethodGet, "/vh/fleet/status", "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("fleet status: want 200, got %d: %s", resp.StatusCode, body)
+	}
+	var status struct {
+		Gauge struct {
+			Label     string  `json:"label"`
+			Available bool    `json:"available"`
+			Value     float64 `json:"value"`
+		} `json:"gauge"`
+		Coverage struct {
+			Complete bool `json:"complete"`
+		} `json:"coverage"`
+	}
+	if err := json.Unmarshal(body, &status); err != nil {
+		t.Fatalf("fleet status not JSON: %v", err)
+	}
+	if !status.Coverage.Complete || !status.Gauge.Available {
+		t.Fatalf("shared cluster must be completely acquired (gauge available), got %+v", status)
+	}
+	want := fmt.Sprintf("/%d busy", selectedTotal)
+	if !strings.HasSuffix(status.Gauge.Label, want) {
+		t.Fatalf("gauge denominator must equal the selected population over discovery (%d), got label %q", selectedTotal, status.Gauge.Label)
 	}
 }

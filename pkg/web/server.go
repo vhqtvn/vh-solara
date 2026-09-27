@@ -2156,8 +2156,19 @@ type fleetGatesProject struct {
 // blew the per-worker time budget (observed bason: timeout at 2/7 projects
 // on an ~83 ms RTT link). This endpoint returns, for the REQUESTED dirs
 // (repeated ?dir= query params; no params = every live project), exactly
-// {schema:1, projects:[{dir, gate}]} marshaled from the store's lean
-// GateFacts() accessor — no snapshot marshaling of sessions at all.
+// {schema:1, fleet_selection:"root_unarchived_v1", projects:[{dir, gate}]}
+// marshaled from the store's lean GateFactsFleetSelected() accessor — no
+// snapshot marshaling of sessions at all.
+//
+// SELECTED-ONLY population (gauge-semantics slice): the gate map carries
+// ONLY the fleet watch's selected sessions — effective root+unarchived (see
+// state.Store.GateFactsFleetSelected). Subagent children and archived
+// sessions never cross the tunnel on this path; each selected root still
+// carries its subtree-aggregated pending counts (subtree_pending_permission
+// / question / input) so a descendant's wait surfaces on its root. The
+// fleet_selection marker asserts the entries speak that vocabulary. A full
+// /vh/snapshot stays COMPLETE (children present, fleet_selected=false) — the
+// controller filters snapshot-derived gates by fleet_selected identically.
 //
 // Contract:
 //   - GET only (405 otherwise); auth-gated like every other /vh/* route
@@ -2231,13 +2242,14 @@ func (s *Server) handleFleetGates(w http.ResponseWriter, r *http.Request) {
 		if a == nil {
 			continue // not instantiated: omitted, never fabricated
 		}
-		out = append(out, fleetGatesProject{Dir: d, Gate: a.Store().GateFacts()})
+		out = append(out, fleetGatesProject{Dir: d, Gate: a.Store().GateFactsFleetSelected()})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Dir < out[j].Dir })
 	b, err := json.Marshal(struct {
-		Schema   int                 `json:"schema"`
-		Projects []fleetGatesProject `json:"projects"`
-	}{Schema: 1, Projects: out})
+		Schema         int                 `json:"schema"`
+		FleetSelection string              `json:"fleet_selection"`
+		Projects       []fleetGatesProject `json:"projects"`
+	}{Schema: 1, FleetSelection: state.FleetSelectionRootUnarchivedV1, Projects: out})
 	if err != nil {
 		vhlog.Error("gates: marshal failed", "err", err)
 		http.Error(w, "gates marshal failed", http.StatusInternalServerError)

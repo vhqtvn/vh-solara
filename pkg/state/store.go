@@ -230,6 +230,15 @@ type Snapshot struct {
 	// (the full Snapshot(), /vh/snapshot, coordapi, MCP) leaves Partial nil so the
 	// legacy wholesale-replace apply path runs unchanged. See PartialMeta.
 	Partial *PartialMeta `json:"partial,omitempty"`
+	// FleetSelection, when non-empty, is the fleet-watch projection capability
+	// marker (FleetSelectionRootUnarchivedV1): every Gate entry in this
+	// snapshot — full OR partial frame — carries the fleet_selected tri-state
+	// plus the subtree pending counts. Snapshots stay COMPLETE (children and
+	// archived sessions included, fleet_selected=false); the marker only
+	// asserts the fields speak the selection vocabulary. Set by
+	// materializeSnapshot for both capture paths; additive, ignored by
+	// consumers that predate it.
+	FleetSelection string `json:"fleet_selection,omitempty"`
 }
 
 // PartialMeta is the wire metadata a tree-Stream-1 partial detail frame carries
@@ -352,7 +361,55 @@ type GateFacts struct {
 	// docs/ai/wire-field-deprecation.md (audit L-09 / remediation M12).
 	PermissionWasBlocked bool            `json:"permissionWasBlocked"`
 	Tokens               json.RawMessage `json:"tokens,omitempty"` // raw token-usage object of the latest assistant turn (meaningful iff hydrated)
+
+	// --- fleet-watch projection fields (schema-1 additive; gauge-semantics
+	// slice of the fleet-status program) ---
+	//
+	// The fleet rollup (GET /vh/fleet/status) folds ONLY "selected" sessions:
+	// effective ROOTS that are not archived under any archive authority. The
+	// three fields below let the controller fold that population identically
+	// from the lean /vh/gates path (which pre-filters to selected entries) and
+	// from full /vh/snapshot gate maps (which stay COMPLETE — the ordinary SPA
+	// consumers are untouched; the controller filters by fleet_selected).
+	// See computeFleetAggregatesLocked (snapshots.go) for the shared
+	// derivation; the selection predicate reuses the store's established
+	// archive/tree predicates and does NOT reinvent them.
+
+	// FleetSelected reports whether this session belongs to the fleet watch's
+	// selected population: its effective parent is "" (a raw root, or an
+	// unresolved parent collapsed to a root by effectiveParentOfLocked) AND it
+	// is not archived by own-info (time.archived), not in the authoritative
+	// archived-ID snapshot, and its parent chain does not terminate at an
+	// archived session (the §9.1 orphan rule). Tri-state on the wire: the
+	// pointer is ALWAYS set by this package's derivations (both false and true
+	// serialize; omitempty only drops nil); a nil after decode means the
+	// producer predates fleet selection.
+	FleetSelected *bool `json:"fleet_selected,omitempty"`
+	// SubtreePendingPermission / SubtreePendingQuestion count the SESSIONS in
+	// this session's subtree (inclusive of self) that currently hold at least
+	// one pending permission / pending question. Distinct kinds so a
+	// permission→question transition with an unchanged union count still
+	// changes the emitted facts; the existing self-only PendingPermission /
+	// PendingQuestion booleans are unchanged. Counts are read-time
+	// aggregations (no new maintained indexes), so a resident descendant's
+	// pending input surfaces on its selected root even though the descendant
+	// is itself outside the selected population.
+	SubtreePendingPermission int `json:"subtree_pending_permission,omitempty"`
+	SubtreePendingQuestion   int `json:"subtree_pending_question,omitempty"`
+	// SubtreePendingInput counts the subtree sessions (inclusive of self)
+	// holding a pending permission OR question — the per-kind union (a session
+	// with both kinds counts once). Same value family as the maintained
+	// subtreePendingInput index (differential-tested against it).
+	SubtreePendingInput int `json:"subtree_pending_input,omitempty"`
 }
+
+// FleetSelectionRootUnarchivedV1 is the capability/version marker for the
+// fleet-watch projection carried on the snapshot envelope and the lean
+// /vh/gates envelope: "the gate facts in this payload speak fleet selection
+// root_unarchived_v1" (fleet_selected + the three subtree pending counts on
+// every gate entry). Additive self-description; consumers that do not know it
+// ignore it.
+const FleetSelectionRootUnarchivedV1 = "root_unarchived_v1"
 
 // MessageWithParts mirrors OpenCode's GET /session/:id/message item shape.
 type MessageWithParts struct {

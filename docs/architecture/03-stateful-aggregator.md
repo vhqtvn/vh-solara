@@ -78,14 +78,24 @@ a running aggregator answer — this handler never opens a project). Returns
 ONLY the per-session gate facts the fleet rollup folds — no session/message
 marshaling:
 ```json
-{ "schema": 1, "projects": [ { "dir": "...", "gate": { "<sessionID>": { ...GateFacts } } } ] }
+{ "schema": 1, "fleet_selection": "root_unarchived_v1",
+  "projects": [ { "dir": "...", "gate": { "<sessionID>": { ...GateFacts } } } ] }
 ```
+The gate map is **selected-only**: effective root+unarchived sessions
+(`fleet_selected: true` on every entry). Subagent children and archived
+sessions never cross this path, while each selected root carries
+`subtree_pending_permission` / `subtree_pending_question` /
+`subtree_pending_input` — its descendants' pending waits aggregated onto the
+root. `fleet_selection` is the capability marker asserting that vocabulary.
+A full `/vh/snapshot` stays COMPLETE (children present, `fleet_selected:
+false`); the controller filters snapshot-derived gates by `fleet_selected`
+identically, so both acquisition paths fold the same population.
 `z=1` opts into the same gzip64 envelope as `/vh/snapshot` (threshold and
 shape shared). Exists so the controller's `GET /vh/fleet/status` stops
 moving whole session trees over the WAN tunnel (~5.9 MB raw for a 7-project
 roster became one small batched response). The controller treats any lean
-failure (404 from an older worker, non-2xx, malformed) as "use the
-per-project snapshot fallback".
+failure (404 from an older worker, non-2xx, malformed, a marker-violating
+body) as "use the per-project snapshot fallback".
 
 ### `GET /vh/stream?cursor=<seq>`
 Resumable SSE. Emits `id: <seq>` on every event so a client can track its cursor.
