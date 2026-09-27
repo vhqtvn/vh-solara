@@ -1,0 +1,452 @@
+/* Push-notification admin dialog (AdminMenu → "Push notifications") —
+ * device token registry (GET/POST/PATCH/DELETE /vh/notify/tokens) plus
+ * the delivery history (GET /vh/notify/history).
+ *
+ * Scoped; consumes foundation tokens only (web/src/styles/foundation/
+ * tokens.css). The dialog chrome (.dialog / .dialog-head / .dialog-body /
+ * .dialog-title / .icon-btn / .btn / .btn-primary) is the shared GLOBAL
+ * base; this module owns only the notify-pane internals plus the
+ * overlay lift.
+ *
+ * PERF (AGENTS.md → "Web frontend performance — Firefox/WebRender"): the
+ * dialog body is a scroll container (global .dialog-body). The GPU-pinning
+ * pattern families called out there are DELIBERATELY absent from every
+ * rule in this file: no element masking, no backdrop blur, no paint
+ * containment, no lazy visibility skipping. (Named obliquely so
+ * a forbidden-pattern grep over this module stays empty; see
+ * FleetStatusDialog.module.css for the spelled-out rationale.)
+ */
+
+/* Lift above the admin popup (z-index 60, var(--z-popover)) this dialog
+ * is launched from — same lift as FleetStatusDialog, kept scoped. */
+.overlay {
+  z-index: var(--z-modal);
+}
+
+/* A touch wider than FleetStatusDialog's 480px — device rows carry an
+ * actions rail + a two-line history list. Full-bleed on mobile via the
+ * global .dialog media query. */
+.dialog {
+  width: 540px;
+}
+
+.status {
+  font-size: 12.5px;
+  color: var(--fg-dim);
+  padding: 8px 2px;
+}
+.err {
+  font-size: 12.5px;
+  color: var(--warn);
+  padding: 4px 2px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.ok {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ok);
+  padding: 4px 2px;
+}
+
+/* The 409 (--notify-store off) hint — quiet, but unmissable. */
+.off {
+  font-size: 12.5px;
+  color: var(--fg-dim);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 2px 0 8px;
+  line-height: 1.5;
+}
+.off code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.secHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 10px 0 6px;
+}
+.secTitle {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--fg-strong);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.addBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--accent);
+  background: none;
+  border: 1px dashed var(--border);
+  border-radius: 7px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.addBtn:hover {
+  border-color: var(--accent);
+}
+
+.empty {
+  font-size: 12px;
+  color: var(--fg-dim);
+  padding: 2px 2px 6px;
+  line-height: 1.5;
+}
+.hint {
+  font-size: 11.5px;
+  color: var(--fg-dim);
+  padding: 2px 2px 0;
+  line-height: 1.4;
+}
+.dim {
+  color: var(--fg-dim);
+}
+.mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--fg-dim);
+  overflow-wrap: anywhere;
+}
+.errText {
+  color: var(--warn);
+  overflow-wrap: anywhere;
+}
+.okText {
+  color: var(--ok);
+}
+
+/* ── Devices ─────────────────────────────────────────────────────────
+ * One card per registered device: identity line (label / masked
+ * preview / date / scope badge), a secondary telemetry line, the
+ * actions rail, then optional confirm / scope-editor / note blocks. */
+.dev {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 0 0 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.devTop {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+}
+.devName {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.devDate {
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  border-radius: 999px;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fg-dim);
+}
+.badgeOn {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 40%, var(--border));
+}
+.badgeOn::before {
+  background: var(--ok);
+}
+.badgeOff {
+  color: var(--fg-dim);
+}
+.devSub {
+  font-size: 11.5px;
+  color: var(--fg-dim);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.devActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Small row-level buttons (global .btn is reserved for section-level
+ * primary actions like Add device / Save scope). */
+.mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--fg);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 3px 9px;
+  cursor: pointer;
+}
+.mini:hover {
+  border-color: var(--accent);
+}
+.mini:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.miniDanger {
+  color: var(--danger);
+}
+.miniDanger:hover {
+  border-color: var(--danger);
+}
+
+/* Inline confirm boxes (delete / empty-scope) — warn-tinted, never a
+ * second modal. Plain blocks: NO portal, NO fixed positioning. */
+.warnBox {
+  font-size: 12px;
+  color: var(--fg);
+  background: color-mix(in srgb, var(--warn) 10%, var(--bg-2));
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+  border-radius: 8px;
+  padding: 7px 9px;
+  line-height: 1.5;
+}
+.warnBtns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* Scope editor: one open row at a time; inset box under its row (same
+ * inline-expansion posture as the confirm boxes). */
+.scopeBox {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.chk {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--fg);
+  cursor: pointer;
+  min-width: 0;
+}
+.chk input {
+  accent-color: var(--accent);
+}
+.chkAll {
+  font-weight: 600;
+  color: var(--fg-strong);
+}
+.chkGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 4px 10px;
+}
+.scopeBtns {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* Per-row notes (test-send results, mutation refusals). */
+.note {
+  font-size: 12px;
+  color: var(--fg);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.noteErr {
+  color: var(--warn);
+}
+
+/* ── Add device ────────────────────────────────────────────────────── */
+.addRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.inToken {
+  flex: 2 1 190px;
+}
+.inLabel {
+  flex: 1 1 110px;
+}
+.inToken,
+.inLabel {
+  font: inherit;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 5px 8px;
+  min-width: 0;
+}
+.inToken:focus-visible,
+.inLabel:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+}
+.inToken {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* ── History ─────────────────────────────────────────────────────────
+ * Newest-first list; each event is a plain block (dot + body + action
+ * chip + count + relative ts + deliveries toggle), deliveries expand
+ * inline. */
+.ev {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 9px;
+  margin: 0 0 5px;
+}
+.evMain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+.evDot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--fg-dim);
+}
+.evBody {
+  flex: 1 1 160px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.evTitle {
+  font-size: 12.5px;
+  color: var(--fg);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.evKind {
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.chip {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  line-height: 1;
+  border-radius: 999px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+}
+/* appeared = needs attention (warn), changed = info (accent),
+ * cleared = recovery (ok). */
+.chipAppeared {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+.chipChanged {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.chipCleared {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--border));
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
+}
+.evCount {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.evTs {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.delivBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  color: var(--fg-dim);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  cursor: pointer;
+}
+.delivBtn:hover {
+  border-color: var(--accent);
+}
+.deliv {
+  margin-top: 5px;
+  padding: 5px 0 0 15px;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.delivRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  font-size: 11.5px;
+}
+.retired {
+  color: var(--fg-dim);
+  font-style: italic;
+}
+
+/* ── Footer ────────────────────────────────────────────────────────── */
+.foot {
+  padding: 10px 10px 2px;
+}
+.footHint {
+  font-size: 11.5px;
+  color: var(--fg-dim);
+  line-height: 1.4;
+}

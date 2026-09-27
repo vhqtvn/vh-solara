@@ -85,6 +85,15 @@ type Daemon struct {
 	// before Start (cmd/server.go: SetNotifyTransport).
 	notifyTransport Notifier
 
+	// notifyTestSendMu/notifyTestSendLast implement the test-send rate
+	// limit (notify_http.go): per-Daemon in-memory last-send timestamp,
+	// minimum interval 10s, applied to ALL test sends (single-operator
+	// controller — per-session granularity is unnecessary). In-memory
+	// only by design: the limit protects the transport from operator
+	// hammering, not a quota; a restart clearing it is fine.
+	notifyTestSendMu   sync.Mutex
+	notifyTestSendLast time.Time
+
 	// notifyWatchOnce/notifyWatcherRunning gate StartNotifyWatcher
 	// (notify_watcher.go): the fleet-condition watcher starts at most
 	// once per Daemon, only when the registry AND a real transport are

@@ -36,8 +36,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
+	"time"
 )
 
 // maxNotifyBodyBytes caps every /vh/notify/* request body (a token
@@ -45,6 +49,38 @@ import (
 // abuse). Deliberately sized so a maximal (2048-byte) token plus JSON
 // syntax always fits.
 const maxNotifyBodyBytes = 4 << 10
+
+// notifyTestSendInterval is the minimum spacing between test sends
+// (per-Daemon, in-memory — see the Daemon fields). Test sends drive the
+// REAL transport (an operator comparing "did my phone buzz" needs no
+// faster cadence), and FCM budgets are shared with the watcher's real
+// dispatches, so a rapid re-click loop must be refused server-side, not
+// just de-bounced in one UI.
+const notifyTestSendInterval = 10 * time.Second
+
+// notifyTestSendNow is the clock seam for the test-send rate limit
+// (house pattern: a package var so lane-1 tests advance time
+// deterministically instead of sleeping). Production reads time.Now.
+var notifyTestSendNow = time.Now
+
+// notifyTestSendAllow is the check-and-record gate for one test send:
+// when the interval since the last ATTEMPT has elapsed it records now
+// and returns ok; otherwise it returns the remaining wait WITHOUT
+// recording (a refused send must not extend the window). The attempt
+// (not the success) is what consumes a slot — a failed send hit the
+// provider exactly like a successful one.
+func (d *Daemon) notifyTestSendAllow() (ok bool, wait time.Duration) {
+	d.notifyTestSendMu.Lock()
+	defer d.notifyTestSendMu.Unlock()
+	now := notifyTestSendNow()
+	if !d.notifyTestSendLast.IsZero() {
+		if elapsed := now.Sub(d.notifyTestSendLast); elapsed < notifyTestSendInterval {
+			return false, notifyTestSendInterval - elapsed
+		}
+	}
+	d.notifyTestSendLast = now
+	return true, 0
+}
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -328,7 +364,11 @@ func (d *Daemon) handleNotifyTokenPatch(w http.ResponseWriter, r *http.Request) 
 // Check order: CSRF (403) → transport configured (409 naming
 // --notify-fcm-credentials) → decode (400) → resolve token (409 store
 // disabled for the by-id path / 404 unknown id / 400 bad bare token) →
-// send → 200 {sent, transport, error?}.
+// rate limit (429 + Retry-After, notifyTestSendAllow) → send → 200
+// {sent, transport, error?}. The rate-limit gate sits AFTER resolution
+// on purpose: a malformed request or unknown id must keep its precise
+// 400/404 and must NOT consume a rate-limit slot; only a send about to
+// hit the provider does.
 //
 // The response reports PROVIDER ACCEPTANCE only ("sent: the transport
 // accepted the message") — never device delivery; the error string is
@@ -381,6 +421,15 @@ func (d *Daemon) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		token = req.Token
+	}
+	// Rate limit: one test send per interval across the whole controller
+	// (single-operator). Refusals carry the standard Retry-After hint and
+	// a short body naming the wait; they do not extend the window.
+	if ok, wait := d.notifyTestSendAllow(); !ok {
+		secs := int(math.Ceil(wait.Seconds()))
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		http.Error(w, fmt.Sprintf("test-send rate limit: wait %ds before the next test send", secs), http.StatusTooManyRequests)
+		return
 	}
 	sendErr := sender.Send(r.Context(), token, testNotifyMessage())
 	// Best-effort telemetry on the by-id path — handed to the store's

@@ -126,6 +126,30 @@ type notifyTestWireView struct {
 	Error     string `json:"error"`
 }
 
+// fakeNotifyClock installs a controllable clock on the test-send rate
+// limit seam (notifyTestSendNow) and returns an advance function.
+// Restored via t.Cleanup. Lane-1 determinism: the rate-limit tests (and
+// the crux test's rapid consecutive sends) advance time instead of
+// sleeping 10s.
+func fakeNotifyClock(t *testing.T) (advance func(time.Duration)) {
+	t.Helper()
+	now := time.Now()
+	notifyTestSendNow = func() time.Time { return now }
+	t.Cleanup(func() { notifyTestSendNow = time.Now })
+	return func(d time.Duration) { now = now.Add(d) }
+}
+
+// stubNotifier is a minimal configured transport for the rate-limit
+// tests: every Send succeeds, Name is stable. (The full FCM pair is
+// exercised by the crux test; the limit itself needs no provider.)
+type stubNotifier struct{ sends int }
+
+func (n *stubNotifier) Name() string { return "stub" }
+func (n *stubNotifier) Send(context.Context, string, NotifyMessage) error {
+	n.sends++
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // CSRF ladder + method discipline
 // ---------------------------------------------------------------------------
@@ -406,6 +430,9 @@ func TestNotifyHTTP_TestSendThroughRealChain(t *testing.T) {
 	d, h, session := newNotifyAuthDaemon(t)
 	loadNotifyStore(t, d)
 	d.SetNotifyTransport(n)
+	// The test-send rate limit (10s per Daemon) would refuse the crux
+	// test's rapid consecutive sends; drive the seam clock instead.
+	advance := fakeNotifyClock(t)
 
 	// Bare-token path: test BEFORE registering.
 	rec := doNotify(t, h, http.MethodPost, "/vh/notify/test",
@@ -431,6 +458,7 @@ func TestNotifyHTTP_TestSendThroughRealChain(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &enrolled)
 	id := enrolled.Token.ID
 
+	advance(notifyTestSendInterval) // rate limit: the bare send just consumed the slot
 	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test",
 		`{"id":"`+id+`"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusOK {
@@ -492,9 +520,12 @@ func TestNotifyHTTP_TestSendThroughRealChain(t *testing.T) {
 
 	// Error surfacing: FCM answers a BARE 404 (no UNREGISTERED) →
 	// sent:false + the plain send-failure text naming the status.
+	// (advance: the by-id send consumed the rate-limit slot; the FAILED
+	// send must also reach the provider — a refusal here would 429.)
 	fcm.respond = func(int) (int, string, http.Header) {
 		return http.StatusNotFound, `{"error":{"code":404,"message":"Requested entity was not found","status":"NOT_FOUND"}}`, nil
 	}
+	advance(notifyTestSendInterval)
 	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test",
 		`{"id":"`+id+`"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusOK {
@@ -605,5 +636,109 @@ func TestNotifyHTTP_RegistryFilePersistsThroughChain(t *testing.T) {
 	}
 	if len(f.Tokens) != 1 || f.Tokens[0].Label != " disk " {
 		t.Errorf("reloaded file = %+v", f.Tokens)
+	}
+}
+
+// TestNotifyHTTP_TestSendRateLimit pins the S3 test-send rate limit:
+// per-Daemon, 10s minimum between ATTEMPTS (a failed send consumes a
+// slot; a refused one does not extend the window), 429 + Retry-After +
+// a body naming the wait, and the gate sits AFTER decode/resolve (bad
+// bodies and unknown ids keep their precise 400/404 without consuming
+// or extending a slot).
+func TestNotifyHTTP_TestSendRateLimit(t *testing.T) {
+	stub := &stubNotifier{}
+	d, h, session := newNotifyAuthDaemon(t)
+	loadNotifyStore(t, d)
+	d.SetNotifyTransport(stub)
+	advance := fakeNotifyClock(t)
+
+	// Enroll one token so the by-id path is exercisable.
+	rec := doNotify(t, h, http.MethodPost, "/vh/notify/tokens",
+		`{"token":"fcm-ratelimit-000001","label":"Phone"}`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("enroll: %d %s", rec.Code, rec.Body.String())
+	}
+	var enrolled notifyTokenWireView
+	_ = json.Unmarshal(rec.Body.Bytes(), &enrolled)
+	id := enrolled.Token.ID
+
+	// First send: allowed, reaches the stub transport.
+	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"fcm-ratelimit-000001"}`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first send: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if stub.sends != 1 {
+		t.Fatalf("stub.sends = %d, want 1", stub.sends)
+	}
+
+	// Rapid second send (bare-token path): 429 + Retry-After naming the
+	// full wait; the provider is untouched.
+	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"fcm-ratelimit-000001"}`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("rapid second send: want 429, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "10" {
+		t.Errorf("Retry-After = %q, want %q", got, "10")
+	}
+	if !strings.Contains(rec.Body.String(), "wait 10s") {
+		t.Errorf("429 body must name the wait: %q", rec.Body.String())
+	}
+	if stub.sends != 1 {
+		t.Fatalf("refused send must not reach the provider: stub.sends = %d", stub.sends)
+	}
+
+	// The limit is per-Daemon, not per-token or per-path: a DIFFERENT
+	// token, and the by-id path, are equally refused inside the window.
+	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"fcm-ratelimit-000002"}`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("different bare token inside the window: want 429, got %d", rec.Code)
+	}
+	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"id":"`+id+`"}`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("by-id inside the window: want 429, got %d", rec.Code)
+	}
+
+	// Partial wait: 4s in, the remaining 6s is named; the 429s above did
+	// NOT extend the window (they never record).
+	advance(4 * time.Second)
+	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"fcm-ratelimit-000001"}`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("4s into the window: want 429, got %d", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "6" {
+		t.Errorf("Retry-After after 4s = %q, want 6", got)
+	}
+
+	// Validation refusals keep their precise codes WITHOUT consuming or
+	// extending a slot (the gate sits after decode/resolve).
+	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{}`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("empty test body: want 400, got %d", rec.Code)
+	}
+	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"id":"8899aabbccddeeff"}`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unknown id: want 404, got %d", rec.Code)
+	}
+
+	// Past the interval (exactly 10s after the RECORDED attempt — the
+	// interleaved 429/400/404 did not shift it): the send passes. Bare-
+	// token on purpose: a by-id send here would queue ASYNC registry
+	// telemetry whose drain persists into t.TempDir() after the test
+	// returns (racing RemoveAll); the by-id rate-limit behavior is
+	// already pinned by the in-window 429 above.
+	advance(6 * time.Second)
+	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"fcm-ratelimit-000001"}`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("send after full interval: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if stub.sends != 2 {
+		t.Errorf("stub.sends = %d, want 2 (refusals never reached the provider)", stub.sends)
+	}
+	var view notifyTestWireView
+	if err := json.Unmarshal(rec.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !view.Sent || view.Transport != "stub" {
+		t.Errorf("response = %+v, want sent/stub", view)
 	}
 }
