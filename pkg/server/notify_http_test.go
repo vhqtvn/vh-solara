@@ -480,13 +480,18 @@ func TestNotifyHTTP_TestSendThroughRealChain(t *testing.T) {
 		t.Errorf("two sends caused %d OAuth exchanges, want 1 (cached)", got)
 	}
 
-	// Registry telemetry on the by-id path (best-effort).
-	e, ok := d.notifyStore.byID(id)
-	if !ok || e.LastUsedAt == nil || e.LastError != "" {
-		t.Errorf("by-id send must record last_used_at and clear last_error: %+v", e)
+	// Registry telemetry on the by-id path (best-effort, ASYNC — the
+	// response returns before the file write lands, so poll).
+	if !waitForNotify(time.Second, func() bool {
+		e, ok := d.notifyStore.byID(id)
+		return ok && e.LastUsedAt != nil && e.LastError == ""
+	}) {
+		e, _ := d.notifyStore.byID(id)
+		t.Errorf("by-id send must (asynchronously) record last_used_at and clear last_error: %+v", e)
 	}
 
-	// Error surfacing: FCM answers UNREGISTERED → sent:false + typed text.
+	// Error surfacing: FCM answers a BARE 404 (no UNREGISTERED) →
+	// sent:false + the plain send-failure text naming the status.
 	fcm.respond = func(int) (int, string, http.Header) {
 		return http.StatusNotFound, `{"error":{"code":404,"message":"Requested entity was not found","status":"NOT_FOUND"}}`, nil
 	}
@@ -496,12 +501,15 @@ func TestNotifyHTTP_TestSendThroughRealChain(t *testing.T) {
 		t.Fatalf("failed test-send must still be 200 (sent:false), got %d", rec.Code)
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &view)
-	if view.Sent || !strings.Contains(view.Error, "invalid/unregistered") {
-		t.Fatalf("failed test-send response = %+v, want sent:false + invalid-token error text", view)
+	if view.Sent || !strings.Contains(view.Error, "HTTP 404") {
+		t.Fatalf("failed test-send response = %+v, want sent:false + plain HTTP-404 error text", view)
 	}
-	e, _ = d.notifyStore.byID(id)
-	if !strings.Contains(e.LastError, "invalid/unregistered") {
-		t.Errorf("registry last_error must carry the typed failure: %q", e.LastError)
+	if !waitForNotify(time.Second, func() bool {
+		e, ok := d.notifyStore.byID(id)
+		return ok && strings.Contains(e.LastError, "HTTP 404")
+	}) {
+		e, _ := d.notifyStore.byID(id)
+		t.Errorf("registry last_error must (asynchronously) carry the failure: %q", e.LastError)
 	}
 
 	// Body refusals: both/neither, unknown id, bad bare token, unknown field.

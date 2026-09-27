@@ -333,7 +333,7 @@ func (d *Daemon) handleNotifyTokenPatch(w http.ResponseWriter, r *http.Request) 
 // The response reports PROVIDER ACCEPTANCE only ("sent: the transport
 // accepted the message") — never device delivery; the error string is
 // the sanitized transport error (typed classes surface their meaning,
-// e.g. invalid/unregistered tokens, so the operator can diagnose a dead
+// e.g. unregistered tokens, so the operator can diagnose a dead
 // registration without a separate API).
 func (d *Daemon) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
 	if !requireNotifyCSRF(w, r) {
@@ -383,10 +383,13 @@ func (d *Daemon) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
 		token = req.Token
 	}
 	sendErr := sender.Send(r.Context(), token, testNotifyMessage())
-	// Best-effort telemetry on the by-id path: never unwinds the send
-	// result, never blocks on persist failure.
+	// Best-effort telemetry on the by-id path — handed to the store's
+	// ASYNC drain (a synchronous persist here would put a full-file write
+	// on the request path; the response must not wait for it). Never
+	// unwinds the send result; a persist failure is swallowed inside
+	// recordSendResult exactly as before.
 	for _, id := range storeIDs {
-		d.notifyStore.recordSendResult(id, sendErr)
+		d.notifyStore.recordSendResultAsync(id, sendErr)
 	}
 	resp := struct {
 		Schema    int    `json:"schema"`

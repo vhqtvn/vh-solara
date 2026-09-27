@@ -87,6 +87,13 @@ var serverCmd = &cobra.Command{
 			notifier = fcm
 		}
 		daemon.SetNotifyTransport(notifier)
+		// Fleet-condition watcher (notify_watcher.go): starts ONLY when
+		// both the registry and a real transport are configured — no
+		// store means nobody to send to; no creds means nothing to send
+		// through (history-only mode is a later slice, not half-built
+		// here). A no-start is silent BY DESIGN (the unset-flag postures
+		// already speak through their 409s).
+		daemon.StartNotifyWatcher()
 		if err := daemon.Start(); err != nil {
 			log.Fatalf("Server failed: %v", err)
 		}

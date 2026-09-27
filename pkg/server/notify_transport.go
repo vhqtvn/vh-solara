@@ -25,14 +25,21 @@ package server
 //     ErrNotifyDisabled). Used as the daemon default and by tests.
 //
 // Error taxonomy (the S2 sender's actionable signals):
-//   - *NotifyInvalidTokenError: the provider PERMANENTLY rejects the
-//     registration token (FCM 404 / UNREGISTERED). S2 retires the stored
-//     token on this class.
+//   - *NotifyUnregisteredError: the provider CONFIRMED the registration
+//     token is dead (FCM spells the reason UNREGISTERED in its error
+//     details). The device uninstalled the app / rotated its token;
+//     retrying cannot succeed. S2's sender retires the stored token on
+//     EXACTLY this class.
 //   - *NotifyRetryError: rate-limit / transient-provider signal (FCM 429
 //     or any 5xx), carrying the parsed Retry-After when present.
 //   - anything else: configuration/transport failure (OAuth exchange
 //     refused, malformed request, network) — caller-visible as plain
-//     errors; never silently swallowed.
+//     errors; never silently swallowed. This includes a BARE 404
+//     (NOT_FOUND without UNREGISTERED): a misconfigured FCM project or
+//     proxy answers 404 for reasons that have nothing to do with the
+//     token's registration state, so a bare 404 must NOT retire tokens
+//     (the mass-retirement hazard S2's split closes — see
+//     NotifyUnregisteredError).
 //
 // Startup posture (cmd/server.go): --notify-fcm-credentials unset ⇒
 // nullNotifier (test-send answers 409 naming the flag); set-but-bad ⇒
@@ -102,17 +109,26 @@ type Notifier interface {
 // posture naming --notify-fcm-credentials (never a silent no-op).
 var ErrNotifyDisabled = errors.New("notification transport not configured (no --notify-fcm-credentials on this controller)")
 
-// NotifyInvalidTokenError reports a registration token the provider
-// rejects PERMANENTLY (FCM HTTP 404 or an UNREGISTERED error detail). The
-// device has uninstalled the app / rotated its token; retrying the same
-// token cannot succeed. S2's sender uses this class to retire stored
-// tokens.
-type NotifyInvalidTokenError struct {
+// NotifyUnregisteredError reports a registration token the provider has
+// CONFIRMED dead: FCM's error details carry the UNREGISTERED reason code
+// (whatever HTTP status transports it — 404 is the canonical carrier, but
+// a proxy may rewrite the status while the reason string survives). This
+// is POSITIVE evidence the device uninstalled the app or rotated its
+// token; retrying the same token cannot succeed, so S2's sender retires
+// the stored token on exactly this class.
+//
+// Deliberately NOT triggered by a bare 404 whose body lacks UNREGISTERED:
+// a misconfigured service-account project (wrong project_id) answers
+// 404 NOT_FOUND for EVERY send — classifying those as unregistered would
+// mass-retire a healthy registry on a config typo. A bare 404 stays in
+// the plain send-failure class (surfaced, retried by the operator, never
+// retirement evidence).
+type NotifyUnregisteredError struct {
 	Detail string
 }
 
-func (e *NotifyInvalidTokenError) Error() string {
-	return "notification token invalid/unregistered: " + e.Detail
+func (e *NotifyUnregisteredError) Error() string {
+	return "notification token unregistered: " + e.Detail
 }
 
 // NotifyRetryError reports a rate-limit / transient provider failure
@@ -419,9 +435,9 @@ type fcmNotification struct {
 }
 
 // Send implements Notifier. One OAuth token fetch (cached) + one POST; no
-// retries. Error classes: *NotifyInvalidTokenError (404/UNREGISTERED —
-// S2 retires the token), *NotifyRetryError (429/5xx + Retry-After hint),
-// plain errors otherwise.
+// retries. Error classes: *NotifyUnregisteredError (UNREGISTERED reason —
+// S2 retires the token; a bare 404 is deliberately NOT this class),
+// *NotifyRetryError (429/5xx + Retry-After hint), plain errors otherwise.
 func (f *FCMNotifier) Send(ctx context.Context, token string, msg NotifyMessage) error {
 	if token == "" {
 		return errors.New("fcm: send: empty token")
@@ -461,12 +477,15 @@ func (f *FCMNotifier) Send(ctx context.Context, token string, msg NotifyMessage)
 		return nil
 	}
 	detail := snippet([]byte(scrubNotifyToken(string(body), token)))
-	// Invalid-token: FCM answers 404 NOT_FOUND for an unregistered token
-	// and spells the reason UNREGISTERED in the error details. Either
-	// signal alone is conclusive (a proxy may rewrite the status; the
-	// reason string may ride a different code).
-	if resp.StatusCode == http.StatusNotFound || strings.Contains(detail, "UNREGISTERED") {
-		return &NotifyInvalidTokenError{Detail: detail}
+	// Unregistered (retiring): the UNREGISTERED reason code in the error
+	// details is CONCLUSIVE positive evidence the token is dead, whatever
+	// HTTP status carries it (a proxy may rewrite the status; the reason
+	// string may ride a different code). A bare 404 WITHOUT UNREGISTERED
+	// is deliberately NOT this class — see NotifyUnregisteredError for the
+	// misconfigured-project mass-retirement hazard — and falls through to
+	// the plain send-failure return below.
+	if strings.Contains(detail, "UNREGISTERED") {
+		return &NotifyUnregisteredError{Detail: detail}
 	}
 	// Retryable: rate-limit (429) and provider-side transients (5xx),
 	// with the parsed Retry-After hint when present.

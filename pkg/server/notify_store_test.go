@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -608,5 +609,117 @@ func TestNotifyStore_CanonicalFileRoundTrip(t *testing.T) {
 	}
 	if len(f.Tokens) != 1 || f.Tokens[0].LastError == "" {
 		t.Errorf("round-trip lost state: %+v", f.Tokens)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Async send-result recorder (S2)
+// ---------------------------------------------------------------------------
+
+// waitForNotify polls cond every 5ms until it holds or the deadline
+// passes; returns whether cond ever held. Shared by the S2 notify tests
+// for ASYNC effects (the telemetry drain, the watcher's background
+// dispatch) that must not be asserted synchronously.
+func waitForNotify(deadline time.Duration, cond func() bool) bool {
+	deadlineTimer := time.NewTimer(deadline)
+	defer deadlineTimer.Stop()
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if cond() {
+			return true
+		}
+		select {
+		case <-deadlineTimer.C:
+			return cond()
+		case <-tick.C:
+		}
+	}
+}
+
+// TestNotifyStore_RecordSendResultAsyncOffCriticalPath pins the S2
+// requirement that the telemetry write runs OFF the send critical path:
+// with the persist seam BLOCKED (notifyCreateExcl parked on a channel),
+// recordSendResultAsync must return immediately and the store FILE must
+// not yet carry the outcome; once the seam unblocks, the drain goroutine
+// must land last_used_at/last_error in memory AND in the file without
+// any further prodding. (The "not landed yet" check reads the FILE, not
+// the holder: recordSendResult holds the holder mutex across the parked
+// persist, so a memory check would block on that mutex.)
+func TestNotifyStore_RecordSendResultAsyncOffCriticalPath(t *testing.T) {
+	h, path := newStoreHolder(t)
+	e, _, err := h.submit("fcm-token-asyncrecorder", "lbl")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blocked := make(chan struct{})
+	orig := notifyCreateExcl
+	notifyCreateExcl = func(name string) (*os.File, error) {
+		<-blocked
+		return orig(name)
+	}
+	var unblockOnce sync.Once
+	unblock := func() { unblockOnce.Do(func() { close(blocked) }) }
+	// Restore the seam AND release the drain even on a fatal partway
+	// through (a permanently parked global seam would hang every later
+	// persist in the package).
+	t.Cleanup(func() { notifyCreateExcl = orig; unblock() })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.recordSendResultAsync(e.ID, errErrForTest())
+	}()
+	select {
+	case <-done:
+		// Returned without the write landing — exactly the contract.
+	case <-time.After(2 * time.Second):
+		t.Fatal("recordSendResultAsync blocked while the persist seam was wedged — it must return off the critical path")
+	}
+	// The write has not landed while the seam is still blocked (check
+	// the FILE — see the comment above for why not the holder).
+	if data, err := os.ReadFile(path); err == nil && strings.Contains(string(data), "boom") {
+		t.Fatal("telemetry write landed while the persist seam was still blocked — the drain is not actually asynchronous")
+	}
+
+	unblock()
+	if !waitForNotify(2*time.Second, func() bool {
+		f, err := loadNotifyStoreFile(path)
+		return err == nil && len(f.Tokens) == 1 && f.Tokens[0].LastUsedAt != nil && strings.Contains(f.Tokens[0].LastError, "boom")
+	}) {
+		t.Fatal("drain never landed the telemetry in memory+file after unblock")
+	}
+}
+
+// TestNotifyStore_RetireIsDelete pins that the S2 sender's retirement
+// path is exactly the holder's delete: the unregistered-class outcome
+// removes the entry, persists, and bumps the generation (a STRUCTURAL
+// change), while an unknown id (already deleted mid-send) is a no-op.
+func TestNotifyStore_RetireIsDelete(t *testing.T) {
+	h, path := newStoreHolder(t)
+	e, _, err := h.submit("fcm-token-retire-me-now", "lbl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	genBefore := h.generation()
+
+	ok, err := h.delete(e.ID)
+	if err != nil || !ok {
+		t.Fatalf("retire (delete): ok=%v err=%v", ok, err)
+	}
+	if h.generation() != genBefore+1 {
+		t.Errorf("retirement must bump the structural generation: %d → %d", genBefore, h.generation())
+	}
+	if _, still := h.byID(e.ID); still {
+		t.Error("retired token must be gone from the registry")
+	}
+	f, err := loadNotifyStoreFile(path)
+	if err != nil || len(f.Tokens) != 0 {
+		t.Fatalf("retirement must persist: err=%v tokens=%d", err, len(f.Tokens))
+	}
+	// Double retire (already deleted mid-send): no-op, no error.
+	if ok, err := h.delete(e.ID); ok || err != nil {
+		t.Errorf("retire of unknown id: want ok=false nil, got %v %v", ok, err)
 	}
 }

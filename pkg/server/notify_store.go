@@ -313,26 +313,36 @@ var notifyCreateExcl = func(name string) (*os.File, error) {
 }
 
 // persistNotifyStore writes the canonical form (2-space indent, trailing
-// newline, no comments) atomically: an EXCLUSIVELY-created 0600 sibling tmp
-// file → full write → sync → close → rename, so a crash mid-write can never
-// leave a truncated registry the next startup would refuse to load, and the
-// published file is mode 0600 by construction. The tmp is created O_EXCL
-// (never O_TRUNC) and never reused: Go applies the requested perm only when
-// CREATING, so writing through a pre-existing <store>.tmp (a crash artifact
-// from an interrupted persist, or anything else that grabbed the predictable
-// sibling path) would publish this raw-token registry at that artifact's
-// mode. On EEXIST the stale tmp is cleared and the exclusive create retried
-// ONCE; a second collision fails the persist naming path+reason — never a
-// non-exclusive fallback write. This deliberately diverges from the
-// statusConfigHolder WriteFile pattern (status_config.go): the roster config
-// is non-secret, this file holds raw FCM bearer tokens. Callers serialize
-// persists (the holder does, under its mutex).
+// newline, no comments) atomically via persistAtomic0600. See that helper
+// for the O_EXCL/0600/rename discipline; callers serialize persists (the
+// holder does, under its mutex).
 func persistNotifyStore(path string, f *notifyStoreFile) error {
 	data, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal notify store: %v", err)
 	}
 	data = append(data, '\n')
+	return persistAtomic0600(path, data)
+}
+
+// persistAtomic0600 publishes data at path atomically: an EXCLUSIVELY-
+// created 0600 sibling tmp file → full write → sync → close → rename, so
+// a crash mid-write can never leave a truncated document the next startup
+// would refuse to load, and the published file is mode 0600 by
+// construction. The tmp is created O_EXCL (never O_TRUNC) and never
+// reused: Go applies the requested perm only when CREATING, so writing
+// through a pre-existing <path>.tmp (a crash artifact from an interrupted
+// persist, or anything else that grabbed the predictable sibling path)
+// would publish the file at that artifact's mode. On EEXIST the stale tmp
+// is cleared and the exclusive create retried ONCE; a second collision
+// fails the persist naming path+reason — never a non-exclusive fallback
+// write.
+//
+// Shared by the token registry (raw FCM bearer tokens — secret) and the
+// notification history (non-secret, but the SAME discipline is kept for
+// uniformity and defense-in-depth: one crash-safe write path, one mode
+// posture, one set of tests). Callers serialize persists.
+func persistAtomic0600(path string, data []byte) error {
 	tmp := path + ".tmp"
 	tf, err := notifyCreateExcl(tmp)
 	if err != nil {
@@ -427,7 +437,29 @@ type notifyStoreHolder struct {
 	path    string // persistence path; "" = registry disabled
 	entries []notifyStoreEntry
 	gen     uint64
+
+	// results/recordOnce carry the ASYNCHRONOUS send-telemetry drain: a
+	// small buffered channel plus one drain goroutine, created lazily on
+	// the first recordSendResultAsync call (see that method for why the
+	// write must live off the send critical path). The goroutine runs for
+	// the process lifetime — this daemon has no shutdown path for its
+	// other forever-goroutines either (daemon.go Start).
+	results    chan notifySendOutcome
+	recordOnce sync.Once
 }
+
+// notifySendOutcome is one queued recordSendResult job.
+type notifySendOutcome struct {
+	id  string
+	err error
+}
+
+// notifyResultQueueDepth bounds the async telemetry backlog. Sends are
+// few in v1 (one operator, a handful of devices); a full queue means the
+// drain goroutine is wedged on a pathological persist, and DROPPING
+// telemetry (never blocking the send path, never growing without bound)
+// is the documented best-effort trade.
+const notifyResultQueueDepth = 64
 
 // notifyStoreSnapshot is one coherent deep copy of the holder state.
 type notifyStoreSnapshot struct {
@@ -640,6 +672,37 @@ func (h *notifyStoreHolder) recordSendResult(id string, sendErr error) {
 	_ = h.persistLocked()
 }
 
+// recordSendResultAsync hands one send outcome to the background drain
+// goroutine and returns IMMEDIATELY — the registry telemetry write (a
+// full-file persist under the holder mutex) must never sit on the send
+// critical path: the watcher's dispatch and the test-send handler answer
+// without waiting for the file to land, and a slow/blocked persist cannot
+// delay the next send. The drain runs recordSendResult (documented
+// best-effort) exactly as the synchronous path did. When the queue is
+// full the outcome is DROPPED with a log line (see
+// notifyResultQueueDepth) — telemetry, not delivery, is the sacrificial
+// layer. The zero-time lastNotifiedAt semantics of the watcher are
+// unaffected: this records only registry bookkeeping.
+func (h *notifyStoreHolder) recordSendResultAsync(id string, err error) {
+	h.recordOnce.Do(func() {
+		h.results = make(chan notifySendOutcome, notifyResultQueueDepth)
+		go h.drainSendResults()
+	})
+	select {
+	case h.results <- notifySendOutcome{id: id, err: err}:
+	default:
+		log.Printf("notify: send-result queue full (depth %d) — dropping telemetry for token %s", notifyResultQueueDepth, id)
+	}
+}
+
+// drainSendResults is the single background consumer of the async
+// telemetry queue (started lazily, runs for the process lifetime).
+func (h *notifyStoreHolder) drainSendResults() {
+	for out := range h.results {
+		h.recordSendResult(out.id, out.err)
+	}
+}
+
 // truncateRunes cuts s to at most max BYTES on a rune boundary.
 func truncateRunes(s string, max int) string {
 	if len(s) <= max {
@@ -700,13 +763,21 @@ func notifyEntryWire(e notifyStoreEntry) notifyTokenWire {
 // LoadNotifyStore reads, validates, secures, and installs the
 // notification-token registry at path (the --notify-store startup path).
 // Securing = the load-time 0600 mode repair (see loadNotifyStoreFile). A
-// missing/unreadable/invalid file returns an error naming the path and the
-// precise reason — the caller (cmd/server.go) fails startup on it rather
+// missing/unreadable/invalid file returns an error naming the path and
+// the precise reason — the caller (cmd/server.go) fails startup on it rather
 // than silently running a disabled or empty registry. On error the
 // daemon's registry state is unchanged.
+//
+// The same call installs the delivery-history holder at path+".history"
+// (notify_history.go): a missing history file starts empty; a present-
+// but-bad one fails here with the same set-but-bad discipline (the
+// operator's reliable record is not silently discarded).
 func (d *Daemon) LoadNotifyStore(path string) error {
 	f, err := loadNotifyStoreFile(path)
 	if err != nil {
+		return err
+	}
+	if err := d.notifyHistory.setPath(path + ".history"); err != nil {
 		return err
 	}
 	d.notifyStore.setLoaded(path, f)

@@ -64,10 +64,18 @@ type Daemon struct {
 	// notifyStore is the push-notification token registry holder (see
 	// notify_store.go): file-backed (--notify-store), mutex-guarded,
 	// generation-stamped. Zero value = registry disabled — every
-	// /vh/notify/* handler then answers the honest 409 posture naming the
-	// flag. Entries are created/managed via the notify HTTP family
-	// (notify_http.go); S2's sender will consume snapshots.
+	// /vh/notify/* handler then answers the honest 409 posture naming
+	// the flag. Entries are created/managed via the notify HTTP family
+	// (notify_http.go); the S2 watcher consumes snapshots.
 	notifyStore notifyStoreHolder
+
+	// notifyHistory is the push-notification delivery history holder
+	// (see notify_history.go): the bounded file-backed record of every
+	// fleet-condition transition the watcher (notify_watcher.go)
+	// emits, served by GET /vh/notify/history. Its path derives from
+	// the registry path + ".history" (installed by LoadNotifyStore);
+	// zero value = unconfigured (the family's 409 posture).
+	notifyHistory notifyHistoryHolder
 
 	// notifyTransport is the configured push transport (see
 	// notify_transport.go): an *FCMNotifier built from
@@ -76,6 +84,14 @@ type Daemon struct {
 	// built Daemons); handlers resolve it through notifySender(). Set
 	// before Start (cmd/server.go: SetNotifyTransport).
 	notifyTransport Notifier
+
+	// notifyWatchOnce/notifyWatcherRunning gate StartNotifyWatcher
+	// (notify_watcher.go): the fleet-condition watcher starts at most
+	// once per Daemon, only when the registry AND a real transport are
+	// configured. The sync.Once synchronizes the write; readers after
+	// Do observe the final value.
+	notifyWatchOnce      sync.Once
+	notifyWatcherRunning bool
 
 	// tunnelDeflate is the controller-side permessage-deflate write policy
 	// for the worker tunnel WebSocket (Q4c experiment). Parsed once from
@@ -260,6 +276,14 @@ func (d *Daemon) buildRootHandler() http.Handler {
 	userMux.HandleFunc("DELETE /vh/notify/tokens/{id}", d.handleNotifyTokenDelete)
 	userMux.HandleFunc("PATCH /vh/notify/tokens/{id}", d.handleNotifyTokenPatch)
 	userMux.HandleFunc("POST /vh/notify/test", d.handleNotifyTest)
+
+	// Notification delivery history (GET /vh/notify/history; see
+	// notify_history.go): the bounded file-backed record of watcher-
+	// emitted fleet-condition transitions with per-token outcomes.
+	// Read-only/CSRF-exempt like the token list; same 409-disabled
+	// posture; covered by the /vh/notify/ prefix carve-out below, so it
+	// answers from worker-subdomain hosts too.
+	userMux.HandleFunc("GET /vh/notify/history", d.handleNotifyHistory)
 
 	// Latency diagnostics — AGGREGATED global view. The controller merges its
 	// own probes (diag.Default) with every connected worker's snapshot fetched

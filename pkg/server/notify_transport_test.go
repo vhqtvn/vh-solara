@@ -9,10 +9,11 @@ package server
 // public key; iss/scope/aud/exp-iat claims), token caching (a second send
 // does NOT re-exchange while unexpired; a short expires_in DOES), the
 // send message shape + Authorization header + project-derived path,
-// error classification (404/UNREGISTERED → invalid-token; 429/5xx +
-// Retry-After → retry), credential parsing (PKCS#8 + PKCS#1, missing
-// fields, real-Google extra fields ignored), the nullNotifier posture,
-// and the default endpoints when nothing is injected.
+// error classification (UNREGISTERED → retiring unregistered class; bare
+// 404 → plain, 429/5xx + Retry-After → retry), credential parsing
+// (PKCS#8 + PKCS#1, missing fields, real-Google extra fields ignored),
+// the nullNotifier posture, and the default endpoints when nothing is
+// injected.
 
 import (
 	"context"
@@ -504,25 +505,47 @@ func TestFCMNotifier_ErrorClassification(t *testing.T) {
 	n := newTestFCMNotifier(t, key, oauth, fcm)
 	ctx := context.Background()
 
-	// 404 → invalid token.
+	// 404 + UNREGISTERED → the retiring unregistered class (canonical
+	// FCM shape for a dead token).
 	fcm.respond = func(int) (int, string, http.Header) {
-		return http.StatusNotFound, `{"error":{"code":404,"message":"Requested entity was not found","status":"NOT_FOUND"}}`, nil
+		return http.StatusNotFound, `{"error":{"code":404,"message":"The registration token is not registered","status":"NOT_FOUND","details":[{"errorCode":"UNREGISTERED"}]}}`, nil
 	}
 	err := n.Send(ctx, "dead-token-aaaaaaaaaaaa", NotifyMessage{})
-	var invalid *NotifyInvalidTokenError
-	if !errorsAs(err, &invalid) {
-		t.Errorf("404: want *NotifyInvalidTokenError, got %T: %v", err, err)
+	var unreg *NotifyUnregisteredError
+	if !errorsAs(err, &unreg) {
+		t.Errorf("404+UNREGISTERED: want *NotifyUnregisteredError, got %T: %v", err, err)
 	}
 
-	// UNREGISTERED detail (on a non-404 status) → invalid token too.
+	// UNREGISTERED detail (on a non-404 status) → unregistered too — the
+	// reason string is conclusive whatever status a proxy left on it.
 	fcm.respond = func(int) (int, string, http.Header) {
 		return http.StatusBadRequest, `{"error":{"code":400,"message":"The registration token is not registered","status":"INVALID_ARGUMENT","details":[{"errorCode":"UNREGISTERED"}]}}`, nil
 	}
 	err = n.Send(ctx, "dead-token-aaaaaaaaaaaa", NotifyMessage{})
-	if !errorsAs(err, &invalid) {
-		t.Errorf("UNREGISTERED: want *NotifyInvalidTokenError, got %T: %v", err, err)
+	if !errorsAs(err, &unreg) {
+		t.Errorf("UNREGISTERED: want *NotifyUnregisteredError, got %T: %v", err, err)
 	}
 
+	// BARE 404 (NOT_FOUND only, no UNREGISTERED) → a PLAIN send-failure
+	// error, NOT the retiring class: a misconfigured project answers 404
+	// for every send and must not mass-retire a healthy registry.
+	fcm.respond = func(int) (int, string, http.Header) {
+		return http.StatusNotFound, `{"error":{"code":404,"message":"Requested entity was not found","status":"NOT_FOUND"}}`, nil
+	}
+	err = n.Send(ctx, "live-token-aaaaaaaaaaaaa", NotifyMessage{})
+	if err == nil {
+		t.Fatal("bare 404: want an error")
+	}
+	if errorsAs(err, &unreg) {
+		t.Errorf("bare 404 must NOT classify as unregistered (retirement safety): %v", err)
+	}
+	var retry *NotifyRetryError
+	if errorsAs(err, &retry) {
+		t.Errorf("bare 404 must not classify as retry either: %v", err)
+	}
+	if !strings.Contains(err.Error(), "HTTP 404") {
+		t.Errorf("bare 404 plain error should name the status: %v", err)
+	}
 	// 429 + Retry-After → retry error carrying the hint.
 	hdr := http.Header{}
 	hdr.Set("Retry-After", "37")
@@ -530,7 +553,6 @@ func TestFCMNotifier_ErrorClassification(t *testing.T) {
 		return http.StatusTooManyRequests, `{"error":{"code":429,"message":"Quota exceeded"}}`, hdr
 	}
 	err = n.Send(ctx, "live-token-aaaaaaaaaaaaa", NotifyMessage{})
-	var retry *NotifyRetryError
 	if !errorsAs(err, &retry) {
 		t.Errorf("429: want *NotifyRetryError, got %T: %v", err, err)
 	} else {
@@ -561,7 +583,7 @@ func TestFCMNotifier_ErrorClassification(t *testing.T) {
 		t.Errorf("200: want nil error, got %v", err)
 	}
 
-	// 403 (SENDER_ID_MISMATCH-shaped) → plain error, NOT invalid/retry.
+	// 403 (SENDER_ID_MISMATCH-shaped) → plain error, NOT unregistered/retry.
 	fcm.respond = func(int) (int, string, http.Header) {
 		return http.StatusForbidden, `{"error":{"code":403,"message":"SenderId mismatch"}}`, nil
 	}
@@ -569,7 +591,7 @@ func TestFCMNotifier_ErrorClassification(t *testing.T) {
 	if err == nil {
 		t.Fatal("403: want an error")
 	}
-	if errorsAs(err, &invalid) || errorsAs(err, &retry) {
+	if errorsAs(err, &unreg) || errorsAs(err, &retry) {
 		t.Errorf("403: must be a plain error, got a typed one: %v", err)
 	}
 
@@ -587,7 +609,7 @@ func TestFCMNotifier_ErrorClassification(t *testing.T) {
 	}
 
 	// Empty token → plain error (caller misuse, not a provider signal).
-	if err := n.Send(ctx, "", NotifyMessage{}); err == nil || errorsAs(err, &invalid) {
+	if err := n.Send(ctx, "", NotifyMessage{}); err == nil || errorsAs(err, &unreg) {
 		t.Errorf("empty token: want plain error, got %v", err)
 	}
 }
@@ -611,20 +633,20 @@ func TestFCMNotifier_ErrorDetailTokenScrub(t *testing.T) {
 	tok := "echoed-fcm-device-token-314159265358979"
 
 	// UNREGISTERED on a 400 whose message echoes the token verbatim →
-	// still classified invalid-token, but the surfaced text is token-free.
+	// still classified unregistered, but the surfaced text is token-free.
 	fcm.respond = func(int) (int, string, http.Header) {
 		return http.StatusBadRequest, `{"error":{"code":400,"message":"The registration token ` + tok + ` is not registered","status":"INVALID_ARGUMENT","details":[{"errorCode":"UNREGISTERED"}]}}`, nil
 	}
 	err := n.Send(ctx, tok, NotifyMessage{})
-	var invalid *NotifyInvalidTokenError
-	if !errorsAs(err, &invalid) {
-		t.Fatalf("UNREGISTERED+echo: want *NotifyInvalidTokenError, got %T: %v", err, err)
+	var unreg *NotifyUnregisteredError
+	if !errorsAs(err, &unreg) {
+		t.Fatalf("UNREGISTERED+echo: want *NotifyUnregisteredError, got %T: %v", err, err)
 	}
 	if got := err.Error(); strings.Contains(got, tok) {
-		t.Errorf("invalid-token error leaks the device token: %q", got)
+		t.Errorf("unregistered error leaks the device token: %q", got)
 	}
 	if got := err.Error(); !strings.Contains(got, "«token»") {
-		t.Errorf("invalid-token error should carry the redaction marker: %q", got)
+		t.Errorf("unregistered error should carry the redaction marker: %q", got)
 	}
 
 	// Plain 403 whose body echoes the token → plain error, token-free.
