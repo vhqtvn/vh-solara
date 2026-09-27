@@ -86,7 +86,16 @@ The gate map is **selected-only**: effective root+unarchived sessions
 sessions never cross this path, while each selected root carries
 `subtree_pending_permission` / `subtree_pending_question` /
 `subtree_pending_input` — its descendants' pending waits aggregated onto the
-root. `fleet_selection` is the capability marker asserting that vocabulary.
+root — and, since the subtree error/retry slice, `subtree_error` /
+`subtree_retry` — the SESSIONS in its subtree (inclusive of self) whose
+activity is error / retry, surfaced as **pointer-valued counts**: a real
+worker ALWAYS sets them (a supported zero serializes as an explicit `0`;
+`omitempty` only drops nil), so an absent key identifies a producer that
+predates the counts. `fleet_selection` is the capability marker asserting
+that vocabulary — including the activity counts: a producer emitting the
+marker WITHOUT them is a same-vocabulary partial and is rejected by the
+controller's acquisition validators rather than folded (the marker's meaning
+was extended in place; no second marker exists for the counts).
 A full `/vh/snapshot` stays COMPLETE (children present, `fleet_selected:
 false`); the controller filters snapshot-derived gates by `fleet_selected`
 identically, so both acquisition paths fold the same population.
@@ -96,15 +105,23 @@ moving whole session trees over the WAN tunnel (~5.9 MB raw for a 7-project
 roster became one small batched response). The controller treats any lean
 failure (404 from an older worker, non-2xx, malformed, a marker-violating
 body — including a **missing or unknown `fleet_selection` marker**, which
-is required, not optional, and an explicitly not-selected entry, since
-this endpoint's contract is selected-only) as "use the per-project
-snapshot fallback".
-The fallback snapshot must speak the SAME vocabulary: a field-less or
-unknown-marker snapshot envelope classifies the worker `error`
-(`workers[].detail` names the unsupported producer and the upgrade ask)
-— an unsupported producer is never folded as a healthy observed empty
+is required, not optional; an explicitly not-selected entry, since
+this endpoint's contract is selected-only; and a nonempty gate entry
+missing `subtree_error`/`subtree_retry` or carrying a negative count) as
+"use the per-project snapshot fallback".
+The fallback snapshot must speak the SAME vocabulary: a field-less,
+unknown-marker, or count-less snapshot envelope classifies the worker
+`error` (`workers[].detail` names the unsupported producer and the upgrade
+ask) — an unsupported producer is never folded as a healthy observed empty
 ("No sessions"). A marked genuinely-empty envelope (omitted/empty `gate`)
 is valid: supported zero stays honest.
+On the fold side, the `session_error` / `session_retry` conditions count
+the summed subtree error/retry SESSIONS over selected roots (one contributor
+root per kind — a child's error/retry surfaces on its root; the root's OWN
+activity fields stay unchanged, error still does not count as busy, retry
+still does, and `session_done`'s strict-stop remains
+`!subtree_busy && subtree_pending_input == 0`, so a finished root and a
+descendant error can coexist).
 
 **Release contract (operator checklist — version floor ↔ fleet
 selection).** The first tag that ships `pkg/version` (the tunnel version
@@ -114,7 +131,11 @@ a floor-satisfying field-less worker passes the boundary and every refresh
 classifies it `error`. Rule: ship the boundary and the selection fields
 under ONE tag, or bump both floors in the same release commit that changes
 the selection vocabulary. No floor change or tag action is authorized by
-code alone — the tag is a protected operator decision.
+code alone — the tag is a protected operator decision. The same rule covers
+the S3 activity-count extension (the marker's meaning grew in place):
+a controller with count validation classifies a count-less same-marker
+worker `error` on every refresh, so controller and worker must ship the
+extension under one tag or the floors must move with whichever ships first.
 
 ### `GET /vh/stream?cursor=<seq>`
 Resumable SSE. Emits `id: <seq>` on every event so a client can track its cursor.

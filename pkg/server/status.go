@@ -23,13 +23,17 @@ package server
 //     project_missing > session_error | session_retry > session_done; each
 //     {kind,count,since,label,link}. Pending conditions count pending
 //     SESSIONS summed over SELECTED roots (a root's subtree_pending_*
-//     surfaces its descendants' waits); session_done is informational-only
-//     ("N finished", never a severity input). `since` is the first
-//     CONTINUOUSLY observed controller time for the current contributors
-//     (continuity tracked across published generations; reset on loss of
-//     evidence). `link` is a trusted worker-origin /app?dir=…&session=… URL
-//     built from the configured HostPattern (null when no mapping exists)
-//     — never from the request Host.
+//     surfaces its descendants' waits); since S3 session_error/session_retry
+//     count subtree error/retry SESSIONS the same way (a root's
+//     subtree_error/subtree_retry surfaces its descendants' failed/retrying
+//     turns; the count units are sessions, one contributor root each);
+//     session_done is informational-only ("N finished", never a severity
+//     input). `since` is the first CONTINUOUS observed controller time for
+//     the current contributors (continuity tracked across published
+//     generations; reset on loss of evidence). `link` is a trusted
+//     worker-origin /app?dir=…&session=… URL built from the configured
+//     HostPattern (null when no mapping exists) — never from the request
+//     Host.
 //   - FOLD POPULATION (gauge semantics): every fold — gauge, session-tier
 //     conditions, projects[] — operates on SELECTED sessions only: effective
 //     root+unarchived, identified by the worker-side gate fact
@@ -735,10 +739,13 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 	// filtered HERE by the same field, so both acquisition paths fold an
 	// identical population. A selected root's SUBTREE pending counts surface
 	// its descendants' waits (a child's pending permission contributes to its
-	// root's permission_pending — subagent signals must not vanish), while
-	// session_error/session_retry stay the root's OWN activity facts.
+	// root's permission_pending — subagent signals must not vanish), and
+	// since S3 the session_error/session_retry conditions count the subtree
+	// error/retry SESSION sums the same way (a child's error/retry surfaces
+	// on its root; the root's OWN activity facts stay on the wire unchanged).
 	var selectedRoots, busyRoots int
 	var permCount, questCount int // summed per-kind pending SESSION counts
+	var errCount, retryCount int  // summed subtree error/retry SESSION counts (S3)
 	permC, questC, errC, retryC, doneC := []fleetContributor{}, []fleetContributor{}, []fleetContributor{}, []fleetContributor{}, []fleetContributor{}
 	downIDs, missingIDs := []string{}, []string{}
 	observedProjectDirs := map[string]bool{} // dirs CONFIRMED instantiated this generation (successful snapshots only)
@@ -818,12 +825,25 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 					questC = append(questC, c)
 					questCount += gf.SubtreePendingQuestion
 				}
-				if gf.Activity == "error" {
+				// Subtree error/retry conditions (S3): the summed subtree
+				// ACTIVITY session counts, one contributor per selected root per
+				// kind (mirroring pending — a resident child never enters the
+				// fold population itself, so a descendant's error/retry can only
+				// surface through its root's counts). The nil clause is a
+				// DEFENSIVE BELT only: both acquisition validators reject a
+				// nonempty gate map whose entries lack the pointer fields (an
+				// unsupported producer), so nil cannot reach this fold through
+				// acquisition — and nil must NOT fall back to the root's own
+				// Activity (that root-only fallback is exactly the silent
+				// misread the presence contract forbids).
+				if gf.SubtreeError != nil && *gf.SubtreeError > 0 {
 					errC = append(errC, c)
+					errCount += *gf.SubtreeError
 					row.hasErr = true
 				}
-				if gf.Activity == "retry" {
+				if gf.SubtreeRetry != nil && *gf.SubtreeRetry > 0 {
 					retryC = append(retryC, c)
+					retryCount += *gf.SubtreeRetry
 					row.hasRetry = true
 				}
 				if fleetSessionDone(gf) {
@@ -923,8 +943,12 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 		// worker_missing; link stays null — there is no valid /app mapping
 		// for a project that is not running anywhere.
 		workerAgg(fleetCondProjectMissing, missingProjectDirs, "pmissing", pluralCount(len(missingProjectDirs), "project not running", "projects not running")),
-		newAgg(fleetCondSessionError, len(errC), errC, "err", pluralCount(len(errC), "session error", "session errors"), true),
-		newAgg(fleetCondSessionRetry, len(retryC), retryC, "retry", pluralCount(len(retryC), "session retrying", "sessions retrying"), true),
+		// session_error/session_retry count the summed subtree ACTIVITY
+		// sessions (S3): a root whose descendants hold N error/retry
+		// sessions contributes N to the count with ONE contributor key/link
+		// (the root), exactly like the pending conditions above.
+		newAgg(fleetCondSessionError, errCount, errC, "err", pluralCount(errCount, "session error", "session errors"), true),
+		newAgg(fleetCondSessionRetry, retryCount, retryC, "retry", pluralCount(retryCount, "session retrying", "sessions retrying"), true),
 		// session_done: informational LAST-priority condition ("N finished").
 		// Since-continuity rides the existing tracker keyed worker+dir+root:
 		// an observed resume (busy/retry, pending, unfinished/latest-message
@@ -1501,13 +1525,22 @@ func fetchLeanGates(fetch func(path string) ([]byte, error), projects []fleetDis
 // snapshot fallback) speaks the fleet-selection vocabulary this controller
 // folds: the KNOWN capability marker must be present (absent = a field-less
 // pre-selection producer; any other value = a vocabulary version we cannot
-// interpret), and every entry of every nonempty gate map must carry the
+// interpret), every entry of every nonempty gate map must carry the
 // fleet_selected tri-state explicitly (an advertised-but-untagged entry is
-// a producer bug). A marked empty or omitted gate map IS valid — a
-// supported, genuinely-empty population, never conflated with an
-// unsupported producer. An envelope that fails this check must never be
-// folded: its all-excluded entries would masquerade unsupported data as an
-// observed empty fleet ("No sessions" with available:true).
+// a producer bug), and — since S3 — every such entry must also carry the
+// subtree activity counts explicitly: nonnil subtree_error/subtree_retry
+// with non-negative values. Nil counts on a nonempty map are a SAME-MARKER
+// PARTIAL (a producer speaking root_unarchived_v1 without the activity
+// fields — e.g. a pre-S3 worker): the marker's meaning was extended rather
+// than versioned (the brief: no second capability marker solely for counts),
+// so a partial is rejected exactly like any other vocabulary violation
+// instead of folding unsupported data as observed zeros or silently falling
+// back to root-only semantics. A negative count is malformed. A marked empty
+// or omitted gate map IS valid — a supported, genuinely-empty population
+// needs no activity-count entries, never conflated with an unsupported
+// producer. An envelope that fails this check must never be folded: its
+// all-excluded/zero-defaulted entries would masquerade unsupported data as
+// an observed empty fleet ("No sessions" with available:true).
 func fleetSelectionValid(marker string, gates ...map[string]state.GateFacts) bool {
 	if marker != state.FleetSelectionRootUnarchivedV1 {
 		return false
@@ -1515,6 +1548,12 @@ func fleetSelectionValid(marker string, gates ...map[string]state.GateFacts) boo
 	for _, g := range gates {
 		for _, gf := range g {
 			if gf.FleetSelected == nil {
+				return false
+			}
+			if gf.SubtreeError == nil || gf.SubtreeRetry == nil {
+				return false
+			}
+			if *gf.SubtreeError < 0 || *gf.SubtreeRetry < 0 {
 				return false
 			}
 		}

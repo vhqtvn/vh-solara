@@ -259,11 +259,16 @@ func TestSnapshotWithTreePartial_FullCaptureUnchanged(t *testing.T) {
 func TestSnapshotWithTreePartial_FrontierMatchesTreeNodesAndSubtreeBusy(t *testing.T) {
 	s := New(64)
 	// R(loaded via busy D0) + D1(frontier, child of R). D0 busy in R's subtree;
-	// D1's subtree has no busy descendant.
+	// D1's subtree has no busy descendant. E0 (child of D1) is driven to
+	// ActivityError — the S3 third-capture-path pin: the partial frame's
+	// frontier gates must carry the NONNIL subtree activity counts and the
+	// correct per-kind sums (error does NOT set SubtreeBusy — the carve-out).
 	s.Apply(ev("session.created", evSessionCreated("R", "")))
 	s.Apply(ev("session.created", evSessionCreated("D0", "R")))
 	s.Apply(ev("session.status", evStatus("D0", "busy")))
 	s.Apply(ev("session.created", evSessionCreated("D1", "R")))
+	s.Apply(ev("session.created", evSessionCreated("E0", "D1")))
+	s.Apply(ev("session.error", evError("E0")))
 
 	e := NewTreeEmitter(s, "/proj")
 	detail, tree := s.SnapshotWithTreePartial(e, "cold")
@@ -299,6 +304,27 @@ func TestSnapshotWithTreePartial_FrontierMatchesTreeNodesAndSubtreeBusy(t *testi
 		t.Fatalf("D1 missing from partial Gate (it is a frontier node)")
 	} else if g.SubtreeBusy {
 		t.Errorf("D1.SubtreeBusy=true but D1's subtree has no busy descendant")
+	}
+
+	// S3: the partial frame's frontier gates carry the subtree ACTIVITY
+	// counts — nonnil on every frontier entry (presence contract; this is
+	// the third capture path after the full snapshot and lean gates), with
+	// E0's error surfacing on D1 and R as a per-kind sum that does NOT set
+	// SubtreeBusy (the error carve-out).
+	for id, g := range detail.Gate {
+		if g.SubtreeError == nil || g.SubtreeRetry == nil {
+			t.Errorf("%s: partial gate must carry nonnil subtree_error/subtree_retry, got %+v", id, g)
+		}
+	}
+	if g, ok := detail.Gate["D1"]; !ok {
+		t.Fatalf("D1 missing from partial Gate")
+	} else if g.SubtreeError == nil || *g.SubtreeError != 1 || *g.SubtreeRetry != 0 {
+		t.Errorf("D1 subtree activity: want err=1 retry=0 (E0 below), got %+v", g)
+	}
+	if g, ok := detail.Gate["R"]; !ok {
+		t.Fatalf("R missing from partial Gate")
+	} else if g.SubtreeError == nil || *g.SubtreeError != 1 || *g.SubtreeRetry != 0 {
+		t.Errorf("R subtree activity: want err=1 retry=0 (E0 below D1), got %+v", g)
 	}
 }
 

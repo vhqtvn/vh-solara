@@ -492,7 +492,9 @@ func seedFleetParentChildren(c *Cluster, t *testing.T, n int) (root string, chil
 
 // fleetLeanFacts is the subtree-aggregate slice of a lean gate entry the
 // propagation proof attributes worker-side (the same fields the controller
-// fold consumes).
+// fold consumes). S3: the subtree ACTIVITY counts ride along as pointers —
+// the same presence shape the wire carries (nil would mean an unsupported
+// producer; the real worker always sets them).
 type fleetLeanFacts struct {
 	FleetSelected            *bool  `json:"fleet_selected"`
 	Activity                 string `json:"activity"`
@@ -500,6 +502,8 @@ type fleetLeanFacts struct {
 	SubtreePendingPermission int    `json:"subtree_pending_permission"`
 	SubtreePendingQuestion   int    `json:"subtree_pending_question"`
 	SubtreePendingInput      int    `json:"subtree_pending_input"`
+	SubtreeError             *int   `json:"subtree_error"`
+	SubtreeRetry             *int   `json:"subtree_retry"`
 }
 
 // fleetLeanGate fetches the default project's selected-only lean gate map
@@ -538,8 +542,9 @@ type fleetRollupView struct {
 	Coverage struct {
 		Complete bool `json:"complete"`
 	} `json:"coverage"`
-	Conditions []fleetCondView    `json:"conditions"`
-	Projects   []fleetProjRowView `json:"projects"`
+	KnownOverall string             `json:"known_overall"`
+	Conditions   []fleetCondView    `json:"conditions"`
+	Projects     []fleetProjRowView `json:"projects"`
 }
 
 type fleetCondView struct {
@@ -855,5 +860,192 @@ func TestE2E_FleetStatusResidentChildPropagation(t *testing.T) {
 		}
 		row := fleetDefaultProjectRow(v)
 		return row != nil && row.Busy == baseRow.Busy && row.Pending == baseRow.Pending
+	})
+}
+
+// TestE2E_FleetStatusDescendantErrorRetryPropagation is the S3 crux: a
+// RESIDENT subagent child driven into activity ERROR and another into RETRY
+// surface on their ROOT through the entire real chain — fixture /event
+// ingress (session.error / session.status retry) → worker store subtree
+// derivation (computeFleetAggregatesLocked) → lean /vh/gates wire
+// (subtree_error/subtree_retry pointers) → yamux tunnel → controller rollup
+// fold (session_error/session_retry conditions counting DESCENDANT sessions
+// with the root as contributor) — while the children themselves NEVER enter
+// the selected fold population. Reset returns every surface to baseline.
+//
+// FRESH CLUSTER with a HostPattern so the conditions' deep links are built
+// and the "contributor = the ROOT" claim is assertable through the link's
+// session parameter (children are not on the wire; the root is the only
+// possible contributor identity).
+//
+// Leg order is deliberate: ERROR first, RETRY second. The fake's
+// /session/status never reports error (emit deletes the busy-map entry on
+// session.error), so the worker's 60s status-reconcile would clear an
+// ActivityError it re-reads; the retry leg mirrors type:"retry" into the
+// busy map and is immune. Keeping the error leg early bounds the exposure
+// well inside the reconcile cadence (the whole test runs in a few seconds).
+func TestE2E_FleetStatusDescendantErrorRetryPropagation(t *testing.T) {
+	c, err := StartClusterWithOptions(WithHostPattern("$ID.fleet.example"))
+	if err != nil {
+		t.Fatalf("StartCluster: %v", err)
+	}
+	t.Cleanup(c.Close)
+	root, children := seedFleetParentChildren(c, t, 2)
+	childErr, childRetry := children[0], children[1]
+
+	// 1. Baseline: root selected and quiet — and the S3 wire contract
+	//    visible through the REAL tunnel: the lean entry carries explicit
+	//    supported ZEROS ("subtree_error":0 / "subtree_retry":0 on the raw
+	//    JSON — omitempty only drops nil), never absent keys.
+	gate := fleetLeanGate(c, t)
+	rawRoot, ok := gate[root]
+	if !ok {
+		t.Fatalf("owned root %s must be selected in the lean map (%d entries)", root, len(gate))
+	}
+	for _, ch := range children {
+		if _, ok := gate[ch]; ok {
+			t.Fatalf("child %s must never appear in the selected-only lean map", ch)
+		}
+	}
+	for _, key := range []string{`"subtree_error":0`, `"subtree_retry":0`} {
+		if !strings.Contains(string(rawRoot), key) {
+			t.Fatalf("baseline root lean entry must carry an explicit %s (supported zero), got %s", key, rawRoot)
+		}
+	}
+	waitLeanEntry := func(desc string, pred func(fleetLeanFacts) bool) {
+		t.Helper()
+		deadline := time.Now().Add(6 * time.Second)
+		for time.Now().Before(deadline) {
+			raw, ok := fleetLeanGate(c, t)[root]
+			if ok {
+				var f fleetLeanFacts
+				if json.Unmarshal(raw, &f) == nil && pred(f) {
+					return
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatalf("root %s lean entry never satisfied (%s) within 6s", root, desc)
+	}
+	var quiet fleetLeanFacts
+	if err := json.Unmarshal(rawRoot, &quiet); err != nil {
+		t.Fatalf("root lean entry not JSON: %v", err)
+	}
+	if quiet.FleetSelected == nil || !*quiet.FleetSelected || quiet.SubtreeBusy || quiet.SubtreeError == nil || *quiet.SubtreeError != 0 || quiet.SubtreeRetry == nil || *quiet.SubtreeRetry != 0 {
+		t.Fatalf("owned root must start selected+quiet with nonnil zero counts, got %+v", quiet)
+	}
+	selectedTotal := len(gate)
+
+	base := waitFleetRollup(c, t, 15*time.Second, "baseline generation reflects the owned root", func(v fleetRollupView) bool {
+		if !v.Coverage.Complete || !v.Gauge.Available {
+			return false
+		}
+		row := fleetDefaultProjectRow(v)
+		return row != nil && row.Sessions == selectedTotal
+	})
+	baseRow := fleetDefaultProjectRow(base)
+	if baseRow == nil {
+		t.Fatal("baseline rollup must carry the default project row")
+	}
+	baseBusy, baseTotal, ok := parseBusyLabel(base.Gauge.Label)
+	if !ok {
+		t.Fatalf("baseline gauge label not parseable: %q", base.Gauge.Label)
+	}
+	baseErr := fleetCondCount(base, "session_error")
+	baseRetry := fleetCondCount(base, "session_retry")
+
+	// 2. ERROR leg: drive childErr into ActivityError through the fake's
+	//    real /event stream (session.error — the only ActivityError source).
+	c.Fake.EmitSessionTerminal(childErr, "session.error")
+	// Worker wire: the root's entry carries the descendant error (1), the
+	// retry count stays 0, the subtree is NOT busy (the error carve-out),
+	// and the root's OWN activity stays idle (self-only facts unchanged).
+	waitLeanEntry("subtree_error==1, !subtree_busy, root own idle", func(f fleetLeanFacts) bool {
+		return f.SubtreeError != nil && *f.SubtreeError == 1 &&
+			f.SubtreeRetry != nil && *f.SubtreeRetry == 0 &&
+			!f.SubtreeBusy && f.Activity == "idle"
+	})
+	// Controller fold through the tunnel: session_error counts base+1
+	// DESCENDANT sessions on the single root, label vocabulary pinned, link
+	// deep-links the ROOT, severity degraded by error, gauge UNCHANGED
+	// (error is not busy).
+	errGen := waitFleetRollup(c, t, 15*time.Second, "session_error == base+1 from the descendant", func(v fleetRollupView) bool {
+		return fleetCondCount(v, "session_error") == baseErr+1 && fleetCondCount(v, "session_retry") == baseRetry
+	})
+	ec := fleetCond(errGen, "session_error")
+	if ec == nil {
+		t.Fatal("session_error condition must be present")
+	}
+	wantErrLabel := fmt.Sprintf("%d session errors", baseErr+1)
+	if baseErr+1 == 1 {
+		wantErrLabel = "1 session error"
+	}
+	if ec.Count != baseErr+1 || ec.Label != wantErrLabel {
+		t.Fatalf("session_error: want count=%d label=%q, got %+v", baseErr+1, wantErrLabel, ec)
+	}
+	wantLink := "https://worker-e2e.fleet.example/app?dir=&session=" + root
+	if ec.Link == nil || *ec.Link != wantLink {
+		t.Fatalf("session_error link: contributor must be the ROOT, want %q, got %v", wantLink, ec.Link)
+	}
+	if errGen.KnownOverall != "degraded" {
+		t.Fatalf("error must drive known_overall=degraded, got %+v", errGen)
+	}
+	wantGauge := fmt.Sprintf("%d/%d busy", baseBusy, baseTotal)
+	if errGen.Gauge.Label != wantGauge {
+		t.Fatalf("error must NOT move the gauge (carve-out): want %q, got %q", wantGauge, errGen.Gauge.Label)
+	}
+
+	// 3. RETRY leg: childRetry into ActivityRetry (session.status retry —
+	//    mirrored into the fake's /session/status so the reconcile keeps it).
+	c.Fake.EmitSessionRetry(childRetry)
+	// Worker wire: BOTH descendants surfaced — subtree_error still 1,
+	// subtree_retry 1 — and the root's subtree is now BUSY (retry is
+	// busy-class), unlike the error leg.
+	waitLeanEntry("subtree_error==1 && subtree_retry==1 && subtree_busy", func(f fleetLeanFacts) bool {
+		return f.SubtreeError != nil && *f.SubtreeError == 1 &&
+			f.SubtreeRetry != nil && *f.SubtreeRetry == 1 &&
+			f.SubtreeBusy
+	})
+	// Controller fold: session_retry joins (base+1), session_error
+	// survives, and the retry moves the gauge numerator through the root's
+	// subtree_busy (the child is excluded from the fold, so the +1 can only
+	// propagate).
+	wantBusy := fmt.Sprintf("%d/%d busy", baseBusy+1, baseTotal)
+	retryGen := waitFleetRollup(c, t, 15*time.Second, "session_retry==base+1 and gauge "+wantBusy, func(v fleetRollupView) bool {
+		if !v.Coverage.Complete || !v.Gauge.Available || v.Gauge.Label != wantBusy {
+			return false
+		}
+		return fleetCondCount(v, "session_retry") == baseRetry+1 && fleetCondCount(v, "session_error") == baseErr+1
+	})
+	rc := fleetCond(retryGen, "session_retry")
+	if rc == nil {
+		t.Fatal("session_retry condition must be present")
+	}
+	if rc.Count != baseRetry+1 || rc.Link == nil || *rc.Link != wantLink {
+		t.Fatalf("session_retry: want count=%d link=%q, got %+v", baseRetry+1, wantLink, rc)
+	}
+	if got := fleetCondCount(retryGen, "session_error"); got != baseErr+1 {
+		t.Fatalf("session_error must survive the retry arm, got %d", got)
+	}
+
+	// 4. CLEARING through the real path: /fixture/reset emits session.idle
+	//    for each child (clears error AND retry activity + the busy mirror);
+	//    every surface returns to the baseline.
+	fleetWorkerPost(c, t, "/oc/fixture/reset?session="+childErr)
+	fleetWorkerPost(c, t, "/oc/fixture/reset?session="+childRetry)
+	waitLeanEntry("cleared: root quiet again", func(f fleetLeanFacts) bool {
+		return !f.SubtreeBusy &&
+			f.SubtreeError != nil && *f.SubtreeError == 0 &&
+			f.SubtreeRetry != nil && *f.SubtreeRetry == 0
+	})
+	waitFleetRollup(c, t, 15*time.Second, "rollup back to baseline (no error/retry conditions, gauge baseline)", func(v fleetRollupView) bool {
+		if !v.Coverage.Complete || !v.Gauge.Available || v.Gauge.Label != wantGauge {
+			return false
+		}
+		if fleetCondCount(v, "session_error") != baseErr || fleetCondCount(v, "session_retry") != baseRetry {
+			return false
+		}
+		row := fleetDefaultProjectRow(v)
+		return row != nil && row.Busy == baseRow.Busy
 	})
 }

@@ -401,14 +401,35 @@ type GateFacts struct {
 	// with both kinds counts once). Same value family as the maintained
 	// subtreePendingInput index (differential-tested against it).
 	SubtreePendingInput int `json:"subtree_pending_input,omitempty"`
+
+	// SubtreeError / SubtreeRetry count the SESSIONS in this session's
+	// subtree (inclusive of self) whose activity is error / retry — NOT error
+	// objects or non-"stop" finish reasons. POINTERS by contract (the S3
+	// presence-aware fold): this package's derivations ALWAYS set them
+	// (nonnil zero on supported entries, all capture paths — full snapshot,
+	// lean /vh/gates, partial frontier frame), so a nil after decode means
+	// the producer predates the activity counts and its data must not fold
+	// as observed zeros (the controller's acquisition validators reject
+	// nil-count entries in nonempty gate maps). omitempty only drops nil.
+	// The retry count is differential-tested against the maintained
+	// subtreeRetryCount index; the error count deliberately has NO maintained
+	// counterpart (error is excluded from the busy index by the error
+	// carve-out).
+	SubtreeError *int `json:"subtree_error,omitempty"`
+	SubtreeRetry *int `json:"subtree_retry,omitempty"`
 }
 
 // FleetSelectionRootUnarchivedV1 is the capability/version marker for the
 // fleet-watch projection carried on the snapshot envelope and the lean
 // /vh/gates envelope: "the gate facts in this payload speak fleet selection
-// root_unarchived_v1" (fleet_selected + the three subtree pending counts on
-// every gate entry). Additive self-description; consumers that do not know it
-// ignore it.
+// root_unarchived_v1" (fleet_selected + the three subtree pending counts +
+// the subtree_error/subtree_retry activity counts on every gate entry).
+// Additive self-description; consumers that do not know it ignore it.
+// Since the S3 slice the marker ALSO asserts the activity counts: a producer
+// emitting this marker without nonnil subtree_error/subtree_retry on every
+// nonempty-gate entry is an unsupported partial (the controller's validators
+// reject it — no legacy tolerance), so the marker value itself stays stable
+// and no second capability marker is needed for the counts.
 const FleetSelectionRootUnarchivedV1 = "root_unarchived_v1"
 
 // MessageWithParts mirrors OpenCode's GET /session/:id/message item shape.

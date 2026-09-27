@@ -10,6 +10,7 @@ package state
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -254,6 +255,170 @@ func TestFleetAggregatesDifferentialWithMaintainedUnion(t *testing.T) {
 	check("orphan pending")
 	s.Apply(ev("session.created", `{"info":{"id":"r3"}}`))
 	check("reabsorbed")
+}
+
+// TestFleetSelectedSubtreeActivityCounts pins the S3 subtree ACTIVITY
+// surface: per-kind subtree error/retry SESSION counts (inclusive of self)
+// on every gate entry, as ALWAYS-NONNIL pointers — the presence contract
+// that lets the controller distinguish a supported zero (explicit 0) from a
+// producer that predates the counts (nil, rejected at acquisition). A
+// resident descendant's error/retry surfaces on its selected root even
+// though the descendant is itself outside the selected population, and a
+// session in error does NOT contribute to the retry count (or vice versa).
+func TestFleetSelectedSubtreeActivityCounts(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"root"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"childE","parentID":"root"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"childR","parentID":"root"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"grandE","parentID":"childR"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"rootSelfErr"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"quiet"}}`))
+
+	// session.error is the ONLY ActivityError source (a session.status
+	// type:"error" normalizes to idle); retry seeds via session.status.
+	s.Apply(ev("session.error", `{"sessionID":"childE"}`))
+	s.Apply(ev("session.error", `{"sessionID":"grandE"}`))
+	s.Apply(ev("session.status", `{"sessionID":"childR","status":{"type":"retry"}}`))
+	s.Apply(ev("session.error", `{"sessionID":"rootSelfErr"}`))
+
+	gates := s.GateFacts()
+	// Presence first: EVERY entry (selected or not, quiet or not) carries
+	// both pointers — the shared derivation never omits them.
+	for sid, g := range gates {
+		if g.SubtreeError == nil || g.SubtreeRetry == nil {
+			t.Fatalf("session %s: subtree_error/subtree_retry must be nonnil on every derived entry, got %+v", sid, g)
+		}
+	}
+	// root's subtree: childE + grandE in error, childR in retry.
+	if g := gates["root"]; *g.SubtreeError != 2 || *g.SubtreeRetry != 1 {
+		t.Errorf("root subtree activity: want err=2 retry=1, got %+v", g)
+	}
+	// childR: own retry + grandE's error below it.
+	if g := gates["childR"]; *g.SubtreeError != 1 || *g.SubtreeRetry != 1 {
+		t.Errorf("childR subtree activity: want err=1 retry=1, got %+v", g)
+	}
+	// Leaves count only themselves; kinds never cross.
+	if g := gates["childE"]; *g.SubtreeError != 1 || *g.SubtreeRetry != 0 {
+		t.Errorf("childE subtree activity: want err=1 retry=0, got %+v", g)
+	}
+	if g := gates["grandE"]; *g.SubtreeError != 1 || *g.SubtreeRetry != 0 {
+		t.Errorf("grandE subtree activity: want err=1 retry=0, got %+v", g)
+	}
+	// Self-inclusive on a selected root; supported zero on a quiet root.
+	if g := gates["rootSelfErr"]; *g.SubtreeError != 1 || *g.SubtreeRetry != 0 {
+		t.Errorf("rootSelfErr subtree activity: want err=1 retry=0 (self-inclusive), got %+v", g)
+	}
+	if g := gates["quiet"]; *g.SubtreeError != 0 || *g.SubtreeRetry != 0 {
+		t.Errorf("quiet subtree activity: want err=0 retry=0 (supported zero), got %+v", g)
+	}
+	// The filtered accessor carries the identical facts.
+	filt := s.GateFactsFleetSelected()
+	for _, sid := range []string{"root", "rootSelfErr", "quiet"} {
+		other, ok := filt[sid]
+		if !ok {
+			t.Fatalf("filtered accessor: selected root %s missing", sid)
+		}
+		if *other.SubtreeError != *gates[sid].SubtreeError || *other.SubtreeRetry != *gates[sid].SubtreeRetry {
+			t.Errorf("filtered entry %s drifted from the complete map: %+v vs %+v", sid, other, gates[sid])
+		}
+	}
+	for _, sid := range []string{"childE", "childR", "grandE"} {
+		if _, ok := filt[sid]; ok {
+			t.Errorf("filtered accessor: child %s must never appear", sid)
+		}
+	}
+
+	// WIRE shape: a supported zero SERIALIZES (an explicit "subtree_error":0
+	// / "subtree_retry":0) — omitempty only drops the nil. This is the
+	// producer half of the presence contract.
+	b, err := json.Marshal(gates["quiet"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"subtree_error":0`, `"subtree_retry":0`} {
+		if !strings.Contains(string(b), key) {
+			t.Fatalf("quiet root wire: want explicit %s on a supported zero, got %s", key, b)
+		}
+	}
+
+	// Recovery: the error clears (a live session.idle), the counts follow.
+	s.Apply(ev("session.idle", `{"sessionID":"childE"}`))
+	gates = s.GateFacts()
+	if g := gates["root"]; *g.SubtreeError != 1 || *g.SubtreeRetry != 1 {
+		t.Errorf("root after childE idle: want err=1 retry=1, got %+v", g)
+	}
+	s.Apply(ev("session.idle", `{"sessionID":"childR"}`))
+	s.Apply(ev("session.idle", `{"sessionID":"grandE"}`))
+	gates = s.GateFacts()
+	if g := gates["root"]; *g.SubtreeError != 0 || *g.SubtreeRetry != 0 {
+		t.Errorf("root after full recovery: want err=0 retry=0, got %+v", g)
+	}
+}
+
+// TestFleetAggregatesRetryDifferentialWithMaintainedIndex pins the read-time
+// retry projection against the MAINTAINED subtreeRetryCount index across the
+// lifecycle inputs the index's own writers cover (activity transitions,
+// create, reparent, delete) — the S3 differential the brief prescribes
+// instead of a new mutable index. (The error count has no maintained
+// counterpart by design; its equivalence to the busy index is deliberately
+// NOT asserted — error is excluded from subtreeBusyCount by the carve-out.)
+func TestFleetAggregatesRetryDifferentialWithMaintainedIndex(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"r1"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"c1","parentID":"r1"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"g1","parentID":"c1"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"r2"}}`))
+
+	check := func(stage string) {
+		t.Helper()
+		s.mu.RLock()
+		read := s.computeFleetAggregatesLocked()
+		maint := map[string]int{}
+		for id, v := range s.subtreeRetryCount {
+			maint[id] = v
+		}
+		s.mu.RUnlock()
+		ids := map[string]bool{}
+		for id := range maint {
+			ids[id] = true
+		}
+		for id := range read {
+			ids[id] = true
+		}
+		for id := range ids {
+			if read[id].retrySessions != maint[id] {
+				t.Fatalf("%s: retry drift at %s: read=%d maintained=%d", stage, id, read[id].retrySessions, maint[id])
+			}
+		}
+	}
+
+	check("seed (all idle)")
+	// busy→retry is retry-CHANGING: both the index and the read projection
+	// must flip together.
+	s.Apply(ev("session.status", `{"sessionID":"g1","status":{"type":"busy"}}`))
+	check("g1 busy (retry count still 0)")
+	s.Apply(ev("session.status", `{"sessionID":"g1","status":{"type":"retry"}}`))
+	check("g1 retry (propagates to r1/c1)")
+	s.Apply(ev("session.status", `{"sessionID":"g1","status":{"type":"idle"}}`))
+	check("g1 idle (cleared)")
+	s.Apply(ev("session.status", `{"sessionID":"g1","status":{"type":"retry"}}`))
+	s.Apply(ev("session.status", `{"sessionID":"r2","status":{"type":"retry"}}`))
+	check("two retrying sessions in distinct subtrees")
+	// Reparent c1 (with g1 retrying below it) under r2.
+	s.Apply(ev("session.updated", `{"info":{"id":"c1","parentID":"r2"}}`))
+	check("post-reparent (r1 loses, r2 gains)")
+	// Delete the retrying leaf; contributions leave with it.
+	s.RemoveSessions([]string{"g1"})
+	check("post-delete")
+	// session.error on the remaining retry root flips retry→error: the
+	// retry index must drop while the error count rises (checked via the
+	// gate surface, since error has no maintained index).
+	s.Apply(ev("session.error", `{"sessionID":"r2"}`))
+	check("r2 error (retry index drops)")
+	g := s.GateFacts()["r2"]
+	if *g.SubtreeError != 1 || *g.SubtreeRetry != 0 {
+		t.Fatalf("r2 after error: want subtree err=1 retry=0, got %+v", g)
+	}
 }
 
 // TestSnapshotFleetSelectionContract pins the SNAPSHOT side of the wire

@@ -131,13 +131,15 @@ func fleetAddOnline(t *testing.T, reg *Registry, id string) {
 	})
 }
 
-// fleetGF builds one scripted gate fact the way a REAL slice-2 worker
+// fleetGF builds one scripted gate fact the way a REAL slice-3 worker
 // derives it for a SELECTED root: fleet_selected=true, self-inclusive
-// subtree busy for own busy/retry, and the per-kind/union subtree pending
+// subtree busy for own busy/retry, the per-kind/union subtree pending
 // counts agreeing with the self-only booleans (a root holding the pending
-// input itself contributes 1 to its own subtree counts). Workers that fold
-// DESCENDANT waits emit larger subtree ints on the root — the
-// descendant-wait tests script those directly.
+// input itself contributes 1 to its own subtree counts), and nonnil
+// subtree_error/subtree_retry counts (own activity error/retry contributes
+// 1; a quiet root carries an explicit supported zero). Workers that fold
+// DESCENDANT waits or descendant error/retry sessions emit larger subtree
+// ints on the root — the descendant tests script those directly.
 func fleetGF(activity string, perm, quest bool) state.GateFacts {
 	sel := true
 	gf := state.GateFacts{
@@ -156,6 +158,17 @@ func fleetGF(activity string, perm, quest bool) state.GateFacts {
 	if perm || quest {
 		gf.SubtreePendingInput = 1
 	}
+	// Activity counts are pointers on the S3 wire: a real producer ALWAYS
+	// sets them (supported zero serializes as an explicit 0).
+	errN, retryN := 0, 0
+	if activity == "error" {
+		errN = 1
+	}
+	if activity == "retry" {
+		retryN = 1
+	}
+	gf.SubtreeError = &errN
+	gf.SubtreeRetry = &retryN
 	return gf
 }
 
@@ -1106,11 +1119,13 @@ func TestFleetStatus_LimitedDetailCumulative(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "w1")
 	// Fixed literals so the byte math is exact: the /a snapshot carries the
 	// fleet_selection marker (the fallback validator requires it) and its
-	// session carries fleet_selected (gauge-semantics fold: only selected
-	// roots count). Discovery (27 B) + snapA together exceed the 38-B
-	// budget, so the trip names /a (whose observation still counts).
+	// session carries the FULL S3 vocabulary (fleet_selected + nonnil
+	// subtree_error/subtree_retry — an error root contributes 1, a quiet
+	// retry count serializes as an explicit supported zero). Discovery
+	// (27 B) + snapA together exceed the 38-B budget, so the trip names /a
+	// (whose observation still counts).
 	discovery := `[{"dir":"/a"},{"dir":"/b"}]`
-	snapA := `{"fleet_selection":"root_unarchived_v1","gate":{"s1":{"activity":"error","fleet_selected":true}}}`
+	snapA := `{"fleet_selection":"root_unarchived_v1","gate":{"s1":{"activity":"error","fleet_selected":true,"subtree_error":1,"subtree_retry":0}}}`
 	fake.setBody("w1", "/vh/projects", discovery)
 	fake.setBody("w1", "/vh/snapshot?z=1&dir=%2Fa", snapA)
 	svc := d.fleetStatusService()
@@ -1975,6 +1990,218 @@ func TestFleetStatus_DescendantPendingSurfacesOnRoot(t *testing.T) {
 	}
 }
 
+// TestFleetStatus_DescendantErrorRetrySurfacesOnRoot pins the S3 subtree
+// error/retry fold through the LEAN path: the wire carries ONLY the selected
+// roots (the errored/retrying children never cross the tunnel), the roots'
+// subtree activity counts surface the descendant sessions — the condition
+// COUNT is the summed SESSION count (N error sessions on one contributing
+// root, not roots), labels/links name the ROOT, error does NOT count as busy
+// (the gauge carve-out) while retry does (subtree_busy), and known_overall
+// is degraded when any error session is observed. Mirrors
+// TestFleetStatus_DescendantPendingSurfacesOnRoot shape-for-shape.
+func TestFleetStatus_DescendantErrorRetrySurfacesOnRoot(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "$ID.example.test")
+	fleetAddOnline(t, d.Registry, "w")
+	// root-err: OWN activity idle, two DESCENDANT sessions in error — the
+	// count units are descendant sessions surfaced on a non-error root.
+	errRoot := fleetGF("idle", false, false)
+	errRoot.SubtreeError = intPtr(2)
+	// root-retry: three descendant retrying sessions; retry is busy-class,
+	// so the root's subtree_busy is true (a real worker always derives it).
+	retryRoot := fleetGF("idle", false, false)
+	retryRoot.SubtreeRetry = intPtr(3)
+	retryRoot.SubtreeBusy = true
+	fake.setBody("w", "/vh/projects", fleetProjectsBody("/repo"))
+	fake.setBody("w", fleetGatesPath("/repo"), fleetGatesBody(map[string]map[string]state.GateFacts{
+		"/repo": {"root-err": errRoot, "root-retry": retryRoot},
+	}))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	want := []string{fleetCondSessionError, fleetCondSessionRetry}
+	got := condKinds(resp)
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("conditions: want %v, got %v", want, got)
+	}
+	for _, c := range resp.Conditions {
+		switch c.Kind {
+		case fleetCondSessionError:
+			if c.Count != 2 || c.Label != "2 session errors" {
+				t.Fatalf("session_error: want count=2 label=\"2 session errors\" (summed descendant sessions), got %+v", c)
+			}
+			if c.Link == nil || *c.Link != "https://w.example.test/app?dir=%2Frepo&session=root-err" {
+				t.Fatalf("session_error link must deep-link the contributing ROOT, got %v", c.Link)
+			}
+		case fleetCondSessionRetry:
+			if c.Count != 3 || c.Label != "3 sessions retrying" {
+				t.Fatalf("session_retry: want count=3 label=\"3 sessions retrying\", got %+v", c)
+			}
+			if c.Link == nil || *c.Link != "https://w.example.test/app?dir=%2Frepo&session=root-retry" {
+				t.Fatalf("session_retry link must deep-link the contributing ROOT, got %v", c.Link)
+			}
+		}
+	}
+	// Severity: error is degraded; retry alone would be attention.
+	if resp.KnownOverall != fleetOverallDegraded {
+		t.Fatalf("known_overall: want degraded (error observed), got %s", resp.KnownOverall)
+	}
+	if resp.Summary != "2 session errors" {
+		t.Fatalf("summary must lead with session_error, got %q", resp.Summary)
+	}
+	// Gauge: error does NOT make the root busy (the carve-out), retry does —
+	// 1/2 over the selected population.
+	if !resp.Gauge.Available || resp.Gauge.Label != "1/2 busy" {
+		t.Fatalf("gauge: want 1/2 busy (error≠busy, retry=busy), got %+v", resp.Gauge)
+	}
+	// Project rows: both roots share /repo → ONE row, severity-ranked by
+	// err>retry; 2 sessions, 1 busy (the retry root only — error≠busy).
+	if len(resp.Projects) != 1 {
+		t.Fatalf("one row per dir expected (both roots share /repo): got %+v", resp.Projects)
+	}
+	if p := resp.Projects[0]; p.Dir != "/repo" || p.Sessions != 2 || p.Busy != 1 {
+		t.Fatalf("project row: want dir=/repo sessions=2 busy=1, got %+v", p)
+	}
+}
+
+// intPtr is the test-scripting shorthand for the pointer-valued activity
+// counts (the production derivation always sets them; tests inject values a
+// real worker would emit for descendant aggregation).
+func intPtr(n int) *int { return &n }
+
+// TestFleetStatus_SubtreeCountPresenceValidation pins the S3 presence
+// contract on BOTH acquisition validators: a producer that speaks the
+// CURRENT marker but omits the subtree activity counts is a SAME-VOCABULARY
+// PARTIAL — rejected exactly like a field-less producer (lean routes to the
+// fallback; a fallback that also lacks the counts classifies the worker
+// error) — never folded with missing fields silently read as zero. Negative
+// counts are malformed. Explicit supported zeros are valid and fold as
+// observed zeros (no conditions). A marked empty gate map needs no counts
+// (already pinned by TestFleetStatus_SupportedEmptyGaugeStaysHonest).
+func TestFleetStatus_SubtreeCountPresenceValidation(t *testing.T) {
+	t.Run("lean same-marker partial routes to fallback", func(t *testing.T) {
+		// fleet_selected present, marker correct, subtree_error/retry ABSENT
+		// — the exact shape a pre-S3 worker emits under the same marker.
+		d, fake := newFleetTestDaemon(t, "")
+		fleetAddOnline(t, d.Registry, "w")
+		fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+		fake.setBody("w", fleetGatesPath("/a"),
+			`{"schema":1,"fleet_selection":"root_unarchived_v1","projects":[{"dir":"/a",`+
+				`"gate":{"s1":{"activity":"error","fleet_selected":true}}}]}`)
+		fake.setBody("w", "/vh/snapshot?z=1&dir=%2Fa", fleetSnapBody(map[string]state.GateFacts{
+			"s1": fleetGF("error", false, false),
+		}))
+
+		resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+		if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
+			t.Fatalf("count-less lean must fall back to a valid snapshot and end ok, got %+v", w)
+		}
+		if n := fake.count("w"); n != 3 {
+			t.Fatalf("calls: want discovery + rejected lean + 1 snapshot, got %d", n)
+		}
+		// The fallback's OWN vocabulary (counts present) drives the fold.
+		if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondSessionError || resp.Conditions[0].Count != 1 {
+			t.Fatalf("fallback observation must drive conditions, got %v", resp.Conditions)
+		}
+	})
+	t.Run("negative counts are malformed", func(t *testing.T) {
+		d, fake := newFleetTestDaemon(t, "")
+		fleetAddOnline(t, d.Registry, "w")
+		fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+		fake.setBody("w", fleetGatesPath("/a"),
+			`{"schema":1,"fleet_selection":"root_unarchived_v1","projects":[{"dir":"/a",`+
+				`"gate":{"s1":{"activity":"idle","fleet_selected":true,"subtree_error":-1,"subtree_retry":0}}}]}`)
+		fake.setBody("w", "/vh/snapshot?z=1&dir=%2Fa", fleetSnapBody(map[string]state.GateFacts{
+			"s1": fleetGF("idle", false, false),
+		}))
+
+		resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+		if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
+			t.Fatalf("negative-count lean must fall back (malformed, not supported-zero), got %+v", w)
+		}
+		if got := condKinds(resp); len(got) != 0 {
+			t.Fatalf("no conditions expected from the valid fallback's quiet root, got %v", got)
+		}
+	})
+	t.Run("fallback same-marker partial is explicit error", func(t *testing.T) {
+		d, fake := newFleetTestDaemon(t, "")
+		applyFleetRosters(t, d, []string{"w"}, []string{"/a"})
+		fleetAddOnline(t, d.Registry, "w")
+		fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+		// No lean body scripted → fallback; counts absent on a nonempty gate.
+		fake.setBody("w", "/vh/snapshot?z=1&dir=%2Fa",
+			`{"fleet_selection":"root_unarchived_v1","gate":{"s1":{"activity":"error","fleet_selected":true}}}`)
+
+		resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+		w := workerEntry(t, resp, "w")
+		if w.Status != fleetWorkerError {
+			t.Fatalf("count-less fallback: want error, got %+v", w)
+		}
+		if w.Detail != wantUnsupportedSelectionDetail("/vh/snapshot?z=1&dir=%2Fa") {
+			t.Fatalf("detail: want the unsupported-producer ask, got %q", w.Detail)
+		}
+		// Never a healthy fold: the error session must not surface as a
+		// condition from data the validator rejected.
+		if got := condKinds(resp); len(got) != 0 {
+			t.Fatalf("rejected entries must not fold, got %v", got)
+		}
+		if resp.Coverage.Complete || resp.Gauge.Available {
+			t.Fatalf("unsupported producer must stay incomplete/unavailable, got %+v", resp.Coverage)
+		}
+	})
+	t.Run("explicit supported zeros fold as observed zeros", func(t *testing.T) {
+		d, fake := newFleetTestDaemon(t, "")
+		fleetAddOnline(t, d.Registry, "w")
+		fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+		fake.setBody("w", fleetGatesPath("/a"),
+			`{"schema":1,"fleet_selection":"root_unarchived_v1","projects":[{"dir":"/a",`+
+				`"gate":{"s1":{"activity":"idle","fleet_selected":true,"subtree_error":0,"subtree_retry":0}}}]}`)
+
+		resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+		if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
+			t.Fatalf("explicit zeros are a supported quiet root, got %+v", w)
+		}
+		if n := fake.count("w"); n != 2 {
+			t.Fatalf("calls: want discovery + lean only (no fallback), got %d", n)
+		}
+		if got := condKinds(resp); len(got) != 0 {
+			t.Fatalf("a supported zero must fold as NO condition, got %v", got)
+		}
+		if !resp.Gauge.Available || resp.Gauge.Label != "0/1 busy" {
+			t.Fatalf("gauge: want 0/1 busy, got %+v", resp.Gauge)
+		}
+	})
+}
+
+// TestFleetStatus_DoneAndDescendantErrorCoexist pins the strict-stop
+// UNCHANGED by S3: session_done's quiescence remains `!subtree_busy &&
+// subtree_pending_input == 0` — subtree error/retry counts do NOT gate done.
+// A root whose descendant is in ERROR (excluded from subtree_busy by the
+// carve-out, holds no pending input) with an otherwise-finished own turn is
+// BOTH done AND a session_error contributor: the conditions coexist, done
+// stays informational (degraded comes from the error, not the finish).
+func TestFleetStatus_DoneAndDescendantErrorCoexist(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	fleetAddOnline(t, d.Registry, "w")
+	doneErr := fleetDoneGF()
+	doneErr.SubtreeError = intPtr(1) // one descendant session in error
+	fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+	fake.setBody("w", fleetGatesPath("/a"), fleetGatesBody(map[string]map[string]state.GateFacts{
+		"/a": {"root": doneErr},
+	}))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	want := []string{fleetCondSessionError, fleetCondSessionDone}
+	got := condKinds(resp)
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("conditions: want %v (error AND done coexisting), got %v", want, got)
+	}
+	if resp.KnownOverall != fleetOverallDegraded {
+		t.Fatalf("known_overall: want degraded (error input; done never adds severity), got %s", resp.KnownOverall)
+	}
+	if resp.Summary != "1 session error" {
+		t.Fatalf("summary: want the error lead, got %q", resp.Summary)
+	}
+}
+
 // TestFleetStatus_SelectedFoldSnapshotPath pins the SAME selected-population
 // fold through the SNAPSHOT fallback: children and archived roots arrive in
 // the complete gate map and are filtered by fleet_selected at the fold.
@@ -1991,11 +2218,14 @@ func TestFleetStatus_SelectedFoldSnapshotPath(t *testing.T) {
 	selFalse := false
 	fake.setBody("w", "/vh/projects", fleetProjectsBody("/repo"))
 	// No lean body scripted → the lean attempt fails → snapshot fallback.
+	// The raw literals carry the full S3 vocabulary (nonnil activity counts)
+	// — a real current worker always sets the pointers.
+	zero := 0
 	fake.setBody("w", "/vh/snapshot?z=1&dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{
-		"root-busy":  {Activity: "busy", FleetSelected: &selTrue},  // busy root (belt: no subtree_busy)
-		"root-idle":  fleetGF("idle", false, false),                // selected, idle
-		"child-busy": {Activity: "busy", FleetSelected: &selFalse}, // child: not in the fold population
-		"arch-root":  {Activity: "idle", FleetSelected: &selFalse}, // archived root: excluded
+		"root-busy":  {Activity: "busy", FleetSelected: &selTrue, SubtreeError: &zero, SubtreeRetry: &zero},  // busy root (belt: no subtree_busy)
+		"root-idle":  fleetGF("idle", false, false),                                                          // selected, idle
+		"child-busy": {Activity: "busy", FleetSelected: &selFalse, SubtreeError: &zero, SubtreeRetry: &zero}, // child: not in the fold population
+		"arch-root":  {Activity: "idle", FleetSelected: &selFalse, SubtreeError: &zero, SubtreeRetry: &zero}, // archived root: excluded
 	}))
 
 	resp := decodeFleet(t, doFleet(d.buildRootHandler()))

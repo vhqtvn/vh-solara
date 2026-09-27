@@ -887,6 +887,13 @@ func gateFactsFromScalars(sc snapSessionCap, subtreeBusy bool, agg fleetNodeAgg)
 		SubtreePendingPermission: agg.permPending,
 		SubtreePendingQuestion:   agg.questPending,
 		SubtreePendingInput:      agg.unionPending,
+		// Activity counts (S3): POINTERS, always nonnil from this derivation
+		// — a supported zero serializes as an explicit 0 and only nil (a
+		// producer predating the counts) is omitted. Every capture path
+		// (full snapshot, lean /vh/gates, partial frontier frame) flows
+		// through this one composition, so presence is uniform.
+		SubtreeError: &agg.errSessions,
+		SubtreeRetry: &agg.retrySessions,
 		// Tokens is the caller's private byte copy — assigned directly (no
 		// aliasing; see the capture-phase copy invariant).
 		Tokens: sc.lastTokens,
@@ -970,17 +977,24 @@ func (s *Store) GateFactsFleetSelected() map[string]GateFacts {
 }
 
 // fleetNodeAgg is one session's fleet-watch projection: the selected flag
-// (effective root + not archived under any authority) and the subtree pending
-// SESSION counts (inclusive of self). Computed READ-TIME under one lock span
-// by computeFleetAggregatesLocked — deliberately NO new maintained indexes
-// (the store's union-only subtreePendingInput index cannot supply per-kind
-// counts, and adding maintained counters would expand every lifecycle
-// writer's obligations; see the gauge brief's O1-vs-O2 debate).
+// (effective root + not archived under any authority), the subtree pending
+// SESSION counts (inclusive of self), and the subtree ACTIVITY session
+// counts (error / retry, inclusive of self — the S3 fold inputs). Computed
+// READ-TIME under one lock span by computeFleetAggregatesLocked —
+// deliberately NO new maintained indexes (the store's union-only
+// subtreePendingInput index cannot supply per-kind counts, and adding
+// maintained counters would expand every lifecycle writer's obligations; see
+// the gauge brief's O1-vs-O2 debate). The retry count is differential-tested
+// against the maintained subtreeRetryCount index; the error count has no
+// maintained counterpart by design (the error carve-out excludes error from
+// the busy index).
 type fleetNodeAgg struct {
-	selected     bool
-	permPending  int
-	questPending int
-	unionPending int
+	selected      bool
+	permPending   int
+	questPending  int
+	unionPending  int
+	errSessions   int
+	retrySessions int
 }
 
 // computeFleetAggregatesLocked derives the fleet-watch projection for every
@@ -989,13 +1003,19 @@ type fleetNodeAgg struct {
 //
 // Per-kind counts: ONE memoized post-order traversal over the children
 // forest (rootIDs → descendants), summing each node's own pending booleans
-// into its ancestors' per-kind counters. Cycle-safe (a malformed parent cycle
-// terminates; its members are never reachable from rootIDs and therefore get
-// no aggregate entry — readers treat missing as zero/unselected, pinning the
-// existing no-root behavior instead of inventing a topology repair). The
-// union count is derived in the same traversal (self perm-or-quest) so
-// per-kind and union facts share one topology observation; its equivalence
-// to the maintained subtreePendingInput index is differential-tested.
+// and activity-error/retry contributions into its ancestors' per-kind
+// counters. The error/retry counts (S3) ride the SAME traversal with the
+// same memoization — no new algorithm, no new maintained index; a session in
+// ActivityError contributes 1 to errSessions and 0 to retrySessions
+// regardless of any busy-class index (the error carve-out: error is not
+// busy). Cycle-safe (a malformed parent cycle terminates; its members are
+// never reachable from rootIDs and therefore get no aggregate entry —
+// readers treat missing as zero/unselected, pinning the existing no-root
+// behavior instead of inventing a topology repair). The union count is
+// derived in the same traversal (self perm-or-quest) so per-kind and union
+// facts share one topology observation; its equivalence to the maintained
+// subtreePendingInput index is differential-tested, as is the retry count's
+// equivalence to the maintained subtreeRetryCount index.
 //
 // Selection: the predicate REUSES the store's established tree/archive
 // authorities verbatim — effectiveParentOfLocked (root collapse),
@@ -1003,8 +1023,8 @@ type fleetNodeAgg struct {
 // (authoritative snapshot membership), chainTerminatesAtArchivedLocked (the
 // §9.1 archived-chain orphan rule) — rather than reconstructing them from
 // JSON timestamps. A resident child of a live root is never selected
-// (it is not an effective root), but its pending input still reaches its
-// root through the counts above.
+// (it is not an effective root), but its pending input and error/retry
+// activity still reach its root through the counts above.
 func (s *Store) computeFleetAggregatesLocked() map[string]fleetNodeAgg {
 	agg := make(map[string]fleetNodeAgg, len(s.sessions))
 	inProgress := map[string]bool{}
@@ -1027,12 +1047,20 @@ func (s *Store) computeFleetAggregatesLocked() map[string]fleetNodeAgg {
 		if a.permPending > 0 || a.questPending > 0 {
 			a.unionPending = 1
 		}
+		if s.activity[id] == ActivityError {
+			a.errSessions = 1
+		}
+		if s.activity[id] == ActivityRetry {
+			a.retrySessions = 1
+		}
 		for _, cid := range s.children[id] {
 			visit(cid)
 			ca := agg[cid] // zero value if a cycle guard skipped it
 			a.permPending += ca.permPending
 			a.questPending += ca.questPending
 			a.unionPending += ca.unionPending
+			a.errSessions += ca.errSessions
+			a.retrySessions += ca.retrySessions
 		}
 		agg[id] = a
 	}

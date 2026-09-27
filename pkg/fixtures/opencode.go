@@ -1123,6 +1123,22 @@ func (f *FakeOpenCode) EmitSessionBusy(sessionID string) {
 	})
 }
 
+// EmitSessionRetry emits a LIVE session.status retry for sessionID through
+// the fake's real /event stream, seeding the aggregator store's
+// ActivityRetry (the only retry-activity source besides a hydrate from
+// /session/status). Sibling of EmitSessionBusy (same TEST-ONLY contract:
+// deterministic, sticky, no side effects; never reached by the shipped
+// binary) added for the S3 fleet-status descendant-retry proof. Like every
+// session.status emit, the fake mirrors the status into its /session/status
+// busy map (type "retry"), so the aggregator's periodic status reconcile
+// PRESERVES the retry instead of clearing it — the property that makes a
+// sticky retry deterministic for e2e polling.
+func (f *FakeOpenCode) EmitSessionRetry(sessionID string) {
+	f.emit("session.status", map[string]any{
+		"sessionID": sessionID, "status": map[string]any{"type": "retry"},
+	})
+}
+
 // EmitSessionTerminal emits a turn-TERMINAL event (session.idle or
 // session.error) for sessionID through the fake's real /event stream. It is the
 // deterministic P7 Slice 3 release seam: the event propagates fixture /event →

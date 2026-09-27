@@ -90,6 +90,30 @@ func TestGateFactsLeanParityWithSnapshot(t *testing.T) {
 		t.Errorf("idle1: want subtree perm=1 union=1, got %+v", g)
 	}
 
+	// --- S3 subtree activity counts ---
+	// Presence on EVERY entry (the controller's validators reject nil counts
+	// in nonempty gate maps — the lean path is one of the three capture
+	// paths that must never omit them), then the per-kind sums: root's
+	// subtree holds err (error) + grand (retry); idle1's holds grand (retry);
+	// the error carve-out means err contributes to NO busy-class fact.
+	for sid, g := range lean {
+		if g.SubtreeError == nil || g.SubtreeRetry == nil {
+			t.Fatalf("%s: subtree_error/subtree_retry must be nonnil on the lean path, got %+v", sid, g)
+		}
+	}
+	if g := lean["root"]; *g.SubtreeError != 1 || *g.SubtreeRetry != 1 {
+		t.Errorf("root: want subtree err=1 retry=1, got %+v", g)
+	}
+	if g := lean["idle1"]; *g.SubtreeError != 0 || *g.SubtreeRetry != 1 {
+		t.Errorf("idle1: want subtree err=0 retry=1, got %+v", g)
+	}
+	if g := lean["err"]; *g.SubtreeError != 1 || *g.SubtreeRetry != 0 || g.SubtreeBusy {
+		t.Errorf("err: want subtree err=1 retry=0 and NOT subtree-busy (carve-out), got %+v", g)
+	}
+	if g := lean["grand"]; *g.SubtreeError != 0 || *g.SubtreeRetry != 1 {
+		t.Errorf("grand: want subtree err=0 retry=1, got %+v", g)
+	}
+
 	filt := s.GateFactsFleetSelected()
 	if len(filt) != 1 {
 		t.Fatalf("filtered lean map: want exactly [root], got %d entries", len(filt))
