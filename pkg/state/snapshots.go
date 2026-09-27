@@ -894,6 +894,11 @@ func gateFactsFromScalars(sc snapSessionCap, subtreeBusy bool, agg fleetNodeAgg)
 		// through this one composition, so presence is uniform.
 		SubtreeError: &agg.errSessions,
 		SubtreeRetry: &agg.retrySessions,
+		// Root-scoped finished-unread (unread slice): same presence-aware
+		// pointer contract — always nonnil here (false serializes as an
+		// explicit false), set from the store's unread map in the shared
+		// selection pass, so all three capture paths carry it uniformly.
+		Unread: &agg.unread,
 		// Tokens is the caller's private byte copy — assigned directly (no
 		// aliasing; see the capture-phase copy invariant).
 		Tokens: sc.lastTokens,
@@ -978,8 +983,9 @@ func (s *Store) GateFactsFleetSelected() map[string]GateFacts {
 
 // fleetNodeAgg is one session's fleet-watch projection: the selected flag
 // (effective root + not archived under any authority), the subtree pending
-// SESSION counts (inclusive of self), and the subtree ACTIVITY session
-// counts (error / retry, inclusive of self — the S3 fold inputs). Computed
+// SESSION counts (inclusive of self), the subtree ACTIVITY session
+// counts (error / retry, inclusive of self — the S3 fold inputs), and the
+// root-scoped finished-unread mark (the unread slice's fold input). Computed
 // READ-TIME under one lock span by computeFleetAggregatesLocked —
 // deliberately NO new maintained indexes (the store's union-only
 // subtreePendingInput index cannot supply per-kind counts, and adding
@@ -987,7 +993,10 @@ func (s *Store) GateFactsFleetSelected() map[string]GateFacts {
 // the gauge brief's O1-vs-O2 debate). The retry count is differential-tested
 // against the maintained subtreeRetryCount index; the error count has no
 // maintained counterpart by design (the error carve-out excludes error from
-// the busy index).
+// the busy index). The unread flag rides the SELECTION pass (a plain
+// s.unread[id] membership read — the mark is already root-scoped and
+// maintained by markUnreadLocked/clearUnreadLocked/AckUnread), so it needs
+// no traversal and no subtree aggregation.
 type fleetNodeAgg struct {
 	selected      bool
 	permPending   int
@@ -995,6 +1004,7 @@ type fleetNodeAgg struct {
 	unionPending  int
 	errSessions   int
 	retrySessions int
+	unread        bool
 }
 
 // computeFleetAggregatesLocked derives the fleet-watch projection for every
@@ -1068,10 +1078,19 @@ func (s *Store) computeFleetAggregatesLocked() map[string]fleetNodeAgg {
 		visit(r)
 	}
 	// Selection pass over every live session (independent of the traversal:
-	// non-roots and cycle members get entries too, selected=false).
+	// non-roots and cycle members get entries too, selected=false). The
+	// root-scoped unread mark rides the SAME pass — s.unread is keyed by
+	// rootOf and only ever holds effective roots (markUnreadLocked targets
+	// rootOfLocked), so unread=true can only appear on an entry that is its
+	// own subtree's root. Children never aggregate their root's mark (the
+	// mark IS the root's; the fold population is selected roots), and the
+	// belt-and-suspenders live-root intersection UnreadRoots applies is
+	// unnecessary here: the fold reads the flag only off fleet-selected
+	// entries, which are live effective roots by construction.
 	for sid, se := range s.sessions {
 		a := agg[sid]
 		a.selected = s.fleetSelectedLocked(sid, se)
+		a.unread = s.unread[sid]
 		agg[sid] = a
 	}
 	return agg

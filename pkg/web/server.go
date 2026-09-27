@@ -2165,7 +2165,10 @@ type fleetGatesProject struct {
 // state.Store.GateFactsFleetSelected). Subagent children and archived
 // sessions never cross the tunnel on this path; each selected root still
 // carries its subtree-aggregated pending counts (subtree_pending_permission
-// / question / input) so a descendant's wait surfaces on its root. The
+// / question / input) so a descendant's wait surfaces on its root, the
+// subtree activity counts (subtree_error/subtree_retry), and the
+// root-scoped finished-unread flag (`unread`, a presence-aware pointer —
+// the same signal POST /vh/ack clears). The
 // fleet_selection marker asserts the entries speak that vocabulary. A full
 // /vh/snapshot stays COMPLETE (children present, fleet_selected=false) — the
 // controller filters snapshot-derived gates by fleet_selected identically.

@@ -135,19 +135,23 @@ func fleetAddOnline(t *testing.T, reg *Registry, id string) {
 // derives it for a SELECTED root: fleet_selected=true, self-inclusive
 // subtree busy for own busy/retry, the per-kind/union subtree pending
 // counts agreeing with the self-only booleans (a root holding the pending
-// input itself contributes 1 to its own subtree counts), and nonnil
+// input itself contributes 1 to its own subtree counts), nonnil
 // subtree_error/subtree_retry counts (own activity error/retry contributes
-// 1; a quiet root carries an explicit supported zero). Workers that fold
+// 1; a quiet root carries an explicit supported zero), and a nonnil unread
+// tri-state (false by default — a quiet root's supported zero; tests that
+// want a finished-unread badge set it explicitly). Workers that fold
 // DESCENDANT waits or descendant error/retry sessions emit larger subtree
 // ints on the root — the descendant tests script those directly.
 func fleetGF(activity string, perm, quest bool) state.GateFacts {
 	sel := true
+	unread := false
 	gf := state.GateFacts{
 		Activity:          activity,
 		PendingPermission: perm,
 		PendingQuestion:   quest,
 		FleetSelected:     &sel,
 		SubtreeBusy:       activity == "busy" || activity == "retry",
+		Unread:            &unread,
 	}
 	if perm {
 		gf.SubtreePendingPermission = 1
@@ -1119,13 +1123,14 @@ func TestFleetStatus_LimitedDetailCumulative(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "w1")
 	// Fixed literals so the byte math is exact: the /a snapshot carries the
 	// fleet_selection marker (the fallback validator requires it) and its
-	// session carries the FULL S3 vocabulary (fleet_selected + nonnil
-	// subtree_error/subtree_retry — an error root contributes 1, a quiet
-	// retry count serializes as an explicit supported zero). Discovery
+	// session carries the FULL current vocabulary (fleet_selected + nonnil
+	// subtree_error/subtree_retry + nonnil unread — an error root
+	// contributes 1, a quiet retry count and an unmarked unread serialize
+	// as explicit supported zeros). Discovery
 	// (27 B) + snapA together exceed the 38-B budget, so the trip names /a
 	// (whose observation still counts).
 	discovery := `[{"dir":"/a"},{"dir":"/b"}]`
-	snapA := `{"fleet_selection":"root_unarchived_v1","gate":{"s1":{"activity":"error","fleet_selected":true,"subtree_error":1,"subtree_retry":0}}}`
+	snapA := `{"fleet_selection":"root_unarchived_v1","gate":{"s1":{"activity":"error","fleet_selected":true,"subtree_error":1,"subtree_retry":0,"unread":false}}}`
 	fake.setBody("w1", "/vh/projects", discovery)
 	fake.setBody("w1", "/vh/snapshot?z=1&dir=%2Fa", snapA)
 	svc := d.fleetStatusService()
@@ -1692,6 +1697,12 @@ func TestFleetSummaryLengthCap(t *testing.T) {
 		{true, fleetCondSessionDone, 1, "1 finished"},
 		{true, fleetCondSessionDone, 3, "3 finished"},
 		{false, fleetCondSessionDone, 2, "Unknown; 2 finished"},
+		// session_unread (informational, between retry and done): an
+		// unread-only fleet leads with the badge ("N unread" — the ladder
+		// extension the unread-only case genuinely needs).
+		{true, fleetCondSessionUnread, 1, "1 unread"},
+		{true, fleetCondSessionUnread, 4, "4 unread"},
+		{false, fleetCondSessionUnread, 2, "Unknown; 2 unread"},
 	}
 	for _, c := range cases {
 		got := fleetSummary(c.complete, c.kind, c.count)
@@ -2067,6 +2078,285 @@ func TestFleetStatus_DescendantErrorRetrySurfacesOnRoot(t *testing.T) {
 // real worker would emit for descendant aggregation).
 func intPtr(n int) *int { return &n }
 
+// boolPtr is the same shorthand for the pointer-valued unread tri-state.
+func boolPtr(b bool) *bool { return &b }
+
+// TestFleetStatus_MixedCountsSingleRoot closes the S3-review deferred unit
+// case (trigger: path_touched buildRollup): ONE selected root whose subtree
+// holds BOTH 2 error sessions AND 3 retry sessions folds BOTH counts from
+// the SAME contributor entry — session_error count=2 AND session_retry
+// count=3, each condition's deep link naming that one root. Pins that the
+// per-kind sums are independent accumulators over one entry (an early-out
+// or shared counter would drop one kind), and that retry's busy-class makes
+// the mixed root subtree_busy (gauge 1/1) while error's carve-out adds
+// nothing to busy.
+func TestFleetStatus_MixedCountsSingleRoot(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "$ID.example.test")
+	fleetAddOnline(t, d.Registry, "w")
+	mixed := fleetGF("idle", false, false)
+	mixed.SubtreeError = intPtr(2)
+	mixed.SubtreeRetry = intPtr(3)
+	mixed.SubtreeBusy = true // 3 retrying descendants: busy-class
+	fake.setBody("w", "/vh/projects", fleetProjectsBody("/repo"))
+	fake.setBody("w", fleetGatesPath("/repo"), fleetGatesBody(map[string]map[string]state.GateFacts{
+		"/repo": {"root-mixed": mixed},
+	}))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	want := []string{fleetCondSessionError, fleetCondSessionRetry}
+	got := condKinds(resp)
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("conditions: want %v, got %v", want, got)
+	}
+	wantLink := "https://w.example.test/app?dir=%2Frepo&session=root-mixed"
+	for _, c := range resp.Conditions {
+		switch c.Kind {
+		case fleetCondSessionError:
+			if c.Count != 2 || c.Label != "2 session errors" {
+				t.Fatalf("session_error from the mixed root: want count=2 label=\"2 session errors\", got %+v", c)
+			}
+			if c.Link == nil || *c.Link != wantLink {
+				t.Fatalf("session_error link must name the SAME root as retry, got %v", c.Link)
+			}
+		case fleetCondSessionRetry:
+			if c.Count != 3 || c.Label != "3 sessions retrying" {
+				t.Fatalf("session_retry from the mixed root: want count=3 label=\"3 sessions retrying\", got %+v", c)
+			}
+			if c.Link == nil || *c.Link != wantLink {
+				t.Fatalf("session_retry link must name the SAME root as error, got %v", c.Link)
+			}
+		}
+	}
+	// One contributor row; retry (not error) makes it busy.
+	if p := resp.Projects[0]; p.Dir != "/repo" || p.Sessions != 1 || p.Busy != 1 {
+		t.Fatalf("project row: want sessions=1 busy=1 (retry-only busy), got %+v", p)
+	}
+}
+
+// TestFleetStatus_UnreadConditionAndRows pins the unread slice's fold:
+// session_unread counts SELECTED ROOTS carrying the root-scoped
+// finished-unread mark (a boolean per root — no subtree sum), sits strictly
+// BETWEEN session_retry and session_done in display priority, is
+// INFORMATIONAL (never a known_overall/overall severity input), and feeds
+// projects[].unread. The unread and done predicates are DISTINCT and
+// coexist: unread covers ANY ordinary busy→idle (an interrupted run —
+// finish_reason "length" — included, and even an unhydrated root), done
+// requires a completed stop-terminated turn. An ACKED completed root is
+// done-but-not-unread; an unacked interrupted root is
+// unread-but-not-done; an unacked completed root is BOTH.
+func TestFleetStatus_UnreadConditionAndRows(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "$ID.example.test")
+	fleetAddOnline(t, d.Registry, "w")
+	// both: completed with stop, unacked → unread AND done.
+	both := fleetDoneGF()
+	both.Unread = boolPtr(true)
+	// interrupted: busy→idle mid-run (length-terminated) → unread, NOT done.
+	interrupted := fleetDoneGF()
+	interrupted.FinishReason = "length"
+	interrupted.Unread = boolPtr(true)
+	// ackedDone: completed with stop, already acknowledged → done, NOT unread.
+	ackedDone := fleetDoneGF()
+	fake.setBody("w", "/vh/projects", fleetProjectsBody("/repo"))
+	fake.setBody("w", fleetGatesPath("/repo"), fleetGatesBody(map[string]map[string]state.GateFacts{
+		"/repo": {"root-both": both, "root-interrupted": interrupted, "root-acked": ackedDone},
+	}))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	want := []string{fleetCondSessionUnread, fleetCondSessionDone}
+	got := condKinds(resp)
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("conditions: want exactly [session_unread session_done] in that order (unread strictly between retry and done), got %v", got)
+	}
+	for _, c := range resp.Conditions {
+		switch c.Kind {
+		case fleetCondSessionUnread:
+			if c.Count != 2 || c.Label != "2 unread" {
+				t.Fatalf("session_unread: want count=2 (both+interrupted roots) label=\"2 unread\", got %+v", c)
+			}
+			if c.Since == nil {
+				t.Fatalf("session_unread must carry since continuity, got %+v", c)
+			}
+		case fleetCondSessionDone:
+			if c.Count != 2 || c.Label != "2 finished" {
+				t.Fatalf("session_done: want count=2 (both+acked roots) label=\"2 finished\", got %+v", c)
+			}
+		}
+	}
+	// Informational: neither unread nor done touches severity — a fleet
+	// whose ONLY conditions are informational stays nominal, and the
+	// summary leads with the higher-priority badge (unread before done).
+	if resp.KnownOverall != fleetOverallNominal || resp.Overall != fleetOverallNominal {
+		t.Fatalf("unread/done are informational: want nominal/nominal, got %s/%s", resp.Overall, resp.KnownOverall)
+	}
+	if resp.Summary != "2 unread" {
+		t.Fatalf("summary: want \"2 unread\" (unread outranks done), got %q", resp.Summary)
+	}
+	// Row: one dir, three selected roots — 2 unread, 2 done, 0 busy.
+	if len(resp.Projects) != 1 {
+		t.Fatalf("projects: want the /repo row, got %+v", resp.Projects)
+	}
+	if p := resp.Projects[0]; p.Dir != "/repo" || p.Sessions != 3 || p.Unread != 2 || p.Done != 2 || p.Busy != 0 {
+		t.Fatalf("project row: want sessions=3 unread=2 done=2 busy=0, got %+v", p)
+	}
+}
+
+// TestFleetStatus_UnreadInterruptedVsDonePredicate is the explicit
+// interrupted-mid-run pin the unread brief prescribes: a root whose subtree
+// went busy→idle WITHOUT a completed stop-terminated turn (the process-death
+// / interruption shape: no completed assistant at all) is unread=1 and
+// done=0 — unread is the "something finished and nobody looked" badge, done
+// is the conservative completed-with-stop product definition. Also pins the
+// reverse corner (an acked completed root: unread=0, done=1) so neither
+// predicate implies the other in either direction.
+func TestFleetStatus_UnreadInterruptedVsDonePredicate(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	fleetAddOnline(t, d.Registry, "w")
+	// Death shape: never hydrated, no completed assistant, finish_reason
+	// empty — but the subtree DID go busy→idle, so the store marked it.
+	unreadOnly := fleetGF("idle", false, false)
+	unreadOnly.Unread = boolPtr(true)
+	// Acked completed shape: done, mark cleared by the ack.
+	doneOnly := fleetDoneGF()
+	fake.setBody("w", "/vh/projects", fleetProjectsBody("/repo"))
+	fake.setBody("w", fleetGatesPath("/repo"), fleetGatesBody(map[string]map[string]state.GateFacts{
+		"/repo": {"root-dead": unreadOnly, "root-acked": doneOnly},
+	}))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	if got := condKinds(resp); len(got) != 2 || got[0] != fleetCondSessionUnread || got[1] != fleetCondSessionDone {
+		t.Fatalf("conditions: want [session_unread session_done], got %v", got)
+	}
+	for _, c := range resp.Conditions {
+		if c.Kind == fleetCondSessionUnread && (c.Count != 1 || c.Label != "1 unread") {
+			t.Fatalf("session_unread: want count=1 label=\"1 unread\" (singular ladder), got %+v", c)
+		}
+		if c.Kind == fleetCondSessionDone && c.Count != 1 {
+			t.Fatalf("session_done: want count=1, got %+v", c)
+		}
+	}
+}
+
+// TestFleetStatus_UnreadPresenceValidation extends the S3 presence contract
+// to the unread tri-state: a producer that speaks the CURRENT marker but
+// omits `unread` is a SAME-VOCABULARY PARTIAL — the lean leg routes to the
+// fallback (which, when valid, still ends ok), and a fallback that also
+// lacks the flag classifies the worker error with the unsupported-producer
+// detail — never folded with nil silently read as false.
+func TestFleetStatus_UnreadPresenceValidation(t *testing.T) {
+	t.Run("lean unread-less partial routes to fallback", func(t *testing.T) {
+		d, fake := newFleetTestDaemon(t, "")
+		fleetAddOnline(t, d.Registry, "w")
+		fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+		// fleet_selected + counts present, unread ABSENT — the exact shape
+		// a pre-unread worker emits under the same marker.
+		fake.setBody("w", fleetGatesPath("/a"),
+			`{"schema":1,"fleet_selection":"root_unarchived_v1","projects":[{"dir":"/a",`+
+				`"gate":{"s1":{"activity":"idle","fleet_selected":true,"subtree_error":0,"subtree_retry":0}}}]}`)
+		fake.setBody("w", "/vh/snapshot?z=1&dir=%2Fa", fleetSnapBody(map[string]state.GateFacts{
+			"s1": fleetGF("idle", false, false),
+		}))
+
+		resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+		if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
+			t.Fatalf("unread-less lean must fall back to a valid snapshot and end ok, got %+v", w)
+		}
+		if n := fake.count("w"); n != 3 {
+			t.Fatalf("calls: want discovery + rejected lean + 1 snapshot, got %d", n)
+		}
+		if got := condKinds(resp); len(got) != 0 {
+			t.Fatalf("valid fallback quiet root: no conditions, got %v", got)
+		}
+	})
+	t.Run("fallback unread-less partial is explicit error", func(t *testing.T) {
+		d, fake := newFleetTestDaemon(t, "")
+		applyFleetRosters(t, d, []string{"w"}, []string{"/a"})
+		fleetAddOnline(t, d.Registry, "w")
+		fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+		// No lean body scripted → fallback; unread absent on a nonempty gate.
+		fake.setBody("w", "/vh/snapshot?z=1&dir=%2Fa",
+			`{"fleet_selection":"root_unarchived_v1","gate":{"s1":{"activity":"idle","fleet_selected":true,"subtree_error":0,"subtree_retry":0}}}`)
+
+		resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+		w := workerEntry(t, resp, "w")
+		if w.Status != fleetWorkerError {
+			t.Fatalf("unread-less fallback: want error, got %+v", w)
+		}
+		if w.Detail != wantUnsupportedSelectionDetail("/vh/snapshot?z=1&dir=%2Fa") {
+			t.Fatalf("detail: want the unsupported-producer ask, got %q", w.Detail)
+		}
+		if resp.Coverage.Complete || resp.Gauge.Available {
+			t.Fatalf("unsupported producer must stay incomplete/unavailable, got %+v", resp.Coverage)
+		}
+	})
+	t.Run("unread=true folds from the lean path", func(t *testing.T) {
+		d, fake := newFleetTestDaemon(t, "")
+		fleetAddOnline(t, d.Registry, "w")
+		fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+		marked := fleetGF("idle", false, false)
+		marked.Unread = boolPtr(true)
+		fake.setBody("w", fleetGatesPath("/a"), fleetGatesBody(map[string]map[string]state.GateFacts{
+			"/a": {"s1": marked},
+		}))
+
+		resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+		if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
+			t.Fatalf("a marked lean entry is fully supported, got %+v", w)
+		}
+		if n := fake.count("w"); n != 2 {
+			t.Fatalf("calls: want discovery + lean only (no fallback), got %d", n)
+		}
+		if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondSessionUnread || resp.Conditions[0].Count != 1 {
+			t.Fatalf("marked root must fold session_unread count=1, got %v", resp.Conditions)
+		}
+	})
+}
+
+// TestFleetStatus_UnreadSinceContinuity drives the unread condition's
+// `since` lifecycle through buildRollup with controlled clocks: the mark
+// persists across consecutive generations, the ack clears the contributor
+// (condition gone, continuity reaped), and a LATER re-mark starts a FRESH
+// since (continuity was lost — the tracker resets when unread clears).
+func TestFleetStatus_UnreadSinceContinuity(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	fleetAddOnline(t, d.Registry, "w1")
+	fake.setBody("w1", "/vh/projects", fleetProjectsBody(""))
+	marked := fleetGF("idle", false, false)
+	marked.Unread = boolPtr(true)
+	acked := fleetGF("idle", false, false)
+	fake.setBody("w1", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{"s1": marked}))
+
+	svc := d.fleetStatusService()
+	snap := d.statusCfg.snapshot()
+	t0 := time.Date(2026, 9, 28, 10, 0, 0, 0, time.UTC)
+
+	r1, _ := svc.buildRollup(t0, snap)
+	if len(r1.Conditions) != 1 || r1.Conditions[0].Kind != fleetCondSessionUnread || r1.Conditions[0].Since == nil {
+		t.Fatalf("gen1: want one session_unread with since, got %+v", r1.Conditions)
+	}
+	if got := *r1.Conditions[0].Since; got != "2026-09-28T10:00:00Z" {
+		t.Fatalf("gen1 since: want birth time, got %s", got)
+	}
+
+	r2, _ := svc.buildRollup(t0.Add(3*time.Second), snap)
+	if got := *r2.Conditions[0].Since; got != "2026-09-28T10:00:00Z" {
+		t.Fatalf("gen2 (continuous mark): since must persist, got %s", got)
+	}
+
+	// The ack clears the mark — condition gone.
+	fake.setBody("w1", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{"s1": acked}))
+	r3, _ := svc.buildRollup(t0.Add(6*time.Second), snap)
+	if len(r3.Conditions) != 0 {
+		t.Fatalf("gen3 (acked): want no conditions, got %+v", r3.Conditions)
+	}
+
+	// A later re-mark (next finished turn) resets continuity to a fresh birth.
+	fake.setBody("w1", "/vh/snapshot?z=1", fleetSnapBody(map[string]state.GateFacts{"s1": marked}))
+	r4, _ := svc.buildRollup(t0.Add(9*time.Second), snap)
+	if got := *r4.Conditions[0].Since; got != "2026-09-28T10:00:09Z" {
+		t.Fatalf("gen4 (re-marked): since must RESET to the new birth time, got %s", got)
+	}
+}
+
 // TestFleetStatus_SubtreeCountPresenceValidation pins the S3 presence
 // contract on BOTH acquisition validators: a producer that speaks the
 // CURRENT marker but omits the subtree activity counts is a SAME-VOCABULARY
@@ -2153,7 +2443,7 @@ func TestFleetStatus_SubtreeCountPresenceValidation(t *testing.T) {
 		fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
 		fake.setBody("w", fleetGatesPath("/a"),
 			`{"schema":1,"fleet_selection":"root_unarchived_v1","projects":[{"dir":"/a",`+
-				`"gate":{"s1":{"activity":"idle","fleet_selected":true,"subtree_error":0,"subtree_retry":0}}}]}`)
+				`"gate":{"s1":{"activity":"idle","fleet_selected":true,"subtree_error":0,"subtree_retry":0,"unread":false}}}]}`)
 
 		resp := decodeFleet(t, doFleet(d.buildRootHandler()))
 		if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
@@ -2218,14 +2508,15 @@ func TestFleetStatus_SelectedFoldSnapshotPath(t *testing.T) {
 	selFalse := false
 	fake.setBody("w", "/vh/projects", fleetProjectsBody("/repo"))
 	// No lean body scripted → the lean attempt fails → snapshot fallback.
-	// The raw literals carry the full S3 vocabulary (nonnil activity counts)
-	// — a real current worker always sets the pointers.
+	// The hand-built literals carry the full current vocabulary (nonnil
+	// activity counts + nonnil unread) — a real current worker always sets
+	// the pointers.
 	zero := 0
 	fake.setBody("w", "/vh/snapshot?z=1&dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{
-		"root-busy":  {Activity: "busy", FleetSelected: &selTrue, SubtreeError: &zero, SubtreeRetry: &zero},  // busy root (belt: no subtree_busy)
-		"root-idle":  fleetGF("idle", false, false),                                                          // selected, idle
-		"child-busy": {Activity: "busy", FleetSelected: &selFalse, SubtreeError: &zero, SubtreeRetry: &zero}, // child: not in the fold population
-		"arch-root":  {Activity: "idle", FleetSelected: &selFalse, SubtreeError: &zero, SubtreeRetry: &zero}, // archived root: excluded
+		"root-busy":  {Activity: "busy", FleetSelected: &selTrue, SubtreeError: &zero, SubtreeRetry: &zero, Unread: boolPtr(false)},  // busy root (belt: no subtree_busy)
+		"root-idle":  fleetGF("idle", false, false),                                                                                  // selected, idle
+		"child-busy": {Activity: "busy", FleetSelected: &selFalse, SubtreeError: &zero, SubtreeRetry: &zero, Unread: boolPtr(false)}, // child: not in the fold population
+		"arch-root":  {Activity: "idle", FleetSelected: &selFalse, SubtreeError: &zero, SubtreeRetry: &zero, Unread: boolPtr(false)}, // archived root: excluded
 	}))
 
 	resp := decodeFleet(t, doFleet(d.buildRootHandler()))

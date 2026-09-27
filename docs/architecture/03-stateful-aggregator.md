@@ -91,11 +91,19 @@ root — and, since the subtree error/retry slice, `subtree_error` /
 activity is error / retry, surfaced as **pointer-valued counts**: a real
 worker ALWAYS sets them (a supported zero serializes as an explicit `0`;
 `omitempty` only drops nil), so an absent key identifies a producer that
-predates the counts. `fleet_selection` is the capability marker asserting
-that vocabulary — including the activity counts: a producer emitting the
-marker WITHOUT them is a same-vocabulary partial and is rejected by the
-controller's acquisition validators rather than folded (the marker's meaning
-was extended in place; no second marker exists for the counts).
+predates the counts. Since the unread slice, each selected root also
+carries `unread` — the ROOT-scoped finished-unread mark (the same store
+state the SPA's unread dot renders and `POST /vh/ack` clears), same
+**presence-aware pointer** contract: always set by a real worker (a
+supported `false` serializes explicitly; nil = a producer predating the
+field), root-scoped with NO subtree aggregation (the mark is root-shaped;
+a child's entry never carries its root's mark). `fleet_selection` is the
+capability marker asserting
+that vocabulary — including the activity counts and the unread flag: a
+producer emitting the marker WITHOUT them is a same-vocabulary partial and
+is rejected by the controller's acquisition validators rather than folded
+(the marker's meaning
+was extended in place; no second marker exists for the additions).
 A full `/vh/snapshot` stays COMPLETE (children present, `fleet_selected:
 false`); the controller filters snapshot-derived gates by `fleet_selected`
 identically, so both acquisition paths fold the same population.
@@ -107,21 +115,29 @@ failure (404 from an older worker, non-2xx, malformed, a marker-violating
 body — including a **missing or unknown `fleet_selection` marker**, which
 is required, not optional; an explicitly not-selected entry, since
 this endpoint's contract is selected-only; and a nonempty gate entry
-missing `subtree_error`/`subtree_retry` or carrying a negative count) as
+missing `subtree_error`/`subtree_retry`/`unread` or carrying a negative
+count) as
 "use the per-project snapshot fallback".
 The fallback snapshot must speak the SAME vocabulary: a field-less,
-unknown-marker, or count-less snapshot envelope classifies the worker
-`error` (`workers[].detail` names the unsupported producer and the upgrade
-ask) — an unsupported producer is never folded as a healthy observed empty
-("No sessions"). A marked genuinely-empty envelope (omitted/empty `gate`)
-is valid: supported zero stays honest.
+unknown-marker, count-less, or unread-less snapshot envelope classifies the
+worker `error` (`workers[].detail` names the unsupported producer and the
+upgrade ask) — an unsupported producer is never folded as a healthy
+observed empty ("No sessions"). A marked genuinely-empty envelope
+(omitted/empty `gate`) is valid: supported zero stays honest.
 On the fold side, the `session_error` / `session_retry` conditions count
 the summed subtree error/retry SESSIONS over selected roots (one contributor
 root per kind — a child's error/retry surfaces on its root; the root's OWN
 activity fields stay unchanged, error still does not count as busy, retry
 still does, and `session_done`'s strict-stop remains
 `!subtree_busy && subtree_pending_input == 0`, so a finished root and a
-descendant error can coexist).
+descendant error can coexist). The `session_unread` condition counts
+SELECTED ROOTS whose `unread` mark is set (a boolean per root, no subtree
+sum) — an informational badge between `session_retry` and `session_done`
+that never degrades `overall`/`known_overall`, and a predicate DISTINCT
+from `session_done`: unread covers ANY ordinary busy→idle (an interrupted
+run included), done requires a completed stop-terminated turn; the two
+coexist (a normally-finished, unacknowledged root is both). `projects[]`
+rows carry the per-dir `unread` count alongside `done`.
 
 **Release contract (operator checklist — version floor ↔ fleet
 selection).** The first tag that ships `pkg/version` (the tunnel version
@@ -132,9 +148,11 @@ classifies it `error`. Rule: ship the boundary and the selection fields
 under ONE tag, or bump both floors in the same release commit that changes
 the selection vocabulary. No floor change or tag action is authorized by
 code alone — the tag is a protected operator decision. The same rule covers
-the S3 activity-count extension (the marker's meaning grew in place):
-a controller with count validation classifies a count-less same-marker
-worker `error` on every refresh, so controller and worker must ship the
+the S3 activity-count extension and the unread extension (the marker's
+meaning grew in place both times):
+a controller with count/unread validation classifies a count-less or
+unread-less same-marker worker `error` on every refresh, so controller and
+worker must ship each
 extension under one tag or the floors must move with whichever ships first.
 
 ### `GET /vh/stream?cursor=<seq>`

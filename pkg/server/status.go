@@ -20,15 +20,21 @@ package server
 //     nominal. Confirmed severity stays visible in known_overall.
 //   - `conditions[]`: server-owned display-priority order
 //     permission_pending > question_pending > worker_down | worker_missing >
-//     project_missing > session_error | session_retry > session_done; each
+//     project_missing > session_error | session_retry > session_unread >
+//     session_done; each
 //     {kind,count,since,label,link}. Pending conditions count pending
 //     SESSIONS summed over SELECTED roots (a root's subtree_pending_*
 //     surfaces its descendants' waits); since S3 session_error/session_retry
 //     count subtree error/retry SESSIONS the same way (a root's
 //     subtree_error/subtree_retry surfaces its descendants' failed/retrying
 //     turns; the count units are sessions, one contributor root each);
-//     session_done is informational-only ("N finished", never a severity
-//     input). `since` is the first CONTINUOUS observed controller time for
+//     session_unread counts SELECTED roots whose root-scoped finished-unread
+//     mark is set (the worker gate's unread flag — a badge awaiting
+//     acknowledgement, cleared client-side by POST /vh/ack); session_done is
+//     informational-only ("N finished", never a severity input). Both
+//     session_unread and session_done are informational: neither ever
+//     degrades overall/known_overall. `since` is the first CONTINUOUS
+//     observed controller time for
 //     the current contributors (continuity tracked across published
 //     generations; reset on loss of evidence). `link` is a trusted
 //     worker-origin /app?dir=…&session=… URL built from the configured
@@ -174,7 +180,9 @@ type fleetWorkerEntry struct {
 // hosted on two workers is ONE row; its roots stay distinct contributors to
 // the fleet totals). Sessions counts SELECTED roots; Busy counts roots whose
 // subtree is busy (own busy/retry included — counted once); Done counts
-// session_done roots; Pending counts roots with union subtree pending > 0.
+// session_done roots; Pending counts roots with union subtree pending > 0;
+// Unread counts roots whose root-scoped finished-unread mark is set (the
+// unread badge population — awaits acknowledgement, never a severity).
 // Label comes from the status-config project roster (omitted for
 // unlabelled/unconfigured dirs). Complete is false when the displayed counts
 // are known-partial contributions (any in-scope worker's acquisition was
@@ -188,6 +196,7 @@ type fleetProjectRow struct {
 	Busy     int    `json:"busy"`
 	Done     int    `json:"done"`
 	Pending  int    `json:"pending"`
+	Unread   int    `json:"unread"`
 	Complete bool   `json:"complete"`
 }
 
@@ -234,9 +243,12 @@ type fleetOptionsProject struct {
 
 // Condition kinds in the server-owned display-priority order. Exactly this
 // order in conditions[]; at most one aggregate per kind; nonzero counts only.
-// session_done is INFORMATIONAL and strictly LAST: below session_retry, never
-// independently attention/degraded, and never the known_overall severity
-// input — it surfaces finished sessions for the watch face, it does not page.
+// session_unread and session_done are BOTH informational and trail the
+// severity tiers: session_unread (finished-unread badge) sits strictly
+// between session_retry and session_done, never independently
+// attention/degraded, and never the known_overall severity input — it
+// surfaces roots awaiting acknowledgement, it does not page. session_done
+// stays strictly LAST.
 const (
 	fleetCondPermissionPending = "permission_pending"
 	fleetCondQuestionPending   = "question_pending"
@@ -245,6 +257,7 @@ const (
 	fleetCondProjectMissing    = "project_missing"
 	fleetCondSessionError      = "session_error"
 	fleetCondSessionRetry      = "session_retry"
+	fleetCondSessionUnread     = "session_unread"
 	fleetCondSessionDone       = "session_done"
 )
 
@@ -256,6 +269,7 @@ var fleetConditionOrder = []string{
 	fleetCondProjectMissing,
 	fleetCondSessionError,
 	fleetCondSessionRetry,
+	fleetCondSessionUnread,
 	fleetCondSessionDone,
 }
 
@@ -746,7 +760,7 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 	var selectedRoots, busyRoots int
 	var permCount, questCount int // summed per-kind pending SESSION counts
 	var errCount, retryCount int  // summed subtree error/retry SESSION counts (S3)
-	permC, questC, errC, retryC, doneC := []fleetContributor{}, []fleetContributor{}, []fleetContributor{}, []fleetContributor{}, []fleetContributor{}
+	permC, questC, errC, retryC, unreadC, doneC := []fleetContributor{}, []fleetContributor{}, []fleetContributor{}, []fleetContributor{}, []fleetContributor{}, []fleetContributor{}
 	downIDs, missingIDs := []string{}, []string{}
 	observedProjectDirs := map[string]bool{} // dirs CONFIRMED instantiated this generation (successful snapshots only)
 	observed := 0
@@ -845,6 +859,23 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 					retryC = append(retryC, c)
 					retryCount += *gf.SubtreeRetry
 					row.hasRetry = true
+				}
+				// Root-scoped finished-unread (unread slice): a BOOLEAN per
+				// selected root (the count is roots, not sessions — the mark is
+				// root-shaped by construction, no subtree aggregation), the
+				// same signal the SPA renders as the unread dot and clears via
+				// POST /vh/ack. The nil clause is a DEFENSIVE BELT only, same
+				// as the activity counts above: both acquisition validators
+				// reject a nonempty gate map whose entries lack the pointer, so
+				// nil cannot reach this fold, and nil must NOT fold as false
+				// (that silent misread is what the presence contract forbids).
+				// DISTINCT from session_done: unread covers ANY ordinary
+				// busy→idle transition (an interrupted run included — there is
+				// no finish_reason conjunct), done requires a completed
+				// stop-terminated turn; the two coexist.
+				if gf.Unread != nil && *gf.Unread {
+					unreadC = append(unreadC, c)
+					row.unread++
 				}
 				if fleetSessionDone(gf) {
 					doneC = append(doneC, c)
@@ -949,6 +980,16 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 		// (the root), exactly like the pending conditions above.
 		newAgg(fleetCondSessionError, errCount, errC, "err", pluralCount(errCount, "session error", "session errors"), true),
 		newAgg(fleetCondSessionRetry, retryCount, retryC, "retry", pluralCount(retryCount, "session retrying", "sessions retrying"), true),
+		// session_unread: informational badge condition ("N unread"),
+		// strictly between session_retry and session_done. Count units are
+		// selected ROOTS (the mark is root-scoped — one contributor root,
+		// boolean, no subtree sum). Since-continuity rides the existing
+		// tracker keyed worker+dir+root: the mark clearing (the client
+		// acked, or the root went busy again) removes the contributor and
+		// RESETS its continuity; a later mark starts a fresh since.
+		// INFORMATIONAL: never a known_overall/overall severity input —
+		// unread is a badge, not a fault.
+		newAgg(fleetCondSessionUnread, len(unreadC), unreadC, "unread", pluralCount(len(unreadC), "unread", "unread"), true),
 		// session_done: informational LAST-priority condition ("N finished").
 		// Since-continuity rides the existing tracker keyed worker+dir+root:
 		// an observed resume (busy/retry, pending, unfinished/latest-message
@@ -1067,13 +1108,15 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 // counts over the dir's SELECTED roots across every contributing worker
 // observation. hasPerm/hasQuest/hasErr/hasRetry feed the row's
 // problem-severity sort rank only (the row shape itself exposes
-// sessions/busy/done/pending).
+// sessions/busy/done/pending/unread; unread is informational and never
+// raises a row's rank, like done).
 type fleetProjFold struct {
 	dir      string
 	sessions int
 	busy     int
 	done     int
 	pending  int
+	unread   int
 	hasPerm  bool
 	hasQuest bool
 	hasErr   bool
@@ -1145,6 +1188,7 @@ func buildFleetProjects(order []string, rows map[string]*fleetProjFold, labels m
 			Busy:     f.busy,
 			Done:     f.done,
 			Pending:  f.pending,
+			Unread:   f.unread,
 			Complete: complete,
 		}
 		b, err := json.Marshal(r)
@@ -1529,10 +1573,13 @@ func fetchLeanGates(fetch func(path string) ([]byte, error), projects []fleetDis
 // fleet_selected tri-state explicitly (an advertised-but-untagged entry is
 // a producer bug), and — since S3 — every such entry must also carry the
 // subtree activity counts explicitly: nonnil subtree_error/subtree_retry
-// with non-negative values. Nil counts on a nonempty map are a SAME-MARKER
-// PARTIAL (a producer speaking root_unarchived_v1 without the activity
-// fields — e.g. a pre-S3 worker): the marker's meaning was extended rather
-// than versioned (the brief: no second capability marker solely for counts),
+// with non-negative values; and — since the unread slice — the root-scoped
+// unread tri-state (nonnil; a bool pointer has no negative case). Nil
+// counts or a nil unread flag on a nonempty map are a SAME-MARKER
+// PARTIAL (a producer speaking root_unarchived_v1 without the later
+// fields — e.g. a pre-S3 or pre-unread worker): the marker's meaning was
+// extended rather than versioned (the brief: no second capability marker
+// solely for the additions),
 // so a partial is rejected exactly like any other vocabulary violation
 // instead of folding unsupported data as observed zeros or silently falling
 // back to root-only semantics. A negative count is malformed. A marked empty
@@ -1554,6 +1601,12 @@ func fleetSelectionValid(marker string, gates ...map[string]state.GateFacts) boo
 				return false
 			}
 			if *gf.SubtreeError < 0 || *gf.SubtreeRetry < 0 {
+				return false
+			}
+			// Root-scoped unread tri-state (unread slice): nonnil required —
+			// same presence pattern as the counts; a bool pointer has no
+			// negative-value case to reject.
+			if gf.Unread == nil {
 				return false
 			}
 		}
@@ -1768,6 +1821,8 @@ func fleetKindWord(kind string) string {
 		return "errors"
 	case fleetCondSessionRetry:
 		return "retrying"
+	case fleetCondSessionUnread:
+		return "unread"
 	case fleetCondSessionDone:
 		return "finished"
 	}
@@ -1790,6 +1845,8 @@ func fleetSingularWord(kind string) string {
 		return "error"
 	case fleetCondSessionRetry:
 		return "retrying"
+	case fleetCondSessionUnread:
+		return "unread"
 	case fleetCondSessionDone:
 		return "finished"
 	}
@@ -1845,6 +1902,7 @@ func conditionPhrase(kind string, singular bool) string {
 		fleetCondProjectMissing:    {"project not running", "projects not running"},
 		fleetCondSessionError:      {"session error", "session errors"},
 		fleetCondSessionRetry:      {"session retrying", "sessions retrying"},
+		fleetCondSessionUnread:     {"unread", "unread"},
 		fleetCondSessionDone:       {"finished", "finished"},
 	}
 	p, ok := pairs[kind]

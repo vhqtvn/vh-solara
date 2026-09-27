@@ -460,3 +460,110 @@ func TestSnapshotFleetSelectionContract(t *testing.T) {
 		t.Fatalf("lean selected entry drifted from snapshot entry:\n lean=%+v\n snap=%+v", lean["root"], snap.Gate["root"])
 	}
 }
+
+// unreadOf extracts the unread tri-state from a gate entry — presence-aware:
+// it FATALS on a nil pointer (the store's derivations always set it; a nil
+// means the capture path being probed dropped the field).
+func unreadOf(t *testing.T, gf GateFacts, sid string) bool {
+	t.Helper()
+	if gf.Unread == nil {
+		t.Fatalf("session %s: unread must be a set pointer in store-derived gate entries", sid)
+	}
+	return *gf.Unread
+}
+
+// TestGateFactsUnreadProjection pins the unread slice's store-side surface:
+// the ROOT-scoped finished-unread mark (markUnreadLocked on an ordinary
+// busy→idle) rides the fleet projection on the root's OWN gate entry across
+// ALL THREE capture paths — the lean accessors (GateFacts /
+// GateFactsFleetSelected), the full snapshot's gate map, and the partial
+// frontier frame — as a NONNIL pointer (a supported false serializes as an
+// explicit "unread":false; omitempty drops nil only; the producer half of
+// the presence contract the controller's validator enforces). The mark is
+// root-scoped with NO subtree aggregation: a child finishing marks its ROOT
+// and the child's own entry stays false. AckUnread clears the flag, and a
+// return to busy (clearUnreadLocked on idle→busy) clears it as well.
+func TestGateFactsUnreadProjection(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"root"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"child","parentID":"root"}}`))
+
+	// Quiet baseline: nonnil supported false on the lean selected map, and
+	// the wire serializes it explicitly (presence: 0-vs-absent must be
+	// distinguishable for the controller's fold).
+	lean := s.GateFactsFleetSelected()
+	if got := unreadOf(t, lean["root"], "root"); got {
+		t.Fatalf("quiet root: want unread=false, got true")
+	}
+	b, err := json.Marshal(lean["root"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"unread":false`) {
+		t.Fatalf("quiet root wire: want an explicit \"unread\":false (supported zero), got %s", b)
+	}
+
+	// Ordinary busy→idle on the CHILD marks the ROOT (root-scoped reach —
+	// markUnreadLocked targets rootOf; an ordinary completion, so the
+	// markOnIdle policy arms it).
+	s.Apply(ev("session.status", `{"sessionID":"child","status":{"type":"busy"}}`))
+	s.Apply(ev("session.idle", `{"sessionID":"child"}`))
+
+	// All three capture paths carry the mark on the root, nonnil.
+	if got := unreadOf(t, s.GateFacts()["root"], "root"); !got {
+		t.Fatalf("full GateFacts(): root must carry unread=true after a child's ordinary busy→idle")
+	}
+	if got := unreadOf(t, s.GateFactsFleetSelected()["root"], "root"); !got {
+		t.Fatalf("lean GateFactsFleetSelected(): root must carry unread=true")
+	}
+	snap := s.Snapshot(nil)
+	if got := unreadOf(t, snap.Gate["root"], "root"); !got {
+		t.Fatalf("full snapshot gate: root must carry unread=true")
+	}
+	// The child's COMPLETE-map entry stays false — unread is root-scoped,
+	// never subtree-aggregated onto descendants (and the child is absent
+	// from the lean selected map entirely).
+	if got := unreadOf(t, snap.Gate["child"], "child"); got {
+		t.Fatalf("child entry must NOT aggregate its root's unread mark, got true")
+	}
+	if _, ok := s.GateFactsFleetSelected()["child"]; ok {
+		t.Fatalf("child must never appear in the selected-only lean map")
+	}
+	// Partial frontier frame (third capture path): the root's frontier gate
+	// carries the mark too — one shared derivation, no per-path logic.
+	e := NewTreeEmitter(s, "/proj")
+	partial, _ := s.SnapshotWithTreePartial(e, "unread")
+	if g, ok := partial.Gate["root"]; !ok {
+		t.Fatalf("root missing from the partial frontier gate map")
+	} else if g.Unread == nil || !*g.Unread {
+		t.Fatalf("partial frontier root gate: want nonnil unread=true, got %+v", g)
+	}
+	// Wire shape of the marked root: an explicit true.
+	b, err = json.Marshal(s.GateFactsFleetSelected()["root"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"unread":true`) {
+		t.Fatalf("marked root wire: want an explicit \"unread\":true, got %s", b)
+	}
+
+	// AckUnread (the POST /vh/ack surface's store call) clears the ROOT —
+	// and acking any session in the subtree resolves to the same root.
+	s.AckUnread("child")
+	if got := unreadOf(t, s.GateFactsFleetSelected()["root"], "root"); got {
+		t.Fatalf("AckUnread(child) must clear the ROOT's mark, still true")
+	}
+
+	// Re-arm via another ordinary completion, then verify the idle→busy
+	// transition itself clears the stale mark (clearUnreadLocked — "running
+	// again — no longer a stale finished").
+	s.Apply(ev("session.status", `{"sessionID":"child","status":{"type":"busy"}}`))
+	s.Apply(ev("session.idle", `{"sessionID":"child"}`))
+	if got := unreadOf(t, s.GateFactsFleetSelected()["root"], "root"); !got {
+		t.Fatalf("re-armed root must be unread again")
+	}
+	s.Apply(ev("session.status", `{"sessionID":"child","status":{"type":"busy"}}`))
+	if got := unreadOf(t, s.GateFactsFleetSelected()["root"], "root"); got {
+		t.Fatalf("idle→busy must clear the stale finished-unread mark (clearUnreadLocked)")
+	}
+}

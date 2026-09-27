@@ -417,19 +417,34 @@ type GateFacts struct {
 	// carve-out).
 	SubtreeError *int `json:"subtree_error,omitempty"`
 	SubtreeRetry *int `json:"subtree_retry,omitempty"`
+	// Unread reports this session's ROOT-scoped finished-unread mark — the
+	// same signal the SPA renders as the unread dot and clears via
+	// AckUnread (POST /vh/ack). Root-scoped by design: the mark is keyed by
+	// rootOf (markUnreadLocked on an ordinary busy→idle transition), so a
+	// selected root's own entry carries it while a child's entry never does
+	// (NO subtree aggregation — unread is already root-shaped; the fold
+	// population is selected roots exactly). POINTERS by contract, exactly
+	// like FleetSelected/SubtreeError/SubtreeRetry (the presence-aware
+	// pattern): this package's derivations ALWAYS set it (nonnil false on
+	// supported entries, all capture paths), so a nil after decode means
+	// the producer predates the field and its data must not fold as an
+	// observed false (the controller's acquisition validators reject
+	// nil-unread entries in nonempty gate maps). omitempty drops nil only.
+	Unread *bool `json:"unread,omitempty"`
 }
 
 // FleetSelectionRootUnarchivedV1 is the capability/version marker for the
 // fleet-watch projection carried on the snapshot envelope and the lean
 // /vh/gates envelope: "the gate facts in this payload speak fleet selection
 // root_unarchived_v1" (fleet_selected + the three subtree pending counts +
-// the subtree_error/subtree_retry activity counts on every gate entry).
-// Additive self-description; consumers that do not know it ignore it.
-// Since the S3 slice the marker ALSO asserts the activity counts: a producer
-// emitting this marker without nonnil subtree_error/subtree_retry on every
-// nonempty-gate entry is an unsupported partial (the controller's validators
-// reject it — no legacy tolerance), so the marker value itself stays stable
-// and no second capability marker is needed for the counts.
+// the subtree_error/subtree_retry activity counts + the root-scoped unread
+// flag on every gate entry). Additive self-description; consumers that do
+// not know it ignore it. Since the S3 slice the marker ALSO asserts the
+// activity counts, and since the unread slice the unread flag: a producer
+// emitting this marker without nonnil subtree_error/subtree_retry/unread on
+// every nonempty-gate entry is an unsupported partial (the controller's
+// validators reject it — no legacy tolerance), so the marker value itself
+// stays stable and no second capability marker is needed for the additions.
 const FleetSelectionRootUnarchivedV1 = "root_unarchived_v1"
 
 // MessageWithParts mirrors OpenCode's GET /session/:id/message item shape.

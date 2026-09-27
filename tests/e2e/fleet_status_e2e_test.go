@@ -30,8 +30,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -120,8 +122,9 @@ func TestE2E_FleetStatusRollupThroughRealTunnel(t *testing.T) {
 	// present must be in the display-priority order and carry a since.
 	// The whitelist covers EVERY schema-1 kind incl. the gauge-semantics
 	// additions (project_missing was historically absent from this map —
-	// an unknown kind would have fatalf'd; session_done rides last).
-	order := map[string]int{"permission_pending": 0, "question_pending": 1, "worker_down": 2, "worker_missing": 3, "project_missing": 4, "session_error": 5, "session_retry": 6, "session_done": 7}
+	// an unknown kind would have fatalf'd; session_unread rides between
+	// retry and done, session_done stays last).
+	order := map[string]int{"permission_pending": 0, "question_pending": 1, "worker_down": 2, "worker_missing": 3, "project_missing": 4, "session_error": 5, "session_retry": 6, "session_unread": 7, "session_done": 8}
 	last := -1
 	for _, c := range status.Conditions {
 		rank, ok := order[c.Kind]
@@ -494,7 +497,8 @@ func seedFleetParentChildren(c *Cluster, t *testing.T, n int) (root string, chil
 // propagation proof attributes worker-side (the same fields the controller
 // fold consumes). S3: the subtree ACTIVITY counts ride along as pointers —
 // the same presence shape the wire carries (nil would mean an unsupported
-// producer; the real worker always sets them).
+// producer; the real worker always sets them). The unread slice adds the
+// root-scoped finished-unread tri-state (same pointer contract).
 type fleetLeanFacts struct {
 	FleetSelected            *bool  `json:"fleet_selected"`
 	Activity                 string `json:"activity"`
@@ -504,6 +508,7 @@ type fleetLeanFacts struct {
 	SubtreePendingInput      int    `json:"subtree_pending_input"`
 	SubtreeError             *int   `json:"subtree_error"`
 	SubtreeRetry             *int   `json:"subtree_retry"`
+	Unread                   *bool  `json:"unread"`
 }
 
 // fleetLeanGate fetches the default project's selected-only lean gate map
@@ -560,6 +565,7 @@ type fleetProjRowView struct {
 	Busy     int    `json:"busy"`
 	Done     int    `json:"done"`
 	Pending  int    `json:"pending"`
+	Unread   int    `json:"unread"`
 }
 
 func fleetRollupNow(c *Cluster, t *testing.T) fleetRollupView {
@@ -880,8 +886,9 @@ func TestE2E_FleetStatusResidentChildPropagation(t *testing.T) {
 //
 // Leg order is deliberate: ERROR first, RETRY second. The fake's
 // /session/status never reports error (emit deletes the busy-map entry on
-// session.error), so the worker's 60s status-reconcile would clear an
-// ActivityError it re-reads; the retry leg mirrors type:"retry" into the
+// session.error — re-verified against pkg/fixtures/opencode.go's emit mirror
+// during the unread slice), so the worker's 60s status-reconcile would clear
+// an ActivityError it re-reads; the retry leg mirrors type:"retry" into the
 // busy map and is immune. Keeping the error leg early bounds the exposure
 // well inside the reconcile cadence (the whole test runs in a few seconds).
 func TestE2E_FleetStatusDescendantErrorRetryPropagation(t *testing.T) {
@@ -1047,5 +1054,174 @@ func TestE2E_FleetStatusDescendantErrorRetryPropagation(t *testing.T) {
 		}
 		row := fleetDefaultProjectRow(v)
 		return row != nil && row.Busy == baseRow.Busy
+	})
+}
+
+// TestE2E_FleetStatusUnreadAckLifecycle is the unread slice's e2e crux: a
+// RESIDENT subagent child driven through an ordinary busy→idle transition
+// marks its ROOT finished-unread in the worker store (markUnreadLocked,
+// root-scoped — the same signal the SPA renders as the unread dot), which
+// surfaces through the entire real chain — fixture /event ingress → worker
+// store fleet projection → lean /vh/gates wire (`unread:true` on the root,
+// the child never on the wire) → yamux tunnel → controller rollup fold
+// (session_unread condition + projects[].unread) — and an ACK through the
+// REAL worker ack surface clears it end to end: POST /vh/ack (the route the
+// SPA's scrolled-to-bottom ack calls; pkg/web handleAck → Store.AckUnread)
+// sent through the controller's worker-subdomain raw proxy → the REAL
+// yamux tunnel → the worker's real csrfGuard + handler, with the CHILD's
+// session id (proving AckUnread's rootOf resolution — acking any session in
+// the subtree acks the ROOT). The condition/row must drop to zero on the
+// next rollup generation. Informational severity is pinned too: the badge
+// never moves known_overall.
+//
+// FRESH CLUSTER (attribution: the fake's /event stream is not
+// directory-scoped, so a shared cluster would count this topology's marks
+// once per live project) with a HostPattern so the ack can ride the real
+// subdomain-proxy tunnel leg. Auth note: this harness runs both edges
+// auth-open (ModeNone — the cookie the production SPA carries is moot
+// here); the CSRF header is enforced by the worker's REAL csrfGuard on the
+// far side of the tunnel.
+func TestE2E_FleetStatusUnreadAckLifecycle(t *testing.T) {
+	c, err := StartClusterWithOptions(WithHostPattern("$ID.fleet.example"))
+	if err != nil {
+		t.Fatalf("StartCluster: %v", err)
+	}
+	t.Cleanup(c.Close)
+	root, children := seedFleetParentChildren(c, t, 1)
+	child := children[0]
+
+	// 1. Baseline: the root is selected on the lean wire with an EXPLICIT
+	//    supported-zero unread (presence: "unread":false serializes; nil
+	//    would mean an unsupported producer), and a rollup generation that
+	//    already reflects the owned root. Fresh-cluster attribution makes
+	//    the unread baseline hard-zero (no other root can hold a mark from
+	//    another project's traffic).
+	gate := fleetLeanGate(c, t)
+	rawRoot, ok := gate[root]
+	if !ok {
+		t.Fatalf("owned root %s must be selected in the lean map (%d entries)", root, len(gate))
+	}
+	if !strings.Contains(string(rawRoot), `"unread":false`) {
+		t.Fatalf("baseline root lean entry must carry an explicit \"unread\":false (supported zero), got %s", rawRoot)
+	}
+	selectedTotal := len(gate)
+	base := waitFleetRollup(c, t, 15*time.Second, "baseline generation reflects the owned root", func(v fleetRollupView) bool {
+		if !v.Coverage.Complete || !v.Gauge.Available {
+			return false
+		}
+		row := fleetDefaultProjectRow(v)
+		return row != nil && row.Sessions == selectedTotal
+	})
+	baseRow := fleetDefaultProjectRow(base)
+	if baseRow == nil {
+		t.Fatal("baseline rollup must carry the default project row")
+	}
+	baseUnread := fleetCondCount(base, "session_unread")
+	if baseUnread != 0 || baseRow.Unread != 0 {
+		t.Fatalf("fresh cluster must start unread-free (attribution precondition), got condition=%d row=%d", baseUnread, baseRow.Unread)
+	}
+
+	waitLeanEntry := func(desc string, pred func(fleetLeanFacts) bool) {
+		t.Helper()
+		deadline := time.Now().Add(6 * time.Second)
+		for time.Now().Before(deadline) {
+			raw, ok := fleetLeanGate(c, t)[root]
+			if ok {
+				var f fleetLeanFacts
+				if json.Unmarshal(raw, &f) == nil && pred(f) {
+					return
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatalf("root %s lean entry never satisfied (%s) within 6s", root, desc)
+	}
+
+	// 2. Drive the CHILD through an ordinary busy→idle completion (the
+	//    markOnIdle=true family): sticky busy via the fixture control, then
+	//    the real session.idle terminal. The store marks the ROOT — the
+	//    child is not even on the lean wire, so root-scoping is the only
+	//    way the mark can surface.
+	c.Fake.EmitSessionBusy(child)
+	waitLeanEntry("root subtree_busy from the busy child", func(f fleetLeanFacts) bool {
+		return f.SubtreeBusy
+	})
+	c.Fake.EmitSessionTerminal(child, "session.idle")
+	// Worker wire: the ROOT carries unread=true, subtree no longer busy.
+	waitLeanEntry("root unread=true after the child's ordinary busy→idle", func(f fleetLeanFacts) bool {
+		return f.Unread != nil && *f.Unread && !f.SubtreeBusy
+	})
+
+	// 3. Controller fold through the tunnel: session_unread == 1 with the
+	//    pinned label, the default project row's unread == 1, and the badge
+	//    is INFORMATIONAL — known_overall stays at its baseline severity.
+	unreadGen := waitFleetRollup(c, t, 15*time.Second, "session_unread==1 and projects[].unread==1", func(v fleetRollupView) bool {
+		if fleetCondCount(v, "session_unread") != 1 {
+			return false
+		}
+		row := fleetDefaultProjectRow(v)
+		return row != nil && row.Unread == 1
+	})
+	uc := fleetCond(unreadGen, "session_unread")
+	if uc == nil {
+		t.Fatal("session_unread condition must be present")
+	}
+	if uc.Count != 1 || uc.Label != "1 unread" {
+		t.Fatalf("session_unread: want count=1 label=\"1 unread\", got %+v", uc)
+	}
+	if unreadGen.KnownOverall != base.KnownOverall {
+		t.Fatalf("session_unread is informational: known_overall must stay %q, got %q", base.KnownOverall, unreadGen.KnownOverall)
+	}
+
+	// 4. ACK through the REAL worker ack surface VIA THE TUNNEL: POST
+	//    /vh/ack with the worker-subdomain Host (hostInterceptor → raw
+	//    yamux proxy → worker web server), the CSRF header the worker's
+	//    real csrfGuard requires, and the CHILD's session id — proving
+	//    AckUnread resolves the subtree id to its ROOT.
+	//
+	// TRANSPORT ISOLATION (required): the raw proxy HIJACKS this
+	// connection and owns it as a tunnel pipe for its lifetime, so the
+	// socket must NEVER return to a keep-alive pool. Production browsers
+	// isolate it for free (the worker subdomain is a different origin);
+	// this test's controller and the subdomain share 127.0.0.1:port, so a
+	// pooled DefaultTransport socket would be REUSED by the next
+	// cluster.Do GET — whose bytes the proxy then relays down the tunnel
+	// to the worker, whose catch-all answers the SPA shell (observed:
+	// "invalid character '<'"). DisableKeepAlives sends Connection: close
+	// and never pools the socket.
+	ackHost := strings.ReplaceAll(c.HostPattern, "$ID", c.WorkerID)
+	req, _ := http.NewRequest(http.MethodPost, c.ControllerURL+"/vh/ack",
+		strings.NewReader(`{"sessionID":`+strconv.Quote(child)+`}`))
+	req.Host = ackHost
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(e2eCsrfHeader, e2eCsrfValue)
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("ack POST through the tunnel: %v", err)
+	}
+	ackBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("ack POST /vh/ack: want 200, got %d: %s", resp.StatusCode, ackBody)
+	}
+	if !strings.Contains(string(ackBody), `"ok":true`) {
+		t.Fatalf("ack POST must return {\"ok\":true}, got %s", ackBody)
+	}
+
+	// 5. The ack clears the count: worker wire drops to an explicit false,
+	//    and the NEXT rollup generation's condition and row drop to zero.
+	waitLeanEntry("root unread cleared by the ack (explicit false)", func(f fleetLeanFacts) bool {
+		return f.Unread != nil && !*f.Unread
+	})
+	waitFleetRollup(c, t, 15*time.Second, "session_unread and projects[].unread back to zero after the ack", func(v fleetRollupView) bool {
+		if !v.Coverage.Complete || fleetCondCount(v, "session_unread") != 0 {
+			return false
+		}
+		row := fleetDefaultProjectRow(v)
+		return row != nil && row.Unread == 0
 	})
 }

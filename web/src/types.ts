@@ -67,14 +67,23 @@ export interface GateFacts {
   // fleet rollup folds on (nil = the producing daemon predates the
   // projection); the subtree_pending_* counts are the per-kind/union
   // pending SESSION counts over the session's subtree (inclusive of self) —
-  // a subagent child's wait surfaces on its root. The SPA does not read
-  // these yet (ordinary snapshots stay complete; the watch UI is future
-  // work); declared so the wire contract is documented where the rest of
-  // GateFacts lives.
+  // a subagent child's wait surfaces on its root; subtree_error /
+  // subtree_retry are the per-kind subtree ACTIVITY session counts
+  // (inclusive of self — the fleet session_error/session_retry fold
+  // inputs); unread is the ROOT-scoped finished-unread badge (the same
+  // signal the SPA's own unread dot renders and POST /vh/ack clears — see
+  // Snapshot.unread below; on the gate it is a presence-aware pointer-ish
+  // optional: absent = the producing daemon predates the field, false =
+  // supported zero). The SPA does not read these gate fields yet (ordinary
+  // snapshots stay complete; the watch UI is future work); declared so the
+  // wire contract is documented where the rest of GateFacts lives.
   fleet_selected?: boolean;
   subtree_pending_permission?: number;
   subtree_pending_question?: number;
   subtree_pending_input?: number;
+  subtree_error?: number;
+  subtree_retry?: number;
+  unread?: boolean;
   [k: string]: unknown;
 }
 
@@ -118,6 +127,12 @@ export interface Snapshot {
   activity?: Record<string, string>;
   permissions?: Record<string, Permission[]>;
   questions?: Record<string, Question[]>;
+  // unread is the SPA's OWN finished-unread surface: the list of ROOT
+  // session ids currently marked finished-unread (root-scoped; cleared by
+  // the SPA's POST /vh/ack). DISTINCT from the per-entry gate fact
+  // `GateFacts.unread` (the fleet-watch projection of the SAME store mark —
+  // same signal, different carrier: this array is the SPA's snapshot
+  // transport, the gate field is the controller fold's lean transport).
   unread?: string[];
   // Per-session todos. The daemon stores the raw `todo.updated` properties, so
   // each value is the ENVELOPE `{ sessionID, todos: [...] }`, not the bare array.
