@@ -95,7 +95,26 @@ shape shared). Exists so the controller's `GET /vh/fleet/status` stops
 moving whole session trees over the WAN tunnel (~5.9 MB raw for a 7-project
 roster became one small batched response). The controller treats any lean
 failure (404 from an older worker, non-2xx, malformed, a marker-violating
-body) as "use the per-project snapshot fallback".
+body — including a **missing or unknown `fleet_selection` marker**, which
+is required, not optional, and an explicitly not-selected entry, since
+this endpoint's contract is selected-only) as "use the per-project
+snapshot fallback".
+The fallback snapshot must speak the SAME vocabulary: a field-less or
+unknown-marker snapshot envelope classifies the worker `error`
+(`workers[].detail` names the unsupported producer and the upgrade ask)
+— an unsupported producer is never folded as a healthy observed empty
+("No sessions"). A marked genuinely-empty envelope (omitted/empty `gate`)
+is valid: supported zero stays honest.
+
+**Release contract (operator checklist — version floor ↔ fleet
+selection).** The first tag that ships `pkg/version` (the tunnel version
+boundary) must also ship the fleet-selection fields above, and the floors
+in `pkg/version/version.go` must equal that first shipping tag. Otherwise
+a floor-satisfying field-less worker passes the boundary and every refresh
+classifies it `error`. Rule: ship the boundary and the selection fields
+under ONE tag, or bump both floors in the same release commit that changes
+the selection vocabulary. No floor change or tag action is authorized by
+code alone — the tag is a protected operator decision.
 
 ### `GET /vh/stream?cursor=<seq>`
 Resumable SSE. Emits `id: <seq>` on every event so a client can track its cursor.

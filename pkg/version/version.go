@@ -57,6 +57,18 @@ const (
 // stamped and there is no in-repo version constant). Bump BOTH together with
 // the protocol change they guard; the two constants may diverge only when
 // the two sides' protocols genuinely diverge.
+//
+// RELEASE CONTRACT (fleet-status S1, followsups-brief family 1): the first
+// tag that ships this package must ALSO ship the fleet-selection gate
+// fields (pkg/state GateFacts.FleetSelected + the fleet_selection marker on
+// /vh/gates and /vh/snapshot envelopes), and the floors above must EQUAL
+// that first shipping tag. A floor-satisfying but field-less worker (the
+// tag lands without the fields, or below 1.67.0) passes the tunnel boundary
+// yet fails the controller's acquisition-side vocabulary check on every
+// refresh (worker `error`, never a healthy empty fold). Rule: ship both
+// under ONE tag, or bump both floors in the same release commit that
+// changes the selection vocabulary. Operator release checklist lives at
+// docs/architecture/03-stateful-aggregator.md → "GET /vh/gates".
 const (
 	MinWorkerVersion     = "1.67.0"
 	MinControllerVersion = "1.67.0"

@@ -35,10 +35,15 @@ package server
 //     root+unarchived, identified by the worker-side gate fact
 //     fleet_selected. The lean /vh/gates path is pre-filtered by the worker;
 //     the snapshot fallback carries the complete map and the fold filters it
-//     by the same field (identical populations on both paths). The gauge is
-//     busy selected roots / selected roots ("N/M busy"); `projects[]` is a
-//     bounded per-dir breakdown (≤16 rows / 8 KiB, omission-accounted) with
-//     config-roster labels.
+//     by the same field (identical populations on both paths). Both paths
+//     VALIDATE the fleet-selection vocabulary before any observation folds
+//     (the root_unarchived_v1 marker + tagged entries; see
+//     fleetSelectionValid): a marker-less lean body routes to the fallback,
+//     and a fallback envelope without the vocabulary classifies the worker
+//     `error` (unsupported producer) — unsupported data never masquerades as
+//     an observed empty fleet. The gauge is busy selected roots / selected
+//     roots ("N/M busy"); `projects[]` is a bounded per-dir breakdown
+//     (≤16 rows / 8 KiB, omission-accounted) with config-roster labels.
 //   - `summary`: server-authored English, ≤30 Unicode code points.
 //   - `gauge`: {value 0-1, label, available} — available=false distinguishes
 //     "unknown" from a real zero.
@@ -54,9 +59,13 @@ package server
 //     /vh/gates?z=1 request covering every in-scope project (the rollup
 //     consumes only the gate map per project — the worker returns exactly
 //     that, gzipped, no session-tree marshaling). On ANY lean failure (404
-//     from an old worker, non-2xx, malformed, timeout, cap trip) the
-//     acquisition falls back to ONE tree-only /vh/snapshot per in-scope
-//     project (z=1) — the pre-lean path, unchanged. The optional project
+//     from an old worker, non-2xx, malformed, timeout, cap trip — including
+//     a missing or unknown fleet_selection marker) the acquisition falls
+//     back to ONE tree-only /vh/snapshot per in-scope project (z=1) — the
+//     pre-lean path, unchanged except that each snapshot envelope must now
+//     also speak the fleet-selection vocabulary: a field-less fallback from
+//     an unsupported producer is a worker `error`, never a healthy empty
+//     fold. The optional project
 //     roster from the status config file (--status-config; see
 //     status_config.go) intersects discovery with the configured dirs
 //     (unconfigured dirs are excluded everywhere) and turns a configured dir
@@ -104,6 +113,7 @@ import (
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/state"
+	"github.com/vhqtvn/vh-solara/pkg/version"
 )
 
 // ---------------------------------------------------------------------------
@@ -715,9 +725,12 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 	// --- fold observations ------------------------------------------------
 	// The fold operates on the SELECTED population only: effective
 	// root+unarchived sessions, identified by the worker-side gate fact
-	// fleet_selected (nil = the producer predates fleet selection → excluded;
-	// the tunnel version boundary makes that unreachable in practice — see
-	// the design note in fetchLeanGates). The lean path is pre-filtered by
+	// fleet_selected. Both acquisition paths VALIDATE the selection
+	// vocabulary before any observation reaches this fold (see
+	// fleetSelectionValid and the fallback check in acquireWorker), so a
+	// nil fleet_selected from a field-less producer can no longer get here
+	// — the nil clause in the per-entry filter below is a defensive belt,
+	// not a supported producer class. The lean path is pre-filtered by
 	// the worker; the snapshot fallback carries the complete map and is
 	// filtered HERE by the same field, so both acquisition paths fold an
 	// identical population. A selected root's SUBTREE pending counts surface
@@ -767,7 +780,10 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 			for _, sid := range sids {
 				gf := p.gate[sid]
 				if gf.FleetSelected == nil || !*gf.FleetSelected {
-					continue // child, archived, or pre-selection producer: not in the fold population
+					// child, archived, or (defensively — see the fold note
+					// above) an untagged pre-selection entry: not in the fold
+					// population
+					continue
 				}
 				selectedRoots++
 				// Busy = the root's subtree is busy (inclusive of own
@@ -1347,7 +1363,14 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 	// payloads — honored by every current worker; an even older worker that
 	// ignores z=1 serves raw JSON, which the transport passes through
 	// unchanged (envelope decode is opt-in), so the request stays safe
-	// against any worker version.
+	// against any worker version. Since S1 the snapshot envelope must SPEAK
+	// THE FLEET-SELECTION VOCABULARY (the same contract the lean path
+	// validates): a field-less fallback (pre-selection producer) or an
+	// unknown marker version is an unsupported producer — a worker `error`
+	// with an explicit detail, NEVER folded as a healthy observed empty
+	// ("No sessions"). Previously validated projects keep their
+	// observations (partial-observation semantics, like every other
+	// mid-acquisition failure).
 	for _, p := range projects {
 		path := "/vh/snapshot?z=1"
 		if p.Dir != "" {
@@ -1359,11 +1382,17 @@ func (s *fleetStatusService) acquireWorker(ctx context.Context, workerID string,
 			return res
 		}
 		var snap struct {
-			Gate map[string]state.GateFacts `json:"gate"`
+			FleetSelection string                     `json:"fleet_selection"`
+			Gate           map[string]state.GateFacts `json:"gate"`
 		}
 		if err := json.Unmarshal(body, &snap); err != nil {
 			res.status = fleetWorkerError
 			res.detail = fleetMalformedDetail(path)
+			return res
+		}
+		if !fleetSelectionValid(snap.FleetSelection, snap.Gate) {
+			res.status = fleetWorkerError
+			res.detail = fleetUnsupportedSelectionDetail(path)
 			return res
 		}
 		cumulative += int64(len(body))
@@ -1402,16 +1431,20 @@ type fleetDiscoveredProject struct {
 // or a malformed/unexpected-schema body routes back to the per-project
 // snapshot path; the lean attempt itself never fails the worker.
 //
-// Fleet-selection validation: a worker that advertises the
-// root_unarchived_v1 capability must tag every nonempty gate entry with the
-// fleet_selected tri-state — an advertised-but-untagged entry is a producer
-// bug (malformed, not supported-zero) and routes to the fallback like any
-// other malformed body. An envelope with NO marker is accepted as-is
-// (operator amendment: the slice-1 tunnel version boundary floors worker
-// versions at 1.67.0, and controller+worker ship as one binary — a
-// marker-less lean response from a boundary-passing worker is not a state
-// this fleet models; the fold's nil-fleet_selected → excluded filter is the
-// documented residual treatment, see buildRollup).
+// Fleet-selection validation (capability guard): the lean contract
+// REQUIRES the root_unarchived_v1 marker — an envelope without it (a
+// field-less pre-selection producer) or with an unknown vocabulary version
+// cannot be interpreted and routes to the fallback like any other
+// unexpected shape; a marked envelope must tag every nonempty gate entry
+// with the fleet_selected tri-state (an advertised-but-untagged entry is a
+// producer bug, not supported-zero) AND every entry must be SELECTED —
+// this endpoint's producer contract is selected-only, so an explicitly
+// false-tagged entry is a misbuild, not a population statement. This SUPERSEDES the slice-2 operator
+// amendment that accepted marker-less lean bodies (the deviation the
+// fleet-status follow-ups brief closed): acceptance let a field-less
+// producer fold as a healthy "No sessions". Whether the fallback can serve
+// the worker is decided by the fallback's own vocabulary check in
+// acquireWorker — never by silently folding unvalidated entries.
 func fetchLeanGates(fetch func(path string) ([]byte, error), projects []fleetDiscoveredProject) (map[string]map[string]state.GateFacts, int64, bool) {
 	var sb strings.Builder
 	sb.WriteString("/vh/gates?z=1")
@@ -1436,29 +1469,57 @@ func fetchLeanGates(fetch func(path string) ([]byte, error), projects []fleetDis
 	if err := json.Unmarshal(body, &lean); err != nil || lean.Schema != 1 || lean.Projects == nil {
 		return nil, 0, false
 	}
-	switch lean.FleetSelection {
-	case "":
-		// No capability marker: accepted (see the doc comment).
-	case state.FleetSelectionRootUnarchivedV1:
-		// Advertised capability: every nonempty gate map must carry the
-		// selection tri-state on every entry.
-		for _, p := range lean.Projects {
-			for _, gf := range p.Gate {
-				if gf.FleetSelected == nil {
-					return nil, 0, false
-				}
+	gateMaps := make([]map[string]state.GateFacts, 0, len(lean.Projects))
+	for _, p := range lean.Projects {
+		gateMaps = append(gateMaps, p.Gate)
+	}
+	if !fleetSelectionValid(lean.FleetSelection, gateMaps...) {
+		return nil, 0, false
+	}
+	// The lean endpoint's producer contract is SELECTED-ONLY (pkg/web
+	// GateFactsFleetSelected filters children/archived server-side): an
+	// explicitly false-tagged entry on this path is a misbuild whose
+	// all-false gate map would fold as a healthy "No sessions" — route it
+	// to the fallback like any other contract violation. (The fallback's
+	// complete map legitimately carries false entries; it only requires
+	// the tri-state to be EXPLICIT — see fleetSelectionValid.)
+	for _, p := range lean.Projects {
+		for _, gf := range p.Gate {
+			if gf.FleetSelected == nil || !*gf.FleetSelected {
+				return nil, 0, false
 			}
 		}
-	default:
-		// An unknown selection vocabulary version: we cannot interpret these
-		// entries — treat like any other unexpected shape and fall back.
-		return nil, 0, false
 	}
 	gates := make(map[string]map[string]state.GateFacts, len(lean.Projects))
 	for _, p := range lean.Projects {
 		gates[p.Dir] = p.Gate
 	}
 	return gates, int64(len(body)), true
+}
+
+// fleetSelectionValid reports whether an acquisition envelope (lean or
+// snapshot fallback) speaks the fleet-selection vocabulary this controller
+// folds: the KNOWN capability marker must be present (absent = a field-less
+// pre-selection producer; any other value = a vocabulary version we cannot
+// interpret), and every entry of every nonempty gate map must carry the
+// fleet_selected tri-state explicitly (an advertised-but-untagged entry is
+// a producer bug). A marked empty or omitted gate map IS valid — a
+// supported, genuinely-empty population, never conflated with an
+// unsupported producer. An envelope that fails this check must never be
+// folded: its all-excluded entries would masquerade unsupported data as an
+// observed empty fleet ("No sessions" with available:true).
+func fleetSelectionValid(marker string, gates ...map[string]state.GateFacts) bool {
+	if marker != state.FleetSelectionRootUnarchivedV1 {
+		return false
+	}
+	for _, g := range gates {
+		for _, gf := range g {
+			if gf.FleetSelected == nil {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------
@@ -1518,6 +1579,20 @@ func fleetResponseCapDetail(err error, path string, cap int64) string {
 		return fleetClampDetail(fmt.Sprintf("response %s > %s cap (%s)", fleetHumanBytes(ovs.Got), fleetHumanBytes(cap), tp))
 	}
 	return fleetClampDetail(fmt.Sprintf("response over %s cap (%s)", fleetHumanBytes(cap), tp))
+}
+
+// fleetUnsupportedSelectionDetail names an unsupported fleet-selection
+// producer: the envelope does not speak the root_unarchived_v1 vocabulary
+// this controller folds (no marker, an unknown marker version, or untagged
+// gate entries) — a vh-solara worker built before fleet selection, i.e.
+// older than the tunnel version floor or a pre-selection dev build the
+// boundary admits fail-open. The upgrade ask sources pkg/version's floor
+// so it can never drift from the boundary. Bounded by the detail ceiling
+// like every limited/error detail.
+func fleetUnsupportedSelectionDetail(path string) string {
+	return fleetClampDetail(fmt.Sprintf(
+		"unsupported fleet selection vocabulary (%s): upgrade the vh-solara worker to >= %s",
+		fleetTruncRunes(path, fleetDetailPathMaxRunes), version.MinWorkerVersion))
 }
 
 // fleetHumanBytes renders a byte count compactly for detail strings: whole

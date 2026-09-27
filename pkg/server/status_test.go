@@ -28,6 +28,7 @@ import (
 	"github.com/vhqtvn/vh-solara/pkg/auth"
 	"github.com/vhqtvn/vh-solara/pkg/state"
 	"github.com/vhqtvn/vh-solara/pkg/tunnel"
+	"github.com/vhqtvn/vh-solara/pkg/version"
 )
 
 // ---------------------------------------------------------------------------
@@ -158,8 +159,17 @@ func fleetGF(activity string, perm, quest bool) state.GateFacts {
 	return gf
 }
 
+// fleetSnapBody builds a snapshot response body the way a CURRENT worker
+// materializes it: the fleet_selection capability marker plus the gate map
+// (empty gate renders as an empty object here; a real marked-empty snapshot
+// omits the key — both are valid to the fallback validator). Tests that
+// need a FIELD-LESS or unknown-vocabulary producer script their own raw
+// literals (see TestFleetStatus_FieldlessFallbackIsExplicitError).
 func fleetSnapBody(gate map[string]state.GateFacts) string {
-	b, err := json.Marshal(map[string]any{"gate": gate})
+	b, err := json.Marshal(map[string]any{
+		"fleet_selection": state.FleetSelectionRootUnarchivedV1,
+		"gate":            gate,
+	})
 	if err != nil {
 		panic(err)
 	}
@@ -1094,13 +1104,13 @@ func TestFleetStatus_LimitedDetailResponseCap(t *testing.T) {
 func TestFleetStatus_LimitedDetailCumulative(t *testing.T) {
 	d, fake := newFleetTestDaemon(t, "")
 	fleetAddOnline(t, d.Registry, "w1")
-	// Fixed literals so the byte math is exact: discovery is 27 B, the /a
-	// snapshot 38 B — cumulative 65 after /a already exceeds the 38-B
-	// budget, so the trip names /a (whose observation still counts). The
-	// raw literal carries fleet_selected (gauge-semantics fold: only
-	// selected roots count, so an untagged session would fold as nothing).
+	// Fixed literals so the byte math is exact: the /a snapshot carries the
+	// fleet_selection marker (the fallback validator requires it) and its
+	// session carries fleet_selected (gauge-semantics fold: only selected
+	// roots count). Discovery (27 B) + snapA together exceed the 38-B
+	// budget, so the trip names /a (whose observation still counts).
 	discovery := `[{"dir":"/a"},{"dir":"/b"}]`
-	snapA := `{"gate":{"s1":{"activity":"error","fleet_selected":true}}}`
+	snapA := `{"fleet_selection":"root_unarchived_v1","gate":{"s1":{"activity":"error","fleet_selected":true}}}`
 	fake.setBody("w1", "/vh/projects", discovery)
 	fake.setBody("w1", "/vh/snapshot?z=1&dir=%2Fa", snapA)
 	svc := d.fleetStatusService()
@@ -1129,7 +1139,7 @@ func TestFleetStatus_LimitedDetailCumulative(t *testing.T) {
 	d2, fake2 := newFleetTestDaemon(t, "")
 	fleetAddOnline(t, d2.Registry, "w2")
 	fake2.setBody("w2", "/vh/projects", `[{"dir":"`+long+`"}]`)
-	fake2.setBody("w2", "/vh/snapshot?z=1&dir="+long, `{"gate":{}}`)
+	fake2.setBody("w2", "/vh/snapshot?z=1&dir="+long, `{"fleet_selection":"root_unarchived_v1","gate":{}}`)
 	d2.fleetStatusService().budgets.MaxWorkerCumulativeBytes = 1
 	resp2 := decodeFleet(t, doFleet(d2.buildRootHandler()))
 	w2 := workerEntry(t, resp2, "w2")
@@ -1967,10 +1977,13 @@ func TestFleetStatus_DescendantPendingSurfacesOnRoot(t *testing.T) {
 
 // TestFleetStatus_SelectedFoldSnapshotPath pins the SAME selected-population
 // fold through the SNAPSHOT fallback: children and archived roots arrive in
-// the complete gate map and are filtered by fleet_selected at the fold; a
-// nil fleet_selected (pre-selection producer) is excluded — the documented
-// residual treatment. Also pins the busy belt: a root whose own activity is
-// busy counts busy even if the producer left subtree_busy unset.
+// the complete gate map and are filtered by fleet_selected at the fold.
+// (A nil fleet_selected no longer reaches this fold — the fallback
+// validator rejects an untagged entry as an unsupported producer; that
+// classification is pinned by TestFleetStatus_FieldlessFallbackIsExplicitError.
+// The fold's nil clause is a defensive belt.) Also pins the busy belt: a
+// root whose own activity is busy counts busy even if the producer left
+// subtree_busy unset.
 func TestFleetStatus_SelectedFoldSnapshotPath(t *testing.T) {
 	d, fake := newFleetTestDaemon(t, "")
 	fleetAddOnline(t, d.Registry, "w")
@@ -1979,11 +1992,10 @@ func TestFleetStatus_SelectedFoldSnapshotPath(t *testing.T) {
 	fake.setBody("w", "/vh/projects", fleetProjectsBody("/repo"))
 	// No lean body scripted → the lean attempt fails → snapshot fallback.
 	fake.setBody("w", "/vh/snapshot?z=1&dir=%2Frepo", fleetSnapBody(map[string]state.GateFacts{
-		"root-busy":       {Activity: "busy", FleetSelected: &selTrue},  // busy root (belt: no subtree_busy)
-		"root-idle":       fleetGF("idle", false, false),                // selected, idle
-		"child-busy":      {Activity: "busy", FleetSelected: &selFalse}, // child: not in the fold population
-		"arch-root":       {Activity: "idle", FleetSelected: &selFalse}, // archived root: excluded
-		"legacy-untagged": {Activity: "busy"},                           // nil fleet_selected: excluded (residual)
+		"root-busy":  {Activity: "busy", FleetSelected: &selTrue},  // busy root (belt: no subtree_busy)
+		"root-idle":  fleetGF("idle", false, false),                // selected, idle
+		"child-busy": {Activity: "busy", FleetSelected: &selFalse}, // child: not in the fold population
+		"arch-root":  {Activity: "idle", FleetSelected: &selFalse}, // archived root: excluded
 	}))
 
 	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
@@ -2337,29 +2349,351 @@ func TestFleetStatus_ProjectsCapAndOmission(t *testing.T) {
 }
 
 // TestFleetStatus_LeanMarkerValidation pins the capability validation: a
-// lean response that ADVERTISES root_unarchived_v1 but carries an untagged
-// gate entry is a producer bug — malformed, not supported-zero — and routes
-// to the snapshot fallback (which serves the worker ok and drives conditions
+// lean response that ADVERTISES root_unarchived_v1 but violates the
+// producer contract — an UNTAGGED gate entry (producer bug), or an
+// explicitly NOT-SELECTED entry (this endpoint is selected-only by
+// contract; an all-false map is a misbuild that would fold as a healthy
+// "No sessions") — is malformed, not supported-zero, and routes to the
+// snapshot fallback (which serves the worker ok and drives conditions
 // from its own complete gate map).
 func TestFleetStatus_LeanMarkerValidation(t *testing.T) {
+	for name, body := range map[string]string{
+		"untagged entry": `{"schema":1,"fleet_selection":"root_unarchived_v1","projects":[{"dir":"/a","gate":{"s1":{"activity":"idle"}}}]}`,
+		"entry not selected": `{"schema":1,"fleet_selection":"root_unarchived_v1","projects":[{"dir":"/a",` +
+			`"gate":{"s1":{"activity":"idle","fleet_selected":false}}}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			d, fake := newFleetTestDaemon(t, "")
+			fleetAddOnline(t, d.Registry, "w")
+			fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+			fake.setBody("w", fleetGatesPath("/a"), body)
+			fake.setBody("w", "/vh/snapshot?z=1&dir=%2Fa", fleetSnapBody(map[string]state.GateFacts{
+				"s1": fleetGF("idle", true, false),
+			}))
+
+			resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+			if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
+				t.Fatalf("%s: contract-violating lean must fall back and end ok, got %+v", name, w)
+			}
+			if n := fake.count("w"); n != 3 {
+				t.Fatalf("%s: calls: want discovery + rejected lean + 1 snapshot, got %d", name, n)
+			}
+			if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondPermissionPending {
+				t.Fatalf("%s: fallback observation must drive conditions, got %v", name, got)
+			}
+		})
+	}
+}
+
+// wantUnsupportedSelectionDetail mirrors fleetUnsupportedSelectionDetail's
+// exact wording (sourced from version.MinWorkerVersion, never a hardcoded
+// floor) so the S1 tests pin the honest unsupported-producer ask.
+func wantUnsupportedSelectionDetail(path string) string {
+	return fmt.Sprintf(
+		"unsupported fleet selection vocabulary (%s): upgrade the vh-solara worker to >= %s",
+		path, version.MinWorkerVersion)
+}
+
+// TestFleetStatus_LeanMarkerRequired pins the S1 lean capability contract:
+// the fleet_selection marker is REQUIRED. An envelope without it (a
+// field-less pre-selection producer) or with an unknown vocabulary version
+// routes to the snapshot fallback exactly like any other unexpected shape
+// — and a VALID fallback then serves the worker ok (the "invalid lean +
+// valid fallback" matrix cell). The prior marker-less acceptance is
+// explicitly superseded.
+func TestFleetStatus_LeanMarkerRequired(t *testing.T) {
+	for name, body := range map[string]string{
+		"marker absent": `{"schema":1,"projects":[{"dir":"/a","gate":{"s1":{"activity":"idle","fleet_selected":true}}}]}`,
+		"marker unknown": `{"schema":1,"fleet_selection":"future_v9","projects":[{"dir":"/a",` +
+			`"gate":{"s1":{"activity":"idle","fleet_selected":true}}}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			d, fake := newFleetTestDaemon(t, "")
+			applyFleetRosters(t, d, []string{"w"}, []string{"/a"})
+			fleetAddOnline(t, d.Registry, "w")
+			fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+			fake.setBody("w", fleetGatesPath("/a"), body)
+			fake.setBody("w", "/vh/snapshot?z=1&dir=%2Fa", fleetSnapBody(map[string]state.GateFacts{
+				"s1": fleetGF("idle", true, false),
+			}))
+
+			resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+			if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
+				t.Fatalf("marker-less lean (%s) must fall back to a valid snapshot and end ok, got %+v", name, w)
+			}
+			if n := fake.count("w"); n != 3 {
+				t.Fatalf("calls: want discovery + rejected lean + 1 snapshot, got %d", n)
+			}
+			if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondPermissionPending {
+				t.Fatalf("fallback observation must drive conditions, got %v", got)
+			}
+		})
+	}
+}
+
+// TestFleetStatus_FieldlessFallbackIsExplicitError pins the S1 honesty crux:
+// when the fallback snapshot ALSO fails the fleet-selection vocabulary
+// check, the worker is classified error with an explicit unsupported-
+// producer detail — NEVER folded as a healthy observed empty. Covers the
+// real pre-selection shape (no marker + untagged entries), the advertised-
+// but-untagged producer bug, and an unknown marker version. A marked empty
+// (gate omitted) stays valid — that case is pinned separately below.
+func TestFleetStatus_FieldlessFallbackIsExplicitError(t *testing.T) {
+	for name, body := range map[string]string{
+		"field-less (pre-selection worker)": `{"gate":{"s1":{"activity":"busy"}}}`,
+		"marked but untagged entries":       `{"fleet_selection":"root_unarchived_v1","gate":{"s1":{"activity":"busy"}}}`,
+		"unknown marker version":            `{"fleet_selection":"future_v9","gate":{"s1":{"activity":"busy","fleet_selected":true}}}`,
+		"unknown marker, empty gate":        `{"fleet_selection":"future_v9","gate":{}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			d, fake := newFleetTestDaemon(t, "")
+			applyFleetRosters(t, d, []string{"w"}, []string{"/a"})
+			fleetAddOnline(t, d.Registry, "w")
+			fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+			// No lean body scripted → the lean attempt fails → fallback.
+			fake.setBody("w", "/vh/snapshot?z=1&dir=%2Fa", body)
+
+			resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+			w := workerEntry(t, resp, "w")
+			if w.Status != fleetWorkerError {
+				t.Fatalf("%s: want error, got %+v", name, w)
+			}
+			if want := wantUnsupportedSelectionDetail("/vh/snapshot?z=1&dir=%2Fa"); w.Detail != want {
+				t.Fatalf("%s detail: want %q, got %q", name, want, w.Detail)
+			}
+			if n := len([]rune(w.Detail)); n > fleetDetailMaxRunes {
+				t.Fatalf("detail exceeds the %d-code-point ceiling: %d", fleetDetailMaxRunes, n)
+			}
+			if w.ObservedAt != nil {
+				t.Fatalf("%s: an error row must carry no observed_at, got %+v", name, w)
+			}
+			// The honesty crux: NEVER a healthy "No sessions" — the busy
+			// session must not fold, coverage is incomplete, overall stays
+			// unknown, and the invalid project is not observed.
+			if resp.Gauge.Available || resp.Gauge.Label != "Coverage incomplete" {
+				t.Fatalf("%s: gauge must stay unavailable, got %+v", name, resp.Gauge)
+			}
+			if resp.Coverage.Complete || resp.Overall != fleetOverallUnknown {
+				t.Fatalf("%s: unsupported producer must force incomplete/unknown, got %+v %s", name, resp.Coverage, resp.Overall)
+			}
+			if got := condKinds(resp); len(got) != 0 {
+				t.Fatalf("%s: unsupported entries must not fold into conditions, got %v", name, got)
+			}
+			if resp.Coverage.ObservedProjects != 0 || resp.Coverage.UnknownProjects != 1 {
+				t.Fatalf("%s: the invalid snapshot's dir must not count observed, got %+v", name, resp.Coverage)
+			}
+			if len(resp.Projects) != 0 {
+				t.Fatalf("%s: no project row may be fabricated, got %+v", name, resp.Projects)
+			}
+		})
+	}
+}
+
+// TestFleetStatus_FieldlessWorkerAlongsideSupported pins the mixed-fleet
+// matrix cell: a supported worker folds normally while a field-less worker
+// in the SAME refresh classifies error — the fleet response is incomplete/
+// unknown overall, and the supported worker's observations still count.
+func TestFleetStatus_FieldlessWorkerAlongsideSupported(t *testing.T) {
 	d, fake := newFleetTestDaemon(t, "")
-	fleetAddOnline(t, d.Registry, "w")
-	fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
-	// Marker advertised; the entry lacks fleet_selected.
-	fake.setBody("w", fleetGatesPath("/a"), `{"schema":1,"fleet_selection":"root_unarchived_v1","projects":[{"dir":"/a","gate":{"s1":{"activity":"idle"}}}]}`)
-	fake.setBody("w", "/vh/snapshot?z=1&dir=%2Fa", fleetSnapBody(map[string]state.GateFacts{
-		"s1": fleetGF("idle", true, false),
+	applyFleetRosters(t, d, []string{"new", "old"}, []string{"/repo"})
+	fleetAddOnline(t, d.Registry, "new")
+	fleetAddOnline(t, d.Registry, "old")
+
+	fake.setBody("new", "/vh/projects", fleetProjectsBody("/repo"))
+	fake.setBody("new", fleetGatesPath("/repo"), fleetGatesBody(map[string]map[string]state.GateFacts{
+		"/repo": {"s1": fleetGF("busy", false, false)},
 	}))
+	fake.setBody("old", "/vh/projects", fleetProjectsBody("/repo"))
+	// old: lean unscripted (fails) → field-less snapshot.
+	fake.setBody("old", "/vh/snapshot?z=1&dir=%2Frepo", `{"gate":{"s1":{"activity":"busy"}}}`)
 
 	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
-	if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
-		t.Fatalf("marker-violating lean must fall back and end ok, got %+v", w)
+	if w := workerEntry(t, resp, "new"); w.Status != fleetWorkerOK {
+		t.Fatalf("supported worker: want ok, got %+v", w)
 	}
-	if n := fake.count("w"); n != 3 {
-		t.Fatalf("calls: want discovery + rejected lean + 1 snapshot, got %d", n)
+	w := workerEntry(t, resp, "old")
+	if w.Status != fleetWorkerError || w.Detail != wantUnsupportedSelectionDetail("/vh/snapshot?z=1&dir=%2Frepo") {
+		t.Fatalf("field-less worker: want error + unsupported detail, got %+v", w)
 	}
-	if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondPermissionPending {
-		t.Fatalf("fallback observation must drive conditions, got %v", got)
+	if resp.Coverage.Complete || resp.Overall != fleetOverallUnknown {
+		t.Fatalf("mixed support must force incomplete/unknown, got %+v %s", resp.Coverage, resp.Overall)
+	}
+	if resp.Gauge.Available {
+		t.Fatalf("mixed support must never yield a healthy gauge, got %+v", resp.Gauge)
+	}
+	// The supported worker's busy root still folds (1 selected session, no
+	// condition kinds — busy is not a condition).
+	if len(resp.Conditions) != 0 {
+		t.Fatalf("conditions: none expected, got %v", condKinds(resp))
+	}
+	if len(resp.Projects) != 1 || resp.Projects[0].Dir != "/repo" || resp.Projects[0].Sessions != 1 || resp.Projects[0].Complete {
+		t.Fatalf("supported worker's row must fold as known-partial, got %+v", resp.Projects)
+	}
+}
+
+// TestFleetStatus_FieldlessProjectAfterValidOne pins the mixed-PROJECTS
+// matrix cell inside ONE worker: when the fallback's FIRST project
+// validates and a LATER project is field-less, the worker classifies error
+// (naming the field-less project's path) while the already-validated
+// project keeps its observation — the same partial-observation semantics
+// as every other mid-acquisition failure. The field-less project is not
+// observed and never folds as an empty row.
+func TestFleetStatus_FieldlessProjectAfterValidOne(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	applyFleetRosters(t, d, []string{"w"}, []string{"/a", "/b"})
+	fleetAddOnline(t, d.Registry, "w")
+	fake.setBody("w", "/vh/projects", fleetProjectsBody("/a", "/b"))
+	// No lean body scripted → fallback; /a validates, /b is field-less.
+	fake.setBody("w", "/vh/snapshot?z=1&dir=%2Fa", fleetSnapBody(map[string]state.GateFacts{
+		"s1": fleetGF("error", false, false),
+	}))
+	fake.setBody("w", "/vh/snapshot?z=1&dir=%2Fb", `{"gate":{"s2":{"activity":"busy"}}}`)
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	w := workerEntry(t, resp, "w")
+	if w.Status != fleetWorkerError || w.Detail != wantUnsupportedSelectionDetail("/vh/snapshot?z=1&dir=%2Fb") {
+		t.Fatalf("want error naming the field-less project, got %+v", w)
+	}
+	// /a's validated observation stays counted (partial-observation
+	// semantics); /b never observes.
+	if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondSessionError || resp.Conditions[0].Count != 1 {
+		t.Fatalf("/a's observation must survive the later failure: %v", resp.Conditions)
+	}
+	if resp.Coverage.ObservedProjects != 1 || resp.Coverage.UnknownProjects != 1 {
+		t.Fatalf("project coverage: want 1 observed / 1 unknown, got %+v", resp.Coverage)
+	}
+	if len(resp.Projects) != 1 || resp.Projects[0].Dir != "/a" || resp.Projects[0].Sessions != 1 {
+		t.Fatalf("only /a may render a row, got %+v", resp.Projects)
+	}
+}
+
+// TestFleetStatus_SupportedEmptyGaugeStaysHonest pins the DO-NOT-OVER-REJECT
+// side of S1: a marked, genuinely-empty population still serves the honest
+// available "No sessions" gauge — on BOTH acquisition paths (lean marked
+// empty; fallback snapshot with the gate key omitted, the real worker's
+// omitempty shape for an empty project).
+func TestFleetStatus_SupportedEmptyGaugeStaysHonest(t *testing.T) {
+	t.Run("lean marked empty", func(t *testing.T) {
+		d, fake := newFleetTestDaemon(t, "")
+		applyFleetRosters(t, d, []string{"w"}, []string{"/a"})
+		fleetAddOnline(t, d.Registry, "w")
+		fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+		fake.setBody("w", fleetGatesPath("/a"), fleetGatesBody(map[string]map[string]state.GateFacts{
+			"/a": {}, // marker + empty gate: supported zero
+		}))
+
+		resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+		if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
+			t.Fatalf("marked-empty lean must serve ok, got %+v", w)
+		}
+		if n := fake.count("w"); n != 2 {
+			t.Fatalf("calls: want discovery + lean only, got %d", n)
+		}
+		if !resp.Gauge.Available || resp.Gauge.Label != "No sessions" {
+			t.Fatalf("gauge: want available \"No sessions\", got %+v", resp.Gauge)
+		}
+		if resp.Overall != fleetOverallNominal || resp.Summary != "Nominal" {
+			t.Fatalf("supported empty: want nominal, got %s / %q", resp.Overall, resp.Summary)
+		}
+	})
+	t.Run("fallback marked empty, gate omitted", func(t *testing.T) {
+		d, fake := newFleetTestDaemon(t, "")
+		applyFleetRosters(t, d, []string{"w"}, []string{"/a"})
+		fleetAddOnline(t, d.Registry, "w")
+		fake.setBody("w", "/vh/projects", fleetProjectsBody("/a"))
+		// No lean body scripted → fallback. A real current worker omits the
+		// empty gate map (omitempty); the marker alone asserts the vocabulary.
+		fake.setBody("w", "/vh/snapshot?z=1&dir=%2Fa", `{"fleet_selection":"root_unarchived_v1"}`)
+
+		resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+		if w := workerEntry(t, resp, "w"); w.Status != fleetWorkerOK {
+			t.Fatalf("marked-empty snapshot must serve ok, got %+v", w)
+		}
+		if !resp.Gauge.Available || resp.Gauge.Label != "No sessions" {
+			t.Fatalf("gauge: want available \"No sessions\", got %+v", resp.Gauge)
+		}
+	})
+}
+
+// TestFleetStatus_LeanSuccessCumulativeBudgetExit pins the D1 lean-success
+// budget-exit branch: a SUCCESSFUL lean body that pushes the worker over
+// MaxWorkerCumulativeBytes classifies limited with the cumulative detail
+// naming the LAST requested dir, and the lean observations STAY counted
+// (no fallback re-fetch — the acquisition already has real data).
+func TestFleetStatus_LeanSuccessCumulativeBudgetExit(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	applyFleetRosters(t, d, []string{"w"}, []string{"/a", "/b"})
+	fleetAddOnline(t, d.Registry, "w")
+	discovery := `[{"dir":"/a"},{"dir":"/b"}]`
+	leanBody := fleetGatesBody(map[string]map[string]state.GateFacts{
+		"/a": {"s1": fleetGF("error", false, false)},
+		"/b": {"s2": fleetGF("busy", false, false)},
+	})
+	fake.setBody("w", "/vh/projects", discovery)
+	fake.setBody("w", fleetGatesPath("/a", "/b"), leanBody)
+	// Budget = the discovery size alone: cumulative trips immediately after
+	// the lean body lands.
+	svc := d.fleetStatusService()
+	svc.budgets.MaxWorkerCumulativeBytes = int64(len(discovery))
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	w := workerEntry(t, resp, "w")
+	if w.Status != fleetWorkerLimited {
+		t.Fatalf("w: want limited after a successful-but-oversized lean body, got %+v", w)
+	}
+	want := fmt.Sprintf("cumulative %d B > %d B budget after /b", len(discovery)+len(leanBody), len(discovery))
+	if w.Detail != want {
+		t.Fatalf("cumulative detail: want %q, got %q", want, w.Detail)
+	}
+	// Lean observations retained: /a's error session still fires its
+	// condition despite the limited exit; no fallback fetches ran.
+	if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondSessionError || resp.Conditions[0].Count != 1 {
+		t.Fatalf("lean observations must stay counted: %v", resp.Conditions)
+	}
+	if n := fake.count("w"); n != 2 {
+		t.Fatalf("calls: want discovery + ONE lean (no fallback after limited), got %d", n)
+	}
+	if resp.Coverage.Complete || resp.Gauge.Available {
+		t.Fatalf("limited exit must force incomplete coverage / unavailable gauge, got %+v", resp.Coverage)
+	}
+}
+
+// TestFleetStatus_LeanPathProjectCapLimited pins the D1 lean-path
+// project-cap exit: when discovery exceeds MaxProjectsPerWorker but the
+// (truncated) lean request SUCCEEDS, the worker classifies limited with the
+// project-cap detail — parity with the fallback path's classification —
+// the in-cap projects' lean observations stay counted, and exactly ONE
+// lean fetch covers them (no per-project snapshots).
+func TestFleetStatus_LeanPathProjectCapLimited(t *testing.T) {
+	d, fake := newFleetTestDaemon(t, "")
+	applyFleetRosters(t, d, []string{"w"}, []string{"/p1", "/p2", "/p3"})
+	fleetAddOnline(t, d.Registry, "w")
+	fake.setBody("w", "/vh/projects", fleetProjectsBody("/p1", "/p2", "/p3"))
+	// The lean request covers ONLY the capped (sorted) list /p1,/p2.
+	fake.setBody("w", fleetGatesPath("/p1", "/p2"), fleetGatesBody(map[string]map[string]state.GateFacts{
+		"/p1": {"s1": fleetGF("error", false, false)},
+		"/p2": {"s2": fleetGF("error", false, false)},
+	}))
+	d.fleetStatusService().budgets.MaxProjectsPerWorker = 2
+
+	resp := decodeFleet(t, doFleet(d.buildRootHandler()))
+	w := workerEntry(t, resp, "w")
+	if w.Status != fleetWorkerLimited {
+		t.Fatalf("w: want limited via the lean path's project-cap exit, got %+v", w)
+	}
+	if want := "project count 3 > 2 cap"; w.Detail != want {
+		t.Fatalf("project-cap detail: want %q, got %q", want, w.Detail)
+	}
+	// In-cap lean observations retained: two error sessions fire one
+	// session_error condition of count 2.
+	if got := condKinds(resp); len(got) != 1 || got[0] != fleetCondSessionError || resp.Conditions[0].Count != 2 {
+		t.Fatalf("in-cap lean observations must stay counted: %v", resp.Conditions)
+	}
+	if n := fake.count("w"); n != 2 {
+		t.Fatalf("calls: want discovery + ONE lean over the capped list, got %d", n)
+	}
+	if resp.Coverage.ObservedProjects != 2 || resp.Coverage.UnknownProjects != 1 {
+		t.Fatalf("project coverage: want 2 observed / 1 unknown, got %+v", resp.Coverage)
 	}
 }
 
