@@ -17,6 +17,7 @@ import { firstNeedsYouAtFor } from "./store";
 import { isSavedLayout, scheduleSave, type SavedLayout } from "./layoutPersistence";
 import {
   buildTimeFleetOrigins,
+  coerceMasterLayoutEntry,
   coerceTabLayoutEntry,
   validateServerLayoutTargets,
 } from "./layoutValidation";
@@ -27,6 +28,8 @@ import {
   loadNamedLayout,
   renameNamedLayout,
   saveTabLayout,
+  type MasterLayoutEntry,
+  type NamedMasterSession,
   type TabLayoutEntry,
   // Aliased: the controller class has a saveMasterLayout METHOD (the HostOps
   // facet); the un-aliased name would shadow the module function that method
@@ -130,6 +133,41 @@ function controllerForPane(paneId: string): HostController | null {
     if (c.renderers.has(paneId)) return c;
   }
   return null;
+}
+
+/**
+ * The ONE destructive master-session apply (add-all → close-all → activate).
+ * Shared by BOTH entry paths — the local-name path (HostOps.loadMasterLayout)
+ * and the server-sourced path (HostOps.loadMasterLayoutEntry) — so a
+ * server-sourced master row can never load through a second apply
+ * implementation (F3 H1: same validated destructive load, whatever the
+ * bytes' origin). Caller has already validated the session (non-empty
+ * workspaces; the server path additionally gates structure + targets).
+ * Returns false only when nothing could be applied (empty session — the
+ * never-zero invariant makes a zero-workspace outcome unreachable).
+ */
+function applyMasterSession(session: NamedMasterSession): boolean {
+  const saved = session.workspaces;
+  if (saved.length === 0) return false;
+  // Pre-existing ids captured BEFORE the adds (the close set).
+  const oldIds = storeWorkspaces().map((w) => w.id);
+  // 1. Cold-mount every saved workspace (blob order preserved).
+  const created: { id: string; name: string }[] = [];
+  for (const w of saved) {
+    const id = storeAddWorkspace(w.name, w.layout);
+    created.push({ id, name: w.name });
+  }
+  // 2. Close every pre-existing workspace via the existing destroy path.
+  //    Active is on a NEW workspace throughout (the last add activated it),
+  //    so no close re-activates anything unexpectedly.
+  for (const id of oldIds) storeCloseWorkspace(id);
+  // 3. Activate the saved active by name (first match; fallback = first).
+  const activeName = session.activeWorkspaceName;
+  const target = activeName
+    ? created.find((c) => c.name === activeName)
+    : undefined;
+  storeSetActiveWorkspace(target?.id ?? created[0].id);
+  return true;
 }
 
 export class HostController implements HostOps {
@@ -815,27 +853,51 @@ export class HostController implements HostOps {
   loadMasterLayout(name: string): boolean {
     const entry = loadNamedLayout(name);
     if (!entry || entry.scope !== "master") return false;
-    const saved = entry.session.workspaces;
-    if (saved.length === 0) return false;
-    // Pre-existing ids captured BEFORE the adds (the close set).
-    const oldIds = storeWorkspaces().map((w) => w.id);
-    // 1. Cold-mount every saved workspace (blob order preserved).
-    const created: { id: string; name: string }[] = [];
+    if (entry.session.workspaces.length === 0) return false;
+    return applyMasterSession(entry.session);
+  }
+
+  /**
+   * DESTRUCTIVE session replace for a SERVER-SOURCED master entry (the
+   * /vh/layouts catalog) — the master counterpart of loadLayoutEntry. The
+   * apply is the EXACT SAME path a local master load takes (applyMasterSession
+   * — never a second apply implementation); what differs is the entry gate,
+   * because server bytes are untrusted until validated:
+   *
+   *  1. STRUCTURAL: the entry is re-coerced through the shared
+   *     coerceMasterLayoutEntry (a malformed entry is rejected, reason
+   *     "invalid-entry"), the session must be non-empty, and EVERY workspace
+   *     layout must pass the cold-restore pipeline's isSavedLayout structural
+   *     guard. Unlike a TAB entry there is NO zero-panel rejection: a master
+   *     snapshot legitimately contains EMPTY workspaces (a local master save
+   *     captures them; an empty workspace cold-restores as an empty workspace
+   *     — that IS the saved session, not a degenerate load).
+   *  2. TARGETS: every pane target of EVERY workspace layout is checked via
+   *     validateServerLayoutTargets against the BUILD-TIME fleet allowlist —
+   *     the same block-WHOLE policy as a server tab entry: a server master
+   *     entry with ANY unallowlisted target is REJECTED whole (reason
+   *     "invalid-targets"; the UI surfaces a visible error), never partially
+   *     and never silently opened (F3 hazard H1).
+   *
+   * The UI's two-step confirm gates this call exactly as for a local load.
+   */
+  loadMasterLayoutEntry(
+    entry: MasterLayoutEntry,
+  ): { ok: true } | { ok: false; reason: "invalid-entry" | "invalid-targets" } {
+    const coerced = coerceMasterLayoutEntry(entry.name, entry);
+    if (!coerced) return { ok: false, reason: "invalid-entry" };
+    const saved = coerced.session.workspaces;
+    if (saved.length === 0) return { ok: false, reason: "invalid-entry" };
+    const fleetOrigins = buildTimeFleetOrigins();
     for (const w of saved) {
-      const id = storeAddWorkspace(w.name, w.layout);
-      created.push({ id, name: w.name });
+      if (!isSavedLayout(w.layout)) return { ok: false, reason: "invalid-entry" };
+      const check = validateServerLayoutTargets(
+        w.layout as unknown as SavedLayout,
+        fleetOrigins,
+      );
+      if (!check.valid) return { ok: false, reason: "invalid-targets" };
     }
-    // 2. Close every pre-existing workspace via the existing destroy path.
-    //    Active is on a NEW workspace throughout (the last add activated it),
-    //    so no close re-activates anything unexpectedly.
-    for (const id of oldIds) storeCloseWorkspace(id);
-    // 3. Activate the saved active by name (first match; fallback = first).
-    const activeName = entry.session.activeWorkspaceName;
-    const target = activeName
-      ? created.find((c) => c.name === activeName)
-      : undefined;
-    storeSetActiveWorkspace(target?.id ?? created[0].id);
-    return true;
+    return applyMasterSession(coerced.session) ? { ok: true } : { ok: false, reason: "invalid-entry" };
   }
 
   /**
@@ -1099,6 +1161,7 @@ export class HostController implements HostOps {
     this.ops.loadLayoutEntry = (entry) => this.loadLayoutEntry(entry);
     this.ops.saveMasterLayout = (name) => this.saveMasterLayout(name);
     this.ops.loadMasterLayout = (name) => this.loadMasterLayout(name);
+    this.ops.loadMasterLayoutEntry = (entry) => this.loadMasterLayoutEntry(entry);
     this.ops.renameLayout = (name, newName) => this.renameLayout(name, newName);
   }
 

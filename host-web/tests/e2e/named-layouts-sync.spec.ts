@@ -320,6 +320,141 @@ test.describe("named layouts sync (server catalog merge)", () => {
     expect((await H.workspaces(page)).length).toBe(wsBefore);
   });
 
+  // ---- MASTER (all-tabs) blocked-load rejection branches --------------------
+  // The master counterpart of the three tab gates above: a SERVER-SOURCED
+  // master entry that lists (the catalog client's isMasterLayoutEntry only
+  // checks each workspace layout is a non-null OBJECT — the interior is
+  // un-inspected until load) but fails loadMasterLayoutEntry's re-validation
+  // is BLOCKED WHOLE: visible error, popover stays open, the session is never
+  // partially replaced (F3 hazard H1 — the load takes the SERVER entry
+  // through the validated path). Master rows load through a TWO-STEP confirm
+  // (destructive session replace), unlike tab rows' single tap.
+
+  /** A wire-shaped MASTER (whole-session) catalog entry: session.workspaces
+   *  is [{name, layout}] — each layout blob as opaque as a tab entry's. */
+  function wireMasterEntry(
+    name: string,
+    workspaces: Array<{ name: string; layout: Record<string, unknown> }>,
+  ): Record<string, unknown> {
+    return {
+      scope: "master",
+      name,
+      session: {
+        activeWorkspaceName: workspaces[0]?.name ?? null,
+        workspaces,
+      },
+      savedAt: Date.now(),
+    };
+  }
+
+  /** Switch the popover to the ALL-TABS scope (where master rows list). */
+  async function openMasterScope(page: Page): Promise<void> {
+    await openLayouts(page);
+    await page.locator('[data-testid="layouts-scope-all"]').click();
+  }
+
+  test("server MASTER entry with a malformed ({}) workspace layout: load BLOCKED whole, session not replaced", async ({ page }) => {
+    // The master mirror of the tab {}-layout gate: workspace "Ws 2"'s layout
+    // is an OBJECT (so the row lists + is badged) but not a restorable
+    // SavedLayout — loadMasterLayoutEntry re-validates EVERY workspace
+    // through isSavedLayout and rejects with invalid-entry on the first
+    // failure. Block-WHOLE: the valid "Ws 1" is NOT partially applied.
+    await page.route(SYNC_URL, (route) =>
+      fulfillDoc(route, 2, [
+        wireMasterEntry("m-blob", [
+          { name: "Ws 1", layout: onePaneLayout(H.serverUrl("srv-Z")) },
+          { name: "Ws 2", layout: {} },
+        ]),
+      ]),
+    );
+    await openMasterScope(page);
+    const row = layoutRow(page, "m-blob");
+    await expect(row).toBeVisible();
+    await expect(row).toHaveAttribute("data-scope", "master");
+    await expect(row).toHaveAttribute("data-synced", "1");
+
+    const wsBefore = (await H.workspaces(page)).length;
+    // Two-step confirm: first tap arms "Replace all tabs?", ✓ runs the load.
+    await row.locator('[data-testid="layout-load"]').click();
+    await row.locator('[data-testid="layout-load-confirm"]').click();
+
+    const err = page.locator('[data-testid="layout-load-error"]');
+    await expect(err).toBeVisible();
+    await expect(err).toHaveText(/could not be loaded/i);
+    // The popover STAYS open (a blocked load is not a result)…
+    await expect(page.locator('[data-testid="layouts-popover"]')).toBeVisible();
+    // …and the session was NOT replaced — same workspace set as before (the
+    // valid "Ws 1" was not partially opened either: block-WHOLE).
+    expect((await H.workspaces(page)).length).toBe(wsBefore);
+  });
+
+  test("server MASTER entry with an unallowlisted workspace target: load BLOCKED whole, nothing opens", async ({ page }) => {
+    // The master mirror of the tab target gate: workspace "Ws 2" carries a
+    // javascript: pane target — an object the catalog client accepts (the
+    // interior is opaque pre-load) but validateServerLayoutTargets rejects
+    // for EVERY workspace of the session → invalid-targets, block-WHOLE, and
+    // the poisoned url never reaches an unsandboxed iframe.src.
+    await page.route(SYNC_URL, (route) =>
+      fulfillDoc(route, 2, [
+        wireMasterEntry("m-evil", [
+          { name: "Ws 1", layout: onePaneLayout(H.serverUrl("srv-Z")) },
+          { name: "Ws 2", layout: onePaneLayout("javascript:alert(1)", "evil") },
+        ]),
+      ]),
+    );
+    await openMasterScope(page);
+    const row = layoutRow(page, "m-evil");
+    await expect(row).toBeVisible();
+
+    const wsBefore = (await H.workspaces(page)).length;
+    await row.locator('[data-testid="layout-load"]').click();
+    await row.locator('[data-testid="layout-load-confirm"]').click();
+
+    const err = page.locator('[data-testid="layout-load-error"]');
+    await expect(err).toBeVisible();
+    await expect(err).toHaveText(/targets not allowed/i);
+    await expect(page.locator('[data-testid="layouts-popover"]')).toBeVisible();
+    expect((await H.workspaces(page)).length).toBe(wsBefore);
+    const srcs = await H.iframeSrcs(page);
+    expect(srcs.some((src) => src.startsWith("javascript:"))).toBe(false);
+  });
+
+  test("server MASTER entry with an EMPTY session: dropped from the merged list; a valid sibling master row still loads", async ({ page }) => {
+    // The master analogue of the tab zero-panel degenerate (a local master
+    // save cannot produce an empty session). For server-sourced master data
+    // the empty-session rejection lives at the CATALOG gate:
+    // isMasterLayoutEntry requires a non-empty workspaces array, so the
+    // poison entry is dropped from the doc (never lists → the destructive
+    // load is unreachable). loadMasterLayoutEntry's OWN empty-session and
+    // re-coerce rejections are defense-in-depth behind that shared gate —
+    // the catalog client coerces every listed row through the SAME
+    // coerceMasterLayoutEntry before the UI can pass it to the load path.
+    await page.route(SYNC_URL, (route) =>
+      fulfillDoc(route, 2, [
+        wireMasterEntry("m-empty", []),
+        wireMasterEntry("m-ok", [
+          { name: "Ws 1", layout: onePaneLayout(H.serverUrl("srv-Z")) },
+        ]),
+      ]),
+    );
+    await openMasterScope(page);
+    await expect(layoutRow(page, "m-ok")).toBeVisible();
+    await expect(layoutRow(page, "m-empty")).toHaveCount(0);
+
+    // The valid sibling LOADS through the two-step confirm — the control
+    // proving the blocked outcomes above are the gates at work, not broken
+    // machinery: on success the popover CLOSES (vs. staying open on a block)
+    // and the session is replaced by exactly the saved one.
+    await layoutRow(page, "m-ok").locator('[data-testid="layout-load"]').click();
+    await layoutRow(page, "m-ok").locator('[data-testid="layout-load-confirm"]').click();
+    await expect(page.locator('[data-testid="layouts-popover"]')).toHaveCount(0);
+    await expect
+      .poll(async () => H.workspaceName(page, (await H.activeWorkspace(page))!), { timeout: 8000 })
+      .toBe("Ws 1");
+    await expect.poll(async () => (await H.panes(page)).length, { timeout: 8000 }).toBe(1);
+    expect((await H.paneParams(page))[0]?.url).toBe(H.serverUrl("srv-Z"));
+  });
+
   test("dev degradation: no backend → catalog silently empty; local saves work, warn once, stay loadable", async ({ page }) => {
     // NO route interception: the vite dev server answers /vh/layouts with its
     // SPA fallback (200 HTML) — the catalog client must degrade SILENTLY.

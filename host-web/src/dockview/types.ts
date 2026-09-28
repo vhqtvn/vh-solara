@@ -5,7 +5,7 @@
 // web UI. Panes are tiled by Dockview with `renderer: 'always'` so the iframe
 // element is never reparented/destroyed — only its geometry/visibility changes.
 
-import type { TabLayoutEntry } from "./namedLayouts";
+import type { MasterLayoutEntry, TabLayoutEntry } from "./namedLayouts";
 
 export type ViewKind = "chat" | "terminal" | "diff" | "sessions";
 
@@ -498,6 +498,24 @@ export interface HostOps {
    * applied; false when no MASTER layout is saved under the name or its
    * session is empty (never leaves zero workspaces). */
   loadMasterLayout?(name: string): boolean;
+  /**
+   * DESTRUCTIVE session replace for a SERVER-SOURCED master entry (the
+   * /vh/layouts catalog) — the master counterpart of loadLayoutEntry. The
+   * apply is the EXACT SAME destructive path a local master load takes
+   * (add-all → close-all → activate; never a second apply implementation);
+   * what differs is the entry gate, because server bytes are untrusted: the
+   * entry is re-coerced (coerceMasterLayoutEntry), every workspace layout
+   * must pass the isSavedLayout structural guard (an EMPTY workspace is
+   * legitimate in a session snapshot — no zero-panel rejection here), and
+   * EVERY pane target of EVERY workspace is checked against the build-time
+   * fleet origin allowlist (validateServerLayoutTargets): a server master
+   * entry with ANY unallowlisted target is REJECTED WHOLE ({ok:false,
+   * reason:"invalid-targets"}), never partially and never silently opened
+   * (F3: the UI surfaces a visible error). The UI's two-step confirm gates
+   * this call exactly as for a local load. */
+  loadMasterLayoutEntry?(
+    entry: MasterLayoutEntry,
+  ): { ok: true } | { ok: false; reason: "invalid-entry" | "invalid-targets" };
   /**
    * Rename a saved layout (either scope): re-key the entry, preserving scope,
    * payload, and the original savedAt. `newName` is trimmed + capped (60); an

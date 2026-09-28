@@ -129,6 +129,23 @@ func validEntry(name string) map[string]any {
 	}
 }
 
+// validMasterEntry builds a valid MASTER entry body map (two workspaces, the
+// first active by name).
+func validMasterEntry(name string) map[string]any {
+	return map[string]any{
+		"scope": "master",
+		"name":  name,
+		"session": map[string]any{
+			"activeWorkspaceName": "Main",
+			"workspaces": []any{
+				map[string]any{"name": "Main", "layout": map[string]any{"grid": map[string]any{"n": 1}, "panels": []any{}}},
+				map[string]any{"name": "Side", "layout": map[string]any{"grid": map[string]any{"n": 2}, "panels": []any{}}},
+			},
+		},
+		"savedAt": 1726600000000,
+	}
+}
+
 // --- GET /vh/layouts ---------------------------------------------------------
 
 // TestLayoutsHTTPGetShape verifies the GET response is the public shape: has
@@ -268,7 +285,7 @@ func TestLayoutsHTTPPutPerEntryIsolation(t *testing.T) {
 	}
 	before := decodeLayoutsResp(t, getBefore.Body)
 	getBefore.Body.Close()
-	beforeByName := map[string]TabLayoutEntry{}
+	beforeByName := map[string]NamedLayoutEntry{}
 	for _, e := range before.Entries {
 		beforeByName[e.Name] = e
 	}
@@ -288,7 +305,7 @@ func TestLayoutsHTTPPutPerEntryIsolation(t *testing.T) {
 	}
 
 	// Catalog diff is EXACTLY the one new entry.
-	afterByName := map[string]TabLayoutEntry{}
+	afterByName := map[string]NamedLayoutEntry{}
 	for _, e := range after.Entries {
 		afterByName[e.Name] = e
 	}
@@ -380,6 +397,174 @@ func TestLayoutsHTTPPutMultibyteNameAtCapRoundTrips(t *testing.T) {
 	}
 }
 
+// --- master scope (v1 widening): happy path, CAS, cross-scope namespace ------
+
+// TestLayoutsHTTPPutMasterHappyPath verifies a valid master PUT succeeds
+// (200), bumps the revision, and the committed doc + a GET both carry the
+// session shape (workspaces + activeWorkspaceName) — the tab entry's wire
+// shape is untouched alongside it.
+func TestLayoutsHTTPPutMasterHappyPath(t *testing.T) {
+	_, web := newLayoutsTestServer(t)
+
+	// A tab entry first: both scopes coexist in one catalog.
+	var base int64
+	tabResp := layoutsPut(t, web.URL+"/vh/layouts", entryBody(base, validEntry("tab-only")))
+	defer tabResp.Body.Close()
+	if tabResp.StatusCode != 200 {
+		t.Fatalf("tab seed PUT: status %d", tabResp.StatusCode)
+	}
+	base++
+
+	resp := layoutsPut(t, web.URL+"/vh/layouts", entryBody(base, validMasterEntry("fleet")))
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("master PUT: status %d, want 200. body: %s", resp.StatusCode, b)
+	}
+	r := decodeLayoutsResp(t, resp.Body)
+	if r.Revision != 2 {
+		t.Fatalf("after master PUT: Revision = %d, want 2", r.Revision)
+	}
+	if len(r.Entries) != 2 {
+		t.Fatalf("entries = %d, want 2 (both scopes coexist)", len(r.Entries))
+	}
+	m := r.Entries[0] // sorted by name: "fleet" < "tab-only"
+	if m.Name != "fleet" || m.Scope != "master" {
+		t.Fatalf("master entry mismatch: %+v", m)
+	}
+	if m.Session == nil || len(m.Session.Workspaces) != 2 {
+		t.Fatalf("master session mismatch: %+v", m.Session)
+	}
+	if m.Session.ActiveWorkspaceName == nil || *m.Session.ActiveWorkspaceName != "Main" {
+		t.Fatalf("master activeWorkspaceName mismatch: %v", m.Session.ActiveWorkspaceName)
+	}
+	if m.Session.Workspaces[0].Name != "Main" || m.Session.Workspaces[1].Name != "Side" {
+		t.Fatalf("master workspace names mismatch: %+v", m.Session.Workspaces)
+	}
+	if !jsonEqual(m.Session.Workspaces[1].Layout, json.RawMessage(`{"grid":{"n":2},"panels":[]}`)) {
+		t.Fatalf("master workspace layout round-trip mismatch: %s", m.Session.Workspaces[1].Layout)
+	}
+
+	// GET carries both entries; the master session round-trips through the
+	// persisted catalog.
+	get, err := http.Get(web.URL + "/vh/layouts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer get.Body.Close()
+	g := decodeLayoutsResp(t, get.Body)
+	if len(g.Entries) != 2 {
+		t.Fatalf("GET entries = %d, want 2", len(g.Entries))
+	}
+	gm := g.Entries[0]
+	if gm.Scope != "master" || gm.Session == nil || len(gm.Session.Workspaces) != 2 {
+		t.Fatalf("GET master entry drifted: %+v", gm)
+	}
+	if gm.TabTitle != "" || len(gm.Layout) != 0 {
+		t.Fatalf("GET master entry leaks tab-variant fields: tabTitle=%q layout=%s", gm.TabTitle, gm.Layout)
+	}
+	gt := g.Entries[1]
+	if gt.Scope != "tab" || gt.TabTitle != "Title tab-only" || gt.Session != nil {
+		t.Fatalf("GET tab entry drifted: %+v", gt)
+	}
+}
+
+// TestLayoutsHTTPPutMaster409CASMismatch verifies the CAS guard applies to a
+// master entry exactly as to a tab entry: a stale baseRevision → 409 with the
+// current doc, no mutation.
+func TestLayoutsHTTPPutMaster409CASMismatch(t *testing.T) {
+	_, web := newLayoutsTestServer(t)
+
+	resp := layoutsPut(t, web.URL+"/vh/layouts", entryBody(0, validEntry("a")))
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("setup PUT: status %d", resp.StatusCode)
+	}
+
+	stale := layoutsPut(t, web.URL+"/vh/layouts", entryBody(0, validMasterEntry("m")))
+	defer stale.Body.Close()
+	if stale.StatusCode != http.StatusConflict {
+		t.Fatalf("stale master PUT: status = %d, want 409", stale.StatusCode)
+	}
+	cur := decodeLayoutsResp(t, stale.Body)
+	if cur.Revision != 1 || len(cur.Entries) != 1 || cur.Entries[0].Name != "a" {
+		t.Fatalf("409 body = rev %d entries %+v, want the current doc (rev 1, [a])", cur.Revision, cur.Entries)
+	}
+
+	// Adopt + retry (the client contract): base 1 succeeds.
+	retry := layoutsPut(t, web.URL+"/vh/layouts", entryBody(1, validMasterEntry("m")))
+	defer retry.Body.Close()
+	if retry.StatusCode != 200 {
+		b, _ := io.ReadAll(retry.Body)
+		t.Fatalf("adopted master PUT: status %d body %s", retry.StatusCode, b)
+	}
+	after := decodeLayoutsResp(t, retry.Body)
+	if after.Revision != 2 || len(after.Entries) != 2 {
+		t.Fatalf("adopted master PUT: rev=%d entries=%d, want 2/2", after.Revision, len(after.Entries))
+	}
+}
+
+// TestLayoutsHTTPPutSameNameCrossScopeReplace pins the SHARED name namespace:
+// upserting an existing name with the OTHER scope's entry replaces it (same
+// CAS path, no catalog growth).
+func TestLayoutsHTTPPutSameNameCrossScopeReplace(t *testing.T) {
+	_, web := newLayoutsTestServer(t)
+
+	var base int64
+	resp := layoutsPut(t, web.URL+"/vh/layouts", entryBody(base, validEntry("dual")))
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("tab PUT: status %d", resp.StatusCode)
+	}
+	base++
+
+	resp2 := layoutsPut(t, web.URL+"/vh/layouts", entryBody(base, validMasterEntry("dual")))
+	defer resp2.Body.Close()
+	if resp2.StatusCode != 200 {
+		b, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("master PUT over tab name: status %d body %s", resp2.StatusCode, b)
+	}
+	r := decodeLayoutsResp(t, resp2.Body)
+	if len(r.Entries) != 1 {
+		t.Fatalf("cross-scope replace grew the catalog: %d entries", len(r.Entries))
+	}
+	e := r.Entries[0]
+	if e.Name != "dual" || e.Scope != "master" || e.Session == nil {
+		t.Fatalf("cross-scope replace did not install the master entry: %+v", e)
+	}
+}
+
+// TestLayoutsHTTPPutMasterMultibyteAtCapRoundTrips pins the F5 rune-cap rule
+// for master session names: an 80-rune CJK workspace name (240 bytes) and an
+// 80-rune active name are AT-CAP and must round-trip byte-exact.
+func TestLayoutsHTTPPutMasterMultibyteAtCapRoundTrips(t *testing.T) {
+	_, web := newLayoutsTestServer(t)
+
+	wsName := strings.Repeat("業", maxLayoutWorkspaceNameLen)
+	e := validMasterEntry("caps")
+	e["session"] = map[string]any{
+		"activeWorkspaceName": wsName,
+		"workspaces":          []any{map[string]any{"name": wsName, "layout": map[string]any{"grid": map[string]any{"n": 1}, "panels": []any{}}}},
+	}
+	resp := layoutsPut(t, web.URL+"/vh/layouts", entryBody(0, e))
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("PUT at-cap multibyte master: status %d, want 200. body: %s", resp.StatusCode, b)
+	}
+	r := decodeLayoutsResp(t, resp.Body)
+	got := r.Entries[0]
+	if got.Session == nil || len(got.Session.Workspaces) != 1 {
+		t.Fatalf("master session mismatch: %+v", got.Session)
+	}
+	if got.Session.Workspaces[0].Name != wsName {
+		t.Fatalf("workspace name not byte-exact: %d bytes, want %d", len(got.Session.Workspaces[0].Name), len(wsName))
+	}
+	if got.Session.ActiveWorkspaceName == nil || *got.Session.ActiveWorkspaceName != wsName {
+		t.Fatalf("activeWorkspaceName not byte-exact: %v", got.Session.ActiveWorkspaceName)
+	}
+}
+
 // --- CSRF enforcement -------------------------------------------------------
 
 // TestLayoutsHTTPCSRFEnforced verifies PUT without X-VH-CSRF is rejected by
@@ -464,7 +649,7 @@ func TestLayoutsHTTPPut400(t *testing.T) {
 		{"missing_base_revision", map[string]any{"entry": validEntry("x")}, "missing_base_revision"},
 		{"missing_entry", map[string]any{"baseRevision": 0}, "missing_entry"},
 		{"null_entry", map[string]any{"baseRevision": 0, "entry": nil}, "missing_entry"},
-		{"wrong_scope", entryBody(0, with(validEntry("x"), "scope", "master")), "invalid_scope"},
+		{"wrong_scope", entryBody(0, with(validEntry("x"), "scope", "workspace")), "invalid_scope"},
 		{"absent_scope", entryBody(0, without(validEntry("x"), "scope")), "invalid_scope"},
 		{"empty_name", entryBody(0, with(validEntry("x"), "name", "")), "invalid_name"},
 		{"untrimmed_name", entryBody(0, with(validEntry("x"), "name", " padded ")), "invalid_name"},
@@ -476,6 +661,46 @@ func TestLayoutsHTTPPut400(t *testing.T) {
 		{"negative_saved_at", entryBody(0, with(validEntry("x"), "savedAt", -1)), "invalid_saved_at"},
 		{"layout_not_object", entryBody(0, with(validEntry("x"), "layout", []any{1, 2})), "invalid_layout"},
 		{"layout_null", entryBody(0, with(validEntry("x"), "layout", nil)), "invalid_layout"},
+		// --- master-variant validation -----------------------------------
+		// master without a session (absent or null) → invalid_session.
+		{"master_missing_session", entryBody(0, without(validMasterEntry("x"), "session")), "invalid_session"},
+		{"master_null_session", entryBody(0, with(validMasterEntry("x"), "session", nil)), "invalid_session"},
+		// master with an EMPTY workspaces array → invalid_session.
+		{"master_empty_workspaces", entryBody(0, with(validMasterEntry("x"), "session", map[string]any{"activeWorkspaceName": nil, "workspaces": []any{}})), "invalid_session"},
+		// master with too many workspaces → invalid_session (bounded session).
+		{"master_too_many_workspaces", entryBody(0, with(validMasterEntry("x"), "session", map[string]any{
+			"workspaces": manyWorkspaces(maxMasterSessionWorkspaces + 1),
+		})), "invalid_session"},
+		// workspace name violations → invalid_name.
+		{"master_ws_name_empty", entryBody(0, with(validMasterEntry("x"), "session", map[string]any{
+			"workspaces": []any{map[string]any{"name": "", "layout": map[string]any{"grid": map[string]any{"n": 1}, "panels": []any{}}}},
+		})), "invalid_name"},
+		{"master_ws_name_oversized", entryBody(0, with(validMasterEntry("x"), "session", map[string]any{
+			"workspaces": []any{map[string]any{"name": strings.Repeat("w", maxLayoutWorkspaceNameLen+1), "layout": map[string]any{"grid": map[string]any{"n": 1}, "panels": []any{}}}},
+		})), "invalid_name"},
+		{"master_ws_name_oversized_multibyte", entryBody(0, with(validMasterEntry("x"), "session", map[string]any{
+			"workspaces": []any{map[string]any{"name": strings.Repeat("業", maxLayoutWorkspaceNameLen+1), "layout": map[string]any{"grid": map[string]any{"n": 1}, "panels": []any{}}}},
+		})), "invalid_name"},
+		// activeWorkspaceName oversize → invalid_session (bounded string).
+		{"master_active_name_oversized", entryBody(0, with(validMasterEntry("x"), "session", map[string]any{
+			"activeWorkspaceName": strings.Repeat("a", maxLayoutWorkspaceNameLen+1),
+			"workspaces":          manyWorkspaces(1),
+		})), "invalid_session"},
+		// per-workspace layout opacity/size caps → the SAME codes as tab.
+		{"master_ws_layout_not_object", entryBody(0, with(validMasterEntry("x"), "session", map[string]any{
+			"workspaces": []any{map[string]any{"name": "Main", "layout": []any{1, 2}}},
+		})), "invalid_layout"},
+		{"master_ws_layout_null", entryBody(0, with(validMasterEntry("x"), "session", map[string]any{
+			"workspaces": []any{map[string]any{"name": "Main", "layout": nil}},
+		})), "invalid_layout"},
+		// scope-confused payloads: master carrying tab fields, tab carrying a
+		// session — the wire shapes stay exactly the TS variants'.
+		{"master_with_tab_title", entryBody(0, with(validMasterEntry("x"), "tabTitle", "T")), "invalid_tab_title"},
+		{"master_with_top_level_layout", entryBody(0, with(validMasterEntry("x"), "layout", map[string]any{"grid": map[string]any{"n": 1}, "panels": []any{}})), "invalid_layout"},
+		{"tab_with_session", entryBody(0, with(validEntry("x"), "session", map[string]any{"workspaces": manyWorkspaces(1)})), "invalid_session"},
+		// master name caps are the SAME 60-rune cap as tab.
+		{"master_oversized_name", entryBody(0, with(validMasterEntry("x"), "name", strings.Repeat("n", maxLayoutNameLen+1))), "invalid_name"},
+		{"master_negative_saved_at", entryBody(0, with(validMasterEntry("x"), "savedAt", -1)), "invalid_saved_at"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -525,7 +750,7 @@ func TestLayoutsHTTPPut400(t *testing.T) {
 		layout := json.RawMessage(`{"pad":"` + string(big) + `"}`)
 		body, _ := json.Marshal(putLayoutsReq{
 			BaseRevision: ptrInt64(0),
-			Entry: &TabLayoutEntry{
+			Entry: &NamedLayoutEntry{
 				Scope: "tab", Name: "big", TabTitle: "Big", Layout: layout, SavedAt: 1,
 			},
 		})
@@ -539,6 +764,48 @@ func TestLayoutsHTTPPut400(t *testing.T) {
 			t.Fatalf("error code = %q, want layout_too_large", e.Error)
 		}
 	})
+
+	// oversized MASTER per-workspace layout → the SAME layout_too_large code
+	// (per-workspace layouts are under the SAME size cap as tab layouts).
+	t.Run("master_ws_layout_too_large", func(t *testing.T) {
+		_, web := newLayoutsTestServer(t)
+		big := make([]byte, maxLayoutJSONBytes+1)
+		for i := range big {
+			big[i] = 'a'
+		}
+		body, _ := json.Marshal(putLayoutsReq{
+			BaseRevision: ptrInt64(0),
+			Entry: &NamedLayoutEntry{
+				Scope: "master", Name: "big-session", SavedAt: 1,
+				Session: &NamedMasterSession{
+					ActiveWorkspaceName: nil,
+					Workspaces: []NamedMasterWorkspace{{
+						Name:   "Main",
+						Layout: json.RawMessage(`{"pad":"` + string(big) + `"}`),
+					}},
+				},
+			},
+		})
+		resp := layoutsPutRaw(t, web.URL+"/vh/layouts", body, true)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+		e := decodeLayoutsErr(t, resp.Body)
+		if e.Error != "layout_too_large" {
+			t.Fatalf("error code = %q, want layout_too_large", e.Error)
+		}
+		// Nothing was committed.
+		get, err := http.Get(web.URL + "/vh/layouts")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer get.Body.Close()
+		g := decodeLayoutsResp(t, get.Body)
+		if g.Revision != 0 || len(g.Entries) != 0 {
+			t.Fatalf("rejected master PUT mutated catalog: revision=%d entries=%d", g.Revision, len(g.Entries))
+		}
+	})
 }
 
 // with returns a copy of the entry map with key overridden.
@@ -549,6 +816,19 @@ func with(m map[string]any, key string, val any) map[string]any {
 	}
 	out[key] = val
 	return out
+}
+
+// manyWorkspaces builds n minimal valid workspace maps (test fixture for
+// session-shape cases).
+func manyWorkspaces(n int) []any {
+	ws := make([]any, 0, n)
+	for i := 0; i < n; i++ {
+		ws = append(ws, map[string]any{
+			"name":   "ws-" + strconv.Itoa(i),
+			"layout": map[string]any{"grid": map[string]any{"n": 1}, "panels": []any{}},
+		})
+	}
+	return ws
 }
 
 // without returns a copy of the entry map with key removed.

@@ -25,7 +25,7 @@ import {
   resolveBaseFleet,
   type FleetEntry,
 } from "../state/mockData";
-import type { TabLayoutEntry } from "./namedLayouts";
+import type { MasterLayoutEntry, TabLayoutEntry } from "./namedLayouts";
 import type { SavedLayout } from "./layoutPersistence";
 
 /**
@@ -79,6 +79,77 @@ export function coerceTabLayoutEntry(name: string, v: unknown): TabLayoutEntry |
     layout: e.layout as SerializedDockview,
     savedAt: e.savedAt,
   };
+}
+
+/**
+ * Structural guard for a WELL-FORMED master-layout entry as it appears on the
+ * wire from the server catalog: scope "master", a non-empty PRE-TRIMMED name,
+ * a session object with activeWorkspaceName string|null and a NON-EMPTY
+ * workspaces array of {name: non-empty string, layout: non-null object}, and
+ * a finite savedAt. The server validates this exact shape before storage
+ * (non-empty workspaces is a server-side invariant), so anything looser here
+ * is a malformed/hostile document — the companion {@link
+ * coerceMasterLayoutEntry} (the shared local-store read path) is
+ * deliberately more lenient (an empty workspaces array survives a LOCAL
+ * read; the load path no-ops it).
+ */
+export function isMasterLayoutEntry(obj: unknown): obj is MasterLayoutEntry {
+  if (typeof obj !== "object" || obj === null) return false;
+  const e = obj as Record<string, unknown>;
+  if (e.scope !== "master") return false;
+  if (typeof e.name !== "string" || e.name === "" || e.name !== e.name.trim()) {
+    return false;
+  }
+  if (typeof e.savedAt !== "number" || !Number.isFinite(e.savedAt)) return false;
+  if (typeof e.session !== "object" || e.session === null) return false;
+  const s = e.session as Record<string, unknown>;
+  if (s.activeWorkspaceName !== null && typeof s.activeWorkspaceName !== "string") {
+    return false;
+  }
+  if (!Array.isArray(s.workspaces) || s.workspaces.length === 0) return false;
+  for (const w of s.workspaces) {
+    if (typeof w !== "object" || w === null) return false;
+    const rec = w as Record<string, unknown>;
+    if (typeof rec.name !== "string" || rec.name === "") return false;
+    if (typeof rec.layout !== "object" || rec.layout === null) return false;
+  }
+  return true;
+}
+
+/**
+ * Structural guard for ONE master-scope store value (lifted from the private
+ * coerceEntry master-branch in namedLayouts.ts — behavior identical, so the
+ * local store read path and the server-catalog client validate master data
+ * with ONE set of checks). `name` is the caller's key for the entry. Returns
+ * the coerced entry or null (the caller drops the entry — a poison entry
+ * never poisons the store/doc). The per-workspace layout blobs stay opaque
+ * objects — the cold-restore pipeline re-validates them at consume time.
+ * activeWorkspaceName falls back to null when absent/non-string (a missing
+ * or unknown active activates the FIRST workspace at load). A tab-scope (or
+ * unknown-scope) value returns null — this coerces MASTER entries only.
+ */
+export function coerceMasterLayoutEntry(name: string, v: unknown): MasterLayoutEntry | null {
+  if (typeof v !== "object" || v === null) return null;
+  const e = v as Record<string, unknown>;
+  if (typeof e.savedAt !== "number" || !Number.isFinite(e.savedAt)) return null;
+  if (e.scope !== "master") return null;
+  if (typeof e.session !== "object" || e.session === null) return null;
+  const s = e.session as Record<string, unknown>;
+  if (!Array.isArray(s.workspaces)) return null;
+  const workspaces: MasterLayoutEntry["session"]["workspaces"] = [];
+  for (const w of s.workspaces) {
+    if (typeof w !== "object" || w === null) return null;
+    const rec = w as Record<string, unknown>;
+    if (typeof rec.name !== "string" || rec.name.trim() === "") return null;
+    if (typeof rec.layout !== "object" || rec.layout === null) return null;
+    workspaces.push({
+      name: rec.name,
+      layout: rec.layout as SerializedDockview,
+    });
+  }
+  const activeWorkspaceName =
+    typeof s.activeWorkspaceName === "string" ? s.activeWorkspaceName : null;
+  return { scope: "master", name, session: { activeWorkspaceName, workspaces }, savedAt: e.savedAt };
 }
 
 /**

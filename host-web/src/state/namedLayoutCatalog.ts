@@ -2,7 +2,8 @@
 // NAMED-LAYOUT CATALOG CLIENT — host-web's FIRST /vh/* API client.
 //
 // Talks to the worker-side named-layouts catalog (pkg/web/named_layouts*.go):
-//   GET /vh/layouts            → {revision, entries:[TabLayoutEntry…]}
+//   GET /vh/layouts            → {revision, entries:[NamedLayoutEntry…]}
+//                                 (the TAB or the MASTER variant per entry)
 //   PUT /vh/layouts (per-entry) → body {baseRevision, entry} — exactly ONE
 //                                 entry per PUT (F3-pinned granularity);
 //                                 200 = full public doc (revision +1);
@@ -40,18 +41,24 @@
 // proxy forwards the same path).
 // =============================================================================
 
-import { coerceTabLayoutEntry, isTabLayoutEntry } from "../dockview/layoutValidation";
+import {
+  coerceMasterLayoutEntry,
+  coerceTabLayoutEntry,
+  isMasterLayoutEntry,
+  isTabLayoutEntry,
+} from "../dockview/layoutValidation";
 import {
   normalizeLayoutName,
   normalizeTabTitle,
-  type TabLayoutEntry,
+  type NamedLayoutEntry,
 } from "../dockview/namedLayouts";
 
-/** The catalog's public wire shape (GET body, PUT 200/409 body). */
+/** The catalog's public wire shape (GET body, PUT 200/409 body). Entries
+ *  carry BOTH scopes (the NamedLayoutEntry union — tab or master variant). */
 export interface ServerLayoutsDoc {
   /** CAS guard value for the next PUT. Never ordered, never displayed. */
   revision: number;
-  entries: TabLayoutEntry[];
+  entries: NamedLayoutEntry[];
 }
 
 const LAYOUTS_PATH = "/vh/layouts";
@@ -65,22 +72,29 @@ function warnSkip(): void {
 /**
  * Parse a catalog doc from an unknown body. A structurally invalid doc is
  * null (silent degradation); a poison ENTRY is dropped, not the doc (the
- * same per-entry tolerance the local store's read path has). Entries are
- * strictly validated (isTabLayoutEntry — pre-trimmed name, non-empty
- * tabTitle) because the server is a remote writer whose bytes are untrusted
- * here, then coerced through the SHARED coerceTabLayoutEntry so local and
- * server data flow through one validation path.
+ * same per-entry tolerance the local store's read path has). Entries of
+ * EITHER scope are strictly validated (isTabLayoutEntry /
+ * isMasterLayoutEntry — pre-trimmed name, the scope's own payload shape)
+ * because the server is a remote writer whose bytes are untrusted here,
+ * then coerced through the SHARED coerceTabLayoutEntry /
+ * coerceMasterLayoutEntry so local and server data flow through one
+ * validation path per scope.
  */
 function parseDoc(body: unknown): ServerLayoutsDoc | null {
   if (typeof body !== "object" || body === null) return null;
   const o = body as Record<string, unknown>;
   if (typeof o.revision !== "number" || !Number.isFinite(o.revision)) return null;
   if (!Array.isArray(o.entries)) return null;
-  const entries: TabLayoutEntry[] = [];
+  const entries: NamedLayoutEntry[] = [];
   for (const v of o.entries) {
-    if (!isTabLayoutEntry(v)) continue;
-    const coerced = coerceTabLayoutEntry(v.name, v);
-    if (coerced) entries.push(coerced);
+    if (isTabLayoutEntry(v)) {
+      const coerced = coerceTabLayoutEntry(v.name, v);
+      if (coerced) entries.push(coerced);
+    } else if (isMasterLayoutEntry(v)) {
+      const coerced = coerceMasterLayoutEntry(v.name, v);
+      if (coerced) entries.push(coerced);
+    }
+    // Unknown scope / malformed entry → dropped, never the doc.
   }
   return { revision: o.revision, entries };
 }
@@ -104,10 +118,11 @@ export async function fetchCatalog(): Promise<ServerLayoutsDoc | null> {
 }
 
 /**
- * Publish ONE entry to the worker catalog (the push half of an explicit
- * save). Fire-and-forget by design: the LOCAL save has already succeeded;
- * this resolves as a NO-OP SUCCESS on any failure after one console.warn —
- * the operator's save is never blocked or failed by the server.
+ * Publish ONE entry (either scope) to the worker catalog (the push half of
+ * an explicit save). Fire-and-forget by design: the LOCAL save has already
+ * succeeded; this resolves as a NO-OP SUCCESS on any failure after one
+ * console.warn — the operator's save is never blocked or failed by the
+ * server.
  *
  * Sequence: GET the current revision (the CAS base) → PUT {baseRevision,
  * entry} → on 409 ADOPT the returned current doc and retry exactly ONCE (a
@@ -116,23 +131,25 @@ export async function fetchCatalog(): Promise<ServerLayoutsDoc | null> {
  * committed doc (the caller may refresh its list from it). Returns null on
  * every failure path.
  *
- * The entry is defensively re-normalized client-side (name trim/cap 60,
- * tabTitle trim/cap 80 with the empty→name fallback) — the server requires
- * the already-normalized form and rejects anything else with a 400, and the
- * sanctioned callers (the Layouts save flow, which publishes exactly what
- * namedLayouts.saveTabLayout wrote) already pass normalized entries.
+ * The entry is defensively re-normalized client-side per scope: the name
+ * trim/cap 60 always; a TAB entry's tabTitle trim/cap 80 with the empty→name
+ * fallback; a MASTER entry's session passes through verbatim (the local
+ * store write already validated it). The server requires the already-
+ * normalized form and rejects anything else with a 400; the sanctioned
+ * callers (the Layouts save flow, which publishes exactly what
+ * namedLayouts.saveTabLayout/saveMasterLayout wrote) already pass normalized
+ * entries.
  */
-export async function publishEntry(entry: TabLayoutEntry): Promise<ServerLayoutsDoc | null> {
+export async function publishEntry(entry: NamedLayoutEntry): Promise<ServerLayoutsDoc | null> {
   const name = normalizeLayoutName(entry.name);
   if (!name) {
     warnSkip();
     return null;
   }
-  const payload: TabLayoutEntry = {
-    ...entry,
-    name,
-    tabTitle: normalizeTabTitle(entry.tabTitle) || name,
-  };
+  const payload: NamedLayoutEntry =
+    entry.scope === "master"
+      ? { ...entry, name }
+      : { ...entry, name, tabTitle: normalizeTabTitle(entry.tabTitle) || name };
   try {
     let base = await fetchCatalog();
     if (base === null) {

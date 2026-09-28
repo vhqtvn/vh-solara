@@ -1,15 +1,23 @@
 package web
 
-// Server-managed tab-only named layouts — worker-scoped v1: the HTTP API.
+// Server-managed named layouts (tab + master scopes), worker-scoped v1: the
+// HTTP API.
 //
 // GET  /vh/layouts → layoutsPublicResp {revision, entries:[…]} (entries sorted
-//                   by name for a deterministic wire shape; never nil).
+//                   by name for a deterministic wire shape; never nil; each
+//                   entry is the tab or the master variant per its scope).
 // PUT  /vh/layouts → PER-ENTRY upsert. The body carries exactly ONE entry plus
 //                   the REQUIRED baseRevision CAS guard:
 //
 //                     { "baseRevision": <int64>,
 //                       "entry": { "scope":"tab", "name":…, "tabTitle":…,
-//                                  "layout":{…}, "savedAt":<ms> } }
+//                                  "layout":{…}, "savedAt":<ms> }
+//                       — or the master variant —
+//                       "entry": { "scope":"master", "name":…,
+//                                  "session":{ "activeWorkspaceName":…|null,
+//                                              "workspaces":[{"name":…,
+//                                                              "layout":{…}}] },
+//                                  "savedAt":<ms> } }
 //
 //                   This per-entry granularity is PINNED by the task card's F3
 //                   envelope (task-2026-09-17t20-32-39): a whole-catalog
@@ -25,10 +33,12 @@ package web
 // or sequencing authority).
 //
 // Strict-input contract (mirrors pins_http.go): the HTTP layer REJECTS what a
-// lenient client might send — wrong scope, untrimmed/empty/oversized name or
-// tabTitle, negative savedAt, non-object or oversized layout — with a
-// MACHINE-READABLE JSON 400 {error, message} rather than coercing. The
-// trimming the TypeScript client performs client-side
+// lenient client might send — wrong scope, untrimmed/empty/oversized name,
+// tabTitle or workspace name, negative savedAt, non-object or oversized
+// layouts, a missing/empty/malformed master session, or a scope's payload
+// fields on the other scope's entry — with a MACHINE-READABLE JSON 400
+// {error, message} rather than coercing. A malformed entry NEVER enters the
+// store. The trimming the TypeScript client performs client-side
 // (host-web/src/dockview/namedLayouts.ts caps NAMED_LAYOUT_NAME_MAX=60 and
 // TAB_TITLE_MAX=80) is NOT re-done server-side: the server requires the
 // already-normalized form so the stored bytes are exactly what the client
@@ -58,30 +68,52 @@ const maxLayoutNameLen = 60
 // happens before sending; the server requires a non-empty normalized title).
 const maxLayoutTabTitleLen = 80
 
-// maxLayoutJSONBytes caps a single entry's serialized layout payload. A
-// fractional dockview layout is a few KiB in practice; 256 KiB is a generous
-// ceiling that bounds the catalog file (≤100 entries × 256 KiB ≈ 25 MiB
-// worst case) while accepting any realistic document. BYTE-based on purpose
+// maxLayoutJSONBytes caps a single entry's serialized layout payload (a tab
+// entry's layout OR one master-session workspace's layout). A fractional
+// dockview layout is a few KiB in practice; 256 KiB is a generous ceiling
+// that bounds the catalog file (≤100 entries × 256 KiB ≈ 25 MiB worst case)
+// while accepting any realistic document. BYTE-based on purpose
 // (stored-bytes semantics): it bounds the STORED entry size on the raw
-// undecoded-interior bytes of the Layout field, checked POST-decode — the
+// undecoded-interior bytes of a Layout field, checked POST-decode — the
 // outer PUT json.Decode in handleNamedLayoutsPut has already copied Layout
-// as a json.RawMessage by the time validateTabLayoutEntry measures it. The
+// as a json.RawMessage by the time validateLayoutBytes measures it. The
 // request-level allocation bound is the 1 MiB http.MaxBytesReader wrapped
 // around r.Body in handleNamedLayoutsPut.
 const maxLayoutJSONBytes = 256 << 10
 
-// layoutsScopeTab is the only entry scope accepted in v1. The TS side models
-// a "master" scope too; it is explicitly out of server scope for v1.
-const layoutsScopeTab = "tab"
+// layoutsScopeTab and layoutsScopeMaster are the two accepted entry scopes
+// (the TS union NamedLayoutEntry discriminates on the same values). The
+// name namespace spans BOTH: an upsert of a name replaces the entry whatever
+// its scope — the HTTP upsert and the store are scope-blind beyond entry
+// validation.
+const (
+	layoutsScopeTab    = "tab"
+	layoutsScopeMaster = "master"
+)
+
+// maxLayoutWorkspaceNameLen caps a master session's workspace names (and the
+// active-workspace name) in RUNES. It mirrors the workspace-name UI bound
+// (maxlength=80 on the tabstrip rename input; TAB_TITLE_MAX applies the same
+// 80 for the same reason — the value becomes a workspace name on load).
+const maxLayoutWorkspaceNameLen = 80
+
+// maxMasterSessionWorkspaces bounds a master session's workspace count. Real
+// sessions are single-digit; 100 is generously above that (same scale as
+// maxNamedLayouts) while keeping a poison session from storing tens of
+// thousands of entries inside one catalog row (the 1 MiB request cap bounds
+// bytes, not element count).
+const maxMasterSessionWorkspaces = 100
 
 // layoutsPublicResp is the wire shape for GET /vh/layouts and the
 // success/conflict body of PUT /vh/layouts. It deliberately OMITS
 // schemaVersion (internal persistence detail, same policy as pins). Entries
 // is sorted by name for a deterministic wire shape and is always non-nil (at
-// least []).
+// least []); each entry is the TAB variant ({scope,name,tabTitle,layout,
+// savedAt}) or the MASTER variant ({scope,name,session,savedAt}) per its
+// scope — the same discrimination the TS NamedLayoutEntry union applies.
 type layoutsPublicResp struct {
-	Revision int64            `json:"revision"`
-	Entries  []TabLayoutEntry `json:"entries"`
+	Revision int64              `json:"revision"`
+	Entries  []NamedLayoutEntry `json:"entries"`
 }
 
 // layoutsPublicRespFromDoc derives the wire response from a full
@@ -89,7 +121,7 @@ type layoutsPublicResp struct {
 func layoutsPublicRespFromDoc(doc NamedLayoutsDoc) layoutsPublicResp {
 	out := layoutsPublicResp{
 		Revision: doc.Revision,
-		Entries:  make([]TabLayoutEntry, 0, len(doc.Entries)),
+		Entries:  make([]NamedLayoutEntry, 0, len(doc.Entries)),
 	}
 	names := make([]string, 0, len(doc.Entries))
 	for k := range doc.Entries {
@@ -108,16 +140,16 @@ func layoutsPublicRespFromDoc(doc NamedLayoutsDoc) layoutsPublicResp {
 // entry — per-entry granularity is the pinned contract. The decoder is
 // lenient on unknown fields (forward compatibility, same policy as pins).
 type putLayoutsReq struct {
-	BaseRevision *int64          `json:"baseRevision"`
-	Entry        *TabLayoutEntry `json:"entry"`
+	BaseRevision *int64            `json:"baseRevision"`
+	Entry        *NamedLayoutEntry `json:"entry"`
 }
 
 // layoutErrResp is the MACHINE-READABLE error body for PUT /vh/layouts 400s:
 // {error: "<stable code>", message: "<human-readable>"}. Error codes are a
-// stable contract for the host-web client (phases 3-4): invalid_body,
+// stable contract for the host-web client: invalid_body,
 // missing_base_revision, missing_entry, invalid_scope, invalid_name,
-// invalid_tab_title, invalid_saved_at, invalid_layout, layout_too_large,
-// catalog_full.
+// invalid_tab_title, invalid_session, invalid_saved_at, invalid_layout,
+// layout_too_large, catalog_full.
 type layoutErrResp struct {
 	Error   string `json:"error"`
 	Message string `json:"message"`
@@ -146,13 +178,20 @@ func (s *Server) handleNamedLayouts(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// validateTabLayoutEntry checks the strict-input contract for one entry.
-// Returns the stable error code + message for the first violation, or "".
-// Input must be the ALREADY-NORMALIZED client form (the TS client trims and
-// caps before sending); the server does not coerce.
-func validateTabLayoutEntry(e *TabLayoutEntry) (code, message string) {
-	if e.Scope != layoutsScopeTab {
-		return "invalid_scope", `entry.scope must be exactly "tab" (v1)`
+// validateNamedLayoutEntry checks the strict-input contract for one entry of
+// EITHER scope. Returns the stable error code + message for the first
+// violation, or "". Input must be the ALREADY-NORMALIZED client form (the TS
+// client trims and caps before sending); the server does not coerce.
+//
+// Scope-discriminated fields: a TAB entry must carry tabTitle + a top-level
+// layout and NO session; a MASTER entry must carry session and NEITHER
+// tabTitle nor a top-level layout (its layouts live in session.workspaces,
+// each under the SAME opacity/size caps as a tab layout). Carrying the other
+// scope's payload field is a 400, not an ignore — the wire shapes stay
+// exactly the TS variants'.
+func validateNamedLayoutEntry(e *NamedLayoutEntry) (code, message string) {
+	if e.Scope != layoutsScopeTab && e.Scope != layoutsScopeMaster {
+		return "invalid_scope", `entry.scope must be exactly "tab" or "master"`
 	}
 	if e.Name == "" {
 		return "invalid_name", "entry.name must be non-empty (trim client-side before sending)"
@@ -163,24 +202,79 @@ func validateTabLayoutEntry(e *TabLayoutEntry) (code, message string) {
 	if e.Name != strings.TrimSpace(e.Name) {
 		return "invalid_name", "entry.name must be pre-trimmed (no surrounding whitespace)"
 	}
-	if e.TabTitle == "" {
-		return "invalid_tab_title", "entry.tabTitle must be non-empty (apply the client-side name fallback before sending)"
-	}
-	if utf8.RuneCountInString(e.TabTitle) > maxLayoutTabTitleLen {
-		return "invalid_tab_title", "entry.tabTitle exceeds the 80-char cap"
-	}
-	if e.TabTitle != strings.TrimSpace(e.TabTitle) {
-		return "invalid_tab_title", "entry.tabTitle must be pre-trimmed (no surrounding whitespace)"
-	}
 	if e.SavedAt < 0 {
 		return "invalid_saved_at", "entry.savedAt must be a non-negative epoch-milliseconds value"
 	}
-	trimmed := bytes.TrimSpace(e.Layout)
-	if len(trimmed) == 0 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
-		return "invalid_layout", "entry.layout must be a non-empty JSON object"
+	if e.Scope == layoutsScopeTab {
+		if e.TabTitle == "" {
+			return "invalid_tab_title", "entry.tabTitle must be non-empty (apply the client-side name fallback before sending)"
+		}
+		if utf8.RuneCountInString(e.TabTitle) > maxLayoutTabTitleLen {
+			return "invalid_tab_title", "entry.tabTitle exceeds the 80-char cap"
+		}
+		if e.TabTitle != strings.TrimSpace(e.TabTitle) {
+			return "invalid_tab_title", "entry.tabTitle must be pre-trimmed (no surrounding whitespace)"
+		}
+		if e.Session != nil {
+			return "invalid_session", `entry.session must be absent for scope "tab"`
+		}
+		return validateLayoutBytes(e.Layout)
 	}
-	if len(e.Layout) > maxLayoutJSONBytes {
-		return "layout_too_large", "entry.layout exceeds the 256 KiB cap"
+	// Scope "master".
+	if e.TabTitle != "" {
+		return "invalid_tab_title", `entry.tabTitle must be empty for scope "master" (the session carries the workspaces)`
+	}
+	if len(bytes.TrimSpace(e.Layout)) != 0 {
+		return "invalid_layout", `entry.layout must be absent for scope "master" (layouts live in session.workspaces)`
+	}
+	return validateMasterSession(e.Session)
+}
+
+// validateLayoutBytes applies the tab-layout opacity/size contract to one
+// opaque serialized dockview document: a non-empty JSON object within the
+// 256 KiB stored-bytes cap (BYTE-based on purpose — see maxLayoutJSONBytes).
+func validateLayoutBytes(layout json.RawMessage) (code, message string) {
+	trimmed := bytes.TrimSpace(layout)
+	if len(trimmed) == 0 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
+		return "invalid_layout", "layout must be a non-empty JSON object"
+	}
+	if len(layout) > maxLayoutJSONBytes {
+		return "layout_too_large", "layout exceeds the 256 KiB cap"
+	}
+	return "", ""
+}
+
+// validateMasterSession applies the strict-input contract to a master
+// entry's session payload: present, a non-empty bounded workspaces array of
+// {name, layout} (names non-empty ≤80 runes; layouts under the SAME
+// opacity/size caps as tab layouts), and activeWorkspaceName JSON-null or a
+// bounded string (it only selects which workspace activates on load — an
+// unmatched name falls back to the first workspace, so emptiness is
+// tolerated but the length is still capped to bound the stored doc).
+func validateMasterSession(s *NamedMasterSession) (code, message string) {
+	if s == nil {
+		return "invalid_session", `entry.session is required for scope "master"`
+	}
+	if s.ActiveWorkspaceName != nil && utf8.RuneCountInString(*s.ActiveWorkspaceName) > maxLayoutWorkspaceNameLen {
+		return "invalid_session", "session.activeWorkspaceName exceeds the 80-char cap"
+	}
+	if len(s.Workspaces) == 0 {
+		return "invalid_session", "session.workspaces must be a non-empty array"
+	}
+	if len(s.Workspaces) > maxMasterSessionWorkspaces {
+		return "invalid_session", "session.workspaces exceeds the 100-workspace cap"
+	}
+	for i := range s.Workspaces {
+		w := &s.Workspaces[i]
+		if w.Name == "" {
+			return "invalid_name", "session.workspaces[].name must be non-empty"
+		}
+		if utf8.RuneCountInString(w.Name) > maxLayoutWorkspaceNameLen {
+			return "invalid_name", "session.workspaces[].name exceeds the 80-char cap"
+		}
+		if code, message := validateLayoutBytes(w.Layout); code != "" {
+			return code, message
+		}
 	}
 	return "", ""
 }
@@ -216,7 +310,7 @@ func (s *Server) handleNamedLayoutsPut(w http.ResponseWriter, r *http.Request) {
 
 	// 4. Strict per-entry validation (BEFORE the CAS guard, per the
 	//    validation-precedence contract).
-	if code, message := validateTabLayoutEntry(req.Entry); code != "" {
+	if code, message := validateNamedLayoutEntry(req.Entry); code != "" {
 		writeLayoutsErr(w, http.StatusBadRequest, code, message)
 		return
 	}

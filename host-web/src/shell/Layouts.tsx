@@ -7,6 +7,8 @@ import {
   listTabLayouts,
   loadNamedLayout,
   normalizeLayoutName,
+  type MasterLayoutEntry,
+  type NamedLayoutEntry,
   type TabLayoutEntry,
 } from "../dockview/namedLayouts";
 import { activeWorkspaceId, hostOps, panes, workspaces } from "../dockview/store";
@@ -70,9 +72,18 @@ interface MergedTabRow {
   synced: boolean;
 }
 
+/** A merged ALL-TABS row: the same server-wins-by-name merge the tab list
+ *  uses, over master-scope rows (`tabs` is the session's workspace count). */
+interface MergedMasterRow {
+  name: string;
+  tabs: number;
+  savedAt: number;
+  synced: boolean;
+}
+
 /** Sort helper: most-recent-first (savedAt desc; name asc tiebreak — the same
  *  deterministic order namedLayouts' local lists use). */
-function byRecency(a: MergedTabRow, b: MergedTabRow): number {
+function byRecency(a: { name: string; savedAt: number }, b: { name: string; savedAt: number }): number {
   return b.savedAt !== a.savedAt
     ? b.savedAt - a.savedAt
     : a.name.localeCompare(b.name);
@@ -93,37 +104,65 @@ export function Layouts() {
   const [rev, setRev] = createSignal(0);
 
   // ---- server catalog state (v1 layouts sync) -----------------------------
-  // Server entries are fetched ONLY when this popover opens or a publish
-  // completes — never at boot/module init, never into the boot arbitration
-  // (F3 hazard H2). This is a LIST-LEVEL overlay in this popover ONLY: the
-  // view-merge below NEVER writes back into the local store (F3 hazard H1 —
-  // shadowed local entries stay intact in vh-host:namedLayouts:v2, masked
-  // but never destroyed), and any fetch failure silently degrades to a
-  // local-only list (dev/unfolded posture).
-  const [serverEntries, setServerEntries] = createSignal<TabLayoutEntry[]>([]);
+  // Server entries (BOTH scopes — the doc carries the NamedLayoutEntry union)
+  // are fetched ONLY when this popover opens or a publish completes — never
+  // at boot/module init, never into the boot arbitration (F3 hazard H2).
+  // This is a LIST-LEVEL overlay in this popover ONLY: the view-merges below
+  // NEVER write back into the local store (F3 hazard H1 — shadowed local
+  // entries stay intact in vh-host:namedLayouts:v2, masked but never
+  // destroyed), and any fetch failure silently degrades to a local-only
+  // list (dev/unfolded posture).
+  const [serverEntries, setServerEntries] = createSignal<NamedLayoutEntry[]>([]);
   const refreshServerList = (): void => {
     fetchCatalog().then((doc) => setServerEntries(doc ? doc.entries : []));
   };
 
   // VIEW-MERGE (F3 H1, server-wins): local rows first, then server rows
   // OVERWRITE by name — the worker catalog owns the MERGED LIST on
-  // collisions. Read-only over the local store; no ordering is derived from
+  // collisions. Because the name namespace spans BOTH scopes (local store
+  // and server catalog), a server entry of EITHER scope owns its name: a
+  // local row under a server-owned name is masked in its list too (one name
+  // = one row, in exactly the scope list matching the server entry's scope).
+  // Read-only over the local store; no ordering is derived from
   // revision/savedAt across stores (savedAt ordering is display-only, local
   // to whatever rows the merge produced).
+  const serverNames = createMemo<Set<string>>(() => {
+    const names = new Set<string>();
+    for (const e of serverEntries()) names.add(e.name);
+    return names;
+  });
   const tabList = createMemo<MergedTabRow[]>(() => {
     void rev();
+    const owned = serverNames();
     const byName = new Map<string, MergedTabRow>();
     for (const l of listTabLayouts()) {
+      if (owned.has(l.name)) continue; // shadowed by a server entry (either scope)
       byName.set(l.name, { name: l.name, tabTitle: l.tabTitle, savedAt: l.savedAt, synced: false });
     }
     for (const e of serverEntries()) {
+      if (e.scope !== "tab") continue;
       byName.set(e.name, { name: e.name, tabTitle: e.tabTitle, savedAt: e.savedAt, synced: true });
     }
     return [...byName.values()].sort(byRecency);
   });
-  const masterList = createMemo(() => {
+  const masterList = createMemo<MergedMasterRow[]>(() => {
     void rev();
-    return listMasterLayouts();
+    const owned = serverNames();
+    const byName = new Map<string, MergedMasterRow>();
+    for (const l of listMasterLayouts()) {
+      if (owned.has(l.name)) continue; // shadowed by a server entry (either scope)
+      byName.set(l.name, { name: l.name, tabs: l.tabs, savedAt: l.savedAt, synced: false });
+    }
+    for (const e of serverEntries()) {
+      if (e.scope !== "master") continue;
+      byName.set(e.name, {
+        name: e.name,
+        tabs: e.session.workspaces.length,
+        savedAt: e.savedAt,
+        synced: true,
+      });
+    }
+    return [...byName.values()].sort(byRecency);
   });
 
   // Blocked-load error surface (server-sourced entry with unallowlisted
@@ -181,8 +220,23 @@ export function Layouts() {
   const doSave = () => {
     if (scope() === "master") {
       if (!canSaveMaster()) return; // aria-disabled guard — full no-op
-      const ok = hostOps()?.saveMasterLayout?.(layoutName()) ?? false;
+      const rawName = layoutName();
+      const ok = hostOps()?.saveMasterLayout?.(rawName) ?? false;
       if (ok) {
+        // PUBLISH to the worker catalog, fire-and-forget — the master
+        // counterpart of the tab branch below: the local save has already
+        // succeeded, so any server failure warns (inside the client) and
+        // degrades to a local-only row; the save itself never fails. The
+        // JUST-WRITTEN normalized entry is read back from the store so the
+        // wire payload is exactly the validated bytes storage kept. On
+        // success the merged list adopts the committed doc — the row gains
+        // its synced badge.
+        const saved = loadNamedLayout(rawName);
+        if (saved && saved.scope === "master") {
+          void publishEntry(saved).then((doc) => {
+            if (doc) setServerEntries(doc.entries);
+          });
+        }
         setLayoutName("");
         setRev((n) => n + 1);
       }
@@ -217,12 +271,18 @@ export function Layouts() {
   };
 
   // ---- row actions -----------------------------------------------------------
-  /** The server-sourced entry currently shown for `name` (undefined when the
-   *  row is local-only). By construction a row for name X is server-sourced
-   *  exactly when the fetched catalog holds X — the merge overwrote any
+  /** The server-sourced TAB entry currently shown for `name` (undefined when
+   *  the row is local-only or the server row is master-scope). By
+   *  construction a tab-scope row for name X is server-sourced exactly when
+   *  the fetched catalog holds X as a tab entry — the merge overwrote any
    *  shadowed local entry, and the LOAD must take the SERVER bytes. */
   const serverEntryFor = (name: string): TabLayoutEntry | undefined =>
-    serverEntries().find((e) => e.name === name);
+    serverEntries().find((e): e is TabLayoutEntry => e.scope === "tab" && e.name === name);
+
+  /** The server-sourced MASTER entry currently shown for `name` (same
+   *  construction, master scope). */
+  const serverMasterEntryFor = (name: string): MasterLayoutEntry | undefined =>
+    serverEntries().find((e): e is MasterLayoutEntry => e.scope === "master" && e.name === name);
 
   const doLoadTab = (name: string) => {
     setLoadError("");
@@ -253,6 +313,29 @@ export function Layouts() {
   };
 
   const doLoadMaster = (name: string) => {
+    setLoadError("");
+    const serverEntry = serverMasterEntryFor(name);
+    if (serverEntry) {
+      // Server-sourced row: the SERVER entry through the validated
+      // destructive apply (structural re-coerce + per-workspace target gate
+      // — the same two gates a server TAB entry passes, then the SAME
+      // add-all/close-all/activate path a local master load takes). The
+      // two-step confirm already ran in the row. A blocked load keeps the
+      // popover open and surfaces the error inline — the session is NEVER
+      // partially replaced.
+      const res = hostOps()?.loadMasterLayoutEntry?.(serverEntry);
+      if (!res) return; // no ops registered yet (cold window) — no-op
+      if (res.ok) {
+        surface.closePopover();
+        return;
+      }
+      setLoadError(
+        res.reason === "invalid-targets"
+          ? "Layout contains targets not allowed on this device"
+          : "This layout could not be loaded",
+      );
+      return;
+    }
     const ok = hostOps()?.loadMasterLayout?.(name);
     if (ok) surface.closePopover();
   };
@@ -402,6 +485,7 @@ export function Layouts() {
                       name={entry.name}
                       tabs={entry.tabs}
                       savedAt={entry.savedAt}
+                      synced={entry.synced}
                       onLoad={doLoadMaster}
                       onDelete={doDelete}
                       onRename={doRename}
@@ -411,6 +495,11 @@ export function Layouts() {
                 <Show when={masterList().length === 0}>
                   <div class={s.empty} data-testid="layout-empty">
                     No saved layouts yet.
+                  </div>
+                </Show>
+                <Show when={loadError()}>
+                  <div class={s.loadError} data-testid="layout-load-error" role="alert">
+                    {loadError()}
                   </div>
                 </Show>
               </>
@@ -614,11 +703,18 @@ function TabRow(props: {
 /** An ALL-TABS (master) row: name + "N tabs" subtitle + relative time. The
  *  Load action is a TWO-STEP confirm (destructive session replace): the first
  *  tap swaps the row into "Replace all tabs?" + ✓/✕; ✓ runs the load, ✕ (or
- *  the ~3.5s timeout) reverts. Mirrors the workspace-delete confirm. */
+ *  the ~3.5s timeout) reverts. Mirrors the workspace-delete confirm. A
+ *  SERVER-SOURCED row (synced) carries the "synced" badge and its rename/
+ *  delete actions are DISABLED — the same server-owns-the-row posture as a
+ *  synced TabRow (v1 has no server rename/delete; a local mutation would
+ *  fork it locally and the server row would resurrect on refresh). The
+ *  two-step confirm applies REGARDLESS of source — the load is destructive
+ *  either way. */
 function MasterRow(props: {
   name: string;
   tabs: number;
   savedAt: number;
+  synced?: boolean;
   onLoad(name: string): void;
   onDelete(name: string): void;
   onRename(oldName: string, newName: string): boolean;
@@ -660,6 +756,7 @@ function MasterRow(props: {
       data-testid="layout-row"
       data-name={props.name}
       data-scope="master"
+      data-synced={props.synced ? "1" : "0"}
       data-confirming={confirming() ? "1" : "0"}
     >
       <Show
@@ -682,7 +779,18 @@ function MasterRow(props: {
               onClick={() => startConfirm()}
             >
               <span class={s.rowText}>
-                <span class={s.rowName}>{props.name}</span>
+                <span class={s.rowLine}>
+                  <span class={s.rowName}>{props.name}</span>
+                  <Show when={props.synced}>
+                    <span
+                      class={s.syncBadge}
+                      data-testid="layout-row-synced"
+                      title="Saved on this server — available on every device connected to it"
+                    >
+                      synced
+                    </span>
+                  </Show>
+                </span>
                 <span class={s.rowSub}>
                   {props.tabs} tab{props.tabs === 1 ? "" : "s"}
                 </span>
@@ -738,21 +846,27 @@ function MasterRow(props: {
       >
         <button
           type="button"
-          class={s.actBtn}
+          class={props.synced ? `${s.actBtn} ${s.actBtnDisabled}` : s.actBtn}
           aria-label={`Rename layout ${props.name}`}
-          title={`Rename ${props.name}`}
+          title={props.synced ? "Synced layout — managed on the server" : `Rename ${props.name}`}
           data-testid="layout-rename"
-          onClick={() => row.beginRename(props.name)}
+          disabled={props.synced}
+          onClick={() => {
+            if (!props.synced) row.beginRename(props.name);
+          }}
         >
           ✎
         </button>
         <button
           type="button"
-          class={s.delBtn}
+          class={props.synced ? `${s.delBtn} ${s.delBtnDisabled}` : s.delBtn}
           aria-label={`Delete layout ${props.name}`}
-          title={`Delete ${props.name}`}
+          title={props.synced ? "Synced layout — managed on the server" : `Delete ${props.name}`}
           data-testid="layout-delete"
-          onClick={() => props.onDelete(props.name)}
+          disabled={props.synced}
+          onClick={() => {
+            if (!props.synced) props.onDelete(props.name);
+          }}
         >
           ×
         </button>

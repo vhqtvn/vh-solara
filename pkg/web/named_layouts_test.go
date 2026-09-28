@@ -41,7 +41,7 @@ func testLayout(n int) json.RawMessage {
 
 // mustUpsert is an Upsert that fatals on error (used when the test expects
 // success). Returns the post-upsert snapshot.
-func mustUpsert(t *testing.T, s *NamedLayoutStore, baseRevision int64, entry TabLayoutEntry) NamedLayoutsDoc {
+func mustUpsert(t *testing.T, s *NamedLayoutStore, baseRevision int64, entry NamedLayoutEntry) NamedLayoutsDoc {
 	t.Helper()
 	ok, cur, err := s.Upsert(baseRevision, entry)
 	if err != nil {
@@ -54,13 +54,35 @@ func mustUpsert(t *testing.T, s *NamedLayoutStore, baseRevision int64, entry Tab
 }
 
 // layoutEntry builds a valid tab entry for tests.
-func layoutEntry(name string, n int, savedAt int64) TabLayoutEntry {
-	return TabLayoutEntry{
+func layoutEntry(name string, n int, savedAt int64) NamedLayoutEntry {
+	return NamedLayoutEntry{
 		Scope:    "tab",
 		Name:     name,
 		TabTitle: "Title " + name,
 		Layout:   testLayout(n),
 		SavedAt:  savedAt,
+	}
+}
+
+// masterLayoutEntry builds a valid master (session) entry for tests: n
+// workspaces, the first active by name.
+func masterLayoutEntry(name string, n int, savedAt int64) NamedLayoutEntry {
+	active := "Ws 1"
+	sess := &NamedMasterSession{
+		ActiveWorkspaceName: &active,
+		Workspaces:          make([]NamedMasterWorkspace, 0, n),
+	}
+	for i := 0; i < n; i++ {
+		sess.Workspaces = append(sess.Workspaces, NamedMasterWorkspace{
+			Name:   "Ws " + strconv.Itoa(i+1),
+			Layout: testLayout(i + 1),
+		})
+	}
+	return NamedLayoutEntry{
+		Scope:   "master",
+		Name:    name,
+		Session: sess,
+		SavedAt: savedAt,
 	}
 }
 
@@ -343,7 +365,9 @@ func TestNamedLayoutStoreCorruptOrSchemaMismatchResetsToZeroDoc(t *testing.T) {
 		body []byte
 	}{
 		{"malformed_json", []byte(`{"schemaVersion":1,"revision":1,"entries":{ BROKEN`)},
-		{"wrong_schema", []byte(`{"schemaVersion":2,"revision":1,"entries":{"a":{"scope":"tab"}}}`)},
+		// 3 = a version THIS binary never reads or writes (1 and 2 both load;
+		// see namedLayoutsSchemaVersion) — the still-unknown "wrong" version.
+		{"wrong_schema", []byte(`{"schemaVersion":3,"revision":1,"entries":{"a":{"scope":"tab"}}}`)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -456,5 +480,334 @@ func TestNamedLayoutStoreConcurrentSingleWinner(t *testing.T) {
 	snap := st.Snapshot()
 	if snap.Revision != 1 || len(snap.Entries) != 1 {
 		t.Fatalf("post-race: Revision=%d len(Entries)=%d, want 1/1", snap.Revision, len(snap.Entries))
+	}
+}
+
+// 11. Master (session) upsert persists to disk and a reload via a second
+// NewNamedLayoutStore round-trips the session (workspace names, per-workspace
+// layout values, activeWorkspaceName) and the null-active variant.
+func TestNamedLayoutStoreMasterUpsertPersistsAndRoundTrips(t *testing.T) {
+	st, path := newLayoutTestStore(t)
+
+	cur := mustUpsert(t, st, 0, masterLayoutEntry("fleet", 2, 1726600099999))
+	if cur.Revision != 1 {
+		t.Fatalf("Revision = %d, want 1", cur.Revision)
+	}
+	e := cur.Entries["fleet"]
+	if e.Scope != "master" || e.TabTitle != "" || len(e.Layout) != 0 {
+		t.Fatalf("master entry carries tab-variant fields: %+v", e)
+	}
+	if e.Session == nil || len(e.Session.Workspaces) != 2 {
+		t.Fatalf("master entry session mismatch: %+v", e.Session)
+	}
+	if e.Session.ActiveWorkspaceName == nil || *e.Session.ActiveWorkspaceName != "Ws 1" {
+		t.Fatalf("activeWorkspaceName mismatch: %v", e.Session.ActiveWorkspaceName)
+	}
+	for i, w := range e.Session.Workspaces {
+		if w.Name != "Ws "+strconv.Itoa(i+1) {
+			t.Fatalf("workspace[%d].Name = %q", i, w.Name)
+		}
+		if !jsonEqual(w.Layout, testLayout(i+1)) {
+			t.Fatalf("workspace[%d] layout drifted: %s", i, w.Layout)
+		}
+	}
+
+	// Reload from disk: the session round-trips (semantic layout equality —
+	// MarshalIndent re-indents RawMessage bytes; same note as test 2).
+	st2, err := NewNamedLayoutStore(path)
+	if err != nil {
+		t.Fatalf("reload NewNamedLayoutStore: %v", err)
+	}
+	rel := st2.Snapshot().Entries["fleet"]
+	if rel.Session == nil || len(rel.Session.Workspaces) != 2 {
+		t.Fatalf("reload session mismatch: %+v", rel.Session)
+	}
+	if rel.Session.ActiveWorkspaceName == nil || *rel.Session.ActiveWorkspaceName != "Ws 1" {
+		t.Fatalf("reload activeWorkspaceName mismatch: %v", rel.Session.ActiveWorkspaceName)
+	}
+	if rel.Session.Workspaces[1].Name != "Ws 2" {
+		t.Fatalf("reload workspace name drifted: %q", rel.Session.Workspaces[1].Name)
+	}
+	if !jsonEqual(rel.Session.Workspaces[1].Layout, testLayout(2)) {
+		t.Fatalf("reload workspace layout drifted: %s", rel.Session.Workspaces[1].Layout)
+	}
+
+	// The null-active variant round-trips too (JSON null activeWorkspaceName).
+	cur2 := mustUpsert(t, st, 1, NamedLayoutEntry{
+		Scope: "master", Name: "no-active", SavedAt: 1,
+		Session: &NamedMasterSession{
+			ActiveWorkspaceName: nil,
+			Workspaces:          []NamedMasterWorkspace{{Name: "solo", Layout: testLayout(7)}},
+		},
+	})
+	rel2 := cur2.Entries["no-active"]
+	if rel2.Session == nil || rel2.Session.ActiveWorkspaceName != nil {
+		t.Fatalf("null-active round-trip mismatch: %+v", rel2.Session)
+	}
+}
+
+// 12. Same-name CROSS-SCOPE replace: the name namespace spans both scopes —
+// an upsert of an existing name replaces the entry regardless of scope (same
+// CAS path, no growth, revision bumps).
+func TestNamedLayoutStoreSameNameCrossScopeReplace(t *testing.T) {
+	st, _ := newLayoutTestStore(t)
+
+	mustUpsert(t, st, 0, layoutEntry("dual", 1, 1000))
+	cur := mustUpsert(t, st, 1, masterLayoutEntry("dual", 3, 2000))
+	if len(cur.Entries) != 1 {
+		t.Fatalf("cross-scope replace grew the catalog: len=%d", len(cur.Entries))
+	}
+	e := cur.Entries["dual"]
+	if e.Scope != "master" || e.Session == nil || len(e.Session.Workspaces) != 3 {
+		t.Fatalf("cross-scope replace did not install the master entry: %+v", e)
+	}
+
+	// And back: a tab upsert of the same name replaces the master entry.
+	cur2 := mustUpsert(t, st, 2, layoutEntry("dual", 9, 3000))
+	if len(cur2.Entries) != 1 {
+		t.Fatalf("reverse cross-scope replace grew the catalog: len=%d", len(cur2.Entries))
+	}
+	e2 := cur2.Entries["dual"]
+	if e2.Scope != "tab" || e2.Session != nil || e2.TabTitle != "Title dual" {
+		t.Fatalf("reverse cross-scope replace did not install the tab entry: %+v", e2)
+	}
+}
+
+// 13. A master entry's Upsert argument must not alias store state: mutating
+// the session (workspace layout bytes, the activeName pointer, the slice)
+// AFTER a successful Upsert must not change the stored doc (the Session
+// deep-copy companion of test 9).
+func TestNamedLayoutStoreMasterUpsertArgumentNotAliased(t *testing.T) {
+	st, _ := newLayoutTestStore(t)
+	entry := masterLayoutEntry("m", 2, 1000)
+	mustUpsert(t, st, 0, entry)
+
+	// Mutate the caller-side entry after the fact.
+	entry.Session.Workspaces[0].Layout[0] = 'X'
+	*entry.Session.ActiveWorkspaceName = "MUTATED"
+	entry.Session.Workspaces = append(entry.Session.Workspaces, NamedMasterWorkspace{
+		Name: "injected", Layout: testLayout(99),
+	})
+
+	snap := st.Snapshot()
+	e := snap.Entries["m"]
+	if e.Session == nil || len(e.Session.Workspaces) != 2 {
+		t.Fatalf("post-Upsert caller slice mutation leaked: %+v", e.Session)
+	}
+	if !bytes.Equal(e.Session.Workspaces[0].Layout, testLayout(1)) {
+		t.Fatalf("post-Upsert caller layout mutation leaked: %s", e.Session.Workspaces[0].Layout)
+	}
+	if e.Session.ActiveWorkspaceName == nil || *e.Session.ActiveWorkspaceName != "Ws 1" {
+		t.Fatalf("post-Upsert caller activeName mutation leaked: %v", e.Session.ActiveWorkspaceName)
+	}
+}
+
+// 14. Backward compat: a hand-written v1 (tab-only) document — exactly what a
+// pre-master binary (git tag v1.72.0) persists — loads into THIS binary
+// unchanged (entries + revision intact, file byte-identical on load), and the
+// first successful mutation upgrades the on-disk file to the current schema
+// (lazy upgrade: the load itself never rewrites).
+func TestNamedLayoutStoreV1DocLoadsAndUpgradesLazily(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "named-layouts.json")
+	// A v1 doc as the OLD binary writes it: schemaVersion 1, tab-only entries
+	// (scope/name/tabTitle/layout/savedAt — no session field exists in v1).
+	v1Body := []byte(`{
+  "schemaVersion": 1,
+  "revision": 5,
+  "entries": {
+    "focus": {"scope":"tab","name":"focus","tabTitle":"Title focus","layout":{"grid":{"n":1},"panels":[]},"savedAt":1726600000000},
+    "debug": {"scope":"tab","name":"debug","tabTitle":"Title debug","layout":{"grid":{"n":2},"panels":[]},"savedAt":1726600001000}
+  }
+}`)
+	if err := os.WriteFile(path, v1Body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := NewNamedLayoutStore(path)
+	if err != nil {
+		t.Fatalf("NewNamedLayoutStore(v1 doc): %v", err)
+	}
+	snap := st.Snapshot()
+	// The v1 doc LOADS: both tab entries and the CAS revision survive…
+	if snap.Revision != 5 || len(snap.Entries) != 2 {
+		t.Fatalf("v1 doc did not load: Revision=%d len(Entries)=%d, want 5/2", snap.Revision, len(snap.Entries))
+	}
+	focus := snap.Entries["focus"]
+	if focus.Scope != "tab" || focus.TabTitle != "Title focus" || focus.SavedAt != 1726600000000 {
+		t.Fatalf("v1 entry drifted on load: %+v", focus)
+	}
+	if !jsonEqual(focus.Layout, testLayout(1)) {
+		t.Fatalf("v1 layout value drifted: %s", focus.Layout)
+	}
+	// …the in-memory doc is normalized to the CURRENT schema version…
+	if snap.SchemaVersion != namedLayoutsSchemaVersion {
+		t.Fatalf("in-memory SchemaVersion = %d, want %d (normalized on load)", snap.SchemaVersion, namedLayoutsSchemaVersion)
+	}
+	// …and the load did NOT rewrite the on-disk file (still the v1 bytes).
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(got, v1Body) {
+		t.Fatalf("load rewrote the v1 file:\ngot:  %s\nwant: %s", got, v1Body)
+	}
+
+	// LAZY UPGRADE: the first successful mutation (CAS against the v1 doc's
+	// carried revision) persists the catalog as the CURRENT schema.
+	cur := mustUpsert(t, st, 5, layoutEntry("added", 1, 1))
+	if cur.Revision != 6 || len(cur.Entries) != 3 {
+		t.Fatalf("post-upgrade Upsert: Revision=%d len=%d, want 6/3", cur.Revision, len(cur.Entries))
+	}
+	upgraded, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile upgraded: %v", err)
+	}
+	var onDisk struct {
+		SchemaVersion int                         `json:"schemaVersion"`
+		Entries       map[string]NamedLayoutEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(upgraded, &onDisk); err != nil {
+		t.Fatalf("upgraded doc unmarshal: %v", err)
+	}
+	if onDisk.SchemaVersion != namedLayoutsSchemaVersion {
+		t.Fatalf("upgraded file schemaVersion = %d, want %d", onDisk.SchemaVersion, namedLayoutsSchemaVersion)
+	}
+	if len(onDisk.Entries) != 3 {
+		t.Fatalf("upgraded file lost entries: %d, want 3 (v1 pair + the new one)", len(onDisk.Entries))
+	}
+	if _, ok := onDisk.Entries["focus"]; !ok {
+		t.Fatal("upgraded file lost the v1 entry \"focus\"")
+	}
+}
+
+// oldReaderTabEntry + oldReaderDoc mirror the PRE-master on-disk shape at git
+// tag v1.72.0 (pkg/web/named_layouts.go): schemaVersion 1, entries keyed by
+// name with TAB-ONLY values — no session field exists in the old struct, so
+// encoding/json SILENTLY DISCARDS a master entry's session payload when an
+// old binary unmarshals a union doc (the erasure mechanism under test).
+type oldReaderTabEntry struct {
+	Scope    string          `json:"scope"`
+	Name     string          `json:"name"`
+	TabTitle string          `json:"tabTitle"`
+	Layout   json.RawMessage `json:"layout"`
+	SavedAt  int64           `json:"savedAt"`
+}
+
+type oldReaderDoc struct {
+	SchemaVersion int                          `json:"schemaVersion"`
+	Revision      int64                        `json:"revision"`
+	Entries       map[string]oldReaderTabEntry `json:"entries"`
+}
+
+// loadAsV1BinaryReader replicates the v1.72.0 NewNamedLayoutStore READ path
+// against path (verified line-for-line against
+// `git show v1.72.0:pkg/web/named_layouts.go`): ReadFile; on unmarshal error
+// OR SchemaVersion != 1 → a zero doc IN MEMORY (nil error, file NEVER
+// deleted/rewritten); on success the unmarshaled doc. It performs no writes
+// of any kind — the old binary's ONLY write path is a successful Upsert.
+func loadAsV1BinaryReader(path string) (oldReaderDoc, error) {
+	zero := oldReaderDoc{SchemaVersion: 1, Entries: map[string]oldReaderTabEntry{}}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return zero, nil
+		}
+		return zero, err
+	}
+	var doc oldReaderDoc
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return zero, nil // corrupt → zero doc in memory, file intact
+	}
+	if doc.SchemaVersion != 1 {
+		return zero, nil // mismatch → zero doc in memory, file intact
+	}
+	if doc.Entries == nil {
+		doc.Entries = map[string]oldReaderTabEntry{}
+	}
+	return doc, nil
+}
+
+// 15. ROLLBACK REGRESSION (the data-integrity crux): a v2 catalog containing
+// a master entry, read by the OLD (v1-only) binary's exact load semantics,
+// is NOT ingested (the old binary sees a zero catalog — no silent
+// session-discard) and the on-disk document is NOT rewritten by the load —
+// the master entry survives byte-intact. Also demonstrates the counterfactual:
+// had the SAME union doc been numbered v1 (the pre-fix state), the old reader
+// WOULD ingest the master entry with its session payload silently discarded —
+// the mangled catalog its next upsert would then persist.
+func TestNamedLayoutStoreRollbackOldBinaryCannotEraseMasterDoc(t *testing.T) {
+	st, path := newLayoutTestStore(t)
+	mustUpsert(t, st, 0, masterLayoutEntry("fleet", 2, 1726600099999))
+
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile before: %v", err)
+	}
+	// The persisted union doc carries the CURRENT schema version — this
+	// assertion is the red signal for the pre-fix state (version left at 1).
+	var head struct {
+		SchemaVersion int `json:"schemaVersion"`
+	}
+	if err := json.Unmarshal(before, &head); err != nil {
+		t.Fatalf("parse persisted doc: %v", err)
+	}
+	if head.SchemaVersion != namedLayoutsSchemaVersion {
+		t.Fatalf("persisted master catalog schemaVersion = %d, want %d (the union doc MUST not be v1-numbered)", head.SchemaVersion, namedLayoutsSchemaVersion)
+	}
+	if !bytes.Contains(before, []byte(`"session"`)) {
+		t.Fatalf("persisted master catalog lacks the session payload: %s", before)
+	}
+
+	// The OLD binary (v1.72.0 load semantics) reads the v2 doc.
+	oldDoc, err := loadAsV1BinaryReader(path)
+	if err != nil {
+		t.Fatalf("old reader errored (v1.72.0 returns nil on mismatch): %v", err)
+	}
+	// (a) The old binary ingested NOTHING — the mismatch branch fired before
+	// any unmarshaled entry could reach its in-memory catalog, so the silent
+	// session-discard path is unreachable.
+	if len(oldDoc.Entries) != 0 || oldDoc.Revision != 0 {
+		t.Fatalf("old reader ingested the v2 doc: Revision=%d entries=%d, want 0/0 (in-memory reset)", oldDoc.Revision, len(oldDoc.Entries))
+	}
+	// (b) No rewrite-and-erase: the load never touched the file — the master
+	// entry survives byte-intact for a roll-forward.
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("old reader's load rewrote the on-disk doc:\nbefore: %s\nafter:  %s", before, after)
+	}
+
+	// COUNTERFACTUAL (why the version NUMBER is load-bearing): the same union
+	// bytes numbered v1 — the pre-fix on-disk form — load SUCCESSFULLY into
+	// the old binary, which silently discards the master session payload.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(before, &raw); err != nil {
+		t.Fatalf("reparse: %v", err)
+	}
+	raw["schemaVersion"], _ = json.Marshal(1)
+	flipped, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("flip marshal: %v", err)
+	}
+	if err := json.Unmarshal(flipped, &oldDoc); err != nil {
+		t.Fatalf("old reader rejected the v1-numbered union doc: %v", err)
+	}
+	if len(oldDoc.Entries) != 1 {
+		t.Fatalf("v1-numbered union doc did not ingest into the old reader: %+v", oldDoc.Entries)
+	}
+	mangled := oldDoc.Entries["fleet"]
+	if mangled.Scope != "master" || len(mangled.Layout) != 0 {
+		t.Fatalf("v1-numbered union doc ingested unexpectedly shaped entry: %+v", mangled)
+	}
+	// The session payload WAS in the bytes the old decoder consumed, yet the
+	// ingested entry carries none of it (the old struct has no session field;
+	// a master entry carries no layout either) — silent discard demonstrated.
+	// The old binary's next successful upsert would persist exactly this
+	// mangled catalog; the v2 numbering makes the ingestion itself unreachable.
+	if !bytes.Contains(flipped, []byte(`"session"`)) {
+		t.Fatalf("counterfactual doc lost the session payload before the old reader saw it: %s", flipped)
 	}
 }
