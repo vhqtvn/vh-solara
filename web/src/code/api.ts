@@ -105,6 +105,11 @@ export async function codeResolve(path: string): Promise<string[]> {
 
 export const codeRawUrl = (path: string) => `/vh/code/raw?${D()}&path=${encodeURIComponent(path)}`;
 
+// Same endpoint + confinement, but attachment disposition and the 1 GiB
+// download cap (the inline/raw path stays capped at 16 MiB). Used for the
+// viewer's Download actions — build artifacts dwarf the preview cap.
+export const codeDownloadUrl = (path: string) => `${codeRawUrl(path)}&download=1`;
+
 export async function codeSearch(q: string, path = ""): Promise<{ hits: CodeHit[]; capped?: boolean }> {
   if (!q.trim()) return { hits: [] };
   try {

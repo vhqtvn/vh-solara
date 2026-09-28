@@ -83,6 +83,14 @@ const PATHS: Record<string, () => JSX.Element> = {
   ),
   arrowUp: () => <path d="M12 19V5M5 12l7-7 7 7" />,
   arrowDown: () => <path d="M12 5v14M19 12l-7 7-7-7" />,
+  // Arrow-into-tray — download the open file (code viewer).
+  download: () => (
+    <>
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <path d="m7 10 5 5 5-5" />
+      <path d="M12 15V3" />
+    </>
+  ),
   paperclip: () => (
     <path d="M21.4 11.05 12.2 20.2a5 5 0 0 1-7.07-7.07l9.19-9.19a3 3 0 0 1 4.24 4.24l-9.2 9.19a1 1 0 0 1-1.41-1.41l8.48-8.49" />
   ),

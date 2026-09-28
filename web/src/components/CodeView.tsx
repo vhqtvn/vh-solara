@@ -1,6 +1,6 @@
 import { createEffect, createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js";
 import { projectDir } from "../sync";
-import { codeFile, codeLangs, codeRawUrl, codeSearch, codeStatus, codeStyles, codeTree, type CodeEntry, type CodeFile, type CodeHit } from "../code/api";
+import { codeDownloadUrl, codeFile, codeLangs, codeRawUrl, codeSearch, codeStatus, codeStyles, codeTree, type CodeEntry, type CodeFile, type CodeHit } from "../code/api";
 import { codeOpenPath, setCodeOpenPath, codeOpenLine, setCodeOpenLine, codeTabs, addCodeTab, closeCodeTab, resolvePicker, setResolvePicker, openResolved } from "../code/state";
 import { bindBackDismiss } from "../lib/backStack";
 import { layoutPx } from "../lib/zoom";
@@ -233,6 +233,19 @@ export default function CodeView() {
   });
 
   const copy = (text: string) => void navigator.clipboard?.writeText(text);
+  // Copy-content: fetch the raw source and put the exact text on the clipboard.
+  // Never scrape the highlighted DOM (chroma line spans lose structure) — this
+  // copies the true source in Raw and Rendered-markdown mode alike.
+  const copyContent = async () => {
+    const p = openPath();
+    if (!p) return;
+    try {
+      const res = await fetch(codeRawUrl(p));
+      if (res.ok) copy(await res.text());
+    } catch {
+      /* fetch failed — nothing to copy */
+    }
+  };
   // Open the go-to-line dialog; the actual line parse + scroll happens in the
   // dialog's onConfirm (see <TextPromptDialog> below).
   const gotoLine = () => setGotoOpen(true);
@@ -400,6 +413,14 @@ export default function CodeView() {
                   <button type="button" class="icon-btn" data-tip="Go to line" aria-label="Go to line" onClick={gotoLine}><Icon name="arrowDown" size={14} /></button>
                   <button type="button" class="icon-btn" data-tip={codeWrap() ? "No wrap" : "Wrap"} aria-label="Wrap" classList={{ on: codeWrap() }} onClick={() => setCodeWrap(!codeWrap())}><Icon name="wrap" size={14} /></button>
                 </Show>
+                {/* Download: an anchor (not a button) so the browser handles it
+                    natively — same-origin + download attr + the server's
+                    attachment disposition; works for every kind, including
+                    binary/too-large files that have no preview. */}
+                <a class="icon-btn" href={codeDownloadUrl(openPath())} download="" data-tip="Download" aria-label="Download"><Icon name="download" size={14} /></a>
+                <Show when={file()?.kind === "text" || file()?.kind === "markdown"}>
+                  <button type="button" class="icon-btn" data-tip="Copy content" aria-label="Copy content" onClick={() => void copyContent()}><Icon name="copy" size={14} /></button>
+                </Show>
                 <button type="button" class="icon-btn" data-tip="Copy path" aria-label="Copy path" onClick={() => copy(openPath())}><Icon name="clipboard" size={14} /></button>
                 <Select
                   class="code-style-select"
@@ -420,10 +441,10 @@ export default function CodeView() {
                         <div class="code-image"><img src={codeRawUrl(f.path)} alt={f.path} /></div>
                       </Match>
                       <Match when={f.kind === "binary"}>
-                        <div class="code-empty">Binary file ({fmtSize(f.size)}) — <a href={codeRawUrl(f.path)} target="_blank" rel="noopener noreferrer">download</a></div>
+                        <div class="code-empty">Binary file ({fmtSize(f.size)}) — <a href={codeDownloadUrl(f.path)} download="">Download</a></div>
                       </Match>
                       <Match when={f.kind === "toolarge"}>
-                        <div class="code-empty">File too large to preview ({fmtSize(f.size)}) — <a href={codeRawUrl(f.path)} target="_blank" rel="noopener noreferrer">download</a></div>
+                        <div class="code-empty">File too large to preview ({fmtSize(f.size)}) — <a href={codeDownloadUrl(f.path)} download="">Download</a></div>
                       </Match>
                       <Match when={f.kind === "markdown"}>
                         <div class="code-md md" innerHTML={f.html} />

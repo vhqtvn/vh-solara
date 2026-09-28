@@ -31,6 +31,7 @@ const (
 	codeHighlightMaxLines = 6000      // and cap lines so a giant <pre> never hangs the page
 	codeSearchMaxResults  = 200
 	codeRawMaxBytes       = 16 << 20 // 16 MiB for image/raw serving
+	codeDownloadMaxBytes  = 1 << 30  // 1 GiB for explicit ?download=1 (build artifacts dwarf the inline cap; ServeContent streams + is range-capable, so a big cap is cheap)
 )
 
 // codeDir resolves and validates the project directory from the request.
@@ -292,7 +293,9 @@ func indexByteZero(b []byte) bool {
 	return false
 }
 
-// GET /vh/code/raw?path=<rel> — raw bytes (images, downloads). Range-capable.
+// GET /vh/code/raw?path=<rel>&download=1 — raw bytes (images, downloads).
+// Range-capable. ?download=1 switches to an attachment disposition and the
+// much larger download cap; confinement (safeJoin) is identical either way.
 func (s *Server) handleCodeRaw(w http.ResponseWriter, r *http.Request) {
 	dir, ok := codeDir(r)
 	if !ok {
@@ -304,8 +307,13 @@ func (s *Server) handleCodeRaw(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad path", http.StatusBadRequest)
 		return
 	}
+	download := r.URL.Query().Get("download") == "1"
+	var maxBytes int64 = codeRawMaxBytes
+	if download {
+		maxBytes = codeDownloadMaxBytes
+	}
 	st, err := os.Stat(abs)
-	if err != nil || st.IsDir() || st.Size() > codeRawMaxBytes {
+	if err != nil || st.IsDir() || st.Size() > maxBytes {
 		http.Error(w, "not servable", http.StatusNotFound)
 		return
 	}
@@ -315,6 +323,9 @@ func (s *Server) handleCodeRaw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
+	if download {
+		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+rfc5987Encode(filepath.Base(abs)))
+	}
 	// http.ServeContent sniffs content-type + handles range; SVG is served as text
 	// by the sniffer, so set it explicitly (it's displayed in an <img>, never as a
 	// document, so this is safe).
@@ -323,6 +334,26 @@ func (s *Server) handleCodeRaw(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeContent(w, r, abs, st.ModTime(), f)
+}
+
+// rfc5987Encode percent-encodes s per RFC 5987 attr-char — the value form for
+// Content-Disposition filename* — so non-ASCII names and header-breaking bytes
+// (quotes, newlines — both legal in POSIX filenames) survive verbatim.
+func rfc5987Encode(s string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+			strings.IndexByte("!#$&+-.^_`|~", c) >= 0 {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteByte(hex[c>>4])
+		b.WriteByte(hex[c&0x0f])
+	}
+	return b.String()
 }
 
 type searchHit struct {

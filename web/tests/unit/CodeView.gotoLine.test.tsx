@@ -26,6 +26,7 @@ vi.mock("../../src/code/api", () => ({
   // file()?.kind === "text") and the code-content pane mounts.
   codeFile: async () => ({ kind: "text", path: "x.go", html: "<pre>line</pre>", highlighted: true, lang: "go" }),
   codeRawUrl: (p: string) => `/raw/${encodeURIComponent(p)}`,
+  codeDownloadUrl: (p: string) => `/raw/${encodeURIComponent(p)}?download=1`,
 }));
 
 vi.mock("../../src/code/state", () => ({

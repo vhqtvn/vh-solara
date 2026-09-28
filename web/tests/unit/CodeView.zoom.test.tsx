@@ -27,6 +27,7 @@ vi.mock("../../src/code/api", () => ({
   codeSearch: async () => ({ hits: [], capped: false }),
   codeFile: async () => ({ kind: "binary", path: "x.bin", size: 2048 }),
   codeRawUrl: (p: string) => `/raw/${encodeURIComponent(p)}`,
+  codeDownloadUrl: (p: string) => `/raw/${encodeURIComponent(p)}?download=1`,
 }));
 
 vi.mock("../../src/code/state", () => ({
