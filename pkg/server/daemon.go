@@ -243,6 +243,21 @@ func (d *Daemon) buildRootHandler() http.Handler {
 	// registry-liveness invalidation, strong ETag stable within a generation.
 	userMux.HandleFunc("GET /vh/fleet/status", d.handleFleetStatus)
 
+	// Live fleet-status SSE stream (GET /vh/fleet/stream; see
+	// status_stream.go): one held connection per client pushing the FULL
+	// current rollup JSON body per published generation as event
+	// `fleet.status`. Same session-cookie auth family and clean-401 posture
+	// as the rollup route above (the whole userMux chain is auth-gated;
+	// /vh/* is API-class). GET-only by pattern, so other methods get the
+	// mux's 405 and no X-VH-CSRF exception is needed (csrfGuard gates
+	// unsafe methods under /api/ only — a safe GET stream is CSRF-exempt;
+	// HEAD rides the GET pattern and answers headers-only). hostInterceptor
+	// special-cases this exact path (see below) so the stream is served by
+	// the controller even on worker subdomains — a proxied stream would
+	// die with the worker's 404 and the worker has no fleet rollup to
+	// stream anyway.
+	userMux.HandleFunc("GET /vh/fleet/stream", d.handleFleetStream)
+
 	// Fleet-status configuration manage API (GET/PUT /vh/fleet/config; see
 	// status_config.go) — same session-cookie auth family as the rollup
 	// route above (the whole userMux chain is auth-gated). GET is read-only:
@@ -405,10 +420,11 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 		}
 
 		// Route precedence: the aggregated /vh/diag/latency, the fleet-wide
-		// /vh/fleet/status + /vh/fleet/config family, and the whole
-		// /vh/notify/ push-notification family are CONTROLLER-OWNED and
-		// must be served by the controller even when the browser's host is
-		// a per-worker subdomain (e.g. "workerID.controller.example.com").
+		// /vh/fleet/status + /vh/fleet/config family (including the SSE
+		// stream /vh/fleet/stream), and the whole /vh/notify/
+		// push-notification family are CONTROLLER-OWNED and must be served
+		// by the controller even when the browser's host is a per-worker
+		// subdomain (e.g. "workerID.controller.example.com").
 		// Without this carve-out the hostInterceptor would proxy the request
 		// down to that worker, returning a single-worker diag snapshot and
 		// forcing the operator to re-fetch per project, or a 404 for fleet
@@ -434,6 +450,7 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 		// aggregator's own fan-out (which goes through the tunnel via
 		// Proxy.FetchWorkerSnapshot, not through this hostInterceptor).
 		if r.URL.Path == "/vh/diag/latency" || r.URL.Path == "/vh/fleet/status" ||
+			r.URL.Path == "/vh/fleet/stream" ||
 			r.URL.Path == "/vh/fleet/config" || r.URL.Path == "/vh/fleet/config/options" ||
 			strings.HasPrefix(r.URL.Path, "/vh/notify/") {
 			next.ServeHTTP(w, r)

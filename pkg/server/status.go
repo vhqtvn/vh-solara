@@ -440,6 +440,24 @@ type fleetStatusService struct {
 	// refresh goroutine (refreshes are single-flight), so it needs no lock of
 	// its own.
 	since map[string]time.Time
+
+	// SSE stream subscriber registry for GET /vh/fleet/stream (the
+	// implementation lives in status_stream.go; the fields live here because
+	// Go structs cannot be extended across files). subs maps every live
+	// stream subscriber to its capacity-one wake channel; guarded by mu;
+	// dedup is handler-local — each stream handler keeps its own last,
+	// seeded by the validated bootstrap serve() (see handleFleetStream).
+	// streamDemandCancel is non-nil while the subscriber-demand refresh
+	// loop runs (first subscriber → last subscriber; see status_stream.go).
+	subs               map[*fleetStreamSub]struct{}
+	streamDemandCancel context.CancelFunc
+
+	// Stream knobs (production constants live in status_stream.go; these are
+	// fields so lane-1 tests can tighten the cadences). Guarded by mu.
+	streamHeartbeat      time.Duration
+	streamDemandInterval time.Duration
+	streamWriteBudget    time.Duration
+	streamMaxSubs        int
 }
 
 func newFleetStatusService(d *Daemon) *fleetStatusService {
@@ -447,6 +465,12 @@ func newFleetStatusService(d *Daemon) *fleetStatusService {
 		d:       d,
 		budgets: defaultFleetBudgets(),
 		since:   map[string]time.Time{},
+
+		subs:                 map[*fleetStreamSub]struct{}{},
+		streamHeartbeat:      fleetStreamHeartbeat,
+		streamDemandInterval: fleetStreamDemandInterval,
+		streamWriteBudget:    fleetStreamWriteBudget,
+		streamMaxSubs:        fleetStreamMaxSubs,
 	}
 }
 
@@ -548,6 +572,10 @@ func (s *fleetStatusService) refresh(done chan struct{}, regGen uint64) {
 		cfgGen:      snap.gen,
 	}
 	s.mu.Unlock()
+	// SSE: every publication wakes stream subscribers (status_stream.go).
+	// Called AFTER releasing mu — wake delivery is a nonblocking channel
+	// send under its own brief mu acquisition, never a network write.
+	s.wakeStreamSubscribers()
 }
 
 // publishFallback publishes a minimal honest generation: schema 1, unknown
@@ -591,6 +619,10 @@ func (s *fleetStatusService) publishFallback(regGen, cfgGen uint64) {
 		cfgGen:      cfgGen,
 	}
 	s.mu.Unlock()
+	// SSE: fallback publications wake stream subscribers too — a fallback
+	// generation is still a new current state (same post-unlock discipline
+	// as refresh: no wake while holding mu).
+	s.wakeStreamSubscribers()
 }
 
 // ---------------------------------------------------------------------------
