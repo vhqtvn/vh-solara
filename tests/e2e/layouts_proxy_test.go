@@ -188,29 +188,46 @@ func TestLayoutsProxyPerEntryUpsert(t *testing.T) {
 		t.Fatalf("stale PUT: 409 body revision=%d entries=%+v, want 1/[focus] (current server doc)", conflict.Revision, conflict.Entries)
 	}
 
-	// --- 5. Invalid entry → the worker's TRUE machine-readable 400 (strict
-	// validation runs worker-side and the error body survives the raw copy).
-	invalidEntry := map[string]any{
-		"scope":    "master", // out of v1 server scope
+	// --- 5. Invalid entries → the worker's TRUE machine-readable 400s
+	// (strict validation runs worker-side and the error body survives the
+	// raw copy). Two DISTINCT error codes prove the machine-readable body
+	// survives the tunnel bit-for-bit, not just the status.
+	putInvalid := func(entry map[string]any, wantCode string) {
+		t.Helper()
+		r, b := doViaSubdomain(t, c, http.MethodPut, "/vh/layouts", putBody(1, entry), true)
+		if r.StatusCode != http.StatusBadRequest {
+			t.Fatalf("invalid PUT via subdomain (want %s): status %d (want the worker's true 400), body %s", wantCode, r.StatusCode, b)
+		}
+		var errBody struct {
+			Error   string `json:"error"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(b, &errBody); err != nil {
+			t.Fatalf("invalid PUT (want %s): decode 400 body %q: %v", wantCode, b, err)
+		}
+		if errBody.Error != wantCode {
+			t.Fatalf("invalid PUT (want %s): error code %q (body %s)", wantCode, errBody.Error, b)
+		}
+	}
+
+	// 5a. scope "master" is a VALID scope, but a master entry must NOT carry
+	// tabTitle (the session carries the workspaces) → invalid_tab_title.
+	putInvalid(map[string]any{
+		"scope":    "master",
 		"name":     "bad",
 		"tabTitle": "Bad",
 		"layout":   map[string]any{"panels": []any{}},
 		"savedAt":  1726600000000,
-	}
-	resp, body = doViaSubdomain(t, c, http.MethodPut, "/vh/layouts", putBody(1, invalidEntry), true)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("invalid PUT via subdomain: status %d (want the worker's true 400), body %s", resp.StatusCode, body)
-	}
-	var errBody struct {
-		Error   string `json:"error"`
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(body, &errBody); err != nil {
-		t.Fatalf("invalid PUT: decode 400 body %q: %v", body, err)
-	}
-	if errBody.Error != "invalid_scope" {
-		t.Fatalf("invalid PUT: error code %q, want invalid_scope (body %s)", errBody.Error, body)
-	}
+	}, "invalid_tab_title")
+
+	// 5b. A genuinely bogus scope (otherwise-valid fields) → invalid_scope.
+	putInvalid(map[string]any{
+		"scope":    "bogus",
+		"name":     "bad",
+		"tabTitle": "Bad",
+		"layout":   map[string]any{"panels": []any{}},
+		"savedAt":  1726600000000,
+	}, "invalid_scope")
 
 	// --- 6. Missing CSRF → the worker's TRUE 403 (the worker-side csrfGuard
 	// applies on the tunnel path too; X-VH-CSRF was withheld).
