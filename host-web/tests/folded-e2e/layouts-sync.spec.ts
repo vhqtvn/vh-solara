@@ -234,7 +234,11 @@ test.describe.serial("folded layouts sync (server-backed named layouts)", () => 
     await bootFolded(page);
     const origin = new URL(page.url()).origin;
 
+    // The merged "+" (D3 chrome merge): ws-add opens the AddMenu popover;
+    // "New workspace" mints the fresh EMPTY workspace (the old strip ws-add
+    // semantics, now one popover action).
     await page.locator('[data-testid="ws-add"]').click();
+    await page.locator('[data-testid="add-menu-new-workspace"]').click();
     // Both tabs exist and the new EMPTY workspace's host has mounted (its
     // empty affordance shows) — this also guarantees captureAllLayouts will
     // see a registered api for BOTH workspaces at save time (a null-layout

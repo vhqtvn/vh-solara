@@ -22,13 +22,23 @@ test.describe("host shell UI wiring", () => {
     await H.loadHost(page);
   });
 
-  test("workspace tabstrip + Add server are present", async ({ page }) => {
-    // The brand + one ws-tab per workspace + the add-workspace "+" + the
-    // "Add server" trigger are present in the primary nav.
+  test("workspace tabstrip + merged add trigger are present", async ({ page }) => {
+    // The brand + one ws-tab per workspace + the SINGLE merged "+" (D3 chrome
+    // merge: ws-add opens the AddMenu popover offering "New workspace" +
+    // "Connect server…"). The old standalone strip AddServer trigger is gone;
+    // add-server-btn exists ONLY in the empty-workspace overlay (absent here
+    // — the seeded workspace has panes), which workspace-tabs.spec.ts drives.
     const wsTabs = page.locator('[data-testid="ws-tab"]');
     await expect(wsTabs).toHaveCount(1); // the seeded default workspace
     await expect(page.locator('[data-testid="ws-add"]')).toHaveCount(1);
-    await expect(page.locator('[data-testid="add-server-btn"]')).toHaveCount(1);
+    await expect(page.locator('[data-testid="add-server-btn"]')).toHaveCount(0);
+    // The merged popover carries BOTH actions.
+    await page.locator('[data-testid="ws-add"]').click();
+    await expect(page.locator('[data-testid="add-menu-popover"]')).toBeVisible();
+    await expect(page.locator('[data-testid="add-menu-new-workspace"]')).toBeVisible();
+    await expect(page.locator('[data-testid="add-server-url"]')).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="add-menu-popover"]')).toHaveCount(0);
   });
 
   test("no statusbar chrome remains in the DOM", async ({ page }) => {

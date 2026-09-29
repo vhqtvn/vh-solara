@@ -29,7 +29,8 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     await H.loadHost(page);
   });
 
-  // Feature: the tabstrip renders one ws-tab per workspace + a ws-add button.
+  // Feature: the tabstrip renders one ws-tab per workspace + the single
+  // merged "+" (ws-add → AddMenu popover: New workspace + Connect server…).
   test("tabstrip shows one ws-tab per workspace + ws-add", async ({ page }) => {
     const wsIds = await H.workspaces(page);
     expect(wsIds.length, "at least one seeded workspace").toBeGreaterThanOrEqual(1);
@@ -89,12 +90,15 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     await H.assertSurvived(page, ws2Pane, before!, "ws2 pane across ws switch");
   });
 
-  // Feature: ws-add creates a new (empty) workspace and activates it.
-  test("ws-add creates a new empty workspace and activates it", async ({ page }) => {
+  // Feature: the merged "+" offers New workspace; creating one activates it
+  // and it starts empty (the empty-workspace affordance).
+  test("ws-add popover creates a new empty workspace and activates it", async ({ page }) => {
     const before = (await H.workspaces(page)).length;
     const beforeActive = await H.activeWorkspace(page);
 
     await page.locator('[data-testid="ws-add"]').click();
+    await expect(page.locator('[data-testid="add-menu-popover"]')).toBeVisible();
+    await page.locator('[data-testid="add-menu-new-workspace"]').click();
 
     await expect.poll(async () => (await H.workspaces(page)).length).toBe(before + 1);
     // The new workspace is active.
@@ -102,6 +106,58 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     // A runtime-added workspace starts EMPTY (the empty-workspace affordance).
     await expect.poll(async () => (await H.panes(page)).length).toBe(0);
     await expect(page.locator('[data-testid="empty-workspace"]')).toBeVisible();
+  });
+
+  // Feature (F3 E2E ENFORCEMENT, cc1): the OVERLAY add-server path (the
+  // empty-active-workspace gate's AddServer — App.tsx:157, surface id
+  // "add-server") is DRIVEN end-to-end: open its popover, submit a real url,
+  // a pane opens. The strip's merged AddMenu (surface id "add-menu") is
+  // co-mounted the whole time; the DISTINCT surface ids keep dismissal
+  // independent (cc2 — same-id mounting would clobber the registry).
+  test("overlay AddServer drives a server add end-to-end; co-mounted AddMenu never clobbers dismissal", async ({ page }) => {
+    // Make the ACTIVE workspace empty → the overlay AddServer renders while
+    // the populated strip (incl. the merged +) stays mounted.
+    await page.locator('[data-testid="ws-add"]').click();
+    await page.locator('[data-testid="add-menu-new-workspace"]').click();
+    await expect(page.locator('[data-testid="empty-workspace"]')).toBeVisible();
+
+    // CO-MOUNTED posture: the overlay trigger AND the strip trigger exist.
+    const overlayBtn = page.locator('[data-testid="add-server-btn"]');
+    await expect(overlayBtn).toHaveCount(1);
+    await expect(page.locator('[data-testid="ws-add"]')).toHaveCount(1);
+
+    // Distinct-surface-id check (cc2), BEFORE the drive (the overlay
+    // unmounts on success): opening the STRIP menu closes the overlay
+    // popover (group exclusion) without killing its registration — the
+    // overlay trigger still works afterwards.
+    await overlayBtn.click();
+    await expect(page.locator('[data-testid="add-server-popover"]')).toBeVisible();
+    await page.locator('[data-testid="ws-add"]').click();
+    await expect(page.locator('[data-testid="add-menu-popover"]')).toBeVisible();
+    await expect(page.locator('[data-testid="add-server-popover"]')).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="add-menu-popover"]')).toHaveCount(0);
+    await overlayBtn.click();
+    await expect(page.locator('[data-testid="add-server-popover"]')).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="add-server-popover"]')).toHaveCount(0);
+
+    // DRIVE the overlay path: open the OVERLAY's popover (add-server-popover
+    // — the overlay surface, not the strip menu) and submit a real url.
+    await overlayBtn.click();
+    await expect(page.locator('[data-testid="add-server-popover"]')).toBeVisible();
+    const before = (await H.panes(page)).length;
+    const url = H.serverUrl("overlay-drive");
+    await page.locator('[data-testid="add-server-url"]').fill(url);
+    await page.locator('[data-testid="add-server-label"]').fill("overlay-drive");
+    await page.locator('[data-testid="add-server-submit"]').click();
+    // The pane opened (the submit path genuinely ran — not render-visible).
+    await expect.poll(async () => (await H.panes(page)).length).toBe(before + 1);
+    const params = await H.paneParams(page);
+    expect(params.find((p) => p.url === url), "overlay add opened a pane for the url").toBeDefined();
+    // USER-VISIBLE outcome: the workspace is no longer empty — the overlay
+    // (and its AddServer) unmounts by design (App.tsx's activeEmpty gate).
+    await expect(page.locator('[data-testid="empty-workspace"]')).toHaveCount(0);
   });
 
   // ---- Tab CONTEXT MENU (replaces the × two-step confirm + direct rename) ----
@@ -420,5 +476,178 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
         `[data-testid="ws-needs-you"][data-workspace="${ws1}"]`,
       ).count();
     }, { timeout: 8000 }).toBe(1);
+  });
+
+  // ---- PRIORITY-FIT MEMBERSHIP (attention-selected visibility) ---------------
+  // Width budgets are MEASURED, not eyeballed: at an 800px viewport the tabs
+  // container is ~461px wide (brand + text-bearing Layouts/Settings chrome),
+  // so the fit budget is ~409px. Test 1 uses short names (active + prev
+  // always fit); test 2 uses ~58-char names (nothing fits beside the active
+  // tab); test 3 crowds a ~200px needy tab behind ~70px fillers. Every
+  // window holds with large margins in every engine.
+
+  // Feature: phone-width saturation with 20 workspaces — the active workspace
+  // (canonically LAST) stays visible (tier 0 outranks fit), the rendered row
+  // keeps CANONICAL order (membership is priority-selected, never reshuffled),
+  // the overflow trigger appears, the overflow lists every hidden workspace,
+  // and the search filters the hidden list.
+  test("priority fit: 20-workspace saturation keeps active-last visible + canonical order + searchable overflow", async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 800 });
+    // 20 total (seed + 19 short-named — ~50px tabs against the measured
+    // ~409px budget at this viewport). addWorkspace ACTIVATES each new
+    // workspace, so the canonical LAST workspace ends active and the
+    // second-to-last is the one-slot prev-active (D1).
+    for (let i = 2; i <= 20; i++) await H.addWorkspace(page, `Ws ${i}`);
+    const all = await H.workspaces(page);
+    expect(all.length).toBe(20);
+    const last = all[all.length - 1];
+
+    // Saturated: fewer than 20 tabs render; the overflow trigger exists.
+    await expect
+      .poll(async () => page.locator('[data-testid="ws-tab"]').count(), { timeout: 5000 })
+      .toBeLessThan(20);
+    const trigger = page.locator('[data-testid="ws-overflow-trigger"]');
+    await expect(trigger).toBeVisible();
+
+    // The ACTIVE (canonical-last) workspace is rendered + selected, and the
+    // PREV-ACTIVE keeps a visible slot (the D1 recency tier — short tabs fit
+    // comfortably, so both survive saturation).
+    const activeTab = page.locator(`[data-testid="ws-tab"][data-workspace="${last}"]`);
+    await expect(activeTab).toBeVisible();
+    await expect(activeTab).toHaveAttribute("aria-selected", "true");
+    await expect(
+      page.locator(`[data-testid="ws-tab"][data-workspace="${all[all.length - 2]}"]`),
+    ).toBeVisible();
+
+    // The rendered row is in CANONICAL workspace order.
+    const rendered = await page.locator('[data-testid="ws-tab"]').evaluateAll((els) =>
+      (els as HTMLElement[]).map((e) => e.dataset.workspace ?? ""),
+    );
+    expect(rendered).toEqual(all.filter((id) => rendered.includes(id!)));
+
+    // The overflow popover lists exactly the hidden complement; search
+    // filters it deterministically (pick a hidden row's OWN name).
+    await trigger.click();
+    const rows = page.locator('[data-testid="ws-overflow-row"]');
+    await expect(rows).toHaveCount(20 - rendered.length);
+    const hiddenIds = await rows.evaluateAll((els) =>
+      (els as HTMLElement[]).map((e) => e.dataset.workspace ?? ""),
+    );
+    expect(hiddenIds.length).toBeGreaterThan(0);
+    const pick = hiddenIds[Math.floor(hiddenIds.length / 2)]!;
+    const pickName = (await H.workspaceName(page, pick)) ?? "";
+    await page.locator('[data-testid="ws-overflow-search"]').fill(pickName);
+    await expect(rows).toHaveCount(1);
+    await expect(rows.first()).toHaveAttribute("data-workspace", pick);
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="ws-overflow-popover"]')).toHaveCount(0);
+
+    await page.screenshot({ path: path.join(VISION_DIR, "priority-fit-360.png"), fullPage: true });
+  });
+
+  // Feature: selecting a HIDDEN workspace from the overflow activates it and
+  // it becomes visible (the active rule) — quiet workspaces are reachable in
+  // ≤2 taps. The previously-active workspace keeps a slot (one-slot recency,
+  // D1 — prev-active tier).
+  test("overflow: choosing a hidden workspace activates it and makes it visible", async ({ page }) => {
+    // 600px viewport → a fit budget (~175px, engine-dependent ±40px) far
+    // below active(218, the tabLabel max-width:200px cap) + seed(~92+4):
+    // the seed can NEVER fit beside the active tab here, so every quiet
+    // workspace (incl. the seed) sits behind the overflow trigger while the
+    // active tab stays visible (tier 0 outranks fit — computeFits always
+    // includes the top-ranked candidate).
+    await page.setViewportSize({ width: 600, height: 800 });
+    const seed = (await H.workspaces(page))[0];
+    for (let i = 0; i < 6; i++) {
+      await H.addWorkspace(page, `LongWorkspaceNameForWidthPaddingLongWorkspaceNameForWidth${i}`);
+    }
+
+    const trigger = page.locator('[data-testid="ws-overflow-trigger"]');
+    await expect(trigger).toBeVisible();
+    // The seed workspace (quiet, canonically first) starts hidden.
+    const seedTab = page.locator(`[data-testid="ws-tab"][data-workspace="${seed}"]`);
+    await expect(seedTab).toHaveCount(0);
+
+    await trigger.click();
+    const row = page.locator(`[data-testid="ws-overflow-row"][data-workspace="${seed}"]`);
+    await expect(row).toBeVisible();
+    await row.click();
+
+    // The chosen workspace ACTIVATES and becomes VISIBLE (the active rule —
+    // tier 0 outranks fit even in a fully saturated strip).
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(seed);
+    await expect(seedTab).toBeVisible();
+    await expect(seedTab).toHaveAttribute("aria-selected", "true");
+    // The popover closed with the choice.
+    await expect(page.locator('[data-testid="ws-overflow-popover"]')).toHaveCount(0);
+  });
+
+  // Feature: MEMBERSHIP FREEZE — while a strip menu is open, a hidden
+  // workspace going needs-you does NOT reshuffle the visible set (the cue and
+  // badges keep updating LIVE); closing the menu applies the promotion.
+  test("membership freezes while a tab menu is open; cue updates live; unfreeze promotes the needy workspace", async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 800 });
+    const seed = (await H.workspaces(page))[0];
+    // Layout for the measured ~409px budget: seed(~100px, ACTIVE) + four
+    // ~70px fillers (canonical indexes 1-4 — they consume the budget before
+    // the needy tab, canonical index 5, ~200px, is considered) + a fifth
+    // filler created LAST so the one-slot prev-active is a FILLER rather
+    // than the needy workspace. Pre-freeze the needy tab is hidden;
+    // post-promotion it jumps to tier 1 (right after the active seed) and
+    // fits easily.
+    for (let i = 1; i <= 4; i++) await H.addWorkspace(page, `FillerWs${i}`);
+    const needy = await H.addWorkspace(page, "NeedyWorkspaceNameForWidthPad1");
+    await H.addServer(page, H.serverUrl("freeze-seed"), "freeze-seed");
+    const needyPane = (await H.panes(page))[0];
+    expect(needyPane).toBeTruthy();
+    await H.addWorkspace(page, "FillerWs5"); // activates it; prev-active ≠ needy
+    await H.setActiveWorkspace(page, seed);
+
+    // Saturated with Needy hidden (quiet, no attention).
+    const needyTab = page.locator(`[data-testid="ws-tab"][data-workspace="${needy}"]`);
+    await expect(page.locator('[data-testid="ws-overflow-trigger"]')).toBeVisible();
+    await expect(needyTab).toHaveCount(0);
+
+    // FREEZE: open the active tab's context menu (a TABSTRIP_POPOVER_GROUP
+    // surface — membership must hold still while it is open).
+    await page.locator(`[data-testid="ws-tab"][data-workspace="${seed}"]`).click({ button: "right" });
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toBeVisible();
+
+    // The hidden workspace goes needs-you: the overflow cue updates LIVE
+    // (counts hidden WORKSPACES, not sessions — exactly 1 here)…
+    await H.probeStatus(page, {
+      sourcePaneId: needyPane!,
+      origin: H.MOCK_ORIGIN,
+      payload: {
+        type: "status",
+        dir: "/proj",
+        session: "sess-1",
+        title: "Needs Reply",
+        attention: "needs_reply",
+        activity: "idle",
+        following: true,
+        runningCount: 0,
+        unreadCount: 0,
+      },
+    });
+    const cue = page.locator('[data-testid="ws-overflow-cue"]');
+    await expect(cue).toBeVisible();
+    await expect(cue).toHaveAttribute("data-kind", "needs-you");
+    await expect(cue).toHaveAttribute("data-count", "1");
+
+    // …but membership is FROZEN while the menu is open: no promotion yet.
+    await page.waitForTimeout(400);
+    await expect(needyTab).toHaveCount(0);
+
+    // UNFREEZE: close the menu — the needy workspace is promoted into the
+    // strip (attention-selected membership) with its live badge.
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+    await expect(needyTab).toBeVisible();
+    await expect(
+      page.locator(`[data-testid="ws-needs-you"][data-workspace="${needy}"]`),
+    ).toBeVisible();
+    // With the needy workspace no longer hidden, the needs-you cue clears.
+    await expect(page.locator('[data-testid="ws-overflow-cue"]')).toHaveCount(0);
   });
 });

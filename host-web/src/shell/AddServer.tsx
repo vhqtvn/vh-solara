@@ -1,36 +1,37 @@
-import { For, Show, createSignal } from "solid-js";
-import { hostOps, panes, focusedId } from "../dockview/store";
+import { For, Show, createEffect, createSignal, untrack, type Accessor } from "solid-js";
+import { addWorkspace, hostOps, panes, focusedId } from "../dockview/store";
 import { runtimeServers } from "../state/serverList";
 import type { AddServerOutcome } from "../dockview/types";
 import { TABSTRIP_POPOVER_GROUP, usePopoverSurface } from "./popover";
+import ts from "./Tabstrip.module.css";
 import s from "./AddServer.module.css";
 
 /**
  * Runtime add/remove-server affordance (decision #3 — `+` = "Add server").
  *
- * The operator reported the bare `⊕` glyph "does nothing" — the real issue was
- * legibility: the pane-creation mechanism worked, but there was no label, no
- * heading, no helper text, and no outcome feedback. This rewrite fixes all of
- * that:
- *  - the trigger reads "+ Add server" on desktop (icon + aria-label on narrow);
- *  - the popover has a heading "Add a server" + a URL description explaining
- *    that session tabs appear AFTER the operator opens a session in a server
- *    pane (Fork B — explicit-watch);
- *  - submit calls HostOps.addServerWithOutcome (deterministic-duplicate
- *    handling) and shows an outcome line ("Already open" / "Opened" / "Added
- *    and opened") that STAYS VISIBLE so the operator can tell what happened.
+ * TWO composed surfaces since the priority-fit chrome merge (D3):
  *
- * OPEN/CLOSE goes through the shared surface stack (popover.ts): Escape closes
- * (topmost-only), a pointerdown outside the wrap closes, and the tabstrip
- * group keeps this popover mutually exclusive with Settings — exactly one
- * tabstrip popover open at a time (finding 1).
+ *  - <AddServer> — the server-add-only trigger + popover, surface id
+ *    "add-server". Now mounted ONLY by App.tsx's empty-workspace overlay
+ *    (App.tsx:157); its testids (add-server-btn / add-server-popover /
+ *    add-server-url / …) and server-add-only semantics are UNCHANGED.
+ *  - <AddMenu> — the STRIP's single merged "+" trigger (data-testid="ws-add",
+ *    surface id "add-menu" — DISTINCT: popover.ts's registry is
+ *    singleton-per-id, and both components can be mounted simultaneously
+ *    whenever the active workspace is empty). Its popover offers "New
+ *    workspace" (store addWorkspace — the old strip ws-add action) plus a
+ *    "Connect server…" section embedding the SAME <AddServerForm> below.
  *
- * CATALOG ROWS are two SIBLING real buttons (finding 3): the pick button
- * (label + url → click prefills the form) and the ✕ remove button. They are
- * NOT nested — a button's descendants are presentational to ARIA, which
- * flattened the old row[role=button] > button✕ structure and hid Remove from
- * screen readers. The pick button's aria-label names both the label AND the
- * url so the server address is announced.
+ * The two surfaces share TABSTRIP_POPOVER_GROUP, so at most one popover is
+ * open at a time (mutual exclusion) and the shared form testids never appear
+ * twice in the DOM.
+ *
+ * The operator-reported legibility fix is preserved verbatim inside the form:
+ * heading + URL description (Fork B — explicit-watch), submit calls
+ * HostOps.addServerWithOutcome (deterministic duplicate handling), and an
+ * outcome line ("Already open" / "Opened" / "Added and opened") that STAYS
+ * VISIBLE. CATALOG ROWS are two SIBLING real buttons (finding 3) with the
+ * pick button's aria-label naming both label AND url.
  *
  * All actions go through the typed HostOps controller surface (store.hostOps),
  * NOT the DEV-only window.__host bridge, so this works in production builds.
@@ -40,29 +41,33 @@ import s from "./AddServer.module.css";
  * (null return), an inline error is shown, and no pane opens. The url lands on
  * an unsandboxed iframe.src, so this guard is the iframe-src XSS boundary.
  */
-export function AddServer() {
-  let wrapEl: HTMLDivElement | undefined;
 
+/** The shared add-server form (URL + optional label + submit + outcome +
+ *  catalog). Owns its own state; prefills from the focused pane on each
+ *  open TRANSITION of the hosting popover (untracked — later focus moves
+ *  while open never wipe the operator's typing). Rendered inside exactly one
+ *  open popover at a time (the surfaces share TABSTRIP_POPOVER_GROUP). */
+function AddServerForm(props: { open: Accessor<boolean> }) {
   const [url, setUrl] = createSignal("");
   const [label, setLabel] = createSignal("");
   const [error, setError] = createSignal("");
   const [outcome, setOutcome] = createSignal<AddServerOutcome | null>(null);
 
-  const surface = usePopoverSurface({
-    id: "add-server",
-    group: TABSTRIP_POPOVER_GROUP,
-    anchor: () => wrapEl,
-    // OPERATOR POINT #4: "default to prefill current server." Prefill the URL
-    // field with the currently-active pane's server URL so the operator can
-    // quickly open another window into the same box, or edit for a different
-    // server. Label is left empty (the operator names the new window).
-    onOpen: () => {
+  // OPERATOR POINT #4: "default to prefill current server." Prefill the URL
+  // field with the currently-active pane's server URL so the operator can
+  // quickly open another window into the same box, or edit for a different
+  // server. Label is left empty (the operator names the new window). Runs
+  // once per open transition; the panes/focusedId reads are untracked so a
+  // focus change while open cannot re-wipe the form.
+  createEffect(() => {
+    if (!props.open()) return;
+    untrack(() => {
       const activePane = panes().find((p) => p.id === focusedId());
       setUrl(activePane?.url ?? "");
       setLabel("");
       setError("");
       setOutcome(null);
-    },
+    });
   });
 
   const submit = (e: Event) => {
@@ -124,6 +129,116 @@ export function AddServer() {
   };
 
   return (
+    <>
+      <form class={s.form} onSubmit={submit}>
+        <label class={s.field}>
+          <span class={s.fieldLabel}>Server URL</span>
+          <input
+            ref={urlInputEl}
+            class={s.input}
+            type="text"
+            placeholder="https://srv.example.com"
+            value={url()}
+            aria-label="Server URL"
+            data-testid="add-server-url"
+            onInput={(e) => setUrl(e.currentTarget.value)}
+          />
+          <span class={s.helper}>
+            Connect another vh-solara server. Session tabs appear after you
+            open a session in a server pane.
+          </span>
+        </label>
+        <label class={s.field}>
+          <span class={s.fieldLabel}>Label (optional)</span>
+          <input
+            class={s.input}
+            type="text"
+            placeholder="my-server"
+            value={label()}
+            aria-label="Server label"
+            data-testid="add-server-label"
+            onInput={(e) => setLabel(e.currentTarget.value)}
+          />
+        </label>
+        <button type="submit" class={s.addBtn} data-testid="add-server-submit">
+          Add server
+        </button>
+      </form>
+      <Show when={error()}>
+        <div class={s.error} data-testid="add-server-error" role="alert">
+          {error()}
+        </div>
+      </Show>
+      <Show when={outcome()}>
+        <div
+          class={s.outcome}
+          data-testid="add-server-outcome"
+          data-kind={outcome()!.kind}
+          role="status"
+        >
+          {outcomeText(outcome()!)}
+        </div>
+      </Show>
+      <Show when={runtimeServers().length > 0}>
+        <div class={s.catalog} data-testid="server-catalog">
+          <For each={runtimeServers()}>
+            {(srv) => (
+              /* A plain flex row (NO role/tabindex — finding 3): the row's
+               * two affordances are SIBLING real buttons, so neither is an
+               * interactive-inside-interactive violation and both are
+               * reliably exposed to assistive tech. data-testid/data-url
+               * stay on the row (a stable, layout-level marker). */
+              <div class={s.catalogRow} data-testid="server-row" data-url={srv.url}>
+                <button
+                  type="button"
+                  class={s.catalogPick}
+                  // The accessible name carries BOTH the label and the url
+                  // (finding 3: the old row aria-label hid the address).
+                  aria-label={`Use ${srv.label} — ${srv.url}`}
+                  title={`Fill the form with ${srv.label}`}
+                  onClick={(e) => pick(e, srv)}
+                >
+                  <span class={s.catalogLabel} title={srv.url}>
+                    {srv.label}
+                  </span>
+                  <span class={s.catalogUrl}>{srv.url}</span>
+                </button>
+                <button
+                  type="button"
+                  class={s.removeBtn}
+                  title={`Remove ${srv.label}`}
+                  aria-label={`Remove ${srv.label}`}
+                  data-testid="remove-server"
+                  data-url={srv.url}
+                  // A sibling (not a descendant) of the pick button: no
+                  // propagation to stop — removing never prefills.
+                  onClick={() => remove(srv.url)}
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
+    </>
+  );
+}
+
+/** Server-add-only affordance, mounted by App.tsx's empty-workspace overlay.
+ *  Surface id "add-server" (RETAINED — the overlay mount is unchanged). */
+export function AddServer() {
+  let wrapEl: HTMLDivElement | undefined;
+
+  const surface = usePopoverSurface({
+    id: "add-server",
+    group: TABSTRIP_POPOVER_GROUP,
+    anchor: () => wrapEl,
+    // Prefill bookkeeping lives in AddServerForm's open-transition effect —
+    // no other on-open sync is needed here.
+  });
+
+  return (
     <div class={s.wrap} ref={wrapEl}>
       <button
         type="button"
@@ -140,97 +255,74 @@ export function AddServer() {
       <Show when={surface.open()}>
         <div class={s.popover} data-testid="add-server-popover">
           <div class={s.heading}>Add a server</div>
-          <form class={s.form} onSubmit={submit}>
-            <label class={s.field}>
-              <span class={s.fieldLabel}>Server URL</span>
-              <input
-                ref={urlInputEl}
-                class={s.input}
-                type="text"
-                placeholder="https://srv.example.com"
-                value={url()}
-                aria-label="Server URL"
-                data-testid="add-server-url"
-                onInput={(e) => setUrl(e.currentTarget.value)}
-              />
-              <span class={s.helper}>
-                Connect another vh-solara server. Session tabs appear after you
-                open a session in a server pane.
-              </span>
-            </label>
-            <label class={s.field}>
-              <span class={s.fieldLabel}>Label (optional)</span>
-              <input
-                class={s.input}
-                type="text"
-                placeholder="my-server"
-                value={label()}
-                aria-label="Server label"
-                data-testid="add-server-label"
-                onInput={(e) => setLabel(e.currentTarget.value)}
-              />
-            </label>
-            <button type="submit" class={s.addBtn} data-testid="add-server-submit">
-              Add server
-            </button>
-          </form>
-          <Show when={error()}>
-            <div class={s.error} data-testid="add-server-error" role="alert">
-              {error()}
-            </div>
-          </Show>
-          <Show when={outcome()}>
-            <div
-              class={s.outcome}
-              data-testid="add-server-outcome"
-              data-kind={outcome()!.kind}
-              role="status"
-            >
-              {outcomeText(outcome()!)}
-            </div>
-          </Show>
-          <Show when={runtimeServers().length > 0}>
-            <div class={s.catalog} data-testid="server-catalog">
-              <For each={runtimeServers()}>
-                {(srv) => (
-                  /* A plain flex row (NO role/tabindex — finding 3): the row's
-                   * two affordances are SIBLING real buttons, so neither is an
-                   * interactive-inside-interactive violation and both are
-                   * reliably exposed to assistive tech. data-testid/data-url
-                   * stay on the row (a stable, layout-level marker). */
-                  <div class={s.catalogRow} data-testid="server-row" data-url={srv.url}>
-                    <button
-                      type="button"
-                      class={s.catalogPick}
-                      // The accessible name carries BOTH the label and the url
-                      // (finding 3: the old row aria-label hid the address).
-                      aria-label={`Use ${srv.label} — ${srv.url}`}
-                      title={`Fill the form with ${srv.label}`}
-                      onClick={(e) => pick(e, srv)}
-                    >
-                      <span class={s.catalogLabel} title={srv.url}>
-                        {srv.label}
-                      </span>
-                      <span class={s.catalogUrl}>{srv.url}</span>
-                    </button>
-                    <button
-                      type="button"
-                      class={s.removeBtn}
-                      title={`Remove ${srv.label}`}
-                      aria-label={`Remove ${srv.label}`}
-                      data-testid="remove-server"
-                      data-url={srv.url}
-                      // A sibling (not a descendant) of the pick button: no
-                      // propagation to stop — removing never prefills.
-                      onClick={() => remove(srv.url)}
-                    >
-                      ✕
-                    </button>
-                  </div>
-                )}
-              </For>
-            </div>
-          </Show>
+          <AddServerForm open={surface.open} />
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+/**
+ * The STRIP's single merged "+" trigger (D3 — the chrome merge): one popover
+ * offering "New workspace" (the old strip ws-add action, store.addWorkspace)
+ * and a "Connect server…" section embedding the shared AddServerForm. Replaces
+ * the TWO look-alike triggers that rendered as identical icons at phone width
+ * (the old strip ws-add button + the strip AddServer mount).
+ *
+ *  - data-testid="ws-add" (the strip's workspace-add entry point — the folded
+ *    and preview production specs click it).
+ *  - SURFACE-ID CONTRACT: surface id "add-menu", DISTINCT from AddServer's
+ *    "add-server" — popover.ts's registry is singleton-per-id, and both
+ *    components are mounted simultaneously whenever the active workspace is
+ *    empty (the overlay's gate). Same TABSTRIP_POPOVER_GROUP → at most one
+ *    popover open, each independently dismissible.
+ *  - Trigger/popover styling lives in Tabstrip.module.css (the strip chrome
+ *    module); the form keeps AddServer.module.css.
+ */
+export function AddMenu() {
+  let wrapEl: HTMLDivElement | undefined;
+
+  const surface = usePopoverSurface({
+    id: "add-menu",
+    group: TABSTRIP_POPOVER_GROUP,
+    anchor: () => wrapEl,
+  });
+
+  const newWorkspace = () => {
+    // Close FIRST (never leave an open popover over a workspace-switching
+    // strip), then mint the workspace — addWorkspace ACTIVATES the fresh
+    // empty workspace, whose overlay AddServer co-mounts by design.
+    surface.closePopover();
+    addWorkspace();
+  };
+
+  return (
+    <div class={ts.addMenuWrap} ref={wrapEl}>
+      <button
+        type="button"
+        class={ts.plus}
+        title="Add workspace or server"
+        aria-label="Add workspace or server"
+        aria-expanded={surface.open() ? "true" : "false"}
+        data-testid="ws-add"
+        onClick={() => surface.togglePopover()}
+      >
+        +
+      </button>
+      <Show when={surface.open()}>
+        <div class={ts.addMenuPopover} data-testid="add-menu-popover" aria-label="Add workspace or server">
+          <button
+            type="button"
+            class={ts.addMenuPrimary}
+            data-testid="add-menu-new-workspace"
+            onClick={newWorkspace}
+          >
+            New workspace
+          </button>
+          <div class={ts.addMenuSection}>
+            <div class={ts.addMenuSectionLabel}>Connect server…</div>
+            <AddServerForm open={surface.open} />
+          </div>
         </div>
       </Show>
     </div>

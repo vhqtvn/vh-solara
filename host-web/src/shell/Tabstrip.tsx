@@ -1,7 +1,6 @@
-import { For, Show, createEffect, createSignal, onCleanup, untrack } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, untrack } from "solid-js";
 import {
   activeWorkspaceId,
-  addWorkspace,
   closeWorkspace,
   needsYouCount,
   needsYouCountFor,
@@ -14,17 +13,44 @@ import {
 } from "../dockview/store";
 import { TABSTRIP_POPOVER_GROUP, usePopoverSurface } from "./popover";
 import { next } from "../attentionNext";
-import { AddServer } from "./AddServer";
+import { AddMenu } from "./AddServer";
+import { WorkspaceOverflow } from "./WorkspaceOverflow";
 import { Layouts } from "./Layouts";
 import { Settings } from "./Settings";
+import {
+  computeFits,
+  rankByPriority,
+  type PriorityCandidate,
+} from "./priorityFit";
 import s from "./Tabstrip.module.css";
 
 /**
- * Top WORKSPACE tabstrip (i3 upper tabs = workspaces): brand + one tab per
- * workspace + "+" + "Add server" + the P3 NEXT hero button. Clicking a tab
- * switches the active workspace — a SURVIVAL-SAFE CSS-visibility-only switch
- * (App.tsx's overlay stack; no host is disposed, no iframe reloads). The "+"
- * creates a new empty workspace.
+ * Top WORKSPACE tabstrip (i3 upper tabs = workspaces): brand + a
+ * PRIORITY-FIT subset of workspace tabs + the "⋯" overflow affordance + the
+ * single merged "+" AddMenu + the P3 NEXT hero button. Clicking a tab switches
+ * the active workspace — a SURVIVAL-SAFE CSS-visibility-only switch
+ * (App.tsx's overlay stack; no host is disposed, no iframe reloads).
+ *
+ * PRIORITY-FIT MEMBERSHIP (attention-selected visibility): the strip shows
+ * the workspaces that FIT the measured width, chosen by attention priority —
+ * active → needs-you → unread → running → prev-active (one-slot recency) →
+ * remaining; ties by canonical index (priorityFit.ts, decisions D1/D4).
+ *  - MEMBERSHIP ONLY: the rendered row stays in CANONICAL workspace order;
+ *    priority never reshuffles visible tabs.
+ *  - MEASUREMENT: a hidden aria-hidden measuring row (every workspace at
+ *    natural width, live badges included) + a ResizeObserver on the tabs
+ *    container. Plain px math — host-web has no UI zoom. (Reference pattern:
+ *    web/src/components/TabBar.tsx — measurement concept only.)
+ *  - FREEZE: visible membership/order is frozen during strip interaction —
+ *    a pressed pointer, any open strip popover/menu (TABSTRIP_POPOVER_GROUP)
+ *    or inline rename, and KEYBOARD focus in the strip. Badges, the overflow
+ *    cue, and the hidden-workspace list keep updating LIVE while frozen; only
+ *    membership holds still. Never auto-scrolls the strip on status change
+ *    (the fitted row does not overflow; there is no scroll-into-view call
+ *    anywhere).
+ *  - SATURATION (honest, D4): whatever does not fit goes to the "⋯" overflow
+ *    list (WorkspaceOverflow.tsx — searchable, live badges); the active
+ *    workspace is ALWAYS visible (tier 0 outranks fit).
  *
  * P3 NEXT HERO BUTTON (moved here from the deleted bottom statusbar — operator
  * directive "no [FAB], just a button next to add server is enough"). It is the
@@ -32,41 +58,27 @@ import s from "./Tabstrip.module.css";
  * the active workspace has a needs-you pane (needsYouCount() > 0; ws-scoped
  * visibility — the locked choice), pulses to draw the eye, and on click calls
  * next() (attentionNext.ts — UNCHANGED): rank → cross-ws → restore-from-tray →
- * keyboard-rule → focus the highest-priority needy pane system-wide. It is the
- * ONLY statusbar element that survived the statusbar removal; everything else
- * (Q1-C liveness dot/label, server count, focus line, layout button, i3 control
- * cluster, attention-hub "N need you · M running" counts, renderer badge) was
- * deleted. next() routes through store.hostOps().next (production-capable — NOT
- * the DEV bridge).
- *
- * This RESTORES the pre-P4 workspace model (commits bd406bd/ca20b0a/497e36e
- * had replaced it with a pane-tab strip; the operator rejected that — tabs were
- * mirroring the visible pane layout, pointless). Workspaces are the i3 unit:
- * named containers you switch between; panes tile WITHIN a workspace.
+ * keyboard-rule → focus the highest-priority needy pane system-wide. next()
+ * routes through store.hostOps().next (production-capable — NOT the DEV
+ * bridge).
  *
  * PER-TAB AFFORDANCES:
  *  - CONTEXT MENU (right-click / long-press / F2): Rename, Close, Close
- *    others. This REPLACED the per-tab × (with its two-step "Delete?" confirm)
- *    and the direct long-press→rename — tabs are width-constrained, the × cost
- *    horizontal space on EVERY tab, and the gestures now have one home. The
- *    menu rides the SAME surface stack as Settings/AddServer/Layouts
- *    (popover.ts, mutually exclusive group): Esc closes topmost-only, a
- *    pointerdown outside the tab closes it, a pane tap closes it, a workspace
- *    switch closes it reactively. Last-workspace guard: Close + Close others
- *    are aria-disabled no-ops (the store refuses to empty the shell anyway).
- *    Deleting a workspace DESTROYS its panes (intentional; not a survival op).
+ *    others. The menu rides the SAME surface stack as AddMenu/Overflow/
+ *    Layouts/Settings (popover.ts, mutually exclusive group): Esc closes
+ *    topmost-only, a pointerdown outside the tab closes it, a pane tap closes
+ *    it, a workspace switch closes it reactively. Last-workspace guard:
+ *    Close + Close others are aria-disabled no-ops (the store refuses to
+ *    empty the shell anyway). Deleting a workspace DESTROYS its panes
+ *    (intentional; not a survival op).
  *  - RENAME: menu → Rename opens the inline edit. Commit on blur/Enter; cancel
- *    on Esc. Long-press over double-tap (double-tap conflicts with mobile zoom).
- *  - PER-TAB BADGE: needs-you count on EVERY tab (background ws's needy sessions
- *    are the ones the operator can't see). Rounded-rect number, GPU-cheap,
- *    distinct from Q1-C liveness.
+ *    on Esc.
+ *  - PER-TAB BADGE: needs-you count on EVERY tab (background ws's needy
+ *    sessions are the ones the operator can't see). Rounded-rect number,
+ *    GPU-cheap, distinct from Q1-C liveness. Badges are NEVER truncated.
  *
  * Layout ops within the active workspace go through the typed HostOps controller
- * surface (store.hostOps), not the DEV-only window.__host test bridge. The
- * statusbar's layout control cluster (split/tabbed/stacked/zoom/close) was
- * removed with the statusbar; the layout overlay (gesture-triggered) is the
- * primary command surface, and the HostOps setLayoutMode/toggleZoom/etc. remain
- * for the DEV bridge + future overlay work.
+ * surface (store.hostOps), not the DEV-only window.__host test bridge.
  */
 
 /** Long-press threshold (ms) to open the tab context menu. Same value the old
@@ -81,12 +93,24 @@ const MENU_PRESS_DRIFT_PX = 12;
  * Tabstrip.module.css). */
 const MENU_WIDTH_PX = 176;
 
+/** Gap between adjacent tabs (px) — keep in sync with `.tabs { gap }` in
+ * Tabstrip.module.css (computeFits budgets it). */
+const TAB_GAP_PX = 4;
+/** Width reserved for the "⋯" overflow trigger whenever anything is hidden:
+ * the 26px icon trigger + the cue badge at its widest + the strip's 8px flex
+ * gap. Slightly conservative when the cue is absent — a deterministic,
+ * fixed reserve beats a circular (cue depends on membership) measurement. */
+const OVERFLOW_RESERVE_PX = 52;
+/** A focusin arriving within this window after a pointerdown on the strip is
+ * attributed to the POINTER (browsers focus the pressed control), not the
+ * keyboard — pointer-attributed focus does not freeze membership. */
+const POINTER_FOCUS_MS = 500;
+
 /**
  * TAB-PAIRS display cap (REVERSIBLE DEFAULT). A count of 10 or more renders as
  * the fixed-width "9+" instead of its full integer, keeping every badge a tight
- * constant-width token even on a heavily-loaded dir. Alternative (flip): render
- * the raw integer — denser information, wider/shifting tabs. The SPA sends the
- * TRUE integer; the cap is host-side display formatting only (the badge's
+ * constant-width token even on a heavily-loaded dir. The SPA sends the TRUE
+ * integer; the cap is host-side display formatting only (the badge's
  * data-count attribute always carries the true integer).
  */
 function fmtCount(n: number): string {
@@ -100,11 +124,7 @@ function isNonzero(p: { running: number; unread: number }): boolean {
 
 /**
  * TAB-PAIRS human label (REVERSIBLE DEFAULT): the badge run's title/aria-label
- * in aggregate human words — "2 running, 3 unread" — never pair notation (the
- * operator reads "(X|Y)" as noise; the numbers are the signal). Aggregated
- * across panes because the per-pane split is already visible as badge groups.
- * Alternative (flip): a per-pane breakdown ("pane 1: 2 running; …") — more
- * precise, but noisy for the common 1-2-pane workspace.
+ * in aggregate human words — "2 running, 3 unread" — never pair notation.
  */
 function pairsLabel(pairs: { running: number; unread: number }[]): string {
   const running = pairs.reduce((n, p) => n + p.running, 0);
@@ -115,39 +135,270 @@ function pairsLabel(pairs: { running: number; unread: number }[]): string {
   return parts.join(", ");
 }
 
-export function Tabstrip() {
+/** The tab label content (name + live pair badges + needs-you pill) shared by
+ *  the real tab and the hidden measuring tab — the SAME markup, so measured
+ *  widths equal rendered widths. No interactivity here. `live` gates the
+ *  e2e-facing data-testids/data-* mirrors so the aria-hidden measuring row
+ *  never pollutes test selectors. */
+function TabContent(props: { ws: Workspace; live?: boolean }) {
+  const need = () => needsYouCountFor(props.ws.id);
+  const pairs = () => statusPairsFor(props.ws.id);
+  const showPairs = () => pairs().some((p) => p.running > 0 || p.unread > 0);
+  const pairsText = () => pairs().map((p) => `(${fmtCount(p.running)}|${fmtCount(p.unread)})`).join("");
+  const t = (id: string) => (props.live ? id : undefined);
   return (
-    <div class={s.tabstrip}>
+    <>
+      <span
+        class={s.tabLabel}
+        data-testid={t("ws-tab-label")}
+        title={props.ws.name}
+      >
+        {props.ws.name}
+      </span>
+      <Show when={showPairs()}>
+        <span
+          class={s.tabPairs}
+          data-testid={t("ws-tab-pairs")}
+          data-workspace={props.live ? props.ws.id : undefined}
+          data-pairs={pairsText()}
+          role="img"
+          aria-label={pairsLabel(pairs())}
+          title={pairsLabel(pairs())}
+        >
+          <For each={pairs()}>
+            {(p, i) => (
+              <Show when={isNonzero(p)}>
+                <span class={s.paneBadges} data-pane-index={i()}>
+                  <Show when={p.running > 0}>
+                    <span class={s.badgeRunning} data-kind="running" data-count={p.running} title={`${p.running} running`}>
+                      {fmtCount(p.running)}
+                    </span>
+                  </Show>
+                  <Show when={p.unread > 0}>
+                    <span class={s.badgeUnread} data-kind="unread" data-count={p.unread} title={`${p.unread} unread`}>
+                      {fmtCount(p.unread)}
+                    </span>
+                  </Show>
+                </span>
+              </Show>
+            )}
+          </For>
+        </span>
+      </Show>
+      <Show when={need() > 0}>
+        <span
+          class={s.needBadge}
+          data-testid={t("ws-needs-you")}
+          data-workspace={props.live ? props.ws.id : undefined}
+          title={`${need()} session${need() === 1 ? "" : "s"} need you`}
+        >
+          {need()}
+        </span>
+      </Show>
+    </>
+  );
+}
+
+export function Tabstrip() {
+  // ---- measurement + membership state ---------------------------------------
+  let stripEl: HTMLDivElement | undefined;
+  let tabsEl: HTMLDivElement | undefined;
+  let measureEl: HTMLDivElement | undefined;
+
+  /** Tabs container clientWidth (px) — the stable available space (the flex
+   *  container, NOT the content row, which sizes to content). */
+  const [avail, setAvail] = createSignal(0);
+  /** Natural tab widths by workspace id, measured off the hidden row. */
+  const [widths, setWidths] = createSignal<Record<string, number>>({});
+  /** Frozen predicate parts (see freeze memo below). */
+  const [pressed, setPressed] = createSignal(0);
+  const [openMenu, setOpenMenu] = createSignal(false);
+  const [kbdFocus, setKbdFocus] = createSignal(false);
+  /** One-slot recency (D1): the workspace active immediately before the
+   *  current one. No timers, no grace window. */
+  const [prevActiveId, setPrevActiveId] = createSignal<string | null>(null);
+  /** The applied VISIBLE set. Initialized to all workspaces (the pre-measure
+   *  render shows everything, like the web TabBar reference); corrected by
+   *  the fit effect as soon as measurement lands. */
+  const [visibleSet, setVisibleSet] = createSignal<Set<string>>(
+    new Set(workspaces().map((w) => w.id)),
+  );
+
+  // Width-affecting inputs as one reactive key: the workspace set (ids +
+  // names), every workspace's needs-you count and status pairs (badges change
+  // tab width). Measuring re-runs whenever this key changes.
+  const widthKey = createMemo(() =>
+    workspaces()
+      .map((ws) => `${ws.id}:${ws.name}:${needsYouCountFor(ws.id)}:${JSON.stringify(statusPairsFor(ws.id))}`)
+      .join("|"),
+  );
+
+  // Measure every workspace tab at natural width off the hidden row. Runs
+  // AFTER the DOM paints (queueMicrotask) so a badge/name change is reflected.
+  const measure = () => {
+    if (!measureEl) return;
+    const next: Record<string, number> = {};
+    for (const el of measureEl.children) {
+      const id = (el as HTMLElement).dataset.workspace;
+      if (id) next[id] = (el as HTMLElement).getBoundingClientRect().width;
+    }
+    setWidths(next);
+  };
+  createEffect(() => {
+    void widthKey();
+    queueMicrotask(measure);
+  });
+
+  // Available width: the flex container's clientWidth via ResizeObserver
+  // (sibling chrome appearing/disappearing — brand @480px, NEXT button,
+  // overflow trigger — resizes it), plus an initial read.
+  onMount(() => {
+    if (!tabsEl || !stripEl) return;
+    const ro = new ResizeObserver(() => setAvail(tabsEl!.clientWidth));
+    ro.observe(tabsEl);
+    setAvail(tabsEl.clientWidth);
+    onCleanup(() => ro.disconnect());
+
+    // ---- FREEZE observation -------------------------------------------------
+    // (a) OPEN MENUS / RENAME within the strip: every TABSTRIP_POPOVER_GROUP
+    //     trigger (Settings gear, Layouts, AddMenu, the overflow trigger, the
+    //     per-tab menu's aria-expanded tab) and the inline rename
+    //     (data-editing) live INSIDE this strip subtree and reflects its open
+    //     state in the DOM — so one MutationObserver watching those
+    //     attributes covers the whole group without any cross-component
+    //     wiring (popover.ts's registry is module-private by design).
+    const recountOpen = () => {
+      const n = stripEl!.querySelectorAll('[aria-expanded="true"], [data-editing="1"]').length;
+      setOpenMenu(n > 0);
+    };
+    recountOpen();
+    const mo = new MutationObserver(recountOpen);
+    mo.observe(stripEl, {
+      subtree: true,
+      childList: true,
+      attributeFilter: ["aria-expanded", "data-editing"],
+    });
+    onCleanup(() => mo.disconnect());
+
+    // (b) KEYBOARD focus within the strip (arrowing through tabs, F2 flows).
+    //     Pointer-attributed focus (a press focused a control) does NOT
+    //     freeze — see POINTER_FOCUS_MS.
+    const onFocusIn = () => {
+      if (Date.now() - lastPointerAt < POINTER_FOCUS_MS) return;
+      setKbdFocus(true);
+    };
+    const onFocusOut = () => {
+      // focusout fires before the next focus target receives focus — read
+      // activeElement a microtask later, when the transfer has settled.
+      queueMicrotask(() => setKbdFocus(!!stripEl && stripEl.contains(document.activeElement)));
+    };
+    stripEl.addEventListener("focusin", onFocusIn);
+    stripEl.addEventListener("focusout", onFocusOut);
+    onCleanup(() => {
+      stripEl?.removeEventListener("focusin", onFocusIn);
+      stripEl?.removeEventListener("focusout", onFocusOut);
+    });
+  });
+
+  // A pointer press anywhere on the strip freezes membership until release —
+  // "no membership motion while touching the strip". The release listeners
+  // live on window (a press that starts on the strip may release outside it).
+  let lastPointerAt = 0;
+  let releaseCleanup: (() => void) | undefined;
+  const onStripPointerDown = () => {
+    lastPointerAt = Date.now();
+    if (pressed() > 0) return;
+    setPressed(1);
+    const release = () => {
+      setPressed(0);
+      releaseCleanup?.();
+      releaseCleanup = undefined;
+    };
+    window.addEventListener("pointerup", release, true);
+    window.addEventListener("pointercancel", release, true);
+    releaseCleanup = () => {
+      window.removeEventListener("pointerup", release, true);
+      window.removeEventListener("pointercancel", release, true);
+    };
+  };
+  onCleanup(() => releaseCleanup?.());
+
+  /** MEMBERSHIP FREEZE: while any strip interaction is in progress the
+   *  applied visible set holds still (badges/queues keep updating). */
+  const frozen = createMemo(() => pressed() > 0 || openMenu() || kbdFocus());
+
+  // prev-active tracking (D1): remember the immediately-previous active
+  // workspace. Updates even while frozen (the applied set re-derives on
+  // unfreeze with the latest value).
+  let lastActive: string | null = null;
+  createEffect(() => {
+    const cur = activeWorkspaceId();
+    if (lastActive !== null && lastActive !== cur) setPrevActiveId(lastActive);
+    lastActive = cur;
+  });
+
+  // THE FIT: rank by priority, then greedily fit widths to the available
+  // space (priorityFit.ts). Gated by the freeze — while frozen the applied
+  // set is untouched; unfreezing re-runs this effect with fresh inputs.
+  createEffect(() => {
+    void widthKey(); // width-affecting inputs (names + badges)
+    void avail(); // container width
+    const list = workspaces();
+    const active = activeWorkspaceId();
+    const prev = prevActiveId();
+    if (frozen()) return;
+    const candidates: PriorityCandidate[] = list.map((ws, index) => {
+      const pairs = statusPairsFor(ws.id);
+      return {
+        id: ws.id,
+        index,
+        active: ws.id === active,
+        prevActive: ws.id === prev,
+        needsYou: needsYouCountFor(ws.id),
+        running: pairs.reduce((n, p) => n + p.running, 0),
+        unread: pairs.reduce((n, p) => n + p.unread, 0),
+      };
+    });
+    const ranked = rankByPriority(candidates);
+    const w = widths();
+    const fit = computeFits(
+      ranked.map((c) => ({ id: c.id, width: w[c.id] ?? 0 })),
+      { available: avail(), gap: TAB_GAP_PX, overflowReserve: OVERFLOW_RESERVE_PX },
+    );
+    setVisibleSet(new Set(fit.visible));
+  });
+
+  // Visible workspaces in CANONICAL order (membership is priority-selected;
+  // the rendered row NEVER reshuffles) + the complement for the overflow.
+  const visibleWorkspaces = createMemo(() => workspaces().filter((ws) => visibleSet().has(ws.id)));
+  const hiddenIds = createMemo(() => workspaces().filter((ws) => !visibleSet().has(ws.id)).map((ws) => ws.id));
+
+  return (
+    <div class={s.tabstrip} ref={stripEl} onPointerDown={onStripPointerDown}>
       <div class={s.brand}>
         <span class={s.brandMark}>◈</span>
         <span class={s.brandText}>VHSolara</span>
         <span class={s.brandSub}>host</span>
       </div>
       {/* a11y completion: the tabs container carries the tablist role the
-          per-tab role="tab"/aria-selected semantics already imply (a tab
-          without a tablist parent is incomplete AT structure). */}
-      <div class={s.tabs} data-testid="ws-tabs" role="tablist" aria-label="Workspaces">
-        <For each={workspaces()}>
+          per-tab role="tab"/aria-selected semantics already imply. */}
+      <div class={s.tabs} data-testid="ws-tabs" role="tablist" aria-label="Workspaces" ref={tabsEl}>
+        <For each={visibleWorkspaces()}>
           {(ws) => <WorkspaceTab ws={ws} />}
         </For>
       </div>
-      <button
-        type="button"
-        class={s.plus}
-        title="Add workspace"
-        data-testid="ws-add"
-        onClick={() => addWorkspace()}
-      >
-        +
-      </button>
-      <AddServer />
-      {/* Saved-layouts popover (Layouts.tsx) — the de-confusion slice's new
-          tabstrip surface: per-workspace ("this tab") layouts AND whole-session
-          ("all tabs") master snapshots, each renamable. The manager moved OUT
-          of Settings here (Settings used to carry both "Layout…" and
-          "Layouts…" — two near-identical labels, different functions; its
-          overlay trigger is now "Edit layout…"). Same tabstrip popover group
-          as AddServer + Settings (mutually exclusive). */}
+      {/* Overflow affordance (only when something is hidden). Lives OUTSIDE
+          the .tabs scroller so its popover escapes the overflow clip (the
+          strip itself is overflow:visible). */}
+      <Show when={hiddenIds().length > 0}>
+        <WorkspaceOverflow hiddenIds={hiddenIds} />
+      </Show>
+      {/* The single merged "+" (D3): New workspace + Connect server… in one
+          AddMenu popover (surface id "add-menu"). */}
+      <AddMenu />
+      {/* Saved-layouts popover (Layouts.tsx) — per-workspace ("this tab")
+          layouts AND whole-session ("all tabs") master snapshots. Same
+          tabstrip popover group as AddMenu + Settings (mutually exclusive). */}
       <Layouts />
       {/* Settings gear (host-chrome popover: Edit layout…, reload + auto-rotate
           toggle). Sits after Layouts in the right cluster; see Settings.tsx. */}
@@ -157,8 +408,8 @@ export function Tabstrip() {
           needs-you pane (needsYouCount() > 0), pulses to draw the eye, and on
           click calls next() which routes to the highest-priority needy pane
           system-wide. Production-capable (hostOps().next, NOT the DEV bridge).
-          GPU-cheap: a slow opacity pulse ONLY (no mask-image / backdrop-filter —
-          AGENTS.md Firefox/WebRender rules); honored under prefers-reduced-motion. */}
+          GPU-cheap: a slow opacity pulse ONLY; honored under
+          prefers-reduced-motion. */}
       <Show when={needsYouCount() > 0}>
         <button
           type="button"
@@ -170,12 +421,26 @@ export function Tabstrip() {
         >
           NEXT
         </button>
-      </Show>
+        </Show>
       <Show when={trayIds().length > 0}>
         <span class={s.trayBadge} title="Collapsed panes (active workspace)">
           tray: {trayIds().length}
         </span>
       </Show>
+      {/* HIDDEN MEASURING ROW (priority-fit): every workspace at natural
+          width — same markup as a real tab (TabContent), laid out in a
+          clipped, invisible, aria-hidden row. getBoundingClientRect on its
+          children is the width source for computeFits. Position:absolute so
+          it never contributes to the strip's flex layout. */}
+      <div class={s.measureRow} aria-hidden="true" ref={measureEl}>
+        <For each={workspaces()}>
+          {(ws) => (
+            <div class={s.tab} data-workspace={ws.id}>
+              <TabContent ws={ws} />
+            </div>
+          )}
+        </For>
+      </div>
     </div>
   );
 }
@@ -185,39 +450,23 @@ export function Tabstrip() {
  *  inline rename the menu can open. */
 function WorkspaceTab(props: { ws: Workspace }) {
   const active = () => activeWorkspaceId() === props.ws.id;
-  const need = () => needsYouCountFor(props.ws.id);
   // Last-workspace guard: Close + Close others render aria-disabled no-ops in
   // the menu (the store's closeWorkspace refuses to empty the shell anyway).
   const isLast = () => workspaces().length <= 1;
 
-  // ---- TAB-PAIRS: per-pane (running|unread) micro-badges in the tab label ----
-  // One pair per pane, in the workspace's live serialized panel order (stable
-  // across reload). NONZERO-ONLY BADGES (REVERSIBLE DEFAULT — the badge-UI
-  // redesign flipped the old rule): only panes with a nonzero count render a
-  // badge group at all — a (0|0) pane renders NOTHING (the old text run
-  // rendered every pair incl (0|0) once any pair was nonzero). Pane↔group
-  // association is preserved by data-pane-index (the pane's index in the live
-  // panel order), not by visual position. When ALL pairs are zero we render
-  // nothing after the name (a quiet workspace reads as a bare label —
-  // unchanged). A pane whose status has not landed yet contributes (0|0).
-  const pairs = () => statusPairsFor(props.ws.id);
-  const showPairs = () => pairs().some((p) => p.running > 0 || p.unread > 0);
-  // Machine-readable mirror of the FULL pair run (incl zero pairs, incl the
-  // 9+ cap) — the derivation-contract surface e2e asserts against
-  // (pair[i] === the status pane[i] reported). The badge DOM is presentation;
-  // this attribute is the data.
-  const pairsText = () => pairs().map((p) => `(${fmtCount(p.running)}|${fmtCount(p.unread)})`).join("");
+  // (The tab's live label content — name + TAB-PAIRS badges + the needs-you
+  //  pill — is rendered by <TabContent ws live/> below, SHARED with the hidden
+  //  measuring row so measured widths equal rendered widths.)
 
   // ---- tab context menu (right-click / long-press / F2) ---------------------
   // Registered on the shared surface stack (popover.ts) in the SAME group as
-  // the other tabstrip popovers (mutually exclusive with Settings/AddServer/
-  // Layouts): Escape closes topmost-only, a pointerdown outside this tab
-  // closes it, a pane tap closes it via dismissAnchoredSurfaces. The anchor is
-  // the TAB element: it contains both the trigger (the tab itself) and the
-  // menu, so a pointerdown on a menu item never counts as an outside click
-  // that would dismiss-before-activate. The menu is position:fixed — it
-  // escapes the .tabs overflow clip (verified: no transform/filter/
-  // perspective/will-change ancestor would turn it into a containing block).
+  // the other tabstrip popovers (mutually exclusive with AddMenu/Overflow/
+  // Settings/Layouts): Escape closes topmost-only, a pointerdown outside this
+  // tab closes it, a pane tap closes it via dismissAnchoredSurfaces. The
+  // anchor is the TAB element: it contains both the trigger (the tab itself)
+  // and the menu, so a pointerdown on a menu item never counts as an outside
+  // click that would dismiss-before-activate. The menu is position:fixed — it
+  // escapes the .tabs overflow clip.
   let tabEl: HTMLDivElement | undefined;
   const [menuPos, setMenuPos] = createSignal({ left: 0, top: 0 });
   // Fixed coords, computed on open: drop under the tab, clamped so a
@@ -240,20 +489,15 @@ function WorkspaceTab(props: { ws: Workspace }) {
 
   // Dismiss on workspace switch: a KEYBOARD switch (focus another tab, Enter)
   // moves no pointer, so the surface stack's outside-click pass never fires —
-  // close reactively instead. activeWorkspaceId() is the tracked dep; the
-  // menu state is deliberately untracked (reading it would re-run on open).
+  // close reactively instead.
   createEffect(() => {
     activeWorkspaceId();
     if (untrack(menu.open)) menu.closePopover();
   });
 
   // Menu actions. Every item stops its click from reaching the tab's own
-  // click handler (bubbling would read as a tap-again toggle / a workspace
-  // switch). The menu closes FIRST for the destructive items (never leave an
-  // open menu over a workspace that is already gone); a disabled
-  // (last-workspace) item is a FULL no-op — no close, no run — matching the
-  // Settings popover's disabled-action semantics so the operator can still
-  // pick another entry.
+  // click handler. The menu closes FIRST for the destructive items; a
+  // disabled (last-workspace) item is a FULL no-op.
   const menuRename = () => {
     menu.closePopover();
     beginEdit();
@@ -267,8 +511,6 @@ function WorkspaceTab(props: { ws: Workspace }) {
     if (isLast()) return;
     menu.closePopover();
     // Snapshot first: closeWorkspace splices the very array being iterated.
-    // Closing the ACTIVE workspace (when this tab is a background one) is fine
-    // — the store activates a remaining one (this tab).
     for (const w of workspaces().slice()) {
       if (w.id !== props.ws.id) closeWorkspace(w.id);
     }
@@ -370,11 +612,9 @@ function WorkspaceTab(props: { ws: Workspace }) {
       data-active={active() ? "1" : "0"}
       data-editing={editing() ? "1" : "0"}
       data-menu-open={menu.open() ? "1" : "0"}
-      // a11y: the tab was a <button> (focusable, Enter/Space to activate). It is
-      // now a <div> because it hosts nested interactive elements (the rename
-      // input + the context menu's items). Restore the keyboard + AT semantics
-      // explicitly so workspace-switch + the menu stay reachable without a
-      // pointer. aria-haspopup/expanded advertise the context menu to AT.
+      // a11y: role=tab + explicit keyboard/AT semantics (the tab hosts nested
+      // interactive elements — the rename input + the context menu's items).
+      // aria-haspopup/expanded advertise the context menu to AT.
       role="tab"
       tabindex={editing() ? -1 : 0}
       aria-selected={active() ? "true" : "false"}
@@ -399,9 +639,7 @@ function WorkspaceTab(props: { ws: Workspace }) {
       // Right-click / Menu key / Shift+F10 (the browser synthesizes a
       // contextmenu event for the last two on the focused element).
       onContextMenu={onTabContextMenu}
-      // Long-press arms the menu timer (see onTabPointerDown). The handlers
-      // live on the WHOLE tab now — the × is gone, so every pixel of the tab
-      // is menu target (the old rename long-press was label-only).
+      // Long-press arms the menu timer (see onTabPointerDown).
       onPointerDown={onTabPointerDown}
       onPointerMove={onTabPointerMove}
       onPointerUp={clearPressTimer}
@@ -409,10 +647,9 @@ function WorkspaceTab(props: { ws: Workspace }) {
       onPointerCancel={clearPressTimer}
       onKeyDown={(e) => {
         if (editing()) return;
-        // F2 = the standard rename key (file managers, IDEs): it now opens the
-        // menu that CONTAINS Rename (the direct-rename entry is gone). The
-        // keyboard path to a menu ACTION is F2 → Tab (into the items) → Enter;
-        // item activation below must keep its native button behavior.
+        // F2 = the standard rename key: it opens the menu that CONTAINS
+        // Rename. The keyboard path to a menu ACTION is F2 → Tab (into the
+        // items) → Enter; item activation keeps native button behavior.
         if (e.key === "F2") {
           e.preventDefault();
           menu.togglePopover();
@@ -430,13 +667,11 @@ function WorkspaceTab(props: { ws: Workspace }) {
         }
         if (menu.open()) {
           // Menu open: an Enter/Space on the TAB ITSELF must not fall through
-          // to the workspace-switch branch (the early return already covers
-          // it — no preventDefault needed: the tab div has no native Enter
-          // default, and an UNCONDITIONAL one would swallow the keydowns that
-          // bubble here from the focused MENU ITEMS (buttons are DOM children
-          // of this tab), killing their native Enter/Space activation — found
-          // by commit-review). The items are the next Tab stops; Escape closes
-          // via the surface stack.
+          // to the workspace-switch branch (no preventDefault needed: the tab
+          // div has no native Enter default, and an UNCONDITIONAL one would
+          // swallow the keydowns that bubble here from the focused MENU ITEMS
+          // (buttons are DOM children of this tab), killing their native
+          // Enter/Space activation — found by commit-review).
           return;
         }
         if (e.key === "Enter" || e.key === " ") {
@@ -445,67 +680,7 @@ function WorkspaceTab(props: { ws: Workspace }) {
         }
       }}
     >
-      <Show
-        when={editing()}
-        fallback={
-          <>
-            <span class={s.tabLabel} data-testid="ws-tab-label" title={props.ws.name}>
-              {props.ws.name}
-            </span>
-                {/* TAB-PAIRS badges: per-pane micro-badge groups — a NEUTRAL
-                    "running" badge + an ACCENT "unread" badge per pane,
-                    nonzero counts only. A sibling of the (possibly
-                    ellipsized) name span so the badges are NEVER truncated —
-                    on overflow the tabstrip's .tabs row scrolls horizontally
-                    instead (measured behavior, not silent clipping).
-                    data-pairs mirrors the full pair run (incl zeros) for
-                    deterministic e2e/vision assertions; each badge carries
-                    data-kind + data-count (the TRUE integer — the 9+ cap is
-                    display text only). role="img" + aria-label give AT the
-                    human-words summary ("2 running, 3 unread"). */}
-                <Show when={showPairs()}>
-                  <span
-                    class={s.tabPairs}
-                    data-testid="ws-tab-pairs"
-                    data-workspace={props.ws.id}
-                    data-pairs={pairsText()}
-                    role="img"
-                    aria-label={pairsLabel(pairs())}
-                    title={pairsLabel(pairs())}
-                  >
-                    <For each={pairs()}>
-                      {(p, i) => (
-                        <Show when={isNonzero(p)}>
-                          <span class={s.paneBadges} data-pane-index={i()}>
-                            <Show when={p.running > 0}>
-                              <span
-                                class={s.badgeRunning}
-                                data-kind="running"
-                                data-count={p.running}
-                                title={`${p.running} running`}
-                              >
-                                {fmtCount(p.running)}
-                              </span>
-                            </Show>
-                            <Show when={p.unread > 0}>
-                              <span
-                                class={s.badgeUnread}
-                                data-kind="unread"
-                                data-count={p.unread}
-                                title={`${p.unread} unread`}
-                              >
-                                {fmtCount(p.unread)}
-                              </span>
-                            </Show>
-                          </span>
-                        </Show>
-                      )}
-                    </For>
-                  </span>
-                </Show>
-              </>
-            }
-      >
+      <Show when={editing()} fallback={<TabContent ws={props.ws} live />}>
         <input
           ref={inputEl}
           class={s.tabInput}
@@ -528,29 +703,10 @@ function WorkspaceTab(props: { ws: Workspace }) {
         />
       </Show>
 
-      {/* PER-TAB needs-you badge (EVERY workspace, not just active). A
-          background ws's needy sessions are the ones the operator can't see on
-          the active grid — surfacing them here is the whole point. Hidden when
-          the count is 0. Same rounded-rect number + amber as the prior badge;
-          distinct from Q1-C liveness (dot) and the per-pane attention badge. */}
-      <Show when={need() > 0}>
-        <span
-          class={s.needBadge}
-          data-testid="ws-needs-you"
-          data-workspace={props.ws.id}
-          title={`${need()} session${need() === 1 ? "" : "s"} need you`}
-        >
-          {need()}
-        </span>
-      </Show>
-
       {/* Tab CONTEXT MENU (right-click / long-press / F2). A child of the tab
           (the surface-stack anchor) but position:fixed — it escapes the .tabs
           overflow clip; coords are set in onOpen (placeMenu). role="menu" +
-          menuitem mirror the Settings popover pattern. The Close pair is
-          aria-disabled (NOT native-disabled) on the last workspace so
-          keyboard/AT users can still discover the entries; activation is a
-          full no-op then. Plain bg/border/shadow only — GPU-cheap, static. */}
+          menuitem mirror the Settings popover pattern. */}
       <Show when={menu.open()}>
         <div
           class={s.tabMenu}

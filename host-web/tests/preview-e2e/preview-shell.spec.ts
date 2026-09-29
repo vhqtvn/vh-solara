@@ -85,13 +85,24 @@ test.describe("host shell — production build (vite preview)", () => {
     expect(diag.hasRead, "production ring carries the init read event").toBe(true);
   });
 
-  test("production tabstrip HAS workspace chrome (ws-tab/ws-add/add-server)", async ({ page }) => {
-    // Phase 1: the workspace tabs + add-workspace "+" are RESTORED to the
-    // primary tabstrip. The "Add server" trigger sits beside them. This proves
-    // the production bundle reflects the workspace-tabstrip shell.
+  test("production tabstrip HAS workspace chrome (ws-tab + the single merged ws-add)", async ({ page }) => {
+    // Phase 1 restored the workspace tabs + add-workspace "+". The D3 chrome
+    // merge replaced the TWO strip triggers (ws-add + AddServer) with ONE
+    // merged "+" (ws-add → AddMenu popover: "New workspace" + "Connect
+    // server…"). This proves the production bundle reflects the merged
+    // workspace-tabstrip shell: exactly one + on the strip, whose popover
+    // carries BOTH actions, and NO overlay add-server trigger (the seeded
+    // workspace is populated — add-server-btn exists only in the
+    // empty-workspace overlay).
     await expect(page.locator('[data-testid="ws-tab"]')).toHaveCount(1);
     await expect(page.locator('[data-testid="ws-add"]')).toHaveCount(1);
-    await expect(page.locator('[data-testid="add-server-btn"]')).toHaveCount(1);
+    await expect(page.locator('[data-testid="add-server-btn"]')).toHaveCount(0);
+    await page.locator('[data-testid="ws-add"]').click();
+    await expect(page.locator('[data-testid="add-menu-popover"]')).toBeVisible();
+    await expect(page.locator('[data-testid="add-menu-new-workspace"]')).toBeVisible();
+    await expect(page.locator('[data-testid="add-server-url"]')).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="add-menu-popover"]')).toHaveCount(0);
   });
 
   test("production build has NO statusbar chrome", async ({ page }) => {

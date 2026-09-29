@@ -88,31 +88,32 @@ test.describe("settings popover", () => {
     await expect(btn).toHaveAttribute("aria-expanded", "false");
 
     // Click-outside closes: open again, then tap ANOTHER tabstrip control
-    // (the AddServer trigger — a real sibling-chrome outside tap; it opens
-    // the AddServer popover as its own side effect).
+    // (the merged add trigger — a real sibling-chrome outside tap; it opens
+    // the AddMenu popover as its own side effect).
     await openSettings(page);
-    await page.locator('[data-testid="add-server-btn"]').click();
+    await page.locator('[data-testid="ws-add"]').click();
     await expect(page.locator('[data-testid="settings-popover"]')).toBeHidden();
-    await expect(page.locator('[data-testid="add-server-popover"]')).toBeVisible();
+    await expect(page.locator('[data-testid="add-menu-popover"]')).toBeVisible();
   });
 
-  test("AddServer-then-gear: the gear closes AddServer — never both forms at once", async ({ page }) => {
-    // The ordering the old suite never exercised: AddServer FIRST, then the
-    // gear. AddServer used to have NO outside-click/Escape dismissal, so
+  test("AddMenu-then-gear: the gear closes the merged menu — never both forms at once", async ({ page }) => {
+    // The ordering the old suite never exercised: the add popover FIRST, then
+    // the gear. AddServer used to have NO outside-click/Escape dismissal, so
     // both popovers stayed open and Settings covered ~246px of the AddServer
     // form (its controls still tabbable underneath). The shared surface
     // stack's tabstrip group makes them mutually exclusive.
-    const addBtn = page.locator('[data-testid="add-server-btn"]');
+    const addBtn = page.locator('[data-testid="ws-add"]');
     await H.openAddServer(page);
     await expect(addBtn).toHaveAttribute("aria-expanded", "true");
 
     await page.locator('[data-testid="settings-btn"]').click();
 
-    // Exactly one tabstrip popover: Settings open, AddServer GONE (the form
-    // unmounts with <Show>, so no control stays visible or tabbable).
+    // Exactly one tabstrip popover: Settings open, the AddMenu GONE (the
+    // embedded form unmounts with <Show>, so no control stays visible or
+    // tabbable).
     await expect(page.locator('[data-testid="settings-popover"]')).toBeVisible();
     await expect(page.locator('[data-testid="settings-popover"]')).toHaveCount(1);
-    await expect(page.locator('[data-testid="add-server-popover"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="add-menu-popover"]')).toHaveCount(0);
     await expect(page.locator('[data-testid="add-server-url"]')).toHaveCount(0);
     await expect(page.locator('[data-testid="add-server-label"]')).toHaveCount(0);
     await expect(page.locator('[data-testid="server-catalog"]')).toHaveCount(0);

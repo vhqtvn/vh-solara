@@ -238,14 +238,14 @@ test.describe("layout overlay interaction model", () => {
     const ids = await H.panes(page);
     await H.openLayoutOverlay(page, ids[0]);
     await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
-    // The AddServer trigger is OUTSIDE <main> (in the tabstrip, a sibling of
-    // <main>) → not covered by the capture layer → still clickable. Clicking it
-    // toggles its popover without dismissing the overlay (the popover is a
+    // The merged add trigger is OUTSIDE <main> (in the tabstrip, a sibling of
+    // <main>) → not covered by the capture layer → still clickable. Clicking
+    // it toggles its popover without dismissing the overlay (the popover is a
     // tabstrip child too, not inside <main>).
-    const add = page.locator('[data-testid="add-server-btn"]');
+    const add = page.locator('[data-testid="ws-add"]');
     await expect(add).toBeEnabled();
     await add.click();
-    await expect(page.locator('[data-testid="add-server-popover"]')).toBeVisible();
+    await expect(page.locator('[data-testid="add-menu-popover"]')).toBeVisible();
     // The overlay is still open (the capture layer does not reach the tabstrip).
     await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
     // The workspace tabs are also still clickable (a sibling of <main>).
@@ -540,7 +540,7 @@ test.describe("layout overlay interaction model", () => {
   // spoofed messages (wrong origin / unregistered source) are rejected BEFORE
   // the dismiss call.
 
-  test("pane-activate closes each tabstrip popover (Layouts, Settings, AddServer)", async ({ page }) => {
+  test("pane-activate closes each tabstrip popover (Layouts, Settings, AddMenu)", async ({ page }) => {
     const ids = await H.panes(page);
     const pane = ids[0];
     // One per popover: open via the REAL tabstrip trigger, post a valid
@@ -549,7 +549,7 @@ test.describe("layout overlay interaction model", () => {
     const cases = [
       { btn: '[data-testid="layouts-btn"]', pop: '[data-testid="layouts-popover"]' },
       { btn: '[data-testid="settings-btn"]', pop: '[data-testid="settings-popover"]' },
-      { btn: '[data-testid="add-server-btn"]', pop: '[data-testid="add-server-popover"]' },
+      { btn: '[data-testid="ws-add"]', pop: '[data-testid="add-menu-popover"]' },
     ];
     for (const { btn, pop } of cases) {
       await page.locator(btn).click();

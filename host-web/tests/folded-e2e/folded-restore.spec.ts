@@ -489,7 +489,7 @@ test.describe.serial("folded-posture layout restore", () => {
     });
     expect(healed, "hash still #state=-shaped after the heal").toBeTruthy();
     expect(
-      (healed!.workspaces ?? []).map((w) => w.id).sort(),
+      (healed!.workspaces ?? []).map((w) => w.id ?? "").sort(),
       "hash healed to the fresh 2-ws state",
     ).toEqual(freshIds.slice().sort());
     const after = (await waitForQuiescentMirror(
@@ -501,5 +501,96 @@ test.describe.serial("folded-posture layout restore", () => {
       (after.workspaces ?? []).map((w) => w.id ?? "").sort(),
       "LS not regressed below the fresh workspace set",
     ).toEqual(freshIds.slice().sort());
+  });
+
+  // PRIORITY-FIT + FOLDED RESTORE: a workspace activated from the OVERFLOW
+  // list at phone width (the operator's mobile PWA posture) must survive a
+  // clean folded relaunch — identity + layout restored, and the restored
+  // ACTIVE workspace's tab REVEALED in the still-saturated strip (the active
+  // rule: tier 0 outranks fit). Everything production-safe: real UI clicks
+  // (the merged "+" popover), DOM + localStorage reads only.
+  test("overflow-activated workspace restores on folded relaunch (identity + layout + active tab revealed)", async ({ page }) => {
+    // Phone width — the PWA posture; the tabstrip saturates with 5 workspaces.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto("/");
+    await expect(page.locator('[data-testid="host-app-root"]')).toBeVisible();
+    await expect
+      .poll(async () => (await paneIds(page)).length, { timeout: 20000 })
+      .toBeGreaterThanOrEqual(1);
+
+    // Saturate via the REAL merged "+" UI: 4 more workspaces (5 total). Each
+    // creation ACTIVATES the fresh workspace, so the seed ("Workspace 1" —
+    // quiet, canonically first) drops behind the overflow trigger.
+    for (let i = 0; i < 4; i++) {
+      await page.locator('[data-testid="ws-add"]').click();
+      await page.locator('[data-testid="add-menu-new-workspace"]').click();
+    }
+    const trigger = page.locator('[data-testid="ws-overflow-trigger"]');
+    await expect(trigger).toBeVisible();
+    await expect.poll(async () => page.locator('[data-testid="ws-tab"]').count()).toBeLessThan(5);
+    const seedTab = page.locator('[data-testid="ws-tab"]', { hasText: "Workspace 1" });
+    await expect(seedTab).toHaveCount(0); // the seed workspace is hidden
+
+    // Activate the seed FROM THE OVERFLOW LIST (≤2 taps for a quiet ws).
+    await trigger.click();
+    const row = page.locator('[data-testid="ws-overflow-row"]', { hasText: "Workspace 1" });
+    await expect(row).toBeVisible();
+    await row.click();
+
+    // It activated AND became visible (the active rule), with its live /app
+    // pane — the workspace is not empty.
+    await expect(seedTab).toBeVisible();
+    await expect(seedTab).toHaveAttribute("data-active", "1");
+    await expect(seedTab).toHaveAttribute("aria-selected", "true");
+    await expect(page.locator('[data-testid="empty-workspace"]')).toBeHidden();
+    const origin = new URL(page.url()).origin;
+    expect((await iframeSrcs(page)).some((src) => src.startsWith(`${origin}/app`))).toBe(true);
+
+    // The v3 blob converges on the 5-workspace session with the seed ACTIVE.
+    await waitForQuiescentMirror(
+      page,
+      (p) => {
+        const o = p as {
+          activeWorkspaceId?: string;
+          workspaces?: Array<{ id?: string; name?: string }>;
+        };
+        return (
+          (o.workspaces?.length ?? 0) === 5 &&
+          o.workspaces?.find((w) => w.id === o.activeWorkspaceId)?.name === "Workspace 1" &&
+          totalPanels(p) === 1
+        );
+      },
+      "5-ws blob with the overflow-activated seed active",
+    );
+
+    // CLEAN RELAUNCH (goto "/", no hash — the PWA start_url posture).
+    await page.goto("/");
+    await expect(page.locator('[data-testid="host-app-root"]')).toBeVisible();
+    await expect
+      .poll(async () => (await paneIds(page)).length, { timeout: 20000 })
+      .toBeGreaterThanOrEqual(1);
+
+    // Identity + layout restored: the ACTIVE workspace is the seed — its
+    // /app pane renders, no empty affordance, no re-seed after the read.
+    await expect(page.locator('[data-testid="empty-workspace"]')).toBeHidden();
+    expect((await iframeSrcs(page)).some((src) => src.startsWith(`${origin}/app`))).toBe(true);
+    const events = await ring(page);
+    const read = lastOf(events, "read");
+    expect(read?.source, "relaunch read the v3 blob").toBe("v3");
+    expect(since(events, "seed", read!.t), `no seed after the relaunch read\nring:\n${fingerprint(events)}`).toEqual([]);
+    expect(
+      events.filter((e) => e.kind === "restore").some((e) => e.outcome === "restored" && e.panes === 1),
+      "a workspace restored from the blob with its pane",
+    ).toBe(true);
+
+    // ACTIVE-TAB REVEAL: the strip is still saturated (5 workspaces at 390px)
+    // but the restored ACTIVE workspace's tab is rendered + selected — the
+    // priority-fit active rule holds across a folded relaunch.
+    await expect(trigger).toBeVisible();
+    await expect.poll(async () => page.locator('[data-testid="ws-tab"]').count()).toBeLessThan(5);
+    const restoredTab = page.locator('[data-testid="ws-tab"]', { hasText: "Workspace 1" });
+    await expect(restoredTab).toBeVisible();
+    await expect(restoredTab).toHaveAttribute("data-active", "1");
+    await expect(restoredTab).toHaveAttribute("aria-selected", "true");
   });
 });

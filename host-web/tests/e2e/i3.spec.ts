@@ -172,24 +172,27 @@ test.describe("i3 host-shell Phase 1", () => {
     await page.screenshot({ path: path.join(VISION_DIR, "06-persistence.png"), fullPage: true });
   });
 
-  // ---- Item 7: AddServer popover opens when tabs are present ----------------
-  test("AddServer popover opens with workspace tabs present", async ({ page }) => {
-    // Preconditions: at least one ws-tab is present (default workspace) AND at
-    // least one pane exists (seeded). The bug: + did not open when tabs existed.
+  // ---- Item 7: the merged AddMenu popover opens when tabs are present --------
+  test("AddMenu popover opens with workspace tabs present", async ({ page }) => {
+    // Preconditions: at least one ws-tab is present (default workspace) AND
+    // at least one pane exists (seeded). The bug: + did not open when tabs
+    // existed. Post chrome-merge the strip's + is the merged AddMenu (New
+    // workspace + Connect server… in one popover).
     await expect(page.locator('[data-testid="ws-tab"]')).toHaveCount(1);
     expect((await H.panes(page)).length).toBeGreaterThanOrEqual(1);
 
-    // Click + : the popover opens.
-    const trigger = page.locator('[data-testid="add-server-btn"]');
+    // Click + : the merged popover opens (with the embedded server form).
+    const trigger = page.locator('[data-testid="ws-add"]');
     await trigger.click();
-    await expect(page.locator('[data-testid="add-server-popover"]')).toBeVisible();
+    await expect(page.locator('[data-testid="add-menu-popover"]')).toBeVisible();
+    await expect(page.locator('[data-testid="add-server-url"]')).toBeVisible();
 
     // Toggle closed (click the trigger again) + reopen: still opens reliably
     // (the toggle is not one-shot, and re-opening is not blocked by tabs).
     await trigger.click();
-    await expect(page.locator('[data-testid="add-server-popover"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="add-menu-popover"]')).toHaveCount(0);
     await trigger.click();
-    await expect(page.locator('[data-testid="add-server-popover"]')).toBeVisible();
+    await expect(page.locator('[data-testid="add-menu-popover"]')).toBeVisible();
 
     await page.screenshot({ path: path.join(VISION_DIR, "07-popover.png"), fullPage: true });
   });

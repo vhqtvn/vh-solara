@@ -1231,10 +1231,16 @@ export function serverUrl(server: string): string {
   return `${MOCK_ORIGIN}/?${q.toString()}`;
 }
 
-/** Open the add-server popover via the REAL tabstrip trigger. */
+/** Open the add-server form via the REAL strip affordance — the merged "+"
+ *  AddMenu popover (data-testid="ws-add" → add-menu-popover → the embedded
+ *  "Connect server…" section). The strip's old standalone AddServer trigger
+ *  is gone (D3 chrome merge); the overlay AddServer (empty-active-workspace
+ *  gate) keeps its own add-server-btn, which specs exercise directly where
+ *  that surface is the point. */
 export async function openAddServer(page: Page): Promise<void> {
-  await page.locator('[data-testid="add-server-btn"]').click();
-  await expect(page.locator('[data-testid="add-server-popover"]')).toBeVisible();
+  await page.locator('[data-testid="ws-add"]').click();
+  await expect(page.locator('[data-testid="add-menu-popover"]')).toBeVisible();
+  await expect(page.locator('[data-testid="add-server-url"]')).toBeVisible();
 }
 
 /** Fill + submit the add-server form via the REAL UI. */

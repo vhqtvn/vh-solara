@@ -25,6 +25,15 @@
   margin-right: 4px;
   flex: 0 0 auto;
 }
+/* Phone width: the brand yields its strip real estate to workspace tabs (D3
+ * — same breakpoint family as AddServer.module.css's triggerText hide). The
+ * tabstrip's flex gap only applies between RENDERED items, so a hidden brand
+ * costs nothing. */
+@media (max-width: 480px) {
+  .brand {
+    display: none;
+  }
+}
 .brandMark {
   color: var(--accent);
   font-size: 14px;
@@ -298,6 +307,78 @@
     opacity: 0.5;
   }
 }
+/* ---- PRIORITY-FIT measurement + merged AddMenu chrome ------------------------
+ * The hidden measuring row (every workspace tab at natural width — see
+ * Tabstrip.tsx) and the strip's single merged "+" AddMenu popover (D3). Plain
+ * bg/border/shadow only — no mask-image / backdrop-filter (GPU rules). */
+
+/* HIDDEN MEASURING ROW: absolute (never contributes to the strip's flex
+ * layout), visibility:hidden + height:0 + overflow:hidden (invisible and
+ * clipped, but children still LAY OUT — getBoundingClientRect returns real
+ * widths). display:flex + the same gap as .tabs so inter-tab spacing matches
+ * the rendered row; children are plain .tab divs (same box model as real
+ * tabs). aria-hidden at the JSX level; pointer-events:none so it can never
+ * intercept. */
+.measureRow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: flex;
+  gap: 4px;
+  height: 0;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+}
+/* The merged AddMenu ("+") anchor wrap — same shape as AddServer's .wrap
+ * (position:relative so the popover drops from the trigger). */
+.addMenuWrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+/* The merged popover: shared chrome from Popover.module.css + the 320px form
+ * width (the embedded AddServerForm fields size themselves). */
+.addMenuPopover {
+  composes: popover from "./Popover.module.css";
+  width: 320px;
+}
+/* "New workspace" — the primary action (accent affordance, the old strip
+ * ws-add semantics). */
+.addMenuPrimary {
+  height: 28px;
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  background: var(--accent-soft);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.addMenuPrimary:hover {
+  background: var(--accent);
+  color: var(--bg);
+}
+.addMenuPrimary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* The "Connect server…" section: a divider + label above the shared
+ * AddServerForm (the form's own styles live in AddServer.module.css). */
+.addMenuSection {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+.addMenuSectionLabel {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .nextBtn {
     animation: none;
