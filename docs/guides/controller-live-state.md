@@ -8,11 +8,16 @@ the server's own detection cadence, and the plain
 [`GET /vh/fleet/status`](#relationship-to-get-vhfleetstatus) stays available
 as the conditional (ETag) fallback.
 
-Everything below is the frozen Slice-1 contract (2026-09). Authentication,
-cookies, CSRF, and error conventions are exactly those of the rest of the
-`/vh/*` family: session-cookie auth (clean `401` when unauthenticated),
-plain-text `http.Error` bodies, `X-VH-CSRF` only needed on mutations (this
-is a GET — nothing to send).
+This guide also carries the **shared history read cursor** contract
+([below](#shared-history-read-cursor-slice-2)) — the operator-level
+read-through state the companion app's devices share through
+`/vh/notify/history`.
+
+Everything in the stream section is the frozen Slice-1 contract (2026-09).
+Authentication, cookies, CSRF, and error conventions are exactly those of
+the rest of the `/vh/*` family: session-cookie auth (clean `401` when
+unauthenticated), plain-text `http.Error` bodies, `X-VH-CSRF` only needed
+on mutations (this is a GET — nothing to send).
 
 ## Wire contract
 
@@ -124,3 +129,92 @@ controller (nginx or similar):
 
 WebSocket upgrade is NOT involved: the stream is plain HTTP/1.1 chunked
 responses (and works over HTTP/2); no special upgrade headers are needed.
+
+## Shared history read cursor (Slice 2)
+
+The notification history carries ONE operator-level read-through
+cursor, shared by every device: "seen on the phone → dimmed on the
+watch". The server is single-operator, so there is exactly one cursor —
+no per-device or per-token dimension. It means "the operator has seen
+through event id N", not per-event read marks or push-delivery
+acknowledgements.
+
+### Endpoints
+
+#### `POST /vh/notify/history/read`
+
+Body (strict, exactly one field):
+
+```json
+{"id": 123}
+```
+
+Session-cookie auth + `X-VH-CSRF: 1` (a `/vh/` mutation — plain-text
+errors, family conventions). `id` is the greatest event id the client
+actually rendered as read — never auto-ack the newest id from an
+unrelated page.
+
+| Behavior | Result |
+|---|---|
+| `id` ≤ current cursor (incl. `0`) | `200` no-op, current state echoed, **no disk write** — stale/replaying devices never see conflicts |
+| `id` above the newest assigned event id | `400` naming the newest id (never clamped) |
+| Malformed body (missing/null/negative/fraction/exponent/overflow/string/bool/duplicate keys/unknown fields/trailing docs/>4 KiB) | `400` plain text |
+| `id` key spelled as a case variant (`"ID"`, `"Id"`, …) | `400` naming the key — encoding/json would match it case-insensitively, so variants are never silently decoded or last-won |
+| Notifications not configured (`--notify-store` unset) | `409` naming the flag (after the CSRF check) |
+| Persistence failure | `500`; the in-memory cursor does NOT advance — the cursor never outruns what a restart can honor |
+| Success | `{"schema":1,"read_id":123,"unread_count":7}` |
+
+Key matching is on the **decoded** key, not the raw wire bytes: an
+escape-encoded spelling that decodes to exactly `id` (e.g.
+`{"\u0069d":123}`) is accepted as the same field, while any two members
+decoding to `id` — including an escaped+exact mix like
+`{"\u0069d":1,"id":2}` — count as duplicate keys (`400`).
+
+The advance is forward-only and monotonic. Trimmed historical ids stay
+valid watermarks — acknowledging an id that has already been trimmed
+out of the 500-event window is fine.
+
+### `GET /vh/notify/history` (extended, additive)
+
+The existing response gains two fields; nothing else changes:
+
+```json
+{"schema":1,"events":[…],"first_id":118,"last_id":123,"read_id":100,"unread_count":7}
+```
+
+- `read_id` — the global cursor (0 = nothing acknowledged yet).
+- `unread_count` — RETAINED events with id > `read_id`: the whole
+  500-event window, independent of `since`/`limit`. It is never an
+  archive total, and trimming can lower it without any acknowledgement
+  (events falling off the window stop counting as unread). If
+  `read_id` is below the trimmed `first_id`, the whole retained window
+  counts as unread; the cursor itself is preserved, never clamped.
+- Page and cursor metadata are captured together (one holder lock) and
+  the POST response echoes the same pair — clients may update their
+  badge from either response.
+
+`GET /vh/notify/tokens` is unchanged (no cursor fields).
+
+### How devices stay in sync
+
+Shared storage does not push read state: a second device learns the
+cursor on its next history GET (app foreground, watch face refresh) or
+its own acknowledgement. The fleet SSE stream carries no read-state
+event. Acknowledge after rendering, from the greatest id actually shown
+— acknowledging an assumed-newest id would erase unread state for
+events the user has not seen.
+
+### Persistence + compatibility notes
+
+- The cursor lives IN the history file (`<notify-store>.history`):
+  every acknowledgement atomically re-persists the full retained event
+  window together with the new cursor (same crash-safe 0600
+  tmp+rename discipline as the rest of the family). A restart
+  therefore honors acknowledged cursors, and an ack also flushes any
+  events that were still memory-only after a failed append persist.
+- While the cursor is 0 the field is omitted — a never-acked history
+  stays byte-identical to the legacy format.
+- **Downgrade hazard:** a controller binary from before this feature
+  uses strict decoding and refuses to start on a history file that
+  carries `read_id`. Back the file up before downgrading; there is no
+  silent reset or migration.

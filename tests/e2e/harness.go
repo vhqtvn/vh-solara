@@ -23,6 +23,7 @@ import (
 
 	"github.com/vhqtvn/vh-solara/pkg/agent"
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
+	"github.com/vhqtvn/vh-solara/pkg/auth"
 	"github.com/vhqtvn/vh-solara/pkg/fixtures"
 	"github.com/vhqtvn/vh-solara/pkg/server"
 	"github.com/vhqtvn/vh-solara/pkg/web"
@@ -60,6 +61,7 @@ type ClusterOption func(*clusterOptions)
 
 type clusterOptions struct {
 	hostPattern string
+	passphrase  string
 }
 
 // WithHostPattern sets the controller daemon's host-based provisioning
@@ -68,6 +70,16 @@ type clusterOptions struct {
 // raw tunnel proxy). Default "" keeps host interception OFF.
 func WithHostPattern(pattern string) ClusterOption {
 	return func(o *clusterOptions) { o.hostPattern = pattern }
+}
+
+// WithPassphraseAuth installs passphrase session auth on the cluster's
+// controller user edge (default: no auth middleware). Needed by tests
+// that must exercise the real login/401/CSRF ladder over real HTTP
+// (e.g. the /vh/notify/* family). The coordination API
+// (/api/coord/*, bearer-gated) is matched BEFORE session auth, so the
+// harness's own readiness polling is unaffected.
+func WithPassphraseAuth(passphrase string) ClusterOption {
+	return func(o *clusterOptions) { o.passphrase = passphrase }
 }
 
 // StartCluster brings the whole stack up and waits until the worker is online.
@@ -121,6 +133,13 @@ func StartClusterWithOptions(opts ...ClusterOption) (*Cluster, error) {
 	}
 	d := server.NewDaemon(userAddr, daemonAddr, cfg.hostPattern)
 	d.APIToken = c.APIToken
+	if cfg.passphrase != "" {
+		a, err := auth.New(ctx, auth.Config{Mode: auth.ModePassphrase, Passphrase: cfg.passphrase})
+		if err != nil {
+			return nil, fmt.Errorf("cluster passphrase auth: %w", err)
+		}
+		d.Auth = a
+	}
 	c.Daemon = d
 	go func() { _ = d.Start() }()
 	c.ControllerURL = "http://" + userAddr

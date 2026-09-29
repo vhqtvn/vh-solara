@@ -72,7 +72,10 @@ type Daemon struct {
 	// notifyHistory is the push-notification delivery history holder
 	// (see notify_history.go): the bounded file-backed record of every
 	// fleet-condition transition the watcher (notify_watcher.go)
-	// emits, served by GET /vh/notify/history. Its path derives from
+	// emits, served by GET /vh/notify/history, PLUS the operator-level
+	// global read-through cursor advanced by POST
+	// /vh/notify/history/read (persisted in the same history file —
+	// one atomic events+cursor replacement). Its path derives from
 	// the registry path + ".history" (installed by LoadNotifyStore);
 	// zero value = unconfigured (the family's 409 posture).
 	notifyHistory notifyHistoryHolder
@@ -308,6 +311,15 @@ func (d *Daemon) buildRootHandler() http.Handler {
 	// posture; covered by the /vh/notify/ prefix carve-out below, so it
 	// answers from worker-subdomain hosts too.
 	userMux.HandleFunc("GET /vh/notify/history", d.handleNotifyHistory)
+
+	// Global read-cursor advance (POST /vh/notify/history/read; see
+	// notify_history.go): the operator-level "read through id N"
+	// acknowledgement shared by every device. A /vh/ mutation: the
+	// in-handler X-VH-CSRF check (403) fires before the 409/400 ladder,
+	// per the family convention above; the method-agnostic prefix
+	// carve-out covers it on worker subdomains (methods enforced by
+	// this pattern — anything but POST gets the mux's 405).
+	userMux.HandleFunc("POST /vh/notify/history/read", d.handleNotifyHistoryRead)
 
 	// Latency diagnostics — AGGREGATED global view. The controller merges its
 	// own probes (diag.Default) with every connected worker's snapshot fetched

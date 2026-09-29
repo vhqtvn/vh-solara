@@ -742,3 +742,41 @@ func TestNotifyHTTP_TestSendRateLimit(t *testing.T) {
 		t.Errorf("response = %+v, want sent/stub", view)
 	}
 }
+
+// TestNotifyRead_TokensGetUnchanged pins the Slice-2 additivity fence:
+// the shared read cursor lives in the HISTORY surface only — the tokens
+// GET response carries no read_id/unread_count keys and its envelope
+// shape is byte-stable across an ack.
+func TestNotifyRead_TokensGetUnchanged(t *testing.T) {
+	d, h, session := newNotifyAuthDaemon(t)
+	loadNotifyStore(t, d)
+	d.notifyHistory.append(histEntry(fleetCondWorkerDown, notifyActionAppeared, 1))
+
+	before := doNotify(t, h, http.MethodGet, "/vh/notify/tokens", "", withCookie(session))
+	if before.Code != http.StatusOK {
+		t.Fatalf("tokens GET: %d", before.Code)
+	}
+
+	// Ack through the real read route, then re-GET tokens.
+	ack := doRead(t, h, `{"id":1}`, withCookie(session), withCSRF())
+	if ack.Code != http.StatusOK {
+		t.Fatalf("read ack: %d (%s)", ack.Code, ack.Body.String())
+	}
+	after := doNotify(t, h, http.MethodGet, "/vh/notify/tokens", "", withCookie(session))
+
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(after.Body.Bytes(), &probe); err != nil {
+		t.Fatalf("tokens body: %v", err)
+	}
+	for _, key := range []string{"read_id", "unread_count"} {
+		if _, ok := probe[key]; ok {
+			t.Errorf("tokens GET must not carry %q (history-surface only): %s", key, after.Body.String())
+		}
+	}
+	if _, ok := probe["schema"]; !ok {
+		t.Errorf("tokens GET envelope lost its schema field: %s", after.Body.String())
+	}
+	if before.Body.String() != after.Body.String() {
+		t.Errorf("tokens GET body changed across an ack:\nbefore: %s\nafter:  %s", before.Body.String(), after.Body.String())
+	}
+}
