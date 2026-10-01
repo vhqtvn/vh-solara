@@ -150,8 +150,15 @@ const sessionSnapshot = (seq: number, id = "s1") => ({
 // (tree.snapshot flows constantly in production), so the control fires one per
 // cycle to keep treeContentSeen fresh. See treeLivenessContentStall.test.ts for
 // the mirror (where the tree IS the subject and the session is the control).
+//
+// Slice 3: the snapshot payload carries the authoritative activity map — a
+// wholesale snapshot REPLACES s.activity (reducers), so a busy project's tree
+// snapshot must re-assert the busy marker the test relies on (an activity-less
+// fixture would legitimately read as idle to the idle-aware watchdog and skip
+// the session force).
 const treeSnapshot = (seq: number, sessionIds: string[] = ["s1"]) => ({
   seq,
+  activity: Object.fromEntries(sessionIds.map((id) => [id, "busy"])),
   sessions: sessionIds.map((id) => ({ id })),
 });
 
@@ -168,6 +175,13 @@ describe("content-stall: pings keep sessionLastSeen fresh but sessionContentSeen
     // session that delivered initial content, then goes content-silent while
     // the transport keeps pinging).
     sessionESes()[0].fire("snapshot", sessionSnapshot(1), "1");
+    await flush();
+    // Slice 3 (idle-aware watchdog): the session under test must be BUSY —
+    // the frozen-transcript scenario this test protects is a WORKING session
+    // gone content-silent. A terminally idle session now SKIPS the force
+    // (idleWatchdog.test.ts covers that branch); without this marker the
+    // content-stall would be expected idle silence, not a stall.
+    store.setState("activity", "s1", "busy");
     await flush();
 
     // Cycles of ONLY pings (transport alive) on the SESSION under test, with

@@ -175,6 +175,15 @@ describe("tree content-stall: pings keep treeLastSeen fresh but treeContentSeen 
     // ONE session snapshot so the control stream has a content baseline too.
     sessionESes()[0].fire("snapshot", sessionSnapshot(1), "1");
     await flush();
+    // Slice 3 (idle-aware watchdog): the tree under test must be ACTIVE —
+    // something running in the project (state.activity busy). A tree with
+    // NOTHING running anywhere now SKIPS the content-stale force (idle
+    // silence is expected; idleWatchdog.test.ts covers that branch); the
+    // stuck-running-node scenario this test protects is by definition an
+    // active project. The session control staying idle is fine — its content
+    // flows each cycle below.
+    store.setState("activity", "s1", "busy");
+    await flush();
 
     // Cycles of ONLY tree pings (transport alive) with ZERO tree content. The
     // tree ping refreshes treeLastSeen (transport clock) but NOT treeContentSeen

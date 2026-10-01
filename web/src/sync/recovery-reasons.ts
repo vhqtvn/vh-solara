@@ -42,6 +42,24 @@ import { log } from "../lib/log";
 //  - visibility-pause       slice 2: pane hidden → streams suspended.
 //  - visibility-resume      slice 2: pane revealed → streams resumed from
 //                           cursors.
+//  - idle-content-stale-skipped slice 3: the Stream2 content-stale watchdog
+//                           tripped on an IDLE (not sessionWorking) session and
+//                           the force was SKIPPED — silence is expected for a
+//                           terminal-idle session. Counted PER SKIPPED TICK
+//                           (a rate meter: ticks where today's code would have
+//                           forced a cursorless full snapshot but slice 3 did
+//                           not), so an all-idle soak shows this climbing while
+//                           `idle-content-stale` freezes at 0.
+//  - tree-idle-stale-skipped slice 3: the Stream1 tree content-stale watchdog
+//                           tripped with NO activity anywhere in the project
+//                           (anySessionActive() false) and the force was
+//                           SKIPPED. Per-skipped-tick, same rate-meter contract.
+//  - busy-edge-rearm        slice 3: an idle→busy edge on the selected session
+//                           proactively re-opened Stream2 through the retry
+//                           seam (cursor-preserving ring replay) because the
+//                           stream was closed or its content clock was aged —
+//                           the prompt-to-idle-dead-stream attach fix. Counted
+//                           once per acted-on edge.
 export const RECOVERY_REASONS = [
   "idle-content-stale",
   "session-transport-stale",
@@ -55,6 +73,9 @@ export const RECOVERY_REASONS = [
   "tree-overlap-capture",
   "visibility-pause",
   "visibility-resume",
+  "idle-content-stale-skipped",
+  "tree-idle-stale-skipped",
+  "busy-edge-rearm",
 ] as const;
 export type RecoveryReason = (typeof RECOVERY_REASONS)[number];
 

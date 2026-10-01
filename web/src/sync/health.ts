@@ -17,6 +17,9 @@
 //                          getTreeContentSeen().
 //   From ./periodic-resync: markAuthoritativeRecovery().
 //   From ./stream:  STALE_MS.
+//   From ./selectors: sessionWorking() / anySessionActive() — the slice-3
+//                     idle-gate activity predicates (read-only; the same
+//                     selectors ChatView / the tree render use).
 //   From ./session-stream: openSessionStream(id, force?), getSesId(),
 //                          isSessionClosed(), getSessionLastSeen(),
 //                          getSessionContentSeen().
@@ -44,6 +47,7 @@ import {
 import { captureDiagEntry } from "./diaglog";
 import { classifyStall, countRecovery } from "./recovery-reasons";
 import { isPaneVisible } from "../paneVisibility";
+import { sessionWorking, anySessionActive } from "./selectors";
 
 // Content-stall threshold (product policy). Transport staleness (STALE_MS)
 // catches a stream whose pings STOP. CONTENT_STALE_MS catches a stream whose
@@ -141,29 +145,47 @@ export function watchdogTick() {
     const transportStale = !!(getTreeLastSeen() && Date.now() - getTreeLastSeen() > STALE_MS);
     const contentStale = !!(getTreeContentSeen() && Date.now() - getTreeContentSeen() > CONTENT_STALE_MS);
     if (transportStale || contentStale) {
-      // Slice 1 (webperf): count the forced reconnect by stable reason code
-      // (tree-idle-stale vs tree-transport-stale) so idle churn is measurable
-      // via window.__vhSyncDiag. classifyStall mirrors the log reason below.
-      const reason = classifyStall("tree", contentStale, transportStale);
-      if (reason) countRecovery(reason);
-      log.warn("sync", "tree stream stale → forcing reconnect", {
-        silentMs: getTreeLastSeen() ? Date.now() - getTreeLastSeen() : 0,
-        contentSilentMs: getTreeContentSeen() ? Date.now() - getTreeContentSeen() : 0,
-        reason: contentStale && !transportStale ? "content-stall" : "transport-stall",
-      });
-      // StallEntry: capture the watchdog's pre-recovery state. Today this path
-      // had NO diag — the operator could only observe the symptom (stuck
-      // running node) with no record of the watchdog firing.
-      captureDiagEntry({
-        kind: "stall",
-        ts: Date.now(),
-        trigger: "content-stale-watchdog",
-        stream: "tree",
-        treeLastSeenAge: getTreeLastSeen() ? Date.now() - getTreeLastSeen() : undefined,
-        treeContentSeenAge: getTreeContentSeen() ? Date.now() - getTreeContentSeen() : undefined,
-      });
-      setState("status", "reconnecting");
-      connect();
+      // Slice 3 (webperf): an IDLE tree going content-silent must not force a
+      // periodic reconnect. When NOTHING is running or input-pending anywhere
+      // in the project (anySessionActive() — the client mirror of the server's
+      // RunningRoots concept, /vh/diag/busy), the server's tree emitter
+      // legitimately has zero content to deliver, so treeContentSeen aging out
+      // is EXPECTED silence, not a stalled stream — the very idle churn this
+      // slice removes (~130s/pane reconnects on a finished fleet). Counted per
+      // skipped tick as a rate meter; the forced code (tree-idle-stale) freezes
+      // at 0 in an all-idle soak. TRANSPORT-stale is NEVER skipped: a socket
+      // whose pings stopped is dead regardless of activity. Safety net for a
+      // ping-masked (open-but-contentless) tree on an idle project: the
+      // on-focus resync (TREE_RESYNC_MIN_GAP_MS-throttled) + the ~10min
+      // conditional periodic resync (periodic-resync.ts) self-heal; slice 4's
+      // sentinel closes the residual sub-period window.
+      if (contentStale && !transportStale && !anySessionActive()) {
+        countRecovery("tree-idle-stale-skipped");
+      } else {
+        // Slice 1 (webperf): count the forced reconnect by stable reason code
+        // (tree-idle-stale vs tree-transport-stale) so idle churn is measurable
+        // via window.__vhSyncDiag. classifyStall mirrors the log reason below.
+        const reason = classifyStall("tree", contentStale, transportStale);
+        if (reason) countRecovery(reason);
+        log.warn("sync", "tree stream stale → forcing reconnect", {
+          silentMs: getTreeLastSeen() ? Date.now() - getTreeLastSeen() : 0,
+          contentSilentMs: getTreeContentSeen() ? Date.now() - getTreeContentSeen() : 0,
+          reason: contentStale && !transportStale ? "content-stall" : "transport-stall",
+        });
+        // StallEntry: capture the watchdog's pre-recovery state. Today this path
+        // had NO diag — the operator could only observe the symptom (stuck
+        // running node) with no record of the watchdog firing.
+        captureDiagEntry({
+          kind: "stall",
+          ts: Date.now(),
+          trigger: "content-stale-watchdog",
+          stream: "tree",
+          treeLastSeenAge: getTreeLastSeen() ? Date.now() - getTreeLastSeen() : undefined,
+          treeContentSeenAge: getTreeContentSeen() ? Date.now() - getTreeContentSeen() : undefined,
+        });
+        setState("status", "reconnecting");
+        connect();
+      }
     }
   }
   // --- Stream 2 (selected-session messages) liveness: INDEPENDENT clock. ---
@@ -202,27 +224,51 @@ export function watchdogTick() {
       const transportStale = !!(getSessionLastSeen() && Date.now() - getSessionLastSeen() > STALE_MS);
       const contentStale = !!(getSessionContentSeen() && Date.now() - getSessionContentSeen() > CONTENT_STALE_MS);
       if (transportStale || contentStale) {
-        // Slice 1 (webperf): count by stable reason (idle-content-stale vs
-        // session-transport-stale) — the idle-pane churn driver.
-        const reason = classifyStall("session", contentStale, transportStale);
-        if (reason) countRecovery(reason);
-        log.warn("sync", "session stream stale → forcing reconnect", {
-          id: sesId,
-          silentMs: getSessionLastSeen() ? Date.now() - getSessionLastSeen() : 0,
-          contentSilentMs: getSessionContentSeen() ? Date.now() - getSessionContentSeen() : 0,
-          reason: contentStale && !transportStale ? "content-stall" : "transport-stall",
-        });
-        // StallEntry: capture the watchdog's pre-recovery state.
-        captureDiagEntry({
-          kind: "stall",
-          ts: Date.now(),
-          trigger: "content-stale-watchdog",
-          stream: "session",
-          sessionId: sesId,
-          sessionLastSeenAge: getSessionLastSeen() ? Date.now() - getSessionLastSeen() : undefined,
-          sessionContentSeenAge: getSessionContentSeen() ? Date.now() - getSessionContentSeen() : undefined,
-        });
-        openSessionStream(sesId, true);
+        // Slice 3 (webperf): a HEALTHY IDLE session must not force periodic
+        // recovery. sessionWorking(sesId) is the authoritative busy selector
+        // (the same one ChatView's Working pill reads: state.activity self
+        // busy/retry + the tree node's server-computed subtreeBusy rollup). A
+        // session that is NOT working is terminally idle — it emits no
+        // message.* events, so sessionContentSeen aging past CONTENT_STALE_MS
+        // is EXPECTED silence, and forcing openSessionStream(id, true) here
+        // was the idle-pane churn driver (~130s cursorless full snapshots per
+        // pane). Counted per skipped tick as a rate meter; the forced code
+        // (idle-content-stale) freezes at 0 in an all-idle soak.
+        //
+        // The prompt-to-idle-dead-stream case is covered by the busy-edge
+        // re-arm (session-stream.ts ensureSessionStreamLiveForActivity): the
+        // idle→busy edge proactively reopens Stream2 cursor-preserving, so the
+        // live tail attaches immediately instead of waiting for this watchdog.
+        // TRANSPORT-stale is NEVER skipped (a dead socket is dead regardless
+        // of activity), and a BUSY session keeps today's EXACT behavior — the
+        // frozen-session protection: a running session whose stream silently
+        // died (ping-mask gap) still force-reconnects here within
+        // CONTENT_STALE_MS, including through long no-delta tool runs.
+        if (contentStale && !transportStale && !sessionWorking(sesId)) {
+          countRecovery("idle-content-stale-skipped");
+        } else {
+          // Slice 1 (webperf): count by stable reason (idle-content-stale vs
+          // session-transport-stale) — the idle-pane churn driver.
+          const reason = classifyStall("session", contentStale, transportStale);
+          if (reason) countRecovery(reason);
+          log.warn("sync", "session stream stale → forcing reconnect", {
+            id: sesId,
+            silentMs: getSessionLastSeen() ? Date.now() - getSessionLastSeen() : 0,
+            contentSilentMs: getSessionContentSeen() ? Date.now() - getSessionContentSeen() : 0,
+            reason: contentStale && !transportStale ? "content-stall" : "transport-stall",
+          });
+          // StallEntry: capture the watchdog's pre-recovery state.
+          captureDiagEntry({
+            kind: "stall",
+            ts: Date.now(),
+            trigger: "content-stale-watchdog",
+            stream: "session",
+            sessionId: sesId,
+            sessionLastSeenAge: getSessionLastSeen() ? Date.now() - getSessionLastSeen() : undefined,
+            sessionContentSeenAge: getSessionContentSeen() ? Date.now() - getSessionContentSeen() : undefined,
+          });
+          openSessionStream(sesId, true);
+        }
       }
     }
   }

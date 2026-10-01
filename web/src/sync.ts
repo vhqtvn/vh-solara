@@ -42,6 +42,7 @@ import {
   getResumableSesId,
   suspendSessionStreamForVisibility,
   resumeSessionStreamForVisibility,
+  startBusyEdgeRearm,
 } from "./sync/session-stream";
 import { isPaneVisible, onPaneVisibilityChange } from "./paneVisibility";
 import { watchdogTick, maybeReconnect, tickHealth, resyncTree, stampTreeResyncBoundary } from "./sync/health";
@@ -147,6 +148,13 @@ export function startSync() {
       }, { defer: true }),
     ),
   );
+  // Slice 3 (webperf): the idle→busy edge re-arm. The idle-gated watchdog no
+  // longer forces recovery for a terminally-idle selected session; when that
+  // session becomes busy (typically the operator prompts from this pane), this
+  // watcher proactively ensures Stream-2 is live — a closed or content-aged
+  // stream reopens CURSOR-PRESERVING through the retry seam (ring replay, not
+  // a cursorless full snapshot), so the live tail attaches immediately.
+  startBusyEdgeRearm();
   // Periodic health check: reconnects a closed/stale stream without a reload.
   window.setInterval(watchdogTick, 10_000);
   // Feature 1 (stale indicator): a faster, reconnect-free health tick so the

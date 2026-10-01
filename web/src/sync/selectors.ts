@@ -5,7 +5,8 @@
 import type { Part, SessionMessages } from "../types";
 import { toolSubject, toolVerb } from "../lib/toolLabel";
 import { state } from "./store";
-import { treeNode } from "./treeState";
+import { treeNode, treeMap } from "./treeState";
+import { working } from "./treeSelectors";
 
 // The root of a session (top of the parentID chain that's still in the store).
 export function rootOf(id: string): string {
@@ -153,6 +154,34 @@ export function sessionWorking(sessionID: string): boolean {
 
 export function isActivityWorking(act?: string): boolean {
   return act === "busy" || act === "retry";
+}
+
+// anySessionActive — is ANYTHING happening anywhere in the current project?
+// The idle-gate predicate for the Stream-1 (tree) content-stale watchdog
+// (slice 3 webperf): an idle project (nothing running, nothing input-pending)
+// emits no tree content, so tree silence past CONTENT_STALE_MS is EXPECTED and
+// must not force a periodic reconnect. Union of the two authoritative activity
+// surfaces, mirroring sessionWorking's own semantics at project scope:
+//   1. state.activity values (self activity: busy|retry) — covers sessions the
+//      tree flat map does not know (Stream-1 `activity` events are project-wide
+//      and snapshot-seeded, independent of tree residency).
+//   2. treeSelectors.working() over every resident tree node — covers the
+//      server-computed rollups (flags.subtreeBusy / flags.subtreeNeedsInput)
+//      that reach ancestors of running/pending descendants, including under
+//      collapsed or unloaded branches the activity map alone would miss.
+// CONSERVATIVE BY CONSTRUCTION: either surface claiming activity keeps the
+// watchdog armed (a stale "busy" in the activity map degrades to today's
+// behavior — an unnecessary reconnect — never to a missed recovery). The
+// server's RunningRoots diagnostic (/vh/diag/busy, derived from
+// subtreeBusyCount) is the same concept server-side; this is its client mirror.
+export function anySessionActive(): boolean {
+  for (const act of Object.values(state.activity)) {
+    if (isActivityWorking(act)) return true;
+  }
+  for (const node of treeMap().values()) {
+    if (working(node)) return true;
+  }
+  return false;
 }
 
 // What the agent is doing right now, surfaced as the Working pill's verb + an

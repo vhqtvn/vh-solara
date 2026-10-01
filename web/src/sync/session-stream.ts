@@ -40,10 +40,19 @@
 // TDZ-safe — every cross-module read happens inside listener/reducer bodies at
 // runtime, never at module-eval time.
 import { produce } from "solid-js/store";
+import { createEffect, createRoot, on } from "solid-js";
 import type { Snapshot } from "../types";
 import { prependMessagesIfAbsent, appendPartSuffix, utf8ByteLength, type PartAppendPayload } from "../lib/reduce";
 import { log } from "../lib/log";
-import { setState, projectDir } from "./store";
+import { setState, projectDir, selectedId } from "./store";
+import { sessionWorking } from "./selectors";
+// CONTENT_STALE_MS (./health): the busy-edge re-arm's content-clock threshold.
+// This ADDS a session-stream → health reverse edge to the existing health →
+// session-stream edge (openSessionStream etc.) — the same documented TDZ-safe
+// cycle discipline health ↔ stream already follow (stream imports watchdogTick
+// from health while health imports STALE_MS from stream): the imported const is
+// read ONLY inside function bodies at runtime, never at module-eval time.
+import { CONTENT_STALE_MS } from "./health";
 import { isGateActive, currentGateEpoch, markBusyDirty } from "../busy";
 import { decodeSnapshot, decodeMessagesBatch } from "./decode";
 import {
@@ -895,6 +904,83 @@ export function resumeSessionStreamForVisibility(): void {
   // UI-honesty invariant: a resumed pane never shows stale data as fresh
   // without the per-session refresh dot until the first event reconciles.
   openSessionES(sesId);
+}
+
+// === Slice 3 (webperf): busy-edge Stream-2 re-arm ============================
+//
+// The idle-gated watchdog (./health) deliberately stops forcing recovery for a
+// terminally-idle session — silence is EXPECTED there. The correctness edge
+// that creates: the operator prompts a session that has been idle long enough
+// that its Stream-2 silently died (or went ping-masked) while nobody was
+// watching. Without re-arming, the missed-tail window is the watchdog's
+// CONTENT_STALE_MS (~120s) — and only AFTER the session flips busy, since the
+// gate reads activity at tick time.
+//
+// ensureSessionStreamLiveForActivity closes that edge AT the idle→busy
+// transition: if the stream is closed, or its CONTENT clock is aged past the
+// same conservative CONTENT_STALE_MS threshold (the stream delivered nothing
+// throughout the idle period — it either worked and has an ~empty ring replay
+// ahead, or it died and MUST be replaced now), reopen it THROUGH THE RETRY
+// SEAM (openSessionES) — sesCursor is preserved, so the server takes the ring
+// replay branch (server.go `hasCursor && replayOK`) and the live tail attaches
+// immediately. NEVER openSessionStream (its closeSessionStream resets
+// sesCursor=0 → cursorless full snapshot — the exact cost this slice removes).
+// Bounded: ONE action per busy edge (the caller is edge-triggered); a stream
+// whose content clock is FRESH (delivered within CONTENT_STALE_MS — e.g. a
+// busy→idle→busy flutter seconds apart) is presumed healthy and left alone.
+//
+// No-loss / no-dup argument (why tearing down even a HEALTHY open stream here
+// is safe): sesCursor only advances when an event is APPLIED, so the replay
+// range covers everything in-flight on the old connection at teardown; the
+// replacement re-baselines the per-connection delivery ordinal
+// (sesLastDeliveryOrdinal=-1 in openSessionES; the server restarts its
+// handler-local ordinal per connection), message-body duplicates are merged
+// away by prependMessagesIfAbsent (live always wins), and the compound SSE id
+// globalSeq component keeps sesCursor monotonic across the swap.
+export function ensureSessionStreamLiveForActivity(): void {
+  // A host-hidden pane's streams are deliberately suspended — the reveal path
+  // (resumeSessionStreamForVisibility) owns reopening them; a busy edge is
+  // no reason to reopen a hidden pane's stream.
+  if (sesSuspended) return;
+  if (!sesId || !projectDir()) return;
+  const closed = !ses || ses.readyState === EventSource.CLOSED;
+  const contentAged =
+    sessionContentSeen === 0 || Date.now() - sessionContentSeen > CONTENT_STALE_MS;
+  if (!closed && !contentAged) return; // delivered recently → presumed healthy
+  countRecovery("busy-edge-rearm");
+  // Cancel any pending CLOSED-retry backoff timer: the reopen below supersedes
+  // it (otherwise the timer would fire openSessionES AGAIN on top of the fresh
+  // connection — a needless teardown/replace).
+  clearTimeout(sesRetry);
+  openSessionES(sesId);
+}
+
+// startBusyEdgeRearm — arm the reactive idle→busy edge watcher. Wired once
+// from startSync beside the selection-follow effect. The source memo reads
+// sessionWorking(selectedId()) — the AUTHORITATIVE busy selector ChatView's
+// Working pill uses (state.activity self busy/retry + the tree node's
+// server-computed subtreeBusy rollup), so the edge fires regardless of WHERE
+// the busy transition originated (this pane's own send, a queued-item drain on
+// an idle session, or a tree activity event from another pane) as long as SOME
+// stream delivered the transition. on(..., {defer:true}) skips the boot value;
+// only a genuine not-working→working edge acts (prev is `undefined` on the
+// first observed change — Solid's defer artifact — which is also a "was not
+// working" baseline, so !prev covers it; a session already busy at arm time
+// only acts after a real busy→idle→busy cycle). Selection switches are
+// self-guarding: the selection-follow effect just opened the new session
+// fresh (content clock seeded), so the edge's health check is a no-op for it.
+export function startBusyEdgeRearm(): void {
+  createRoot(() => {
+    createEffect(
+      on(
+        () => sessionWorking(selectedId() ?? ""),
+        (busy, prev) => {
+          if (busy && !prev) ensureSessionStreamLiveForActivity();
+        },
+        { defer: true },
+      ),
+    );
+  });
 }
 
 // getResumableSesId — the session id a visibility REVEAL should (re)open, or
