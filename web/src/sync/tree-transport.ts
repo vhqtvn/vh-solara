@@ -91,6 +91,7 @@ import {
   maybeResolveReconcile,
 } from "./stream";
 import { captureDiagEntry } from "./diaglog";
+import { countRecovery, countSnapshotBytes } from "./recovery-reasons";
 
 // Parse a compound SSE id ("globalSeq.ordinal") or legacy numeric id.
 // O3: the ordinal is a per-connection delivery counter for Inv1 gap detection;
@@ -783,6 +784,9 @@ function checkTreeOrdinalGap(ordinal: number, kind: string): void {
   if (ordinal <= expected) return; // contiguous or out-of-order
   const gap = ordinal - expected;
   // Ordinal gap = DIRECTLY actionable real loss. No covering check.
+  // Slice 1 (webperf): count the forced fresh-snapshot reconnect by stable
+  // reason code (window.__vhSyncDiag).
+  countRecovery("tree-seq-gap");
   captureDiagEntry({
     kind: "stall",
     ts: Date.now(),
@@ -883,6 +887,9 @@ export function connect(fresh = false) {
     // store or clear state. Mirrors Stream 2's sesGen guard.
     if (gen !== treeGen) return;
     markTreeSeen();
+    // Slice 1 (webperf): cumulative snapshot bytes received (Stream 1, detail
+    // projection) — SSE data length ≈ wire bytes.
+    countSnapshotBytes("tree", ((e as MessageEvent).data ?? "").length);
     // Parse the outer envelope ONCE. The server emits either the raw snapshot
     // JSON (small/legacy) OR {encoding:"gzip64", data:base64(gzip(snapshot))}
     // when z=1 AND the payload exceeds the threshold. The decode helper is a
@@ -994,6 +1001,9 @@ export function connect(fresh = false) {
   es.addEventListener("tree.snapshot", (e) => {
     if (gen !== treeGen) return;
     markTreeSeen();
+    // Slice 1 (webperf): cumulative snapshot bytes received (Stream 1, tree
+    // projection — gzip64/base64 when warm, so data length ≈ exact wire bytes).
+    countSnapshotBytes("tree", ((e as MessageEvent).data ?? "").length);
     const ev = e as MessageEvent;
     // F4: store seq from the compound SSE id's globalSeq component, not the body.
     // O3: snapshots carry ordinal 0 and are NOT gap-checked by the tree stream.
@@ -1020,6 +1030,9 @@ export function connect(fresh = false) {
       !pendingOwner.legacy
     ) {
       log.warn("sync", "overlapping tree.snapshot (same-gen capture while pending) → resync");
+      // Slice 1 (webperf): count the overlap-forced resync by stable reason
+      // code (window.__vhSyncDiag).
+      countRecovery("tree-overlap-capture");
       cancelPendingOwner();
       connect(true);
       return;
@@ -1269,6 +1282,56 @@ export function connect(fresh = false) {
       backoff = Math.min(backoff * 2, 15_000);
     }
   };
+}
+
+
+// === Slice 2 (webperf build1): visibility suspend/resume =====================
+//
+// The Stream-1 twin of session-stream's suspend: a host-hidden pane closes its
+// tree EventSource so the idle content-stale watchdog (which would otherwise
+// force connect() every ~130s, each reconnect re-seeding the tree+detail
+// projections server-side) has nothing to churn. The shared resume cursor
+// (state.cursor) lives in the STORE and is deliberately untouched — resume
+// goes through connect(), the same cursor-based resume any transient
+// reconnect uses.
+let treeSuspended = false;
+
+export function suspendTreeForVisibility(): void {
+  if (treeSuspended) return;
+  treeSuspended = true;
+  clearTimeout(reconnectTimer);
+  // Mirrors connect()'s teardown prefix (audit §3a order): bump the generation
+  // BEFORE close so in-flight decodes/listeners from the suspended connection
+  // are invalidated; cancel any pending coherent owner; reset the decode gate
+  // and the gap baseline (the replacement connection re-baselines them).
+  treeGen++;
+  cancelPendingOwner();
+  treeSnapshotDecode = Promise.resolve();
+  treeSnapshotDecoding = false;
+  treeLastDeliveryOrdinal = -1;
+  es?.close();
+  es = null;
+  // NOT touched: state.cursor (store-owned resume position — the reveal
+  // replays missed ring deltas from it), treeLastSeen/treeContentSeen (the
+  // watchdog is pane-gated while hidden; connect() re-seeds at construction).
+}
+
+export function resumeTreeFromVisibility(): void {
+  if (!treeSuspended) return;
+  treeSuspended = false;
+  if (!projectDir()) return;
+  // Someone already reconnected the tree while we were hidden (e.g. an
+  // on-focus resyncTree racing the pane-visibility notify in the other
+  // listener-registration order): clearing the flag above is all that is
+  // needed — do not stack a second connect on a healthy stream.
+  if (!isTreeClosed()) return;
+  // First open this page-load mirrors the boot path — connect(true), the
+  // fresh snapshot: LS-hydrated in-memory state is incomplete (only
+  // sessions+activity persist), so a cursor resume would miss state
+  // established before the cursor. Later resumes are transient reconnects:
+  // cursor-based ring replay (server re-seeds the tree=2 projections on the
+  // reconnect block; bounded, once per reveal).
+  connect(!everOpened);
 }
 
 

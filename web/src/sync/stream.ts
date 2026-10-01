@@ -45,11 +45,13 @@ import {
 //     sesSnapshotOwnership / preselectHydrate / coherentBarrierReloadRace).
 //   closeSessionStream → (a) namespace tests (the `stream?.closeSessionStream()`
 //     afterEach teardown across the C4 / liveness / backoff suite).
-import { openSessionStream, closeSessionStream, getSesGen } from "./session-stream";
+import { openSessionStream, closeSessionStream, getSesGen, suspendSessionStreamForVisibility, resumeSessionStreamForVisibility, getResumableSesId } from "./session-stream";
+import { suspendTreeForVisibility, resumeTreeFromVisibility } from "./tree-transport";
 // health (watchdog + foreground/online recovery).
 //   watchdogTick / maybeReconnect → (a) namespace tests (sessionLiveness /
 //     treeLivenessContentStall / sessionLivenessContentStall).
 import { watchdogTick, maybeReconnect } from "./health";
+import { countRecovery } from "./recovery-reasons";
 // periodic-resync (Q6 conditional drift self-heal).
 //   TREE_RESYNC_PERIODIC_INTERVAL_MS / startPeriodicResync /
 //   _setLastAuthoritativeRecoveryForTest / _getPeriodicResyncStatsForTest
@@ -72,6 +74,12 @@ export {
   openSessionStream,
   closeSessionStream,
   getSesGen,
+  getResumableSesId,
+  suspendSessionStreamForVisibility,
+  resumeSessionStreamForVisibility,
+  // tree-transport (visibility lifecycle — Slice 2 webperf)
+  suspendTreeForVisibility,
+  resumeTreeFromVisibility,
   // health
   watchdogTick,
   maybeReconnect,
@@ -167,6 +175,9 @@ function reconcileBusy(): Promise<void> {
     reconcileResolve = resolve;
     expectTreeSnap = true;
     expectSessionSnap = !!sel;
+    // Slice 1 (webperf): count the busy-release forced reconcile by stable
+    // reason code (window.__vhSyncDiag).
+    countRecovery("busy-reconcile");
     connect(true);
     // force=true so the selected session's Stream-2 EventSource is recreated
     // even when it's already healthy/open — the fresh snapshot this produces is

@@ -33,6 +33,7 @@ import { patchTreeAgent } from "./treeState";
 import { maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
 import { openSessionStream } from "./session-stream";
 import { captureDiagEntry } from "./diaglog";
+import { countRecovery } from "./recovery-reasons";
 
 // interpretEffects — map factual effects to side-effect policy. sync-state-dirty
 // is intentionally NOT handled here: the entrypoint persists it LAST (after the
@@ -102,6 +103,9 @@ function interpretEffects(effects: ReconcileEffect[]): void {
         if (e.sessionID === selectedId()) {
           const sm = state.messages[e.sessionID];
           const lastMsg = sm && sm.order.length ? sm.byId[sm.order[sm.order.length - 1]] : null;
+          // Slice 1 (webperf): count the tail-incomplete forced re-snapshot by
+          // stable reason code (window.__vhSyncDiag).
+          countRecovery("tail-incomplete");
           captureDiagEntry({
             kind: "stall",
             ts: Date.now(),

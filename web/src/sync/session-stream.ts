@@ -61,6 +61,7 @@ import {
   maybeResolveReconcile,
 } from "./stream";
 import { captureDiagEntry } from "./diaglog";
+import { countRecovery, countSnapshotBytes } from "./recovery-reasons";
 
 // === Slice 3: part.append suffix streaming client opt-in ====================
 //
@@ -351,6 +352,9 @@ function checkSesOrdinalGap(ordinal: number, kind: string): void {
   const gap = ordinal - expected;
   // Ordinal gap = DIRECTLY actionable real loss. No covering check.
   const sid = sesId;
+  // Slice 1 (webperf): count the forced fresh-snapshot resync by stable
+  // reason code (window.__vhSyncDiag).
+  countRecovery("seq-gap");
   captureDiagEntry({
     kind: "stall",
     ts: Date.now(),
@@ -404,6 +408,10 @@ export function getSesCursor(): number {
 
 export function closeSessionStream() {
   clearTimeout(sesRetry);
+  // A full close supersedes any visibility suspension (Slice 2): the next
+  // openSessionStream starts a fresh connection with no resume cursor, and
+  // resumeSessionStreamForVisibility must not reopen over it.
+  sesSuspended = false;
   // Invalidate any in-flight listeners from the outgoing connection: bump the
   // generation so a stale callback (e.g. a late frame already queued before
   // close() propagated) can't refresh sessionLastSeen or mutate the store.
@@ -577,7 +585,20 @@ export function openSessionStream(id: string, force = false) {
   // the no-project state and a stray selection cleared before a project lands.
   if (!id || !projectDir()) return;
   sesId = id;
-  const open = () => {
+  openSessionES(id);
+}
+
+// === open() extraction (Slice 2 webperf — visibility lifecycle) ==============
+// openSessionES — the actual Stream-2 EventSource construction, extracted
+// VERBATIM from openSessionStream's former nested `const open = () => {...}`
+// closure so the visibility-resume path (resumeSessionStreamForVisibility)
+// can re-open THROUGH it directly — exactly like the native CLOSED-retry path
+// (ses.onerror → setTimeout(open, …)) — WITHOUT going through
+// openSessionStream's closeSessionStream() call, which resets sesCursor=0 and
+// would force a cursorless full re-snapshot on every pane reveal. The retry
+// seam (open directly, cursor preserved) is the load-bearing property; `id`
+// became a parameter (the closure's only non-module capture).
+function openSessionES(id: string): void {
     if (sesId !== id) return;
     // Bump the connection generation so listeners captured by any prior open()
     // of THIS selection (a retry) or a superseded selection are ignored. The
@@ -641,6 +662,10 @@ export function openSessionStream(id: string, force = false) {
       // the clock or the store.
       if (gen !== sesGen) return;
       markSessionSeen();
+      // Slice 1 (webperf): cumulative snapshot bytes received (Stream 2) —
+      // the idle-churn cost signal. SSE data length ≈ wire bytes (exact for
+      // the gzip64/base64 payloads that dominate).
+      countSnapshotBytes("session", ((e as MessageEvent).data ?? "").length);
       // O3: parse compound SSE id — globalSeq for sesCursor resume, ordinal for
       // gap detection. Using max guards against any out-of-order delivery.
       const { globalSeq: seq, ordinal } = parseSSEID((e as MessageEvent).lastEventId);
@@ -808,12 +833,80 @@ export function openSessionStream(id: string, force = false) {
         // (f54ffff4) is preserved — backoff gates the REOPEN cadence, not the
         // cursor logic.
         clearTimeout(sesRetry);
-        sesRetry = window.setTimeout(open, sesBackoff);
+        sesRetry = window.setTimeout(() => openSessionES(id), sesBackoff);
         sesBackoff = Math.min(sesBackoff * 2, 15_000);
       }
     };
-  };
-  open();
+}
+
+
+// === Slice 2 (webperf build1): visibility suspend/resume =====================
+//
+// A pane hidden by the HOST (docked tab / inactive workspace — CSS visibility
+// on a cross-origin iframe, so document.visibilityState stays "visible") must
+// not keep an idle Stream-2 burning the tunnel: the content-stale watchdog
+// reconnects it every ~130s and each force resets sesCursor → a cursorless
+// full snapshot. suspendSessionStreamForVisibility tears the EventSource down
+// WITHOUT the cursor reset (the one behavioral difference from
+// closeSessionStream), so the reveal replays missed ring deltas instead of
+// re-shipping the transcript.
+//
+// Why forced paths can't defeat the suspension while hidden: every force
+// caller (seq-gap / offset-mismatch / tail-incomplete / busy-reconcile /
+// watchdog) is EVENT-driven or user-driven, and a suspended pane receives no
+// stream events (its ES is closed) and no user input (it is hidden). The
+// watchdog/maybeReconnect/resyncTree entries are separately pane-gated in
+// ./health. The resume path itself bypasses the openSessionStream guard by
+// construction (it calls openSessionES directly, like the native retry).
+let sesSuspended = false;
+
+export function suspendSessionStreamForVisibility(): void {
+  if (sesSuspended) return;
+  sesSuspended = true;
+  clearTimeout(sesRetry);
+  // Invalidate in-flight listeners (mirrors closeSessionStream's audit-§3a
+  // ordering: sesGen++ BEFORE es.close()).
+  sesGen++;
+  ses?.close();
+  ses = null;
+  // PRESERVE sesId + sesCursor: the reveal reopens through openSessionES (the
+  // retry seam), so cursorParam > 0 → the server takes the ring-replay branch.
+  // (closeSessionStream would reset sesCursor=0 here — that is exactly the
+  // fresh-snapshot churn this slice removes.)
+  // Liveness clocks: left to age. The watchdog is pane-gated while hidden, and
+  // openSessionES re-seeds both clocks at construction on reveal
+  // (markSessionSeen), so no stale classification can act on them.
+  // The suspended connection's buffered part.append suffixes are dropped (gen
+  // bump would reject them anyway); the replacement replays from cursor.
+  pendingAppends = [];
+  appendFlushScheduled = false;
+  // A reveal starts the CLOSED-reopen backoff fresh (mirrors closeSessionStream).
+  sesBackoff = 1500;
+}
+
+export function resumeSessionStreamForVisibility(): void {
+  if (!sesSuspended) return;
+  sesSuspended = false;
+  if (!sesId || !projectDir()) return;
+  // Reopen THROUGH the retry seam (NOT openSessionStream, whose
+  // closeSessionStream() call would reset sesCursor → cursorless full
+  // snapshot). openSessionES preserves the cursor → ring replay. Arms the
+  // existing `refreshing[id]` indicator (cleared on first snapshot) — the
+  // UI-honesty invariant: a resumed pane never shows stale data as fresh
+  // without the per-session refresh dot until the first event reconciles.
+  openSessionES(sesId);
+}
+
+// getResumableSesId — the session id a visibility REVEAL should (re)open, or
+// null when the reveal must NOT resume Stream-2: null when nothing is
+// resumable (never opened / closed), and the empty-string sentinel "" never
+// applies (sesId is "" exactly when nothing is open). Consumed by the sync.ts
+// facade's reveal reconciliation (review a-F2/b-F1/c-F2/d-F1: a selection
+// change delivered while the pane was hidden must not leave the reveal
+// streaming the STALE pre-hide session).
+export function getResumableSesId(): string | null {
+  if (!sesSuspended) return null;
+  return sesId || null;
 }
 
 
@@ -1210,6 +1303,9 @@ function flushAppends(): void {
   // Stream2 to repair; a non-selected session re-snapshots on next open.
   for (const sid of mismatchSessions) {
     if (sid === sesId) {
+      // Slice 1 (webperf): count the offset-mismatch cursorless re-snapshot
+      // by stable reason code (window.__vhSyncDiag).
+      countRecovery("offset-mismatch");
       captureDiagEntry({
         kind: "stall",
         ts: Date.now(),

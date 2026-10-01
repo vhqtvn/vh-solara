@@ -1785,6 +1785,20 @@ func logRequests(next http.Handler) http.Handler {
 	})
 }
 
+// streamClassLabel — short human label for the /vh/stream class used by the
+// VH_DEBUG "stream baseline" lines (Slice 1 webperf build1). Mirrors
+// diagnostics.ClassifyStream's int space.
+func streamClassLabel(class int) string {
+	switch class {
+	case diag.StreamClassTree:
+		return "tree"
+	case diag.StreamClassSelected:
+		return "selected"
+	default:
+		return "firehose"
+	}
+}
+
 // statusWriter captures the response status for logging while forwarding
 // http.Flusher so streamed/proxied responses keep flushing.
 type statusWriter struct {
@@ -2704,6 +2718,20 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 		baseline = head
 		sw.RecordReplayPath() // PROBE 3: cursor-replay baseline branch
+		// Slice 1 (webperf build1): VH_DEBUG line distinguishing the cursor-
+		// replay baseline branch from the fresh-snapshot branch so worker logs
+		// alone can count reconnect amplification (journalctl:
+		// path="replay" vs path="fresh"). Mirrors the P1-WEB-038 /vh/snapshot
+		// dur_ms pattern: vhlog.Debug is level-gated by VH_DEBUG, so the
+		// default path pays only the call.
+		if vhlog.Enabled() {
+			vhlog.Debug("stream baseline",
+				"path", "replay",
+				"class", streamClassLabel(streamClass),
+				"cursor", cursor,
+				"replayed", len(events),
+				"head", head)
+		}
 		// Phase 3 Step B (C-F1): tree=2 resume/reconnect must ALSO bootstrap
 		// the full session-detail snapshot and re-seed the tree frontier,
 		// mirroring the fresh-connect path (GAP 3, committed 3903b131). The
@@ -2779,6 +2807,18 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		// session load (the deferred per-session-ring finding).
 		if hasCursor && !replayOK {
 			diag.IncStream2ReplayFallback()
+		}
+		// Slice 1 (webperf build1): the fresh-snapshot twin of the replay
+		// branch's "stream baseline" debug line — counts full-snapshot sends
+		// (including the ring-gap fallback above) vs cursor replays from
+		// worker logs. VH_DEBUG-gated.
+		if vhlog.Enabled() {
+			vhlog.Debug("stream baseline",
+				"path", "fresh",
+				"class", streamClassLabel(streamClass),
+				"had_cursor", hasCursor,
+				"cursor", cursor,
+				"head", head)
 		}
 		// NON-BLOCKING hydration: kick the upstream fetch off in the background
 		// (EnsureMessagesAsync) so the snapshot sends immediately, then forward

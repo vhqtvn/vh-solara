@@ -31,9 +31,21 @@ import {
 import { rootOf } from "./sync/selectors";
 import { currentUrlSession, syncUrl, setApplyingUrl } from "./sync/url";
 import { wasManagedPopState } from "./lib/backStack";
-import { connect } from "./sync/tree-transport";
-import { closeSessionStream, openSessionStream } from "./sync/session-stream";
-import { watchdogTick, maybeReconnect, tickHealth, resyncTree } from "./sync/health";
+import {
+  connect,
+  suspendTreeForVisibility,
+  resumeTreeFromVisibility,
+} from "./sync/tree-transport";
+import {
+  closeSessionStream,
+  openSessionStream,
+  getResumableSesId,
+  suspendSessionStreamForVisibility,
+  resumeSessionStreamForVisibility,
+} from "./sync/session-stream";
+import { isPaneVisible, onPaneVisibilityChange } from "./paneVisibility";
+import { watchdogTick, maybeReconnect, tickHealth, resyncTree, stampTreeResyncBoundary } from "./sync/health";
+import { installSyncDiagGlobal, countRecovery } from "./sync/recovery-reasons";
 import { startPeriodicResync } from "./sync/periodic-resync";
 import { setSelectedId, switchProject, openSession } from "./sync/actions";
 
@@ -52,16 +64,88 @@ bindAlertsContext({
   displayOf: displayName,
 });
 
+// === Slice 2 (webperf build1): pane-visibility sync lifecycle =================
+// A host-hidden pane (docked tab / inactive workspace — the 9-pane idle tab's
+// 8 hidden panes) suspends BOTH SSE streams + all recovery; the reveal
+// reconnects exactly once, resuming from the preserved cursors. The host
+// signal (vh-host-visibility) — NOT document.visibilityState alone, which
+// stays "visible" in a CSS-hidden cross-origin iframe — drives it.
+// Standalone (non-embedded) panes have no host signal (hostVisible always
+// true), so THEIR suspension boundary is document background/foreground: a
+// backgrounded standalone tab now closes its streams instead of letting the
+// browser suspend the sockets while the (doc-gated) watchdog stands down, and
+// foreground resumes from the cursor — a deliberate small behavior change
+// (bounded, once per foreground), not a bug.
+function suspendSyncForVisibility(): void {
+  countRecovery("visibility-pause");
+  suspendTreeForVisibility();
+  suspendSessionStreamForVisibility();
+}
+
+function resumeSyncForVisibility(): void {
+  countRecovery("visibility-resume");
+  resumeTreeFromVisibility();
+  // The reveal resume IS an authoritative recovery (the server's reconnect
+  // block re-seeds the tree projections) — stamp the on-focus resync throttle
+  // so a resyncTree() firing in the same visibilitychange dispatch cannot
+  // immediately supersede it with a redundant connect(true).
+  stampTreeResyncBoundary();
+  // Reveal reconciliation (review a-F2/b-F1/c-F2/d-F1): the selection may
+  // have moved while hidden (host-driven vh-host-select). The suspended
+  // cursor belongs to the PRE-hide session — resume it ONLY when it is still
+  // the current selection; otherwise open the current selection fresh (and
+  // a cleared selection just closes, mirroring openSessionStream("")).
+  const sel = selectedId();
+  const resumable = getResumableSesId();
+  if (!sel) {
+    if (resumable !== null) closeSessionStream();
+  } else if (resumable !== null && resumable === sel) {
+    resumeSessionStreamForVisibility();
+  } else {
+    // Stale suspension (selection moved) OR boot-hidden (nothing ever
+    // opened): open the CURRENT selection through the normal fresh path.
+    openSessionStream(sel);
+    void openSession(sel);
+  }
+}
+
 export function startSync() {
+  // Slice 1 (webperf): install the dev-visible recovery counter surface
+  // (`window.__vhSyncDiag()`) — a plain getter, zero cost until invoked.
+  installSyncDiagGlobal();
+  // Slice 2 (webperf): the pane-visibility lifecycle. onPaneVisibilityChange
+  // fires only on TRANSITIONS (paneVisibility.notify's last-value guard), so
+  // the host's periodic resync messages cannot double-resume.
+  onPaneVisibilityChange((visible) => {
+    if (visible) resumeSyncForVisibility();
+    else suspendSyncForVisibility();
+  });
   // Page load: snapshot to fully reconcile ONLY when a project is already
   // selected (deep link ?dir= or localStorage fallback). With no project the app
   // shows the no-project empty state and does NOT bridge the daemon's cwd;
   // selecting a project later calls connect(true) via switchProject.
-  if (projectDir()) connect(true);
-  else closeSessionStream(); // ensure no stray session stream from a prior tab state
+  // Slice 2: a pane hidden at boot defers ALL streaming to the reveal (the
+  // suspend markers arm the resume path; nothing connects while hidden).
+  if (!isPaneVisible()) {
+    // Hidden at boot: defer ALL streaming to the reveal. Routed through the
+    // same suspendSyncForVisibility as a live hide so the counters stay
+    // symmetric (a boot-hidden pane counts one visibility-pause too).
+    suspendSyncForVisibility();
+  } else if (projectDir()) {
+    connect(true);
+  } else {
+    closeSessionStream(); // ensure no stray session stream from a prior tab state
+  }
   // The active-session message stream follows the selection.
+  // Slice 2: gated on pane visibility — a hidden pane (incl. hidden-at-boot,
+  // where this effect fires for the restored selection) must not open a
+  // Stream-2; the reveal path (resumeSyncForVisibility) owns the (re)open.
   createRoot(() =>
-    createEffect(on(selectedId, (id) => openSessionStream(id ?? ""), { defer: true })),
+    createEffect(
+      on(selectedId, (id) => {
+        if (isPaneVisible()) openSessionStream(id ?? "");
+      }, { defer: true }),
+    ),
   );
   // Periodic health check: reconnects a closed/stale stream without a reload.
   window.setInterval(watchdogTick, 10_000);
@@ -115,8 +199,13 @@ export function startSync() {
   const initial = currentUrlSession() ?? loadSelected(projectDir());
   if (initial) {
     setSelectedIdRaw(initial);
-    openSessionStream(initial);
-    void openSession(initial);
+    // Slice 2: a hidden-at-boot pane defers the initial session open to the
+    // reveal (resumeSyncForVisibility's fallback opens it fresh). Selection +
+    // LS bookkeeping still run — only the streaming/network opens wait.
+    if (isPaneVisible()) {
+      openSessionStream(initial);
+      void openSession(initial);
+    }
     persistSelection(projectDir(), initial);
   }
   // Legacy session/project entries only. Modern selection never pushes history

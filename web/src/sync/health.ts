@@ -42,6 +42,8 @@ import {
   getSessionContentSeen,
 } from "./session-stream";
 import { captureDiagEntry } from "./diaglog";
+import { classifyStall, countRecovery } from "./recovery-reasons";
+import { isPaneVisible } from "../paneVisibility";
 
 // Content-stall threshold (product policy). Transport staleness (STALE_MS)
 // catches a stream whose pings STOP. CONTENT_STALE_MS catches a stream whose
@@ -91,6 +93,14 @@ export function isStale(): boolean {
 // Runs while the tab is visible.
 export function watchdogTick() {
   if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+  // Slice 2 (webperf): a pane hidden by the HOST (CSS visibility on a
+  // cross-origin iframe — document.visibilityState stays "visible") must not
+  // run watchdog recovery: its streams are deliberately suspended, and
+  // reconnecting them would re-create the idle churn (~130s force → cursorless
+  // full snapshot) this slice removes. paneVisible() folds in BOTH signals
+  // (document + host); the doc check above is retained as the cheap
+  // original-path early-out.
+  if (!isPaneVisible()) return;
   // No project selected: never (re)connect the cwd bridge. The watchdog just
   // advances the stale-health tick (cheap, harmless) and stands down otherwise.
   if (!projectDir()) {
@@ -131,6 +141,11 @@ export function watchdogTick() {
     const transportStale = !!(getTreeLastSeen() && Date.now() - getTreeLastSeen() > STALE_MS);
     const contentStale = !!(getTreeContentSeen() && Date.now() - getTreeContentSeen() > CONTENT_STALE_MS);
     if (transportStale || contentStale) {
+      // Slice 1 (webperf): count the forced reconnect by stable reason code
+      // (tree-idle-stale vs tree-transport-stale) so idle churn is measurable
+      // via window.__vhSyncDiag. classifyStall mirrors the log reason below.
+      const reason = classifyStall("tree", contentStale, transportStale);
+      if (reason) countRecovery(reason);
       log.warn("sync", "tree stream stale → forcing reconnect", {
         silentMs: getTreeLastSeen() ? Date.now() - getTreeLastSeen() : 0,
         contentSilentMs: getTreeContentSeen() ? Date.now() - getTreeContentSeen() : 0,
@@ -187,6 +202,10 @@ export function watchdogTick() {
       const transportStale = !!(getSessionLastSeen() && Date.now() - getSessionLastSeen() > STALE_MS);
       const contentStale = !!(getSessionContentSeen() && Date.now() - getSessionContentSeen() > CONTENT_STALE_MS);
       if (transportStale || contentStale) {
+        // Slice 1 (webperf): count by stable reason (idle-content-stale vs
+        // session-transport-stale) — the idle-pane churn driver.
+        const reason = classifyStall("session", contentStale, transportStale);
+        if (reason) countRecovery(reason);
         log.warn("sync", "session stream stale → forcing reconnect", {
           id: sesId,
           silentMs: getSessionLastSeen() ? Date.now() - getSessionLastSeen() : 0,
@@ -213,6 +232,9 @@ export function maybeReconnect() {
   // No project selected: no stream to reconnect (and connect() would no-op
   // anyway, but avoid even the readyState read / status churn).
   if (!projectDir()) return;
+  // Slice 2 (webperf): online/visibility recovery must not reopen a hidden
+  // pane's suspended streams (same gate as the watchdog).
+  if (!isPaneVisible()) return;
   if (isTreeClosed()) connect();
   else watchdogTick();
 }
@@ -256,6 +278,10 @@ let lastTreeResync = 0;
 export function resyncTree() {
   // No project selected → nothing to resync (connect(true) would no-op anyway).
   if (!projectDir()) return;
+  // Slice 2 (webperf): no drift self-heal for a host-hidden pane — the on-focus
+  // and periodic triggers both funnel through here, and a hidden pane's tree is
+  // suspended (a resync would reopen it cursorless).
+  if (!isPaneVisible()) return;
   // Let the watchdog own recovery of a closed/stale stream; a resync here would
   // only race it (maybeReconnect already reconnects a CLOSED tree). The value
   // of a resync is healing a HEALTHY-but-drifted tree, which is exactly the
@@ -277,4 +303,14 @@ export function resyncTree() {
 // ForTest so a grep keeps it visually distinct from runtime API.
 export function _resetResyncGateForTest(): void {
   lastTreeResync = 0;
+}
+
+// stampTreeResyncBoundary — mark "a recovery boundary just happened" in the
+// on-focus/periodic resync throttle (Slice 2 webperf). Called by the sync.ts
+// facade after a visibility-reveal resume: the resume itself reconciles (the
+// server's reconnect block re-seeds the tree=2 projections), so the on-focus
+// resyncTree listener firing in the SAME visibilitychange dispatch must not
+// immediately supersede it with a redundant connect(true).
+export function stampTreeResyncBoundary(): void {
+  lastTreeResync = Date.now();
 }
