@@ -216,12 +216,22 @@
 .status-mark.syncing .brand-mark path:nth-child(3), .status-mark.syncing .brand-mark path:nth-child(6) { animation: sync-flash 1s ease-in-out infinite; }
 .status-mark.syncing .status-core::before, .status-mark.syncing .status-core::after { width:3px; height:3px; border:.75px solid var(--bg); border-left-color:transparent; border-bottom-color:transparent; transform: rotate(45deg); left:.55px; top:.55px; border-radius:50%; }
 .status-mark.syncing .status-core::after { transform: rotate(225deg); }
-.status-mark.reconnecting svg { animation: reconnect-jolt 1s steps(2, end) infinite; }
-.status-mark.reconnecting .brand-mark path:nth-child(1), .status-mark.reconnecting .brand-mark path:nth-child(2) { animation: reconnect-split 1s ease-in-out infinite; }
-.status-mark.reconnecting .halo { animation: reconnect-ring .72s ease-in-out infinite; }
-.status-mark.reconnecting .orbital { opacity: .8; animation: reconnect-orbit .72s ease-in-out infinite; }
-.status-mark.reconnecting .spark { opacity: 0; animation: spark-burst .72s ease-out infinite; }
-.status-mark.reconnecting .status-core { animation: core-alert .72s ease-in-out infinite; }
+/* SLICE 6 (webperf build1): reconnecting is STATIC + bounded one-shot ENTRY
+   cues only. The former treatment ran SIX concurrent INFINITE animations
+   (reconnect-jolt/split/ring/orbit, spark-burst, core-alert) on an
+   always-present surface — in the idle 9-pane tab every pane's mark cycled
+   "reconnecting" on each watchdog force, keeping all nine animating
+   forever. Now the state carries STATIC color/border (the --status tokens
+   above + a dashed halo) and at most three ≤600ms one-shot settle cues fire
+   on state ENTRY (class application), run once, then unapply — the end
+   keyframes equal the un-animated base, so there is no visual pop and no
+   retained fill. .orbital and .spark simply rest at their base opacity:0
+   (no rule needed). Hidden panes additionally stop cycling at the source
+   (slice 2 pauses the streams that flipped this state). */
+.status-mark.reconnecting svg { animation: reconnect-jolt .6s ease-out 1; }
+.status-mark.reconnecting .brand-mark path:nth-child(1), .status-mark.reconnecting .brand-mark path:nth-child(2) { animation: reconnect-split .6s ease-in-out 1; }
+.status-mark.reconnecting .halo { border-style: dashed; opacity: .8; }
+.status-mark.reconnecting .status-core { animation: core-alert .6s ease-in-out 1; }
 .status-mark.reconnecting .status-core::before { width:.75px; height:2.8px; left:1.75px; top:.55px; background:var(--bg); }
 .status-mark.reconnecting .status-core::after { width:.75px; height:.75px; left:1.75px; bottom:.55px; background:var(--bg); }
 
@@ -231,7 +241,11 @@
    inside the glyph edge. All keyframes are opacity/transform/filter-only →
    compositor-friendly. Reduced motion is handled globally by the repo's
    prefers-reduced-motion * override (~3774); the e-ink animation:none kill
-   switch (~284) is documented in the block header above. */
+   switch (~284) is documented in the block header above.
+   SLICE 6 (webperf build1): the reconnect-* keyframes are ONE-SHOT entry cues
+   (iteration 1, no fill) whose 100% frame equals the element's un-animated
+   base — they settle, not loop. reconnect-ring / reconnect-orbit / spark-burst
+   were deleted with their (formerly infinite) reconnecting-state rules. */
 @keyframes spin-rev { to { transform: rotate(-360deg); } }
 @keyframes mark-breathe { 0%,100%{transform:scale(.98);opacity:.78;} 50%{transform:scale(1.025);opacity:1;} }
 @keyframes live-settle { 0%,100%{transform:scale(1);filter:drop-shadow(0 0 4px var(--status-soft)) drop-shadow(0 2px 5px rgba(0,0,0,.32));} 50%{transform:scale(1.018);filter:drop-shadow(0 0 7px var(--status-soft)) drop-shadow(0 2px 5px rgba(0,0,0,.32));} }
@@ -242,10 +256,7 @@
 @keyframes loading-dot-orbit { 0%{transform:rotate(0deg) translateX(8px) rotate(0deg) scale(.78);opacity:.18;} 18%{opacity:.9;} 62%{opacity:.9;} 100%{transform:rotate(360deg) translateX(8px) rotate(-360deg) scale(.78);opacity:.18;} }
 @keyframes packet-orbit { 0%{transform:rotate(0deg) translateX(9px) rotate(0deg) scale(.72);opacity:0;} 18%{opacity:.9;} 70%{opacity:.9;} 100%{transform:rotate(360deg) translateX(9px) rotate(-360deg) scale(.72);opacity:0;} }
 @keyframes core-search { 0%,100%{transform:scale(.78);opacity:.72;} 50%{transform:scale(1.12);opacity:1;} }
-@keyframes reconnect-jolt { 0%,100%{transform:translate(0,0) scale(1);} 25%{transform:translate(.45px,-.45px) scale(1.01);} 55%{transform:translate(-.45px,.45px) scale(.99);} }
-@keyframes reconnect-split { 0%,100%{transform:translateX(0);} 32%{transform:translateX(-.9px);} 64%{transform:translateX(.9px);} }
-@keyframes reconnect-ring { 0%{transform:rotate(0deg) scale(.92);opacity:.2;} 42%{transform:rotate(180deg) scale(1.12);opacity:.82;} 100%{transform:rotate(360deg) scale(.92);opacity:.2;} }
-@keyframes reconnect-orbit { 0%,100%{transform:rotate(20deg) scale(.88);opacity:.15;} 50%{transform:rotate(220deg) scale(1.05);opacity:.85;} }
-@keyframes spark-burst { 0%{transform:scale(.4);opacity:0;} 28%{opacity:1;} 100%{transform:translate(4px,-2px) scale(1);opacity:0;} }
-@keyframes core-alert { 0%,100%{transform:scale(.92);} 50%{transform:scale(1.16);} }
+@keyframes reconnect-jolt { 0%{transform:translate(.45px,-.45px) scale(1.01);} 55%{transform:translate(-.45px,.45px) scale(.99);} 100%{transform:translate(0,0) scale(1);} }
+@keyframes reconnect-split { 0%{transform:translateX(-.9px);} 55%{transform:translateX(.9px);} 100%{transform:translateX(0);} }
+@keyframes core-alert { 0%{transform:scale(1.16);} 100%{transform:scale(1);} }
 
