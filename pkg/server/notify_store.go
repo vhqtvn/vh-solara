@@ -446,6 +446,21 @@ type notifyStoreHolder struct {
 	// other forever-goroutines either (daemon.go Start).
 	results    chan notifySendOutcome
 	recordOnce sync.Once
+
+	// flushMu/enqueued/processed/flushProgress carry the deterministic
+	// join bookkeeping for the async drain (see flushSendResults):
+	// enqueued counts outcomes handed to the drain goroutine, processed
+	// counts outcomes whose recordSendResult — including the best-effort
+	// persist — has COMPLETED. flushMu is deliberately NOT h.mu: the
+	// drain takes it only for nanosecond counter updates, never across
+	// the (slow, potentially wedged) persist, so the off-critical-path
+	// contract of recordSendResultAsync is unaffected. flushProgress is
+	// a close-broadcast wakeup channel, lazily (re)created under flushMu
+	// so the holder's zero value stays valid.
+	flushMu       sync.Mutex
+	flushProgress chan struct{}
+	enqueued      int
+	processed     int
 }
 
 // notifySendOutcome is one queued recordSendResult job.
@@ -682,17 +697,29 @@ func (h *notifyStoreHolder) recordSendResult(id string, sendErr error) {
 // full the outcome is DROPPED with a log line (see
 // notifyResultQueueDepth) — telemetry, not delivery, is the sacrificial
 // layer. The zero-time lastNotifiedAt semantics of the watcher are
-// unaffected: this records only registry bookkeeping.
+// unaffected: this records only registry bookkeeping. Every hand-off
+// (and every drop) is reflected in the flush bookkeeping under flushMu
+// so flushSendResults can join the drain deterministically.
 func (h *notifyStoreHolder) recordSendResultAsync(id string, err error) {
 	h.recordOnce.Do(func() {
 		h.results = make(chan notifySendOutcome, notifyResultQueueDepth)
 		go h.drainSendResults()
 	})
+	// The reservation (enqueued++) shares ONE flushMu critical section
+	// with the send and its rollback, so a concurrent flushSendResults
+	// never observes a half-reserved count: every outcome counted as
+	// enqueued is already in the channel and owed a drain wakeup.
+	// Holding flushMu across the buffered send is safe — flushMu is
+	// never held across a persist.
+	h.flushMu.Lock()
+	h.enqueued++
 	select {
 	case h.results <- notifySendOutcome{id: id, err: err}:
 	default:
+		h.enqueued-- // dropped: the drain will never see this outcome
 		log.Printf("notify: send-result queue full (depth %d) — dropping telemetry for token %s", notifyResultQueueDepth, id)
 	}
+	h.flushMu.Unlock()
 }
 
 // drainSendResults is the single background consumer of the async
@@ -700,7 +727,48 @@ func (h *notifyStoreHolder) recordSendResultAsync(id string, err error) {
 func (h *notifyStoreHolder) drainSendResults() {
 	for out := range h.results {
 		h.recordSendResult(out.id, out.err)
+		h.drainProgress()
 	}
+}
+
+// drainProgress marks one queued outcome as fully recorded (recordSendResult
+// has returned — the best-effort persist attempt is over) and wakes any
+// flushSendResults waiter.
+func (h *notifyStoreHolder) drainProgress() {
+	h.flushMu.Lock()
+	h.processed++
+	if h.flushProgress != nil {
+		close(h.flushProgress)
+		h.flushProgress = nil
+	}
+	h.flushMu.Unlock()
+}
+
+// flushSendResults deterministically joins the async send-result drain:
+// it blocks until every outcome handed to recordSendResultAsync so far
+// has been fully recorded — recordSendResult returned and its best-effort
+// persist with it. Tests wire it via t.Cleanup registered AFTER the
+// t.TempDir call that owns the persistence path (cleanups run LIFO, so
+// the join executes BEFORE the TempDir RemoveAll): without the join, the
+// drain goroutine's persist can race the test temp dir's removal
+// ("unlinkat ...: directory not empty"). Purely a join — it does NOT
+// stop the drain (the daemon has no shutdown path), it preserves the
+// drop-on-full policy, and it returns immediately on a holder whose
+// drain never started or has nothing pending.
+func (h *notifyStoreHolder) flushSendResults() {
+	h.flushMu.Lock()
+	for h.processed < h.enqueued {
+		if h.flushProgress == nil {
+			h.flushProgress = make(chan struct{})
+		}
+		wakeup := h.flushProgress
+		// Release flushMu while waiting: publishers (senders, the drain's
+		// progress updates) need it to signal completion.
+		h.flushMu.Unlock()
+		<-wakeup
+		h.flushMu.Lock()
+	}
+	h.flushMu.Unlock()
 }
 
 // truncateRunes cuts s to at most max BYTES on a rune boundary.

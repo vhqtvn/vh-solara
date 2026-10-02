@@ -23,12 +23,15 @@ import (
 )
 
 // newStoreHolder builds a holder whose persistence path points inside a
-// temp dir (file need not exist yet — first persist creates it).
+// temp dir (file need not exist yet — first persist creates it). Installs
+// the async-drain join so no drain persist outlives the temp dir (see
+// loadNotifyStore for the LIFO argument).
 func newStoreHolder(t *testing.T) (*notifyStoreHolder, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "notify-tokens.json")
 	var h notifyStoreHolder
 	h.setLoaded(path, &notifyStoreFile{Schema: notifyStoreSchema, Tokens: []notifyStoreEntry{}})
+	t.Cleanup(h.flushSendResults)
 	return &h, path
 }
 
@@ -721,5 +724,81 @@ func TestNotifyStore_RetireIsDelete(t *testing.T) {
 	// Double retire (already deleted mid-send): no-op, no error.
 	if ok, err := h.delete(e.ID); ok || err != nil {
 		t.Errorf("retire of unknown id: want ok=false nil, got %v %v", ok, err)
+	}
+}
+
+// TestNotifyStore_FlushSendResultsJoinsDrain pins the deterministic join
+// the test teardowns (loadNotifyStore / newStoreHolder) rely on: once
+// recordSendResultAsync has returned and flushSendResults has returned,
+// the outcome is ALREADY on disk — no polling, no sleeps. Also pins the
+// immediate-return posture (never-started drain) and the two hard cases:
+// concurrent flushers must all terminate, and a queue overflow (dropped
+// outcomes whose reservations were rolled back) must not hang the join.
+func TestNotifyStore_FlushSendResultsJoinsDrain(t *testing.T) {
+	// Never-started drain / nothing pending: must return immediately
+	// (a hang here times the test out — that IS the failure signal).
+	var idle notifyStoreHolder
+	idle.flushSendResults()
+
+	h, path := newStoreHolder(t)
+	e, _, err := h.submit("fcm-token-async-flush-aa", "lbl")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A burst mixing known/unknown ids and error/nil outcomes, joined by
+	// concurrent flushers.
+	for i := 0; i < 8; i++ {
+		h.recordSendResultAsync(e.ID, errErrForTest())
+		h.recordSendResultAsync("ffffffffffffffff", nil) // unknown id: recorded as a no-op
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h.flushSendResults()
+		}()
+	}
+	wg.Wait()
+
+	// Deterministic (no waitForNotify): the persist has COMPLETED for
+	// every non-dropped outcome — the file already carries the telemetry.
+	f, err := loadNotifyStoreFile(path)
+	if err != nil {
+		t.Fatalf("reload after flush: %v", err)
+	}
+	if len(f.Tokens) != 1 || f.Tokens[0].LastUsedAt == nil || !strings.Contains(f.Tokens[0].LastError, "boom") {
+		t.Fatalf("flush returned before the outcome persisted: %+v", f.Tokens)
+	}
+
+	// Overflow path: park the persist seam so the drain wedges mid-write,
+	// overflow the queue (the excess outcomes MUST drop — their
+	// reservations roll back), then unblock and join. Broken rollback
+	// accounting would hang flush forever (test timeout = red signal).
+	blocked := make(chan struct{})
+	orig := notifyCreateExcl
+	notifyCreateExcl = func(name string) (*os.File, error) {
+		<-blocked
+		return orig(name)
+	}
+	var unblockOnce sync.Once
+	unblock := func() { unblockOnce.Do(func() { close(blocked) }) }
+	t.Cleanup(func() { notifyCreateExcl = orig; unblock() })
+
+	for i := 0; i < notifyResultQueueDepth+4; i++ {
+		h.recordSendResultAsync(e.ID, nil)
+	}
+	unblock()
+	h.flushSendResults()
+
+	// The surviving outcomes are persisted too (nil error clears
+	// last_error; last_used_at must be set).
+	f, err = loadNotifyStoreFile(path)
+	if err != nil {
+		t.Fatalf("reload after overflow flush: %v", err)
+	}
+	if len(f.Tokens) != 1 || f.Tokens[0].LastUsedAt == nil || f.Tokens[0].LastError != "" {
+		t.Fatalf("overflow flush left the file inconsistent: %+v", f.Tokens)
 	}
 }

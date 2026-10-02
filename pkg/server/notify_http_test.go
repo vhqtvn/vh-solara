@@ -48,7 +48,13 @@ func newNotifyAuthDaemon(t *testing.T) (*Daemon, http.Handler, *http.Cookie) {
 	return d, h, loginPassphrase(t, h, "secret")
 }
 
-// loadNotifyStore seeds a registry file + holder on the daemon.
+// loadNotifyStore seeds a registry file + holder on the daemon. It also
+// installs the drain JOIN: the async send-result drain persists into
+// this temp dir from a background goroutine that outlives the test body,
+// so the test must not end (t.TempDir's RemoveAll) while a persist may
+// still be in flight — "unlinkat ...: directory not empty". The cleanup
+// below runs BEFORE that RemoveAll (cleanups are LIFO, and TempDir's was
+// registered by the t.TempDir call above).
 func loadNotifyStore(t *testing.T, d *Daemon) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "notify-tokens.json")
@@ -62,6 +68,7 @@ func loadNotifyStore(t *testing.T, d *Daemon) string {
 			t.Fatalf("LoadNotifyStore: %v", err)
 		}
 	}
+	t.Cleanup(d.notifyStore.flushSendResults)
 	return path
 }
 
