@@ -364,3 +364,19 @@
   transition: none !important;
   scroll-behavior: auto !important;
 }
+/* (webperf paint slice 3) Host-hidden pane animation pause. The host shell
+ * hides inactive workspaces' iframes with visibility:hidden — the iframe's
+ * document stays "visible" (the cross-origin blindness paneVisibility.ts works
+ * around), so its CSS animations would keep running unobserved, and every
+ * running animation keeps the refresh driver ticking and restyles on every
+ * tick. paneVisibility.ts toggles .pane-hidden on <html> from the host's
+ * vh-host-visibility signal (and the tab's own visibilitychange); pausing —
+ * not removing — keeps animation state intact, resumes mid-flight on reveal,
+ * and like the e-ink switch above, !important also overrides inline styles.
+ * Paused animations are not running, so they stop requesting frames.
+ * Transitions are deliberately NOT paused (unlike the e-ink switch): they are
+ * event-driven and bounded (≤~0.25s), so they cannot keep the driver ticking;
+ * pausing them would freeze mid-flight state changes across a hide/reveal. */
+:root.pane-hidden, :root.pane-hidden *, :root.pane-hidden *::before, :root.pane-hidden *::after {
+  animation-play-state: paused !important;
+}

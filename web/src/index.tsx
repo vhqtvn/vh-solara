@@ -20,7 +20,7 @@ import { startHeartbeat } from "./heartbeat";
 import { startStatusEmitter } from "./statusEmitter";
 import { startSelectListener } from "./selectListener";
 import { startTailListener } from "./tailListener";
-import { startPaneVisibility } from "./paneVisibility";
+import { startPaneVisibility, installPaneAnimationGate } from "./paneVisibility";
 import { startHostGesture } from "./hostGesture";
 import { refreshProjectSettings } from "./projectSettings";
 import "./styles/main.css";
@@ -114,6 +114,11 @@ if (standalone === "code") {
   // host posts {type:"vh-host-visibility",visible}; standalone it tracks only
   // document.visibilityState. See web/src/paneVisibility.ts.
   startPaneVisibility();
+  // Animation gate driven by the same signal: toggles .pane-hidden on <html>
+  // so ALL CSS animations pause while the operator can't see this pane (a
+  // hidden iframe's animations otherwise keep the refresh driver ticking).
+  // See paneVisibility.ts → installPaneAnimationGate + tokens.css.
+  installPaneAnimationGate();
   // Host gesture recognizer (no-op when standalone). Same embed gate +
   // captured-origin security pattern as the heartbeat/status/select bridges.
   // When embedded, recognizes a triple completed bare-Ctrl (desktop) / 3-finger-tap (mobile)

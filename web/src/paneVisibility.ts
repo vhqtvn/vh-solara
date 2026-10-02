@@ -89,6 +89,7 @@ export function __resetPaneVisibilityForTest(host = true, doc = true): void {
   setDocVisible(doc);
   last = host && doc;
   listeners.clear();
+  gateInstalled = false; // test hygiene: a fresh module is "not installed" again
 }
 
 /** Test-only: drive the host signal without a MessageEvent. */
@@ -96,3 +97,39 @@ export function __setHostVisibleForTest(v: boolean): void {
   setHostVisible(v);
   notify();
 }
+
+/**
+ * Class toggled on <html> while the pane is not visible (host-hidden workspace
+ * or the tab itself hidden). foundation/tokens.css pauses ALL CSS animations
+ * under it (same !important discipline as the e-ink kill-switch).
+ *
+ * Why: the host hides inactive workspaces' iframes with `visibility:hidden`,
+ * which the iframe CANNOT observe — its document stays "visible" — so without
+ * this gate a hidden pane's indicator animations keep running unobserved, and
+ * any running animation (even a compositor-only one) keeps the refresh driver
+ * ticking and restyles the pane on every frame (profile-measured 2026-10-03:
+ * idle hidden panes styled their animated elements on all 281 ticks of a
+ * 4.8s capture). Paused animations are NOT running animations: they stop
+ * requesting refresh-driver frames, and they resume mid-flight when the pane
+ * becomes visible again (no state reset, no re-fire of one-shot cues).
+ */
+export const PANE_HIDDEN_CLASS = "pane-hidden";
+
+/**
+ * Install the <html> class gate. Idempotent. Wire once in index.tsx after
+ * startPaneVisibility(); it reads paneVisible() initially and on every
+ * visibility transition thereafter.
+ */
+export function installPaneAnimationGate(): void {
+  if (typeof document === "undefined") return;
+  const apply = (): void => {
+    document.documentElement.classList.toggle(PANE_HIDDEN_CLASS, !isPaneVisible());
+  };
+  // Always re-sync the class on install (idempotent, self-healing after a
+  // module reset); subscribe only once.
+  apply();
+  if (gateInstalled) return;
+  gateInstalled = true;
+  onPaneVisibilityChange(apply);
+}
+let gateInstalled = false;
