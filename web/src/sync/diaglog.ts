@@ -72,13 +72,19 @@ export interface ColdOpenEntry {
   *                             closures; the probe itself is counted in
   *                             recovery-reasons.ts sentinel-* codes).
   *  - `reconnect`            — any other forced reconnect (visibility/online).
+  *  - `resume-silent-fallback` — slice 5b fix: a cursor-preserving recovery
+  *                             reopen delivered nothing for
+  *                             SES_RESUME_SILENT_FALLBACK_MS (ring replay
+  *                             provably continuous but interest-filtered to
+  *                             zero frames); ONE cursorless snapshot
+  *                             confirmation follows.
   */
 export interface StallEntry {
   kind: "stall";
   /** Wall-clock capture time (ms epoch). */
   ts: number;
   /** What triggered the stall detection + self-heal. */
-  trigger: "seq-gap" | "tail-incomplete-on-idle" | "content-stale-watchdog" | "sentinel-timeout" | "reconnect" | "part-append-offset-mismatch";
+  trigger: "seq-gap" | "tail-incomplete-on-idle" | "content-stale-watchdog" | "sentinel-timeout" | "reconnect" | "part-append-offset-mismatch" | "resume-silent-fallback";
   /** Which stream(s) the detection + recovery targets. */
   stream: "tree" | "session" | "both";
   /** The session the stall concerns (for session-scoped triggers). */

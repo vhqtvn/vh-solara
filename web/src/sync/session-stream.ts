@@ -418,6 +418,10 @@ export function getSesCursor(): number {
 
 export function closeSessionStream() {
   clearTimeout(sesRetry);
+  // Slice 5b fix: a full close supersedes any armed silence-fallback timer
+  // (the fire-side gen guard already stands down, but don't leave a stray
+  // wake scheduled against the next connection).
+  clearResumeSilenceFallback();
   // A full close supersedes any visibility suspension (Slice 2): the next
   // openSessionStream starts a fresh connection with no resume cursor, and
   // resumeSessionStreamForVisibility must not reopen over it.
@@ -886,6 +890,10 @@ export function suspendSessionStreamForVisibility(): void {
   if (sesSuspended) return;
   sesSuspended = true;
   clearTimeout(sesRetry);
+  // Slice 5b fix: a suspended pane's resume must not inherit an armed
+  // silence-fallback timer from a pre-hide recovery — the reveal path owns
+  // reopening (the gen guard would stand the fire down anyway).
+  clearResumeSilenceFallback();
   // Invalidate in-flight listeners (mirrors closeSessionStream's audit-§3a
   // ordering: sesGen++ BEFORE es.close()).
   sesGen++;
@@ -951,6 +959,80 @@ export function markSessionLivenessProof(): void {
 //     openSessionStream(sesId) call routed through closeSessionStream, which
 //     RESETS sesCursor=0 — the last cursorless full-snapshot path on the
 //     watchdog. Same seam, same argument.
+//
+// SLICE 5b FIX (stale-ring repair, multiproject-latency A2/S5): the server's
+// ring-gap fallback only fires when the cursor is ALREADY evicted at REQUEST
+// time. When this reopen races the eviction (the stream closed, the ring then
+// rotates past the frozen cursor via interest-filtered events from OTHER
+// sessions), the replay is provably continuous → ZERO frames are written
+// (everything in the range is filtered) → the connection live-tails silently
+// and NO snapshot ever lands: refreshing[id] stays armed (only a snapshot
+// clears it) and the repair is indistinguishable from a dead stream until the
+// next content event. The silence fallback below closes that window: if the
+// resumed connection delivers NOTHING (no snapshot → sesSnapDone stays false;
+// no message events → sesCursor frozen) within SES_RESUME_SILENT_FALLBACK_MS,
+// reopen CURSORLESS (sesCursor=0 → the server's fresh-snapshot branch) so the
+// repair is confirmed by an authoritative snapshot (clears refreshing, MERGE
+// re-seeds state; no missed/dup/reorder — prependMessagesIfAbsent). Any
+// delivered content cancels the fallback, so a resume the ring CAN serve
+// keeps the cheap replay path (fence: continuity-provable resumes unchanged).
+// Scoped to THIS seam only: visibility reveals and busy-edge re-arms keep
+// pure cursor-preserving behavior. Worst case equals the pre-5b cost of this
+// one path (which always cursorless-snapshotted), and it is one-shot — the
+// fallback's own open does not re-arm, so a silent server cannot loop it.
+export const SES_RESUME_SILENT_FALLBACK_MS = 8_000;
+
+// The armed silence-fallback timer + the connection generation it belongs to.
+// Cleared on close/suspend/replace; the fire-side gen guard makes a stray
+// wake harmless.
+let sesResumeFallback: number | undefined;
+
+function clearResumeSilenceFallback(): void {
+  if (sesResumeFallback !== undefined) {
+    clearTimeout(sesResumeFallback);
+    sesResumeFallback = undefined;
+  }
+}
+
+function armResumeSilenceFallback(): void {
+  clearResumeSilenceFallback();
+  const gen = sesGen; // the connection openSessionES just constructed
+  const cursorAtOpen = sesCursor; // the preserved cursor the resume asked with
+  sesResumeFallback = window.setTimeout(() => {
+    sesResumeFallback = undefined;
+    // Superseded (switch/force/close/suspend/newer reopen) → stand down; the
+    // replacement connection owns its own recovery.
+    if (gen !== sesGen) return;
+    // Content arrived on the resumed connection (a snapshot sets sesSnapDone;
+    // snapshot + message events advance sesCursor — both pre-busy-gate, so a
+    // gated frame still counts as delivered) → continuity confirmed; keep the
+    // cheap cursor connection.
+    if (sesSnapDone || sesCursor !== cursorAtOpen) return;
+    countRecovery("resume-silent-fallback");
+    captureDiagEntry({
+      kind: "stall",
+      ts: Date.now(),
+      trigger: "resume-silent-fallback",
+      stream: "session",
+      sessionId: sesId || undefined,
+      eventSourceState: {
+        tree: 0, // not tracked here; health.ts fills tree state in its own entries
+        session: ses?.readyState ?? -1,
+      },
+    });
+    log.warn("sync", "cursor-preserving resume delivered nothing → cursorless snapshot fallback", {
+      id: sesId,
+      silentMs: SES_RESUME_SILENT_FALLBACK_MS,
+      cursor: cursorAtOpen,
+    });
+    // Cursorless reopen: the server takes the fresh-snapshot branch; the
+    // snapshot confirms the repair. sesCursor=0 makes openSessionES omit the
+    // cursor param (its cursorParam derives from sesCursor).
+    sesCursor = 0;
+    openSessionES(sesId);
+  }, SES_RESUME_SILENT_FALLBACK_MS);
+}
+
 export function reopenSessionStreamPreservingCursor(): void {
   if (!sesId || !projectDir()) return;
   // Cancel any pending CLOSED-retry backoff timer: this reopen supersedes it
@@ -958,6 +1040,9 @@ export function reopenSessionStreamPreservingCursor(): void {
   // connection). Mirrors ensureSessionStreamLiveForActivity.
   clearTimeout(sesRetry);
   openSessionES(sesId);
+  // Slice 5b fix: confirm the resume actually delivered — see the block
+  // comment above.
+  armResumeSilenceFallback();
 }
 
 // === Slice 3 (webperf): busy-edge Stream-2 re-arm ============================

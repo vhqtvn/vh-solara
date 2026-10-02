@@ -73,12 +73,29 @@ import { log } from "../lib/log";
 //  - sentinel-timeout       slice 5: SENTINEL_TIMEOUT elapsed with no frame —
 //                           the worker pipeline is presumed dead; the
 //                           cursor-PRESERVING recovery ran (openSessionES
-//                           seam / tree connect(), never a cursorless force).
+//                           seam / tree connect(), never an IMMEDIATE
+//                           cursorless force). If the resumed Stream2 then
+//                           stays silent past
+//                           SES_RESUME_SILENT_FALLBACK_MS, the slice-5b fix
+//                           follows up with ONE cursorless snapshot
+//                           confirmation (counted separately below).
 //  - sentinel-legacy-fallback slice 5: the probe POST answered 404/405 (old
 //                           worker, no route) — capability memo'd unavailable
 //                           for the session lifetime and the legacy
 //                           heuristic (idle-skip / active-force) ran exactly
 //                           as pre-slice-5.
+//  - resume-silent-fallback slice 5b fix: a cursor-preserving recovery reopen
+//                           (watchdog CLOSED branch / sentinel timeout)
+//                           delivered NO snapshot and NO message events
+//                           within SES_RESUME_SILENT_FALLBACK_MS — the ring
+//                           replay was provably continuous but everything in
+//                           range was interest-filtered, so the repair can
+//                           never be confirmed on that connection. ONE
+//                           cursorless reopen follows so the server's
+//                           fresh-snapshot branch confirms the repair
+//                           (clears refreshing[id]; MERGE re-seeds). Counted
+//                           once per silent resume; any delivered content
+//                           cancels it (never fires on a served replay).
 export const RECOVERY_REASONS = [
   "idle-content-stale",
   "session-transport-stale",
@@ -99,6 +116,7 @@ export const RECOVERY_REASONS = [
   "sentinel-alive",
   "sentinel-timeout",
   "sentinel-legacy-fallback",
+  "resume-silent-fallback",
 ] as const;
 export type RecoveryReason = (typeof RECOVERY_REASONS)[number];
 
