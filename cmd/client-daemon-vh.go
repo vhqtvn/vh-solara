@@ -179,6 +179,16 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 		if rt.vhCancel != nil {
 			rt.vhCancel()
 		}
+		// Tear down repo-declared managed processes exactly like the
+		// teardown path does. Without this every UI-triggered vh restart
+		// orphaned one generation of managed procs (they run in their own
+		// process groups, and KillMode=process leaves them to systemd).
+		if rt.procMgr != nil {
+			rt.procMgr.StopAll()
+		}
+		if rt.procCtxCancel != nil {
+			rt.procCtxCancel()
+		}
 		removeDaemonState()
 		if daemonExternalManaged {
 			os.Exit(0) // supervisor (systemd Restart=always) relaunches us
