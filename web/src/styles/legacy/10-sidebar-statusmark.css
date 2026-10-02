@@ -129,15 +129,18 @@
    `contain: paint` is deliberately NOT used here (unlike the former .status-ind)
    because the design's effect layers extend OUTSIDE the box via negative insets
    (halo -5px / ::after -3px / scan -4px); contain:paint would clip to the box
-   and gut the halo + scan + ambient glow. translateZ(0) alone is what promotes
-   this to its own compositor layer, so the isolation intent still holds without
-   the clip. The `live` (resting) state continuously animates filter:drop-shadow
-   on the always-visible glyph — the operator has ACCEPTED this risk; the surface
-   isolation keeps it scoped. No backdrop-filter, no animated mask on a scroll
-   surface, no content-visibility. The .scan mask is static. Real Firefox/
-   WebRender heat verification is an operator follow-up (headless can't
-   GPU-rasterize; see AGENTS.mission.md). NB: root class is `.status-mark` —
-   distinct from `.status-dot` (status-pop corner badge) and `.chat-live`. */
+    and gut the halo + scan + ambient glow. translateZ(0) alone is what promotes
+    this to its own compositor layer, so the isolation intent still holds without
+    the clip. SLICE 1 (webperf paint): the `live` (resting) state NO LONGER
+    animates filter on the always-visible glyph — the former infinite
+    live-settle filter animation was a per-frame MAIN-THREAD restyle in every
+    connected pane (filter is not compositor-animatable); it is now a single
+    one-shot settle cue on state entry, resting at the static base glow. No
+    backdrop-filter, no animated mask on a scroll surface, no content-visibility.
+    The .scan mask is static. Real Firefox/WebRender heat verification is an
+    operator follow-up (headless can't GPU-rasterize; see AGENTS.mission.md).
+    NB: root class is `.status-mark` — distinct from `.status-dot`
+    (status-pop corner badge) and `.chat-live`. */
 .status-mark {
   --status: var(--fg-dim);
   --status-soft: color-mix(in srgb, var(--fg-dim) 22%, transparent);
@@ -203,12 +206,28 @@
 .status-mark.connecting .scan { opacity: .9; animation: spin 1.25s linear infinite; }
 .status-mark.connecting .packet { opacity: 0; animation: loading-dot-orbit 1.08s linear infinite; }
 .status-mark.connecting .status-core { animation: core-search 1.05s ease-in-out infinite; }
-.status-mark.live .brand-mark { animation: live-settle 2.2s ease-in-out infinite; }
-.status-mark.live .halo { animation: live-halo 2.2s ease-in-out infinite; }
+/* SLICE 1 (webperf paint): `live` and `stale` are the states an IDLE pane sits
+   in for hours (live = connected+quiet, stale = watchdog-quiet), so they must
+   carry ZERO running animations — profile evidence (tmp/agent-runs/
+   webperf-paint/mechanism.md): every pane with ANY running animation restyles
+   every refresh tick, and even compositor-only transforms keep the driver
+   ticking; 6 idle stale panes each styled exactly their 2 animated elements on
+   every one of 281 ticks. Same treatment as the slice-6 `reconnecting` fix:
+   static state + ONE bounded one-shot entry cue whose end frame equals the
+   un-animated base (no fill, no pop, nothing retained).
+   • live: the glyph breathes ONCE on entry (live-settle, 1 iteration — its
+     0%/100% frames are exactly the base filter/transform), then rests with the
+     static accent glow from the base `.status-mark svg` rule. The former
+     infinite live-halo was deleted; the halo rests at its base opacity.
+   • stale: amber + dashed halo + the static clock glyph (::before/::after
+     hands) carry the semantics; the ::before hand winds down ONCE on entry
+     (clock-hand, steps(8), 1 iteration — ends at 360°≡0°=base). The infinite
+     stale-drift halo rotation was deleted (dashed+amber already reads stale). */
+.status-mark.live .brand-mark { animation: live-settle 1.2s ease-out 1; }
 .status-mark.live .status-core::before { border: solid var(--bg); border-width: 0 .9px .9px 0; width:1.6px; height:2.7px; left:1.25px; top:.35px; border-radius:0; transform: rotate(45deg); }
 .status-mark.stale svg { opacity: .86; }
-.status-mark.stale .halo { border-style: dashed; animation: stale-drift 3s linear infinite; }
-.status-mark.stale .status-core::before { width:.75px; height:2.5px; left:1.75px; top:.6px; background:var(--bg); transform-origin: bottom center; animation: clock-hand 2.4s steps(8) infinite; }
+.status-mark.stale .halo { border-style: dashed; }
+.status-mark.stale .status-core::before { width:.75px; height:2.5px; left:1.75px; top:.6px; background:var(--bg); transform-origin: bottom center; animation: clock-hand 2.4s steps(8) 1; }
 .status-mark.stale .status-core::after { width:2.4px; height:.75px; left:1.75px; top:2.6px; background:var(--bg); border-radius:0; }
 .status-mark.syncing .halo { animation: spin 1.15s linear infinite; }
 .status-mark.syncing .orbital { opacity: .9; animation: spin-rev .82s linear infinite; }
@@ -238,19 +257,23 @@
 /* spin is reused from the shared @keyframes spin (~2278). spin-rev and the rest
    are status-mark-local. Orbits (loading-dot-orbit / packet-orbit) are tuned for
    the 24px header size (translateX 8/9px, filter blur 4px) so packets orbit just
-   inside the glyph edge. All keyframes are opacity/transform/filter-only →
-   compositor-friendly. Reduced motion is handled globally by the repo's
+   inside the glyph edge. Keyframes are opacity/transform-only (the exception,
+   live-settle's filter, is a deliberate ONE-SHOT entry cue — filter is NOT
+   compositor-animatable, so it must never loop; see the SLICE 1 note above).
+   Reduced motion is handled globally by the repo's
    prefers-reduced-motion * override (~3774); the e-ink animation:none kill
    switch (~284) is documented in the block header above.
    SLICE 6 (webperf build1): the reconnect-* keyframes are ONE-SHOT entry cues
    (iteration 1, no fill) whose 100% frame equals the element's un-animated
    base — they settle, not loop. reconnect-ring / reconnect-orbit / spark-burst
-   were deleted with their (formerly infinite) reconnecting-state rules. */
+    were deleted with their (formerly infinite) reconnecting-state rules.
+    SLICE 1 (webperf paint): the infinite stale-drift + live-halo keyframes
+    were deleted with their state rules (see the SLICE 1 note above); live-settle
+    and clock-hand survive as ONE-SHOT entry cues (iteration 1, no fill) whose
+    end frames equal the element's un-animated base. */
 @keyframes spin-rev { to { transform: rotate(-360deg); } }
 @keyframes mark-breathe { 0%,100%{transform:scale(.98);opacity:.78;} 50%{transform:scale(1.025);opacity:1;} }
 @keyframes live-settle { 0%,100%{transform:scale(1);filter:drop-shadow(0 0 4px var(--status-soft)) drop-shadow(0 2px 5px rgba(0,0,0,.32));} 50%{transform:scale(1.018);filter:drop-shadow(0 0 7px var(--status-soft)) drop-shadow(0 2px 5px rgba(0,0,0,.32));} }
-@keyframes live-halo { 0%,100%{opacity:.22;transform:scale(.96);} 50%{opacity:.5;transform:scale(1.04);} }
-@keyframes stale-drift { to { transform: rotate(360deg); } }
 @keyframes clock-hand { to { transform: rotate(360deg); } }
 @keyframes sync-flash { 0%,100%{opacity:.62;transform:translateY(0);} 50%{opacity:1;transform:translateY(-2px);} }
 @keyframes loading-dot-orbit { 0%{transform:rotate(0deg) translateX(8px) rotate(0deg) scale(.78);opacity:.18;} 18%{opacity:.9;} 62%{opacity:.9;} 100%{transform:rotate(360deg) translateX(8px) rotate(-360deg) scale(.78);opacity:.18;} }

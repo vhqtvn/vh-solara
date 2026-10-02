@@ -6,7 +6,12 @@
    legacy.css (referenced here as a global animation name). */
 .empty { flex: 1; display: grid; place-items: center; padding: var(--s-5); }
 .empty-card { display: flex; flex-direction: column; align-items: center; text-align: center; max-width: 360px; }
-.empty-mark { width: 64px; height: 64px; color: var(--accent); margin-bottom: var(--s-3); animation: empty-float 4s var(--ease) infinite; }
+/* (webperf paint slice 1) The empty-state glyph used to float on a 4s
+   INFINITE loop — an idle pane showing an empty chat kept its refresh driver
+   ticking forever (any running animation does, even compositor-only ones).
+   Now a single 2.4s settle on mount (one iteration; the 0%/100% frames equal
+   the un-animated base, so it rests statically). */
+.empty-mark { width: 64px; height: 64px; color: var(--accent); margin-bottom: var(--s-3); animation: empty-float 2.4s var(--ease) 1; }
 .empty-title { margin: 0 0 6px; font-size: var(--text-lg); font-weight: 650; letter-spacing: -0.01em; }
 .empty-sub { margin: 0 0 var(--s-4); color: var(--fg-dim); }
 .empty-cta {

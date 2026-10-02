@@ -47,32 +47,11 @@
 }
 @media (pointer: coarse) { .chat-nav { display: none; } }
 
-/* opencode-style "running" progress bar (a whipping fill) while working. */
-.session-progress {
-  position: absolute;
-  inset: 0 0 auto;
-  height: 2px;
-  overflow: hidden;
-  pointer-events: none;
-  z-index: 6;
-}
-.session-progress-bar {
-  width: 100%;
-  height: 100%;
-  border-radius: 999px;
-  background: var(--accent);
-  clip-path: inset(0 100% 0 0 round 999px);
-  will-change: clip-path;
-  animation: session-progress-whip 1100ms infinite;
-}
-@keyframes session-progress-whip {
-  0% { clip-path: inset(0 100% 0 0 round 999px); animation-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1); }
-  48% { clip-path: inset(0 0 0 0 round 999px); animation-timing-function: cubic-bezier(0.65, 0, 0.35, 1); }
-  100% { clip-path: inset(0 0 0 100% round 999px); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .session-progress-bar { animation: none; clip-path: none; opacity: 0.7; }
-}
+/* (webperf paint slice 1) The dead `.session-progress` / `.session-progress-bar`
+   rules and the `session-progress-whip` clip-path keyframes were removed here:
+   no component ever applied those classes (grep: zero usages outside this
+   file), so the only thing the rule could ever do was ship an infinite
+   main-thread clip-path animation as a landmine for whoever revived it. */
 .chat-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-anchor: auto; padding: 16px; overscroll-behavior: contain; }
 
 /* Scroll-edge fade REMOVED. It was a gradient `mask-image` on the scroll surface
