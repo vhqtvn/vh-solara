@@ -1603,6 +1603,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/theme.json", s.handleThemeJSON)
 	mux.HandleFunc("/vh/theme.css", s.handleThemeCSS)
 	mux.HandleFunc("/vh/stream", s.handleStream)
+	// Liveness sentinel probe (webperf slice 4): POST /vh/stream/probe emits a
+	// transient no-id vh.liveness event into the project store. See
+	// stream_probe.go for the full wire contract and invariant set.
+	mux.HandleFunc("/vh/stream/probe", s.handleStreamProbe)
 	mux.HandleFunc("/vh/render", s.handleRender)
 	mux.HandleFunc("/vh/highlight.css", s.handleHighlightCSS)
 	// Image proxy: GET-only, auth-gated (under /vh/*). Fetches external images
@@ -3011,11 +3015,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				discReason = diag.DiscSubscriberChannelClosed // PROBE 3
 				return                                        // dropped as a slow consumer; client will reconnect + resume
 			}
-			if ev.Kind == state.KindNotice || ev.Kind == kindPinsUpdated || ev.Kind == kindLabelsUpdated || ev.Kind == kindArchiveFailuresUpdated {
+			if ev.Kind == state.KindNotice || ev.Kind == kindPinsUpdated || ev.Kind == kindLabelsUpdated || ev.Kind == kindArchiveFailuresUpdated || ev.Kind == kindLiveness {
 				// Transient fan-out (state.KindNotice, the Phase 3
 				// pins.updated full-state frame, the Slice 3 labels.updated
-				// full-state frame, or the Slice 1 archive-failures.updated
-				// full-state frame): not part of the replayable view and it
+				// full-state frame, the Slice 1 archive-failures.updated
+				// full-state frame, or the slice-4 liveness sentinel probe
+				// echo): not part of the replayable view and it
 				// reuses the current head seq, so forward it WITHOUT the
 				// seq-baseline guard and WITHOUT an id line (don't move the
 				// resume cursor). A resuming client never replays it —
@@ -3023,8 +3028,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				// bootstrap frames emitted above on connect. The SSE event name
 				// is ev.Kind itself, so a notice stays "notice", a pins.updated
 				// becomes "pins.updated", a labels.updated becomes
-				// "labels.updated", and an archive-failures.updated becomes
-				// "archive-failures.updated" — the client dispatches on the name.
+				// "labels.updated", an archive-failures.updated becomes
+				// "archive-failures.updated", and a liveness echo becomes
+				// "vh.liveness" — the client dispatches on the name.
 				writeRawNoID(w, ev.Kind, ev.Payload)
 				flusher.Flush()
 				continue
