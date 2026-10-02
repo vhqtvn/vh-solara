@@ -189,13 +189,17 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 @keyframes empty-float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-5px); } }
 
 /* Working indicator: a pill with the VHSolara monogram whose accent stroke
-   travels along the glyph (a moving dash, not a full repaint), plus an animated
-   "Working…" ellipsis. Every color is a theme token — the accent drives the
-   stroke + glow; nothing is hardcoded.
-   Perf note (see AGENTS.md Firefox/WebRender gotchas): stroke-dashoffset + the
-   drop-shadow glow animate on the SVG paint layer. It's affordable here because
-   it's ONE tiny ~24px glyph (not a scroll container / not a growing message),
-   but the drop-shadow is the first lever to drop if GPU heat ever returns. */
+   highlights the glyph as a STATIC dash (see the slice-2 note at .vh-current:
+   the dash traces once on mount, then rests), plus a static "Working…"
+   ellipsis pulsing in opacity. Every color is a theme token — the accent
+   drives the stroke + glow; nothing is hardcoded.
+   Perf note (see AGENTS.md Firefox/WebRender gotchas): stroke-dashoffset and
+   content are NOT compositor-animatable — they must never loop (the former
+   infinite march was a per-frame MAIN-THREAD restyle; profile evidence in
+   tmp/agent-runs/webperf-paint/mechanism.md). The only surviving loop is the
+   opacity pulse (compositor), and the whole pill unmounts with the working
+   state. The static drop-shadow glow does not animate; drop it first if GPU
+   heat ever returns. */
 .working {
   display: inline-flex; align-items: center; gap: 8px; min-width: 0;
   /* Cap width so a long tool subject truncates instead of pushing the Tasks
@@ -214,11 +218,19 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
   fill: none;
   stroke: var(--accent);
   stroke-width: 8; stroke-linecap: round; stroke-linejoin: round;
-  stroke-dasharray: 28 180; stroke-dashoffset: 180;
+  stroke-dasharray: 28 180; stroke-dashoffset: 0;
   filter:
     drop-shadow(0 0 3px color-mix(in srgb, var(--accent) 90%, transparent))
     drop-shadow(0 0 8px color-mix(in srgb, var(--accent) 45%, transparent));
-  animation: vh-inline-current 1.15s linear infinite;
+  /* (webperf paint slice 2) stroke-dashoffset is NOT compositor-animatable —
+     the former 1.15s infinite march was a per-frame MAIN-THREAD restyle in
+     every pane with a running session (profile: the live panes styled 4–20
+     elements every tick). The mark now rests as a STATIC dash highlight and
+     traces once on mount (single sweep from the old base offset 180 to the
+     new resting offset 0 — no fill, no retained animation). The working
+     semantics survive: accent color + glow + dash pattern + the elapsed
+     timer + the pulsing dots beside it. */
+  animation: vh-inline-current 1.15s linear 1;
 }
 .vh-current.hot {
   stroke: color-mix(in srgb, var(--accent) 42%, var(--fg-strong, #fff));
@@ -226,7 +238,7 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
   stroke-dasharray: 12 196;
   animation-duration: 0.85s;
 }
-@keyframes vh-inline-current { to { stroke-dashoffset: 0; } }
+@keyframes vh-inline-current { from { stroke-dashoffset: 180; } to { stroke-dashoffset: 0; } }
 .working-text { display: inline-flex; align-items: baseline; min-width: 0; color: var(--fg); }
 .working-verb { flex: 0 0 auto; }
 /* Subject truncates like .tool-subject (overflow ellipsis) so a long command or
@@ -238,17 +250,21 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .working-elapsed { flex: 0 0 auto; color: var(--fg-dim); font-weight: 550; font-variant-numeric: tabular-nums; }
-.working-dots { display: inline-block; width: 18px; flex: 0 0 auto; color: var(--accent); }
-.working-dots::after { content: ""; animation: working-dots 1.2s steps(4, end) infinite; }
-@keyframes working-dots {
-  0% { content: ""; }
-  25% { content: "."; }
-  50% { content: ".."; }
-  75%, 100% { content: "..."; }
+/* (webperf paint slice 2) the animated `content` ellipsis was a per-frame
+   MAIN-THREAD restyle (content is not compositor-animatable). The ellipsis is
+   now STATIC text and the "still working" liveness cue moved to an opacity
+   pulse on the whole span — opacity is compositor-only, and the pill unmounts
+   with the working state (ChatTasksStatus renders it under Show when
+   working()), so it animates only while something actually runs. */
+.working-dots {
+  display: inline-block; width: 18px; flex: 0 0 auto; color: var(--accent);
+  animation: working-dots-pulse 1.2s ease-in-out infinite;
 }
+.working-dots::after { content: "..."; }
+@keyframes working-dots-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 @media (prefers-reduced-motion: reduce) {
   .vh-current { animation: none; stroke-dasharray: none; }
-  .working-dots::after { animation: none; content: "..."; }
+  .working-dots { animation: none; }
 }
 
 /* Child/subagent session: composer replaced by a read-only notice. */
