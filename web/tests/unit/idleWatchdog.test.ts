@@ -97,9 +97,15 @@ async function setupFresh(): Promise<void> {
 
 beforeEach(async () => {
   (globalThis as unknown as { EventSource: unknown }).EventSource = MockEventSource;
+  // Slice 5 (webperf): the fetch stub answers 404 — the OLD-WORKER posture.
+  // The liveness sentinel memos capability-unavailable and the watchdog runs
+  // the LEGACY heuristics this suite pins byte-for-byte (idle-skip /
+  // active-force). The capability-confirmed outcomes (probe → proven-alive /
+  // timeout → cursor-preserving recovery / whichever-first nonce
+  // correlation) live in sentinel.test.ts.
   vi.stubGlobal(
     "fetch",
-    vi.fn().mockResolvedValue(new Response("{}", { status: 200 })),
+    vi.fn().mockResolvedValue(new Response("{}", { status: 404 })),
   );
   window.localStorage.clear();
   Object.defineProperty(document, "visibilityState", {
@@ -151,6 +157,9 @@ describe("(a) idle session: content-stale watchdog SKIPS the force", () => {
       treeESes()[0].fire("snapshot", treeSnapshot(cycle + 2), String(cycle + 2));
       sessionESes()[0].fire("ping"); // transport alive, content silent
       stream.watchdogTick();
+      // Slice 5: settle the sentinel probe's 404 .then (microtask) so the
+      // legacy fallback decision lands within the same cycle.
+      await flush();
     }
 
     // The idle session did NOT force a reconnect.
@@ -179,6 +188,7 @@ describe("(b) busy session: content-stale watchdog forces EXACTLY as before", ()
       vi.advanceTimersByTime(15_000);
       sessionESes()[0].fire("ping");
       stream.watchdogTick();
+      await flush(); // settle the 404 .then (slice-5 legacy fallback)
     }
 
     expect(sessionESes()).toHaveLength(2);
@@ -286,6 +296,7 @@ describe("(d) idle tree: content-stale watchdog SKIPS the force", () => {
       vi.advanceTimersByTime(15_000);
       treeESes()[0].fire("ping"); // transport alive, content silent
       stream.watchdogTick();
+      await flush(); // settle the 404 .then (slice-5 legacy fallback)
     }
 
     expect(treeESes()).toHaveLength(1);
@@ -308,6 +319,7 @@ describe("(e) active tree: content-stale watchdog forces EXACTLY as before", () 
       vi.advanceTimersByTime(15_000);
       treeESes()[0].fire("ping");
       stream.watchdogTick();
+      await flush(); // settle the 404 .then (slice-5 legacy fallback)
     }
 
     expect(treeESes()).toHaveLength(2);

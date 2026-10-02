@@ -71,6 +71,7 @@ import {
 } from "./stream";
 import { captureDiagEntry } from "./diaglog";
 import { countRecovery, countSnapshotBytes } from "./recovery-reasons";
+import { noteLivenessFrame } from "./liveness";
 
 // === Slice 3: part.append suffix streaming client opt-in ====================
 //
@@ -810,6 +811,18 @@ function openSessionES(id: string): void {
       }
     });
     registerSessionPingListener(ses, gen);
+    // Slice 5 (webperf/F7): the liveness sentinel's correlation listener. The
+    // worker broadcasts vh.liveness (no id, transient — EmitTransient bypasses
+    // Interest, so a message-filtered session stream receives it too); this
+    // listener feeds the frame to the pending-probe matcher in ./liveness.
+    // Deliberately does NOT touch the liveness clocks: a liveness echo is not
+    // CONTENT (refreshing here would let a periodic probe mask a genuine
+    // content stall); only the issuing boundary's onProven refreshes, once
+    // per probe. Gen-guarded like every content listener.
+    ses.addEventListener("vh.liveness", (e) => {
+      if (gen !== sesGen) return;
+      noteLivenessFrame((e as MessageEvent).data);
+    });
     // L1 t1: socket established → pure connection-latency delta. Stream 2 had
     // no explicit onopen before; added for the latency diagnostic (and parity
     // with Stream 1's connect/backoff semantics).
@@ -903,6 +916,47 @@ export function resumeSessionStreamForVisibility(): void {
   // existing `refreshing[id]` indicator (cleared on first snapshot) — the
   // UI-honesty invariant: a resumed pane never shows stale data as fresh
   // without the per-session refresh dot until the first event reconciles.
+  openSessionES(sesId);
+}
+
+// === Slice 5 (webperf/F7): sentinel proof refresher + closed-stream reopen ===
+//
+// markSessionLivenessProof refreshes Stream2's liveness clocks after a
+// liveness sentinel probe came back PROVEN (the nonce traversed the full
+// worker pipeline to THIS pane). Called from ./health's onProven closure —
+// NOT from the vh.liveness listener (a stray/late echo must never refresh a
+// clock; only the pending probe's resolution does, exactly once). Equivalent
+// to markSessionSeen(): the content clock is the one that matters (the
+// boundary that probed was content-stale with transport fresh), and
+// re-seeding both keeps the dual-clock invariant "content ≤ transport age"
+// trivially intact.
+export function markSessionLivenessProof(): void {
+  markSessionSeen();
+}
+
+// reopenSessionStreamPreservingCursor — the sentinel-timeout + closed-stream
+// recovery seam: reopen Stream2 THROUGH the retry seam (openSessionES) so
+// sesCursor is PRESERVED and the server takes the ring-replay branch
+// (deltas from the ring) instead of a cursorless full snapshot. This is
+// ensureSessionStreamLiveForActivity's reopen half without its busy-edge
+// counter, exposed for ./health's watchdog:
+//   - sentinel timeout (slice 5): pipeline presumed dead → recover WITHOUT
+//     paying the full-snapshot cost. No-loss argument identical to the
+//     busy-edge re-arm: sesCursor only advances on APPLIED events, so the
+//     replay range covers everything in-flight at teardown; the server falls
+//     back to a fresh snapshot itself when the cursor is older than the
+//     ring (hasCursor && !replayOK) — correctness never depends on the
+//     cursor being recent.
+//   - closed-stream branch (slice 5b): the watchdog's old
+//     openSessionStream(sesId) call routed through closeSessionStream, which
+//     RESETS sesCursor=0 — the last cursorless full-snapshot path on the
+//     watchdog. Same seam, same argument.
+export function reopenSessionStreamPreservingCursor(): void {
+  if (!sesId || !projectDir()) return;
+  // Cancel any pending CLOSED-retry backoff timer: this reopen supersedes it
+  // (otherwise the timer would fire openSessionES AGAIN on top of the fresh
+  // connection). Mirrors ensureSessionStreamLiveForActivity.
+  clearTimeout(sesRetry);
   openSessionES(sesId);
 }
 

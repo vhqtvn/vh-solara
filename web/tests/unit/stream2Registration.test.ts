@@ -193,6 +193,7 @@ const EXPECTED_SESSION_LISTENER_KINDS = [
   "part.upsert",
   "ping",
   "snapshot",
+  "vh.liveness",
 ];
 
 const SID = "s1";

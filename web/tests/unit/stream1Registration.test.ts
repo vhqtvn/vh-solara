@@ -166,6 +166,7 @@ const EXPECTED_TREE_LISTENER_KINDS = [
   "tree.snapshot",
   "unread.clear",
   "unread.set",
+  "vh.liveness",
 ];
 
 // ===========================================================================

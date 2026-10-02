@@ -45,7 +45,7 @@ import {
 //     sesSnapshotOwnership / preselectHydrate / coherentBarrierReloadRace).
 //   closeSessionStream → (a) namespace tests (the `stream?.closeSessionStream()`
 //     afterEach teardown across the C4 / liveness / backoff suite).
-import { openSessionStream, closeSessionStream, getSesGen, suspendSessionStreamForVisibility, resumeSessionStreamForVisibility, getResumableSesId, ensureSessionStreamLiveForActivity, startBusyEdgeRearm } from "./session-stream";
+import { openSessionStream, closeSessionStream, getSesGen, suspendSessionStreamForVisibility, resumeSessionStreamForVisibility, getResumableSesId, ensureSessionStreamLiveForActivity, startBusyEdgeRearm, reopenSessionStreamPreservingCursor } from "./session-stream";
 import { suspendTreeForVisibility, resumeTreeFromVisibility } from "./tree-transport";
 // health (watchdog + foreground/online recovery).
 //   watchdogTick / maybeReconnect → (a) namespace tests (sessionLiveness /
@@ -80,6 +80,8 @@ export {
   // session-stream (slice-3 busy-edge re-arm)
   ensureSessionStreamLiveForActivity,
   startBusyEdgeRearm,
+  // session-stream (slice-5 sentinel / closed-stream cursor-preserving reopen)
+  reopenSessionStreamPreservingCursor,
   // tree-transport (visibility lifecycle — Slice 2 webperf)
   suspendTreeForVisibility,
   resumeTreeFromVisibility,

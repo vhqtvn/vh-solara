@@ -58,22 +58,27 @@ export interface ColdOpenEntry {
  * loss (or suspected loss) and forces a self-heal resync. Written BEFORE the
  * resync fires so the pre-recovery state is preserved in the ring.
  *
- * The triggers:
- *  - `seq-gap`              — a per-stream seq gap not covered by the other
- *                             stream's cursor (Invariant 1).
- *  - `tail-incomplete-on-idle` — activity=idle arrived but the resident tail's
- *                             last assistant message lacks time.completed
- *                             (Invariant 2).
- *  - `content-stale-watchdog` — the dual-clock watchdog forced a reconnect
- *                             (health.ts transport/content stall paths).
- *  - `reconnect`            — any other forced reconnect (visibility/online).
- */
+  * The triggers:
+  *  - `seq-gap`              — a per-stream seq gap not covered by the other
+  *                             stream's cursor (Invariant 1).
+  *  - `tail-incomplete-on-idle` — activity=idle arrived but the resident tail's
+  *                             last assistant message lacks time.completed
+  *                             (Invariant 2).
+  *  - `content-stale-watchdog` — the dual-clock watchdog forced a reconnect
+  *                             (health.ts transport/content stall paths).
+  *  - `sentinel-timeout`     — the liveness sentinel (slice 5 webperf/F7)
+  *                             waited SENTINEL_TIMEOUT for the probe nonce and
+  *                             recovered cursor-preserving (health.ts onTimeout
+  *                             closures; the probe itself is counted in
+  *                             recovery-reasons.ts sentinel-* codes).
+  *  - `reconnect`            — any other forced reconnect (visibility/online).
+  */
 export interface StallEntry {
   kind: "stall";
   /** Wall-clock capture time (ms epoch). */
   ts: number;
   /** What triggered the stall detection + self-heal. */
-  trigger: "seq-gap" | "tail-incomplete-on-idle" | "content-stale-watchdog" | "reconnect" | "part-append-offset-mismatch";
+  trigger: "seq-gap" | "tail-incomplete-on-idle" | "content-stale-watchdog" | "sentinel-timeout" | "reconnect" | "part-append-offset-mismatch";
   /** Which stream(s) the detection + recovery targets. */
   stream: "tree" | "session" | "both";
   /** The session the stall concerns (for session-scoped triggers). */

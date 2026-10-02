@@ -34,7 +34,13 @@
 import { createSignal } from "solid-js";
 import { log } from "../lib/log";
 import { state, setState, projectDir } from "./store";
-import { connect, isTreeClosed, getTreeLastSeen, getTreeContentSeen } from "./tree-transport";
+import {
+  connect,
+  isTreeClosed,
+  getTreeLastSeen,
+  getTreeContentSeen,
+  markTreeLivenessProof,
+} from "./tree-transport";
 import { markAuthoritativeRecovery } from "./periodic-resync";
 import { STALE_MS } from "./stream";
 import {
@@ -43,11 +49,14 @@ import {
   isSessionClosed,
   getSessionLastSeen,
   getSessionContentSeen,
+  markSessionLivenessProof,
+  reopenSessionStreamPreservingCursor,
 } from "./session-stream";
 import { captureDiagEntry } from "./diaglog";
 import { classifyStall, countRecovery } from "./recovery-reasons";
 import { isPaneVisible } from "../paneVisibility";
 import { sessionWorking, anySessionActive } from "./selectors";
+import { issueLivenessProbe, livenessCapabilityAvailable } from "./liveness";
 
 // Content-stall threshold (product policy). Transport staleness (STALE_MS)
 // catches a stream whose pings STOP. CONTENT_STALE_MS catches a stream whose
@@ -145,23 +154,25 @@ export function watchdogTick() {
     const transportStale = !!(getTreeLastSeen() && Date.now() - getTreeLastSeen() > STALE_MS);
     const contentStale = !!(getTreeContentSeen() && Date.now() - getTreeContentSeen() > CONTENT_STALE_MS);
     if (transportStale || contentStale) {
-      // Slice 3 (webperf): an IDLE tree going content-silent must not force a
-      // periodic reconnect. When NOTHING is running or input-pending anywhere
-      // in the project (anySessionActive() — the client mirror of the server's
-      // RunningRoots concept, /vh/diag/busy), the server's tree emitter
-      // legitimately has zero content to deliver, so treeContentSeen aging out
-      // is EXPECTED silence, not a stalled stream — the very idle churn this
-      // slice removes (~130s/pane reconnects on a finished fleet). Counted per
-      // skipped tick as a rate meter; the forced code (tree-idle-stale) freezes
-      // at 0 in an all-idle soak. TRANSPORT-stale is NEVER skipped: a socket
-      // whose pings stopped is dead regardless of activity. Safety net for a
-      // ping-masked (open-but-contentless) tree on an idle project: the
-      // on-focus resync (TREE_RESYNC_MIN_GAP_MS-throttled) + the ~10min
-      // conditional periodic resync (periodic-resync.ts) self-heal; slice 4's
-      // sentinel closes the residual sub-period window.
-      if (contentStale && !transportStale && !anySessionActive()) {
+      // Legacy decision helpers — the EXACT pre-slice-5 behaviors, kept as
+      // named closures so the sentinel's onLegacy fallback (old worker, 404)
+      // runs them byte-for-byte rather than re-deriving them.
+      const legacyIdleSkip = () => {
+        // Slice 3 (webperf): an IDLE tree going content-silent must not force
+        // a periodic reconnect. When NOTHING is running or input-pending
+        // anywhere in the project (anySessionActive()), the server's tree
+        // emitter legitimately has zero content to deliver, so
+        // treeContentSeen aging out is EXPECTED silence, not a stalled
+        // stream — the very idle churn this removes (~130s/pane reconnects
+        // on a finished fleet). Counted per skipped tick as a rate meter.
+        // TRANSPORT-stale is NEVER skipped: a socket whose pings stopped is
+        // dead regardless of activity. Safety net for a ping-masked tree on
+        // an idle project: the on-focus resync + the ~10min conditional
+        // periodic resync self-heal; the sentinel closes the residual
+        // sub-period window.
         countRecovery("tree-idle-stale-skipped");
-      } else {
+      };
+      const legacyForce = () => {
         // Slice 1 (webperf): count the forced reconnect by stable reason code
         // (tree-idle-stale vs tree-transport-stale) so idle churn is measurable
         // via window.__vhSyncDiag. classifyStall mirrors the log reason below.
@@ -185,6 +196,55 @@ export function watchdogTick() {
         });
         setState("status", "reconnecting");
         connect();
+      };
+      // Slice 5 (webperf/F7): the liveness SENTINEL replaces both content-
+      // stale heuristics (idle-skip AND active-force) whenever the worker
+      // has the probe route. A content-only stall (pings flow, zero content)
+      // is exactly the boundary where "is the worker pipeline alive?" is a
+      // PROVABLE question: POST /vh/stream/probe, wait for the nonce to
+      // traverse worker store → tunnel → controller → this pane. Proven →
+      // refresh the content clock and do NOT recover (kills the idle-pane
+      // F7 residual: an idle pane with a dead pipeline now recovers, and a
+      // healthy idle pane stays put with a PROVEN heartbeat instead of an
+      // assumed one). Timeout → cursor-preserving connect() (the tree's
+      // connect() already passes state.cursor; the server falls back to a
+      // fresh snapshot itself on ring-gap, so correctness never depends on
+      // the cursor being recent). 404/405 → legacy, exactly as before.
+      // TRANSPORT-stale never probes: a socket whose pings stopped cannot
+      // deliver the proof frame anyway — it forces immediately (unchanged).
+      const contentOnly = contentStale && !transportStale;
+      if (contentOnly && livenessCapabilityAvailable()) {
+        issueLivenessProbe("tree", {
+          onProven: () => markTreeLivenessProof(),
+          onTimeout: () => {
+            // A pane that went HIDDEN mid-probe must not recover here: its
+            // streams are deliberately suspended and the reveal path
+            // (resumeTreeFromVisibility) owns reopening them cursor-
+            // preserving. The clocks re-seed at construction on reveal.
+            if (!isPaneVisible()) return;
+            captureDiagEntry({
+              kind: "stall",
+              ts: Date.now(),
+              trigger: "sentinel-timeout",
+              stream: "tree",
+              treeLastSeenAge: getTreeLastSeen() ? Date.now() - getTreeLastSeen() : undefined,
+              treeContentSeenAge: getTreeContentSeen() ? Date.now() - getTreeContentSeen() : undefined,
+            });
+            setState("status", "reconnecting");
+            connect();
+          },
+          onLegacy: () => {
+            if (!anySessionActive()) legacyIdleSkip();
+            else legacyForce();
+          },
+        });
+        // issueLivenessProbe returning false (a probe already in flight)
+        // means this tick stands down — the pending probe's outcome covers
+        // the worker-pipeline question for this boundary's turn.
+      } else if (contentOnly && !anySessionActive()) {
+        legacyIdleSkip();
+      } else {
+        legacyForce();
       }
     }
   }
@@ -202,7 +262,15 @@ export function watchdogTick() {
   const sesId = getSesId();
   if (sesId) {
     if (isSessionClosed()) {
-      openSessionStream(sesId);
+      // Slice 5b (webperf): cursor-PRESERVING closed-stream recovery. The old
+      // openSessionStream(sesId) routed through closeSessionStream, which
+      // RESETS sesCursor=0 → a cursorless full snapshot on every watchdog
+      // pass over a fatally-closed stream (the last cursorless force path on
+      // the watchdog). The suspend-style seam reopens through openSessionES
+      // directly: sesCursor survives → the server takes the ring-replay
+      // branch (and itself falls back to a fresh snapshot on ring-gap, so
+      // correctness never depends on the cursor being recent).
+      reopenSessionStreamPreservingCursor();
     } else {
       // Two independent stall signals, EITHER trips the forced fresh-snapshot
       // reconnect (openSessionStream(id, true) → cursorless → authoritative
@@ -224,29 +292,32 @@ export function watchdogTick() {
       const transportStale = !!(getSessionLastSeen() && Date.now() - getSessionLastSeen() > STALE_MS);
       const contentStale = !!(getSessionContentSeen() && Date.now() - getSessionContentSeen() > CONTENT_STALE_MS);
       if (transportStale || contentStale) {
-        // Slice 3 (webperf): a HEALTHY IDLE session must not force periodic
-        // recovery. sessionWorking(sesId) is the authoritative busy selector
-        // (the same one ChatView's Working pill reads: state.activity self
-        // busy/retry + the tree node's server-computed subtreeBusy rollup). A
-        // session that is NOT working is terminally idle — it emits no
-        // message.* events, so sessionContentSeen aging past CONTENT_STALE_MS
-        // is EXPECTED silence, and forcing openSessionStream(id, true) here
-        // was the idle-pane churn driver (~130s cursorless full snapshots per
-        // pane). Counted per skipped tick as a rate meter; the forced code
-        // (idle-content-stale) freezes at 0 in an all-idle soak.
-        //
-        // The prompt-to-idle-dead-stream case is covered by the busy-edge
-        // re-arm (session-stream.ts ensureSessionStreamLiveForActivity): the
-        // idle→busy edge proactively reopens Stream2 cursor-preserving, so the
-        // live tail attaches immediately instead of waiting for this watchdog.
-        // TRANSPORT-stale is NEVER skipped (a dead socket is dead regardless
-        // of activity), and a BUSY session keeps today's EXACT behavior — the
-        // frozen-session protection: a running session whose stream silently
-        // died (ping-mask gap) still force-reconnects here within
-        // CONTENT_STALE_MS, including through long no-delta tool runs.
-        if (contentStale && !transportStale && !sessionWorking(sesId)) {
+        // Legacy decision helpers — the EXACT pre-slice-5 behaviors (see the
+        // tree branch above for the closure rationale).
+        const legacyIdleSkip = () => {
+          // Slice 3 (webperf): a HEALTHY IDLE session must not force periodic
+          // recovery. sessionWorking(sesId) is the authoritative busy selector
+          // (the same one ChatView's Working pill reads: state.activity self
+          // busy/retry + the tree node's server-computed subtreeBusy rollup). A
+          // session that is NOT working is terminally idle — it emits no
+          // message.* events, so sessionContentSeen aging past CONTENT_STALE_MS
+          // is EXPECTED silence, and forcing openSessionStream(id, true) here
+          // was the idle-pane churn driver (~130s cursorless full snapshots per
+          // pane). Counted per skipped tick as a rate meter; the forced code
+          // (idle-content-stale) freezes at 0 in an all-idle soak.
+          //
+          // The prompt-to-idle-dead-stream case is covered by the busy-edge
+          // re-arm (session-stream.ts ensureSessionStreamLiveForActivity): the
+          // idle→busy edge proactively reopens Stream2 cursor-preserving, so the
+          // live tail attaches immediately instead of waiting for this watchdog.
+          // TRANSPORT-stale is NEVER skipped (a dead socket is dead regardless
+          // of activity), and a BUSY session keeps today's EXACT behavior — the
+          // frozen-session protection: a running session whose stream silently
+          // died (ping-mask gap) still force-reconnects here within
+          // CONTENT_STALE_MS, including through long no-delta tool runs.
           countRecovery("idle-content-stale-skipped");
-        } else {
+        };
+        const legacyForce = () => {
           // Slice 1 (webperf): count by stable reason (idle-content-stale vs
           // session-transport-stale) — the idle-pane churn driver.
           const reason = classifyStall("session", contentStale, transportStale);
@@ -268,6 +339,58 @@ export function watchdogTick() {
             sessionContentSeenAge: getSessionContentSeen() ? Date.now() - getSessionContentSeen() : undefined,
           });
           openSessionStream(sesId, true);
+        };
+        // Slice 5 (webperf/F7): the liveness sentinel replaces both content-
+        // stale heuristics here too (mirror of the tree branch above). Proven
+        // alive → refresh the content clock and do NOT recover — this also
+        // kills the remaining false-positive cursorless full snapshots on
+        // ACTIVE sessions with legitimately long silent tool runs (the
+        // busy+silent case previously forced unconditionally). Timeout →
+        // cursor-PRESERVING recovery through the retry seam
+        // (reopenSessionStreamPreservingCursor — NEVER openSessionStream,
+        // whose closeSessionStream resets sesCursor). 404/405 → legacy
+        // idle-skip / active-force, byte-for-byte. TRANSPORT-stale never
+        // probes (a dead socket cannot deliver the proof frame) — unchanged.
+        const contentOnly = contentStale && !transportStale;
+        if (contentOnly && livenessCapabilityAvailable()) {
+          issueLivenessProbe("session", {
+            onProven: () => markSessionLivenessProof(),
+            onTimeout: () => {
+              // Hidden mid-probe: the reveal path
+              // (resumeSessionStreamForVisibility) owns reopening; recovery
+              // here would reopen a deliberately-suspended pane's stream.
+              if (!isPaneVisible()) return;
+              captureDiagEntry({
+                kind: "stall",
+                ts: Date.now(),
+                trigger: "sentinel-timeout",
+                stream: "session",
+                sessionId: getSesId() || undefined,
+                sessionLastSeenAge: getSessionLastSeen() ? Date.now() - getSessionLastSeen() : undefined,
+                sessionContentSeenAge: getSessionContentSeen() ? Date.now() - getSessionContentSeen() : undefined,
+              });
+              reopenSessionStreamPreservingCursor();
+            },
+            onLegacy: () => {
+              // Evaluate the CURRENT selection at fire time (the boundary
+              // captured sesId at issue time; the selection may have moved).
+              const cur = getSesId();
+              if (!cur || cur !== sesId) {
+                // Selection moved during the probe window: the switch
+                // already opened the NEW session's stream fresh — forcing
+                // the OLD captured sesId here would flip Stream2 back and
+                // reset module sesId to it. Stand down.
+                return;
+              }
+              if (!sessionWorking(cur)) legacyIdleSkip();
+              else legacyForce();
+            },
+          });
+          // false return (probe already in flight) → stand down this tick.
+        } else if (contentOnly && !sessionWorking(sesId)) {
+          legacyIdleSkip();
+        } else {
+          legacyForce();
         }
       }
     }

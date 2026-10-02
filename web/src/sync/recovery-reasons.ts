@@ -60,6 +60,25 @@ import { log } from "../lib/log";
 //                           stream was closed or its content clock was aged —
 //                           the prompt-to-idle-dead-stream attach fix. Counted
 //                           once per acted-on edge.
+//  - sentinel-probe-issued  slice 5 (webperf/F7): a content-stale boundary
+//                           fired a POST /vh/stream/probe and armed
+//                           SENTINEL_TIMEOUT. Rate meter (≈1 per
+//                           CONTENT_STALE_MS per idle pane).
+//  - sentinel-alive         slice 5: the probe nonce came back as a no-id
+//                           vh.liveness frame on an open stream — liveness
+//                           PROVEN end-to-end; the stale clock was refreshed
+//                           and NO recovery ran. The proven-alive
+//                           distinguisher for the idle soak (vs the legacy
+//                           assumed-alive skip counters above).
+//  - sentinel-timeout       slice 5: SENTINEL_TIMEOUT elapsed with no frame —
+//                           the worker pipeline is presumed dead; the
+//                           cursor-PRESERVING recovery ran (openSessionES
+//                           seam / tree connect(), never a cursorless force).
+//  - sentinel-legacy-fallback slice 5: the probe POST answered 404/405 (old
+//                           worker, no route) — capability memo'd unavailable
+//                           for the session lifetime and the legacy
+//                           heuristic (idle-skip / active-force) ran exactly
+//                           as pre-slice-5.
 export const RECOVERY_REASONS = [
   "idle-content-stale",
   "session-transport-stale",
@@ -76,6 +95,10 @@ export const RECOVERY_REASONS = [
   "idle-content-stale-skipped",
   "tree-idle-stale-skipped",
   "busy-edge-rearm",
+  "sentinel-probe-issued",
+  "sentinel-alive",
+  "sentinel-timeout",
+  "sentinel-legacy-fallback",
 ] as const;
 export type RecoveryReason = (typeof RECOVERY_REASONS)[number];
 

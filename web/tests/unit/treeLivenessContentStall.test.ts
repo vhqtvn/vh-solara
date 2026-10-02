@@ -125,9 +125,13 @@ const flush = async (): Promise<void> => {
 beforeEach(async () => {
   instances = [];
   (globalThis as unknown as { EventSource: unknown }).EventSource = MockEventSource;
+  // Slice 5 (webperf): 404 = old-worker posture — the sentinel stands down to
+  // the legacy heuristics, so this suite's forced-reconnect assertions pin
+  // the pre-slice-5 contract (and double as the 404-legacy coverage). The
+  // capability-confirmed sentinel outcomes live in sentinel.test.ts.
   vi.stubGlobal(
     "fetch",
-    vi.fn().mockResolvedValue(new Response("{}", { status: 200 })),
+    vi.fn().mockResolvedValue(new Response("{}", { status: 404 })),
   );
   window.localStorage.clear();
   Object.defineProperty(document, "visibilityState", {
@@ -203,6 +207,7 @@ describe("tree content-stall: pings keep treeLastSeen fresh but treeContentSeen 
       sessionESes()[0].fire("ping"); // session transport fresh
       sessionESes()[0].fire("snapshot", sessionSnapshot(cycle + 2), String(cycle + 2)); // session content flows
       stream.watchdogTick();
+      await flush(); // settle the 404 .then (slice-5 legacy fallback)
     }
 
     // A SECOND tree EventSource is created (the content-stall forced a reconnect

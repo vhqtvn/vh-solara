@@ -114,9 +114,13 @@ const flush = async (): Promise<void> => {
 beforeEach(async () => {
   instances = [];
   (globalThis as unknown as { EventSource: unknown }).EventSource = MockEventSource;
+  // Slice 5 (webperf): 404 = old-worker posture — the sentinel stands down to
+  // the legacy heuristics, so this suite's forced-reconnect assertions pin
+  // the pre-slice-5 contract (and double as the 404-legacy coverage). The
+  // capability-confirmed sentinel outcomes live in sentinel.test.ts.
   vi.stubGlobal(
     "fetch",
-    vi.fn().mockResolvedValue(new Response("{}", { status: 200 })),
+    vi.fn().mockResolvedValue(new Response("{}", { status: 404 })),
   );
   window.localStorage.clear();
   Object.defineProperty(document, "visibilityState", {
@@ -205,6 +209,7 @@ describe("content-stall: pings keep sessionLastSeen fresh but sessionContentSeen
       sessionESes()[0].fire("ping"); // sessionLastSeen fresh (transport alive)...
       // deliberately NO session snapshot/message/part → content stall on the session
       stream.watchdogTick();
+      await flush(); // settle the 404 .then (slice-5 legacy fallback)
     }
 
     // A SECOND session EventSource is created (the content-stall forced a

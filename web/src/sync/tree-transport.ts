@@ -92,6 +92,7 @@ import {
 } from "./stream";
 import { captureDiagEntry } from "./diaglog";
 import { countRecovery, countSnapshotBytes } from "./recovery-reasons";
+import { noteLivenessFrame } from "./liveness";
 
 // Parse a compound SSE id ("globalSeq.ordinal") or legacy numeric id.
 // O3: the ordinal is a per-connection delivery counter for Inv1 gap detection;
@@ -169,6 +170,17 @@ export function getTreeContentSeen(): number {
 }
 export function isTreeClosed(): boolean {
   return !es || es.readyState === EventSource.CLOSED;
+}
+// markTreeLivenessProof — Slice 5 (webperf/F7): refresh Stream1's liveness
+// clocks after a sentinel probe came back PROVEN (the nonce traversed the
+// full worker pipeline to this pane). Called from ./health's onProven
+// closure ONLY — never from the vh.liveness listener (a stray/late echo must
+// not refresh a clock; only the pending probe's resolution does, exactly
+// once). Equivalent to markTreeSeen(): the boundary that probed was
+// content-stale with transport fresh, and re-seeding both keeps the
+// dual-clock invariant intact.
+export function markTreeLivenessProof(): void {
+  markTreeSeen();
 }
 // lastSeenStateWritten throttles the mirror into the reactive store: the mark*
 // helpers fire on every SSE byte, but writing state.lastSeen that often would
@@ -1458,6 +1470,18 @@ function registerAuxiliaryListeners(es: EventSource, gen: number): void {
   // treeContentSeen — refreshed solely by content listeners, which DO gen-guard
   // — drives the content-stall decision.)
   es.addEventListener("ping", () => markTreeTransportSeen()); // heartbeat for the watchdog
+  // Slice 5 (webperf/F7): the liveness sentinel's correlation listener — the
+  // tree-stream half of "whichever stream receives the broadcast first". The
+  // worker's vh.liveness is a transient no-id frame fanned out to EVERY live
+  // subscriber of the project store; this listener only feeds it to the
+  // pending-probe matcher in ./liveness and deliberately does NOT touch the
+  // liveness clocks (a liveness echo is not CONTENT — refreshing here would
+  // let a periodic probe mask a genuine content stall). Gen-guarded like the
+  // other content listeners.
+  es.addEventListener("vh.liveness", (e) => {
+    if (gen !== treeGen) return;
+    noteLivenessFrame((e as MessageEvent).data);
+  });
   for (const kind of ["session.upsert", "session.delete"]) {
     es.addEventListener(kind, async (e) => {
       // Gen guard at entry (mirrors the TREE_STREAM_KINDS listener) — a stale
