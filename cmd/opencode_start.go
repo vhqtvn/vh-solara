@@ -195,6 +195,8 @@ func EnsureDetachedOpenCode(bin string, workspace string, extraW ...io.Writer) D
 			Reason:  fmt.Sprintf("opencode serve failed to listen on port %d: %v", port, err),
 		}
 	}
+	// Ready ⇒ the ring holds everything the child printed up to now.
+	flushDetachedLog(ocLogPath())
 	writeOCState(ocState{PID: cmd.Process.Pid, Port: port}) // best-effort; unchanged discard semantics
 	return DetachedStartResult{
 		Verdict: DetachedStartSpawned,
@@ -232,7 +234,9 @@ func ApplyDetachedOCStart(res DetachedStartResult, life *oclife.Lifecycle, prefi
 		// Seed the lifecycle ring with the detached disk-log tail so
 		// /vh/opencode/logs reflects recent history after a reconnect: the
 		// in-memory ring is fresh, but the process kept accumulating output.
-		seedRingFromDiskLog(life.Ring(), ocLogPath())
+		// Then keep following it: the child writes the file directly, so the
+		// ring stays live across this reconnect too.
+		followDetachedLog(ocLogPath(), res.PID, seedRingFromDiskLog(life.Ring(), ocLogPath()), ringWriter(life))
 		log.Printf("%s: reconnected to our detached OpenCode pid=%d port=%d", prefix, res.PID, res.Port)
 		return res.Port, urlFor(res.Port), nil
 
@@ -243,7 +247,7 @@ func ApplyDetachedOCStart(res DetachedStartResult, life *oclife.Lifecycle, prefi
 		// drops — and record the failure so /vh/opencode/status tells the
 		// operator to use the restart action. Worker keeps serving.
 		life.SetFailed(res.Reason, nil)
-		seedRingFromDiskLog(life.Ring(), ocLogPath())
+		followDetachedLog(ocLogPath(), res.PID, seedRingFromDiskLog(life.Ring(), ocLogPath()), ringWriter(life))
 		log.Printf("%s: detached OpenCode pid=%d port=%d alive but unreachable (%s) — worker stays up; opencode status=failed; refusing to spawn beside it", prefix, res.PID, res.Port, res.Reason)
 		return res.Port, urlFor(res.Port), nil
 
@@ -414,6 +418,8 @@ func restartDetachedOpenCode(bin string, port int, workspace string, curPID int,
 		// posture as the boot path's readiness failure).
 		return cmd, port, fmt.Errorf("opencode serve failed to listen on port %d: %v", port, err)
 	}
+	// Ready ⇒ the ring holds everything the child printed up to now.
+	flushDetachedLog(ocLogPath())
 	writeOCState(ocState{PID: cmd.Process.Pid, Port: port}) // best-effort; unchanged discard semantics
 	return cmd, port, nil
 }

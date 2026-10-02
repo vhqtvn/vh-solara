@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vhqtvn/vh-solara/pkg/oclife"
 	"github.com/vhqtvn/vh-solara/pkg/ringlog"
 )
 
@@ -304,29 +305,51 @@ func startOpenCodeServeDetached(bin string, port int, workspace string, extraFil
 	}
 	cmd.Env = os.Environ()
 	cmd.ExtraFiles = extraFiles
-	// Fan output to the per-project disk log AND any extra sinks (the lifecycle
-	// ring). A nil sink is dropped so a caller passing an explicit nil stays
-	// safe; io.MultiWriter would otherwise panic on a nil Write.
-	sinks := make([]io.Writer, 0, 1+len(extraW))
-	if lf, err := os.OpenFile(ocLogPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
-		sinks = append(sinks, lf)
-	}
+	// The child writes the per-project disk log through a REAL fd — never a
+	// pipe into this process, whose read end would die with the daemon and
+	// EPIPE every later write (see opencode_logtail.go). Extra sinks (the
+	// lifecycle ring) are fed by following the file instead. A nil sink is
+	// dropped so a caller passing an explicit nil stays safe.
+	sinks := make([]io.Writer, 0, len(extraW))
 	for _, w := range extraW {
 		if w != nil {
 			sinks = append(sinks, w)
 		}
 	}
-	if len(sinks) == 1 {
-		cmd.Stdout = sinks[0]
-		cmd.Stderr = sinks[0]
-	} else if len(sinks) > 1 {
-		mw := io.MultiWriter(sinks...)
-		cmd.Stdout = mw
-		cmd.Stderr = mw
+	logPath := ocLogPath()
+	lf, lerr := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if lerr == nil {
+		cmd.Stdout = lf
+		cmd.Stderr = lf
+	} else {
+		// No disk log: fall back to piping into the sinks. That feed dies
+		// with the daemon, but nothing better survives without a file.
+		log.Printf("detached opencode: open log %s: %v (output not persisted)", logPath, lerr)
+		if len(sinks) == 1 {
+			cmd.Stdout, cmd.Stderr = sinks[0], sinks[0]
+		} else if len(sinks) > 1 {
+			mw := io.MultiWriter(sinks...)
+			cmd.Stdout, cmd.Stderr = mw, mw
+		}
+	}
+	var from int64
+	if lerr == nil {
+		from = logSize(logPath)
 	}
 	setSurviveAttrs(cmd)
-	if err := cmd.Start(); err != nil {
+	err := cmd.Start()
+	if lf != nil {
+		_ = lf.Close() // the child holds its own copy
+	}
+	if err != nil {
 		return nil, fmt.Errorf("failed to start detached opencode serve: %v", err)
+	}
+	if lerr == nil && len(sinks) > 0 {
+		var w io.Writer = sinks[0]
+		if len(sinks) > 1 {
+			w = io.MultiWriter(sinks...)
+		}
+		followDetachedLog(logPath, cmd.Process.Pid, from, w)
 	}
 	return cmd, nil
 }
@@ -347,22 +370,24 @@ func startOpenCodeServeDetached(bin string, port int, workspace string, extraFil
 //   - All errors are non-fatal: a missing/corrupt log must NOT block worker
 //     startup. A warning is logged and the ring is left in whatever partial
 //     state the read produced.
-func seedRingFromDiskLog(ring *ringlog.Ring, logPath string) {
+//
+// It returns the file offset the seed covers, where followDetachedLog resumes.
+func seedRingFromDiskLog(ring *ringlog.Ring, logPath string) int64 {
 	if ring == nil {
-		return
+		return logSize(logPath)
 	}
 	info, err := os.Stat(logPath)
 	if err != nil {
 		// Missing file = fresh instance (or first-ever detached spawn); not an error.
-		return
+		return 0
 	}
 	if info.Size() == 0 {
-		return
+		return 0
 	}
 	f, err := os.Open(logPath)
 	if err != nil {
 		log.Printf("seedRingFromDiskLog: open %s: %v (continuing with empty ring)", logPath, err)
-		return
+		return info.Size()
 	}
 	defer f.Close()
 	var off int64
@@ -371,12 +396,23 @@ func seedRingFromDiskLog(ring *ringlog.Ring, logPath string) {
 	}
 	if _, err := f.Seek(off, io.SeekStart); err != nil {
 		log.Printf("seedRingFromDiskLog: seek %s: %v (continuing with empty ring)", logPath, err)
-		return
+		return info.Size()
 	}
-	tail, err := io.ReadAll(f)
+	// Bounded to the size observed above so the returned offset is exactly
+	// where a follower must resume (bytes appended meanwhile are its job).
+	tail, err := io.ReadAll(io.LimitReader(f, info.Size()-off))
 	if err != nil {
 		log.Printf("seedRingFromDiskLog: read %s: %v (continuing with partial ring)", logPath, err)
-		return
 	}
 	ring.Append(string(tail))
+	return off + int64(len(tail))
+}
+
+// ringWriter is life's ring as a follower sink, nil when the topology has no
+// ring (a nil sink makes followDetachedLog a no-op).
+func ringWriter(life *oclife.Lifecycle) io.Writer {
+	if r := life.Ring(); r != nil {
+		return r.Writer()
+	}
+	return nil
 }
