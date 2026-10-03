@@ -19,6 +19,7 @@ describe("themes", () => {
     for (const id of [
       "rose-pine", "one-dark", "everforest", "ayu", "solarized-dark", "solarized-light",
       "monokai", "kanagawa", "material", "catppuccin-latte", "rose-pine-dawn", "custom",
+      "oled", "oled-violet",
     ]) {
       expect(ids).toContain(id);
     }

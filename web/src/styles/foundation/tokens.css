@@ -123,7 +123,22 @@
   --fg: #ffffff; --fg-dim: #c9c9c9; --accent: #4cc2ff; --accent-2: #e0a3ff;
   --code-bg: #0a0a0a; --code-surface: #000000;
 }
-/* OpenChamber "Fields of the Shire" palettes, ported. These lean on the
+/* OLED — true-black palettes for OLED panels, where only #000000 turns pixels
+   fully off (off-blacks like #06080d keep the whole panel lit). Like hc the
+   base + code surface are pure black, but borders stay dim (a minimal
+   elevation hint) and accents are saturated to pop against black. */
+:root.theme-oled {
+  --bg: #000000; --bg-2: #0a0a0a; --border: #242424;
+  --fg: #d0d7e2; --fg-dim: #8a94a3; --accent: #4c9cff; --accent-2: #b388ff;
+  --code-bg: #0a0a0a; --code-surface: #000000;
+}
+/* OLED Violet — same true-black chrome, violet/pink accent family. */
+:root.theme-oled-violet {
+  --bg: #000000; --bg-2: #0a0a0a; --border: #262626;
+  --fg: #d8d2e8; --fg-dim: #8d87a0; --accent: #a277ff; --accent-2: #ff7edb;
+  --code-bg: #0a0a0a; --code-surface: #000000;
+}
+/* OpenChamber "Fields of the Shire" palettes, ported.  These lean on the
    markdown/chat token defaults but recolor headings/quotes to the warm Shire
    hues for a distinctly different reading experience. */
 :root.theme-shire-dark {

@@ -19,6 +19,8 @@ export const THEMES: ThemeDef[] = [
   { id: "dim", name: "Dim", swatch: { bg: "#1c2128", fg: "#adbac7", accent: "#539bf5", accent2: "#dcbdfb" } },
   { id: "midnight", name: "Midnight", swatch: { bg: "#06080d", fg: "#c9d1d9", accent: "#6cb6ff", accent2: "#b39dff" } },
   { id: "hc", name: "High contrast", swatch: { bg: "#000000", fg: "#ffffff", accent: "#4cc2ff", accent2: "#e0a3ff" } },
+  { id: "oled", name: "OLED", swatch: { bg: "#000000", fg: "#d0d7e2", accent: "#4c9cff", accent2: "#b388ff" } },
+  { id: "oled-violet", name: "OLED Violet", swatch: { bg: "#000000", fg: "#d8d2e8", accent: "#a277ff", accent2: "#ff7edb" } },
   { id: "shire-dark", name: "Shire (dark)", swatch: { bg: "#1b1815", fg: "#ebe0d1", accent: "#7a8a5a", accent2: "#c47a3a" } },
   { id: "tokyonight", name: "Tokyo Night", swatch: { bg: "#1a1b26", fg: "#c0caf5", accent: "#7aa2f7", accent2: "#bb9af7" } },
   { id: "dracula", name: "Dracula", swatch: { bg: "#282a36", fg: "#f8f8f2", accent: "#bd93f9", accent2: "#ff79c6" } },

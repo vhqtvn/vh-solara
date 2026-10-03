@@ -25,7 +25,7 @@
  * to every element directly via `*`; non-scrollable elements ignore them. The
  * colors reuse theme tokens (`--fg-dim`) which resolve in ALL shipped themes
  * (every theme block in tokens.css defines `--fg-dim`), so the thumb adapts to
- * dark, light, dim, midnight, hc, shire-*, tokyonight, dracula, nord,
+ * dark, light, dim, midnight, hc, oled, oled-violet, shire-*, tokyonight, dracula, nord,
  * catppuccin, gruvbox, rose-pine, one-dark, everforest, ayu, solarized-*,
  * monokai, kanagawa, material, catppuccin-latte, rose-pine-dawn, paper,
  * paper-color, eink, and eink-color. No hardcoded colors.
