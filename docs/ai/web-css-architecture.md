@@ -82,6 +82,20 @@ Rules:
 3. **`--vh-*` tokens are the stable embedded-view contract.** Treat them as a
    public surface — change them deliberately, not in passing.
 
+Token families living in `foundation/tokens.css` `:root` (derived defaults
+unless noted): surfaces, text, accents, semantic status
+(`--danger`/`--warn`/`--ok`/`--info`/`--sel` + their `-fg` partners), fixed
+`--label-*` (server-validated against `pkg/web/labels.go` — never extend
+one-sidedly), elevation shadows (`--shadow-sm|md|lg`), overlay backdrops
+(`--scrim`, `--scrim-strong`), interaction surfaces (`--hover-bg`,
+`--active-bg`), `--focus-ring`, `--md-*`/`--chat-*`, the `--z-*` ladder, and
+`--sidebar-w`. Per-theme `:root.theme-*` blocks override only what needs
+tuning — e.g. `theme-light-scoped` softens the shadow tiers, and the e-ink
+themes zero them. Consumers reference `var(--token)` WITHOUT inline fallbacks
+(fallbacks are how phantom/drift bugs started); `--shadow-lg` is additionally
+re-defined late in `legacy/80-professional-pass.css` — kept byte-identical
+there until that shard folds (see "Open follow-ups").
+
 ## 3. The 8 migration carry-forward rules
 
 These are the hard-won AI-first guidance distilled from the actual migration.

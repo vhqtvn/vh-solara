@@ -29,14 +29,14 @@
   background: var(--bg-2);
   border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
+  box-shadow: var(--shadow-md);
   padding: 5px;
   max-height: 60vh;
   overflow-y: auto;
 }
 .proj-item { display: flex; align-items: center; border-radius: 6px; }
 .proj-item.on { background: color-mix(in srgb, var(--accent) 15%, transparent); }
-.proj-item:hover { background: color-mix(in srgb, var(--fg) 7%, transparent); }
+.proj-item:hover { background: var(--hover-bg); }
 .proj-pick {
   flex: 1;
   display: flex;

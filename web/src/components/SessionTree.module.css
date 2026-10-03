@@ -63,7 +63,7 @@
   color: var(--fg);
 }
 .groupToggle:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--focus-ring);
   outline-offset: -1px;
 }
 .groupToggle:disabled {
@@ -140,7 +140,7 @@
   color: var(--fg);
 }
 .groupManageBtn:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
 
@@ -158,7 +158,7 @@
   background: var(--bg-2);
   border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: 0 12px 40px #0009;
+  box-shadow: var(--shadow-lg);
 }
 .groupMenuItem {
   display: flex;
@@ -220,7 +220,7 @@
   transform: scale(1.12);
 }
 .groupSwatch:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
 .groupSwatch:disabled {

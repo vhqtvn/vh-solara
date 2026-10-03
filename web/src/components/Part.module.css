@@ -117,8 +117,8 @@
 }
 .tool-sub-status:global(.error) { background: var(--danger); }
 .tool-sub-status:global(.needs-input) {
-  background: var(--warn, #e8a838);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn, #e8a838) 32%, transparent);
+  background: var(--warn);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 32%, transparent);
   animation: pulse 1.1s ease-in-out infinite;
 }
 .tool-sub-spin {

@@ -23,7 +23,7 @@
   background: var(--bg-2);
   border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: var(--shadow-lg, 0 12px 40px #0009);
+  box-shadow: var(--shadow-lg);
 }
 
 .menuItem {

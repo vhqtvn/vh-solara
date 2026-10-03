@@ -31,7 +31,7 @@
   border: 1px solid var(--border);
   background: var(--bg-2);
   color: var(--fg);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  box-shadow: var(--shadow-sm);
   animation: dialog-in 0.16s var(--ease, ease);
 }
 .och-pill.starting {
@@ -73,7 +73,7 @@
   border-radius: 12px;
   border: 1px solid var(--border);
   background: var(--bg-2);
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--shadow-lg);
   animation: dialog-in 0.16s var(--ease, ease);
 }
 .och-panel.failed {

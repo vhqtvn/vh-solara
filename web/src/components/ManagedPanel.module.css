@@ -14,7 +14,7 @@
   display: flex; flex-direction: column; gap: 6px; padding: 12px;
   width: min(440px, calc(100vw - 24px)); max-height: 82vh; overflow-y: auto;
   background: var(--bg-2); border: 1px solid var(--border); border-radius: 12px;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--shadow-lg);
 }
 .managed-trust-actions { display: flex; gap: 6px; }
 .managed-trust-actions :global(.admin-btn) { flex: 1; justify-content: center; }

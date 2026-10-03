@@ -13,7 +13,7 @@
 .settings-group-title:first-child { margin-top: 0; }
 .setting-note { font-size: 12px; margin: 8px 0; }
 .setting-note:global(.ok) { color: var(--accent); }
-.setting-note:global(.err) { color: var(--danger, #e5534b); }
+.setting-note:global(.err) { color: var(--danger); }
 .notif-channel {
   border: 1px solid var(--border);
   border-radius: 8px;

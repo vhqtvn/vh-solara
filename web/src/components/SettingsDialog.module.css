@@ -28,7 +28,7 @@
 .custom-theme-import { display: flex; gap: 6px; }
 .custom-theme-import input { flex: 1 1 auto; min-width: 0; }
 .custom-theme-import button { flex: 0 0 auto; }
-.setting-err { color: var(--danger, #f85149); }
+.setting-err { color: var(--danger); }
 
 /* Install-app button in Settings → App. */
 .install-app-btn {

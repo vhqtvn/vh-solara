@@ -55,6 +55,33 @@
   --warn: #d29922;
   --ok: #3fb950;
   --sel: #1f6feb; /* selection / "current" highlight base */
+  --info: #388bfd; /* informational status — blue sibling of --danger/--warn/--ok, same saturated mid-tone posture (between --sel and --accent) so it reads on both light and dark; tint/translucent variants derive via color-mix at the use site */
+
+  /* Elevation shadow tiers (popovers/menus → toast pills & dropdowns →
+     dialogs/overlays), pure black at fixed alphas so every dark theme derives
+     unchanged. --shadow-lg is byte-identical to the late :root definition in
+     legacy/80-professional-pass.css (which still wins the cascade today), so
+     that shard can fold into tokens.css later with zero visual change — see
+     web-css-architecture.md "Open follow-ups". Light themes soften these via
+     :root.theme-light-scoped; e-ink zeroes them (a shadow only ghosts an e-ink
+     panel — borders carry elevation there). */
+  --shadow-sm: 0 6px 18px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 12px 32px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 18px 50px -16px rgba(0, 0, 0, 0.7);
+  /* Overlay backdrops: --scrim for ordinary modal dimmers (≈ the legacy
+     .dialog-overlay #0008), --scrim-strong for attention-locked full-screen
+     viewers (Mermaid). A near-black dimmer reads on light pages too, so themes
+     rarely override. */
+  --scrim: rgba(0, 0, 0, 0.5);
+  --scrim-strong: rgba(0, 0, 0, 0.88);
+  /* Interaction surfaces, derived from --fg via color-mix so they flip with the
+     theme (light text lightens dark rows; dark text darkens light ones).
+     Override only when the fg-mix reads wrong for a palette. */
+  --hover-bg: color-mix(in srgb, var(--fg) 7%, transparent);
+  --active-bg: color-mix(in srgb, var(--fg) 14%, transparent);
+  /* Keyboard-focus ring color, derived from --accent so every theme stays
+     on-brand. Consume as e.g. `outline: 2px solid var(--focus-ring)`. */
+  --focus-ring: var(--accent);
 
   /* Root-session label palette (groups + tags). A FIXED saturated mid-tone set
      the server validates against (pkg/web labels.go: red orange amber green teal
@@ -298,7 +325,14 @@
 /* On light themes the most-prominent text must be dark, not white. */
 /* Light-theme overrides apply to ALL light themes via the generic marker class
    (set in theme.ts), so Shire (light) gets them too — not just `light`. */
-:root.theme-light-scoped { --fg-strong: var(--fg); --danger-fg: #cf222e; --accent-fg: #fff; }
+:root.theme-light-scoped {
+  --fg-strong: var(--fg); --danger-fg: #cf222e; --accent-fg: #fff;
+  /* The dark-theme shadow alphas render as heavy grey blobs on a light page —
+     soften the tiers (borders already carry most of the separation). */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.12);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.14);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
 :root.theme-light-scoped .vh-diff-add { background: #e6ffec; color: #1f2328; }
 :root.theme-light-scoped .vh-diff-del { background: #ffebe9; color: #1f2328; }
 :root.theme-light-scoped .vh-diff-hunk { background: #ddf4ff; color: #0969da; }
@@ -345,6 +379,8 @@
   --fg: #000000; --fg-dim: #555555; --fg-strong: #000000;
   --accent-fg: #ffffff; --danger-fg: #ffffff;
   --bg-input: #ffffff; --bg-elev: #ffffff;
+  /* Borders carry elevation here (see block comment); shadows only ghost. */
+  --shadow-sm: none; --shadow-md: none; --shadow-lg: none;
 }
 /* E Ink (B&W): a purely monochrome page. Even status colours are greys, set
    apart only by darkness — there is no colour on a Carta panel. */

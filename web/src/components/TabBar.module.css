@@ -33,7 +33,7 @@
   position: absolute; top: calc(100% + 4px); right: 0; z-index: 60; min-width: 150px;
   display: flex; flex-direction: column; padding: 4px;
   background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px;
-  box-shadow: var(--shadow-lg, 0 12px 40px #0009);
+  box-shadow: var(--shadow-lg);
 }
 .tabbar-menu-item {
   display: flex; align-items: center; gap: 8px; text-align: left; width: 100%;

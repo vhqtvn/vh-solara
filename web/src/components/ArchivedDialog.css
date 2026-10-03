@@ -79,8 +79,8 @@
   border-radius: 8px;
   font-size: 12px;
   word-break: break-word;
-  background: color-mix(in srgb, var(--danger, #e5484d) 12%, transparent);
-  color: var(--danger, #e5484d);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
 }
 @media (hover: none) {
   .arch-restore { opacity: 1; }

@@ -13,7 +13,7 @@
   gap: 8px;
   font-size: 13px;
   border-radius: 999px;
-  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
+  box-shadow: var(--shadow-md);
   padding: 7px 14px;
   max-width: calc(100vw - 24px);
   animation: dialog-in 0.16s var(--ease, ease);

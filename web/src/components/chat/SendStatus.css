@@ -69,7 +69,7 @@
 .sendStatusLine[data-kind="conflict"],
 .sendStatusLine[data-kind="rejected"],
 .sendStatusLine[data-kind="blocked"] {
-  background: color-mix(in srgb, var(--danger, #e5484d) 16%, var(--bg-2));
+  background: color-mix(in srgb, var(--danger) 16%, var(--bg-2));
 }
 
 .sendStatusText {

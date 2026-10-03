@@ -15,7 +15,7 @@
   background: var(--bg-2);
   border: 1px solid var(--border);
   border-radius: 999px;
-  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
+  box-shadow: var(--shadow-md);
   padding: 8px 8px 8px 14px;
   max-width: calc(100vw - 24px);
   animation: dialog-in 0.16s var(--ease, ease);

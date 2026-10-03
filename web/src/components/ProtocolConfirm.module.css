@@ -44,9 +44,9 @@
 .proto-warn {
   margin: 0 0 4px;
   padding: 8px 10px;
-  border: 1px solid var(--warn, #d97706);
+  border: 1px solid var(--warn);
   border-radius: 6px;
-  background: color-mix(in srgb, var(--warn, #d97706) 12%, transparent);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
   color: var(--fg);
   font-size: var(--text-sm);
   line-height: 1.4;

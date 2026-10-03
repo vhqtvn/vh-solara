@@ -48,7 +48,7 @@
   z-index: var(--z-overlay-full);
   display: flex;
   flex-direction: column;
-  background: rgba(0, 0, 0, 0.88);
+  background: var(--scrim-strong);
   padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right))
     max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
   outline: none;
