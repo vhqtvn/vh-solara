@@ -1,8 +1,62 @@
 package oclife
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 )
+
+func TestDeathWatchSnapshotFields(t *testing.T) {
+	l := New(TopologyDetached)
+	l.SetReady()
+
+	s := l.Snapshot()
+	if s.DownSince != nil {
+		t.Fatalf("DownSince set before any death: %v", s.DownSince)
+	}
+	if s.RestartAttempts != 0 || s.RestartCapped {
+		t.Fatalf("restart progress set before any death: %+v", s)
+	}
+
+	// Death observed → down-since recorded without changing state.
+	l.MarkDown()
+	s = l.Snapshot()
+	if s.State != StateReady {
+		t.Fatalf("MarkDown changed state: %s", s.State)
+	}
+	if s.DownSince == nil {
+		t.Fatal("DownSince nil after MarkDown")
+	}
+	first := *s.DownSince
+
+	// Repeated MarkDown keeps the first timestamp.
+	time.Sleep(2 * time.Millisecond)
+	l.MarkDown()
+	if got := *l.Snapshot().DownSince; !got.Equal(first) {
+		t.Fatalf("MarkDown moved DownSince: first=%v now=%v", first, got)
+	}
+
+	// Restart progress is reported verbatim.
+	l.SetRestartProgress(3, true)
+	s = l.Snapshot()
+	if s.RestartAttempts != 3 || !s.RestartCapped {
+		t.Fatalf("restart progress not reported: %+v", s)
+	}
+
+	// A failed state (crash-loop give-up) keeps the down-window detail…
+	l.SetFailed("opencode crash-loop: 3 restarts in 10m0s — giving up", nil)
+	s = l.Snapshot()
+	if s.DownSince == nil || !s.RestartCapped {
+		t.Fatalf("failed state lost death-watch detail: %+v", s)
+	}
+
+	// …and the next ready clears it.
+	l.SetReady()
+	s = l.Snapshot()
+	if s.DownSince != nil || s.RestartAttempts != 0 || s.RestartCapped {
+		t.Fatalf("ready state kept stale death-watch detail: %+v", s)
+	}
+}
 
 // TestFailedOwnedSnapshot validates the failed-state snapshot + owned capability
 // flags (validation plan item #1): a lifecycle constructed for the owned
@@ -117,7 +171,40 @@ func TestInitialStateStarting(t *testing.T) {
 	for _, topo := range []Topology{TopologyOwned, TopologyDetached, TopologyExternal} {
 		l := New(topo)
 		if s := l.Snapshot(); s.State != StateStarting {
-			t.Errorf("topology %s: initial state = %q, want starting", topo, s.State)
+			t.Errorf("topology %s: initial state = %s, want starting", topo, s.State)
 		}
+	}
+}
+
+// TestSnapshotAdditiveJSON pins the additive-fields contract: an OLD consumer
+// decoding a NEW snapshot ignores the unknown fields, and a snapshot with no
+// death-watch activity marshals without the new keys at all.
+func TestSnapshotAdditiveJSON(t *testing.T) {
+	l := New(TopologyDetached)
+	l.SetReady()
+	b, err := json.Marshal(l.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"down_since", "restart_attempts", "restart_capped"} {
+		if _, ok := raw[key]; ok {
+			t.Fatalf("key %q present in an all-clear snapshot: %s", key, b)
+		}
+	}
+
+	// New fields round-trip.
+	l.MarkDown()
+	l.SetRestartProgress(2, false)
+	b, _ = json.Marshal(l.Snapshot())
+	var s Snapshot
+	if err := json.Unmarshal(b, &s); err != nil {
+		t.Fatalf("new snapshot not decodable into Snapshot: %v", err)
+	}
+	if s.DownSince == nil || s.RestartAttempts != 2 {
+		t.Fatalf("death-watch fields did not round-trip: %s", b)
 	}
 }

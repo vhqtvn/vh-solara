@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"log"
 	"time"
 )
@@ -29,6 +30,25 @@ func (rt *clientDaemonRuntime) setupWebMode() {
 		}
 		rt.opencodeWebCmd = c
 		log.Printf("Started opencode web on port %d (pid=%d)", rt.webPort, c.Process.Pid)
+
+		// oc-death-watch (S1), DETECTION-ONLY: `opencode web` has no
+		// lifecycle and NO auto-restart (a dying web UI takes the daemon
+		// with it, exactly as before — the telemetry teardown HealthCheck
+		// decides). The watcher's job is to NOTICE the death fast, log it
+		// with pid/exit/uptime, and perform the sole Wait() so
+		// cmd.ProcessState is finally populated — the HealthCheck's exit
+		// condition worked but could never fire before. Its Reap is safe
+		// here: unlike the detached serve child, there is no pid-reuse
+		// invariant to preserve for a web child nobody signals by pid.
+		rt.vhCtx, rt.vhCancel = context.WithCancel(context.Background())
+		rt.webWatcher = newOCDeathWatcher(nil, nil)
+		rt.webWatcher.Reap = func() {
+			if c := rt.opencodeWebCmd; c != nil {
+				_ = c.Wait()
+			}
+		}
+		rt.webWatcher.Start(rt.vhCtx)
+		rt.webWatcher.Arm(c.Process.Pid, rt.webPort, true)
 
 		if err := waitForPort(rt.webPort, 30*time.Second); err != nil {
 			log.Fatalf("opencode web failed to listen on port %d: %v", rt.webPort, err)

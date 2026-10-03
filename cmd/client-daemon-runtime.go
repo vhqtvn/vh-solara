@@ -50,7 +50,11 @@ type clientDaemonRuntime struct {
 	// state instead of killing the reporting worker.
 	ocLife   *oclife.Lifecycle
 	vhCancel context.CancelFunc
-	vhHTTP   *http.Server
+	// vhCtx is the daemon-lifetime context (created BEFORE the topology
+	// arms in setupVHMode / the web-mode branch) that vhCancel tears down.
+	// The death watchers are bound to it, so daemon shutdown stops them.
+	vhCtx  context.Context
+	vhHTTP *http.Server
 	// vhSrv is the vh web Server (set only in the WebOpenChamber case where
 	// the daemon builds it). Hoisted to this scope so daemon.KillFunc (after
 	// the switch) can cancel + await its owned background goroutines.
@@ -69,6 +73,17 @@ type clientDaemonRuntime struct {
 	external     bool
 	opencodeURL  string
 	opencodePort int
+
+	// oc-death-watch (S1). ocWatcher watches the detached `opencode serve`
+	// child (detect death without reaping; auto-restart through the shared
+	// serialized arm). webWatcher watches the `--web opencode` child in
+	// DETECTION-ONLY mode (no lifecycle, no auto-restart; its Reap is the
+	// sole Wait so the teardown HealthCheck observes the exit). Both are
+	// bound to vhCtx. Access to ocWatcher's field is under opencodeMu
+	// (set once at boot before serving starts; read by the restart arm's
+	// OnDone and autoRestartDetached under the same mutex).
+	ocWatcher  *ocDeathWatcher
+	webWatcher *ocDeathWatcher
 }
 
 // newClientDaemonRuntime resolves the daemon flags + env into the runtime

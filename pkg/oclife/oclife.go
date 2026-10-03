@@ -116,6 +116,18 @@ type Snapshot struct {
 	ExitCode               *int                   `json:"exit_code,omitempty"`
 	Capabilities           Capabilities           `json:"capabilities"`
 	DiagnosticCompleteness DiagnosticCompleteness `json:"diagnostic_completeness"`
+
+	// Death-watch additions (S1). Additive: older consumers ignore unknown
+	// JSON fields, and omitempty keeps snapshots byte-identical to the old
+	// shape while unset.
+	//
+	// DownSince is set when the death watcher observed the process go down
+	// (kept across failed→starting during a restart; cleared on ready).
+	// RestartAttempts/RestartCapped report auto-restart progress toward the
+	// crash-loop cap.
+	DownSince       *time.Time `json:"down_since,omitempty"`
+	RestartAttempts int        `json:"restart_attempts,omitempty"`
+	RestartCapped   bool       `json:"restart_capped,omitempty"`
 }
 
 // Lifecycle is the worker-local OpenCode state machine. Construct one per
@@ -129,13 +141,16 @@ type Lifecycle struct {
 	caps Capabilities
 	diag DiagnosticCompleteness
 
-	mu             sync.Mutex
-	topology       Topology
-	state          State
-	stateChangedAt time.Time
-	opencodeURL    string
-	failureSummary string
-	exitCode       *int
+	mu              sync.Mutex
+	topology        Topology
+	state           State
+	stateChangedAt  time.Time
+	opencodeURL     string
+	failureSummary  string
+	exitCode        *int
+	downSince       *time.Time
+	restartAttempts int
+	restartCapped   bool
 }
 
 // New returns a Lifecycle for the given topology, starting in StateStarting.
@@ -226,6 +241,37 @@ func (l *Lifecycle) transition(state State, summary string, exit *int) {
 		l.failureSummary = ""
 		l.exitCode = nil
 	}
+	if state == StateReady {
+		// Back up and serving again: the down spell is over. This also
+		// re-arms the crash-loop accounting (a fresh healthy window resets
+		// the watcher's backoff — the watcher clears its own attempt
+		// history; these fields just stop being reported).
+		l.downSince = nil
+		l.restartAttempts = 0
+		l.restartCapped = false
+	}
+}
+
+// MarkDown records that the process went down at this moment (death-watch
+// observation). It does NOT change the lifecycle state — the caller decides
+// the disposition (restart, deliberate stop, crash-loop give-up). Repeated
+// calls while already down keep the first timestamp.
+func (l *Lifecycle) MarkDown() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.downSince == nil {
+		now := time.Now()
+		l.downSince = &now
+	}
+}
+
+// SetRestartProgress reports auto-restart progress toward the crash-loop cap
+// so the status snapshot can show it (S2 UI consumes this).
+func (l *Lifecycle) SetRestartProgress(attempts int, capped bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.restartAttempts = attempts
+	l.restartCapped = capped
 }
 
 // SetOpenCodeURL records the OpenCode base URL the aggregator/reverse-proxy
@@ -261,5 +307,8 @@ func (l *Lifecycle) Snapshot() Snapshot {
 		ExitCode:               l.exitCode,
 		Capabilities:           l.caps,
 		DiagnosticCompleteness: l.diag,
+		DownSince:              l.downSince,
+		RestartAttempts:        l.restartAttempts,
+		RestartCapped:          l.restartCapped,
 	}
 }

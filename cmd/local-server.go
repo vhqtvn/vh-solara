@@ -60,7 +60,16 @@ with --opencode-url, or spawn a survivable detached instance with
 		var opencodeReapDone <-chan struct{}
 		var opencodeMu sync.Mutex
 		var vhCancel context.CancelFunc
+		var vhCtx context.Context
 		var vhHTTP *http.Server
+		// oc-death-watch (S1): the detached child's death watcher and the
+		// SHARED restart arm both the boot verdict and the UI restart hook
+		// route through (mirrors client-daemon's detachedArm wiring).
+		// webSrv is assigned once the web server is built; the arm reads it
+		// lazily so the closure can exist before construction.
+		var ocWatch *ocDeathWatcher
+		var detachedArm *ocDetachedRestartArm
+		var webSrv *web.Server
 
 		external := localOpenCodeURL != ""
 		var opencodeURL string
@@ -84,6 +93,34 @@ with --opencode-url, or spawn a survivable detached instance with
 			topo = oclife.TopologyOwned
 		}
 		ocLife := oclife.New(topo)
+
+		// Daemon-lifetime context (oc-death-watch S1): created BEFORE the
+		// topology arms so the death watcher — armed in the detached boot
+		// arm below — is bound to the same cancellation the restart-server
+		// hook and the deferred teardown drive. CancelFunc is idempotent.
+		vhCtx, vhCancel = context.WithCancel(context.Background())
+		defer vhCancel()
+
+		// The SHARED serialized detached restart (oc-death-watch S1
+		// extraction): the exact wiring the old inlined arm of
+		// restartOpencodeLocked had, so the UI restart hook and the death
+		// watcher's auto-restart cannot drift.
+		detachedArm = &ocDetachedRestartArm{
+			Bin:     localOpenCodeBin,
+			Cwd:     cwd,
+			Life:    ocLife,
+			Noun:    "local-server",
+			Srv:     func() *web.Server { return webSrv },
+			Cmd:     func() *exec.Cmd { return opencodeServeCmd },
+			SetCmd:  func(c *exec.Cmd) { opencodeServeCmd = c },
+			Port:    func() int { return opencodePort },
+			SetPort: func(port int, url string) { opencodePort, opencodeURL = port, url },
+			OnDone: func(c *exec.Cmd, effectivePort int, err error) {
+				if ocWatch != nil && c != nil && c.Process != nil && effectivePort > 0 {
+					ocWatch.Arm(c.Process.Pid, effectivePort, true)
+				}
+			},
+		}
 
 		switch {
 		case external:
@@ -115,6 +152,40 @@ with --opencode-url, or spawn a survivable detached instance with
 			// HasLogTail: true.
 			res := EnsureDetachedOpenCode(localOpenCodeBin, cwd, ocLife.Ring().Writer())
 			opencodePort, opencodeURL, opencodeServeCmd = ApplyDetachedOCStart(res, ocLife, "local-server")
+
+			// oc-death-watch (S1): start the death watcher and point it at
+			// whatever the boot verdict left (spawned/retained child →
+			// parent wait fast path; reattached/occupied instance →
+			// identity poll; contended/orphaned → nothing to watch).
+			// Auto-restart routes through the SAME detachedArm the UI
+			// restart hook uses, serialized on opencodeMu, deferring to a
+			// newer generation (user restart) and skipping deliberate
+			// stops — mirrors client-daemon's armOpenCodeWatcher.
+			ocWatch = newOCDeathWatcher(ocLife, func(gen uint64) {
+				opencodeMu.Lock()
+				defer opencodeMu.Unlock()
+				if ocWatch == nil || ocWatch.Generation() != gen {
+					return // superseded by a newer child (user restart's spawn)
+				}
+				switch ocLife.Snapshot().State {
+				case oclife.StateStarting, oclife.StateStopped:
+					return
+				}
+				if err := detachedArm.Run(); err != nil {
+					log.Printf("opencode watch: auto-restart attempt failed: %v", err)
+				}
+			})
+			ocWatch.Start(vhCtx)
+			switch res.Verdict {
+			case DetachedStartSpawned, DetachedStartFailed:
+				if res.PID > 0 {
+					ocWatch.Arm(res.PID, res.Port, true)
+				}
+			case DetachedStartReattached, DetachedStartOccupied:
+				if res.PID > 0 {
+					ocWatch.Arm(res.PID, res.Port, false)
+				}
+			}
 
 		default:
 			// Owned INITIAL boot (P1-API-006 A2): the same shared
@@ -154,6 +225,9 @@ with --opencode-url, or spawn a survivable detached instance with
 		if err != nil {
 			log.Fatalf("Failed to build vh web server: %v", err)
 		}
+		// The shared detached restart arm reads the running server lazily
+		// (oc-death-watch S1): assign now that it exists.
+		webSrv = srv
 		// Record whether OpenCode is attached externally (--opencode-url) so the
 		// direct-DB unarchive guard can refuse fast in that topology (the local DB
 		// may not be the remote instance's). See pkg/opencode/db.go.
@@ -190,42 +264,14 @@ with --opencode-url, or spawn a survivable detached instance with
 				return nil
 			}
 			if localOpenCodeDetached {
-				// Serialized restart (P1-API-002): the same shared transaction
-				// client-daemon routes through — under the starter lock, revalidate
-				// the recorded pid before signaling (never signal a recycled pid),
-				// wait out the old owner, respawn on the stable port.
-				ocLife.SetStarting()
-				curPID := 0
-				if opencodeServeCmd != nil && opencodeServeCmd.Process != nil {
-					curPID = opencodeServeCmd.Process.Pid
-				}
-				oldPort := opencodePort
-				// Ring fan-in parity (F3): the replacement detached child's
-				// output must keep flowing into the lifecycle ring — a
-				// ring-fed boot child must not lose the feed across an
-				// accepted detached restart. The same extraW sink the boot
-				// arm and client-daemon's detached restart arm wire, so
-				// /vh/opencode/logs stays truthful after the swap.
-				c, effectivePort, err := restartDetachedOpenCode(localOpenCodeBin, oldPort, cwd, curPID, ocLife.Ring().Writer())
-				if c != nil {
-					opencodeServeCmd = c
-				}
-				if err != nil {
-					ocLife.SetFailed(fmt.Sprintf("detached opencode restart failed: %v", err), nil)
-					return err
-				}
-				// P1-API-003: BEFORE the readiness flip, propagate a fresh spawn
-				// port to everything still targeting the old one — the ocLife
-				// status URL and the RUNNING web server's proxy + aggregators
-				// (applyFreshPortRetarget is the SAME wiring client-daemon's arm
-				// uses, so the two binaries cannot drift). Same-port restarts
-				// no-op here.
-				if p, u, retargeted := applyFreshPortRetarget(effectivePort, oldPort, ocLife, srv); retargeted {
-					opencodePort, opencodeURL = p, u
-					log.Printf("detached opencode restart landed on a fresh port %d — retargeted the running local-server (was port %d)", p, oldPort)
-				}
-				ocLife.SetReady()
-				return nil
+				// Serialized restart (P1-API-002) through the SHARED detached
+				// arm — the exact wiring the death watcher's auto-restart uses,
+				// so the two cannot drift: under the starter lock, revalidate
+				// the recorded pid before signaling (never signal a recycled
+				// pid), wait out the old owner, respawn on the stable port
+				// (fresh-port swap retargeted BEFORE the readiness flip), and
+				// re-arm the death watcher on the retained child via OnDone.
+				return detachedArm.Run()
 			}
 			// Owned (P1-API-005): the SHARED child-aware restart operation —
 			// the same rules client-daemon's owned arm follows, so the two
@@ -361,11 +407,9 @@ with --opencode-url, or spawn a survivable detached instance with
 		// Best-effort changelog fetcher; never blocks the update/version flow.
 		srv.SetOpencodeChangelog(OpencodeChangelog)
 
-		var vhCtx context.Context
-		vhCtx, vhCancel = context.WithCancel(context.Background())
-		// Ensure the aggregator's context is cancelled on every return path (the
-		// restart hook also calls vhCancel; CancelFunc is idempotent).
-		defer vhCancel()
+		// vhCtx/vhCancel were created BEFORE the topology arms (oc-death
+		// watch S1) so the death watcher shares this cancellation; the
+		// aggregator is bound to the same context here.
 		go agg.Run(vhCtx)
 		handler := srv.Handler()
 		// Optional AF_UNIX listener for the same /vh/* — reachable by bind-mount

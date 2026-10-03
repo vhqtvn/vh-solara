@@ -52,6 +52,12 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 	}
 	rt.ocLife = oclife.New(topo)
 
+	// Daemon-lifetime context (oc-death-watch S1): created BEFORE the
+	// topology arms so the death watcher — armed inside
+	// startDetachedOpenCode — is bound to the same cancellation the
+	// teardown path (KillFunc) and the restart-server hook drive.
+	rt.vhCtx, rt.vhCancel = context.WithCancel(context.Background())
+
 	switch {
 	case rt.external:
 		// External-managed: attach to an already-running OpenCode (e.g. its
@@ -226,8 +232,9 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 	// degrades to "Changelog unavailable" on any failure.
 	srv.SetOpencodeChangelog(OpencodeChangelog)
 
-	var vhCtx context.Context
-	vhCtx, rt.vhCancel = context.WithCancel(context.Background())
+	// vhCtx was created at the top of setupVHMode, BEFORE the topology
+	// arms, so the death watcher shares it (oc-death-watch S1).
+	vhCtx := rt.vhCtx
 	go agg.Run(vhCtx)
 
 	// Notifications/alerts engine: daemon-side detection + outbound webhooks,
@@ -372,6 +379,92 @@ func (rt *clientDaemonRuntime) startOwnedOpenCode() {
 func (rt *clientDaemonRuntime) startDetachedOpenCode() {
 	res := EnsureDetachedOpenCode(daemonOpenCodeBin, rt.cwd, rt.ocLife.Ring().Writer())
 	rt.opencodePort, rt.opencodeURL, rt.opencodeServeCmd = ApplyDetachedOCStart(res, rt.ocLife, "Web mode: vh")
+	rt.armOpenCodeWatcher(res)
+}
+
+// armOpenCodeWatcher starts the detached-OpenCode death watcher (oc-death
+// watch S1) and points it at whatever the boot verdict left: the child we
+// spawned (parent wait fast path), the recorded instance we reattached to
+// or found occupied (identity poll — not our child), or the
+// readiness-failure retained child (still ours, still worth watching — its
+// pid feeds the next restart's curPID). Contended/OrphanedOwner boots arm
+// nothing (no live child of ours to watch). External URLs never get a
+// watcher. A runtime without a daemon-lifetime context (boot-seam tests)
+// arms nothing — the watcher is a daemon-lifetime concern.
+func (rt *clientDaemonRuntime) armOpenCodeWatcher(res DetachedStartResult) {
+	if rt.vhCtx == nil {
+		return
+	}
+	rt.ocWatcher = newOCDeathWatcher(rt.ocLife, rt.autoRestartDetached)
+	rt.ocWatcher.Start(rt.vhCtx)
+	switch res.Verdict {
+	case DetachedStartSpawned, DetachedStartFailed:
+		// Failed keeps a readiness-failure child only when we spawned one
+		// this boot (spawn-error failures carry PID 0 and arm nothing).
+		if res.PID > 0 {
+			rt.ocWatcher.Arm(res.PID, res.Port, true)
+		}
+	case DetachedStartReattached, DetachedStartOccupied:
+		// A previous daemon's child — we are not its parent; the
+		// identity-poll path applies.
+		if res.PID > 0 {
+			rt.ocWatcher.Arm(res.PID, res.Port, false)
+		}
+	}
+}
+
+// detachedArm builds the SHARED serialized detached restart (ocDetachedRestartArm)
+// wired to this runtime's fields — the exact wiring the old inlined arm of
+// restartOpencode had. The UI restart hook and the death watcher BOTH route
+// through it, so user- and watcher-driven restarts cannot drift.
+func (rt *clientDaemonRuntime) detachedArm() *ocDetachedRestartArm {
+	return &ocDetachedRestartArm{
+		Bin:  daemonOpenCodeBin,
+		Cwd:  rt.cwd,
+		Life: rt.ocLife,
+		Noun: "daemon",
+		Srv:  func() *web.Server { return rt.vhSrv },
+		Cmd:  func() *exec.Cmd { return rt.opencodeServeCmd },
+		SetCmd: func(c *exec.Cmd) {
+			rt.opencodeServeCmd = c
+		},
+		Port: func() int { return rt.opencodePort },
+		SetPort: func(port int, url string) {
+			rt.opencodePort, rt.opencodeURL = port, url
+		},
+		// Re-arm the watcher on whatever child the attempt retained — the
+		// watcher is what notices if a readiness-failure retained child
+		// dies (its pid feeds the next restart's curPID).
+		OnDone: func(c *exec.Cmd, effectivePort int, err error) {
+			if w := rt.ocWatcher; w != nil && c != nil && c.Process != nil && effectivePort > 0 {
+				w.Arm(c.Process.Pid, effectivePort, true)
+			}
+		},
+	}
+}
+
+// autoRestartDetached is the death watcher's restart executor: ONE
+// serialized attempt through the same detachedArm the UI restart hook
+// uses. The watcher's plain state checks cannot see races (a user restart
+// completing while an attempt waits for the mutex), so the generation is
+// re-checked under the lock: if a newer child was armed (the user restart
+// won), this attempt is a no-op; if a restart is in flight (starting) or a
+// deliberate stop landed (stopped), it skips. Exactly one spawn results
+// from a user restart racing the watcher.
+func (rt *clientDaemonRuntime) autoRestartDetached(gen uint64) {
+	rt.opencodeMu.Lock()
+	defer rt.opencodeMu.Unlock()
+	w := rt.ocWatcher
+	if w == nil || w.Generation() != gen {
+		return // superseded by a newer child (e.g. the user restart's spawn)
+	}
+	switch rt.ocLife.Snapshot().State {
+	case oclife.StateStarting, oclife.StateStopped:
+		return
+	}
+	if err := rt.detachedArm().Run(); err != nil {
+		log.Printf("opencode watch: auto-restart attempt failed: %v", err)
+	}
 }
 
 // restartOpencode stops the current opencode and respawns it through the
@@ -411,36 +504,15 @@ func (rt *clientDaemonRuntime) restartOpencode() error {
 		return nil
 	}
 	if daemonOpenCodeDetached {
-		// Serialized restart (P1-API-002): under the per-project starter lock,
-		// reread state and revalidate the recorded pid (alive + cmdline
-		// match) IMMEDIATELY before signaling — a recycled pid is never
-		// signaled — wait for the old owner to release the owner lock, then
-		// respawn through the same guarded handoff on the stable port.
-		rt.ocLife.SetStarting()
-		curPID := 0
-		if rt.opencodeServeCmd != nil && rt.opencodeServeCmd.Process != nil {
-			curPID = rt.opencodeServeCmd.Process.Pid
-		}
-		oldPort := rt.opencodePort
-		c, effectivePort, err := restartDetachedOpenCode(daemonOpenCodeBin, oldPort, rt.cwd, curPID, rt.ocLife.Ring().Writer())
-		if c != nil {
-			rt.opencodeServeCmd = c
-		}
-		if err != nil {
-			rt.ocLife.SetFailed(fmt.Sprintf("detached opencode restart failed: %v", err), nil)
-			return err
-		}
-		// P1-API-003: BEFORE the readiness flip, propagate a fresh spawn
-		// port (foreign listener on the old port, or a D2 re-derive) to
-		// everything still targeting the old one — the ocLife status URL
-		// and the RUNNING web server's proxy + aggregators. Same-port
-		// restarts no-op here.
-		if p, u, retargeted := applyFreshPortRetarget(effectivePort, oldPort, rt.ocLife, rt.vhSrv); retargeted {
-			rt.opencodePort, rt.opencodeURL = p, u
-			log.Printf("detached opencode restart landed on a fresh port %d — retargeted the running daemon (was port %d)", p, oldPort)
-		}
-		rt.ocLife.SetReady()
-		return nil
+		// Serialized restart (P1-API-002) through the SHARED detached arm —
+		// the exact wiring the death watcher's auto-restart uses, so the
+		// two cannot drift: under the per-project starter lock, reread
+		// state and revalidate the recorded pid (alive + cmdline match)
+		// IMMEDIATELY before signaling — a recycled pid is never signaled —
+		// wait for the old owner to release the owner lock, respawn on the
+		// stable port (fresh-port swap retargeted BEFORE the readiness
+		// flip), and re-arm the death watcher on the retained child.
+		return rt.detachedArm().Run()
 	}
 	// Owned (P1-API-005). The reaper goroutine is the SOLE Wait() caller, so
 	// stop the current child through stopOwnedOpenCodeChild — signal + wait
