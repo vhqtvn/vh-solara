@@ -6,7 +6,9 @@ import { projectDir, startSync, state } from "./sync";
 import { agents, loadAgents } from "./agents";
 import { loadModels, models } from "./models";
 import { startLifecyclePolling } from "./opencode-lifecycle";
-import { applyTheme } from "./theme";
+import { applyTheme, onThemeApplied } from "./theme";
+import { broadcastTheme } from "./themeTokens";
+import { postCodeTheme } from "./code/frame";
 import { applyFont, applyMonoFont } from "./font";
 import "./prefs"; // import for side effect: DOM-affecting prefs apply reactively on load
 import { registerServiceWorker, startVersionCheck } from "./pwa";
@@ -81,6 +83,17 @@ if (standalone === "code") {
   render(() => <StandaloneCode />, root);
   installScrollEdges();
 } else {
+  // Route EVERY theme apply — local setThemeId/setCustomTheme AND the
+  // cross-document `storage` sync + visibility catch-up in theme.ts — to the
+  // surfaces that style themselves: embedded registered views (semantic
+  // --vh-* tokens via postMessage) and the framed code viewer (vh-code:theme
+  // nudge; it re-applies the shared same-origin localStorage theme). Registered
+  // HERE (not imported by theme.ts) so theme stays a leaf module, and only in
+  // the main app — the standalone code-viewer document never pushes.
+  onThemeApplied(() => {
+    broadcastTheme();
+    postCodeTheme();
+  });
   // Embed-gated document-liveness heartbeat (no-op when standalone). When this
   // SPA is embedded by the vh-solara host shell, it heartbeats so the host can
   // drive a per-pane "document alive / reloaded / no recent signal" indicator.

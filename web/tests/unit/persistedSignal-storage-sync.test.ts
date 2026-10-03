@@ -73,4 +73,30 @@ describe("persistedSignal cross-document storage sync", () => {
     expect(localStorage.getItem("vh.prefs.test.k4")).toBe(before === null ? enveloped : before);
     expect(localStorage.getItem("vh.prefs.test.k4")).toBe(enveloped);
   });
+
+  it("calls onRemoteChange with the re-read value on the remote path only (never local writes)", () => {
+    localStorage.clear();
+    const remote: number[] = [];
+    const [val, set] = persistedSignal<number>("vh.prefs.test.k5", 1, 1, undefined, {
+      onRemoteChange: (v) => remote.push(v),
+    });
+    // A LOCAL write persists and updates the signal but must NOT invoke the
+    // remote hook — the local caller owns its own side effects.
+    set(2);
+    expect(val()).toBe(2);
+    expect(remote).toEqual([]);
+
+    // Another document writes → signal updates AND the hook fires with the
+    // re-read value, so imperative apply work re-runs without a reload.
+    const enveloped = JSON.stringify({ v: 1, data: 9 });
+    localStorage.setItem("vh.prefs.test.k5", enveloped);
+    fireStorage("vh.prefs.test.k5", enveloped);
+    expect(val()).toBe(9);
+    expect(remote).toEqual([9]);
+
+    // Events for other keys fire nothing.
+    localStorage.setItem("vh.prefs.unrelated", JSON.stringify({ v: 1, data: 0 }));
+    fireStorage("vh.prefs.unrelated", JSON.stringify({ v: 1, data: 0 }));
+    expect(remote).toEqual([9]);
+  });
 });

@@ -6,7 +6,7 @@ import { postThemeTo } from "../themeTokens";
 // auth and TLS). Sandboxed — read-only by intent; the worker injects a strict
 // CSP + framing headers on the proxied responses. On load we push vh-solara's
 // theme tokens so the view can render native to the active palette (live updates
-// arrive via broadcastTheme() on theme change — see App).
+// arrive via broadcastTheme() from applyTheme — see theme.ts).
 export default function ViewFrame(props: { view: RegisteredView }) {
   return (
     <iframe

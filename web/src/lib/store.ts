@@ -48,12 +48,26 @@ export function saveVersioned<T>(key: string, version: number, data: T): void {
   }
 }
 
+// Optional persistedSignal behaviors. Strictly additive: every field is
+// optional and call sites that pass no options behave exactly as before.
+export interface PersistedSignalOptions<T> {
+  // Runs after the signal was updated from ANOTHER same-origin document (the
+  // `storage` event path), with the re-read value. NOT run for local writes —
+  // the local setter's caller owns its own side effects (apply-on-set). This
+  // is the hook for values whose application is imperative (the theme:
+  // .theme-* classes + inline vars on <html>): without it a remote change
+  // updates the in-memory signal but the document keeps rendering the old
+  // value until something else calls the imperative apply.
+  onRemoteChange?: (value: T) => void;
+}
+
 // A Solid signal backed by versioned localStorage: hydrated from storage on
 // init, and the returned setter persists on every write. Collapses the
 // "createSignal(loadVersioned(...)) + a setter that calls saveVersioned" pattern
 // that was hand-written for every preference. The setter takes a value (prefs
 // don't use the updater form). Wrap it when a setter also has a side effect
-// (e.g. apply the value to the DOM).
+// (e.g. apply the value to the DOM); pass `options.onRemoteChange` for the
+// same side effect on the cross-document path.
 //
 // Cross-document sync: when more than one document on this origin holds the same
 // pref (each host pane is a separate iframe document; each browser tab is a
@@ -72,6 +86,7 @@ export function persistedSignal<T>(
   version: number,
   fallback: T,
   migrate?: (old: unknown, fromVersion: number) => T,
+  options?: PersistedSignalOptions<T>,
 ): [Accessor<T>, (value: T) => void] {
   const [get, set] = createSignal<T>(loadVersioned(key, version, fallback, migrate));
   const setSaved = (value: T) => {
@@ -84,7 +99,11 @@ export function persistedSignal<T>(
       // Re-read through the shared parse/migrate path. localStorage is shared
       // same-origin, so by the time the event fires here our storage already
       // reflects the other document's write; loadVersioned reads it back out.
-      set(() => loadVersioned(key, version, fallback, migrate));
+      const remote = loadVersioned(key, version, fallback, migrate);
+      set(() => remote);
+      // Re-run the consumer's imperative apply for the remote value (no-op
+      // when none was given).
+      options?.onRemoteChange?.(remote);
     });
   }
   return [get, setSaved];

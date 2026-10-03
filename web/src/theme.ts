@@ -2,8 +2,7 @@
 // custom-theme idea, kept lean): chrome palettes via CSS-variable classes on
 // <html>. Code syntax uses the dark chroma sheet by default and the
 // .theme-light-scoped light sheet for light themes (see /vh/highlight.css).
-import { createSignal } from "solid-js";
-import { loadVersioned, saveVersioned } from "./lib/store";
+import { persistedSignal } from "./lib/store";
 
 export interface ThemeDef {
   id: string;
@@ -93,11 +92,21 @@ const DEFAULT_CUSTOM: CustomTheme = {
   light: false,
 };
 const LS_CUSTOM = "vh.theme.custom.v1";
-const [customTheme, setCustomThemeSig] = createSignal<CustomTheme>(
-  loadVersioned<CustomTheme>(LS_CUSTOM, 1, DEFAULT_CUSTOM, (old) => ({
+// persistedSignal: hydrated from localStorage, persisted on set, and re-read
+// when another same-origin document (browser tab / host pane iframe) writes the
+// key. onRemoteChange mirrors setCustomTheme's local conditional apply: a
+// remote custom-field edit re-applies live only while the custom theme is the
+// ACTIVE one. (`theme` is referenced before its declaration below — safe: the
+// callback runs on storage events, long after module init.)
+const [customTheme, setCustomThemeSaved] = persistedSignal<CustomTheme>(
+  LS_CUSTOM,
+  1,
+  DEFAULT_CUSTOM,
+  (old) => ({
     ...DEFAULT_CUSTOM,
     ...(old && typeof old === "object" ? (old as Partial<CustomTheme>) : {}),
-  })),
+  }),
+  { onRemoteChange: () => { if (theme() === "custom") applyTheme(); } },
 );
 export { customTheme };
 
@@ -105,8 +114,7 @@ export { customTheme };
 // re-apply live.
 export function setCustomTheme(patch: Partial<CustomTheme>) {
   const next = { ...customTheme(), ...patch };
-  setCustomThemeSig(next);
-  saveVersioned(LS_CUSTOM, 1, next);
+  setCustomThemeSaved(next);
   if (theme() === "custom") applyTheme();
 }
 
@@ -180,8 +188,17 @@ export function importCustomTheme(text: string): boolean {
 }
 
 const LS_THEME = "vh.theme.v1";
-const [theme, setThemeSig] = createSignal<string>(
-  loadVersioned<string>(LS_THEME, 1, "dark", (old) => (typeof old === "string" && old ? old : "dark")),
+// persistedSignal + remote-change hook: when another same-origin document
+// (browser tab / host pane iframe) changes the shared theme, re-apply it HERE
+// live — applyTheme is imperative (classes + inline vars on <html>), so a
+// signal-only update would leave this document rendering the old theme until
+// reload (the reported cross-tab sync bug).
+const [theme, setThemeSaved] = persistedSignal<string>(
+  LS_THEME,
+  1,
+  "dark",
+  (old) => (typeof old === "string" && old ? old : "dark"),
+  { onRemoteChange: () => applyTheme() },
 );
 
 export function applyTheme() {
@@ -207,12 +224,62 @@ export function applyTheme() {
   // /vh/highlight.css) — apply to every light theme, including a light custom one.
   el.classList.toggle("theme-light-scoped", light);
   el.style.colorScheme = light ? "light" : "dark";
+  notifyThemeApplied();
+}
+
+// Downstream theme-applied hooks. applyTheme is imperative, and two of its
+// consumers live OUTSIDE this module's dependency graph: the embedded-view
+// token broadcast (themeTokens.ts) and the code-frame theme nudge
+// (code/frame.ts — pulls the UI/layout graph and must not become a static
+// import of this leaf module; layout.ts reads window.matchMedia at module
+// load). Instead of importing them, expose a registry: the app entry
+// (index.tsx) registers the pushes once at boot, and EVERY apply route —
+// local setThemeId/setCustomTheme, the cross-document `storage` path, and the
+// visibility catch-up below — fans out through the same listeners. Returns an
+// unregister. Callback-based on purpose: a module-level createEffect would
+// need a reactive root to run at this scope.
+const themeAppliedListeners = new Set<() => void>();
+export function onThemeApplied(cb: () => void): () => void {
+  themeAppliedListeners.add(cb);
+  return () => {
+    themeAppliedListeners.delete(cb);
+  };
+}
+function notifyThemeApplied() {
+  for (const cb of themeAppliedListeners) {
+    try {
+      cb();
+    } catch {
+      /* one throwing consumer must not break the apply loop */
+    }
+  }
 }
 
 export function setThemeId(id: string) {
-  setThemeSig(id);
-  saveVersioned(LS_THEME, 1, id);
+  setThemeSaved(id);
   applyTheme();
 }
 
 export { theme };
+
+// Frozen-tab catch-up. The `storage` event IS delivered to ordinary background
+// tabs, but a fully FROZEN tab (browsers freeze heavy background tabs; mobile
+// backgrounded views) may never run the listener — it thaws with stale
+// in-memory signals while the shared localStorage already holds the newer
+// value. On becoming visible, re-run the exact storage-event path for both
+// theme keys: dispatch a synthetic `storage` event, which the persistedSignal
+// listeners treat identically to a real one (re-read, update signal, re-apply
+// via onRemoteChange). Idempotent — if nothing was missed, the re-read yields
+// the same values and applyTheme() rewrites identical classes/vars.
+if (
+  typeof document !== "undefined" &&
+  typeof document.addEventListener === "function" &&
+  typeof StorageEvent !== "undefined"
+) {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    for (const key of [LS_THEME, LS_CUSTOM]) {
+      window.dispatchEvent(new StorageEvent("storage", { key }));
+    }
+  });
+}
