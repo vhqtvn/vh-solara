@@ -14,19 +14,30 @@ IMAGE=vh-solara-e2e
 NAME=vh-e2e-run
 PORT=8099
 BASE="http://127.0.0.1:${PORT}"
+# Flow 8 (death-watch self-heal) runs a SECOND container on the REAL
+# production binary (`vh-solara local-server --opencode-detached`) instead of
+# the bare e2eserver harness, so the operator's "kill my live opencode" ask is
+# testable end-to-end: pkill opencode → watcher detects → status failed +
+# down_since → death log line → auto-restart heals with a NEW pid.
+NAME_REAL=vh-e2e-real
+PORT_REAL=8098
+BASE_REAL="http://127.0.0.1:${PORT_REAL}"
 KEEP="${1:-}"
 
 cleanup() {
   if [ "$KEEP" != "--keep" ]; then
     docker rm -f "$NAME" >/dev/null 2>&1 || true
+    docker rm -f "$NAME_REAL" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
 fail() {
   echo "FAIL: $*" >&2
-  echo "----- container logs -----" >&2
+  echo "----- container logs ($NAME) -----" >&2
   docker logs "$NAME" 2>&1 | tail -60 >&2 || true
+  echo "----- container logs ($NAME_REAL) -----" >&2
+  docker logs "$NAME_REAL" 2>&1 | tail -60 >&2 || true
   exit 1
 }
 
@@ -542,6 +553,192 @@ for i in $(seq 1 60); do
   [ "$i" = 60 ] && fail "[queue-claim flow] turn did not start after dispatch ($RESULT)"
 done
 
+# ===========================================================================
+# Flow 8: death-watch self-heal against the REAL production binary.
+#
+# The operator's ask, automated: "kill my live opencode and prove the daemon
+# detects it, tells me, and brings it back." Flows 1-7 run against
+# tools/e2eserver (a bare exec harness with NO watcher), so this flow boots a
+# SEPARATE container running the real `vh-solara local-server` in the
+# production detached topology. Asserted, end to end:
+#   1. pkill -x opencode → /vh/opencode/status flips to
+#      "state":"failed" WITH "down_since" (the S2 retry-storm gate's input).
+#   2. the death-watch log line names the dead pid
+#      (cmd/opencode_watch.go: "opencode watch: pid N exited (…)).
+#   3. auto-restart heals: status "ready", down_since ABSENT, and a NEW
+#      opencode pid (the snapshot carries no pid field — pids come from
+#      pgrep, the process-visible truth).
+#   4. (stretch) a prompt POSTed while OpenCode is down FAILS VISIBLY
+#      (dead upstream → lazy-proxy 502) and never lands; the same prompt
+#      retried after recovery lands EXACTLY ONCE (caller-minted msg id:
+#      exact GET 200 for the retry's id, permanent 404 for the down-probe's).
+# Default watcher knobs apply (250ms tick, 1s initial backoff) — well inside
+# the lane's existing 30-90x1s poll budgets.
+# ===========================================================================
+echo "==> [death-watch flow] starting the REAL vh-solara local-server container"
+docker rm -f "$NAME_REAL" >/dev/null 2>&1 || true
+docker run -d --name "$NAME_REAL" -p "${PORT_REAL}:8099" --entrypoint /bin/sh "$IMAGE" -c '
+  /usr/local/bin/fakellm -addr 127.0.0.1:11434 &
+  cd /work && exec /usr/local/bin/vh-solara local-server \
+    --addr 0.0.0.0:8099 \
+    --opencode-bin /root/.opencode/bin/opencode \
+    --opencode-detached' >/dev/null \
+  || fail "[death-watch flow] could not start $NAME_REAL"
+
+echo "==> [death-watch flow] waiting for the local-server web listener"
+for i in $(seq 1 60); do
+  if curl -fsS "${BASE_REAL}/vh/healthz" >/dev/null 2>&1; then break; fi
+  sleep 1
+  [ "$i" = 60 ] && fail "[death-watch flow] local-server did not become ready"
+done
+
+echo "==> [death-watch flow] waiting for detached opencode to reach ready"
+for i in $(seq 1 60); do
+  STATUS_REAL=$(curl -fsS "${BASE_REAL}/vh/opencode/status" 2>/dev/null || true)
+  echo "$STATUS_REAL" | grep -q '"state":"ready"' && break
+  sleep 1
+  [ "$i" = 60 ] && fail "[death-watch flow] opencode never reached ready (last: $STATUS_REAL)"
+done
+
+echo "==> [death-watch flow] creating a session + minting the down-probe id"
+RSID=""
+for i in $(seq 1 30); do
+  RSID=$(curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE_REAL}/oc/session" \
+        -H 'Content-Type: application/json' -d '{"title":"death-watch"}' \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
+  [ -n "$RSID" ] && break
+  sleep 1
+  [ "$i" = 30 ] && fail "[death-watch flow] could not create a session on local-server"
+done
+echo "    session id: $RSID"
+DOWN_ID=$(python3 "$repo_root/tests/e2e-docker/mint_msg_id.py") \
+  || fail "[death-watch flow] could not mint down-probe msg_ id"
+echo "    down-probe id: $DOWN_ID"
+
+echo "==> [death-watch flow] capturing the live opencode pid"
+OLD_PIDS=""
+for i in $(seq 1 30); do
+  OLD_PIDS=$(docker exec "$NAME_REAL" pgrep -x opencode 2>/dev/null || true)
+  [ -n "$OLD_PIDS" ] && break
+  sleep 1
+  [ "$i" = 30 ] && fail "[death-watch flow] no opencode process found in $NAME_REAL"
+done
+echo "    opencode pid(s): $(echo "$OLD_PIDS" | tr '\n' ' ')"
+
+echo "==> [death-watch flow] killing opencode (SIGTERM)"
+docker exec "$NAME_REAL" pkill -x opencode
+
+echo "==> [death-watch flow] asserting status flips to failed + down_since"
+for i in $(seq 1 30); do
+  STATUS_REAL=$(curl -fsS "${BASE_REAL}/vh/opencode/status" 2>/dev/null || true)
+  echo "$STATUS_REAL" | grep -q '"state":"failed"' \
+    && echo "$STATUS_REAL" | grep -q '"down_since"' && break
+  sleep 1
+  [ "$i" = 30 ] && fail "[death-watch flow] status never showed failed+down_since (last: $STATUS_REAL)"
+done
+echo "    $(echo "$STATUS_REAL" | python3 -c 'import sys,json;s=json.load(sys.stdin);print("state=%s down_since=%s attempts=%s" % (s.get("state"), bool(s.get("down_since")), s.get("restart_attempts")))')"
+
+echo "==> [death-watch flow] probing a prompt while down (must fail visibly, never land)"
+# Deterministic dead-window probe: poll a cheap /oc GET until the lazy proxy
+# surfaces its dead-upstream 502, then POST the prompt immediately (ms later).
+# The respawn's boot (~1s) cannot complete inside the POST's flight time, so
+# the prompt deterministically hits the dead upstream — vh-solara rejects it
+# visibly and it never reaches opencode.
+DOWN_PROBE=""
+for i in $(seq 1 15); do
+  DOWN_PROBE=$(curl -s -o /dev/null -w "%{http_code}" "${BASE_REAL}/oc/session" 2>/dev/null || true)
+  [ "$DOWN_PROBE" = "502" ] && break
+  sleep 0.2
+done
+[ "$DOWN_PROBE" = "502" ] \
+  || fail "[death-watch flow] upstream never went visibly down (last probe: $DOWN_PROBE)"
+DOWN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H 'X-VH-CSRF: 1' \
+  -X POST "${BASE_REAL}/oc/session/${RSID}/prompt_async" \
+  -H 'Content-Type: application/json' \
+  -d "{\"messageID\":\"${DOWN_ID}\",\"parts\":[{\"type\":\"text\",\"text\":\"sent while down\"}]}" \
+  || true)
+case "$DOWN_CODE" in
+  5*) echo "    prompt while down -> $DOWN_CODE (fails visibly, never landed)" ;;
+  *) fail "[death-watch flow] prompt while down returned $DOWN_CODE (want a visible 5xx)" ;;
+esac
+
+echo "==> [death-watch flow] asserting the death log line names the dead pid"
+DEATH_LINE_OK=""
+for i in $(seq 1 30); do
+  if docker logs "$NAME_REAL" 2>&1 | grep -q "opencode watch: pid.*exited"; then
+    DEATH_LINE_OK=1
+    docker logs "$NAME_REAL" 2>&1 | grep "opencode watch: pid" | tail -1 | sed 's/^/    /'
+    break
+  fi
+  sleep 1
+  [ "$i" = 30 ] && fail "[death-watch flow] death-watch log line never appeared"
+done
+
+echo "==> [death-watch flow] waiting for auto-restart to heal (new pid, down_since cleared)"
+for i in $(seq 1 90); do
+  STATUS_REAL=$(curl -fsS "${BASE_REAL}/vh/opencode/status" 2>/dev/null || true)
+  echo "$STATUS_REAL" | grep -q '"state":"ready"' \
+    && ! echo "$STATUS_REAL" | grep -q '"down_since"' && break
+  sleep 1
+  [ "$i" = 90 ] && fail "[death-watch flow] opencode did not self-heal to ready (last: $STATUS_REAL)"
+done
+NEW_PIDS=$(docker exec "$NAME_REAL" pgrep -x opencode 2>/dev/null || true)
+[ -n "$NEW_PIDS" ] || fail "[death-watch flow] no opencode process after heal"
+# The killed child stays an UNREAPED zombie (the watcher deliberately never
+# reaps it — the PID-reuse invariant), so pgrep still lists the old pid. The
+# honest respawn proof: a NEW pid in the set AND the old pid no longer
+# runnable (zombie stat Z, or fully gone).
+FRESH_PIDS=""
+for p in $NEW_PIDS; do
+  case " $OLD_PIDS " in
+    *" $p "*) ;;
+    *) FRESH_PIDS="$FRESH_PIDS $p" ;;
+  esac
+done
+[ -n "$FRESH_PIDS" ] \
+  || fail "[death-watch flow] no NEW opencode pid after heal (set: $(echo "$NEW_PIDS" | tr '\n' ' '))"
+OLD_STAT=$(docker exec "$NAME_REAL" ps -o stat= -p $OLD_PIDS 2>/dev/null || true)
+case "$OLD_STAT" in
+  Z*|"") echo "    healed: new pid(s)$(echo "$FRESH_PIDS" | tr '\n' ' ')(old pid $(echo "$OLD_PIDS" | tr '\n' ' ')stat='${OLD_STAT:-gone}')" ;;
+  *) fail "[death-watch flow] old opencode pid still runnable after heal (stat=$OLD_STAT)" ;;
+esac
+
+echo "==> [death-watch flow] retrying the prompt after recovery (lands exactly once)"
+RETRY_ID=$(python3 "$repo_root/tests/e2e-docker/mint_msg_id.py") \
+  || fail "[death-watch flow] could not mint retry msg_ id"
+RETRY_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H 'X-VH-CSRF: 1' \
+  -X POST "${BASE_REAL}/oc/session/${RSID}/prompt_async" \
+  -H 'Content-Type: application/json' \
+  -d "{\"messageID\":\"${RETRY_ID}\",\"parts\":[{\"type\":\"text\",\"text\":\"retry after recovery\"}]}" \
+  || true)
+[ "$RETRY_CODE" = "204" ] \
+  || fail "[death-watch flow] post-recovery prompt_async did not return 204 (got $RETRY_CODE)"
+
+# The retry lands (poll the exact GET), the down-probe NEVER does (404) —
+# exactly-once landing across the down window.
+RETRY_OK=""
+for i in $(seq 1 60); do
+  RB=$(mktemp)
+  RCODE=$(curl -s -o "$RB" -w "%{http_code}" "${BASE_REAL}/oc/session/${RSID}/message/${RETRY_ID}" 2>/dev/null || true)
+  if [ "$RCODE" = "200" ]; then
+    RRES=$(python3 "$repo_root/tests/e2e-docker/assert_msgid_get.py" "$RETRY_ID" < "$RB" 2>/dev/null || true)
+    [ "$(echo "$RRES" | sed -n 1p)" = "OK" ] && RETRY_OK=1
+  elif [ "$RCODE" = "404" ]; then
+    : # persistence is async to the 204 — keep polling
+  else
+    rm -f "$RB"; fail "[death-watch flow] unexpected retry GET status $RCODE"
+  fi
+  rm -f "$RB"
+  [ -n "$RETRY_OK" ] && break
+  sleep 1
+  [ "$i" = 60 ] && fail "[death-watch flow] retried prompt never landed (last status=$RCODE)"
+done
+echo "    retry id $RETRY_ID -> landed (exact GET 200)"
+DOWN_GET=$(curl -s -o /dev/null -w "%{http_code}" "${BASE_REAL}/oc/session/${RSID}/message/${DOWN_ID}" 2>/dev/null || true)
+[ "$DOWN_GET" = "404" ] \
+  || fail "[death-watch flow] down-probe id resolved after recovery (got $DOWN_GET; the never-landed prompt must stay 404)"
+echo "    down-probe id $DOWN_ID -> still 404 (sent-while-down never landed)"
+
 echo
 echo "PASS: real opencode driven by the fake LLM exercised the full flow:"
 echo "      - prompt -> streamed assistant reply (snapshot + live stream)"
@@ -555,4 +752,8 @@ echo "               cross-session 404 (isolation), non-msg 400 (brand reject)"
 echo "      - queue-claim: Claim persisted opencodeMsgID BEFORE dispatch (list),"
 echo "                     prompt_async -> 204, exact GET -> persisted user msg,"
 echo "                     gate.activity -> busy (turn started)"
+echo "      - death-watch (REAL vh-solara local-server): pkill opencode -> failed +"
+echo "                     down_since, death log line, auto-restart heals with a new pid;"
+echo "                     prompt while down -> 5xx (never lands), retry after recovery"
+echo "                     lands exactly once"
 exit 0

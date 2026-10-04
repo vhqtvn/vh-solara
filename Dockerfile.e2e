@@ -54,18 +54,26 @@ COPY --from=hostbuild /app/host-web/dist ./pkg/web/host-dist
 #   docker run --rm golang:1.25-alpine go version
 # (As of go.mod 1.25.12 the margin is zero: the image supplies exactly go1.25.12.)
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
+# /out/vh-solara is the REAL production binary (Flow 8 in tests/e2e-docker/
+# run.sh boots it as `vh-solara local-server --opencode-detached` so the
+# death-watch self-heal lane exercises the production daemon wiring, not the
+# bare e2eserver harness).
 RUN go build -trimpath -o /out/e2eserver ./tools/e2eserver \
- && go build -trimpath -o /out/fakellm ./tools/fakellm
+  && go build -trimpath -o /out/fakellm ./tools/fakellm \
+  && go build -trimpath -o /out/vh-solara .
 
 # 4) Runtime with the real opencode binary (glibc/bun).
+# procps: Flow 8 (death-watch self-heal) drives the kill-test from run.sh via
+# `docker exec … pgrep/pkill -x opencode` — without procps neither exists.
 FROM debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git tar sqlite3 \
- && rm -rf /var/lib/apt/lists/*
+  && apt-get install -y --no-install-recommends ca-certificates curl git tar sqlite3 procps \
+  && rm -rf /var/lib/apt/lists/*
 # Install the real opencode CLI.
 RUN curl -fsSL https://opencode.ai/install | bash
 COPY --from=gobuild /out/e2eserver /usr/local/bin/e2eserver
 COPY --from=gobuild /out/fakellm /usr/local/bin/fakellm
+COPY --from=gobuild /out/vh-solara /usr/local/bin/vh-solara
 
 # Workspace opencode runs in, configured to use the fake LLM.
 RUN mkdir -p /work && git init -q /work \
