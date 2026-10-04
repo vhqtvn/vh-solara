@@ -344,8 +344,29 @@ for (const scale of [1.25, 0.8] as const) {
     // places. tip-in animates opacity only — gBCR is stable while it fades.
     const anchor = page.locator(".icon-btn[aria-label='Search sessions']");
     await expect(anchor).toBeVisible();
-    await anchor.hover();
     const bubble = page.locator(".tooltip");
+    // Long-lane hardening: Tooltip.tsx's document-level capture `scroll`
+    // listener cancels a PENDING arm (hide() clears the timer) and nothing
+    // re-arms while the pointer rests — so a scroll anywhere during the arm
+    // window (in a long serial lane the demo transcript is still hydrating /
+    // auto-scrolling when this test hovers) leaves .tooltip permanently
+    // absent (observed: element-not-found after 5s, full-lane run only). The
+    // bubble measurement is only meaningful once one is actually shown, so
+    // re-arm like a user would: off to the tip-free composer, back onto the
+    // anchor (probed live: scroll-mid-arm kills the single hover; a re-hover
+    // shows it deterministically). Bounded retries; green path costs nothing.
+    let armed = false;
+    for (let attempt = 0; attempt < 4 && !armed; attempt++) {
+      await anchor.hover();
+      armed = await bubble.waitFor({ state: "visible", timeout: 1200 }).then(
+        () => true,
+        () => false,
+      );
+      if (!armed) {
+        await page.getByPlaceholder(/Message/).hover();
+        await page.waitForTimeout(120);
+      }
+    }
     await expect(bubble).toBeVisible({ timeout: 5000 });
 
     // placeTooltip computes in VIEWPORT px (anchor gBCR, bubble gBCR, and
@@ -602,11 +623,17 @@ test("anchor at 100% zoom: autocomplete popup and context menu track (identity s
 // Live-browser proof strategy: the same physical wheel gesture (identical
 // pixel-mode deltaY notches) must advance the terminal by the same VISUAL
 // distance at every zoom. Rows are LAYOUT units, so the parity invariant is
-// Δrows(1.25) × 1.25 ≈ Δrows(1) — inside a tolerance covering xterm's
-// per-event round() row quantization (≤ z×0.5 + 0.5 rows ≈ 1.13 at 1.25).
+// Δrows(1.25) × 1.25 ≈ Δrows(1) — inside a tolerance covering BOTH the
+// per-event row quantization AND the marker-read binning of the two phases:
+// topLineNumber bins the first visible pure-int row (±1 row per phase), and
+// the comparison scales phase 2's binning by ×1.25, so the worst-case
+// quantization residual is 1 + 1.25 = 2.25 rows (observed live on the
+// firefox-zoom project: moved100 flips 174↔176 run-to-run with moved125=141
+// stable — residuals 0.25 / 2.25). Tolerance 3 = 2.25 + margin; the unfixed
+// seam still fails it by an order of magnitude (0.25×moved ≈ 44 rows at
+// Firefox's ~176-row advance, ≈ 7 rows at Chromium's ~27).
 // Unfixed code scrolls Δrows(1.25) = Δrows(1) (layout px are what the delta
-// is wrongly treated as), so |Δ×1.25 − Δ| = 0.25Δ ≈ 7 rows for this test's
-// ~28-row gesture — far outside tolerance. The assertion is font-metric
+// is wrongly treated as). The assertion is font-metric
 // INDEPENDENT: no cell size is assumed, only that both zoom phases share the
 // same layout dims (dock height pref is layout px) and the same PTY buffer.
 //
@@ -619,7 +646,7 @@ test("anchor at 100% zoom: autocomplete popup and context menu track (identity s
 test.describe("terminal wheel parity across UI zoom", () => {
   const NOTCHES = 8;
   const NOTCH = -300; // visual px per wheel event (pixel deltaMode)
-  const PARITY_TOL_ROWS = 1.5;
+  const PARITY_TOL_ROWS = 3;
   // Non-vacuity floor: the observed gesture moves ~25-30 rows at 100% (the
   // per-notch advance depends on engine wheel heuristics — measured ~3.4
   // rows/notch in this lane), far above quantization noise; a broken seam
@@ -746,8 +773,9 @@ test.describe("terminal wheel parity across UI zoom", () => {
 
     // Parity: rows are layout px, so equal VISUAL advance means
     // moved125 × 1.25 ≈ moved100. Unfixed code leaves moved125 == moved100
-    // (0.25×moved ≈ 7 rows off at this gesture size — well outside the 1.5-row
-    // quantization tolerance); the fix lands within it.
+    // (0.25×moved ≈ 7 rows off at Chromium's ~27-row gesture — well outside
+    // the 3-row quantization tolerance; see the derive-note above); the fix
+    // lands within it.
     console.log(`[wheel-parity] moved100=${moved100} moved125=${moved125} → ${moved125 * 1.25} vs ${moved100}`);
     expect(
       Math.abs(moved125 * 1.25 - moved100),
@@ -822,6 +850,32 @@ test.describe("terminal selection drag escaping the host under UI zoom", () => {
       return out;
     });
 
+  // Flake hardening (same contract as the wheel-parity describe's
+  // settledTopLineNumber): the seq burst AND the returning shell prompt
+  // stream in asynchronously — a row-COUNT poll alone passes while the
+  // viewport still owes its final ~2 lines, and that late autoscroll moves
+  // the row grid MID-GESTURE: the press anchors on line L, the release at
+  // the same Y lands on L+2, and the oracle sees a "reversed" multi-row
+  // selection (observed live in full-lane runs: exactly-2-row drift, 3
+  // full-height divs, deterministic under pipeline latency). Poll until the
+  // first visible pure-int line is STABLE across two samples before any
+  // geometry is measured or dragged.
+  async function settledTopLineNumber(page: Page): Promise<number> {
+    let prev: number | null = null;
+    for (let i = 0; i < 40; i++) {
+      const cur = await page.locator(".xterm-rows").evaluate((el) => {
+        for (const line of (el as HTMLElement).innerText.split("\n")) {
+          if (/^\d+$/.test(line.trim())) return Number.parseInt(line, 10);
+        }
+        return null;
+      });
+      if (cur !== null && cur === prev) return cur;
+      prev = cur;
+      await page.waitForTimeout(150);
+    }
+    throw new Error(`terminal scroll marker never settled (last: ${prev})`);
+  }
+
   async function runEscapedDragTest(page: Page, scale: number): Promise<void> {
     test.setTimeout(90_000);
     await page.setViewportSize({ width: 1280, height: 900 });
@@ -834,12 +888,22 @@ test.describe("terminal selection drag escaping the host under UI zoom", () => {
     await expect(page.locator(".term-host")).toBeVisible({ timeout: 10000 });
     await expect(page.locator(".term-status.open")).toBeVisible({ timeout: 10000 });
     await page.locator(".term-host").click(); // focus the terminal
-    await page.keyboard.type("seq 1 250");
+    // `; sleep 30` keeps the shell BUSY after the ladder: no returning prompt
+    // (= no post-ladder bytes, ever, inside this test's window). Without it
+    // the prompt chunk arrives async — sometimes >300ms after the ladder,
+    // past the settle poll — and its 2-line autoscroll lands mid-gesture
+    // (the anchor/release row drift this spec's oracle forbids). The PTY is
+    // killed by the next test's beforeEach regardless.
+    await page.keyboard.type("seq 1 250; sleep 30");
     await page.keyboard.press("Enter");
     await expect
       .poll(() => numberRowRects(page).then((rs) => rs.length), { timeout: 15000 })
-      .toBeGreaterThanOrEqual(5); // output complete (number ladder rendered)
+      .toBeGreaterThanOrEqual(5); // ladder rendering (final settle below)
     await assertZoomPremise(page, scale);
+    // Settle the ladder's async tail BEFORE measuring/dragging — see
+    // settledTopLineNumber above for the mid-gesture autoscroll failure this
+    // prevents.
+    await settledTopLineNumber(page);
 
     // Geometry (all VISUAL px): screen rect, host rect, and the anchor row —
     // the number row 3 above the bottom-most one.
