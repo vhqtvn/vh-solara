@@ -36,8 +36,9 @@ echo "==> [1/5] build web/ SPA (into gitignored web/dist-build/)"
 echo "==> [2/5] materialize SPA into pkg/web/dist/ (the //go:embed path)"
 bash web/scripts/materialize.sh
 
-echo "==> [3/5] build vh-solara binary (embeds the real SPA)"
+echo "==> [3/5] build vh-solara binaries (real server + fake-only fixtureserver)"
 go build -o vh-solara .
+go build -o vh-solara-fixtureserver ./tools/fixtureserver
 
 echo "==> [4/5] install host-web deps"
 ( cd host-web && npm ci )

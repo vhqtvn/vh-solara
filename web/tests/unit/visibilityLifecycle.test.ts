@@ -1,22 +1,31 @@
 // @vitest-environment jsdom
 //
 // Slice 2 (webperf build1): pane-visibility sync lifecycle.
+// Hidden-pane STATUS (2026-10-04): the tree stream stays live while
+// host-hidden (docs/ai/hidden-pane-status.md).
 //
-// CONTRACT under test (the idle 9-pane heat fix):
+// CONTRACT under test:
 //   1. A pane hidden via the HOST signal (vh-host-visibility → hostVisible
 //      false; document.visibilityState stays "visible" — the cross-origin
-//      iframe gap) runs NO watchdog/maybeReconnect/resyncTree recovery: its
-//      streams stay suspended instead of churning ~130s reconnects.
-//   2. suspendSessionStreamForVisibility closes the ES WITHOUT resetting
+//      iframe gap) suspends ONLY its transcript stream (Stream-2). The TREE
+//      stream (Stream-1) stays connected — the host's tab badges derive from
+//      it — and keeps its watchdog/maybeReconnect liveness recovery. The
+//      session branch of the watchdog and resyncTree stand down while
+//      host-hidden (no transcript churn, no drift-churn snapshots).
+//   2. A pane hidden via the DOCUMENT (standalone tab backgrounded, or the
+//      embedded tab backgrounded) suspends BOTH streams and runs NO recovery
+//      of any kind — the original slice-2 posture, preserved.
+//   3. suspendSessionStreamForVisibility closes the ES WITHOUT resetting
 //      sesCursor; the reveal reopens THROUGH the retry seam with cursor=N
 //      (ring replay), exactly once.
-//   3. Tree suspend/resume: the FIRST resume after boot connects FRESH (no
-//      cursor — LS-hydrated state is incomplete); later resumes connect with
-//      cursor (transient-reconnect resume).
+//   4. Tree suspend/resume: the FIRST resume after a DOC-hidden boot connects
+//      FRESH (no cursor — LS-hydrated state is incomplete); later resumes
+//      connect with cursor (transient-reconnect resume). A host-hidden pane
+//      boots its tree OPEN (status must be live without a reveal).
 //
-// The sync.ts facade glue (onPaneVisibilityChange → suspend/resume) is
-// mirrored here manually so the module seams are exercised without booting
-// the full startSync surface.
+// The sync.ts facade glue (onPaneVisibilityChange → suspend/resume, and the
+// startSync boot branch) is mirrored here manually so the module seams are
+// exercised without booting the full startSync surface.
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 
 const CONNECTING = 0;
@@ -78,6 +87,56 @@ let paneVis: typeof import("../../src/paneVisibility") = null as unknown as type
 let health: typeof import("../../src/sync/health") = null as unknown as typeof import("../../src/sync/health");
 let counters: typeof import("../../src/sync/recovery-reasons") = null as unknown as typeof import("../../src/sync/recovery-reasons");
 
+/** Drive document visibility through the REAL signal path (listener installed
+ *  by startPaneVisibility), as a browser tab switch would. */
+function setDocVisibility(v: "visible" | "hidden"): void {
+  Object.defineProperty(document, "visibilityState", {
+    get: () => v,
+    configurable: true,
+  });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
+
+/** Mirrors sync.ts suspendSyncForVisibility (2026-10-04 policy). */
+function suspendSyncMirror(): void {
+  counters.countRecovery("visibility-pause");
+  if (paneVis.isDocVisible()) {
+    // Host-hidden: only the transcript stream suspends; the tree stays live.
+    stream.suspendSessionStreamForVisibility();
+    return;
+  }
+  stream.suspendTreeForVisibility();
+  stream.suspendSessionStreamForVisibility();
+}
+
+/** Mirrors sync.ts resumeSyncForVisibility (reveal reconciliation). */
+function resumeSyncMirror(): void {
+  counters.countRecovery("visibility-resume");
+  stream.resumeTreeFromVisibility();
+  health.stampTreeResyncBoundary();
+  const sel = store.selectedId();
+  const resumable = stream.getResumableSesId();
+  if (!sel) {
+    if (resumable !== null) stream.closeSessionStream();
+  } else if (resumable !== null && resumable === sel) {
+    stream.resumeSessionStreamForVisibility();
+  } else {
+    stream.openSessionStream(sel);
+  }
+}
+
+/** Mirrors the startSync boot branch (2026-10-04 policy). */
+function bootSyncMirror(): void {
+  if (!paneVis.isPaneVisible()) {
+    suspendSyncMirror();
+    if (paneVis.isDocVisible() && store.projectDir()) stream.connect(true);
+  } else if (store.projectDir()) {
+    stream.connect(true);
+  } else {
+    stream.closeSessionStream();
+  }
+}
+
 async function setupFresh(): Promise<void> {
   vi.resetModules();
   instances = [];
@@ -88,28 +147,15 @@ async function setupFresh(): Promise<void> {
   counters = await import("../../src/sync/recovery-reasons");
   store.setProjectDirRaw("/test");
   store.setSelectedIdRaw("s1");
-  // Mirror the sync.ts facade wiring (startSync's onPaneVisibilityChange +
-  // resumeSyncForVisibility's reveal reconciliation), including the slice-1
-  // reason counting. (openSession's HTTP leg is omitted — fetch is stubbed.)
+  // Install the REAL document-visibility tracker so setDocVisibility drives
+  // the module's own signal (jsdom defaults to "visible" — the embedded
+  // iframe posture). Not embedded → no host message listener; the host signal
+  // is driven via __setHostVisibleForTest below.
+  paneVis.startPaneVisibility();
+  // Mirror the sync.ts facade wiring (startSync's onPaneVisibilityChange).
   paneVis.onPaneVisibilityChange((visible) => {
-    if (visible) {
-      counters.countRecovery("visibility-resume");
-      stream.resumeTreeFromVisibility();
-      health.stampTreeResyncBoundary();
-      const sel = store.selectedId();
-      const resumable = stream.getResumableSesId();
-      if (!sel) {
-        if (resumable !== null) stream.closeSessionStream();
-      } else if (resumable !== null && resumable === sel) {
-        stream.resumeSessionStreamForVisibility();
-      } else {
-        stream.openSessionStream(sel);
-      }
-    } else {
-      counters.countRecovery("visibility-pause");
-      stream.suspendTreeForVisibility();
-      stream.suspendSessionStreamForVisibility();
-    }
+    if (visible) resumeSyncMirror();
+    else suspendSyncMirror();
   });
 }
 
@@ -138,29 +184,39 @@ const sessionSnapshot = (seq: number, id = "s1") => ({
   messages: {},
 });
 
-describe("hidden pane (host signal) → no recovery of any kind", () => {
-  it("watchdogTick does NOT reconnect stale/closed streams while host-hidden", async () => {
+describe("host-hidden pane (2026-10-04): tree stays live, session + churn stand down", () => {
+  it("host-hide closes ONLY the session stream; the tree stays connected", async () => {
     stream.connect();
     treeESes()[0].simulateOpen();
     stream.openSessionStream("s1");
     sessionESes()[0].simulateOpen();
     await vi.advanceTimersByTimeAsync(0);
 
-    // Hide the pane (host signal; document stays "visible" in jsdom).
     paneVis.__setHostVisibleForTest(false);
-    expect(treeESes()[0].readyState).toBe(CLOSED); // suspended
-    expect(sessionESes()[0].readyState).toBe(CLOSED);
+    expect(treeESes()[0].readyState, "tree stays OPEN while host-hidden").toBe(OPEN);
+    expect(sessionESes()[0].readyState, "session suspends").toBe(CLOSED);
+  });
 
-    // Age EVERY clock past both thresholds with the pane hidden.
+  it("watchdogTick recovers a stalled TREE while host-hidden, never the session", async () => {
+    stream.connect();
+    treeESes()[0].simulateOpen();
+    stream.openSessionStream("s1");
+    sessionESes()[0].simulateOpen();
+    await vi.advanceTimersByTimeAsync(0);
+
+    paneVis.__setHostVisibleForTest(false);
+    // Age the tree's transport clock past STALE_MS with the pane hidden (a
+    // dead-but-OPEN socket while the operator never reveals the workspace).
     vi.advanceTimersByTime(200_000);
     stream.watchdogTick();
 
-    // No recovery: no new EventSources were constructed while hidden.
-    expect(treeESes()).toHaveLength(1);
+    // The tree recovered (a NEW EventSource was constructed)…
+    expect(treeESes().length).toBeGreaterThan(1);
+    // …and the session did NOT (its branch stands down while host-hidden).
     expect(sessionESes()).toHaveLength(1);
   });
 
-  it("maybeReconnect and resyncTree are no-ops while host-hidden", async () => {
+  it("maybeReconnect reconnects a closed tree while host-hidden; resyncTree stays a no-op", async () => {
     stream.connect();
     treeESes()[0].simulateOpen();
     stream.openSessionStream("s1");
@@ -169,22 +225,74 @@ describe("hidden pane (host signal) → no recovery of any kind", () => {
     health._resetResyncGateForTest();
 
     paneVis.__setHostVisibleForTest(false);
-    stream.maybeReconnect(); // tree is "closed" (suspended) — must not connect
-    health.resyncTree(); // on-focus/periodic funnel — must not connect(true)
-    expect(treeESes()).toHaveLength(1);
+    // Simulate the tree dying on its own (server drop): closed, not suspended.
+    treeESes()[0].close();
+    stream.maybeReconnect();
+    expect(treeESes().length, "tree recovered").toBeGreaterThan(1);
+    health.resyncTree(); // on-focus/periodic drift funnel — must NOT connect(true)
+    const treeCount = treeESes().length;
     expect(sessionESes()).toHaveLength(1);
+    // A second resyncTree call confirms the no-op (no cursorless snapshot).
+    health.resyncTree();
+    expect(treeESes()).toHaveLength(treeCount);
   });
 
-  it("document-visible but host-hidden is the discriminated case (doc check alone would pass)", async () => {
+  it("document-visible but host-hidden runs the TREE watchdog branch (the discriminated case)", async () => {
     // jsdom's document.visibilityState defaults to "visible" — exactly the
-    // CSS-hidden-iframe posture. The host signal must gate it.
+    // CSS-hidden-iframe posture. The tree branch must RUN in this state.
     expect(document.visibilityState).toBe("visible");
     paneVis.__setHostVisibleForTest(false);
-    stream.connect(); // direct connect still works (boot path is gated in the facade)
+    stream.connect(); // direct connect still works (boot path connects too)
     expect(treeESes()).toHaveLength(1);
     vi.advanceTimersByTime(200_000);
     stream.watchdogTick();
-    expect(treeESes()).toHaveLength(1); // no watchdog reopen
+    expect(treeESes().length, "watchdog reopens the dead tree").toBeGreaterThan(1);
+  });
+
+  it("boot-hidden (host) with a project still opens the tree; the session defers to reveal", async () => {
+    paneVis.__setHostVisibleForTest(false);
+    bootSyncMirror();
+    expect(treeESes(), "tree opened at boot while host-hidden").toHaveLength(1);
+    expect(treeESes()[0].url).not.toContain("cursor=");
+    expect(sessionESes(), "session deferred").toHaveLength(0);
+
+    paneVis.__setHostVisibleForTest(true);
+    expect(treeESes(), "reveal does not reconnect the live tree").toHaveLength(1);
+    expect(sessionESes(), "reveal opens the restored selection").toHaveLength(1);
+  });
+});
+
+describe("doc-hidden pane (standalone/backgrounded) → no recovery of any kind", () => {
+  it("doc-hide suspends BOTH streams; watchdogTick/maybeReconnect/resyncTree are no-ops", async () => {
+    stream.connect();
+    treeESes()[0].simulateOpen();
+    stream.openSessionStream("s1");
+    sessionESes()[0].simulateOpen();
+    await vi.advanceTimersByTimeAsync(0);
+    health._resetResyncGateForTest();
+
+    setDocVisibility("hidden");
+    expect(treeESes()[0].readyState).toBe(CLOSED); // suspended
+    expect(sessionESes()[0].readyState).toBe(CLOSED);
+
+    vi.advanceTimersByTime(200_000);
+    stream.watchdogTick();
+    stream.maybeReconnect();
+    health.resyncTree();
+
+    expect(treeESes()).toHaveLength(1);
+    expect(sessionESes()).toHaveLength(1);
+    setDocVisibility("visible"); // restore for afterEach hygiene
+  });
+
+  it("doc-hidden boot defers ALL streaming to the reveal", async () => {
+    setDocVisibility("hidden");
+    bootSyncMirror();
+    expect(treeESes()).toHaveLength(0);
+    expect(sessionESes()).toHaveLength(0);
+    setDocVisibility("visible");
+    expect(treeESes(), "reveal connects the tree fresh").toHaveLength(1);
+    expect(treeESes()[0].url).not.toContain("cursor=");
   });
 });
 
@@ -282,10 +390,11 @@ describe("session stream suspend/resume (cursor preservation)", () => {
   });
 });
 
-describe("tree stream suspend/resume", () => {
-  it("first resume after boot connects FRESH; later resumes connect with cursor", async () => {
-    paneVis.__setHostVisibleForTest(false); // hidden at boot → suspend, never opened
-    paneVis.__setHostVisibleForTest(true); // reveal
+describe("tree stream suspend/resume (doc-hidden boundary)", () => {
+  it("first resume after a doc-hidden boot connects FRESH; later resumes connect with cursor", async () => {
+    setDocVisibility("hidden"); // hidden at boot → both suspended, never opened
+    bootSyncMirror();
+    setDocVisibility("visible"); // reveal
     expect(treeESes()).toHaveLength(1);
     // everOpened is false (no onopen fired) → fresh connect (no cursor param,
     // mirroring the boot connect(true) contract for LS-hydrated state).
@@ -296,12 +405,38 @@ describe("tree stream suspend/resume", () => {
     treeESes()[0].fire("session.upsert", { id: "s1" }, "42.1");
     await vi.advanceTimersByTimeAsync(0);
 
-    paneVis.__setHostVisibleForTest(false);
+    setDocVisibility("hidden"); // doc-hidden suspend (tree suspended)
     expect(treeESes()[0].readyState).toBe(CLOSED);
-    paneVis.__setHostVisibleForTest(true);
+    setDocVisibility("visible"); // transient-reconnect resume
     expect(treeESes()).toHaveLength(2);
-    // Transient-reconnect resume: cursor-based (ring replay).
+    // Resume: cursor-based (ring replay).
     expect(treeESes()[1].url).toContain("cursor=");
+  });
+
+  it("host-hidden → doc-hidden: no transition re-fires (pane already hidden); the tree heals on doc-return", async () => {
+    // Host-hidden first (tree stays live)…
+    paneVis.__setHostVisibleForTest(false);
+    stream.connect();
+    treeESes()[0].simulateOpen();
+    treeESes()[0].fire("session.upsert", { id: "s1" }, "42.1");
+    await vi.advanceTimersByTimeAsync(0);
+    // …then the document hides too (operator backgrounds the whole tab).
+    // paneVisible was ALREADY false, so notify() fires no transition and the
+    // facade suspend does not re-run: the tree stream stays connected. The
+    // browser suspends background socket delivery as it sees fit; the
+    // doc-gated watchdog stands down while hidden. Documented edge in
+    // docs/ai/hidden-pane-status.md (cost: one open SSE per host-hidden pane
+    // while the whole browser window is backgrounded).
+    setDocVisibility("hidden");
+    expect(treeESes()[0].readyState, "no re-suspend at the doc boundary").toBe(OPEN);
+    // Simulate the socket dying while the tab is backgrounded…
+    treeESes()[0].close();
+    // …doc returns (still host-hidden): the watchdog's tree branch runs again
+    // and recovers it — hidden-pane status stays fresh without a reveal.
+    setDocVisibility("visible");
+    vi.advanceTimersByTime(200_000);
+    stream.watchdogTick();
+    expect(treeESes().length, "tree recovered on doc-return").toBeGreaterThan(1);
   });
 });
 

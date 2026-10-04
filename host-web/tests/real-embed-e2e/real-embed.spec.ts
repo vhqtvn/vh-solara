@@ -38,6 +38,46 @@ import * as H from "../e2e/util";
 // cannot drift the config's boot target from the spec's frame-finder.
 const REAL = `http://localhost:${process.env.REAL_EMBED_REAL_PORT ?? "8765"}`;
 
+// The demo project dir the fake upstream's seeded sessions report — SAME env
+// var the config sets (REAL_EMBED_DEMO_DIR) so the pane's ?dir= and the Go
+// fixture's VH_DEMO_DIR can never drift (lane-6 VH_DEMO_DIR convention).
+const DEMO_DIR = process.env.REAL_EMBED_DEMO_DIR ?? "";
+
+// Drive a fixture control route through the real local-server's TRANSPARENT
+// /oc/* reverse proxy (the fake upstream is attached via --opencode-url). The
+// POST follows the server's CSRF guard contract (X-VH-CSRF on /oc/* writes).
+// The resulting event flows the REAL production path end-to-end:
+// fixture /event → aggregator store → tree SSE → the SPA's sync store →
+// statusEmitter derivePaneCounts → postMessage → the host's per-workspace
+// tab-pairs badge. No host-side status injection anywhere.
+async function ocFixture(page: Page, path: string, json?: Record<string, unknown>): Promise<void> {
+  const res = await page.request.post(`${REAL}${path}`, {
+    headers: { "X-VH-CSRF": "1" },
+    data: json,
+  });
+  expect(res.ok(), `fixture route ${path} -> ${res.status()}`).toBe(true);
+}
+
+// Deterministic (0|0) baseline regardless of PRIOR fixture/store state (the
+// fake and the aggregator store are long-lived and shared across tests and
+// debug runs; a previous busy→reset cycle leaves the "slow" root
+// finished-unread). Drive one full cycle, then ack the root's unread through
+// the real ack route (POST /vh/ack {sessionID} with the same ?dir= store the
+// pane reads — reqDir), then wait for the pane's posted status to settle at
+// 0 running / 0 unread. Also proves the pane's tree is fully live BEFORE the
+// test's own transitions (not a stale pre-tree post).
+async function settleBaseline(page: Page, paneId: string): Promise<void> {
+  await ocFixture(page, "/oc/fixture/busy?session=slow");
+  await ocFixture(page, `/oc/fixture/reset?session=slow`);
+  await ocFixture(page, `/vh/ack?dir=${encodeURIComponent(DEMO_DIR)}`, { sessionID: "slow" });
+  await expect
+    .poll(async () => H.status(page, paneId), {
+      timeout: 20_000,
+      message: "pane status settles at the deterministic (0|0) baseline",
+    })
+    .toMatchObject({ runningCount: 0, unreadCount: 0 });
+}
+
 // ---------------------------------------------------------------------------
 // network probe (reused from the Phase-0′ spike, proven on both browsers)
 // ---------------------------------------------------------------------------
@@ -885,5 +925,198 @@ test.describe("lane 8: real SPA cross-origin iframe embed", () => {
     } finally {
       await ctx.close();
     }
+  });
+});
+
+// =============================================================================
+// HIDDEN-PANE STATUS LIVENESS (2026-10-04 operator report; solution brief
+// tmp/agent-runs/hidden-pane-status-20261004/brief.md, Phase 0 RED + Phase 1
+// GREEN). The operator report: while a workspace is HIDDEN (not the active
+// one), its tab badge numbers (running/unread) stop updating — they show
+// stale counts until the workspace is revealed again.
+//
+// Root cause (established by two completed analysis slices): the SPA's
+// suspendSyncForVisibility (web/src/sync.ts) suspends BOTH SSE streams when
+// the host hides the pane, freezing the tree store the statusEmitter derives
+// counts from. The host-side consumption layer (pairsByWs/needsYouByWs) is
+// sound — pinned by the lane-7 overflow-live.spec.ts mock spec.
+//
+// THIS spec is the FIRST end-to-end repro + fix proof on the REAL path:
+//   real fake upstream (session.status busy / session.idle) → real aggregator
+//   store → real tree SSE → real SPA store (inside a real cross-origin
+//   iframe, HIDDEN via a real workspace switch) → real statusEmitter → real
+//   host tab badge. NO injected host messages anywhere (the lane-7 spec
+//   proves the host side with probeStatus; this proves the SPA side emits).
+//
+// Assertions map 1:1 to the brief's adequacy gate:
+//   - FRESHNESS: hidden badge picks up running +1, then the terminal
+//     transition (running cleared + unread bumped), while hidden.
+//   - SURVIVAL: iframe identity (mountTs/nonce) unchanged across hide/reveal,
+//     heartbeats CONTINUE while hidden (fresh lastSeen through the hidden
+//     window) — the pane is never reloaded to get live status.
+//   - PARITY: unread is NOT acked by background observation (no auto-select /
+//     read-receipt from a hidden pane) and no attention is fabricated.
+// =============================================================================
+test.describe("lane 8: hidden-pane status liveness (real upstream → hidden real SPA → host tab badge)", () => {
+  // CONTROL (green at HEAD and after the fix): the SAME real-path drive with
+  // the workspace VISIBLE. Isolates hiddenness as the ONLY variable in the
+  // hidden test below — if this fails, the driving mechanism (fixture →
+  // aggregator → SSE → emitter → badge) is broken, not the hide policy.
+  test("visible control: the same upstream drive updates the badge when the workspace is visible", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const hidden = await H.addWorkspace(page, "visible-control");
+    expect(hidden).toBeTruthy();
+    expect(DEMO_DIR, "REAL_EMBED_DEMO_DIR is set by playwright.real-embed.config.ts").not.toBe("");
+    const added = await H.addServerWithOutcome(
+      page,
+      `${REAL}/app/?dir=${encodeURIComponent(DEMO_DIR)}`,
+      "demo",
+    );
+    expect(added, "real demo pane added").toBeTruthy();
+    const pairsOf = async (): Promise<string | null> => {
+      const el = await page.$(`[data-testid="ws-tab-pairs"][data-workspace="${hidden}"]`);
+      return el ? el.getAttribute("data-pairs") : null;
+    };
+    await expect
+      .poll(async () => H.status(page, added!.paneId), { timeout: 30_000, message: "first status from the real demo pane" })
+      .not.toBeNull();
+    await settleBaseline(page, added!.paneId);
+    expect(await pairsOf(), "no badge at the (0|0) baseline").toBeNull();
+
+    // The workspace stays ACTIVE (visible) throughout.
+    await ocFixture(page, "/oc/fixture/busy?session=slow");
+    await expect.poll(pairsOf, { timeout: 8_000, message: "visible badge picks up running (+1)" }).toBe("(1|0)");
+    await ocFixture(page, "/oc/fixture/reset?session=slow");
+    await expect.poll(pairsOf, { timeout: 8_000, message: "visible badge: running cleared + unread bumped" }).toBe("(0|1)");
+  });
+
+  test("hidden workspace's tab badge tracks upstream count changes live; iframe survives; unread not acked", async ({
+    page,
+  }) => {
+    await page.goto("/");
+
+    // Two workspaces so one can be HIDDEN (inactive workspace = its panes get
+    // vh-host-visibility hidden → App.tsx visibility:hidden, iframe stays
+    // mounted — the runtime state the operator report describes).
+    const seed = (await H.workspaces(page))[0];
+    const hidden = await H.addWorkspace(page, "hidden-status");
+    expect(hidden, "second workspace created (and auto-activated)").toBeTruthy();
+
+    // The real demo pane, bound to the fake's demo project (?dir=DEMO_DIR so
+    // the SPA's tree carries the seeded sessions: demo/other/slow/mdhard/
+    // mermaid/editpvw roots, nothing running, nothing unread at seed).
+    expect(DEMO_DIR, "REAL_EMBED_DEMO_DIR is set by playwright.real-embed.config.ts").not.toBe("");
+    const added = await H.addServerWithOutcome(
+      page,
+      `${REAL}/app/?dir=${encodeURIComponent(DEMO_DIR)}`,
+      "demo",
+    );
+    expect(added, "real demo pane added to the hidden-status workspace").toBeTruthy();
+    const paneId = added!.paneId;
+
+    // The real SPA booted and its statusEmitter POSTED a first status through
+    // the real handshake (hostOrigin captured → 1Hz poll → first post). This
+    // is the pane's status in the HOST's store — pane-bound, works while
+    // hidden. R0/U0 = the seed state (0 running, 0 unread).
+    await expect
+      .poll(async () => H.status(page, paneId), {
+        timeout: 30_000,
+        message: "first status from the real demo pane (SPA booted, emitter posted)",
+      })
+      .not.toBeNull();
+
+    // The hidden-status workspace holds exactly ONE pane (the real demo pane)
+    // → its tab badge data-pairs is exactly "(R0|U0)". The badge element
+    // renders ONLY when a count is non-zero (Tabstrip showPairs()), so the
+    // (0|0) baseline has NO badge. settleBaseline also proves the pane's tree
+    // is fully hydrated and live (not a pre-tree post).
+    const pairsOf = async (): Promise<string | null> => {
+      const el = await page.$(`[data-testid="ws-tab-pairs"][data-workspace="${hidden}"]`);
+      return el ? el.getAttribute("data-pairs") : null;
+    };
+    await settleBaseline(page, paneId);
+    expect(await pairsOf(), "no badge at the (0|0) baseline (showPairs()=false)").toBeNull();
+
+    // Capture the pane document's survival identity BEFORE hiding (heartbeat
+    // accepted: mountTs = the SPA's performance.timeOrigin, changes iff the
+    // document reloaded).
+    const before = await H.waitForFreshHeartbeat(page, paneId, 0);
+    expect(before.mountTs, "heartbeat identity captured while visible").toBeGreaterThan(0);
+
+    // ---- HIDE: switch back to the seed workspace. The demo pane's iframe is
+    // now visibility:hidden (host-hidden), its SPA receives
+    // vh-host-visibility:false. The host's visibility pump samples every live
+    // renderer on a 1s tick and posts on change (iframeRenderer.ts
+    // VIS_TICK_MS=1000), so the false can arrive up to ~1s after the switch.
+    // Soak past TWO ticks so the hidden state is deterministically in effect
+    // in the pane BEFORE we drive the upstream change (a shorter wait races
+    // the pump: the change can land while streams are still live, then freeze
+    // mid-test — a flake, not the repro).
+    await H.setActiveWorkspace(page, seed);
+    await page.waitForTimeout(2_500);
+
+    // ---- FRESHNESS (running): upstream session.status busy for the "slow"
+    // root session, through the REAL path (fixture control → aggregator →
+    // tree SSE → SPA store → statusEmitter → host badge). At HEAD (both
+    // streams suspended while hidden) the badge never appears — this poll
+    // TIMES OUT on null: the documented RED, the first real-path repro of
+    // the operator report.
+    await ocFixture(page, "/oc/fixture/busy?session=slow");
+    await expect
+      .poll(pairsOf, {
+        timeout: 8_000,
+        message: "HIDDEN pane's tab badge appears + picks up running (+1) live",
+      })
+      .toBe("(1|0)");
+
+    // ---- FRESHNESS (terminal transition): reset → session.idle clears the
+    // busy AND marks the root unread (the ordinary turn-completed shape) →
+    // badge (0|1) while still hidden.
+    await ocFixture(page, "/oc/fixture/reset?session=slow");
+    await expect
+      .poll(pairsOf, {
+        timeout: 8_000,
+        message: "HIDDEN pane's badge: running cleared + unread bumped",
+      })
+      .toBe("(0|1)");
+
+    // ---- PARITY: background observation must NOT ack the unread (no
+    // auto-select, no read-receipt from a hidden pane). Soak past several
+    // emitter ticks — the unread watermark survives hidden observation.
+    await page.waitForTimeout(3_000);
+    expect(await pairsOf(), "unread NOT acked by background observation").toBe("(0|1)");
+    const st = await H.status(page, paneId);
+    expect(st?.attention ?? "none", "no attention fabricated while hidden").toBe("none");
+
+    // ---- SURVIVAL: the SAME document kept heartbeating THROUGH the hidden
+    // window (a heartbeat strictly newer than the pre-hide one arrived) and
+    // its identity never changed (no reload — live status never cost the
+    // pane its iframe).
+    const during = await H.waitForFreshHeartbeat(page, paneId, before.lastSeen);
+    expect(during.mountTs, "mountTs unchanged across hide (iframe not reloaded)").toBe(before.mountTs);
+    expect(during.nonce, "nonce unchanged across hide (iframe not reloaded)").toBe(before.nonce);
+
+    // ---- REVEAL: switch back; the badge still reads the live value, the
+    // pane is still alive, and one more real-path change still lands (the
+    // stream resumed cleanly on reveal — no wedged state after the fix).
+    await H.setActiveWorkspace(page, hidden as string);
+    expect(await pairsOf(), "badge unchanged on reveal").toBe("(0|1)");
+    expect(await H.liveness(page, paneId), "revealed pane still alive").toBe("alive");
+    await ocFixture(page, "/oc/fixture/busy?session=slow");
+    await expect
+      .poll(pairsOf, {
+        timeout: 8_000,
+        message: "revealed pane's badge picks up running (+1) live",
+      })
+      .toBe("(1|0)");
+    await ocFixture(page, "/oc/fixture/reset?session=slow");
+    await expect
+      .poll(pairsOf, {
+        timeout: 8_000,
+        message: "revealed pane's badge returns to (0|1)",
+      })
+      .toBe("(0|1)");
   });
 });

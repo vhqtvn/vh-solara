@@ -34,6 +34,17 @@ export const paneVisible = () => docVisible() && hostVisible();
 /** Non-reactive read for timer callbacks. */
 export const isPaneVisible = (): boolean => paneVisible();
 
+/**
+ * Non-reactive: true when the DOCUMENT is visible, even if the host has hidden
+ * the pane. Splits the two hiders: host-hidden (inactive workspace — document
+ * still "visible" in the CSS-hidden cross-origin iframe) vs document-hidden
+ * (the whole tab backgrounded). Sync recovery policy keys off this split:
+ * the tree stream keeps its watchdog/liveness recovery while host-hidden
+ * (hidden-pane status must stay fresh), while a document-hidden pane recovers
+ * nothing (see sync.ts + docs/ai/hidden-pane-status.md).
+ */
+export const isDocVisible = (): boolean => docVisible();
+
 type Listener = (visible: boolean) => void;
 const listeners = new Set<Listener>();
 let last = true;

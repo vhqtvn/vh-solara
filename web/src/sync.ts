@@ -44,7 +44,7 @@ import {
   resumeSessionStreamForVisibility,
   startBusyEdgeRearm,
 } from "./sync/session-stream";
-import { isPaneVisible, onPaneVisibilityChange } from "./paneVisibility";
+import { isPaneVisible, isDocVisible, onPaneVisibilityChange } from "./paneVisibility";
 import { watchdogTick, maybeReconnect, tickHealth, resyncTree, stampTreeResyncBoundary } from "./sync/health";
 import { installSyncDiagGlobal, countRecovery } from "./sync/recovery-reasons";
 import { startPeriodicResync } from "./sync/periodic-resync";
@@ -67,18 +67,36 @@ bindAlertsContext({
 
 // === Slice 2 (webperf build1): pane-visibility sync lifecycle =================
 // A host-hidden pane (docked tab / inactive workspace — the 9-pane idle tab's
-// 8 hidden panes) suspends BOTH SSE streams + all recovery; the reveal
-// reconnects exactly once, resuming from the preserved cursors. The host
-// signal (vh-host-visibility) — NOT document.visibilityState alone, which
-// stays "visible" in a CSS-hidden cross-origin iframe — drives it.
+// 8 hidden panes) suspends its transcript stream + all recovery that exists
+// solely for the operator's eyes; the reveal reconnects exactly once, resuming
+// from the preserved cursors. The host signal (vh-host-visibility) — NOT
+// document.visibilityState alone, which stays "visible" in a CSS-hidden
+// cross-origin iframe — drives it.
+//
+// Hidden-pane STATUS (2026-10-04, docs/ai/hidden-pane-status.md): while
+// host-hidden, the TREE stream (Stream-1) stays LIVE. statusEmitter derives
+// the running/unread counts from the tree store and posts them to the host
+// (not visibility-gated), so the host's tab badges for an inactive workspace
+// stay fresh ONLY if the tree keeps flowing. Only the transcript/UI stream
+// (Stream-2) is suspended — its content has no consumer while hidden, and
+// suspending it keeps the per-token render/animation cost at zero.
+//
 // Standalone (non-embedded) panes have no host signal (hostVisible always
 // true), so THEIR suspension boundary is document background/foreground: a
-// backgrounded standalone tab now closes its streams instead of letting the
+// backgrounded standalone tab closes BOTH streams instead of letting the
 // browser suspend the sockets while the (doc-gated) watchdog stands down, and
 // foreground resumes from the cursor — a deliberate small behavior change
 // (bounded, once per foreground), not a bug.
 function suspendSyncForVisibility(): void {
   countRecovery("visibility-pause");
+  // Host-hidden (document still visible): the tree STAYS connected — only the
+  // transcript stream suspends. Doc-hidden (standalone backgrounded): suspend
+  // both, as before. (paneVisible false + docVisible true is exactly the
+  // host-hidden state; docVisible false implies paneVisible false.)
+  if (isDocVisible()) {
+    suspendSessionStreamForVisibility();
+    return;
+  }
   suspendTreeForVisibility();
   suspendSessionStreamForVisibility();
 }
@@ -125,13 +143,19 @@ export function startSync() {
   // selected (deep link ?dir= or localStorage fallback). With no project the app
   // shows the no-project empty state and does NOT bridge the daemon's cwd;
   // selecting a project later calls connect(true) via switchProject.
-  // Slice 2: a pane hidden at boot defers ALL streaming to the reveal (the
-  // suspend markers arm the resume path; nothing connects while hidden).
+  // Slice 2: a hidden-at-boot pane defers its transcript streaming to the
+  // reveal (the suspend markers arm the resume path).
+  // Hidden-pane STATUS (2026-10-04): a HOST-hidden pane (doc still visible)
+  // still opens its TREE stream at boot — status must be live for a pane the
+  // operator has never revealed (a pane added to a never-activated workspace).
+  // Only a doc-hidden (standalone backgrounded) boot defers ALL streaming.
   if (!isPaneVisible()) {
-    // Hidden at boot: defer ALL streaming to the reveal. Routed through the
-    // same suspendSyncForVisibility as a live hide so the counters stay
-    // symmetric (a boot-hidden pane counts one visibility-pause too).
+    // Hidden at boot: route through the same suspendSyncForVisibility as a
+    // live hide so the counters stay symmetric (a boot-hidden pane counts one
+    // visibility-pause too) and the session-suspension markers arm the reveal
+    // resume path.
     suspendSyncForVisibility();
+    if (isDocVisible() && projectDir()) connect(true);
   } else if (projectDir()) {
     connect(true);
   } else {

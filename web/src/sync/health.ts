@@ -54,7 +54,7 @@ import {
 } from "./session-stream";
 import { captureDiagEntry } from "./diaglog";
 import { classifyStall, countRecovery } from "./recovery-reasons";
-import { isPaneVisible } from "../paneVisibility";
+import { isPaneVisible, isDocVisible } from "../paneVisibility";
 import { sessionWorking, anySessionActive } from "./selectors";
 import { issueLivenessProbe, livenessCapabilityAvailable } from "./liveness";
 
@@ -106,14 +106,18 @@ export function isStale(): boolean {
 // Runs while the tab is visible.
 export function watchdogTick() {
   if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
-  // Slice 2 (webperf): a pane hidden by the HOST (CSS visibility on a
-  // cross-origin iframe — document.visibilityState stays "visible") must not
-  // run watchdog recovery: its streams are deliberately suspended, and
-  // reconnecting them would re-create the idle churn (~130s force → cursorless
-  // full snapshot) this slice removes. paneVisible() folds in BOTH signals
-  // (document + host); the doc check above is retained as the cheap
-  // original-path early-out.
-  if (!isPaneVisible()) return;
+  // Slice 2 (webperf) + hidden-pane STATUS (2026-10-04): split the two
+  // hiders. A pane hidden by the HOST (CSS visibility on a cross-origin
+  // iframe — document.visibilityState stays "visible") keeps its TREE stream
+  // deliberately live (the host's tab badges derive from the tree store), so
+  // the tree branch below KEEPS RUNNING while host-hidden — a dead-but-OPEN
+  // or closed tree socket must still be recovered, or hidden-pane status
+  // silently freezes on a stalled connection. Only the SESSION branch stands
+  // down for a host-hidden pane: Stream-2 is deliberately suspended there and
+  // the reveal path (resumeSyncForVisibility) owns its reopen. A doc-hidden
+  // pane (standalone backgrounded; both streams closed) still runs nothing.
+  const paneVisibleNow = isPaneVisible();
+  if (!paneVisibleNow && !isDocVisible()) return;
   // No project selected: never (re)connect the cwd bridge. The watchdog just
   // advances the stale-health tick (cheap, harmless) and stands down otherwise.
   if (!projectDir()) {
@@ -217,11 +221,14 @@ export function watchdogTick() {
         issueLivenessProbe("tree", {
           onProven: () => markTreeLivenessProof(),
           onTimeout: () => {
-            // A pane that went HIDDEN mid-probe must not recover here: its
-            // streams are deliberately suspended and the reveal path
-            // (resumeTreeFromVisibility) owns reopening them cursor-
-            // preserving. The clocks re-seed at construction on reveal.
-            if (!isPaneVisible()) return;
+            // A pane that went DOC-hidden mid-probe must not recover here:
+            // its tree stream is deliberately suspended and the reveal path
+            // (resumeTreeFromVisibility) owns reopening it cursor-
+            // preserving (the clocks re-seed at construction on reveal).
+            // Hidden-pane STATUS (2026-10-04): a HOST-hidden pane's tree is
+            // NOT suspended — a timed-out probe still recovers it there, or
+            // hidden-pane status freezes on a dead pipeline.
+            if (!isDocVisible()) return;
             captureDiagEntry({
               kind: "stall",
               ts: Date.now(),
@@ -259,7 +266,12 @@ export function watchdogTick() {
   // sessionLastSeen seeded to "now" by open() → not stale → gets a fresh
   // deadline (no tight construction/close loop). Reconnecting ONLY Stream2
   // does NOT flip global status to disconnected (that follows the tree above).
-  const sesId = getSesId();
+  // Hidden-pane STATUS (2026-10-04): the session branch stands down for a
+  // host-hidden pane — Stream-2 is deliberately suspended there and the
+  // reveal path (resumeSessionStreamForVisibility) owns its reopen.
+  // getSesId() keeps returning the PRESERVED suspended session id, so the
+  // gate must be explicit pane visibility, not inferred from sesId.
+  const sesId = paneVisibleNow ? getSesId() : null;
   if (sesId) {
     if (isSessionClosed()) {
       // Slice 5b (webperf): cursor-PRESERVING closed-stream recovery. The old
@@ -402,8 +414,11 @@ export function maybeReconnect() {
   // anyway, but avoid even the readyState read / status churn).
   if (!projectDir()) return;
   // Slice 2 (webperf): online/visibility recovery must not reopen a hidden
-  // pane's suspended streams (same gate as the watchdog).
-  if (!isPaneVisible()) return;
+  // pane's suspended streams. Hidden-pane STATUS (2026-10-04): a HOST-hidden
+  // pane's tree is NOT suspended — online/foreground recovery may recover it
+  // (watchdogTick internally stands its session branch down while host-hidden).
+  // A doc-hidden pane (both streams closed) still recovers nothing.
+  if (!isPaneVisible() && !isDocVisible()) return;
   if (isTreeClosed()) connect();
   else watchdogTick();
 }
@@ -448,8 +463,16 @@ export function resyncTree() {
   // No project selected → nothing to resync (connect(true) would no-op anyway).
   if (!projectDir()) return;
   // Slice 2 (webperf): no drift self-heal for a host-hidden pane — the on-focus
-  // and periodic triggers both funnel through here, and a hidden pane's tree is
-  // suspended (a resync would reopen it cursorless).
+  // and periodic triggers both funnel through here, and a resync would churn
+  // the live tree (connect(true) = cursorless full snapshot). Hidden-pane
+  // STATUS (2026-10-04): this stays pane-gated DELIBERATELY even though the
+  // tree now stays live while host-hidden — a hidden pane's badges need event
+  // delivery, not snapshot parity: an ordinal gap on the live stream is
+  // detected per-frame by the transport (tree-seq-gap) and heals on reveal,
+  // while an UNDETECTED drift (missed non-ordinal content) only costs
+  // badge counts catching up at the reveal's authoritative reconnect. The
+  // watchdog above still recovers a CLOSED/stalled tree while hidden — that
+  // is liveness, not drift-churn.
   if (!isPaneVisible()) return;
   // Let the watchdog own recovery of a closed/stale stream; a resync here would
   // only race it (maybeReconnect already reconnects a CLOSED tree). The value

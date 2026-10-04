@@ -44,11 +44,17 @@ const defaultDemoDir = "/work/demo"
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8099", "address for the vh web server")
+	// fakeOnly runs JUST the fake OpenCode HTTP API on -addr — no aggregator,
+	// no web server, no SPA. For lanes that attach the REAL vh-solara binary
+	// via --opencode-url and need the fixture upstream at a STABLE address the
+	// test harness can also drive directly (host-web lane 8 real-embed: the
+	// real local-server proxies /oc/* to it and the spec POSTs
+	// /oc/fixture/busy & /oc/fixture/reset to drive live count changes through
+	// the REAL event path). Test infrastructure only; the default (unset)
+	// behavior is unchanged.
+	fakeOnly := flag.Bool("fake-only", false, "serve only the fake OpenCode API on -addr (no aggregator/web/SPA)")
 	flag.Parse()
 
-	if os.Getenv("VH_QUOTA_FIXTURE") == "" {
-		_ = os.Setenv("VH_QUOTA_FIXTURE", demoQuotaJSON)
-	}
 	// Resolve + create the consolidated demo project directory BEFORE seeding
 	// the fixture (sessions report this directory). MkdirAll is idempotent and
 	// tolerates concurrent runs. VH_DEMO_DIR lets the e2e lane pin a known
@@ -65,6 +71,18 @@ func main() {
 	}
 	fixtures.SetDemoDir(demoProjectDir)
 	log.Printf("fixture: demo project dir = %s", demoProjectDir)
+
+	if *fakeOnly {
+		log.Printf("fixture: fake-only OpenCode API on http://%s (no aggregator/web)", *addr)
+		if err := http.ListenAndServe(*addr, fixtures.New().Handler()); err != nil {
+			log.Fatalf("fake-only opencode serve: %v", err)
+		}
+		return
+	}
+
+	if os.Getenv("VH_QUOTA_FIXTURE") == "" {
+		_ = os.Setenv("VH_QUOTA_FIXTURE", demoQuotaJSON)
+	}
 	// Isolate persisted notes/archive to a throwaway dir so fixture runs never
 	// touch the real user config (and start clean each process).
 	stateDir := os.Getenv("VH_STATE_DIR")

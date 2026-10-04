@@ -577,4 +577,31 @@ describe("status emitter — derivation + emission (embedded)", () => {
     expect(statusMsgs(posted).length, "unread change re-emits").toBe(afterFirst + 2);
     expect(statusMsgs(posted).at(-1)!.msg.unreadCount).toBe(1);
   });
+
+  it("host-hidden pane STILL emits count changes (hidden-pane status contract pin)", async () => {
+    // 2026-10-04 (docs/ai/hidden-pane-status.md): the host's tab badges for an
+    // inactive workspace stay fresh ONLY because (a) the tree stream stays
+    // live while host-hidden and (b) THIS emitter is not visibility-gated.
+    // Pin (b): with the host-visibility signal false (and the document still
+    // "visible" — the CSS-hidden cross-origin iframe posture), a count change
+    // still posts. If someone adds an isPaneVisible() gate here, hidden-pane
+    // status freezes — exactly the bug this contract guards against.
+    const paneVis = await import("../../src/paneVisibility");
+    setState("sessions", SID, { id: SID });
+    setState("activity", SID, "idle");
+    handshakeAndTick();
+    const baseline = statusMsgs(posted).length;
+    expect(baseline).toBeGreaterThan(0);
+
+    paneVis.__setHostVisibleForTest(false); // host-hidden; doc stays visible
+    setState("activity", SID, "busy");
+    vi.advanceTimersByTime(1000);
+    expect(statusMsgs(posted).length, "count change posted while host-hidden").toBe(baseline + 1);
+    expect(statusMsgs(posted).at(-1)!.msg.runningCount).toBe(1);
+
+    setState("unread", SID, true);
+    vi.advanceTimersByTime(1000);
+    expect(statusMsgs(posted).at(-1)!.msg.unreadCount, "unread change posted while host-hidden").toBe(1);
+    paneVis.__setHostVisibleForTest(true); // restore for afterEach hygiene
+  });
 });

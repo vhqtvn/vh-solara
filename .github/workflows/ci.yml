@@ -200,12 +200,15 @@ jobs:
         run: npm ci && npm run build
       - name: materialize SPA into pkg/web/dist (the //go:embed path)
         run: bash web/scripts/materialize.sh
-      - name: build vh-solara binary (embeds the real SPA)
+      - name: build vh-solara binaries (real server + fake-only fixtureserver)
         # setup-go puts go on PATH; the export is belt-and-suspenders (matches
         # the AGENTS convention for local runs where go may not be on PATH).
+        # The fixtureserver binary backs the lane's controllable fake upstream
+        # (playwright.real-embed.config.ts webServer[0], -fake-only).
         run: |
           export PATH="$PATH:/usr/local/go/bin"
           go build -o vh-solara .
+          go build -o vh-solara-fixtureserver ./tools/fixtureserver
       - name: install host-web deps
         working-directory: host-web
         run: npm ci

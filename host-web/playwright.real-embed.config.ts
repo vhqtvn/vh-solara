@@ -13,7 +13,12 @@ import { defineConfig, devices } from "@playwright/test";
 //                                           VITE_IFRAME_ORIGIN=:8765)
 //   embedded SPA : http://localhost:8765   (real vh-solara local-server,
 //                                           --auth-mode none (loopback default),
-//                                           --frame-ancestors localhost:5183)
+//                                           --frame-ancestors localhost:5183,
+//                                           --opencode-url → fake :8766)
+//   fake backend : http://127.0.0.1:8766   (pkg/fixtures via fixtureserver
+//                                           -fake-only — the CONTROLLABLE
+//                                           upstream; driven per-spec through
+//                                           the local-server's /oc/* proxy)
 //
 // NO-AUTH posture: --auth-mode none is the server default (cmd/auth_flags.go),
 // permitted on a loopback bind. The server binds 127.0.0.1:8765 (loopback) and
@@ -46,14 +51,29 @@ const repoRoot = path.resolve(hostRoot, "..");
 
 const REAL_PORT = process.env.REAL_EMBED_REAL_PORT ?? "8765";
 const HOST_PORT = process.env.REAL_EMBED_HOST_PORT ?? "5183";
+// The fake OpenCode (pkg/fixtures via `fixtureserver -fake-only`) — the lane's
+// CONTROLLABLE upstream. Sits BEFORE local-server in the webServer array:
+// local-server's external-attach boot verdict (waitForURL /session, 30s) is
+// terminal, so the fake must be listening first.
+const FAKE_PORT = process.env.REAL_EMBED_FAKE_PORT ?? "8766";
 // localhost (not 127.0.0.1) so both origins share the `localhost` registrable
 // site — required for same-site framing semantics. Servers bind 127.0.0.1.
 const REAL_ORIGIN = `http://localhost:${REAL_PORT}`;
 const HOST_ORIGIN = `http://localhost:${HOST_PORT}`;
 
-// Go binary built at repo root (make build / CI). From host-web/ that's
+// Go binaries built at repo root (make build / CI). From host-web/ that's
 // ../vh-solara. Override with VH_SOLARA_BIN for non-default locations.
 const vhBin = process.env.VH_SOLARA_BIN ?? path.join(repoRoot, "vh-solara");
+// The fake-only fixtureserver binary (same build step as vh-solara — see
+// real-embed-run.sh / the CI job). Override with VH_FIXTURE_BIN.
+const fakeBin = process.env.VH_FIXTURE_BIN ?? path.join(repoRoot, "vh-solara-fixtureserver");
+
+// The consolidated demo project dir the fake's seeded sessions report. Mirrors
+// the lane-6 convention (web/playwright.config.ts VH_DEMO_DIR): the config sets
+// process.env so the Go fixture (VH_DEMO_DIR, inline in the webServer command)
+// and the spec's pane URLs (?dir=) share ONE source of truth.
+const DEMO_DIR = process.env.REAL_EMBED_DEMO_DIR ?? path.join(repoRoot, "tmp", "real-embed-demo");
+process.env.REAL_EMBED_DEMO_DIR = DEMO_DIR;
 
 const artifactRoot =
   process.env.PLAYWRIGHT_ARTIFACTS_DIR ??
@@ -90,12 +110,30 @@ export default defineConfig({
   ],
   webServer: [
     {
+      // Fake OpenCode API (pkg/fixtures, -fake-only): the lane's CONTROLLABLE
+      // upstream, at a STABLE address. The real local-server below attaches to
+      // it via --opencode-url, so the SPA's tree/session streams carry REAL
+      // fixture state, and the spec drives live running/unread changes through
+      // the REAL event path by POSTing /oc/fixture/busy & /oc/fixture/reset
+      // through the local-server's transparent /oc/* proxy. MUST be first in
+      // this array: local-server's external-attach verdict is a 30s terminal
+      // waitForURL on <upstream>/session.
+      command: `VH_DEMO_DIR="${DEMO_DIR}" "${fakeBin}" -fake-only -addr 127.0.0.1:${FAKE_PORT}`,
+      cwd: hostRoot,
+      url: `http://127.0.0.1:${FAKE_PORT}/session`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+    {
       // Real vh-solara local-server (:8765). NO-AUTH (loopback default),
       // --frame-ancestors allows the host origin (REPLACES 'self', omits
       // X-Frame-Options so cross-origin framing is permitted). --opencode-url
-      // is a dead loopback target so the server STAYS UP (decoupled design,
-      // ocLife=failed) and the SPA renders its real shell with empty state.
-      command: `"${vhBin}" local-server --addr 127.0.0.1:${REAL_PORT} --frame-ancestors ${HOST_ORIGIN} --opencode-url http://127.0.0.1:1`,
+      // attaches to the fake fixture above — the SPA streams REAL fixture
+      // state (sessions, activity, permissions) instead of the pre-2026-10-04
+      // dead loopback target, making the upstream controllable per-spec.
+      command: `"${vhBin}" local-server --addr 127.0.0.1:${REAL_PORT} --frame-ancestors ${HOST_ORIGIN} --opencode-url http://127.0.0.1:${FAKE_PORT}`,
       cwd: hostRoot,
       url: `http://127.0.0.1:${REAL_PORT}/`,
       reuseExistingServer: !process.env.CI,

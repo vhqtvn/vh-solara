@@ -213,8 +213,15 @@ export type HostToPane =
   | { type: "host-mode"; mode: "keyboard-focus" | "normal" }
   // Pane visibility (see iframeRenderer's visibility pump + the SPA's
   // web/src/paneVisibility.ts): whether the pane is actually on screen (not a
-  // hidden dockview tab / inactive workspace). The SPA pauses its polling
-  // loops while hidden; live streams (and so status/badges) keep running.
+  // hidden dockview tab / inactive workspace). The SPA's stream policy keys
+  // off this signal SPLIT from document visibility (2026-10-04,
+  // docs/ai/hidden-pane-status.md): while host-hidden (document still
+  // "visible" in the CSS-hidden cross-origin iframe) the SPA pauses polling,
+  // animations and its transcript stream (Stream-2), but KEEPS the tree
+  // stream (Stream-1) live — so status/badges keep updating live for an
+  // inactive workspace. Document-hidden (whole tab backgrounded) suspends
+  // both streams. The heartbeat/document-liveness signal below is
+  // independent of both: "document alive" ≠ "status fresh".
   | { type: "vh-host-visibility"; visible: boolean };
 
 // ---- document-liveness indicator (Q1-C) ------------------------------------
