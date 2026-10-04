@@ -24,7 +24,7 @@ import { Portal } from "solid-js/web";
 import { agents, resolveAgentForSession, selectAgentForSession } from "../../agents";
 import { agentDisplay } from "../../projectSettings";
 import { chooseVariant, models } from "../../models";
-import { queueFor, queueMode, removeQueued } from "../../queue";
+import { queueFor, queueMode, removeQueued, type QueuedMessage } from "../../queue";
 import { highlightInput } from "../../lib/composerHighlight";
 import { isInlineChipOrphan } from "../../lib/inlineAttach";
 import { layoutPx } from "../../lib/zoom";
@@ -85,6 +85,13 @@ export interface ComposerProps {
   // falls back to the raw composer send (today's behavior; minimal unit
   // harnesses omit it).
   retrySame?: (attemptId: string) => Promise<void>;
+  // Slice 3 (intent recovery): guarded queue-item retry (createSend's
+  // retryQueuedItem) — forwarded to QueueChip's Retry button. Re-sends an
+  // outcome-UNKNOWN item's IDENTICAL payload under its original
+  // opencodeMsgID (idempotent on opencode ≥ 1.17.18); `failed` items are
+  // refused (the resolve matrix rejects failed→sent). Optional — absent it,
+  // chips render no retry action (progressive rollout / minimal harnesses).
+  retryQueuedItem?: (q: QueuedMessage) => void;
   abort: () => void;
   // A1 create-linkage (send-defers study), forwarded to SendStatus: the sync
   // store's session map (watched reactively for a session whose time.created
@@ -233,7 +240,9 @@ export function Composer(props: ComposerProps) {
               flight, NOT removable (the state machine owns the transition to
               terminal); terminal `failed`/`unknown` → dismissable
               (FIX-QUEUE-GC-4 flipped DELETE from pending-only to "pending +
-              terminal; not dispatching") AND recoverable (retract-to-compose for
+              terminal; not dispatching") AND recoverable (retry — same-
+              messageID re-send for UNKNOWN items that kept their
+              opencodeMsgID, slice 3 intent recovery; retract-to-compose for
               failed/unknown, mark-sent for unknown — Bug 1 / Bug 2). `sent` is
               filtered from the visible queue upstream (queueFor), so it needs no
               surface. See QueueChip.tsx for the per-state action wiring. */}
@@ -247,6 +256,7 @@ export function Composer(props: ComposerProps) {
                   <QueueChip
                     q={q}
                     onRemove={(id) => void removeQueued(props.sessionId(), id)}
+                    onRetry={props.retryQueuedItem}
                     onRetract={props.recovery.retract}
                     onMarkSent={props.recovery.markSent}
                   />

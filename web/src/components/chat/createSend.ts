@@ -3,7 +3,7 @@
 // createQueueRecovery / createAttachments). The factory owns the send
 // orchestration (buildParts, captureConfig, sendText, dispatchSend, runShell,
 // send) and the public surface the drainer/retry path call into
-// (send, resendText, dispatchQueuedItem). It owns NO network/localStorage
+// (send, retrySameMessage, retryQueuedItem, resendText, dispatchQueuedItem). It owns NO network/localStorage
 // directly except the documented globals (fetch, localStorage, setTimeout,
 // Promise) — all session/composer/queue/transport state is INJECTED as deps
 // so the cluster is unit-testable in isolation.
@@ -63,6 +63,12 @@ type QueueConfig = { providerID?: string; modelID?: string; variant?: string; ag
 // with ≥7s of the dispatch budget still available for the actual
 // prompt_async POST.
 const QUEUED_DISPATCH_GATE_TIMEOUT_MS = 5_000;
+
+// Slice 3 (intent recovery): the down-tied failure copy — EXACT string, the
+// S4 manual check quotes it. Used as the queue item detail (the QueueChip's
+// visible .queue-detail-note) while the lifecycle snapshot says OpenCode is
+// down. The notification title variant lives at the call site.
+const DOWN_NOT_SENT_DETAIL = "OpenCode is down — message not sent";
 
 export type SendDependencies = {
   // session
@@ -124,6 +130,24 @@ export type SendDependencies = {
   // fetched in time (queue.ts bounds the GET; hygiene micro-slice §8 6a) —
   // null means "list unavailable", never "empty list".
   fetchQueue: (id: string) => Promise<QueuedMessage[] | null>;
+  // Slice 3 (intent recovery, 2026-10-03 incident): true while the lifecycle
+  // snapshot says OpenCode is DOWN (down_since set — the daemon OBSERVED the
+  // death; web/src/opencode-lifecycle.ts, S1/S2 down-state knowledge). While
+  // down, a /oc proxy 502 is explained by the death, so the failure copy says
+  // so instead of a generic upstream error. Optional on purpose: absent (or
+  // false) keeps every failure path byte-identical to the pre-slice behavior
+  // (regression-pinned by the non-down tests).
+  opencodeDown?: Accessor<boolean>;
+  // Slice 3 (intent recovery): records a terminal outcome for a RETRIED queue
+  // item — same shape as the drainer's resolve dep (queue.resolveQueued).
+  // Optional: absent refuses the retry loudly (nothing would record the
+  // outcome of the re-dispatch).
+  resolveQueued?: (
+    sessionId: string,
+    itemId: string,
+    state: "sent" | "failed" | "unknown",
+    detail: string,
+  ) => Promise<unknown>;
   // True while an attachment upload is in flight (createAttachments'
   // `uploading`) — admission blocks on it (no partial send).
   uploading: Accessor<boolean>;
@@ -159,6 +183,13 @@ export type SendController = {
   // stored verbatim payload under ITS attemptId — or refuses loudly. See
   // retrySameMessage below for the exact eligibility/refusal semantics.
   retrySameMessage(attemptId: string): Promise<void>;
+  // Slice 3 (intent recovery): guarded QUEUE-ITEM retry — re-POSTs an
+  // outcome-UNKNOWN item's IDENTICAL dispatch payload under its claim-minted
+  // opencodeMsgID (caller-id-wins on opencode ≥ 1.17.18: no duplicate persist
+  // if the first dispatch landed), then records the outcome (the resolve
+  // matrix's allowed unknown→sent edge). `failed` items are refused. Explicit
+  // user-driven only (QueueChip Retry button); NEVER automatic.
+  retryQueuedItem(sessionId: string, item: QueuedMessage): Promise<void>;
   resendText(text: string, sessionId: string): Promise<boolean>;
   dispatchQueuedItem(
     sessionId: string,
@@ -551,6 +582,31 @@ export function createSend(deps: SendDependencies): SendController {
       let detail = "";
       try { detail = (await res.text()).slice(0, 300); } catch {}
       if (res.status === 502) {
+        if (deps.opencodeDown?.()) {
+          // Slice 3 (intent recovery, 2026-10-03 incident): the daemon
+          // OBSERVED the OpenCode death (down_since set), so this 502 is
+          // explained by the down state — say so instead of the generic
+          // proxy error. State stays `unknown` (NOT `failed`): (a) the
+          // dying-mid-POST corner means delivery cannot be strictly
+          // excluded, and (b) the server resolve matrix only allows
+          // unknown→sent (pkg/web/queue.go Resolve) — a `failed` item could
+          // never record the retry's success.
+          //
+          // PROMINENCE EXCEPTION (deliberate O2 single-owner deviation, incident
+          // finding): the quiet unknown chip ALONE was missed during the
+          // incident, so the down-tied failure ALSO fires ONE notification per
+          // failed dispatch. The chip remains the durable owner of the fact
+          // (Retry / mark-sent / dismiss live there); the notification is the
+          // attention cue only. Non-down 502s keep the suppressed chip-only
+          // behavior byte-for-byte.
+          log.error("send", "queued POST hit proxy 502 while OpenCode down", { id, itemId: item.id, detail });
+          deps.pushNotification({
+            kind: "error", sessionID: id,
+            title: "Message not sent — OpenCode is down",
+            detail: `${DOWN_NOT_SENT_DETAIL}. Retry it after OpenCode recovers.`,
+          });
+          return { state: "unknown", detail: DOWN_NOT_SENT_DETAIL };
+        }
         const msg = detail || "proxy 502";
         log.error("send", "queued POST hit proxy 502 (outcome unknown)", { id, itemId: item.id, detail: msg });
         // O2 single-owner dedup: the unknown QueueChip visibly carries the
@@ -606,7 +662,16 @@ export function createSend(deps: SendDependencies): SendController {
             detail = (await res.text()).slice(0, 300);
           } catch {}
           log.error("send", "POST failed", { id, url, status: res.status, detail });
-          deps.pushNotification({ kind: "error", sessionID: id, title: failTitle, detail: detail || `HTTP ${res.status}` });
+          // Slice 3 (intent recovery): while OpenCode is down (daemon-
+          // observed, down_since set), a proxy 502 gets the down-tied copy
+          // instead of the generic upstream error. The composer restore in
+          // send()'s shell branch already preserves the text — re-sending
+          // after recovery is the operator's explicit action (no auto-retry).
+          const down = res.status === 502 && (deps.opencodeDown?.() ?? false);
+          deps.pushNotification({
+            kind: "error", sessionID: id, title: failTitle,
+            detail: down ? "OpenCode is down — command not sent" : detail || `HTTP ${res.status}`,
+          });
           return false;
         }
         log.debug("send", "accepted", { id, url });
@@ -1324,6 +1389,84 @@ export function createSend(deps: SendDependencies): SendController {
     });
   }
 
+  // Slice 3 (intent recovery): guarded QUEUE-ITEM retry. The ONLY trigger is
+  // the QueueChip's explicit Retry button (wired through ChatView/Composer) —
+  // there is NO timer, NO loop, NO drain-driven re-arm anywhere (the standing
+  // operator no-auto-retry policy is a hard constraint). UNKNOWN-STATE items
+  // only: the retry re-POSTs the IDENTICAL dispatch payload by reusing
+  // dispatchQueuedItem verbatim — the item's claim-minted opencodeMsgID
+  // (pkg/web/queue.go mints it at Claim via opencode.MintMessageID) is
+  // threaded into prompt_async's `messageID` body field, so on opencode
+  // ≥ 1.17.18 the resend is caller-id-wins idempotent — if the first POST
+  // landed, OpenCode persists no duplicate; if it never landed, the retry
+  // delivers it. On older OpenCode a resend may duplicate (the Retry tooltip
+  // states this boundary). `failed` items are refused: failed proves
+  // non-delivery AND the resolve matrix rejects failed→sent (a successful
+  // retry could never be recorded — review t1b-F1/t1d-F1).
+  //
+  // Click-time revalidation (retrySameMessage's discipline, applied to queue
+  // items): only a STILL-unknown item that retained its correlation id is
+  // retryable — anything else refuses loudly, never falls through to a fresh
+  // composer send. Once per click: a per-item in-flight latch swallows
+  // further clicks on the SAME item while its POST is pending (each click
+  // maps to at most one POST; no internal replay). A retry that fails again
+  // re-surfaces via dispatchQueuedItem's classification (including the
+  // down-tied copy + notification while down); the resolve stays inside the
+  // matrix's monotonic rules (identical state+detail is a no-op; a
+  // conflicting rewrite is surfaced by the queue layer, never silently
+  // applied), and the item never double-pends.
+  const RETRY_DISPATCH_TIMEOUT_MS = 12_000; // mirrors the drainer's DEFAULT_DISPATCH_TIMEOUT_MS
+  const retryInFlight = new Set<string>();
+  async function retryQueuedItem(sessionId: string, item: QueuedMessage): Promise<void> {
+    if (item.state !== "unknown" || !item.opencodeMsgID) {
+      // UNKNOWN-ONLY (review t1b-F1/t1d-F1): the queue resolve matrix
+      // (pkg/web/queue.go Resolve) allows exactly unknown→sent — it REJECTS
+      // failed→sent with errQueueResolveConflict. A `failed` item whose
+      // retry re-POST SUCCEEDED would deliver the message but be unable to
+      // record it: the resolve 409s, the client reverts to server truth, and
+      // the chip re-renders `failed` with the STALE detail for a message
+      // that just landed — inviting duplicate re-sends. `failed` also proves
+      // non-delivery, so retract-to-compose (re-edit as a NEW message) is
+      // its honest recovery. Legacy items (no claim-minted messageID)
+      // likewise have no idempotent resend. Nothing was sent by this click.
+      log.error("send", "guarded queue retry refused: item not retryable", { id: sessionId, itemId: item.id });
+      deps.pushNotification({
+        kind: "error", sessionID: sessionId, title: "Retry unavailable — status changed",
+        detail: "Nothing was sent. This queued message can no longer be retried as-is; edit it again or dismiss it.",
+      });
+      return;
+    }
+    if (!deps.resolveQueued) {
+      // Defensive: without a resolve seam the outcome of the re-dispatch
+      // could never be recorded — refuse rather than fire a blind POST.
+      deps.pushNotification({
+        kind: "error", sessionID: sessionId, title: "Retry unavailable",
+        detail: "Nothing was sent. The queue status recorder is not wired in this build.",
+      });
+      return;
+    }
+    if (retryInFlight.has(item.id)) return; // swallow re-clicks on an in-flight retry
+    retryInFlight.add(item.id);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), RETRY_DISPATCH_TIMEOUT_MS);
+    try {
+      // Identical resend: dispatchQueuedItem builds the body from the item's
+      // captured config/text/attachments and threads item.opencodeMsgID into
+      // body.messageID — the EXACT id the original dispatch carried.
+      const outcome = await dispatchQueuedItem(sessionId, item, ctrl.signal);
+      await deps.resolveQueued(sessionId, item.id, outcome.state, outcome.detail);
+      // Refresh the cache so the chip reflects the resolved state (a
+      // successful retry's `sent` clears it). Guarded (review t1d-F2): a
+      // rejecting refresh must not surface as an unhandled rejection off
+      // the click's promise chain — the resolve above already recorded the
+      // outcome authoritatively.
+      await deps.fetchQueue(sessionId).catch(() => {});
+    } finally {
+      clearTimeout(timer);
+      retryInFlight.delete(item.id);
+    }
+  }
+
   // retry() reuses sendText() to resend an OLD message; named resendText on the
   // public surface so ChatView's retry closure can call it without reaching
   // into the private sendText. Same evidence gate as send(): the session
@@ -1352,5 +1495,5 @@ export function createSend(deps: SendDependencies): SendController {
     return sendText(text, id, ag.agent, new Set(), { attemptId, tapText: text });
   }
 
-  return { send, retrySameMessage, resendText, dispatchQueuedItem };
+  return { send, retrySameMessage, retryQueuedItem, resendText, dispatchQueuedItem };
 }

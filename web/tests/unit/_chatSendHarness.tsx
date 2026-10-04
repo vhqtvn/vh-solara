@@ -70,6 +70,19 @@ const H = vi.hoisted(() => ({
   // to exercise the drain path (area 5); leave empty to keep the drainer idle.
   queueStore: { items: {} as Record<string, any[]> },
 
+  // Slice 3 (intent recovery): controllable OpenCode down-state. When set,
+  // the mocked opencode-lifecycle snapshot reports down_since (daemon-observed
+  // death) — the send/dispatch failure paths render the down-tied copy.
+  // Faithful default: undefined = no snapshot = never down, so every pre-slice
+  // behavior test sees the exact old copy. Set via mocks.lifecycleDownSince.
+  lifecycle: { downSince: undefined as string | undefined },
+
+  // Slice 3 (intent recovery): recorder for the REAL notify surface ChatView
+  // calls (pushNotification). The mock forwards to the actual implementation
+  // (so notification-driven UI keeps working) and records every call for
+  // assertions. Read via mocks.notifications().
+  notify: { pushed: [] as any[] },
+
   // claim/resolve/fetchQueue are wired to read+mutate queueStore by default
   // (set in resetHarness), so the drain behaves like a faithful in-memory
   // backend (pending → dispatching → terminal). Override per-test as needed.
@@ -205,6 +218,38 @@ vi.mock("../../src/queue", async (importOriginal) => {
   };
 });
 
+// --- opencode-lifecycle mock (slice 3: controllable down-state) ------------
+// Spread the real module; override ONLY `snapshot` so it reports down_since
+// when the test sets H.lifecycle.downSince (daemon-observed OpenCode death —
+// S1/S2 knowledge: down_since set = down). Default (undefined) = no snapshot,
+// matching a worker without lifecycle endpoints, so every failure path keeps
+// its exact pre-slice copy.
+vi.mock("../../src/opencode-lifecycle", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    snapshot: () =>
+      H.lifecycle.downSince
+        ? { ...(actual.UNKNOWN_SNAPSHOT as object), state: "failed", down_since: H.lifecycle.downSince }
+        : null,
+  };
+});
+
+// --- notify mock (slice 3: record-only spy) ---------------------------------
+// Forward to the REAL pushNotification (notification-driven UI in these tests
+// keeps working unchanged) and record every call so failure-copy tests can
+// assert the surfaced notification without poking the store.
+vi.mock("../../src/notify", async (importOriginal) => {
+  const actual = (await importOriginal()) as any;
+  return {
+    ...actual,
+    pushNotification: (n: any) => {
+      H.notify.pushed.push(n);
+      return actual.pushNotification(n);
+    },
+  };
+});
+
 // --- default behaviors for the queue drain fns -----------------------------
 // Called by resetHarness(). Models a faithful in-memory backend: claim moves
 // the oldest pending → dispatching (single winner); resolve records a terminal
@@ -257,6 +302,8 @@ export function resetHarness() {
   H.fetchQueue.mockReset();
   H.fetchQueue.mockImplementation(defaultFetchQueue);
   H.queueStore.items = {};
+  H.lifecycle.downSince = undefined;
+  H.notify.pushed = [];
   H.createSessionUnknownCertainty = false;
   H.modelsState.bySession = {};
   H.modelsState.explicit.clear();
@@ -339,6 +386,20 @@ export const mocks = {
   get queueStore() {
     return H.queueStore;
   },
+  // Slice 3 (intent recovery): set to an ISO timestamp to simulate the
+  // daemon-observed OpenCode death (snapshot.down_since set); reset to
+  // undefined in resetHarness/resetAll.
+  get lifecycleDownSince() {
+    return H.lifecycle.downSince;
+  },
+  set lifecycleDownSince(v: string | undefined) {
+    H.lifecycle.downSince = v;
+  },
+  // Slice 3 (intent recovery): every pushNotification call ChatView made
+  // (forwarded to the real notify store, recorded here for assertions).
+  notifications(): ReadonlyArray<any> {
+    return H.notify.pushed;
+  },
   get modelsState() {
     return H.modelsState;
   },
@@ -415,21 +476,24 @@ export function seedUserMessage(sessionId: string, messageId: string, text: stri
  *  draft) back to the draft-hero state, mirroring newSession(). */
 export { state, setState };
 
-/** Seed a pending queue item into H.queueStore (the in-memory backend the
- *  mocked claim/resolve read+mutate). Returns the item. The drainer will pick
- *  it up on the next idle drain-trigger effect (area 5). */
+/** Seed a pending (or overridden-state — slice 3 retry tests seed terminal
+ * `failed`/`unknown` items directly) queue item into H.queueStore (the
+ * in-memory backend the mocked claim/resolve read+mutate). Returns the item.
+ * The drainer will pick up a `pending` item on the next idle drain-trigger
+ * effect (area 5); terminal states are never claimed. */
 export function seedPendingItem(
   sessionId: string,
-  opts: { id?: string; text?: string; sendConfig?: any; opencodeMsgID?: string; attachments?: any[] } = {},
+  opts: { id?: string; text?: string; sendConfig?: any; opencodeMsgID?: string; attachments?: any[]; state?: "pending" | "dispatching" | "failed" | "unknown"; detail?: string } = {},
 ) {
   const item = {
     id: opts.id ?? "q-seed-1",
     order: (H.queueStore.items[sessionId]?.length ?? 0) + 1,
-    state: "pending" as const,
+    state: opts.state ?? ("pending" as const),
     text: opts.text ?? "seeded prompt",
     attachments: opts.attachments ?? [],
     sendConfig: opts.sendConfig,
     opencodeMsgID: opts.opencodeMsgID,
+    detail: opts.detail,
     createdAt: 1,
   };
   (H.queueStore.items[sessionId] ||= []).push(item);

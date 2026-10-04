@@ -71,6 +71,10 @@ interface Harness {
   /** Create-certainty Slice 2: ids the send flow materialized (the
    *  ownership-then-navigation sequencing). */
   materialized: string[];
+  /** Slice 3 (intent recovery): guarded queue-item retry seam + the resolve
+   *  calls it recorded (sessionId, itemId, state, detail) for assertions. */
+  retryQueuedItem: ReturnType<typeof createSend>["retryQueuedItem"];
+  resolveCalls: Array<[string, string, "sent" | "failed" | "unknown", string]>;
 }
 
 function harness(overrides: {
@@ -92,6 +96,13 @@ function harness(overrides: {
   /** Overrides the sync tap-time resolver (post-mint gate cells: "pending"
    *  forces the admission to wait on awaitAgent instead of a tap snapshot). */
   resolveAgent?: SendDependencies["resolveAgent"];
+  /** Slice 3 (intent recovery): the lifecycle down-state accessor — true
+   *  simulates the daemon-observed OpenCode death (snapshot.down_since set)
+   *  for the down-tied failure-copy cells. */
+  opencodeDown?: () => boolean;
+  /** Slice 3 (intent recovery): overrides the queue resolve seam the retry
+   *  records outcomes through (default: an in-memory recorder, no network). */
+  resolveQueued?: SendDependencies["resolveQueued"];
 } = {}): Harness {
   const [input, setInput] = createSignal("");
   const [atts, setAtts] = createSignal<Attachment[]>([]);
@@ -168,10 +179,22 @@ function harness(overrides: {
     },
     draftKey: (sid) => `vh.draft.${sid}`,
   };
-  const { send, retrySameMessage, dispatchQueuedItem } = createSend(deps);
+  // Slice 3 (intent recovery): the down-state + retry seams. resolveCalls
+  // records what the retry wrote (an in-memory stand-in for the backend-
+  // authoritative resolve — no network, faithful (sessionId, itemId, state,
+  // detail) shape).
+  const resolveCalls: Harness["resolveCalls"] = [];
+  deps.opencodeDown = overrides.opencodeDown;
+  deps.resolveQueued =
+    overrides.resolveQueued ??
+    (async (sid, itemId, state, detail) => {
+      resolveCalls.push([sid, itemId, state, detail]);
+    });
+  const { send, retrySameMessage, retryQueuedItem, dispatchQueuedItem } = createSend(deps);
   return {
     send,
     retrySameMessage,
+    retryQueuedItem,
     dispatchQueuedItem,
     input,
     setInput,
@@ -179,6 +202,7 @@ function harness(overrides: {
     setAtts,
     notes,
     enqueueInputs,
+    resolveCalls,
     get uploadCalls() {
       return uploadCalls;
     },
@@ -1256,6 +1280,201 @@ describe("createSend — dispatchQueuedItem dispatch-path classification (queued
     const out = await h.dispatchQueuedItem("ses-1", item(), new AbortController().signal);
     expect(out.state).toBe("failed");
     expect(out.detail).toBe("500 upstream");
+    expect(h.notes).toHaveLength(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // Slice 3 (intent recovery, 2026-10-03 incident) — down-tied 502 copy.
+  // While the lifecycle snapshot says OpenCode is down (down_since set — the
+  // daemon OBSERVED the death), a prompt_async proxy 502 is explained by the
+  // down state: the failure says so, prominently, on BOTH paths. The queue
+  // item stays `unknown` (NOT `failed`) so a successful retry can resolve to
+  // `sent` (the server resolve matrix only allows unknown→sent) and the
+  // dying-mid-POST corner stays covered by the unknown chip's honest
+  // check-transcript instruction.
+  // -------------------------------------------------------------------------
+  it("502 while OpenCode is DOWN → unknown with the down-tied detail + ONE prominent notification (incident finding: the quiet chip alone was missed)", async () => {
+    vi.stubGlobal("fetch", respondText(502, "upstream connect error"));
+    const h = harness({ opencodeDown: () => true });
+    const out = await h.dispatchQueuedItem("ses-1", item(), new AbortController().signal);
+    expect(out.state).toBe("unknown");
+    expect(out.detail).toBe("OpenCode is down — message not sent");
+    // Prominence: exactly one error notification carrying the down-tied copy.
+    expect(h.notes).toHaveLength(1);
+    expect(h.notes[0].kind).toBe("error");
+    expect(h.notes[0].title).toBe("Message not sent — OpenCode is down");
+    expect(h.notes[0].detail).toContain("OpenCode is down — message not sent");
+    expect(h.notes[0].detail).toContain("Retry");
+  });
+
+  it("502 while NOT down keeps the exact pre-slice classification — unknown, proxy copy, NO notification (regression pin)", async () => {
+    // The pre-slice pin (above) covers this at the same seam; this cell pins
+    // it WITH the down-seam present but false, proving the copy switches on
+    // the SNAPSHOT (down_since), not on the mere existence of the lifecycle.
+    vi.stubGlobal("fetch", respondText(502, "upstream unreachable"));
+    const h = harness({ opencodeDown: () => false });
+    const out = await h.dispatchQueuedItem("ses-1", item(), new AbortController().signal);
+    expect(out.state).toBe("unknown");
+    expect(out.detail).toBe("proxy 502 (outcome unknown): upstream unreachable");
+    expect(h.notes).toHaveLength(0);
+  });
+
+  it("direct dispatchSend failure while OpenCode is DOWN shows the down-tied command copy (shell path)", async () => {
+    // The shell (!cmd) path POSTs /oc/.../shell directly — the OTHER surface
+    // a 502 lands on. While down, its failure notification ties to the death
+    // instead of the generic upstream error, and the composer text restores.
+    vi.stubGlobal("fetch", respondText(502, "upstream connect error"));
+    const h = harness({ opencodeDown: () => true });
+    h.setInput("!echo lost command");
+    await h.send();
+    expect(h.notes).toHaveLength(1);
+    expect(h.notes[0].kind).toBe("error");
+    expect(h.notes[0].detail).toBe("OpenCode is down — command not sent");
+    // Composer restore: the operator's text is NOT lost.
+    expect(h.input()).toBe("!echo lost command");
+  });
+
+  it("direct dispatchSend 502 while NOT down keeps the generic upstream copy (regression pin)", async () => {
+    vi.stubGlobal("fetch", respondText(502, "upstream connect error"));
+    const h = harness({ opencodeDown: () => false });
+    h.setInput("!echo lost command");
+    await h.send();
+    expect(h.notes).toHaveLength(1);
+    expect(h.notes[0].detail).toBe("upstream connect error");
+    expect(h.input()).toBe("!echo lost command");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Slice 3 (intent recovery) — retryQueuedItem: the guarded queue-item retry.
+// The ONLY trigger is the QueueChip's explicit Retry button — there is no
+// timer, loop, or drain-driven re-arm anywhere (standing operator
+// no-auto-retry policy). These cells pin the retry contract at the controller
+// seam: identical payload under the IDENTICAL messageID, once per click,
+// outcome recorded, failures re-surfaced. UNKNOWN-STATE items only
+// (t1b-F1/t1d-F1): the queue resolve matrix allows exactly unknown→sent —
+// `failed` items are refused loudly (a failed retry that SUCCEEDED could
+// never be recorded; failed proves non-delivery).
+// ---------------------------------------------------------------------------
+describe("createSend slice 3 — retryQueuedItem (guarded same-messageID queue-item retry)", () => {
+  const respondText = (status: number, body: string) =>
+    vi.fn(() => Promise.resolve({ ok: status >= 200 && status < 300, status, text: async () => body }));
+  const terminalItem = (opts: Partial<QueuedMessage> = {}): QueuedMessage => ({
+    id: "q-retry-1",
+    order: 1,
+    state: "unknown",
+    text: "the lost prompt",
+    attachments: [],
+    sendConfig: { providerID: "p", modelID: "m", agent: "build" },
+    opencodeMsgID: "msg_retry_abc123",
+    createdAt: 1,
+    resolvedAt: 1,
+    detail: "OpenCode is down — message not sent",
+    ...opts,
+  });
+  const postedBodies = (): Array<Record<string, unknown>> =>
+    ((globalThis as any).fetch as any).mock.calls.map((c: any[]) => JSON.parse(c[1].body));
+
+  it("re-sends the IDENTICAL payload under the IDENTICAL messageID and records the outcome", async () => {
+    vi.stubGlobal("fetch", respondText(204, ""));
+    const h = harness();
+    await h.retryQueuedItem("ses-1", terminalItem());
+    expect(((globalThis as any).fetch as any).mock.calls.length).toBe(1);
+    const body = postedBodies()[0];
+    // Same correlation id — caller-id-wins: if the original dispatch landed,
+    // opencode ≥ 1.17.18 persists no duplicate.
+    expect(body.messageID).toBe("msg_retry_abc123");
+    // Identical payload: the same parts/agent/model the original carried.
+    expect(body.parts).toEqual([{ type: "text", text: "the lost prompt" }]);
+    expect(body.agent).toBe("build");
+    expect(body.model).toEqual({ providerID: "p", modelID: "m" });
+    // Outcome recorded for the item (unknown → sent is the allowed edge).
+    expect(h.resolveCalls).toEqual([["ses-1", "q-retry-1", "sent", ""]]);
+  });
+
+  it("refuses loudly on a non-retryable item (pending state / missing messageID): no POST, nothing sent", async () => {
+    vi.stubGlobal("fetch", respondText(204, ""));
+    const h = harness();
+    // Legacy item: no claim-minted correlation id → no idempotent resend.
+    await h.retryQueuedItem("ses-1", terminalItem({ opencodeMsgID: undefined }));
+    // Still-terminal-but-non-retryable state.
+    await h.retryQueuedItem("ses-1", terminalItem({ id: "q-p", opencodeMsgID: "msg_x", state: "dispatching" }));
+    expect(((globalThis as any).fetch as any).mock.calls.length).toBe(0);
+    expect(h.resolveCalls).toHaveLength(0);
+    expect(h.notes).toHaveLength(2);
+    expect(h.notes[0].title).toBe("Retry unavailable — status changed");
+    expect(h.notes[0].detail).toContain("Nothing was sent");
+  });
+
+  it("t1b-F1/t1d-F1 pin: a terminal `failed` item is REFUSED even with a messageID — no outbound POST (the resolve matrix rejects failed→sent)", async () => {
+    // The defect this pins: retrying a failed item whose re-POST succeeds
+    // would deliver the message but be UNRECORDABLE — resolve('sent') 409s,
+    // the client reverts to server truth, and the chip re-renders `failed`
+    // with a stale detail for a message that just landed. Unknown-only is
+    // the contract; the failed item's honest recovery is retract-to-compose.
+    vi.stubGlobal("fetch", respondText(204, ""));
+    const h = harness();
+    await h.retryQueuedItem("ses-1", terminalItem({ state: "failed", detail: "500 upstream" }));
+    expect(((globalThis as any).fetch as any).mock.calls.length).toBe(0);
+    expect(h.resolveCalls).toHaveLength(0);
+    expect(h.notes).toHaveLength(1);
+    expect(h.notes[0].title).toBe("Retry unavailable — status changed");
+    expect(h.notes[0].detail).toContain("Nothing was sent");
+  });
+
+  it("once per click: an in-flight retry swallows re-clicks on the SAME item (no loop, no double-pending)", async () => {
+    // Controlled hang: the POST stays pending until the test releases it
+    // (re-clicks must not fire a second POST; nothing is recorded while the
+    // first is in flight).
+    let release!: (v: unknown) => void;
+    const hang = vi.fn(() => new Promise((res) => { release = res; }));
+    vi.stubGlobal("fetch", hang);
+    const h = harness();
+    const first = h.retryQueuedItem("ses-1", terminalItem());
+    // Re-clicks on the SAME item return immediately (swallowed by the latch).
+    await h.retryQueuedItem("ses-1", terminalItem());
+    await h.retryQueuedItem("ses-1", terminalItem());
+    expect(hang.mock.calls.length).toBe(1);
+    expect(h.resolveCalls).toHaveLength(0); // nothing recorded while in flight
+    // Settle the in-flight POST: exactly one outcome is recorded, once.
+    release({ ok: true, status: 204, text: async () => "" });
+    await first;
+    expect(h.resolveCalls).toEqual([["ses-1", "q-retry-1", "sent", ""]]);
+  });
+
+  it("a DIFFERENT item's retry is not blocked by an in-flight one (per-item latch)", async () => {
+    // Each hanging POST gets its own resolver; releasing all settles both.
+    const resolvers: Array<(v: unknown) => void> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise((res) => { resolvers.push(res); })),
+    );
+    const h = harness();
+    const first = h.retryQueuedItem("ses-1", terminalItem());
+    const second = h.retryQueuedItem("ses-1", terminalItem({ id: "q-retry-2", opencodeMsgID: "msg_other" }));
+    expect(((globalThis as any).fetch as any).mock.calls.length).toBe(2);
+    for (const r of resolvers) r({ ok: true, status: 204, text: async () => "" });
+    await Promise.all([first, second]);
+    expect(h.resolveCalls.map((c) => c[1]).sort()).toEqual(["q-retry-1", "q-retry-2"]);
+  });
+
+  it("a retry that fails again RE-SURFACES the failure (down-tied copy + notification) — no silent swallow", async () => {
+    vi.stubGlobal("fetch", respondText(502, "still down"));
+    const h = harness({ opencodeDown: () => true });
+    await h.retryQueuedItem("ses-1", terminalItem());
+    // Re-classified + recorded as unknown with the down-tied detail again.
+    expect(h.resolveCalls).toEqual([["ses-1", "q-retry-1", "unknown", "OpenCode is down — message not sent"]]);
+    // Prominence held on the retry too: the notification fired again.
+    expect(h.notes).toHaveLength(1);
+    expect(h.notes[0].title).toBe("Message not sent — OpenCode is down");
+  });
+
+  it("a retry that succeeds after recovery resolves unknown → sent (the server matrix's allowed edge)", async () => {
+    vi.stubGlobal("fetch", respondText(204, ""));
+    const h = harness({ opencodeDown: () => false }); // recovered
+    // Item left `unknown` from the incident window (down-tied detail).
+    await h.retryQueuedItem("ses-1", terminalItem());
+    expect(h.resolveCalls).toEqual([["ses-1", "q-retry-1", "sent", ""]]);
     expect(h.notes).toHaveLength(0);
   });
 });

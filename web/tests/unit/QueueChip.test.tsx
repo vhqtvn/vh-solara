@@ -9,12 +9,17 @@
 // their `detail` to staleDispatchRecoveryDetail: a human-readable explanation
 // including the duplicate-risk warning. These tests pin the SPA contract that
 // the detail is surfaced VISIBLELY (not only in the data-tip tooltip) for
-// `unknown` items, that its absence is graceful, that other terminal states do
-// NOT show the recovery note, and that no resend/retry button is ever rendered
-// for terminal items (recovery = operator composes a NEW message). The GC-4
-// dismissal coverage pins that the dismiss (x) button shows for pending and
-// terminal failed/unknown (never dispatching), and that clicking it calls
-// onRemove with the correct item id.
+// `unknown` items, that its absence is graceful, and that other terminal
+// states do NOT show the recovery note. The GC-4 dismissal coverage pins that
+// the dismiss (x) button shows for pending and terminal failed/unknown
+// (never dispatching), and that clicking it calls onRemove with the correct
+// item id. Slice 3 (intent recovery) ADDS the Retry affordance for OUTCOME-
+// UNKNOWN items that retained their claim-minted opencodeMsgID — a
+// same-messageID re-send (idempotent on opencode ≥ 1.17.18), explicit
+// user-driven only. `failed` items get NO retry (the resolve matrix rejects
+// failed→sent, so a successful retry could never be recorded), and items
+// WITHOUT a messageID (legacy) get none either — their recovery stays
+// retract-with-warning + dismiss.
 //
 // The data-layer contract (cache, resolve, claim) is pinned in queue.test.ts.
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -138,6 +143,9 @@ describe("QueueChip — action visibility per state (dismiss / retract / mark-se
   //   failed      → retract + dismiss (2 actions)
   //   unknown     → mark-sent + retract + dismiss (3 actions)
   //   sent        → filtered upstream (queueFor), no chip
+  // (Slice 3 ADDS retry for UNKNOWN items WITH a retained opencodeMsgID +
+  // wired handler — see the retry describe block below. The count pins here
+  // use fixtures WITHOUT a messageID/handler, i.e. the pre-slice action set.)
   it("renders ONE action (dismiss) for pending; NONE for dispatching", () => {
     const r1 = render(() => (
       <QueueChip q={item({ state: "pending" })} onRemove={vi.fn()} />
@@ -199,10 +207,13 @@ describe("QueueChip — action visibility per state (dismiss / retract / mark-se
     r.unmount();
   });
 
-  it("NEVER renders a resend/retry affordance for any state", () => {
-    // Recovery means compose a NEW message (retract) or acknowledge an
-    // already-sent one (mark-sent) — never reviving this item. No button or
-    // label may read "resend"/"retry".
+  it("renders NO retry (and no other revival affordance) when the item lacks a correlation id or the handler is unwired", () => {
+    // Slice 3 contract update: the Retry affordance exists ONLY for terminal
+    // failed/unknown items that retained their claim-minted opencodeMsgID AND
+    // have a wired handler (the identical-messageID resend is what makes
+    // revival safe — idempotent on opencode ≥ 1.17.18). This fixture — the
+    // pre-slice shape (legacy item, no handler wired) — must keep rendering
+    // no resend/retry surface: its honest recovery is retract-with-warning.
     const r = render(() => (
       <QueueChip
         q={item({ state: "unknown", detail: RECOVERY_DETAIL })}
@@ -211,10 +222,94 @@ describe("QueueChip — action visibility per state (dismiss / retract / mark-se
         onMarkSent={vi.fn()}
       />
     ));
+    expect(r.container.querySelector(".queue-retry")).toBeNull();
     const txt = r.container.textContent!.toLowerCase();
     expect(txt).not.toContain("resend");
     expect(txt).not.toContain("retry");
     r.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Slice 3 (intent recovery, 2026-10-03 incident) — the Retry affordance.
+// An OUTCOME-UNKNOWN item that retained its claim-minted opencodeMsgID gets
+// an explicit, user-driven Retry action: the handler re-sends the IDENTICAL
+// payload under the SAME messageID (caller-id-wins on opencode ≥ 1.17.18 —
+// no duplicate persist if the first dispatch landed). The tooltip states the
+// version boundary honestly. NEVER automatic (no timer/loop). `failed`
+// items NEVER get the affordance (t1a-F2/t1b-F1: the resolve matrix rejects
+// failed→sent — a successful retry could never be recorded; failed proves
+// non-delivery, so retract is the honest recovery).
+// ---------------------------------------------------------------------------
+describe("QueueChip — retry action (slice 3: explicit same-messageID re-send)", () => {
+  it("renders retry for `unknown` items WITH an opencodeMsgID + handler — NEVER for `failed` (t1a-F2: resolve matrix rejects failed→sent), pending/dispatching, legacy, or unwired", () => {
+    const withId = { opencodeMsgID: "msg_retry_abc" };
+    // t1a-F2 chip-seam pin: a terminal `failed` item WITH a correlation id
+    // AND a wired handler still gets NO retry affordance — unknown-only is
+    // the contract (a failed retry that succeeded could never be recorded;
+    // `failed` proves non-delivery, so retract is the honest recovery).
+    const failed = render(() => (
+      <QueueChip q={item({ state: "failed", ...withId })} onRemove={vi.fn()} onRetry={vi.fn()} />
+    ));
+    expect(failed.container.querySelector(".queue-retry")).toBeNull();
+    failed.unmount();
+
+    const unknown = render(() => (
+      <QueueChip q={item({ state: "unknown", ...withId })} onRemove={vi.fn()} onRetry={vi.fn()} />
+    ));
+    expect(unknown.container.querySelector(".queue-retry")).toBeTruthy();
+    unknown.unmount();
+
+    // Non-terminal states never retry.
+    for (const state of ["pending", "dispatching"] as const) {
+      const r = render(() => (
+        <QueueChip q={item({ state, ...withId })} onRemove={vi.fn()} onRetry={vi.fn()} />
+      ));
+      expect(r.container.querySelector(".queue-retry")).toBeNull();
+      r.unmount();
+    }
+
+    // Terminal but legacy (no messageID): no idempotent resend exists.
+    const legacy = render(() => (
+      <QueueChip q={item({ state: "unknown" })} onRemove={vi.fn()} onRetry={vi.fn()} />
+    ));
+    expect(legacy.container.querySelector(".queue-retry")).toBeNull();
+    legacy.unmount();
+
+    // Handler unwired (progressive rollout): the affordance stays hidden.
+    const unwired = render(() => (
+      <QueueChip q={item({ state: "unknown", ...withId })} onRemove={vi.fn()} />
+    ));
+    expect(unwired.container.querySelector(".queue-retry")).toBeNull();
+    unwired.unmount();
+  });
+
+  it("clicking retry calls onRetry with the WHOLE item (the handler revalidates + re-sends by item.opencodeMsgID)", () => {
+    const onRetry = vi.fn();
+    const q = item({
+      id: "q-retry-9",
+      state: "unknown",
+      text: "the lost prompt",
+      detail: "OpenCode is down — message not sent",
+      opencodeMsgID: "msg_retry_9",
+    });
+    const { container } = render(() => (
+      <QueueChip q={q} onRemove={vi.fn()} onRetry={onRetry} />
+    ));
+    container.querySelector(".queue-retry")!.click();
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(onRetry).toHaveBeenCalledWith(q);
+  });
+
+  it("the retry tooltip states the version safety boundary honestly (idempotent on ≥ 1.17.18; older may duplicate)", () => {
+    const { container } = render(() => (
+      <QueueChip q={item({ state: "unknown", opencodeMsgID: "msg_t" })} onRemove={vi.fn()} onRetry={vi.fn()} />
+    ));
+    const btn = container.querySelector(".queue-retry")!;
+    const tip = (btn.getAttribute("data-tip")! + " " + btn.getAttribute("aria-label")!).toLowerCase();
+    expect(tip).toContain("same message id");
+    expect(tip).toContain("1.17.18");
+    expect(tip).toContain("duplicate");
   });
 });
 

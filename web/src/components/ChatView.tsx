@@ -72,6 +72,10 @@ import Icon from "./Icon";
 import Spinner from "./Spinner";
 import BrandMark from "./BrandMark";
 import { pushNotification } from "../notify";
+// Slice 3 (intent recovery): the lifecycle store's snapshot — read at send/
+// dispatch failure time to tie a /oc proxy 502 to the daemon-observed OpenCode
+// death (down_since set) instead of surfacing a generic upstream error.
+import { snapshot } from "../opencode-lifecycle";
 import { groupParts } from "./chat/MessageParts";
 import { MessageRow } from "./chat/MessageRow";
 import { createComposerAutocomplete } from "./chat/createComposerAutocomplete";
@@ -1652,7 +1656,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // click-time), so a forward declaration bridges it. msgActions is assigned
   // synchronously right after createSend returns, before any user interaction.
   let msgActions: MessageActions;
-  const { send, retrySameMessage, resendText, dispatchQueuedItem } = createSend({
+  const { send, retrySameMessage, retryQueuedItem, resendText, dispatchQueuedItem } = createSend({
     sessionId: () => props.sessionId,
     draft: () => !!props.draft,
     ensureSession,
@@ -1690,6 +1694,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // reconcile-first recovery path (enqueue response lost), and the
     // live-upload gate (no partial send while an attachment upload runs).
     fetchQueue,
+    // Slice 3 (intent recovery): true while the lifecycle snapshot says
+    // OpenCode is down (down_since set — the daemon observed the death). The
+    // send/dispatch failure paths read it to tie a /oc proxy 502 to the down
+    // state with explicit copy instead of a generic upstream error.
+    opencodeDown: () => !!snapshot()?.down_since,
+    // Slice 3 (intent recovery): records the outcome of a RETRIED queue item
+    // (QueueChip Retry button → createSend.retryQueuedItem). Same queue
+    // resolve the drainer uses; aliased through a closure so the dep stays
+    // optional in the factory (minimal harnesses omit it and the retry
+    // refuses loudly instead of firing a blind POST).
+    resolveQueued: (sid, itemId, state, detail) => resolveQueued(sid, itemId, state, detail),
     uploading: att.uploading,
     isSending,
     setSending,
@@ -1950,6 +1965,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         recovery={recovery}
         send={send}
         retrySame={retrySameMessage}
+        // Slice 3 (intent recovery): QueueChip's Retry button → guarded
+        // same-messageID re-send of an outcome-unknown queue item (explicit
+        // user action only — never automatic; failed items are refused).
+        retryQueuedItem={(q) => void retryQueuedItem(props.sessionId, q)}
         abort={msgActions.abort}
         sessions={() => state.sessions}
         openSession={openLinkedSession}

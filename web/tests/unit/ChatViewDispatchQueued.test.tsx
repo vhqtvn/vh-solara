@@ -157,4 +157,98 @@ describe("AREA 5 — dispatchQueuedItem: request construction + outcome classifi
       { type: "file", url: "file:///real/x.txt", filename: "x.txt", mime: "text/plain" },
     ]);
   });
+
+  // -------------------------------------------------------------------------
+  // Slice 3 (intent recovery, 2026-10-03 incident) — CHATVIEW-LEVEL wiring:
+  // the lifecycle snapshot (down_since) flows through the createSend
+  // `opencodeDown` dep into BOTH failure surfaces, and the QueueChip's Retry
+  // button drives retryQueuedItem end-to-end through the mounted view.
+  // (Controller-seam classification cells live in createSendAttempts.test.ts.)
+  // -------------------------------------------------------------------------
+  it("(e) 502 while the snapshot says OpenCode is DOWN resolves unknown with the down-tied detail + a prominent notification", async () => {
+    mocks.lifecycleDownSince = "2026-10-03T21:44:12Z";
+    routePromptAsync({ ok: false, status: 502, text: "upstream connect error" });
+    seedPendingItem(SID, { id: "q-down-1", text: "lost prompt", sendConfig: SEED_CONFIG, opencodeMsgID: "oc-msg-down" });
+    render(() => liveView(SID));
+    await waitFor(() => expect(mocks.resolve).toHaveBeenCalledTimes(1));
+    const [, itemId, state, detail] = mocks.resolve.mock.calls[0];
+    expect(itemId).toBe("q-down-1");
+    // unknown (NOT failed): the retry's success must stay resolvable to sent
+    // (server matrix: only unknown→sent is allowed).
+    expect(state).toBe("unknown");
+    expect(detail).toBe("OpenCode is down — message not sent");
+    // Prominence: the notification fired through the REAL notify surface
+    // (recorded by the harness spy) — not the quiet chip alone.
+    const notes = mocks.notifications().filter((n: any) => n.kind === "error");
+    expect(notes.length).toBe(1);
+    expect(notes[0].title).toBe("Message not sent — OpenCode is down");
+  });
+
+  it("(f) 502 while NOT down keeps the exact pre-slice copy and NO notification (regression pin, ChatView wiring)", async () => {
+    routePromptAsync({ ok: false, status: 502, text: "upstream connect error" });
+    seedPendingItem(SID, { id: "q-502-2", text: "ambiguous", sendConfig: SEED_CONFIG, opencodeMsgID: "oc-msg-502" });
+    render(() => liveView(SID));
+    await waitFor(() => expect(mocks.resolve).toHaveBeenCalledTimes(1));
+    const [, , state, detail] = mocks.resolve.mock.calls[0];
+    expect(state).toBe("unknown");
+    expect(detail).toBe("proxy 502 (outcome unknown): upstream connect error");
+    expect(mocks.notifications().length).toBe(0);
+  });
+
+  it("(g) the QueueChip Retry button re-sends the IDENTICAL payload under the same messageID through the mounted view", async () => {
+    // Incident shape: the item was left `unknown` with the down-tied detail;
+    // OpenCode has since recovered (no down_since). One explicit click → one
+    // POST with body.messageID === the claim-minted id → resolve → sent.
+    routePromptAsync({ ok: true, status: 204 });
+    seedPendingItem(SID, {
+      id: "q-retry-1",
+      text: "lost prompt",
+      sendConfig: SEED_CONFIG,
+      opencodeMsgID: "oc-msg-retry",
+      state: "unknown",
+      detail: "OpenCode is down — message not sent",
+    });
+    const { container } = render(() => liveView(SID));
+    // The chip renders with a Retry action (terminal + messageID + handler).
+    const retryBtn = await waitFor(() => {
+      const b = container.querySelector("button.queue-retry") as HTMLButtonElement;
+      expect(b).toBeTruthy();
+      return b;
+    });
+    retryBtn.click();
+    await waitFor(() => expect(mocks.resolve).toHaveBeenCalledWith(SID, "q-retry-1", "sent", ""));
+    const calls = promptAsyncCalls();
+    expect(calls.length).toBe(1); // no timer, no second dispatch
+    const body = JSON.parse(calls[0][1].body);
+    expect(body.messageID).toBe("oc-msg-retry");
+    expect(body.parts).toEqual([{ type: "text", text: "lost prompt" }]);
+    // The drainer never re-claimed the terminal item (no stray POSTs beyond
+    // the retry itself — asserted by calls.length above).
+  });
+
+  it("(h) a Retry that hits a still-down OpenCode re-surfaces the down-tied failure and records unknown", async () => {
+    mocks.lifecycleDownSince = "2026-10-03T21:50:00Z";
+    routePromptAsync({ ok: false, status: 502, text: "still down" });
+    seedPendingItem(SID, {
+      id: "q-retry-2",
+      text: "lost prompt",
+      sendConfig: SEED_CONFIG,
+      opencodeMsgID: "oc-msg-retry-2",
+      state: "unknown",
+      detail: "OpenCode is down — message not sent",
+    });
+    const { container } = render(() => liveView(SID));
+    const retryBtn = await waitFor(() => {
+      const b = container.querySelector("button.queue-retry") as HTMLButtonElement;
+      expect(b).toBeTruthy();
+      return b;
+    });
+    retryBtn.click();
+    await waitFor(() =>
+      expect(mocks.resolve).toHaveBeenCalledWith(SID, "q-retry-2", "unknown", "OpenCode is down — message not sent"),
+    );
+    // Re-surfaced prominently — the notification fired on the RETRY dispatch.
+    const notes = mocks.notifications().filter((n: any) => n.title === "Message not sent — OpenCode is down");
+    expect(notes.length).toBe(1);
+  });
 });
