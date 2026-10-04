@@ -1,8 +1,21 @@
-# OpenCode Death Recovery: Operator Manual Check
+# OpenCode Death Recovery: Verification & Spot-Check
 
-This guide describes the operator procedure to verify the live self-healing mechanisms for OpenCode death recovery (introduced in the oc-death-watch workstream).
+This guide describes the automated verification layers and the optional operator procedure to spot-check the live self-healing mechanisms for OpenCode death recovery (introduced in the oc-death-watch workstream).
 
-## Prerequisites
+## Automated Verification
+
+Three automated layers verify the OpenCode death/recovery path (manual checking is demoted to an optional spot-check on live data):
+
+1. **Go boot-glue test** (`cmd/opencode_bootglue_test.go`): Drives real `setupVHMode()` wiring with a stub opencode. Simulates SIGTERM on the child → verifies live SSE notice (stalled/OpenCode) on `/vh/stream` → failed+down_since → auto-heal ready with new pid → aggregator upstream-down gating.
+   Run: `vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go test ./cmd/ -run TestOCBootGlue -count=1 -v'`
+
+2. **Web end-to-end** (`web/tests/e2e/opencode-down.spec.ts`): Uses the fixtureserver `/vh/fixture/oclife?mode=down|restarting|capped|ready|off` fixture (OFF by default; `off` restores exact pre-change 503) to pin the panel's exact down-state strings.
+   Run: `vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && npm --prefix web run test:e2e -- opencode-down'`
+
+3. **Docker gold lane (Flow 8)**: Uses the `vh-e2e-real` container (real binary `local-server --opencode-detached` + real opencode). Exercises pkill → death log line → failed+down_since → dead-window prompt 5xx → heal (fresh pid; old pid intentional zombie) → retry-after-recovery lands exactly once. Timing expectations are ~2–3min. (Note pre-existing lane flakes: Flow 5-C 2m-boundary race and Flow 1 cold-start hydrate stall).
+   Run: `bash tests/e2e-docker/run.sh`
+
+## Optional Live Spot-Check Prerequisites
 
 1. Deployed build is **at or past commit `6c15b91`**. Check: `vh-solara --version` (release builds print the tag; a `dev` build must be one built from ≥ this HEAD).
 2. The daemon service is running: `systemctl --user status vh-opencode.service` (active). `log.Printf` output lands in its journal.
@@ -10,7 +23,7 @@ This guide describes the operator procedure to verify the live self-healing mech
 4. A journal tail is running in a second terminal: `journalctl --user -u vh-opencode.service -f`
 5. Find the live `opencode serve` pid: `pgrep -x opencode` (or read the state file `~/.config/vh-solara/opencode/<sha1-of-daemon-cwd>.json`, field `pid`). Confirm the UI shows no health panel.
 
-## Step 1: Simulating an Unexpected Kill
+## Optional Step 1: Simulating an Unexpected Kill
 
 Run the following command to simulate the exact shape of the 2026-10-03 incident:
 ```bash
@@ -41,7 +54,7 @@ Detection is bounded by the watcher's `250ms` poll tick (knobs in `cmd/opencode_
 - Chat reconnects within `30s` (the capped backoff).
 - The failed-to-send chip grows a circular-arrow retry button.
 
-## Step 2: The Zombie Invariant Check
+## Optional Step 2: The Zombie Invariant Check
 
 Between the kill and replacement spawn (~1–2s window), check the old PID:
 ```bash
@@ -51,7 +64,7 @@ ps -o pid,stat,cmd -p <old-pid>
 
 This is the **no-reap invariant**: the daemon observes the exit WITHOUT reaping (Linux `waitid(WNOWAIT)`), so the pid stays reserved and can never be recycled under the restart arm's `curPID` check.
 
-## Step 3: Crash-Loop Cap and Give-Up
+## Optional Step 3: Crash-Loop Cap and Give-Up
 
 Force the cap by killing every replacement within a few seconds (preventing it from resetting the 30s healthy-reset timer):
 1. `pkill -x opencode` as soon as it appears.
