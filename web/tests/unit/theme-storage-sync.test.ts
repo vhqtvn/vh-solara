@@ -6,13 +6,16 @@
 // covers the THEME layer on top of it: the imperative apply (classes + inline
 // vars on <html>) must re-run on the `storage` path for both vh.theme.v1 and
 // vh.theme.custom.v1, the downstream pushes (embedded-view tokens + code-frame
-// nudge) must run on the remote path too, and the visibilitychange catch-up
-// must recover a write a frozen tab never saw.
+// nudge) must run on the remote path too, the visibilitychange catch-up
+// must recover a write a frozen tab never saw, and the push-route consolidation
+// holds (exactly one fan-out per theme application; no duplicate App.tsx route).
 //
 // Same simulation model as the persistedSignal tests: another same-origin
 // document writes the shared localStorage and the browser fires `storage` in
 // THIS document — we set localStorage directly and dispatch the event.
 import { afterEach, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { customTheme, onThemeApplied, setCustomTheme, setThemeId, theme } from "../../src/theme";
 import { broadcastTheme, THEME_TOKENS } from "../../src/themeTokens";
 
@@ -154,6 +157,65 @@ describe("theme cross-document storage sync", () => {
       off();
       frame.remove();
     }
+  });
+});
+
+describe("single theme push route (registry fan-out)", () => {
+  it("fans out exactly once per theme application — local switch, custom live edit, remote write", () => {
+    localStorage.clear();
+    let calls = 0;
+    const off = onThemeApplied(() => calls++);
+    try {
+      setThemeId("dark");
+      expect(calls).toBe(1); // one applyTheme → one fan-out
+      setThemeId("nord");
+      expect(calls).toBe(2);
+      setThemeId("custom");
+      expect(calls).toBe(3);
+      setCustomTheme({ bg: "#123456" }); // custom live edit: ONE apply, ONE fan-out
+      expect(calls).toBe(4);
+      remoteWrite(LS_THEME, "dracula"); // cross-document path shares the same route
+      expect(calls).toBe(5);
+    } finally {
+      off();
+    }
+  });
+
+  it("does NOT fan out when custom fields change while a non-custom theme is active (no apply → no push)", () => {
+    // Intentional narrowing vs. the removed App.tsx theme-watch effect: it
+    // pushed on every signal DELTA, including custom-field edits that applied
+    // nothing (tokens unchanged — a useless duplicate push). The registry fans
+    // out only when applyTheme actually runs.
+    localStorage.clear();
+    setThemeId("dark");
+    let calls = 0;
+    const off = onThemeApplied(() => calls++);
+    try {
+      setCustomTheme({ bg: "#654321" }); // local edit, custom NOT active
+      expect(calls).toBe(0);
+      remoteWrite(LS_CUSTOM, { ...customTheme(), bg: "#102030" }); // remote ditto
+      expect(calls).toBe(0);
+      // …and the theme really was untouched by those writes:
+      expect(document.documentElement.classList.contains("theme-dark")).toBe(true);
+    } finally {
+      off();
+    }
+  });
+
+  it("keeps App.tsx free of a duplicate theme-push route (the registry is the only fan-out)", () => {
+    // History: App.tsx used to carry a theme-watch createEffect tracking
+    // theme()/customTheme() and pushing broadcastTheme()+postCodeTheme() via
+    // queueMicrotask — on top of index.tsx's onThemeApplied registration, so
+    // every theme change with a value delta pushed tokens TWICE (idempotent
+    // consumers, duplicate postMessage traffic only). A unit test cannot mount
+    // App.tsx, so guard the source contract instead (same readFileSync
+    // source-scan pattern as wire-field-aliases / reducersPolicyBoundary).
+    // The registration owner is index.tsx boot; per-frame boot pushes are
+    // ViewFrame's onLoad → postThemeTo.
+    const src = readFileSync(resolve(__dirname, "../../src/App.tsx"), "utf8");
+    expect(src).not.toContain("broadcastTheme"); // no direct push route
+    expect(src).not.toContain("postCodeTheme"); // no direct nudge route
+    expect(src).not.toContain("onThemeApplied"); // no SECOND registration either
   });
 });
 

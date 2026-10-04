@@ -5,7 +5,7 @@ import GitView from "./components/GitView";
 import CodeFrame, { codeMode } from "./components/CodeFrame";
 import { codeDockSide } from "./prefs";
 import TabBar, { type TabItem } from "./components/TabBar";
-import { codeShowing, installCodeFrameHost, openFileAt, pathSelection, postCodeTheme, setPathSelection, toggleCodeDock } from "./code/frame";
+import { codeShowing, installCodeFrameHost, openFileAt, pathSelection, setPathSelection, toggleCodeDock } from "./code/frame";
 import { anyModalOpen } from "./lib/a11y";
 import NotesView from "./components/NotesView";
 import PreferencesView from "./components/PreferencesView";
@@ -44,8 +44,7 @@ import { refreshViews, views } from "./views";
 import { managed, refreshManaged } from "./managed";
 import { displayName, notesVisible, refreshProjectSettings, watchProjectSettings } from "./projectSettings";
 import { pushNotification } from "./notify";
-import { broadcastTheme, postThemeTo } from "./themeTokens";
-import { customTheme, theme } from "./theme";
+import { postThemeTo } from "./themeTokens";
 import { adminOpen, diagLogOpen, embeddedViewId, isEmbeddedView, navOpen, ocLogsOpen, perfDiagOpen, setAdminOpen, setDiagLogOpen, setNavOpen, setOcLogsOpen, setPaletteOpen, setPerfDiagOpen, setSettingsOpen, setTermOpen, setView, settingsOpen, termOpen, view, VIEW_PREFIX } from "./ui";
 import { bindBackDismiss } from "./lib/backStack";
 import { startPoll } from "./lib/poll";
@@ -214,19 +213,12 @@ export default function App() {
           : "A project wants to run repo-declared commands — review it in Project processes.",
     });
   });
-  // Push the live theme to every embedded view whenever it changes (built-in or
-  // custom, light/dark) — operator toggles restyle the views without a reload.
-  // Deferred to a microtask: the effect fires synchronously on the signal write,
-  // which is BEFORE setThemeId/setCustomTheme call applyTheme(); reading computed
-  // styles now would see the previous theme. The microtask runs after applyTheme.
-  createEffect(() => {
-    theme();
-    customTheme();
-    queueMicrotask(() => {
-      broadcastTheme();
-      postCodeTheme(); // keep the framed code viewer in sync too
-    });
-  });
+  // NOTE: live theme pushes to embedded views and the framed code viewer are
+  // NOT tracked here anymore. Every apply route funnels through the theme-applied
+  // registry in theme.ts (applyTheme fans out at its end), with index.tsx
+  // registering the push helpers once at boot — a signal-watch effect here would
+  // fire on the signal write BEFORE applyTheme() runs (hence its old microtask
+  // deferral) and duplicate the registry's push on every theme change.
   // The embedded view currently selected (if any), resolved from the live list.
   const activeEmbedded = () =>
     isEmbeddedView(view()) ? views().find((v) => v.view_id === embeddedViewId(view())) : undefined;
