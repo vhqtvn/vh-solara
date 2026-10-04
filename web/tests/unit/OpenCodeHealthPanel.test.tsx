@@ -45,6 +45,32 @@ const OWNED_READY = {
   diagnostic_completeness: "complete",
 };
 
+// ── oc-death-watch S2: down-state fixtures ────────────────────────────────
+// Shapes a death-watched worker serves while OpenCode is down. The clock
+// stamp is rendered locale-aware, so tests compute the expected HH:MM with
+// the same expression the panel uses.
+const DOWN_SINCE = "2026-10-03T21:04:00Z";
+const downClock = () =>
+  new Date(DOWN_SINCE).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+
+const OWNED_DOWN_RESTARTING = {
+  ...OWNED_FAILED,
+  failure_summary: "opencode serve pid 4242 exited (signal KILL/9) after 1h2m",
+  down_since: DOWN_SINCE,
+  restart_attempts: 2,
+};
+
+const OWNED_DOWN_CAPPED = {
+  ...OWNED_FAILED,
+  failure_summary: "opencode crash-loop: 5 restarts in 10m0s — giving up",
+  down_since: DOWN_SINCE,
+  restart_attempts: 5,
+  restart_capped: true,
+};
+
 function resp(body: unknown, ok = true, status = 200, text = ""): Response {
   return {
     ok,
@@ -178,6 +204,117 @@ describe("OpenCodeHealthPanel", () => {
     // Defer a tick: effects should resolve to "render nothing".
     await new Promise((r) => setTimeout(r, 10));
     expect(document.querySelector('[role="status"]')).toBeNull();
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // oc-death-watch S2 — explicit down states.
+  // A death-watched worker sets down_since (+ restart_attempts /
+  // restart_capped) on the snapshot; the panel must say OpenCode is DOWN and
+  // what the daemon is doing about it, instead of panes merely looking slow.
+  // ─────────────────────────────────────────────────────────────────────
+
+  it("S2: down + auto-restarting renders the explicit down line with attempt count", async () => {
+    const { store, Panel } = await fresh();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/opencode/status"))
+          return Promise.resolve(resp(OWNED_DOWN_RESTARTING));
+        if (url.includes("/vh/opencode/logs"))
+          return Promise.resolve(resp(null, true, 200, ""));
+        return Promise.resolve(resp({}, false, 404));
+      }),
+    );
+    await store.refreshOpenCodeLifecycle();
+    render(() => <Panel />);
+
+    await waitFor(() => {
+      expect(document.body.textContent).toContain("OpenCode down");
+    });
+    // Title is the down title, not the boot-failure title.
+    expect(document.body.textContent).not.toContain("OpenCode failed to start");
+    const line = document.querySelector('[data-testid="och-down-line"]');
+    expect(line).toBeTruthy();
+    expect(line?.textContent).toBe(
+      `OpenCode down since ${downClock()} — restarting (attempt 2)`,
+    );
+    // The failure summary (death detail) still surfaces below the down line.
+    expect(document.body.textContent).toContain(
+      "opencode serve pid 4242 exited",
+    );
+  });
+
+  it("S2: crash-loop give-up renders the paused line with the attempt count", async () => {
+    const { store, Panel } = await fresh();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/opencode/status"))
+          return Promise.resolve(resp(OWNED_DOWN_CAPPED));
+        if (url.includes("/vh/opencode/logs"))
+          return Promise.resolve(resp(null, true, 200, ""));
+        return Promise.resolve(resp({}, false, 404));
+      }),
+    );
+    await store.refreshOpenCodeLifecycle();
+    render(() => <Panel />);
+
+    await waitFor(() => {
+      expect(document.body.textContent).toContain("OpenCode down");
+    });
+    const line = document.querySelector('[data-testid="och-down-line"]');
+    expect(line).toBeTruthy();
+    expect(line?.textContent).toBe(
+      `OpenCode down since ${downClock()} — restart paused after 5 attempts`,
+    );
+    // The give-up summary (crash-loop) still surfaces.
+    expect(document.body.textContent).toContain("opencode crash-loop:");
+  });
+
+  it("S2: failed WITHOUT down_since keeps the legacy boot-failure title and no down line", async () => {
+    const { store, Panel } = await fresh();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/opencode/status"))
+          return Promise.resolve(resp(OWNED_FAILED));
+        if (url.includes("/vh/opencode/logs"))
+          return Promise.resolve(resp(null, true, 200, ""));
+        return Promise.resolve(resp({}, false, 404));
+      }),
+    );
+    await store.refreshOpenCodeLifecycle();
+    render(() => <Panel />);
+
+    await waitFor(() => {
+      expect(document.body.textContent).toContain("OpenCode failed to start");
+    });
+    expect(
+      document.querySelector('[data-testid="och-down-line"]'),
+    ).toBeNull();
+    expect(document.body.textContent).not.toContain("OpenCode down since");
+  });
+
+  it("S2: healthy control — no down line, no prominent panel", async () => {
+    const { store, Panel } = await fresh();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/opencode/status"))
+          return Promise.resolve(resp(OWNED_READY));
+        return Promise.resolve(resp({}, false, 404));
+      }),
+    );
+    await store.refreshOpenCodeLifecycle();
+    render(() => <Panel />);
+
+    await waitFor(() => {
+      expect(document.body.textContent).toContain("OpenCode ready");
+    });
+    expect(
+      document.querySelector('[data-testid="och-down-line"]'),
+    ).toBeNull();
     expect(document.querySelector('[role="alert"]')).toBeNull();
   });
 

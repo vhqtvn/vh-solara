@@ -157,6 +157,35 @@ func (a *Aggregator) SetOnConnected(fn func()) {
 	a.seedMu.Unlock()
 }
 
+// SetUpstreamDownProbe installs the predicate Run consults before waiting on a
+// reconnect or hydrate retry: while it reports true (the daemon KNOWS the
+// OpenCode upstream is down — the daemons wire it to the oclife death-watch
+// DownSince state), both backoffs jump straight to their caps instead of
+// ramping from 1s, quieting the per-instance retry storm against a dead port
+// (web.Server.aggFor starts one RunManaged per opened project dir — N+1 loops
+// would otherwise hammer the dead port every second each). A nil predicate
+// (external --opencode-url mode: no lifecycle knowledge; bare tests) leaves
+// Run's behavior exactly as before this gate existed. Guarded by seedMu to
+// match the read side in upstreamKnownDown; safe to install before or after
+// Run started (the read is non-blocking under the lock).
+func (a *Aggregator) SetUpstreamDownProbe(fn func() bool) {
+	a.seedMu.Lock()
+	a.upstreamDown = fn
+	a.seedMu.Unlock()
+}
+
+// upstreamKnownDown reads the upstream-down predicate under seedMu (brief,
+// non-blocking — the "never block under seedMu" discipline) and evaluates it
+// OUTSIDE the lock: the daemon's predicate takes the lifecycle's own mutex, and
+// calling it under seedMu would nest two locks for no benefit. Returns false
+// when no predicate is installed (no lifecycle knowledge).
+func (a *Aggregator) upstreamKnownDown() bool {
+	a.seedMu.Lock()
+	fn := a.upstreamDown
+	a.seedMu.Unlock()
+	return fn != nil && fn()
+}
+
 // fireOnConnected invokes the onConnected callback, read under seedMu and
 // called outside it.
 func (a *Aggregator) fireOnConnected() {
@@ -175,23 +204,25 @@ func (a *Aggregator) fireOnConnected() {
 // safe to call on the request path (aggFor) without taking seedMu.
 func (a *Aggregator) AnyHydrateCompleted() bool { return a.anyHydrateCompleted.Load() }
 
-// hydrateBackoffMax caps the exponential backoff between hydrate retries in
-// Run's per-connection loop (a.hydrateRetryBase doubling up to this value).
-// It deliberately mirrors the stream-reconnect backoff's 30s cap below while
-// staying a separate constant: hydrate retries and stream reconnects are
-// independent concerns with independent state.
-const hydrateBackoffMax = 30 * time.Second
-
 // Run keeps a live tail on OpenCode's event stream, re-hydrating the full view
 // on every (re)connect because the stream has no replay. A hydrate attempt
 // that fails while the stream stays healthy is retried with capped backoff
-// (a.hydrateRetryBase doubling to hydrateBackoffMax) until the first success
+// (a.hydrateRetryBase doubling to a.hydrateBackoffMax) until the first success
 // for that connection, so a transient upstream failure (e.g. a cold-start
 // ListSessions timeout) self-heals instead of leaving the store unhydrated
 // (empty view, seq 0 — the tree reconciler cannot repair it, it only deletes
 // ghosts / re-asserts archives) until the stream happens to end or an operator
-// POSTs /vh/reload. Retries stop at the first success for the connection. It
-// blocks until ctx is cancelled.
+// POSTs /vh/reload. Retries stop at the first success for the connection.
+//
+// Upstream-down gating (oc-death-watch S2): when the daemon-installed
+// upstream-down predicate (SetUpstreamDownProbe) reports true, BOTH the
+// hydrate-retry and the stream-reconnect backoffs skip their 1s ramp and jump
+// straight to their caps — while the daemon knows the port is dead, per-second
+// dials are pure noise. On recovery (predicate false again) the normal ramp
+// resumes; the healthy-window reset below restores the 1s base once a
+// connection survives 30s. With no predicate installed (external
+// --opencode-url mode), behavior is byte-identical to before the gate.
+// It blocks until ctx is cancelled.
 func (a *Aggregator) Run(ctx context.Context) {
 	// Capture the aggregator's lifetime ctx so background work (the cold-seed)
 	// can derive from it instead of a short-lived request ctx. Done once, under
@@ -270,13 +301,20 @@ func (a *Aggregator) Run(ctx context.Context) {
 		// events. hydrateBackoff is deliberately separate from the
 		// stream-reconnect backoff below: it resets at the top of each
 		// connection iteration (declared here) and stops growing entirely at
-		// the first success.
+		// the first success. While the daemon KNOWS the upstream is down
+		// (upstreamKnownDown), the ramp is skipped — every retry waits at
+		// the cap, so a down spell costs one capped-interval probe per
+		// connection instead of a per-second storm.
 		var streamErr error
 		hydrateBackoff := a.hydrateRetryBase
 		if err := a.hydrate(ctx); err != nil {
 			logHydrateFailure(err)
 		retryHydrate:
 			for {
+				if down := a.upstreamKnownDown(); down && hydrateBackoff != a.hydrateBackoffMax {
+					log.Printf("[aggregator] upstream down — hydrate retry backoff capped at %v", a.hydrateBackoffMax)
+					hydrateBackoff = a.hydrateBackoffMax
+				}
 				select {
 				case <-ctx.Done():
 					// Aggregator shutting down mid-retry: cancel the tail's
@@ -300,7 +338,7 @@ func (a *Aggregator) Run(ctx context.Context) {
 						break retryHydrate
 					}
 					logHydrateFailure(err)
-					if hydrateBackoff < hydrateBackoffMax {
+					if hydrateBackoff < a.hydrateBackoffMax {
 						hydrateBackoff *= 2
 					}
 				}
@@ -325,13 +363,23 @@ func (a *Aggregator) Run(ctx context.Context) {
 		if time.Since(start) > 30*time.Second {
 			backoff = time.Second
 		}
+		// Upstream-down gating: while the daemon knows OpenCode is down,
+		// skip the 1s→×2 ramp and reconnect at the cap (set whenever the
+		// current backoff differs from it — including a backoff ramped
+		// above a since-shrunk cap). The healthy-window reset above still
+		// applies on recovery — once a fresh connection survives 30s the
+		// ramp is restored for any LATER outage.
+		if a.upstreamKnownDown() && backoff != a.reconnectBackoffMax {
+			log.Printf("[aggregator] upstream down — reconnect backoff capped at %v", a.reconnectBackoffMax)
+			backoff = a.reconnectBackoffMax
+		}
 		log.Printf("[aggregator] event stream ended (%v); reconnecting in %v", err, backoff)
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(backoff):
 		}
-		if backoff < 30*time.Second {
+		if backoff < a.reconnectBackoffMax {
 			backoff *= 2
 		}
 	}

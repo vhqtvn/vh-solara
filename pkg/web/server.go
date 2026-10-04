@@ -293,6 +293,12 @@ type Server struct {
 	// (default project and every lazily-created one) — the alerts engine uses it
 	// to subscribe its detector to the project's store. Idempotent per dir.
 	aggHook func(dir string, a *aggregator.Aggregator)
+	// upstreamDownProbe, when set by the daemon (oc-death-watch S2), is
+	// installed on the default aggregator immediately and on every per-dir
+	// aggregator aggFor lazily creates, so ALL Run loops quiet their retry
+	// ramp while the daemon knows OpenCode is down. nil (external
+	// --opencode-url mode) leaves aggregator behavior untouched.
+	upstreamDownProbe func() bool
 	// managedDefaultOnce guards the one-time managed-project open of the default
 	// project (daemon cwd), triggered by the first request that touches it.
 	managedDefaultOnce sync.Once
@@ -865,6 +871,13 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	// is a redundant no-op for both paths. See the armed field doc in
 	// pkg/aggregator/aggregator.go for the full model.
 	a.Arm()
+	// Upstream-down gating (oc-death-watch S2): propagate the daemon's
+	// lifecycle-derived predicate so this per-dir Run loop also skips the
+	// 1s retry ramp while OpenCode is known down. Read outside aggMu — the
+	// daemon installs it once at boot, before any request can reach aggFor.
+	if s.upstreamDownProbe != nil {
+		a.SetUpstreamDownProbe(s.upstreamDownProbe)
+	}
 	s.aggs[dir] = a
 	// Managed-project hook: discover .vh-solara/project.jsonc, gate on trust, and
 	// (if trusted) start declared processes + register views. Non-blocking; nil
@@ -916,6 +929,21 @@ func (s *Server) aggForExisting(dir string) *aggregator.Aggregator {
 // SetAggHook installs a per-project callback fired as each aggregator is touched
 // (default + lazily-created). The alerts engine uses it to subscribe. Optional.
 func (s *Server) SetAggHook(fn func(dir string, a *aggregator.Aggregator)) { s.aggHook = fn }
+
+// SetUpstreamDownProbe installs the daemon's "OpenCode is known down right now"
+// predicate (oc-death-watch S2): applied to the default aggregator immediately
+// and to every per-dir aggregator aggFor lazily creates, so all aggregator Run
+// loops cap their reconnect/hydrate retry backoffs while the daemon knows the
+// upstream is dead instead of ramping from 1s against the dead port (N+1
+// per-project loops otherwise hammer it every second). The daemon calls this
+// once at boot, before serving requests; not calling it (external
+// --opencode-url mode) leaves every aggregator's behavior unchanged.
+func (s *Server) SetUpstreamDownProbe(fn func() bool) {
+	s.upstreamDownProbe = fn
+	if s.agg != nil && fn != nil {
+		s.agg.SetUpstreamDownProbe(fn)
+	}
+}
 
 // registerFailFast records sessionID as a fail-closed-permission spawn. Called
 // only on the fresh-execution path of a fail_fast spawn's idempotent handler,

@@ -92,6 +92,20 @@
   font-size: 14px;
   font-weight: 600;
 }
+/* Death-watch down line (worker S1 → UI S2): "OpenCode down since 21:04 —
+ * restarting (attempt 2)" / "— restart paused after 5 attempts". Warn while
+ * the daemon is still auto-restarting; danger once it gave up. Tokens only;
+ * NOT a scroll container, but the WebRender guardrails apply regardless — no
+ * mask-image, no backdrop-filter, no contain/content-visibility. */
+.och-down {
+  font-size: 12.5px;
+  line-height: 1.45;
+  font-weight: 600;
+  color: var(--warn);
+}
+.och-down.capped {
+  color: var(--danger-fg);
+}
 .och-summary {
   font-size: 12.5px;
   line-height: 1.45;

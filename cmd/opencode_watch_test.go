@@ -4,10 +4,13 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -428,5 +431,229 @@ func TestOCWatchExitCodeReported(t *testing.T) {
 	}, "exit code 7 reported")
 	if got, want := fakeTotal(sc), 0; got != want {
 		t.Fatalf("detection-only watcher spawned something: %d", got)
+	}
+}
+
+// ── S2: death-policy notifications (watcher SetAlert hook) ────────────────
+
+// alertSink captures watcher alert events for assertions. The watcher fires
+// the sink from its loop goroutine, so records are mutex-guarded.
+type alertSink struct {
+	mu   sync.Mutex
+	evts []string // "event\x00detail", in firing order
+}
+
+func (s *alertSink) record(event, detail string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.evts = append(s.evts, event+"\x00"+detail)
+}
+
+func (s *alertSink) counts() map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := map[string]int{}
+	for _, e := range s.evts {
+		c[strings.SplitN(e, "\x00", 2)[0]]++
+	}
+	return c
+}
+
+func (s *alertSink) wantCounts(t *testing.T, want map[string]int) {
+	t.Helper()
+	if got := s.counts(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("alert events = %v, want exactly %v", got, want)
+	}
+}
+
+func (s *alertSink) details(event string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, e := range s.evts {
+		p := strings.SplitN(e, "\x00", 2)
+		if p[0] == event {
+			out = append(out, p[1])
+		}
+	}
+	return out
+}
+
+// Test 7 (oc-death-watch S2): the "down" notification fires EXACTLY ONCE per
+// down-spell — the first death opens the spell; a replacement child dying
+// inside the SAME spell (DownSince still set) stays silent; healing
+// (SetReady) closes the spell and the next death opens a fresh one.
+// Detection-only watcher + plain sh children keep the spell arithmetic
+// deterministic (no restart racing).
+func TestOCWatchAlertOncePerDownSpell(t *testing.T) {
+	sc := newOCLockScenario(t)
+	withWatchKnobs(t, 5*time.Millisecond, time.Hour, time.Hour, time.Hour, time.Hour, 5)
+	life := oclife.New("detached")
+	rt := &clientDaemonRuntime{cwd: sc.dir}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	var sink alertSink
+	rt.ocWatcher = newOCDeathWatcher(life, nil) // detection-only
+	rt.ocWatcher.SetAlert(sink.record)
+	rt.ocWatcher.Start(ctx)
+
+	// spawnDeath arms + kills a child, then waits until ITS pid shows up in
+	// the failure summary — a per-death observable (the failed state itself
+	// is stale after the first death, but the summary names the pid).
+	spawnDeath := func(label string) {
+		t.Helper()
+		c := exec.Command("sh", "-c", "sleep 30")
+		setDetachedAttrs(c)
+		if err := c.Start(); err != nil {
+			t.Fatalf("start child %s: %v", label, err)
+		}
+		t.Cleanup(func() { _ = c.Wait() })
+		rt.ocWatcher.Arm(c.Process.Pid, 0, true)
+		killPid9(c.Process.Pid)
+		watchWaitFor(t, 3*time.Second, func() bool {
+			return strings.Contains(life.Snapshot().FailureSummary, fmt.Sprintf("pid %d exited", c.Process.Pid))
+		}, "death of "+label+" observed")
+	}
+
+	// Spell 1 opens with A's death → exactly one "down".
+	spawnDeath("A")
+	sink.wantCounts(t, map[string]int{"down": 1})
+	if d := sink.details("down"); len(d) != 1 || !strings.HasPrefix(d[0], "opencode serve pid ") {
+		t.Fatalf("down detail = %v, want the death summary", d)
+	}
+
+	// SAME spell: B dies while DownSince is still set → silent (the
+	// crash-loop anti-spam rule).
+	spawnDeath("B")
+	sink.wantCounts(t, map[string]int{"down": 1})
+
+	// Heal closes the spell; C's death opens a NEW one → second "down".
+	life.SetReady()
+	if life.Snapshot().DownSince != nil {
+		t.Fatal("SetReady must clear DownSince (spell close)")
+	}
+	spawnDeath("C")
+	sink.wantCounts(t, map[string]int{"down": 2})
+	if got := len(sink.details("down")); got != 2 {
+		t.Fatalf("down details = %d, want 2", got)
+	}
+}
+
+// Test 8 (oc-death-watch S2): the crash-loop give-up raises exactly ONE
+// "capped" notification. Runs the REAL detached restart arm — the detached
+// flag is pinned true, per the S1 review rule (tests exercising the restart
+// arm must pin the mode or they silently test the owned arm). Healed crashes
+// each open a fresh spell (one "down" each); the cap-terminating death opens
+// its spell AND announces the give-up: 4 down + 1 capped.
+func TestOCWatchAlertCappedFiresOnce(t *testing.T) {
+	sc := newOCLockScenario(t)
+	withDaemonOpenCodeBin(t, sc.bin)
+	withDaemonOpenCodeDetached(t, true) // restartOpencode branches on this flag
+	withWatchKnobs(t, 5*time.Millisecond, 5*time.Millisecond, 10*time.Millisecond, time.Hour, time.Hour, 3)
+	rt, life := watchRuntime(sc)
+
+	var sink alertSink
+	rt.startDetachedOpenCode()
+	// Wire the sink AFTER Start — the same shape the daemon uses (InitAlerts
+	// runs after the watcher is armed), proving the mu-guarded late wiring.
+	rt.ocWatcher.SetAlert(sink.record)
+
+	watchWaitFor(t, 10*time.Second, func() bool { return life.Snapshot().State == oclife.StateReady }, "boot ready")
+
+	// 3 healed crashes (cap 3): each heal (SetReady) closes the spell, so
+	// each subsequent death legitimately re-alerts — one "down" per spell.
+	for i := 0; i < 3; i++ {
+		old := rtChildPID(rt)
+		killPid9(old)
+		watchWaitFor(t, 15*time.Second, func() bool {
+			return life.Snapshot().State == oclife.StateReady && rtChildPID(rt) != 0 && rtChildPID(rt) != old
+		}, fmt.Sprintf("heal after crash %d", i+1))
+	}
+
+	// 4th crash: cap reached → give-up. The give-up state settles; the
+	// alert must have fired EXACTLY once for it.
+	killPid9(rtChildPID(rt))
+	watchWaitFor(t, 5*time.Second, func() bool {
+		s := life.Snapshot()
+		return s.State == oclife.StateFailed && s.RestartCapped && strings.Contains(s.FailureSummary, "crash-loop")
+	}, "crash-loop give-up state")
+	time.Sleep(300 * time.Millisecond) // let any would-be duplicate settle
+
+	sink.wantCounts(t, map[string]int{"down": 4, "capped": 1})
+	caps := sink.details("capped")
+	if len(caps) != 1 || !strings.HasPrefix(caps[0], "opencode crash-loop:") || !strings.Contains(caps[0], "giving up") {
+		t.Fatalf("capped detail = %v, want the crash-loop give-up summary", caps)
+	}
+}
+
+// Test 9 (oc-death-watch S2, version skew): the lifecycle snapshot's new
+// death-watch fields are ADDITIVE on the wire — an old-shape consumer
+// (pre-S1 client) unmarshals the enriched snapshot without error and with
+// every field it knows intact, and a spell-free snapshot omits the new keys
+// entirely (omitempty — byte-compatible with the old shape while unset).
+func TestOCLifeSnapshotJSONAdditive(t *testing.T) {
+	now := time.Now()
+	code := 9
+	enriched := oclife.Snapshot{
+		Topology:               oclife.TopologyDetached,
+		State:                  oclife.StateFailed,
+		StateChangedAt:         now,
+		OpenCodeURL:            "http://127.0.0.1:1",
+		FailureSummary:         "boom",
+		ExitCode:               &code,
+		Capabilities:           oclife.Capabilities{CanRestart: true, HasProcessOutput: true, HasLogTail: true},
+		DiagnosticCompleteness: oclife.DiagPartial,
+		DownSince:              &now,
+		RestartAttempts:        2,
+		RestartCapped:          true,
+	}
+	b, err := json.Marshal(enriched)
+	if err != nil {
+		t.Fatalf("marshal enriched snapshot: %v", err)
+	}
+
+	// Old-shape consumer: the pre-S1 field set ONLY. Unknown keys must be
+	// ignored and every known field must survive the round trip.
+	var old struct {
+		Topology       string    `json:"topology"`
+		State          string    `json:"state"`
+		StateChangedAt time.Time `json:"state_changed_at"`
+		OpenCodeURL    string    `json:"opencode_url"`
+		FailureSummary string    `json:"failure_summary"`
+		ExitCode       *int      `json:"exit_code"`
+		Capabilities   struct {
+			CanRestart       bool `json:"can_restart"`
+			HasProcessOutput bool `json:"has_process_output"`
+			HasLogTail       bool `json:"has_log_tail"`
+			HasExitStatus    bool `json:"has_exit_status"`
+		} `json:"capabilities"`
+		DiagnosticCompleteness string `json:"diagnostic_completeness"`
+	}
+	if err := json.Unmarshal(b, &old); err != nil {
+		t.Fatalf("old-shape consumer failed on enriched snapshot: %v", err)
+	}
+	if old.Topology != "detached" || old.State != "failed" || old.FailureSummary != "boom" ||
+		old.OpenCodeURL != "http://127.0.0.1:1" || old.ExitCode == nil || *old.ExitCode != 9 ||
+		!old.Capabilities.CanRestart || old.DiagnosticCompleteness != "partial" {
+		t.Fatalf("old-shape consumer lost known fields: %+v", old)
+	}
+
+	// Spell-free snapshot: the new keys are absent from the wire entirely.
+	plain := oclife.Snapshot{
+		Topology:               oclife.TopologyDetached,
+		State:                  oclife.StateReady,
+		StateChangedAt:         now,
+		Capabilities:           oclife.Capabilities{CanRestart: true},
+		DiagnosticCompleteness: oclife.DiagPartial,
+	}
+	zb, err := json.Marshal(plain)
+	if err != nil {
+		t.Fatalf("marshal plain snapshot: %v", err)
+	}
+	for _, key := range []string{"down_since", "restart_attempts", "restart_capped"} {
+		if strings.Contains(string(zb), key) {
+			t.Fatalf("spell-free snapshot leaks %q on the wire: %s", key, zb)
+		}
 	}
 }

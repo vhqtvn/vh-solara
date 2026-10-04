@@ -45,6 +45,16 @@ export interface Snapshot {
   exit_code?: number | null;
   capabilities: Capabilities;
   diagnostic_completeness: DiagnosticCompleteness;
+  // Death-watch additions (worker-side S1; consumed by the UI in S2). Additive
+  // + omitempty on the wire, so an older worker simply omits them — the panel
+  // falls back to the plain failed-state rendering. They arrive through the
+  // same /vh/opencode/status poll (res.json() cast below), no extra fetch.
+  /** Set from the first observed death of a down-spell; cleared on ready. */
+  down_since?: string;
+  /** Auto-restart attempts in the current crash window (omit/0 = none). */
+  restart_attempts?: number;
+  /** True once the crash-loop cap was hit and auto-restart gave up. */
+  restart_capped?: boolean;
 }
 
 // A neutral "unknown" shape for 503 (lifecycle not wired) and network errors.

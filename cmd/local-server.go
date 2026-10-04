@@ -239,6 +239,13 @@ with --opencode-url, or spawn a survivable detached instance with
 		// operator can observe a failed OpenCode without local-server having
 		// died with it. Mirrors client-daemon's setupVHMode wiring.
 		srv.SetOpenCodeLifecycle(ocLife)
+		// Retry-storm gating (oc-death-watch S2), mirroring client-daemon:
+		// while the death watcher knows OpenCode is down (DownSince set),
+		// every aggregator Run loop skips its 1s retry ramp. External mode
+		// gets no probe (no lifecycle knowledge of the operator's process).
+		if !external {
+			srv.SetUpstreamDownProbe(func() bool { return ocLife.Snapshot().DownSince != nil })
+		}
 
 		// Restart the owned OpenCode in place; the aggregator re-hydrates. Caller
 		// holds opencodeMu. Drives ocLife through starting → ready|failed so

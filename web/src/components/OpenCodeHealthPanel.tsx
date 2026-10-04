@@ -200,6 +200,39 @@ export default function OpenCodeHealthPanel() {
     }
   }
 
+  // Clock time (HH:MM, locale-aware) for the down-since stamp — the down line
+  // reads "down since 21:04", not a full timestamp; the precise instant is in
+  // the meta row below.
+  function fmtClock(iso: string): string {
+    if (!iso) return "";
+    try {
+      return new Date(iso).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    } catch {
+      return "";
+    }
+  }
+
+  // Death-watch down line (worker S1 fields, consumed here): an explicit
+  // "OpenCode is down and here is what the daemon is doing about it" state, so
+  // a dead OpenCode never reads as panes merely being slow/stale. Three
+  // shapes, in priority order: crash-loop give-up > restart in progress >
+  // plain down. The crash cap itself is daemon-side config and not part of the
+  // snapshot, so the attempt count is rendered without an "/N" suffix.
+  const downLine = (): string => {
+    const s = snap();
+    const since = fmtClock(s?.down_since ?? "");
+    if (s?.restart_capped) {
+      return `OpenCode down since ${since} — restart paused after ${s.restart_attempts ?? 0} attempts`;
+    }
+    if ((s?.restart_attempts ?? 0) > 0) {
+      return `OpenCode down since ${since} — restarting (attempt ${s?.restart_attempts})`;
+    }
+    return `OpenCode down since ${since}`;
+  };
+
   const exitCodeKnown = (): boolean => {
     const s = snap();
     return (
@@ -242,8 +275,19 @@ export default function OpenCodeHealthPanel() {
           <Show when={snap()?.state === "failed"}>
             <div class={styles["och-head"]}>
               <Icon name="alert" size={16} />
-              <span class={styles["och-title"]}>OpenCode failed to start</span>
+              <span class={styles["och-title"]}>
+                {snap()?.down_since ? "OpenCode down" : "OpenCode failed to start"}
+              </span>
             </div>
+            <Show when={snap()?.down_since}>
+              <div
+                class={styles["och-down"]}
+                classList={{ [styles["capped"]]: !!snap()?.restart_capped }}
+                data-testid="och-down-line"
+              >
+                {downLine()}
+              </div>
+            </Show>
             <Show when={snap()?.failure_summary}>
               <div class={styles["och-summary"]}>{snap()?.failure_summary}</div>
             </Show>

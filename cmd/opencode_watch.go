@@ -202,6 +202,15 @@ type ocDeathWatcher struct {
 	// detached serve child would break the no-reap PID-reuse invariant.
 	Reap func()
 
+	// onAlert (oc-death-watch S2), when set, receives death-policy events
+	// for the daemon's notifications engine: event "down" (detail = the
+	// death summary) fires ONCE PER DOWN-SPELL — only the first death
+	// observed while DownSince is unset; replacement children dying inside
+	// the same spell stay silent — and event "capped" (detail = the
+	// crash-loop give-up summary) fires once per give-up. Guarded by mu:
+	// the daemon wires it after Start from another goroutine.
+	onAlert func(event, detail string)
+
 	mu       sync.Mutex
 	gen      uint64
 	started  bool
@@ -281,6 +290,27 @@ func (w *ocDeathWatcher) Generation() uint64 {
 	return w.gen
 }
 
+// SetAlert wires the death-policy alert sink (see onAlert). Optional — a
+// watcher without one (web mode, local-server, boot-seam tests) just skips
+// notification delivery. Safe to call before or after Start: the field is
+// mu-guarded and the loop reads it per-event via fireAlert.
+func (w *ocDeathWatcher) SetAlert(fn func(event, detail string)) {
+	w.mu.Lock()
+	w.onAlert = fn
+	w.mu.Unlock()
+}
+
+// fireAlert invokes the alert sink, if wired, with the hook read under mu
+// (the daemon may wire it after Start's loop goroutine is already running).
+func (w *ocDeathWatcher) fireAlert(event, detail string) {
+	w.mu.Lock()
+	fn := w.onAlert
+	w.mu.Unlock()
+	if fn != nil {
+		fn(event, detail)
+	}
+}
+
 // Stop halts the loop (ctx cancellation covers the production teardown path).
 func (w *ocDeathWatcher) Stop() {
 	w.stopOnce.Do(func() { close(w.stopCh) })
@@ -336,10 +366,15 @@ func (w *ocDeathWatcher) run(ctx context.Context) {
 	// giveUp records the terminal crash-loop state. deathLine, when
 	// non-empty, is the already-formatted death context to prepend.
 	giveUp := func(deathLine string) {
+		summary := fmt.Sprintf("opencode crash-loop: %d restarts in %s — giving up", len(attempts), ocWatchCrashWindow)
 		if w.life != nil {
 			w.life.SetRestartProgress(len(attempts), true)
-			w.life.SetFailed(fmt.Sprintf("opencode crash-loop: %d restarts in %s — giving up", len(attempts), ocWatchCrashWindow), nil)
+			w.life.SetFailed(summary, nil)
 		}
+		// S2: exactly one notification per give-up — the cap is terminal
+		// (no further attempts fire), so no dedup is needed beyond the
+		// sink's own cooldowns.
+		w.fireAlert("capped", summary)
 		if deathLine != "" {
 			log.Printf("%s — crash-loop cap reached: %d restarts in %s — giving up", deathLine, len(attempts), ocWatchCrashWindow)
 		} else {
@@ -374,6 +409,16 @@ func (w *ocDeathWatcher) run(ctx context.Context) {
 			target = nil // disarm; re-armed by the next Arm (OnDone / boot)
 
 			// ——— death observed ———
+			// S2 alert dedup: MarkDown keeps the FIRST DownSince of a
+			// down-spell, so "was this death already announced?" reduces to
+			// "was the spell already open when we got here?". A replacement
+			// child dying inside the same spell (restart attempt #2, #3, …
+			// of a crash loop) does NOT re-alert — one "down" notice per
+			// spell; the spell ends at SetReady, which clears DownSince.
+			// The fire itself waits for the disposition below: deliberate
+			// stops and in-flight restarts are EXPECTED deaths and stay
+			// silent.
+			wasDown := w.life != nil && w.life.Snapshot().DownSince != nil
 			if w.life != nil {
 				w.life.MarkDown()
 			}
@@ -381,10 +426,15 @@ func (w *ocDeathWatcher) run(ctx context.Context) {
 			summary := fmt.Sprintf("opencode serve pid %d exited (%s) after %s", pid, rep.describe(), uptime.Round(time.Second))
 
 			if w.restart == nil {
-				// Detection-only (web mode): log + expose + reap.
+				// Detection-only (web mode): log + expose + reap. The death
+				// is unexpected by definition here (nothing deliberate is in
+				// flight in this mode), so it alerts like the restart path.
 				log.Printf("%s — unexpected; not restarting (detection-only)", line)
 				if w.life != nil {
 					w.life.SetFailed(summary, rep.Code)
+				}
+				if !wasDown {
+					w.fireAlert("down", summary)
 				}
 				if w.Reap != nil {
 					w.Reap()
@@ -407,6 +457,13 @@ func (w *ocDeathWatcher) run(ctx context.Context) {
 				// by construction. Do not double-spawn; do not count it.
 				log.Printf("%s — restart already in progress — not auto-restarting", line)
 				continue
+			}
+
+			// Unexpected death (first of its spell): raise the ONE
+			// per-spell "down" notification. Later deaths inside the same
+			// spell (crash-loop attempts) were filtered above by wasDown.
+			if !wasDown {
+				w.fireAlert("down", summary)
 			}
 
 			// A child that stayed healthy long enough resets the crash

@@ -123,6 +123,18 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 	// so the controller/operator can observe a failed OpenCode THROUGH
 	// the tunnel without this worker having died with it.
 	srv.SetOpenCodeLifecycle(rt.ocLife)
+	// Retry-storm gating (oc-death-watch S2): while the death watcher KNOWS
+	// OpenCode is down (lifecycle DownSince set — observed death, kept
+	// across the failed→starting restart sequence, cleared on ready), every
+	// aggregator Run loop (the default one below + one per opened project
+	// dir via aggFor) skips its 1s reconnect/hydrate ramp and waits at the
+	// capped backoff instead. External mode gets no probe: it has no
+	// lifecycle knowledge of the operator-managed OpenCode, and its
+	// aggregators must behave exactly as before this gate existed.
+	if !rt.external {
+		life := rt.ocLife
+		srv.SetUpstreamDownProbe(func() bool { return life.Snapshot().DownSince != nil })
+	}
 
 	// Managed-project processes + views: discover a checked-in
 	// .vh-solara/project.jsonc, gate it behind explicit per-project trust,
@@ -239,8 +251,18 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 
 	// Notifications/alerts engine: daemon-side detection + outbound webhooks,
 	// plus the in-app notice bus. Non-fatal if its config can't load.
-	if _, err := srv.InitAlerts(vhCtx); err != nil {
+	if alertEngine, err := srv.InitAlerts(vhCtx); err != nil {
 		log.Printf("alerts engine disabled: %v", err)
+	} else if rt.ocWatcher != nil {
+		// oc-death-watch S2: route the death watcher's notifications
+		// through the alerts engine — exactly one "OpenCode down" notice
+		// per down-spell and one per crash-loop give-up (the watcher
+		// dedups; the engine's dispatcher/pusher cooldowns back it up).
+		// Owned-mode boots have no ocWatcher (the reaper owns exit
+		// observation there) and get no watcher-driven notices.
+		rt.ocWatcher.SetAlert(func(event, detail string) {
+			alertEngine.EmitDaemonNotice(detail)
+		})
 	}
 
 	handler := srv.Handler()

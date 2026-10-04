@@ -174,4 +174,55 @@ describe("opencode-lifecycle client", () => {
     expect(m.snapshot()?.state).toBe("ready");
     expect(m.lifecycleAvailable()).toBe(true);
   });
+
+  // oc-death-watch S2: the worker's additive death-watch fields flow through
+  // the /vh/opencode/status poll into the store signal untouched — the poll
+  // is a res.json() cast, so enrichment requires no client-side changes, but
+  // this pins the passthrough the HealthPanel's down-state rendering rides on.
+  it("surfaces the death-watch fields (down_since / restart_attempts / restart_capped)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResp({
+            ...OWNED_FAILED,
+            failure_summary:
+              "opencode serve pid 4242 exited (signal KILL/9) after 1h2m",
+            down_since: "2026-10-03T21:04:00Z",
+            restart_attempts: 2,
+            restart_capped: false,
+          }),
+        ),
+      ),
+    );
+    const m = await load();
+    await m.refreshOpenCodeLifecycle();
+    expect(m.snapshot()?.state).toBe("failed");
+    expect(m.snapshot()?.down_since).toBe("2026-10-03T21:04:00Z");
+    expect(m.snapshot()?.restart_attempts).toBe(2);
+    expect(m.snapshot()?.restart_capped).toBe(false);
+    expect(m.lifecycleAvailable()).toBe(true);
+  });
+
+  // Down-state poll cadence (S2): a failed (down) state drives the FAST
+  // interval, so the UI sees recovery/escalation within ~2s — and a ready
+  // state returns to the normal cadence. nextInterval is internal; the
+  // behavior is observable through the exported polling start/stop? It is
+  // not — so assert the discriminator directly via the module's exported
+  // surface: the snapshot's state is what nextInterval branches on. This is
+  // a shape pin, not a timer test.
+  it("keeps failed (down) snapshots in the fast-poll discriminator state", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(jsonResp(OWNED_FAILED))),
+    );
+    const m = await load();
+    await m.refreshOpenCodeLifecycle();
+    // The adaptive poll branches on state === "starting" || state ===
+    // "failed" → FAST_INTERVAL_MS. A down spell reports state "failed"
+    // (SetFailed per death), so the degraded cadence engages with zero
+    // changes to the poll logic — pin that coupling here.
+    expect(m.snapshot()?.state).toBe("failed");
+    expect(m.snapshot()?.down_since).toBeUndefined();
+  });
 });

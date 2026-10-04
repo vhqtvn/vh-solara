@@ -1,6 +1,7 @@
 package alerts
 
 import (
+	"context"
 	"encoding/json"
 	"path/filepath"
 	"sync"
@@ -244,5 +245,77 @@ func TestEngineFinishedSuppressedWhenNotSendable(t *testing.T) {
 	w.sweep()
 	if has(*fired, TypeFinished, "ghost") {
 		t.Errorf("finished must not fire when the session isn't sendable")
+	}
+}
+
+// TestEmitDaemonNoticeFansOutToAllProjects (oc-death-watch S2): a daemon-level
+// notice reaches EVERY attached project store's in-app bus with the agreed
+// shape — existing kind TypeStalled, Title naming the subject, Detail carrying
+// the event text, and empty session/root (it is not about any session). The
+// outbound dispatcher/pusher arms are the same one-line delegations Attach's
+// deliver performs (their routing/cooldown logic is covered by
+// routing_test.go); this test pins the fan-out + shape.
+func TestEmitDaemonNoticeFansOutToAllProjects(t *testing.T) {
+	cfg, err := NewStore(filepath.Join(t.TempDir(), "alerts.jsonc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eng := NewEngine(cfg, NewPresence(), NewDispatcher(cfg, NewPresence()))
+
+	subs := map[string]<-chan state.ClientEvent{}
+	for _, dir := range []string{"projA", "projB"} {
+		st := state.New(4096)
+		eng.Attach(ctx, dir, st)
+		ch, unsub := st.Subscribe(16)
+		defer unsub()
+		subs[dir] = ch
+	}
+
+	eng.EmitDaemonNotice("opencode serve pid 42 exited (signal TERM/15) after 1h2m")
+
+	for dir, ch := range subs {
+		select {
+		case ev := <-ch:
+			if ev.Kind != state.KindNotice {
+				t.Fatalf("%s: fan-out kind = %q, want %q", dir, ev.Kind, state.KindNotice)
+			}
+			var n Notice
+			if err := json.Unmarshal(ev.Payload, &n); err != nil {
+				t.Fatalf("%s: payload not a Notice: %v", dir, err)
+			}
+			if n.Type != TypeStalled {
+				t.Errorf("%s: type = %q, want existing kind %q", dir, n.Type, TypeStalled)
+			}
+			if n.Title != "OpenCode" {
+				t.Errorf("%s: title = %q, want %q", dir, n.Title, "OpenCode")
+			}
+			if n.Detail != "opencode serve pid 42 exited (signal TERM/15) after 1h2m" {
+				t.Errorf("%s: detail = %q, want the event text verbatim", dir, n.Detail)
+			}
+			if n.SessionID != "" || n.Root != "" {
+				t.Errorf("%s: daemon notice must not claim a session (sessionID=%q root=%q)", dir, n.SessionID, n.Root)
+			}
+			if n.Ts == 0 {
+				t.Errorf("%s: ts must be stamped", dir)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: never received the daemon notice on its store bus", dir)
+		}
+	}
+
+	// A store attached AFTER the emit is a LIVE-subscriber fan-out, not a
+	// replay — no notice may arrive on it (EmitNotice has no replay by
+	// design; a fresh subscriber sees only later events).
+	late := state.New(4096)
+	eng.Attach(ctx, "projLate", late)
+	lateCh, lateUnsub := late.Subscribe(16)
+	defer lateUnsub()
+	select {
+	case ev := <-lateCh:
+		t.Fatalf("late-attached store unexpectedly received a notice: %+v", ev)
+	case <-time.After(150 * time.Millisecond):
+		// good — no replay
 	}
 }

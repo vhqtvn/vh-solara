@@ -83,6 +83,44 @@ func (e *Engine) Attach(ctx context.Context, dir string, store *state.Store) {
 	go w.run(ctx)
 }
 
+// EmitDaemonNotice delivers a daemon-level (non-session) notice — e.g. the
+// OpenCode death watcher's "serve died" and "crash-loop give-up" events
+// (oc-death-watch S2) — through the SAME routing as session notices: in-app
+// fan-out to every attached project store, outbound channels via the
+// dispatcher, and Web Push when attached. It reuses the existing kind set
+// (TypeStalled: the upstream the user relies on has stopped making progress)
+// and carries the event text in Detail with Title naming the subject.
+//
+// Dedup discipline is the CALLER's: the death watcher raises this once per
+// down-spell and once per crash-loop give-up; the dispatcher's and pusher's
+// per-(type,session,channel) cooldowns (SessionID is empty here, so the key is
+// global per channel) back that up so a flapping emitter cannot spam. In-app
+// delivery reaches devices scoped "all"; a "current"-scoped device sees the
+// daemon's health-panel surface instead (the notice's empty root never matches
+// a focused session).
+func (e *Engine) EmitDaemonNotice(detail string) {
+	n := Notice{
+		Type:   TypeStalled,
+		Title:  "OpenCode",
+		Detail: detail,
+		Ts:     time.Now().UnixMilli(),
+	}
+	payload, _ := json.Marshal(n)
+	e.mu.Lock()
+	attached := make([]*watcher, 0, len(e.watchers))
+	for _, w := range e.watchers {
+		attached = append(attached, w)
+	}
+	e.mu.Unlock()
+	for _, w := range attached {
+		w.store.EmitNotice(payload)
+	}
+	e.dispatcher.Dispatch(n)
+	if e.pusher != nil {
+		e.pusher.Send(n)
+	}
+}
+
 // sessTrack is the engine's local model of one session, built from events.
 type sessTrack struct {
 	parentID string

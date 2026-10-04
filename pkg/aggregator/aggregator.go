@@ -250,6 +250,35 @@ type Aggregator struct {
 	// RunManaged so the goroutine launch establishes the happens-before edge
 	// to the read.
 	hydrateRetryBase time.Duration
+
+	// hydrateBackoffMax caps the exponential hydrate-retry backoff inside
+	// Run's per-connection loop (hydrateRetryBase doubling up to this
+	// value). Formerly the package const hydrateBackoffMax; moved to a
+	// PER-INSTANCE field (same discipline as hydrateRetryBase) so the
+	// upstream-down gating test can shrink it per-aggregator without racing
+	// a lingering goroutine from another test's aggregator. Defaults to
+	// 30s; read only by Run on its own goroutine; set before Run/RunManaged.
+	hydrateBackoffMax time.Duration
+
+	// reconnectBackoffMax caps the stream-reconnect backoff in Run's outer
+	// loop (1s doubling up to this value). Formerly an inline 30s literal;
+	// extracted as a PER-INSTANCE field (same discipline as
+	// hydrateRetryBase/hydrateBackoffMax) so the upstream-down gating test
+	// can shrink it. Defaults to 30s; read only by Run on its own
+	// goroutine; set before Run/RunManaged.
+	reconnectBackoffMax time.Duration
+
+	// upstreamDown, when non-nil, reports whether the daemon KNOWS the
+	// OpenCode upstream is down right now (the daemon wires it to the
+	// oclife death-watch state: lifecycle.DownSince != nil). While it
+	// reports true, Run's reconnect and hydrate-retry backoffs jump
+	// straight to their caps instead of ramping from 1s — the retry storm
+	// against a dead port is pure noise the daemon already has better
+	// information about. nil (external --opencode-url mode, bare tests)
+	// means "no lifecycle knowledge" and Run behaves exactly as before.
+	// Guarded by seedMu (the lifecycle-group lock); read on Run's goroutine
+	// via upstreamKnownDown, which never blocks under the lock.
+	upstreamDown func() bool
 }
 
 // olderPageInflight is the single-flight slot for a Part-B older-page fetch
@@ -295,6 +324,8 @@ func New(baseURL string, ringCapacity int) *Aggregator {
 		treeReconcileIdleInterval: defaultTreeReconcileIdleInterval,
 		archivedSnapshotInterval:  defaultArchivedSnapshotInterval,
 		hydrateRetryBase:          time.Second,
+		hydrateBackoffMax:         30 * time.Second,
+		reconnectBackoffMax:       30 * time.Second,
 	}
 }
 
@@ -313,6 +344,8 @@ func NewForDirectory(baseURL, directory string, ringCapacity int) *Aggregator {
 		treeReconcileIdleInterval: defaultTreeReconcileIdleInterval,
 		archivedSnapshotInterval:  defaultArchivedSnapshotInterval,
 		hydrateRetryBase:          time.Second,
+		hydrateBackoffMax:         30 * time.Second,
+		reconnectBackoffMax:       30 * time.Second,
 	}
 }
 
