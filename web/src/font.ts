@@ -1,8 +1,7 @@
 // Configurable display/UI font. System by default (zero cost, offline); other
 // choices lazily load their webfont only when selected, so you pay only for what
 // you pick. Drives the --font-ui CSS variable.
-import { createSignal } from "solid-js";
-import { loadVersioned, saveVersioned } from "./lib/store";
+import { persistedSignal } from "./lib/store";
 
 const SYS = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
 // The baseline monospace stack (the default --font-mono). Used for the
@@ -46,14 +45,26 @@ export const MONO_FONTS: FontDef[] = [
 const LS_FONT = "vh.font.v1";
 const LS_CUSTOM = "vh.font.custom.v1";
 const asStr = (old: unknown) => (typeof old === "string" ? old : "");
-const [font, setF] = createSignal<string>(loadVersioned<string>(LS_FONT, 1, "system", (o) => asStr(o) || "system"));
+// persistedSignal + remote-change hook (mirrors theme.ts, c8a7eb1c): when
+// another same-origin document (browser tab / host pane iframe) changes the
+// shared font, re-apply it HERE live — applyFont is imperative (a CSS var on
+// <html> + an on-demand webfont <link>), so a signal-only update would leave
+// this document rendering the old font until reload (the cross-tab sync gap).
+const [font, setF] = persistedSignal<string>(LS_FONT, 1, "system", (o) => asStr(o) || "system", {
+  onRemoteChange: () => applyFont(),
+});
 // A locally-installed font family the user types in (CSP-safe: no external load).
-const [customFont, setCustomSig] = createSignal<string>(loadVersioned<string>(LS_CUSTOM, 1, "", asStr));
+// onRemoteChange mirrors setCustomFont's local conditional apply: a remote
+// custom-family edit re-applies live only while "custom" is the ACTIVE font.
+const [customFont, setCustomSig] = persistedSignal<string>(LS_CUSTOM, 1, "", asStr, {
+  onRemoteChange: () => {
+    if (font() === "custom") applyFont();
+  },
+});
 const loaded = new Set<string>();
 
 export function setCustomFont(family: string) {
-  setCustomSig(family);
-  saveVersioned(LS_CUSTOM, 1, family);
+  setCustomSig(family); // persistedSignal's setter persists
   if (font() === "custom") applyFont();
 }
 export { customFont };
@@ -78,8 +89,7 @@ export function applyFont() {
 }
 
 export function setFontId(id: string) {
-  setF(id);
-  saveVersioned(LS_FONT, 1, id);
+  setF(id); // persistedSignal's setter persists
   applyFont();
 }
 
@@ -89,7 +99,13 @@ export { font };
 //     versioned signal, on-demand webfont loading via the shared `loaded` set,
 //     and applyMonoFont() that writes --font-mono on <html>. ---
 const LS_MONO = "vh.font.mono.v1";
-const [monoFont, setMonoSig] = createSignal<string>(loadVersioned<string>(LS_MONO, 1, "system-mono", (o) => asStr(o) || "system-mono"));
+// Same persistedSignal + remote-change pattern as the UI font above: a remote
+// mono change re-applies --font-mono here live. (xterm terminals read
+// monoFontStack() at creation, so they pick the new stack on their next
+// creation — unchanged pull behavior, no push consumer.)
+const [monoFont, setMonoSig] = persistedSignal<string>(LS_MONO, 1, "system-mono", (o) => asStr(o) || "system-mono", {
+  onRemoteChange: () => applyMonoFont(),
+});
 
 export function applyMonoFont() {
   const def = MONO_FONTS.find((f) => f.id === monoFont()) || MONO_FONTS[0];
@@ -98,8 +114,7 @@ export function applyMonoFont() {
 }
 
 export function setMonoFontId(id: string) {
-  setMonoSig(id);
-  saveVersioned(LS_MONO, 1, id);
+  setMonoSig(id); // persistedSignal's setter persists
   applyMonoFont();
 }
 
@@ -111,3 +126,26 @@ export function monoFontStack(): string {
 }
 
 export { monoFont };
+
+// Frozen-tab catch-up (mirror of theme.ts). The `storage` event IS delivered
+// to ordinary background tabs, but a fully FROZEN tab (browsers freeze heavy
+// background tabs; mobile backgrounded views) may never run the listener — it
+// thaws with stale in-memory signals while the shared localStorage already
+// holds the newer value. On becoming visible, re-run the exact storage-event
+// path for all three font keys: dispatch a synthetic `storage` event, which
+// the persistedSignal listeners treat identically to a real one (re-read,
+// update signal, re-apply via onRemoteChange). Idempotent — if nothing was
+// missed, the re-read yields the same values and applyFont()/applyMonoFont()
+// rewrite identical vars.
+if (
+  typeof document !== "undefined" &&
+  typeof document.addEventListener === "function" &&
+  typeof StorageEvent !== "undefined"
+) {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    for (const key of [LS_FONT, LS_CUSTOM, LS_MONO]) {
+      window.dispatchEvent(new StorageEvent("storage", { key }));
+    }
+  });
+}
