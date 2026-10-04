@@ -59,12 +59,11 @@
 
   /* Elevation shadow tiers (popovers/menus → toast pills & dropdowns →
      dialogs/overlays), pure black at fixed alphas so every dark theme derives
-     unchanged. --shadow-lg is byte-identical to the late :root definition in
-     legacy/80-professional-pass.css (which still wins the cascade today), so
-     that shard can fold into tokens.css later with zero visual change — see
-     web-css-architecture.md "Open follow-ups". Light themes soften these via
-     :root.theme-light-scoped; e-ink zeroes them (a shadow only ghosts an e-ink
-     panel — borders carry elevation there). */
+     unchanged. --shadow-lg was byte-identical to a late :root definition in
+     legacy/80-professional-pass.css until that duplicate folded into here
+     (zero visual change — the values matched exactly). Light themes soften
+     these via :root.theme-light-scoped; e-ink zeroes them (a shadow only
+     ghosts an e-ink panel — borders carry elevation there). */
   --shadow-sm: 0 6px 18px rgba(0, 0, 0, 0.35);
   --shadow-md: 0 12px 32px rgba(0, 0, 0, 0.45);
   --shadow-lg: 0 18px 50px -16px rgba(0, 0, 0, 0.7);
@@ -386,7 +385,7 @@
    apart only by darkness — there is no colour on a Carta panel. */
 :root.theme-eink {
   --border: #6e6e6e; --accent: #000000; --accent-2: #000000;
-  --danger: #000000; --warn: #3a3a3a; --ok: #5e5e5e; --sel: #000000;
+  --danger: #000000; --warn: #3a3a3a; --ok: #5e5e5e; --sel: #000000; --info: #4c4c4c;
   --md-h1: #000000; --md-h2: #000000; --md-h3: #000000;
   --md-link: #000000; --md-code: #000000; --md-marker: #000000;
   --md-quote: #3a3a3a; --md-quote-border: #6e6e6e;

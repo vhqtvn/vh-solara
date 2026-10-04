@@ -92,9 +92,9 @@ one-sidedly), elevation shadows (`--shadow-sm|md|lg`), overlay backdrops
 `--sidebar-w`. Per-theme `:root.theme-*` blocks override only what needs
 tuning — e.g. `theme-light-scoped` softens the shadow tiers, and the e-ink
 themes zero them. Consumers reference `var(--token)` WITHOUT inline fallbacks
-(fallbacks are how phantom/drift bugs started); `--shadow-lg` is additionally
-re-defined late in `legacy/80-professional-pass.css` — kept byte-identical
-there until that shard folds (see "Open follow-ups").
+(fallbacks are how phantom/drift bugs started; `--shadow-lg` was the last
+token re-defined late in `legacy/80-professional-pass.css` — that
+byte-identical duplicate has since folded into `tokens.css`).
 
 ## 3. The 8 migration carry-forward rules
 

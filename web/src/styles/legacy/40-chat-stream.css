@@ -40,7 +40,7 @@
   width: max-content; max-width: 300px;
   background: var(--bg-2); color: var(--fg);
   border: 1px solid var(--border); border-radius: 8px;
-  box-shadow: var(--shadow-lg, 0 12px 40px #0009);
+  box-shadow: var(--shadow-lg);
   padding: 7px 10px; font-size: 12.5px; line-height: 1.4;
   pointer-events: none; z-index: 21;
   display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;

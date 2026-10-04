@@ -31,7 +31,7 @@
   background: var(--bg-2);
   border: 1px solid var(--border);
   border-radius: 10px;
-  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
+  box-shadow: var(--shadow-lg);
   padding: 6px;
   animation: dialog-in 0.12s var(--ease, ease);
 }
@@ -45,7 +45,7 @@
   background: var(--bg-2);
   border: 1px solid var(--border);
   border-radius: 14px;
-  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
+  box-shadow: var(--shadow-lg);
   padding: 8px;
 }
 /* Compact copy/export group: a 2-up grid + a small section label. */
