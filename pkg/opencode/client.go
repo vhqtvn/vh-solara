@@ -690,7 +690,16 @@ var noEventTimeout = 45 * time.Second
 // read) never ran — interruptible, so a dead stream returns to the caller for
 // reconnect instead of silently freezing live UI updates.
 func (c *Client) SubscribeEvents(ctx context.Context, handler func(Event) error) error {
-	req, err := c.newRequest(ctx, http.MethodGet, "/event", nil)
+	// reqCtx outlives Do (it scopes the body read too), so it is cancelled
+	// only on return. headerTimer bounds the wait for response HEADERS: the
+	// idle timer below only arms once headers arrive, so without this a
+	// subscribe that lands on an OpenCode still booting after a restart
+	// (port bound, TCP accepted, request never answered) blocked in Do
+	// forever — hydrate succeeded on its own timed request, the UI showed a
+	// snapshot, and no live event ever arrived until vh was restarted.
+	reqCtx, cancelReq := context.WithCancel(ctx)
+	defer cancelReq()
+	req, err := c.newRequest(reqCtx, http.MethodGet, "/event", nil)
 	if err != nil {
 		return err
 	}
@@ -698,9 +707,16 @@ func (c *Client) SubscribeEvents(ctx context.Context, handler func(Event) error)
 
 	// No client-level timeout for the streaming connection; a timeout here
 	// would kill a healthy long-lived stream. Liveness is enforced by the
-	// idle timer in the read loop below, not by the HTTP client.
+	// header timer here and the idle timer in the read loop below.
+	headerTimer := time.AfterFunc(idleTimeout, cancelReq)
 	httpClient := &http.Client{}
 	resp, err := httpClient.Do(req)
+	if !headerTimer.Stop() && ctx.Err() == nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return fmt.Errorf("subscribe /event: no response headers in %v", idleTimeout)
+	}
 	if err != nil {
 		return err
 	}

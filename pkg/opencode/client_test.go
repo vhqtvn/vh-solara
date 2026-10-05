@@ -81,6 +81,32 @@ func TestSubscribeEventsDeadButOpen(t *testing.T) {
 	}
 }
 
+// TestSubscribeEventsHeadersNeverArrive pins the post-restart freeze: an
+// OpenCode that accepts the /event connection but never writes response
+// headers (still booting) must not park SubscribeEvents in http.Client.Do
+// forever — it has to return so the aggregator reconnects.
+func TestSubscribeEventsHeadersNeverArrive(t *testing.T) {
+	withIdleTimeout(t, 120*time.Millisecond)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/event", func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL)
+
+	start := time.Now()
+	err := c.SubscribeEvents(context.Background(), func(Event) error { return nil })
+	elapsed := time.Since(start)
+
+	if err == nil || !strings.Contains(err.Error(), "no response headers") {
+		t.Fatalf("expected header-timeout error, got %v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("SubscribeEvents hung waiting for headers: %v (want ~%v)", elapsed, idleTimeout)
+	}
+}
+
 // contentFreeEventServer accepts /event and then emits a continuous flow of
 // SSE frames that carry NO parseable event — the live-but-content-free
 // wedge. frameKind selects the poison: "empty-data" emits `data:` frames
