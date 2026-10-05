@@ -24,6 +24,16 @@ import { projectUrl } from "./util";
 //     lands SPECIFICALLY on that anchored [data-mid] row (not just "somewhere
 //     off the tail"). This is the exact restore target maybeRestore positions.
 //
+// (c) POST-RELOAD WHEEL-DOWN — restore lands, then a real wheel-down must
+//     ADVANCE the viewport and keep it there: the restore drift servo may not
+//     revert the reader's own scrolling (provenance review: wheel-down was
+//     unstamped, so the servo yanked every tick back to the anchor).
+//
+// (d) POST-RELOAD NAVIGATOR-DOT JUMP — restore lands, then clicking a turn-
+//     navigator dot (rendered OUTSIDE .chat-scroll, inside .chat-main) must
+//     LAND the jump, not have it aborted by the drift servo reverting the
+//     smooth-scroll frames (which also cancels the animation outright).
+//
 // HOME: a new focused spec (not unread-dot.spec.ts or scroll-follow.spec.ts).
 // The read-position machinery spans BOTH files' concerns (anchors + the jump
 // button live in unread-dot; streaming + reload-restore live in scroll-
@@ -41,8 +51,11 @@ import { projectUrl } from "./util";
 // CSS defenses hide the `.working` pill — breaking waitForTurnSettled's
 // turn-settle signal (`.working-text` visibility). Width 400 (narrow intent)
 // is preserved; 600 is safely normal-tier (short is <=520, hysteresis leaves
-// at >=536), and the demo/`other` transcripts still overflow `.chat-scroll`
-// (clientHeight ~348) so all scroll math below stays meaningful.
+// at >=536), and the demo transcript still overflows `.chat-scroll`
+// (clientHeight ~370-406 depending on the composer's resolving-agent bar)
+// so the scroll math below stays meaningful. Test (b) additionally GATES its
+// transcript size on measured mid-row scroll margin (see midRowMargin there)
+// rather than trusting the fixed viewport arithmetic.
 const VP = { width: 400, height: 600 };
 
 type Page = import("@playwright/test").Page;
@@ -239,21 +252,45 @@ test("reload lands on the stored read-anchor [data-mid] row", async ({ page }) =
   // build the transcript before asserting/gluing.
   await expect(page.locator(".chat-scroll")).toBeVisible({ timeout: 10000 });
 
-  // Build an overflowing transcript: 3 prompt_async turns (each appends a user
-  // + assistant message → 6 messages total). At 400×600 the ~348px chat
-  // clientHeight is comfortably overflowed. Serial turns (settle between each)
-  // avoid concurrent simulatePrompt goroutines interleaving on one session.
-  // (Across repeat-each iterations the shared fixture backend accumulates
-  // more messages on `other`; that's fine — we read runtime ids and pick
-  // mid-history by index regardless of total count.)
-  for (let i = 0; i < 3; i++) {
+  // Build an overflowing transcript: prompt turns (each appends a user +
+  // assistant message) UNTIL the mid-history row has real scroll margin.
+  // GEOMETRY-GATED, not a fixed count: at 400×600 a 6-message transcript
+  // (3 turns) barely overflows and floor(len/2) lands within ~9px of the
+  // max-scroll boundary — inside the composer-height swing (clientHeight
+  // toggles ~370↔406 with the "Resolving agent…" bar), so the deliberate
+  // scroll-up can clamp to a no-op (no scroll event → following never drops
+  // → no jump button) and the post-reload restore clamps to rowTopRel > 8
+  // (the flake this gate removes). 200px margin covers the bar swing, the
+  // placeholder→real height settling drift, and keeps the anchor a genuine
+  // mid-history position at any accumulated message count (serial suite +
+  // repeat-each share the fixture backend; leftover `other` messages from
+  // part-delta make the starting count vary). Serial turns (settle between
+  // each) avoid concurrent simulatePrompt goroutines interleaving on one
+  // session.
+  const midRowMargin = () =>
+    page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+      const rows = Array.from(el.querySelectorAll(".msg[data-mid]")) as HTMLElement[];
+      const elTop = el.getBoundingClientRect().top;
+      const mid = rows[Math.floor(rows.length / 2)];
+      if (!mid) return -1;
+      const midOffset = mid.getBoundingClientRect().top - elTop + el.scrollTop;
+      return el.scrollHeight - el.clientHeight - midOffset;
+    });
+  let turns = 0;
+  while (turns < 8) {
     await promptSession(
       page,
       "other",
-      `read-position anchor seed turn ${i + 1}.\nSecond line.\nThird line.\nFourth line.\nFifth line.`,
+      `read-position anchor seed turn ${turns + 1}.\nSecond line.\nThird line.\nFourth line.\nFifth line.`,
     );
     await waitForTurnSettled(page);
+    turns++;
+    if ((await midRowMargin()) >= 200) break;
   }
+  // Hard precondition: the anchor region is decisively scrollable. If a
+  // future layout change tightens the viewport, fail HERE with a clear
+  // signal instead of knife-edging into the clamp flake below.
+  expect(await midRowMargin()).toBeGreaterThanOrEqual(200);
 
   // Now messages exist. Glue to the tail: scroll to bottom → onScrolled
   // atBottom branch → clearReadAnchor (clears any stale anchor; defensive,
@@ -343,4 +380,172 @@ test("reload lands on the stored read-anchor [data-mid] row", async ({ page }) =
   // `following() && working()` Show is false regardless of working()).
   await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
   await expect(page.locator(".chat-live")).toHaveCount(0);
+});
+
+// Shared prologue for the post-restore INTERACTION tests (c)/(d): drives the
+// same REAL flow as test (b) — build an overflowing transcript on `other`
+// (geometry-gated on mid-row scroll margin), glue to the tail, write the read
+// anchor via the real scroll-up → debounced flushReadCursor path, reload, and
+// resolve only once maybeRestore has verifiably parked the viewport on the
+// stored anchor (same three-condition poll: atTop / notAtBottom / notAtOrigin).
+// Returns the persisted anchor id. Parameterized on the viewport so (c) keeps
+// the narrow-intent VP while (d) uses a desktop-width VP (>=721px) to render
+// the right-edge turn navigator.
+async function establishRestoredAnchor(
+  page: Page,
+  viewport: { width: number; height: number },
+  minMargin: number,
+): Promise<string> {
+  await page.setViewportSize(viewport);
+  await page.goto(projectUrl("/?session=other"));
+  await expect(page.locator(".chat-scroll")).toBeVisible({ timeout: 10000 });
+
+  // Build an overflowing transcript (same geometry-gated loop as test (b);
+  // serial turns avoid concurrent simulatePrompt goroutines).
+  const midRowMargin = () =>
+    page.locator(".chat-scroll").evaluate((el) => {
+      const rows = Array.from(el.querySelectorAll(".msg[data-mid]")) as HTMLElement[];
+      const elTop = el.getBoundingClientRect().top;
+      const mid = rows[Math.floor(rows.length / 2)];
+      if (!mid) return -1;
+      const midOffset = mid.getBoundingClientRect().top - elTop + el.scrollTop;
+      return el.scrollHeight - el.clientHeight - midOffset;
+    });
+  let turns = 0;
+  while (turns < 8) {
+    await promptSession(
+      page,
+      "other",
+      `read-position interaction seed turn ${turns + 1}.\nSecond line.\nThird line.\nFourth line.\nFifth line.`,
+    );
+    await waitForTurnSettled(page);
+    turns++;
+    if ((await midRowMargin()) >= minMargin) break;
+  }
+  expect(await midRowMargin()).toBeGreaterThanOrEqual(minMargin);
+
+  // Glue to the tail (known bottom-pinned start state), then anchor a genuine
+  // mid-history row via the real scroll path.
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expect(page.locator("button.jump")).toHaveCount(0, { timeout: 3000 });
+
+  const msgIds = await page
+    .locator(".msg[data-mid]")
+    .evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.mid ?? ""));
+  expect(msgIds.length).toBeGreaterThanOrEqual(4);
+  const anchorTarget = msgIds[Math.floor(msgIds.length / 2)];
+  expect(anchorTarget).toBeTruthy();
+
+  await scrollRowToTop(page, anchorTarget);
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  await page.waitForTimeout(600); // 400ms debounce → anchor persisted
+
+  const anchor = await readAnchor(page, "other");
+  expect(anchor).toBeDefined();
+  expect(msgIds).toContain(anchor!);
+
+  // RELOAD → fresh ChatView mount → poll until the restore lands on the
+  // anchored row (identical three-condition poll to test (b)).
+  await page.reload();
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  await expect
+    .poll(
+      async () => {
+        const g = await rowGeometry(page, anchor!);
+        if (g.rowTopRel === null) return 0;
+        const atTop = Math.abs(g.rowTopRel) <= 8;
+        const notAtBottom = g.scrollTop < g.maxScroll - 24;
+        const notAtOrigin = g.scrollTop > 24;
+        return atTop && notAtBottom && notAtOrigin ? 1 : 0;
+      },
+      { timeout: 8000 },
+    )
+    .toBe(1);
+  return anchor!;
+}
+
+// (c) POST-RELOAD WHEEL-DOWN — the restore drift servo must NOT revert the
+//     reader's own scroll. The natural "continue reading" gesture after a
+//     restore is scrolling DOWN; the servo's provenance sensor (wheel stamped
+//     only for deltaY < 0) missed it, so every wheel-down tick was classified
+//     as untrusted browser drift and corrected back to the anchor — the reader
+//     could not advance past the restored position at all.
+test("wheel down after restore advances the viewport instead of reverting", async ({ page }) => {
+  const anchor = await establishRestoredAnchor(page, VP, 300);
+  void anchor;
+
+  const scrollTopNow = () =>
+    page.locator(".chat-scroll").evaluate((el: HTMLElement) => el.scrollTop);
+  const before = await scrollTopNow();
+
+  // A REAL wheel-down over the chat viewport (position the mouse first —
+  // page.mouse.wheel dispatches at the current position).
+  const box = await page.locator(".chat-scroll").boundingBox();
+  expect(box).not.toBeNull();
+  await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+  await page.mouse.wheel(0, 200);
+  await page.waitForTimeout(500);
+
+  // The viewport STAYS scrolled down (advanced by roughly the wheel delta;
+  // >100 leaves headroom for clamp/sub-pixel). Under the defect the servo
+  // reverted the tick within the same scroll event, so this read ≈ before.
+  const after = await scrollTopNow();
+  expect(after).toBeGreaterThan(before + 100);
+
+  // ...and it REMAINS advanced after the input-freshness window (300ms) has
+  // fully elapsed — no deferred servo creep-back.
+  await page.waitForTimeout(600);
+  expect(await scrollTopNow()).toBeGreaterThan(before + 100);
+});
+
+// (d) POST-RELOAD NAVIGATOR-DOT JUMP — a jump initiated from OUTSIDE the scroll
+//     container must LAND, not be aborted. ChatNavigator renders as a sibling
+//     of .chat-scroll (inside .chat-main), so its dots were invisible to the
+//     servo's pointerdown sensor (scoped to .chat-scroll). The smooth
+//     scrollIntoView frames arrived with no stamped input → the trusted drift
+//     servo reverted them tick-by-tick, and each corrective scrollTop write
+//     also CANCELS the browser's smooth-scroll animation — the jump died at
+//     its first frame and the reader stayed stuck on the restore anchor.
+test("navigator dot jump after restore lands on the target turn", async ({ page }) => {
+  // Desktop-width VP (isDesktop = matchMedia(min-width: 721px)) so the
+  // right-edge turn navigator renders; the seeded turns give >= 2 user turns.
+  const anchor = await establishRestoredAnchor(page, { width: 1000, height: 600 }, 200);
+
+  const dots = page.locator(".chat-nav-dot");
+  await expect(dots.first()).toBeVisible({ timeout: 5000 });
+  expect(await dots.count()).toBeGreaterThanOrEqual(2);
+
+  // The first dot jumps to the FIRST user turn — a large upward jump from the
+  // mid-history anchor (block:"start" aligns that row's top to the scrollport
+  // top; ~16px container padding keeps it within the tolerance below).
+  const target = await page
+    .locator(".msg.user[data-mid]")
+    .first()
+    .evaluate((el) => (el as HTMLElement).dataset.mid ?? "");
+  expect(target).toBeTruthy();
+  expect(target).not.toBe(anchor);
+
+  await dots.first().click();
+  // The jump LANDS: the target turn's row reaches the viewport top region.
+  // Under the defect the aborted animation leaves it a full transcript away
+  // and this poll times out.
+  await expect
+    .poll(
+      async () => {
+        const g = await rowGeometry(page, target);
+        return g.rowTopRel !== null && Math.abs(g.rowTopRel) <= 48 ? 1 : 0;
+      },
+      { timeout: 5000 },
+    )
+    .toBe(1);
+
+  // ...and it STAYS landed well past the click's 300ms input-freshness window
+  // (no servo creep-back toward the abandoned restore anchor).
+  await page.waitForTimeout(700);
+  const g = await rowGeometry(page, target);
+  expect(g.rowTopRel).not.toBeNull();
+  expect(Math.abs(g.rowTopRel!)).toBeLessThanOrEqual(48);
 });

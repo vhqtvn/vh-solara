@@ -623,6 +623,123 @@ describe("classifyScrollDelta — restore / hydration / load-more", () => {
 });
 
 // ---------------------------------------------------------------------------
+// trustedNoUserInput — partial browser scroll-anchoring correction.
+//
+// During Deferred hydration the browser's overflow-anchor:auto PARTIALLY
+// tracks an above-anchor shrink: it moves scrollTop by less than anchorDelta
+// (its anchor node sits below our logical data-mid row). The strict
+// compensation gate (browser did not move at all) skips the cycle, the
+// remainder is never corrected (no further RO frames fire once heights
+// settle), and the restored reader sits ~a row off the anchor permanently —
+// the read-position e2e flake (observed −103px at 48 messages:
+// anchorDelta −287, browser moved −184, remainder +103 frozen).
+//
+// When the caller asserts input provenance (no fresh wheel/pointer over the
+// viewport — ChatView's Approach-A infra), the same-frame scrollTop movement
+// can only be browser/system anchoring, so the remainder is corrected to the
+// anchor-tracked expectation. Without the assertion the strict gate stands:
+// a genuinely scrolling reader is never corrected.
+// ---------------------------------------------------------------------------
+describe("classifyScrollDelta — trustedNoUserInput partial-tracking correction", () => {
+  function read(
+    previous: ScrollGeometry,
+    current: ScrollGeometry,
+    anchorDelta?: number,
+    trustedNoUserInput?: boolean,
+  ) {
+    return classifyScrollDelta({
+      previous,
+      current,
+      mode: "read" as ScrollMode,
+      following: false,
+      anchorDelta,
+      trustedNoUserInput,
+    });
+  }
+
+  it("partial browser tracking WITHOUT provenance → strict gate stands (no correction; pre-fix behavior)", () => {
+    // The e2e-observed undershoot frame: anchor offset −287, browser moved
+    // scrollTop only −184. Without provenance this must stay uncorrected —
+    // the movement is indistinguishable from a user scroll.
+    const d = read(
+      { scrollTop: 3039, scrollHeight: 6633, clientHeight: 406 },
+      { scrollTop: 2855, scrollHeight: 5894, clientHeight: 406 },
+      -287,
+    );
+    expect(d.expectedScrollTop).toBe(2752);
+    expect(d.residualUserDelta).toBe(103);
+    expect(d.intent).toBe("user-scroll-down");
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("partial browser tracking WITH provenance → remainder corrected to anchor-tracked expectation", () => {
+    const d = read(
+      { scrollTop: 3039, scrollHeight: 6633, clientHeight: 406 },
+      { scrollTop: 2855, scrollHeight: 5894, clientHeight: 406 },
+      -287,
+      true,
+    );
+    expect(d.expectedScrollTop).toBe(2752);
+    expect(d.intent).toBe("none"); // corrected, NOT mistaken for user scroll
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(2752);
+  });
+
+  it("partial tracking on GROW-above with provenance → corrected too", () => {
+    // Mirror shape: hydration grows above the anchor (+250) but the browser
+    // tracked only +100 (its anchor node below ours under-tracked).
+    const d = read(
+      { scrollTop: 500, scrollHeight: 1500, clientHeight: 600 },
+      { scrollTop: 600, scrollHeight: 1750, clientHeight: 600 },
+      250,
+      true,
+    );
+    expect(d.expectedScrollTop).toBe(750);
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(750);
+  });
+
+  it("provenance does NOT override a movement LARGER than anchorDelta (over-tracking/external stays strict)", () => {
+    // scrollTop moved −400 while the anchor only shifted −287: the excess
+    // (−113) looks like user scroll. Provenance must not "correct" it back —
+    // the loosened gate only admits movement smaller than the anchor shift.
+    const d = read(
+      { scrollTop: 3039, scrollHeight: 6633, clientHeight: 406 },
+      { scrollTop: 2639, scrollHeight: 5894, clientHeight: 406 },
+      -287,
+      true,
+    );
+    expect(d.residualUserDelta).toBe(-113);
+    expect(d.intent).toBe("user-scroll-up");
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("provenance with anchorDelta 0 (grow-below) → still churn, no write", () => {
+    const d = read(
+      { scrollTop: 500, scrollHeight: 2000, clientHeight: 600 },
+      { scrollTop: 500, scrollHeight: 2500, clientHeight: 600 },
+      0,
+      true,
+    );
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("full browser tracking WITH provenance → already correct, no write", () => {
+    // Browser moved exactly anchorDelta: residual 0 → nothing to correct.
+    const d = read(
+      { scrollTop: 3039, scrollHeight: 6633, clientHeight: 406 },
+      { scrollTop: 2752, scrollHeight: 5894, clientHeight: 406 },
+      -287,
+      true,
+    );
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Interaction-scoped follow hold (Approach E) — pure classifier invariant.
 //
 // While the operator interacts with the PendingInput blocker card, ChatView

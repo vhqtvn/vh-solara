@@ -57,14 +57,40 @@ const RECOVERY_TAIL_GAP = 64;
 // reader (~300px, P1-WEB-042) is rejected. Absolute (not a viewport fraction)
 // for the same reason as RECOVERY_TAIL_GAP.
 const TURN_FINISH_RECOVERY_GAP = 200;
-// Max age (ms) of a wheel/touch input for it to back a scroll-away as genuine
-// reader intent (the Approach A input-backed veto — see the busy→idle effect).
-// A real wheel produces its scroll event within a frame (~16ms); 300ms
-// comfortably admits it while expiring a stale marker before a later, unrelated
-// (:1178-style) geometry misclassification can misuse it as fake input
-// provenance. No timer is needed — onScrolled reads the timestamp and the
-// staleness check naturally rejects an old one.
+// Max age (ms) of a physical input (wheel/pointer/key) for it to back a
+// scroll-away as genuine reader intent (the Approach A input-backed veto —
+// see the busy→idle effect). A real wheel produces its scroll event within a
+// frame (~16ms); 300ms comfortably admits it while expiring a stale marker
+// before a later, unrelated (:1178-style) geometry misclassification can
+// misuse it as fake input provenance. No timer is needed — onScrolled reads
+// the timestamp and the staleness check naturally rejects an old one. This
+// expiry is ALSO the marker's ONLY lifecycle bound: there is deliberately NO
+// consume-clear at the end of onScrolled — a continuous gesture (scrollbar
+// drag, touch pan, smooth scrollIntoView) fires MANY scroll events from ONE
+// pointerdown, and consuming the marker after the first event would strip
+// provenance from the rest of the gesture, letting the trusted drift servo
+// yank the reader mid-gesture.
 const INPUT_FRESHNESS_MS = 300;
+// Keys that scroll a scroll container when focus is inside it (arrows,
+// PageUp/PageDown, Home/End, Space) or activate the focused control
+// (Enter/Space — e.g. a navigator dot fired from the keyboard). The
+// transcript CONTAINS tabindex=0 elements (ToolPart diff/output panes,
+// MessageRow's .msg-perf), so keyboard scroll-nav over .chat-scroll is a REAL
+// reader modality, not a moot one — keydown bubbles from those focused
+// children up to .chat-main, where the input sensor lives. Tight on purpose:
+// unrelated keys (modifiers, plain letters) stamp nothing.
+const SCROLL_NAV_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+  "Enter",
+]);
 import QuestionCard from "./QuestionCard";
 import PermissionCard from "./PermissionCard";
 import PendingInput from "./PendingInput";
@@ -480,13 +506,15 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // ~96px drift (the :1178 race — recover) from a genuine ~96px scroll-up (a
   // deliberate reader — must NOT yank). The discriminator is PHYSICAL INPUT
   // provenance: the :1178 race is geometry-only (composer autosize + a streamed
-  // chunk fire NO wheel/pointer over the viewport), while a deliberate scroll-up
-  // has real input. `pendingInputAt` is stamped by wheel/pointerdown listeners on
-  // the scroll viewport (onMount below) and consumed by onScrolled's user-scroll-
-  // away branch to arm `inputBackedAway`. The geometry classifier cannot
-  // fabricate input provenance, so the :1178 misclassification — which reaches
-  // onScrolled as a bogus user-scroll-up — does NOT arm the veto (pendingInputAt
-  // is stale/0), leaving the geometric recovery intact. `inputBackedAway` mirrors
+  // chunk fire no input over the viewport), while a deliberate scroll-up has
+  // real input. `pendingInputAt` is stamped by the input listeners on the chat
+  // viewport REGION (.chat-main — the scroll container AND its overlays; see
+  // the onMount sensor block) and read by onScrolled's user-scroll-away branch
+  // to arm `inputBackedAway`, by the contentEl RO's read-mode correction, and
+  // by onScrolled's drift servo. The geometry classifier cannot fabricate
+  // input provenance, so the :1178 misclassification — which reaches onScrolled
+  // as a bogus user-scroll-up — does NOT arm the veto (pendingInputAt is
+  // stale/0), leaving the geometric recovery intact. `inputBackedAway` mirrors
   // userScrolledUp's lifecycle: armed on a genuine scroll-away, cleared at every
   // re-engage (reached-bottom, jumpToLatest, the RO-recovery branches, session
   // switch). DELIBERATELY NOT cleared at busy→idle: it persists so a reader who
@@ -494,7 +522,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // (An earlier flag-based attempt gated on onScrolled's own classification and
   // gave 5/40 — the :1178 misclassification set that flag too; sourcing the
   // signal from real input events OUTSIDE onScrolled is what defeats it.)
-  let pendingInputAt = 0; // ms timestamp of the last wheel/pointerdown over the viewport; 0 = none
+  let pendingInputAt = 0; // ms timestamp of the last physical input over the chat viewport region; 0 = none
   let inputBackedAway = false; // durable: the current off-tail episode is input-backed
   createEffect(() => {
     const w = working();
@@ -514,6 +542,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         setUserScrolledUp(false);
         contentROArmedLatch = false;
         preArmGap = Infinity;
+        endAnchorServo(); // re-engage following ⇒ anchor servo state is stale, drop it
         pin();
       }
     }
@@ -525,6 +554,39 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // intent during hydration / load-more.
   let restoredAnchorId: string | undefined;
   let restoredAnchorOffset = -1;
+  // The anchor's viewport-relative top at the last accepted instant (NaN =
+  // untracked). onScrolled's trusted drift servo corrects browser
+  // partial-tracking against it; user-backed events re-baseline it. See the
+  // baseline-pair comment in onScrolled for the full mechanics.
+  let restoredAnchorVtop = NaN;
+  // Restore-contract servo: TRUE from maybeRestore's anchor positioning
+  // until the reader's FIRST fresh physical input (wheel/pointer/key) — exactly
+  // the window where the product promises "reload lands you ON the anchor".
+  // While armed, corrections are ABSOLUTE (hold the anchor at the
+  // restore-captured vtop), because the incremental chain (anchorDelta +
+  // scroll-event servo) can only PRESERVE whatever offset existed at each
+  // baselining instant — a browser partial-tracking error captured at any
+  // such instant is defended forever (observed −103/+40px residuals). The
+  // first user input disarms it permanently; afterwards the incremental
+  // regime owns the viewport and a reader is never yanked.
+  let anchorServoArmed = false;
+  // Tear down the WHOLE restored-anchor servo state (armed flag + anchor id +
+  // content-offset baseline + viewport-top baseline), not just the armed flag.
+  // Every transition back INTO following — jumpToLatest, reached-bottom, the
+  // busy→idle / RO recoveries — must clear all of it: leaving a stale
+  // restoredAnchorId/Vtop behind while following=true lets a LATER
+  // system-driven following-drop (the :1178 composer-grow misclassification)
+  // measure the abandoned anchor against the stale baseline and yank the tail
+  // reader (the vtop baseline is otherwise only re-baselined while
+  // !following(), so it goes stale for exactly as long as the reader follows).
+  // The session-switch effect uses this too. restoredFor is deliberately NOT
+  // touched (it is the restore-once lock, not servo state).
+  function endAnchorServo() {
+    anchorServoArmed = false;
+    restoredAnchorId = undefined;
+    restoredAnchorOffset = -1;
+    restoredAnchorVtop = NaN;
+  }
   function geom(el: HTMLElement | undefined): ScrollGeometry {
     if (!el) return { scrollTop: -1, scrollHeight: -1, clientHeight: -1 };
     return { scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
@@ -549,6 +611,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     setUserScrolledUp(false); // user explicitly chose to follow again
     inputBackedAway = false; // Approach A: explicit re-engage clears the veto
     pendingInputAt = 0;
+    endAnchorServo(); // explicit jump = restore contract AND anchor state ended
     pin();
   }
   // Tail-follow bridge (host tail/follow control): expose the active chat's
@@ -592,6 +655,9 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     if (!el) return;
     restoredAnchorId = cand;
     restoredAnchorOffset = anchorContentOffset(el);
+    // Load-older preserves the reader's CURRENT viewport position (not the
+    // restore target) — refresh the servo baseline to this instant.
+    restoredAnchorVtop = el.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
   }
   const { hasOlder, loadingOlder, onLoadOlder } = createLoadOlder({
     sessionId: () => props.sessionId,
@@ -777,6 +843,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         restoredAnchorId = anchor;
         restoredAnchorOffset = anchorContentOffset(el);
         pinnedGeom = geom(scrollEl);
+        // Arm the restore-contract servo at the exact instant of positioning:
+        // the measured post-write vtop (incl. any clamp error) is the target
+        // every trusted correction holds until the reader's first input.
+        anchorServoArmed = true;
+        restoredAnchorVtop = el.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
       } else {
         // Stale anchor (message since deleted) — fall back to the bottom.
         setFollowing(true);
@@ -854,8 +925,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // valid snapshot yet" sentinel, so the first real pin after switch
         // proceeds normally.
         pinnedGeom = { scrollTop: -1, scrollHeight: -1, clientHeight: -1 };
-        restoredAnchorId = undefined;
-        restoredAnchorOffset = -1;
+        endAnchorServo();
         restoredFor = "";
         // Reset the recovery/latch state too: a spurious arm in the LEAVING
         // session (contentROArmedLatch/preArmGap) must not carry into the
@@ -1046,11 +1116,46 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         if (ael) {
           const off = anchorContentOffset(ael);
           const anchorDelta = restoredAnchorOffset >= 0 ? off - restoredAnchorOffset : 0;
-          const d = classifyScrollDelta({ previous: pinnedGeom, current, mode: "read", following: false, anchorDelta });
+          // Input provenance (Approach A infra): this frame carries no fresh
+          // wheel/pointer/key input over the viewport region ⇒ any same-frame
+          // scrollTop movement is browser/system scroll-anchoring, so the
+          // reducer may also correct PARTIAL tracking (browser moved by less
+          // than anchorDelta — its anchor node sits below our logical row and
+          // under-tracks above-anchor shrink during Deferred hydration).
+          // Without this, the un-corrected remainder persists after heights
+          // settle (no further RO frames) and the restored reader sits ~a row
+          // off the anchor permanently (the read-position e2e flake, −103px).
+          // A reader with fresh input keeps the strict gate — never yanked
+          // (wheel in either direction, pointer incl. drag, scroll-nav keys).
+          const freshInput = pendingInputAt !== 0 && Date.now() - pendingInputAt < INPUT_FRESHNESS_MS;
+          const d = classifyScrollDelta({
+            previous: pinnedGeom,
+            current,
+            mode: "read",
+            following: false,
+            anchorDelta,
+            trustedNoUserInput: !freshInput,
+          });
           if (d.shouldScroll && d.newScrollTop !== undefined) {
             scrollEl.scrollTop = d.newScrollTop;
           }
+          // Armed restore-contract servo: while no user input has arrived
+          // since positioning, hold the anchor ABSOLUTELY at the
+          // restore-captured vtop — the incremental write above can only
+          // preserve the offset it inherited, so any institutionalized drift
+          // (browser partial tracking captured at a baselining instant) is
+          // snapped out here instead of defended.
+          if (anchorServoArmed && !freshInput) {
+            const vt = ael.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
+            if (Math.abs(vt - restoredAnchorVtop) > 1) {
+              scrollEl.scrollTop += layoutPx(vt - restoredAnchorVtop);
+            }
+          }
           restoredAnchorOffset = off; // advance measured baseline
+          // Keep the servo baseline current so the next trusted scroll event
+          // measures drift from this cycle's settled truth (NaN-safe: an
+          // untracked anchor just records).
+          restoredAnchorVtop = ael.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
         }
       } else if (contentROArmedLatch) {
         // (b) non-recovery fix: a concurrent content-grow + viewport-shrink frame
@@ -1075,6 +1180,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           preArmGap = Infinity;
           inputBackedAway = false; // Approach A: re-engage clears the veto
           pendingInputAt = 0;
+          endAnchorServo(); // re-engage following ⇒ anchor servo state is stale, drop it
           pin();
         }
       }
@@ -1155,6 +1261,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           preArmGap = Infinity;
           inputBackedAway = false; // Approach A: re-engage clears the veto
           pendingInputAt = 0;
+          endAnchorServo(); // re-engage following ⇒ anchor servo state is stale, drop it
           pin();
           return;
         }
@@ -1182,6 +1289,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         preArmGap = Infinity;
         inputBackedAway = false; // Approach A: re-engage clears the veto
         pendingInputAt = 0;
+        endAnchorServo(); // re-engage following ⇒ anchor servo state is stale, drop it
         pin();
       }
     });
@@ -1189,47 +1297,70 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     onCleanup(() => ro.disconnect());
   });
 
-  // Approach A — physical-input provenance listeners for the busy→idle veto.
-  // Stamp `pendingInputAt` on a real input over the chat viewport so onScrolled's
-  // user-scroll-away branch can arm `inputBackedAway`. These are OUTSIDE the
-  // geometry classifier, so the :1178 race (which fires NO real input — it is
-  // composer autosize + a streamed chunk) cannot fake provenance. Two surfaces
-  // cover every deliberate-reader modality except keyboard (the chat viewport is
-  // not focusable, so keyboard scroll-nav is moot):
-  //   • wheel       — wheel/trackpad (the deterministic e2e path).
-  //   • pointerdown — mouse/touch/pen AND scrollbar-thumb drag: a pointer press
-  //     over the scroll container (including its scrollbar lane) precedes every
-  //     pointer-driven scroll-away. Direction is resolved by onScrolled's
-  //     classification, so a press that does not scroll away simply never arms
-  //     the veto. passive where it matters: observation only — never
-  //     preventDefault — and a passive wheel listener avoids WebRender scroll-
-  //     jank on the always-present scroll surface (AGENTS.md "Web frontend
-  //     performance"). pointerdown has no default scroll action to block.
-  // ChatView is reused across sessions and scrollEl is stable across the reuse,
-  // so a single onMount mount/unmount pair covers the component's lifetime.
+  // Approach A — physical-input provenance listeners. Stamp `pendingInputAt`
+  // on real input over the chat viewport REGION so onScrolled's user-scroll-
+  // away branch can arm `inputBackedAway`, the contentEl RO's read-mode
+  // correction can pick the strict gate, and the drift servo can hand the
+  // viewport to the reader. These are OUTSIDE the geometry classifier, so the
+  // :1178 race (which fires NO real input — it is composer autosize + a
+  // streamed chunk) cannot fake provenance. Four surfaces on .chat-main cover
+  // every deliberate-reader modality:
+  //   • wheel        — wheel/trackpad in BOTH directions (the deterministic
+  //     e2e paths: wheel-up no-yank AND post-restore wheel-down continue-
+  //     reading). Stamping down used to be skipped to keep a coincident :1178
+  //     up-misclassification from falsely arming the veto, but the drift servo
+  //     ALSO reads this marker and an unstamped wheel-down made every
+  //     post-restore down-tick "trusted" drift — the servo reverted the
+  //     reader's own scrolling tick-by-tick. The residual veto exposure (a
+  //     real wheel within 300ms of a :1178 misclassification falsely arming
+  //     it) is bounded by INPUT_FRESHNESS_MS + the geometric gate, and costs
+  //     at most one skipped re-glue (recoverable via "↓ Latest").
+  //   • pointerdown  — mouse/touch/pen AND scrollbar-thumb drag. Scoped to
+  //     .chat-main (the scroll viewport + its overlays), NOT .chat-scroll: the
+  //     turn navigator's dots render OUTSIDE the scroll container, and a nav
+  //     jump is user input too — without this scoping the drift servo treated
+  //     the jump's smooth-scroll frames as untrusted drift, reverted them,
+  //     and each corrective scrollTop write also CANCELED the smooth
+  //     animation (the jump died at its first frame).
+  //   • pointermove  — with a button held (e.buttons !== 0): restamps through
+  //     a continuous drag so the many scroll events of ONE gesture keep their
+  //     provenance (hover moves stamp nothing). Together with dropping the
+  //     end-of-onScrolled consume-clear, a drag no longer loses provenance
+  //     after its first scroll event.
+  //   • keydown      — scroll-nav/activation keys (SCROLL_NAV_KEYS), bubbling
+  //     from the tabindex=0 elements the transcript CONTAINS (ToolPart panes,
+  //     .msg-perf) and from the navigator/Latest buttons. Keyboard scrolling
+  //     is a real modality, not a moot one.
+  // passive where it matters: observation only — never preventDefault — and a
+  // passive wheel listener avoids WebRender scroll-jank on the always-present
+  // scroll surface (AGENTS.md "Web frontend performance"). The composer is
+  // OUTSIDE .chat-main, so typing and composer drags never stamp. ChatView is
+  // reused across sessions and chatMainEl is stable across the reuse, so a
+  // single onMount mount/unmount pair covers the component's lifetime.
   onMount(() => {
-    if (!scrollEl) return;
-    // Wheel: only an UPWARD wheel (deltaY < 0) can precede a scroll-away-to-
-    // read-history; arming on down would let a coincident :1178 up-
-    // misclassification falsely arm the veto.
-    const onWheel = (e: WheelEvent) => {
-      if (e.deltaY < 0) pendingInputAt = Date.now();
+    if (!chatMainEl) return;
+    const onWheel = () => {
+      pendingInputAt = Date.now();
     };
-    // pointerdown covers mouse, touch, pen, AND scrollbar-thumb drag (a press on
-    // the scrollbar lane targets the scroll container). It fires at the START of
-    // the gesture; onScrolled's fresh-input correlation (within INPUT_FRESHNESS_MS)
-    // arms the veto on the resulting scroll-away. Shares the exact onScrolled
-    // correlation path proven by the wheel-based busy→idle no-yank test; the
-    // pointer (scrollbar-drag) path is proven by the pointer-drag no-yank test.
     const onPointerDown = () => {
       pendingInputAt = Date.now();
     };
-    const node = scrollEl;
+    const onPointerMove = (e: PointerEvent) => {
+      if (e.buttons !== 0) pendingInputAt = Date.now();
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (SCROLL_NAV_KEYS.has(e.key)) pendingInputAt = Date.now();
+    };
+    const node = chatMainEl;
     node.addEventListener("wheel", onWheel, { passive: true });
     node.addEventListener("pointerdown", onPointerDown);
+    node.addEventListener("pointermove", onPointerMove);
+    node.addEventListener("keydown", onKeyDown);
     onCleanup(() => {
       node.removeEventListener("wheel", onWheel);
       node.removeEventListener("pointerdown", onPointerDown);
+      node.removeEventListener("pointermove", onPointerMove);
+      node.removeEventListener("keydown", onKeyDown);
     });
   });
 
@@ -1262,6 +1393,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       setFollowing(true);
       setUserScrolledUp(false);
       inputBackedAway = false; // Approach A: re-engage clears the input veto
+      endAnchorServo(); // bottom re-glue = restore contract AND anchor state ended
       if (!props.draft) {
         clearReadAnchor(props.sessionId);
         readStash.invalidateIfSession(props.sessionId);
@@ -1275,12 +1407,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       setUserScrolledUp(true);
       contentROArmedLatch = false; // genuine user scroll → NOT eligible for contentEl RO recovery
       preArmGap = Infinity;
+      anchorServoArmed = false; // the reader owns the viewport now
       // Approach A: if this scroll-away was backed by fresh physical input (a
-      // real wheel/pointer within INPUT_FRESHNESS_MS), arm the durable veto so the
+      // real wheel/pointer/key within INPUT_FRESHNESS_MS), arm the durable veto so the
       // busy→idle turn-finish recovery does NOT yank a deliberate reader. The
       // :1178 race has no physical input → pendingInputAt is stale/0 → the veto
-      // stays unset → geometric recovery remains intact. (Read BEFORE the
-      // consume-clear at the end of onScrolled.)
+      // stays unset → geometric recovery remains intact. (The marker is NOT
+      // consume-cleared here — see INPUT_FRESHNESS_MS: the 300ms expiry is its
+      // only bound, so continuous gestures keep their provenance.)
       if (pendingInputAt && Date.now() - pendingInputAt < INPUT_FRESHNESS_MS) {
         inputBackedAway = true;
       }
@@ -1300,14 +1434,72 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // Advance the baseline to the settled geometry (after any write) so the
     // next scroll/RO event computes an incremental delta.
     pinnedGeom = geom(scrollEl);
-    // Approach A: onScrolled is the correlation point for pendingInputAt — once
-    // it has run, the input's effect is classified (armed the veto above or
-    // not), so consume the marker. This keeps the veto's input provenance tight:
-    // a real wheel re-stamps it on the next gesture, while a stray marker cannot
-    // linger into a later (:1178-style) misclassification. (The staleness check
-    // in the arm branch is the secondary safety net for a wheel that fires NO
-    // scroll event.)
-    pendingInputAt = 0;
+    // Read-mode anchor alignment (baseline pair + trusted drift servo).
+    //
+    // The contentEl RO's anchor correction derives anchorDelta against
+    // (pinnedGeom, restoredAnchorOffset). A scroll event between two RO
+    // cycles advances pinnedGeom HERE — if restoredAnchorOffset lags at its
+    // last-RO value, the next RO adds the FULL inter-RO anchor shift on top
+    // of the already-moved st baseline and overshoots by exactly the
+    // browser's partial move (observed +40px during Deferred hydration).
+    // Re-baseline the anchor offset at the SAME instant so both sides of the
+    // delta refer to one moment.
+    //
+    // The servo: the browser's scroll-anchoring can PARTIALLY track an
+    // above-anchor shift (its anchor node sits below our logical row), and
+    // once this scroll event re-baselines, that partial-tracking error is
+    // invisible to every later RO (anchorDelta ≈ 0) — the restored reader
+    // sits tens of px off the anchor permanently. When the event carries NO
+    // fresh physical input (wheel/pointer/key — Approach A provenance), the
+    // scrollTop movement was browser/system anchoring, so the measured drift
+    // of the anchor's viewport-top vs its last accepted value is corrected
+    // here. A user-backed event NEVER corrects — it re-baselines (accepts
+    // the reader's chosen position). NaN sentinel = untracked: first event
+    // after restore/load-older baselines without correcting.
+    //
+    // "Trusted" is TWO-TIER (provenance review fix):
+    //   • armed era (anchorServoArmed, i.e. NO user input since restore):
+    //     provenance only. The classify result is NOT consulted because this
+    //     handler's classify call cannot pass anchorDelta — a browser
+    //     partial-tracking shift of >1px arrives here classified as
+    //     user-scroll, and gating on it would kill the exact corrections the
+    //     armed era exists to make (the observed −103px/+40px residuals). In
+    //     this era there is no user input by definition, so untrusted =
+    //     fresh physical input = the reader taking ownership.
+    //   • post-disarm era (the reader has input at least once): provenance
+    //     AND the classify result — never correct a frame classified as
+    //     user-scroll-up/down. This is the belt for modalities the sensors
+    //     might still miss and for programmatic scrolls that carry no sensor
+    //     at all: a navigator-dot jump, a wheel-down, a keyboard scroll all
+    //     classify as user intent (large residual, no anchor shift modeled
+    //     here) and must NEVER be reverted — pre-fix, an unstamped wheel-down
+    //     or a nav jump was reverted tick-by-tick (and the corrective write
+    //     also canceled the browser's smooth-scroll animation).
+    if (restoredAnchorId && !following()) {
+      const ael = scrollEl.querySelector(`[data-mid="${cssEsc(restoredAnchorId)}"]`) as HTMLElement | null;
+      if (ael) {
+        const vtop = ael.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
+        const freshInput = pendingInputAt !== 0 && Date.now() - pendingInputAt < INPUT_FRESHNESS_MS;
+        const userIntent = d.intent === "user-scroll-up" || d.intent === "user-scroll-down";
+        const trusted = !freshInput && (anchorServoArmed || !userIntent);
+        // First fresh physical input since restore: the reader has taken
+        // ownership of the viewport — disarm the absolute restore servo
+        // permanently (the incremental regime below never yanks them).
+        if (!trusted) anchorServoArmed = false;
+        if (trusted && !Number.isNaN(restoredAnchorVtop) && Math.abs(vtop - restoredAnchorVtop) > 1) {
+          scrollEl.scrollTop += layoutPx(vtop - restoredAnchorVtop);
+          pinnedGeom = geom(scrollEl);
+        }
+        restoredAnchorOffset = anchorContentOffset(ael);
+        const settled = ael.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
+        restoredAnchorVtop = settled;
+      }
+    }
+    // Approach A: the marker's only lifecycle bound is the INPUT_FRESHNESS_MS
+    // expiry (see its decl) — deliberately NO consume-clear here, so the
+    // scroll events of a continuous gesture (drag / touch pan / smooth
+    // scrollIntoView) all keep the provenance of the gesture's initiating
+    // input.
     navigator.scheduleActiveTurn();
   }
 

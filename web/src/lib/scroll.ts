@@ -188,6 +188,15 @@ export interface ClassifyScrollDeltaArgs {
   // so a browser that did NOT keep the anchor pinned is corrected instead of
   // being read as user intent.
   anchorDelta?: number;
+  // Caller-asserted input provenance (read mode only): when true, the caller
+  // guarantees there is NO fresh physical user input (wheel/pointer) over the
+  // scroll viewport for this frame, so any same-frame scrollTop movement can
+  // only be browser/system scroll-anchoring — and PARTIAL tracking (the
+  // browser moved scrollTop by less than anchorDelta) is corrected to the
+  // anchor-tracked expectation rather than left as a permanent offset. The
+  // base gate (browser did not move at all) stays the default so callers
+  // without provenance keep the strict, yank-safe behavior.
+  trustedNoUserInput?: boolean;
   // Absorb sub-pixel / clamp churn. Default ~1px.
   epsilon?: number;
 }
@@ -240,12 +249,25 @@ export function classifyScrollDelta(
   // user scroll) yet the residual against the anchor-tracked expectation is
   // large. Covers both grow-above-froze (residual negative) and
   // shrink-above-froze (residual positive), unified by abs().
-  if (
+  //
+  // trustedNoUserInput widens the "barely moved" gate to cover PARTIAL
+  // browser tracking: the browser's scroll-anchoring moved scrollTop by some
+  // amount that is NOT anchorDelta (its anchor node is usually below our
+  // logical anchor row, so above-anchor shrink under-tracks). Without this,
+  // the un-corrected remainder persists forever after heights settle (no
+  // further ResizeObserver frames fire) — the restored reader sits ~a row off
+  // their anchor (observed −103px at e2e load; read-position flake). The
+  // caller may only assert this when no fresh physical input exists over the
+  // chat viewport region (ChatView's Approach-A provenance: wheel in either
+  // direction, pointer press/drag, scroll-nav keydown), so a genuinely
+  // scrolling reader is never corrected/yanked.
+  const browserUnmoved = Math.abs(curr.scrollTop - prev.scrollTop) <= eps;
+  const compensationEligible =
     args.mode === "read" &&
     anchorDelta !== 0 &&
-    Math.abs(curr.scrollTop - prev.scrollTop) <= eps &&
-    Math.abs(residualUserDelta) > eps
-  ) {
+    (browserUnmoved || (args.trustedNoUserInput === true && Math.abs(curr.scrollTop - prev.scrollTop) < Math.abs(anchorDelta) + eps)) &&
+    Math.abs(residualUserDelta) > eps;
+  if (compensationEligible) {
     intent = "none";
     shouldScroll = true;
     newScrollTop = expectedScrollTop;
