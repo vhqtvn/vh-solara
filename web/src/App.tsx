@@ -229,7 +229,7 @@ export default function App() {
   // switch/change, never on poll churn.
   const activeViewKey = () => {
     const v = activeEmbedded();
-    return v ? `${v.view_id} ${v.path_prefix} ${v.sandbox || ""}` : undefined;
+    return v ? `${v.view_id}\x00${v.path_prefix}\x00${v.sandbox || ""}` : undefined;
   };
 
   // Long-press on the Settings button opens the server-admin popup (right-click
