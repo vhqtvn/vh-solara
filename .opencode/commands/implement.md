@@ -6,8 +6,8 @@ subtask: false
 
 Resolve the target plan for the current OpenCode session and implement it.
 
-- consult `docs/ai/codebase-operational-primitives.md` for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not rediscover these from scratch.
-- git mutations must flow through the `committer` agent via the gated-commit protocol. Load the `gated-commit` skill for details.
+- consult `docs/ai/codebase-operational-primitives.md` (when one exists) for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not chase or fail when it is absent, and do not rediscover these from scratch when it is present.
+- git mutations must flow through the `committer` agent via the gated-commit protocol **where `core/gated-commit` is selected**; on profiles without it, automated committing is unavailable — preserve the work, report the missing route, and request separately-authorized activation or operator handling (`.opencode/docs/git-execution-routing.md` → "Capability condition"). Load the `gated-commit` skill for details.
 
 First call the `plan_state` tool with:
 - `operation`: `resolve_plan`
@@ -45,4 +45,4 @@ After changes:
 - list any follow-up work
 - suggest targeted verification commands
 
-For git operations, follow `.opencode/docs/git-execution-routing.md`.
+For git operations, follow `.opencode/docs/git-execution-routing.md` — including its "Capability condition" section (on profiles without `core/gated-commit` selected, automated committing is unavailable: preserve the work, report the missing route, and request separately-authorized activation or operator handling).

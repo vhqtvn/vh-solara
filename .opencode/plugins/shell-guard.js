@@ -81,17 +81,36 @@ import {
 //   - Multiple matching grants list deterministically (agent, pattern, action
 //     sort order).
 //
-// Pattern matching models the canonical trailing-" *" table shapes
-// (token-prefix semantics, mirroring the engine's allowlist matcher); richer
-// glob forms simply fail to match, which is message-only impact — the deny
-// itself always stands. A bare "*" catch-all grant compiles to zero tokens
-// and is deliberately never listed (naming it on every deny would be pure
-// noise).
+// Pattern matching models the canonical table shapes with token-prefix
+// semantics, mirroring the engine's allowlist matcher. Emitted-shape coverage
+// (enumerated from internal/permconfig/tables.go — every CommandGroups entry,
+// DevShCommand "vh-agent-harness *", the exact BacklogCommand, the gate
+// "…commit-gate.sh status" probe, "uuidgen", and the "*" catch-all that
+// computeBashBlock always emits):
+//   - trailing-" *" wildcard patterns (`ls *`, `git --no-pager diff *`,
+//     `.opencode/scripts/commit-gate.sh acquire *`) — matched exactly
+//     (token prefix + wildcard over additional trailing tokens);
+//   - exact token sequences with NO star (`uuidgen`,
+//     `.opencode/scripts/commit-gate.sh status`) — matched exactly (token
+//     equality, same length); dot-path first tokens are ordinary tokens;
+//   - the bare "*" catch-all compiles to zero tokens and is deliberately
+//     never listed (naming it on every deny would be pure noise).
+// LIMITATION (fail-to-match, message-only impact): a `*` anywhere OTHER than
+// the trailing position (interior `cat *=x *`, leading `*git *`) is treated
+// as a literal token character — real command tokens never contain `*`, so
+// such a pattern can never match and its grant is simply not named. A `*`
+// appended DIRECTLY to a token with no preceding space (`git*`) compiles as
+// a wildcard over the bare token and would match/list — a pre-existing
+// shape no emitted table entry uses. The deny itself always stands; only
+// the suffix listing is affected. (The enumeration above is a snapshot of
+// internal/permconfig/tables.go; this LIMITATION paragraph is the governing
+// contract — refresh the enumeration when the emitted shape grammar grows.)
 //
-// Fail-open by design: if opencode.jsonc is absent, unreadable, or not JSON
-// (the canonical emitter's output always is), there is simply no suffix — the
-// plain engine deny stands unchanged. Evaluation semantics and engine-over-
-// table precedence are NOT touched; only the deny MESSAGE is enriched.
+// Fail-open by design: if opencode.jsonc is absent, unreadable, or not
+// parseable as JSON or JSONC (see parseJSONCTolerant for the exact JSONC
+// contract), there is simply no suffix — the plain engine deny stands
+// unchanged. Evaluation semantics and engine-over-table precedence are NOT
+// touched; only the deny MESSAGE is enriched.
 // ---------------------------------------------------------------------------
 
 // compileGrantPattern tokenizes one permission.bash pattern the same way the
@@ -117,15 +136,113 @@ function grantMatchesCommand(grant, commandTokens) {
     return grant.wildcard || commandTokens.length === grant.tokens.length;
 }
 
+// stripJSONCComments removes // line comments and /* block */ comments from a
+// JSONC string while preserving string contents (a // or /* inside a JSON
+// string value, such as a URL, is NOT a comment). Newlines outside comments
+// are preserved. String-aware state machine mirroring internal/jsonc
+// StripComments — the JS twin of the binary's single canonical stripper.
+function stripJSONCComments(s) {
+    let out = "";
+    let inStr = false;
+    for (let i = 0; i < s.length; i++) {
+        const c = s[i];
+        if (inStr) {
+            out += c;
+            if (c === "\\") {
+                if (i + 1 < s.length) {
+                    out += s[i + 1];
+                    i++;
+                }
+            } else if (c === '"') {
+                inStr = false;
+            }
+        } else if (c === '"') {
+            inStr = true;
+            out += c;
+        } else if (c === "/" && s[i + 1] === "/") {
+            // line comment: skip to (but not past) the newline
+            while (i < s.length && s[i] !== "\n") i++;
+            i--; // outer i++ lands back on the newline, which is then emitted
+        } else if (c === "/" && s[i + 1] === "*") {
+            // block comment: skip to the closing */
+            i += 2;
+            while (i + 1 < s.length && !(s[i] === "*" && s[i + 1] === "/")) i++;
+            if (i + 1 < s.length) i++; // now at '/'; outer i++ moves past it
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+// stripJSONCTrailingCommas removes trailing commas (a "," followed by
+// optional whitespace and then "]" or "}") outside strings. String-aware: a
+// comma inside a string is never dropped. Mirrors internal/jsonc
+// StripTrailingCommas.
+function stripJSONCTrailingCommas(s) {
+    let out = "";
+    let inStr = false;
+    for (let i = 0; i < s.length; i++) {
+        const c = s[i];
+        if (inStr) {
+            out += c;
+            if (c === "\\") {
+                if (i + 1 < s.length) {
+                    out += s[i + 1];
+                    i++;
+                }
+            } else if (c === '"') {
+                inStr = false;
+            }
+        } else if (c === '"') {
+            inStr = true;
+            out += c;
+        } else if (c === ",") {
+            // Look ahead past whitespace; if the next significant char closes
+            // an array/object, this is a trailing comma -> drop it.
+            let j = i + 1;
+            while (j < s.length && " \t\n\r".includes(s[j])) j++;
+            if (j < s.length && (s[j] === "]" || s[j] === "}")) {
+                // trailing comma: do not emit
+            } else {
+                out += c;
+            }
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+// parseJSONCTolerant is the reader-side JSONC contract for opencode.jsonc:
+// strict JSON first (the canonical emitter's output always parses here), then
+// one deterministic JSONC normalization pass — string-aware comment stripping
+// plus trailing-comma stripping (the same JSONC semantics as internal/jsonc,
+// the binary's canonical parser) — and parse again. A document that is valid
+// JSONC (valid JSON plus // and /* */ comments and/or trailing commas) now
+// parses IDENTICALLY to its JSON twin, so a hand-edited config gets the same
+// naming suffix as the machine-emitted one — no silent JSON/JSONC divergence.
+// Anything still unparseable after normalization throws, and the caller's
+// fail-open contract handles it. Deterministic: no heuristic repair, no
+// partial results.
+function parseJSONCTolerant(raw) {
+    try {
+        return JSON.parse(raw);
+    } catch {
+        return JSON.parse(stripJSONCTrailingCommas(stripJSONCComments(raw)));
+    }
+}
+
 // loadConfiguredRescueGrants reads the repo's opencode.jsonc and returns the
 // configured allow/ask permission.bash grants (the rescue promises) as
 // {agent, pattern, action} triples: the top-level block (agent "default") plus
-// every agent block. Returns null on ANY read/parse/shape failure (fail-open).
+// every agent block. Parses JSON and JSONC (see parseJSONCTolerant). Returns
+// null on ANY read/parse/shape failure (fail-open).
 function loadConfiguredRescueGrants() {
     try {
         const cfgPath = path.join(repoRoot(), "opencode.jsonc");
         const raw = fs.readFileSync(cfgPath, "utf8");
-        const cfg = JSON.parse(raw);
+        const cfg = parseJSONCTolerant(raw);
         const grants = [];
         const pushBlock = (agent, block) => {
             if (!block || typeof block !== "object") return;
@@ -144,7 +261,7 @@ function loadConfiguredRescueGrants() {
         }
         return grants;
     } catch {
-        return null; // absent/unreadable/not-JSON: no suffix, plain deny stands
+        return null; // absent/unreadable/not JSON-or-JSONC: no suffix, plain deny stands
     }
 }
 

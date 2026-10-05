@@ -18,8 +18,8 @@ export const server = async ({ client, directory }) => {
   concrete block here (run `vh-agent-harness example .opencode/plugins/compaction-primitives.project.md`).
 
 ### Git Mutation Routing
-- Only the \`committer\` agent (C) may execute git mutations, through the gated-commit protocol.
-- All other agents MUST delegate to \`committer\` for any git write. See \`.opencode/docs/git-execution-routing.md\`.
+- Only the \`committer\` agent (C) may execute git mutations, through the gated-commit protocol — and only where \`core/gated-commit\` is selected in \`.vh-agent-harness/vh-harness-profile.yml\`.
+- All other agents MUST delegate to \`committer\` for any git write where that route is wired. On profiles without the capability the committer agent is NOT wired: preserve the work, report the missing route, and request separately-authorized activation (\`capabilities: [core/gated-commit]\`) or operator handling — never probe the route or fall back to raw git. See \`.opencode/docs/git-execution-routing.md\`.
 - Operator escape hatch: SKIP_COMMIT_GATE=1 suppresses only the git-mutation-bypass forbidden-pattern check (all other patterns remain enforced); commit-gate.sh also enters bypass mode under this flag.
 
 ### Shell Guard
@@ -31,7 +31,7 @@ export const server = async ({ client, directory }) => {
 - Never commit \`./tmp/\` contents or ad hoc scratch files.
 - Clean up temporary scripts/logs/downloads when the task completes.
 
-Reference: docs/ai/codebase-operational-primitives.md (canonical source)`,
+Reference: docs/ai/codebase-operational-primitives.md (when one exists; do not fail when absent)`,
             );
         },
     };

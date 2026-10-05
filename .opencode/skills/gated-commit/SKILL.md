@@ -6,6 +6,18 @@ compatibility: opencode
 
 # Gated-Commit Protocol
 
+> **Capability condition.** The committer route this skill describes is WIRED
+> only where `core/gated-commit` is selected in
+> `.vh-agent-harness/vh-harness-profile.yml` (`profile: supervised`, or an
+> explicit `capabilities: [core/gated-commit]` entry). On profiles without it
+> the committer/commit-message/commit-reviewer agents are NOT wired into
+> opencode.jsonc — delegation denies. There: do not probe the route and never
+> fall back to raw git (denied unconditionally on every profile); preserve the
+> work, report "gated-commit capability not selected; automated committing
+> unavailable" in your closeout, and request separately-authorized activation
+> or operator handling. See `.opencode/docs/git-execution-routing.md` →
+> "Capability condition".
+
 > **Message = file = DATA; command = CONTROL.** The committer stages its commit
 > message with the **Write tool** at `tmp/commit-gate-message/msg-${UUID}` — the
 > single path its scoped `edit` permission allows (`{ "*": "deny",

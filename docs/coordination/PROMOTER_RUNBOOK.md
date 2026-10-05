@@ -174,7 +174,10 @@ directly and retired on landing; they never reach this step.
 5. **Commit backlog SEPARATELY from code.** Delegate a single gated commit via
    the committer agent, passing `docs/planning/backlog.md` (and any archived
    rows) as the explicit file list. Do NOT bundle backlog changes into a code
-   commit — that is the whole point of the hybrid split-commit model.
+   commit — that is the whole point of the hybrid split-commit model. (Where
+   `core/gated-commit` is not selected there is no committer route — the
+   backlog commits wait as preserved work until the operator activates the
+   capability or commits host-side.)
 
 ### 3. Conflict resolution (hybrid CAS preservation)
 

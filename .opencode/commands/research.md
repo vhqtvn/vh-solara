@@ -12,8 +12,8 @@ $ARGUMENTS
 
 Workflow:
 - call `plan_state` with `operation: current_session`
-- consult `docs/ai/codebase-operational-primitives.md` for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not rediscover these from scratch.
-- git mutations must flow through the `committer` agent via the gated-commit protocol. Load the `gated-commit` skill for details.
+- consult `docs/ai/codebase-operational-primitives.md` (when one exists) for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not chase or fail when it is absent, and do not rediscover these from scratch when it is present.
+- git mutations must flow through the `committer` agent via the gated-commit protocol **where `core/gated-commit` is selected**; on profiles without it, automated committing is unavailable — preserve the work, report the missing route, and request separately-authorized activation or operator handling (`.opencode/docs/git-execution-routing.md` → "Capability condition"). Load the `gated-commit` skill for details.
 - before raising any previously-blocked topic, check `.local/cleared-assumptions.yaml`. `/research` often runs before any session task contract exists, so consult the cleared-assumptions ledger directly at this stage. If the operator has already cleared an assumption (for example, a license concern, a dependency constraint, or a tooling limitation), do not re-raise it as a new blocker.
 - if a different session alias is already bound and it is clearly carrying an
   unrelated execution task, stop and tell the user to switch to the coordinator
@@ -121,4 +121,4 @@ Return:
 - overlap warnings, if any
 - next recommended command
 
-For git operations, follow `.opencode/docs/git-execution-routing.md`.
+For git operations, follow `.opencode/docs/git-execution-routing.md` — including its "Capability condition" section (on profiles without `core/gated-commit` selected, automated committing is unavailable: preserve the work, report the missing route, and request separately-authorized activation or operator handling).

@@ -1,12 +1,54 @@
 # Git Execution Routing Rule
 
+## Capability condition (read this first)
+
+The committer route described by this document is WIRED only when the
+`core/gated-commit` capability is selected in
+`.vh-agent-harness/vh-harness-profile.yml` — via `profile: supervised`, or an
+explicit `capabilities: [core/gated-commit]` entry. On profiles without it
+(`minimal`, `coordination`, `web`, or any selection that does not include the
+cluster) the `committer` / `commit-message` / `commit-reviewer` agent blocks
+and every `committer` task edge are not wired into opencode.jsonc —
+delegation to `committer` falls through to the default task deny. The workflow
+sections below describe the SELECTED shape.
+
+The SAFETY rule is unconditional on every profile: raw git mutations
+(`git add` / `git commit` / `git push` / `git reset` / …) and direct
+`commit-gate.sh` gate-command invocation are denied for every agent except the
+committer (and the committer exists only where the capability is selected).
+`commit-gate.sh revert <paths>` and the read-only git verbs remain available to
+their usual caller groups everywhere.
+
+On profiles WITHOUT the capability selected, an agent holding reviewed,
+committable work MUST:
+
+1. **STOP** — do not delegate to `committer` (the route is unwired and will
+   deny), do not probe it repeatedly, and never fall back to raw git, the gate
+   script, or the operator escape hatch.
+2. **PRESERVE** the work: leave it in the working tree uncommitted (and record
+   a checkpoint under `.opencode/state/` for long-lived work).
+3. **REPORT** the missing route in the closeout/summary: "gated-commit
+   capability not selected; automated committing unavailable" — with the exact
+   file list that awaits a commit.
+4. **REQUEST** separately-authorized activation: the operator either adds
+   `core/gated-commit` under `capabilities:` in
+   `.vh-agent-harness/vh-harness-profile.yml` (the narrower choice — it does
+   not also switch the debate cluster on) or handles the commit themselves
+   from a host terminal. Activation is the operator's config change; after
+   `vh-agent-harness update`, a running opencode session that predates the
+   change must be restarted to load the new permissions (see "How to update
+   permissions" below).
+
 ## The rule
 
 Only the **committer agent (C)** may execute git mutations. All other agents —
 including `build` and every project-supplied specialist (whatever the project
 names in its overlay packs), `default`, and all read-only specialists — must
 delegate commit requests to the committer agent, which runs them through the
-gated-commit protocol.
+gated-commit protocol. On profiles where `core/gated-commit` is not selected
+there IS no committer agent in the wiring — the delegation leg of this rule
+cannot run; follow "Capability condition" above instead (the no-raw-git half
+of the rule still binds unconditionally).
 
 Subagents that commit (`build` plus any project specialist that delegates to
 the committer — declared in each overlay pack's permission-pack.jsonc) delegate
@@ -67,7 +109,7 @@ Per-agent bash permission gates:
 - All other agents: `gate: "deny"`, `git_readonly: "allow"` (or deny), `*: "deny"` — no git writes, no gate commands
 
 Task delegation gates:
-- `build`, `coordination`, `project-coordinator`, `docs-steward`, plus every agent contributed by an active overlay pack (declared via each pack's permission-pack.jsonc): may delegate to `committer`
+- `build`, `coordination`, `project-coordinator`, `docs-steward`, plus every agent contributed by an active overlay pack (declared via each pack's permission-pack.jsonc): may delegate to `committer` — **these blocks and edges are emitted only when `core/gated-commit` is selected** (see "Capability condition")
 - `committer`: may only delegate to `commit-reviewer`
 
 ### 3. Agent prompts (`.opencode/agents/*.md`, `AGENTS.md`)

@@ -28,8 +28,8 @@ Workflow:
   - do not invent obligations the user did not ask for
 - do not invent a skill requirement unless the user asked for it or the workflow clearly depends on it for correctness, cost control, or operational safety
 - call `plan_state` with `operation: save_task_contract` and provide a concise markdown contract with those sections
-- consult `docs/ai/codebase-operational-primitives.md` for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not rediscover these from scratch.
-- git mutations must flow through the `committer` agent via the gated-commit protocol. Load the `gated-commit` skill for details.
+- consult `docs/ai/codebase-operational-primitives.md` (when one exists) for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not chase or fail when it is absent, and do not rediscover these from scratch when it is present.
+- git mutations must flow through the `committer` agent via the gated-commit protocol **where `core/gated-commit` is selected**; on profiles without it, automated committing is unavailable — preserve the work, report the missing route, and request separately-authorized activation or operator handling (`.opencode/docs/git-execution-routing.md` → "Capability condition"). Load the `gated-commit` skill for details.
 - before raising any previously-blocked topic, check `.local/cleared-assumptions.yaml` for this workspace. Although `save_task_contract` materializes cleared assumptions into the contract payload, no explicit read step follows, so consult the cleared-assumptions ledger directly. If the operator has already cleared an assumption (for example, a license concern, a dependency constraint, or a tooling limitation), do not re-raise it as a new blocker.
 - capture the latest user goal and constraints in a short session brief
 - resolve any repo path references from the latest user request and current conversation:
@@ -62,4 +62,4 @@ Return:
 - any missing or replaced paths that need attention
 - the next recommended command
 
-For git operations, follow `.opencode/docs/git-execution-routing.md`.
+For git operations, follow `.opencode/docs/git-execution-routing.md` — including its "Capability condition" section (on profiles without `core/gated-commit` selected, automated committing is unavailable: preserve the work, report the missing route, and request separately-authorized activation or operator handling).

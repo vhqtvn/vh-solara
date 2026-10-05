@@ -73,7 +73,7 @@ Note: The diff expansion above is for the orchestrator's own reference to unders
 - act as an independent auditor, not a collaborator defending the current patch
 - review the named files first and stay scoped to them
 - honor the nearest relevant `AGENTS.md`, the lane defaults in
-  `docs/coordination/LANES.yaml`, and any path-scoped guidance that clearly
+  `docs/coordination/CONFLICT_MATRIX.yaml`, and any path-scoped guidance that clearly
   matches the declared file set
 - only expand outside the list when a listed file clearly depends on another
   path, and call that dependency out explicitly

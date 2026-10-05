@@ -152,7 +152,10 @@ committer then lands the already-normalized two-commit transaction (backlog-only
 commit + archive-companion commit) against the working tree build/host prepared.
 This documents the current permission split — it is NOT a carve-out: do not
 relax the committer profile from a doc edit (that is a separate coordinator
-decision).
+decision). (Where `core/gated-commit` is not selected there is no committer to
+hand off to — the backlog commits wait as preserved work until the operator
+activates the capability or commits host-side; see
+`.opencode/docs/git-execution-routing.md` → "Capability condition".)
 
 Treat the normalizer output as **one work-cycle transaction** landed through
 **two reviewed commits, back to back**:

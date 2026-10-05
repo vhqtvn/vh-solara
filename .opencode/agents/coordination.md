@@ -94,12 +94,22 @@ the operator to enable `core/worker-read-only` in
 
 
 
+## Git commit routing (capability available)
+
+The `core/gated-commit` capability is selected: git mutations route through
+the `committer` subagent via the gated-commit protocol. When routing work that
+will end in a commit, include the committer handoff in the lane plan and
+require `/commit-review` before it. See
+`.opencode/docs/git-execution-routing.md`.
+
+
+
 
 ## Command hygiene to avoid permission prompts
 
 > **RESTART-GATED:** This subsection takes effect on the next OpenCode restart. Apply the rules consciously even if your loaded copy predates it.
 
-Even as a read-only router, prefer **single simple commands** (no `&&`-chains, brace-groups, or multi-line `python3 -c`) — the safe-parser requires each parsed command to match an allowlist entry independently, and chains fall back to `ask`. For files use the WRITE TOOL (never heredocs); scratch under repo `./tmp/`; use sanctioned wrappers (`.opencode/scripts/readonly-scripts.sh gen-uuid` / `prep-tempdir`); route any git write to the `committer` subagent; put env vars and `timeout` INSIDE `vh-agent-harness exec bash -c '...'`, never as a host prefix before `harness` (a prefix runs on the host, never reaches the container, and is now rejected by shell-guard). Never hardcode absolute `/home/<user>/...` paths — always use repo-relative paths (`docs/...`, `tmp/...`) or resolve from the project root; fat-fingered home-dir usernames (e.g. `/home/<operator-typo>`, `/home/<operator-typo>`) are the recurring cause of the `external_directory` prompts. Full version: AGENTS.md → "Command hygiene to avoid permission prompts".
+Even as a read-only router, prefer **single simple commands** (no `&&`-chains, brace-groups, or multi-line `python3 -c`) — the safe-parser requires each parsed command to match an allowlist entry independently, and chains fall back to `ask`. For files use the WRITE TOOL (never heredocs); scratch under repo `./tmp/`; use sanctioned wrappers (`.opencode/scripts/readonly-scripts.sh gen-uuid` / `prep-tempdir`); route any git write to the `committer` subagent (where `core/gated-commit` is selected — otherwise there is no committer route: preserve the work, report the missing route, and request activation or operator handling); put env vars and `timeout` INSIDE `vh-agent-harness exec bash -c '...'`, never as a host prefix before `harness` (a prefix runs on the host, never reaches the container, and is now rejected by shell-guard). Never hardcode absolute `/home/<user>/...` paths — always use repo-relative paths (`docs/...`, `tmp/...`) or resolve from the project root; fat-fingered home-dir usernames (e.g. `/home/<operator-typo>`, `/home/<operator-typo>`) are the recurring cause of the `external_directory` prompts. Full version: AGENTS.md → "Command hygiene to avoid permission prompts".
 
 Default output:
 - goal framing

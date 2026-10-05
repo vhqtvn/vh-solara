@@ -217,6 +217,121 @@ export function scrubTruncate(value, max) {
     return truncate(scrubCredentials(value), max);
 }
 
+// ---------------------------------------------------------------------------
+// admitReason(raw, knownValues) — the O2 safe-feedback admission pipeline for
+// CLASSIFIER LEAF REASONS flowing into the agent-visible deny string.
+//
+// A parsed <reason> is UNTRUSTED model output that may echo session secrets
+// (the classifier input is sent unscrubbed by design — stage-1 relaxation),
+// config values (endpoint URLs, model names), or control characters. This
+// pipeline is the ONLY way a reason reaches the surfaced deny string. It is
+// UNCONDITIONAL: no caller may bypass it because a reason "looks safe" —
+// admission decisions come AFTER the pipeline, never instead of it.
+//
+// ORDER IS LOAD-BEARING (never reorder):
+//   1. Control normalization — strip C0/C1 control chars except \n and \t;
+//      trim. (The \n/\t ESCAPING happens LAST — see step 4.)
+//   2. Known-value suppression — every EXACT-STRING occurrence (case
+//      sensitive, global, literal — split/join, never regex) of a
+//      config-known value (leaf/top-level modelEndpoint, model, literal
+//      apiKey, resolved env endpoint/key values — supplied by the caller) is
+//      replaced with [suppressed]. Empty values are ignored; env NAMES are
+//      never in the set; the suppressed VALUES are never logged.
+//   3. Credential scrub — the EXISTING scrubCredentials applied verbatim
+//      (never a second scrubber — drift is the documented root cause that
+//      created this module). Credential shapes become [redacted].
+//   4. Length truncation — then ESCAPING, as the final step. Truncation
+//      counts the sanitized-but-unescaped characters (MAX_REASON_CHARS cut +
+//      "…[truncated]" marker), so scrub-before-truncate holds by
+//      construction (a secret split at the boundary cannot survive). Only
+//      THEN are \n -> literal "\n", \t -> literal "\t", and literal
+//      backslashes doubled, guaranteeing the output is single-line. Escape
+//      LAST is load-bearing: the step-2/3 matchers and the
+//      suppression-token detector must see the RAW controls/tokens (an
+//      escaped "\n" two-char sequence would defeat the exact-string
+//      matchers), and the escape may lengthen the text slightly past the
+//      cut — bounded by the caller's total deny-string cap.
+//
+// Returns { text, outcome }:
+//   outcome "none"       — no usable reason (empty/whitespace-only input).
+//                          Caller MUST surface the named fallback <none>,
+//                          NEVER an empty reason=.
+//   outcome "suppressed" — the post-sanitization remainder consists ONLY of
+//                          suppression tokens ([redacted]/[suppressed]) and
+//                          whitespace. Caller MUST surface <suppressed>.
+//   outcome "truncated"  — admitted, but cut at MAX_REASON_CHARS (text ends
+//                          with the …[truncated] marker).
+//   outcome "sanitized"  — admitted; the pipeline altered the text (escape,
+//                          suppression, or redaction happened).
+//   outcome "verbatim"   — admitted; pipeline left the text unchanged.
+//
+// NEVER (whole-pipeline invariants): emit the raw classifier HTTP body, raw
+// err.message, or raw stderr into a surfaced string; reduce a reason to "";
+// apply truncation before scrubbing; let a raw newline survive.
+export const MAX_REASON_CHARS = 240;
+
+// Outcome tokens for the named fallbacks (surfaced literally by the caller).
+export const REASON_NONE = "<none>";
+export const REASON_SUPPRESSED = "<suppressed>";
+
+// Suppression-token-only detector: a remainder made solely of these tokens
+// (plus whitespace) carries no admissible signal.
+const _SUPPRESSION_TOKEN_RE = /^(?:\[redacted\]|\[suppressed\]|\s)*$/;
+
+// Control-char stripper: C0 (U+0000-U+001F) minus \t(U+0009)/\n(U+000A), plus
+// DEL and C1 (U+007F-U+009F). Applied BEFORE escaping so only the two
+// escapable controls remain.
+// eslint-disable-next-line no-control-regex
+const _CONTROL_CHARS_RE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
+
+export function admitReason(raw, knownValues) {
+    if (typeof raw !== "string") {
+        return { text: "", outcome: "none" };
+    }
+    // Step 1: control normalization (strip -> trim -> escape).
+    let out = raw.replace(_CONTROL_CHARS_RE, "").trim();
+    if (out.length === 0) {
+        return { text: "", outcome: "none" };
+    }
+    const normalized = out;
+    // Step 2: known-value suppression (exact-string, literal, global).
+    if (Array.isArray(knownValues)) {
+        for (const value of knownValues) {
+            if (typeof value !== "string" || value.length === 0) continue;
+            if (!out.includes(value)) continue;
+            out = out.split(value).join("[suppressed]");
+        }
+    }
+    // Step 3: credential-pattern scrub (the shared scrubber, verbatim).
+    out = scrubCredentials(out);
+    // Named fallback R3: remainder is ONLY suppression tokens + whitespace.
+    if (_SUPPRESSION_TOKEN_RE.test(out)) {
+        return { text: "", outcome: "suppressed" };
+    }
+    // Step 4: length truncation (scrub-before-truncate by construction — the
+    // cut counts sanitized-but-unescaped characters), then the \n/\t/
+    // backslash ESCAPING as the final step (see the header for why escaping
+    // must come last).
+    let outcome = out === normalized ? "verbatim" : "sanitized";
+    if (out.length > MAX_REASON_CHARS) {
+        out = out.slice(0, MAX_REASON_CHARS) + "…[truncated]";
+        outcome = "truncated";
+    }
+    // Escape \n/\t (and literal backslashes, so an escaped newline can never
+    // be confused with a pre-existing backslash-n) — the single-line
+    // guarantee. Escaping is a sanitization: a text that only changed here is
+    // "sanitized", not "verbatim".
+    const escaped = out
+        .replace(/\\/g, "\\\\")
+        .replace(/\n/g, "\\n")
+        .replace(/\t/g, "\\t");
+    if (escaped !== out && outcome === "verbatim") {
+        outcome = "sanitized";
+    }
+    return { text: escaped, outcome };
+}
+
+
 // ===========================================================================
 // DUAL-PURPOSE SELF-TEST.
 // Run directly (`node auto-gate-scrub.js` or `node --test auto-gate-scrub.js`)
@@ -532,5 +647,136 @@ if (__isMain) {
         const fp = "src/internal/runtime/substrate.go";
         const out = scrubTruncate(fp, 240);
         assert.equal(out, fp, "normal path must be unchanged");
+    });
+
+    // ===== admitReason — O2 safe-feedback admission pipeline =====
+    //
+    // Pins the ordered contract: normalize -> known-value suppress ->
+    // credential scrub -> truncate; named fallbacks for none/suppressed;
+    // single-line output; scrub-before-truncate.
+
+    test("admitReason: R1 benign reason -> verbatim", () => {
+        const r = admitReason("[Rule-X] deletes protected branch", []);
+        assert.equal(r.outcome, "verbatim");
+        assert.equal(r.text, "[Rule-X] deletes protected branch");
+    });
+
+    test("admitReason: R2 empty / whitespace-only -> none (never empty reason=)", () => {
+        assert.equal(admitReason("", []).outcome, "none");
+        assert.equal(admitReason("   \n\t  ", []).outcome, "none");
+        assert.equal(admitReason(null, []).outcome, "none");
+        assert.equal(admitReason(undefined, []).outcome, "none");
+        assert.equal(admitReason(123, []).outcome, "none");
+        assert.equal(admitReason("", []).text, "");
+    });
+
+    test("admitReason: R3 redaction-only remainder -> suppressed", () => {
+        const r = admitReason("sk-abcdefghijklmnopqrstuvwxyz123456", []);
+        assert.equal(r.outcome, "suppressed");
+        assert.equal(r.text, "");
+    });
+
+    test("admitReason: R3 known-value-only remainder -> suppressed", () => {
+        const r = admitReason("http://leaf-b:8082/v1", [
+            "http://leaf-b:8082/v1",
+        ]);
+        assert.equal(r.outcome, "suppressed");
+        assert.equal(r.text, "");
+    });
+
+    test("admitReason: R4 multiline reason -> single-line escaped backslash-n", () => {
+        const r = admitReason("line one\nline two", []);
+        assert.equal(r.outcome, "sanitized");
+        assert.equal(r.text, "line one\\nline two");
+        assert.ok(!r.text.includes("\n"), "no raw U+000A may survive");
+    });
+
+    test("admitReason: R4 tab escaped; other control chars stripped", () => {
+        const r = admitReason("a\tb\u0007c\u0000d", []);
+        assert.equal(r.text, "a\\tbcd");
+    });
+
+    test("admitReason: R4 literal backslash escaped (not confused with escaped newline)", () => {
+        const r = admitReason("path C:\\temp then\nnewline", []);
+        assert.equal(r.text, "path C:\\\\temp then\\nnewline");
+    });
+
+    test("admitReason: R5 oversized -> truncated at 240 with marker; scrub-before-truncate", () => {
+        // Dashed filler: a solid alnum run would itself be redacted as a
+        // high-entropy blob (the scrubber working as designed), which is NOT
+        // the row under test here.
+        const text = "oversized-reason-".repeat(60) + "END-SENTINEL";
+        const r = admitReason(text, []);
+        assert.equal(r.outcome, "truncated");
+        assert.ok(r.text.endsWith("…[truncated]"));
+        assert.equal(r.text.includes("END-SENTINEL"), false);
+        assert.ok(r.text.length <= 240 + "…[truncated]".length);
+    });
+
+    test("admitReason: R5 secret split at the truncation boundary cannot survive", () => {
+        // A long secret straddling the 240-char cut: the scrubber runs BEFORE
+        // the cut, so the secret is [redacted] regardless of position.
+        const secret = "sk-boundarysecretvalue1234567890abcdefghij";
+        const filler = "pad-token-".repeat(23); // 230 chars, dashed (not blob-shaped)
+        const r = admitReason(filler + secret + " tail-token-" + "z".repeat(9), []);
+        assert.equal(r.outcome, "truncated");
+        assert.equal(r.text.includes(secret), false, "secret must not survive truncation");
+    });
+
+    test("admitReason: R6 config-known value -> [suppressed], exact-string only", () => {
+        const known = "http://127.0.0.1:8082/v1/chat/completions";
+        const r = admitReason(`echo ${known} denied`, [known]);
+        assert.equal(r.outcome, "sanitized");
+        assert.equal(r.text, "echo [suppressed] denied");
+        // Exact-string only: a PREFIX of a known value must NOT be suppressed
+        // (a fat-fingered prefix match would redact legitimate text).
+        const p = admitReason("echo http://127.0.0.1:8082/other denied", [known]);
+        assert.equal(p.text, "echo http://127.0.0.1:8082/other denied");
+    });
+
+    test("admitReason: R6 regex metachars in known values are literal (no regex)", () => {
+        const known = "https://api.example/v1/completions?key=abc+.def";
+        const r = admitReason(`hit ${known} twice ${known}`, [known]);
+        assert.equal(r.text, "hit [suppressed] twice [suppressed]");
+    });
+
+    test("admitReason: R6 empty known values are ignored (no blank-match blowup)", () => {
+        const r = admitReason("plain reason", ["", null, undefined, 42]);
+        assert.equal(r.outcome, "verbatim");
+        assert.equal(r.text, "plain reason");
+    });
+
+    test("admitReason: R7 credential shape -> [redacted] via the shared scrubber", () => {
+        const r = admitReason("uses Bearer eyJleGFtcGxl.qm9o.signature here", []);
+        assert.equal(r.outcome, "sanitized");
+        assert.equal(r.text, "uses Bearer [redacted] here");
+    });
+
+    test("admitReason: mixed suppression + credential + multiline composes in order", () => {
+        const known = "http://leaf-b:8082/v1";
+        const r = admitReason(
+            `first\nthen ${known} and Bearer eyJleGFtcGxl.qm9o.signature end`,
+            [known],
+        );
+        assert.equal(
+            r.text,
+            "first\\nthen [suppressed] and Bearer [redacted] end",
+        );
+    });
+
+    test("admitReason: no raw newline in ANY outcome path (grammar invariant)", () => {
+        for (const input of [
+            "\n",
+            "a\n\n\n",
+            "x".repeat(300) + "\n" + "y".repeat(300),
+            "[redacted]\n[suppressed]",
+            "sk-abcdefghijklmnopqrstuvwxyz123456\nrest",
+        ]) {
+            const r = admitReason(input, []);
+            assert.ok(
+                typeof r.text !== "string" || !r.text.includes("\n"),
+                `raw newline survived for input: ${JSON.stringify(input)}`,
+            );
+        }
     });
 }

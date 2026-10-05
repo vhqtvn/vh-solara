@@ -174,20 +174,66 @@ export function stubEvaluate(config) {
 // decidePermission — pure orchestrator (no I/O, no OpenCode coupling).
 //
 // Composes evaluateFn -> parseVerdict -> decision matrix and returns a plain
-// { status, reason, audit } object. The plugin (permission.ask enforce branch)
-// maps `status` onto output.status and logs `audit` to stderr. Defaulting
-// evaluateFn to stubEvaluate keeps Phase 2 self-contained (no live model);
-// Phase 3 passes a real evaluator.
+// { status, reason, audit, kind, subkind } object. The plugin (permission.ask
+// enforce branch) maps `status` onto output.status and logs `audit` to stderr.
+// Defaulting evaluateFn to stubEvaluate keeps Phase 2 self-contained (no live
+// model); Phase 3 passes a real evaluator.
 //
-// Decision matrix (fail-closed dominant):
-//   evaluator throws        -> { status:"deny", reason:"", audit:"fail-closed: evaluator error: <msg>" }
-//   verdict === null        -> { status:"deny", reason:"", audit:"fail-closed: unparseable verdict" }
-//   decision === "allow"    -> { status:"allow", reason:"", audit:"" }
-//   decision === "block"    -> { status:"deny",  reason, audit:"blocked: <reason>" }
+// TYPED PROVENANCE (O2 safe-feedback): `kind` separates a real classifier
+// JUDGMENT from an infrastructure failure, originating in THIS matrix (the
+// executor's control flow — never inferred from classifier prose):
+//
+//   kind "judgment"   — a valid <block> verdict was parsed (allow OR block).
+//   kind "unparseable"— the response carried no anchored <block> tag (R8).
+//   kind "error"      — the evaluator threw (timeout / transport / HTTP /
+//                       config / key failure — R9/R10).
+//
+// `subkind` (kind "error" only, nullable) names the infra failure from a FIXED
+// whitelist, derived ONLY from machine-readable tags on the thrown error
+// (err.name, integer err.status, err.gateSubkind) — NEVER from raw message
+// text. Whitelist: timeout | http-<code> | transport | malformed |
+// missing-key | missing-endpoint | missing-model. An unrecognized shape
+// yields null (the caller surfaces the kindless form).
+//
+// Decision matrix (fail-closed dominant — status semantics UNCHANGED):
+//   evaluator throws        -> { status:"deny", kind:"error",  subkind, reason:"", audit:"fail-closed: evaluator error: <msg>" }
+//   verdict === null        -> { status:"deny", kind:"unparseable", subkind:null, reason:"", audit:"fail-closed: unparseable verdict" }
+//   decision === "allow"    -> { status:"allow", kind:"judgment", subkind:null, reason:"", audit:"" }
+//   decision === "block"    -> { status:"deny",  kind:"judgment", subkind:null, reason, audit:"blocked: <reason>"|"blocked: (no reason)" }
+//
+// The audit strings are the OPERATOR stderr channel (constant-shaped prefixes
+// + the thrown error's message); they are NOT the agent-visible deny string —
+// the plugin routes surfaced egress through the admitReason pipeline and the
+// named fallbacks keyed on kind/subkind.
 //
 // This never throws — it catches the evaluator and returns deny. The plugin
 // still wraps the call defensively so a future regression fail-closes rather
 // than crashes the hook.
+
+// FIXED subkind whitelist (machine-readable failure taxonomy). gateSubkind
+// tags outside this set are ignored (kindless fail(unavailable) form).
+const _SUBKINDS = new Set([
+    "malformed",
+    "missing-key",
+    "missing-endpoint",
+    "missing-model",
+]);
+
+// _deriveSubkind(err) — map a thrown error's TAGGED fields to a whitelisted
+// subkind. Tag precedence: AbortError name -> timeout; integer .status ->
+// http-<code>; TransportError name -> transport; .gateSubkind member ->
+// that value; else null. Never inspects err.message.
+function _deriveSubkind(err) {
+    if (!err || typeof err !== "object") return null;
+    if (err.name === "AbortError") return "timeout";
+    if (Number.isInteger(err.status)) return `http-${err.status}`;
+    if (err.name === "TransportError") return "transport";
+    if (typeof err.gateSubkind === "string" && _SUBKINDS.has(err.gateSubkind)) {
+        return err.gateSubkind;
+    }
+    return null;
+}
+
 export function decidePermission(config, evaluateFn = stubEvaluate) {
     let raw;
     try {
@@ -196,6 +242,8 @@ export function decidePermission(config, evaluateFn = stubEvaluate) {
         const msg = (err && err.message) || String(err);
         return {
             status: "deny",
+            kind: "error",
+            subkind: _deriveSubkind(err),
             reason: "",
             audit: `fail-closed: evaluator error: ${msg}`,
         };
@@ -204,16 +252,20 @@ export function decidePermission(config, evaluateFn = stubEvaluate) {
     if (verdict === null) {
         return {
             status: "deny",
+            kind: "unparseable",
+            subkind: null,
             reason: "",
             audit: "fail-closed: unparseable verdict",
         };
     }
     if (verdict.decision === "allow") {
-        return { status: "allow", reason: "", audit: "" };
+        return { status: "allow", kind: "judgment", subkind: null, reason: "", audit: "" };
     }
     // decision === "block"
     return {
         status: "deny",
+        kind: "judgment",
+        subkind: null,
         reason: verdict.reason,
         audit: verdict.reason
             ? `blocked: ${verdict.reason}`
@@ -404,6 +456,116 @@ if (__isMain) {
         const r = decidePermission({}, thrower);
         assert.equal(r.status, "deny");
         assert.match(r.audit, /fail-closed: evaluator error: boom/);
+    });
+
+    // ===== Typed provenance (kind/subkind — O2 safe-feedback) =====
+
+    test("provenance: block verdict -> kind judgment, subkind null", () => {
+        const r = decidePermission({ stubVerdict: "block" });
+        assert.equal(r.status, "deny");
+        assert.equal(r.kind, "judgment");
+        assert.equal(r.subkind, null);
+    });
+
+    test("provenance: allow verdict -> kind judgment", () => {
+        const r = decidePermission({ stubVerdict: "allow" });
+        assert.equal(r.status, "allow");
+        assert.equal(r.kind, "judgment");
+    });
+
+    test("provenance: unparseable -> kind unparseable, subkind null", () => {
+        const r = decidePermission({ stubVerdict: "fail" });
+        assert.equal(r.status, "deny");
+        assert.equal(r.kind, "unparseable");
+        assert.equal(r.subkind, null);
+    });
+
+    test("provenance: plain throw -> kind error, kindless subkind", () => {
+        const thrower = () => {
+            throw new Error("boom");
+        };
+        const r = decidePermission({}, thrower);
+        assert.equal(r.kind, "error");
+        assert.equal(r.subkind, null);
+    });
+
+    test("provenance: AbortError name -> subkind timeout (tagged, not message)", () => {
+        const thrower = () => {
+            const e = new Error("The operation was aborted");
+            e.name = "AbortError";
+            throw e;
+        };
+        const r = decidePermission({}, thrower);
+        assert.equal(r.kind, "error");
+        assert.equal(r.subkind, "timeout");
+    });
+
+    test("provenance: integer .status tag -> subkind http-<code>", () => {
+        const thrower = () => {
+            const e = new Error("non-2xx response: 500");
+            e.status = 500;
+            throw e;
+        };
+        const r = decidePermission({}, thrower);
+        assert.equal(r.kind, "error");
+        assert.equal(r.subkind, "http-500");
+    });
+
+    test("provenance: TransportError name -> subkind transport", () => {
+        const thrower = () => {
+            const e = new Error("fetch failed");
+            e.name = "TransportError";
+            throw e;
+        };
+        const r = decidePermission({}, thrower);
+        assert.equal(r.kind, "error");
+        assert.equal(r.subkind, "transport");
+    });
+
+    test("provenance: whitelisted .gateSubkind tag -> that subkind", () => {
+        for (const sk of ["malformed", "missing-key", "missing-endpoint", "missing-model"]) {
+            const thrower = () => {
+                const e = new Error(`simulated ${sk}`);
+                e.gateSubkind = sk;
+                throw e;
+            };
+            const r = decidePermission({}, thrower);
+            assert.equal(r.kind, "error");
+            assert.equal(r.subkind, sk);
+        }
+    });
+
+    test("provenance: NON-whitelisted .gateSubkind tag -> kindless (never raw)", () => {
+        const thrower = () => {
+            const e = new Error("weird failure");
+            e.gateSubkind = "totally-unknown-subkind";
+            throw e;
+        };
+        const r = decidePermission({}, thrower);
+        assert.equal(r.kind, "error");
+        assert.equal(r.subkind, null);
+    });
+
+    test("provenance: subkind derives from TAGS, not message text", () => {
+        // An error whose MESSAGE claims timeout but carries no AbortError tag
+        // must NOT be classified timeout — executor control flow is the only
+        // provenance source.
+        const thrower = () => {
+            throw new Error("this timed out, honest");
+        };
+        const r = decidePermission({}, thrower);
+        assert.equal(r.subkind, null);
+    });
+
+    test("provenance: tag precedence AbortError beats status", () => {
+        const thrower = () => {
+            const e = new Error("aborted mid-flight");
+            e.name = "AbortError";
+            e.status = 504;
+            throw e;
+        };
+        const r = decidePermission({}, thrower);
+        assert.equal(r.subkind, "timeout");
     });
 
     // ===== Hard-floor invariant (documented + pinned by test) =====

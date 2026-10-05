@@ -429,6 +429,21 @@ function trimEndStar(cmd) {
 // git-mutation-bypass forbidden pattern.  The committer agent is the sole
 // git-write agent and uses the commit-gate wrapper.  See
 // .opencode/docs/git-execution-routing.md.
+//
+// Capability-conditional note (static, honest on every profile): the committer
+// route exists only where the core/gated-commit capability is selected in
+// .vh-agent-harness/vh-harness-profile.yml. On other profiles the committer
+// agent is not wired into opencode.jsonc — the recovery for an agent holding
+// committable work is to preserve it and request activation or operator
+// handling, never to probe the route or fall back to raw git (denied
+// unconditionally below regardless).
+const GIT_ROUTE_UNAVAILABLE_NOTE =
+    "On profiles without `core/gated-commit` selected the committer " +
+    "agent is not wired: do not probe the route — preserve the work, " +
+    "report the missing route, and request separately-authorized " +
+    "activation (`capabilities: [core/gated-commit]` in " +
+    "`.vh-agent-harness/vh-harness-profile.yml`) or operator handling. " +
+    "See .opencode/docs/git-execution-routing.md.";
 const ALLOWED_PATTERNS = COMMANDS.readonly
     .concat(COMMANDS.git_readonly)
     .concat(COMMANDS.gate)
@@ -1209,7 +1224,7 @@ export function detectWrappedGitMutation(normalizedCmd, cwd) {
                 "Git mutations must go through the commit-gate wrapper. " +
                 "Only the committer agent (C) may execute git writes, " +
                 "and only through `.opencode/scripts/commit-gate.sh`. " +
-                "See .opencode/docs/git-execution-routing.md." +
+                GIT_ROUTE_UNAVAILABLE_NOTE +
                 " (Wrapped `vh-agent-harness " + wrapper + " git …` routed verb '" +
                 w.verb + "' past a global flag.)",
         };
@@ -1343,6 +1358,7 @@ export async function evaluate(command, commandCwd) {
                 reason:
                     "Gate wrapper (commit-gate.sh) must be invoked directly, not through vh-agent-harness exec. " +
                     "Only the committer agent can use the gate wrapper. " +
+                    GIT_ROUTE_UNAVAILABLE_NOTE + " " +
                     "Blessed form: committer authors the message with the Write tool at " +
                     "tmp/commit-gate-message/msg-${UUID}, then runs the single-line " +
                     ".opencode/scripts/commit-gate.sh acquire --paths '<JSON>' " +
@@ -1443,7 +1459,7 @@ export async function evaluate(command, commandCwd) {
                         "Git mutations must go through the commit-gate wrapper. " +
                         "Only the committer agent (C) may execute git writes, " +
                         "and only through `.opencode/scripts/commit-gate.sh`. " +
-                        "See .opencode/docs/git-execution-routing.md." +
+                        GIT_ROUTE_UNAVAILABLE_NOTE +
                         " (Verb '" + w.verb + "' routed past a global flag.)",
                 };
             }
@@ -1500,8 +1516,8 @@ export async function evaluate(command, commandCwd) {
                 "[shell-guard] Non-read-only or unrecognized git command detected: " +
                 JSON.stringify(blocked.tokens) +
                 ". Only the committer agent may execute git mutations," +
-                " through the commit-gate wrapper. See" +
-                " .opencode/docs/git-execution-routing.md." +
+                " through the commit-gate wrapper. " +
+                GIT_ROUTE_UNAVAILABLE_NOTE +
                 " Passing through to permission gate.",
         };
     }

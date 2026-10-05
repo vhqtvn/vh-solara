@@ -30,11 +30,6 @@ exclusive_paths:
       - deployment
     conflict_note: Do not edit while a live release rollout or VPS smoke pass is active.
 
-  .local/demo-server/:
-    owner_lanes:
-      - deployment
-    conflict_note: Treat as local-only operator state. Do not rewrite during unrelated work.
-
 safe_parallel:
   - read_only_repo_mapping
   - checkpoint_reading_without_edits

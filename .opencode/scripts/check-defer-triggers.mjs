@@ -361,7 +361,7 @@ function parseArgs(argv) {
             if (v !== null) options.overrideConfirmedVersion = v;
         } else if (a === "--help" || a === "-h") {
             process.stdout.write(
-                "usage: check-defer-triggers.mjs [--mode promoter|release|release-prep] [--since <ref>] [--tasks <dir>]\n" +
+                "usage: check-defer-triggers.mjs [--mode promoter|release|release-prep] [--tasks <dir>]\n" +
                 "                                  [--release-version <vX.Y.Z>]\n" +
                 "                                  [--override-confirmed-version <vX.Y.Z>]\n" +
                 "  Predicate evaluator for DEFER/p2/follow-up candidates.\n" +
@@ -373,11 +373,15 @@ function parseArgs(argv) {
                 "    --override-confirmed-version is the operator-side wrapper confirmation\n" +
                 "    signal: an override_required record is honored only when\n" +
                 "    override.release_version == --release-version == --override-confirmed-version.\n" +
+                "    Release mode NEVER reads --since (evaluation is manifest-authority at\n" +
+                "    the tagged commit, not diff-based; a --since flag is ignored here).\n" +
                 "  --mode=release-prep: F4-C mechanical enumerator. Reads\n" +
                 "    .local/coordinator/tasks/ (silencer-immune) to find OPEN defer cards\n" +
                 "    whose path_touched target re-fires in the release diff without a\n" +
                 "    disposition; emits draft stub manifest records. Exit 1 = missing\n" +
                 "    dispositions; exit 2 = evaluator error.\n" +
+                "  --since <ref>: diff base for PROMOTER and RELEASE-PREP modes only\n" +
+                "    (defaults to the most recent tag reachable from HEAD, else HEAD~32).\n" +
                 "  Two failure classes: missing/malformed/stale manifest → evaluator-error\n" +
                 "    (repair the committed manifest; override cannot cure it);\n" +
                 "    release-relevant finding requires disposition → blocker (resolve OR\n" +
@@ -1295,8 +1299,10 @@ function mainRelease(options) {
     //    self-heals the current stale state with NO manifest write. kind
     //    (root|tag) stays operator-attested (a genuine first-release vs
     //    incremental-arc judgment); for kind=root no value is derived (whole
-    //    history is in scope regardless). This preserves INVARIANT #2 (the
-    //    evaluator is read-only — it writes nothing).
+    //    history is in scope regardless). This preserves INVARIANT #2 (no
+    //    protected-state writes: the evaluator never writes .git/ or tracked
+    //    files; its transient per-git-call capture scratch lives under repo
+    //    tmp/ with best-effort cleanup).
     const advisories = [];
     if (obj.release_base.kind === "tag") {
         // When --release-version is supplied (CI post-tag recheck), exclude

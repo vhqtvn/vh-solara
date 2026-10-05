@@ -9,8 +9,8 @@ Prepare a grounded solution brief for this question:
 $ARGUMENTS
 
 Workflow:
-- consult `docs/ai/codebase-operational-primitives.md` for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not rediscover these from scratch.
-- git mutations must flow through the `committer` agent via the gated-commit protocol. Load the `gated-commit` skill for details.
+- consult `docs/ai/codebase-operational-primitives.md` (when one exists) for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not chase or fail when it is absent, and do not rediscover these from scratch when it is present.
+- git mutations must flow through the `committer` agent via the gated-commit protocol **where `core/gated-commit` is selected**; on profiles without it, automated committing is unavailable — preserve the work, report the missing route, and request separately-authorized activation or operator handling (`.opencode/docs/git-execution-routing.md` → "Capability condition"). Load the `gated-commit` skill for details.
 - before raising any previously-blocked topic, check `.local/cleared-assumptions.yaml`. `/solution-brief` may run without a current session task contract, so consult the cleared-assumptions ledger directly at this stage. If the operator has already cleared an assumption (for example, a license concern, a dependency constraint, or a tooling limitation), do not re-raise it as a new blocker.
 - call the `solution-brief` subagent with the full question
 - `solution-brief` is read-only on repo source, docs, and durable state; it
@@ -36,4 +36,4 @@ Example invocations:
 - `/solution-brief Should this repo express reusable compare-and-plan workflows as command wrappers, repo-local skills, or documented manual choreography?`
 - `/solution-brief For long-running evaluation orchestration, should the repo prefer a repo-local skill, coordinator task cards, or a thin command wrapper over existing specialists?`
 
-For git operations, follow `.opencode/docs/git-execution-routing.md`.
+For git operations, follow `.opencode/docs/git-execution-routing.md` — including its "Capability condition" section (on profiles without `core/gated-commit` selected, automated committing is unavailable: preserve the work, report the missing route, and request separately-authorized activation or operator handling).

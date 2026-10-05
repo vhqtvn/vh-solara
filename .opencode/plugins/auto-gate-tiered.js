@@ -84,16 +84,33 @@ const _VALID_OUTCOMES = new Set([LEAF.ALLOW, LEAF.DENY, LEAF.FAIL]);
 // Input shapes (covering the existing parseVerdict / decidePermission /
 // decideLive contracts + their failure modes):
 //
-//   {decision:"allow"}            (or {status:"allow"})     -> ALLOW
-//   {decision:"block", reason}    (or {status:"deny"})      -> DENY
+//   {decision:"allow"}                    (parseVerdict)  -> ALLOW
+//   {decision:"block", reason}            (parseVerdict)  -> DENY
+//   {status:"allow", kind?}               (decideLive)    -> ALLOW
+//   {status:"deny",  kind:"judgment"}     (decideLive)    -> DENY
+//   {status:"deny",  kind:"error"}                        -> FAIL
+//   {status:"deny",  kind:"unparseable"}                  -> FAIL
+//   {status:"deny"}  (NO kind — legacy/unknown shape)     -> FAIL
 //   null / undefined              (unparseable / missing)   -> FAIL
 //   a thrown Error object         (caller may pass a caught)-> FAIL
 //   anything else                 (malformed / unknown)     -> FAIL
 //
+// TYPED PROVENANCE (O2 safe-feedback / D2 truth fix): since decideLive
+// returns `kind` alongside `status`, an infrastructure failure (kind
+// "error"|"unparseable") normalizes to FAIL — NOT DENY — so the aggregate
+// reports the tier as INCOMPLETE instead of a false unanimous-deny /
+// disagreement judgment claim. A KINGLESS {status:"deny"} (the historic
+// conflation shape, which pre-provenance code produced for BOTH judgments
+// and infra errors) maps conservatively to FAIL: post-provenance every
+// real decideLive deny carries kind, so a kindless deny means an unknown
+// producer and "everything uncertain -> FAIL" applies. Both DENY and FAIL
+// deny at the aggregate (fail-closed is unchanged) — the difference is the
+// TRUTHFULNESS of the surfaced aggregate reason label.
+//
 // Be CONSERVATIVE: only a STRICTLY valid allow -> ALLOW; only a strictly
-// valid block/deny -> DENY; everything uncertain -> FAIL. This never throws —
-// a leaf that cannot be classified is, by definition, a FAIL (uncertain), and
-// the aggregate layer maps FAIL -> deny (fail-closed).
+// valid judgment block/deny -> DENY; everything uncertain -> FAIL. This
+// never throws — a leaf that cannot be classified is, by definition, a FAIL
+// (uncertain), and the aggregate layer maps FAIL -> deny (fail-closed).
 //
 // The decision/status key precedence: `decision` is checked first (the
 // parseVerdict contract), then `status` (the decidePermission / decideLive
@@ -118,14 +135,21 @@ export function normalizeLeafOutcome(raw) {
     if (typeof raw !== "object") {
         return LEAF.FAIL;
     }
-    // Try the `decision` key first (parseVerdict shape).
+    // Try the `decision` key first (parseVerdict shape — a parsed block IS a
+    // judgment; parseVerdict never fails into a block).
     const dec = raw.decision;
     if (dec === "allow") return LEAF.ALLOW;
     if (dec === "block") return LEAF.DENY;
     // Then the `status` key (decidePermission / decideLive shape).
     const st = raw.status;
     if (st === "allow") return LEAF.ALLOW;
-    if (st === "deny") return LEAF.DENY;
+    if (st === "deny") {
+        // Typed provenance: ONLY a judgment is a DENY. Infra errors
+        // (kind "error"|"unparseable") and the KINDLESS legacy shape
+        // normalize to FAIL (uncertain -> incomplete), never to a
+        // false judgment-deny claim.
+        return raw.kind === "judgment" ? LEAF.DENY : LEAF.FAIL;
+    }
     // Anything else: malformed object, missing decision/status, unknown status
     // string like "ask"/"maybe", or a non-string decision/status -> FAIL.
     return LEAF.FAIL;
@@ -319,18 +343,72 @@ if (__isMain) {
         );
     });
 
-    test("normalize: {status:'allow'} -> ALLOW (decidePermission shape)", () => {
+    test("normalize: {status:'allow'} -> ALLOW (decideLive shape)", () => {
         assert.equal(
             normalizeLeafOutcome({ status: "allow", reason: "" }),
             LEAF.ALLOW,
         );
     });
 
-    test("normalize: {status:'deny'} -> DENY (decideLive shape)", () => {
+    test("normalize: {status:'deny', kind:'judgment'} -> DENY (typed decideLive shape)", () => {
         assert.equal(
-            normalizeLeafOutcome({ status: "deny", audit: "blocked: x" }),
+            normalizeLeafOutcome({ status: "deny", kind: "judgment", audit: "blocked: x" }),
             LEAF.DENY,
         );
+    });
+
+    test("normalize: {status:'deny', kind:'error'} -> FAIL (typed infra failure — D2 truth fix)", () => {
+        // The load-bearing D2 fix: an infra-errored leaf is NOT a judgment
+        // deny. It normalizes to FAIL so the aggregate reports incomplete.
+        assert.equal(
+            normalizeLeafOutcome({ status: "deny", kind: "error", audit: "fail-closed: evaluator error: non-2xx response: 500" }),
+            LEAF.FAIL,
+        );
+    });
+
+    test("normalize: {status:'deny', kind:'unparseable'} -> FAIL", () => {
+        assert.equal(
+            normalizeLeafOutcome({ status: "deny", kind: "unparseable" }),
+            LEAF.FAIL,
+        );
+    });
+
+    test("normalize: KINDLESS {status:'deny'} -> FAIL (historic conflation shape, conservative)", () => {
+        // Pre-provenance producers emitted kindless denies for BOTH judgments
+        // and infra errors — the exact shape that made unanimous-deny a false
+        // safety-judgment claim. Post-provenance every real deny carries
+        // kind; a kindless deny is an unknown producer -> uncertain -> FAIL.
+        assert.equal(
+            normalizeLeafOutcome({ status: "deny", audit: "blocked: x" }),
+            LEAF.FAIL,
+        );
+    });
+
+    test("normalize: {status:'deny'} with UNKNOWN kind -> FAIL (uncertain)", () => {
+        assert.equal(
+            normalizeLeafOutcome({ status: "deny", kind: "banana" }),
+            LEAF.FAIL,
+        );
+    });
+
+    test("normalize: {status:'allow'} with any kind -> ALLOW (kind irrelevant on allow)", () => {
+        assert.equal(
+            normalizeLeafOutcome({ status: "allow", kind: "judgment" }),
+            LEAF.ALLOW,
+        );
+    });
+
+    test("normalize: typed error deny aggregates as INCOMPLETE (end-to-end D2 pin)", () => {
+        // Leaf A allows (judgment), leaf B times out (kind error). The
+        // aggregate must say incomplete — NOT disagreement/unanimous-deny.
+        const r = aggregateLeafOutcomes([
+            normalizeLeafOutcome({ status: "allow", kind: "judgment" }),
+            normalizeLeafOutcome({ status: "deny", kind: "error", subkind: "timeout" }),
+        ]);
+        assert.equal(r.decision, "deny");
+        assert.equal(r.incomplete, true);
+        assert.equal(r.disagreement, false);
+        assert.match(r.audit, /reason=incomplete/);
     });
 
     test("normalize: null -> FAIL (missing verdict)", () => {

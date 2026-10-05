@@ -163,7 +163,16 @@ import { decideLive, serializeTranscript } from "./auto-gate-live.js";
 // alone, so a credential embedded in a `command`/`pattern` cannot survive into
 // the stderr log. The IDENTICAL scrubber is shared with the HTTP-egress path
 // (auto-gate-live.js) via this module — no drift.
-import { scrubTruncate } from "./auto-gate-scrub.js";
+//
+// admitReason (+ the named-fallback tokens) is the O2 safe-feedback pipeline:
+// the ONLY way a classifier leaf <reason> reaches the agent-visible deny
+// string (both live and live-tiered egress sites below route through it).
+import {
+    scrubTruncate,
+    admitReason,
+    REASON_NONE,
+    REASON_SUPPRESSED,
+} from "./auto-gate-scrub.js";
 
 // Tiered-consensus aggregation core (Phase 2): normalizes each leaf outcome
 // (the SAME {status, audit, reason, latencyMs, retries} shape decideLive
@@ -241,6 +250,135 @@ function summarizeArgs(args) {
         parts.push(`args=${keys.length}`);
     }
     return parts.join(" ");
+}
+
+// ---------------------------------------------------------------------------
+// O2 SAFE-FEEDBACK — surfaced deny-string machinery.
+//
+// The agent-visible deny string (the v2 reject `message`, which upstream
+// surfaces to the model as CorrectedError errorText in the NEXT request) is
+// assembled here from (a) the UNCHANGED historical aggregate prefix (compat
+// anchor: existing regexes on "blocked by consensus" / "tier-aggregate" keep
+// matching byte-for-byte) and (b) per-leaf stamps appended AFTER it. A stamp
+// is either a JUDGMENT (a valid <block>yes</block> verdict was parsed; its
+// <reason> rides through the admitReason pipeline) or a NAMED INFRA
+// FALLBACK (parse-error / unavailable) that states no safety judgment was
+// obtained — never an invented policy explanation, never raw error text.
+//
+// Stamp grammar (single line; see the overlay README for the full table):
+//   allow
+//   deny(judgment; reason=<admitted|<none>|<suppressed>>)
+//   fail(parse-error; no parseable verdict returned)
+//   fail(unavailable[/subkind]; no safety judgment was obtained)
+// ---------------------------------------------------------------------------
+
+// Total bound for the assembled deny string. The aggregate prefix is
+// constant-shaped and short; leaf stamps are individually bounded
+// (MAX_REASON_CHARS); this cap bounds the whole assembly for pathological
+// leaf counts.
+const MAX_DENY_STRING_CHARS = 2000;
+
+// Whitelisted subkind SHAPE for interpolation into a fail(...) stamp. subkind
+// originates in auto-gate-verdict.js's fixed-whitelist derivation; this is
+// defense-in-depth so a future malformed value can NEVER ride the surfaced
+// string (it is the only non-constant token inside a stamp).
+const _SUBKIND_SHAPE_RE =
+    /^(?:timeout|transport|malformed|missing-key|missing-endpoint|missing-model|http-[0-9]{1,3})$/;
+
+// collectKnownValues(config, leaves) — the exact-string suppression set for
+// admitReason step 2. Gathers, from the merged LLM config (top level) and
+// every WELL-FORMED leaf: literal modelEndpoint / model / apiKey values, plus
+// the RESOLVED env values for modelEndpointEnv / apiKeyEnv (resolved exactly
+// as auto-gate-live.js resolves them — literal preferred, env name consulted
+// at call time). Env-var NAMES never enter the set; empty values are skipped;
+// the collected VALUES are never logged.
+function collectKnownValues(config, leaves) {
+    const values = [];
+    const add = (v) => {
+        if (typeof v === "string" && v.length > 0 && !values.includes(v)) {
+            values.push(v);
+        }
+    };
+    const addConfig = (c) => {
+        if (!c || typeof c !== "object") return;
+        add(c.modelEndpoint);
+        add(c.model);
+        add(c.apiKey);
+        if (typeof c.modelEndpointEnv === "string" && c.modelEndpointEnv) {
+            add(process.env[c.modelEndpointEnv]);
+        }
+        if (typeof c.apiKeyEnv === "string" && c.apiKeyEnv) {
+            add(process.env[c.apiKeyEnv]);
+        }
+    };
+    addConfig(config);
+    if (Array.isArray(leaves)) {
+        for (const leaf of leaves) addConfig(leaf);
+    }
+    return values;
+}
+
+// leafStampBody(result, knownValues) — the stamp KIND for one leaf result
+// (WITHOUT the `leaf#<i>=` prefix, so the single-leaf live site can reuse the
+// exact same grammar). Typed provenance decides the shape:
+//   status "allow"                       -> "allow"
+//   kind "judgment" (deny)               -> "deny(judgment; reason=<admitted>)"
+//   kind "unparseable"                   -> "fail(parse-error; no parseable verdict returned)"
+//   kind "error" / kindless / malformed  -> "fail(unavailable[/subkind]; no safety judgment was obtained)"
+// The judgment reason ALWAYS rides the admitReason pipeline (unconditional —
+// no "looks safe" bypass), with the named fallbacks <none>/<suppressed>.
+function leafStampBody(result, knownValues) {
+    if (!result || typeof result !== "object") {
+        return "fail(unavailable; no safety judgment was obtained)";
+    }
+    if (result.status === "allow") {
+        return "allow";
+    }
+    if (result.kind === "judgment") {
+        const admitted = admitReason(
+            typeof result.reason === "string" ? result.reason : "",
+            knownValues,
+        );
+        const text =
+            admitted.outcome === "none"
+                ? REASON_NONE
+                : admitted.outcome === "suppressed"
+                  ? REASON_SUPPRESSED
+                  : admitted.text;
+        return `deny(judgment; reason=${text})`;
+    }
+    if (result.kind === "unparseable") {
+        return "fail(parse-error; no parseable verdict returned)";
+    }
+    // kind "error" (or a kindless/unknown deny — the defensive shapes):
+    // named infra fallback; subkind only when it matches the fixed shape.
+    const sk =
+        typeof result.subkind === "string" && _SUBKIND_SHAPE_RE.test(result.subkind)
+            ? `/${result.subkind}`
+            : "";
+    return `fail(unavailable${sk}; no safety judgment was obtained)`;
+}
+
+// buildTieredDenyMessage(agg, results, knownValues) — assemble the
+// live-tiered surfaced deny string: the BYTE-IDENTICAL historical prefix +
+// aggregate audit, then " | " and the per-leaf stamps (config-array
+// ordinals). Capped at MAX_DENY_STRING_CHARS with an explicit aggregate
+// truncation marker. ONE build, TWO sinks: the caller reuses the same stamp
+// strings for the stderr per-leaf line so the operator sees exactly what the
+// model saw — never divergent copies.
+function buildTieredDenyMessage(agg, results, knownValues) {
+    let message = `[auto-gate] blocked by consensus: ${agg.audit}`;
+    if (Array.isArray(results) && results.length > 0) {
+        const stamps = results
+            .map((r, i) => `leaf#${i}=${leafStampBody(r, knownValues)}`)
+            .join(" ");
+        message += ` | ${stamps}`;
+    }
+    if (message.length > MAX_DENY_STRING_CHARS) {
+        message =
+            message.slice(0, MAX_DENY_STRING_CHARS) + "…[aggregate-truncated]";
+    }
+    return message;
 }
 
 // ---------------------------------------------------------------------------
@@ -1564,7 +1702,14 @@ export const server = async ({
                     await handleUncertain(`live decision error: ${msg}`);
                     return;
                 }
-                if (result.audit) console.error(`[auto-gate] ${result.audit}`);
+                // EGRESS DISCIPLINE: result.audit is NOT logged raw on the live
+                // deny path — a judgment audit embeds the RAW classifier
+                // <reason> and an error audit embeds the raw err.message, and
+                // neither may reach any surfaced/logged surface unsanitized.
+                // The sanitized stamp below is the ONLY reason-bearing egress,
+                // built ONCE and used by BOTH sinks (stderr deny-detail line +
+                // the v2 model-visible message) — the same one-build/two-sinks
+                // discipline as the live-tiered branch.
                 const retryTag =
                     result.retries > 0 ? ` retries=${result.retries}` : "";
                 console.error(
@@ -1574,11 +1719,22 @@ export const server = async ({
                 if (result.status === "allow") {
                     await reply(config.replyMode); // "once" | "always"
                 } else {
+                    // D1 (O2 safe-feedback): the single-leaf live deny string
+                    // rides the SAME admission pipeline + grammar as
+                    // live-tiered (minus leaf stamps). The historical
+                    // raw-forward of result.reason / result.audit (which on
+                    // infra failure embedded `fail-closed: evaluator error:
+                    // <raw err.message>` verbatim) is RETIRED — a judgment
+                    // surfaces its sanitized reason; an infra failure
+                    // surfaces the named fail(...) fallback.
+                    const liveStamp = leafStampBody(
+                        result,
+                        collectKnownValues(liveConfig, []),
+                    );
+                    console.error(`[auto-gate] live deny-detail ${liveStamp}`);
                     await reply(
                         "reject",
-                        result.reason ||
-                            result.audit ||
-                            "[auto-gate] blocked by live classifier",
+                        `[auto-gate] blocked by live classifier: ${liveStamp}`,
                     );
                 }
                 return;
@@ -1682,22 +1838,28 @@ export const server = async ({
                 // (4) Parallel per-leaf dispatch. Each leaf gets its OWN
                 // endpoint/model/apiKeyEnv/timeoutMs/retries; the shared
                 // promptFile + transcript apply to all. decideLive already
-                // catches internally and returns {status:"deny"} on error, but
-                // we wrap defensively so a throwing leaf becomes a FAIL
-                // outcome rather than aborting the whole tier.
+                // catches internally and returns a typed {status:"deny",
+                // kind:"error"} on error, but we wrap defensively so a leaf
+                // that somehow throws PAST decideLive becomes an infra-FAIL
+                // outcome (kind "error") rather than aborting the whole tier.
                 const leafPromises = wellFormedLeaves.map((leaf) =>
                     (async () => {
                         try {
                             const leafConfig = { ...config, ...leaf };
                             return await decideLive(leafConfig, serialized);
                         } catch (err) {
-                            // Defensive: decideLive should not throw, but if it
-                            // does, surface a deny-on-error so normalize maps
-                            // it to DENY (not FAIL), keeping the tier honest.
+                            // Defensive wrapper (R10): NO raw error text rides
+                            // the result — the historical `leaf threw: <msg>`
+                            // reason is RETIRED from egress (it embedded raw
+                            // error text). The surfaced stamp is the named
+                            // fail(unavailable...) fallback and the aggregate
+                            // reports the tier incomplete.
                             return {
                                 status: "deny",
-                                audit: null,
-                                reason: `leaf threw: ${(err && err.message) || String(err)}`,
+                                kind: "error",
+                                subkind: null,
+                                audit: "fail-closed: leaf dispatch error",
+                                reason: "",
                                 latencyMs: 0,
                                 retries: 0,
                             };
@@ -1707,7 +1869,9 @@ export const server = async ({
                 const results = await Promise.all(leafPromises);
 
                 // (5) Normalize each leaf outcome via the tiered core (maps
-                // {status:"allow"}->ALLOW, {status:"deny"}->DENY, else FAIL).
+                // {status:"allow"}->ALLOW, {status:"deny",kind:"judgment"}->
+                // DENY, {status:"deny",kind:"error"|"unparseable"} or
+                // kindless/malformed -> FAIL).
                 const normalized = results.map((r) => normalizeLeafOutcome(r));
 
                 // (6) Aggregate via the unanimous-allow policy.
@@ -1715,17 +1879,21 @@ export const server = async ({
                     tierId: "consensus",
                 });
 
-                // (7) EGRESS-DISCIPLINED audit line. agg.audit is already
+                // (7) EGRESS-DISCIPLINED audit lines. agg.audit is
                 // constant-shaped (tierId + integer counts + normalized-outcome
-                // enums ONLY — NEVER leaf endpoint/model/apiKeyEnv values). We
-                // log agg.audit directly plus the aggregate decision flags,
-                // and a per-leaf scrubbed outcome summary (integer retries/
-                // latency + enum outcomes — NO endpoint/model interpolation).
+                // enums ONLY — NEVER leaf endpoint/model/apiKeyEnv values). The
+                // per-leaf summary line carries the SAME sanitized leaf stamps
+                // the deny message surfaces (one build, two sinks — no
+                // divergent copies) plus the integer retries/latency telemetry.
                 console.error(`[auto-gate] ${agg.audit}`);
+                const knownValues = collectKnownValues(llmConfig, wellFormedLeaves);
+                const leafStamps = results.map((r, i) =>
+                    `leaf#${i}=${leafStampBody(r, knownValues)}`,
+                );
                 const perLeafSummary = results
                     .map(
                         (r, i) =>
-                            `leaf#${i}=${normalized[i]}` +
+                            `${leafStamps[i]}` +
                             ` retries=${(r && r.retries) || 0}` +
                             ` latencyMs=${(r && r.latencyMs) || 0}`,
                     )
@@ -1736,13 +1904,15 @@ export const server = async ({
                     `incomplete=${agg.incomplete} ${perLeafSummary}`,
                 );
 
-                // (8) Reply based on the aggregate decision.
+                // (8) Reply based on the aggregate decision. The deny message
+                // is the UNCHANGED historical prefix + aggregate audit (compat
+                // anchor) with the per-leaf stamps appended after " | ".
                 if (agg.decision === "allow") {
                     await reply(config.replyMode); // "once" | "always"
                 } else {
                     await reply(
                         "reject",
-                        `[auto-gate] blocked by consensus: ${agg.audit}`,
+                        buildTieredDenyMessage(agg, results, knownValues),
                     );
                 }
                 return;
@@ -2932,6 +3102,11 @@ if (__isMain) {
         writeTestConfig("create-user.json", { mode: "audit" });
         writeTestConfig("create-proj.json", { mode: "enforce" });
         const LOCAL = testConfigPath("create-local.json");
+        // Hermetic precondition: the first read below requires LOCAL to be
+        // ABSENT, but a previous run of this test leaves it behind (the
+        // setTimeout callback creates it and never unlinks). Remove any
+        // leftover so this test is deterministic across consecutive runs.
+        try { fs.unlinkSync(LOCAL); } catch (_) { /* not present — good */ }
         // First read: no local file yet (committed-project mode=enforce wins).
         const a = readConfig(
             testConfigPath("create-proj.json"),
@@ -4357,6 +4532,251 @@ if (__isMain) {
             typeof replies[0].body.message === "string" &&
                 replies[0].body.message.length > 0,
             "tiered unanimous-deny reject must carry a reason message",
+        );
+    });
+
+    // ===================================================================
+    // O2 SAFE-FEEDBACK CONTRACT — denial-path self-tests (red-first).
+    //
+    // These pin the surfaced deny-string grammar: typed judgment vs infra
+    // stamps, sanitized/attributed leaf reasons, named fallbacks, and the
+    // BYTE-IDENTICAL aggregate prefix (compat anchor — stamps append only
+    // AFTER the unchanged "tier-aggregate" segment).
+    // ===================================================================
+
+    test("live-tiered: judgment reason surfaced with byte-identical aggregate prefix + leaf stamps", async () => {
+        const { hooks, replies } = await setupEventTest(
+            {
+                mode: "live-tiered",
+                promptFile: testConfigPath("evt-classifier-prompt.txt"),
+            },
+            twoLeafLlmConfig(),
+        );
+        const restore = mockFetchByEndpoint({
+            "leaf-a-endpoint": "<block>no</block>", // allow
+            "leaf-b-endpoint":
+                "<block>yes</block><reason>[stamp-test] leaf B says no</reason>", // deny (judgment)
+        });
+        try {
+            await hooks["event"]({ event: makeAskedEvent() });
+        } finally {
+            restore();
+        }
+        assert.equal(replies.length, 1);
+        assert.equal(replies[0].body.response, "reject");
+        assert.equal(replies[0]._route, "v2");
+        // EXACT surfaced string: the historical prefix + agg.audit bytes are
+        // UNCHANGED, and the leaf stamps append after " | ". Ordinals are the
+        // config-array indices (leaf#0 = first configured leaf).
+        assert.equal(
+            replies[0].body.message,
+            "[auto-gate] blocked by consensus: " +
+                "tier-aggregate: deny (reason=disagreement leaves=2 allows=1 denies=1 tier=consensus)" +
+                " | leaf#0=allow" +
+                " leaf#1=deny(judgment; reason=[stamp-test] leaf B says no)",
+        );
+    });
+
+    test("live-tiered: one fail (leaf throws) -> typed fail(unavailable) stamp + truthful incomplete aggregate", async () => {
+        const { hooks, replies } = await setupEventTest(
+            {
+                mode: "live-tiered",
+                promptFile: testConfigPath("evt-classifier-prompt.txt"),
+            },
+            twoLeafLlmConfig(),
+        );
+        const restore = mockFetchByEndpoint({
+            "leaf-a-endpoint": "<block>no</block>", // allow
+            "leaf-b-endpoint": null, // throws -> decideLive deny-on-error
+        });
+        try {
+            await hooks["event"]({ event: makeAskedEvent() });
+        } finally {
+            restore();
+        }
+        assert.equal(replies.length, 1, "incomplete must reply (reject)");
+        assert.equal(replies[0].body.response, "reject");
+        assert.equal(replies[0]._route, "v2");
+        const msg = replies[0].body.message;
+        assert.ok(typeof msg === "string" && msg.length > 0);
+        // Typed-infra stamp: an infrastructure-errored leaf MUST surface as
+        // fail(unavailable...) — never as a judgment deny.
+        assert.ok(
+            msg.includes("fail(unavailable"),
+            "infra-errored leaf must surface a fail(unavailable...) stamp",
+        );
+        assert.ok(
+            msg.includes("no safety judgment was obtained"),
+            "fail stamp must state no safety judgment was obtained",
+        );
+        // Truth fix (D2): the aggregate must report incomplete (an errored
+        // leaf is NOT a judgment deny; unanimous-deny/disagreement would be a
+        // false safety-judgment claim).
+        assert.ok(
+            msg.includes("reason=incomplete"),
+            "aggregate must report reason=incomplete for an errored leaf",
+        );
+        // The raw throw text must never egress into the surfaced string.
+        assert.equal(
+            msg.includes("mock leaf failure"),
+            false,
+            "raw leaf error text must not surface",
+        );
+    });
+
+    test("live-tiered stamp: wrapper-shape error leaf -> fail(unavailable) wording, 'leaf threw:' retired", async () => {
+        // The defensive per-leaf wrapper (a leaf that throws PAST decideLive)
+        // produces a kind:"error" result with NO reason text. Its stamp must
+        // be the named infra fallback — the historical "leaf threw: <msg>"
+        // reason text is RETIRED from egress (it embedded raw error text).
+        // Exercised via the observable egress surface: a fetch that rejects
+        // with a tagged transport error produces the same kind:"error" shape
+        // through decideLive, and the stamp builder is shared.
+        const { hooks, replies } = await setupEventTest(
+            {
+                mode: "live-tiered",
+                promptFile: testConfigPath("evt-classifier-prompt.txt"),
+            },
+            twoLeafLlmConfig(),
+        );
+        const orig = globalThis.fetch;
+        globalThis.fetch = async (url) => {
+            const u = typeof url === "string" ? url : String(url);
+            if (u.includes("leaf-b-endpoint")) {
+                const e = new Error("wrapper-path boom");
+                e.name = "TransportError";
+                throw e;
+            }
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({
+                    choices: [{ message: { content: "<block>no</block>" } }],
+                }),
+            };
+        };
+        try {
+            await hooks["event"]({ event: makeAskedEvent() });
+        } finally {
+            globalThis.fetch = orig;
+        }
+        const msg = replies[0].body.message;
+        assert.ok(msg.includes("fail(unavailable"));
+        assert.ok(msg.includes("no safety judgment was obtained"));
+        assert.equal(
+            msg.includes("leaf threw:"),
+            false,
+            "'leaf threw:' text must be retired from egress",
+        );
+        assert.equal(
+            msg.includes("wrapper-path boom"),
+            false,
+            "raw wrapper error text must not surface",
+        );
+    });
+
+    test("live: deny message routes reason through the admission pipeline (D1)", async () => {
+        // Single-leaf live mode must ride the SAME sanitization grammar as
+        // live-tiered: prefixed stamp, credential redacted, no raw forward —
+        // on BOTH sinks (the v2 message AND the stderr deny-detail line).
+        const { hooks, replies } = await setupEventTest(
+            {
+                mode: "live",
+                promptFile: testConfigPath("evt-classifier-prompt.txt"),
+            },
+            {
+                modelEndpoint: "http://mock-llm",
+                model: "test-model",
+                maxRetries: 0,
+            },
+        );
+        const errors = [];
+        const orig = console.error;
+        console.error = (msg) => errors.push(msg);
+        const restore = mockFetchVerdict(
+            "<block>yes</block><reason>uses Bearer eyJleGFtcGxl.qm9o.signature here</reason>",
+        );
+        try {
+            await hooks["event"]({ event: makeAskedEvent() });
+        } finally {
+            restore();
+            console.error = orig;
+        }
+        assert.equal(replies.length, 1);
+        assert.equal(replies[0].body.response, "reject");
+        assert.equal(replies[0]._route, "v2");
+        const msg = replies[0].body.message;
+        assert.ok(
+            msg.startsWith("[auto-gate] blocked by live classifier: deny(judgment;"),
+            "single-leaf live deny must carry the prefixed stamp grammar",
+        );
+        assert.ok(
+            msg.includes("Bearer [redacted]"),
+            "credential in reason must be redacted",
+        );
+        assert.equal(
+            msg.includes("eyJleGFtcGxl.qm9o.signature"),
+            false,
+            "raw credential must not survive the pipeline",
+        );
+        // SINK 2 (stderr): the deny-detail line carries the SAME sanitized
+        // stamp; the raw reason must not appear on stderr either.
+        const combined = errors.join("\n");
+        assert.match(combined, /live deny-detail deny\(judgment; reason=/);
+        assert.equal(
+            combined.includes("eyJleGFtcGxl.qm9o.signature"),
+            false,
+            "raw credential must not survive into the stderr deny-detail line",
+        );
+        assert.equal(
+            combined.includes("blocked: uses Bearer"),
+            false,
+            "the historical raw-audit deny line must be gone",
+        );
+    });
+
+    test("live: infra error -> fail(unavailable) wording, no raw error egress (D1)", async () => {
+        const { hooks, replies } = await setupEventTest(
+            {
+                mode: "live",
+                promptFile: testConfigPath("evt-classifier-prompt.txt"),
+            },
+            {
+                modelEndpoint: "http://mock-llm",
+                model: "test-model",
+                maxRetries: 0,
+            },
+        );
+        const errors = [];
+        const orig = console.error;
+        console.error = (msg) => errors.push(msg);
+        const restore = mockFetchThrow("non-2xx response: 500");
+        try {
+            await hooks["event"]({ event: makeAskedEvent() });
+        } finally {
+            restore();
+            console.error = orig;
+        }
+        assert.equal(replies.length, 1);
+        assert.equal(replies[0].body.response, "reject");
+        const msg = replies[0].body.message;
+        assert.ok(
+            msg.includes("[auto-gate] blocked by live classifier: fail(unavailable"),
+            "infra error must surface the named fail(unavailable...) fallback",
+        );
+        assert.ok(msg.includes("no safety judgment was obtained"));
+        assert.equal(
+            msg.includes("non-2xx response"),
+            false,
+            "raw evaluator-error text must not surface",
+        );
+        // SINK 2 (stderr): no raw error text on the deny-detail path either.
+        const combined = errors.join("\n");
+        assert.match(combined, /live deny-detail fail\(unavailable/);
+        assert.equal(
+            combined.includes("non-2xx response"),
+            false,
+            "raw evaluator-error text must not survive into stderr",
         );
     });
 

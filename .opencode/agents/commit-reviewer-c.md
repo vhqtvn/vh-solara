@@ -35,7 +35,7 @@ Rules:
 - treat the declared file list as the primary scope
 - when the orchestrator provides a tree_hash AND a head_at_acquire anchor, read the diff via `git diff <head_at_acquire> <tree_hash>` — diff against the acquire-time HEAD anchor, NOT bare `HEAD` (review is lock-free, so a concurrent committer can move bare `HEAD` between acquire and review and pull phantom files into the reviewed scope; the anchor keeps the reviewed scope equal to the acquire-time scope). If a tree_hash is provided without head_at_acquire, fall back to `git diff HEAD <tree_hash>`; if no tree_hash is provided, fall back to `git diff` or reading changed files directly
 - use the diff content as review context, but do not let unrelated dirty files dominate the review
-- honor the nearest relevant `AGENTS.md`, `docs/coordination/LANES.yaml`, and path-scoped guidance for the files under review
+- honor the nearest relevant `AGENTS.md`, `docs/coordination/CONFLICT_MATRIX.yaml`, and path-scoped guidance for the files under review
 - suppress style and naming noise unless it hides a correctness, maintainability, or boundary risk
 - call out any dependency outside the declared slice explicitly instead of silently expanding scope
 - end with both an overall review confidence and an overall risk level

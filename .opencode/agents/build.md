@@ -14,7 +14,7 @@ Subagents do not automatically inherit the top-level `instructions` array — re
 - `AGENTS.md` — repo-wide rules, including the "Shell, container, and workspace hygiene" and "Demo API authentication and routes" sections.
 - `docs/ai/shell-execution.md` — the `vh-agent-harness exec` golden rule and the `Forbidden patterns` table backed by `shell-guard`.
 - `docs/ai/deployment-workflow.md` — project VPS release flow, if present.
-- `docs/ai/codebase-operational-primitives.md` — canonical paths, helper functions, container names, env conventions, and API response shapes.
+- `docs/ai/codebase-operational-primitives.md` (when one exists) — canonical paths, helper functions, container names, env conventions, and API response shapes; skip without failing when absent.
 
 If your mission text and these docs disagree, surface the conflict to the operator instead of silently picking one.
 
@@ -47,6 +47,17 @@ Treat perception output as candidate evidence, never transition authority.
 Preserve provenance and limitations in your slice report.
 
 
+
+## Git commit routing (capability available)
+
+The `core/gated-commit` capability is selected: git mutations route through
+the `committer` subagent via the gated-commit protocol. Before any commit,
+run `/commit-review` on the exact slice; delegate the commit itself to
+`committer` (it owns `commit-gate.sh`). Raw git mutations and direct gate
+invocation from build are denied unconditionally — see
+`.opencode/docs/git-execution-routing.md`.
+
+
 ## Shell hygiene
 
 - Prefix every shell command with `vh-agent-harness exec …` (or use a `vh-agent-harness <subcommand>` wrapper). Direct host-side commands fall through opencode's permission table to `*: ask` and burn operator confirmations.
@@ -63,7 +74,7 @@ Most recurring prompts come from commands the matcher's safe-parser cannot parse
 2. **SINGLE SIMPLE commands** — no `&&`-chains, brace-groups, multi-line `python3 -c`. Write the script to repo `./tmp/` and run the simple form (`vh-agent-harness exec python3 tmp/x.py`, `jq -f tmp/f.jq`).
 3. **Scratch under repo `./tmp/` via the Write tool** — never `/tmp` or out-of-repo paths.
 4. **Sanctioned wrappers** — `.opencode/scripts/readonly-scripts.sh gen-uuid` / `prep-tempdir`; never raw `cat /proc/…` or ad-hoc `mkdir`.
-5. **Git ops → `committer` subagent** — pass ONLY this session's explicit file list. A concurrently-dirty tree is normal; do not let unrelated dirty files dominate your handoff (the private-index gate excludes them). Never run `commit-gate.sh` / `git add` / `git commit` / `git checkout` / `git status`-driven cleanup from build. To revert a stray file you don't own, use `commit-gate.sh revert <paths>`.
+5. **Git ops → `committer` subagent** (only where `core/gated-commit` is selected) — pass ONLY this session's explicit file list. A concurrently-dirty tree is normal; do not let unrelated dirty files dominate your handoff (the private-index gate excludes them). Never run `commit-gate.sh` / `git add` / `git commit` / `git checkout` / `git status`-driven cleanup from build. To revert a stray file you don't own, use `commit-gate.sh revert <paths>`. On profiles without the capability there is no committer route — never raw git; preserve the work, report the missing route, and request activation or operator handling (see "Git commit routing" above).
 6. **Env vars and `timeout` INSIDE `vh-agent-harness exec bash -c '...'`** — never as a host prefix before `harness` (a prefix runs on the host, never reaches the container, and is now rejected by shell-guard). Good: `vh-agent-harness exec bash -c 'FOO=bar python -m mymodule'`. Bad: `FOO=bar vh-agent-harness exec python -m mymodule`.
 7. **Repo-relative paths only — never hardcode absolute `/home/<user>/...` paths.** Always reference files repo-relative (`docs/...`, `tmp/...`, `.opencode/...`) or resolve them from the project root. Hardcoded absolute home-dir paths are the recurring cause of the `external_directory` permission prompts — agents fat-finger the username (e.g. `/home/<operator-typo>`, `/home/<operator-typo>`) and the out-of-project path trips the matcher. The `shell-guard` plugin already resolves repo-relative paths against the repo root; matching that convention here kills the noise at the source. See `docs/ai/shell-execution.md` for the enforcement rationale.
 

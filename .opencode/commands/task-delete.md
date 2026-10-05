@@ -35,8 +35,8 @@ Task id (exactly one explicit id):
 $ARGUMENTS
 
 Workflow:
-- consult `docs/ai/codebase-operational-primitives.md` for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not rediscover these from scratch.
-- git mutations must flow through the `committer` agent via the gated-commit protocol. Load the `gated-commit` skill for details.
+- consult `docs/ai/codebase-operational-primitives.md` (when one exists) for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not chase or fail when it is absent, and do not rediscover these from scratch when it is present.
+- git mutations must flow through the `committer` agent via the gated-commit protocol **where `core/gated-commit` is selected**; on profiles without it, automated committing is unavailable — preserve the work, report the missing route, and request separately-authorized activation or operator handling (`.opencode/docs/git-execution-routing.md` → "Capability condition"). Load the `gated-commit` skill for details.
 - accept exactly ONE explicit task id from `$ARGUMENTS`. Reject before calling the tool if the input is:
   - missing or empty
   - a wildcard or glob (`*`, `?`, brackets)
@@ -64,4 +64,4 @@ Return:
 - the card's last-known title and status (or `malformed: true` if the card could not be parsed)
 - if the card was protected (actively owned or lifecycle-guarded) and `force` was not supplied, the structured refusal and the explicit instruction that re-running with `force` is a separate deliberate action
 
-For git operations, follow `.opencode/docs/git-execution-routing.md`.
+For git operations, follow `.opencode/docs/git-execution-routing.md` — including its "Capability condition" section (on profiles without `core/gated-commit` selected, automated committing is unavailable: preserve the work, report the missing route, and request separately-authorized activation or operator handling).

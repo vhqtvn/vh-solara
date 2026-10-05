@@ -19,8 +19,8 @@ Check and update as needed:
 - .github/prompts/
 
 Rules:
-- consult `docs/ai/codebase-operational-primitives.md` for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not rediscover these from scratch.
-- git mutations must flow through the `committer` agent via the gated-commit protocol. Load the `gated-commit` skill for details.
+- consult `docs/ai/codebase-operational-primitives.md` (when one exists) for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not chase or fail when it is absent, and do not rediscover these from scratch when it is present.
+- git mutations must flow through the `committer` agent via the gated-commit protocol **where `core/gated-commit` is selected**; on profiles without it, automated committing is unavailable — preserve the work, report the missing route, and request separately-authorized activation or operator handling (`.opencode/docs/git-execution-routing.md` → "Capability condition"). Load the `gated-commit` skill for details.
 - backlog is the source of truth for task state
 - if `docs/planning/backlog.md` changed, or a task status moved to `done` / `cancelled`, run `vh-agent-harness exec node .opencode/scripts/normalize-backlog.js` before finishing so active sections stay clean and older history is archived deterministically
 - summarize any archive files touched under `docs/planning/archive/`
@@ -38,4 +38,4 @@ Output:
 - any archive files changed
 - any docs that still need human confirmation
 
-For git operations, follow `.opencode/docs/git-execution-routing.md`.
+For git operations, follow `.opencode/docs/git-execution-routing.md` — including its "Capability condition" section (on profiles without `core/gated-commit` selected, automated committing is unavailable: preserve the work, report the missing route, and request separately-authorized activation or operator handling).

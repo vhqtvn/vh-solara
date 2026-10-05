@@ -10,8 +10,8 @@ Slug:
 $ARGUMENTS
 
 Rules:
-- consult `docs/ai/codebase-operational-primitives.md` for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not rediscover these from scratch.
-- git mutations must flow through the `committer` agent via the gated-commit protocol. Load the `gated-commit` skill for details.
+- consult `docs/ai/codebase-operational-primitives.md` (when one exists) for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not chase or fail when it is absent, and do not rediscover these from scratch when it is present.
+- git mutations must flow through the `committer` agent via the gated-commit protocol **where `core/gated-commit` is selected**; on profiles without it, automated committing is unavailable — preserve the work, report the missing route, and request separately-authorized activation or operator handling (`.opencode/docs/git-execution-routing.md` → "Capability condition"). Load the `gated-commit` skill for details.
 - if there is no clear plan in the current conversation, say that explicitly and stop
 - do not require the plan to be approved yet
 - extract only the latest concrete plan body; do not invent missing requirements
@@ -29,4 +29,4 @@ After saving:
 - note: before `/approve-plan`, an F3 design-readiness envelope (`f3_design_readiness` frontmatter key) will be required — see `/task-ready` for the envelope shape + authority discipline
 - recommend `/approve-plan <slug>` when the draft is ready
 
-For git operations, follow `.opencode/docs/git-execution-routing.md`.
+For git operations, follow `.opencode/docs/git-execution-routing.md` — including its "Capability condition" section (on profiles without `core/gated-commit` selected, automated committing is unavailable: preserve the work, report the missing route, and request separately-authorized activation or operator handling).

@@ -713,6 +713,7 @@ async function _attemptFetchParse(fetchImpl, endpoint, apiKey, body, timeoutMs) 
             `malformed JSON response: ${(e && e.message) || String(e)}`,
         );
         tagged.retryable = false; // parse error: not retryable
+        tagged.gateSubkind = "malformed";
         throw tagged;
     }
 
@@ -745,7 +746,9 @@ async function _classifyLiveCore(config, serializedInput, fetchFn, runnerFn) {
     }
     const model = config && config.model;
     if (typeof model !== "string" || model.length === 0) {
-        throw new Error("missing model");
+        const e = new Error("missing model");
+        e.gateSubkind = "missing-model";
+        throw e;
     }
     // Dual-form endpoint resolution (literal-preferred):
     //   - a NON-EMPTY literal `config.modelEndpoint` wins;
@@ -766,7 +769,9 @@ async function _classifyLiveCore(config, serializedInput, fetchFn, runnerFn) {
         ? endpointLiteral
         : (process.env[endpointEnvName] || "");
     if (typeof endpoint !== "string" || endpoint.length === 0) {
-        throw new Error("missing modelEndpoint");
+        const e = new Error("missing modelEndpoint");
+        e.gateSubkind = "missing-endpoint";
+        throw e;
     }
     // Dual-form key resolution (literal-preferred):
     //   - a NON-EMPTY literal `config.apiKey` (the value itself) wins;
@@ -787,7 +792,11 @@ async function _classifyLiveCore(config, serializedInput, fetchFn, runnerFn) {
         ? apiKeyLiteral
         : (process.env[apiKeyEnv] || "");
     if (!apiKey || typeof apiKey !== "string" || apiKey.length === 0) {
-        throw new Error(`missing API key (literal apiKey or env ${apiKeyEnv})`);
+        const e = new Error(
+            `missing API key (literal apiKey or env ${apiKeyEnv})`,
+        );
+        e.gateSubkind = "missing-key";
+        throw e;
     }
     const timeoutMs =
         config && typeof config.timeoutMs === "number" && config.timeoutMs > 0
@@ -921,7 +930,20 @@ export async function decideLive(config, serializedInput, fetchFn, runnerFn) {
     });
     // `retries` flows up to the live-decision audit line (appended as
     // `retries=N` when > 0); it is a safe integer (no tool-call content).
-    return { status: result.status, audit: result.audit, reason: result.reason, latencyMs, retries };
+    // `kind`/`subkind` are the TYPED PROVENANCE from decidePermission's
+    // matrix (judgment vs error/unparseable; whitelisted infra subkind) —
+    // they let the tier aggregator tell a real judgment deny from an
+    // infrastructure failure WITHOUT string-matching audit prose, and let
+    // the surfaced deny string carry honest fail(...) stamps.
+    return {
+        status: result.status,
+        kind: result.kind,
+        subkind: result.subkind,
+        audit: result.audit,
+        reason: result.reason,
+        latencyMs,
+        retries,
+    };
 }
 
 // ===========================================================================
@@ -2316,6 +2338,94 @@ if (__isMain) {
         const r = await decideLive(GOOD_CONFIG, "input", fakeFetchOk("<block>no</block>"), fakeRunnerOk());
         assert.equal(r.status, "allow");
         assert.equal(r.retries, 0);
+    }));
+
+    // ===== decideLive: typed provenance (kind/subkind — O2 safe-feedback) =====
+    //
+    // kind/subkind ride alongside status so the tier aggregator and the
+    // surfaced deny string can tell a real judgment deny from an
+    // infrastructure failure WITHOUT string-matching audit prose.
+
+    test("decideLive provenance: block verdict -> kind judgment", withKey(async () => {
+        const r = await decideLive(
+            GOOD_CONFIG,
+            "input",
+            fakeFetchOk("<block>yes</block><reason>[x] y</reason>"),
+            fakeRunnerOk(),
+        );
+        assert.equal(r.status, "deny");
+        assert.equal(r.kind, "judgment");
+        assert.equal(r.subkind, null);
+        assert.equal(r.reason, "[x] y");
+    }));
+
+    test("decideLive provenance: AbortError -> kind error subkind timeout", withKey(async () => {
+        const fake = async () => {
+            const e = new Error("aborted");
+            e.name = "AbortError";
+            throw e;
+        };
+        const r = await decideLive(GOOD_CONFIG, "input", fake, fakeRunnerOk());
+        assert.equal(r.status, "deny");
+        assert.equal(r.kind, "error");
+        assert.equal(r.subkind, "timeout");
+    }));
+
+    test("decideLive provenance: HTTP 500 -> kind error subkind http-500", withKey(async () => {
+        const fake = async () => ({ status: 500, json: async () => ({}) });
+        const r = await decideLive(
+            { ...GOOD_CONFIG, maxRetries: 0 },
+            "input",
+            fake,
+            fakeRunnerOk(),
+        );
+        assert.equal(r.status, "deny");
+        assert.equal(r.kind, "error");
+        assert.equal(r.subkind, "http-500");
+    }));
+
+    test("decideLive provenance: transport throw -> kind error subkind transport", withKey(async () => {
+        const fake = async () => {
+            throw new Error("fetch failed ECONNRESET");
+        };
+        const r = await decideLive(
+            { ...GOOD_CONFIG, maxRetries: 0 },
+            "input",
+            fake,
+            fakeRunnerOk(),
+        );
+        assert.equal(r.status, "deny");
+        assert.equal(r.kind, "error");
+        assert.equal(r.subkind, "transport");
+    }));
+
+    test("decideLive provenance: unparseable content -> kind unparseable", withKey(async () => {
+        const r = await decideLive(
+            GOOD_CONFIG,
+            "input",
+            fakeFetchOk("no block tag here"),
+            fakeRunnerOk(),
+        );
+        assert.equal(r.status, "deny");
+        assert.equal(r.kind, "unparseable");
+        assert.equal(r.subkind, null);
+    }));
+
+    test("decideLive provenance: misconfig -> whitelisted missing-* subkind", withKey(async () => {
+        const noModel = await decideLive(
+            { ...GOOD_CONFIG, model: "" },
+            "input",
+            fakeFetchOk("x"),
+        );
+        assert.equal(noModel.kind, "error");
+        assert.equal(noModel.subkind, "missing-model");
+        const noEndpoint = await decideLive(
+            { ...GOOD_CONFIG, modelEndpoint: "" },
+            "input",
+            fakeFetchOk("x"),
+        );
+        assert.equal(noEndpoint.kind, "error");
+        assert.equal(noEndpoint.subkind, "missing-endpoint");
     }));
 
     // ===== decideLive: retries telemetry on the THROW path (telemetry-fix regression) =====
