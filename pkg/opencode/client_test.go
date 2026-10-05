@@ -105,6 +105,13 @@ func TestSubscribeEventsHeadersNeverArrive(t *testing.T) {
 	if elapsed > 2*time.Second {
 		t.Fatalf("SubscribeEvents hung waiting for headers: %v (want ~%v)", elapsed, idleTimeout)
 	}
+	// Mirrors TestSubscribeEventsDeadButOpen's lower bound: the synthetic
+	// header error fires only when the header timer does, so returning
+	// before idleTimeout has elapsed would mean something else cut the
+	// wait (e.g. Do erroring early) — a different failure than pinned here.
+	if elapsed < idleTimeout {
+		t.Fatalf("returned before idle timeout: elapsed=%v timeout=%v", elapsed, idleTimeout)
+	}
 }
 
 // contentFreeEventServer accepts /event and then emits a continuous flow of
@@ -321,6 +328,80 @@ func TestSubscribeEventsCtxCancel(t *testing.T) {
 	}
 	if elapsed > 2*time.Second {
 		t.Fatalf("SubscribeEvents took too long to honor ctx cancel: %v", elapsed)
+	}
+}
+
+// TestSubscribeEventsCtxCancelBeforeHeaders pins the parent-context-authority
+// half of the header timer (the sibling of HeadersNeverArrive's timer-half):
+// when the caller cancels while Do is still parked waiting for response
+// headers, the guard `!headerTimer.Stop() && ctx.Err() == nil` must NOT
+// synthesize the "no response headers" error — Stop() returns true (the timer
+// never fired), so Do's real cancellation error must surface instead. That
+// error is wrapped in *url.Error by the transport, hence errors.Is, not ==.
+// Determinism comes from a server-entry rendezvous instead of a sleep: the
+// cancellation worker waits until the handler has actually been entered —
+// proving Do is blocked on headers, with none written — so cancel never races
+// the 30s timer.
+func TestSubscribeEventsCtxCancelBeforeHeaders(t *testing.T) {
+	// Long idle timeout, set BEFORE any goroutine starts: cancellation must
+	// deterministically win; the header timer must never be able to fire.
+	withIdleTimeout(t, 30*time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// entered is closed by the handler on entry: proof the request reached
+	// the server while no response headers had been written.
+	entered := make(chan struct{})
+	cancelDone := make(chan struct{})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/event", func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		// No headers, no body: park until the client disconnects (it will,
+		// once the cancelled parent tears down the request context).
+		<-r.Context().Done()
+	})
+	srv := httptest.NewServer(mux)
+	// Registered BEFORE the cancel-and-join cleanup below so LIFO ordering
+	// runs that cleanup first: the worker is released and joined before the
+	// server stops waiting on its parked handler.
+	t.Cleanup(srv.Close)
+
+	// Cancellation worker: cancel only after the handler has been entered.
+	// The ctx.Done() alternative exit keeps it from leaking if the request
+	// dies before ever reaching the handler.
+	go func() {
+		defer close(cancelDone)
+		select {
+		case <-entered:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	t.Cleanup(func() {
+		cancel()     // no-op in the normal path; releases a still-waiting worker
+		<-cancelDone // join before srv.Close
+	})
+
+	c := New(srv.URL)
+
+	start := time.Now()
+	err := c.SubscribeEvents(ctx, func(Event) error { return nil })
+	elapsed := time.Since(start)
+
+	// The rendezvous must have fired — cancellation only ever happened
+	// after the handler was entered, so this is deterministic, not raced.
+	select {
+	case <-entered:
+	default:
+		t.Fatal("request never reached the /event handler")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected parent cancellation, got %v", err)
+	}
+	// Upper bound only: prompt cancellation is correct, so no lower bound.
+	if elapsed > 2*time.Second {
+		t.Fatalf("SubscribeEvents took too long to honor ctx cancel before headers: %v", elapsed)
 	}
 }
 
