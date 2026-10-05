@@ -52,10 +52,14 @@ func killPidTerm(pid int) {
 }
 
 // streamRecorder is a mutex-guarded accumulation of everything an SSE
-// endpoint writes — the test greps it for notice frames.
+// endpoint writes — the test greps it for notice frames. The pump
+// goroutine also records its terminal read error (EOF, connection reset,
+// …) so the snapshot-ack barrier below can report WHY the stream stopped
+// instead of timing out with a bare notice failure later.
 type streamRecorder struct {
-	mu  sync.Mutex
-	buf strings.Builder
+	mu      sync.Mutex
+	buf     strings.Builder
+	readErr error
 }
 
 func (s *streamRecorder) write(p string) {
@@ -64,10 +68,87 @@ func (s *streamRecorder) write(p string) {
 	s.buf.WriteString(p)
 }
 
+// fail records the pump's terminal read error (first one wins).
+func (s *streamRecorder) fail(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.readErr == nil {
+		s.readErr = err
+	}
+}
+
+// readErrString returns the terminal read error, or "" while the pump is
+// still streaming.
+func (s *streamRecorder) readErrString() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.readErr == nil {
+		return ""
+	}
+	return s.readErr.Error()
+}
+
 func (s *streamRecorder) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.buf.String()
+}
+
+// completeSnapshotFrame reports whether the recorded wire holds ONE
+// COMPLETE SSE `event: snapshot` frame — the event-name line, its
+// single-line JSON data, and the blank-line terminator — not a partial
+// read. The recorder only appends whole lines (ReadString('\n') returns
+// on the newline), so a `\n\n` after the event-name line proves the
+// frame's terminator arrived: json.Marshal emits no raw newlines, so the
+// data is exactly one line and the first `\n\n` after `event:
+// snapshot\n` is that line's newline plus the blank terminator. The
+// literal `event: snapshot\n` cannot match sibling bootstrap frames
+// (`pins.snapshot`, `labels.snapshot`, tree=2's `tree.snapshot` /
+// `snapshot.complete`) because they all insert characters between the
+// colon and `snapshot\n`.
+func completeSnapshotFrame(s string) bool {
+	const name = "event: snapshot\n"
+	i := strings.Index(s, name)
+	if i < 0 {
+		return false
+	}
+	return strings.Contains(s[i+len(name):], "\n\n")
+}
+
+// ackSnapshotFrame is the subscription-sync barrier (kill-verification
+// brief F1): it blocks until the stream has delivered one complete
+// `event: snapshot` frame, proving the server registered this
+// connection's subscription. Grounding (pkg/web/server.go): the handler
+// calls store.SubscribeWith (~:2597) BEFORE it computes and writes the
+// fresh-subscribe snapshot (~:2931-2961, writeRaw at ~:2957), so receipt
+// of the full frame ⇒ subscription registered ⇒ any later
+// store.EmitNotice (the death notice) is queued to this connection after
+// that point. On failure it says "no snapshot within Ns" up front, with
+// the pump's terminal read error (if the stream died) and the tail of
+// what was received.
+func ackSnapshotFrame(t *testing.T, rec *streamRecorder, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !completeSnapshotFrame(rec.String()) {
+		if errStr := rec.readErrString(); errStr != "" {
+			t.Fatalf("no snapshot within %s: stream read ended first: %s; last stream bytes: %q",
+				timeout, errStr, tailForDiag(rec.String()))
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no snapshot within %s (fresh-subscribe ack; stream still open, read error: %q); last stream bytes: %q",
+				timeout, rec.readErrString(), tailForDiag(rec.String()))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// tailForDiag clamps a diagnostic dump to a sane suffix.
+func tailForDiag(s string) string {
+	const max = 512
+	if len(s) <= max {
+		return s
+	}
+	return "…" + s[len(s)-max:]
 }
 
 // bootGlueStatus fetches /vh/opencode/status off the REAL setupVHMode
@@ -156,10 +237,15 @@ func TestOCBootGlueDeathNoticeReachesStream(t *testing.T) {
 	// installed — engine.Attach, the "OPENED projects only" fan-out rule)
 	// and subscribes the connection. Notices are live-only, so this
 	// ordering is the production shape: browser open → death → notice.
+	// NO cursor param and NO Last-Event-ID header: cursor=0 is a VALID
+	// replay input (hasCursor=true takes the replay branch, which can ship
+	// only deltas with no snapshot frame at all), while a bare fresh
+	// subscribe is guaranteed to emit the baseline snapshot the ack
+	// barrier below waits for.
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	rec := &streamRecorder{}
 	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet,
-		fmt.Sprintf("http://127.0.0.1:%d/vh/stream?cursor=0", rt.webPort), nil)
+		fmt.Sprintf("http://127.0.0.1:%d/vh/stream", rt.webPort), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,18 +265,21 @@ func TestOCBootGlueDeathNoticeReachesStream(t *testing.T) {
 				rec.write(line)
 			}
 			if err != nil {
+				rec.fail(err) // EOF/reset: surface it to the ack barrier
 				return
 			}
 		}
 	}()
 
-	// ": hello" is flushed at handler entry; SubscribeWith happens shortly
-	// after, before the snapshot frames. Wait for the hello then give the
-	// handler a generous beat to register the subscription.
-	watchWaitFor(t, 10*time.Second, func() bool {
-		return strings.Contains(rec.String(), ": hello")
-	}, "stream handshake")
-	time.Sleep(250 * time.Millisecond)
+	// Subscription-sync barrier (replaces the old fixed 250ms sleep, which
+	// only GUESSED at registration latency): the server registers the
+	// subscription (SubscribeWith) strictly before writing the
+	// fresh-subscribe snapshot frame, so waiting for one COMPLETE
+	// `event: snapshot` frame here proves the death notice — emitted via
+	// store.EmitNotice after the SIGTERM below — cannot slip in ahead of
+	// our registration. This also subsumes the old ": hello" handshake
+	// wait (hello is flushed at handler entry, before the snapshot).
+	ackSnapshotFrame(t, rec, 10*time.Second)
 
 	// ——— the incident ———
 	killPidTerm(pid)
