@@ -12,8 +12,9 @@ Three automated layers verify the OpenCode death/recovery path (manual checking 
 2. **Web end-to-end** (`web/tests/e2e/opencode-down.spec.ts`): Uses the fixtureserver `/vh/fixture/oclife?mode=down|restarting|capped|ready|off` fixture (OFF by default; `off` restores exact pre-change 503) to pin the panel's exact down-state strings.
    Run: `vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && npm --prefix web run test:e2e -- opencode-down'`
 
-3. **Docker gold lane (Flow 8)**: Uses the `vh-e2e-real` container (real binary `local-server --opencode-detached` + real opencode). Exercises pkill → death log line → failed+down_since → dead-window prompt 5xx → heal (fresh pid; old pid intentional zombie) → retry-after-recovery lands exactly once. Timing expectations are ~2–3min. (Note pre-existing lane flakes: Flow 5-C 2m-boundary race and Flow 1 cold-start hydrate stall).
-   Run: `bash tests/e2e-docker/run.sh`
+3. **Docker gold lane (Flow 8)**: Uses the `vh-e2e-real` container (real binary `local-server --opencode-detached` + real opencode). Exercises pkill → death log line → failed+down_since → dead-window prompt 5xx → heal (fresh pid; old pid intentional zombie) → retry-after-recovery lands exactly once. Timing expectations are ~2–3min. The lane is flow-selectable; the full lane (1-8) has passed on tree `caeca72` / image sha256:e5302498 / opencode 1.18.34, resolving prior flakes.
+   Run (Flow 8 scoped): `bash tests/e2e-docker/run.sh --flow 8`
+   Run (Full lane): `bash tests/e2e-docker/run.sh`
 
 ## Optional Live Spot-Check Prerequisites
 

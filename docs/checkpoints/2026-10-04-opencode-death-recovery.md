@@ -76,3 +76,9 @@ interaction_touching: false
 command: bash tests/e2e-docker/run.sh
 receipt: S5 crux: Flow 8 exercises pkill, dead-window prompt 5xx, heal, and idempotent retry via scratch harness. Full lane claiming deferred (F2) due to pre-existing flakes. Tree f4f7d6eb.
 ```
+
+## Defer Closure (F1/F2/F3)
+
+- **F1 CLOSED** — `f4df6d67` `test(cmd): await subscribed snapshot before kill in boot-glue test`: 250ms sleep replaced by first-snapshot-ack barrier (complete `event: snapshot` frame awaited before SIGTERM); receipts 20/20 focused + full `./cmd/` ok. Trigger void.
+- **F3 CLOSED** — `caeca726` `fix(web): synchronize OpenCode lifecycle pointer publication`: `atomic.Pointer[oclife.Lifecycle]`, one Load per handler (status/logs/restart), fixture race-by-design comment removed, new `-race` concurrency tests green. Sibling `restartOC` field remains plain (no live race, pre-serve wiring — noted as advisory, not fixed). Upgrade condition void.
+- **F2 CLOSED** — `09818f6c` `test(e2e-docker): flow selector, hydrate readiness, deterministic 5-C seeding`: `--flow <n>` selector (pre-side-effect validation); Flow 8 per-PID tight death-log grep; Flow 1 SID readiness gate (120×1s); Flow 5-C deterministic tombstone seeding (archive completion observed as live-tree disappearance; 30s TTL; back-to-back delete); stale 5s→10s comments fixed; hidden flow-5→flow-1 calibration dependency fixed. Receipts: `--flow 8` PASS, `--flow 1` PASS, `--flow 5` PASS, **full default lane (1-8) exit 0** on tree `caeca72+slice` / image sha256:e5302498… / opencode 1.18.34; log at `tmp/agent-runs/kill-verification-defers/acceptance-run.log`. Claim language honored: full docker-gold lane passed (not full-repo/web green, not permanent flake elimination); Flow 8 retry = NEW message ID (no same-ID idempotency claim); C3 deep-cold-retry not reproduced (warm-leaning). Trigger satisfied.
