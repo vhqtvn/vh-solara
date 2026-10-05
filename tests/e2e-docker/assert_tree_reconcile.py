@@ -3,10 +3,13 @@
 
 Reads the RAW SSE text captured from a LONG-LIVED `GET /vh/stream?tree=2`
 connection on stdin. That connection saw the cold snapshot (so the victim is
-`known` to it), then run.sh raw-DELETED the victim row directly in the
-container's opencode SQLite (bypassing the opencode app => NO session.deleted
-event => a genuine missed delete only the reconcile ticker can catch), then
-waited through multiple reconcile ticks (~5s each).
+`known` to it), then run.sh armed the fast-reconcile tombstone (archiving an
+unrelated disposable session and observing its disappearance from the live
+tree), raw-DELETED the victim row directly in the container's opencode SQLite
+(bypassing the opencode app => NO session.deleted event => a genuine missed
+delete only the reconcile ticker can catch), then waited through multiple
+reconcile ticks (~10s each; every tick is a full ghost scan while the archive
+tombstone is live).
 
 Asserts:
   C1. the cold snapshot shipped ses_tree_victim (so it is `known` to this

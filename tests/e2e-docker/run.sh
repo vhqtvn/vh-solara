@@ -4,7 +4,11 @@
 # assert the prompt round-trips and the streamed assistant reply surfaces via
 # the vh sync API.
 #
-#   tests/e2e-docker/run.sh [--keep]
+#   tests/e2e-docker/run.sh [--keep] [--flow <all|1..8>]
+#
+# --flow N runs ONLY flow N with its own independent setup/cleanup (flow 8
+# boots its own real local-server container; flows 1-7 share the e2eserver
+# container and create the session they need). Default: all flows, in order.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -22,7 +26,29 @@ BASE="http://127.0.0.1:${PORT}"
 NAME_REAL=vh-e2e-real
 PORT_REAL=8098
 BASE_REAL="http://127.0.0.1:${PORT_REAL}"
-KEEP="${1:-}"
+
+# --- args ---------------------------------------------------------------------
+# Parsed (and validated) BEFORE any image/container side effect: an invalid
+# selector must exit nonzero without touching docker state.
+FLOW="all"
+KEEP=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --keep) KEEP="--keep"; shift ;;
+    --flow)
+      [ $# -ge 2 ] || { echo "run.sh: --flow needs a value (all or 1..8)" >&2; exit 2; }
+      FLOW="$2"; shift 2 ;;
+    --flow=*) FLOW="${1#--flow=}"; shift ;;
+    *) echo "run.sh: unknown argument: $1 (usage: run.sh [--keep] [--flow <all|1..8>])" >&2; exit 2 ;;
+  esac
+done
+case "$FLOW" in
+  all|1|2|3|4|5|6|7|8) ;;
+  *) echo "run.sh: invalid --flow '${FLOW}' (want: all or 1..8)" >&2; exit 2 ;;
+esac
+
+# want_flow N: true when flow N is selected (or when all flows run).
+want_flow() { [ "$FLOW" = "all" ] || [ "$FLOW" = "$1" ]; }
 
 cleanup() {
   if [ "$KEEP" != "--keep" ]; then
@@ -41,30 +67,87 @@ fail() {
   exit 1
 }
 
-echo "==> building $IMAGE (real opencode + fake LLM)"
-docker build -f Dockerfile.e2e -t "$IMAGE" . >/dev/null
+build_image() {
+  echo "==> building $IMAGE (real opencode + fake LLM)"
+  docker build -f Dockerfile.e2e -t "$IMAGE" . >/dev/null
+}
 
-docker rm -f "$NAME" >/dev/null 2>&1 || true
-echo "==> starting container"
-docker run -d --name "$NAME" -p "${PORT}:8099" "$IMAGE" >/dev/null
+boot_e2eserver() {
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  echo "==> starting container"
+  docker run -d --name "$NAME" -p "${PORT}:8099" "$IMAGE" >/dev/null
 
-echo "==> waiting for vh web server"
-for i in $(seq 1 60); do
-  if curl -fsS "${BASE}/vh/healthz" >/dev/null 2>&1; then break; fi
-  sleep 1
-  [ "$i" = 60 ] && fail "vh web server did not become ready"
-done
+  echo "==> waiting for vh web server"
+  for i in $(seq 1 60); do
+    if curl -fsS "${BASE}/vh/healthz" >/dev/null 2>&1; then break; fi
+    sleep 1
+    [ "$i" = 60 ] && fail "vh web server did not become ready"
+  done
+}
 
-echo "==> waiting for opencode session backend (create a session)"
 SID=""
-for i in $(seq 1 60); do
-  SID=$(curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session" -H 'Content-Type: application/json' -d '{"title":"e2e"}' \
-        | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
-  [ -n "$SID" ] && break
+# ensure_sid: flows that drive $SID reuse the session a prior flow created
+# (the default all-flows run threads one SID from flow 1) or create their own
+# when selected in isolation.
+ensure_sid() {
+  [ -n "$SID" ] && return 0
+  echo "==> waiting for opencode session backend (create a session)"
+  for i in $(seq 1 60); do
+    SID=$(curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session" -H 'Content-Type: application/json' -d '{"title":"e2e"}' \
+          | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
+    [ -n "$SID" ] && break
+    sleep 1
+    [ "$i" = 60 ] && fail "could not create an opencode session"
+  done
+  echo "    session id: $SID"
+}
+
+build_image
+# Flow 8 boots its own REAL local-server container (inside its section below);
+# every other flow (1-7) drives the shared e2eserver container.
+if [ "$FLOW" != "8" ]; then
+  boot_e2eserver
+fi
+
+# --- Flow 1: prompt -> streamed assistant reply -------------------------------
+if want_flow 1; then
+ensure_sid
+
+echo "==> waiting for the created session to surface in the aggregated snapshot"
+# Cold-hydrate readiness: the session-create 200 only proves OpenCode accepted
+# the session. On a COLD aggregator the hydrate may still be retrying
+# (pkg/aggregator/lifecycle.go: ~1s initial backoff growing x2, attempts capped
+# at 30s each — a bounded ~120s ceiling covers 3 full-timeout failures plus a
+# fast 4th). If the 30s stream capture below starts before the SID is in the
+# aggregated store, the capture can expire before any of this session's message
+# events surface. Poll the aggregated session surface (GET /vh/snapshot ->
+# sessions[].id) until the created SID is visible; readiness only gates the
+# capture — the prompt POST itself is still sent exactly once (never retried).
+SID_VISIBLE=0
+LAST_SNAP=""
+for i in $(seq 1 120); do
+  LAST_SNAP=$(curl -fsS "${BASE}/vh/snapshot" 2>/dev/null || true)
+  if printf '%s' "$LAST_SNAP" | python3 -c '
+import sys, json
+sid = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+ids = [s.get("id", "") for s in d.get("sessions", [])]
+sys.exit(0 if sid in ids else 1)
+' "$SID"; then
+    SID_VISIBLE=1
+    echo "    sid ${SID} visible in aggregated snapshot (poll ${i}/120)"
+    break
+  fi
   sleep 1
-  [ "$i" = 60 ] && fail "could not create an opencode session"
 done
-echo "    session id: $SID"
+if [ "$SID_VISIBLE" != "1" ]; then
+  echo "----- last aggregated snapshot (truncated) -----" >&2
+  printf '%s' "$LAST_SNAP" | head -c 400 >&2; echo >&2
+  fail "created session never surfaced in the aggregated snapshot (poll ${i}/120, elapsed ~${i}s, sid=${SID})"
+fi
 
 echo "==> capturing the live /vh/stream while prompting"
 STREAM_FILE=$(mktemp)
@@ -109,8 +192,11 @@ fi
 STREAM_PARTS=$(grep -c '^event: part.upsert' "$STREAM_FILE" || true)
 rm -f "$STREAM_FILE"
 echo "    live stream delivered ${STREAM_PARTS} part.upsert event(s)"
+fi # flow 1
 
 # --- Flow 2: tool execution -> file diff -------------------------------------
+if want_flow 2; then
+ensure_sid
 echo "==> [tool flow] prompting the model to call the write tool"
 curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session/${SID}/message" \
   -H 'Content-Type: application/json' \
@@ -132,8 +218,11 @@ for i in $(seq 1 30); do
   sleep 1
   [ "$i" = 30 ] && fail "git diff did not include the written file (got: ${DIFF:0:160})"
 done
+fi # flow 2
 
 # --- Flow 3: task tool -> subsession -----------------------------------------
+if want_flow 3; then
+ensure_sid
 echo "==> [subsession flow] prompting the model to spawn a subagent (task tool)"
 curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session/${SID}/message" \
   -H 'Content-Type: application/json' \
@@ -147,12 +236,15 @@ for i in $(seq 1 90); do
   sleep 1
   [ "$i" = 90 ] && fail "subsession (child of $SID) not observed ($RESULT)"
 done
+fi # flow 3
 
 # --- Flow 4: permission round-trip -------------------------------------------
 # opencode is configured with bash="ask", so a bash tool call pauses the turn on
 # a permission request. This is the gold-standard check: it exercises the real
 # `permission.asked` event surfacing through the aggregator AND the reply route
 # resuming the turn — the exact path the earlier permission bugs broke.
+if want_flow 4; then
+ensure_sid
 echo "==> [permission flow] prompting the model to call the bash tool (asks permission)"
 # The /message POST blocks until the turn completes, but this turn pauses on a
 # permission request — so fire it in the background and drive the reply below.
@@ -192,6 +284,7 @@ for i in $(seq 1 60); do
   sleep 1
   [ "$i" = 60 ] && fail "turn did not resume after permission reply ($RESULT)"
 done
+fi # flow 4
 
 # ===========================================================================
 # Flow 5: server-owned session tree (tree=2) -- Phase 2 docker-gold gate.
@@ -212,12 +305,27 @@ done
 # All seeded rows use the id prefix ses_tree_ so they never collide with the
 # real e2e session/subsession exercised above.
 # ===========================================================================
+if want_flow 5; then
+# The seeder (seed_tree.py) self-calibrates project_id/directory/version from
+# an existing REAL session row; the default all-flows run gets it from flow 1,
+# so an isolated flow-5 run must create it itself.
+ensure_sid
 echo "==> [tree flow] seeding synthetic forest into container opencode SQLite"
 SEED_SQL=$(mktemp)
 python3 "$repo_root/tests/e2e-docker/seed_tree.py" > "$SEED_SQL" \
   || fail "seed SQL generation failed"
 DBPATH=$(docker exec "$NAME" sh -c 'echo "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db"')
 [ -n "$DBPATH" ] || fail "could not resolve opencode db path in container"
+# Wait until the calibration session's row is actually persisted (opencode
+# may write it async to the create POST's 200): the seed's self-calibrating
+# subqueries need >=1 real row.
+for i in $(seq 1 15); do
+  REAL_ROWS=$(docker exec "$NAME" sqlite3 "$DBPATH" "SELECT COUNT(*) FROM session;" 2>/dev/null || true)
+  [ "${REAL_ROWS:-0}" -ge 1 ] && break
+  sleep 1
+  [ "$i" = 15 ] && fail "no real session row in container DB for seed calibration (count=${REAL_ROWS:-0})"
+done
+echo "    calibration rows in container opencode DB: ${REAL_ROWS:-0}"
 docker cp "$SEED_SQL" "$NAME":/tmp/seed.sql >/dev/null \
   || fail "docker cp seed.sql failed"
 docker exec "$NAME" sqlite3 "$DBPATH" ".read /tmp/seed.sql" \
@@ -281,27 +389,90 @@ rm -f "$B_P2"
 echo "    B page2 OK: $(echo "$B_RES2" | sed -n 2p)"
 
 # --- C. MISSED-DELETE RECONCILE (THE CRUX -- Phase 2->3 gate) ----------------
+# Determinism contract (why the archive seed below exists): the tree reconcile
+# ticker full-scans for ghosts EVERY 10s tick only while a live archive
+# tombstone exists (pkg/aggregator/reconciliation.go runTreeReconcile ->
+# HasLiveArchiveTombstones); with no tombstone it full-reconciles only once
+# per the 2m idle interval — far outside any bounded capture window. The seed:
+# archive an UNRELATED disposable session through the REAL /vh/archive route.
+# The cascade is ASYNC (the POST 200 returns before the store removes the id),
+# so completion must be observed as the id DISAPPEARING from the live
+# snapshot; that removal is also what arms the 30s tombstone
+# (RemoveSessionIfPresent -> recentlyArchived) — the observation starts the
+# TTL clock. The victim is NEVER archived (a tombstoned id's absence from
+# /session is the expected archive path, not a ghost — pkg/state
+# tree_reconcile.go), so its raw-DB absence still classifies as a ghost and is
+# evicted with node.remove.
 echo "==> [tree flow] C: asserting missed-delete reconcile (raw SQLite delete -> node.remove)"
 C_STREAM=$(mktemp)
-# Open a long-lived tree=2 stream: it captures the cold snapshot (victim is now
-# `known` to this connection), then we raw-DELETE the victim row directly in
-# opencode SQLite, bypassing the app so NO session.deleted event fires. The
-# reconcile ticker (tree reconcile ticker, 5s default) is the only path that can evict
-# the resulting ghost -> it emits node.remove for known ids.
-( curl -fsS -N --max-time 25 "${BASE}/vh/stream?tree=2" > "$C_STREAM" 2>/dev/null & )
+# Open the long-lived tree=2 stream FIRST: its cold snapshot makes the victim
+# `known` to this connection (node.remove is only emitted for known ids)
+# BEFORE the tombstone clock starts.
+SECONDS=0
+( curl -fsS -N --max-time 45 "${BASE}/vh/stream?tree=2" > "$C_STREAM" 2>/dev/null & )
 sleep 2  # let the stream subscribe + receive its cold snapshot
 if ! grep -q 'ses_tree_victim' "$C_STREAM"; then
   rm -f "$C_STREAM"; fail "victim not present in C stream snapshot (not known)"
 fi
-echo "    raw-deleting ses_tree_victim in container opencode SQLite (bypasses app -> no event)"
+
+snap_has_id() {
+  # exit 0 iff $1 is present in the live snapshot's sessions[] list
+  curl -fsS "${BASE}/vh/snapshot" 2>/dev/null | python3 -c '
+import sys, json
+want = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+ids = [s.get("id", "") for s in d.get("sessions", [])]
+sys.exit(0 if want in ids else 1)
+' "$1"
+}
+
+echo "==> [tree flow] C: seeding the fast-reconcile tombstone (archive an unrelated disposable session)"
+SEED_SID=""
+for i in $(seq 1 30); do
+  SEED_SID=$(curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session" \
+        -H 'Content-Type: application/json' -d '{"title":"archive-seed"}' \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
+  [ -n "$SEED_SID" ] && break
+  sleep 1
+  [ "$i" = 30 ] && { rm -f "$C_STREAM"; fail "[tree flow] C: could not create the disposable archive-seed session"; }
+done
+echo "    disposable session: $SEED_SID"
+# It must be VISIBLE in the live tree before archiving: only then does its
+# later disappearance mean the cascade actually completed.
+SEED_VISIBLE=0
+for i in $(seq 1 30); do
+  if snap_has_id "$SEED_SID"; then SEED_VISIBLE=1; break; fi
+  sleep 1
+  [ "$i" = 30 ] && { rm -f "$C_STREAM"; fail "[tree flow] C: disposable session never surfaced in the live snapshot"; }
+done
+echo "    disposable session visible in the live tree (poll ${i})"
+curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/vh/archive" \
+     -H 'Content-Type: application/json' -d "{\"sessionID\":\"${SEED_SID}\"}" >/dev/null \
+  || { rm -f "$C_STREAM"; fail "[tree flow] C: POST /vh/archive for the disposable session failed"; }
+# Completion = the id GONE from the live tree (NOT the POST 200 — the cascade
+# is async). This observation starts the 30s tombstone TTL; from here the
+# remaining steps run back-to-back with NO sleeps before the raw delete.
+SEED_GONE=0
+for i in $(seq 1 15); do
+  if ! snap_has_id "$SEED_SID"; then SEED_GONE=1; break; fi
+  sleep 1
+  [ "$i" = 15 ] && { rm -f "$C_STREAM"; fail "[tree flow] C: archive cascade completion not observed (${SEED_SID} still in the live tree after ~${i}s)"; }
+done
+echo "    archive cascade observed complete: ${SEED_SID} gone from the live tree (tombstone armed, 30s TTL running)"
+
+# --- back-to-back from here: NO sleeps before the raw delete -----------------
+echo "==> [tree flow] C: raw-deleting ses_tree_victim in container opencode SQLite (bypasses app -> no event)"
 docker exec "$NAME" sqlite3 "$DBPATH" "DELETE FROM session WHERE id='ses_tree_victim';" \
   || { rm -f "$C_STREAM"; fail "raw delete of victim failed"; }
-# Wait through multiple reconcile ticks (~5s each): the first tick after the
-# delete detects the ghost and emits node.remove; subsequent ticks must NOT
-# resurrect it. The max-time-25 curl closes at t=25; we sleep 24s after the
-# 2s snapshot wait + 1s flush buffer so the capture is complete.
-sleep 23
-sleep 1
+# The next 10s reconcile tick (full scan: the tombstone is live) finds the
+# victim gone from OpenCode's /session list and emits node.remove for it;
+# later ticks inside the capture must NOT resurrect it. Sleep out the
+# remainder of the 45s capture window + 1s flush buffer, then assert.
+C_REMAIN=$(( 46 - SECONDS ))
+[ "$C_REMAIN" -gt 1 ] && sleep "$C_REMAIN"
 C_RES=$(python3 "$repo_root/tests/e2e-docker/assert_tree_reconcile.py" < "$C_STREAM")
 rm -f "$C_STREAM"
 [ "$(echo "$C_RES" | sed -n 1p)" = "OK" ] \
@@ -332,6 +503,7 @@ D_RES=$(python3 "$repo_root/tests/e2e-docker/assert_tree_reconnect.py" "$HEAD_SE
 rm -f "$D_RECONN"
 [ "$(echo "$D_RES" | sed -n 1p)" = "OK" ] || fail "behavior D (reconnect) failed ($D_RES)"
 echo "    D OK: $(echo "$D_RES" | sed -n 2p)"
+fi # flow 5
 
 # ===========================================================================
 # Flow 6: caller-minted messageID + exact message GET (queue->message-ID
@@ -352,6 +524,8 @@ echo "    D OK: $(echo "$D_RES" | sed -n 2p)"
 #      session_id -> session isolation).
 #   4. GET .../message/<non-msg-id> -> 400 (brand rejection -- caller bug).
 # ===========================================================================
+if want_flow 6; then
+ensure_sid
 echo "==> [msgid flow] minting a valid ascending msg_ id (replicates pkg/opencode/id.go)"
 MINTED=$(python3 "$repo_root/tests/e2e-docker/mint_msg_id.py") \
   || fail "could not mint msg_ id"
@@ -421,6 +595,7 @@ BAD_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${BASE}/oc/session/${SID}/mes
 [ "$BAD_CODE" = "400" ] \
   || fail "[msgid flow] non-msg id GET did not return 400 (got $BAD_CODE; brand check differs from contract)"
 echo "    4 OK: GET .../message/not_a_msg_id -> 400 (brand rejection)"
+fi # flow 6
 
 # ===========================================================================
 # Flow 7: queue Claim -> dispatch -> real-opencode persist -> turn-start
@@ -450,6 +625,7 @@ echo "    4 OK: GET .../message/not_a_msg_id -> 400 (brand rejection)"
 # to THIS dispatch: the shared $SID carries several prior turns whose residual
 # busy/idle state could mask whether Flow 7's dispatch drove the transition.
 # ===========================================================================
+if want_flow 7; then
 echo "==> [queue-claim flow] creating a fresh session for a clean turn-start"
 QSID=""
 for i in $(seq 1 30); do
@@ -552,6 +728,7 @@ for i in $(seq 1 60); do
   sleep 1
   [ "$i" = 60 ] && fail "[queue-claim flow] turn did not start after dispatch ($RESULT)"
 done
+fi # flow 7
 
 # ===========================================================================
 # Flow 8: death-watch self-heal against the REAL production binary.
@@ -575,6 +752,7 @@ done
 # Default watcher knobs apply (250ms tick, 1s initial backoff) — well inside
 # the lane's existing 30-90x1s poll budgets.
 # ===========================================================================
+if want_flow 8; then
 echo "==> [death-watch flow] starting the REAL vh-solara local-server container"
 docker rm -f "$NAME_REAL" >/dev/null 2>&1 || true
 docker run -d --name "$NAME_REAL" -p "${PORT_REAL}:8099" --entrypoint /bin/sh "$IMAGE" -c '
@@ -663,15 +841,26 @@ case "$DOWN_CODE" in
 esac
 
 echo "==> [death-watch flow] asserting the death log line names the dead pid"
+# Tight match per captured OLD_PID: the watcher logs exactly
+# `opencode watch: pid <N> exited (<reason>) after <uptime>` (cmd/opencode_watch.go),
+# so anchor on `pid <N> exited (` — a loose `pid.*exited` would also match a
+# LATER respawn generation's death line (e.g. under a crash loop), proving the
+# wrong pid's death. Every pid we killed must be named.
 DEATH_LINE_OK=""
 for i in $(seq 1 30); do
-  if docker logs "$NAME_REAL" 2>&1 | grep -q "opencode watch: pid.*exited"; then
+  DEATH_ALL_OK=1
+  for p in $OLD_PIDS; do
+    docker logs "$NAME_REAL" 2>&1 | grep -q "opencode watch: pid ${p} exited (" || DEATH_ALL_OK=""
+  done
+  if [ -n "$DEATH_ALL_OK" ]; then
     DEATH_LINE_OK=1
-    docker logs "$NAME_REAL" 2>&1 | grep "opencode watch: pid" | tail -1 | sed 's/^/    /'
+    for p in $OLD_PIDS; do
+      docker logs "$NAME_REAL" 2>&1 | grep "opencode watch: pid ${p} exited (" | tail -1 | sed 's/^/    /'
+    done
     break
   fi
   sleep 1
-  [ "$i" = 30 ] && fail "[death-watch flow] death-watch log line never appeared"
+  [ "$i" = 30 ] && fail "[death-watch flow] death-watch log line for killed pid(s) $(echo "$OLD_PIDS" | tr '\n' ' ')never appeared"
 done
 
 echo "==> [death-watch flow] waiting for auto-restart to heal (new pid, down_since cleared)"
@@ -738,8 +927,10 @@ DOWN_GET=$(curl -s -o /dev/null -w "%{http_code}" "${BASE_REAL}/oc/session/${RSI
 [ "$DOWN_GET" = "404" ] \
   || fail "[death-watch flow] down-probe id resolved after recovery (got $DOWN_GET; the never-landed prompt must stay 404)"
 echo "    down-probe id $DOWN_ID -> still 404 (sent-while-down never landed)"
+fi # flow 8
 
 echo
+if [ "$FLOW" = "all" ]; then
 echo "PASS: real opencode driven by the fake LLM exercised the full flow:"
 echo "      - prompt -> streamed assistant reply (snapshot + live stream)"
 echo "      - write tool -> tool part + git diff"
@@ -756,4 +947,8 @@ echo "      - death-watch (REAL vh-solara local-server): pkill opencode -> faile
 echo "                     down_since, death log line, auto-restart heals with a new pid;"
 echo "                     prompt while down -> 5xx (never lands), retry after recovery"
 echo "                     lands exactly once"
+else
+echo "PASS: flow ${FLOW} completed on its own scoped setup"
+echo "      (selected via --flow ${FLOW}; the other flows were NOT run this invocation)"
+fi
 exit 0
