@@ -1,22 +1,23 @@
-// auto-tool-gate.js — dual-surface plugin: audit + fail-closed enforce + live
+// auto-tool-gate.js — two-hook plugin: audit + fail-closed enforce + live
 // (Phases 1–3b pilot).
 //
 // This is the opt-in pilot for an auto-classifier-style tool-call gate. It
-// hooks BOTH permission surfaces. Behavior is selected by the live config
-// `mode` field (default `audit`):
+// hooks the observer surface and the event surface. Behavior is selected by
+// the live config `mode` field (default `audit`):
 //
 //   mode "audit"   (Phase 1, default) — observability only. Both hooks log to
 //                  stderr with a verdict PLACEHOLDER. No model call, no real
 //                  verdict, no status mutation, no blocking. Zero behavior
 //                  change.
-//   mode "enforce" (Phase 2)          — permission.ask runs the decision path
-//                  (stubEvaluate -> parseVerdict -> matrix) and sets
-//                  output.status. Fail-closed: ANY uncertainty (parse failure,
-//                  evaluator error, thrown exception) -> deny, NEVER silent
+//   mode "enforce" (Phase 2)          — the event hook runs the decision path
+//                  (stubEvaluate -> parseVerdict -> matrix) on each
+//                  permission.asked event and replies via the SDK client.
+//                  Fail-closed: ANY uncertainty (parse failure,
+//                  evaluator error, thrown exception) -> reject, NEVER silent
 //                  allow. tool.execute.before stays an OBSERVER in every mode.
 //                  The Phase 2 evaluator is a DETERMINISTIC STUB, not a real
 //                  classifier model.
-//   mode "live"    (Phase 3b)         — permission.ask fetches the real
+//   mode "live"    (Phase 3b)         — the event hook fetches the real
 //                  transcript, serializes it to a redacted text-mode string,
 //                  and calls a provider-agnostic OpenAI-compatible HTTP
 //                  completion endpoint (see ./auto-gate-live.js). The returned
@@ -24,11 +25,11 @@
 //                  matrix as enforce, so the existing fail-closed matrix
 //                  applies: any transport error / timeout / non-2xx / malformed
 //                  / missing-choices / misconfigured-endpoint / missing-API-key
-//                  -> deny, NEVER silent allow. tool.execute.before stays an
+//                  -> reject, NEVER silent allow. tool.execute.before stays an
 //                  OBSERVER. The API key is read from the named env var at call
 //                  time; it NEVER lives in the (commitable) config file.
 //
-// THREE HOOKS, ONE ENFORCEMENT SURFACE (verified against @opencode-ai/plugin
+// TWO HOOKS, ONE ENFORCEMENT SURFACE (verified against @opencode-ai/plugin
 // + sdk types + the upstream's shipped ACP / CLI / TUI reference impls):
 //
 //   1. tool.execute.before  (input:{tool,sessionID,callID}, output:{args})
@@ -40,13 +41,7 @@
 //      in EVERY mode — it must NOT throw or block in the new model; the
 //      event hook owns enforcement.
 //
-//   2. permission.ask  (input:Permission, output:{status})
-//      DORMANT — OpenCode does not fire `permission.ask` in any stock
-//      release as of the studied version. The hook is RETAINED as a RESERVE
-//      in case upstream wires it (preserves the Phase 2/3b investment).
-//      Do NOT rely on it. No claim of auto-approval rests on this hook.
-//
-//   3. event  ({ event }) — the PRIMARY ENFORCEMENT SURFACE.
+//   2. event  ({ event }) — the PRIMARY ENFORCEMENT SURFACE.
 //      Receives EVERY bus event. Acts only on `permission.asked` — the event
 //      OpenCode publishes when its ruleset routes a tool call to "ask". The
 //      event payload is the Request {id, sessionID, permission, patterns,
@@ -63,6 +58,17 @@
 //      onUncertain:"passthrough" (interactive only) are the only no-reply
 //      paths.
 //
+// NOTE ON THE REMOVED `permission.ask` RESERVE: an earlier revision of this
+// plugin also registered a dormant `permission.ask` hook as a hedge against
+// upstream wiring it. Upstream dispatched that hook only from the plugin
+// system's introduction (2025-08-02) until the legacy permission module was
+// deleted (2026-03-14); the last release carrying the dispatch was v1.2.26
+// and the first without it was v1.2.27. No runtime this repo supports
+// dispatches it, so the reserve was removed as unreachable code. If a future
+// runtime version bump re-wires the hook (re-derive with one grep for the
+// hook name in the runtime's permission/plugin modules), re-open that
+// decision rather than assuming this two-hook surface.
+//
 // HARD-FLOOR INVARIANT: the event hook fires ONLY for ask-routed calls
 // (table-allow fast-paths past the bus event; table-deny / shell-guard blocks
 // before it). The classifier can NEVER override a static deny. It only ever
@@ -70,8 +76,8 @@
 // gate; the classifier runs strictly after it.
 //
 // Phase status:
-//   Phase 3b (implemented here) — live classifier model wired into
-//             permission.ask behind mode:"live" (replaces the enforce stub with
+//   Phase 3b (implemented here) — live classifier model wired into the event
+//             hook behind mode:"live" (replaces the enforce stub with
 //             a real OpenAI-compatible HTTP call via ./auto-gate-live.js).
 //   Phase 4   (later slice)     — promotion review (core-template /
 //             README.agent.md).
@@ -96,14 +102,13 @@
 //           // console.error(reason); return; → ASK (passthrough to perm table)
 //           // return;                        → ALLOW / passthrough (do nothing)
 //       },
-//       "permission.ask": async (input, output) => {
-//           // input  → Permission {id, type, pattern, sessionID, messageID,
-//           //                       callID?, title, metadata:{}, time:{created}}
-//           // output → {status:"ask"|"deny"|"allow"} (default "ask")
-//           // output.status = "allow" → GRANT + skip user prompt
-//           // output.status = "deny"  → BLOCK
-//           // output.status = "ask"   → trigger interactive prompt (default)
-//           // bare return             → leave status unchanged (Phase 1)
+//       "event": async ({ event }) => {
+//           // event.type       → bus event name; we act only on
+//           //                    "permission.asked" (ask-routed tool calls)
+//           // event.properties → Request {id, sessionID, permission, patterns,
+//           //                    metadata, always, tool}
+//           // reply via client.postSessionIdPermissionsPermissionId(...) →
+//           //                    resolves the Deferred the tool call awaits
 //       }
 //   });
 //
@@ -158,7 +163,7 @@ import { decideLive, serializeTranscript } from "./auto-gate-live.js";
 
 // Shared credential scrubber (egress-safe): auto-tool-gate.js is the
 // AUDIT/STDERR-LOG egress surface. Every tool-call-derived value that reaches a
-// console.error line (summarizeArgs output + the permission.ask `pattern`)
+// console.error line (summarizeArgs output + the permission.asked `patterns`)
 // passes through scrubTruncate (scrubCredentials then truncate), NOT truncate
 // alone, so a credential embedded in a `command`/`pattern` cannot survive into
 // the stderr log. The IDENTICAL scrubber is shared with the HTTP-egress path
@@ -285,6 +290,17 @@ const MAX_DENY_STRING_CHARS = 2000;
 const _SUBKIND_SHAPE_RE =
     /^(?:timeout|transport|malformed|missing-key|missing-endpoint|missing-model|http-[0-9]{1,3})$/;
 
+// Named truthful failure for the OUTER decision-boundary catches (the
+// defensive wrappers around the event hook's decidePermission / decideLive
+// calls). Those catches fire only on a fault PAST the decision layer's own
+// typed-error handling, so the truthful statement is that the decision path
+// itself failed internally and NO judgment was obtained. The raw exception
+// text NEVER rides either egress sink (stderr audit line, v2 rejection
+// feedback) — same O2 fallback family as the leaf stamps: a NAMED failure,
+// never a sanitized exception narrative.
+const DECISION_BOUNDARY_FAILURE =
+    "fail(internal; no safety judgment was obtained)";
+
 // collectKnownValues(config, leaves) — the exact-string suppression set for
 // admitReason step 2. Gathers, from the merged LLM config (top level) and
 // every WELL-FORMED leaf: literal modelEndpoint / model / apiKey values, plus
@@ -384,12 +400,40 @@ function buildTieredDenyMessage(agg, results, knownValues) {
 // ---------------------------------------------------------------------------
 // Hot-config reader.
 //
-// Resolves the operator-owned config file relative to the repo root, the same
-// way shell-guard-core.js derives repoRoot() (from this file's location —
-// .opencode/plugins/auto-tool-gate.js -> two levels up). Never uses
-// process.cwd() (unreliable in the plugin server context). No hardcoded
-// absolute paths.
+// Resolves the operator-owned config file relative to the repo root. Like
+// shell-guard-core.js, derives the root from this file's location (never
+// process.cwd(), which is unreliable in the plugin server context; no
+// hardcoded absolute paths) — but via a MARKER-ANCHORED upward walk so BOTH
+// runtime locations resolve the same root:
+//
+//   - Rendered twin: <repoRoot>/.opencode/plugins/auto-tool-gate.js — the
+//     walk finds a marker exactly two levels up, identical to the legacy
+//     fixed two-up resolution.
+//   - Template twin: templates/overlays/<pack>/plugins/auto-tool-gate.js in
+//     a harness dev checkout — four levels deeper; the walk still finds the
+//     true repo root, so selftest scratch lands under the REPO tmp/ and
+//     NEVER under templates/ (whose subdirectories the Go overlay discovery
+//     treats as shipped packs — leftover scratch there breaks `go test`).
+//
+// Markers: `.opencode` (present at the root of every harness install — the
+// rendered plugin lives under it) or `.git` (plain checkouts; matched as dir
+// OR file so worktrees/submodules qualify). Bounded walk (8 levels) with the
+// legacy two-up fallback when no marker is found, so an exotic no-marker
+// environment keeps the historical rendered-twin behavior.
+const REPO_ROOT_MARKERS = [".opencode", ".git"];
+
 function repoRoot() {
+    let dir = __dirname;
+    for (let i = 0; i < 8; i++) {
+        if (
+            REPO_ROOT_MARKERS.some((m) => fs.existsSync(path.join(dir, m)))
+        ) {
+            return dir;
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir) break; // reached the filesystem root
+        dir = parent;
+    }
     return path.resolve(__dirname, "..", "..");
 }
 
@@ -1114,13 +1158,49 @@ export function __resetConfigCaches() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TEST-ONLY FAULT-INJECTION SEAM (outer decision-boundary egress hardening).
+//
+// The event handler's two OUTER decision boundaries (enforce ->
+// decidePermission, live -> decideLive) carry defensive catches. Normal
+// evaluator/HTTP/config failures NEVER reach those catches — they become
+// TYPED deny results inside decidePermission/decideLive — so the catches are
+// only exercisable by a fault that throws AT the boundary itself.
+//
+// This seam is an INTERNAL injection hook, NOT a production configuration
+// flag: the binding lives in module scope, is never exported, and is never
+// read from any config file or env var. Only the self-test section at the
+// bottom of this file (same module scope, behind the __isMain guard) can set
+// it. When unset (the only production state) each guard below is an identity
+// passthrough to the real decision function.
+// ---------------------------------------------------------------------------
+const __testFaults = {
+    decidePermission: null, // (config) => any — set ONLY by the self-test section
+    decideLive: null, // async (config, serialized) => any — set ONLY by the self-test section
+};
+
+function __decisionPermissionGuard(config) {
+    if (__testFaults.decidePermission) {
+        return __testFaults.decidePermission(config);
+    }
+    return decidePermission(config);
+}
+
+async function __decisionLiveGuard(config, serialized) {
+    if (__testFaults.decideLive) {
+        return __testFaults.decideLive(config, serialized);
+    }
+    return await decideLive(config, serialized);
+}
+
 // The factory receives the full PluginInput ({client, project, directory,
 // worktree, serverUrl, $}) — same contract session-state.js relies on for
 // client.session.todo(). We close over `client` (the OpenCode SDK client, used
-// in mode:"live" to fetch the session transcript + in mode:"enforce"/"live" of
-// the event hook to reply to permission.asked) and `directory` (the repo dir,
-// passed as the SDK query param for transcript fetch). The audit and
-// enforce branches never touch either.
+// by the event hook in mode:"live" to fetch the session transcript and in
+// mode:"enforce"/"live" to reply to permission.asked) and `directory` (the
+// repo dir, passed as the SDK query param for transcript fetch). The audit
+// branch of the event hook and the tool.execute.before observer never touch
+// either.
 //
 // `configPath` / `llmConfigPath` are optional test-injection points for the
 // committed PROJECT-level files: production callers omit them (the hooks
@@ -1164,235 +1244,23 @@ export const server = async ({
             // passthrough; this hook changes zero tool-call behavior.
             //
             // This hook sees EVERY tool call — including ones the permission
-            // table auto-allows (those never reach permission.ask). That makes
-            // it the right place to capture the arg summary, and the
-            // complementary surface to permission.ask for the dual-hook audit.
+            // table auto-allows (those never reach permission.asked). That
+            // makes it the right place to capture the arg summary, and the
+            // complementary surface to the event hook for the dual-hook audit.
             //
             // WHY THIS HOOK STAYS AN OBSERVER EVEN IN ENFORCE MODE: it can ONLY
             // block (throw) or passthrough (bare return) — it cannot force-allow
             // or force-ask. Because it fires for ALL calls (not just ask-routed
             // ones), running a classifier verdict here would either block calls
-            // the table already allowed (wrong) or be redundant with
-            // permission.ask. So only permission.ask owns the authoritative
-            // decision (Phase 2+); this hook is always an observer.
+            // the table already allowed (wrong) or be redundant with the event
+            // hook. So only the event hook owns the authoritative decision
+            // (Phase 2+); this hook is always an observer.
             const tool = (input && input.tool) || "unknown";
             const summary = summarizeArgs(output && output.args);
             console.error(
                 `[auto-gate-audit] tool=${tool} ${summary} verdict=AUDIT_ONLY`,
             );
             return;
-        },
-
-        "permission.ask": async (input, output) => {
-            // DORMANT — OpenCode does not fire `permission.ask` in any stock
-            // release as of the studied version. The `event` hook (below) is the
-            // ACTIVE enforcement surface: it receives the `permission.asked`
-            // bus event and replies via the SDK client
-            // (postSessionIdPermissionsPermissionId). This hook is RETAINED as
-            // a RESERVE in case upstream wires permission.ask in a future
-            // release — do NOT rely on it, but keep the investment intact.
-            // Live config — read on every call (mtime-cached).
-            const config = readConfig(configPath, userConfigPath, localConfigPath);
-            if (config.enabled === false) {
-                // Operator kill-switch: fully inert, no audit, no behavior
-                // change. output.status is left at its default so opencode's
-                // normal interactive ask still fires.
-                return;
-            }
-
-            if (config.mode === "enforce") {
-                // ENFORCE (Phase 2): run the verdict decision path.
-                //
-                // HARD-FLOOR INVARIANT: permission.ask fires ONLY for calls
-                // opencode's permission table routes to `ask`. Table-`allow`
-                // fast-paths past this hook; table-`deny` / shell-guard blocks
-                // BEFORE this hook. Therefore the classifier decision below
-                // can only ever lift an `ask` to `allow`/`deny` — it can NEVER
-                // override a static deny, because a statically-denied call
-                // never reaches this hook. The classifier only ever decides
-                // the ask-routed subset.
-                //
-                // Phase 2 uses a STUB evaluator (stubEvaluate inside
-                // decidePermission), NOT a real classifier model. Do NOT run
-                // enforce mode against real traffic until Phase 3 wires a live
-                // model. The decision path fail-closes to deny on ANY
-                // uncertainty (parse failure, evaluator error, thrown
-                // exception).
-                const type = (input && input.type) || "unknown";
-                const pattern = scrubTruncate((input && input.pattern) || "", MAX_ARG_LEN);
-                console.error(
-                    `[auto-gate] permission.ask type=${type} pattern=${pattern} mode=enforce (deciding)`,
-                );
-                // Decision path. decidePermission(config) composes
-                // stubEvaluate(config) -> parseVerdict(raw) -> decision matrix
-                // and NEVER throws (it catches evaluator errors internally and
-                // returns a fail-closed deny). We wrap defensively anyway so a
-                // future regression fail-closes to deny rather than crashing
-                // the hook.
-                let result;
-                try {
-                    result = decidePermission(config);
-                } catch (err) {
-                    const msg = (err && err.message) || String(err);
-                    console.error(
-                        `[auto-gate] fail-closed: decision error: ${msg}`,
-                    );
-                    output.status = "deny";
-                    return;
-                }
-                if (result.audit) {
-                    console.error(`[auto-gate] ${result.audit}`);
-                }
-                output.status = result.status; // "allow" | "deny"
-                return;
-            }
-
-            if (config.mode === "live") {
-                // LIVE (Phase 3b): run the REAL classifier model decision path.
-                //
-                // The same hard-floor invariant holds: permission.ask only
-                // fires for ask-routed calls, so this can only lift an `ask` to
-                // allow/deny — never override a static deny. The decision path
-                // uses the SAME parseVerdict -> decision matrix as enforce, fed
-                // by a real model verdict instead of the stub. The matrix is
-                // fail-closed, so the live path inherits that posture:
-                // transport error / timeout / non-2xx / malformed / missing-
-                // choices / unparseable verdict -> deny, NEVER silent allow.
-                //
-                // Transcript fetch degrades GRACEFULLY: if the SDK call fails
-                // (no client, error wrapper, missing data), we fall back to the
-                // permission payload ALONE (serializeTranscript([], input))
-                // rather than fail-closed. The model still gets the type+pattern
-                // to judge. Only the model-call / decision layer fail-closes.
-                const type = (input && input.type) || "unknown";
-                const pattern = scrubTruncate((input && input.pattern) || "", MAX_ARG_LEN);
-                console.error(
-                    `[auto-gate] permission.ask type=${type} pattern=${pattern} mode=live (deciding)`,
-                );
-
-                // MERGE POINT: build ONE config object for the live path by
-                // merging the plugin-behavior config (already read above into
-                // `config` as {enabled, mode, stubVerdict, promptFile}) with the
-                // LLM config (auto-gate-llm.json → {modelEndpoint,
-                // modelEndpointEnv, model, apiKey, apiKeyEnv, timeoutMs}). A missing LLM file is SILENT here:
-                // readLlmConfig() returns empty-string defaults, which flow
-                // straight into the fail-closed validation below. Downstream
-                // decideLive / classifyLive / resolveSystemPrompt see a single
-                // merged object exactly as before the two-file split.
-                const liveConfig = { ...config, ...readLlmConfig(llmConfigPath, userLlmConfigPath, localLlmConfigPath) };
-
-                // (1) Validate live config up front so a misconfigured live
-                // mode fail-closes to deny with a CLEAR audit line instead of a
-                // cryptic adapter error. Dual-form endpoint: either a literal
-                // modelEndpoint OR a modelEndpointEnv name must be present (the
-                // resolved env VALUE is checked by classifyLive at call time;
-                // here we only confirm the config specifies at least one form).
-                if (!liveConfig.modelEndpoint && !liveConfig.modelEndpointEnv) {
-                    console.error(
-                        "[auto-gate] live mode misconfigured: no modelEndpoint; fail-closed deny",
-                    );
-                    output.status = "deny";
-                    return;
-                }
-                if (!liveConfig.model) {
-                    console.error(
-                        "[auto-gate] live mode misconfigured: no model; fail-closed deny",
-                    );
-                    output.status = "deny";
-                    return;
-                }
-
-                // (2) Fetch the session transcript. Graceful degradation on any
-                // failure: use the permission payload alone. SDK calls return a
-                // RequestResult wrapper — read payload via .data and check
-                // .error (proven in .opencode/plugins/session-state.js).
-                let transcript = [];
-                try {
-                    if (
-                        client &&
-                        client.session &&
-                        typeof client.session.messages === "function" &&
-                        input &&
-                        input.sessionID
-                    ) {
-                        const r = await client.session.messages({
-                            path: { id: input.sessionID },
-                            query: { directory },
-                        });
-                        if (r && r.error) throw r.error;
-                        if (r && Array.isArray(r.data)) {
-                            transcript = r.data;
-                        }
-                    } else {
-                        // No client threaded into the plugin, or no sessionID on
-                        // the input: degrade to permission-payload-only. (This
-                        // is a soft degradation, NOT a fail-closed condition.)
-                        throw new Error("client/session unavailable");
-                    }
-                } catch (err) {
-                    const msg = (err && err.message) || String(err);
-                    console.error(
-                        `[auto-gate] transcript fetch failed (${msg}); using permission payload only`,
-                    );
-                    transcript = [];
-                }
-
-                // (3) Serialize the transcript to a redacted text-mode string.
-                const serialized = serializeTranscript(transcript, input);
-
-                // (4) Run the live model decision path. decideLive() awaits the
-                // HTTP adapter and hands the raw verdict text to the SAME
-                // synchronous decidePermission() decision matrix (so the
-                // existing fail-closed matrix applies unchanged). It returns
-                // {status, audit, reason, latencyMs} and never throws.
-                let result;
-                try {
-                    result = await decideLive(liveConfig, serialized);
-                } catch (err) {
-                    // Defensive: decideLive itself does not throw, but a future
-                    // regression must fail-closed rather than crash the hook.
-                    const msg = (err && err.message) || String(err);
-                    console.error(
-                        `[auto-gate] fail-closed: live decision error: ${msg}`,
-                    );
-                    output.status = "deny";
-                    return;
-                }
-                if (result.audit) {
-                    console.error(`[auto-gate] ${result.audit}`);
-                }
-                // Telemetry: surface the retry count when retries occurred
-                // (result.retries is a safe integer; no tool-call content).
-                // Egress discipline unchanged — this is the existing audit
-                // surface, no new console site.
-                const retryTag = result.retries > 0 ? ` retries=${result.retries}` : "";
-                console.error(
-                    `[auto-gate] live decision status=${result.status} latencyMs=${result.latencyMs}${retryTag}`,
-                );
-                output.status = result.status; // "allow" | "deny"
-                return;
-            }
-
-            // AUDIT ONLY (Phase 1, byte-for-byte unchanged). Log the
-            // permission-decision request WITHOUT changing the outcome. This
-            // hook fires only when opencode's permission table resolves to
-            // `ask` or no-match: table-`allow` calls fast-path past it, and
-            // table-`deny`/shell-guard blocks before it. We record the request
-            // and leave output.status at its default so the normal interactive
-            // ask still fires.
-            //
-            // CRITICAL: this audit branch MUST NOT mutate output.status.
-            // Setting it to "allow" would grant + skip the prompt (the enforce
-            // branch above does that); setting it to "deny" would block. The
-            // audit branch leaves it untouched — audit only, zero behavior
-            // change. This is the default mode (`mode: "audit"`).
-            const type = (input && input.type) || "unknown";
-            const pattern = scrubTruncate((input && input.pattern) || "", MAX_ARG_LEN);
-            const incoming = (output && output.status) || "(unset)";
-            console.error(
-                `[auto-gate-audit] permission.ask type=${type} pattern=${pattern} incoming=${incoming} verdict=AUDIT_ONLY`,
-            );
-            return; // do NOT set output.status — audit only
         },
 
         // ===================================================================
@@ -1606,10 +1474,18 @@ export const server = async ({
                 );
                 let result;
                 try {
-                    result = decidePermission(config);
-                } catch (err) {
-                    const msg = (err && err.message) || String(err);
-                    await handleUncertain(`decision error: ${msg}`);
+                    // Test-only fault seam (see __testFaults above); an
+                    // identity passthrough in every production state.
+                    result = __decisionPermissionGuard(config);
+                } catch (_err) {
+                    // EGRESS DISCIPLINE (dormant-path hardening): the raw
+                    // exception NEVER rides either sink — handleUncertain
+                    // receives a NAMED truthful failure (O2 fallback family).
+                    // The catch itself and the fail-closed reject policy are
+                    // preserved exactly.
+                    await handleUncertain(
+                        `decision error: ${DECISION_BOUNDARY_FAILURE}`,
+                    );
                     return;
                 }
                 if (result.audit) console.error(`[auto-gate] ${result.audit}`);
@@ -1696,10 +1572,16 @@ export const server = async ({
                 // fail-closed decision matrix as enforce.
                 let result;
                 try {
-                    result = await decideLive(liveConfig, serialized);
-                } catch (err) {
-                    const msg = (err && err.message) || String(err);
-                    await handleUncertain(`live decision error: ${msg}`);
+                    // Test-only fault seam (see __testFaults above); an
+                    // identity passthrough in every production state.
+                    result = await __decisionLiveGuard(liveConfig, serialized);
+                } catch (_err) {
+                    // EGRESS DISCIPLINE (dormant-path hardening): same as the
+                    // enforce boundary — a NAMED truthful failure, never the
+                    // raw exception text; catch + fail-closed preserved.
+                    await handleUncertain(
+                        `live decision error: ${DECISION_BOUNDARY_FAILURE}`,
+                    );
                     return;
                 }
                 // EGRESS DISCIPLINE: result.audit is NOT logged raw on the live
@@ -2049,56 +1931,6 @@ if (__isMain) {
         );
     });
 
-    // ===== permission.ask pattern-audit value (enforce / live / audit branches) =====
-    //
-    // All three permission.ask branches build the audit line with the SAME
-    // expression: scrubTruncate((input && input.pattern) || "", MAX_ARG_LEN).
-    // We test that expression directly (it is the value interpolated into the
-    // `pattern=${pattern}` field of the stderr audit line) so a secret in a
-    // permission pattern cannot survive into any of the three audit lines.
-
-    test("permission pattern: Bearer jwt is absent from the audit value", () => {
-        const jwt =
-            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
-        const input = { type: "bash", pattern: `curl -H "Authorization: Bearer ${jwt}"` };
-        // The exact expression the three permission.ask branches interpolate.
-        const patternVal = scrubTruncate(
-            (input && input.pattern) || "",
-            MAX_ARG_LEN,
-        );
-        assert.equal(
-            patternVal.includes(jwt),
-            false,
-            "Bearer jwt in permission pattern must not survive into the audit line",
-        );
-        assert.match(patternVal, /Bearer \[redacted\]/);
-    });
-
-    test("permission pattern: api_key is absent from the audit value", () => {
-        const secret = "sk-abcdefghij1234567890qrstuvwxyz";
-        const input = { type: "bash", pattern: `export api_key=${secret}` };
-        const patternVal = scrubTruncate(
-            (input && input.pattern) || "",
-            MAX_ARG_LEN,
-        );
-        assert.equal(patternVal.includes(secret), false);
-        assert.match(patternVal, /api_key=\[redacted\]/);
-    });
-
-    test("permission pattern: safe pattern with no secret is unchanged", () => {
-        const input = { type: "bash", pattern: "rm -rf tmp/" };
-        const patternVal = scrubTruncate(
-            (input && input.pattern) || "",
-            MAX_ARG_LEN,
-        );
-        assert.equal(patternVal, "rm -rf tmp/");
-    });
-
-    test("permission pattern: missing input -> empty string (no crash)", () => {
-        assert.equal(scrubTruncate((null && null.pattern) || "", MAX_ARG_LEN), "");
-        assert.equal(scrubTruncate((undefined && undefined.pattern) || "", MAX_ARG_LEN), "");
-    });
-
     // ===== Config readers: three-level layered model (project > user > default) =====
     //
     // Filesystem tests for readConfig() (plugin-behavior) and readLlmConfig()
@@ -2145,6 +1977,44 @@ if (__isMain) {
 
     // Ensure the test dir exists for the reader tests below (idempotent).
     fs.mkdirSync(TEST_CONFIG_DIR, { recursive: true });
+
+    // ===== repoRoot() resolution regression (template-twin scratch escape) =====
+    //
+    // repoRoot() must anchor on a REPO MARKER (.opencode / .git) so this
+    // suite's scratch dir resolves under the REPO tmp/ from BOTH runtime
+    // locations: the rendered twin (.opencode/plugins/) AND the template twin
+    // (templates/overlays/<pack>/plugins/ in a harness dev checkout). The
+    // historical bug: a fixed two-up resolution made the template twin land
+    // scratch under templates/overlays/tmp/, which the Go embed + overlay
+    // discovery treat as a shipped pack — breaking `go test ./...` until the
+    // scratch was removed by hand. This test pins the fix.
+    test("repoRoot: scratch dir anchors on a repo-marker root under tmp/ (never templates/)", () => {
+        const root = repoRoot();
+        assert.ok(
+            REPO_ROOT_MARKERS.some((m) => fs.existsSync(path.join(root, m))),
+            `repoRoot()=${root} carries no repo marker (${REPO_ROOT_MARKERS.join(", ")}) — fixed-depth resolution regressed`,
+        );
+        assert.equal(
+            path.dirname(TEST_CONFIG_DIR),
+            path.join(root, "tmp"),
+            "selftest scratch dir must live directly under <repoRoot>/tmp/",
+        );
+        // Twin-conditional escape: when this suite runs as the TEMPLATE twin
+        // (its own directory sits inside a templates/ tree), the scratch MUST
+        // resolve outside that tree. Rendered twins skip this leg (an
+        // adopter repo may legitimately live under a directory named
+        // "templates"; only the plugin's OWN location identifies the twin).
+        const pluginInTemplatesTree = __dirname
+            .split(path.sep)
+            .includes("templates");
+        if (pluginInTemplatesTree) {
+            assert.equal(
+                TEST_CONFIG_DIR.split(path.sep).includes("templates"),
+                false,
+                `template twin: scratch must NOT stay under templates/ (got ${TEST_CONFIG_DIR})`,
+            );
+        }
+    });
 
     // Silence + capture console.error so a missing-file / invalid-JSON audit
     // line does not pollute test output, and so we can assert it fired (or not).
@@ -4777,6 +4647,135 @@ if (__isMain) {
             combined.includes("non-2xx response"),
             false,
             "raw evaluator-error text must not survive into stderr",
+        );
+    });
+
+    // --- outer decision-boundary fault injection (dormant-path egress) ---
+    //
+    // The two OUTER catches around the event hook's decision calls are NOT
+    // reachable by typed evaluator/HTTP failures (those become typed denies
+    // inside decidePermission/decideLive — see the D1 tests above). They are
+    // exercised here through the internal __testFaults seam (set ONLY in this
+    // self-test section; never a production config flag): an injected
+    // sentinel-throwing fault must (a) still fail-closed with a reject reply,
+    // (b) surface a NAMED truthful failure, and (c) keep the sentinel OUT of
+    // BOTH egress sinks — the stderr audit line AND the v2 rejection feedback.
+
+    test("outer-boundary egress: enforce decision fault → named failure, sentinel absent from BOTH sinks", async () => {
+        const { hooks, replies } = await setupEventTest({
+            mode: "enforce",
+            stubVerdict: "allow",
+        });
+        const SENTINEL = "enforce-fault-sentinel-must-not-egress-7f3a91";
+        const errors = [];
+        const orig = console.error;
+        console.error = (msg) => errors.push(msg);
+        __testFaults.decidePermission = () => {
+            throw new Error(SENTINEL);
+        };
+        try {
+            await hooks["event"]({ event: makeAskedEvent() });
+        } finally {
+            __testFaults.decidePermission = null;
+            console.error = orig;
+        }
+        // Fail-closed policy preserved: the catch still replies reject.
+        assert.equal(
+            replies.length,
+            1,
+            "boundary fault must still reply (fail-closed)",
+        );
+        assert.equal(replies[0].body.response, "reject");
+        assert.equal(replies[0]._route, "v2");
+        const msg = replies[0].body.message;
+        assert.ok(
+            typeof msg === "string" && msg.length > 0,
+            "reject must carry a non-empty named failure",
+        );
+        // Named truthful failure (O2 fallback family), never the raw text.
+        assert.ok(
+            msg.includes("fail(internal; no safety judgment was obtained)"),
+            "boundary fault must surface the named fail(internal) failure",
+        );
+        // SINK 1 (v2 rejection feedback): sentinel absent.
+        assert.equal(
+            msg.includes(SENTINEL),
+            false,
+            "injected sentinel must NOT reach the v2 rejection feedback",
+        );
+        // SINK 2 (stderr audit): sentinel absent; the uncertain line names
+        // the failure instead.
+        const combined = errors.join("\n");
+        assert.equal(
+            combined.includes(SENTINEL),
+            false,
+            "injected sentinel must NOT reach the stderr audit line",
+        );
+        assert.match(
+            combined,
+            /uncertain: decision error: fail\(internal; no safety judgment was obtained\)/,
+        );
+    });
+
+    test("outer-boundary egress: live decision fault → named failure, sentinel absent from BOTH sinks", async () => {
+        // Same proof at the LIVE decision boundary. The llm config is
+        // well-formed so the flow reaches the decision call (endpoint/model
+        // validation passes; transcript fetch uses the fake client).
+        const { hooks, replies } = await setupEventTest(
+            {
+                mode: "live",
+                promptFile: testConfigPath("evt-classifier-prompt.txt"),
+            },
+            {
+                modelEndpoint: "http://mock-llm",
+                model: "test-model",
+                maxRetries: 0,
+            },
+        );
+        const SENTINEL = "live-fault-sentinel-must-not-egress-4c2b77";
+        const errors = [];
+        const orig = console.error;
+        console.error = (msg) => errors.push(msg);
+        __testFaults.decideLive = async () => {
+            throw new Error(SENTINEL);
+        };
+        try {
+            await hooks["event"]({ event: makeAskedEvent() });
+        } finally {
+            __testFaults.decideLive = null;
+            console.error = orig;
+        }
+        // Fail-closed policy preserved.
+        assert.equal(
+            replies.length,
+            1,
+            "boundary fault must still reply (fail-closed)",
+        );
+        assert.equal(replies[0].body.response, "reject");
+        assert.equal(replies[0]._route, "v2");
+        const msg = replies[0].body.message;
+        assert.ok(
+            typeof msg === "string" && msg.length > 0,
+            "reject must carry a non-empty named failure",
+        );
+        assert.ok(
+            msg.includes("fail(internal; no safety judgment was obtained)"),
+            "boundary fault must surface the named fail(internal) failure",
+        );
+        assert.equal(
+            msg.includes(SENTINEL),
+            false,
+            "injected sentinel must NOT reach the v2 rejection feedback",
+        );
+        const combined = errors.join("\n");
+        assert.equal(
+            combined.includes(SENTINEL),
+            false,
+            "injected sentinel must NOT reach the stderr audit line",
+        );
+        assert.match(
+            combined,
+            /uncertain: live decision error: fail\(internal; no safety judgment was obtained\)/,
         );
     });
 

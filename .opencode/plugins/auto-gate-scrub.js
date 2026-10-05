@@ -6,7 +6,7 @@
 //   auto-gate-live.js   — HTTP egress: serializeTranscript POSTs the scrubbed
 //                         transcript to an external classifier model endpoint.
 //   auto-tool-gate.js   — audit/stderr-log egress: summarizeArgs (tool.execute
-//                         .before audit line) + the permission.ask audit lines
+//                         .before audit line) + the permission.asked audit lines
 //                         write scrubbed tool-call-derived content to stderr.
 //
 // Why a shared module exists: the same credential-leak class was found on two

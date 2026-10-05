@@ -7,5 +7,6 @@ features:
 overlays:
     - auto-classifier-pilot
     - release
+    - session-progress-pilot
 capabilities:
     - core/media-perception

@@ -494,17 +494,32 @@ function _userConfigBase() {
     );
 }
 
+// Marker-anchored repo root, mirroring auto-tool-gate.js repoRoot(): the
+// rendered twin (<repoRoot>/.opencode/plugins/) finds a marker (.opencode /
+// .git) exactly two levels up — identical to the legacy fixed two-up
+// resolution — while the template twin (templates/overlays/<pack>/plugins/
+// in a harness dev checkout) finds the true repo root further up, so derived
+// paths anchor to the REPO tree and never to templates/ (whose
+// subdirectories the Go overlay discovery treats as shipped packs). Bounded
+// walk (8 levels) with the legacy two-up fallback. Never process.cwd().
+function _repoRoot() {
+    let dir = __dirname;
+    for (let i = 0; i < 8; i++) {
+        if (
+            fs.existsSync(path.join(dir, ".opencode")) ||
+            fs.existsSync(path.join(dir, ".git"))
+        ) {
+            return dir;
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir) break; // reached the filesystem root
+        dir = parent;
+    }
+    return path.resolve(__dirname, "..", "..");
+}
+
 function _defaultProjectGuideDir() {
-    // In production the plugin lives at <repoRoot>/.opencode/plugins/ so
-    // resolving two levels up gives <repoRoot>, then into the guide dir.
-    return path.resolve(
-        __dirname,
-        "..",
-        "..",
-        ".opencode",
-        "sys-prompts",
-        GUIDE_DIR_NAME,
-    );
+    return path.join(_repoRoot(), ".opencode", "sys-prompts", GUIDE_DIR_NAME);
 }
 
 function _defaultUserGuideDir() {
@@ -957,6 +972,45 @@ const __dirname = path.dirname(__filename);
 const __isMain = path.resolve(process.argv[1] ?? "") === __filename;
 
 if (__isMain) {
+    // ===== _repoRoot() resolution regression (template-twin path escape) =====
+    //
+    // Mirrors the pin in auto-tool-gate.js: _repoRoot() must anchor on a REPO
+    // MARKER (.opencode / .git) so the default project guide dir resolves
+    // against the true repo root from BOTH runtime locations — the rendered
+    // twin (.opencode/plugins/, marker exactly two up: identical to the legacy
+    // fixed two-up resolution) AND the template twin
+    // (templates/overlays/<pack>/plugins/ in a harness dev checkout, which a
+    // fixed two-up resolution would misroot at templates/overlays — the
+    // historical bug class this walk eliminates).
+    test("_repoRoot: guide dir anchors on a repo-marker root (never templates/)", () => {
+        const root = _repoRoot();
+        assert.ok(
+            fs.existsSync(path.join(root, ".opencode")) ||
+                fs.existsSync(path.join(root, ".git")),
+            `_repoRoot()=${root} carries no repo marker (.opencode, .git) — fixed-depth resolution regressed`,
+        );
+        assert.equal(
+            _defaultProjectGuideDir(),
+            path.join(root, ".opencode", "sys-prompts", GUIDE_DIR_NAME),
+            "default project guide dir must derive from the marker-anchored root",
+        );
+        // Twin-conditional escape: when this suite runs as the TEMPLATE twin
+        // (its own directory sits inside a templates/ tree), the derived
+        // guide dir MUST resolve outside that tree. Rendered twins skip this
+        // leg (an adopter repo may legitimately live under a directory named
+        // "templates"; only the plugin's OWN location identifies the twin).
+        const pluginInTemplatesTree = __dirname
+            .split(path.sep)
+            .includes("templates");
+        if (pluginInTemplatesTree) {
+            assert.equal(
+                _defaultProjectGuideDir().split(path.sep).includes("templates"),
+                false,
+                `template twin: guide dir must NOT stay under templates/ (got ${_defaultProjectGuideDir()})`,
+            );
+        }
+    });
+
     // ===== serializeTranscript =====
 
     test("serialize: empty transcript -> non-empty fallback naming the permission", () => {

@@ -877,7 +877,7 @@
                 "webfetch": "deny"
             },
             "prompt": "{file:.opencode/agents/coordination.md}",
-            "steps": 50,
+            "steps": 10000,
             "temperature": 0.1
         },
         "debate": {
@@ -986,7 +986,7 @@
                 "webfetch": "deny"
             },
             "prompt": "{file:.opencode/agents/debate.md}",
-            "steps": 40,
+            "steps": 10000,
             "temperature": 0.2
         },
         "debate-critic": {
@@ -1093,7 +1093,7 @@
                 "webfetch": "deny"
             },
             "prompt": "{file:.opencode/agents/debate-critic.md}",
-            "steps": 20,
+            "steps": 10000,
             "temperature": 0.1
         },
         "debate-proposer": {
@@ -1200,7 +1200,7 @@
                 "webfetch": "deny"
             },
             "prompt": "{file:.opencode/agents/debate-proposer.md}",
-            "steps": 20,
+            "steps": 10000,
             "temperature": 0.3
         },
         "debate-synth": {
@@ -1307,7 +1307,7 @@
                 "webfetch": "deny"
             },
             "prompt": "{file:.opencode/agents/debate-synth.md}",
-            "steps": 20,
+            "steps": 10000,
             "temperature": 0.1
         },
         "docs-steward": {
@@ -1509,7 +1509,7 @@
                 "webfetch": "deny"
             },
             "prompt": "{file:.opencode/agents/media-perception.md}",
-            "steps": 30,
+            "steps": 10000,
             "temperature": 0.1
         },
         "plan": {
@@ -1721,7 +1721,7 @@
                 "webfetch": "allow"
             },
             "prompt": "{file:.opencode/agents/planner.md}",
-            "steps": 50,
+            "steps": 10000,
             "temperature": 0.1
         },
         "project-coordinator": {
@@ -1806,7 +1806,7 @@
                 "webfetch": "deny"
             },
             "prompt": "{file:.opencode/agents/project-coordinator.md}",
-            "steps": 50,
+            "steps": 10000,
             "temperature": 0.1
         },
         "releaser": {
@@ -1985,7 +1985,7 @@
                 "webfetch": "deny"
             },
             "prompt": "{file:.opencode/agents/repo-explorer.md}",
-            "steps": 30,
+            "steps": 10000,
             "temperature": 0.1
         },
         "researcher": {
@@ -2093,7 +2093,7 @@
                 "webfetch": "allow"
             },
             "prompt": "{file:.opencode/agents/researcher.md}",
-            "steps": 30,
+            "steps": 10000,
             "temperature": 0.1
         },
         "ship-review": {
@@ -2306,7 +2306,7 @@
                 "webfetch": "deny"
             },
             "prompt": "{file:.opencode/agents/solution-brief.md}",
-            "steps": 60,
+            "steps": 10000,
             "temperature": 0.2
         }
     },

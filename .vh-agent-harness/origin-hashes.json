@@ -177,6 +177,6 @@
     "docs/coordination/schemas/standard-report.schema.json": "sha256:0ab50a39df9d390ffa7dbddd3963809d7102774658348a00118691c89a432974",
     "docs/coordination/schemas/synthesis-report.schema.json": "sha256:34478e9f0164e1d651a78deacf9dc254ff299f15e28158469661469b826a89a6",
     "docs/coordination/schemas/task-card.schema.json": "sha256:ced89cdc152bcc836f205a81611ac768020063a30e10ae7b39eef5b6c2febe76",
-    "opencode.jsonc": "sha256:bed19f0503e2e2d3a467e479f8fb0c42b8777f65bd5ad615819afd4b6f5d158c"
+    "opencode.jsonc": "sha256:0851bf810882678e6ae2f2fdb7a8a6572c9e011acaf8ff3b2f5aeb67deecbe04"
   }
 }

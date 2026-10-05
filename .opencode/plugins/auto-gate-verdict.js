@@ -174,10 +174,10 @@ export function stubEvaluate(config) {
 // decidePermission — pure orchestrator (no I/O, no OpenCode coupling).
 //
 // Composes evaluateFn -> parseVerdict -> decision matrix and returns a plain
-// { status, reason, audit, kind, subkind } object. The plugin (permission.ask
-// enforce branch) maps `status` onto output.status and logs `audit` to stderr.
-// Defaulting evaluateFn to stubEvaluate keeps Phase 2 self-contained (no live
-// model); Phase 3 passes a real evaluator.
+// { status, reason, audit, kind, subkind } object. The plugin (event-hook
+// enforce branch) maps `status` onto the reply disposition and logs `audit` to
+// stderr. Defaulting evaluateFn to stubEvaluate keeps Phase 2 self-contained
+// (no live model); Phase 3 passes a real evaluator.
 //
 // TYPED PROVENANCE (O2 safe-feedback): `kind` separates a real classifier
 // JUDGMENT from an infrastructure failure, originating in THIS matrix (the
@@ -571,14 +571,15 @@ if (__isMain) {
     // ===== Hard-floor invariant (documented + pinned by test) =====
 
     test("hard-floor: classifier only sees ask-routed calls (cannot override deny)", () => {
-        // INVARIANT: permission.ask fires ONLY for calls opencode's permission
-        // table routes to `ask`. Table-`allow` fast-paths past this hook;
-        // table-`deny` / shell-guard blocks BEFORE this hook. Therefore the
-        // classifier decision — whatever decidePermission returns — can only
-        // ever lift an `ask` to `allow`/`deny`. It can NEVER override a static
-        // deny, because a statically-denied call never reaches the hook. This
-        // test pins the invariant in code: every classifier outcome is a plain
-        // allow/deny about the ask-routed subset, never a deny-override.
+        // INVARIANT: the permission.asked event fires ONLY for calls opencode's
+        // permission table routes to `ask`. Table-`allow` fast-paths past the
+        // event hook; table-`deny` / shell-guard blocks BEFORE it. Therefore
+        // the classifier decision — whatever decidePermission returns — can
+        // only ever lift an `ask` to `allow`/`deny`. It can NEVER override a
+        // static deny, because a statically-denied call never reaches the
+        // hook. This test pins the invariant in code: every classifier outcome
+        // is a plain allow/deny about the ask-routed subset, never a
+        // deny-override.
         const outcomes = ["allow", "block", "fail"].map((sv) =>
             decidePermission({ stubVerdict: sv }).status,
         );
