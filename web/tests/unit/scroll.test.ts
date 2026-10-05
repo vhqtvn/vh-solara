@@ -446,6 +446,23 @@ describe("classifyScrollDelta — tail/following", () => {
     expect(d.newScrollTop).toBe(978); // 1296 - 318
   });
 
+  it("content-anchoring absorption budget boundary: residual at exactly the budget is churn, one px past it is intent", () => {
+    // The guard admits residualUserDelta <= contentDelta + |viewportDelta| + eps.
+    // Pin BOTH sides of that boundary so a future edit that nudges the budget
+    // (or drops the +eps) fails loudly here instead of shifting the load-window
+    // flake surface silently. prev=(1000,2000,600); content grows +100,
+    // viewport shrinks -50 → budget = 100 + 50 + 1 = 151.
+    const prev = { scrollTop: 1000, scrollHeight: 2000, clientHeight: 600 };
+    const at = tail(prev, { scrollTop: 1151, scrollHeight: 2100, clientHeight: 550 });
+    expect(at.residualUserDelta).toBe(151);
+    expect(at.intent).toBe("none"); // exactly at the budget (<=) → absorbed
+    expect(at.shouldScroll).toBe(true);
+    expect(at.newScrollTop).toBe(1550); // 2100 - 550
+    const past = tail(prev, { scrollTop: 1152.5, scrollHeight: 2100, clientHeight: 550 });
+    expect(past.residualUserDelta).toBe(152.5);
+    expect(past.intent).toBe("user-scroll-down"); // past the budget → user intent
+  });
+
   it("genuine user scroll-down with no content change stays user-scroll-down (guard is content-gated)", () => {
     // Negative control: while following, a down-move on a frame with NO content
     // change cannot be anchoring (nothing was inserted) — it must still

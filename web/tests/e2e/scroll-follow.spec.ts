@@ -72,11 +72,24 @@ async function topmostAtCenter(
 // The idle demo fixture has working()=false, so a pill-based assertion there
 // would be vacuous; this helper is the non-vacuous replacement for the old
 // ".chat-live visible" checks in openDemo and tests 1/5/6/7/8.
+//
+// NON-VACUOUS GLUE (follow-up hardening): the poll also requires the
+// transcript to actually OVERFLOW the viewport (scrollHeight - clientHeight >
+// 24, beyond the nearBottom band). Before this, the poll passed pre-hydration
+// (container not yet overflowing → gap 0 < 24) — the glue was vacuously "at
+// the tail" before any message content had landed, hiding load-window
+// following-drops behind an early green. With the overflow requirement the
+// glue cannot resolve until the real transcript is in, so a load-window
+// misclassification that drops following shows up HERE as button.jump stuck
+// visible, instead of surfacing later in whichever test asserts the pill.
 async function expectFollowingTail(page: import("@playwright/test").Page) {
   await expect.poll(
     async () =>
       page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
-        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
+        e.scrollHeight - e.clientHeight > 24 &&
+        e.scrollHeight - e.scrollTop - e.clientHeight < 24
+          ? 1
+          : 0,
       ),
     { timeout: 5000 },
   ).toBe(1);

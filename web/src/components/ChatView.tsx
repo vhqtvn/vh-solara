@@ -1258,6 +1258,24 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       if (!scrollEl || !ready()) return;
       if (following()) {
         pin();
+      } else if (anchorServoArmed) {
+        // Restore-contract gate: while the maybeRestore anchor servo owns the
+        // viewport (armed at the anchor positioning, disarmed at the reader's
+        // first genuine scroll / any re-engage), the system recoveries below
+        // must NOT fire. The restored reader can legitimately land INSIDE the
+        // recoveries' admission bands on unsettled hydration layout — the
+        // anchor delta is measured before below-anchor rows finish hydrating,
+        // so a mid-history anchor can sit ~17px off the content bottom, inside
+        // nearBottom's 24px band AND under RECOVERY_TAIL_GAP — and bug-2b would
+        // "recover" them to the tail, killing the restore contract (the
+        // scroll-follow test-12 reopen flake: pin → reached-bottom → anchor
+        // cleared). The contentEl RO's read-mode branch owns repositioning for
+        // a restored reader; these recoveries serve readers whose off-tail
+        // position is theirs, not the restore's. anchorServoArmed (not
+        // restoredAnchorId) is the discriminator: it is cleared at onScrolled's
+        // genuine user-scroll arm, so a restored reader who then deliberately
+        // scrolls near the tail keeps bug-2b's composer-shrink recovery.
+        return;
       } else {
         // (b) non-recovery fix: a spurious arm (the contentEl RO's concurrent
         // content-grow + composer-grow race) can leave the reader near the tail
