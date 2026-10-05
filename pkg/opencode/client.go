@@ -711,14 +711,12 @@ func (c *Client) SubscribeEvents(ctx context.Context, handler func(Event) error)
 	headerTimer := time.AfterFunc(idleTimeout, cancelReq)
 	httpClient := &http.Client{}
 	resp, err := httpClient.Do(req)
-	if !headerTimer.Stop() && ctx.Err() == nil {
-		if resp != nil {
-			resp.Body.Close()
-		}
-		return fmt.Errorf("subscribe /event: no response headers in %v", idleTimeout)
-	}
-	if err != nil {
-		return err
+	// The post-Do decision (synthetic header error vs the caller's real
+	// error) lives in headerWaitOutcome so its full decision matrix —
+	// including caller cancellation landing inside the timer-fire window,
+	// not deterministically reachable end-to-end — is unit-testable.
+	if oerr := headerWaitOutcome(!headerTimer.Stop(), ctx.Err(), resp, err); oerr != nil {
+		return oerr
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -862,4 +860,29 @@ func (c *Client) SubscribeEvents(ctx context.Context, handler func(Event) error)
 			return fmt.Errorf("subscribe /event: no parseable event for %v (live-but-content-free stream)", noEventTimeout)
 		}
 	}
+}
+
+// headerWaitOutcome decides SubscribeEvents's post-Do outcome from the
+// header-timer state and the parent context, keeping the parent context
+// authoritative: the synthetic header error is returned only when the timer
+// fired AND the caller did not cancel. timerFired is headerTimer.Stop()==false
+// (the timer already fired, so its cancelReq cut the request short); parentErr
+// is ctx.Err() of the PARENT context (reqCtx is function-scoped and not yet
+// cancelled at this point, so the timer's cancelReq is invisible to it); doErr
+// is http.Client.Do's error, nil meaning headers arrived and the caller should
+// proceed down the success path. The synthetic path closes a non-nil response
+// body (Do may hand one back alongside the timer-induced error); every other
+// path returns doErr as-is. Extracted from the former inline guard so the
+// full decision matrix — including caller cancellation landing INSIDE the
+// timer-fire window (Stop()==false with the parent already cancelled), a
+// nanosecond race that is not deterministically coverable end-to-end — is
+// unit-testable.
+func headerWaitOutcome(timerFired bool, parentErr error, resp *http.Response, doErr error) error {
+	if timerFired && parentErr == nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return fmt.Errorf("subscribe /event: no response headers in %v", idleTimeout)
+	}
+	return doErr
 }

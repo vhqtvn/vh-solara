@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -331,13 +332,20 @@ func TestSubscribeEventsCtxCancel(t *testing.T) {
 	}
 }
 
-// TestSubscribeEventsCtxCancelBeforeHeaders pins the parent-context-authority
-// half of the header timer (the sibling of HeadersNeverArrive's timer-half):
-// when the caller cancels while Do is still parked waiting for response
-// headers, the guard `!headerTimer.Stop() && ctx.Err() == nil` must NOT
-// synthesize the "no response headers" error — Stop() returns true (the timer
-// never fired), so Do's real cancellation error must surface instead. That
-// error is wrapped in *url.Error by the transport, hence errors.Is, not ==.
+// TestSubscribeEventsCtxCancelBeforeHeaders pins pre-header caller
+// cancellation with a successfully STOPPED header timer (the sibling of
+// HeadersNeverArrive's timer-half): when the caller cancels while Do is still
+// parked waiting for response headers, the timer never fires, so
+// headerTimer.Stop() returns true and the caller's real cancellation error
+// must surface — never the synthetic "no response headers" error. Note this
+// exercises the stopped-timer arm only: because Stop() returned true, the
+// outcome's timerFired input is false and the parent-ctx conjunct is
+// short-circuited away, never evaluated. The complementary arm — Stop()
+// returning false with the parent already cancelled (cancellation landing
+// inside the timer-fire window) — is a nanosecond race this e2e cannot win
+// deterministically; it is covered by the headerWaitOutcome matrix in
+// TestHeaderWaitOutcome instead. Do's error is wrapped in *url.Error by the
+// transport, hence errors.Is, not ==.
 // Determinism comes from a server-entry rendezvous instead of a sleep: the
 // cancellation worker waits until the handler has actually been entered —
 // proving Do is blocked on headers, with none written — so cancel never races
@@ -402,6 +410,142 @@ func TestSubscribeEventsCtxCancelBeforeHeaders(t *testing.T) {
 	// Upper bound only: prompt cancellation is correct, so no lower bound.
 	if elapsed > 2*time.Second {
 		t.Fatalf("SubscribeEvents took too long to honor ctx cancel before headers: %v", elapsed)
+	}
+}
+
+// closeFlagBody is an io.ReadCloser that records Close calls, so
+// TestHeaderWaitOutcome can assert exactly which decision-matrix arms close
+// the response body.
+type closeFlagBody struct {
+	inner  io.ReadCloser
+	closed bool
+}
+
+func (b *closeFlagBody) Read(p []byte) (int, error) { return b.inner.Read(p) }
+func (b *closeFlagBody) Close() error {
+	b.closed = true
+	return b.inner.Close()
+}
+
+// TestHeaderWaitOutcome covers the full decision matrix of the
+// headerWaitOutcome seam deterministically: every (timerFired, parentErr,
+// resp, doErr) combination and the outcome the former inline guard produced
+// for it, so this matrix plus the unchanged e2e family is the behavior-parity
+// proof for the extraction. It includes the one arm the e2e tests can never
+// reach deterministically: caller cancellation landing INSIDE the timer-fire
+// window (headerTimer.Stop()==false with the parent already cancelled),
+// which requires winning a nanosecond race between Do unwinding and the
+// guard evaluation.
+func TestHeaderWaitOutcome(t *testing.T) {
+	// The exact synthetic text under the CURRENT idleTimeout — the seam
+	// formats the live package var, and tests in this package are
+	// sequential (each withIdleTimeout restores it), so this stays
+	// byte-identical by construction.
+	wantSynthetic := fmt.Sprintf("subscribe /event: no response headers in %v", idleTimeout)
+	// A sentinel Do error, distinct from every context error, so the
+	// doErr-wins arms prove the seam returns Do's error verbatim.
+	doFailed := errors.New("subscribe /event: transport failure")
+	// The realistic doErr shape when the parent cancelled Do mid-flight:
+	// wrapped in *url.Error by the transport, hence errors.Is-visible.
+	doCanceled := fmt.Errorf("Get /event: %w", context.Canceled)
+
+	tests := []struct {
+		name       string
+		timerFired bool
+		parentErr  error
+		withResp   bool // attach a response carrying a closeFlagBody
+		doErr      error
+		synthetic  bool // want the synthetic header error
+		closesBody bool // want the response body closed
+	}{
+		{
+			name:       "timer fired, parent alive: synthetic header error",
+			timerFired: true,
+			parentErr:  nil,
+			doErr:      context.Canceled, // reqCtx cancelled by the fired timer
+			synthetic:  true,
+		},
+		{
+			name:       "timer fired, parent alive, resp non-nil: synthetic error and body closed",
+			timerFired: true,
+			parentErr:  nil,
+			withResp:   true,
+			doErr:      context.Canceled,
+			synthetic:  true,
+			closesBody: true,
+		},
+		{
+			// THE race-window arm (review DEFER): the timer fired (its
+			// cancelReq cut Do short) but the parent context is ALSO
+			// cancelled — the caller's real cancellation error must win,
+			// never the synthetic "no response headers" error. Winning
+			// the end-to-end race is not deterministic, so it is pinned
+			// here at the seam.
+			name:       "timer fired, parent cancelled: caller's error wins (race window)",
+			timerFired: true,
+			parentErr:  context.Canceled,
+			doErr:      doCanceled,
+		},
+		{
+			name:       "timer fired, parent cancelled, resp non-nil: body not closed by the seam",
+			timerFired: true,
+			parentErr:  context.Canceled,
+			withResp:   true,
+			doErr:      doCanceled,
+		},
+		{
+			name:       "timer stopped, parent alive, doErr nil: proceed (nil)",
+			timerFired: false,
+			parentErr:  nil,
+			withResp:   true,
+			doErr:      nil,
+		},
+		{
+			name:       "timer stopped, parent alive, doErr non-nil: doErr verbatim",
+			timerFired: false,
+			parentErr:  nil,
+			doErr:      doFailed,
+		},
+		{
+			// The end-state posture TestSubscribeEventsCtxCancelBeforeHeaders
+			// reaches e2e: timer stopped, parent cancelled, Do unwound with
+			// the wrapped cancellation error.
+			name:       "timer stopped, parent cancelled: wrapped cancellation error surfaces",
+			timerFired: false,
+			parentErr:  context.Canceled,
+			doErr:      doCanceled,
+		},
+		{
+			name:       "timer stopped, parent cancelled, doErr nil: proceed (nil)",
+			timerFired: false,
+			parentErr:  context.Canceled,
+			withResp:   true,
+			doErr:      nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body *closeFlagBody
+			var resp *http.Response
+			if tt.withResp {
+				body = &closeFlagBody{inner: io.NopCloser(strings.NewReader("x"))}
+				resp = &http.Response{Body: body}
+			}
+			got := headerWaitOutcome(tt.timerFired, tt.parentErr, resp, tt.doErr)
+			if tt.synthetic {
+				if got == nil || got.Error() != wantSynthetic {
+					t.Fatalf("want synthetic header error %q, got %v", wantSynthetic, got)
+				}
+				if tt.doErr != nil && got == tt.doErr {
+					t.Fatalf("synthetic arm must replace doErr, got it verbatim: %v", got)
+				}
+			} else if got != tt.doErr {
+				t.Fatalf("want doErr verbatim (%v), got %v", tt.doErr, got)
+			}
+			if tt.withResp && body.closed != tt.closesBody {
+				t.Fatalf("body closed=%v, want %v", body.closed, tt.closesBody)
+			}
+		})
 	}
 }
 
