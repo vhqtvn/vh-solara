@@ -303,6 +303,37 @@ export function classifyScrollDelta(
     intent = "none";
   }
 
+  // Content-insert anchoring churn guard (tail + following): when content grew
+  // this frame (a message appended, a streamed chunk landed, hydration filled
+  // the transcript), the browser's scroll-anchoring can move scrollTop DOWN to
+  // keep its anchor node's viewport position — a system-driven move with no
+  // user input, bounded by the concurrent layout mutation. Without this guard
+  // the residual (+move) classifies as user-scroll-down, dropping `following`
+  // and arming the intent latch, which suppresses the busy-edge self-heal —
+  // the e2e Live-pill flake (scroll-follow tests 9/11: a [[stall]] send's user
+  // message appended → +13px anchor move read as intent; and the load shape
+  // where the first scroll event of the page's life is classified against the
+  // pre-hydration mount baseline → the whole ~948px position read as intent).
+  // The absorption budget is contentDelta + |viewportDelta|: anchoring moves
+  // are bounded by the inserted height, and hydration-era frames churn both
+  // axes at once (measured: residual 948 vs contentDelta 857 + |viewportDelta|
+  // 121). DOWN-only by design: while following at the tail, a downward move is
+  // toward the tail (benign — the tail re-glue completes it), whereas an
+  // upward move is the canonical reader-intent signal (deliberate scroll-up
+  // must still drop following; tests 2/3/10b/17b/18). A genuine user
+  // scroll-down on a frame with NO content change keeps contentDelta 0 and
+  // still classifies as user-scroll-down.
+  if (
+    args.mode === "tail" &&
+    args.following &&
+    intent === "user-scroll-down" &&
+    contentDelta > 0 &&
+    residualUserDelta > 0 &&
+    residualUserDelta <= contentDelta + Math.abs(viewportDelta) + eps
+  ) {
+    intent = "none";
+  }
+
   // TAIL-mode re-glue: while following, any non-user-scroll-up transition is
   // layout churn we must absorb by re-pinning to the bottom. Epsilon-guard the
   // write so a no-op frame doesn't churn RO/onScroll.

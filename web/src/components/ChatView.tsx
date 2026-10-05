@@ -831,6 +831,19 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // session. The stale/no-anchor branches below arm false because they
         // land AT the bottom (system restore = follow intent reset).
         setUserScrolledUp(true);
+        // Reset any system-arm recovery state armed BEFORE the restore (the
+        // contentEl RO's user-scroll-up misclassification can arm
+        // contentROArmedLatch + a small preArmGap during the pre-restore
+        // hydration window, while the baseline still sits at the mount-pin
+        // bottom). Without this reset, the scrollEl RO's contentROArmedLatch
+        // recovery (which has no restoredAnchorId gate) fires on the first
+        // post-restore viewport-churn frame, yanks the freshly-restored reader
+        // to the tail, and the resulting reached-bottom classification CLEARS
+        // the anchor — the restored-reader flake (scroll-follow test 12 under
+        // repeat-each stress). A restored reader is read-mode: the system-arm
+        // recovery must not apply to them.
+        contentROArmedLatch = false;
+        preArmGap = Infinity;
         const delta = el.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
         // delta is viewport px under UI zoom (CSS `zoom` on :root; see
         // lib/zoom) while scrollTop is zoomed-layout px — convert once so the

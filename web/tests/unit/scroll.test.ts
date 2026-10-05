@@ -407,6 +407,89 @@ describe("classifyScrollDelta — tail/following", () => {
     expect(d.intent).toBe("reached-bottom");
   });
 
+  it("content-insert anchoring move while following (send-window flake) → churn, re-pin, keep following", () => {
+    // The scroll-follow e2e flake (tests 9/11), signature B: glued at the tail
+    // (969 = 1296-327), a [[stall]] send appends the user message (+95 content)
+    // and browser scroll-anchoring moves scrollTop +13 with NO user input.
+    // Pre-guard this classified user-scroll-down → following dropped + latch
+    // armed → the Live pill never rendered. The down-residual is bounded by the
+    // concurrent content grow, so it is anchoring churn: intent none, tail
+    // re-glue re-pins to the new bottom.
+    const d = tail(
+      { scrollTop: 969, scrollHeight: 1296, clientHeight: 327 },
+      { scrollTop: 982, scrollHeight: 1391, clientHeight: 327 },
+    );
+    expect(d.contentDelta).toBe(95);
+    expect(d.viewportDelta).toBe(0);
+    expect(d.residualUserDelta).toBe(13);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(1064); // 1391 - 327
+  });
+
+  it("hydration-era anchoring move vs the stale mount baseline (load flake) → churn, re-pin, keep following", () => {
+    // The same flake, signature A: the first scroll event of the page's life,
+    // classified against the pre-hydration mount baseline (empty transcript,
+    // scrollTop 0) after hydration grew the content 439→1296 and the viewport
+    // churned 439→318. The browser anchored scrollTop to 948 (no user input);
+    // the whole position read as a +948 residual. The absorption budget
+    // contentDelta + |viewportDelta| (857 + 121) covers the move.
+    const d = tail(
+      { scrollTop: 0, scrollHeight: 439, clientHeight: 439 },
+      { scrollTop: 948, scrollHeight: 1296, clientHeight: 318 },
+    );
+    expect(d.contentDelta).toBe(857);
+    expect(d.viewportDelta).toBe(-121);
+    expect(d.residualUserDelta).toBe(948);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(978); // 1296 - 318
+  });
+
+  it("genuine user scroll-down with no content change stays user-scroll-down (guard is content-gated)", () => {
+    // Negative control: while following, a down-move on a frame with NO content
+    // change cannot be anchoring (nothing was inserted) — it must still
+    // classify as user intent. (The guard requires contentDelta > 0.)
+    const d = tail(
+      { scrollTop: 800, scrollHeight: 2000, clientHeight: 600 },
+      { scrollTop: 1000, scrollHeight: 2000, clientHeight: 600 },
+    );
+    expect(d.contentDelta).toBe(0);
+    expect(d.residualUserDelta).toBe(200);
+    expect(d.intent).toBe("user-scroll-down");
+    // Pre-existing tail-re-glue semantics: the classifier proposes a re-pin for
+    // any non-up intent while following; onScrolled's user-intent branch drops
+    // following and never applies it. The INTENT is the asserted contract here.
+    expect(d.shouldScroll).toBe(true);
+  });
+
+  it("down-residual EXCEEDING the content+viewport budget stays user-scroll-down", () => {
+    // Negative control: a down-move larger than the concurrent layout mutation
+    // (contentDelta + |viewportDelta| + eps) is not attributable to anchoring —
+    // keep classifying it as user intent.
+    const d = tail(
+      { scrollTop: 800, scrollHeight: 2000, clientHeight: 600 },
+      { scrollTop: 1150, scrollHeight: 2100, clientHeight: 600 },
+    );
+    expect(d.contentDelta).toBe(100);
+    expect(d.viewportDelta).toBe(0);
+    expect(d.residualUserDelta).toBe(350); // 350 > 100 + 0 + 1
+    expect(d.intent).toBe("user-scroll-down");
+  });
+
+  it("upward move on a content-grow frame still drops following (guard is DOWN-only)", () => {
+    // Negative control: the canonical reader-intent signal is an UPWARD move —
+    // even on a frame where content grew (mid-stream wheel-up), it must
+    // classify as user-scroll-up so the intent latch arms (tests 10b/17b).
+    const d = tail(
+      { scrollTop: 1400, scrollHeight: 2000, clientHeight: 600 },
+      { scrollTop: 1300, scrollHeight: 2200, clientHeight: 600 },
+    );
+    expect(d.contentDelta).toBe(200);
+    expect(d.residualUserDelta).toBe(-100);
+    expect(d.intent).toBe("user-scroll-up");
+  });
+
   it("max-scroll clamp on dramatic content shrink → reached-bottom, no churn", () => {
     const d = tail(atBottom(), { scrollTop: 400, scrollHeight: 1000, clientHeight: 600 });
     expect(d.residualUserDelta).toBe(0);
