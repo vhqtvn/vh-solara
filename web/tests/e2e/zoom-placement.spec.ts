@@ -1,7 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { projectUrl } from "./util";
+import { projectUrl, settledTopLineNumber, topLineNumber } from "./util";
 
 // Live-browser receipt (M1) for the UI-zoom fixed-placement conversion commits
 // fc2ef59d / f9a8bbd4 / a191148d. prefs.ts applies UI zoom as CSS `zoom` +
@@ -668,27 +668,9 @@ test.describe("terminal wheel parity across UI zoom", () => {
 
   // First pure-integer line visible in the terminal — a scroll marker that
   // needs no font metrics (seq output is a ladder of ints; any prompt/echo
-  // noise above it is skipped identically in both phases).
-  const topLineNumber = (page: Page) =>
-    page.locator(".xterm-rows").evaluate((el) => {
-      for (const line of (el as HTMLElement).innerText.split("\n")) {
-        if (/^\d+$/.test(line.trim())) return Number.parseInt(line, 10);
-      }
-      return null;
-    });
-
-  // xterm v6 smoothScrollDuration defaults to 0 (immediate), but the seq
-  // burst streams asynchronously — poll until the marker is stable.
-  async function settledTopLineNumber(page: Page): Promise<number> {
-    let prev: number | null = null;
-    for (let i = 0; i < 40; i++) {
-      const cur = await topLineNumber(page);
-      if (cur !== null && cur === prev) return cur;
-      prev = cur;
-      await page.waitForTimeout(150);
-    }
-    throw new Error(`terminal scroll marker never settled (last: ${prev})`);
-  }
+  // noise above it is skipped identically in both phases). Hoisted to
+  // ./util.ts together with settledTopLineNumber (shared with the
+  // escaped-selection-drag describe below).
 
   async function measureWheelAdvance(page: Page): Promise<number> {
     const before = await settledTopLineNumber(page);
@@ -851,30 +833,11 @@ test.describe("terminal selection drag escaping the host under UI zoom", () => {
     });
 
   // Flake hardening (same contract as the wheel-parity describe's
-  // settledTopLineNumber): the seq burst AND the returning shell prompt
-  // stream in asynchronously — a row-COUNT poll alone passes while the
-  // viewport still owes its final ~2 lines, and that late autoscroll moves
-  // the row grid MID-GESTURE: the press anchors on line L, the release at
-  // the same Y lands on L+2, and the oracle sees a "reversed" multi-row
-  // selection (observed live in full-lane runs: exactly-2-row drift, 3
-  // full-height divs, deterministic under pipeline latency). Poll until the
-  // first visible pure-int line is STABLE across two samples before any
-  // geometry is measured or dragged.
-  async function settledTopLineNumber(page: Page): Promise<number> {
-    let prev: number | null = null;
-    for (let i = 0; i < 40; i++) {
-      const cur = await page.locator(".xterm-rows").evaluate((el) => {
-        for (const line of (el as HTMLElement).innerText.split("\n")) {
-          if (/^\d+$/.test(line.trim())) return Number.parseInt(line, 10);
-        }
-        return null;
-      });
-      if (cur !== null && cur === prev) return cur;
-      prev = cur;
-      await page.waitForTimeout(150);
-    }
-    throw new Error(`terminal scroll marker never settled (last: ${prev})`);
-  }
+  // settledTopLineNumber, now shared from ./util.ts): poll until the first
+  // visible pure-int line is STABLE across two samples before any geometry is
+  // measured or dragged — the async stream's late autoscroll otherwise moves
+  // the row grid MID-GESTURE (observed live in full-lane runs: exactly-2-row
+  // drift, 3 full-height divs, deterministic under pipeline latency).
 
   async function runEscapedDragTest(page: Page, scale: number): Promise<void> {
     test.setTimeout(90_000);

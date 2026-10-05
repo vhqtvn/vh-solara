@@ -497,7 +497,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // attempt gave 5/40 — the misclassification set that flag too). The geometric
   // gate alone yanked ANY <200px reader including a deliberate one, so Approach A
   // adds the input-backed veto (inputBackedAway, declared just below) to skip the
-  // yank when the off-tail position was caused by genuine wheel/pointer input —
+  // yank when the off-tail position was caused by genuine wheel/pointer/key input —
   // which the :1178 race (geometry-only) cannot fabricate. See the veto decl +
   // the onMount input listeners for the full mechanism.
   let prevWorkingEnd = false;
@@ -533,7 +533,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       const gap = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
       // Recover a system-driven drift (the :1178 race). The input-backed veto
       // (Approach A) prevents yanking a deliberate reader: inputBackedAway is
-      // armed only when fresh wheel/pointer input correlates with the scroll-away,
+      // armed only when fresh wheel/pointer/key input correlates with the scroll-away,
       // which the :1178 geometry misclassification cannot produce. When the veto
       // is set we leave following=false and the reader in place (NOT cleared here
       // — see the decl above).

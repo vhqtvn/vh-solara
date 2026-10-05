@@ -200,16 +200,19 @@ test("font change in tab A reaches tab B live via a real storage event, no reloa
     // The local webfont <link> injection (ensureWebfont in A).
     expect(await fontLinkCount(a, "family=Inter")).toBe(1);
     // B re-applies WITHOUT any reload: real storage event (isTrusted:true)
-    // → persistedSignal re-read → onRemoteChange → applyFont().
-    expect(await fontVar(b, "--font-ui")).toBe(INTER_STACK);
+    // → persistedSignal re-read → onRemoteChange → applyFont(). B-side reads
+    // POLL (the theme spec's discipline): the storage event is delivered to
+    // B asynchronously, so the remote apply lands a beat after A's local
+    // one — poll until the exact expected value (never loosen the assert).
+    await expect.poll(() => fontVar(b, "--font-ui")).toBe(INTER_STACK);
     // …and the new stack reaches the RECEIVING document's cascade. Chromium's
     // computed font-family serialization DROPS quotes around single-word
     // family names ("Inter" → Inter) while keeping them for multi-word ones,
     // so anchor the first family token with both quote forms accepted.
-    expect(await bodyFontFamily(b)).toMatch(/^"?Inter"?,/);
+    await expect.poll(() => bodyFontFamily(b)).toMatch(/^"?Inter"?,/);
     // …and the on-demand webfont <link> is injected remotely (element
     // presence — network-free, see header).
-    expect(await fontLinkCount(b, "family=Inter")).toBe(1);
+    await expect.poll(() => fontLinkCount(b, "family=Inter")).toBe(1);
     const interEvents = await capturedEvents(b, captured);
     expect(
       interEvents.filter((e) => e.key === FONT_KEY && e.isTrusted && e.newValue?.includes("inter")),
@@ -224,8 +227,8 @@ test("font change in tab A reaches tab B live via a real storage event, no reloa
     await a.getByRole("option", { name: "Fira Code", exact: true }).click();
 
     expect(await fontVar(a, "--font-mono")).toBe(FIRA_CODE_STACK);
-    expect(await fontVar(b, "--font-mono")).toBe(FIRA_CODE_STACK);
-    expect(await fontLinkCount(b, "family=Fira+Code")).toBe(1);
+    await expect.poll(() => fontVar(b, "--font-mono")).toBe(FIRA_CODE_STACK);
+    await expect.poll(() => fontLinkCount(b, "family=Fira+Code")).toBe(1);
     const monoEvents = await capturedEvents(b, captured);
     expect(
       monoEvents.filter((e) => e.key === MONO_KEY && e.isTrusted && e.newValue?.includes("fira-code")),
@@ -239,8 +242,11 @@ test("font change in tab A reaches tab B live via a real storage event, no reloa
     await displayFont.click();
     await a.getByRole("option", { name: "Custom (system font)", exact: true }).click();
 
-    // B follows the activation (stack still SYS — family empty).
-    expect(await fontVar(b, "--font-ui")).toBe(SYS);
+    // B follows the activation (stack still SYS — family empty). The value
+    // poll is degenerate here (SYS was already the live value) but keeps the
+    // uniform B-side poll discipline; the ACTIVATION proof is the captured
+    // storage event below.
+    await expect.poll(() => fontVar(b, "--font-ui")).toBe(SYS);
     const customEvents = await capturedEvents(b, captured);
     expect(
       customEvents.filter((e) => e.key === FONT_KEY && e.isTrusted && e.newValue?.includes("custom")),
@@ -257,8 +263,8 @@ test("font change in tab A reaches tab B live via a real storage event, no reloa
     // B re-applies live: font() === "custom" there too, so customFont's
     // onRemoteChange conditional apply fires (the exact branch 47b4305
     // wired; previously a remote family edit did nothing until reload).
-    expect(await fontVar(b, "--font-ui")).toBe(CUSTOM_STACK);
-    expect(await bodyFontFamily(b)).toMatch(/^"?Vonk Axion"?,/);
+    await expect.poll(() => fontVar(b, "--font-ui")).toBe(CUSTOM_STACK);
+    await expect.poll(() => bodyFontFamily(b)).toMatch(/^"?Vonk Axion"?,/);
     const familyEvents = await capturedEvents(b, captured);
     expect(
       familyEvents.filter((e) => e.key === CUSTOM_KEY && e.isTrusted && e.newValue?.includes(CUSTOM_FAMILY)),

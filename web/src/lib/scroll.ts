@@ -189,7 +189,7 @@ export interface ClassifyScrollDeltaArgs {
   // being read as user intent.
   anchorDelta?: number;
   // Caller-asserted input provenance (read mode only): when true, the caller
-  // guarantees there is NO fresh physical user input (wheel/pointer) over the
+  // guarantees there is NO fresh physical user input (wheel/pointer/key) over the
   // scroll viewport for this frame, so any same-frame scrollTop movement can
   // only be browser/system scroll-anchoring — and PARTIAL tracking (the
   // browser moved scrollTop by less than anchorDelta) is corrected to the

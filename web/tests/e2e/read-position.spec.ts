@@ -34,6 +34,21 @@ import { projectUrl } from "./util";
 //     LAND the jump, not have it aborted by the drift servo reverting the
 //     smooth-scroll frames (which also cancels the animation outright).
 //
+// (e) POST-RELOAD KEYBOARD SCROLL — restore lands, then PageDown pressed
+//     while a tabindex=0 transcript element (.msg-perf) INSIDE .chat-scroll
+//     holds focus must ADVANCE the viewport and keep it: the keydown bubbles
+//     to .chat-main's sensor (SCROLL_NAV_KEYS) and stamps the input marker,
+//     so the browser's default container scroll is reader intent, not
+//     "trusted drift" to be corrected back to the anchor.
+//
+// (f) POST-RELOAD POINTER DRAG — restore lands, then an extended pointer
+//     drag whose scroll events extend BEYOND the initiating pointerdown
+//     (>300ms) must be FOLLOWED, not reverted: the pointermove listener
+//     (buttons≠0) restamps the input marker through the whole gesture,
+//     keeping every scroll event of ONE drag fresh. Executed as a CDP touch
+//     pan — the mouse scrollbar-thumb drag is inert under headless CDP
+//     (see the test body for the probe).
+//
 // HOME: a new focused spec (not unread-dot.spec.ts or scroll-follow.spec.ts).
 // The read-position machinery spans BOTH files' concerns (anchors + the jump
 // button live in unread-dot; streaming + reload-restore live in scroll-
@@ -548,4 +563,134 @@ test("navigator dot jump after restore lands on the target turn", async ({ page 
   const g = await rowGeometry(page, target);
   expect(g.rowTopRel).not.toBeNull();
   expect(Math.abs(g.rowTopRel!)).toBeLessThanOrEqual(48);
+});
+
+// (e) POST-RELOAD KEYBOARD SCROLL — the drift servo must not revert the
+//     reader's KEYBOARD scrolling either. The transcript contains tabindex=0
+//     elements (MessageRow's .msg-perf — the `other` transcript has no
+//     ToolPart panes, but every SETTLED assistant turn renders .msg-perf:
+//     simulatePrompt's streamed turns carry time.{created,completed}, part
+//     time.{start,end}, and tokens.output, so turnStats is non-empty). A
+//     PageDown pressed while one of those holds focus scrolls .chat-scroll
+//     (the nearest scrollable ancestor) — the keydown bubbles up to
+//     .chat-main's sensor and stamps pendingInputAt (SCROLL_NAV_KEYS).
+//     Pre-fix, keyboard scrolling was unstamped: every key-driven scroll
+//     event was "trusted drift" and the servo snapped the reader back to the
+//     restore anchor on the next frame.
+test("keyboard PageDown after restore advances the viewport instead of reverting", async ({ page }) => {
+  // minMargin 500: one PageDown advances ~0.9×clientHeight (~330px), so the
+  // landing stays decisively OFF the tail — the assertions below then
+  // measure the servo's no-revert, not the atBottom re-engage branch.
+  await establishRestoredAnchor(page, VP, 500);
+
+  const scrollTopNow = () =>
+    page.locator(".chat-scroll").evaluate((el: HTMLElement) => el.scrollTop);
+  const before = await scrollTopNow();
+
+  // Focus a tabindex=0 transcript element that is ALREADY inside the
+  // viewport — focusing an off-screen row would first scroll it into view
+  // (an UNSTAMPED, servo-correctable move) and muddy the baseline. The
+  // composer is OUTSIDE .chat-main (typing never stamps), so focusing a
+  // TRANSCRIPT element is the point of this test.
+  const focusedMid = await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    const top = el.getBoundingClientRect().top;
+    const bottom = top + el.clientHeight;
+    for (const perf of Array.from(el.querySelectorAll(".msg-perf")) as HTMLElement[]) {
+      const r = perf.getBoundingClientRect();
+      if (r.height > 0 && r.top >= top + 4 && r.bottom <= bottom - 4) {
+        perf.focus();
+        return perf.closest("[data-mid]")?.getAttribute("data-mid") ?? null;
+      }
+    }
+    return null;
+  });
+  expect(focusedMid, "a viewport-visible tabindex=0 .msg-perf row to focus").toBeTruthy();
+
+  // One REAL PageDown: the browser's default action scrolls the focused
+  // element's scroll container down ~a page.
+  await page.keyboard.press("PageDown");
+  await page.waitForTimeout(500);
+
+  // The viewport ADVANCED (roughly one client-height; >100 leaves headroom
+  // for engine page-overlap variance). Under the defect the servo reverted
+  // the keydown-driven scroll back to the anchor within the same tick.
+  const after = await scrollTopNow();
+  expect(after).toBeGreaterThan(before + 100);
+
+  // ...and it REMAINS advanced once the input-freshness window (300ms) has
+  // fully elapsed — no deferred servo creep-back to the restore anchor.
+  await page.waitForTimeout(600);
+  expect(await scrollTopNow()).toBeGreaterThan(before + 100);
+});
+
+// (f) POST-RELOAD POINTER DRAG — a drag whose scroll events extend BEYOND the
+//     initiating pointerdown. Executed as a TOUCH PAN (CDP touchStart/
+//     touchMove/touchEnd spanning ~1s): the compositor-driven pan scrolls
+//     .chat-scroll with real scroll events while contact-pointermove events
+//     (pointerType "touch", buttons=1 — the exact `pointermove w/ buttons≠0`
+//     restamp the fix claims) bubble to .chat-main's sensor, keeping every
+//     scroll event of ONE gesture fresh past the 300ms INPUT_FRESHNESS window
+//     of the pointerdown. (A MOUSE scrollbar-thumb drag is the other drag
+//     surface, but it is NOT drivable here: under headless-Chromium CDP input
+//     the press/moves dispatch DOM events yet the native scrollbar widget
+//     never engages — probed live: pd:1, pm:7, scroll:0, delta 0, while wheel
+//     scrolls fine. The touch pan is the honest executable form of the same
+//     reader gesture.) Pre-fix, the marker went stale mid-drag and the servo
+//     fought the reader tick-by-tick, reverting each dragged scroll event
+//     back toward the anchor.
+// (f) body — see the (f) header entry above for the gesture rationale.
+test("touch drag after restore follows the gesture instead of reverting", async ({ page }) => {
+  // minMargin 500: the pan (+ any residual fling momentum) stays decisively
+  // off the tail, keeping the atBottom re-engage branch out of this test's
+  // measurement.
+  await establishRestoredAnchor(page, VP, 500);
+
+  const scrollTopNow = () =>
+    page.locator(".chat-scroll").evaluate((el: HTMLElement) => el.scrollTop);
+  const before = await scrollTopNow();
+
+  // Pan start: the centre of .chat-scroll's visible box. The finger then
+  // travels UPWARD (a reader continuing DOWN the transcript); touch-action is
+  // auto on .chat-scroll (probed), so the compositor pans the scroller.
+  const start = await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + el.clientHeight / 2 };
+  });
+  const TRAVEL = 144; // total finger px, in 12 upward moves × 80ms (~960ms)
+
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchStart",
+    touchPoints: [{ x: start.x, y: start.y }],
+  });
+  for (let i = 1; i <= 12; i++) {
+    await page.waitForTimeout(80);
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [{ x: start.x, y: start.y - (TRAVEL * i) / 12 }],
+    });
+    if (i === 6) {
+      // MID-GESTURE, ~480ms in — past the freshness window of the
+      // touchStart's pointerdown: the viewport is already following (only
+      // the contact pointermove restamp keeps these scroll events trusted).
+      // Under the defect this reads ≈ before and the test stops here.
+      expect(
+        await scrollTopNow(),
+        "mid-drag (past the pointerdown's freshness window) the viewport already follows",
+      ).toBeGreaterThan(before + 25);
+    }
+  }
+  await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  await page.waitForTimeout(150); // let the (slow-drag) momentum settle
+
+  // The gesture's net effect survives: the pan advances the viewport by
+  // roughly the finger travel (probed ~0.85 px/px; 144px → ~120px), so >60
+  // leaves headroom for slop/fling variance.
+  const after = await scrollTopNow();
+  expect(after, "the viewport follows the drag").toBeGreaterThan(before + 60);
+
+  // ...and it STAYS put once the freshness window has fully elapsed after
+  // the release — no deferred servo creep-back to the restore anchor.
+  await page.waitForTimeout(600);
+  expect(await scrollTopNow(), "no servo creep-back after the drag ends").toBeGreaterThan(before + 60);
 });

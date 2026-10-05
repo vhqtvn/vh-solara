@@ -1,6 +1,6 @@
 // Shared e2e helpers.
 
-import type { APIRequestContext } from "@playwright/test";
+import type { APIRequestContext, Page } from "@playwright/test";
 
 // demoDir is the single consolidated project directory under which ALL real
 // fixture sessions live (pkg/fixtures/opencode.go seeds demo/sub/other/slow and
@@ -125,4 +125,38 @@ export async function resetLabels(request: APIRequestContext): Promise<void> {
     throw new Error(`resetLabels: PUT /vh/labels -> ${put.status()} ${put.statusText()}`);
   }
   throw new Error("resetLabels: exhausted retries on repeated 409 (revision kept advancing)");
+}
+
+// First pure-integer line visible in the terminal (.xterm-rows innerText) — a
+// scroll marker that needs no font metrics: the e2e `seq 1 250` ladders are
+// pure-int lines, and any prompt/echo noise above them is skipped identically
+// in every consumer. Hoisted here from zoom-placement.spec.ts, where it (plus
+// its settling wrapper below) was defined twice — in the wheel-parity and the
+// escaped-selection-drag describes — with identical bodies.
+export function topLineNumber(page: Page): Promise<number | null> {
+  return page.locator(".xterm-rows").evaluate((el) => {
+    for (const line of (el as HTMLElement).innerText.split("\n")) {
+      if (/^\d+$/.test(line.trim())) return Number.parseInt(line, 10);
+    }
+    return null;
+  });
+}
+
+// Poll topLineNumber until it is STABLE across two samples. The seq burst AND
+// the returning shell prompt stream in asynchronously, so a single read can
+// race the terminal's final autoscroll; measuring geometry or gesturing
+// before the ladder settles moves the row grid mid-gesture (the observed
+// anchor/release row drift this prevents is documented in
+// zoom-placement.spec.ts's escaped-drag describe). xterm v6
+// smoothScrollDuration defaults to 0 (immediate) — only the async byte
+// stream needs waiting out, hence the bounded 40×150ms poll.
+export async function settledTopLineNumber(page: Page): Promise<number> {
+  let prev: number | null = null;
+  for (let i = 0; i < 40; i++) {
+    const cur = await topLineNumber(page);
+    if (cur !== null && cur === prev) return cur;
+    prev = cur;
+    await page.waitForTimeout(150);
+  }
+  throw new Error(`terminal scroll marker never settled (last: ${prev})`);
 }
