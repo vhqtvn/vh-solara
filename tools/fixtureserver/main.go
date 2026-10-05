@@ -194,10 +194,7 @@ func main() {
 	//
 	// Sits on the OUTER mux (before the srv.Handler() "/" fallback), so it
 	// bypasses the inner server's CSRF guard — fixture-only, GET-only.
-	// The srv.SetOpenCodeLifecycle call below races the serving goroutine
-	// by design (pointer-sized field write); the fixtureserver is never run
-	// under -race and the e2e poll loop tolerates a stale read for one
-	// cadence. SetExternalOpenCode(true) above stays: it is single-purpose
+	// SetExternalOpenCode(true) above stays: it is single-purpose
 	// (unarchive guard) and does not conflict with serving a lifecycle —
 	// the production daemon sets external=false + a lifecycle together.
 	ocLife := oclife.New(oclife.TopologyDetached)

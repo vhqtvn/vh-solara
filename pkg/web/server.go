@@ -143,7 +143,13 @@ type Server struct {
 	// /vh/opencode/status. nil on servers that don't manage an OpenCode (e.g.
 	// the fixture server); the handler returns 503 in that case. Set by the
 	// daemon (client-daemon.go) after the topology is known.
-	ocLifecycle *oclife.Lifecycle
+	//
+	// Stored in an atomic.Pointer (F3 / P2-TEST-006): the setter may run while
+	// the server is serving (the fixture server swaps it from its own handler;
+	// the daemon swaps it once the topology is known), so a plain field would
+	// be a publication race with every reader. Each request Loads the pointer
+	// exactly ONCE and reuses that *Lifecycle for its whole duration.
+	ocLifecycle atomic.Pointer[oclife.Lifecycle]
 
 	// corsOrigins is the explicit allowlist of cross-origin callers. Empty =
 	// no CORS (strict same-origin). "*" allows any origin (which disables the
@@ -476,7 +482,16 @@ func (s *Server) SetExternalOpenCode(external bool) { s.externalOC = external }
 // hinge: a fatal OpenCode startup failure is recorded as a failed state here
 // instead of killing the worker, so the operator can observe + restart
 // OpenCode through the tunnel while the worker keeps reporting.
-func (s *Server) SetOpenCodeLifecycle(l *oclife.Lifecycle) { s.ocLifecycle = l }
+//
+// Safe to call while the server is serving: the pointer is published
+// atomically. Atomicity is per publication, NOT transactional across a
+// sequence of setter calls — a request that starts under lifecycle A and is
+// still in flight when B is stored completes against A (each handler Loads
+// exactly once and reuses that object for the whole request), and callers
+// performing several lifecycle mutations (e.g. the fixture server's
+// MarkDown/SetFailed/SetRestartProgress choreography) still sequence those
+// through the Lifecycle's own internal locking.
+func (s *Server) SetOpenCodeLifecycle(l *oclife.Lifecycle) { s.ocLifecycle.Store(l) }
 
 // SetRestartServer wires the daemon's vh-server-restart hook (re-exec, or exit
 // for a supervisor to relaunch). Optional.

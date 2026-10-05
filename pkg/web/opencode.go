@@ -161,11 +161,12 @@ func (s *Server) handleOpenCodeStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.ocLifecycle == nil {
+	life := s.ocLifecycle.Load()
+	if life == nil {
 		http.Error(w, "OpenCode lifecycle is not managed by this server", http.StatusServiceUnavailable)
 		return
 	}
-	writeJSONResp(w, s.ocLifecycle.Snapshot())
+	writeJSONResp(w, life.Snapshot())
 }
 
 // ocLogMaxDefault / ocLogMaxCap bound the ?max= query param for
@@ -215,11 +216,12 @@ func (s *Server) handleOpenCodeLogs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.ocLifecycle == nil {
+	life := s.ocLifecycle.Load()
+	if life == nil {
 		http.Error(w, "OpenCode lifecycle is not managed by this server", http.StatusServiceUnavailable)
 		return
 	}
-	snap := s.ocLifecycle.Snapshot()
+	snap := life.Snapshot()
 	if !snap.Capabilities.HasLogTail {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotImplemented)
@@ -228,7 +230,7 @@ func (s *Server) handleOpenCodeLogs(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	ring := s.ocLifecycle.Ring()
+	ring := life.Ring()
 	if ring == nil {
 		// Defensive: capability says HasLogTail but the ring is nil. Should not
 		// happen for owned/detached (New allocates one), but guard against a
@@ -268,11 +270,12 @@ func (s *Server) handleOpenCodeRestart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.ocLifecycle == nil {
+	life := s.ocLifecycle.Load()
+	if life == nil {
 		http.Error(w, "OpenCode lifecycle is not managed by this server", http.StatusServiceUnavailable)
 		return
 	}
-	snap := s.ocLifecycle.Snapshot()
+	snap := life.Snapshot()
 	if !snap.Capabilities.CanRestart {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -302,7 +305,11 @@ func (s *Server) handleOpenCodeRestart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSONResp(w, s.ocLifecycle.Snapshot())
+	// Snapshot the SAME lifecycle this request Loaded at entry (not whatever
+	// is published now): the capability check above and this final snapshot
+	// must describe one coherent object even if the pointer was swapped
+	// mid-request.
+	writeJSONResp(w, life.Snapshot())
 }
 
 // POST /vh/update-opencode — run the configured OpenCode update (default
