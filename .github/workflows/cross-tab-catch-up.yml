@@ -1,0 +1,366 @@
+# Cross-tab catch-up headed experiment — Q1-A from the crosstab-find solution
+# brief (tmp/agent-runs/crosstab-find-solution-brief/brief.md, option O2).
+#
+# PURPOSE (what this lane exists to do): the hidden→visible catch-up
+# assertions in web/tests/e2e/theme-cross-tab.spec.ts and
+# web/tests/e2e/font-cross-tab.spec.ts — the visibilitychange→visible handler
+# re-dispatching SYNTHETIC (isTrusted:false) StorageEvents for the 2 theme /
+# 3 font keys — have NEVER executed in CI: headless Chromium keeps background
+# pages "visible", so the specs always take the annotated `catch-up-skipped`
+# branch. This workflow runs those two specs HEADED (Chromium under Xvfb on a
+# real display server) so a backgrounded page can genuinely become hidden and
+# the catch-up polls can finally run — or not.
+#
+# THIS IS AN EXPERIMENT, NOT A GATE. Xvfb makes headed possible; it does NOT
+# guarantee background pages become hidden. The receipt checker below enforces
+# PROOF ADMISSION: in this lane a `catch-up-skipped` annotation is a FAILED
+# EXPERIMENT (exit red), never a pass. A green exit is insufficient by itself
+# — the per-spec receipts (background-tab: hidden observed, no skip, clean
+# pass at retries=0) are the point, and they are uploaded on success AND
+# failure.
+#
+# Q1-B DISPOSITION RULES (after the first real dispatch, from the brief):
+#   - BOTH catch-up branches executed → record the targeted proof, then assess
+#     REPEATABILITY over further dispatches before ever considering a
+#     schedule. Do not add a cron trigger on one data point.
+#   - Receiver never hides under Xvfb → the experiment failed; the underlying
+#     coverage stays DEFER. Route the O3 operator-desktop fallback (or classify
+#     the outcome not-demonstrable/inconclusive). Do NOT weaken the specs'
+#     environment gates and do NOT delete this lane's receipts.
+#
+# Dispatch-only by design (same precedent as the lanes-8/9 coverage in ci.yml
+# and e2e-flake-watch.yml): workflow_dispatch ONLY — no push, no PR, no
+# schedule — so it can never become PR-blocking. No AD-HOC apt installs: the
+# only package touches are the canonical `npx playwright install --with-deps
+# chromium` browser provisioning (same as the e2e job in ci.yml) and
+# xvfb-run, which is expected preinstalled on ubuntu-latest; if it is
+# missing, the preflight fails honestly for the operator to see (per the
+# brief: agents must not ad-hoc apt-install Xvfb).
+name: cross-tab-catch-up
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  headed-catch-up:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      # Go is required: the Playwright webServer (web/playwright.config.ts)
+      # runs web/scripts/fixture-web.sh, which builds the SPA and `exec go
+      # run ./tools/fixtureserver` (real aggregator + fake OpenCode). Same
+      # provisioning as the e2e job in ci.yml.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: preflight — xvfb-run availability (fail honestly; NEVER apt-install)
+        # ubuntu-latest ships xvfb-run. If a future image drops it, this step
+        # stops the experiment loudly instead of improvising an install (the
+        # brief forbids agent-driven apt installs). The smoke boot also proves
+        # Xvfb can actually allocate a display on this runner.
+        run: |
+          if ! command -v xvfb-run >/dev/null 2>&1; then
+            echo "::error::xvfb-run is not available on this runner — the Q1-A headed experiment cannot run. Surface to the operator; do not apt-install."
+            exit 1
+          fi
+          echo "xvfb-run path: $(command -v xvfb-run)"
+          XVFB_VERSION="$(Xvfb -version 2>&1 | head -1 || true)"
+          XVFB_DISPLAY="$(xvfb-run -a bash -c 'printf "%s" "$DISPLAY"')"
+          echo "Xvfb version: ${XVFB_VERSION:-unknown}"
+          echo "xvfb smoke boot ok (DISPLAY=${XVFB_DISPLAY:-?})"
+          {
+            echo "XVFB_VERSION<<EOF"
+            echo "${XVFB_VERSION:-unknown}"
+            echo "EOF"
+            echo "XVFB_DISPLAY=${XVFB_DISPLAY:-unknown}"
+          } >> "$GITHUB_ENV"
+
+      - name: install deps
+        working-directory: web
+        run: npm ci
+
+      # Chromium only: the lane command pins --project=chromium (the specs'
+      # catch-up gate is a Chromium visibility behavior; firefox projects in
+      # web/playwright.config.ts do not match these spec files anyway).
+      - name: install Playwright browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+
+      - name: record run metadata (binds the receipt to revision + environment)
+        # The brief requires receipts to carry revision, command, lock/browser
+        # versions and environment. Written to the summary AND to the
+        # uploaded artifact dir so the receipt stays bound after the run.
+        run: |
+          PW_VERSION="$(node -p "require('./web/node_modules/playwright-core/package.json').version")"
+          CHROMIUM_REV="$(node -p "require('./web/node_modules/playwright-core/browsers.json').browsers.find(b => b.name === 'chromium').revision")"
+          mkdir -p tmp/agent-runs/crosstab-catchup
+          # Receipt-exactness: record the LITERAL executed command — the run
+          # step's YAML `>` folding resolves to exactly this single line
+          # (incl. the bash -c DISPLAY logger) — not just the logical one.
+          RUN_CMD_LITERAL="$(cat <<'CMD_EOF'
+          xvfb-run -a bash -c 'echo "run DISPLAY=$DISPLAY"; exec npx playwright test theme-cross-tab.spec.ts font-cross-tab.spec.ts --project=chromium --headed --workers=1 --retries=0 --trace=on --reporter=list,json'
+          CMD_EOF
+          )"
+          {
+            echo "## cross-tab-catch-up (Q1-A headed experiment) — environment"
+            echo "- revision: \`${GITHUB_SHA}\`"
+            echo "- ref/event: \`${GITHUB_REF}\` / \`${GITHUB_EVENT_NAME}\`, run \`${GITHUB_RUN_ID}\` attempt \`${GITHUB_RUN_ATTEMPT}\`"
+            echo "- runner: \`${RUNNER_OS} ${RUNNER_ARCH}\` image \`${ImageOS:-unknown}\`"
+            echo "- playwright: \`${PW_VERSION}\` (web lockfile) — chromium revision \`${CHROMIUM_REV}\`"
+            echo "- xvfb: \`${XVFB_VERSION:-unknown}\` (preflight smoke display \`${XVFB_DISPLAY:-unknown}\`)"
+            echo "- command (logical): \`xvfb-run -a npx playwright test theme-cross-tab.spec.ts font-cross-tab.spec.ts --project=chromium --headed --workers=1 --retries=0 --trace=on --reporter=list,json\`"
+            echo "- command (literal executed; the run step folds to exactly this): \`${RUN_CMD_LITERAL}\`"
+            echo "- command env: \`PLAYWRIGHT_JSON_OUTPUT_FILE=${GITHUB_WORKSPACE}/tmp/agent-runs/crosstab-catchup/report.json\` (json reporter writes the report there at onEnd, keeping stdout clean)"
+            echo "- retries=0: nothing masks a flaky or failed catch-up poll"
+          } | tee tmp/agent-runs/crosstab-catchup/metadata.txt | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: headed cross-tab catch-up run (the Q1-A experiment)
+        # The lane command from the brief + --reporter=list,json:
+        #   list → human-readable Actions log
+        #   json → redirected to the file below (PLAYWRIGHT_JSON_OUTPUT_FILE,
+        #          supported by the installed 1.60.0 json reporter, which
+        #          mkdirs + writes the file at onEnd), keeping stdout clean.
+        # The bash -c wrapper only logs the DISPLAY the run actually got; the
+        # playwright invocation itself is exactly the brief's command.
+        # CI=true (set by the runner) makes the config boot a fresh webServer;
+        # --retries=0 overrides the config's CI retry policy.
+        working-directory: web
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ github.workspace }}/tmp/agent-runs/crosstab-catchup/report.json
+        run: >
+          xvfb-run -a bash -c 'echo "run DISPLAY=$DISPLAY";
+          exec npx playwright test theme-cross-tab.spec.ts font-cross-tab.spec.ts
+          --project=chromium --headed --workers=1 --retries=0 --trace=on
+          --reporter=list,json'
+
+      # ── PROOF-MODE RECEIPT CHECKER (the load-bearing part) ────────────────
+      # Runs even when the Playwright step failed (if: always()) so a red run
+      # still yields a diagnosable receipt. Admission rules, per the brief:
+      #   R1: NO test in the run may carry `catch-up-skipped` — in this lane
+      #       a skipped branch is a failed experiment, not a pass.
+      #   R2: BOTH target specs must be present and cleanly PASSED (standing
+      #       assertions: trusted isTrusted:true delivery, rendered-state
+      #       flips, no-reload sentinel — all embedded in the passing body).
+      #   R3: EACH must carry a `background-tab` receipt ending in "hidden"
+      #       (B was genuinely hidden while A was front). Hidden observed +
+      #       no skip + clean pass at retries=0 ⇒ the hidden→visible catch-up
+      #       poll (2 theme keys / 3 font keys) EXECUTED and PASSED — the
+      #       poll passing is the only way the test passes when wasHidden.
+      # Stdlib-only python3; parses the classic Playwright JSON report
+      # (annotations land in BOTH tests[].annotations and
+      # results[].annotations across the supported lockfile range —
+      # web/package.json allows @playwright/test ^1.49.1, so any installed
+      # >= 1.49.1, and these field paths are stable across that range —
+      # both are read).
+      - name: proof-mode receipt check (skipped catch-up = failed experiment)
+        if: always()
+        shell: bash
+        env:
+          CROSS_TAB_REPORT: ${{ github.workspace }}/tmp/agent-runs/crosstab-catchup/report.json
+          CROSS_TAB_RECEIPT: ${{ github.workspace }}/tmp/agent-runs/crosstab-catchup/receipt.txt
+        run: |
+          set +e
+          mkdir -p "$(dirname "$CROSS_TAB_RECEIPT")"
+          python3 - "$CROSS_TAB_REPORT" <<'PY_CROSS_TAB_CHECKER' 2>&1 | tee "$CROSS_TAB_RECEIPT"
+          import json
+          import os
+          import sys
+
+          TARGETS = ("theme-cross-tab.spec.ts", "font-cross-tab.spec.ts")
+          SKIP_TYPE = "catch-up-skipped"
+          BG_TYPE = "background-tab"
+
+          def walk_suites(node, inherited_file, out):
+              # Classic Playwright JSON: suites[].suites[]...specs[].tests[].
+              file = node.get("file") or inherited_file
+              for spec in node.get("specs") or []:
+                  out.append((spec.get("file") or file, spec))
+              for sub in node.get("suites") or []:
+                  walk_suites(sub, file, out)
+
+          def annotations_of(test):
+              # Mid-test test.info().annotations.push(...) entries land in BOTH
+              # tests[].annotations and results[].annotations (test-end
+              # payload replaces both; stable across the supported lockfile
+              # range — @playwright/test ^1.49.1 / installed >= 1.49.1) —
+              # union them, deduped.
+              seen = []
+              def add(ann):
+                  key = (ann.get("type"), ann.get("description"))
+                  if key not in [(a.get("type"), a.get("description")) for a in seen]:
+                      seen.append(ann)
+              for ann in test.get("annotations") or []:
+                  add(ann)
+              for res in test.get("results") or []:
+                  for ann in res.get("annotations") or []:
+                      add(ann)
+              return seen
+
+          def hidden_receipt(anns):
+              # description: "B document.visibilityState while A was front: hidden"
+              for ann in anns:
+                  if ann.get("type") == BG_TYPE:
+                      desc = ann.get("description") or ""
+                      state = desc.rsplit(":", 1)[-1].strip().lower()
+                      return state == "hidden", desc, state
+              return False, "", "(annotation missing)"
+
+          def main():
+              report_path = sys.argv[1] if len(sys.argv) > 1 else ""
+              problems = []
+              print("== cross-tab catch-up proof-mode receipt check ==")
+              print("report: %r" % report_path)
+
+              report = None
+              if not report_path or not os.path.isfile(report_path):
+                  problems.append(
+                      "no Playwright JSON report at %r — playwright never wrote it "
+                      "(crashed before onEnd?); nothing to admit" % report_path)
+              else:
+                  try:
+                      with open(report_path, "r", encoding="utf-8") as fh:
+                          report = json.load(fh)
+                  except (OSError, ValueError) as exc:
+                      problems.append("report at %r is not valid JSON: %s" % (report_path, exc))
+
+              specs = []
+              if report is not None:
+                  for suite in report.get("suites") or []:
+                      walk_suites(suite, None, specs)
+                  if not specs:
+                      problems.append("report contains no specs at all (wrong filter?)")
+                  stats = report.get("stats") or {}
+                  if stats:
+                      print("stats: %s" % json.dumps(stats, sort_keys=True))
+
+              # R1 — no test ANYWHERE in this run may carry catch-up-skipped.
+              for file, spec in specs:
+                  for test in spec.get("tests") or []:
+                      for ann in annotations_of(test):
+                          if ann.get("type") == SKIP_TYPE:
+                              problems.append(
+                                  "%s :: %s — carries '%s' (%s): the hidden->visible "
+                                  "catch-up branch DID NOT run in this environment"
+                                  % (file, spec.get("title"), SKIP_TYPE,
+                                     ann.get("description", "")))
+
+              # R2 + R3 — per target spec: present, cleanly passed, hidden
+              # observed, skip-free.
+              for target in TARGETS:
+                  before = len(problems)
+                  matched = [(f, s) for (f, s) in specs
+                             if os.path.basename(f or "") == target]
+                  if not matched:
+                      problems.append("%s missing from the report" % target)
+                      continue
+                  admitted = 0
+                  for file, spec in matched:
+                      for test in spec.get("tests") or []:
+                          outcome = test.get("status")
+                          results = test.get("results") or []
+                          statuses = [r.get("status") for r in results]
+                          retries = [r.get("retry", 0) for r in results]
+                          anns = annotations_of(test)
+                          skip = [a for a in anns if a.get("type") == SKIP_TYPE]
+                          hid, bg_desc, bg_state = hidden_receipt(anns)
+                          print("-- %s" % target)
+                          print("   test: %s" % spec.get("title"))
+                          print("   outcome=%s result-statuses=%s retries=%s"
+                                % (outcome, statuses, retries))
+                          print("   %s: %s" % (BG_TYPE, bg_desc or "(missing)"))
+                          print("   %s present: %s" % (SKIP_TYPE, bool(skip)))
+                          if outcome != "expected" or statuses != ["passed"]:
+                              problems.append(
+                                  "%s — test did not cleanly pass (outcome=%s, "
+                                  "results=%s); standing assertions (trusted "
+                                  "isTrusted:true delivery, rendered-state flips, "
+                                  "no-reload sentinel) are NOT confirmed"
+                                  % (target, outcome, statuses))
+                              continue
+                          if any(r > 0 for r in retries):
+                              problems.append(
+                                  "%s — nonzero retry in results (retries=%s): "
+                                  "the run command pins --retries=0, so a "
+                                  "nonzero retry means the command/config "
+                                  "drifted and this is NOT a clean pass at "
+                                  "retries=0"
+                                  % (target, retries))
+                              continue
+                          print("   standing assertions: PASSED (trusted isTrusted:true "
+                                "delivery + rendered-state flips + no-reload sentinel "
+                                "are embedded in the passing test body)")
+                          if skip:
+                              continue  # already recorded by R1
+                          if not hid:
+                              problems.append(
+                                  "%s — no 'hidden' %s receipt (state=%s): the "
+                                  "catch-up poll cannot have executed"
+                                  % (target, BG_TYPE, bg_state))
+                              continue
+                          admitted += 1
+                          print("   catch-up admission: hidden observed + no skip + "
+                                "clean pass at retries=0 -> the hidden->visible "
+                                "catch-up poll EXECUTED and PASSED")
+                  if admitted == 0 and len(problems) == before:
+                      problems.append(
+                          "%s — no test admitted for this spec (see the "
+                          "catch-up-skipped / diagnostic problems above)" % target)
+
+              print("")
+              if problems:
+                  print("VERDICT: EXPERIMENT-FAILED (%d problem(s))" % len(problems))
+                  for p in problems:
+                      print("  - %s" % p)
+                  print("Per Q1-B: a skipped/missing catch-up branch is a FAILED "
+                        "experiment in this lane, not a pass.")
+                  return 1
+              print("VERDICT: PROVEN-BRANCH-EXECUTION — both hidden->visible "
+                    "catch-up polls (2 theme keys, 3 font keys) executed and "
+                    "passed; standing assertions passed.")
+              print("Proof ceiling (per the brief): this proves handler "
+                    "execution/idempotence of the synthetic catch-up path, NOT "
+                    "recovery of events missed while a page was frozen.")
+              return 0
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY_CROSS_TAB_CHECKER
+          rc=${PIPESTATUS[0]}
+          {
+            echo ""
+            echo "## Proof-mode receipt"
+            echo '```'
+            cat "$CROSS_TAB_RECEIPT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      # Upload on BOTH success and failure (unlike ci.yml's failure-only
+      # uploads): this lane's GREEN receipts are its entire product — the
+      # Q1-B disposition is decided from them. Covers the JSON report,
+      # checker receipt + metadata, and the traces (config artifactRoot
+      # default: repo tmp/agent-runs/playwright — see web/playwright.config.ts).
+      - name: upload experiment artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cross-tab-catchup
+          path: |
+            tmp/agent-runs/crosstab-catchup
+            tmp/agent-runs/playwright
+          retention-days: 30
+          if-no-files-found: warn
