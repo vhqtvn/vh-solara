@@ -537,7 +537,30 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // which the :1178 geometry misclassification cannot produce. When the veto
       // is set we leave following=false and the reader in place (NOT cleared here
       // — see the decl above).
-      if (gap < TURN_FINISH_RECOVERY_GAP && !inputBackedAway) {
+      // Restore-contract gate (C-F1, third yank behind the restore contract):
+      // a reader RESTORED at a stored anchor can sit inside this recovery's
+      // admission band (gap < 200) with no genuine user scroll — the anchor
+      // lands near the content bottom on unsettled hydration layout — and an
+      // in-flight turn finishing would yank them off the anchor to the tail,
+      // with the resulting reached-bottom classification clearing the stored
+      // anchor for good.
+      //
+      // Gates on restoredAnchorId (NOT just anchorServoArmed): the servo flag
+      // is additionally cleared by SYSTEM-driven events during the post-restore
+      // hydration window — onScrolled's user-intent branch (a browser
+      // insert-anchoring down-move classified as user-scroll-down in read mode,
+      // captured as residual ≤ concurrent contentDelta) and the untrusted drift
+      // servo — so anchorServoArmed alone is defeasible exactly when the reader
+      // has NOT acted (e2e-measured: TURNFIN gap=55, servo=false, no input).
+      // restoredAnchorId is the durable restore-contract marker: it is set with
+      // the servo at the anchor positioning and cleared ONLY by endAnchorServo
+      // (a genuine re-engage — reached-bottom, "↓ Latest", a recovery), so it
+      // spans every state where the restore still owns the viewport. Genuine
+      // reader scrolls keep their existing protection here via the
+      // inputBackedAway veto (tests 17b/17c), independent of this gate; the
+      // restored reader's escapes — "↓ Latest" or scrolling — both clear
+      // restoredAnchorId and re-enable this recovery.
+      if (gap < TURN_FINISH_RECOVERY_GAP && !inputBackedAway && !restoredAnchorId) {
         setFollowing(true);
         setUserScrolledUp(false);
         contentROArmedLatch = false;
