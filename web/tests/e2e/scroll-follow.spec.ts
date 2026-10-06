@@ -873,6 +873,243 @@ test("reopen of a busy session at a stored anchor is not yanked to the tail", as
   await expectFollowingTail(page);
 });
 
+// (12a) An exact-bottom restore landing must not transfer the reader to
+//       tail-follow — restored-reader ownership vs geometric bottom contact.
+//
+// The unsettled-hydration landing defect (slices 2-3): when the below-anchor
+// content is still short at restore time, the restore write CLAMPS to the
+// exact content bottom (captured e2e: REACHED_BOTTOM t:74/102, TURNFIN
+// gap:0). The landing's scroll event then classifies reached-bottom — with
+// ZERO reader input — which flips following=true, ends the anchor servo, and
+// CLEARS the stored anchor: the restore contract silently becomes
+// tail-follow, and the reader is un-restoreable (the "landing lottery" that
+// made slice 3's 12b revert).
+//
+// SYNTHETIC-LAYOUT evidence label (honest scope): the staged geometry is
+// fixture-event-driven (a staged message tail through the real /event
+// stream) driving the REAL restore/native-scroll/browser-clamp path — the
+// small fixture transcripts sit inside the eager last-30 window, so this is
+// NOT proof of Deferred lazy-hydration scheduling. It proves the ownership
+// rule against the captured failure shape. Production reachability of that
+// shape is code-supported (the destructive branch is shared production
+// ChatView logic), not measured here.
+//
+// Staging rationale (measured this slice): browser-local timing cannot
+// control the ordering. On the demo session the clamp's scroll event races
+// the loading-dismiss viewport shrink in the same early frame region — the
+// event usually delivers after the ~91px chrome-mount resize and the
+// classifier never sees bottom contact (RESTORE row t:66 ch:539 → clamp
+// gap 0 → event saw ch:448/gap 91 → intent none). The fixture's "slow"
+// session (900ms message-GET delay) fixes the COLD path (restore at
+// t≈950, settled chrome, clamp + REACHED fired every run) — but a WARM
+// aggregator store (repeat iterations, or any prior test that opened the
+// session) hydrates instantly and the restore runs at t≈53ms while the
+// container does not even overflow (sh == ch: the write clamps 0→0, no
+// scroll event, no contact). /fixture/reset does not re-cold the store.
+// So the staging uses the fixture-event fallback: /fixture/slow-tail
+// appends/removes a staged tail of 8 user rows THROUGH THE REAL /event
+// stream. With the tail present, the restore lands mid-content
+// deterministically on BOTH store paths; REMOVE shrinks the below-anchor
+// content inside the viewport and the BROWSER clamps the held reader to
+// the exact bottom — an event-driven bottom contact with zero reader
+// input (the captured failure shape); RE-ADD re-opens the gap past the
+// nearBottom band through the real contentEl RO path for the assertions.
+// The tail is idempotent, non-baseline (reset sweeps it), and removed in
+// cleanup so sibling specs that open "slow" (reveal-gate) are unaffected.
+//
+// Post-fix ownership rule under test: while a restored contract is active
+// (restoredAnchorId set), system-driven geometric bottom contact must not
+// enable following, end the servo, or clear the persistent anchor — the
+// contract survives the contact, and the re-opened gap leaves the reader in
+// read mode at the anchor with "↓ Latest" offered.
+test("an exact-bottom restore landing keeps the restored contract through released growth", async ({ page, request }) => {
+  const tail = (op: string) =>
+    request.post(`/oc/fixture/slow-tail?session=slow&op=${op}`, {
+      headers: { "X-VH-CSRF": "1" },
+    });
+  // Seed the sl2 anchor BEFORE the SPA imports scroll.ts.
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "vh.scroll.v2",
+      JSON.stringify({ v: 1, data: { slow: "sl2" } }),
+    );
+  });
+  // Stage the tall tail BEFORE load: below-anchor content (sl3 + sl4 +
+  // tail ≈ 764px) exceeds the chat viewport (ch ≈ 394), so the restore
+  // lands sl2 mid-content deterministically — cold AND warm store paths.
+  const append1 = await tail("append");
+  expect(append1.ok()).toBe(true);
+  await page.setViewportSize(VP);
+  await page.goto(projectUrl("/?session=slow"));
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+
+  // MILESTONE 1 — the restore RAN (ready = maybeRestore completed) and the
+  // staged tail is rendered; synchronized on observables, not sleeps.
+  await page.locator(".chat-content.ready").waitFor({ state: "visible", timeout: 10000 });
+  await page.locator('[data-mid="slt8"]').waitFor({ state: "visible", timeout: 10000 });
+
+  // MILESTONE 2 — RELEASE the tail: below-anchor content shrinks inside the
+  // viewport and the browser clamps the held reader to the EXACT content
+  // bottom — the system-driven bottom contact under test. Non-vacuity gate:
+  // if this clamp ever stops producing gap ≤ 1, the test fails loudly here
+  // instead of letting the assertions below pass vacuously.
+  const remove1 = await tail("remove");
+  expect(remove1.ok()).toBe(true);
+  await expect.poll(
+    async () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        Math.abs(e.scrollHeight - e.scrollTop - e.clientHeight) <= 1 ? 1 : 0,
+      ),
+    { timeout: 5000 },
+  ).toBe(1);
+
+  // RE-OPEN the gap: the tail returns through the real event path; the
+  // below-anchor content again exceeds the viewport (~500px of gap at the
+  // held position). Under the bug, the CONTACT already tore the contract
+  // down (following=true), so this growth re-pins to the new bottom; under
+  // the fix the reader holds in read mode (the read-mode servo pulls the
+  // clamped reader back toward the anchor row).
+  const append2 = await tail("append");
+  expect(append2.ok()).toBe(true);
+
+  // OWNERSHIP ASSERTIONS after the gap re-opens:
+  // (1) The reader is NOT at the bottom (gap grew past the 24px band). Under
+  //     the bug, following=true re-pins to the new bottom and this polls to 1.
+  await expect.poll(
+    async () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
+      ),
+    { timeout: 5000 },
+  ).toBe(0);
+  // (2) Read mode held: "↓ Latest" is offered (following=false throughout).
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  // (3) The persistent anchor SURVIVED the contact + re-open (not cleared by
+  //     the reached-bottom classification nor the near-bottom cursor flush).
+  const anchors = await page.evaluate(() => window.localStorage.getItem("vh.scroll.v2"));
+  expect(anchors).toContain("sl2");
+  // CLEANUP: leave "slow" clean for sibling specs (reveal-gate opens it).
+  const remove2 = await tail("remove");
+  expect(remove2.ok()).toBe(true);
+});
+
+// (12b) A turn FINISHING must not yank a reader restored at an anchor —
+//       the busy→idle turn-finish recovery's restore-contract gate (C-F1,
+//       d3867ac), now landable because (12a) fixed the landing lottery that
+//       forced slice 3's revert.
+//
+// Establish a restored contract with NO reader input and the viewport inside
+// the turn-finish recovery's admission band (0 < gap < 200px — the recovery
+// re-engages following + pins to the tail when a turn ends with the reader
+// that close to the bottom), then drive busy→idle through deterministic
+// fixture ops (/fixture/busy + /fixture/idle — real /event stream events,
+// ZERO transcript mutation, so no [[stall]] 5s race and no reload). The
+// recovery must stay gated: the reader keeps the anchor, read mode, and
+// "↓ Latest". Non-vacuous: with the d3867ac gate's `!restoredAnchorId`
+// condition removed, this test reds (the mutation check was run manually
+// during development).
+//
+// SYNTHETIC-LAYOUT label: the in-band gap is staged via the fixture tail
+// (2 rows ≈ 235px below the sl2 anchor → gap ≈ 165px at ch ≈ 394) — same
+// honest scope as (12a).
+test("a turn finishing must not yank a reader restored at an anchor (servo gate)", async ({ page, request }) => {
+  const tail = (op: string, rows = 2) =>
+    request.post(`/oc/fixture/slow-tail?session=slow&op=${op}&rows=${rows}`, {
+      headers: { "X-VH-CSRF": "1" },
+    });
+  // Seed the sl2 anchor BEFORE the SPA imports scroll.ts.
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "vh.scroll.v2",
+      JSON.stringify({ v: 1, data: { slow: "sl2" } }),
+    );
+  });
+  const append1 = await tail("append");
+  expect(append1.ok()).toBe(true);
+  await page.setViewportSize(VP);
+  await page.goto(projectUrl("/?session=slow"));
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  await page.locator(".chat-content.ready").waitFor({ state: "visible", timeout: 10000 });
+  await page.locator('[data-mid="slt2"]').waitFor({ state: "visible", timeout: 10000 });
+
+  // Restored, mid-content, read mode.
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+
+  // NON-VACUITY GATE — the gap sits INSIDE the recovery's admission band
+  // (> nearBottom's 24px so the reader is genuinely off-tail, <
+  // TURN_FINISH_RECOVERY_GAP 200px so the un-gated recovery WOULD admit).
+  // If fixture layout drift ever pushes the gap out of band, this fails
+  // loudly here instead of letting the crux below pass vacuously.
+  const gap = await page.locator(".chat-scroll").evaluate(
+    (e: HTMLElement) => e.scrollHeight - e.scrollTop - e.clientHeight,
+  );
+  expect(gap).toBeGreaterThan(24);
+  expect(gap).toBeLessThan(200);
+
+  // Busy → the reader's session has an in-flight turn (real session.status
+  // event, no transcript mutation). Confirm the page sees it, still restored.
+  const busy = await request.post("/oc/fixture/busy?session=slow", {
+    headers: { "X-VH-CSRF": "1" },
+  });
+  expect(busy.ok()).toBe(true);
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 5000 });
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+
+  // THE CRUX — release the turn (real session.idle event, no mutation).
+  // Under a missing gate the busy→idle recovery admits the anchored reader
+  // (gap < 200, no input veto) and pins to the tail; with the gate the
+  // reader stays put.
+  const idle = await request.post("/oc/fixture/idle?session=slow", {
+    headers: { "X-VH-CSRF": "1" },
+  });
+  expect(idle.ok()).toBe(true);
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 5000 });
+  await expect.poll(
+    async () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
+      ),
+    { timeout: 3000 },
+  ).toBe(0);
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  const anchors = await page.evaluate(() => window.localStorage.getItem("vh.scroll.v2"));
+
+  // GENUINE TAKEOVER — the ownership protection must not swallow legitimate
+  // re-engage (the debate's key objection): a REAL wheel scroll back to the
+  // bottom carries fresh physical input (pendingInputAt), so the reached-
+  // bottom classification takes the FULL re-engage path — following flips
+  // true, the servo ends, and the now-caught-up reader's anchor is cleared
+  // (the sparse "caught up stores no entry" default). Real event routing:
+  // mouse.move onto the chat viewport + wheel deltas, no handler calls.
+  const box = await page.locator(".chat-scroll").boundingBox();
+  expect(box).toBeTruthy();
+  await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+  for (let i = 0; i < 6; i++) await page.mouse.wheel(0, 300);
+  await expect
+    .poll(
+      async () =>
+        page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+          e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
+        ),
+      { timeout: 5000 },
+    )
+    .toBe(1);
+  await expect(page.locator("button.jump")).toHaveCount(0);
+  const after = await page.evaluate(() => window.localStorage.getItem("vh.scroll.v2"));
+  expect(after).not.toContain("sl2");
+
+  expect(anchors).toContain("sl2");
+
+  // CLEANUP: leave "slow" clean (tail removed; reset clears the sticky busy
+  // and emits its own idle).
+  const remove1 = await tail("remove");
+  expect(remove1.ok()).toBe(true);
+  const reset = await request.post("/oc/fixture/reset?session=slow", {
+    headers: { "X-VH-CSRF": "1" },
+  });
+  expect(reset.ok()).toBe(true);
+});
+
 // (13) Tab resume must re-engage Live after a hidden content reshuffle.
 //
 // This is the deterministic reproduction of the reported "Live stops after some

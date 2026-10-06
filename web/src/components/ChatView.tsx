@@ -558,7 +558,8 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // spans every state where the restore still owns the viewport. Genuine
       // reader scrolls keep their existing protection here via the
       // inputBackedAway veto (tests 17b/17c), independent of this gate; the
-      // restored reader's escapes — "↓ Latest" or scrolling — both clear
+      // restored reader's escapes — "↓ Latest" or the reader's first
+      // genuine user scroll back to the bottom — both clear
       // restoredAnchorId and re-enable this recovery.
       if (gap < TURN_FINISH_RECOVERY_GAP && !inputBackedAway && !restoredAnchorId) {
         setFollowing(true);
@@ -728,8 +729,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     readCursorTimer = undefined;
     if (props.draft || !scrollEl || !sid) return;
     if (nearBottom()) {
-      clearReadAnchor(sid);
-      readStash.invalidateIfSession(sid);
+      // Restored-reader ownership (O4): while a restored contract is active,
+      // a system-driven near-bottom position (the exact-bottom landing /
+      // contact-clamp) must NOT clear the persistent anchor via the cursor
+      // path — the contract owns the viewport until a GENUINE re-engage (a
+      // fresh-input reached-bottom or "↓ Latest"), both of which call
+      // endAnchorServo() and clear restoredAnchorId BEFORE this debounce can
+      // fire, leaving this guard inert for genuine readers.
+      if (!restoredAnchorId) {
+        clearReadAnchor(sid);
+        readStash.invalidateIfSession(sid);
+      }
       return;
     }
     const cand = bottommostReadFromDom();
@@ -1442,16 +1452,39 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       following: following(),
     });
     if (d.intent === "reached-bottom") {
-      // Re-engage following (scroll-back-to-bottom, or a clamp that landed us
-      // at the bottom). Clear the intent latch + ack unread.
-      setFollowing(true);
-      setUserScrolledUp(false);
-      inputBackedAway = false; // Approach A: re-engage clears the input veto
-      endAnchorServo(); // bottom re-glue = restore contract AND anchor state ended
-      if (!props.draft) {
-        clearReadAnchor(props.sessionId);
-        readStash.invalidateIfSession(props.sessionId);
-        ackSession(props.sessionId);
+      // Restored-reader ownership (O4, the landing-contract fix): while a
+      // restored contract is active (restoredAnchorId set), SYSTEM-driven
+      // geometric bottom contact must NOT transfer the reader to
+      // tail-follow. The captured defect: an unsettled-layout restore (or a
+      // system content-shrink clamp) lands the reader at the exact content
+      // bottom with zero reader input, and this branch then flipped
+      // following, ended the anchor servo, and cleared the stored anchor —
+      // silently destroying the restore contract (e2e: REACHED_BOTTOM
+      // t:74/102 with no input; TURNFIN gap:0 afterwards). The
+      // discriminator is Approach-A input provenance: a GENUINE reader
+      // scroll back to the bottom carries fresh physical input
+      // (pendingInputAt within INPUT_FRESHNESS_MS) and keeps the full
+      // re-engage path — ownership protection must not swallow legitimate
+      // re-engage. System frames (restore landings, content-shrink clamps,
+      // browser scroll-anchoring) fabricate no input and cannot arm it.
+      const freshInput = pendingInputAt !== 0 && Date.now() - pendingInputAt < INPUT_FRESHNESS_MS;
+      if (restoredAnchorId && !freshInput) {
+        // Preserve the contract: no following flip, no servo end, no anchor
+        // clear, no read ack. The baseline advance + drift-servo code below
+        // still runs (the geometric truth is recorded); the read-mode RO
+        // correction keeps holding the anchor through later churn.
+      } else {
+        // Re-engage following (scroll-back-to-bottom, or a clamp that landed
+        // us at the bottom). Clear the intent latch + ack unread.
+        setFollowing(true);
+        setUserScrolledUp(false);
+        inputBackedAway = false; // Approach A: re-engage clears the input veto
+        endAnchorServo(); // bottom re-glue = restore contract AND anchor state ended
+        if (!props.draft) {
+          clearReadAnchor(props.sessionId);
+          readStash.invalidateIfSession(props.sessionId);
+          ackSession(props.sessionId);
+        }
       }
     } else if (d.intent === "user-scroll-up" || d.intent === "user-scroll-down") {
       // Genuine scroll-away from the tail (residual outside epsilon). Drop

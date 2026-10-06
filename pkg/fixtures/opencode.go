@@ -1372,6 +1372,8 @@ func (f *FakeOpenCode) Handler() http.Handler {
 	})
 	mux.HandleFunc("/fixture/reset", f.handleFixtureReset)
 	mux.HandleFunc("/fixture/busy", f.handleFixtureBusy)
+	mux.HandleFunc("/fixture/slow-tail", f.handleFixtureSlowTail)
+	mux.HandleFunc("/fixture/idle", f.handleFixtureIdle)
 	mux.HandleFunc("/fixture/compaction-burst", f.handleFixtureCompactionBurst)
 	mux.HandleFunc("/fixture/orphan", f.handleFixtureOrphan)
 	mux.HandleFunc("/fixture/delete", f.handleFixtureDelete)
@@ -2540,6 +2542,99 @@ func (f *FakeOpenCode) handleFixtureBusy(w http.ResponseWriter, r *http.Request)
 		"status":    map[string]any{"type": "busy"},
 	})
 	writeJSON(w, map[string]any{"busy": session})
+}
+
+// handleFixtureSlowTail appends or removes a deterministic staged "tail" of
+// user messages on a session through the real /event stream. Test-only seam
+// for web/tests/e2e/scroll-follow.spec.ts (12a, the restore-landing
+// regression): appending stages TALL below-anchor content so the restore
+// lands mid-content identically on the COLD store path (delayed message-GET)
+// and the WARM aggregator-store path (instant hydration — measured: the warm
+// path restores at t≈53ms while the container does not yet overflow, so no
+// browser-local timing can stage the landing); removing releases the tail so
+// the below-anchor content shrinks inside the viewport and the browser clamps
+// the held reader to the exact bottom — the event-driven exact-bottom
+// contact under test. Idempotent both ways: append is a no-op when the tail
+// is present, remove when absent. The tail ids are non-baseline, so
+// /fixture/reset sweeps them like any accumulated turn. Never exercised by
+// the shipped binary.
+func (f *FakeOpenCode) handleFixtureSlowTail(w http.ResponseWriter, r *http.Request) {
+	session := r.URL.Query().Get("session")
+	op := r.URL.Query().Get("op")
+	rows := 8
+	if v := r.URL.Query().Get("rows"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 8 {
+			rows = n
+		}
+	}
+	if session == "" || (op != "append" && op != "remove") {
+		http.Error(w, "missing session or op (append|remove)", http.StatusBadRequest)
+		return
+	}
+	ids := make([]string, rows)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("slt%d", i+1)
+	}
+	f.mu.Lock()
+	present := false
+	for _, m := range f.messages[session] {
+		if id, _ := m.Info["id"].(string); id == ids[0] {
+			present = true
+			break
+		}
+	}
+	if op == "remove" && present {
+		kept := f.messages[session][:0]
+		for _, m := range f.messages[session] {
+			id, _ := m.Info["id"].(string)
+			drop := false
+			for _, t := range ids {
+				if id == t {
+					drop = true
+					break
+				}
+			}
+			if !drop {
+				kept = append(kept, m)
+			}
+		}
+		f.messages[session] = kept
+	}
+	f.mu.Unlock()
+	if op == "append" && !present {
+		now := float64(time.Now().UnixMilli())
+		for i, id := range ids {
+			info := map[string]any{"id": id, "sessionID": session, "role": "user",
+				"time": map[string]any{"created": now, "completed": now}}
+			part := textPart(id, session, id+"p", fmt.Sprintf("Staged tail row %d for the restore-landing regression.", i+1), now)
+			f.appendMessage(session, messageWithParts{Info: info, Parts: []map[string]any{part}})
+			f.emit("message.updated", map[string]any{"info": info})
+			f.emit("message.part.updated", map[string]any{"part": part})
+		}
+	} else if op == "remove" && present {
+		for _, id := range ids {
+			f.emit("message.removed", map[string]any{"sessionID": session, "messageID": id})
+		}
+	}
+	writeJSON(w, map[string]any{"session": session, "op": op, "tail": present})
+}
+
+// handleFixtureIdle emits a turn-terminal session.idle for a session through
+// the real /event stream WITHOUT touching the transcript or any other
+// bookkeeping — the minimal deterministic busy→idle release for the
+// scroll-follow restore-contract e2e (12b: a restored reader whose session's
+// turn finishes must not be yanked). /fixture/reset also emits idle but
+// mutates the transcript; /fixture/busy + this op give a clean busy→idle
+// cycle with zero side effects. Test-only infrastructure — never exercised
+// by the shipped binary.
+func (f *FakeOpenCode) handleFixtureIdle(w http.ResponseWriter, r *http.Request) {
+	session := r.URL.Query().Get("session")
+	if session == "" {
+		http.Error(w, "missing session", http.StatusBadRequest)
+		return
+	}
+	f.EmitSessionTerminal(session, "session.idle")
+	writeJSON(w, map[string]any{"idle": session})
 }
 
 // handleFixtureCompactionBurst scripts the incident-shaped end-of-turn
