@@ -111,9 +111,22 @@ func integOCFakeHelper(t *testing.T) {
 	fd3, _ := os.Readlink("/proc/self/fd/3")
 	_ = os.WriteFile(filepath.Join(dir, fmt.Sprintf("%d.fake", os.Getpid())), []byte(fd3), 0o644)
 	if os.Getenv("VH_FAKE_OC_NOLISTEN") != "1" && port > 0 {
-		ln, err := listenLoopback(port)
-		if err == nil {
-			go serveMinimalHTTP(ln)
+		// Bind-retry (bounded): the spawn port comes from freePort()'s
+		// bind-close window, so a concurrent process can transiently squat
+		// it before this fake binds. The starter's readiness wait verifies
+		// THIS process holds the port (cmd.waitForPortOwned), so serving
+		// late is correct while serving never would wedge the scenario.
+		deadline := time.Now().Add(20 * time.Second)
+		for {
+			ln, err := listenLoopback(port)
+			if err == nil {
+				go serveMinimalHTTP(ln)
+				break
+			}
+			if time.Now().After(deadline) {
+				break // persistent squatter: serve nothing; readiness fails honestly
+			}
+			time.Sleep(150 * time.Millisecond)
 		}
 	}
 	for {

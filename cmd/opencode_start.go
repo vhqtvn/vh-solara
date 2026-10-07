@@ -183,7 +183,11 @@ func EnsureDetachedOpenCode(bin string, workspace string, extraW ...io.Writer) D
 			Reason:  fmt.Sprintf("failed to start detached opencode serve: %v", err),
 		}
 	}
-	if err := waitForPort(port, 30*time.Second); err != nil {
+	// Owned-port readiness (not dial-only): a foreign listener that took the
+	// freePort() bind-close window must never satisfy this wait — publishing
+	// {child,foreign-port} as "spawned" is poisoned state (see
+	// waitForPortOwned).
+	if err := waitForPortOwned(cmd.Process.Pid, port, 30*time.Second); err != nil {
 		// The child is left running deliberately (it may still come up and
 		// holds the project DB); the owner lock it holds keeps any competitor
 		// from spawning beside it. State stays unpublished — a later starter
@@ -413,7 +417,9 @@ func restartDetachedOpenCode(bin string, port int, workspace string, curPID int,
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to start detached opencode serve: %v", err)
 	}
-	if err := waitForPort(port, 30*time.Second); err != nil {
+	// Owned-port readiness, same attribution as the boot path: the
+	// freeness check above narrowed the window, this closes it.
+	if err := waitForPortOwned(cmd.Process.Pid, port, 30*time.Second); err != nil {
 		// Child left running + owner-covered; state stays unpublished (same
 		// posture as the boot path's readiness failure).
 		return cmd, port, fmt.Errorf("opencode serve failed to listen on port %d: %v", port, err)

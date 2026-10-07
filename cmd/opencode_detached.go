@@ -141,6 +141,108 @@ func ocCmdlineMatches(pid, port int) bool {
 	return strings.Contains(args, "opencode") && strings.Contains(args, "--port "+strconv.Itoa(port))
 }
 
+// --- readiness attribution (whose listener is it?) ---
+//
+// INCIDENT CLASS (2026-10-07 full-tree flake, reproduced under listener
+// churn): the spawn port comes from freePort()'s bind-close window, so a
+// concurrent process can take that port in the microseconds before the child
+// binds it. The child's listen then fails (real opencode exits EADDRINUSE;
+// a sleeping child serves nothing) while waitForPort's DIAL still succeeds
+// against the foreign listener — publishing poisoned state: a "spawned"
+// verdict plus a {pid,port} record whose port is answered by a process that
+// is not our child. Later starters then reattach to a stranger (or refuse
+// beside a dead port once the squatter leaves). restartDetachedOpenCode's
+// port-finalization freeness check narrows its window but cannot close it —
+// only attribution can.
+
+// ocListenInodesOnPort returns the socket inodes of every IPv4 LISTEN socket
+// on <port> in this network namespace (the spawn binds 127.0.0.1). ok=false
+// means /proc/net/tcp was unreadable: callers fail OPEN (cannot verify must
+// not block boot), mirroring ocCmdlineMatches.
+func ocListenInodesOnPort(port int) (inodes map[string]bool, ok bool) {
+	b, err := os.ReadFile("/proc/net/tcp")
+	if err != nil {
+		return nil, false
+	}
+	for i, line := range strings.Split(string(b), "\n") {
+		if i == 0 {
+			continue // header
+		}
+		f := strings.Fields(line)
+		if len(f) < 10 || f[3] != "0A" { // LISTEN state only
+			continue
+		}
+		local := strings.Split(f[1], ":")
+		if len(local) != 2 {
+			continue
+		}
+		p, err := strconv.ParseUint(local[1], 16, 32)
+		if err != nil || int(p) != port {
+			continue
+		}
+		if inodes == nil {
+			inodes = map[string]bool{}
+		}
+		inodes[f[9]] = true
+	}
+	return inodes, true
+}
+
+// ocPortHeldByProc reports whether pid owns a LISTEN socket on the port — a
+// dial cannot tell our child's listener from a foreign squatter; this can.
+// Fail-open on an unreadable /proc/net/tcp (same posture as
+// ocCmdlineMatches); a pid whose fds cannot be read (a dying/dead child of
+// ours) is judged NOT holding.
+func ocPortHeldByProc(pid, port int) bool {
+	if pid <= 0 || port <= 0 {
+		return false
+	}
+	inodes, ok := ocListenInodesOnPort(port)
+	if !ok {
+		return true // cannot verify: fail open
+	}
+	if len(inodes) == 0 {
+		return false // nothing listens on the port
+	}
+	fds, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
+	if err != nil {
+		return false // our spawned child: unreadable fds = gone or going
+	}
+	for _, fd := range fds {
+		link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", pid, fd.Name()))
+		if err != nil || !strings.HasPrefix(link, "socket:[") {
+			continue
+		}
+		if inodes[strings.TrimSuffix(strings.TrimPrefix(link, "socket:["), "]")] {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForPortOwned is waitForPort with readiness ATTRIBUTED to the child: a
+// successful dial only counts when pid holds the listening socket, so a
+// foreign process squatting the freePort() bind-close window can never
+// satisfy — or poison state through — the detached spawn's readiness wait.
+func waitForPortOwned(pid, port int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			if ocPortHeldByProc(pid, port) {
+				return nil
+			}
+			// The port answers but NOT as our child's listener (foreign
+			// squatter, or the child's bind is still in flight): keep
+			// polling until the child owns it or the budget ends.
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("port %d not held by pid %d within %v (a foreign listener holds the port, or the child never came up)", port, pid, timeout)
+}
+
 // --- detached-instance gate (split-brain guard) ---
 //
 // INCIDENT (2026-08-28): a daemon restart at peak load probed the recorded

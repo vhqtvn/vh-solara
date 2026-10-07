@@ -334,3 +334,44 @@ func TestOCProbePortEndpoints(t *testing.T) {
 		}
 	})
 }
+
+// TestOCPortHeldByProcAttribution guards readiness ATTRIBUTION: a listener on
+// the spawn port must be credited only to the process that actually holds
+// the socket. Incident class (2026-10-07 full-tree flake, reproduced under
+// listener churn): freePort()'s bind-close window lets a foreign process take
+// the spawn port, and a dial-only readiness wait then satisfied itself
+// against the foreign listener — publishing poisoned state ("spawned", port
+// answered by a stranger). These cases pin the helper both ways.
+func TestOCPortHeldByProcAttribution(t *testing.T) {
+	if _, err := os.ReadFile("/proc/net/tcp"); err != nil {
+		t.Skip("no /proc/net/tcp on this platform; ownership attribution unverifiable (fail-open path)")
+	}
+
+	// Owned: a listener this process holds attributes to this pid.
+	port := fakeOCServer(t, func(w http.ResponseWriter, r *http.Request) {})
+	if !ocPortHeldByProc(os.Getpid(), port) {
+		t.Fatal("own listener must attribute to own pid")
+	}
+	if err := waitForPortOwned(os.Getpid(), port, 2*time.Second); err != nil {
+		t.Fatalf("owned listener must satisfy the owned-port wait: %v", err)
+	}
+
+	// Foreign: the port answers dials, but the "child" — a live process
+	// holding no socket on it — must never be credited.
+	cmd := startFakeOCProcess(t, port)
+	if ocPortHeldByProc(cmd.Process.Pid, port) {
+		t.Fatal("a foreign-held port must not attribute to the child")
+	}
+	if err := waitForPortOwned(cmd.Process.Pid, port, 750*time.Millisecond); err == nil {
+		t.Fatal("dial success against a foreign listener must not satisfy the owned-port wait (poisoned-state regression)")
+	}
+
+	// Nothing listening on the port: held by nobody.
+	if ocPortHeldByProc(cmd.Process.Pid, freePort()) {
+		t.Fatal("a port with no listener is held by nobody")
+	}
+	// Degenerate ids never attribute.
+	if ocPortHeldByProc(0, port) || ocPortHeldByProc(cmd.Process.Pid, 0) {
+		t.Fatal("pid<=0 or port<=0 must not attribute")
+	}
+}

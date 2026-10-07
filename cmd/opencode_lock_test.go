@@ -153,28 +153,47 @@ func ocLockFakeOCHelper(t *testing.T) {
 		}
 	}
 	if os.Getenv("VH_FAKE_OC_NOLISTEN") != "1" && port > 0 {
-		if ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
-			go func() {
-				for {
-					c, err := ln.Accept()
-					if err != nil {
-						return
-					}
-					go func(c net.Conn) {
-						defer c.Close()
-						// Drain the request briefly, then answer with a
-						// minimal valid HTTP 200 — the classify probe only
-						// needs the listener to speak HTTP.
-						_ = c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-						_, _ = io.Copy(io.Discard, c)
-						_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"))
-					}(c)
-				}
-			}()
+		// Bind-retry (bounded): the spawn port comes from freePort()'s
+		// bind-close window, so a concurrent process can transiently squat
+		// it before this fake binds. Real opencode exits EADDRINUSE; this
+		// fake's keeps-serving contract instead waits the squatter out —
+		// the starter's readiness wait verifies THIS process holds the
+		// port (waitForPortOwned), so serving late is correct while
+		// serving never would wedge the scenario.
+		deadline := time.Now().Add(20 * time.Second)
+		for {
+			ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+			if err == nil {
+				go serveFakeOCListener(ln)
+				break
+			}
+			if time.Now().After(deadline) {
+				break // persistent squatter: serve nothing; readiness fails honestly
+			}
+			time.Sleep(150 * time.Millisecond)
 		}
 	}
 	for {
 		time.Sleep(time.Hour)
+	}
+}
+
+// serveFakeOCListener answers fake-`opencode serve` connections: drain the
+// request briefly, then a minimal valid HTTP 200 — the classify probe only
+// needs the listener to speak HTTP. (Extracted from ocLockFakeOCHelper when
+// the listen gained bind-retry.)
+func serveFakeOCListener(ln net.Listener) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			_ = c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			_, _ = io.Copy(io.Discard, c)
+			_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"))
+		}(c)
 	}
 }
 
