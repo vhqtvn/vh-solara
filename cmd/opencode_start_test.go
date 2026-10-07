@@ -455,7 +455,7 @@ func TestRestartDetachedFreshPortWhenNoState(t *testing.T) {
 
 // TestRestartDetachedForeignListenerOnRecordedPort — a FOREIGN listener
 // squats exactly the recorded port. Without the guard the child is handed a
-// port it can never bind (EADDRINUSE) while the dial-only waitForPort
+// port it can never bind (EADDRINUSE) while the old dial-only waitForPort
 // succeeds against the FOREIGN listener — poisoned state, a lying "ready",
 // re-poisoned by every later restart. With the guard the restart succeeds on
 // a DIFFERENT (fresh) port and publishes truthful state.
@@ -492,7 +492,7 @@ func TestRestartDetachedForeignListenerOnRecordedPort(t *testing.T) {
 		t.Fatalf("state=%+v ok=%v want the respawned pid %d", st, ok, c.Process.Pid)
 	}
 	if st.Port == port {
-		t.Fatalf("PORT-PARITY REGRESSION: published port %d is the squatted recorded port — poisoned state (the child died EADDRINUSE while waitForPort dialed the foreign listener)", st.Port)
+		t.Fatalf("PORT-PARITY REGRESSION: published port %d is the squatted recorded port — poisoned state (the child died EADDRINUSE while the old dial-only wait credited the foreign listener)", st.Port)
 	}
 	if st.Port <= 0 {
 		t.Fatalf("published port %d must be a fresh port > 0", st.Port)

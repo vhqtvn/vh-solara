@@ -571,8 +571,8 @@ func TestOCSpawnHandoffRetentionAndRelease(t *testing.T) {
 func TestOCSpawnCrashPostStartPrePublication(t *testing.T) {
 	sc := newOCLockScenario(t)
 
-	// Starter A, fake never listens: A blocks in waitForPort (a ~30s window
-	// between Start and publication).
+	// Starter A, fake never listens: A blocks in waitForPortOwned (a ~30s
+	// window between Start and publication).
 	a := sc.startStarter("A", map[string]string{"VH_FAKE_OC_NOLISTEN": "1"}, false)
 	fakes := sc.waitAliveCount(".fake", 1, 10*time.Second)
 

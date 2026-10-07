@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -125,7 +126,7 @@ func TestFakeOpenCodeHelperProcess(t *testing.T) {
 // right after Start() (alive, readable, zero bytes — the same signature as a
 // zombie), so the helper polls briefly until its cmdline is populated.
 // Production never sees this: the state file is written only after
-// waitForPort() succeeds, long after the spawn's exec completed.
+// waitForPortOwned() succeeds, long after the spawn's exec completed.
 func startFakeOCProcess(t *testing.T, port int) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command(os.Args[0],
@@ -366,12 +367,27 @@ func TestOCPortHeldByProcAttribution(t *testing.T) {
 		t.Fatal("dial success against a foreign listener must not satisfy the owned-port wait (poisoned-state regression)")
 	}
 
-	// Nothing listening on the port: held by nobody.
+	// Nothing listening on the port: held by nobody. Squatter-insensitive:
+	// the assertion holds whether the port stays free or a foreign listener
+	// takes it in freePort()'s bind-close window — the fake child never
+	// binds anything.
 	if ocPortHeldByProc(cmd.Process.Pid, freePort()) {
 		t.Fatal("a port with no listener is held by nobody")
 	}
 	// Degenerate ids never attribute.
 	if ocPortHeldByProc(0, port) || ocPortHeldByProc(cmd.Process.Pid, 0) {
 		t.Fatal("pid<=0 or port<=0 must not attribute")
+	}
+}
+
+// TestOCPortHeldByProcFailsOpenWhenProcUnreadable pins the fail-OPEN posture
+// of ocPortHeldByProc when /proc/net/tcp cannot be read (the knob points it
+// at a nonexistent path — ReadFile: ENOENT).
+func TestOCPortHeldByProcFailsOpenWhenProcUnreadable(t *testing.T) {
+	old := ocProcNetTCPPath
+	ocProcNetTCPPath = filepath.Join(t.TempDir(), "net-tcp-absent") // ReadFile: ENOENT
+	t.Cleanup(func() { ocProcNetTCPPath = old })
+	if !ocPortHeldByProc(os.Getpid(), 1) {
+		t.Fatal("unreadable /proc/net/tcp must fail OPEN (cannot-verify must not block boot — a fail-closed flip bricks detached spawn readiness on non-/proc platforms)")
 	}
 }

@@ -332,7 +332,7 @@ func restartDetachedOpenCode(bin string, port int, workspace string, curPID int,
 	// D2 (P1-API-002 follow-up): a restart handed an unusable port (<= 0 —
 	// a Contended/OrphanedOwner boot with no readable state leaves port 0
 	// wired on the runtime) must never spawn `opencode serve --port 0`:
-	// waitForPort(0) can never succeed, so the directed recovery path would
+	// the readiness wait on port 0 can never succeed, so the directed recovery path would
 	// hang for the readiness budget and strand the child on an OS-assigned
 	// port with the owner lock held and state unpublished. Re-derive under
 	// the lock, exactly like the boot path's stable-port selection: the
@@ -399,12 +399,12 @@ func restartDetachedOpenCode(bin string, port int, workspace string, curPID int,
 	// port or a caller-supplied one, and neither has been checked for a
 	// FOREIGN listener. Stale state can name a port another process now
 	// squats: handing it to the child would kill the child with EADDRINUSE
-	// while the dial-only waitForPort below succeeds against the foreign
-	// listener — publishing poisoned state (a lying "ready" whose proxy
-	// targets the foreign service, re-poisoned by every further restart,
-	// healed only at daemon boot). One final freeness check at this single
-	// port-finalization point trades that for truthful fresh-port state; the
-	// caller retargets the RUNNING daemon at the fresh port immediately
+	// and then fail the waitForPortOwned wait below honestly — attribution
+	// is never satisfied by a foreign listener (the poisoned-"ready" mode
+	// the OLD dial-only waitForPort allowed is closed). One final freeness
+	// check at this single port-finalization point instead hands the child
+	// a bindable port and spares the 30s failure budget; the caller
+	// retargets the RUNNING daemon at the fresh port immediately
 	// (P1-API-003 — applyFreshPortRetarget), so the stale-URL healing no
 	// longer waits for the next daemon boot.
 	if !portFree(port) {

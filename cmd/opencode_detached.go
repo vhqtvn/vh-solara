@@ -155,12 +155,14 @@ func ocCmdlineMatches(pid, port int) bool {
 // port-finalization freeness check narrows its window but cannot close it —
 // only attribution can.
 
+var ocProcNetTCPPath = "/proc/net/tcp" // knob: tests force an unreadable path
+
 // ocListenInodesOnPort returns the socket inodes of every IPv4 LISTEN socket
 // on <port> in this network namespace (the spawn binds 127.0.0.1). ok=false
 // means /proc/net/tcp was unreadable: callers fail OPEN (cannot verify must
 // not block boot), mirroring ocCmdlineMatches.
 func ocListenInodesOnPort(port int) (inodes map[string]bool, ok bool) {
-	b, err := os.ReadFile("/proc/net/tcp")
+	b, err := os.ReadFile(ocProcNetTCPPath)
 	if err != nil {
 		return nil, false
 	}
