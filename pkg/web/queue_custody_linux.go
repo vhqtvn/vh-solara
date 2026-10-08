@@ -9,6 +9,10 @@ import (
 	"syscall"
 )
 
+// custodyPlatformRefusal is the Linux arm of the pre-filesystem platform
+// gate: Linux supports the flock fence, so acquisition proceeds.
+func custodyPlatformRefusal() error { return nil }
+
 // custodyLockAcquire takes the per-project queue-custody flock
 // (LOCK_EX|LOCK_NB) on path, creating the file if absent. The lock belongs
 // to the returned open file DESCRIPTION: the kernel releases it when every

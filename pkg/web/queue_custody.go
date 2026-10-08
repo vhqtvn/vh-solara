@@ -127,8 +127,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // custodyLock is the held platform-lock handle (flock on Linux; the non-Linux
@@ -217,9 +219,10 @@ func SetQueueCustodyEnabledForTest(v bool) {
 }
 
 // queueCustodyAllowed reports whether custody acquisition is permitted: the
-// daemon-dispatch capability is compiled in, or a test override is armed.
+// daemon-dispatch capability is enabled at runtime (SetDaemonDispatchEnabled —
+// the --daemon-dispatch opt-in) or a test override is armed.
 func queueCustodyAllowed() bool {
-	return daemonDispatchCapable || queueCustodyTestEnable.Load()
+	return daemonDispatchEnabled.Load() || queueCustodyTestEnable.Load()
 }
 
 // QueueCustody is ONE holder's per-project custody token: the fencing
@@ -266,6 +269,15 @@ const (
 func AcquireQueueCustody(root string) (*QueueCustody, error) {
 	if !queueCustodyAllowed() {
 		return nil, errQueueCustodyDisabled
+	}
+	// Platform refusal BEFORE ANY filesystem effect (tier1_b-F1, matured
+	// phase-1 defer): the non-Linux stub must refuse without creating so
+	// much as the .vh-solara directory — "fail-closed" means
+	// fail-BEFORE-effects. custodyPlatformRefusal is the platform-split
+	// guard (nil on Linux; errQueueCustody elsewhere), so the ordering here
+	// is the machine-checked invariant the !linux test pins.
+	if err := custodyPlatformRefusal(); err != nil {
+		return nil, err
 	}
 	vhDir := filepath.Join(root, ".vh-solara")
 	if err := os.MkdirAll(vhDir, 0o755); err != nil {
@@ -455,7 +467,11 @@ func (s *sessionQueueStore) ClaimForCustody(tok *QueueCustody) (QueueItem, bool,
 	if err := s.fenceGateLocked(tok); err != nil {
 		return QueueItem{}, false, err
 	}
-	return s.claimOldestPendingLocked()
+	// The claim stamps the custody ERA MARKER (ClaimGeneration) in the same
+	// atomic save as the state transition + correlation-id mint: every item
+	// this epoch claims is certifiable by the slice-2b classifier, while
+	// ClaimGeneration==0 items (legacy browser claims) never are.
+	return s.claimOldestPendingLocked(tok.gen)
 }
 
 // BeginDispatchAttempt durably journals the write-ahead transition
@@ -468,7 +484,10 @@ func (s *sessionQueueStore) ClaimForCustody(tok *QueueCustody) (QueueItem, bool,
 // attempt's identity is its index in the item's Attempts slice (the slice-1
 // schema carries no per-attempt id field; generation+StartedAt identify it).
 // Requires the item to be `dispatching` (claimed — the "prepared" state).
-func (s *sessionQueueStore) BeginDispatchAttempt(tok *QueueCustody, itemID string) (int, error) {
+// ocGen is the OpenCode process generation observed NOW (the
+// restart-barrier input; 0 = unknown, which never certifies a barrier —
+// see QueueAttempt.OCGeneration).
+func (s *sessionQueueStore) BeginDispatchAttempt(tok *QueueCustody, itemID string, ocGen uint64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.archived {
@@ -486,8 +505,9 @@ func (s *sessionQueueStore) BeginDispatchAttempt(tok *QueueCustody, itemID strin
 		}
 		pre := s.items[i] // rollback snapshot (scalar + slice header)
 		s.items[i].Attempts = append(s.items[i].Attempts, QueueAttempt{
-			Generation: tok.gen,
-			StartedAt:  queueNow().UnixMilli(),
+			Generation:   tok.gen,
+			OCGeneration: ocGen,
+			StartedAt:    queueNow().UnixMilli(),
 		})
 		if err := s.save(); err != nil {
 			s.items[i] = pre
@@ -549,4 +569,161 @@ func (s *sessionQueueStore) RecordAttemptOutcome(tok *QueueCustody, itemID strin
 		return nil
 	}
 	return errQueueNotFound
+}
+
+// maxCertifiedRedeliveries bounds how many total dispatch attempts one item
+// tolerates under the certified-recovery loop (slice 2b phase 2). Classes 1-3
+// (design.md "Certified Redelivery") are unconditioned per-occurrence, so
+// without a cap a persistently-down OpenCode would produce an infinite
+// claim→connect_failed→requeue cycle at the recovery cadence. The cap
+// mirrors reconcileMaxAttempts's philosophy (bounded work, operator-facing
+// exhaustion) — an item that exhausts it terminalizes as unknown with an
+// explicit budget-exhausted detail (NOT the ambiguous marker: exhaustion is
+// "we stopped trying", not "delivery is uncertain").
+const maxCertifiedRedeliveries = 8
+
+// requeueBudgetExhaustedDetailFmt is the terminal detail when an item hits
+// maxCertifiedRedeliveries. The %d is the attempt count.
+const requeueBudgetExhaustedDetailFmt = "Certified redelivery budget exhausted after %d attempt(s): every certified redelivery class stayed recoverable but the dispatch never succeeded (OpenCode likely unreachable). Manual review advised."
+
+// RequeueForCertifiedRedelivery transitions one item BACK into the
+// dispatchable state after the classifier certified a redelivery class
+// (never-started / connect_failed / post-restart barrier — the operator-
+// accepted debate-4 DEFAULT ladder). Slice 2b phase 2's ONLY repend path,
+// and deliberately narrow:
+//
+//   - Accepted states: `unknown` (already recovered) or `dispatching` (stale
+//     only — re-checked under s.mu so an IN-FLIGHT dispatch is never
+//     requeued under itself).
+//   - The OpenCode correlation id is PRESERVED VERBATIM (mint-at-claim
+//     invariant, queue.go "PROPERTIES PRESERVED"): redelivery re-POSTs under
+//     the SAME opencodeMsgID. This is safe for exactly the certified
+//     classes — never-started (the id never left the machine: zero attempt
+//     records prove no POST ran), connect_failed (the dial never established
+//     ⇒ OpenCode never saw the id), and the post-restart barrier (a
+//     post-restart exact-ID GET 404 proves the projector transaction never
+//     committed, and the projector pin shows MessageUpdated UPSERTS by
+//     message id, so even a racing late fiber cannot create a second row).
+//     A RE-MINT is never performed here: only Claim mints, and this path
+//     bypasses Claim on purpose (the design's "redispatch same
+//     opencodeMsgID" for the barrier class; re-minting would also orphan the
+//     reconciler correlation for any id OpenCode DID see).
+//   - Bookkeeping reset: ReconcileAttempts/ReconcileTerminal/AmbiguousDelivery
+//     clear and the in-memory reconcile throttle entry is pruned — the item
+//     re-enters the dispatch lifecycle with a fresh reconciliation budget
+//     for its next outcome.
+//   - DispatchStartedAt is re-stamped to NOW so stale-dispatch recovery does
+//     not immediately re-`unknown` the item before the drain loop resumes
+//     it (the loop's resume is begin→fence→POST→receipt for an
+//     already-dispatching item — ResumeQueuedDispatchAttempt).
+//   - Fenced like every custody mutation (fenceGateLocked) and rolled back
+//     on save failure.
+func (s *sessionQueueStore) RequeueForCertifiedRedelivery(tok *QueueCustody, itemID, justification string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.archived {
+		return errQueueArchived
+	}
+	if err := s.fenceGateLocked(tok); err != nil {
+		return err
+	}
+	nowMs := queueNow().UnixMilli()
+	thresholdMs := int64(currentStaleThreshold() / time.Millisecond)
+	for i := range s.items {
+		if s.items[i].ID != itemID {
+			continue
+		}
+		st := s.items[i].State
+		switch {
+		case st == QueueUnknown:
+			// recovered terminal — requeue allowed
+		case st == QueueDispatching:
+			// stale only: an in-flight dispatch (fresh DispatchStartedAt, or
+			// the legacy zero timestamp inside its first threshold window)
+			// must never be requeued under itself.
+			started := s.items[i].DispatchStartedAt
+			if started > 0 && nowMs-started <= thresholdMs {
+				return fmt.Errorf("queue: requeue: item %s dispatch is in flight (started %dms ago, threshold %dms)", itemID, nowMs-started, thresholdMs)
+			}
+		default:
+			return fmt.Errorf("queue: requeue: item %s state %s, want unknown or stale dispatching", itemID, st)
+		}
+		if len(s.items[i].Attempts) >= maxCertifiedRedeliveries {
+			// Budget exhausted: terminal unknown (fail-closed), never
+			// ambiguous-marked (exhaustion is not delivery uncertainty).
+			pre := s.items[i]
+			s.items[i].State = QueueUnknown
+			s.items[i].ResolvedAt = nowMs
+			s.items[i].Detail = fmt.Sprintf(requeueBudgetExhaustedDetailFmt, len(s.items[i].Attempts))
+			s.items[i].ReconcileTerminal = true
+			s.items[i].RequeuePending = false // terminal items await nothing
+			// [deferred C-F2] exhaustion ≠ uncertainty: a stale ambiguous
+			// marker must not survive the budget terminal (mirrors the
+			// requeue branch's reset) — slice 3's FE consumes the marker.
+			s.items[i].AmbiguousDelivery = false
+			if err := s.save(); err != nil {
+				s.items[i] = pre
+				return err
+			}
+			delete(s.reconcileLast, itemID)
+			return nil
+		}
+		pre := s.items[i] // rollback snapshot (scalar fields only)
+		s.items[i].State = QueueDispatching
+		s.items[i].DispatchStartedAt = nowMs
+		s.items[i].ResolvedAt = 0
+		s.items[i].ReconcileAttempts = 0
+		s.items[i].ReconcileTerminal = false
+		s.items[i].AmbiguousDelivery = false
+		s.items[i].RequeuePending = true
+		s.items[i].Detail = justification
+		if err := s.save(); err != nil {
+			s.items[i] = pre
+			return err
+		}
+		delete(s.reconcileLast, itemID)
+		return nil
+	}
+	return errQueueNotFound
+}
+
+// invalidateLoadedCache drops the store's lazy-loaded in-memory copy so the
+// next mutation re-reads queue.json from disk (T1C-F3, matured phase-1
+// defer). The drain loop calls it on every registered store of a project
+// root AT CUSTODY ACQUISITION: the fence authority (queue.custody.gen) is
+// always read fresh from disk, but the store's `loaded` cache could predate
+// the acquisition — masking any queue.json write that landed between the
+// cache's load and this epoch (e.g. a legacy browser claim that raced the
+// arbitration probe). After invalidation the first custody mutation reloads
+// disk state, so a pre-epoch foreign write is OBSERVED (and the fence's
+// queue.json FenceGeneration comparison runs against the real file) instead
+// of being silently overwritten by the cached view. Within the held epoch
+// the store remains the single writer (arbitration + fence refuse everyone
+// else), so no per-mutation reload is needed — the invalidation point is
+// the epoch boundary. Safe with respect to unsaved in-memory state: every
+// mutation persists via save() before returning, so memory==disk at any
+// quiet point this can run.
+func (s *sessionQueueStore) invalidateLoadedCache() {
+	s.mu.Lock()
+	s.loaded = false
+	s.mu.Unlock()
+}
+
+// invalidateStoresUnderRoot invalidates the lazy-load cache of every
+// REGISTERED store under root (see invalidateLoadedCache). Filesystem-only
+// sessions (queue.json present, store never materialized in this process)
+// need nothing: their store loads fresh on first touch.
+func (qr *queueRegistry) invalidateStoresUnderRoot(root string) {
+	prefix := root + "\x00"
+	qr.mu.Lock()
+	var stores []*sessionQueueStore
+	for k, st := range qr.stores {
+		if strings.HasPrefix(k, prefix) {
+			stores = append(stores, st)
+		}
+	}
+	qr.mu.Unlock()
+	for _, st := range stores {
+		st.invalidateLoadedCache()
+	}
 }

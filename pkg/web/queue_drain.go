@@ -105,7 +105,9 @@ type DispatchOutcome struct {
 // before the POST — if the token is stale at that point the POST is SKIPPED
 // (the poster is never invoked) and errQueueFenced is returned, leaving the
 // open attempt journaled (honest: a newer owner will reclassify it).
-func RunQueuedDispatchAttempt(ctx context.Context, s *sessionQueueStore, sid string, tok *QueueCustody, poster promptPoster) (DispatchOutcome, error) {
+// ocGen is the OpenCode process generation to journal with the attempt (the
+// restart-barrier input; 0 = unknown).
+func RunQueuedDispatchAttempt(ctx context.Context, s *sessionQueueStore, sid string, tok *QueueCustody, ocGen uint64, poster promptPoster) (DispatchOutcome, error) {
 	item, won, err := s.ClaimForCustody(tok)
 	if err != nil {
 		return DispatchOutcome{}, err
@@ -113,7 +115,70 @@ func RunQueuedDispatchAttempt(ctx context.Context, s *sessionQueueStore, sid str
 	if !won {
 		return DispatchOutcome{}, nil
 	}
-	idx, err := s.BeginDispatchAttempt(tok, item.ID)
+	return resumeDispatchAttempt(ctx, s, sid, tok, item, ocGen, poster)
+}
+
+// ResumeQueuedDispatchAttempt executes ONE dispatch attempt for an item that
+// is ALREADY `dispatching` under a certified redelivery requeue
+// (RequeueForCertifiedRedelivery preserved its correlation id — mint-at-
+// claim holds: no claim, no re-mint). Same journal protocol and double
+// fence as RunQueuedDispatchAttempt, minus the claim: begin → fence → POST
+// → receipt. The drain loop calls this for requeued items BEFORE claiming
+// new pending ones (FIFO by Order is preserved by the loop's ordering, not
+// by this function).
+func ResumeQueuedDispatchAttempt(ctx context.Context, s *sessionQueueStore, sid string, tok *QueueCustody, itemID string, ocGen uint64, poster promptPoster) (DispatchOutcome, error) {
+	item, ok, err := s.itemForResume(itemID)
+	if err != nil || !ok {
+		return DispatchOutcome{}, err
+	}
+	return resumeDispatchAttempt(ctx, s, sid, tok, item, ocGen, poster)
+}
+
+// itemForResume loads the requeue-target item iff it is still a live
+// requeue (dispatching AND RequeuePending), CONSUMES the marker in the same
+// atomic save (so the loop can never resume one requeue twice or mistake
+// its own in-flight attempt for a requeue), and returns the item for
+// dispatch. A missing item, a state change since classification (e.g. the
+// passive reconciler healed it to sent), or an already-consumed marker
+// aborts the resume cleanly — the certified verdict was a snapshot, the
+// store is the authority. Unfenced by design: this is a store-internal
+// bookkeeping transition under the store mutex (the custody-mode journal
+// writes that follow are fenced as usual).
+func (s *sessionQueueStore) itemForResume(itemID string) (QueueItem, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.archived {
+		return QueueItem{}, false, errQueueArchived
+	}
+	if err := s.load(); err != nil {
+		return QueueItem{}, false, err
+	}
+	for i := range s.items {
+		if s.items[i].ID != itemID {
+			continue
+		}
+		if s.items[i].State != QueueDispatching || !s.items[i].RequeuePending {
+			return QueueItem{}, false, nil
+		}
+		pre := s.items[i]
+		s.items[i].RequeuePending = false
+		if err := s.save(); err != nil {
+			s.items[i] = pre
+			return QueueItem{}, false, err
+		}
+		item := s.items[i]
+		return item, true, nil
+	}
+	return QueueItem{}, false, nil
+}
+
+// resumeDispatchAttempt is the shared begin→fence→POST→receipt core behind
+// RunQueuedDispatchAttempt (post-claim) and ResumeQueuedDispatchAttempt
+// (post-requeue). The item is dispatching; the correlation id was minted at
+// claim and is reused VERBATIM (never re-minted — see queue.go PROPERTIES
+// PRESERVED and RequeueForCertifiedRedelivery's mint-at-claim analysis).
+func resumeDispatchAttempt(ctx context.Context, s *sessionQueueStore, sid string, tok *QueueCustody, item QueueItem, ocGen uint64, poster promptPoster) (DispatchOutcome, error) {
+	idx, err := s.BeginDispatchAttempt(tok, item.ID, ocGen)
 	if err != nil {
 		return DispatchOutcome{}, err
 	}

@@ -2,6 +2,12 @@
 
 package web
 
+// custodyPlatformRefusal is the non-Linux arm of the pre-filesystem
+// platform gate (tier1_b-F1): refusal happens BEFORE AcquireQueueCustody
+// performs ANY filesystem effect (no .vh-solara dir, no lock file, no
+// generation authority) — "fail-closed" means fail-BEFORE-effects.
+func custodyPlatformRefusal() error { return errQueueCustodyUnsupported }
+
 // custodyLockAcquire is the non-Linux fail-closed stub: queue custody is
 // UNAVAILABLE outside the certified matrix (debate-3 AMEND-A1 — the fence
 // requires flock(2); pretending to lock without it would hand two daemons

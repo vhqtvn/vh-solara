@@ -1030,6 +1030,7 @@ func (s *Server) handleReloadProject(w http.ResponseWriter, r *http.Request) {
 
 	// Teardown is for NON-default projects only (see method doc). For dir == ""
 	// the default aggregator is process-lifetime and must stay.
+	stopDrain := false
 	if dir != "" && ok {
 		s.aggMu.Lock()
 		// Re-check under the lock: a concurrent reload for the same dir may have
@@ -1049,6 +1050,16 @@ func (s *Server) handleReloadProject(w http.ResponseWriter, r *http.Request) {
 			s.queueGCMu.Lock()
 			delete(s.queueGCOn, dir)
 			s.queueGCMu.Unlock()
+			// Reset sessionErrOn for the same reason: the fresh aggregator's
+			// store must get a fresh session.error signal subscriber
+			// (slice 2b phase 2). Same lock-order discipline.
+			s.sessionErrMu.Lock()
+			delete(s.sessionErrOn, dir)
+			s.sessionErrMu.Unlock()
+			// The drain loop stop happens AFTER aggMu is released (below):
+			// the loop's tick takes aggMu via aggForExisting, so waiting for
+			// its exit UNDER aggMu would deadlock.
+			stopDrain = true
 			// Reset pinsGCOn for the same reason: the next aggFor(dir) builds a
 			// FRESH aggregator (new store, new subs map), and the L2 pins
 			// subscriber must be rebuilt on it. Mirrors the queueGCOn reset
@@ -1065,6 +1076,9 @@ func (s *Server) handleReloadProject(w http.ResponseWriter, r *http.Request) {
 			s.labelsGCMu.Unlock()
 		}
 		s.aggMu.Unlock()
+	}
+	if stopDrain {
+		s.stopQueueDrainLoop(dir)
 	}
 	writeJSONResp(w, map[string]any{"ok": true})
 }

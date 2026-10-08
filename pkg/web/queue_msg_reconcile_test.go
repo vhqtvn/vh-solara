@@ -662,7 +662,7 @@ func newJournalBearingUnknownStore(t *testing.T, sid, text string, classify Queu
 	if err != nil || !won {
 		t.Fatalf("custody claim: err=%v won=%v", err, won)
 	}
-	idx, err := s.BeginDispatchAttempt(tok, claimed.ID)
+	idx, err := s.BeginDispatchAttempt(tok, claimed.ID, 0)
 	if err != nil {
 		t.Fatalf("begin attempt: %v", err)
 	}

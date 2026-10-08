@@ -384,7 +384,20 @@ func (s *sessionQueueStore) bumpReconcileAttempt(id string, genericDetailFmt, re
 				// (that barrier is certified only inside the slice-2b
 				// matrix, only for certified transport classes). Fail-closed
 				// semantics unchanged: terminal, NEVER resend.
+				//
+				// SLICE 2B PHASE 2 — the durable live-uncertain MARKER: a
+				// journal-bearing item reaching this terminal via the
+				// 404/transient/mismatch paths is the design's class 4
+				// (live-uncertain: the POST may have been written, OpenCode
+				// alive, no barrier) — stamp AmbiguousDelivery so the FE
+				// (slice 3) renders the ambiguous chip + one-tap
+				// replacement-send (debate-4 B1). NEVER set for the
+				// caller-bug 400 path (markReconcileTerminal) — a 400 is a
+				// daemon bug, not delivery uncertainty. A certified requeue
+				// clears the marker (RequeueForCertifiedRedelivery); an
+				// exact-match → sent heal bypasses this branch entirely.
 				s.items[i].Detail = journalAwareTerminalDetail(s.items[i], s.items[i].ReconcileAttempts)
+				s.items[i].AmbiguousDelivery = true
 			default:
 				s.items[i].Detail = fmt.Sprintf(genericDetailFmt, s.items[i].ReconcileAttempts)
 			}

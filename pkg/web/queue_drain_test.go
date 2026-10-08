@@ -96,7 +96,7 @@ func TestQueueDrainCrashAtEachTransition(t *testing.T) {
 		t.Fatalf("epoch 2 generation = %d, want > %d (monotonic across crash)", tok2.Generation(), tok1.Generation())
 	}
 	s2 := &sessionQueueStore{path: path}
-	if _, err := s2.BeginDispatchAttempt(tok2, it.ID); err != nil {
+	if _, err := s2.BeginDispatchAttempt(tok2, it.ID, 0); err != nil {
 		t.Fatalf("begin attempt: %v", err)
 	}
 	tok2.Release() // CRASH before the POST
@@ -132,7 +132,7 @@ func TestQueueDrainCrashAtEachTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 	var usurper *QueueCustody
-	outcome, err := RunQueuedDispatchAttempt(context.Background(), s3, "s1", tok3, func(_ context.Context, _ string, body json.RawMessage) error {
+	outcome, err := RunQueuedDispatchAttempt(context.Background(), s3, "s1", tok3, 0, func(_ context.Context, _ string, body json.RawMessage) error {
 		var b struct {
 			MessageID string `json:"messageID"`
 		}
@@ -186,7 +186,7 @@ func TestQueueDrainCrashAtEachTransition(t *testing.T) {
 	if _, err := s4.Enqueue("completes", nil, QueueSendConfig{}, ""); err != nil {
 		t.Fatal(err)
 	}
-	outcome, err = RunQueuedDispatchAttempt(context.Background(), s4, "s1", tok4, func(context.Context, string, json.RawMessage) error {
+	outcome, err = RunQueuedDispatchAttempt(context.Background(), s4, "s1", tok4, 0, func(context.Context, string, json.RawMessage) error {
 		return nil // 204
 	})
 	if err != nil {
@@ -245,7 +245,7 @@ func TestQueueDrainExecutorRecordsReceipts(t *testing.T) {
 	defer tok.Release()
 
 	mustEnqueue(t, s, "receipt-probe")
-	outcome, err := RunQueuedDispatchAttempt(context.Background(), s, "s1", tok, func(context.Context, string, json.RawMessage) error {
+	outcome, err := RunQueuedDispatchAttempt(context.Background(), s, "s1", tok, 0, func(context.Context, string, json.RawMessage) error {
 		return &opencode.Error{Status: 503, Op: "prompt_async", Body: "overloaded"}
 	})
 	if err != nil {
@@ -274,7 +274,7 @@ func TestQueueDrainExecutorRecordsReceipts(t *testing.T) {
 
 	// A SECOND dispatch attempt on the same item appends a NEW attempt
 	// (index 1) — the journal is an append-only history.
-	idx, err := s.BeginDispatchAttempt(tok, it.ID)
+	idx, err := s.BeginDispatchAttempt(tok, it.ID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +377,7 @@ func TestQueueDrainPrePostFenceBlocksPoster(t *testing.T) {
 	}
 	t.Cleanup(func() { queueDrainPrePostSeam = nil })
 
-	outcome, err := RunQueuedDispatchAttempt(context.Background(), s, "prepost", tok, func(context.Context, string, json.RawMessage) error {
+	outcome, err := RunQueuedDispatchAttempt(context.Background(), s, "prepost", tok, 0, func(context.Context, string, json.RawMessage) error {
 		posterRan = true
 		return nil
 	})
@@ -456,7 +456,7 @@ func TestQueueCustodyLiveTokenGenerationMismatch(t *testing.T) {
 
 	// (c) The executor rejects at claim — the poster is never invoked.
 	posterRan := false
-	_, err = RunQueuedDispatchAttempt(context.Background(), s, "g5", tok, func(context.Context, string, json.RawMessage) error {
+	_, err = RunQueuedDispatchAttempt(context.Background(), s, "g5", tok, 0, func(context.Context, string, json.RawMessage) error {
 		posterRan = true
 		return nil
 	})
@@ -582,7 +582,7 @@ func TestQueueDrainPromptBodyPropagationThroughExecutor(t *testing.T) {
 		t.Fatal(err)
 	}
 	var captured json.RawMessage
-	_, err = RunQueuedDispatchAttempt(context.Background(), s, "bodywire", tok, func(_ context.Context, _ string, body json.RawMessage) error {
+	_, err = RunQueuedDispatchAttempt(context.Background(), s, "bodywire", tok, 0, func(_ context.Context, _ string, body json.RawMessage) error {
 		captured = append([]byte(nil), body...)
 		return nil
 	})

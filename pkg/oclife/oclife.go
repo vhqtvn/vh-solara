@@ -141,6 +141,23 @@ type Lifecycle struct {
 	caps Capabilities
 	diag DiagnosticCompleteness
 
+	// generation is the monotonic OpenCode process-incarnation counter
+	// (slice 2b phase 2): 1 for the boot incarnation (New), bumped on every
+	// SetStarting (each restart arm — owned replacement, detached respawn,
+	// external restart command — drives the lifecycle through SetStarting
+	// before the new process becomes ready). It is the daemon-side restart
+	// signal for queue certified-redelivery classification: an attempt
+	// journaled under an older generation + a post-restart 404 may certify
+	// the post-restart causality barrier (queue_custody.go /
+	// queue_recovery_classify.go; the projector pin proves event+projection
+	// commit atomically, so post-restart reads see committed transactions
+	// only). A MISSING bump on some future restart arm is FAIL-CLOSED: the
+	// generation stays flat, the barrier never certifies, the item stays
+	// ambiguous — a false bump, by contrast, cannot misclassify because the
+	// barrier is CONJUNCTIVE (restart AND post-restart 404; a message that
+	// committed keeps answering 200). Guarded by mu.
+	generation uint64
+
 	mu              sync.Mutex
 	topology        Topology
 	state           State
@@ -160,6 +177,7 @@ func New(topology Topology) *Lifecycle {
 		topology:       topology,
 		state:          StateStarting,
 		stateChangedAt: time.Now(),
+		generation:     1, // the boot incarnation
 	}
 	switch topology {
 	case TopologyOwned:
@@ -204,11 +222,23 @@ func (l *Lifecycle) SetFailed(summary string, exit *int) {
 }
 
 // SetStarting marks the process spawned/respawning and awaiting readiness
-// (used at construction and during a restart sequence).
+// (used at construction and during a restart sequence). Every call is a NEW
+// process incarnation: the generation counter bumps here (see the generation
+// field doc for the certified-redelivery contract and the fail-closed
+// posture around a missing bump).
 func (l *Lifecycle) SetStarting() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.generation++
 	l.transition(StateStarting, "", nil)
+}
+
+// Generation returns the current process-incarnation counter (1 for the
+// boot incarnation; bumped on every SetStarting). Concurrency-safe.
+func (l *Lifecycle) Generation() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.generation
 }
 
 // SetStopped marks an intentional shutdown (clean exit code 0 or a

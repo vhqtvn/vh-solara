@@ -252,6 +252,31 @@ type Server struct {
 	queueGCMu sync.Mutex
 	queueGCOn map[string]bool
 
+	// sessionErrMu + sessionErrOn guard the one-time, per-dir installation
+	// of the session.error → queue-detail signal subscriber (slice 2b phase
+	// 2; see installQueueSessionErrorSignal). Exact same lifecycle shape as
+	// queueGCMu/queueGCOn: installed from aggFor, reset by
+	// handleReloadProject's teardown, retired by store.Close.
+	sessionErrMu sync.Mutex
+	sessionErrOn map[string]bool
+
+	// drainLoopsMu + drainLoops hold the per-dir queue drain loops (slice 2b
+	// phase 2, queue_drain_loop.go) — the daemon dispatcher, started from
+	// aggFor when daemon dispatch is enabled (production default OFF).
+	// Keyed by dir; stopQueueDrainLoop (reload teardown) waits for a full
+	// exit + custody release; Shutdown reaches the loops via bgCtx.
+	drainLoopsMu sync.Mutex
+	drainLoops   map[string]*queueDrainLoop
+
+	// ocGenFn is the OPTIONAL OpenCode process-generation provider (a
+	// monotonic incarnation counter bumped on every observed spawn/respawn)
+	// — the restart-barrier input for certified redelivery classification.
+	// When nil, ocGeneration() falls back to the lifecycle's Generation()
+	// (SetOpenCodeLifecycle), and 0 (unknown) means the barrier can never
+	// certify (fail-closed). Set once by the daemon wiring (local-server /
+	// tests) before serving.
+	ocGenFn func() uint64
+
 	// queueReconcileInFlight is a sync.Map keyed by storeKey(root,sid) that
 	// holds a per-session in-flight guard for message-id reconciliation. The
 	// guard is the LoadOrStore(sentinel)+Delete-on-completion idiom (sync.Map
@@ -497,6 +522,28 @@ func (s *Server) SetExternalOpenCode(external bool) { s.externalOC = external }
 // through the Lifecycle's own internal locking.
 func (s *Server) SetOpenCodeLifecycle(l *oclife.Lifecycle) { s.ocLifecycle.Store(l) }
 
+// SetOpenCodeGenerationFn installs the OpenCode process-generation provider
+// (a monotonic incarnation counter bumped on every observed spawn/respawn)
+// — the restart-barrier input for certified redelivery classification
+// (slice 2b phase 2). Optional: when unset, ocGeneration falls back to the
+// lifecycle's Generation(); with neither wired, the generation is unknown
+// (0) and the post-restart barrier can NEVER certify (fail-closed — an
+// unknown generation cannot prove a restart happened). Tests wire it to the
+// fixture's restart counter; the daemon wiring prefers the lifecycle.
+func (s *Server) SetOpenCodeGenerationFn(fn func() uint64) { s.ocGenFn = fn }
+
+// ocGeneration reports the current OpenCode process generation: the wired
+// provider if any, else the lifecycle's counter, else 0 (unknown).
+func (s *Server) ocGeneration() uint64 {
+	if fn := s.ocGenFn; fn != nil {
+		return fn()
+	}
+	if l := s.ocLifecycle.Load(); l != nil {
+		return l.Generation()
+	}
+	return 0
+}
+
 // SetRestartServer wires the daemon's vh-server-restart hook (re-exec, or exit
 // for a supervisor to relaunch). Optional.
 func (s *Server) SetRestartServer(fn func()) { s.restartServer = fn }
@@ -610,6 +657,8 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		watcherOn:               map[string]bool{},
 		watcherCancel:           map[string]context.CancelFunc{},
 		queueGCOn:               map[string]bool{},
+		sessionErrOn:            map[string]bool{},
+		drainLoops:              map[string]*queueDrainLoop{},
 		pinsGCOn:                map[string]bool{},
 		labelsGCOn:              map[string]bool{},
 		bgCtx:                   bgCtx,
@@ -785,6 +834,13 @@ func (s *Server) SetArchiveRetryConfig(budget int, base, max time.Duration) {
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.bgCancel() // idempotent; never reassigned after NewServer
 	s.stopAllPermissionWatchers()
+	// Stop the per-dir drain loops (slice 2b phase 2) BEFORE the aggregator
+	// teardown: bgCancel already signalled them, and stopQueueDrainLoop only
+	// WAITS for the exit (the loops' own aggregator lookups take aggMu, so
+	// waiting must happen outside stopServerOwnedAggregators' aggMu hold —
+	// this is that outside point). Non-default loops also retire their
+	// lifecycleWG entries, which the wait below awaits.
+	s.stopAllQueueDrainLoops()
 	s.stopServerOwnedAggregators()
 	waitDone := make(chan struct{})
 	go func() {
@@ -819,6 +875,22 @@ func (s *Server) stopAllPermissionWatchers() {
 	s.watcherMu.Unlock()
 }
 
+// stopAllQueueDrainLoops signals every registered drain loop to stop and
+// waits for each to exit + release custody. Shutdown-only (reload uses the
+// per-dir stopQueueDrainLoop). Safe on an empty registry.
+func (s *Server) stopAllQueueDrainLoops() {
+	s.drainLoopsMu.Lock()
+	loops := make([]*queueDrainLoop, 0, len(s.drainLoops))
+	for dir, l := range s.drainLoops {
+		loops = append(loops, l)
+		delete(s.drainLoops, dir)
+	}
+	s.drainLoopsMu.Unlock()
+	for _, l := range loops {
+		<-l.done
+	}
+}
+
 // stopServerOwnedAggregators stops every NON-DEFAULT aggregator the Server
 // created lazily via aggFor, mirroring handleReloadProject's per-dir teardown
 // (stop + delete + reset queueGCOn/pinsGCOn) applied to all server-owned
@@ -844,6 +916,9 @@ func (s *Server) stopServerOwnedAggregators() {
 		s.queueGCMu.Lock()
 		delete(s.queueGCOn, dir)
 		s.queueGCMu.Unlock()
+		s.sessionErrMu.Lock()
+		delete(s.sessionErrOn, dir)
+		s.sessionErrMu.Unlock()
 		s.pinsGCMu.Lock()
 		delete(s.pinsGCOn, dir)
 		s.pinsGCMu.Unlock()
@@ -870,8 +945,10 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 		}
 		s.ensurePermissionWatcher("", s.agg)
 		s.installQueueGCCleanup("", s.agg)
+		s.installQueueSessionErrorSignal("", s.agg)
 		s.installPinsLifecycle("", s.agg)
 		s.installLabelsLifecycle("", s.agg)
+		s.maybeStartQueueDrainLoop("")
 		return s.agg
 	}
 	s.aggMu.Lock()
@@ -909,8 +986,10 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	}
 	s.ensurePermissionWatcher(dir, a)
 	s.installQueueGCCleanup(dir, a)
+	s.installQueueSessionErrorSignal(dir, a)
 	s.installPinsLifecycle(dir, a)
 	s.installLabelsLifecycle(dir, a)
+	s.maybeStartQueueDrainLoop(dir)
 	// Run under the Server's background-task lifetime (bgCtx) so Shutdown cancels
 	// this per-directory aggregator's RunManaged child. RunManaged derives a
 	// cancellable CHILD of bgCtx and arms a.cancel internally, so cancelling that
@@ -1631,17 +1710,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/diag/invariants", s.handleDiagInvariants)
 	mux.HandleFunc("/vh/skill/emit", s.handleSkillEmit)
 	mux.HandleFunc("/vh/version", func(w http.ResponseWriter, r *http.Request) {
-		// Capability advert (send-net-resilience slice 1): queueSchemaVersion
+		// Capability advert (send-net-resilience slice 1; slice 2b phase 2
+		// made daemonDispatchCapable RUNTIME-reflective): queueSchemaVersion
 		// is the on-disk queue.json schema this binary writes/understands;
 		// daemonDispatchCapable advertises daemon-owned dispatch custody —
-		// OFF until the custody slices ship (design "Migration Path": the
-		// flag lets clients feature-detect on the EXISTING version endpoint
-		// rather than a parallel mechanism). Additive keys: existing consumers
-		// read "version" only.
+		// the LIVE value of the --daemon-dispatch opt-in (default OFF) — so
+		// clients feature-detect the daemon-dispatch era on the EXISTING
+		// version endpoint rather than a parallel mechanism. Additive keys:
+		// existing consumers read "version" only.
 		writeJSONResp(w, map[string]any{
 			"version":               s.version(),
 			"queueSchemaVersion":    queueSchemaVersion,
-			"daemonDispatchCapable": daemonDispatchCapable,
+			"daemonDispatchCapable": DaemonDispatchEnabled(),
 		})
 	})
 	mux.HandleFunc("/vh/snapshot", s.handleSnapshot)

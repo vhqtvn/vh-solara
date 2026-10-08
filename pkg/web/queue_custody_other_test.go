@@ -22,18 +22,26 @@ import (
 
 // TestNonLinuxCustodyFailClosed: acquisition refuses with
 // errQueueCustodyUnsupported BEFORE any filesystem effect — no lock file, no
-// generation authority. The legacy browser-dispatch path remains the only
+// generation authority, and (tier1_b-F1, slice 2b phase 2) not even the
+// .vh-solara DIRECTORY the pre-lock MkdirAll used to create before the
+// platform stub refused. The legacy browser-dispatch path remains the only
 // dispatch path on these platforms.
 func TestNonLinuxCustodyFailClosed(t *testing.T) {
 	root := custodyTestRoot(t) // arms the test hook; acquisition must STILL refuse
 	if _, err := AcquireQueueCustody(root); !errors.Is(err, errQueueCustodyUnsupported) {
 		t.Fatalf("non-Linux acquire err = %v, want errQueueCustodyUnsupported (fail-closed stub)", err)
 	}
-	// Fail-closed means fail-BEFORE-effects: neither custody artifact exists.
+	// Fail-closed means fail-BEFORE-effects: neither custody artifact exists...
 	for _, name := range []string{custodyLockFileRel, custodyGenFileRel} {
 		if _, err := os.Stat(filepath.Join(root, ".vh-solara", name)); !os.IsNotExist(err) {
 			t.Fatalf("non-Linux acquire created %s (%v) — the stub must not touch the FS", name, err)
 		}
+	}
+	// ...and the runtime directory itself was never created (tier1_b-F1:
+	// the platform gate runs BEFORE the MkdirAll in AcquireQueueCustody —
+	// an empty .vh-solara/ left behind is still a filesystem effect).
+	if _, err := os.Stat(filepath.Join(root, ".vh-solara")); !os.IsNotExist(err) {
+		t.Fatalf("non-Linux acquire created the .vh-solara directory (%v) — refusal must precede ALL filesystem effects", err)
 	}
 	// The raw platform stub agrees (documented skip-with-proof shape: on this
 	// host we can and do execute the stub directly).

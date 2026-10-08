@@ -32,6 +32,7 @@ var (
 	localCORSOrigins      []string
 	localFrameAncestors   []string
 	localExternalManaged  bool
+	localDaemonDispatch   bool
 	localAuth             authFlags
 )
 
@@ -221,6 +222,21 @@ with --opencode-url, or spawn a survivable detached instance with
 		setOpenCodeRunningVersion(opencodeCurrentVersion(context.Background(), localOpenCodeBin, cwd))
 
 		agg := aggregator.New(opencodeURL, vhEventRingCapacity)
+		// Daemon queue dispatch (send-net-resilience slice 2b phase 2): the
+		// explicit opt-in that makes this daemon take exclusive custody of queue
+		// dispatch behind the flock fence (production default OFF — the legacy
+		// browser claim/POST/resolve path stays the default). Must be set
+		// BEFORE the first project is opened (aggFor starts the per-project
+		// drain loop at project-open time) and before /vh/version is first
+		// served (the capability advert reads the live value).
+		if localDaemonDispatch {
+			if external {
+				log.Printf("local-server: --daemon-dispatch ignored in --opencode-url (external) mode: the queue-custody fence is available but the restart causality barrier is NOT certified for an externally-managed OpenCode — dispatch stays browser-owned. Re-run without --opencode-url to use daemon dispatch.")
+			} else {
+				web.SetDaemonDispatchEnabled(true)
+				log.Printf("local-server: daemon queue dispatch ENABLED (custody-fenced; /vh/version advertises daemonDispatchCapable=true)")
+			}
+		}
 		srv, err := web.NewServer(agg, opencodeURL, vhEventRingCapacity)
 		if err != nil {
 			log.Fatalf("Failed to build vh web server: %v", err)
@@ -527,6 +543,7 @@ func init() {
 	localServerCmd.Flags().StringArrayVar(&localCORSOrigins, "cors-origin", nil, "Allowed cross-origin caller (repeatable; or * to allow any)")
 	localServerCmd.Flags().StringArrayVar(&localFrameAncestors, "frame-ancestors", nil, "Allowed CSP frame-ancestors for cross-origin <iframe> embedding (repeatable; e.g. 'self' https://app.my-root-domain). Default 'self'; the list REPLACES the default, so include 'self' if the app's own iframes (e.g. the code viewer) must still work")
 	localServerCmd.Flags().BoolVar(&localExternalManaged, "external-managed", false, "Run under a supervisor; on a 'restart server' request exit cleanly instead of re-exec'ing")
+	localServerCmd.Flags().BoolVar(&localDaemonDispatch, "daemon-dispatch", false, "EXPERIMENTAL (send-net-resilience 2b): the daemon takes exclusive custody-fenced ownership of queue dispatch (certified auto-recovery). Default off: the browser stays the dispatcher. Refuses (no-op) in --opencode-url external mode")
 	registerAuthFlags(localServerCmd, &localAuth)
 	rootCmd.AddCommand(localServerCmd)
 }

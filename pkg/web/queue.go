@@ -113,17 +113,30 @@ type QueueSendConfig struct {
 //     PRESERVED (load failure never triggers a rewrite).
 const queueSchemaVersion = 1
 
-// daemonDispatchCapable advertises whether this daemon takes exclusive custody
-// of queue dispatch (the send-net-resilience program's daemon-custody mode).
-// Slice 1 lays the schema/admission foundation only — browser-driven
-// claim/POST/resolve remains the sole dispatch path — so the flag ships OFF.
-// It is surfaced (with queueSchemaVersion) on the existing /vh/version
-// endpoint so clients can feature-detect without a parallel mechanism. Slice
-// 2+ flips this as part of the capability-gated migration (design.md
-// "Migration Path": daemon admission receipts and dispatch ship behind a
-// capability flag; old SPAs keep using claim/POST/resolve without
-// interference).
-const daemonDispatchCapable = false
+// daemonDispatchEnabled is the RUNTIME daemon-dispatch capability (slice 2b
+// phase 2): when true, this daemon takes exclusive custody of queue dispatch
+// (the drain loop, queue_drain_loop.go) behind the custody fence. The
+// PRODUCTION DEFAULT IS OFF (design.md "Migration Path": daemon dispatch
+// ships behind an explicit opt-in; the legacy browser claim/POST/resolve path
+// stays the default dispatcher). The opt-in surface is the daemon binary's
+// flag (cmd/local-server.go --daemon-dispatch), which calls
+// SetDaemonDispatchEnabled(true) before serving; /vh/version advertises the
+// live value as "daemonDispatchCapable" so clients feature-detect on the
+// EXISTING version endpoint, and queueCustodyAllowed() honors it alongside
+// the test hook. Backed by sync/atomic so the boot-time write and any later
+// read never race under `go test -race`.
+var daemonDispatchEnabled atomic.Bool
+
+// SetDaemonDispatchEnabled turns the daemon-dispatch capability on/off. This
+// is the PRODUCTION opt-in surface (the local-server flag), not a test hook —
+// but tests reuse it because it is exactly the runtime switch the flag flips.
+// Callers SHOULD defer-restore when testing (SetDaemonDispatchEnabled(false)).
+func SetDaemonDispatchEnabled(v bool) { daemonDispatchEnabled.Store(v) }
+
+// DaemonDispatchEnabled reports the live daemon-dispatch capability: what
+// /vh/version advertises as "daemonDispatchCapable" and what gates custody
+// acquisition (via queueCustodyAllowed) and drain-loop startup.
+func DaemonDispatchEnabled() bool { return daemonDispatchEnabled.Load() }
 
 // QueueAttemptTransportClass classifies a dispatch attempt's transport outcome
 // (send-net-resilience design "Dispatch Ownership"). It is the certification
@@ -168,6 +181,19 @@ type QueueAttempt struct {
 	// representable as a JavaScript number — the FE mirror may treat it as a
 	// JSON number, never a BigInt.
 	Generation uint64 `json:"generation,omitempty"`
+	// OCGeneration is the OpenCode PROCESS generation (incarnation counter)
+	// observed when this attempt started — the restart-barrier input (slice
+	// 2b phase 2): if the current generation is HIGHER, OpenCode restarted
+	// since this attempt's POST, which (with a post-restart exact-ID GET 404
+	// and custodyBarrierCertified) certifies the POST never durably
+	// persisted (the projector pin: event-append and projection commit in
+	// ONE SQLite transaction; post-restart reads see committed transactions
+	// only). 0 = the generation was UNKNOWN at attempt start (no lifecycle
+	// wired — e.g. the fixture server without SetOpenCodeGenerationFn); a
+	// 0 here NEVER certifies a barrier (fail-closed: an unknown generation
+	// cannot prove a restart happened). omitempty for on-disk backward
+	// compatibility.
+	OCGeneration uint64 `json:"ocGeneration,omitempty"`
 	// StartedAt / EndedAt bracket the attempt (ms epoch).
 	StartedAt int64 `json:"startedAt,omitempty"`
 	EndedAt   int64 `json:"endedAt,omitempty"`
@@ -298,6 +324,58 @@ type QueueItem struct {
 	// a queue.json persisted before this field deserializes with
 	// RestartFenceAt==0 (unfenced — generic texts, pre-fence behavior).
 	RestartFenceAt int64 `json:"restartFenceAt,omitempty"`
+
+	// ClaimGeneration is the queue-custody fencing generation stamped when a
+	// CUSTODY claim (ClaimForCustody) moved this item pending → dispatching
+	// (slice 2b phase 2) — the per-item ERA MARKER that distinguishes
+	// custody-claimed items from legacy browser-claimed ones sharing the same
+	// queue.json. The certified-redelivery classifier keys off it: a
+	// stale/unknown item with ClaimGeneration==0 was claimed by the LEGACY
+	// (unfenced, pre-cutover) path and is UNCERTIFIABLE (design.md: "Legacy
+	// unknown chips ... never auto-resent"), while ClaimGeneration!=0 proves
+	// this daemon's custody epoch owned the claim, so the journal's
+	// no-attempt / connect_failed evidence may certify redelivery. Stamped
+	// in the SAME atomic claim save as the state transition and the minted
+	// correlation id. omitempty for on-disk backward compatibility.
+	ClaimGeneration uint64 `json:"claimGeneration,omitempty"`
+
+	// RequeuePending marks a dispatching item as a CERTIFIED-REDELIVERY
+	// requeue awaiting its resume (slice 2b phase 2): the classifier (or a
+	// connect_failed receipt) requeued it for same-msgid redelivery and the
+	// drain loop has not yet consumed the requeue. Set by
+	// RequeueForCertifiedRedelivery in the same atomic save as the state
+	// transition; cleared by itemForResume when the resume begins — so the
+	// loop can distinguish "requeued, awaiting redelivery" from its OWN
+	// in-flight attempt (both are dispatching with a fresh
+	// DispatchStartedAt). omitempty for on-disk backward compatibility; a
+	// crash between requeue and resume leaves it set, and the resume is
+	// idempotent, so a rebooted loop simply completes it.
+	RequeuePending bool `json:"requeuePending,omitempty"`
+
+	// AmbiguousDelivery is the durable live-uncertain marker (slice 2b
+	// phase 2, the design's class 4): the item carries custody-journal
+	// attempt records, the exact-ID GET stayed negative, and NO certified
+	// redelivery class applies (the POST may have been written; OpenCode is
+	// alive; no restart barrier) — the message may or may not have arrived,
+	// and the item is NEVER auto-redelivered (debate-3 BLK-A2 / debate-4
+	// B1). The FE (slice 3) renders the ambiguous chip with the one-tap
+	// replacement-send affordance off this marker; until then it is a
+	// durable, operator-readable fact. Set at ambiguous terminalization;
+	// cleared by a certified requeue (the item re-enters dispatch) and by an
+	// exact-match → sent heal. omitempty for backward compatibility.
+	AmbiguousDelivery bool `json:"ambiguousDelivery,omitempty"`
+
+	// SessionError / SessionErrorAt record the LATEST session.error event
+	// observed on this item's session while the item sat in a
+	// delivery-uncertain state (slice 2b phase 2, the projector-pin
+	// posture): sst/opencode v1.17.18's prompt_async failure branch always
+	// publishes NamedError.Unknown with a human pretty-print (Cause.pretty),
+	// NOT a machine code — so the daemon records it as a DETAIL-LEVEL
+	// SIGNAL ONLY (never a state transition, never a redelivery
+	// authorization; the pin explicitly forbids over-relying on the text).
+	// omitempty for on-disk backward compatibility.
+	SessionError   string `json:"sessionError,omitempty"`
+	SessionErrorAt int64  `json:"sessionErrorAt,omitempty"`
 }
 
 // queueFile is the on-disk shape. Order is persisted so the monotonic commit
@@ -1250,14 +1328,17 @@ func (s *sessionQueueStore) Claim() (QueueItem, bool, error) {
 	if err := s.load(); err != nil {
 		return QueueItem{}, false, err
 	}
-	return s.claimOldestPendingLocked()
+	return s.claimOldestPendingLocked(0)
 }
 
 // claimOldestPendingLocked is the shared claim core behind the legacy Claim
 // and the custody-gated ClaimForCustody (the design's "prepared" transition).
 // Called under s.mu with the queue already loaded; byte-equivalent to the
-// pre-slice-2a inline Claim body.
-func (s *sessionQueueStore) claimOldestPendingLocked() (QueueItem, bool, error) {
+// pre-slice-2a inline Claim body. claimGen is the custody generation to stamp
+// as the item's ClaimGeneration era marker — 0 for the LEGACY claim (the
+// item stays uncertifiable for certified redelivery), the token's generation
+// for the custody claim.
+func (s *sessionQueueStore) claimOldestPendingLocked(claimGen uint64) (QueueItem, bool, error) {
 	for i := range s.items {
 		if s.items[i].State == QueuePending {
 			// Record the dispatch-start timestamp AND mint the OpenCode
@@ -1273,6 +1354,7 @@ func (s *sessionQueueStore) claimOldestPendingLocked() (QueueItem, bool, error) 
 			s.items[i].State = QueueDispatching
 			s.items[i].DispatchStartedAt = queueNow().UnixMilli()
 			s.items[i].OpencodeMsgID = opencode.MintMessageID()
+			s.items[i].ClaimGeneration = claimGen
 			if err := s.save(); err != nil {
 				// Roll back the state, timestamp, AND correlation id so the
 				// store stays consistent with disk (none were durably
@@ -1284,6 +1366,7 @@ func (s *sessionQueueStore) claimOldestPendingLocked() (QueueItem, bool, error) 
 				s.items[i].State = QueuePending
 				s.items[i].DispatchStartedAt = 0
 				s.items[i].OpencodeMsgID = ""
+				s.items[i].ClaimGeneration = 0
 				return QueueItem{}, false, err
 			}
 			item := s.items[i]

@@ -122,6 +122,16 @@ type FakeOpenCode struct {
 	// shipped binary or by existing fixtures/tests.
 	promptArrivals map[string]int
 
+	// promptArrivalIDs records the messageID body field of every prompt_async
+	// arrival, per session (TEST-ONLY, slice 2b phase 2). It makes the
+	// same-msgid contract of certified redelivery WIRE-observable: a
+	// post-restart-barrier redispatch must carry the ORIGINAL correlation
+	// id on its second POST, and this slice is the only witness (the queue
+	// item alone cannot prove which id each wire attempt carried). Guarded
+	// by f.mu, appended in the same critical section as promptArrivals so
+	// the two counters can never disagree. Never read by the shipped binary.
+	promptArrivalIDs map[string][]string
+
 	// messagesBeforeCount is an always-on atomic counter of backward-cursor
 	// message-list GETs (GET /session/:sid/message?before=...). Harmless to
 	// existing fixtures/tests (none read it); gives the OF1 oversized-floor
@@ -316,6 +326,15 @@ func New() *FakeOpenCode {
 		resetGen:       map[string]uint64{},
 		promptArrivals: map[string]int{},
 		mpRuns:         map[uint64]*mpWorkloadRun{},
+		// The BOOT incarnation is generation 1 (slice 2b phase 2): the
+		// restart-generation counter follows oclife.Lifecycle's convention
+		// (New → generation 1, every restart bumps) so a daemon wired to
+		// RestartGeneration() can stamp journaled attempts with a NON-ZERO
+		// generation — 0 is the "unknown generation" sentinel that can
+		// never certify the post-restart causality barrier (fail-closed).
+		// Additive and test-only; the SimulateRestart DELTA semantics the
+		// DelayedPersist mode relies on are unchanged.
+		restartGen: 1,
 	}
 	now := float64(time.Now().UnixMilli())
 	f.sessions = []map[string]any{
@@ -1166,6 +1185,28 @@ func (f *FakeOpenCode) PromptArrivals(sessionID string) int {
 	return f.promptArrivals[sessionID]
 }
 
+// RestartGeneration returns the whole-fake restart generation — the
+// incarnation counter SimulateRestart bumps (TEST-ONLY observability, slice
+// 2b phase 2). The e2e custody tests wire the worker web server's
+// OpenCode-generation provider to this counter so the daemon-side
+// post-restart barrier classification observes simulated restarts exactly
+// as it observes real lifecycle generations in production. Reads existing
+// state under f.mu; no behavior change.
+func (f *FakeOpenCode) RestartGeneration() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.restartGen
+}
+
+// PromptArrivalMessageIDs returns the messageID of every prompt_async
+// arrival for sessionID, in arrival order (TEST-ONLY observability; see
+// promptArrivalIDs). Mirrors the f.mu-guarded read pattern of PromptArrivals.
+func (f *FakeOpenCode) PromptArrivalMessageIDs(sessionID string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.promptArrivalIDs[sessionID]...)
+}
+
 // EmitSessionBusy emits a LIVE session.status busy for sessionID through the
 // fake's real /event stream (the authoritative new-turn path the reducer's
 // NormSessionStatus arm consumes → markTurnRunningLocked → TurnRunning).
@@ -1852,6 +1893,10 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 		messageID := promptMessageID(body)
 		f.mu.Lock()
 		f.promptArrivals[id]++ // test-only observability (see promptArrivals doc)
+		if f.promptArrivalIDs == nil {
+			f.promptArrivalIDs = map[string][]string{}
+		}
+		f.promptArrivalIDs[id] = append(f.promptArrivalIDs[id], messageID) // test-only (see promptArrivalIDs doc)
 		mode := f.promptAsyncMode
 		// Slice-2a DelayedPersist capture: the delay and restart generation are
 		// read in the SAME critical section as the mode so the deferred commit's

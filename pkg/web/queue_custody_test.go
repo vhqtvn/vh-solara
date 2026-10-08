@@ -123,7 +123,7 @@ func TestQueueCustodyStaleGenerationRejected(t *testing.T) {
 	if _, _, err := s.ClaimForCustody(a); !errors.Is(err, errQueueFenced) {
 		t.Fatalf("stale ClaimForCustody err = %v, want errQueueFenced", err)
 	}
-	if _, err := s.BeginDispatchAttempt(a, "q_nope"); !errors.Is(err, errQueueFenced) {
+	if _, err := s.BeginDispatchAttempt(a, "q_nope", 0); !errors.Is(err, errQueueFenced) {
 		t.Fatalf("stale BeginDispatchAttempt err = %v, want errQueueFenced", err)
 	}
 	if err := s.RecordAttemptOutcome(a, "q_nope", 0, QueueAttemptAccepted2xx, ""); !errors.Is(err, errQueueFenced) {
@@ -134,7 +134,7 @@ func TestQueueCustodyStaleGenerationRejected(t *testing.T) {
 	// claim, the poster is never invoked, and the still-pending item is
 	// untouched on disk (no journal was opened by the stale owner).
 	posterCalled := false
-	outcome, err := RunQueuedDispatchAttempt(context.Background(), s, "s1", a, func(context.Context, string, json.RawMessage) error {
+	outcome, err := RunQueuedDispatchAttempt(context.Background(), s, "s1", a, 0, func(context.Context, string, json.RawMessage) error {
 		posterCalled = true
 		return nil
 	})
@@ -166,7 +166,7 @@ func TestQueueCustodyStaleGenerationRejected(t *testing.T) {
 	if err != nil || !won {
 		t.Fatalf("B claim: err=%v won=%v", err, won)
 	}
-	idx, err := s.BeginDispatchAttempt(b, item.ID)
+	idx, err := s.BeginDispatchAttempt(b, item.ID, 0)
 	if err != nil {
 		t.Fatalf("B begin attempt: %v", err)
 	}
@@ -510,7 +510,7 @@ func TestQueueCustodyReleasedTokenExecutorNeverPosts(t *testing.T) {
 	if err != nil || !won {
 		t.Fatalf("claim: err=%v won=%v", err, won)
 	}
-	if _, err := s.BeginDispatchAttempt(tok, item.ID); err != nil {
+	if _, err := s.BeginDispatchAttempt(tok, item.ID, 0); err != nil {
 		t.Fatalf("begin attempt: %v", err)
 	}
 
@@ -531,7 +531,7 @@ func TestQueueCustodyReleasedTokenExecutorNeverPosts(t *testing.T) {
 	// must be rejected outright — the poster is unreachable — even though a
 	// pending item exists to claim, and NOTHING may land on disk.
 	posterCalled := false
-	outcome, err := RunQueuedDispatchAttempt(context.Background(), s, "s1", tok, func(context.Context, string, json.RawMessage) error {
+	outcome, err := RunQueuedDispatchAttempt(context.Background(), s, "s1", tok, 0, func(context.Context, string, json.RawMessage) error {
 		posterCalled = true
 		return nil
 	})
@@ -588,7 +588,7 @@ func TestQueueCustodyRecordOutcomeSaveFailureRollsBackReceipt(t *testing.T) {
 	if err != nil || !won {
 		t.Fatalf("claim: err=%v won=%v", err, won)
 	}
-	idx, err := s.BeginDispatchAttempt(tok, item.ID)
+	idx, err := s.BeginDispatchAttempt(tok, item.ID, 0)
 	if err != nil {
 		t.Fatalf("begin attempt: %v", err)
 	}
@@ -706,7 +706,7 @@ func TestQueueCustodyReleasedOwnerTakeoverInterleave(t *testing.T) {
 	if err != nil || !won {
 		t.Fatalf("A claim: err=%v won=%v", err, won)
 	}
-	if _, err := s.BeginDispatchAttempt(a, item.ID); err != nil {
+	if _, err := s.BeginDispatchAttempt(a, item.ID, 0); err != nil {
 		t.Fatalf("A begin attempt: %v", err)
 	}
 
@@ -731,7 +731,7 @@ func TestQueueCustodyReleasedOwnerTakeoverInterleave(t *testing.T) {
 	// A's executor attempts with a pending item available (pre-fix, A's
 	// token was still fence-valid: it would have claimed and POSTed).
 	posterCalled := false
-	outcome, err := RunQueuedDispatchAttempt(context.Background(), s, "s1", a, func(context.Context, string, json.RawMessage) error {
+	outcome, err := RunQueuedDispatchAttempt(context.Background(), s, "s1", a, 0, func(context.Context, string, json.RawMessage) error {
 		posterCalled = true
 		return nil
 	})
