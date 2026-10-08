@@ -18,6 +18,15 @@ package web
 // info.id===minted, Resolve()s the item to `sent` automatically. This closes
 // the delivered-but-stuck case without EVER re-dispatching.
 //
+// SLICE 2A (send-net-resilience): the reconciler is also the CLASSIFIER for
+// custody-journaled items — those with attempt records (queue_drain.go).
+// Exact-ID GET classifies them into `observed` (found → Resolve sent, the
+// existing path) or ambiguous-wait (not found: bump within the SAME bounded
+// budget, then terminal with a journal-aware detail — see
+// journalAwareTerminalDetail — that claims NO restart causality barrier).
+// It stays strictly passive: no auto-redelivery of ANY class in this slice
+// (the certified classes land in 2b, only after the crash proofs).
+//
 // DESIGN DISCIPLINE (invariants — regression = hard fail):
 //  1. No re-dispatch: the reconciler NEVER invokes prompt_async. It only READs
 //     (GET) and Resolve()s (a terminal-state transition, never repend).
@@ -363,17 +372,51 @@ func (s *sessionQueueStore) bumpReconcileAttempt(id string, genericDetailFmt, re
 		terminal := s.items[i].ReconcileAttempts >= reconcileMaxAttempts
 		if terminal {
 			s.items[i].ReconcileTerminal = true
-			detailFmt := genericDetailFmt
-			if s.items[i].RestartFenceAt != 0 {
-				detailFmt = restartDetailFmt
+			switch {
+			case s.items[i].RestartFenceAt != 0:
+				s.items[i].Detail = fmt.Sprintf(restartDetailFmt, s.items[i].ReconcileAttempts)
+			case len(s.items[i].Attempts) > 0:
+				// Journal-aware ambiguous-wait terminalization (slice 2a):
+				// the item carries custody-journal attempt records, so the
+				// operator detail reports exactly what the journal last
+				// recorded instead of the generic text — and states
+				// explicitly that NO restart causality barrier is claimed
+				// (that barrier is certified only inside the slice-2b
+				// matrix, only for certified transport classes). Fail-closed
+				// semantics unchanged: terminal, NEVER resend.
+				s.items[i].Detail = journalAwareTerminalDetail(s.items[i], s.items[i].ReconcileAttempts)
+			default:
+				s.items[i].Detail = fmt.Sprintf(genericDetailFmt, s.items[i].ReconcileAttempts)
 			}
-			s.items[i].Detail = fmt.Sprintf(detailFmt, s.items[i].ReconcileAttempts)
 		}
 		if err := s.save(); err != nil {
 			s.items[i] = pre
 		}
 		return
 	}
+}
+
+// journalAwareTerminalDetail builds the terminal detail for an item that
+// carries custody-journal attempt records (slice 2a's journal-aware
+// ambiguous-wait classification): the exact-ID GET stayed negative past the
+// budget, and the journal is the best evidence of what happened on the wire.
+// It reports the last attempt's state — an OPEN attempt means the dispatch
+// writer died (or was fenced) mid-POST and never recorded a receipt, so
+// whether the prompt reached OpenCode is unknowable from the journal alone;
+// a classified attempt reports its transport class. It explicitly claims NO
+// restart causality barrier (slice-2b matrix only). Fail-closed: the item is
+// terminal, never resent.
+func journalAwareTerminalDetail(it QueueItem, attempts int) string {
+	if n := len(it.Attempts); n > 0 {
+		last := it.Attempts[n-1]
+		if last.TransportClass == "" {
+			return fmt.Sprintf("Reconcile terminal: no record of this message after %d attempt(s). The dispatch journal shows an attempt that started but never recorded an outcome (its writer crashed or was fenced mid-dispatch) — whether the prompt reached OpenCode cannot be determined from the journal. No restart causality barrier applies; manual review advised.", attempts)
+		}
+		return fmt.Sprintf("Reconcile terminal: no matching record after %d attempt(s). The dispatch journal's last attempt recorded transport class %q. No restart causality barrier applies; manual review advised.", attempts, last.TransportClass)
+	}
+	// Unreachable from bumpReconcileAttempt (guarded by len(Attempts) > 0);
+	// defensive fallback to the generic transient text.
+	return fmt.Sprintf(reconcileTerminalTransientDetailFmt, attempts)
 }
 
 // markReconcileTerminal immediately marks an item ReconcileTerminal with the

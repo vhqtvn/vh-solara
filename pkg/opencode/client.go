@@ -509,6 +509,25 @@ func (c *Client) MessagesTail(ctx context.Context, sessionID string, limit int) 
 	return out, resp.Header.Get("X-Next-Cursor"), nil
 }
 
+// ListRecentMessages returns the most recent `limit` messages of a session as
+// raw JSON objects (chronological order within the page — see MessagesTail
+// for the ordering contract). A convenience reader over MessagesTail that
+// discards the paging cursor.
+//
+// CAUTION-GATE (send-net-resilience slice 2a): this reader exists for the
+// FUTURE suppression watermark (the design addendum's Q4a consumer-safety
+// net: a transcript-level "what did OpenCode actually persist" view used to
+// SUPPRESS duplicate user sends) — and for nothing else. It MUST NOT be used
+// as a delivery oracle: a message's presence here is evidence, but its
+// ABSENCE is NOT proof of non-delivery (the listing may race an in-flight
+// async persist; the exact-ID GET / Message() is the only authoritative
+// per-message check the reconciler relies on). No production caller yet;
+// wired up with the drain-loop slice.
+func (c *Client) ListRecentMessages(ctx context.Context, sessionID string, limit int) ([]json.RawMessage, error) {
+	msgs, _, err := c.MessagesTail(ctx, sessionID, limit)
+	return msgs, err
+}
+
 // EncodeMessageCursor builds an opencode backward-paging cursor token for the
 // (id, time_created) tuple: base64url(JSON({"id":id,"time":timeMs})), keys id
 // then time, UNPADDED. This is the ?before=<token> value the

@@ -79,6 +79,20 @@ type FakeOpenCode struct {
 	promptAsyncMode PromptAsyncMode   // test-only; default PromptAsyncNormal (see PromptAsyncMode doc)
 	createMode      CreateMode        // test-only; default CreateNormal (see CreateMode doc)
 
+	// --- send-net-resilience slice-2a additions (strictly additive) ---
+	//
+	// promptPersistDelay is the DelayedPersist commit delay (TEST-ONLY; zero =
+	// no delay). Guarded by f.mu; see SetPromptAsyncPersistDelay.
+	promptPersistDelay time.Duration
+	// restartGen is the whole-fake restart generation, bumped by
+	// SimulateRestart (TEST-ONLY). A DelayedPersist arrival captures the
+	// generation active when it arrived; the deferred commit executes ONLY IF
+	// the generation is unchanged — a simulated restart between arrival and
+	// commit discards the pending commit exactly like a real process restart
+	// discards an un-flushed write-ahead log entry (committed messages
+	// survive). Guarded by f.mu.
+	restartGen uint64
+
 	// --- test-only exact-GET seam for the reconcile in-flight-guard e2e test ---
 	//
 	// Off by default: reconcileGetBlock == nil means the exact message-GET
@@ -246,6 +260,17 @@ const (
 	// message — the clean-rejection path (OpenCode never received the prompt).
 	// Defined for completeness/future tests; not exercised by the recovery slice.
 	PromptAsyncRejectBeforeCommit
+	// PromptAsyncDelayedPersist returns 204 IMMEDIATELY but persists the user
+	// message only after a test-controlled delay (SetPromptAsyncPersistDelay).
+	// This models REAL prompt_async semantics faithfully — persistence is async
+	// to the 204 (Effect.forkIn) — making the "2xx received, nothing persisted
+	// YET" window observable: an exact-ID GET 404s before the delay elapses and
+	// 200s after (the send-net-resilience slice-2a reconciler window). Combined
+	// with SimulateRestart before the delay elapses, it models the
+	// post-restart-404 topology: the in-flight delayed commit VANISHES (the
+	// restart's write-ahead never included it) while already-committed messages
+	// survive.
+	PromptAsyncDelayedPersist
 )
 
 // CreateMode selects how the fake's POST /session (create) handler responds
@@ -906,6 +931,42 @@ func (f *FakeOpenCode) PromptAsyncModeNow() PromptAsyncMode {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.promptAsyncMode
+}
+
+// SetPromptAsyncPersistDelay sets the DelayedPersist commit delay (TEST-ONLY).
+// Zero (the default) means PromptAsyncDelayedPersist commits as fast as the
+// goroutine can run — set a real delay to open the observable 404→200 window.
+// The fixture is concurrent, so the delay is mutex-guarded; the delay is
+// CAPTURED at arrival time (under the same f.mu hold as the mode read), so a
+// later Set does not race an in-flight deferred commit's sleep.
+func (f *FakeOpenCode) SetPromptAsyncPersistDelay(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.promptPersistDelay = d
+}
+
+// SimulateRestart models an OpenCode process restart (TEST-ONLY): it bumps
+// the whole-fake restart generation and clears every session's busy marker
+// (a restarted OpenCode comes back idle). Effects, by design:
+//
+//   - COMMITTED user messages survive (they are the durable store);
+//   - in-flight DelayedPersist commits VANISH — the deferred commit checks
+//     the generation it captured at arrival and no-ops if a restart
+//     intervened (the un-flushed write-ahead-log-entry model), so the exact-ID
+//     GET 404s forever for that id;
+//   - nothing else is cleared: sessions, messages, and counters keep their
+//     identities across the restart (the fake has no separate "cold store"
+//     to wipe; the vanish semantics above are the only restart effect the
+//     slice-2a tests rely on).
+//
+// This is the post-restart-404 scenario hook: prompt_async already answered
+// 204, the crash happens before the async persist commits, and after the
+// restart the correlation id provably maps to nothing.
+func (f *FakeOpenCode) SimulateRestart() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.restartGen++
+	f.busy = map[string]string{}
 }
 
 // SetCreateMode arms the create-hold mode consumed by the NEXT POST /session
@@ -1792,6 +1853,11 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.promptArrivals[id]++ // test-only observability (see promptArrivals doc)
 		mode := f.promptAsyncMode
+		// Slice-2a DelayedPersist capture: the delay and restart generation are
+		// read in the SAME critical section as the mode so the deferred commit's
+		// behavior is fixed atomically at arrival time.
+		delay := f.promptPersistDelay
+		arrivalRestartGen := f.restartGen
 		f.mu.Unlock()
 		switch mode {
 		case PromptAsyncCommitThenDropResponse:
@@ -1807,6 +1873,25 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 			// Clean rejection: NO user message persisted (OpenCode never
 			// received the prompt). Not exercised by the recovery slice.
 			http.Error(w, "fixture: rejected before commit", http.StatusBadGateway)
+			return
+		case PromptAsyncDelayedPersist:
+			// Faithful-to-real-async-persist path: answer 204 NOW, commit the
+			// user message LATER (after the captured delay). A SimulateRestart
+			// before the delay elapses discards the pending commit (the
+			// generation check below) — the post-restart-404 topology. The
+			// commit itself goes through commitUserMessage so the caller-id-wins
+			// correlation id contract is identical to every other mode.
+			go func() {
+				time.Sleep(delay)
+				f.mu.Lock()
+				cur := f.restartGen
+				f.mu.Unlock()
+				if cur != arrivalRestartGen {
+					return // restarted before commit: the write-ahead entry vanishes
+				}
+				f.commitUserMessage(id, text, messageID)
+			}()
+			w.WriteHeader(http.StatusNoContent)
 			return
 		default:
 			// PromptAsyncNormal: the faithful path.

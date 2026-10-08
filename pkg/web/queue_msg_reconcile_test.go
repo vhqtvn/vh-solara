@@ -22,6 +22,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -580,5 +582,180 @@ func TestReconcile_Unfenced404KeepsGenericDetail(t *testing.T) {
 	want := fmt.Sprintf(reconcileTerminal404DetailFmt, reconcileMaxAttempts)
 	if got.Detail != want {
 		t.Fatalf("unfenced terminal detail = %q,\nwant exact GENERIC text: %q", got.Detail, want)
+	}
+}
+
+// --- journal-aware reconciler branch (slice 2a; gate-review T1B coverage
+// gap: bumpReconcileAttempt's len(Attempts) > 0 path and
+// journalAwareTerminalDetail's output shapes had ZERO tests) ---
+
+// TestQueueMsgReconcile_JournalAwareTerminalDetailShapes pins the PURE
+// function's two output shapes directly:
+//   - OPEN last attempt (empty TransportClass) — the dispatch writer died or
+//     was fenced mid-POST and never recorded a receipt; whether the prompt
+//     reached OpenCode is declared UNKNOWABLE from the journal;
+//   - CLASSIFIED last attempt — the journal's own transport class is
+//     reported verbatim;
+//   - the defensive zero-attempts fallback (unreachable from
+//     bumpReconcileAttempt's guard) degrades to the generic transient text.
+//
+// Both real shapes must carry the no-restart-causality-barrier disclaimer
+// (the barrier is certified only inside the slice-2b matrix).
+func TestQueueMsgReconcile_JournalAwareTerminalDetailShapes(t *testing.T) {
+	open := journalAwareTerminalDetail(QueueItem{
+		Attempts: []QueueAttempt{{Generation: 7, StartedAt: 123}},
+	}, reconcileMaxAttempts)
+	if !strings.Contains(open, "never recorded an outcome") {
+		t.Fatalf("open-attempt detail missing the never-recorded-an-outcome shape: %q", open)
+	}
+	if !strings.Contains(open, "No restart causality barrier applies") {
+		t.Fatalf("open-attempt detail missing the no-barrier disclaimer: %q", open)
+	}
+	if !strings.Contains(open, fmt.Sprintf("after %d attempt(s)", reconcileMaxAttempts)) {
+		t.Fatalf("open-attempt detail missing the attempt count: %q", open)
+	}
+	if strings.Contains(open, "transport class") {
+		t.Fatalf("open-attempt detail must not claim a transport class: %q", open)
+	}
+
+	cls := journalAwareTerminalDetail(QueueItem{
+		Attempts: []QueueAttempt{{Generation: 7, StartedAt: 123, EndedAt: 456, TransportClass: QueueAttemptWrittenUnknown}},
+	}, reconcileMaxAttempts)
+	if !strings.Contains(cls, fmt.Sprintf("transport class %q", QueueAttemptWrittenUnknown)) {
+		t.Fatalf("classified-attempt detail missing the journal's transport class: %q", cls)
+	}
+	if !strings.Contains(cls, "No restart causality barrier applies") {
+		t.Fatalf("classified-attempt detail missing the no-barrier disclaimer: %q", cls)
+	}
+	if strings.Contains(cls, "never recorded an outcome") {
+		t.Fatalf("classified-attempt detail must not use the open-attempt shape: %q", cls)
+	}
+
+	// Defensive fallback (bumpReconcileAttempt guards len(Attempts) > 0, so
+	// this branch is unreachable from production; pin that it degrades to
+	// the generic transient text rather than panicking or inventing a
+	// journal claim).
+	fb := journalAwareTerminalDetail(QueueItem{}, reconcileMaxAttempts)
+	if want := fmt.Sprintf(reconcileTerminalTransientDetailFmt, reconcileMaxAttempts); fb != want {
+		t.Fatalf("zero-attempts fallback = %q, want the generic transient text %q", fb, want)
+	}
+}
+
+// newJournalBearingUnknownStore builds the production shape a custody-
+// journaled item presents to the reconciler: enqueue → custody claim (mints
+// the correlation id) → BeginDispatchAttempt (the write-ahead journal
+// record) → optionally RecordAttemptOutcome (a classified receipt) →
+// Resolve(unknown) — the stale-recovered ambiguous-wait state. classify==""
+// leaves the attempt OPEN (the crashed/fenced-writer shape). Linux-gated
+// (flock custody); the caller skips elsewhere.
+func newJournalBearingUnknownStore(t *testing.T, sid, text string, classify QueueAttemptTransportClass) (*sessionQueueStore, QueueItem) {
+	t.Helper()
+	root := custodyTestRoot(t)
+	s := &sessionQueueStore{path: queuePath(root, sid)}
+	tok, err := AcquireQueueCustody(root)
+	if err != nil {
+		t.Fatalf("acquire custody: %v", err)
+	}
+	defer tok.Release()
+	mustEnqueue(t, s, text)
+	claimed, won, err := s.ClaimForCustody(tok)
+	if err != nil || !won {
+		t.Fatalf("custody claim: err=%v won=%v", err, won)
+	}
+	idx, err := s.BeginDispatchAttempt(tok, claimed.ID)
+	if err != nil {
+		t.Fatalf("begin attempt: %v", err)
+	}
+	if classify != "" {
+		if err := s.RecordAttemptOutcome(tok, claimed.ID, idx, classify, "classified for test"); err != nil {
+			t.Fatalf("record outcome: %v", err)
+		}
+	}
+	if _, err := s.Resolve(claimed.ID, QueueUnknown, "stuck"); err != nil {
+		t.Fatalf("Resolve(unknown): %v", err)
+	}
+	return s, claimed
+}
+
+// TestQueueMsgReconcile_JournalBearingOpenAttemptTerminal drives
+// bumpReconcileAttempt's len(Attempts) > 0 branch end-to-end through the
+// REAL custody journal: an attempt-journaled item whose last attempt is OPEN
+// (writer died/fenced mid-dispatch, no receipt) exhausts the bounded budget
+// and terminalizes with the journal-aware OPEN-attempt detail — NOT the
+// generic 404 text — while staying fail-closed: state unknown, NEVER resent,
+// and no further lookups after terminalization.
+func TestQueueMsgReconcile_JournalBearingOpenAttemptTerminal(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("flock semantics — Linux only")
+	}
+	s, it := newJournalBearingUnknownStore(t, "s1", "journal-open", "")
+	r := newFakeResolver()
+	r.setErr("s1", it.OpencodeMsgID, opencode.ErrMessageNotFound)
+
+	t0 := time.Unix(1000000, 0)
+	for i := 0; i < 3; i++ {
+		s.reconcileMessageIDs("s1", r.lookup, t0.Add(time.Duration(i)*(reconcileThreshold+time.Second)))
+	}
+	got := mustListItem(t, s, it.ID)
+	if !got.ReconcileTerminal {
+		t.Fatalf("journal-bearing persistent 404 must terminalize")
+	}
+	if got.ReconcileAttempts != reconcileMaxAttempts {
+		t.Fatalf("ReconcileAttempts = %d, want %d (journal must not weaken the budget)", got.ReconcileAttempts, reconcileMaxAttempts)
+	}
+	if got.State != QueueUnknown {
+		t.Fatalf("terminal journal-bearing item must stay non-sent: got %q", got.State)
+	}
+	// The journal-aware OPEN shape, not the generic persistent-404 text.
+	if !strings.Contains(got.Detail, "never recorded an outcome") || !strings.Contains(got.Detail, "No restart causality barrier applies") {
+		t.Fatalf("terminal detail = %q, want the journal-aware open-attempt shape", got.Detail)
+	}
+	if want := fmt.Sprintf(reconcileTerminal404DetailFmt, reconcileMaxAttempts); got.Detail == want {
+		t.Fatalf("terminal detail is the GENERIC 404 text — the len(Attempts)>0 branch did not fire: %q", got.Detail)
+	}
+	// The journal evidence survives terminalization (the attempt is still OPEN).
+	if len(got.Attempts) != 1 || got.Attempts[0].TransportClass != "" {
+		t.Fatalf("journal after terminalization = %+v, want the one open attempt preserved", got.Attempts)
+	}
+	// NO RESEND: a 4th pass past the window makes no further lookup.
+	s.reconcileMessageIDs("s1", r.lookup, t0.Add(4*(reconcileThreshold+time.Second)))
+	if r.count() != 3 {
+		t.Fatalf("resolver calls after terminal = %d, want 3 (never resent, no endless lookups)", r.count())
+	}
+}
+
+// TestQueueMsgReconcile_JournalBearingClassifiedAttemptTerminal: the second
+// journal-aware shape — the last attempt carries a classified transport
+// receipt, so the terminal detail reports the journal's OWN class verbatim
+// (written_unknown), with the same fail-closed no-resend semantics.
+func TestQueueMsgReconcile_JournalBearingClassifiedAttemptTerminal(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("flock semantics — Linux only")
+	}
+	s, it := newJournalBearingUnknownStore(t, "s1", "journal-classified", QueueAttemptWrittenUnknown)
+	r := newFakeResolver()
+	r.setErr("s1", it.OpencodeMsgID, opencode.ErrMessageNotFound)
+
+	t0 := time.Unix(1000000, 0)
+	for i := 0; i < 3; i++ {
+		s.reconcileMessageIDs("s1", r.lookup, t0.Add(time.Duration(i)*(reconcileThreshold+time.Second)))
+	}
+	got := mustListItem(t, s, it.ID)
+	if !got.ReconcileTerminal {
+		t.Fatalf("journal-bearing classified item must terminalize")
+	}
+	if got.State != QueueUnknown {
+		t.Fatalf("terminal classified item must stay non-sent: got %q", got.State)
+	}
+	if !strings.Contains(got.Detail, fmt.Sprintf("transport class %q", QueueAttemptWrittenUnknown)) {
+		t.Fatalf("terminal detail = %q, want the journal's own transport class %q", got.Detail, QueueAttemptWrittenUnknown)
+	}
+	if strings.Contains(got.Detail, "never recorded an outcome") {
+		t.Fatalf("classified-attempt detail must not use the open-attempt shape: %q", got.Detail)
+	}
+	// NO RESEND: terminal stops the lookups.
+	s.reconcileMessageIDs("s1", r.lookup, t0.Add(4*(reconcileThreshold+time.Second)))
+	if r.count() != 3 {
+		t.Fatalf("resolver calls after terminal = %d, want 3 (never resent)", r.count())
 	}
 }

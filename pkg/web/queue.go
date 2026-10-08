@@ -146,20 +146,27 @@ const (
 	QueueAttemptAccepted2xx    QueueAttemptTransportClass = "accepted_2xx"
 )
 
-// QueueAttempt is ONE durable dispatch-attempt journal record (slice 1 ships
-// the FIELDS ONLY — the write-ahead journal writer is slice 2a; nothing in
-// this slice populates Attempts). Per the custody-fencing contract (debate-4
-// B3), every attempt carries the fencing generation it was made under so a
-// stale worker's writes can be rejected; timestamps bracket the attempt; the
-// transport class records the outcome certification basis. All fields
-// omitempty for legacy on-disk compatibility.
+// QueueAttempt is ONE durable dispatch-attempt journal record. Slice 1
+// shipped the fields; slice 2a is the WRITER (queue_drain.go — the custody
+// drain appends one record per attempt behind the queue-custody fence).
+// Per the custody-fencing contract (debate-4 B3), every attempt carries the
+// fencing generation it was made under so a stale worker's writes can be
+// rejected; timestamps bracket the attempt; the transport class records the
+// outcome certification basis. All fields omitempty for legacy on-disk
+// compatibility (a queue written by the legacy path has NO attempts key —
+// byte-equivalence when custody is disabled). An attempt's identity is its
+// index in the item's Attempts slice (the schema carries no per-attempt id;
+// generation+StartedAt identify it).
 type QueueAttempt struct {
 	// Generation is the queue-custody fencing generation the attempt was
 	// started under (see queueFile.FenceGeneration). Allocated monotonically
-	// by the custody owner (slice 2a). uint64 to unify with
-	// queueFile.FenceGeneration — the slice-2a fence check compares an
-	// attempt's generation against the store's, so the two must share
-	// width and signedness.
+	// by the custody owner (queue_custody.go — AcquireQueueCustody). uint64
+	// to unify with queueFile.FenceGeneration — the fence check compares an
+	// attempt's generation against the store's, so the two must share width
+	// and signedness. FE-MIRROR SAFETY: allocation ENFORCES a 2^53-1 cap
+	// (maxCustodyGeneration), so every persisted generation is exactly
+	// representable as a JavaScript number — the FE mirror may treat it as a
+	// JSON number, never a BigInt.
 	Generation uint64 `json:"generation,omitempty"`
 	// StartedAt / EndedAt bracket the attempt (ms epoch).
 	StartedAt int64 `json:"startedAt,omitempty"`
@@ -309,10 +316,13 @@ type QueueItem struct {
 // (written before versioning) deserialize as 0 = valid-old.
 //
 // FenceGeneration is the persisted queue-custody fencing generation
-// (custody-fencing contract, debate-4 B3). Slice 1 ships the FIELD only —
-// generation allocation/compare-and-fence is slice 2a; this binary neither
-// increments nor reads it. omitempty: a file written before the field (or by
-// this binary while custody is disabled, which is always in slice 1) omits it.
+// (custody-fencing contract, debate-4 B3). Slice 2a is the allocator +
+// compare-and-fence (queue_custody.go): every custody-mode save stamps the
+// owner's project generation here, and a loaded value HIGHER than a token's
+// generation fences that (stale) owner. The legacy path only round-trips it
+// (load/save) — a file written by a custody-capable binary keeps its
+// generation across legacy saves. omitempty: a file written before the field
+// (or by the legacy path from a never-custodied queue) omits it.
 type queueFile struct {
 	Version         int                              `json:"version,omitempty"`
 	Order           uint64                           `json:"order"`
@@ -404,10 +414,12 @@ type sessionQueueStore struct {
 	archived bool
 
 	// fenceGeneration mirrors queueFile.FenceGeneration (send-net-resilience
-	// slice 1 skeleton): the persisted queue-custody fencing generation. This
-	// slice only round-trips it (load/save) so a file written by a
+	// slice 2a): the persisted queue-custody fencing generation. The legacy
+	// path only round-trips it (load/save) so a file written by a
 	// custody-capable binary keeps its generation across this binary's
-	// saves; allocation and compare-and-fence land in slice 2a.
+	// saves; the custody path stamps the owner's generation in
+	// fenceGateLocked (queue_custody.go) and rejects a loaded value higher
+	// than the token's (a newer owner wrote this queue).
 	fenceGeneration uint64
 
 	// receipts is the durable admission-receipt log (send-reliability slice 1),
@@ -1224,6 +1236,11 @@ func (s *sessionQueueStore) Remove(id string) error {
 // it. This is the cross-client boundary: serialized by the mutex, exactly one
 // caller wins a given item. Returns (QueueItem{}, nil) when no pending item
 // exists.
+//
+// This is the LEGACY browser-facing claim — unfenced and unchanged
+// (send-net-resilience slice 2a: browser dispatch remains the production
+// path while daemonDispatchCapable is false). The custody-gated variant is
+// ClaimForCustody (queue_custody.go).
 func (s *sessionQueueStore) Claim() (QueueItem, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1233,6 +1250,14 @@ func (s *sessionQueueStore) Claim() (QueueItem, bool, error) {
 	if err := s.load(); err != nil {
 		return QueueItem{}, false, err
 	}
+	return s.claimOldestPendingLocked()
+}
+
+// claimOldestPendingLocked is the shared claim core behind the legacy Claim
+// and the custody-gated ClaimForCustody (the design's "prepared" transition).
+// Called under s.mu with the queue already loaded; byte-equivalent to the
+// pre-slice-2a inline Claim body.
+func (s *sessionQueueStore) claimOldestPendingLocked() (QueueItem, bool, error) {
 	for i := range s.items {
 		if s.items[i].State == QueuePending {
 			// Record the dispatch-start timestamp AND mint the OpenCode
