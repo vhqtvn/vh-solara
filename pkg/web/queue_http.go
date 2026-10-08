@@ -61,6 +61,23 @@ func writeQueueStoreErr(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusConflict, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_resolve_conflict"}))
 	case errors.Is(err, errQueueBadAttemptID):
 		writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+	case errors.Is(err, errQueueConflictingAdmissionIDs):
+		// Ambiguous client identity: both wire aliases present with different
+		// values. Machine-readable code mirrors the admission sentinels.
+		writeJSON(w, http.StatusBadRequest, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_admission_id_conflict"}))
+	case errors.Is(err, errQueueSchemaNewer):
+		// AMEND-A4 valid-newer: this binary cannot serve a queue.json written
+		// by a newer binary. The file was NOT touched (no reinterpretation, no
+		// rewrite); the code lets clients feature-detect the version conflict
+		// (the design's migration story surfaces "update required; queue
+		// remains server-held" rather than a silent generic failure).
+		writeJSON(w, http.StatusConflict, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_schema_newer"}))
+	case errors.Is(err, errQueueFileCorrupt):
+		// AMEND-A4 partial-corrupt: malformed/truncated on-disk JSON. Bytes
+		// preserved; machine-readable code distinguishes corruption from the
+		// newer-schema conflict above (status stays 500 — server-side data
+		// integrity the operator must investigate, never a client fix).
+		writeJSON(w, http.StatusInternalServerError, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_file_corrupt"}))
 	case errors.Is(err, errQueueArchived):
 		// 410 Gone: the session queue was archived away; the retained pointer
 		// the handler resolved via store() is now a tombstoned store (BLK-1).
@@ -104,7 +121,7 @@ func (s *Server) handleQueueList(w http.ResponseWriter, r *http.Request) {
 
 // POST /vh/session/{sessionId}/queue — enqueue. Body:
 //
-//	{text, attachments?, sendConfig?, originClientId?, attemptId?}
+//	{text, attachments?, sendConfig?, originClientId?, attemptId?, intentId?}
 //
 // The backend issues the id and monotonic order. originClientId is
 // diagnostics-only and never affects ordering/visibility/dispatch.
@@ -118,6 +135,15 @@ func (s *Server) handleQueueList(w http.ResponseWriter, r *http.Request) {
 // legacy non-idempotent behavior and always respond "replayed": false.
 // Receipt lifetime = session-queue lifetime; archive/cleanup ends the replay
 // guarantee (a post-cleanup replay is a fresh admission).
+//
+// intentId (OPTIONAL, send-net-resilience slice 1) is the design-canonical
+// alias for the SAME admission identity: identical dedupe/conflict/capacity
+// contract, but the admitted item echoes the id as "intentId" instead of
+// "attemptId". The receipt log dedupes by VALUE across aliases, so a replay
+// under either name returns the original receipt. Carrying BOTH names with
+// DIFFERENT values is an ambiguous identity → 400 (code
+// "queue_admission_id_conflict"); carrying both with the SAME value collapses
+// to the canonical intent field.
 func (s *Server) handleQueueEnqueue(w http.ResponseWriter, r *http.Request) {
 	sid, root, ok := s.resolveQueueCtx(w, r)
 	if !ok {
@@ -129,11 +155,29 @@ func (s *Server) handleQueueEnqueue(w http.ResponseWriter, r *http.Request) {
 		SendConfig     QueueSendConfig   `json:"sendConfig"`
 		OriginClientID string            `json:"originClientId"`
 		AttemptID      string            `json:"attemptId"`
+		IntentID       string            `json:"intentId"`
 	}
 	if !decodeBody(w, r, &body) {
 		return
 	}
-	item, replayed, err := s.queues.store(root, sid).EnqueueWithAttemptID(body.AttemptID, body.Text, body.Attachments, body.SendConfig, body.OriginClientID)
+	// Alias resolution: intentId (canonical) / attemptId (legacy) are the same
+	// admission identity. Both present with different values is ambiguous →
+	// surface errQueueConflictingAdmissionIDs (400, code
+	// "queue_admission_id_conflict"); both present with the same value
+	// collapses to the canonical intent field (the store layer enforces the
+	// same rule defensively for direct callers).
+	if body.IntentID != "" && body.AttemptID != "" && body.IntentID != body.AttemptID {
+		writeQueueStoreErr(w, errQueueConflictingAdmissionIDs)
+		return
+	}
+	var item QueueItem
+	var replayed bool
+	var err error
+	if body.IntentID != "" {
+		item, replayed, err = s.queues.store(root, sid).EnqueueWithIntentID(body.IntentID, body.Text, body.Attachments, body.SendConfig, body.OriginClientID)
+	} else {
+		item, replayed, err = s.queues.store(root, sid).EnqueueWithAttemptID(body.AttemptID, body.Text, body.Attachments, body.SendConfig, body.OriginClientID)
+	}
 	if err != nil {
 		writeQueueStoreErr(w, err)
 		return

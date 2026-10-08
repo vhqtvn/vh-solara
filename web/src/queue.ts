@@ -37,6 +37,9 @@ export interface QueuedAttachment {
 }
 export type QueueItemState = "pending" | "dispatching" | "sent" | "failed" | "unknown";
 export interface QueuedMessage {
+  // Daemon-minted durable queue primary key ("q-"+hex). This IS the send-net-
+  // resilience design's `queueID` — the cross-client correlation id — under
+  // its pre-existing name; no separate field exists or is needed.
   id: string;
   order: number;
   state: QueueItemState;
@@ -58,6 +61,19 @@ export interface QueuedMessage {
   // item; absent on legacy items/servers. Used by reconcile-first recovery to
   // match a list item back to its uncertain admission attempt.
   attemptId?: string;
+  // Send-net-resilience slice 1: the design-canonical admission identity — a
+  // client-generated UUID minted once per explicit send gesture (retries reuse
+  // it; intentional repeats mint a new one). The same concept as `attemptId`
+  // under its canonical wire name: exactly one of the two is echoed per item,
+  // recording which name carried the admission; the server dedupes by VALUE
+  // across aliases. Types only in this slice — no FE logic mints or reads it
+  // yet (slice 3's outbox owns that).
+  intentId?: string;
+  // Send-net-resilience slice 1 (skeleton): durable dispatch-attempt journal
+  // records — transport-class certification basis for later redelivery
+  // decisions. Nothing populates it yet (the writer is slice 2a); declared here
+  // so list responses from a custody-capable daemon type-check.
+  attempts?: QueueAttempt[];
   createdAt: number;
   resolvedAt?: number;
   // Failure / ambiguous detail for failed | unknown (diagnostics).
@@ -87,15 +103,43 @@ export interface QueuedMessage {
   reconcileTerminal?: boolean;
 }
 
+// Send-net-resilience slice 1 (types only — mirror of pkg/web QueueAttempt).
+// ONE durable dispatch-attempt journal record; the transport class is the
+// certification basis for redelivery decisions in later slices (connect_failed
+// ⇒ provably not sent ⇒ auto-redelivery candidate; written_unknown ⇒ visible
+// ambiguous chip + one-tap replacement-send, never auto-redelivered;
+// server_error ⇒ terminal failed; accepted_2xx is NEVER read as durability).
+export type QueueAttemptTransportClass =
+  | "connect_failed"
+  | "written_unknown"
+  | "server_error"
+  | "accepted_2xx";
+
+export interface QueueAttempt {
+  // Queue-custody fencing generation the attempt was started under (compare-
+  // and-fence rejects stale-worker writes; allocated in slice 2a).
+  generation?: number;
+  // Attempt bracket timestamps (ms epoch).
+  startedAt?: number;
+  endedAt?: number;
+  // Outcome classification; absent while an attempt is in flight.
+  transportClass?: QueueAttemptTransportClass;
+  // Optional diagnostic text (e.g. server_error body excerpt).
+  detail?: string;
+}
+
 // Input shape for enqueue (the backend issues id + order + state + createdAt).
 // attemptId (send-reliability slice 2) makes admission durably idempotent on
 // slice-1 servers: the same (attemptId, canonical payload) replay returns the
 // ORIGINAL receipt ("replayed": true) and creates no second item. See
-// enqueue() for the legacy-server feature-detect.
+// enqueue() for the legacy-server feature-detect. intentId (send-net-
+// resilience slice 1) is the design-canonical alias for the same admission
+// identity — types only in this slice; no FE caller sets it yet.
 export type QueueInput = Pick<QueuedMessage, "text" | "attachments"> & {
   sendConfig?: QueuedMessage["sendConfig"];
   originClientId?: string;
   attemptId?: string;
+  intentId?: string;
 };
 
 // Typed enqueue failure (send-reliability slice 2). `code` is machine-readable:

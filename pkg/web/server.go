@@ -1631,7 +1631,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/diag/invariants", s.handleDiagInvariants)
 	mux.HandleFunc("/vh/skill/emit", s.handleSkillEmit)
 	mux.HandleFunc("/vh/version", func(w http.ResponseWriter, r *http.Request) {
-		writeJSONResp(w, map[string]string{"version": s.version()})
+		// Capability advert (send-net-resilience slice 1): queueSchemaVersion
+		// is the on-disk queue.json schema this binary writes/understands;
+		// daemonDispatchCapable advertises daemon-owned dispatch custody —
+		// OFF until the custody slices ship (design "Migration Path": the
+		// flag lets clients feature-detect on the EXISTING version endpoint
+		// rather than a parallel mechanism). Additive keys: existing consumers
+		// read "version" only.
+		writeJSONResp(w, map[string]any{
+			"version":               s.version(),
+			"queueSchemaVersion":    queueSchemaVersion,
+			"daemonDispatchCapable": daemonDispatchCapable,
+		})
 	})
 	mux.HandleFunc("/vh/snapshot", s.handleSnapshot)
 	mux.HandleFunc("/vh/projects", s.handleProjects)

@@ -19,8 +19,18 @@ package web
 // pending item and moves it to `dispatching`. Neither `failed` nor `unknown`
 // ever returns to `pending`; they persist until explicit operator dismissal.
 // `resolve` records a terminal outcome and can never repend.
+//
+// Admission identity (send-net-resilience slice 1): an enqueue may carry a
+// client-generated admission id under EITHER the canonical wire name
+// `intentId` (per the accepted design — minted once per explicit send gesture)
+// or the legacy alias `attemptId`. Both names index the SAME durable
+// admission-receipt log and are interchangeable by value; see
+// EnqueueWithIntentID / EnqueueWithAttemptID. The backend-minted item `ID` is
+// the design's `queueID` — the daemon-owned durable primary key used as the
+// cross-client correlation id.
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -79,8 +89,94 @@ type QueueSendConfig struct {
 	Agent      string `json:"agent,omitempty"`
 }
 
+// queueSchemaVersion is the on-disk queue.json schema version this binary
+// writes and understands (send-net-resilience slice 1; the AMEND-A4 version
+// decoder foundation). It is an INT on purpose: the version exists to answer
+// exactly one question — "was this file written by a NEWER binary?" — and an
+// integer answers that with a single unambiguous numeric compare. A string
+// version would drag in format/semver parsing ambiguity for zero additional
+// information (schema bumps are monotonic whole-format changes, not
+// independent major/minor evolutions), and int makes the "absent" legacy
+// sentinel fall out for free (0 via json default when the key is missing).
+//
+// Decode contract (AMEND-A4, enforced in load()):
+//   - no version key (0) or any version <= queueSchemaVersion → valid-old or
+//     current: load normally (legacy files behave exactly as pre-versioning).
+//   - version > queueSchemaVersion → valid-newer: fail with the distinct typed
+//     error errQueueSchemaNewer. NEVER silently reinterpret — an older binary
+//     guessing at a newer format is how corrupt-looking queues get rewritten
+//     and evidence destroyed. The file is left byte-intact for a newer binary
+//     or the read-only diagnostic/export path.
+//   - malformed/truncated JSON, or a syntactically valid but structurally
+//     non-object top-level document (`null`, an array, a number, a string)
+//     → errQueueFileCorrupt (distinct typed error); corrupt bytes are
+//     PRESERVED (load failure never triggers a rewrite).
+const queueSchemaVersion = 1
+
+// daemonDispatchCapable advertises whether this daemon takes exclusive custody
+// of queue dispatch (the send-net-resilience program's daemon-custody mode).
+// Slice 1 lays the schema/admission foundation only — browser-driven
+// claim/POST/resolve remains the sole dispatch path — so the flag ships OFF.
+// It is surfaced (with queueSchemaVersion) on the existing /vh/version
+// endpoint so clients can feature-detect without a parallel mechanism. Slice
+// 2+ flips this as part of the capability-gated migration (design.md
+// "Migration Path": daemon admission receipts and dispatch ship behind a
+// capability flag; old SPAs keep using claim/POST/resolve without
+// interference).
+const daemonDispatchCapable = false
+
+// QueueAttemptTransportClass classifies a dispatch attempt's transport outcome
+// (send-net-resilience design "Dispatch Ownership"). It is the certification
+// basis for redelivery decisions in later slices:
+//
+//   - connect_failed  — the request was never written to the wire ⇒ provably
+//     not sent ⇒ certified auto-redelivery candidate.
+//   - written_unknown — the request may have been written; no verdict ⇒ the
+//     live-uncertain class: visible `ambiguous` chip + one-tap
+//     replacement-send, NEVER auto-redelivered.
+//   - server_error    — explicit non-2xx from OpenCode ⇒ terminal failed.
+//   - accepted_2xx    — a 2xx was received (which is NEVER read as durability:
+//     prompt_async returns before the forked persist commits).
+type QueueAttemptTransportClass string
+
+const (
+	QueueAttemptConnectFailed  QueueAttemptTransportClass = "connect_failed"
+	QueueAttemptWrittenUnknown QueueAttemptTransportClass = "written_unknown"
+	QueueAttemptServerError    QueueAttemptTransportClass = "server_error"
+	QueueAttemptAccepted2xx    QueueAttemptTransportClass = "accepted_2xx"
+)
+
+// QueueAttempt is ONE durable dispatch-attempt journal record (slice 1 ships
+// the FIELDS ONLY — the write-ahead journal writer is slice 2a; nothing in
+// this slice populates Attempts). Per the custody-fencing contract (debate-4
+// B3), every attempt carries the fencing generation it was made under so a
+// stale worker's writes can be rejected; timestamps bracket the attempt; the
+// transport class records the outcome certification basis. All fields
+// omitempty for legacy on-disk compatibility.
+type QueueAttempt struct {
+	// Generation is the queue-custody fencing generation the attempt was
+	// started under (see queueFile.FenceGeneration). Allocated monotonically
+	// by the custody owner (slice 2a). uint64 to unify with
+	// queueFile.FenceGeneration — the slice-2a fence check compares an
+	// attempt's generation against the store's, so the two must share
+	// width and signedness.
+	Generation uint64 `json:"generation,omitempty"`
+	// StartedAt / EndedAt bracket the attempt (ms epoch).
+	StartedAt int64 `json:"startedAt,omitempty"`
+	EndedAt   int64 `json:"endedAt,omitempty"`
+	// TransportClass is the attempt's outcome classification. Empty while an
+	// attempt is in flight (started, not yet classified).
+	TransportClass QueueAttemptTransportClass `json:"transportClass,omitempty"`
+	// Detail is optional diagnostic text (e.g. the server_error body excerpt).
+	Detail string `json:"detail,omitempty"`
+}
+
 // QueueItem is one queued message. ID and Order are backend-issued; Order is the
-// monotonic FIFO commit sequence. OriginClientID is diagnostics-only and MUST
+// monotonic FIFO commit sequence. ID (newQueueID: "q-"+crypto/rand hex) is the
+// design's `queueID` — the daemon-minted durable queue primary key and
+// cross-client correlation id; it has been minted for every item since the
+// queue's introduction, so legacy on-disk items already carry one and no
+// backfill is needed. OriginClientID is diagnostics-only and MUST
 // NOT affect ordering, visibility, or dispatch eligibility.
 //
 // OpencodeMsgID is the authoritative correlation ID minted at Claim/dispatch
@@ -148,12 +244,24 @@ type QueueItem struct {
 	// legacy non-idempotent behavior. omitempty for on-disk backward
 	// compatibility: items persisted before this field deserialize with
 	// AttemptID=="".
-	AttemptID         string `json:"attemptId,omitempty"`
-	OpencodeMsgID     string `json:"opencodeMsgID,omitempty"`
-	CreatedAt         int64  `json:"createdAt"`
-	DispatchStartedAt int64  `json:"dispatchStartedAt,omitempty"`
-	ResolvedAt        int64  `json:"resolvedAt,omitempty"`
-	Detail            string `json:"detail,omitempty"`
+	AttemptID string `json:"attemptId,omitempty"`
+	// IntentID is the CANONICAL admission identity wire name (send-net-
+	// resilience design "Idempotency & Correlation Scheme": a client-generated
+	// UUID minted once per explicit send gesture; retries of the same gesture
+	// reuse it, intentional repeats mint a new one). It is the same concept as
+	// the legacy AttemptID alias above — exactly ONE of the two is stamped per
+	// item, recording which wire name carried the admission; the durable
+	// receipt log dedupes by the id VALUE regardless of which name carried it,
+	// so a replay through either alias of the same value returns the original
+	// receipt. Empty (legacy requests) keeps the non-idempotent path. omitempty
+	// for on-disk backward compatibility.
+	IntentID          string         `json:"intentId,omitempty"`
+	OpencodeMsgID     string         `json:"opencodeMsgID,omitempty"`
+	Attempts          []QueueAttempt `json:"attempts,omitempty"`
+	CreatedAt         int64          `json:"createdAt"`
+	DispatchStartedAt int64          `json:"dispatchStartedAt,omitempty"`
+	ResolvedAt        int64          `json:"resolvedAt,omitempty"`
+	Detail            string         `json:"detail,omitempty"`
 
 	// ReconcileAttempts counts reconciliation passes that FAILED to confirm the
 	// item as sent (404 / 5xx / transport / non-exact 200). Once it reaches
@@ -193,10 +301,24 @@ type QueueItem struct {
 // receipts live in the same atomic save yet a different container. omitempty:
 // a queue.json written before receipts existed (or by a store with only legacy
 // admissions) has no key and loads as nil.
+//
+// Version is the on-disk schema version (send-net-resilience slice 1, see
+// queueSchemaVersion): every save() stamps the version this binary writes;
+// load() distinguishes valid-old (no key) / current / valid-newer
+// (errQueueSchemaNewer, never reinterpreted). omitempty means legacy files
+// (written before versioning) deserialize as 0 = valid-old.
+//
+// FenceGeneration is the persisted queue-custody fencing generation
+// (custody-fencing contract, debate-4 B3). Slice 1 ships the FIELD only —
+// generation allocation/compare-and-fence is slice 2a; this binary neither
+// increments nor reads it. omitempty: a file written before the field (or by
+// this binary while custody is disabled, which is always in slice 1) omits it.
 type queueFile struct {
-	Order    uint64                           `json:"order"`
-	Items    []QueueItem                      `json:"items"`
-	Receipts map[string]queueAdmissionReceipt `json:"admissionReceipts,omitempty"`
+	Version         int                              `json:"version,omitempty"`
+	Order           uint64                           `json:"order"`
+	Items           []QueueItem                      `json:"items"`
+	Receipts        map[string]queueAdmissionReceipt `json:"admissionReceipts,omitempty"`
+	FenceGeneration uint64                           `json:"fenceGeneration,omitempty"`
 }
 
 // queueAdmissionReceipt is the durable dedupe record for ONE client attempt:
@@ -241,6 +363,25 @@ var (
 	// Attempt ids index the persisted receipt map, so their size is bounded to
 	// keep the on-disk footprint sane.
 	errQueueBadAttemptID = errors.New("invalid queue attempt id")
+	// errQueueConflictingAdmissionIDs: the request carried BOTH intentId and
+	// attemptId with DIFFERENT values (send-net-resilience slice 1). The two
+	// names are aliases for the same admission identity; two different values
+	// in one request is an ambiguous client identity and is rejected rather
+	// than guessed.
+	errQueueConflictingAdmissionIDs = errors.New("request carries both intentId and attemptId with different values")
+	// errQueueSchemaNewer (AMEND-A4): the on-disk queue.json carries a schema
+	// version NEWER than this binary understands. The file is NEVER
+	// reinterpreted and NEVER rewritten by this binary — the error surfaces so
+	// an upgraded binary or the read-only diagnostic/export path handles it.
+	errQueueSchemaNewer = errors.New("queue file schema version newer than this binary supports")
+	// errQueueFileCorrupt: the on-disk queue.json is malformed/truncated
+	// JSON, or a syntactically valid but non-object top-level document
+	// (`null` etc. — see load()'s semantic-corruption gate). Corrupt bytes
+	// are PRESERVED — a load failure never triggers a rewrite; the distinct
+	// typed error lets callers (and the HTTP layer) separate corruption
+	// from a newer-schema file instead of treating both as a generic read
+	// failure.
+	errQueueFileCorrupt = errors.New("queue file corrupt (malformed or truncated JSON; bytes preserved)")
 )
 
 // sessionQueueStore owns ONE session's queue: a mutex, a lazy-loaded in-memory
@@ -261,6 +402,13 @@ type sessionQueueStore struct {
 	order    uint64
 	loaded   bool
 	archived bool
+
+	// fenceGeneration mirrors queueFile.FenceGeneration (send-net-resilience
+	// slice 1 skeleton): the persisted queue-custody fencing generation. This
+	// slice only round-trips it (load/save) so a file written by a
+	// custody-capable binary keeps its generation across this binary's
+	// saves; allocation and compare-and-fence land in slice 2a.
+	fenceGeneration uint64
 
 	// receipts is the durable admission-receipt log (send-reliability slice 1),
 	// keyed by client attempt id. Lazily loaded from queueFile.Receipts by
@@ -297,6 +445,7 @@ func (s *sessionQueueStore) load() error {
 		if os.IsNotExist(err) {
 			s.items = nil
 			s.order = 0
+			s.fenceGeneration = 0
 			s.loaded = true
 			return nil
 		}
@@ -304,11 +453,48 @@ func (s *sessionQueueStore) load() error {
 	}
 	var doc queueFile
 	if err := json.Unmarshal(data, &doc); err != nil {
-		return fmt.Errorf("queue: malformed %s: %w", s.path, err)
+		// Partial-corrupt (AMEND-A4): distinct typed error, corrupt bytes
+		// preserved. Nothing is assigned to the store and s.loaded stays
+		// false, so no later mutation can save() over the corrupt file with
+		// a "repaired" (i.e. silent-loss) rewrite — every mutation path
+		// re-runs load() and fails the same way first. The underlying json
+		// error is wrapped with %w so errors.As can reach e.g.
+		// *json.SyntaxError through the chain.
+		return fmt.Errorf("%w: %s: %w", errQueueFileCorrupt, s.path, err)
 	}
+	// Semantic-corruption gate (review t1b-F1/F2, AMEND-A4): a syntactically
+	// valid but structurally NON-OBJECT top-level document must not be
+	// treated as a decoded queue. `null` is the dangerous case — it
+	// unmarshals into queueFile WITHOUT any error, so without this gate it
+	// would fall through as valid-old (version 0), set loaded=true, and the
+	// next mutation's save() would overwrite the original bytes, violating
+	// the never-rewrite-corrupt-bytes invariant. Peek the first JSON token:
+	// anything but an object open brace (null, array, number, string,
+	// boolean) is errQueueFileCorrupt — nothing is assigned to the store
+	// and loaded stays false, exactly like the parse-failure branch above.
+	// Unknown FIELDS within a valid object remain tolerated (forward
+	// tolerance inside the version — unchanged).
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, terr := dec.Token()
+	if terr != nil || tok != json.Delim('{') {
+		return fmt.Errorf("%w: %s: top-level JSON document is not an object", errQueueFileCorrupt, s.path)
+	}
+	if doc.Version > queueSchemaVersion {
+		// Valid-newer (AMEND-A4): this file was written by a newer binary.
+		// Fail with the distinct typed error BEFORE any state is assigned —
+		// never silently reinterpret a newer schema (guessing at unknown
+		// fields is how evidence gets destroyed) and never rewrite it. The
+		// bytes stay on disk for an upgraded binary / the diagnostic path.
+		return fmt.Errorf("%w: file version %d, this binary supports %d (%s)", errQueueSchemaNewer, doc.Version, queueSchemaVersion, s.path)
+	}
+	// No version key (0) or version <= queueSchemaVersion: valid-old/current —
+	// load exactly as before. Unknown fields within a known version are
+	// ignored by encoding/json (forward tolerance inside the version), and
+	// save() re-stamps the file with THIS binary's version.
 	s.items = doc.Items
 	s.order = doc.Order
 	s.receipts = doc.Receipts
+	s.fenceGeneration = doc.FenceGeneration
 	// Normalize legacy on-disk items: a queue.json persisted BEFORE the
 	// attachments-always-array contract had no `attachments` key (the field used
 	// omitempty), so json.Unmarshal leaves QueueItem.Attachments nil. With the
@@ -350,7 +536,7 @@ func (s *sessionQueueStore) save() error {
 	if s.archived {
 		return errQueueArchived
 	}
-	doc := queueFile{Order: s.order, Items: s.items, Receipts: s.receipts}
+	doc := queueFile{Version: queueSchemaVersion, Order: s.order, Items: s.items, Receipts: s.receipts, FenceGeneration: s.fenceGeneration}
 	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return fmt.Errorf("queue: encode: %w", err)
@@ -786,7 +972,7 @@ func (s *sessionQueueStore) List() ([]QueueItem, error) {
 // keep exactly this behavior — no receipt, no dedupe — so pre-slice clients
 // and tests are unaffected. See EnqueueWithAttemptID for the idempotent path.
 func (s *sessionQueueStore) Enqueue(text string, attachments []QueueAttachment, cfg QueueSendConfig, originClientID string) (QueueItem, error) {
-	it, _, err := s.EnqueueWithAttemptID("", text, attachments, cfg, originClientID)
+	it, _, err := s.enqueueAdmission("", "", text, attachments, cfg, originClientID)
 	return it, err
 }
 
@@ -855,14 +1041,18 @@ func queuePayloadFingerprint(text string, attachments []QueueAttachment, cfg Que
 // EnqueueWithAttemptID appends a new pending item with OPTIONAL durable
 // idempotency keyed by a client-generated attempt id (send-reliability
 // slice 1). attemptID=="" is the legacy non-idempotent path (no receipt).
+// This is the LEGACY wire name for the admission identity; the design-canonical
+// alias is EnqueueWithIntentID (send-net-resilience slice 1) — both index the
+// same receipt log.
 //
-// Contract:
-//   - Same (attemptID, canonical payload) → returns the ORIGINAL admission
+// Contract (identical for both aliases; "admission id" below means the id
+// value regardless of which wire name carried it):
+//   - Same (admission id, canonical payload) → returns the ORIGINAL admission
 //     receipt — the exact item snapshot the first caller was handed — with
 //     replayed=true. No second item is created, even if the original item was
 //     later removed or compacted away (no resurrection).
-//   - Same attemptID, changed payload → errQueueAdmissionConflict; no effect.
-//   - New attemptID at receipt capacity → errQueueAdmissionFull BEFORE any
+//   - Same admission id, changed payload → errQueueAdmissionConflict; no effect.
+//   - New admission id at receipt capacity → errQueueAdmissionFull BEFORE any
 //     effect; valid receipts are never evicted.
 //   - The item and its receipt persist in the SAME atomic save: on save
 //     failure BOTH roll back, so an admission is recoverable as a pair or not
@@ -870,6 +1060,39 @@ func queuePayloadFingerprint(text string, attachments []QueueAttachment, cfg Que
 //   - Receipt lifetime = store lifetime. deleteStore (archive/cleanup) ends
 //     the replay guarantee: a post-cleanup replay is a fresh admission.
 func (s *sessionQueueStore) EnqueueWithAttemptID(attemptID, text string, attachments []QueueAttachment, cfg QueueSendConfig, originClientID string) (QueueItem, bool, error) {
+	return s.enqueueAdmission("", attemptID, text, attachments, cfg, originClientID)
+}
+
+// EnqueueWithIntentID is the design-canonical alias of EnqueueWithAttemptID
+// (send-net-resilience design "Idempotency & Correlation Scheme": intentID is
+// a client-generated UUID minted once per explicit send gesture; retries of
+// the same gesture reuse it, intentional repeats mint a new one). The item
+// echoes the id in IntentID (not AttemptID); dedupe, fingerprint-conflict,
+// capacity, atomicity, and lifetime contracts are byte-for-byte those of
+// EnqueueWithAttemptID. intentID=="" is the legacy non-idempotent path.
+func (s *sessionQueueStore) EnqueueWithIntentID(intentID, text string, attachments []QueueAttachment, cfg QueueSendConfig, originClientID string) (QueueItem, bool, error) {
+	return s.enqueueAdmission(intentID, "", text, attachments, cfg, originClientID)
+}
+
+// enqueueAdmission is the shared admission core behind the attemptId (legacy)
+// and intentId (canonical) wire aliases. At most one of intentID / attemptID
+// reaches here non-empty from the HTTP layer; defensively, both present with
+// DIFFERENT values is an ambiguous identity and is rejected, both present with
+// the SAME value collapses to the canonical intent field. The EFFECTIVE
+// admission id — whichever alias carried it — indexes the single durable
+// receipt log, so a replay dedupes by VALUE even if it arrives under the other
+// alias (the replayed receipt echoes the field the FIRST admission stamped).
+func (s *sessionQueueStore) enqueueAdmission(intentID, attemptID, text string, attachments []QueueAttachment, cfg QueueSendConfig, originClientID string) (QueueItem, bool, error) {
+	if intentID != "" && attemptID != "" {
+		if intentID != attemptID {
+			return QueueItem{}, false, errQueueConflictingAdmissionIDs
+		}
+		attemptID = "" // equal values: stamp only the canonical field
+	}
+	admissionID := intentID
+	if admissionID == "" {
+		admissionID = attemptID
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.archived {
@@ -888,12 +1111,12 @@ func (s *sessionQueueStore) EnqueueWithAttemptID(attemptID, text string, attachm
 	if attachments == nil {
 		attachments = []QueueAttachment{}
 	}
-	if attemptID != "" {
-		if len(attemptID) > attemptIDMaxLength {
-			return QueueItem{}, false, fmt.Errorf("%w: length %d exceeds %d", errQueueBadAttemptID, len(attemptID), attemptIDMaxLength)
+	if admissionID != "" {
+		if len(admissionID) > attemptIDMaxLength {
+			return QueueItem{}, false, fmt.Errorf("%w: length %d exceeds %d", errQueueBadAttemptID, len(admissionID), attemptIDMaxLength)
 		}
 		fp := queuePayloadFingerprint(text, attachments, cfg)
-		if rec, ok := s.receipts[attemptID]; ok {
+		if rec, ok := s.receipts[admissionID]; ok {
 			if rec.Fingerprint != fp {
 				return QueueItem{}, false, fmt.Errorf("%w (fingerprint mismatch)", errQueueAdmissionConflict)
 			}
@@ -916,6 +1139,7 @@ func (s *sessionQueueStore) EnqueueWithAttemptID(attemptID, text string, attachm
 		SendConfig:     cfg,
 		OriginClientID: originClientID,
 		AttemptID:      attemptID,
+		IntentID:       intentID,
 		// OpencodeMsgID is intentionally NOT minted here: a `pending` item is
 		// not yet dispatched, and minting the OpenCode correlation id at enqueue
 		// time would let it encode a wall-clock earlier than messages that land
@@ -927,11 +1151,11 @@ func (s *sessionQueueStore) EnqueueWithAttemptID(attemptID, text string, attachm
 	}
 	s.items = append(s.items, item)
 	receiptRecorded := false
-	if attemptID != "" {
+	if admissionID != "" {
 		if s.receipts == nil {
 			s.receipts = map[string]queueAdmissionReceipt{}
 		}
-		s.receipts[attemptID] = queueAdmissionReceipt{
+		s.receipts[admissionID] = queueAdmissionReceipt{
 			Fingerprint: queuePayloadFingerprint(text, attachments, cfg),
 			Item:        item,
 		}
@@ -945,7 +1169,7 @@ func (s *sessionQueueStore) EnqueueWithAttemptID(attemptID, text string, attachm
 		s.items = s.items[:len(s.items)-1]
 		s.order--
 		if receiptRecorded {
-			delete(s.receipts, attemptID)
+			delete(s.receipts, admissionID)
 		}
 		return QueueItem{}, false, err
 	}

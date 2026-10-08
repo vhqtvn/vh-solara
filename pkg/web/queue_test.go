@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -2054,5 +2055,557 @@ func TestQueueAttachmentPathDurableThroughEnqueueReload(t *testing.T) {
 	}
 	if len(got2) != 1 || len(got2[0].Attachments) != 1 || got2[0].Attachments[0].Path != att.Path {
 		t.Fatalf("reload lost path (not durable on disk): got %+v", got2[0].Attachments)
+	}
+}
+
+// --- Send-net-resilience slice 1 — versioned queue.json + intentID admission --
+//
+// Pins the AMEND-A4 version-decoder contract (valid-old / valid-newer /
+// partial-corrupt; corrupt or newer bytes NEVER rewritten) and the intentId
+// admission alias (design-canonical name for the attemptId admission identity;
+// same receipt log, same dedupe-by-value semantics).
+
+// seedQueueFileBody writes a raw queue.json body for (root, sid) and returns
+// its path. Lets decode tests feed exact bytes (legacy, versioned, corrupt,
+// newer-schema) straight at load(). (Distinct from queue_lifecycle_test.go's
+// seedQueueFile, which writes a fixed minimal body.)
+func seedQueueFileBody(t *testing.T, root, sid, body string) string {
+	t.Helper()
+	p := queuePath(root, sid)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// mustReadFile fails the test unless path reads cleanly.
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestQueueFileLegacyNoVersionLoadsExactlyAsBefore pins the valid-old half of
+// the AMEND-A4 decoder: a pre-versioning on-disk file (no version key, old
+// fields) loads cleanly and behaves exactly as today — list returns the items,
+// enqueue works, claim mints the correlation id — and the next save stamps the
+// file with THIS binary's schema version (the lazy in-place upgrade; older
+// binaries that later load the re-stamped file still ignore the unknown key).
+func TestQueueFileLegacyNoVersionLoadsExactlyAsBefore(t *testing.T) {
+	root := t.TempDir()
+	// resolvedAt must be RECENT: compaction (FIX-QUEUE-GC-5) legitimately
+	// purges terminal items past their TTL on List — a 2023-dated sent item
+	// would vanish, which is today's behavior, not a load regression. Inside
+	// the TTL the item survives and the load contract is observable.
+	recentResolved := time.Now().UnixMilli()
+	legacy := seedQueueFileBody(t, root, "s1", fmt.Sprintf(`{"order":2,"items":[`+
+		`{"id":"q-old-1","order":1,"state":"sent","text":"done","attachments":[],"createdAt":%d,"resolvedAt":%d},`+
+		`{"id":"q-old-2","order":2,"state":"pending","text":"waiting","attachments":[],"createdAt":%d}`+
+		`]}`, recentResolved-2000, recentResolved, recentResolved-1000))
+
+	s := &sessionQueueStore{path: legacy}
+	got, err := s.List()
+	if err != nil {
+		t.Fatalf("legacy (no version) List: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "q-old-1" || got[1].ID != "q-old-2" {
+		t.Fatalf("legacy load changed items: %+v", got)
+	}
+
+	// Claim on a legacy-loaded item still mints the correlation id (the
+	// existing invariant, re-pinned through the versioned load path).
+	claimed, won, err := s.Claim()
+	if err != nil || !won {
+		t.Fatalf("claim on legacy-loaded store: won=%v err=%v", won, err)
+	}
+	if claimed.ID != "q-old-2" || claimed.OpencodeMsgID == "" {
+		t.Fatalf("claim = %+v, want q-old-2 with freshly minted OpencodeMsgID", claimed)
+	}
+
+	// Enqueue triggers a save; the re-saved file must now carry version 1.
+	if _, err := s.Enqueue("post-legacy", nil, QueueSendConfig{}, ""); err != nil {
+		t.Fatalf("enqueue on legacy-loaded store: %v", err)
+	}
+	raw := string(mustReadFile(t, legacy))
+	if !strings.Contains(raw, `"version": 1`) {
+		t.Fatalf("re-saved legacy file lacks version stamp: %s", raw)
+	}
+	// And a fresh store reads the stamped file back cleanly (round trip).
+	s2 := &sessionQueueStore{path: legacy}
+	got2, err := s2.List()
+	if err != nil {
+		t.Fatalf("reload of re-stamped file: %v", err)
+	}
+	if len(got2) != 3 {
+		t.Fatalf("re-stamped reload: got %d items, want 3", len(got2))
+	}
+}
+
+// TestQueueFileVersionDecodeTable is the table-driven AMEND-A4 decoder
+// contract: every input class maps to exactly one outcome, and the two
+// failure classes (valid-newer, partial-corrupt) leave the file BYTE-IDENTICAL
+// through both a failed List and a failed Enqueue — a load failure never
+// triggers a rewrite, so corrupt/newer evidence is preserved for a newer
+// binary or the diagnostic/export path.
+func TestQueueFileVersionDecodeTable(t *testing.T) {
+	const itemJSON = `{"id":"q-v","order":1,"state":"pending","text":"v","attachments":[],"createdAt":1700000000000}`
+	cases := []struct {
+		name         string
+		body         string
+		wantErr      error // nil = must load cleanly
+		wantItems    int   // items expected on success
+		wantPreserve bool  // assert file bytes untouched after failed ops
+	}{
+		{
+			name:      "no version key (legacy)",
+			body:      `{"order":1,"items":[` + itemJSON + `]}`,
+			wantItems: 1,
+		},
+		{
+			name:      "current version",
+			body:      `{"version":1,"order":1,"items":[` + itemJSON + `]}`,
+			wantItems: 1,
+		},
+		{
+			name:         "newer version",
+			body:         `{"version":2,"order":1,"items":[` + itemJSON + `]}`,
+			wantErr:      errQueueSchemaNewer,
+			wantPreserve: true,
+		},
+		{
+			name:         "much newer version",
+			body:         `{"version":99,"order":1,"items":[` + itemJSON + `]}`,
+			wantErr:      errQueueSchemaNewer,
+			wantPreserve: true,
+		},
+		{
+			name:         "truncated json",
+			body:         `{"version":1,"order":1,"items":[{"id":"x","ord`,
+			wantErr:      errQueueFileCorrupt,
+			wantPreserve: true,
+		},
+		{
+			name:         "garbage",
+			body:         `not json at all`,
+			wantErr:      errQueueFileCorrupt,
+			wantPreserve: true,
+		},
+		{
+			name:         "wrong-typed version is corrupt not newer",
+			body:         `{"version":"2","order":1,"items":[]}`,
+			wantErr:      errQueueFileCorrupt,
+			wantPreserve: true,
+		},
+		// Semantic-corruption class (review t1b-F1/F2): a syntactically
+		// valid but structurally NON-OBJECT top-level document. `null` is
+		// the dangerous one — it unmarshals into queueFile WITHOUT any
+		// error, so pre-fix it bypassed the corruption branch entirely,
+		// was classified valid-old (version 0), got loaded=true, and the
+		// next mutation's save() would overwrite the original bytes. The
+		// array/number/string documents pin the same classification so it
+		// does not depend on encoding/json's UnmarshalTypeError behavior.
+		{
+			name:         "null document is corrupt not valid-old",
+			body:         `null`,
+			wantErr:      errQueueFileCorrupt,
+			wantPreserve: true,
+		},
+		{
+			name:         "array document is corrupt",
+			body:         `[]`,
+			wantErr:      errQueueFileCorrupt,
+			wantPreserve: true,
+		},
+		{
+			name:         "number document is corrupt",
+			body:         `5`,
+			wantErr:      errQueueFileCorrupt,
+			wantPreserve: true,
+		},
+		{
+			name:         "string document is corrupt",
+			body:         `"x"`,
+			wantErr:      errQueueFileCorrupt,
+			wantPreserve: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			p := seedQueueFileBody(t, root, "s1", tc.body)
+			before := mustReadFile(t, p)
+
+			s := &sessionQueueStore{path: p}
+			items, listErr := s.List()
+			if tc.wantErr == nil {
+				if listErr != nil {
+					t.Fatalf("List: want clean load, got %v", listErr)
+				}
+				if len(items) != tc.wantItems {
+					t.Fatalf("List: got %d items, want %d", len(items), tc.wantItems)
+				}
+				return
+			}
+			if !errors.Is(listErr, tc.wantErr) {
+				t.Fatalf("List: err=%v, want errors.Is(%v)", listErr, tc.wantErr)
+			}
+			if errors.Is(listErr, errQueueSchemaNewer) && errors.Is(listErr, errQueueFileCorrupt) {
+				t.Fatal("decoder classified the file as BOTH newer and corrupt")
+			}
+			// Enqueue must fail with the SAME typed error (load is the gate
+			// for every mutation)…
+			if _, _, err := s.EnqueueWithIntentID("int-x", "x", nil, QueueSendConfig{}, ""); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Enqueue: err=%v, want errors.Is(%v)", err, tc.wantErr)
+			}
+			if !tc.wantPreserve {
+				return
+			}
+			// …and neither failed path may have rewritten a single byte.
+			after := mustReadFile(t, p)
+			if !bytes.Equal(before, after) {
+				t.Fatalf("file rewritten after failed load:\n before=%s\n  after=%s", before, after)
+			}
+			// A second List keeps failing identically (no partial-load cache).
+			if _, err := s.List(); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("second List: err=%v, want errors.Is(%v)", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestQueueFileCorruptErrorUnwrapsToJSON pins the review advisory on the
+// errQueueFileCorrupt wrap: the underlying encoding/json error is wrapped
+// with %w (not %v), so errors.As can reach *json.SyntaxError through the
+// chain — callers can log the precise parse failure without string-matching
+// the message. Only the parse-error-bearing corruption class (truncated /
+// malformed bytes) carries a json error; the semantic class (null/non-object
+// documents, see the decode table) legitimately does not.
+func TestQueueFileCorruptErrorUnwrapsToJSON(t *testing.T) {
+	root := t.TempDir()
+	p := seedQueueFileBody(t, root, "s1", `{"version":1,"order":1,"items":[{"id":"x","ord`)
+	s := &sessionQueueStore{path: p}
+	_, err := s.List()
+	if !errors.Is(err, errQueueFileCorrupt) {
+		t.Fatalf("List: err=%v, want errors.Is(errQueueFileCorrupt)", err)
+	}
+	var se *json.SyntaxError
+	if !errors.As(err, &se) {
+		t.Fatalf("corrupt error does not unwrap to *json.SyntaxError: %v", err)
+	}
+}
+
+// TestQueueFileVersionedRoundTrip pins the save→reload round trip: a file
+// written by THIS binary carries the schema version, and slice-1 skeleton
+// fields (per-item attempts journal, store fenceGeneration, intentId
+// admission echo + receipt) survive save→reload intact — the no-loss
+// invariant the slice-2a journal writer will build on.
+func TestQueueFileVersionedRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	// The receipt fingerprint must be the REAL canonical fingerprint of the
+	// payload — a placeholder would make the replay below (correctly)
+	// conflict. queuePayloadFingerprint is the same-package authority.
+	fp := queuePayloadFingerprint("seeded", nil, QueueSendConfig{})
+	p := seedQueueFileBody(t, root, "s1", fmt.Sprintf(`{"version":1,"order":1,"fenceGeneration":7,"items":[`+
+		`{"id":"q-vt","order":1,"state":"pending","text":"seeded","attachments":[],"createdAt":1700000000000,`+
+		`"intentId":"11111111-2222-3333-4444-555555555555",`+
+		`"attempts":[{"generation":7,"startedAt":1700000010000,"endedAt":1700000012000,"transportClass":"connect_failed","detail":"dial tcp refused"}]}],`+
+		`"admissionReceipts":{"11111111-2222-3333-4444-555555555555":`+
+		`{"fingerprint":%q,"item":{"id":"q-vt","order":1,"state":"pending","text":"seeded","attachments":[],"createdAt":1700000000000,"intentId":"11111111-2222-3333-4444-555555555555"}}}}`,
+		fp))
+
+	s := &sessionQueueStore{path: p}
+	got, err := s.List()
+	if err != nil {
+		t.Fatalf("List on versioned file: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d items, want 1", len(got))
+	}
+	it := got[0]
+	if it.IntentID != "11111111-2222-3333-4444-555555555555" {
+		t.Fatalf("intentId lost on load: %+v", it)
+	}
+	if len(it.Attempts) != 1 || it.Attempts[0].TransportClass != QueueAttemptConnectFailed || it.Attempts[0].Generation != 7 {
+		t.Fatalf("attempts lost on load: %+v", it.Attempts)
+	}
+
+	// Trigger a save through a mutation, then reload via a FRESH store: the
+	// skeleton fields must survive this binary's save path even though slice 1
+	// neither allocates nor reads them.
+	if _, err := s.Enqueue("trigger-save", nil, QueueSendConfig{}, ""); err != nil {
+		t.Fatalf("enqueue (save trigger): %v", err)
+	}
+	raw := string(mustReadFile(t, p))
+	if !strings.Contains(raw, `"version": 1`) {
+		t.Fatalf("saved file lost version stamp: %s", raw)
+	}
+	if !strings.Contains(raw, `"fenceGeneration": 7`) {
+		t.Fatalf("saved file lost fenceGeneration: %s", raw)
+	}
+	if !strings.Contains(raw, `"transportClass": "connect_failed"`) {
+		t.Fatalf("saved file lost attempt journal: %s", raw)
+	}
+
+	s2 := &sessionQueueStore{path: p}
+	got2, err := s2.List()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(got2) != 2 {
+		t.Fatalf("reload: got %d items, want 2", len(got2))
+	}
+	var reloaded *QueueItem
+	for i := range got2 {
+		if got2[i].ID == "q-vt" {
+			reloaded = &got2[i]
+		}
+	}
+	if reloaded == nil {
+		t.Fatalf("reload lost the seeded item: %+v", got2)
+	}
+	if reloaded.IntentID == "" || len(reloaded.Attempts) != 1 || reloaded.Attempts[0].Generation != 7 {
+		t.Fatalf("reload lost slice-1 fields: intentId=%q attempts=%+v", reloaded.IntentID, reloaded.Attempts)
+	}
+	if s2.fenceGeneration != 7 {
+		t.Fatalf("reload lost store fenceGeneration: got %d, want 7", s2.fenceGeneration)
+	}
+
+	// The receipt survived too: a replay of the seeded intentId returns the
+	// original receipt (not a second item).
+	rep, replayed, err := s2.EnqueueWithIntentID("11111111-2222-3333-4444-555555555555", "seeded", nil, QueueSendConfig{}, "")
+	if err != nil {
+		t.Fatalf("receipt replay after round trip: %v", err)
+	}
+	if !replayed || rep.ID != "q-vt" {
+		t.Fatalf("receipt replay: replayed=%v item=%+v, want the original q-vt receipt", replayed, rep)
+	}
+}
+
+// TestQueueIntentIDAdmissionDedupe pins the design-canonical admission alias:
+// enqueue with an intentId dedupes by (session, intentId) — a replay returns
+// the EXISTING admission receipt (same queue item id), never a second item —
+// while requests WITHOUT an id keep the legacy duplicate-enqueue behavior.
+func TestQueueIntentIDAdmissionDedupe(t *testing.T) {
+	s, root := newTestStore(t, "s1")
+	const intent = "aaaaaaaa-0000-0000-0000-000000000001"
+
+	first, replayed, err := s.EnqueueWithIntentID(intent, "hello", nil, QueueSendConfig{}, "")
+	if err != nil {
+		t.Fatalf("first intent admission: %v", err)
+	}
+	if replayed {
+		t.Fatal("first admission must not report replayed")
+	}
+	if first.IntentID != intent {
+		t.Fatalf("admitted item does not echo intentId: %+v", first)
+	}
+	if first.AttemptID != "" {
+		t.Fatalf("intent admission must leave the legacy attemptId field empty: %+v", first)
+	}
+
+	// Replay: same (session, intentID) → the ORIGINAL receipt, same item id,
+	// item count unchanged.
+	second, replayed, err := s.EnqueueWithIntentID(intent, "hello", nil, QueueSendConfig{}, "")
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if !replayed {
+		t.Fatal("replay must report replayed=true")
+	}
+	if !itemsEqual(second, first) {
+		t.Fatalf("replay receipt mismatch:\n first=%+v\nsecond=%+v", first, second)
+	}
+	items, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("replay created a second item: %d items", len(items))
+	}
+
+	// Changed payload under the same intentID → conflict, no effect.
+	if _, _, err := s.EnqueueWithIntentID(intent, "CHANGED", nil, QueueSendConfig{}, ""); !errors.Is(err, errQueueAdmissionConflict) {
+		t.Fatalf("changed payload under same intentId: err=%v, want errQueueAdmissionConflict", err)
+	}
+
+	// Restart-equivalent: a fresh store replays from the persisted receipt log.
+	fresh := &sessionQueueStore{path: queuePath(root, "s1")}
+	third, replayed, err := fresh.EnqueueWithIntentID(intent, "hello", nil, QueueSendConfig{}, "")
+	if err != nil || !replayed || !itemsEqual(third, first) {
+		t.Fatalf("replay after reload: replayed=%v err=%v item=%+v", replayed, err, third)
+	}
+
+	// Cross-alias dedupe: the same id VALUE under the legacy attemptId name
+	// hits the same receipt (the store dedupes by value, not wire name) and
+	// the replayed receipt still echoes the field of the FIRST admission.
+	cross, replayed, err := fresh.EnqueueWithAttemptID(intent, "hello", nil, QueueSendConfig{}, "")
+	if err != nil || !replayed || cross.ID != first.ID || cross.IntentID != intent {
+		t.Fatalf("cross-alias replay: replayed=%v err=%v item=%+v", replayed, err, cross)
+	}
+
+	// Legacy path: absent id → duplicate enqueues create duplicate items
+	// (exactly today's behavior).
+	if _, err := s.Enqueue("no-id-a", nil, QueueSendConfig{}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Enqueue("no-id-b", nil, QueueSendConfig{}, ""); err != nil {
+		t.Fatal(err)
+	}
+	items, err = s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 3 { // 1 intent-admitted + 2 legacy duplicates
+		t.Fatalf("legacy duplicate-enqueue behavior changed: %d items, want 3", len(items))
+	}
+
+	// Oversized intentID is bounded exactly like attemptId (ids index the
+	// persisted receipt map; the size cap keeps queue.json sane).
+	long := strings.Repeat("a", attemptIDMaxLength+1)
+	if _, _, err := s.EnqueueWithIntentID(long, "z", nil, QueueSendConfig{}, ""); !errors.Is(err, errQueueBadAttemptID) {
+		t.Fatalf("oversized intentId: err=%v, want errQueueBadAttemptID", err)
+	}
+
+	// Both aliases with DIFFERENT values is an ambiguous identity.
+	if _, _, err := s.enqueueAdmission("id-one", "id-two", "z", nil, QueueSendConfig{}, ""); !errors.Is(err, errQueueConflictingAdmissionIDs) {
+		t.Fatalf("conflicting admission ids: err=%v, want errQueueConflictingAdmissionIDs", err)
+	}
+}
+
+// TestQueueIntentIDHTTPAdmissionAndConflict drives the intentId contract
+// through the real HTTP stack: admission echoes intentId on the item, a re-POST
+// with the same intentId is an idempotent 200 carrying the SAME item id and
+// replayed=true with the item count unchanged, and a request carrying BOTH
+// alias names with different values is a 400 with the machine-readable code.
+func TestQueueIntentIDHTTPAdmissionAndConflict(t *testing.T) {
+	web, root := newQueueTestServer(t)
+	sid := "s1"
+	const intent = "bbbbbbbb-0000-0000-0000-000000000002"
+
+	// Fresh admission via intentId.
+	r1 := csrfPost(t, web.URL+"/vh/session/"+sid+"/queue", map[string]any{"text": "via-intent", "intentId": intent})
+	defer r1.Body.Close()
+	if r1.StatusCode != 200 {
+		b, _ := io.ReadAll(r1.Body)
+		t.Fatalf("intentId enqueue: %d %s", r1.StatusCode, b)
+	}
+	var enq1 struct {
+		Item     QueueItem `json:"item"`
+		Replayed bool      `json:"replayed"`
+	}
+	if err := json.NewDecoder(r1.Body).Decode(&enq1); err != nil {
+		t.Fatal(err)
+	}
+	if enq1.Replayed || enq1.Item.IntentID != intent || enq1.Item.AttemptID != "" {
+		t.Fatalf("admission echo wrong: replayed=%v item=%+v", enq1.Replayed, enq1.Item)
+	}
+
+	// Replay: same intentId → 200, SAME item id, replayed=true.
+	r2 := csrfPost(t, web.URL+"/vh/session/"+sid+"/queue", map[string]any{"text": "via-intent", "intentId": intent})
+	defer r2.Body.Close()
+	if r2.StatusCode != 200 {
+		t.Fatalf("replay status: %d", r2.StatusCode)
+	}
+	var enq2 struct {
+		Item     QueueItem `json:"item"`
+		Replayed bool      `json:"replayed"`
+	}
+	if err := json.NewDecoder(r2.Body).Decode(&enq2); err != nil {
+		t.Fatal(err)
+	}
+	if !enq2.Replayed || enq2.Item.ID != enq1.Item.ID {
+		t.Fatalf("replay: replayed=%v id=%s, want replayed + original id %s", enq2.Replayed, enq2.Item.ID, enq1.Item.ID)
+	}
+
+	// Item count unchanged (list through the same HTTP surface).
+	resp, err := http.Get(web.URL + "/vh/session/" + sid + "/queue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var list struct {
+		Items []QueueItem `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 1 {
+		t.Fatalf("after replay: %d items, want 1", len(list.Items))
+	}
+
+	// Both alias names, different values → 400 + machine-readable code.
+	r3 := csrfPost(t, web.URL+"/vh/session/"+sid+"/queue", map[string]any{"text": "ambiguous", "intentId": "one", "attemptId": "two"})
+	defer r3.Body.Close()
+	if r3.StatusCode != http.StatusBadRequest {
+		t.Fatalf("conflicting ids status: %d, want 400", r3.StatusCode)
+	}
+	var conflict struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r3.Body).Decode(&conflict); err != nil {
+		t.Fatal(err)
+	}
+	if conflict.Code != "queue_admission_id_conflict" {
+		t.Fatalf("conflict code: %q, want queue_admission_id_conflict", conflict.Code)
+	}
+
+	// The legacy attemptId path still works unchanged through HTTP.
+	r4 := csrfPost(t, web.URL+"/vh/session/"+sid+"/queue", map[string]any{"text": "via-attempt", "attemptId": "att-http-1"})
+	defer r4.Body.Close()
+	if r4.StatusCode != 200 {
+		t.Fatalf("legacy attemptId enqueue: %d", r4.StatusCode)
+	}
+	var enq4 struct {
+		Item     QueueItem `json:"item"`
+		Replayed bool      `json:"replayed"`
+	}
+	if err := json.NewDecoder(r4.Body).Decode(&enq4); err != nil {
+		t.Fatal(err)
+	}
+	if enq4.Replayed || enq4.Item.AttemptID != "att-http-1" || enq4.Item.IntentID != "" {
+		t.Fatalf("legacy attempt echo wrong: replayed=%v item=%+v", enq4.Replayed, enq4.Item)
+	}
+
+	// The saved on-disk file carries the schema version (HTTP-path save).
+	raw := string(mustReadFile(t, queuePath(root, sid)))
+	if !strings.Contains(raw, `"version": 1`) {
+		t.Fatalf("HTTP-saved queue.json lacks version: %s", raw)
+	}
+}
+
+// TestQueueVersionCapabilityAdvert pins the /vh/version capability keys added
+// by send-net-resilience slice 1: the daemon advertises the queue schema
+// version it writes/understands and the daemon-dispatch-capable flag (OFF —
+// this slice ships the schema/admission foundation only; browser-driven
+// claim/POST/resolve remains the sole dispatch path). Existing consumers read
+// only "version", which must keep working (additive keys).
+func TestQueueVersionCapabilityAdvert(t *testing.T) {
+	web, _ := newQueueTestServer(t)
+	resp, err := http.Get(web.URL + "/vh/version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("/vh/version: %d", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := body["version"].(string); !ok || v == "" {
+		t.Fatalf("version key missing/empty: %+v", body)
+	}
+	if got := body["queueSchemaVersion"]; got != float64(queueSchemaVersion) {
+		t.Fatalf("queueSchemaVersion = %v, want %d", got, queueSchemaVersion)
+	}
+	if got, ok := body["daemonDispatchCapable"].(bool); !ok || got {
+		t.Fatalf("daemonDispatchCapable = %v, want false (custody ships disabled)", body["daemonDispatchCapable"])
 	}
 }
