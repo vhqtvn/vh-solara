@@ -12,3 +12,11 @@ package web
 func custodyLockAcquire(path string) (custodyLock, error) {
 	return nil, errQueueCustodyUnsupported
 }
+
+// custodyLockHeld is the non-Linux probe stub (D-F2 mixed-writer
+// arbitration): custody can never be live-held where it cannot be acquired,
+// so the probe constant-false — the browser-facing routes never refuse on
+// arbitration grounds outside the certified matrix.
+func custodyLockHeld(path string) bool {
+	return false
+}

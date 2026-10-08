@@ -17,12 +17,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 )
 
 // custodyTestRoot enables the TEST-ONLY custody gate for one root and
@@ -745,5 +750,99 @@ func TestQueueCustodyReleasedOwnerTakeoverInterleave(t *testing.T) {
 	}
 	if string(before) != string(after) {
 		t.Fatalf("released owner A mutated the store after the takeover:\nbefore: %s\nafter:  %s", before, after)
+	}
+}
+
+// --- B-F6: barrier certification matrix (AMEND-A1 topology exclusions) --------
+
+// TestCustodyBarrierCertificationMatrix pins the restart-causality-barrier
+// predicate: certified ONLY on Linux with a SPAWNED OpenCode. External-OC is
+// NEVER certified (an externally-managed instance can be restarted
+// out-of-band and driven by clients this daemon cannot observe). The
+// non-Linux arm is asserted directly by queue_custody_other_test.go on
+// non-Linux hosts; here the runtime arm pins the half this host can observe.
+func TestCustodyBarrierCertificationMatrix(t *testing.T) {
+	if custodyBarrierCertified(true) {
+		t.Fatal("external-OC must NEVER certify the restart barrier, on any platform")
+	}
+	if runtime.GOOS == "linux" && !custodyBarrierCertified(false) {
+		t.Fatal("Linux + spawned-OC is the certified topology — predicate must hold here")
+	}
+}
+
+// TestExternalOpenCodeSignalExcludesBarrierCertification proves the RUNTIME
+// SIGNAL the predicate consumes: Server.externalOC, wired from --opencode-url
+// (cmd/local-server.go: external := localOpenCodeURL != \"\"), defaulting to
+// spawned (false). Flipping it to external must drop barrier certification —
+// phase 2's barrier logic keys off this exact signal, so the wiring is pinned
+// here (B-F6: the exclusion is enforced, not just documented).
+func TestExternalOpenCodeSignalExcludesBarrierCertification(t *testing.T) {
+	oc := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(oc.Close)
+	srv, err := NewServer(aggregator.New(oc.URL, 100), oc.URL, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+	if srv.externalOC {
+		t.Fatal("default posture must be spawned-OC (externalOC=false) — a bare local-server owns its OpenCode")
+	}
+	if runtime.GOOS == "linux" && !custodyBarrierCertified(srv.externalOC) {
+		t.Fatal("Linux + spawned-OC (the default signal) must certify the barrier")
+	}
+	srv.SetExternalOpenCode(true) // the --opencode-url wiring's effect
+	if !srv.externalOC {
+		t.Fatal("SetExternalOpenCode(true) did not set the topology signal")
+	}
+	if custodyBarrierCertified(srv.externalOC) {
+		t.Fatal("external-OC must never certify the restart barrier (AMEND-A1 exclusion)")
+	}
+}
+
+// --- D-F2 primitive: the non-mutating live-holder probe ------------------------
+
+// TestCustodyLockHeldProbe pins the mixed-writer arbitration probe's contract
+// on Linux: false when the lock file does not exist (and the probe must NOT
+// create it — it is safe in the flag-off posture), false when the file exists
+// but nobody holds the flock, true while a live owner (this process — same
+// semantics as any other: flock is per open-file-description) holds it, and
+// false again after release. The non-Linux stub is pinned by
+// queue_custody_other_test.go.
+func TestCustodyLockHeldProbe(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("flock semantics — Linux only")
+	}
+	root := custodyTestRoot(t)
+	lockPath := filepath.Join(root, ".vh-solara", custodyLockFileRel)
+
+	// No lock file yet: not held, and the probe must not create it.
+	if custodyLockHeld(lockPath) {
+		t.Fatal("probe reported held with no lock file")
+	}
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("probe created the lock file (%v) — it must be non-mutating", err)
+	}
+
+	// A live owner holds it: held.
+	tok, err := AcquireQueueCustody(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !custodyLockHeld(lockPath) {
+		t.Fatal("probe reported not-held while a live owner holds the flock")
+	}
+	// And the probe does not disturb the owner's generation authority.
+	if err := tok.FenceCheck(); err != nil {
+		t.Fatalf("probe disturbed the live owner's fence: %v", err)
+	}
+	tok.Release()
+
+	// File still exists (empty), flock free: not held.
+	if custodyLockHeld(lockPath) {
+		t.Fatal("probe reported held after release (flock must be free)")
 	}
 }

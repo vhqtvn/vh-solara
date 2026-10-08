@@ -126,6 +126,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 )
@@ -159,7 +160,38 @@ var (
 	// newer custody owner exists (or the generation authority is lost). The
 	// stale owner's mutation/POST must not proceed.
 	errQueueFenced = errors.New("queue custody fence rejected a stale-generation write")
+	// errQueueCustodyActive (D-F2 mixed-writer arbitration): a LIVE custody
+	// owner dispatches this project's queue, so the LEGACY browser-facing
+	// claim/resolve mutations are refused with a typed, machine-readable
+	// error (the design's migration signal: old SPAs feature-detect the
+	// ownership conflict and refresh). Enqueue stays open — admission is the
+	// client's durable gesture, not a dispatch mutation. Refused at the
+	// ROUTE layer only (queue_http.go); the store itself stays callable by
+	// the custody owner.
+	errQueueCustodyActive = errors.New("queue custody active: a custody owner dispatches this project's queue; browser claim/resolve refused")
 )
+
+// custodyBarrierCertified reports whether the RESTART CAUSALITY BARRIER —
+// "OpenCode restarted since the POST + post-restart exact-ID GET 404 ⇒ the
+// POST never durably persisted, so redelivery cannot duplicate" — may be
+// CERTIFIED for this daemon's topology (the AMEND-A1 matrix; slice 2b's
+// certified redelivery classes key off it). The claim holds ONLY inside:
+//
+//	Linux (flock custody — enforced by the platform split,
+//	        queue_custody_linux.go vs queue_custody_other.go)
+//	+ an OpenCode instance this daemon SPAWNED (spawned-OC).
+//
+// External OpenCode (SetExternalOpenCode(true), wired from --opencode-url in
+// cmd/local-server.go) is EXCLUDED: an externally-managed instance can be
+// restarted out-of-band and driven by other clients this daemon cannot
+// observe, so a post-restart 404 proves nothing there. Queue custody itself
+// still enforces single-writer queue.json in external mode; only the barrier
+// claim drops. Phase 2's barrier/recovery logic MUST consult this predicate
+// before classifying any item into a certified-redeliver class — B-F6's
+// enforced exclusion is exactly this boolean's `externalOC` arm.
+func custodyBarrierCertified(externalOC bool) bool {
+	return runtime.GOOS == "linux" && !externalOC
+}
 
 // maxCustodyGeneration is the enforced generation ceiling: 2^53-1
 // (Number.MAX_SAFE_INTEGER). See the FE-mirror decision in the file doc

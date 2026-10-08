@@ -332,3 +332,283 @@ func TestQueueDrainFlagOffByteEquivalence(t *testing.T) {
 		t.Fatalf("flag-off acquire err = %v, want errQueueCustodyDisabled", err)
 	}
 }
+
+// --- T1C-F1: the pre-POST fence branch (red-signal) ---------------------------
+//
+// The pre-POST FenceCheck in RunQueuedDispatchAttempt — the compare-and-fence
+// immediately before the upstream POST — previously had NO test that fails if
+// the branch is deleted: the crash-at-each-transition crux proves the RECEIPT
+// fence (mid-POST takeover), but the pre-POST window sits between two store
+// calls with no statement boundary a test can interleave at. The
+// queueDrainPrePostSeam (nil in production) gives the test exactly that
+// window: drive the executor PAST claim/begin with a LIVE token, bump the
+// authority out-of-band at the seam, and the pre-POST fence must reject —
+// the poster NEVER runs. Deleting the FenceCheck (or the seam firing before
+// it) makes this test fail: the poster would be invoked.
+func TestQueueDrainPrePostFenceBlocksPoster(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("flock semantics — Linux only")
+	}
+	root := custodyTestRoot(t)
+	path := queuePath(root, "prepost")
+	tok, err := AcquireQueueCustody(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tok.Release()
+	s := &sessionQueueStore{path: path}
+	if _, err := s.Enqueue("fenced-pre-post", nil, QueueSendConfig{}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Enqueue("second-pending", nil, QueueSendConfig{}, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	posterRan := false
+	// At the exact pre-POST window (begin durable, POST not yet sent): bump
+	// the authority OUT-OF-BAND — the durable record of a newer owner. The
+	// token itself stays LIVE (never released), so the fence must reject via
+	// the generation-MISMATCH branch, not the revocation branch (G5).
+	genPath := filepath.Join(root, ".vh-solara", custodyGenFileRel)
+	queueDrainPrePostSeam = func() {
+		if err := writeCustodyGeneration(genPath, tok.Generation()+1); err != nil {
+			t.Errorf("out-of-band authority bump: %v", err)
+		}
+	}
+	t.Cleanup(func() { queueDrainPrePostSeam = nil })
+
+	outcome, err := RunQueuedDispatchAttempt(context.Background(), s, "prepost", tok, func(context.Context, string, json.RawMessage) error {
+		posterRan = true
+		return nil
+	})
+	if !errors.Is(err, errQueueFenced) {
+		t.Fatalf("pre-POST fence err = %v, want errQueueFenced", err)
+	}
+	if !strings.Contains(err.Error(), "newer owner") {
+		t.Fatalf("fence error = %q, want the generation-mismatch branch (G5: live token, out-of-band bump)", err.Error())
+	}
+	if strings.Contains(err.Error(), "released") {
+		t.Fatalf("fence error = %q — hit the REVOCATION branch; the token must stay live for the mismatch branch", err.Error())
+	}
+	if posterRan {
+		t.Fatal("poster ran despite a failed pre-POST fence — a stale token reached the network")
+	}
+	if outcome.ItemID == "" || outcome.AttemptIdx != 0 || outcome.Class != "" {
+		t.Fatalf("pre-POST fenced outcome = %+v, want item + attempt 0 + unclassified", outcome)
+	}
+	// Durable journal: EXACTLY the begin write — one OPEN attempt under the
+	// (now stale) generation; no receipt, no poster side effects.
+	it := journalItemByText(t, s, "fenced-pre-post")
+	if it.State != QueueDispatching || len(it.Attempts) != 1 {
+		t.Fatalf("fenced item = %+v, want dispatching with exactly 1 attempt", it)
+	}
+	if open := it.Attempts[0]; open.TransportClass != "" || open.EndedAt != 0 || open.Generation != tok.Generation() {
+		t.Fatalf("pre-POST attempt = %+v, want OPEN under generation %d (empty class, no end)", open, tok.Generation())
+	}
+	// The second pending item is untouched by the fenced executor.
+	second := journalItemByText(t, s, "second-pending")
+	if second.State != QueuePending {
+		t.Fatalf("second item state = %s, want pending (fenced executor must not disturb it)", second.State)
+	}
+}
+
+// --- G5: live-token generation mismatch at the fence ---------------------------
+
+// TestQueueCustodyLiveTokenGenerationMismatch covers the FenceCheck branch
+// that had NO coverage post-revocation-fix: cur != c.gen with a LIVE
+// (unreleased) token. The pre-existing tests always release the token first,
+// so the released/revocation branch fires before the authority is even read.
+// Here the token stays live for every assertion; the authority is bumped
+// out-of-band (the durable record of a newer owner — crash recovery, or
+// another machine's acquisition on a shared volume).
+func TestQueueCustodyLiveTokenGenerationMismatch(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("flock semantics — Linux only")
+	}
+	root := custodyTestRoot(t)
+	tok, err := AcquireQueueCustody(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tok.Release() // LIVE for every assertion below — released only at cleanup
+
+	// Out-of-band bump: authority now records a generation NEWER than tok's.
+	genPath := filepath.Join(root, ".vh-solara", custodyGenFileRel)
+	if err := writeCustodyGeneration(genPath, tok.Generation()+1); err != nil {
+		t.Fatal(err)
+	}
+
+	// (a) The fence rejects the live-but-stale token via the MISMATCH branch.
+	err = tok.FenceCheck()
+	if !errors.Is(err, errQueueFenced) {
+		t.Fatalf("live-token mismatch FenceCheck err = %v, want errQueueFenced", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "newer owner") || strings.Contains(msg, "released") {
+		t.Fatalf("fence error = %q, want the mismatch branch (newer owner), not the revocation branch", msg)
+	}
+
+	// (b) The store gates reject it too (claim under a fenced token).
+	s := &sessionQueueStore{path: queuePath(root, "g5")}
+	mustEnqueue(t, s, "g5-probe")
+	if _, _, err := s.ClaimForCustody(tok); !errors.Is(err, errQueueFenced) {
+		t.Fatalf("ClaimForCustody under live-stale token err = %v, want errQueueFenced", err)
+	}
+
+	// (c) The executor rejects at claim — the poster is never invoked.
+	posterRan := false
+	_, err = RunQueuedDispatchAttempt(context.Background(), s, "g5", tok, func(context.Context, string, json.RawMessage) error {
+		posterRan = true
+		return nil
+	})
+	if !errors.Is(err, errQueueFenced) {
+		t.Fatalf("executor under live-stale token err = %v, want errQueueFenced", err)
+	}
+	if posterRan {
+		t.Fatal("poster ran under a live-stale (mismatched) token")
+	}
+}
+
+// --- C-F3: buildPromptBody mirrors the legacy FE dispatch passthrough ---------
+//
+// The daemon body builder must stay shape-compatible with what the legacy
+// browser dispatch sends today (web/src/components/chat/createSend.ts
+// dispatchQueuedItem + buildParts): text part, file parts (minus vh-attach:
+// inline chips), agent, the ATOMIC provider/model pair, variant nested in the
+// model branch, and the claim-minted messageID.
+func TestQueueDrainPromptBodyMirrorsFEDispatch(t *testing.T) {
+	// decodeBody gives a FRESH view per call (a reused struct would keep an
+	// absent-pointer field from the previous case — json.Unmarshal does not
+	// clear what a body omits).
+	decodeBody := func(b json.RawMessage) (parts []map[string]string, agent string, model map[string]string, variant, messageID string) {
+		var raw struct {
+			Parts     []map[string]string `json:"parts"`
+			Agent     string              `json:"agent"`
+			Model     map[string]string   `json:"model"`
+			Variant   string              `json:"variant"`
+			MessageID string              `json:"messageID"`
+		}
+		if err := json.Unmarshal(b, &raw); err != nil {
+			t.Fatal(err)
+		}
+		return raw.Parts, raw.Agent, raw.Model, raw.Variant, raw.MessageID
+	}
+
+	// Full propagation: text + real attachment + inline chip + full config.
+	item := QueueItem{
+		Text: "hello with files",
+		Attachments: []QueueAttachment{
+			{URL: "file:///tmp/report.pdf", Filename: "report.pdf", Mime: "application/pdf"},
+			{URL: "vh-attach:chip-1", Filename: "inline.txt", Mime: "text/plain"}, // synthetic chip — excluded
+		},
+		SendConfig:    QueueSendConfig{ProviderID: "anthropic", ModelID: "claude-4", Variant: "stable", Agent: "build"},
+		OpencodeMsgID: "msg_full",
+	}
+	parts, agent, model, variant, messageID := decodeBody(buildPromptBody(item))
+	if len(parts) != 2 {
+		t.Fatalf("parts = %+v, want 2 (text + real file; the vh-attach: chip is excluded)", parts)
+	}
+	if parts[0]["type"] != "text" || parts[0]["text"] != "hello with files" {
+		t.Fatalf("text part = %+v", parts[0])
+	}
+	filePart := parts[1]
+	if filePart["type"] != "file" || filePart["url"] != "file:///tmp/report.pdf" || filePart["filename"] != "report.pdf" || filePart["mime"] != "application/pdf" {
+		t.Fatalf("file part = %+v, want the full FE shape (url+filename+mime always present)", filePart)
+	}
+	if agent != "build" {
+		t.Fatalf("agent = %q, want the captured SendConfig.Agent", agent)
+	}
+	if model == nil || model["providerID"] != "anthropic" || model["modelID"] != "claude-4" {
+		t.Fatalf("model = %v, want the atomic provider/model pair", model)
+	}
+	if variant != "stable" {
+		t.Fatalf("variant = %q, want it threaded inside the model branch", variant)
+	}
+	if messageID != "msg_full" {
+		t.Fatalf("messageID = %q, want the item's correlation id", messageID)
+	}
+
+	// Empty text: attachments-only item — no text part (FE buildParts guard).
+	item = QueueItem{
+		Attachments:   []QueueAttachment{{URL: "file:///x.png", Filename: "x.png", Mime: "image/png"}},
+		OpencodeMsgID: "msg_attonly",
+	}
+	parts, _, _, _, _ = decodeBody(buildPromptBody(item))
+	if len(parts) != 1 || parts[0]["type"] != "file" {
+		t.Fatalf("attachments-only parts = %+v, want exactly the file part", parts)
+	}
+
+	// HALF a model config (provider without model): the pair is atomic on the
+	// FE — no model key, and therefore no variant either.
+	item = QueueItem{
+		Text:          "half",
+		SendConfig:    QueueSendConfig{ProviderID: "anthropic", Variant: "stable", Agent: "build"},
+		OpencodeMsgID: "msg_half",
+	}
+	_, _, model, variant, _ = decodeBody(buildPromptBody(item))
+	if model != nil {
+		t.Fatalf("half config produced model = %v — the pair must be atomic", model)
+	}
+	if variant != "" {
+		t.Fatalf("variant = %q outside the model branch — the FE nests it there", variant)
+	}
+
+	// Byte-shape legacy compat: a minimal text-only item (the pre-C-F3
+	// builder's exact output) must stay byte-identical.
+	item = QueueItem{Text: "legacy", OpencodeMsgID: "msg_min"}
+	if b := buildPromptBody(item); string(b) != `{"parts":[{"text":"legacy","type":"text"}],"messageID":"msg_min"}` {
+		t.Fatalf("minimal body bytes = %s — legacy text-only dispatch must be byte-identical", b)
+	}
+}
+
+// TestQueueDrainPromptBodyPropagationThroughExecutor proves the WIRING (not
+// just the builder): the executor hands the poster a body built from the
+// CLAIMED item — captured SendConfig and attachments included, correlation id
+// minted at claim.
+func TestQueueDrainPromptBodyPropagationThroughExecutor(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("flock semantics — Linux only")
+	}
+	root := custodyTestRoot(t)
+	tok, err := AcquireQueueCustody(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tok.Release()
+	s := &sessionQueueStore{path: queuePath(root, "bodywire")}
+	if _, err := s.Enqueue("propagate me", []QueueAttachment{
+		{URL: "file:///tmp/a.pdf", Filename: "a.pdf", Mime: "application/pdf"},
+		{URL: "vh-attach:chip", Filename: "chip.txt", Mime: "text/plain"},
+	}, QueueSendConfig{ProviderID: "p1", ModelID: "m1", Variant: "v1", Agent: "ag1"}, "client-1"); err != nil {
+		t.Fatal(err)
+	}
+	var captured json.RawMessage
+	_, err = RunQueuedDispatchAttempt(context.Background(), s, "bodywire", tok, func(_ context.Context, _ string, body json.RawMessage) error {
+		captured = append([]byte(nil), body...)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Parts []map[string]string `json:"parts"`
+		Agent string              `json:"agent"`
+		Model *struct {
+			ProviderID string `json:"providerID"`
+			ModelID    string `json:"modelID"`
+		} `json:"model"`
+		Variant   string `json:"variant"`
+		MessageID string `json:"messageID"`
+	}
+	if err := json.Unmarshal(captured, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Parts) != 2 || got.Parts[0]["type"] != "text" || got.Parts[1]["url"] != "file:///tmp/a.pdf" {
+		t.Fatalf("propagated parts = %+v, want text + real file (chip excluded)", got.Parts)
+	}
+	if got.Agent != "ag1" || got.Model == nil || got.Model.ProviderID != "p1" || got.Model.ModelID != "m1" || got.Variant != "v1" {
+		t.Fatalf("propagated config = agent:%q model:%+v variant:%q — SendConfig must thread through", got.Agent, got.Model, got.Variant)
+	}
+	if got.MessageID == "" || !strings.HasPrefix(got.MessageID, "msg_") {
+		t.Fatalf("propagated messageID = %q, want the claim-minted id", got.MessageID)
+	}
+}

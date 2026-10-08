@@ -48,3 +48,29 @@ func (l *custodyFlock) Release() {
 		l.f = nil
 	}
 }
+
+// custodyLockHeld reports whether a LIVE owner currently holds the project's
+// queue-custody flock — a NON-MUTATING probe (D-F2 mixed-writer arbitration):
+// open the lock file WITHOUT O_CREATE and try LOCK_EX|LOCK_NB. EWOULDBLOCK ⇒
+// a live open file description (the daemon's custody owner, in this or any
+// process) holds it; acquired ⇒ no live holder (the deferred close drops the
+// probe's lock — close-only, the disciplined form above); missing/unreadable
+// file ⇒ not held (acquisition creates the file, so absence proves no owner).
+// The probe never bumps the generation authority and never creates files, so
+// it is safe on the flag-off posture (callers gate it behind
+// queueCustodyAllowed()).
+//
+// HONEST BOUND: this is ADVISORY arbitration for the LEGACY browser writer,
+// not a fence — a custody owner acquiring between the probe and the legacy
+// write is caught by the compare-and-fence gate, not by this probe.
+func custodyLockHeld(path string) bool {
+	f, err := os.OpenFile(path, os.O_RDWR|syscall.O_CLOEXEC, 0o644)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return true // EWOULDBLOCK/EAGAIN: a live holder exists
+	}
+	return false // we acquired it ourselves — nobody else holds it
+}

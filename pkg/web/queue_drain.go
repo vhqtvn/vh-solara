@@ -52,9 +52,33 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
 )
+
+// vhAttachURLPrefix mirrors web/src/lib/inlineAttach.ts:94
+// (VH_ATTACH_URL_PREFIX = "vh-attach:"): synthetic inline-chip attachment
+// urls. The FE's buildParts EXCLUDES them from the prompt body (the chip's
+// token was substituted into the text at send; emitting the chip as a file
+// part would double-send a bogus file whose url is not a real file:// path).
+// The daemon body builder mirrors that exclusion (C-F3).
+const vhAttachURLPrefix = "vh-attach:"
+
+// queueDrainPrePostSeam is a TEST-ONLY interleave seam placed at the EXACT
+// pre-POST fence window — after BeginDispatchAttempt's durable journal write
+// returns and immediately before the compare-and-fence FenceCheck that guards
+// the upstream POST. It is nil in production and no production code path ever
+// sets it (zero dispatch-behavior change); its sole purpose is deterministic
+// red-signal testing of the pre-POST fence branch (T1C-F1): a test sets the
+// seam to perform an out-of-band takeover (authority bump / release) at the
+// precise point the fence guards, so the executor can be driven PAST
+// claim/begin with a live token and the fence made to fail exactly at the
+// pre-POST check — without the seam, that window is unreachable from test
+// code (there is no statement boundary between begin and the fence).
+// Set/Reset discipline: tests MUST restore nil (defer) so the seam never
+// leaks across tests.
+var queueDrainPrePostSeam func()
 
 // promptPoster performs ONE upstream prompt_async POST. Production binds it
 // to opencode.Client.Prompt (non-2xx arrives as *opencode.Error with Status
@@ -93,6 +117,11 @@ func RunQueuedDispatchAttempt(ctx context.Context, s *sessionQueueStore, sid str
 	if err != nil {
 		return DispatchOutcome{}, err
 	}
+	// TEST-ONLY interleave point (nil in production): lets a test perform a
+	// takeover at the exact pre-POST window (see queueDrainPrePostSeam).
+	if queueDrainPrePostSeam != nil {
+		queueDrainPrePostSeam()
+	}
 	// Compare-and-fence immediately before the upstream POST (debate-4 B3).
 	// A stale token must not reach the network even once.
 	if err := tok.FenceCheck(); err != nil {
@@ -106,19 +135,74 @@ func RunQueuedDispatchAttempt(ctx context.Context, s *sessionQueueStore, sid str
 	return DispatchOutcome{ItemID: item.ID, OpencodeMsgID: item.OpencodeMsgID, AttemptIdx: idx, Class: class}, nil
 }
 
-// buildPromptBody assembles the prompt_async body for one queued item. SLICE
-// 2A MINIMAL SHAPE: a single text part + the caller-id-wins messageID (the
-// correlation id minted at claim, so OpenCode persists the user message
-// under the exact id the reconciler GETs). sendConfig/attachment threading
-// lands with the production drain wiring (the fields persist on the item;
-// no production dispatch runs in this slice).
+// buildPromptBody assembles the prompt_async body for one queued item. It is
+// an EXACT MIRROR of the legacy FE dispatch passthrough (C-F3: web/src/
+// components/chat/createSend.ts dispatchQueuedItem + buildParts — the wire
+// shape the daemon executor must stay byte-compatible with while the legacy
+// browser path is still the production dispatcher):
+//
+//	parts: one {type:"text", text} part (only when the text is non-empty)
+//	       followed by one {type:"file", url, filename, mime} part per
+//	       attachment EXCEPT synthetic inline chips (url prefix
+//	       vh-attach: — see vhAttachURLPrefix; the chip's token was
+//	       substituted into the text at send, so emitting it would
+//	       double-send a bogus file part)
+//	agent: the item's CAPTURED SendConfig.Agent. The FE sends `agent`
+//	       unconditionally (its evidence gate guarantees non-empty); the
+//	       daemon threads the captured config and omits the key when the
+//	       capture has none — re-resolving an incomplete capture through the
+//	       agent-evidence gate is the drain-loop wiring's concern (phase 2),
+//	       not the body builder's.
+//	model: {providerID, modelID} — only when BOTH halves are present (the FE
+//	       treats the pair as atomic; threading a lone half would dispatch
+//	       under a half-switched config).
+//	variant: only inside the model branch (the FE nests it there).
+//	messageID: the claim-minted correlation id (caller-id-wins upstream), so
+//	       OpenCode persists the user message under the exact id the
+//	       reconciler GETs.
+//
+// promptBodyModel is the `model` member of the prompt_async body — the
+// provider/model PAIR the FE treats as atomic (never a lone half).
+type promptBodyModel struct {
+	ProviderID string `json:"providerID"`
+	ModelID    string `json:"modelID"`
+}
+
+// promptBody is the prompt_async request body shape (the FE passthrough
+// mirror — see buildPromptBody).
+type promptBody struct {
+	Parts     []map[string]string `json:"parts"`
+	Agent     string              `json:"agent,omitempty"`
+	Model     *promptBodyModel    `json:"model,omitempty"`
+	Variant   string              `json:"variant,omitempty"`
+	MessageID string              `json:"messageID,omitempty"`
+}
+
 func buildPromptBody(item QueueItem) json.RawMessage {
-	body := struct {
-		Parts     []map[string]string `json:"parts"`
-		MessageID string              `json:"messageID,omitempty"`
-	}{
-		Parts:     []map[string]string{{"type": "text", "text": item.Text}},
-		MessageID: item.OpencodeMsgID,
+	parts := make([]map[string]string, 0, 1+len(item.Attachments))
+	if item.Text != "" {
+		parts = append(parts, map[string]string{"type": "text", "text": item.Text})
+	}
+	for _, a := range item.Attachments {
+		if strings.HasPrefix(a.URL, vhAttachURLPrefix) {
+			continue // synthetic inline chip (mirrors the FE buildParts guard)
+		}
+		parts = append(parts, map[string]string{
+			"type":     "file",
+			"url":      a.URL,
+			"filename": a.Filename,
+			"mime":     a.Mime,
+		})
+	}
+	body := promptBody{Parts: parts, Agent: item.SendConfig.Agent}
+	if item.SendConfig.ProviderID != "" && item.SendConfig.ModelID != "" {
+		body.Model = &promptBodyModel{ProviderID: item.SendConfig.ProviderID, ModelID: item.SendConfig.ModelID}
+		if item.SendConfig.Variant != "" {
+			body.Variant = item.SendConfig.Variant // nested in the FE's model branch
+		}
+	}
+	if item.OpencodeMsgID != "" {
+		body.MessageID = item.OpencodeMsgID
 	}
 	b, _ := json.Marshal(body)
 	return b

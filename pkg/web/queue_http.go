@@ -16,10 +16,22 @@ package web
 // Project is resolved via ?dir= / x-opencode-directory (reqDir → projectRoot),
 // matching every other /vh/* handler. The session id is sanitized with safeID
 // before any filesystem use (same as attachments).
+//
+// MIXED-WRITER ARBITRATION (D-F2, custody era): when a LIVE queue-custody
+// owner dispatches this project's queue (the daemon-dispatch era's single
+// writer; today that requires the capability flag or the test hook — the
+// production flag is OFF and this path is dormant), the browser-facing claim
+// and resolve routes REFUSE with 409 + code "queue_custody_active"
+// (errQueueCustodyActive). The legacy browser is not yet observe-only (that
+// is slice 3), so an UNFENCED browser claim racing the fenced custody writer
+// would be a second dispatcher — the route refusal is the arbitration.
+// Enqueue and list stay open for all callers: admission is the client's
+// durable gesture and list is read-only. See queueCustodyArbitrationRefused.
 
 import (
 	"errors"
 	"net/http"
+	"path/filepath"
 )
 
 // resolveQueueCtx extracts + validates the session id and project root from a
@@ -78,6 +90,14 @@ func writeQueueStoreErr(w http.ResponseWriter, err error) {
 		// newer-schema conflict above (status stays 500 — server-side data
 		// integrity the operator must investigate, never a client fix).
 		writeJSON(w, http.StatusInternalServerError, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_file_corrupt"}))
+	case errors.Is(err, errQueueCustodyActive):
+		// D-F2 mixed-writer arbitration: a live custody owner dispatches this
+		// project's queue; the legacy browser claim/resolve mutation is
+		// refused with a machine-readable code so the FE can feature-detect
+		// the ownership conflict (the design's migration story: old SPAs
+		// refresh / surface the custody state rather than silently racing the
+		// single writer).
+		writeJSON(w, http.StatusConflict, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_custody_active"}))
 	case errors.Is(err, errQueueArchived):
 		// 410 Gone: the session queue was archived away; the retained pointer
 		// the handler resolved via store() is now a tombstoned store (BLK-1).
@@ -208,15 +228,44 @@ func (s *Server) handleQueueRemove(w http.ResponseWriter, r *http.Request) {
 	writeJSONResp(w, map[string]any{"ok": true})
 }
 
+// queueCustodyArbitrationRefused reports whether the LEGACY browser-facing
+// queue mutations (claim/resolve) must be refused for this project root
+// because a LIVE queue-custody owner — the daemon-dispatch era's single
+// writer — holds the project's queue (D-F2 mixed-writer arbitration).
+//
+// DORMANT BY DEFAULT: with the daemon-dispatch capability OFF (the slice-2
+// production posture) and no test override armed, this returns false WITHOUT
+// touching the filesystem — the legacy browser dispatch path stays
+// byte-equivalent (no lock files are created, no probes run). When the
+// capability is on (or SetQueueCustodyEnabledForTest armed), a non-mutating
+// flock probe (custodyLockHeld) decides per project root: held ⇒ refuse.
+// The probe is ADVISORY arbitration for the legacy writer; the
+// compare-and-fence gate (queue_custody.go) remains the hard single-writer
+// guarantee for everything that reaches the store.
+func (s *Server) queueCustodyArbitrationRefused(root string) bool {
+	if !queueCustodyAllowed() {
+		return false
+	}
+	return custodyLockHeld(filepath.Join(root, ".vh-solara", custodyLockFileRel))
+}
+
 // POST /vh/session/{sessionId}/queue/claim — atomically claim the oldest
 // pending item (move it to dispatching). Exactly one caller wins a given item
 // (serialized by the per-session mutex). Response always 200:
 //
 //	{item: <QueueItem>}  — won the claim
 //	{item: null}         — no pending item to dispatch
+//
+// MIXED-WRITER ARBITRATION (D-F2): refused with 409 +
+// code "queue_custody_active" while a live custody owner dispatches this
+// project's queue (dormant while the daemon-dispatch capability is off).
 func (s *Server) handleQueueClaim(w http.ResponseWriter, r *http.Request) {
 	sid, root, ok := s.resolveQueueCtx(w, r)
 	if !ok {
+		return
+	}
+	if s.queueCustodyArbitrationRefused(root) {
+		writeQueueStoreErr(w, errQueueCustodyActive)
 		return
 	}
 	item, won, err := s.queues.store(root, sid).Claim()
@@ -240,9 +289,17 @@ func (s *Server) handleQueueClaim(w http.ResponseWriter, r *http.Request) {
 // any other terminal rewrite or downgrade — notably sent → failed/unknown —
 // is a 409 conflict (code "queue_resolve_conflict") rather than silently
 // applied or silently lost.
+//
+// MIXED-WRITER ARBITRATION (D-F2): refused with 409 +
+// code "queue_custody_active" while a live custody owner dispatches this
+// project's queue (dormant while the daemon-dispatch capability is off).
 func (s *Server) handleQueueResolve(w http.ResponseWriter, r *http.Request) {
 	sid, root, ok := s.resolveQueueCtx(w, r)
 	if !ok {
+		return
+	}
+	if s.queueCustodyArbitrationRefused(root) {
+		writeQueueStoreErr(w, errQueueCustodyActive)
 		return
 	}
 	itemID := r.PathValue("itemId")

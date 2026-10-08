@@ -4,10 +4,10 @@
 # assert the prompt round-trips and the streamed assistant reply surfaces via
 # the vh sync API.
 #
-#   tests/e2e-docker/run.sh [--keep] [--flow <all|1..8>]
+#   tests/e2e-docker/run.sh [--keep] [--flow <all|1..9>]
 #
-# --flow N runs ONLY flow N with its own independent setup/cleanup (flow 8
-# boots its own real local-server container; flows 1-7 share the e2eserver
+# --flow N runs ONLY flow N with its own independent setup/cleanup (flows 8-9
+# boot their own real local-server container; flows 1-7 share the e2eserver
 # container and create the session they need). Default: all flows, in order.
 set -euo pipefail
 
@@ -26,6 +26,16 @@ BASE="http://127.0.0.1:${PORT}"
 NAME_REAL=vh-e2e-real
 PORT_REAL=8098
 BASE_REAL="http://127.0.0.1:${PORT_REAL}"
+# Flow 9 (restart causality barrier, send-net-resilience slice 2b / AMEND-A7)
+# runs a THIRD real local-server container. It pins the barrier semantics the
+# certified redelivery class 3 rests on against REAL OpenCode: (A) a commit
+# that completed before a restart SURVIVES it; (B) a prompt POSTed into the
+# ambiguous in-flight window then killed mid-flight has a STABLE exact-ID
+# observation (once observed it never flips — a classifier keyed on the GET
+# is sound); (C) a prompt sent while down never lands (5xx, eternal 404).
+NAME_BARRIER=vh-e2e-barrier
+PORT_BARRIER=8097
+BASE_BARRIER="http://127.0.0.1:${PORT_BARRIER}"
 
 # --- args ---------------------------------------------------------------------
 # Parsed (and validated) BEFORE any image/container side effect: an invalid
@@ -36,15 +46,15 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --keep) KEEP="--keep"; shift ;;
     --flow)
-      [ $# -ge 2 ] || { echo "run.sh: --flow needs a value (all or 1..8)" >&2; exit 2; }
+      [ $# -ge 2 ] || { echo "run.sh: --flow needs a value (all or 1..9)" >&2; exit 2; }
       FLOW="$2"; shift 2 ;;
     --flow=*) FLOW="${1#--flow=}"; shift ;;
-    *) echo "run.sh: unknown argument: $1 (usage: run.sh [--keep] [--flow <all|1..8>])" >&2; exit 2 ;;
+    *) echo "run.sh: unknown argument: $1 (usage: run.sh [--keep] [--flow <all|1..9>])" >&2; exit 2 ;;
   esac
 done
 case "$FLOW" in
-  all|1|2|3|4|5|6|7|8) ;;
-  *) echo "run.sh: invalid --flow '${FLOW}' (want: all or 1..8)" >&2; exit 2 ;;
+  all|1|2|3|4|5|6|7|8|9) ;;
+  *) echo "run.sh: invalid --flow '${FLOW}' (want: all or 1..9)" >&2; exit 2 ;;
 esac
 
 # want_flow N: true when flow N is selected (or when all flows run).
@@ -54,6 +64,7 @@ cleanup() {
   if [ "$KEEP" != "--keep" ]; then
     docker rm -f "$NAME" >/dev/null 2>&1 || true
     docker rm -f "$NAME_REAL" >/dev/null 2>&1 || true
+    docker rm -f "$NAME_BARRIER" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -64,6 +75,8 @@ fail() {
   docker logs "$NAME" 2>&1 | tail -60 >&2 || true
   echo "----- container logs ($NAME_REAL) -----" >&2
   docker logs "$NAME_REAL" 2>&1 | tail -60 >&2 || true
+  echo "----- container logs ($NAME_BARRIER) -----" >&2
+  docker logs "$NAME_BARRIER" 2>&1 | tail -60 >&2 || true
   exit 1
 }
 
@@ -103,11 +116,13 @@ ensure_sid() {
 }
 
 build_image
-# Flow 8 boots its own REAL local-server container (inside its section below);
-# every other flow (1-7) drives the shared e2eserver container.
-if [ "$FLOW" != "8" ]; then
-  boot_e2eserver
-fi
+# Flows 8-9 boot their own REAL local-server containers (inside their
+# sections below); every other flow (1-7) drives the shared e2eserver
+# container.
+case "$FLOW" in
+  8|9) ;;
+  *) boot_e2eserver ;;
+esac
 
 # --- Flow 1: prompt -> streamed assistant reply -------------------------------
 if want_flow 1; then
@@ -929,6 +944,224 @@ DOWN_GET=$(curl -s -o /dev/null -w "%{http_code}" "${BASE_REAL}/oc/session/${RSI
 echo "    down-probe id $DOWN_ID -> still 404 (sent-while-down never landed)"
 fi # flow 8
 
+if want_flow 9; then
+# =============================================================================
+# Flow 9 — restart causality barrier (send-net-resilience slice 2b, AMEND-A7).
+# Against REAL OpenCode on the REAL local-server binary, pin the three legs
+# the certified redelivery class 3 (post-restart-barrier + exact-ID GET 404)
+# rests on:
+#   A. COMMITTED-SURVIVES: a prompt that landed (exact GET 200) BEFORE a
+#      restart is STILL 200 after it (durable commit survives; the barrier
+#      never misreads a landed prompt as lost).
+#   B. OBSERVATION-STABILITY: a prompt POSTed into the ambiguous in-flight
+#      window and killed mid-flight has a STABLE exact-ID observation — the
+#      GET may flip 404→200 at most once (the fork raced the kill and won)
+#      and thereafter NEVER flips again, in either direction, across the
+#      restart AND after full heal. A classifier keyed on this GET is sound.
+#   C. NEVER-LANDS-WHILE-DOWN: a prompt sent while opencode is down fails
+#      visibly (5xx) and its id stays 404 forever (no phantom persistence).
+# =============================================================================
+echo "==> [restart-barrier flow] starting the REAL vh-solara local-server container"
+docker rm -f "$NAME_BARRIER" >/dev/null 2>&1 || true
+docker run -d --name "$NAME_BARRIER" -p "${PORT_BARRIER}:8099" --entrypoint /bin/sh "$IMAGE" -c '
+  /usr/local/bin/fakellm -addr 127.0.0.1:11434 &
+  cd /work && exec /usr/local/bin/vh-solara local-server \
+    --addr 0.0.0.0:8099 \
+    --opencode-bin /root/.opencode/bin/opencode \
+    --opencode-detached' >/dev/null \
+  || fail "[restart-barrier flow] could not start $NAME_BARRIER"
+
+echo "==> [restart-barrier flow] waiting for the local-server web listener"
+for i in $(seq 1 60); do
+  if curl -fsS "${BASE_BARRIER}/vh/healthz" >/dev/null 2>&1; then break; fi
+  sleep 1
+  [ "$i" = "60" ] && fail "[restart-barrier flow] local-server did not become ready"
+done
+
+echo "==> [restart-barrier flow] waiting for detached opencode to reach ready"
+barrier_ready() {
+  curl -fsS "${BASE_BARRIER}/vh/opencode/status" 2>/dev/null \
+    | grep -q '"state":"ready"'
+}
+# After a kill, wait for the watcher to DETECT the death (failed + down_since)
+# before waiting for the heal — otherwise the stale pre-death "ready" state
+# passes immediately and requests hit the dead port (flow-8 lesson).
+barrier_wait_down_then_ready() {
+  for i in $(seq 1 30); do
+    S=$(curl -fsS "${BASE_BARRIER}/vh/opencode/status" 2>/dev/null || true)
+    echo "$S" | grep -q '"state":"failed"' && echo "$S" | grep -q '"down_since"' && break
+    sleep 1
+    [ "$i" = "30" ] && fail "[restart-barrier flow] watcher never flagged the death (last: $S)"
+  done
+  for i in $(seq 1 90); do
+    barrier_ready && break
+    sleep 1
+    [ "$i" = "90" ] && fail "[restart-barrier flow] opencode did not self-heal to ready"
+  done
+}
+for i in $(seq 1 60); do
+  barrier_ready && break
+  sleep 1
+  [ "$i" = "60" ] && fail "[restart-barrier flow] opencode never reached ready"
+done
+
+echo "==> [restart-barrier flow] creating a session"
+BSID=""
+for i in $(seq 1 30); do
+  BSID=$(curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE_BARRIER}/oc/session" \
+        -H 'Content-Type: application/json' -d '{"title":"restart-barrier"}' \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
+  [ -n "$BSID" ] && break
+  sleep 1
+  [ "$i" = "30" ] && fail "[restart-barrier flow] could not create a session on local-server"
+done
+echo "    session id: $BSID"
+
+barrier_post_prompt() { # $1 = messageID, $2 = text -> echoes http code
+  curl -s -o /dev/null -w "%{http_code}" -H 'X-VH-CSRF: 1' \
+    -X POST "${BASE_BARRIER}/oc/session/${BSID}/prompt_async" \
+    -H 'Content-Type: application/json' \
+    -d "{\"messageID\":\"$1\",\"parts\":[{\"type\":\"text\",\"text\":\"$2\"}]}" \
+    || true
+}
+barrier_get_code() { # $1 = messageID -> echoes http code of the exact-ID GET
+  curl -s -o /dev/null -w "%{http_code}" \
+    "${BASE_BARRIER}/oc/session/${BSID}/message/$1" 2>/dev/null || true
+}
+
+# --- A: committed-survives ----------------------------------------------------
+A_ID=$(python3 "$repo_root/tests/e2e-docker/mint_msg_id.py") \
+  || fail "[restart-barrier flow] could not mint id A"
+A_POST=$(barrier_post_prompt "$A_ID" "committed before restart")
+[ "$A_POST" = "204" ] \
+  || fail "[restart-barrier flow] prompt A did not return 204 (got $A_POST)"
+A_PRE=""
+for i in $(seq 1 60); do
+  A_PRE=$(barrier_get_code "$A_ID")
+  [ "$A_PRE" = "200" ] && break
+  [ "$A_PRE" = "404" ] || fail "[restart-barrier flow] unexpected GET status for A ($A_PRE)"
+  sleep 1
+  [ "$i" = "60" ] && fail "[restart-barrier flow] prompt A never landed (persistence is async to the 204, but not THIS async)"
+done
+echo "    A: id $A_ID committed (exact GET 200) before the restart"
+
+echo "==> [restart-barrier flow] killing opencode (SIGTERM) — restart epoch"
+docker exec "$NAME_BARRIER" pkill -x opencode
+echo "==> [restart-barrier flow] waiting for death detection + auto-restart heal"
+barrier_wait_down_then_ready
+
+A_POST_RESTART=$(barrier_get_code "$A_ID")
+[ "$A_POST_RESTART" = "200" ] \
+  || fail "[restart-barrier flow] A did NOT survive the restart (GET $A_POST_RESTART, want 200) — the barrier would misread landed prompts as lost"
+echo "    A: survived the restart (still 200)"
+
+# --- B: observation-stability across the kill-raced in-flight window ---------
+B_ID=$(python3 "$repo_root/tests/e2e-docker/mint_msg_id.py") \
+  || fail "[restart-barrier flow] could not mint id B"
+B_POST=$(barrier_post_prompt "$B_ID" "in flight when killed")
+[ "$B_POST" = "204" ] \
+  || fail "[restart-barrier flow] prompt B did not return 204 (got $B_POST)"
+# Kill IMMEDIATELY: the forked persistence fiber races the kill. Whichever
+# side wins, the exact-ID observation must be STABLE from then on.
+docker exec "$NAME_BARRIER" pkill -x opencode
+
+# Poll the observation across ~10s of the down/restart window: sample every
+# 0.5s; a 5xx (proxy dead) is NOT an observation — only exact 200/404 count.
+# Among real observations: at most ONE transition, only 404->200; 200->404
+# (a committed row vanishing) or oscillation is a FAIL.
+B_FLIPS=0
+B_LAST=""
+B_SAMPLE=$(barrier_get_code "$B_ID")
+case "$B_SAMPLE" in
+  200|404) B_LAST="$B_SAMPLE" ;;
+esac
+B_FIRST="${B_LAST:-none-yet}"
+for i in $(seq 1 20); do
+  sleep 0.5
+  B_NOW=$(barrier_get_code "$B_ID")
+  case "$B_NOW" in
+    200|404) ;;
+    *) continue ;; # dead-window 5xx: the new instance has not answered yet
+  esac
+  if [ -n "$B_LAST" ] && [ "$B_NOW" != "$B_LAST" ]; then
+    B_FLIPS=$((B_FLIPS + 1))
+    if [ "$B_LAST" = "200" ] && [ "$B_NOW" = "404" ]; then
+      fail "[restart-barrier flow] B observation flipped 200->404 — a committed message VANISHED (durable row disappeared across restart)"
+    fi
+    [ "$B_FLIPS" -le 1 ] \
+      || fail "[restart-barrier flow] B observation oscillated ($B_FLIPS flips) — classifier input is unstable"
+    [ "$B_LAST" = "404" ] && [ "$B_NOW" = "200" ] \
+      || fail "[restart-barrier flow] B flipped $B_LAST->$B_NOW (only 404->200 may ever happen)"
+  fi
+  B_LAST="$B_NOW"
+done
+echo "    B: in-flight id $B_ID — observation ${B_FIRST} -> ${B_LAST:-unobserved} (${B_FLIPS} flip(s)) across the kill window (stable)"
+
+# Post-heal consistency: the observation settled in the window must HOLD.
+# If B landed (200): stays 200. If B never landed (404): it must STILL be 404
+# after full heal — the dead fiber cannot resurrect; this is exactly the
+# post-restart-barrier + 404 => never-persisted contract of certified class 3.
+# NOTE: the B kill's death may already have been detected AND healed DURING
+# the sampling window above (fast restart), so waiting for "failed" here
+# would never fire — wait for ready + a REAL (non-5xx) observation instead.
+for i in $(seq 1 60); do
+  barrier_ready || { sleep 1; continue; }
+  B_PROBE=$(barrier_get_code "$B_ID")
+  case "$B_PROBE" in 200|404) break ;; esac
+  sleep 1
+  [ "$i" = "60" ] && fail "[restart-barrier flow] upstream never answered with a real observation after the B kill (last: $B_PROBE)"
+done
+sleep 2
+B_FINAL=$(barrier_get_code "$B_ID")
+if [ -z "$B_LAST" ]; then
+  B_LAST="$B_FINAL" # every in-window sample was a dead 5xx — first real observation is now
+fi
+[ "$B_FINAL" = "$B_LAST" ] \
+  || fail "[restart-barrier flow] B observation moved AFTER heal ($B_LAST -> $B_FINAL) — the barrier's 404 verdict is not sound"
+if [ "$B_FINAL" = "200" ]; then
+  echo "    B: landed after all (fork beat the kill) — still 200 post-heal"
+else
+  echo "    B: never landed — still 404 post-heal (post-restart-barrier 404 => never persisted)"
+fi
+
+# --- C: never-lands-while-down ------------------------------------------------
+# Deterministic dead-window probe (flow-8 pattern): wait for the lazy proxy to
+# surface its dead-upstream 5xx, THEN post — C must fail visibly and stay 404.
+C_ID=$(python3 "$repo_root/tests/e2e-docker/mint_msg_id.py") \
+  || fail "[restart-barrier flow] could not mint id C"
+echo "==> [restart-barrier flow] killing opencode once more for the dead-window probe"
+docker exec "$NAME_BARRIER" pkill -x opencode
+C_DOWN=""
+for i in $(seq 1 15); do
+  C_DOWN=$(curl -s -o /dev/null -w "%{http_code}" "${BASE_BARRIER}/oc/session" 2>/dev/null || true)
+  [ "$C_DOWN" = "502" ] && break
+  sleep 0.2
+done
+[ "$C_DOWN" = "502" ] \
+  || fail "[restart-barrier flow] upstream never went visibly down (last probe: $C_DOWN)"
+C_POST=$(barrier_post_prompt "$C_ID" "sent while down")
+case "$C_POST" in
+  5*) echo "    C: prompt while down -> $C_POST (fails visibly, never landed)" ;;
+  *) fail "[restart-barrier flow] prompt while down returned $C_POST (want a visible 5xx)" ;;
+esac
+
+echo "==> [restart-barrier flow] final heal + C never-lands verdict"
+# Same as post-B: the death may already be healed by the time we look —
+# wait for ready + a REAL observation of C (non-5xx) before the verdict.
+for i in $(seq 1 90); do
+  barrier_ready || { sleep 1; continue; }
+  C_PROBE=$(barrier_get_code "$C_ID")
+  case "$C_PROBE" in 200|404) break ;; esac
+  sleep 1
+  [ "$i" = "90" ] && fail "[restart-barrier flow] upstream never answered with a real observation after the C kill (last: $C_PROBE)"
+done
+sleep 2
+C_FINAL=$(barrier_get_code "$C_ID")
+[ "$C_FINAL" = "404" ] \
+  || fail "[restart-barrier flow] C resolved after the restart (GET $C_FINAL; a never-delivered prompt must stay 404)"
+echo "    C: id $C_ID -> still 404 after full heal (never landed)"
+fi # flow 9
+
 echo
 if [ "$FLOW" = "all" ]; then
 echo "PASS: real opencode driven by the fake LLM exercised the full flow:"
@@ -947,6 +1180,10 @@ echo "      - death-watch (REAL vh-solara local-server): pkill opencode -> faile
 echo "                     down_since, death log line, auto-restart heals with a new pid;"
 echo "                     prompt while down -> 5xx (never lands), retry after recovery"
 echo "                     lands exactly once"
+echo "      - restart-barrier (REAL vh-solara local-server): committed-survives (A),"
+echo "                     kill-raced in-flight observation stable / never flips (B),"
+echo "                     sent-while-down never lands (C) — the certified class-3"
+echo "                     barrier semantics against real OpenCode"
 else
 echo "PASS: flow ${FLOW} completed on its own scoped setup"
 echo "      (selected via --flow ${FLOW}; the other flows were NOT run this invocation)"
