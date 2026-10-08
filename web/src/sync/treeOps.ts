@@ -110,8 +110,16 @@ export interface TreeSnapshot {
 export function decodeTreeSnapshot(raw: unknown): TreeSnapshot | null {
   if (!raw || typeof raw !== "object") return null;
   const obj = raw as { nodes?: unknown; focusedSessionId?: unknown; epoch?: unknown; seq?: unknown };
-  if (!Array.isArray(obj.nodes) || !obj.nodes.every(isTreeNode)) return null;
-  const snap: TreeSnapshot = { nodes: obj.nodes as TreeNode[] };
+  // Ghost-row guard: the server serialized an EMPTY frontier as `"nodes":null`
+  // (a nil Go slice) — e.g. the state right after the project's LAST live
+  // session was archived. A null nodes array is NOT malformed: it is the
+  // AUTHORITATIVE empty tree and must be accepted as `[]` so the transport
+  // reseeds (clears) a stale treeMap. An ABSENT field stays malformed (the
+  // server always emits `nodes`; absence means a corrupt frame, and accepting
+  // it as empty would let a torn frame wipe a good tree).
+  const nodes = obj.nodes === null ? [] : obj.nodes;
+  if (!Array.isArray(nodes) || !nodes.every(isTreeNode)) return null;
+  const snap: TreeSnapshot = { nodes: nodes as TreeNode[] };
   if (typeof obj.focusedSessionId === "string") snap.focusedSessionId = obj.focusedSessionId;
   // C4: retain identity for coherent-correlation. A non-string epoch (incl.
   // omission on a pre-Q5 daemon) is left undefined → the barrier's legacy path.

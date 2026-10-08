@@ -447,7 +447,17 @@ func (e *TreeEmitter) snapshotFrontierLocked(cause string) *TreeSnapshot {
 	// Emit order (INV-B parent-before-child): roots/active-path first (parents),
 	// then their direct children. Within the parent set, emit ancestors before
 	// descendants by depth so a child never precedes its parent.
-	out := &TreeSnapshot{Dir: e.dir, Tree: "2", Cause: cause}
+	//
+	// Nodes is initialized to an EMPTY SLICE (not left nil) so a store with zero
+	// live sessions — e.g. the project's LAST live session was just archived —
+	// serializes `"nodes":[]`, never `"nodes":null`. A null array is rejected by
+	// the client's decodeTreeSnapshot (treated as malformed), which strands the
+	// stale tree instead of applying the authoritative empty frontier — the
+	// ghost-row bug. Mirrors the L-01 guard (pkg/web/tree_children.go) and the
+	// NodeChildren op-marshal normalization (tree_node.go). This is the ONLY
+	// TreeSnapshot construction site, so every emit path (SnapshotFrontier fresh,
+	// SnapshotWithTree reconnect, SnapshotWithTreePartial) is covered at once.
+	out := &TreeSnapshot{Dir: e.dir, Tree: "2", Cause: cause, Nodes: []Node{}}
 
 	parents := sortedByDepthLocked(s, parentSet)
 	for _, id := range parents {

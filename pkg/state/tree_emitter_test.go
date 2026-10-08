@@ -630,6 +630,59 @@ func TestTreeSnapshotCarriesStoreEpoch(t *testing.T) {
 	}
 }
 
+// TestTreeSnapshotEmptyStoreNodesIsArray is the ghost-row regression (L-01
+// snapshot-side): a per-dir store with ZERO live sessions — the state right
+// after the project's LAST live session is archived — must serialize
+// `"nodes":[]`, never `"nodes":null`. The client's decodeTreeSnapshot treats a
+// non-array nodes as malformed and routes to markOwnerLegacy WITHOUT reseeding
+// the tree store, so a null array strands the pre-archive treeMap forever (the
+// stale "ghost row" until a full page reload). Asserts the MARSHALLED JSON —
+// not just non-nil — on every snapshot emit path (SnapshotFrontier fresh,
+// SnapshotWithTree reconnect/full, SnapshotWithTreePartial reconnect/frontier),
+// all of which share snapshotFrontierLocked as the sole construction site.
+func TestTreeSnapshotEmptyStoreNodesIsArray(t *testing.T) {
+	assertArray := func(t *testing.T, path string, snap *TreeSnapshot) {
+		t.Helper()
+		b, err := json.Marshal(snap)
+		if err != nil {
+			t.Fatalf("%s: marshal: %v", path, err)
+		}
+		if !json.Valid(b) {
+			t.Fatalf("%s: marshalled snapshot is not valid JSON", path)
+		}
+		var probe struct {
+			Nodes *[]Node `json:"nodes"`
+		}
+		if err := json.Unmarshal(b, &probe); err != nil {
+			t.Fatalf("%s: unmarshal probe: %v", path, err)
+		}
+		if probe.Nodes == nil {
+			t.Errorf("%s: marshalled snapshot has \"nodes\":null; want \"nodes\":[] (empty store must serialize an empty array — ghost-row regression), body: %s", path, b)
+		}
+		if len(*probe.Nodes) != 0 {
+			t.Errorf("%s: empty store marshalled %d nodes; want 0", path, len(*probe.Nodes))
+		}
+	}
+
+	// Path 1: fresh cold load (SnapshotFrontier, cause "initial").
+	s := New(64)
+	e := NewTreeEmitter(s, "/proj")
+	assertArray(t, "SnapshotFrontier(initial)", e.SnapshotFrontier("initial"))
+	assertArray(t, "SnapshotFrontier(reconnect)", e.SnapshotFrontier("reconnect"))
+
+	// Path 2: full capture (SnapshotWithTree — the reconnect/full filter route).
+	detail, tree := s.SnapshotWithTree(e, nil, "reconnect")
+	assertArray(t, "SnapshotWithTree(reconnect)", tree)
+	if detail.Seq != tree.Seq {
+		t.Errorf("SnapshotWithTree detail.Seq=%d != tree.Seq=%d (Q5 correlation)", detail.Seq, tree.Seq)
+	}
+
+	// Path 3: frontier-scoped partial (SnapshotWithTreePartial — the tree-only
+	// reconnect/cold route when no session is selected).
+	_, tree = s.SnapshotWithTreePartial(e, "reconnect")
+	assertArray(t, "SnapshotWithTreePartial(reconnect)", tree)
+}
+
 // ---------------------------------------------------------------------------
 // Group 10 — Q5 capture consolidation (SnapshotWithTree)
 // ---------------------------------------------------------------------------

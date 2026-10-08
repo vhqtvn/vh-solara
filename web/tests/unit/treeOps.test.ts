@@ -94,6 +94,30 @@ describe("decodeTreeSnapshot — §5/§7.1 snapshot", () => {
     expect(decodeTreeSnapshot({})).toBeNull();
     expect(decodeTreeSnapshot(null)).toBeNull();
   });
+
+  // Ghost-row regression (L-01 snapshot-side): a per-dir store with zero live
+  // sessions serialized `"nodes":null` (a nil Go slice). That frame is the
+  // AUTHORITATIVE empty tree — it must decode to an empty snapshot (accepted +
+  // applied by the transport, clearing a stale treeMap), NOT be rejected as
+  // malformed (the pre-fix behavior routed it to markOwnerLegacy and stranded
+  // the pre-archive tree forever). An ABSENT nodes field stays malformed.
+  it("normalizes nodes:null to an empty authoritative snapshot", () => {
+    const snap = decodeTreeSnapshot({ nodes: null });
+    expect(snap).not.toBeNull();
+    expect(snap?.nodes).toEqual([]);
+  });
+
+  it("normalizes nodes:null while retaining epoch/seq identity (Q5 correlation)", () => {
+    const snap = decodeTreeSnapshot({ nodes: null, epoch: "E1", seq: 5 });
+    expect(snap?.nodes).toEqual([]);
+    expect(snap?.epoch).toBe("E1");
+    expect(snap?.seq).toBe(5);
+  });
+
+  it("still rejects a non-array, non-null nodes value", () => {
+    expect(decodeTreeSnapshot({ nodes: "bogus" })).toBeNull();
+    expect(decodeTreeSnapshot({ nodes: { 0: "x" } })).toBeNull();
+  });
 });
 
 // ---- §8 expand fetch (pagination + stale-cursor restart) ------------------

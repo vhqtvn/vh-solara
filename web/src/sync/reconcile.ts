@@ -29,7 +29,7 @@ import { pushNotification } from "../notify";
 import { dropPinnedSession } from "../pins";
 import { dropLabelRoot } from "../labels";
 import { resetPageInFlight, reapShadowsIfOverCap } from "./history";
-import { patchTreeAgent } from "./treeState";
+import { patchTreeAgent, removeTreeNode } from "./treeState";
 import { maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
 import { openSessionStream } from "./session-stream";
 import { captureDiagEntry } from "./diaglog";
@@ -60,6 +60,19 @@ function interpretEffects(effects: ReconcileEffect[]): void {
         resetPageInFlight(e.sessionID);
         dropPinnedSession(e.sessionID);
         dropLabelRoot(e.sessionID);
+        // Ghost-row guard: prune the structural tree row EAGERLY (same
+        // semantics as the server's node.remove: drops the node + its loaded
+        // descendants). projectSessionRemoval above prunes the DETAIL slices
+        // (sessions/lastAgents/gate/...) but not treeMap — the tree normally
+        // loses the row via the tree stream's node.remove op, but that op can
+        // land on a stream the client already replaced (archive → reconnect
+        // racing the server's async cascade), and a snapshot regression
+        // (nodes:null) would strand the row forever. This runs for EVERY
+        // session-removed effect — the eager archive/delete prunes
+        // (pruneSessionDeleted) AND real session.delete events — and is
+        // idempotent with the server op (a no-op for ids not in the treeMap,
+        // e.g. proj=1 mode where the tree store is empty).
+        removeTreeNode(e.sessionID);
         // B2b id-reuse guard (mirrors the reducer's lastAgents prune): drop the
         // removed session's PERSISTED agent pick too, or a server-side id reuse
         // would resurrect the old session's explicit agent pick for the new
