@@ -771,3 +771,105 @@ func TestStaticContentTypeOnGzipPath(t *testing.T) {
 		})
 	}
 }
+
+// TestStaticIdentityWithoutAcceptEncodingHeader (S2 pin B-F2) pins the
+// truly-ABSENT Accept-Encoding header case: a request that carries NO
+// Accept-Encoding header at all (not merely an empty value — that form is
+// already pinned by TestStaticGzipNegotiation) must get the IDENTITY variant.
+// This matters because the stdlib transport auto-adds `Accept-Encoding: gzip`
+// and transparently decompresses when the application sets nothing — masking
+// server-side negotiation bugs from ordinary clients. Two server-observable
+// routes cover it:
+//   - a real round trip over http.Client{Transport: DisableCompression: true},
+//     which never injects the header (precondition-asserted via resp.Request);
+//   - direct handler invocation with httptest.NewRequest, which constructs a
+//     request without the header (precondition-asserted on the raw header map).
+//
+// No server.go changes: additive test only, on the existing gzip matrix
+// fixtures (both the non-hashed /sw.js revalidate class and a hashed asset).
+func TestStaticIdentityWithoutAcceptEncodingHeader(t *testing.T) {
+	raw := gzipTestBody(2048) // exactly what the fixtures serve for these files
+
+	t.Run("DisableCompression client omits the header", func(t *testing.T) {
+		ws := newCacheMatrixServer(t)
+		defer ws.Close()
+		client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+		for _, path := range []string{"/sw.js", "/assets/app-B3xV1zC4.js"} {
+			req, err := http.NewRequest(http.MethodGet, ws.URL+path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			// Precondition: the request as sent carried NO Accept-Encoding
+			// (no redirects here, so resp.Request is the request as sent).
+			if ae := resp.Request.Header.Get("Accept-Encoding"); ae != "" {
+				t.Fatalf("%s precondition: Accept-Encoding = %q, want absent (DisableCompression)", path, ae)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("%s status = %d, want 200", path, resp.StatusCode)
+			}
+			if ce := resp.Header.Get("Content-Encoding"); ce != "" {
+				t.Errorf("%s Content-Encoding = %q, want none (identity variant)", path, ce)
+			}
+			if !bytes.Equal(body, raw) {
+				t.Errorf("%s identity body diverged from the served file (%d vs %d bytes)",
+					path, len(body), len(raw))
+			}
+			if !strings.Contains(strings.Join(resp.Header.Values("Vary"), ","), "Accept-Encoding") {
+				t.Errorf("%s identity variant of a gzip-eligible static missing Vary: Accept-Encoding", path)
+			}
+		}
+	})
+
+	t.Run("direct handler invocation sees no header", func(t *testing.T) {
+		bigJS := gzipTestBody(2048)
+		appIndex := "<!doctype html><html><head><title>VHSolara</title></head><body><div id=\"root\"></div></body></html>"
+		dist := fstest.MapFS{
+			"index.html":             {Data: []byte(appIndex)},
+			"sw.js":                  {Data: bigJS},
+			"assets/app-B3xV1zC4.js": {Data: bigJS},
+		}
+		agg := aggregator.New("http://127.0.0.1:1", 100)
+		srv, err := NewServer(agg, "http://127.0.0.1:1", 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv.staticFS = dist
+		srv.static = http.FileServer(http.FS(dist))
+		handler := srv.Handler()
+
+		for _, path := range []string{"/sw.js", "/assets/app-B3xV1zC4.js"} {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			// Precondition: the header key is genuinely ABSENT from the map
+			// (Get cannot distinguish absent from empty).
+			if _, present := req.Header["Accept-Encoding"]; present {
+				t.Fatalf("%s precondition: Accept-Encoding unexpectedly present in %v", path, req.Header)
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			resp := rec.Result()
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("%s status = %d, want 200", path, resp.StatusCode)
+			}
+			if ce := resp.Header.Get("Content-Encoding"); ce != "" {
+				t.Errorf("%s Content-Encoding = %q, want none (no coding offered)", path, ce)
+			}
+			if !bytes.Equal(body, bigJS) {
+				t.Errorf("%s identity body diverged from the served file (%d vs %d bytes)", path, len(body), len(bigJS))
+			}
+			// The identity variant of a gzip-eligible static still declares
+			// its variance (same contract the DisableCompression subtest and
+			// TestStaticCacheHeaders pin on both variants).
+			if !strings.Contains(strings.Join(resp.Header.Values("Vary"), ","), "Accept-Encoding") {
+				t.Errorf("%s identity variant of a gzip-eligible static missing Vary: Accept-Encoding", path)
+			}
+		}
+	})
+}

@@ -37,26 +37,35 @@ describe("service worker host-route exclusion (post-fold cache-pollution fix)", 
   it("does NOT precache `/` (the host shell is online-only)", () => {
     // Pre-fold the precache was addAll(["/", "/index.html"]) where both were the
     // single-server index. Post-fold `/` is the host shell and must not be
-    // precached; only the single-server index (/index.html) is precached.
-    expect(sw.includes('addAll(["/index.html"])'), "precache must be addAll([\"/index.html\"]) only").toBe(true);
+    // precached. Since S2, install does NO network work at all (cold-boot
+    // latency); the shell precache lives in activate and fetches ONLY the
+    // single-server key — never `/`.
+    expect(sw.includes("addAll("), "install must stay network-free (no addAll)").toBe(false);
+    expect(sw.includes("fetch(SHELL_KEY)"), "activate precaches the single-server shell only").toBe(true);
     expect(
       sw.includes('addAll(["/", "/index.html"])'),
       "precache must NOT include `/` (host shell) — drop it from addAll",
     ).toBe(false);
   });
 
-  it("keeps network-first navigation + /index.html fallback for the single-server shell", () => {
-    // The fix must NOT turn navigation cache-first (that would serve stale
-    // content). Network-first: fetch, cache.put on success, cache.match on
-    // offline failure. Guards against an accidental cache-first revert.
-    expect(sw.includes('cache.put("/index.html", res.clone())')).toBe(true);
-    expect(sw.includes('cache.match("/index.html")')).toBe(true);
+  it("keeps network-first-with-TTL navigation + /index.html fallback for the single-server shell", () => {
+    // The fix must NOT turn navigation unconditionally cache-first (that would
+    // serve stale content forever). Since S2 the shell is network-first with a
+    // 30s fresh window: inside the TTL the cached shell serves (zero network),
+    // at/after it the shell goes to the network and refreshes the entry; any
+    // fetch failure falls back to the cached shell (offline). Guards against an
+    // accidental unbounded cache-first revert.
+    expect(sw.includes("const SHELL_TTL_MS = 30000;")).toBe(true);
+    expect(sw.includes("age < SHELL_TTL_MS")).toBe(true);
+    expect(sw.includes("await cache.put(SHELL_KEY, mk());")).toBe(true);
+    expect(sw.includes("cache.match(SHELL_KEY)")).toBe(true);
   });
 
   it("still caches single-server hashed assets (did not over-exclude)", () => {
     // The host exclusion must not ripple into the single-server asset cache
     // clauses (/assets/, /icon, /screenshots/ are single-server root assets).
-    expect(sw.includes('url.pathname.startsWith("/assets/")')).toBe(true);
-    expect(sw.includes('url.pathname.startsWith("/icon")')).toBe(true);
+    // Since S2 the prefixes live in the ASSET_PUT_PREFIXES table (mirrored in
+    // web/src/lib/swPolicy.ts).
+    expect(sw.includes('const ASSET_PUT_PREFIXES = ["/assets/", "/icon", "/screenshots/"];')).toBe(true);
   });
 });
