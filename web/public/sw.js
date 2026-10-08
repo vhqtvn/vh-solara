@@ -195,7 +195,7 @@ self.addEventListener("fetch", (e) => {
     // /index.html, letting a host-shell document pollute the single-server
     // offline fallback; this narrowing closes that quirk.
     if (url.pathname === "/app" || url.pathname.startsWith("/app/") || url.pathname === "/index.html") {
-      e.respondWith(shellResponse());
+      e.respondWith(shellResponse(req));
     }
     return;
   }
@@ -206,11 +206,22 @@ self.addEventListener("fetch", (e) => {
 // network (this is what removes the serialized pane-doc stride on warm boots);
 // stale/miss → ONE coalesced network fetch that refreshes the cache (deploy
 // freshness). Offline (or any fetch failure) → stale-any-age cached shell.
-async function shellResponse() {
+// request.cache "reload"/"no-cache"/"no-store" (F5 / location.reload() /
+// explicit opt-out) bypass the FRESH serve — a reload always pulls the live
+// shell (F10; mirrors the boot-data bypass, plus "no-cache": Chromium
+// surfaces a NAVIGATION's reload mode to the SW fetch event as "no-cache",
+// not "reload" — verified empirically; subresource modes present truthfully)
+// — but the entry is still READ so the offline fallback survives (offline +
+// reload serves the cached shell, not a 504), and a successful reload fetch
+// still refreshes the cache (no-store skips the put, mirroring
+// bootPutEligible).
+async function shellResponse(req) {
+  const noStore = req.cache === "no-store";
+  const bypass = noStore || req.cache === "reload" || req.cache === "no-cache";
   const cache = await caches.open(CACHE);
   const cached = await cache.match(SHELL_KEY);
   const age = cached ? entryAge(cached.headers.get(STAMP_HEADER)) : Infinity;
-  if (cached && age < SHELL_TTL_MS) return cached;
+  if (cached && !bypass && age < SHELL_TTL_MS) return cached;
   try {
     const make = await coalesce("shell:" + SHELL_KEY, async () => {
       const res = await fetch(SHELL_KEY);
@@ -224,7 +235,7 @@ async function shellResponse() {
         headers.delete("Vary");
         headers.set(STAMP_HEADER, String(Date.now()));
         const mk = () => new Response(body, { status: res.status, statusText: res.statusText, headers });
-        await cache.put(SHELL_KEY, mk());
+        if (!noStore) await cache.put(SHELL_KEY, mk());
         return mk;
       }
       return () => res.clone(); // error pages: per-waiter clone, never cached

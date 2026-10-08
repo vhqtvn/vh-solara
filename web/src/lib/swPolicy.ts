@@ -80,6 +80,17 @@ export function bypassBootCache(requestCache: string): boolean {
   return requestCache === "no-store" || requestCache === "reload";
 }
 
+/**
+ * bypassShellCache mirrors the SHELL bypass vocabulary (F10). Wider than the
+ * boot-data one: a reload NAVIGATION's cache mode surfaces as "no-cache" in
+ * the SW fetch event in Chromium (subresource modes present truthfully), so
+ * the shell must also treat "no-cache" as a bypass or a reload inside the 30s
+ * TTL would serve the cached shell — the F10 finding.
+ */
+export function bypassShellCache(requestCache: string): boolean {
+  return bypassBootCache(requestCache) || requestCache === "no-cache";
+}
+
 /** no-store must not write the cache; every other mode (incl. reload) may. */
 export function bootPutEligible(requestCache: string): boolean {
   return requestCache !== "no-store";
@@ -148,9 +159,14 @@ export function entryAge(stampedAt: string | null | undefined, now: number): num
 
 export type ShellDecision = "cache" | "network";
 
-/** shellDecision: within the TTL the cached shell serves; stale → network. */
-export function shellDecision(age: number): ShellDecision {
-  return age < SHELL_TTL_MS ? "cache" : "network";
+/**
+ * shellDecision: within the TTL the cached shell serves; stale → network.
+ * A bypass request-cache mode ("reload"/"no-store" — F10, mirrors
+ * bypassBootCache) always goes to the network regardless of age; the SW still
+ * READS the cached entry so its offline fallback survives a bypassed reload.
+ */
+export function shellDecision(age: number, bypass = false): ShellDecision {
+  return !bypass && age < SHELL_TTL_MS ? "cache" : "network";
 }
 
 export type BootDecision = "fresh" | "stale-revalidate" | "miss";

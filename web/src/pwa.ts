@@ -52,17 +52,38 @@ export function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) return;
   if (import.meta.env?.DEV) return; // no SW in the dev server
 
-  window.addEventListener("load", async () => {
-    // Only auto-reload on a *controller change that we triggered* (an applied
-    // update on an already-controlled page) — never on first install.
-    const hadController = !!navigator.serviceWorker.controller;
-    let reloaded = false;
-    navigator.serviceWorker.addEventListener("controllerchange", () => {
-      if (!hadController || reloaded) return;
-      reloaded = true;
-      window.location.reload();
-    });
+  // Register at MODULE-EVAL time (S2b), not window load: the SW must be
+  // active+claiming before the later panes' doc/boot fetches fire, or the
+  // whole cold boot runs un-intercepted (claim() landed ~1.5s in at
+  // window-load — after panes 1..5 had already fetched). In-flight page
+  // fetches are never re-routed by claim(), and pane-0's own boot fetches
+  // (issued earlier in the same module eval) escape interception either way —
+  // this is about panes 1..N.
+  //
+  // Reload-storm safety is NOT the load-event timing — it is the guard below,
+  // which is timing-independent: `hadController` is captured synchronously
+  // BEFORE register() (the controller is set at document creation for an
+  // in-scope page, so the capture is accurate at any registration time), and
+  // the `reloaded` flag caps the reload at one per document. Enumerated
+  // shapes: no-controller cold boot → claim()'s controllerchange is a no-op
+  // (never reloads — no storm); controlled page, same BUILD_ID → no
+  // controllerchange at all; controlled page + new deploy → exactly ONE
+  // reload, and the reloaded document is already controlled by the new worker
+  // so its register() finds no update → terminates. Deliberately NO
+  // sessionStorage cross-document flag: same-origin iframes share the tab's
+  // sessionStorage, so it would reload only pane-0 and leave the other panes
+  // on the old shell under the new worker.
+  // Only auto-reload on a *controller change that we triggered* (an applied
+  // update on an already-controlled page) — never on first install.
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!hadController || reloaded) return;
+    reloaded = true;
+    window.location.reload();
+  });
 
+  void (async () => {
     const reg = await navigator.serviceWorker.register("/sw.js").catch(() => null);
     if (!reg) return;
 
@@ -88,5 +109,5 @@ export function registerServiceWorker() {
       if (document.visibilityState === "visible") check();
     });
     window.setInterval(check, 60 * 60 * 1000);
-  });
+  })();
 }

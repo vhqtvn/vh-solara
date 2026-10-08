@@ -16,6 +16,7 @@ import {
   bootDecision,
   bootPutEligible,
   bypassBootCache,
+  bypassShellCache,
   classifyRequest,
   createCoalescer,
   entryAge,
@@ -143,6 +144,23 @@ describe("shellDecision", () => {
     expect(shellDecision(SHELL_TTL_MS - 1)).toBe("cache");
     expect(shellDecision(SHELL_TTL_MS)).toBe("network");
     expect(shellDecision(Number.POSITIVE_INFINITY)).toBe("network"); // unstamped entry
+  });
+
+  it("F10: reload/no-store bypass the fresh serve regardless of age", () => {
+    // A reload (F5 / location.reload() sets request.cache "reload") must
+    // always pull the live shell, never the TTL-fresh cached one.
+    expect(shellDecision(0, true)).toBe("network");
+    expect(shellDecision(SHELL_TTL_MS - 1, true)).toBe("network");
+    // The shell bypass also covers "no-cache": Chromium surfaces a reload
+    // NAVIGATION's cache mode to the SW fetch event as "no-cache", not
+    // "reload" (empirically verified) — without it F10 never fires for
+    // navigation reloads. The boot-data vocabulary stays narrower (subresource
+    // modes present truthfully).
+    expect(bypassShellCache("reload")).toBe(true);
+    expect(bypassShellCache("no-store")).toBe(true);
+    expect(bypassShellCache("no-cache")).toBe(true);
+    expect(bypassShellCache("default")).toBe(false);
+    expect(bypassBootCache("no-cache")).toBe(false);
   });
 });
 
