@@ -1414,10 +1414,17 @@ export async function waitForPersistedWorkspaceName(
   );
 }
 
-/** The `.src` of every pane iframe, in DOM order (defense-in-depth check: a
- *  poisoned `javascript:` url must never reach an unsandboxed iframe.src). */
+/** The pane iframes' src attributes in DOM order, SKIPPING not-yet-assigned
+ *  ones (""). Since S3b (lever B) a pane's src is assigned a moment AFTER its
+ *  element is created (gated on the narrow SW's active worker — bounded ≤2s
+ *  fail-open), so an immediate read during that window legitimately observes
+ *  "" srcs. Filtering them makes every consumer's read mean "srcs actually
+ *  assigned"; callers that must observe assignment use expect.poll on this.
+ *  (The un-filtered read used to be a defense-in-depth check that a poisoned
+ *  `javascript:` url never reached an unsandboxed iframe.src — that intent is
+ *  preserved: an ASSIGNED src is still returned verbatim for such checks.) */
 export async function iframeSrcs(page: Page): Promise<string[]> {
   return page.locator("iframe.pane-iframe").evaluateAll((els) =>
-    (els as HTMLIFrameElement[]).map((e) => e.src),
+    (els as HTMLIFrameElement[]).map((e) => e.src).filter((s) => s !== ""),
   );
 }

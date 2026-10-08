@@ -3,6 +3,7 @@ import type {
   IContentRenderer,
 } from "dockview-core";
 import type { HostOps, PaneParams, PaneHeaderState } from "./types";
+import { paneSrcGate } from "../swNarrow";
 import {
   bindContentWindow,
   bindPaneOrigin,
@@ -78,6 +79,9 @@ export class IframeRenderer implements IContentRenderer {
   // Last visibility sent to the pane (undefined = not yet sent for this load).
   private visSent: boolean | undefined;
   private visTicks = 0;
+  // Set in dispose() so a pane closed before the SW activation gate resolves
+  // never assigns a src to a torn-down renderer (S3b lever B).
+  private disposed = false;
 
   constructor(private readonly ops: HostOps) {
     // Root container: body only (header removed — chromeless panes). This
@@ -126,14 +130,15 @@ export class IframeRenderer implements IContentRenderer {
 
   private buildIframe(): void {
     const p = this.params!;
-    // EXACTLY ONE iframe, created once. Its src is set at creation (from
+    // EXACTLY ONE iframe, created once. Its src is set ONCE (from
     // params.url, with any stored route query appended) and never changed
     // (changing src reloads). Geometry/visibility is owned by Dockview.
     // params.url is the FULL iframe src — mock content page url in mock mode,
     // a real server origin in real-fleet mode (VITE_SERVERS). A stored route
     // (a ?dir=...&session=... query captured from the SPA's route emission) is
     // appended so the SPA deep-links itself on cold restore (reload). src is
-    // set ONCE here; runtime route changes update params WITHOUT touching src.
+    // assigned ONCE here; runtime route changes update params WITHOUT
+    // touching src.
     const iframe = document.createElement("iframe");
     iframe.className = "pane-iframe";
     let src = p.url;
@@ -149,7 +154,19 @@ export class IframeRenderer implements IContentRenderer {
         src = p.url;
       }
     }
-    iframe.src = src;
+    // S3b lever B: the src ASSIGNMENT MOMENT (only that — never layout
+    // restoration) is gated on the narrow /app registration's ACTIVE worker
+    // so the pane document is BORN service-worker-controlled and the S2/S2b
+    // SW machinery (coalescing, boot-data TTL/SWR, shell TTL) covers COLD
+    // boots, not just warm ones. The gate is bounded + fail-open (≤2s, then
+    // un-gated — today's behavior), memoized host-wide (instant after the
+    // first boot), and never rejects; a pane disposed while waiting skips
+    // the assignment entirely. Everything else here is unchanged: still one
+    // iframe element, still exactly one src assignment, still appended now.
+    void paneSrcGate().then(() => {
+      if (this.disposed) return;
+      iframe.src = src;
+    });
     iframe.title = p.label;
     // No sandbox: the child keeps its real cross-origin (mock :5174 vs host
     // :5173 by port; real servers are cross-origin by domain) so it can run its
@@ -258,6 +275,7 @@ export class IframeRenderer implements IContentRenderer {
   }
 
   dispose(): void {
+    this.disposed = true;
     liveRenderers.delete(this);
     unbindContentWindow(this.paneId);
   }

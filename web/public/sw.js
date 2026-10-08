@@ -33,9 +33,44 @@
 // to the network. This mirrors Go's isHostRoute (pkg/web/server.go). BUILD_ID
 // is unique per build, so shipping this reaps every prior cache (incl. any
 // stale `/` from a pre-fold install) on activate.
+//
+// S3b narrow-scope posture: the SAME file serves TWO registrations on one
+// origin — ROOT (scope "/"), registered by the SPA (pwa.ts, unchanged from
+// S2b), and NARROW (scope "/app"), registered by the HOST shell at boot
+// (host-web/src/swNarrow.ts) so cold-booting /app panes are BORN
+// service-worker-controlled (pane src assignment is gated on this
+// registration's ACTIVE worker — see iframeRenderer.ts). Nothing below may
+// assume the root scope: every scope-sensitive branch (in-scope navigation
+// strays, notificationclick's openWindow fallback) derives from
+// self.registration.scope. Root-scope behavior is byte-stable with S2b.
+// Cross-registration safety is receipted (S3a X2/X6): claim() respects
+// longest-scope-prefix — the narrow claim takes panes from root, root NEVER
+// takes panes from narrow, no ping-pong across deploy skew.
 
 const BUILD_ID = "__BUILD_ID__";
 const CACHE = "vh-" + BUILD_ID;
+
+// --- Narrow-scope plumbing (S3b) ---------------------------------------------
+// Lazily derived (self.registration is settled by the time any event fires).
+// SCOPE_PATH is "/" for the root registration, "/app" for the narrow one.
+let scopePathCache = null;
+function scopePath() {
+  if (scopePathCache === null) scopePathCache = new URL(self.registration.scope).pathname;
+  return scopePathCache;
+}
+function narrowScope() {
+  return scopePath() !== "/";
+}
+
+// Host focus channel: the HOST document is OUTSIDE the narrow scope, so this
+// worker can never see it in clients.matchAll (S3a X4 — all engines; Firefox
+// additionally returns NO iframe clients at all). At narrow activation the
+// host transfers one port of a MessageChannel here (swNarrow.ts); a
+// notificationclick that finds no focusable window client asks the host to
+// focus itself over it. The port lives with the worker — the host re-wires on
+// every activation (updatefound), so a BUILD_ID change tears down the stale
+// channel deterministically.
+let hostFocusPort = null;
 
 // --- Policy tables (mirror of web/src/lib/swPolicy.ts) ----------------------
 const STAMP_HEADER = "x-vh-sw-at"; // store-time stamp on cached entries (ms epoch)
@@ -126,8 +161,22 @@ self.addEventListener("activate", (e) => {
 });
 
 // Legacy "apply update" message — harmless now that install skips waiting.
+// VH_HOST_FOCUS_CHANNEL (S3b): the host shell transfers a MessageChannel port
+// (host-mediated notification focus — see the note above the declaration).
+// VH_PING is a zero-behavior liveness probe any same-origin page can use
+// (e2e asserts the out-of-scope host document CAN reach this worker).
 self.addEventListener("message", (e) => {
   if (e.data && e.data.type === "SKIP_WAITING") self.skipWaiting();
+  if (e.data && e.data.type === "VH_HOST_FOCUS_CHANNEL" && e.ports && e.ports[0]) {
+    hostFocusPort = e.ports[0];
+  }
+  if (e.data && e.data.type === "VH_PING") {
+    try {
+      e.source && e.source.postMessage({ type: "vh-pong" });
+    } catch {
+      /* source went away — ignore */
+    }
+  }
 });
 
 // Web Push: the daemon pushes a notice when the app is closed and you're away.
@@ -158,6 +207,15 @@ self.addEventListener("push", (e) => {
 // needs-you notifications — tags starting "vh-needy-" — share this path):
 // never route to a specific pane/session from the (possibly stale)
 // notification payload; the app re-derives fresh state on arrival.
+// S3b scope-aware order (S3a X4 receipts — the NARROW registration's matchAll
+// can never see the host window; Firefox returns no iframe clients either):
+//   1. focus an existing controlled window client (the click's user
+//      activation makes client.focus() the reliable bring-to-front);
+//   2. else ask a connected host shell to focus itself over the focus
+//      channel (deterministic on engines where matchAll is blind);
+//   3. else open the app INSIDE this worker's scope — openWindow enforces
+//      scope, and openWindow("/") from the narrow worker is rejected on every
+//      engine (X4). For the root registration the target is "/" — unchanged.
 self.addEventListener("notificationclick", (e) => {
   e.notification.close();
   e.waitUntil(
@@ -166,7 +224,15 @@ self.addEventListener("notificationclick", (e) => {
       for (const c of all) {
         if ("focus" in c) return c.focus();
       }
-      if (self.clients.openWindow) return self.clients.openWindow("/");
+      if (hostFocusPort) {
+        try {
+          hostFocusPort.postMessage({ type: "vh-focus-host" });
+          return;
+        } catch {
+          /* stale port (worker/client teardown race) — fall through */
+        }
+      }
+      if (self.clients.openWindow) return self.clients.openWindow(scopePath());
     })(),
   );
 });
@@ -196,6 +262,22 @@ self.addEventListener("fetch", (e) => {
     // offline fallback; this narrowing closes that quirk.
     if (url.pathname === "/app" || url.pathname.startsWith("/app/") || url.pathname === "/index.html") {
       e.respondWith(shellResponse(req));
+      return;
+    }
+    // S3b FIREFOX INVARIANT (S3a X1 case-C): a worker whose fetch listener
+    // lets an IN-SCOPE navigation fall through permanently drops that
+    // client's SW coverage on Firefox — on reload AND on every later
+    // same-frame re-src. The narrow scope is a STRING prefix ("/app" also
+    // matches strays like /apple), and this worker only ever sees fetch
+    // events for in-scope requests, so any navigation reaching this line
+    // under the narrow scope is in-scope: serve it with an explicit
+    // pass-through respondWith (fetch(request) counts — X1 `-rw` control).
+    // The root registration keeps the S2b fall-through byte-for-byte (its
+    // only real navigation clients are the /app shells, which respond above;
+    // switching root pass-throughs to respondWith would also change redirect
+    // semantics, e.g. the /auth login redirect).
+    if (narrowScope() && url.pathname.startsWith(scopePath())) {
+      e.respondWith(fetch(req));
     }
     return;
   }

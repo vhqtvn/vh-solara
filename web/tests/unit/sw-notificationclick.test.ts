@@ -38,14 +38,19 @@ describe("service worker notificationclick routing (needs-you v1)", () => {
   it("prefers focusing an existing window; openWindow stays the FALLBACK", () => {
     const iMatch = sw.indexOf("clients.matchAll");
     const iFocus = sw.indexOf("c.focus()");
-    const iOpen = sw.indexOf('clients.openWindow("/")');
+    const iHostPort = sw.indexOf("vh-focus-host");
+    const iOpen = sw.indexOf("clients.openWindow(scopePath())");
     expect(iMatch, "matchAll present").toBeGreaterThanOrEqual(0);
     expect(iFocus, "client.focus() present").toBeGreaterThanOrEqual(0);
-    expect(iOpen, 'openWindow("/") fallback present').toBeGreaterThanOrEqual(0);
+    expect(iOpen, "openWindow(scopePath()) fallback present").toBeGreaterThanOrEqual(0);
     // Source order pins the control flow: match first, focus inside the
-    // matchAll result loop (returns BEFORE the fallback), openWindow last.
+    // matchAll result loop (returns BEFORE the fallbacks), then the S3b
+    // host-focus channel (matchAll is blind to the host window under the
+    // narrow scope — and to ALL iframe clients on Firefox), openWindow last
+    // (scope-aware: "/" for the root registration, "/app" for narrow).
     expect(iFocus, "focus() must come after matchAll (it focuses a matched client)").toBeGreaterThan(iMatch);
-    expect(iOpen, "openWindow must come AFTER focus (fallback only)").toBeGreaterThan(iFocus);
+    expect(iHostPort, "host-focus channel must come after client focus").toBeGreaterThan(iFocus);
+    expect(iOpen, "openWindow must come AFTER the host-focus channel (last resort)").toBeGreaterThan(iHostPort);
   });
 
   it("keeps the click GENERAL — no pane/session routing from the notification payload", () => {

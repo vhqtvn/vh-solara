@@ -7,6 +7,7 @@ import {
   workspaces,
   workspaceApiFor,
 } from "./dockview/store";
+import { ACTIVATION_BUDGET_MS, ensureNarrowRegistration } from "./swNarrow";
 
 // =============================================================================
 // PWA NEEDS-YOU ATTENTION NOTIFICATIONS (v1).
@@ -26,11 +27,20 @@ import {
 //   3. Android REQUIRES ServiceWorkerRegistration.showNotification(); the
 //      `new Notification()` constructor throws there. Every notification here
 //      goes through the SW registration — never the page constructor.
-//   4. The root SW (/sw.js, scope /) is registration-persistent and
+//   4. The ROOT SW (/sw.js, scope /) is registration-persistent and
 //      origin-wide; its fetch handler route-excludes / and /host/* (host
-//      passthrough — zero interference).
-//   5. SW notifications attribute to the installed root app; clicks switch to
-//      it (the sw.js notificationclick handler focuses an existing window).
+//      passthrough — zero interference). S3b: the host ALSO registers the
+//      same script at scope /app (swNarrow.ts) so panes are born controlled;
+//      notifications display through THAT held registration (see
+//      notifyRegistration — the host doc's `ready` hangs under narrow-only,
+//      S3a X4). Both registrations share this file's notificationclick
+//      handler, which is scope-aware (matchAll → host focus channel →
+//      in-scope openWindow) — the host window itself is invisible to the
+//      narrow worker's matchAll on every engine, and Firefox returns no
+//      iframe clients at all (X4), so click-to-focus is host-mediated.
+//   5. SW notifications attribute to the installed app; clicks focus an
+//      existing window when one is visible to the worker (see 4 for the
+//      scope-aware fallback ladder).
 //   6. Same-tag showNotification REPLACES; distinct tags are separate shade
 //      entries; getNotifications({tag}) + close() cleans up.
 //
@@ -322,15 +332,36 @@ function enumerateNeedy(): NeedyPane[] {
 
 // ---- service-worker plumbing --------------------------------------------------
 
-/** The active SW registration, or null when unavailable. `ready` resolves to
- *  the origin's active registration (platform fact #4 — registration-
- *  persistent; the SPA registers the same /sw.js). Never rejects in practice;
- *  a dev server without /sw.js simply never resolves (we degrade quietly). */
-function swReady(): Promise<ServiceWorkerRegistration | null> {
+/**
+ * Resolve the registration notifications go through (S3b surgery, S3a X4):
+ * prefer the HELD narrow registration (registered at host boot — always
+ * available when the folded host could register at all), because the host
+ * document's `serviceWorker.ready` HANGS FOREVER under narrow-only (no
+ * registration covers the host doc at "/") and reselects the ROOT
+ * registration under both-state. Fallback: a BOUNDED ready race (root
+ * registration — the both-state steady path for hosts where the narrow
+ * registration failed, e.g. dev servers without /sw.js). Never hangs; null
+ * → degrade quietly (same posture as before, but now with a bound).
+ */
+async function notifyRegistration(): Promise<ServiceWorkerRegistration | null> {
+  const narrow = await ensureNarrowRegistration();
+  if (narrow && narrow.active) return narrow;
   if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) {
-    return Promise.resolve(null);
+    return null;
   }
-  return navigator.serviceWorker.ready.catch(() => null);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ACTIVATION_BUDGET_MS);
+    navigator.serviceWorker.ready.then(
+      (reg) => {
+        clearTimeout(timer);
+        resolve(reg);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(null);
+      },
+    );
+  });
 }
 
 /**
@@ -365,7 +396,7 @@ async function showNotification(
 ): Promise<void> {
   note({ op: "show", tag, title, body });
   try {
-    const reg = await swReady();
+    const reg = await notifyRegistration();
     if (!reg) return;
     await reg.showNotification(title, { tag, body });
   } catch {
@@ -377,7 +408,7 @@ async function showNotification(
 async function closeTag(tag: string): Promise<void> {
   note({ op: "close", tag });
   try {
-    const reg = await swReady();
+    const reg = await notifyRegistration();
     if (!reg) return;
     const list = await reg.getNotifications({ tag });
     for (const n of list) n.close();

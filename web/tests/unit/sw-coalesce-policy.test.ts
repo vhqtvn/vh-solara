@@ -20,6 +20,9 @@ import {
   classifyRequest,
   createCoalescer,
   entryAge,
+  isNarrowScope,
+  navDispatch,
+  openWindowTarget,
   shellDecision,
 } from "../../src/lib/swPolicy";
 
@@ -244,6 +247,52 @@ describe("boot-data project scoping (review F1 fix)", () => {
     expect(bootPutEligible("no-store")).toBe(false);
     expect(bootPutEligible("reload")).toBe(true);
     expect(bootPutEligible("default")).toBe(true);
+  });
+});
+
+describe("S3b narrow-scope vocabulary (navDispatch / openWindowTarget / isNarrowScope)", () => {
+  it("shell paths dispatch to the shell policy under BOTH scopes", () => {
+    for (const scope of ["/", "/app"]) {
+      expect(navDispatch("/app", "navigate", scope), `scope ${scope}`).toBe("shell");
+      expect(navDispatch("/app/session/1", "navigate", scope), `scope ${scope}`).toBe("shell");
+      expect(navDispatch("/index.html", "navigate", scope), `scope ${scope}`).toBe("shell");
+      // .html suffix is treated as a navigation even for subresource mode.
+      expect(navDispatch("/app/x.html", "no-cors", scope), `scope ${scope}`).toBe("shell");
+    }
+  });
+
+  it("FIREFOX INVARIANT: under the NARROW scope every in-scope navigation responds (never falls through)", () => {
+    // S3a X1 case-C: an in-scope navigation that falls through a fetch
+    // listener permanently drops that client's SW coverage on Firefox. The
+    // narrow scope is a string prefix, so strays like /apple are in-scope and
+    // MUST dispatch pass-through-fetch.
+    expect(navDispatch("/apple", "navigate", "/app")).toBe("pass-through-fetch");
+    expect(navDispatch("/app-xyz", "navigate", "/app")).toBe("pass-through-fetch");
+    expect(navDispatch("/application", "navigate", "/app")).toBe("pass-through-fetch");
+    // The pane document itself (scope path exactly) is the shell, not a stray.
+    expect(navDispatch("/app", "navigate", "/app")).toBe("shell");
+  });
+
+  it("ROOT scope keeps the S2b fall-through for non-shell navigations (byte-stable)", () => {
+    // e.g. /auth/login (login redirect — fall-through preserves redirect
+    // semantics), unknown root paths (host shell server-side).
+    expect(navDispatch("/auth/login", "navigate", "/")).toBe("no-intercept");
+    expect(navDispatch("/apple", "navigate", "/")).toBe("no-intercept");
+    expect(navDispatch("/anything.html", "navigate", "/")).toBe("no-intercept");
+  });
+
+  it("non-navigation requests are not navDispatch's concern", () => {
+    expect(navDispatch("/assets/x.js", "no-cors", "/app")).toBe("no-intercept");
+    expect(navDispatch("/assets/x.js", "no-cors", "/")).toBe("no-intercept");
+  });
+
+  it("openWindowTarget is the scope path — always in-scope for the worker", () => {
+    // openWindow("/") from the narrow worker is rejected on every engine
+    // (S3a X4); the target must be inside the registration scope.
+    expect(openWindowTarget("/")).toBe("/");
+    expect(openWindowTarget("/app")).toBe("/app");
+    expect(isNarrowScope("/")).toBe(false);
+    expect(isNarrowScope("/app")).toBe(true);
   });
 });
 

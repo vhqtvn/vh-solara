@@ -79,6 +79,45 @@ describe("sw.js guard chain (order is load-bearing)", () => {
     expect(shellNarrow).toBeGreaterThan(-1);
   });
 
+  it("shell bypass vocabulary: reload/no-cache/no-store all bypass the fresh serve (S2b defer B-F1)", () => {
+    // B-F1 wanted the shell cache-mode bypass vocabulary pinned in this
+    // mirror spec (the F10 finding: Chromium surfaces a NAVIGATION reload as
+    // "no-cache" in the SW fetch event — narrower than the boot-data bypass).
+    // Mirror side: swPolicy.bypassShellCache (unit-pinned in
+    // sw-coalesce-policy.test.ts). SW side: the exact bypass line in
+    // shellResponse + the no-store put skip.
+    expect(sw).toContain('const bypass = noStore || req.cache === "reload" || req.cache === "no-cache";');
+    expect(sw).toContain('if (!noStore) await cache.put(SHELL_KEY, mk());');
+    expect(sw).toContain('const noStore = req.cache === "no-store";');
+  });
+
+  it("S3b narrow-scope plumbing: scope derived from registration, never assumed '/'", () => {
+    expect(sw).toContain("new URL(self.registration.scope).pathname");
+    expect(sw).toContain('function narrowScope()');
+    expect(sw).toContain('scopePath() !== "/"');
+  });
+
+  it("S3b Firefox invariant: every in-scope NARROW navigation is respondWith'd", () => {
+    // S3a X1 case-C: a fetch listener that lets an in-scope navigation fall
+    // through permanently drops that client's coverage on Firefox. Under the
+    // narrow scope every navigation this worker can see is in-scope (string-
+    // prefix match), so the stray branch must respondWith a pass-through.
+    expect(sw).toContain("if (narrowScope() && url.pathname.startsWith(scopePath()))");
+    expect(sw).toContain("e.respondWith(fetch(req));");
+    // ...and the ROOT scope keeps the S2b fall-through (no stray respondWith
+    // for the root registration): the stray branch is narrow-gated, and the
+    // shell branch returns before it.
+    const stray = sw.indexOf("if (narrowScope() && url.pathname.startsWith(scopePath()))");
+    const shell = sw.indexOf('url.pathname === "/app" || url.pathname.startsWith("/app/")');
+    expect(stray).toBeGreaterThan(shell);
+  });
+
+  it("S3b host focus channel + liveness probe message vocabulary", () => {
+    expect(sw).toContain('"VH_HOST_FOCUS_CHANNEL"');
+    expect(sw).toContain('hostFocusPort.postMessage({ type: "vh-focus-host" })');
+    expect(sw).toContain('"VH_PING"');
+  });
+
   it("boot-data failures reject waiters and stale revalidate keeps the entry", () => {
     expect(sw).toContain('load.catch(() => {})');
     expect(sw).toContain("rejects every waiter");
@@ -126,7 +165,11 @@ describe("sw.js handlers that must survive unchanged", () => {
 
   it("keeps the general notificationclick contract (focus-or-open, no routing)", () => {
     expect(sw).toContain("self.clients.matchAll({ type: \"window\", includeUncontrolled: false })");
-    expect(sw).toContain('self.clients.openWindow("/")');
+    // S3b: openWindow is scope-aware — the target is the registration scope
+    // path ("/" root — today's behavior; "/app" narrow — openWindow("/")
+    // from the narrow worker is rejected on every engine, S3a X4). The
+    // host-focus channel sits between matchAll-focus and openWindow.
+    expect(sw).toContain("self.clients.openWindow(scopePath())");
     // And it must NOT route to a pane/session from the payload.
     expect(sw).toContain("re-derives fresh state on arrival");
   });

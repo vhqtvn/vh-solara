@@ -206,15 +206,12 @@ test.describe.serial("folded layouts sync (server-backed named layouts)", () => 
       void blobB;
 
       // USER-VISIBLE outcome: the loaded workspace's pane RENDERS (an iframe
-      // at /app is mounted for it) — not just a blob entry.
+      // at /app is mounted for it) — not just a blob entry. Polling on the
+      // ASSIGNED src: since S3b lever B the src is set a moment after the
+      // pane element exists (narrow-SW activation gate, bounded fail-open).
       await expect
-        .poll(async () => (await paneIds(pageB)).length, { timeout: 20_000 })
-        .toBeGreaterThanOrEqual(1);
-      const srcsB = await iframeSrcs(pageB);
-      expect(
-        srcsB.some((src) => src.startsWith(`${origin}/app`)),
-        "the restored pane's iframe points at /app",
-      ).toBe(true);
+        .poll(async () => (await iframeSrcs(pageB)).some((src) => src.startsWith(`${origin}/app`)))
+        .toBe(true);
     } finally {
       await ctxB.close();
     }
@@ -350,15 +347,11 @@ test.describe.serial("folded layouts sync (server-backed named layouts)", () => 
       await expect(pageB.locator('[data-testid="empty-workspace"]')).toBeVisible();
       // …and switching to the restored "Workspace 1" mounts the saved /app
       // pane (an iframe at origin + /app) — the restored session RENDERS.
+      // Polling on the ASSIGNED src (S3b lever B gate — see above).
       await pageB.locator('[data-testid="ws-tab"]', { hasText: "Workspace 1" }).click();
       await expect
-        .poll(async () => (await paneIds(pageB)).length, { timeout: 20_000 })
-        .toBeGreaterThanOrEqual(1);
-      const srcsB = await iframeSrcs(pageB);
-      expect(
-        srcsB.some((src) => src.startsWith(`${origin}/app`)),
-        "the restored workspace's pane iframe points at /app",
-      ).toBe(true);
+        .poll(async () => (await iframeSrcs(pageB)).some((src) => src.startsWith(`${origin}/app`)))
+        .toBe(true);
     } finally {
       await ctxB.close();
     }

@@ -56,7 +56,7 @@ const stateDir =
 
 export default defineConfig({
   testDir: path.join(hostRoot, "tests/folded-e2e"),
-  testMatch: /(folded-restore|layouts-sync)\.spec\.ts/,
+  testMatch: /(folded-restore|layouts-sync|folded-sw-narrow)\.spec\.ts/,
   // Serial: one real server, shared origin state (localStorage/SW) across a
   // context would leak between workers. Each TEST uses its own fresh context.
   fullyParallel: false,
@@ -78,6 +78,16 @@ export default defineConfig({
     // Firefox opt-in: the restore logic under test is engine-independent
     // (storage + dockview serialization); add when measured stable.
     // { name: "firefox", use: { ...devices["Desktop Firefox"] } },
+    // S3b narrow-SW spec: Firefox IS engine-load-bearing here (the X1
+    // case-C fall-through quirk is Firefox-only — a fetch listener without
+    // respondWith permanently drops iframe coverage on reload), so the
+    // narrow-scope spec runs on both engines while the restore specs stay
+    // chromium-only.
+    {
+      name: "firefox",
+      use: { ...devices["Desktop Firefox"] },
+      testMatch: /folded-sw-narrow\.spec\.ts/,
+    },
   ],
   webServer: [
     {

@@ -159,9 +159,12 @@ test.describe.serial("folded-posture layout restore", () => {
     await expect(page.locator('[data-testid="host-app-root"]')).toBeVisible();
 
     // The folded self-seed: ONE pane at origin + /app (resolveBaseFleet →
-    // localAppEntry). Wait for it to exist and be saved.
+    // localAppEntry). Wait for it to exist and be saved. Polling on SRCS
+    // (not pane count): since S3b lever B the pane's src is assigned a
+    // moment after its element is created (narrow-SW activation gate), so
+    // the meaningful wait is for the ASSIGNED src.
     await expect
-      .poll(async () => (await paneIds(page)).length, { timeout: 20000 })
+      .poll(async () => (await iframeSrcs(page)).length, { timeout: 20000 })
       .toBeGreaterThanOrEqual(1);
     const origin = new URL(page.url()).origin;
     const srcs = await iframeSrcs(page);
@@ -223,6 +226,10 @@ test.describe.serial("folded-posture layout restore", () => {
       "post-relaunch blob (1 panel)",
     )) as { workspaces?: Array<{ id?: string; layout?: { panels?: Record<string, unknown> } }> };
     expect(after.workspaces?.[0]?.id, "same workspace restored").toBe(wsId);
+    // Bounded wait for the ASSIGNED src (S3b lever B gate — see test 1).
+    await expect
+      .poll(async () => (await iframeSrcs(page)).length, { timeout: 20000 })
+      .toBeGreaterThanOrEqual(1);
     const srcs2 = await iframeSrcs(page);
     expect(srcs2.length, "restored pane iframe present").toBe(1);
     expect(srcs2[0].startsWith(`${origin}/app`), "restored pane still points at /app").toBe(true);
@@ -299,9 +306,10 @@ test.describe.serial("folded-posture layout restore", () => {
     await page.goto("/");
 
     // CRUX: BOTH planted panes restore (2 .pane elements, both iframes at
-    // /app, the routed one deep-linked with its captured query).
+    // /app, the routed one deep-linked with its captured query). Polling on
+    // ASSIGNED srcs (S3b lever B gate — see test 1's note).
     await expect
-      .poll(async () => (await paneIds(page)).length, { timeout: 20000 })
+      .poll(async () => (await iframeSrcs(page)).length, { timeout: 20000 })
       .toBe(2);
     await expect(page.locator('[data-testid="empty-workspace"]')).toBeHidden();
     const srcs = await iframeSrcs(page);
@@ -544,7 +552,10 @@ test.describe.serial("folded-posture layout restore", () => {
     await expect(seedTab).toHaveAttribute("aria-selected", "true");
     await expect(page.locator('[data-testid="empty-workspace"]')).toBeHidden();
     const origin = new URL(page.url()).origin;
-    expect((await iframeSrcs(page)).some((src) => src.startsWith(`${origin}/app`))).toBe(true);
+    // Bounded wait — the pane's src assignment is gated (S3b lever B).
+    await expect
+      .poll(async () => (await iframeSrcs(page)).some((src) => src.startsWith(`${origin}/app`)))
+      .toBe(true);
 
     // The v3 blob converges on the 5-workspace session with the seed ACTIVE.
     await waitForQuiescentMirror(
@@ -573,7 +584,10 @@ test.describe.serial("folded-posture layout restore", () => {
     // Identity + layout restored: the ACTIVE workspace is the seed — its
     // /app pane renders, no empty affordance, no re-seed after the read.
     await expect(page.locator('[data-testid="empty-workspace"]')).toBeHidden();
-    expect((await iframeSrcs(page)).some((src) => src.startsWith(`${origin}/app`))).toBe(true);
+    // Bounded wait — the pane's src assignment is gated (S3b lever B).
+    await expect
+      .poll(async () => (await iframeSrcs(page)).some((src) => src.startsWith(`${origin}/app`)))
+      .toBe(true);
     const events = await ring(page);
     const read = lastOf(events, "read");
     expect(read?.source, "relaunch read the v3 blob").toBe("v3");

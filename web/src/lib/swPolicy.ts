@@ -142,6 +142,65 @@ export function assetPutEligible(pathname: string): boolean {
   return ASSET_PUT_PREFIXES.some((p) => pathname.startsWith(p));
 }
 
+// --- S3b narrow-scope vocabulary ----------------------------------------------
+
+/**
+ * The pathname of the registration scope a worker evaluates under: "/" for
+ * the ROOT registration (SPA, pwa.ts — unchanged from S2b) and "/app" for
+ * the NARROW registration (host shell, host-web/src/swNarrow.ts — cold panes
+ * are born controlled). The same sw.js file serves both; scope-sensitive
+ * branches must derive from this, never assume "/".
+ */
+export type ScopePath = string;
+
+/** True when the scope is NOT the root "/" (i.e. the narrow registration). */
+export function isNarrowScope(scopePath: string): boolean {
+  return scopePath !== "/";
+}
+
+/** How an in-handler NAVIGATION request is dispatched by the SW. */
+export type NavDispatch = "shell" | "pass-through-fetch" | "no-intercept";
+
+/**
+ * navDispatch mirrors the SW fetch handler's navigation branch for a given
+ * registration scope (S3b):
+ *   - shell paths (/app, /app/*, /index.html) → "shell" (respondWith
+ *     shellResponse) under EITHER scope;
+ *   - FIREFOX INVARIANT (S3a X1 case-C): under a NARROW scope every other
+ *     in-scope navigation (the scope is a STRING prefix — "/app" also matches
+ *     strays like /apple) is served with an explicit pass-through
+ *     respondWith(fetch(request)) — a fetch listener that lets an in-scope
+ *     navigation fall through permanently drops that client's SW coverage on
+ *     Firefox (reload AND later same-frame re-src). The worker only sees
+ *     in-scope requests, so "in-scope" needs no extra check in the SW; the
+ *     mirror models it with the explicit startsWith for testability.
+ *   - the ROOT scope keeps the S2b fall-through ("no-intercept") for non-shell
+ *     navigations — byte-stable behavior (switching root pass-throughs to
+ *     respondWith would change redirect semantics, e.g. /auth).
+ * Non-navigation requests are "no-intercept" here (classifyRequest's asset
+ * class covers them).
+ */
+export function navDispatch(pathname: string, mode: string, scopePath: string): NavDispatch {
+  const isNav = mode === "navigate" || pathname.endsWith(".html");
+  if (!isNav) return "no-intercept";
+  if (pathname === "/app" || pathname.startsWith("/app/") || pathname === SHELL_KEY) {
+    return "shell";
+  }
+  if (isNarrowScope(scopePath) && pathname.startsWith(scopePath)) return "pass-through-fetch";
+  return "no-intercept";
+}
+
+/**
+ * openWindowTarget mirrors notificationclick's last-resort openWindow target:
+ * a worker may only open a window INSIDE its own scope — openWindow("/") from
+ * the narrow worker is rejected on every engine (S3a X4), so the target is
+ * the scope path itself ("/" root → "/", "/app" narrow → the single-server
+ * SPA entry).
+ */
+export function openWindowTarget(scopePath: string): string {
+  return scopePath;
+}
+
 /**
  * entryAge returns the age in ms of a cached entry from its stamp header
  * value. A missing, malformed, or non-numeric stamp yields Infinity: an
