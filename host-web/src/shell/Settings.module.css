@@ -137,3 +137,104 @@
   line-height: 1.35;
   resize: vertical;
 }
+
+/* ---- Theme picker view (the "Theme…" item swaps the popover content) ----
+ * Same compact pattern as the web ThemePicker: a scrolling listbox of
+ * swatch + name options, ✓ on the active one. GPU-cheap only: plain
+ * bg/border + inline swatch colors — no mask-image/backdrop-filter/contain
+ * (AGENTS.md Firefox/WebRender rules). */
+
+/* Back-to-menu row (replaces the heading in the picker view). */
+.backBtn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 2px 4px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.backBtn:hover {
+  color: var(--fg);
+}
+.backBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 4px;
+}
+.backIcon {
+  font-size: 14px;
+  line-height: 1;
+}
+/* Scrollable option grid: 2 columns at the popover's 280px width (minus
+ * padding), capped so the popover never grows past the viewport — the list
+ * scrolls instead. */
+.themeGrid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 4px;
+  max-height: min(420px, 60vh);
+  overflow-y: auto;
+  padding-right: 2px; /* keep the scrollbar off the hover borders */
+}
+/* One theme option: swatch (painted from the ThemeDef's representative
+ * colors via inline style) + name; ✓ marks the active theme. */
+.themeOption {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg);
+  font-size: 11px;
+  line-height: 1.2;
+  text-align: left;
+  cursor: pointer;
+  min-width: 0; /* let the name ellipsize instead of blowing the grid out */
+}
+.themeOption:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.themeOption:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* Mini swatch mirroring the web picker: theme bg + border, three dots
+ * (accent / accent2 / fg) hinting the palette. */
+.themeSwatch {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  width: 24px;
+  height: 16px;
+  border: 1px solid;
+  border-radius: 4px;
+  flex: 0 0 auto;
+}
+.themeSwatch > span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+}
+.themeName {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.themeCheck {
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}

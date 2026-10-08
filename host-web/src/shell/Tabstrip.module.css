@@ -202,7 +202,7 @@
   padding: 4px;
   display: flex;
   flex-direction: column;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow-pop);
 }
 .tabMenuItem {
   appearance: none;

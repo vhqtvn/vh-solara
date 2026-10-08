@@ -1,3 +1,29 @@
+/* HOST-SHELL design tokens.
+ *
+ * Theme model (mirrors the SPA's, independently applied): themes are
+ * `.theme-<id>` classes on <html>, set by src/theme.ts (and pre-paint by the
+ * inline script in index.html). The HOST theme affects the host shell ONLY —
+ * each embedded SPA iframe keeps its own independent theme (different
+ * storage key: vh-host:theme:v1 here vs vh.theme.v1 in the SPA).
+ *
+ * :root carries the DEFAULT (dark) palette verbatim — the pre-change look —
+ * plus the tokens that DERIVE from the palette via var()/color-mix so every
+ * theme block only overrides the 6 core colors: --accent-soft tracks
+ * --accent, --sash tracks --border, --shadow-* are softened once for all
+ * light themes via the .host-theme-light marker (set alongside the theme
+ * class by src/theme.ts). Each block derives --bg-elev by mixing its surface
+ * toward its fg (lighter on dark themes, darker on light — the same
+ * direction the SPA's light themes take for elevated surfaces).
+ *
+ * Catalog parity: the ids + light flags come from the shared
+ * web/src/themeCatalog.ts; the palette VALUES are the corresponding
+ * `:root.theme-<id>` blocks in web/src/styles/foundation/tokens.css
+ * (--bg→--bg, --bg-2→--bg-soft, --border/--fg/--fg-dim/--accent verbatim).
+ * "custom" (the SPA's user-built theme) is intentionally absent — the host
+ * picker offers the curated catalog only. There is deliberately no
+ * .theme-dark block: dark IS the :root default (as in the SPA).
+ */
+
 :root {
   --bg: #0d1117;
   --bg-soft: #161b22;
@@ -6,13 +32,26 @@
   --fg: #e6edf3;
   --fg-dim: #8b949e;
   --accent: #58a6ff;
-  --accent-soft: rgba(88, 166, 255, 0.15);
+  --accent-soft: color-mix(in srgb, var(--accent) 15%, transparent);
   --good: #3fb950;
   --warn: #d29922;
-  --sash: #30363d;
+  --sash: var(--border);
+  /* Elevation shadows (popovers/menus; the smaller layout-overlay card tier).
+   * Near-black at fixed alphas on dark themes; softened once for ALL light
+   * themes below (the host analogue of the SPA's .theme-light-scoped shadow
+   * softening — heavy grey blobs read badly on a light page). */
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.4);
+  --shadow-soft: 0 2px 10px rgba(0, 0, 0, 0.4);
   color-scheme: dark;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   font-size: 13px;
+}
+
+/* Light-theme adjustments keyed off the marker class (set with the theme
+ * class by src/theme.ts) — one place for every light theme. */
+:root.host-theme-light {
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.18);
+  --shadow-soft: 0 2px 10px rgba(0, 0, 0, 0.16);
 }
 
 * {
@@ -37,4 +76,214 @@ body {
   width: 100%;
   height: 100%;
   background: var(--bg);
+}
+
+/* ===== Theme palettes (catalog parity with the SPA; see file header). ===== */
+
+/* --- dark themes --- */
+:root.theme-dim {
+  --bg: #1c2128; --bg-soft: #22272e; --border: #373e47;
+  --fg: #adbac7; --fg-dim: #768390; --accent: #539bf5;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-midnight {
+  --bg: #06080d; --bg-soft: #0b0f17; --border: #1b2230;
+  --fg: #c9d1d9; --fg-dim: #7a8699; --accent: #6cb6ff;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-hc {
+  --bg: #000000; --bg-soft: #0a0a0a; --border: #4d4d4d;
+  --fg: #ffffff; --fg-dim: #c9c9c9; --accent: #4cc2ff;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-oled {
+  --bg: #000000; --bg-soft: #0a0a0a; --border: #242424;
+  --fg: #d0d7e2; --fg-dim: #8a94a3; --accent: #4c9cff;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-oled-violet {
+  --bg: #000000; --bg-soft: #0a0a0a; --border: #262626;
+  --fg: #d8d2e8; --fg-dim: #8d87a0; --accent: #a277ff;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-shire-dark {
+  --bg: #1b1815; --bg-soft: #23201c; --border: #413e3a;
+  --fg: #ebe0d1; --fg-dim: #83796f; --accent: #7a8a5a;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-tokyonight {
+  --bg: #1a1b26; --bg-soft: #1f2335; --border: #2f334d;
+  --fg: #c0caf5; --fg-dim: #7a82a8; --accent: #7aa2f7;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-dracula {
+  --bg: #282a36; --bg-soft: #2d2f3d; --border: #3b3d4d;
+  --fg: #f8f8f2; --fg-dim: #8a8da3; --accent: #bd93f9;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-nord {
+  --bg: #2e3440; --bg-soft: #343b49; --border: #434c5e;
+  --fg: #e5e9f0; --fg-dim: #8a93a5; --accent: #88c0d0;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-catppuccin {
+  --bg: #1e1e2e; --bg-soft: #252537; --border: #363a4f;
+  --fg: #cdd6f4; --fg-dim: #8087a2; --accent: #89b4fa;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-gruvbox {
+  --bg: #282828; --bg-soft: #32302f; --border: #504945;
+  --fg: #ebdbb2; --fg-dim: #a89984; --accent: #83a598;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-rose-pine {
+  --bg: #191724; --bg-soft: #1f1d2e; --border: #403d52;
+  --fg: #e0def4; --fg-dim: #908caa; --accent: #9ccfd8;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-one-dark {
+  --bg: #282c34; --bg-soft: #2c313a; --border: #3e4451;
+  --fg: #abb2bf; --fg-dim: #828997; --accent: #61afef;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-everforest {
+  --bg: #2d353b; --bg-soft: #343f44; --border: #475258;
+  --fg: #d3c6aa; --fg-dim: #9da9a0; --accent: #a7c080;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-ayu {
+  --bg: #1f2430; --bg-soft: #232834; --border: #383e4c;
+  --fg: #cccac2; --fg-dim: #8a9199; --accent: #ffcc66;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-solarized-dark {
+  --bg: #002b36; --bg-soft: #073642; --border: #0a4b59;
+  --fg: #93a1a1; --fg-dim: #657b83; --accent: #268bd2;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-monokai {
+  --bg: #272822; --bg-soft: #2d2e27; --border: #49483e;
+  --fg: #f8f8f2; --fg-dim: #75715e; --accent: #66d9ef;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-kanagawa {
+  --bg: #1f1f28; --bg-soft: #2a2a37; --border: #54546d;
+  --fg: #dcd7ba; --fg-dim: #727169; --accent: #7e9cd8;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-material {
+  --bg: #263238; --bg-soft: #2e3c43; --border: #425057;
+  --fg: #eeffff; --fg-dim: #8d9ea3; --accent: #82aaff;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-synthwave-84 {
+  --bg: #262335; --bg-soft: #1a1721; --border: #34294f;
+  --fg: #ffffff; --fg-dim: #848bbd; --accent: #f92aad;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-night-owl {
+  --bg: #011627; --bg-soft: #0b2942; --border: #1d3b53;
+  --fg: #d6deeb; --fg-dim: #637777; --accent: #82aaff;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-cobalt2 {
+  --bg: #193549; --bg-soft: #122738; --border: #2a4556;
+  --fg: #ffffff; --fg-dim: #8eb0c8; --accent: #ffc600;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-catppuccin-macchiato {
+  --bg: #24273a; --bg-soft: #1e2030; --border: #363a4f;
+  --fg: #cad3f5; --fg-dim: #6e738d; --accent: #8aadf4;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-catppuccin-frappe {
+  --bg: #303446; --bg-soft: #292c3c; --border: #414559;
+  --fg: #c6d0f5; --fg-dim: #737994; --accent: #8caaee;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-kanagawa-dragon {
+  --bg: #181616; --bg-soft: #1b1a1a; --border: #3a3736;
+  --fg: #c5c9c5; --fg-dim: #8b8d88; --accent: #7e9cd8;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-gruvbox-material {
+  --bg: #1d2021; --bg-soft: #282828; --border: #3c3836;
+  --fg: #d4be98; --fg-dim: #a89984; --accent: #7daea3;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+
+/* --- light themes (color-scheme flips for scrollbars/inputs) --- */
+:root.theme-light {
+  color-scheme: light;
+  --bg: #ffffff; --bg-soft: #f6f8fa; --border: #d0d7de;
+  --fg: #1f2328; --fg-dim: #656d76; --accent: #0969da;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-shire-light {
+  color-scheme: light;
+  --bg: #f9f5eb; --bg-soft: #efe8da; --border: #ddd3c2;
+  --fg: #1a1612; --fg-dim: #8a7e72; --accent: #5d6e3f;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-solarized-light {
+  color-scheme: light;
+  --bg: #fdf6e3; --bg-soft: #eee8d5; --border: #ddd6c1;
+  --fg: #586e75; --fg-dim: #93a1a1; --accent: #268bd2;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-catppuccin-latte {
+  color-scheme: light;
+  --bg: #eff1f5; --bg-soft: #e6e9ef; --border: #ccd0da;
+  --fg: #4c4f69; --fg-dim: #8c8fa1; --accent: #1e66f5;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-rose-pine-dawn {
+  color-scheme: light;
+  --bg: #faf4ed; --bg-soft: #fffaf3; --border: #dfdad9;
+  --fg: #575279; --fg-dim: #797593; --accent: #56949f;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+/* Paper themes go monochrome: even the status colors are greys (the SPA's
+ * paper palettes override --ok/--warn the same way). */
+:root.theme-paper {
+  color-scheme: light;
+  --bg: #f4f4f2; --bg-soft: #e9e9e6; --border: #c2c2bf;
+  --fg: #161616; --fg-dim: #5a5a58; --accent: #2b2b2b;
+  --good: #6b6b6b; --warn: #4d4d4d;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-paper-color {
+  color-scheme: light;
+  --bg: #eceae2; --bg-soft: #e2e0d6; --border: #c3c1b6;
+  --fg: #24231f; --fg-dim: #6a685f; --accent: #4f7a8f;
+  --good: #5f7e4f; --warn: #997b3a;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+/* E Ink themes: borders carry elevation; status colors follow the panel
+ * aesthetic (B&W greys / Kaleido-muted) as in the SPA's palettes. */
+:root.theme-eink {
+  color-scheme: light;
+  --bg: #ffffff; --bg-soft: #f2f2f2; --border: #6e6e6e;
+  --fg: #000000; --fg-dim: #555555; --accent: #000000;
+  --good: #5e5e5e; --warn: #3a3a3a;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-eink-color {
+  color-scheme: light;
+  --bg: #ffffff; --bg-soft: #f2f2f2; --border: #7a7a7a;
+  --fg: #000000; --fg-dim: #555555; --accent: #0b5cad;
+  --good: #2e7d32; --warn: #9a6400;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-one-light {
+  color-scheme: light;
+  --bg: #fafafa; --bg-soft: #f0f0f0; --border: #e5e5e5;
+  --fg: #383a42; --fg-dim: #9da0a6; --accent: #4078f2;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
+}
+:root.theme-ayu-light {
+  color-scheme: light;
+  --bg: #fafafa; --bg-soft: #f3f3f0; --border: #e6e7e8;
+  --fg: #5b6773; --fg-dim: #97989e; --accent: #399ee6;
+  --bg-elev: color-mix(in srgb, var(--bg-soft) 92%, var(--fg));
 }

@@ -8,6 +8,7 @@ import {
 } from "../attentionNotify";
 import { focusedId, hostOps } from "../dockview/store";
 import { getLayoutDiagRing } from "../dockview/layoutDiag";
+import { HOST_THEMES, hostTheme, setHostTheme } from "../theme";
 import { TABSTRIP_POPOVER_GROUP, usePopoverSurface } from "./popover";
 import s from "./Settings.module.css";
 
@@ -99,6 +100,12 @@ export function Settings() {
     group: TABSTRIP_POPOVER_GROUP,
     anchor: () => wrapEl,
   });
+
+  // Popover content view: the plain menu ↔ the THEME picker (a second pane in
+  // the SAME popover surface — Escape/outside-tap dismissal keeps working
+  // unchanged through the shared surface stack). The content lives inside
+  // <Show when={surface.open()}> so each open starts fresh on the menu view.
+  const [view, setView] = createSignal<"menu" | "themes">("menu");
 
   // ---- "Copy layout diagnostics" action (production-capable) ---------------
   // Copies the layout-persistence diag ring (layoutDiag.ts — always-on, last
@@ -208,6 +215,16 @@ export function Settings() {
       hint: () => attentionNotifyHint(),
     },
     {
+      // Theme picker (host shell ONLY). Opens the picker VIEW inside this
+      // same popover — the host's theme is independent from every embedded
+      // SPA's own theme (separate storage key; never synced, by design).
+      kind: "action",
+      testid: "settings-theme",
+      label: "Theme…",
+      description: "Host shell appearance (apps keep their own).",
+      run: () => setView("themes"),
+    },
+    {
       // Evidence collection for the on-device PWA relaunch layout loss
       // (2026-08-31 diagnosis-first slice). The diag ring records the init
       // read source/origin, every flush (trigger+bytes+ws), seeds, and clears
@@ -255,75 +272,120 @@ export function Settings() {
       </button>
       <Show when={surface.open()}>
         <div class={s.popover} role="menu" data-testid="settings-popover" aria-label="Settings">
-          <div class={s.heading}>Settings</div>
-          <div class={s.menu} role="presentation">
-            <For each={items}>
-              {(item) => (
-                <button
-                  type="button"
-                  // The disabled accessor is CALLED in the class/aria-disabled
-                  // expressions so SolidJS tracks it — the state is live while
-                  // the popover is open and re-derived on every open (the
-                  // <Show> content remounts).
-                  class={
-                    item.kind === "action" && item.disabled?.()
-                      ? `${s.item} ${s.itemDisabled}`
-                      : s.item
-                  }
-                  data-testid={item.testid}
-                  role={item.kind === "toggle" ? "menuitemcheckbox" : "menuitem"}
-                  aria-checked={item.kind === "toggle" ? (item.isOn() ? "true" : "false") : undefined}
-                  // aria-disabled (NOT the native disabled attr): the button
-                  // stays focusable/discoverable; the dimmed style + activate's
-                  // guard make it non-interactive.
-                  aria-disabled={
-                    item.kind === "action" && item.disabled?.() ? "true" : undefined
-                  }
-                  onClick={() => activate(item)}
-                >
-                  <span class={s.itemText}>
-                    <span class={s.itemLabel}>{item.label}</span>
-                    <span class={s.itemDesc}>{item.description}</span>
-                    {/* Optional live hint line (permission denial guidance,
-                        copy-diagnostics "Copied" feedback). Called in the JSX
-                        expression so SolidJS tracks the hint signal while the
-                        popover is open. */}
-                    {item.hint ? (
-                      <Show when={item.hint()} keyed>
-                        {(h) => (
-                          <span class={s.itemHint} data-testid={`${item.testid}-hint`}>
-                            {h}
-                          </span>
-                        )}
-                      </Show>
-                    ) : null}
-                  </span>
-                  {item.kind === "toggle" ? (
-                    /* Cheap checkbox affordance: a bordered square with a ✓
-                       glyph when on. Plain bg/border — no GPU-heavy CSS. */
-                    <span class={s.itemCheck} aria-hidden="true">
-                      <Show when={item.isOn()}>
-                        <span class={s.itemCheckMark}>✓</span>
-                      </Show>
+          <Show when={view() === "menu"}>
+            <div class={s.heading}>Settings</div>
+            <div class={s.menu} role="presentation">
+              <For each={items}>
+                {(item) => (
+                  <button
+                    type="button"
+                    // The disabled accessor is CALLED in the class/aria-disabled
+                    // expressions so SolidJS tracks it — the state is live while
+                    // the popover is open and re-derived on every open (the
+                    // <Show> content remounts).
+                    class={
+                      item.kind === "action" && item.disabled?.()
+                        ? `${s.item} ${s.itemDisabled}`
+                        : s.item
+                    }
+                    data-testid={item.testid}
+                    role={item.kind === "toggle" ? "menuitemcheckbox" : "menuitem"}
+                    aria-checked={item.kind === "toggle" ? (item.isOn() ? "true" : "false") : undefined}
+                    // aria-disabled (NOT the native disabled attr): the button
+                    // stays focusable/discoverable; the dimmed style + activate's
+                    // guard make it non-interactive.
+                    aria-disabled={
+                      item.kind === "action" && item.disabled?.() ? "true" : undefined
+                    }
+                    onClick={() => activate(item)}
+                  >
+                    <span class={s.itemText}>
+                      <span class={s.itemLabel}>{item.label}</span>
+                      <span class={s.itemDesc}>{item.description}</span>
+                      {/* Optional live hint line (permission denial guidance,
+                          copy-diagnostics "Copied" feedback). Called in the JSX
+                          expression so SolidJS tracks the hint signal while the
+                          popover is open. */}
+                      {item.hint ? (
+                        <Show when={item.hint()} keyed>
+                          {(h) => (
+                            <span class={s.itemHint} data-testid={`${item.testid}-hint`}>
+                              {h}
+                            </span>
+                          )}
+                        </Show>
+                      ) : null}
                     </span>
-                  ) : null}
-                </button>
-              )}
-            </For>
-          </div>
-          {/* Copy-diagnostics FALLBACK: a readonly textarea staged with the
-              ring JSON and selected, for browsers where the async clipboard is
-              unavailable or denied (non-secure LAN origins — the operator's
-              http device path). Rendered only while the fallback is active. */}
-          <Show when={diagFallback()}>
-            <textarea
-              class={s.diagTextarea}
-              ref={diagTextarea}
-              readonly
-              data-testid="settings-diag-textarea"
-              value={diagFallback() ?? ""}
-              spellcheck={false}
-            />
+                    {item.kind === "toggle" ? (
+                      /* Cheap checkbox affordance: a bordered square with a ✓
+                         glyph when on. Plain bg/border — no GPU-heavy CSS. */
+                      <span class={s.itemCheck} aria-hidden="true">
+                        <Show when={item.isOn()}>
+                          <span class={s.itemCheckMark}>✓</span>
+                        </Show>
+                      </span>
+                    ) : null}
+                  </button>
+                )}
+              </For>
+            </div>
+            {/* Copy-diagnostics FALLBACK: a readonly textarea staged with the
+                ring JSON and selected, for browsers where the async clipboard
+                is unavailable or denied (non-secure LAN origins — the
+                operator's http device path). Rendered only while the fallback
+                is active. */}
+            <Show when={diagFallback()}>
+              <textarea
+                class={s.diagTextarea}
+                ref={diagTextarea}
+                readonly
+                data-testid="settings-diag-textarea"
+                value={diagFallback() ?? ""}
+                spellcheck={false}
+              />
+            </Show>
+          </Show>
+          <Show when={view() === "themes"}>
+            {/* THEME PICKER — the host shell's theme, INDEPENDENT from every
+                embedded SPA's theme (src/theme.ts; separate storage key).
+                Same compact pattern as the web ThemePicker: listbox of
+                swatch + name options, ✓ on the active one. GPU-cheap only
+                (plain bg/border + inline swatch colors). */}
+            <button
+              type="button"
+              class={s.backBtn}
+              data-testid="theme-back"
+              onClick={() => setView("menu")}
+            >
+              <span class={s.backIcon} aria-hidden="true">‹</span> Settings
+            </button>
+            <div class={s.themeGrid} role="listbox" aria-label="Host theme" data-testid="theme-grid">
+              <For each={HOST_THEMES}>
+                {(t) => (
+                  <button
+                    type="button"
+                    role="option"
+                    class={s.themeOption}
+                    data-testid={`theme-${t.id}`}
+                    aria-selected={hostTheme() === t.id ? "true" : "false"}
+                    onClick={() => setHostTheme(t.id)}
+                  >
+                    <span
+                      class={s.themeSwatch}
+                      style={{ background: t.swatch.bg, "border-color": t.swatch.accent }}
+                    >
+                      <span style={{ background: t.swatch.accent }} />
+                      <span style={{ background: t.swatch.accent2 }} />
+                      <span style={{ background: t.swatch.fg }} />
+                    </span>
+                    <span class={s.themeName}>{t.name}</span>
+                    <Show when={hostTheme() === t.id}>
+                      <span class={s.themeCheck} aria-hidden="true">✓</span>
+                    </Show>
+                  </button>
+                )}
+              </For>
+            </div>
           </Show>
         </div>
       </Show>

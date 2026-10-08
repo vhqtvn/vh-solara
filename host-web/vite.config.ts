@@ -1,5 +1,10 @@
 import { defineConfig } from "vite";
 import solid from "vite-plugin-solid";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+
+const hostRoot = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(hostRoot, "..");
 
 // Host SPA — served on :5173 in dev/test. Embeds one cross-origin <iframe>
 // per vh-solara server (iframe content lives on :5174, see vite.iframe.config.ts).
@@ -21,6 +26,17 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     host: "127.0.0.1",
+    // The host theme system imports the SHARED theme catalog from the web/
+    // tree (src/theme.ts → ../../web/src/themeCatalog.ts). Vite's default
+    // fs.allow is the detected workspace root, and this repo has NO workspace
+    // markers (no root package.json/workspaces, no pnpm-workspace.yaml — .git
+    // is explicitly NOT a marker in Vite's ROOT_FILES), so the default allow
+    // list collapses to host-web/ alone and the dev server would 403 the
+    // cross-tree import. Allow the repo root explicitly (dev server only;
+    // `vite build` reads from disk and is unaffected).
+    fs: {
+      allow: [repoRoot],
+    },
   },
   preview: {
     port: 5173,

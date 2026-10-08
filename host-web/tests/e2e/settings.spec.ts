@@ -376,6 +376,77 @@ test.describe("settings popover", () => {
     await H.assertSurvived(page, b, bb, "live-toggle pane B");
   });
 
+  test("theme picker applies the host theme, persists, and re-applies in a fresh page (pre-paint)", async ({ page }) => {
+    const html = page.locator("html");
+
+    // Default: dark — which IS the :root palette, so NO theme- class is set.
+    await expect(html).not.toHaveClass(/theme-/);
+
+    // Open the picker via the "Theme…" menu item.
+    await openSettings(page);
+    await page.locator('[data-testid="settings-theme"]').click();
+    const grid = page.locator('[data-testid="theme-grid"]');
+    await expect(grid).toBeVisible();
+    // The host offers the curated catalog ONLY — no "Custom…" (the SPA's
+    // user-built theme is deliberately not host-offerable in v1).
+    await expect(page.locator('[data-testid="theme-custom"]')).toHaveCount(0);
+    await expect(grid.locator('[role="option"]')).toHaveCount(38);
+
+    // Pick a LIGHT theme: theme class + light marker + color-scheme flip +
+    // the pane surface (body bg) painted from the theme palette.
+    await page.locator('[data-testid="theme-solarized-light"]').click();
+    await expect(html).toHaveClass(/theme-solarized-light/);
+    await expect(html).toHaveClass(/host-theme-light/);
+    await expect
+      .poll(() => page.evaluate(() => getComputedStyle(document.documentElement).colorScheme))
+      .toBe("light");
+    await expect
+      .poll(() => page.evaluate(() => getComputedStyle(document.body).backgroundColor))
+      .toBe("rgb(253, 246, 227)"); // #fdf6e3 — solarized-light bg
+    // Persisted under the HOST key (versioned envelope) — and the SPA's own
+    // theme key is untouched (independent themes, by design).
+    expect(await page.evaluate(() => localStorage.getItem("vh-host:theme:v1"))).toBe(
+      JSON.stringify({ v: 1, data: "solarized-light" }),
+    );
+    expect(await page.evaluate(() => localStorage.getItem("vh.theme.v1"))).toBeNull();
+
+    await page.screenshot({
+      path: path.join(VISION_DIR, "06-theme-picker-light.png"),
+      fullPage: true,
+    });
+
+    // A DARK theme flips color-scheme back and clears the light marker.
+    await page.locator('[data-testid="theme-dracula"]').click();
+    await expect(html).toHaveClass(/theme-dracula/);
+    await expect(html).not.toHaveClass(/host-theme-light/);
+    await expect
+      .poll(() => page.evaluate(() => getComputedStyle(document.documentElement).colorScheme))
+      .toBe("dark");
+
+    // Re-pick the light theme for the persistence half, then back out to the
+    // menu (the picker is a view INSIDE the settings popover).
+    await page.locator('[data-testid="theme-solarized-light"]').click();
+    await page.locator('[data-testid="theme-back"]').click();
+    await expect(page.locator('[data-testid="settings-reload"]')).toBeVisible();
+
+    // PERSISTENCE in a FRESH page on the same origin. This spec's
+    // beforeEach clears localStorage on every navigation OF THIS PAGE, so a
+    // second context page (no init script) is the honest witness: the inline
+    // pre-paint script in index.html must already carry the theme class when
+    // the document lands (no dark flash), and the body paints the palette.
+    const page2 = await page.context().newPage();
+    try {
+      await page2.goto("/");
+      await expect(page2.locator("html")).toHaveClass(/theme-solarized-light/);
+      await expect(page2.locator("html")).toHaveClass(/host-theme-light/);
+      await expect
+        .poll(() => page2.evaluate(() => getComputedStyle(document.body).backgroundColor))
+        .toBe("rgb(253, 246, 227)");
+    } finally {
+      await page2.close();
+    }
+  });
+
   test("Copy layout diagnostics: clipboard payload carries the ring JSON; denial falls back to a selected textarea", async ({
     page,
   }) => {

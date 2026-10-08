@@ -18,6 +18,34 @@
          route in pkg/web/server.go handleStatic. -->
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
+    <!-- Pre-paint HOST theme (no first-paint flash): set .theme-<id> on
+         <html> before anything renders, from the host's OWN storage key
+         (vh-host:theme:v1 — the embedded SPAs keep their independent
+         vh.theme.v1). Ids validated against an inline copy of the catalog
+         ids; KEEP IN SYNC with web/src/themeCatalog.ts — a catalog theme
+         missing here only costs a one-paint flash, because
+         host/src/index.tsx re-applies via applyHostTheme() at boot. -->
+    <script>
+      (function () {
+        try {
+          var raw = localStorage.getItem("vh-host:theme:v1");
+          if (!raw) return;
+          var id = JSON.parse(raw).data;
+          var ids =
+            ",dim,midnight,hc,oled,oled-violet,shire-dark,tokyonight,dracula,nord,catppuccin,gruvbox,rose-pine,one-dark,everforest,ayu,solarized-dark,monokai,kanagawa,material,synthwave-84,night-owl,cobalt2,catppuccin-macchiato,catppuccin-frappe,kanagawa-dragon,gruvbox-material,light,shire-light,solarized-light,catppuccin-latte,rose-pine-dawn,paper,paper-color,eink,eink-color,one-light,ayu-light,";
+          if (id && ids.indexOf("," + id + ",") !== -1 && id !== "dark") {
+            var el = document.documentElement;
+            el.classList.add("theme-" + id);
+            if (
+              ",light,shire-light,solarized-light,catppuccin-latte,rose-pine-dawn,paper,paper-color,eink,eink-color,one-light,ayu-light,".indexOf(
+                "," + id + ",",
+              ) !== -1
+            )
+              el.classList.add("host-theme-light");
+          }
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

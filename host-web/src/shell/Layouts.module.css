@@ -196,9 +196,10 @@
   border-radius: 4px;
 }
 /* Master two-step confirm state: the amber destructive tint (the
- * workspace-delete confirm treatment). */
+ * workspace-delete confirm treatment). Derived from --warn so paper/e-ink
+ * themes (which grey out status colors) stay coherent. */
 .rowConfirming {
-  background: rgba(210, 153, 34, 0.14);
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
 }
 .rowMain {
   display: flex;

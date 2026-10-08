@@ -22,7 +22,7 @@
   border-radius: 8px;
   background: var(--bg-elev);
   color: var(--fg);
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow-soft);
   display: flex;
   flex-direction: column;
   gap: 6px;

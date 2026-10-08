@@ -120,12 +120,13 @@
   opacity: 1;
 }
 
-/* floating group (collapse-to-tray) chrome: slim, keep-mounted, restorable */
+/* floating group (collapse-to-tray) chrome: slim, keep-mounted, restorable.
+ * Tokens (not hardcoded darks) so the floating group follows the host theme. */
 .dv-resize-container {
-  border: 1px solid #30363d;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-pop);
 }
 .dv-floating-titlebar {
-  background: #161b22;
-  color: #c9d1d9;
+  background: var(--bg-soft);
+  color: var(--fg);
 }

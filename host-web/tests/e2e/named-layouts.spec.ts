@@ -749,12 +749,14 @@ test.describe("named layouts", () => {
     await expect(editItem).toHaveText(/Edit layout…/);
     await expect(editItem).not.toHaveText(/Layout…/);
     await expect(page.locator('[data-testid="settings-layouts"]')).toHaveCount(0);
-    // The menu is exactly: Edit layout…, Reload page, Copy layout diagnostics,
-    // Auto-rotate layout, Needs-you notifications (the attention-notify opt-in
-    // toggle — the second menuitemcheckbox, added by the needs-you
-    // notifications slice; Copy layout diagnostics is the third menuitem,
-    // added by the 2026-08-31 diagnosis-first slice).
-    await expect(page.locator('[data-testid="settings-popover"] [role="menuitem"]')).toHaveCount(3);
+    // The menu is exactly: Edit layout…, Reload page, Theme…, Copy layout
+    // diagnostics, Auto-rotate layout, Needs-you notifications (the
+    // attention-notify opt-in toggle — the second menuitemcheckbox, added by
+    // the needs-you notifications slice; Copy layout diagnostics by the
+    // 2026-08-31 diagnosis-first slice; Theme… by the host-theme slice —
+    // the host shell theme picker view).
+    await expect(page.locator('[data-testid="settings-popover"] [role="menuitem"]')).toHaveCount(4);
+    await expect(page.locator('[data-testid="settings-theme"]')).toHaveText(/Theme…/);
     await expect(page.locator('[data-testid="settings-copy-diag"]')).toHaveText(/Copy layout diagnostics/);
     await expect(page.locator('[data-testid="settings-popover"] [role="menuitemcheckbox"]')).toHaveCount(2);
     await expect(page.locator('[data-testid="settings-notify"]')).toHaveText(/Needs-you notifications/);
