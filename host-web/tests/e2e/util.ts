@@ -1428,3 +1428,8 @@ export async function iframeSrcs(page: Page): Promise<string[]> {
     (els as HTMLIFrameElement[]).map((e) => e.src).filter((s) => s !== ""),
   );
 }
+
+// Host-theme persistence contract — single-sourced from host-web/src/theme.ts
+// (LS_KEY + the {v:1,data} envelope written by setHostTheme/persistSignal).
+export { LS_KEY } from "../../src/theme";
+export const hostThemeEnvelope = (id: string) => JSON.stringify({ v: 1, data: id });

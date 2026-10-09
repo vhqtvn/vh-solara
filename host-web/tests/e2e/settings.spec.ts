@@ -405,8 +405,8 @@ test.describe("settings popover", () => {
       .toBe("rgb(253, 246, 227)"); // #fdf6e3 — solarized-light bg
     // Persisted under the HOST key (versioned envelope) — and the SPA's own
     // theme key is untouched (independent themes, by design).
-    expect(await page.evaluate(() => localStorage.getItem("vh-host:theme:v1"))).toBe(
-      JSON.stringify({ v: 1, data: "solarized-light" }),
+    expect(await page.evaluate((k) => localStorage.getItem(k), H.LS_KEY)).toBe(
+      H.hostThemeEnvelope("solarized-light"),
     );
     expect(await page.evaluate(() => localStorage.getItem("vh.theme.v1"))).toBeNull();
 
@@ -479,8 +479,10 @@ test.describe("settings popover", () => {
     //
     // Persistence is planted directly (the picker→localStorage write path is
     // proven by the test above; this one isolates the boot READ path).
-    await page.evaluate(() =>
-      localStorage.setItem("vh-host:theme:v1", JSON.stringify({ v: 1, data: "solarized-light" })));
+    await page.evaluate(
+      ({ k, v }) => localStorage.setItem(k, v),
+      { k: H.LS_KEY, v: H.hostThemeEnvelope("solarized-light") },
+    );
 
     const page2 = await page.context().newPage();
     let releaseEntry: () => void = () => {};

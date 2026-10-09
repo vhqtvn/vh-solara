@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { iframeSrcs } from "../e2e/util";
+import { iframeSrcs, LS_KEY, hostThemeEnvelope } from "../e2e/util";
 
 // =============================================================================
 // FOLDED-POSTURE HOST-THEME e2e — closes the dev-posture-only coverage gap
@@ -38,11 +38,10 @@ import { iframeSrcs } from "../e2e/util";
 // (no DEV bridges exist in the folded build).
 // =============================================================================
 
-const HOST_THEME_KEY = "vh-host:theme:v1";
 const SPA_THEME_KEY = "vh.theme.v1";
 const SPA_CUSTOM_THEME_KEY = "vh.theme.custom.v1";
 /** Real persisted envelope setHostTheme writes (host-web/src/theme.ts). */
-const LIGHT_ENVELOPE = JSON.stringify({ v: 1, data: "solarized-light" });
+const LIGHT_ENVELOPE = hostThemeEnvelope("solarized-light");
 /** solarized-light body bg (#fdf6e3) — the same palette value the dev lane
  * asserts; proves the theme block shipped inside the folded CSS bundle. */
 const LIGHT_BG = "rgb(253, 246, 227)";
@@ -94,7 +93,7 @@ test.describe.serial("folded-posture host theme", () => {
     // layer where Playwright routing lives.
     await page.addInitScript((args) => {
       localStorage.setItem(args.key, args.envelope);
-    }, { key: HOST_THEME_KEY, envelope: LIGHT_ENVELOPE });
+    }, { key: LS_KEY, envelope: LIGHT_ENVELOPE });
 
     // Route-hold EXACTLY the entry request. Module scripts are deferred: the
     // browser FETCHES when the parser reaches the tag but EXECUTES after
@@ -265,7 +264,7 @@ test.describe.serial("folded-posture host theme", () => {
     await page.waitForTimeout(400);
 
     // The host key carries the write, under the real versioned envelope…
-    expect(await page.evaluate((k) => localStorage.getItem(k), HOST_THEME_KEY)).toBe(
+    expect(await page.evaluate((k) => localStorage.getItem(k), LS_KEY)).toBe(
       LIGHT_ENVELOPE,
     );
     // …and the SPA's theme keys are ABSENT — the SPA's persistedSignal never

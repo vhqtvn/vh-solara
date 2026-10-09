@@ -26,7 +26,7 @@ import { THEMES, type ThemeDef } from "../../web/src/themeCatalog";
 
 /** Storage key — follows the host's `vh-host:*` convention; MUST NOT collide
  * with the SPA's `vh.theme.v1` / `vh.theme.custom.v1` (same origin when folded). */
-const LS_KEY = "vh-host:theme:v1";
+export const LS_KEY = "vh-host:theme:v1";
 const DEFAULT_THEME = "dark";
 
 /** The host's offerable themes: the full curated catalog minus "custom". */
