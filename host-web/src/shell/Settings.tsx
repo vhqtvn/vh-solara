@@ -95,17 +95,22 @@ type MenuItem = ActionItem | ToggleItem;
 export function Settings() {
   let wrapEl: HTMLDivElement | undefined;
 
+  // Popover content view: the plain menu ↔ the THEME picker (a second pane in
+  // the SAME popover surface — Escape/outside-tap dismissal keeps working
+  // unchanged through the shared surface stack). The signal is COMPONENT-scope
+  // — closing only unmounts the <Show> content, the state itself survives —
+  // so the surface's onOpen hook resets it to "menu": every open starts
+  // fresh on the menu view, never on the view the previous visit ended on.
+  const [view, setView] = createSignal<"menu" | "themes">("menu");
+
   const surface = usePopoverSurface({
     id: "settings",
     group: TABSTRIP_POPOVER_GROUP,
     anchor: () => wrapEl,
+    // Runs exactly once per OPEN (openPopover/togglePopover call it before
+    // flipping the signal; close paths never do) — see the view comment above.
+    onOpen: () => setView("menu"),
   });
-
-  // Popover content view: the plain menu ↔ the THEME picker (a second pane in
-  // the SAME popover surface — Escape/outside-tap dismissal keeps working
-  // unchanged through the shared surface stack). The content lives inside
-  // <Show when={surface.open()}> so each open starts fresh on the menu view.
-  const [view, setView] = createSignal<"menu" | "themes">("menu");
 
   // ---- "Copy layout diagnostics" action (production-capable) ---------------
   // Copies the layout-persistence diag ring (layoutDiag.ts — always-on, last

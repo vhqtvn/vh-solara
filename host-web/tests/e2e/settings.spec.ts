@@ -447,6 +447,126 @@ test.describe("settings popover", () => {
     }
   });
 
+  test("reopening Settings starts on the menu view (the view signal resets on open)", async ({ page }) => {
+    // The view signal is COMPONENT-scope: closing the popover only unmounts
+    // the <Show> content — the signal value survives. Without the surface's
+    // onOpen reset, a visit that ended on the theme picker made the NEXT
+    // open land straight on the picker (the source comment used to CLAIM
+    // "each open starts fresh on the menu view"; the reset is what makes it
+    // true — review finding).
+    await openSettings(page);
+    await page.locator('[data-testid="settings-theme"]').click();
+    await expect(page.locator('[data-testid="theme-grid"]')).toBeVisible();
+
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="settings-popover"]')).toBeHidden();
+
+    // Reopen: the MENU is showing (a menu-only item), not the picker.
+    await openSettings(page);
+    await expect(page.locator('[data-testid="settings-reload"]')).toBeVisible();
+    await expect(page.locator('[data-testid="theme-grid"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="theme-back"]')).toHaveCount(0);
+  });
+
+  test("pre-paint: the inline head script carries the theme BEFORE the entry module evaluates", async ({ page }) => {
+    // The fresh-page assertions in the picker test above run after goto()
+    // resolves — i.e. after the entry module has run applyHostTheme() — so
+    // they cannot tell the inline <head> script apart from the module-top
+    // apply. Here the entry-module REQUEST is held at the route layer: when
+    // the browser asks for /src/index.tsx (the LAST tag of <body>), parsing
+    // has necessarily passed the <head> inline script, so whatever is on
+    // <html> at that moment is the INLINE script's work alone.
+    //
+    // Persistence is planted directly (the picker→localStorage write path is
+    // proven by the test above; this one isolates the boot READ path).
+    await page.evaluate(() =>
+      localStorage.setItem("vh-host:theme:v1", JSON.stringify({ v: 1, data: "solarized-light" })));
+
+    const page2 = await page.context().newPage();
+    let releaseEntry: () => void = () => {};
+    let signalRequested!: () => void;
+    const entryRequested = new Promise<void>((r) => {
+      signalRequested = r;
+    });
+    try {
+      await page2.route("**/src/index.tsx*", async (route) => {
+        signalRequested();
+        await new Promise<void>((r) => {
+          releaseEntry = r;
+        });
+        await route.continue();
+      });
+      const nav = page2.goto("/");
+      // No unhandled rejection if a failed assert below closes the page
+      // mid-hold; the happy path still awaits `nav` explicitly.
+      void nav.catch(() => {});
+      await entryRequested;
+
+      // BEFORE any module JS has run: theme class + light marker from the
+      // inline script alone (crux of this verifier).
+      const cls = await page2.evaluate(() => document.documentElement.className);
+      expect(cls).toContain("theme-solarized-light");
+      expect(cls).toContain("host-theme-light");
+
+      // Release: the module boots, applyHostTheme() re-applies idempotently —
+      // the classes survive the handoff (no flash back to dark).
+      releaseEntry();
+      await nav;
+      await expect(page2.locator("html")).toHaveClass(/theme-solarized-light/);
+      await expect(page2.locator("html")).toHaveClass(/host-theme-light/);
+    } finally {
+      releaseEntry();
+      await page2.close();
+    }
+  });
+
+  test("cross-window sync: a picker write in page A reaches page B live via the storage listener (no reload)", async ({ page }) => {
+    // theme.ts registers a `storage` listener for cross-window theme sync —
+    // storage events fire only in OTHER same-origin documents (never the
+    // writer), so the honest witness is a SECOND page in the SAME browser
+    // context, loaded BEFORE the write (a page booted after would read the
+    // stored theme at init, not through the listener).
+    const pageB = await page.context().newPage();
+    try {
+      await H.loadHost(pageB); // full boot at default dark — no theme classes
+      // Reload sentinel: if pageB were reloaded by any step below, this flag
+      // would vanish (a fresh document never sets it).
+      await pageB.evaluate(() => {
+        (window as unknown as { __themeSyncNoReload?: boolean }).__themeSyncNoReload = true;
+      });
+      const htmlB = pageB.locator("html");
+      await expect(htmlB).not.toHaveClass(/theme-/);
+
+      // Page A drives the REAL picker. Default → dark theme: the class
+      // appears in B without any reload.
+      await openSettings(page);
+      await page.locator('[data-testid="settings-theme"]').click();
+      await page.locator('[data-testid="theme-dracula"]').click();
+      await expect(page.locator("html")).toHaveClass(/theme-dracula/);
+      await expect(htmlB).toHaveClass(/theme-dracula/);
+
+      // dark → LIGHT: the light marker flips too (light-only adjustments).
+      await page.locator('[data-testid="theme-solarized-light"]').click();
+      await expect(htmlB).toHaveClass(/theme-solarized-light/);
+      await expect(htmlB).toHaveClass(/host-theme-light/);
+
+      // light → default dark: every theme class clears in B (dark IS :root).
+      await page.locator('[data-testid="theme-dark"]').click();
+      await expect(htmlB).not.toHaveClass(/theme-/);
+      await expect(htmlB).not.toHaveClass(/host-theme-light/);
+
+      // No reload ever happened in B (sentinel intact) — the classes moved
+      // through the storage listener, live.
+      expect(
+        await pageB.evaluate(
+          () => (window as unknown as { __themeSyncNoReload?: boolean }).__themeSyncNoReload,
+        ),
+      ).toBe(true);
+    } finally {
+      await pageB.close();
+    }
+  });
+
   test("Copy layout diagnostics: clipboard payload carries the ring JSON; denial falls back to a selected textarea", async ({
     page,
   }) => {
