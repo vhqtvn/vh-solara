@@ -1479,6 +1479,7 @@ func (f *FakeOpenCode) Handler() http.Handler {
 	mux.HandleFunc("/fixture/compaction-burst", f.handleFixtureCompactionBurst)
 	mux.HandleFunc("/fixture/orphan", f.handleFixtureOrphan)
 	mux.HandleFunc("/fixture/delete", f.handleFixtureDelete)
+	mux.HandleFunc("/fixture/seed-project", f.handleFixtureSeedProject)
 	mux.HandleFunc("/fixture/agent-hold/arm", f.handleFixtureAgentHoldArm)
 	mux.HandleFunc("/fixture/agent-hold/release", f.handleFixtureAgentHoldRelease)
 	mux.HandleFunc("/fixture/agent-hold/reset", f.handleFixtureAgentHoldReset)
@@ -3131,6 +3132,99 @@ func (f *FakeOpenCode) handleFixtureDelete(w http.ResponseWriter, r *http.Reques
 	// determinism — same trap).
 	f.emit("session.deleted", map[string]any{"info": map[string]any{"id": session}})
 	writeJSON(w, map[string]any{"deleted": session})
+}
+
+// handleFixtureSeedProject seeds count dedicated-directory ROOT sessions on
+// demand (POST /fixture/seed-project {"dir":...,"count":N}). Test-only
+// infrastructure for specs that must drive a project to ZERO live sessions
+// through the REAL /vh/archive cascade: the shared demo dir cannot serve that
+// role because archiving it to empty is unrecoverable in-lane (the fake's
+// PATCH only SETS time.archived, /fixture/reset never clears f.archived,
+// /vh/unarchive is guard-refused in the fixtureserver topology, and the
+// store's 30s reinsertion tombstone outlives any rerun) — a spec that archived
+// demo sessions would poison every sibling spec in the serial lane.
+//
+// Contract:
+//   - dir (required): the project directory the seeded rows report. It never
+//     has to exist on disk (nothing writes there); it only scopes the tree.
+//   - count (default 2, clamped 1..8): how many sessions to create.
+//   - Re-seeding one dir REPLACES it: prior rows in that dir (and their
+//     archived flags / transcripts) are dropped fixture-side, each with a
+//     session.deleted emit, so the dir's state is a pure function of the last
+//     call. Idempotent-per-dir is therefore not the caller's concern.
+//   - Session ids are minted from the global counter and NEVER reused, so a
+//     --repeat-each rerun cannot collide with a prior run's 30s store
+//     reinsertion tombstone (store.go setArchivedTombstone).
+//   - Rows go live through the normal emitter path — one session.created emit
+//     per row in the exact shape handleSessionRoot's POST create uses — so the
+//     aggregator store upserts and the tree emitter projects them like any
+//     real session (no synthetic client-side seeding).
+//
+// Response: {"dir":...,"sessions":[ids in creation order]}.
+func (f *FakeOpenCode) handleFixtureSeedProject(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Dir   string `json:"dir"`
+		Count int    `json:"count"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Dir == "" {
+		http.Error(w, `bad json or missing "dir"`, http.StatusBadRequest)
+		return
+	}
+	if body.Count < 1 {
+		body.Count = 2
+	}
+	if body.Count > 8 {
+		body.Count = 8
+	}
+	now := float64(time.Now().UnixMilli())
+	f.mu.Lock()
+	// Replace-per-dir: sweep any prior seed of this dir. The dropped ids are
+	// collected under the lock and emitted after the unlock (emit takes f.mu
+	// itself — same discipline as handleFixtureAgentHoldReset).
+	var dropped []string
+	kept := f.sessions[:0]
+	for _, s := range f.sessions {
+		if d, _ := s["directory"].(string); d == body.Dir {
+			if id, _ := s["id"].(string); id != "" {
+				dropped = append(dropped, id)
+				delete(f.archived, id)
+				delete(f.busy, id)
+				delete(f.messages, id)
+			}
+			continue
+		}
+		kept = append(kept, s)
+	}
+	f.sessions = kept
+	ids := make([]string, 0, body.Count)
+	rows := make([]map[string]any, 0, body.Count)
+	for i := 0; i < body.Count; i++ {
+		f.counter++
+		sid := fmt.Sprintf("ses_gseed%d", f.counter)
+		// Staggered created times (oldest first) so the tree's time sort is
+		// deterministic within one seed batch.
+		created := now - float64(body.Count-i)*1000
+		rows = append(rows, map[string]any{
+			"id": sid, "projectID": "proj", "title": "Ghost seed " + strconv.Itoa(i+1),
+			"directory": body.Dir,
+			"model":     map[string]any{"providerID": "fake", "id": "dummy", "variant": "default"},
+			"time":      map[string]any{"created": created, "updated": created},
+		})
+		ids = append(ids, sid)
+	}
+	f.sessions = append(f.sessions, rows...)
+	f.mu.Unlock()
+	for _, id := range dropped {
+		f.emit("session.deleted", map[string]any{"info": map[string]any{"id": id}})
+	}
+	for _, row := range rows {
+		f.emit("session.created", map[string]any{"info": row})
+	}
+	writeJSON(w, map[string]any{"dir": body.Dir, "sessions": ids})
 }
 
 // agentHoldSessionRow builds the agenthold session row. A ROOT (no parentID)
