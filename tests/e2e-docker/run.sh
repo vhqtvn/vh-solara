@@ -194,19 +194,54 @@ done
 echo "==> verifying the live /vh/stream delivered streaming events"
 sleep 1
 # SSE frames are `event: <kind>` + `data: <raw payload>`; match the event line.
-if ! grep -q '^event: message.upsert' "$STREAM_FILE"; then
+# The session's messages reach this capture in EITHER wire shape:
+#   - legacy per-event: message.upsert + part.upsert raw-text events (fast
+#     hydrate / already-loaded session; warm reconcile keeps individual upserts)
+#   - cold batch: ONE `messages.batch` envelope {sessionID, encoding:"gzip64",
+#     data} whose message text is INSIDE the base64-gzip blob — what cold-boot
+#     slow-hydrate ships (pkg/state/store.go KindMessagesBatch). A batch-only
+#     capture failing these legacy-only greps was the measured lane-4 flake.
+BATCH_EVENTS=$(grep -c '^event: messages.batch' "$STREAM_FILE" || true)
+UPSERT_EVENTS=$(grep -c '^event: message.upsert' "$STREAM_FILE" || true)
+if [ "$BATCH_EVENTS" = "0" ] && [ "$UPSERT_EVENTS" = "0" ]; then
   echo "----- stream capture -----" >&2; tail -20 "$STREAM_FILE" >&2
-  fail "no message.upsert events on /vh/stream"
+  fail "no message.upsert or messages.batch events on /vh/stream"
 fi
-if ! grep -q '^event: part.upsert' "$STREAM_FILE"; then
+# Per-part streaming frames only exist in the legacy shape; a messages.batch
+# delivers the same history wholesale (no part.upsert events to find).
+if [ "$BATCH_EVENTS" = "0" ] && ! grep -q '^event: part.upsert' "$STREAM_FILE"; then
   fail "no part.upsert (streaming) events on /vh/stream"
 fi
-if ! grep -q 'FAKE-LLM reply' "$STREAM_FILE"; then
-  fail "streamed assistant text not seen on /vh/stream"
+# The streamed assistant text must be observed in whichever shape carried it:
+# raw in a legacy event's data line, or inside any decoded gzip64 batch payload
+# (base64 -> gunzip -> {"messages":[...]}, mirroring web/src/sync/stream.ts).
+if ! grep -q 'FAKE-LLM reply' "$STREAM_FILE" \
+   && ! python3 -c '
+import sys, json, base64, gzip
+found = False
+for line in sys.stdin:
+    if not line.startswith("data: "):
+        continue
+    try:
+        d = json.loads(line[6:])
+    except Exception:
+        continue
+    if d.get("encoding") != "gzip64":
+        continue
+    try:
+        inner = gzip.decompress(base64.b64decode(d.get("data", "")))
+    except Exception:
+        continue
+    if b"FAKE-LLM reply" in inner:
+        found = True
+        break
+sys.exit(0 if found else 1)
+' < "$STREAM_FILE"; then
+  fail "streamed assistant text not seen on /vh/stream (raw or in a messages.batch payload)"
 fi
 STREAM_PARTS=$(grep -c '^event: part.upsert' "$STREAM_FILE" || true)
 rm -f "$STREAM_FILE"
-echo "    live stream delivered ${STREAM_PARTS} part.upsert event(s)"
+echo "    live stream delivered ${STREAM_PARTS} part.upsert + ${BATCH_EVENTS} messages.batch event(s)"
 fi # flow 1
 
 # --- Flow 2: tool execution -> file diff -------------------------------------
