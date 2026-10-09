@@ -1835,6 +1835,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/term/list", s.handleTermList)
 	mux.HandleFunc("/vh/term/kill", s.handleTermKill)
 	mux.HandleFunc("/vh/git/status", s.handleGitStatus)
+	mux.HandleFunc("/vh/git/log", s.handleGitLog)
 	mux.HandleFunc("/vh/git/stage", s.handleGitStage)
 	mux.HandleFunc("/vh/git/unstage", s.handleGitUnstage)
 	mux.HandleFunc("/vh/git/discard", s.handleGitDiscard)

@@ -75,6 +75,32 @@
 }
 .git-commit-btn:disabled { opacity: 0.45; cursor: default; }
 
+/* --- slice-6 uncertain-outcome + reconciliation banner ---
+   Warn-toned (not danger): the outcome is UNKNOWN, not failed. Cheap CSS
+   only — no masks, no backdrop filters (Firefox/WebRender GPU rules). */
+.git-uncertain {
+  margin: 0 4px 12px; padding: 8px 10px;
+  border: 1px solid var(--warn); border-radius: var(--radius);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+  font-size: 13px;
+}
+.git-uncertain-title { font-weight: 600; color: var(--warn); }
+.git-uncertain-detail { margin-top: 4px; color: var(--fg); }
+.git-uncertain-log { margin-top: 6px; border-top: 1px dashed var(--border); padding-top: 6px; font-size: 12px; }
+.git-uncertain-log-head { color: var(--fg-dim); margin-bottom: 4px; }
+.git-uncertain-log-row {
+  display: flex; gap: 8px; align-items: baseline;
+  font-family: var(--font-mono); overflow: hidden;
+}
+.git-uncertain-hash { color: var(--fg-dim); flex: 0 0 auto; }
+.git-uncertain-subject { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.git-uncertain-date { color: var(--fg-dim); flex: 0 0 auto; }
+.git-uncertain-empty { color: var(--fg-dim); font-family: inherit; }
+/* Failed reconcile (reads unreadable): warn-toned honesty line, still not a
+   "failed" claim — the outcome remains unknown. */
+.git-uncertain-refresh-failed { margin-top: 6px; color: var(--warn); }
+.git-uncertain .git-mini { margin-top: 6px; }
+
 /* --- professional-pass refinements (from shard 80; base+refinement moved
       together so the refinement still wins over the base above) --- */
 .gitfile { border-radius: var(--radius); }
