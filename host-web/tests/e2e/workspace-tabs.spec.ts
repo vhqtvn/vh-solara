@@ -752,6 +752,75 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     await expect(page.locator('[data-testid="ws-overflow-cue"]')).toHaveCount(0);
   });
 
+  // Feature: MEMBERSHIP FREEZE — the PRESSED arm of the freeze predicate
+  // (pressed || openMenu || kbdFocus, Tabstrip.tsx). A pointer press anywhere
+  // on the strip (the STRIP-WIDE pointerdown) freezes membership until the
+  // WINDOW-level release. The press targets the strip BACKGROUND — the
+  // tab-free right end of the tabs container, guaranteed ≥52px wide by the
+  // fit's overflow reserve whenever anything is hidden — so the tab-anchored
+  // long-press menu timer (MENU_PRESS_MS=500, bound per-TAB) never arms and
+  // the hold below cannot open a menu (no timing window to race).
+  test("membership freezes while the strip is pressed; release unfreezes and promotes the needy workspace", async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 800 });
+    const seed = (await H.workspaces(page))[0];
+    // Same measured geometry as the menu/kbd-focus freeze tests above (seed
+    // ~92px ACTIVE + ~60px fillers consume the ~409px budget before the
+    // ~218px long-capped needy tab; a fifth filler created LAST keeps the
+    // one-slot prev-active off the needy workspace). Distinct names in the
+    // same width classes (9-char fillers, a ≥200px-capped needy name) so any
+    // cross-test leak fails loudly without moving the geometry.
+    for (let i = 1; i <= 4; i++) await H.addWorkspace(page, `PressedF${i}`);
+    const needy = await H.addWorkspace(page, "NeedyPressedFreezeNameForWidthPadB1");
+    const needyPane = await H.addServer(page, H.serverUrl("pressed-freeze"), "pressed-freeze");
+    expect(needyPane).toBeTruthy();
+    await H.addWorkspace(page, "PressedF5"); // activates it; prev-active ≠ needy
+    await H.setActiveWorkspace(page, seed);
+
+    // Saturated with Needy hidden (quiet, no attention).
+    const needyTab = page.locator(`[data-testid="ws-tab"][data-workspace="${needy}"]`);
+    await expect(page.locator('[data-testid="ws-overflow-trigger"]')).toBeVisible();
+    await expect(needyTab).toHaveCount(0);
+
+    // The neutral handshake must land before the probe (last write wins).
+    await H.waitForReady(page, needyPane!);
+
+    // FREEZE via a POINTER PRESS on the strip background. The press point is
+    // 20px inside the RIGHT edge of the tabs container — the fit reserves
+    // ≥52px there (OVERFLOW_RESERVE_PX) whenever anything is hidden, so it is
+    // guaranteed tab-free (and the "⋯" trigger lives OUTSIDE the container),
+    // while the pointerdown still bubbles to the strip-wide listener.
+    const tabsBox = await page.locator('[data-testid="ws-tabs"]').boundingBox();
+    expect(tabsBox).not.toBeNull();
+    await page.mouse.move(tabsBox!.x + tabsBox!.width - 20, tabsBox!.y + tabsBox!.height / 2);
+    await page.mouse.down(); // arms `pressed`; release is window-level
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+
+    // The hidden workspace goes needs-you: the overflow cue updates LIVE
+    // (counts hidden WORKSPACES, not sessions — exactly 1 here)…
+    await probeStatusCounts(page, needyPane!, 0, 0, "needs_reply");
+    const cue = page.locator('[data-testid="ws-overflow-cue"]');
+    await expect(cue).toBeVisible();
+    await expect(cue).toHaveAttribute("data-kind", "needs-you");
+    await expect(cue).toHaveAttribute("data-count", "1");
+
+    // …but membership is FROZEN while the strip is pressed (the hold
+    // outlasts MENU_PRESS_MS with no menu opening — the press is on
+    // background, not a tab — so the freeze can only be the pressed arm).
+    await page.waitForTimeout(400);
+    await expect(needyTab).toHaveCount(0);
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+
+    // UNFREEZE: release the pointer (the window-level pointerup clears
+    // `pressed`) — the needy workspace is promoted into the strip
+    // (attention-selected membership) with its live badge, and the cue clears.
+    await page.mouse.up();
+    await expect(needyTab).toBeVisible();
+    await expect(
+      page.locator(`[data-testid="ws-needs-you"][data-workspace="${needy}"]`),
+    ).toBeVisible();
+    await expect(page.locator('[data-testid="ws-overflow-cue"]')).toHaveCount(0);
+  });
+
   // Feature: TIER PRECEDENCE — an UNREAD workspace outranks a RUNNING one at
   // equal fit (TIER.UNREAD=2 < TIER.RUNNING=3, priorityFit.ts): when only one
   // of two ~218px long-capped tabs fits beside the active seed, the unread
