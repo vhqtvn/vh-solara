@@ -117,9 +117,12 @@ function watchActivations(reg: ServiceWorkerRegistration): void {
 }
 
 /**
- * Lever A — ensure the narrow registration exists. Idempotent (one attempt
- * per host document; a second call returns the memoized promise). Never
- * rejects; resolves null on any failure (fail-open posture).
+ * Lever A — ensure the narrow registration exists. Collapses concurrent
+ * callers into ONE register() attempt, memoized on SUCCESS only: a failed
+ * attempt (null resolution) clears the memo, so a later caller retries what
+ * may have been transient (dev host briefly lacking /sw.js, network hiccup,
+ * insecure context) instead of being served the cached failure forever.
+ * Never rejects; resolves null on any failure (fail-open posture).
  */
 export function ensureNarrowRegistration(): Promise<ServiceWorkerRegistration | null> {
   if (registerPromise) return registerPromise;
@@ -133,7 +136,14 @@ export function ensureNarrowRegistration(): Promise<ServiceWorkerRegistration | 
     } catch {
       return null; // no /sw.js (dev hosts), no SW support, insecure origin…
     }
-  })();
+  })().then((reg) => {
+    // A null (failed) resolution must not stay memoized (B10 / S3b c-F3) —
+    // the failure would be cached for the document lifetime and no later
+    // caller could retry. Success keeps the memo (concurrent callers still
+    // share one attempt); unregisterNarrow below clears it explicitly.
+    if (!reg) registerPromise = null;
+    return reg;
+  });
   return registerPromise;
 }
 
@@ -148,6 +158,12 @@ export function ensureNarrowRegistration(): Promise<ServiceWorkerRegistration | 
  * later (operator splits) resolve instantly once the worker is active.
  */
 export function paneSrcGate(): Promise<void> {
+  // Deliberate asymmetry vs ensureNarrowRegistration (B10): a FAILED
+  // registration clears the register memo (transient failures deserve a
+  // retry), but the GATE itself is never re-armed on failure — a re-armed
+  // gate could repeatedly delay pane boot. A later successful
+  // re-registration still covers already-booted panes via the worker's
+  // claim() (S3a X1 case B); only panes born in between boot uncontrolled.
   if (gatePromise) return gatePromise;
   gatePromise = (async () => {
     const deadline = Date.now() + ACTIVATION_BUDGET_MS;
@@ -207,6 +223,7 @@ export async function unregisterNarrow(): Promise<boolean> {
   heldReg = null;
   focusPort = null;
   gatePromise = Promise.resolve(); // later panes boot un-gated
+  registerPromise = null; // a later ensure re-registers (rollback → re-register)
   if (!reg) return false;
   return reg.unregister().catch(() => false);
 }
