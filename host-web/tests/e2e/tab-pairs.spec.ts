@@ -93,6 +93,16 @@ function zeros(n: number): string {
   return "(0|0)".repeat(Math.max(0, n));
 }
 
+/** The exact src iframeRenderer.buildIframe constructs for a pane whose
+ * params carry a stored route: the url with the route query REPLACING the
+ * url's own query (WHATWG URL semantics — identical in Node and the browser,
+ * so the expected string is asserted by exact equality, not substring). */
+function srcWithRoute(url: string, route: string): string {
+  const u = new URL(url);
+  u.search = route.startsWith("?") ? route.slice(1) : route;
+  return u.href;
+}
+
 test.describe("tab-pairs badges (per-pane running/unread micro-badges in the workspace tab label)", () => {
   test.beforeEach(async ({ page }) => {
     await H.loadHost(page);
@@ -500,6 +510,20 @@ test.describe("tab-pairs badges (per-pane running/unread micro-badges in the wor
   // plus the RELOADED outcome: the fresh document reconnects (heartbeat +
   // WS echo via waitForReady) and its iframe carries the SAME url (the
   // serialize-recreate contract — url survives, iframe state does not).
+  //
+  // Hardened (F6/F7 + last-pane-out advisories):
+  //   - F6: a route captured pre-move (probePaneMessage — the REAL-router
+  //     seam route-state.spec.ts proves on all engines) must survive the
+  //     serialization into the RECREATED pane's {route,label} params AND
+  //     deep-link its iframe src (url with the route query replacing the
+  //     url's own — the exact src iframeRenderer.buildIframe constructs
+  //     once). Asserted on BOTH paths: the staged-layout NEW-workspace move
+  //     and the live addPanel EXISTING-workspace move.
+  //   - F7: the NEW-workspace move auto-names the target ("Workspace 2" —
+  //     deterministic: the fixture seeds exactly one workspace).
+  //   - LAST PANE OUT: moving the final pane out of a one-pane workspace
+  //     leaves the source PERSISTING with zero panes (no auto-close, no
+  //     crash on selecting the emptied workspace).
 
   test("move pane to NEW workspace: membership change + auto-switch + pane reloads (url preserved, reconnects)", async ({
     page,
@@ -509,8 +533,26 @@ test.describe("tab-pairs badges (per-pane running/unread micro-badges in the wor
     expect(ws1Panes.length, "ws1 has seeded panes").toBeGreaterThanOrEqual(2);
     const mover = ws1Panes[0];
     await H.waitForReady(page, mover);
-    const moverUrl = (await H.paneParams(page)).find((p) => p.id === mover)!.url;
+    const moverRec = (await H.paneParams(page)).find((p) => p.id === mover)!;
+    const moverUrl = moverRec.url;
     expect(moverUrl).toBeTruthy();
+    const moverLabel = moverRec.label;
+    expect(moverLabel, "mover has a label pre-move").toBeTruthy();
+
+    // F6: capture a SPA route on the mover pre-move (source-bound through the
+    // REAL router — the same emission path the SPA's heartbeat loop uses).
+    // The serialize-recreate move must carry it into the RECREATED pane.
+    const route = "?dir=/mv-new-ws&session=9";
+    const seeded = await H.probePaneMessage(page, {
+      sourcePaneId: mover,
+      origin: H.MOCK_ORIGIN,
+      payload: { type: "route", route },
+    });
+    expect(seeded.accepted, "route message accepted (source-bound)").toBe(true);
+    expect(
+      (await H.paneParams(page)).find((p) => p.id === mover)!.route,
+      "route captured into the mover's params pre-move",
+    ).toBe(route);
 
     // Open the layout overlay on the mover (production HostOps path) and drive
     // the move picker: with no other workspace, the ONLY entry is New workspace.
@@ -527,6 +569,13 @@ test.describe("tab-pairs badges (per-pane running/unread micro-badges in the wor
     const target = await H.activeWorkspace(page);
     expect(target).toBeTruthy();
     expect(target, "auto-switched to the new workspace").not.toBe(ws1);
+    // F7: the new workspace carries the deterministic auto-generated name
+    // (store: `Workspace ${workspaces().length + 1}`; the fixture seeds
+    // exactly one workspace, so the move mints "Workspace 2").
+    expect(
+      await H.workspaceName(page, target!),
+      "F7: auto-generated workspace name",
+    ).toBe("Workspace 2");
     const targetPanes = await H.panes(page);
     expect(targetPanes.length, "new workspace holds exactly the moved pane").toBe(1);
     const moved = targetPanes[0]!;
@@ -540,11 +589,21 @@ test.describe("tab-pairs badges (per-pane running/unread micro-badges in the wor
     await expect.poll(async () => H.liveness(page, moved), { timeout: 10000 }).toBe("alive");
     const movedParams = await H.paneParams(page);
     expect(movedParams[0]!.url, "moved pane keeps its url").toBe(moverUrl);
-    const srcs = await H.iframeSrcs(page);
-    expect(
-      srcs.some((src) => src === moverUrl),
-      "the re-created iframe loads the SAME url",
-    ).toBe(true);
+    // F6: the recreated pane (fresh id) carries the SAME label + captured
+    // route in its params — the full {url,label,route} serialization.
+    const movedRec = movedParams.find((p) => p.id === moved)!;
+    expect(movedRec.label, "F6: moved pane keeps its label").toBe(moverLabel);
+    expect(movedRec.route, "F6: moved pane keeps its captured route").toBe(route);
+    // F6 deep-link: the recreated iframe's src is the url with the stored
+    // route query replacing the url's own (iframeRenderer builds src ONCE
+    // from url+route) — exact equality against the same construction. This
+    // SUPERSEDES the old bare-url src equality: with a stored route the
+    // DESIGNED src is url+route, so a bare-url src here would mean the
+    // staged-layout serialization DROPPED the route (the F6 regression);
+    // a mangled url fails it just the same.
+    await expect
+      .poll(async () => H.iframeSrcs(page), { timeout: 8000 })
+      .toContain(srcWithRoute(moverUrl, route));
 
     // The SOURCE lost the pane (membership change; ws1 keeps its other panes).
     await H.setActiveWorkspace(page, ws1!);
@@ -563,7 +622,25 @@ test.describe("tab-pairs badges (per-pane running/unread micro-badges in the wor
     expect(ws1Panes.length).toBeGreaterThanOrEqual(2);
     const mover = ws1Panes[0];
     await H.waitForReady(page, mover);
-    const moverUrl = (await H.paneParams(page)).find((p) => p.id === mover)!.url;
+    const moverRec = (await H.paneParams(page)).find((p) => p.id === mover)!;
+    const moverUrl = moverRec.url;
+    const moverLabel = moverRec.label;
+    expect(moverLabel, "mover has a label pre-move").toBeTruthy();
+
+    // F6: seed a route pre-move (DISTINCT from the new-ws test's route so any
+    // cross-leak fails loudly). Must land BEFORE ws2 exists — addWorkspace
+    // auto-activates the new ws and paneParams is active-workspace-scoped.
+    const route = "?dir=/mv-existing-ws&session=7";
+    const seeded = await H.probePaneMessage(page, {
+      sourcePaneId: mover,
+      origin: H.MOCK_ORIGIN,
+      payload: { type: "route", route },
+    });
+    expect(seeded.accepted, "route message accepted (source-bound)").toBe(true);
+    expect(
+      (await H.paneParams(page)).find((p) => p.id === mover)!.route,
+      "route captured into the mover's params pre-move",
+    ).toBe(route);
 
     // A second workspace with one pane of its own.
     const ws2 = await H.addWorkspace(page, "Target");
@@ -591,6 +668,17 @@ test.describe("tab-pairs badges (per-pane running/unread micro-badges in the wor
     expect(moved).not.toBe(mover);
     const params = await H.paneParams(page);
     expect(params.find((p) => p.id === moved)!.url).toBe(moverUrl);
+    // F6: label + captured route survive into the live addPanel recreation
+    // (the OTHER serialization path from the staged-layout new-ws move).
+    const movedRec = params.find((p) => p.id === moved)!;
+    expect(movedRec.label, "F6: moved pane keeps its label").toBe(moverLabel);
+    expect(movedRec.route, "F6: moved pane keeps its captured route").toBe(route);
+    // F6 deep-link: the recreated iframe src carries the route query (exact
+    // src the renderer constructs; polled — src assignment is gate-deferred
+    // up to ~2s on first boot, per the iframeSrcs contract).
+    await expect
+      .poll(async () => H.iframeSrcs(page), { timeout: 8000 })
+      .toContain(srcWithRoute(moverUrl, route));
     // The moved pane reconnected in the target (the reload outcome).
     await H.waitForReady(page, moved);
 
@@ -599,5 +687,35 @@ test.describe("tab-pairs badges (per-pane running/unread micro-badges in the wor
     await expect
       .poll(async () => (await H.panes(page)).sort())
       .toEqual(ws1Panes.filter((id) => id !== mover).sort());
+
+    // ---- LAST PANE OUT (committer advisory): moving the final pane out of a
+    // one-pane workspace leaves the source PERSISTING with zero panes — no
+    // auto-close, no crash on selecting the emptied workspace.
+    const remaining = await H.panes(page); // ws1 active: its non-mover panes
+    expect(remaining.length).toBeGreaterThanOrEqual(1);
+    // Reduce ws1 to exactly one pane (closes are bridge ops; the keeper's
+    // iframe survives them — the same pattern util.twoPanes uses).
+    for (const id of remaining.slice(1)) await H.closePane(page, id);
+    await expect.poll(async () => (await H.panes(page)).length).toBe(1);
+    const last = (await H.panes(page))[0]!;
+
+    await H.openLayoutOverlay(page, last);
+    await page.locator('[data-testid="layout-overlay-move-menu"]').click();
+    const lastTarget = page.locator(
+      `[data-testid="layout-overlay-move-target"][data-workspace="${ws2}"]`,
+    );
+    await expect(lastTarget).toHaveCount(1);
+    await lastTarget.click();
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws2);
+
+    // The source ws PERSISTS (no auto-close on empty): still exactly two
+    // workspaces, ws1 among them.
+    const wsList = await H.workspaces(page);
+    expect(wsList.length, "no workspace auto-closed on empty").toBe(2);
+    expect(wsList, "emptied source ws persists").toContain(ws1);
+    // Selecting the emptied workspace is safe (no crash) and holds 0 panes.
+    await H.setActiveWorkspace(page, ws1!);
+    await expect.poll(async () => H.panes(page), { timeout: 5000 }).toEqual([]);
+    expect(await H.workspaceName(page, ws1!), "emptied ws keeps its name").toBeTruthy();
   });
 });
