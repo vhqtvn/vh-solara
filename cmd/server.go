@@ -60,7 +60,8 @@ var serverCmd = &cobra.Command{
 		}
 		// A set-but-bad config file is a STARTUP FAILURE, never a silent
 		// fallback to discovered scope: LoadStatusConfig names the path and
-		// the precise reason.
+		// the precise reason. A missing file in an existing directory
+		// starts empty (created on first save).
 		if serverStatusConfig != "" {
 			if err := daemon.LoadStatusConfig(serverStatusConfig); err != nil {
 				log.Fatalf("--status-config: %v", err)
@@ -68,7 +69,8 @@ var serverCmd = &cobra.Command{
 		}
 		// Same discipline for the notification registry: set-but-bad fails
 		// startup (LoadNotifyStore names the path and reason); unset leaves
-		// the family in the honest 409 disabled posture.
+		// the family in the honest 409 disabled posture. A missing file in
+		// an existing directory starts empty (created on first change).
 		if serverNotifyStore != "" {
 			if err := daemon.LoadNotifyStore(serverNotifyStore); err != nil {
 				log.Fatalf("--notify-store: %v", err)
@@ -106,8 +108,8 @@ func init() {
 	serverCmd.Flags().StringVar(&hostPattern, "host-pattern", "", "Host template to extract/build worker URLs (e.g., '$ID.example.com')")
 	serverCmd.Flags().StringVar(&serverWorkerSecret, "worker-secret", "", "Shared secret required from workers on registration via X-VH-Worker-Secret (prefer the VH_WORKER_SECRET env var); empty = open registration")
 	serverCmd.Flags().StringVar(&serverAPIToken, "api-token", "", "Bearer token required on the cross-worker coordination API /api/workers/{id}/sessions|events (prefer the VH_API_TOKEN env var); empty = open")
-	serverCmd.Flags().StringVar(&serverStatusConfig, "status-config", "", "Path to the fleet-status config JSONC file: the expected workers/projects rosters for GET /vh/fleet/status, managed live via PUT /vh/fleet/config (the file is rewritten as canonical JSON on save; comments allowed on read). A set-but-invalid file fails startup. Unset = config management disabled (discovered scope).")
-	serverCmd.Flags().StringVar(&serverNotifyStore, "notify-store", "", "Path to the push-notification token registry JSON file for the companion app, managed via POST/GET/PATCH/DELETE /vh/notify/tokens (rewritten as canonical JSON on change). A set-but-invalid file fails startup. Unset = the /vh/notify/ endpoints answer 409 (notifications disabled).")
+	serverCmd.Flags().StringVar(&serverStatusConfig, "status-config", "", "Path to the fleet-status config JSONC file: the expected workers/projects rosters for GET /vh/fleet/status, managed live via PUT /vh/fleet/config (the file is rewritten as canonical JSON on save; comments allowed on read; created on first save when missing). A set-but-invalid file fails startup. Unset = config management disabled (discovered scope).")
+	serverCmd.Flags().StringVar(&serverNotifyStore, "notify-store", "", "Path to the push-notification token registry JSON file for the companion app, managed via POST/GET/PATCH/DELETE /vh/notify/tokens (rewritten as canonical JSON on change; created on first change when missing). A set-but-invalid file fails startup. Unset = the /vh/notify/ endpoints answer 409 (notifications disabled).")
 	serverCmd.Flags().StringVar(&serverNotifyFCMCreds, "notify-fcm-credentials", "", "Path to the Google service-account JSON (client_email, private_key, project_id) used to send FCM push notifications via POST /vh/notify/test. A set-but-invalid file fails startup. Unset = no transport configured (test-send answers 409; the token registry still works).")
 	registerAuthFlags(serverCmd, &serverAuth)
 	rootCmd.AddCommand(serverCmd)

@@ -48,25 +48,20 @@ func newNotifyAuthDaemon(t *testing.T) (*Daemon, http.Handler, *http.Cookie) {
 	return d, h, loginPassphrase(t, h, "secret")
 }
 
-// loadNotifyStore seeds a registry file + holder on the daemon. It also
-// installs the drain JOIN: the async send-result drain persists into
-// this temp dir from a background goroutine that outlives the test body,
-// so the test must not end (t.TempDir's RemoveAll) while a persist may
-// still be in flight — "unlinkat ...: directory not empty". The cleanup
-// below runs BEFORE that RemoveAll (cleanups are LIFO, and TempDir's was
-// registered by the t.TempDir call above).
+// loadNotifyStore installs the registry holder on the daemon at a path
+// inside a temp dir where the file does NOT exist yet (the first-boot
+// empty-start posture). It also installs the drain JOIN: the async
+// send-result drain persists into this temp dir from a background
+// goroutine that outlives the test body, so the test must not end
+// (t.TempDir's RemoveAll) while a persist may still be in flight —
+// "unlinkat ...: directory not empty". The cleanup below runs BEFORE
+// that RemoveAll (cleanups are LIFO, and TempDir's was registered by the
+// t.TempDir call above).
 func loadNotifyStore(t *testing.T, d *Daemon) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "notify-tokens.json")
 	if err := d.LoadNotifyStore(path); err != nil {
-		// First boot: the file may not exist yet — install an empty
-		// registry by persisting the canonical empty form, then load.
-		if err := persistNotifyStore(path, &notifyStoreFile{Schema: notifyStoreSchema, Tokens: []notifyStoreEntry{}}); err != nil {
-			t.Fatalf("seed empty notify store: %v", err)
-		}
-		if err := d.LoadNotifyStore(path); err != nil {
-			t.Fatalf("LoadNotifyStore: %v", err)
-		}
+		t.Fatalf("LoadNotifyStore: %v", err)
 	}
 	t.Cleanup(d.notifyStore.flushSendResults)
 	return path
@@ -643,6 +638,41 @@ func TestNotifyHTTP_RegistryFilePersistsThroughChain(t *testing.T) {
 	}
 	if len(f.Tokens) != 1 || f.Tokens[0].Label != " disk " {
 		t.Errorf("reloaded file = %+v", f.Tokens)
+	}
+}
+
+// TestNotifyHTTP_EmptyStartGetPosture pins the GET posture after a
+// missing-file empty start through the REAL chain: the registry is
+// configured (not the 409 disabled posture), GET serves the honest empty
+// envelope {"schema":1,"tokens":[]}, the file itself is still absent
+// (lazy create), and the first create through the chain materializes it.
+func TestNotifyHTTP_EmptyStartGetPosture(t *testing.T) {
+	d, h, session := newNotifyAuthDaemon(t)
+	path := loadNotifyStore(t, d)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("empty start must not create the store file (lazy first write), stat err=%v", err)
+	}
+
+	rec := doNotify(t, h, http.MethodGet, "/vh/notify/tokens", "", withCookie(session))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET after empty start: want 200 (configured, empty), got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if got, want := strings.TrimSpace(rec.Body.String()), `{"schema":1,"tokens":[]}`; got != want {
+		t.Fatalf("GET after empty start: want %s, got %s", want, got)
+	}
+
+	// First mutation through the real chain creates the file.
+	rec = doNotify(t, h, http.MethodPost, "/vh/notify/tokens",
+		`{"token":"fcm-token-empty-start-1","label":"Phone"}`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("first create after empty start: want 201, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("first mutation through the chain must create the store file: %v", err)
+	}
+	f, err := loadNotifyStoreFile(path)
+	if err != nil || len(f.Tokens) != 1 {
+		t.Fatalf("reload after chain create: err=%v tokens=%+v", err, f.Tokens)
 	}
 }
 

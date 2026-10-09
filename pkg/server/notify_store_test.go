@@ -106,13 +106,33 @@ func TestNotifyStore_DecodeValidationMatrix(t *testing.T) {
 	}
 }
 
-// TestNotifyStore_LoadFileErrors pins the startup-load failure shape
-// (path named) and the success path installing entries.
+// TestNotifyStore_LoadFileErrors pins the startup-load failure shape.
+// A missing FILE is no longer an error (empty start — see
+// TestNotifyStore_MissingFileEmptyStart); the failures here are a missing
+// PARENT directory (typo protection: fail at boot naming the directory,
+// not at first write), a parent that is a regular file, and a
+// present-but-corrupt file (strict decode, path named).
 func TestNotifyStore_LoadFileErrors(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := loadNotifyStoreFile(filepath.Join(dir, "missing.json")); err == nil || !strings.Contains(err.Error(), "missing.json") {
-		t.Errorf("missing file: want error naming the path, got %v", err)
+
+	// Missing parent directory: the error must NAME the directory.
+	missingParent := filepath.Join(dir, "no-such-dir")
+	if _, err := loadNotifyStoreFile(filepath.Join(missingParent, "missing.json")); err == nil ||
+		!strings.Contains(err.Error(), missingParent) {
+		t.Errorf("missing parent dir: want error naming %s, got %v", missingParent, err)
 	}
+
+	// Parent path exists but is a regular file.
+	plain := filepath.Join(dir, "plain-file")
+	if err := os.WriteFile(plain, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadNotifyStoreFile(filepath.Join(plain, "missing.json")); err == nil ||
+		!strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("parent is a file: want error saying the parent is not a directory, got %v", err)
+	}
+
+	// Present-but-corrupt file: still a load failure naming the path.
 	bad := filepath.Join(dir, "bad.json")
 	if err := os.WriteFile(bad, []byte(`{"schema":1,"tokens":[],"x":1}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -127,6 +147,65 @@ func TestNotifyStore_LoadFileErrors(t *testing.T) {
 	}
 	if d.notifyStore.configured() {
 		t.Error("failed load must leave the daemon's registry state unchanged (disabled)")
+	}
+
+	// The missing-parent failure through the Daemon surface leaves the
+	// registry unconfigured as well.
+	var d2 Daemon
+	if err := d2.LoadNotifyStore(filepath.Join(missingParent, "missing.json")); err == nil {
+		t.Error("LoadNotifyStore with a missing parent dir must fail")
+	}
+	if d2.notifyStore.configured() {
+		t.Error("failed load must leave the daemon's registry unconfigured")
+	}
+}
+
+// TestNotifyStore_MissingFileEmptyStart pins the first-run bootstrap: a
+// MISSING store file inside an EXISTING directory loads as the empty
+// registry — exactly what decoding {"schema":1,"tokens":[]} produces —
+// with the holder configured at the flag path and NO file created at
+// startup; the file materializes lazily on the first mutation through
+// the existing atomic 0600 persist path.
+func TestNotifyStore_MissingFileEmptyStart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "notify-tokens.json")
+
+	var d Daemon
+	if err := d.LoadNotifyStore(path); err != nil {
+		t.Fatalf("missing store file in an existing dir must load empty: %v", err)
+	}
+	if !d.notifyStore.configured() {
+		t.Fatal("holder must be configured at the flag path after an empty start")
+	}
+	snap := d.notifyStore.snapshot()
+	if snap.path != path {
+		t.Fatalf("empty start path = %q, want %q", snap.path, path)
+	}
+	if len(snap.entries) != 0 {
+		t.Fatalf("empty start must load zero entries, got %+v", snap.entries)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("empty start must NOT create the file (lazy first write), stat err=%v", err)
+	}
+
+	// First mutation (submit) creates the file: 0600, canonical, reloads.
+	e, created, err := d.notifyStore.submit("fcm-token-fresh-boot-01", "Operator phone")
+	if err != nil || !created {
+		t.Fatalf("first submit after empty start: created=%v err=%v", created, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("first mutation must create the store file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("lazily created file mode = %o, want 0600", perm)
+	}
+	f, err := loadNotifyStoreFile(path)
+	if err != nil {
+		t.Fatalf("reload lazily created store: %v", err)
+	}
+	if f.Schema != notifyStoreSchema || len(f.Tokens) != 1 || f.Tokens[0].ID != e.ID {
+		t.Fatalf("reloaded store = schema %d tokens %+v, want the submitted entry %q", f.Schema, f.Tokens, e.ID)
 	}
 }
 

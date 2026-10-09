@@ -95,6 +95,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -346,12 +347,43 @@ func validateFleetBudgetsConfig(b *fleetBudgetsConfig) error {
 // File load / persist
 // ---------------------------------------------------------------------------
 
-// loadStatusConfigFile reads and strictly decodes the config at path. Errors
-// name the path plus the precise reason — a set-but-bad --status-config is a
-// startup failure, never a silent fallback to discovered scope.
+// requireExistingParentDir enforces the lazy-create bootstrap contract
+// shared by the two file-backed startup loaders (status config, notify
+// store): a MISSING file may start empty only when its parent directory
+// exists and is a directory. A typo'd flag path (missing or
+// non-directory parent) fails at boot with the directory named —
+// surfacing the typo at startup instead of as a mysterious first-write
+// failure much later.
+func requireExistingParentDir(path string) error {
+	dir := filepath.Dir(path)
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("parent directory %s of %s: %v", dir, path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("parent %s of %s is not a directory", dir, path)
+	}
+	return nil
+}
+
+// loadStatusConfigFile reads and strictly decodes the config at path.
+// Errors name the path plus the precise reason — a set-but-bad
+// --status-config is a startup failure, never a silent fallback to
+// discovered scope. A MISSING file inside an existing directory is the
+// one tolerated posture: it loads as the empty config (the file is
+// created lazily by the first PUT, via the same atomic persist path).
 func loadStatusConfigFile(path string) (*fleetStatusConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// First boot: empty start only when the parent directory
+			// exists — otherwise the path is a typo and must fail now,
+			// naming the directory.
+			if perr := requireExistingParentDir(path); perr != nil {
+				return nil, perr
+			}
+			return &fleetStatusConfig{}, nil
+		}
 		return nil, fmt.Errorf("read status config %s: %v", path, err)
 	}
 	cfg, err := decodeStatusConfig(data)
@@ -551,10 +583,12 @@ func (h *statusConfigHolder) replaceAndPersist(cfg *fleetStatusConfig) error {
 // ---------------------------------------------------------------------------
 
 // LoadStatusConfig reads, validates, and installs the fleet-status config at
-// path (the --status-config startup path). A missing/unreadable/invalid file
-// returns an error naming the path and the precise reason — the caller
-// (cmd/server.go) fails startup on it rather than silently switching to
-// discovered scope. On error the daemon's config state is unchanged.
+// path (the --status-config startup path). A missing file inside an EXISTING
+// directory installs the empty config, writable at that path (the file is
+// created on the first PUT). Any other unreadable/invalid file returns an
+// error naming the path and the precise reason — the caller (cmd/server.go)
+// fails startup on it rather than silently switching to discovered scope. On
+// error the daemon's config state is unchanged.
 func (d *Daemon) LoadStatusConfig(path string) error {
 	cfg, err := loadStatusConfigFile(path)
 	if err != nil {

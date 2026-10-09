@@ -270,8 +270,14 @@ func decodeNotifyStore(data []byte) (*notifyStoreFile, error) {
 var notifyChmod = os.Chmod
 
 // loadNotifyStoreFile reads and strictly decodes the registry at path.
-// Errors name the path plus the precise reason — a set-but-bad
-// --notify-store is a startup failure, never a silent empty registry.
+// A MISSING file inside an existing directory is the one tolerated
+// posture: it loads as the empty registry (exactly what decoding
+// {"schema":1,"tokens":[]} produces); the file is created lazily by the
+// first mutation through the existing atomic persist path. A missing or
+// non-directory PARENT is a typo and returns an error naming the
+// directory — fail at boot, not at first write. Every other error names
+// the path plus the precise reason — a set-but-bad --notify-store is a
+// startup failure, never a silent empty registry.
 // A successfully loaded file also has its mode secured: any bit beyond
 // 0600 (group/other read/write/exec) is repaired with a one-line warning,
 // because the file holds raw FCM bearer tokens (b-F1). Repair, not fatal
@@ -284,6 +290,17 @@ var notifyChmod = os.Chmod
 func loadNotifyStoreFile(path string) (*notifyStoreFile, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// First boot: empty start only when the parent directory
+			// exists — otherwise the path is a typo and must fail now,
+			// naming the directory. Short-circuits BEFORE the
+			// decode/stat/repair sequence below: there is no file to
+			// decode or secure yet.
+			if perr := requireExistingParentDir(path); perr != nil {
+				return nil, perr
+			}
+			return &notifyStoreFile{Schema: notifyStoreSchema, Tokens: []notifyStoreEntry{}}, nil
+		}
 		return nil, fmt.Errorf("read notify store %s: %v", path, err)
 	}
 	f, err := decodeNotifyStore(data)
@@ -831,7 +848,9 @@ func notifyEntryWire(e notifyStoreEntry) notifyTokenWire {
 // LoadNotifyStore reads, validates, secures, and installs the
 // notification-token registry at path (the --notify-store startup path).
 // Securing = the load-time 0600 mode repair (see loadNotifyStoreFile). A
-// missing/unreadable/invalid file returns an error naming the path and
+// missing file inside an EXISTING directory installs the empty registry,
+// configured at that path (the file is created on the first mutation).
+// Any other unreadable/invalid file returns an error naming the path and
 // the precise reason — the caller (cmd/server.go) fails startup on it rather
 // than silently running a disabled or empty registry. On error the
 // daemon's registry state is unchanged.

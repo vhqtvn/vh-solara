@@ -280,7 +280,8 @@ func TestFleetConfig_LoadFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name, path, marker string
 	}{
-		{"missing file", filepath.Join(dir, "nope.jsonc"), "no such file"},
+		{"missing parent dir", filepath.Join(dir, "no-such-dir", "status.jsonc"), filepath.Join(dir, "no-such-dir")},
+		{"parent is a file", filepath.Join(dir, "good.jsonc", "status.jsonc"), "not a directory"},
 		{"path is a directory", sub, "is a directory"},
 		{"invalid content", badContent, "invalid worker id"},
 		{"unknown key", unknownKey, "unknown field"},
@@ -306,6 +307,80 @@ func TestFleetConfig_LoadFailures(t *testing.T) {
 	}
 	if after.path != before.path {
 		t.Fatalf("failed loads must not change the persistence path: %q → %q", before.path, after.path)
+	}
+}
+
+// TestFleetConfig_MissingFileEmptyStart pins the first-run bootstrap: a
+// MISSING config file inside an EXISTING directory loads as the empty
+// config (same state as unset rosters) with the holder WRITABLE at the
+// flag path and NO file created at startup; GET serves the honest empty
+// config (writable=true, [] rosters) through the real handler chain, and
+// the first PUT materializes the file (canonical JSON, 0600) which
+// reloads to the applied state.
+func TestFleetConfig_MissingFileEmptyStart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "status.jsonc")
+
+	d, h, session := newFleetConfigAuthDaemon(t, "")
+	if err := d.LoadStatusConfig(path); err != nil {
+		t.Fatalf("missing config file in an existing dir must load empty: %v", err)
+	}
+	if !d.statusCfg.writable() {
+		t.Fatal("holder must be writable at the flag path after an empty start")
+	}
+	snap := d.statusCfg.snapshot()
+	if snap.path != path || len(snap.workers) != 0 || len(snap.projects) != 0 {
+		t.Fatalf("empty start: path=%q workers=%+v projects=%+v", snap.path, snap.workers, snap.projects)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("empty start must NOT create the file (lazy first PUT), stat err=%v", err)
+	}
+
+	// GET through the real chain: writable=true, empty rosters as [].
+	rec := doFleetConfigGet(h, withCookie(session))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET after empty start: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	resp := decodeFleetConfig(t, rec)
+	if !resp.Writable || len(resp.Workers) != 0 || len(resp.Projects) != 0 {
+		t.Fatalf("GET after empty start: want writable empty config, got %+v", resp)
+	}
+	if !strings.Contains(rec.Body.String(), `"workers":[]`) || !strings.Contains(rec.Body.String(), `"projects":[]`) {
+		t.Fatalf("empty rosters must render as []: %s", rec.Body.String())
+	}
+
+	// First PUT through the real chain creates the file: canonical JSON,
+	// 0600, reloading to the applied state.
+	putBody := `{"workers":[{"id":"alpha"}],"projects":[{"dir":"/srv/app"}]}`
+	rec2 := doFleetConfigPut(h, putBody, withCookie(session), withCSRF())
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("first PUT after empty start: want 200, got %d (body=%q)", rec2.Code, rec2.Body.String())
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("first PUT must create the config file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("lazily created file mode = %o, want 0600", perm)
+	}
+	want, err := json.MarshalIndent(&fleetStatusConfig{
+		Workers:  []fleetConfigWorker{{ID: "alpha"}},
+		Projects: []fleetConfigProject{{Dir: "/srv/app"}},
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = append(want, '\n')
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != string(want) {
+		t.Fatalf("lazily created file must be the canonical form:\n got: %q (err %v)\nwant: %q", got, err, want)
+	}
+	rl, err := loadStatusConfigFile(path)
+	if err != nil {
+		t.Fatalf("reload lazily created config: %v", err)
+	}
+	if len(rl.Workers) != 1 || rl.Workers[0].ID != "alpha" || len(rl.Projects) != 1 || rl.Projects[0].Dir != "/srv/app" {
+		t.Fatalf("reloaded config = %+v, want the PUT state", rl)
 	}
 }
 
