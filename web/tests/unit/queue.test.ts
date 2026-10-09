@@ -370,6 +370,44 @@ describe("claimQueued — single-winner dispatch boundary", () => {
     // Nothing dispatched; the drain path must stop here.
     expect(queueFor(sid)).toHaveLength(0);
   });
+
+  // --- send-net-resilience slice 3: custody-refusal interpretation -----------
+  it("a 409 queue_custody_active claim refusal latches projection mode and returns no-claim (ownership info, not an error)", async () => {
+    const sid = "s-claim-custody";
+    touched.push(sid);
+    const { __resetQueueDispatchModeForTests, projectionActive } = await import("../../src/lib/queueDispatchMode");
+    __resetQueueDispatchModeForTests();
+    try {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(() =>
+          Promise.resolve(
+            res(409, { ok: false, error: "queue custody active", code: "queue_custody_active" }),
+          ),
+        ),
+      );
+      const got = await claimQueued(sid);
+      expect(got).toBeNull(); // no claim — the daemon owns dispatch
+      expect(projectionActive()).toBe(true); // the drainer stands down from now on
+    } finally {
+      __resetQueueDispatchModeForTests();
+    }
+  });
+
+  it("an UNCoded 409 claim keeps the legacy no-claim shape without latching projection", async () => {
+    const sid = "s-claim-409-legacy";
+    touched.push(sid);
+    const { __resetQueueDispatchModeForTests, projectionActive } = await import("../../src/lib/queueDispatchMode");
+    __resetQueueDispatchModeForTests();
+    try {
+      vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(409, { error: "not claimed" }))));
+      const got = await claimQueued(sid);
+      expect(got).toBeNull();
+      expect(projectionActive()).toBe(false); // an old-server 409 is NOT custody information
+    } finally {
+      __resetQueueDispatchModeForTests();
+    }
+  });
 });
 
 describe("resolveQueued — terminal outcome; never repends; sent clears / failed+unknown stay", () => {
@@ -1128,6 +1166,56 @@ describe("removeQueued — bounded DELETE (§8 6b: retract's awaited removal)", 
       expect(queueFor(sid).map((m) => m.id)).toEqual(["a"]);
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+// --- send-net-resilience slice 3: the resolve-write custody refusal -------------
+//
+// A 409 queue_custody_active on resolve is OWNERSHIP INFORMATION: terminal for
+// the write (never retried), projection mode latched, the optimistic overlay
+// DROPPED so the daemon's journal truth wins on the next list read, and no
+// status-unsaved row armed (the record is not ours to save anymore).
+describe("resolveQueued — custody-refused (409 queue_custody_active)", () => {
+  it("stops the retry loop, latches projection, drops the overlay, and refreshes to server truth", async () => {
+    const sid = "s-res-custody";
+    touched.push(sid);
+    const { __resetQueueDispatchModeForTests, projectionActive } = await import("../../src/lib/queueDispatchMode");
+    __resetQueueDispatchModeForTests();
+    try {
+      // Seed the cache with a dispatching item (the pre-refusal state).
+      vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(200, { items: [item("q-1", { state: "dispatching" })] }))));
+      await fetchQueue(sid);
+
+      // Resolve POSTs answer the custody refusal; the subsequent refresh GET
+      // answers the daemon's journal truth (the item is STILL dispatching —
+      // the daemon's reconciler owns its classification).
+      let calls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((url: string, init?: any) => {
+          calls++;
+          if (init?.method === "POST") {
+            return Promise.resolve(
+              res(409, { ok: false, error: "queue custody active", code: "queue_custody_active" }),
+            );
+          }
+          return Promise.resolve(res(200, { items: [item("q-1", { state: "dispatching" })] }));
+        }),
+      );
+      const out = await resolveQueued(sid, "q-1", "unknown", "dispatch timed out");
+      expect(out.kind).toBe("custody-refused");
+      // Exactly ONE resolve POST — the custody refusal is terminal, not retried.
+      expect(calls).toBe(2); // one resolve POST + one refresh GET
+      expect(projectionActive()).toBe(true);
+      // The optimistic local `unknown` was dropped: server truth (dispatching,
+      // daemon-owned) is what the cache holds for the chip to render.
+      expect(queueFor(sid).find((m) => m.id === "q-1")?.state).toBe("dispatching");
+      // No status-unsaved row was armed for this outcome (the daemon records it).
+      const { sendActionsFor } = await import("../../src/lib/sendActionStatus");
+      expect(sendActionsFor(sid).filter((a) => a.stage === "unsaved")).toHaveLength(0);
+    } finally {
+      __resetQueueDispatchModeForTests();
     }
   });
 });

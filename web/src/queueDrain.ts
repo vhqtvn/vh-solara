@@ -60,6 +60,14 @@ export interface DrainDeps {
   // Sending-guard lifecycle (wraps sync/store setSending).
   setSending: (id: string, v: boolean) => void;
   isSending: (id: string) => boolean;
+  // Send-net-resilience slice 3: observe-only projection gate. When true the
+  // daemon owns dispatch (capability advertised on /vh/version, or a claim/
+  // resolve was refused with 409 queue_custody_active) and this drainer
+  // STOPS claiming/dispatching — the FE projects queue state and reconciles
+  // chips by intentID; the daemon's custody drain owns claim/POST/resolve.
+  // OPTIONAL: absent (or false) keeps the legacy browser-dispatch path
+  // byte-intact (older servers never trip it).
+  observeOnly?: () => boolean;
   // Optional: invoked after a successful resolve (ChatView refreshes the cache
   // via fetchQueue so the UI reflects the terminal state). Best-effort.
   onResolved?: (id: string) => void;
@@ -94,6 +102,11 @@ export function createQueueDrainer(
   let draining = false;
   return {
     drain: async () => {
+      // Slice 3 projection gate: when the daemon owns dispatch, this drainer
+      // must never claim. Checked FIRST so a projection-mode page performs no
+      // queue mutation at all; absent dep (legacy wiring / unit harnesses) is
+      // a no-op read and the legacy path below is byte-intact.
+      if (deps.observeOnly?.()) return;
       const id = deps.getId();
       if (!deps.canDrain() || !id || draining || deps.isSending(id)) return;
       draining = true;

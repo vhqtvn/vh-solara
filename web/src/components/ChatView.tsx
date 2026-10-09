@@ -111,11 +111,23 @@ import { createQueueSync } from "./chat/createQueueSync";
 import { createAttachments } from "./chat/createAttachments";
 import { createQueueRecovery } from "./chat/createQueueRecovery";
 import { createSend } from "./chat/createSend";
+import { createAmbiguousReplacement } from "./chat/createAmbiguousReplacement";
 import { createMessageActions, type MessageActions } from "./chat/createMessageActions";
 import { createNavigator } from "./chat/createNavigator";
 import { createLoadOlder } from "./chat/createLoadOlder";
 import { ChatNavigator } from "./chat/ChatNavigator";
 import { Composer } from "./chat/Composer";
+import OutboxStorageBanner from "./OutboxStorageBanner";
+import {
+  markAdmitted,
+  reconcileOutboxSession,
+  replacementRequestedFor,
+  saveGesture,
+  type OutboxContextHead,
+  type OutboxPayload,
+  type OutboxSaveResult,
+} from "../lib/outbox";
+import { projectionActive, refreshDispatchMode } from "../lib/queueDispatchMode";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
 
@@ -1935,6 +1947,26 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // click-time), so a forward declaration bridges it. msgActions is assigned
   // synchronously right after createSend returns, before any user interaction.
   let msgActions: MessageActions;
+  // Send-net-resilience slice 3: the context-head capture (debate-4 finding
+  // 7 (amended 2026-10-09)) — the resident transcript's tail for a session.
+  // Null (never a fabricated head) when the session's window is not resident.
+  const captureHead = (sid: string): OutboxContextHead | null => {
+    const order = state.messages[sid]?.order;
+    if (!order) return null;
+    return { sessionId: sid, lastMessageId: order.length ? order[order.length - 1] : null, count: order.length };
+  };
+  // The outbox seam bound to the real lib/outbox module (the BLK-A3 gate in
+  // createSend's admission path + the replacement controller below).
+  const outboxDeps = {
+    save: (input: {
+      intentId: string;
+      sessionId: string;
+      payload: OutboxPayload;
+      capturedHead: OutboxContextHead | null;
+    }): Promise<OutboxSaveResult> => saveGesture(input),
+    markAdmitted,
+    captureHead,
+  };
   const { send, retrySameMessage, retryQueuedItem, resendText, dispatchQueuedItem } = createSend({
     sessionId: () => props.sessionId,
     draft: () => !!props.draft,
@@ -1987,6 +2019,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     uploading: att.uploading,
     isSending,
     setSending,
+    // Send-net-resilience slice 3: the BLK-A3 outbox gate (gesture save before
+    // admission; blocking "not saved" state on storage failure; capture-
+    // compare stale-context gate).
+    outbox: outboxDeps,
     userScrolledUp,
     jumpToLatest,
     pushHistory,
@@ -2019,6 +2055,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     resolve: resolveQueued,
     setSending,
     isSending,
+    // Send-net-resilience slice 3: when the daemon owns dispatch (capability
+    // advertised on /vh/version, or a claim/resolve was refused with 409
+    // queue_custody_active), this drainer stands down — observe-only
+    // projection; the daemon's custody drain owns claim/POST/resolve.
+    observeOnly: projectionActive,
     onResolved: (id) => void fetchQueue(id),
   });
   // C7: the queue-synchronization effects (drain-trigger on busy→idle + idle-
@@ -2038,6 +2079,28 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     migrateLegacyQueue,
     fetchQueue,
     drain: () => queueDrainer.drain(),
+    // Send-net-resilience slice 3: outbox reconcile on session open + focus
+    // (re-admission of un-admitted gestures under their original intentId /
+    // stale-context surfacing / pruning) + the dispatch-mode advertisement
+    // refresh (the observe-only feature-detect).
+    reconcileOutbox: (id) =>
+      reconcileOutboxSession(id, {
+        fetchList: fetchQueue,
+        enqueue: (sid, input) => enqueue(sid, input),
+        currentHead: captureHead,
+      }),
+    refreshDispatchMode,
+  });
+
+  // Send-net-resilience slice 3: the ambiguous-replacement controller (the
+  // one-tap "Send new message" off an AmbiguousDelivery chip — a NEW gesture:
+  // fresh intentId, head recaptured at tap, BLK-A3 outbox gate, and the
+  // original item marked ambiguous_replacement_requested).
+  const ambiguousReplace = createAmbiguousReplacement({
+    sessionId: () => props.sessionId,
+    enqueue: (sid, input) => enqueue(sid, input),
+    captureHead,
+    notify: pushNotification,
   });
 
   return (
@@ -2219,6 +2282,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         workingAriaLabel={workingAriaLabel}
       />
 
+      {/* Send-net-resilience slice 3: the BLK-A3 blocking persistent
+          "not saved — copy your text" banner (armed by the outbox module when
+          a gesture's IDB save failed — storage unavailable / quota /
+          eviction; the composer retains the text). Rendered above the
+          composer so it is impossible to miss while composing. */}
+      <OutboxStorageBanner />
+
       <Composer
         draft={() => !!props.draft}
         sessionId={() => props.sessionId}
@@ -2248,6 +2318,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // same-messageID re-send of an outcome-unknown queue item (explicit
         // user action only — never automatic; failed items are refused).
         retryQueuedItem={(q) => void retryQueuedItem(props.sessionId, q)}
+        // Send-net-resilience slice 3: the AmbiguousDelivery chip (Wait /
+        // Copy text / Send new message with the verbatim two-message
+        // warning) replaces the generic unknown chip for marked items.
+        ambiguousTap={(q) => ambiguousReplace.tap(q)}
+        ambiguousReplace={(q) => void ambiguousReplace.replace(q)}
+        ambiguousReplacementFor={(q) => !!replacementRequestedFor(q.intentId)}
+        removeQueuedItem={(id) => void removeQueued(props.sessionId, id)}
         abort={msgActions.abort}
         sessions={() => state.sessions}
         openSession={openLinkedSession}

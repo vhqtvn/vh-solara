@@ -89,7 +89,18 @@ export type SendReason =
   // receipt (the session exists and is linked) — but this attempt's message
   // was never sent (admission never ran past the create). "Session found" is
   // not "message sent".
-  | "session-create-resolved";
+  | "session-create-resolved"
+  // Send-net-resilience slice 3 (BLK-A3): the IndexedDB outbox save failed —
+  // the gesture is blocked BEFORE admission with a persistent "not saved —
+  // copy your text" state; the composer retains the text in memory.
+  | "storage-unavailable"
+  // Send-net-resilience slice 3 (debate-4 finding 7, amended 2026-10-09):
+  // the context-head no longer matches the live transcript at a RESUME
+  // (reconcile re-admission of a saved gesture onto a moved-on conversation)
+  // or REPLACEMENT (the chip's confirm/re-verify) checkpoint — a visible
+  // stale-context confirmation must precede sending. Never trips inside the
+  // live tap→save→admit window (hydration catch-up there is innocent).
+  | "stale-context";
 
 // The operator-facing recovery action this record affords (Slice 3 renders it).
 //   retry-same — re-send the IDENTICAL prepared attempt (same attemptId +
@@ -550,6 +561,30 @@ export function markSendAttemptStatusUnsaved(
     recovery: "retry-save",
     retrySave: save,
     updatedAt: Date.now(),
+  });
+  mintedSeq.set(attemptId, ++seq);
+}
+
+/** Send-net-resilience slice 3: UPSERT a full action record under an
+ *  EXISTING id (the outbox reconcile path synthesizes rows for gestures whose
+ *  attemptId was minted in a previous page life). Mirrors the upsert halves
+ *  of markSendAttemptResolveConflict/markSendAttemptStatusUnsaved: an
+ *  existing record is patched (preserving stage-unrelated fields); a missing
+ *  one is created with the given fields. */
+export function ensureSendActionRecord(
+  attemptId: string,
+  ownerKey: string,
+  p: Partial<SendAction> & { stage: SendStage; certainty: SendCertainty; recovery: SendRecovery },
+): void {
+  if (getSendAction(attemptId)) {
+    patch(attemptId, p);
+    return;
+  }
+  setActions(attemptId, {
+    attemptId,
+    ownerKey,
+    updatedAt: Date.now(),
+    ...p,
   });
   mintedSeq.set(attemptId, ++seq);
 }

@@ -207,7 +207,7 @@ test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry 
   // NAMED handler so ONLY this route is lifted for recovery (the prompt_async
   // capture must keep running — it proves single-dispatch after the retry).
   const wireAttempts: string[] = [];
-  let firstServerAdmission: { replayed?: boolean; item?: { attemptId?: string } } | null = null;
+  let firstServerAdmission: { replayed?: boolean; item?: { attemptId?: string; intentId?: string } } | null = null;
   const queueRouteHandler = async (route: Route) => {
     const req = route.request();
     if (req.method() === "POST") {
@@ -242,7 +242,9 @@ test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry 
   await page.locator(".composer-bar .send-btn").click();
 
   // (a) the wire carried an attemptId; the server admitted the item (the
-  // fetch-performed admission got a 200 with an attemptId echo).
+  // fetch-performed admission got a 200 with the gesture-id echo — slice 3
+  // sends the same id as attemptId + intentId and the slice-1 server
+  // collapses the pair onto the canonical intentId field).
   await expect
     .poll(() => wireAttempts.length, { timeout: 10_000 })
     .toBeGreaterThanOrEqual(1);
@@ -251,7 +253,9 @@ test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry 
   // poll for it rather than racing the handler's post-fetch assignment.
   await expect.poll(() => firstServerAdmission !== null, { timeout: 10_000 }).toBe(true);
   expect(firstServerAdmission?.replayed).toBe(false);
-  expect(firstServerAdmission?.item?.attemptId).toBe(wireAttempts[0]);
+  expect(
+    firstServerAdmission?.item && (firstServerAdmission.item.intentId ?? firstServerAdmission.item.attemptId),
+  ).toBe(wireAttempts[0]);
 
   // The honest outcome-unknown state renders — readable text, payload
   // surfacing ("Same message:"), and the retry-SAME affordance (never an
@@ -290,10 +294,11 @@ test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry 
   const replayResp = await replayRespPromise;
   expect(replayResp.status()).toBe(200);
   // (b) the REAL envelope answers replayed:true for the same attemptId —
-  // this is exactly the response the FE's feature-detect consumes.
+  // this is exactly the response the FE's feature-detect consumes. (The
+  // replayed item echoes the canonical intentId alias — same gesture id.)
   const replayBody = await replayResp.json();
   expect(replayBody.replayed).toBe(true);
-  expect(replayBody.item.attemptId).toBe(wireAttempts[0]);
+  expect(replayBody.item.intentId ?? replayBody.item.attemptId).toBe(wireAttempts[0]);
   // The retry reused the SAME attemptId on the wire (no fresh attempt).
   expect(wireAttempts[wireAttempts.length - 1]).toBe(wireAttempts[0]);
 
@@ -307,13 +312,17 @@ test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry 
   await expect(ta).toHaveValue(MSG);
 
   // (c) exactly ONE item server-side under this attemptId — no duplicate —
-  // and exactly ONE downstream dispatch of the recovered message.
+  // and exactly ONE downstream dispatch of the recovered message. (Slice 3
+  // alias note: the enqueue body now carries the same gesture id as BOTH
+  // attemptId + intentId; a slice-1 server collapses the pair to the
+  // canonical `intentId` field, so either alias identifies the item.)
   await expect
     .poll(
       async () => {
         const res = await request.get(apiUrl(HOLD_SESSION));
-        const items: Array<{ attemptId?: string }> = (await res.json().catch(() => ({ items: [] }))).items ?? [];
-        return items.filter((it) => it.attemptId === wireAttempts[0]).length;
+        const items: Array<{ attemptId?: string; intentId?: string }> =
+          (await res.json().catch(() => ({ items: [] }))).items ?? [];
+        return items.filter((it) => (it.intentId ?? it.attemptId) === wireAttempts[0]).length;
       },
       { timeout: 10_000, message: "exactly one daemon queue item under the replayed attemptId" },
     )

@@ -77,6 +77,14 @@ export interface QueueSyncDeps {
   // ChatView and owns the single-flight `draining` flag + sending-guard
   // lifecycle; this factory only arms it from the drain-trigger effect.
   drain: () => Promise<void>;
+  // Send-net-resilience slice 3 (OPTIONAL): reconcile the session's outbox
+  // gestures against the authoritative queue list (boot / session-open /
+  // focus). Wired by ChatView to lib/outbox's reconcileOutboxSession; absent
+  // (unit harnesses) the effect is skipped with no behavior change.
+  reconcileOutbox?: (id: string) => Promise<void>;
+  // Send-net-resilience slice 3 (OPTIONAL): refresh /vh/version's
+  // daemonDispatchCapable advertisement (the projection-mode feature-detect).
+  refreshDispatchMode?: () => Promise<void>;
 }
 
 // Side-effect-only controller: registers its effects + cleanup under the
@@ -102,9 +110,15 @@ export function createQueueSync(deps: QueueSyncDeps): void {
   createEffect(() => {
     const id = deps.sessionId();
     if (deps.draft() || !id) return;
-    // Session open: migrate any legacy local queue into the backend, then fetch.
+    // Session open: refresh the dispatch-ownership advertisement, migrate any
+    // legacy local queue into the backend, reconcile the outbox, then fetch.
+    // (Slice 3: reconcile BEFORE fetch so a re-admitted gesture's item is in
+    // the cache when the first render reads it; reconcile is internally
+    // failure-tolerant and never blocks the fetch.)
     void (async () => {
+      void deps.refreshDispatchMode?.();
       await deps.migrateLegacyQueue(id);
+      await deps.reconcileOutbox?.(id).catch(() => {});
       void deps.fetchQueue(id);
     })();
   });
@@ -133,7 +147,13 @@ export function createQueueSync(deps: QueueSyncDeps): void {
   });
   onMount(() => {
     const onFocus = () => {
-      if (!deps.draft() && deps.sessionId()) void deps.fetchQueue(deps.sessionId());
+      if (!deps.draft() && deps.sessionId()) {
+        void deps.fetchQueue(deps.sessionId());
+        // Slice 3: focus is the multi-tab recovery trigger — a gesture saved
+        // by a killed/other tab is re-evaluated here (re-admitted under its
+        // original intentId, or surfaced when the context moved on).
+        void deps.reconcileOutbox?.(deps.sessionId()).catch(() => {});
+      }
     };
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onFocus);

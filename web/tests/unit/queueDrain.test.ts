@@ -484,3 +484,54 @@ describe("createQueueDrainer — bounded dispatch timeout (hung-socket send-loss
     }
   });
 });
+
+// --- send-net-resilience slice 3: the observe-only projection gate -------------
+//
+// When the daemon owns dispatch (daemonDispatchCapable on /vh/version, or a
+// claim/resolve was refused with 409 queue_custody_active), the drainer must
+// perform NO queue mutation at all: no claim, no dispatch, no resolve. The
+// dep is OPTIONAL — absent (or false) keeps the legacy path byte-intact.
+describe("createQueueDrainer — observeOnly projection gate (slice 3)", () => {
+  it("observeOnly=true: a pending queue stays untouched (no claim/dispatch/resolve)", async () => {
+    const store = fakeStore(["daemon owns this"]);
+    const h = makeDeps(store);
+    const drainer = createQueueDrainer({ ...h.deps, observeOnly: () => true });
+    await drainer.drain();
+    expect(h.claims).toBe(0);
+    expect(h.dispatches).toHaveLength(0);
+    expect(h.resolves).toHaveLength(0);
+    expect(store.items[0].state).toBe("pending");
+  });
+
+  it("observeOnly=false: the legacy claim→dispatch→resolve path is unchanged", async () => {
+    const store = fakeStore(["legacy path"]);
+    const h = makeDeps(store);
+    const drainer = createQueueDrainer({ ...h.deps, observeOnly: () => false });
+    await drainer.drain();
+    expect(h.claims).toBe(1);
+    expect(store.items[0].state).toBe("sent");
+  });
+
+  it("absent dep: byte-intact legacy behavior (the optional seam is a no-op)", async () => {
+    const store = fakeStore(["no dep"]);
+    const h = makeDeps(store);
+    const drainer = createQueueDrainer(h.deps);
+    await drainer.drain();
+    expect(h.claims).toBe(1);
+    expect(store.items[0].state).toBe("sent");
+  });
+
+  it("the gate is read per-drain: flipping projection on mid-session stands the drainer down", async () => {
+    const store = fakeStore(["flip"]);
+    const h = makeDeps(store);
+    let projection = false;
+    const drainer = createQueueDrainer({ ...h.deps, observeOnly: () => projection });
+    projection = true;
+    await drainer.drain();
+    expect(h.claims).toBe(0);
+    projection = false;
+    await drainer.drain();
+    expect(h.claims).toBe(1);
+    expect(store.items[0].state).toBe("sent");
+  });
+});

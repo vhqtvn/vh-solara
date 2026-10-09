@@ -49,9 +49,35 @@ import type { Attachment } from "./createAttachments";
 import { EnqueueError, type QueuedMessage } from "../../queue";
 import type { DrainOutcome } from "../../queueDrain";
 import type { Notification } from "../../notify";
+import type { OutboxContextHead, OutboxPayload, OutboxSaveResult } from "../../lib/outbox";
 
 // Model/agent/variant a prompt is sent with (captured at queue time too).
 type QueueConfig = { providerID?: string; modelID?: string; variant?: string; agent?: string };
+
+// Send-net-resilience slice 3: the outbox seam (BLK-A3 + debate-4 finding 7,
+// amended 2026-10-09 — compare at resume/replacement, not admission).
+// Injected so this factory owns NO IndexedDB (mirroring the no-network/
+// no-localStorage discipline); ChatView binds lib/outbox. OPTIONAL: absent
+// keeps the pre-slice behavior byte-intact for minimal unit harnesses — the
+// production wiring always passes it.
+export interface SendOutboxDeps {
+  // Persist the gesture; `{ok:true}` resolves strictly AFTER the IDB
+  // transaction committed (the only legitimate origin of a "locally saved"
+  // claim). On failure the caller MUST abort the send (blocking persistent
+  // "not saved — copy your text" state; the composer keeps the text).
+  save: (input: {
+    intentId: string;
+    sessionId: string;
+    payload: OutboxPayload;
+    capturedHead: OutboxContextHead | null;
+  }) => Promise<OutboxSaveResult>;
+  // Admission confirmed: link the queue item to the durable gesture record.
+  markAdmitted: (intentId: string, queueItemId: string) => Promise<void>;
+  // The live context-head for a session (transcript tail), or null when
+  // unknowable (never fabricates staleness). Captured ONCE at tap and
+  // persisted with the gesture — the RESUME/replacement stale gates read it.
+  captureHead: (sessionId: string) => OutboxContextHead | null;
+}
 
 // F5 (review): bound on the LEGACY agent-less queued item's re-resolve gate
 // inside the drainer's dispatch window. The drainer bounds a whole dispatch
@@ -122,8 +148,9 @@ export type SendDependencies = {
       attachments: Attachment[];
       sendConfig: QueueConfig;
       attemptId?: string;
+      intentId?: string;
     },
-  ) => Promise<unknown>;
+  ) => Promise<{ id?: string } | unknown>;
   // Authoritative queue list (queue.ts fetchQueue) — injected for the
   // reconcile-first recovery path when an enqueue response is lost
   // (send-reliability slice 2). Resolves null when the list could not be
@@ -148,6 +175,11 @@ export type SendDependencies = {
     state: "sent" | "failed" | "unknown",
     detail: string,
   ) => Promise<unknown>;
+  // Send-net-resilience slice 3: the IndexedDB outbox seam (see
+  // SendOutboxDeps). Optional — absent keeps the pre-slice admission path
+  // byte-intact (minimal unit harnesses); production ChatView always wires
+  // lib/outbox's real implementation.
+  outbox?: SendOutboxDeps;
   // True while an attachment upload is in flight (createAttachments'
   // `uploading`) — admission blocks on it (no partial send).
   uploading: Accessor<boolean>;
@@ -357,19 +389,22 @@ export function createSend(deps: SendDependencies): SendController {
       // Response-less failure (timeout / network / ambiguous 2xx): the
       // admission outcome is UNKNOWN — never "failed, safe to resend".
       // Reconcile-first: a fresh authoritative list showing an item admitted
-      // under our attemptId proves durable custody after all.
-      let confirmed = false;
+      // under our gesture id (either wire alias — slice-1 servers echo
+      // attemptId, slice-3 sends the same value as intentId) proves durable
+      // custody after all.
+      let confirmed: QueuedMessage | undefined;
       try {
         const items = await deps.fetchQueue(id);
         // items === null: the bounded list GET timed out / failed — no answer.
-        // Stay uncertain (confirmed stays false); never treat null as an empty
-        // authoritative list.
-        confirmed = !!items && items.some((it) => it.attemptId === attempt.attemptId);
+        // Stay uncertain (confirmed stays undefined); never treat null as an
+        // empty authoritative list.
+        confirmed = items?.find((it) => it.attemptId === attempt.attemptId || it.intentId === attempt.attemptId);
       } catch {
         /* list unavailable — stay uncertain */
       }
       if (confirmed) {
         finishSendAttempt(attempt.attemptId); // admitted after all; the item is authority
+        if (confirmed.id && deps.outbox) void deps.outbox.markAdmitted(attempt.attemptId, confirmed.id);
         return true;
       }
       updateSendAction(attempt.attemptId, {
@@ -473,10 +508,66 @@ export function createSend(deps: SendDependencies): SendController {
       }
     }
     if (attempt) updateSendAction(attempt.attemptId, { stage: "admitting" });
+    // OUTBOX GATE (slice 3, BLK-A3 + debate-4 finding 7, amended 2026-10-09):
+    // the gesture is made locally durable BEFORE the admission POST, gated on
+    // the IDB transaction COMMIT. Only a committed save may proceed; a storage
+    // failure blocks the send (persistent "not saved — copy your text" state,
+    // text retained in the composer). The captured head's stale gate runs at
+    // RESUME/replacement — see the capture note below (a save-window compare
+    // would false-positive on hydration catch-up).
+    // Skipped when no attempt context (defensive legacy callers) or no outbox
+    // seam (minimal harnesses) — byte-identical to the pre-slice path.
+    if (attempt && deps.outbox) {
+      const ob = deps.outbox;
+      const intentId = attempt.attemptId;
+      // Capture ONCE AT TAP (debate-4 finding 7, as amended 2026-10-09: the
+      // context the OPERATOR saw when composing) and persist it with the
+      // gesture. The COMPARE runs at RESUME (the outbox reconcile's
+      // re-admission gate — where the message actually sat unsent while the
+      // conversation could move on; a changed head surfaces a visible blocked
+      // row, never an auto-send) and for replacement sends (the chip's inline
+      // confirmation + the controller's re-verify); NOT inside this one
+      // continuous gesture: a save-window compare would trip on innocent
+      // hydration catch-up (the agent-gate parked-send class — the transcript
+      // legitimately fills in during the async window; that is not "the
+      // conversation moved on"). An unknowable tap head (transcript not yet
+      // resident) never fabricates staleness downstream.
+      const tapHead = ob.captureHead(id);
+      const save = await ob.save({
+        intentId,
+        sessionId: id,
+        payload: {
+          text: input.text,
+          attachments: input.attachments.map((a) => ({
+            url: a.url,
+            filename: a.filename,
+            mime: a.mime,
+            path: a.path,
+          })),
+          sendConfig: input.sendConfig,
+        },
+        capturedHead: tapHead,
+      });
+      if (!save.ok) {
+        // BLK-A3: NEVER proceed on an uncommitted local save — block before
+        // admission. The outbox module armed the blocking banner with the
+        // retained payload; the caller keeps the composer text (this returns
+        // false before any composer change).
+        updateSendAction(intentId, {
+          stage: "blocked", certainty: "definitive", recovery: "restore",
+          detail: `outbox save failed: ${save.reason}`, reason: "storage-unavailable",
+        });
+        log.error("send", "outbox save failed — send blocked before admission", { id, reason: save.reason });
+        return false;
+      }
+    }
+    let admittedItem: { id?: string } | unknown;
     try {
-      await deps.enqueue(
+      admittedItem = await deps.enqueue(
         id,
-        attempt ? { ...input, attemptId: attempt.attemptId } : input,
+        attempt
+          ? { ...input, attemptId: attempt.attemptId, intentId: attempt.attemptId }
+          : input,
       );
     } catch (e) {
       // Enqueue failed or its response was lost — typed classification with
@@ -485,8 +576,14 @@ export function createSend(deps: SendDependencies): SendController {
       return classifyAdmissionFailure(e, id, attempt, text);
     }
     // Durable custody confirmed — the queue item is now the authority. Drop
-    // the action record (Slice 3 renders the chip, not the action).
-    if (attempt) finishSendAttempt(attempt.attemptId);
+    // the action record (Slice 3 renders the chip, not the action) and link
+    // the outbox gesture to its item (best-effort; a failed link write never
+    // fails the send — the server owns custody now).
+    if (attempt) {
+      finishSendAttempt(attempt.attemptId);
+      const itemId = (admittedItem as { id?: string } | null | undefined)?.id;
+      if (itemId && deps.outbox) void deps.outbox.markAdmitted(attempt.attemptId, itemId);
+    }
     // The caller decides whether to clear the composer (and only if it still
     // owns the submitted state). This function does not touch
     // setInput/setAttachments.

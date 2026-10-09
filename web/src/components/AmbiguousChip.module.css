@@ -1,0 +1,81 @@
+/* AmbiguousChip — scoped styles (send-net-resilience slice 3). Consumes
+   global tokens only; no new global CSS. A non-scrolling, small, flat
+   composer surface — no mask-image / backdrop-filter / contain /
+   content-visibility (Firefox/WebRender GPU rules, AGENTS.md). */
+
+.ambiguousChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.5;
+  /* Semantic warning tokens (the live-uncertain class is a warning, not an
+     error — the message may have arrived). */
+  background: color-mix(in srgb, var(--warn) 14%, var(--bg-2));
+  color: var(--fg);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+}
+
+.state {
+  color: var(--warn);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+
+/* The BINDING verbatim warning (debate-4 B1) — always visible while the
+   three actions are shown; readable, never tooltip-only. */
+.warning {
+  display: inline;
+  color: var(--fg-dim);
+  max-width: 480px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.act {
+  /* Matches the legacy .queue-action affordance scale (global sibling
+     classes stay in the legacy shards; this chip owns its scoped set). */
+  border: none;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 11px;
+  padding: 2px 4px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.act:hover {
+  background: var(--hover-bg);
+  color: var(--fg);
+}
+.act:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* The one-tap replacement is the highest-agency action — visually distinct
+   (the operator must notice it sends a NEW message). */
+.replace {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* The inline stale-context confirmation note (paired with Send anyway /
+   Cancel while active). */
+.stale {
+  color: var(--fg);
+  font-style: italic;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  max-width: 360px;
+}

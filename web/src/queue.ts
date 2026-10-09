@@ -23,6 +23,7 @@ import { createSignal } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { loadVersioned, saveVersioned } from "./lib/store";
 import { markSendAttemptResolveConflict, markSendAttemptStatusUnsaved } from "./lib/sendActionStatus";
+import { noteQueueCustodyRefusal } from "./lib/queueDispatchMode";
 
 export interface QueuedAttachment {
   url: string;
@@ -101,6 +102,16 @@ export interface QueuedMessage {
   // give-up already carries its own "manual review advised" detail. (An
   // earlier consumer, the composer custody line, was removed in 61ca3a9.)
   reconcileTerminal?: boolean;
+  // Send-net-resilience slice 2b (FE mirror): the durable live-uncertain
+  // marker. The item carries custody-journal attempt records, the exact-ID
+  // GET stayed negative, and NO certified redelivery class applies — the
+  // message may or may not have arrived and is NEVER auto-redelivered. Slice
+  // 3 renders the ambiguous chip (Wait / Copy text / Send new message with
+  // the verbatim two-message warning) off this marker; the server keeps
+  // `state: "unknown"` + reconcileTerminal alongside it. Cleared server-side
+  // by a certified requeue or an exact-match → sent heal (in which case the
+  // item becomes `sent` and the chip clears).
+  ambiguousDelivery?: boolean;
 }
 
 // Send-net-resilience slice 1 (types only — mirror of pkg/web QueueAttempt).
@@ -539,6 +550,19 @@ export async function claimQueued(sessionId: string): Promise<QueuedMessage | nu
       // after the finally). Mirrors the createSession/resolveWithRetry shape.
       const j = await readJSON(res);
       item = j.item || null;
+    } else if (res.status === 409) {
+      // Slice 3 (custody arbitration): 409 + code queue_custody_active means
+      // a LIVE custody owner (the daemon dispatch loop) holds this project's
+      // queue — this is OWNERSHIP INFORMATION, not an error. Latch the
+      // observe-only projection mode (the drainer stops claiming/dispatching;
+      // the daemon owns dispatch) and return no-claim. Body read inside the
+      // armed window; an unreadable body is treated as a plain no-claim (the
+      // legacy 409-not-removable shape never carried this code).
+      const j = await readJSON(res);
+      if (j.code === "queue_custody_active") {
+        noteQueueCustodyRefusal();
+        return null;
+      }
     }
   } catch {
     // Network error OR abort/timeout (incl. a hung BODY after headers) — no
@@ -645,6 +669,21 @@ export async function resolveQueued(
       /* offline: the optimistic local state stays; the next successful poll
          reconciles (the overlay is gone, so server truth wins when it lands). */
     }
+  } else if (outcome.kind === "custody-refused") {
+    // Slice 3 (custody arbitration): a live daemon custody owner refused the
+    // resolve — ownership information, not an error. (a) latch projection
+    // mode (this page stops claiming/dispatching from now on); (b) DROP our
+    // optimistic overlay so the next list read shows the daemon's journal
+    // truth instead of fighting it (the daemon's reconciler owns outcome
+    // recording for custody-claimed items); (c) refresh. No status-unsaved
+    // row: the record is not ours to save anymore.
+    noteQueueCustodyRefusal();
+    knownOutcomes.delete(id);
+    try {
+      await fetchQueue(sessionId);
+    } catch {
+      /* offline: the next poll reconciles */
+    }
   } else {
     // UNRECORDED (send-reliability slice 3): attempts exhausted on transient
     // errors. The dispatch outcome IS known and visible (the optimistic
@@ -704,15 +743,21 @@ const RESOLVE_TIMEOUT_MS = 5000;
 
 // Typed outcome of the bounded resolve-write retry loop (send-reliability
 // slice 2):
-//   recorded   — a 2xx landed (item may be absent on a body-less 2xx).
-//   conflict   — the server answered 409 queue_resolve_conflict: it holds a
-//                DIFFERENT terminal state. Terminal for this write — the loop
-//                STOPS (an explicit conflict must never be retried forever).
-//   unrecorded — attempts exhausted on transient errors (network/5xx); the
-//                optimistic local terminal state stays visible.
+//   recorded        — a 2xx landed (item may be absent on a body-less 2xx).
+//   conflict        — the server answered 409 queue_resolve_conflict: it holds a
+//                     DIFFERENT terminal state. Terminal for this write — the loop
+//                     STOPS (an explicit conflict must never be retried forever).
+//   custody-refused — the server answered 409 queue_custody_active (slice 3): a
+//                     live custody owner (the daemon dispatch loop) owns this
+//                     project's queue and refused the browser resolve. NOT an
+//                     error and NOT retryable: the daemon's journal/reconciler
+//                     owns outcome recording for this item now.
+//   unrecorded      — attempts exhausted on transient errors (network/5xx); the
+//                     optimistic local terminal state stays visible.
 export type ResolveWriteOutcome =
   | { kind: "recorded"; item?: QueuedMessage }
   | { kind: "conflict"; detail: string }
+  | { kind: "custody-refused"; detail: string }
   | { kind: "unrecorded" };
 
 // resolveWithRetry POSTs the resolve write a bounded number of times. The
@@ -744,10 +789,15 @@ async function resolveWithRetry(
         // Body read inside the armed window. A coded resolve-conflict is
         // terminal for this write — STOP immediately (explicit conflict, not
         // retry-forever). An uncoded 409 keeps the legacy transient-retry
-        // behavior (older servers, non-monotonic sentinels).
+        // behavior (older servers, non-monotonic sentinels). A custody
+        // refusal (slice 3) is likewise terminal: the daemon's custody owner
+        // owns outcome recording — never retry, never mark unsaved.
         const j = await readJSON(res);
         if (j.code === "queue_resolve_conflict") {
           return { kind: "conflict", detail: String(j.error || "") };
+        }
+        if (j.code === "queue_custody_active") {
+          return { kind: "custody-refused", detail: String(j.error || "queue_custody_active") };
         }
       }
     } catch {

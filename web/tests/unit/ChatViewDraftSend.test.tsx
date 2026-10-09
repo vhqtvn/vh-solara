@@ -161,6 +161,24 @@ vi.mock("../../src/queue", async (importOriginal) => {
   return { ...actual, enqueue: enqueueMock };
 });
 
+// outbox (send-net-resilience slice 3): jsdom has no IndexedDB, so the REAL
+// module's save would fail and block every send before admission. Mock a
+// HEALTHY memory outbox (save commits; no captured head → the stale gate
+// never fabricates staleness; no overlays) — the pre-slice admission behavior
+// these draft tests pin.
+vi.mock("../../src/lib/outbox", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    saveGesture: async () => ({ ok: true }) as const,
+    markAdmitted: async () => {},
+    capturedHeadFor: async () => null,
+    dropGesture: async () => {},
+    reconcileOutboxSession: async () => {},
+    replacementRequestedFor: () => undefined,
+  };
+});
+
 // Defensive: ChatView's onMount / openSession may issue unrelated fetches
 // (loadModels, fetchQueue, ...). Stub globalThis.fetch so none of them throw.
 // jsdom also lacks IntersectionObserver and PointerEvent — stub those too.

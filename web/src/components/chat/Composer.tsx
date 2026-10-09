@@ -30,6 +30,7 @@ import { isInlineChipOrphan } from "../../lib/inlineAttach";
 import { layoutPx } from "../../lib/zoom";
 import Icon from "../Icon";
 import { QueueChip } from "../QueueChip";
+import { AmbiguousChip } from "../AmbiguousChip";
 import Select from "../Select";
 import ModelDialog from "../ModelDialog";
 import { SendStatus } from "./SendStatus";
@@ -92,6 +93,15 @@ export interface ComposerProps {
   // refused (the resolve matrix rejects failed→sent). Optional — absent it,
   // chips render no retry action (progressive rollout / minimal harnesses).
   retryQueuedItem?: (q: QueuedMessage) => void;
+  // Send-net-resilience slice 3: the AmbiguousDelivery chip contract. Items
+  // carrying the daemon's ambiguousDelivery marker render AmbiguousChip
+  // (Wait / Copy text / Send new message behind the VERBATIM two-message
+  // warning) instead of the generic unknown chip. Optional — absent, marked
+  // items fall back to the generic unknown chip (minimal harnesses).
+  ambiguousTap?: (q: QueuedMessage) => Promise<"confirmed" | "stale-confirm" | "refused">;
+  ambiguousReplace?: (q: QueuedMessage) => void;
+  ambiguousReplacementFor?: (q: QueuedMessage) => boolean;
+  removeQueuedItem?: (id: string) => void;
   abort: () => void;
   // A1 create-linkage (send-defers study), forwarded to SendStatus: the sync
   // store's session map (watched reactively for a session whose time.created
@@ -253,13 +263,40 @@ export function Composer(props: ComposerProps) {
               </span>
               <For each={queueFor(props.sessionId())}>
                 {(q) => (
-                  <QueueChip
-                    q={q}
-                    onRemove={(id) => void removeQueued(props.sessionId(), id)}
-                    onRetry={props.retryQueuedItem}
-                    onRetract={props.recovery.retract}
-                    onMarkSent={props.recovery.markSent}
-                  />
+                  <Show
+                    when={q.state === "unknown" && q.ambiguousDelivery && props.ambiguousReplace && props.ambiguousTap}
+                    fallback={
+                      <QueueChip
+                        q={q}
+                        onRemove={(id) =>
+                          props.removeQueuedItem
+                            ? props.removeQueuedItem(id)
+                            : void removeQueued(props.sessionId(), id)
+                        }
+                        onRetry={props.retryQueuedItem}
+                        onRetract={props.recovery.retract}
+                        onMarkSent={props.recovery.markSent}
+                      />
+                    }
+                  >
+                    {/* Send-net-resilience slice 3: the durable live-uncertain
+                        chip (debate-4 B1) — the daemon marked this delivery
+                        ambiguous (never auto-redelivered); the operator gets
+                        Wait / Copy text / Send new message behind the verbatim
+                        warning, and the outbox overlay renders the
+                        "Replacement requested" state after a replacement. */}
+                    <AmbiguousChip
+                      q={q}
+                      onTap={props.ambiguousTap!}
+                      onReplace={props.ambiguousReplace!}
+                      replacementRequested={() => !!props.ambiguousReplacementFor?.(q)}
+                      onRemove={(id) =>
+                        props.removeQueuedItem
+                          ? props.removeQueuedItem(id)
+                          : void removeQueued(props.sessionId(), id)
+                      }
+                    />
+                  </Show>
                 )}
               </For>
             </div>

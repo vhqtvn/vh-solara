@@ -331,6 +331,18 @@ export function SendStatus(props: SendStatusProps) {
           // via an exact receipt — "session found" is NOT "message sent".
           case "session-create-resolved":
             return "Session was created — this message was not sent.";
+          // Send-net-resilience slice 3 (BLK-A3): the local outbox save
+          // failed, so the gesture was blocked BEFORE admission. The blocking
+          // banner (OutboxStorageBanner) owns the "copy your text" affordance;
+          // this row states the same fact where the send's history lives.
+          case "storage-unavailable":
+            return "Not saved — message storage is unavailable. Your text is kept in the composer; copy it before closing this tab.";
+          // Send-net-resilience slice 3 (debate-4 finding 7 (amended
+          // 2026-10-09)): the captured context-head no longer matches the
+          // live transcript — the operator must review before this message
+          // may send. Never auto-sent.
+          case "stale-context":
+            return "Not sent — the conversation moved on while this message was waiting. Review it and send again.";
           default:
             return "Not sent — kept in the composer.";
         }
@@ -454,6 +466,11 @@ export function SendStatus(props: SendStatusProps) {
     try {
       const out = await resolveQueued(ownerKey(), save.itemId, save.state, save.detail);
       if (out.kind === "recorded") {
+        finishSendAttempt(rec.attemptId);
+      } else if (out.kind === "custody-refused") {
+        // Slice 3: a daemon custody owner refused the write — it owns outcome
+        // recording now. The row's job (surface the unconfirmed save) is over;
+        // queue truth reconciles via the list.
         finishSendAttempt(rec.attemptId);
       } else if (out.kind === "conflict") {
         markSendAttemptResolveConflict(rec.attemptId, ownerKey(), out.detail || "queue_resolve_conflict");

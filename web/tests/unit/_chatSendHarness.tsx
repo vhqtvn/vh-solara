@@ -99,6 +99,19 @@ const H = vi.hoisted(() => ({
     bySession: {} as Record<string, { providerID: string; modelID: string; variant?: string }>,
     explicit: new Set<string>(),
   },
+
+  // Send-net-resilience slice 3: the outbox seam ChatView binds into
+  // createSend + the replacement controller. Defaults model a HEALTHY memory
+  // outbox (save always commits; no captured head → the stale gate never
+  // fabricates staleness; no replacement overlays), so every pre-slice test
+  // sees the old admission behavior through the new gate. Override per-test
+  // via mocks.outbox*.
+  outboxSave: vi.fn(async () => ({ ok: true } as const)),
+  outboxMarkAdmitted: vi.fn(async () => {}),
+  outboxCapturedHeadFor: vi.fn(async () => null),
+  outboxDropGesture: vi.fn(async () => {}),
+  outboxReconcile: vi.fn(async () => {}),
+  outboxReplacementFor: undefined as string | undefined,
 }));
 
 // --- agents mock -----------------------------------------------------------
@@ -250,6 +263,26 @@ vi.mock("../../src/notify", async (importOriginal) => {
   };
 });
 
+// --- outbox mock (slice 3: the BLK-A3 seam under test control) ---------------
+// Spread the real module (types + the banner's storageFailure/evictionSuspected
+// signals stay real — they can only arm when H.outboxSave is overridden to
+// fail) and override exactly the functions ChatView binds: the four seam fns
+// injected into createSend / the replacement controller, the queue-sync
+// reconcile entry, and the replacement-overlay read. Defaults model a healthy
+// memory outbox so all pre-slice tests keep their exact admission behavior.
+vi.mock("../../src/lib/outbox", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    saveGesture: H.outboxSave,
+    markAdmitted: H.outboxMarkAdmitted,
+    capturedHeadFor: H.outboxCapturedHeadFor,
+    dropGesture: H.outboxDropGesture,
+    reconcileOutboxSession: H.outboxReconcile,
+    replacementRequestedFor: (_intentId?: string) => H.outboxReplacementFor,
+  };
+});
+
 // --- default behaviors for the queue drain fns -----------------------------
 // Called by resetHarness(). Models a faithful in-memory backend: claim moves
 // the oldest pending → dispatching (single winner); resolve records a terminal
@@ -307,6 +340,18 @@ export function resetHarness() {
   H.createSessionUnknownCertainty = false;
   H.modelsState.bySession = {};
   H.modelsState.explicit.clear();
+  // Slice 3 outbox seam: restore the healthy-memory-outbox defaults.
+  H.outboxSave.mockReset();
+  H.outboxSave.mockImplementation(async () => ({ ok: true }) as const);
+  H.outboxMarkAdmitted.mockReset();
+  H.outboxMarkAdmitted.mockImplementation(async () => {});
+  H.outboxCapturedHeadFor.mockReset();
+  H.outboxCapturedHeadFor.mockImplementation(async () => null);
+  H.outboxDropGesture.mockReset();
+  H.outboxDropGesture.mockImplementation(async () => {});
+  H.outboxReconcile.mockReset();
+  H.outboxReconcile.mockImplementation(async () => {});
+  H.outboxReplacementFor = undefined;
 }
 
 /** Install jsdom-missing browser globals ChatView reads at mount / on render:
@@ -402,6 +447,30 @@ export const mocks = {
   },
   get modelsState() {
     return H.modelsState;
+  },
+  // Send-net-resilience slice 3: the outbox seam handles. Defaults (a healthy
+  // memory outbox: save ok, no captured head, no overlays) are restored by
+  // resetHarness; override per-test for the BLK-A3 / stale-context gates.
+  get outboxSave() {
+    return H.outboxSave;
+  },
+  get outboxMarkAdmitted() {
+    return H.outboxMarkAdmitted;
+  },
+  get outboxCapturedHeadFor() {
+    return H.outboxCapturedHeadFor;
+  },
+  get outboxDropGesture() {
+    return H.outboxDropGesture;
+  },
+  get outboxReconcile() {
+    return H.outboxReconcile;
+  },
+  get outboxReplacementFor() {
+    return H.outboxReplacementFor;
+  },
+  set outboxReplacementFor(v: string | undefined) {
+    H.outboxReplacementFor = v;
   },
 };
 

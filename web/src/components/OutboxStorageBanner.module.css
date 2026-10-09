@@ -1,0 +1,52 @@
+/* OutboxStorageBanner — scoped styles (send-net-resilience slice 3). A small
+   persistent composer-adjacent alert: flat, cheap DOM, global tokens only.
+   No mask-image / backdrop-filter / contain / content-visibility
+   (Firefox/WebRender GPU rules). */
+
+.banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 10px 2px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  background: color-mix(in srgb, var(--danger) 12%, var(--bg-2));
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  color: var(--fg);
+}
+
+.text {
+  flex: 1 1 240px;
+  min-width: 0;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+
+.text strong {
+  color: var(--danger);
+}
+
+.btn {
+  border: 1px solid var(--border);
+  background: var(--bg-elev, var(--bg-2));
+  color: var(--fg);
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn:hover:not(:disabled) {
+  background: var(--hover-bg);
+}
+.btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+.btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}

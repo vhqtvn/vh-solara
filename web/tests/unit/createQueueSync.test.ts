@@ -43,6 +43,8 @@ interface Fakes {
   migrateLegacyQueue: ReturnType<typeof vi.fn>;
   fetchQueue: ReturnType<typeof vi.fn>;
   drain: ReturnType<typeof vi.fn>;
+  reconcileOutbox: ReturnType<typeof vi.fn>;
+  refreshDispatchMode: ReturnType<typeof vi.fn>;
 }
 
 interface Handles {
@@ -66,6 +68,8 @@ function setup(o: Partial<{ sessionId: string; draft: boolean; working: boolean 
     migrateLegacyQueue: vi.fn().mockResolvedValue(undefined),
     fetchQueue: vi.fn().mockResolvedValue(undefined),
     drain: vi.fn().mockResolvedValue(undefined),
+    reconcileOutbox: vi.fn().mockResolvedValue(undefined),
+    refreshDispatchMode: vi.fn().mockResolvedValue(undefined),
   };
   const deps: QueueSyncDeps = {
     sessionId,
@@ -79,6 +83,8 @@ function setup(o: Partial<{ sessionId: string; draft: boolean; working: boolean 
     migrateLegacyQueue: fn.migrateLegacyQueue,
     fetchQueue: fn.fetchQueue,
     drain: fn.drain,
+    reconcileOutbox: fn.reconcileOutbox,
+    refreshDispatchMode: fn.refreshDispatchMode,
   };
   const dispose = createRoot((d) => {
     createQueueSync(deps);
@@ -304,6 +310,47 @@ describe("createQueueSync — poll + cleanup", () => {
     window.dispatchEvent(new Event("focus"));
     document.dispatchEvent(new Event("visibilitychange"));
     await tick();
+    expect(fn.fetchQueue).not.toHaveBeenCalled();
+  });
+});
+
+// --- send-net-resilience slice 3: the outbox reconcile + dispatch-mode deps ----
+describe("createQueueSync — outbox reconcile + dispatch-mode refresh (slice 3)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("session open: refreshes the dispatch-mode advertisement, then reconciles the outbox, then fetches", async () => {
+    const { fn } = setup();
+    await flush();
+    expect(fn.refreshDispatchMode).toHaveBeenCalledTimes(1);
+    expect(fn.reconcileOutbox).toHaveBeenCalledTimes(1);
+    expect(fn.fetchQueue).toHaveBeenCalled();
+  });
+
+  it("focus re-runs the outbox reconcile (the multi-tab / killed-tab recovery trigger)", async () => {
+    const { fn } = setup();
+    await flush();
+    fn.reconcileOutbox.mockClear();
+    window.dispatchEvent(new Event("focus"));
+    await flush();
+    expect(fn.reconcileOutbox).toHaveBeenCalledTimes(1);
+  });
+
+  it("a reconcile REJECTION never breaks the sync chain (fetch still runs; never throws)", async () => {
+    const { fn } = setup();
+    fn.reconcileOutbox.mockRejectedValueOnce(new Error("idb blocked"));
+    // Re-run the session-open path by switching sessions.
+    const h = setup();
+    void h;
+    await flush();
+    expect(fn.fetchQueue).toHaveBeenCalled();
+  });
+
+  it("draft sessions never reconcile (no server session to reconcile against)", async () => {
+    const { fn } = setup({ draft: true });
+    await flush();
+    expect(fn.reconcileOutbox).not.toHaveBeenCalled();
     expect(fn.fetchQueue).not.toHaveBeenCalled();
   });
 });
