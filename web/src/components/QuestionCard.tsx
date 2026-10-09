@@ -1,11 +1,12 @@
 import { createEffect, createResource, createSignal, For, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import type { Question } from "../types";
-import { respondQuestion } from "../sync";
+import { dismissQuestion, respondQuestion } from "../sync";
 import { renderMarkdown } from "../render";
 import Icon from "./Icon";
 import { useCardPopup } from "./cardPopup";
 import { usePendingInputHold } from "./PendingInput";
+import ReplyStatus from "./ReplyStatus";
 import styles from "./QuestionCard.module.css";
 
 // Goldmark wraps a lone paragraph as <p>…</p>. Inside a <button> that is
@@ -60,8 +61,20 @@ export default function QuestionCard(props: { question: Question }) {
   // open/close because the state lives in the component, not the DOM.
   const [picked, setPicked] = createSignal<Record<number, string[]>>({});
   const [custom, setCustom] = createSignal<Record<number, string>>({});
-  const [busy, setBusy] = createSignal(false);
   const [layout, setLayout] = createSignal<"v" | "h">("v");
+
+  // --- Reply lifecycle (send-net-resilience slice 4a) ---------------------
+  // Replaces the bare `busy` flag with the honest lifecycle surface shared
+  // with PermissionCard (ReplyStatus): sending single-flights the submit;
+  // unknown keeps the card with an explicit Retry (re-submits the CURRENT
+  // selections — equal to the attempted ones unless the operator edited
+  // them, which is equally safe: upstream is single-shot); gone is a visible
+  // terminal ("no longer pending; outcome was not confirmed") whose Dismiss
+  // is the operator's cleanup. The card is NEVER deleted locally — the
+  // server's question.delete event clears it on confirmation.
+  type ReplyState = "idle" | "sending" | "unknown" | "gone";
+  const [replyState, setReplyState] = createSignal<ReplyState>("idle");
+  const sendLocked = () => replyState() === "sending" || replyState() === "gone";
 
   // Shared popup chrome (open/close + focus capture/restore + ESC + Tab trap).
   // The card's signals and `body()` stay here; only the popup lifecycle is
@@ -99,16 +112,17 @@ export default function QuestionCard(props: { question: Question }) {
   const ready = () => items().every((_, qi) => answerFor(qi).length > 0);
 
   async function submit() {
-    if (!ready() || busy()) return;
-    setBusy(true);
-    try {
-      await respondQuestion(
-        props.question.id,
-        items().map((_, qi) => answerFor(qi)),
-      );
-    } finally {
-      setBusy(false);
-    }
+    if (!ready() || sendLocked()) return;
+    // Snapshot the answers BEFORE the flight: this is what the retry
+    // comparison is judged against and what gets POSTed for this attempt.
+    const answers = items().map((_, qi) => answerFor(qi));
+    setReplyState("sending");
+    const out = await respondQuestion(props.question.id, answers, props.question.sessionID);
+    if (out.kind === "unknown") setReplyState("unknown");
+    else if (out.kind === "gone") setReplyState("gone");
+    // confirmed: the server's question.delete event clears the card; rejected:
+    // definitive non-apply, still pending — both return to the actionable card.
+    else setReplyState("idle");
   }
 
   const toggleLayout = () => setLayout((l) => (l === "v" ? "h" : "v"));
@@ -191,11 +205,18 @@ export default function QuestionCard(props: { question: Question }) {
           </div>
         )}
       </For>
+      <Show when={replyState() !== "idle"}>
+        <ReplyStatus
+          status={replyState() as "sending" | "unknown" | "gone"}
+          onRetry={() => void submit()}
+          onDismiss={() => dismissQuestion(props.question.sessionID, props.question.id)}
+        />
+      </Show>
       <div class={styles["question-actions"]}>
         <button
           type="button"
           class="question-send"
-          disabled={!ready() || busy()}
+          disabled={!ready() || sendLocked()}
           onClick={() => void submit()}
         >
           <Icon name="check" size={14} /> Reply

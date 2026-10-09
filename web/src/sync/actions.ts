@@ -379,78 +379,211 @@ async function postBounded(url: string, body: unknown, timeoutMs = REPLY_TIMEOUT
   }
 }
 
-// Surface a timed-out permission/question reply honestly (send-reliability
-// hygiene micro-slice). SEMANTICS: a timed-out reply is OUTCOME-UNKNOWN — the
-// POST may have been applied upstream, so this must NOT claim "failed", and
-// the card must NOT be restored as if unsent (a restored card invites a
-// SECOND reply for a request that may already be answered). The minimal
-// honest surface is one notification with outcome-unknown wording; the card
-// stays cleared and later server events reconcile the turn's real state.
-function replyOutcomeUnknown(kind: "Permission" | "Question", sessionID?: string): void {
+// Surface an unconfirmed permission/question reply honestly (send-reliability
+// hygiene micro-slice; reworded in send-net-resilience slice 4a now that the
+// CARD is the recovering surface). SEMANTICS: an unconfirmed reply is
+// OUTCOME-UNKNOWN — the POST may have been applied upstream, so this must NOT
+// claim "failed". The notification is the cross-session surface; the owning
+// card additionally stays visible with an explicit Retry affordance (retry is
+// safe: upstream replies are single-shot, so a retry either lands or comes
+// back gone — it can never double-apply).
+function replyOutcomeUnknown(kind: "Permission" | "Question", sessionID?: string, detail?: string): void {
   pushNotification({
     kind: "error",
     sessionID,
     title: `${kind} reply not confirmed`,
     detail:
       `The ${kind.toLowerCase()} reply was sent but no confirmation arrived — ` +
-      "it may still have been applied. The card was not restored; check the " +
-      "session's state before answering again.",
+      "it may still have been applied. The card keeps a Retry; " +
+      "retrying is safe and cannot double-apply." +
+      (detail ? ` (${detail})` : ""),
   });
 }
 
-// Reply to a pending permission request: "once" | "always" | "reject".
-// Uses OpenCode's canonical permission-reply route (POST /permission/:id/reply
-// with {reply}); falls back to the legacy session-scoped route ({response}) for
-// older servers. Clears the card optimistically so the UI responds immediately.
-export async function respondPermission(sessionID: string, permissionID: string, response: string) {
+// Surface a definitively-rejected reply (a non-gone 4xx from the verb — the
+// daemon mapped an upstream 4xx through, so the reply was NOT applied). The
+// request is still pending upstream; the card returns to actionable and the
+// operator can answer again.
+function replyRejected(kind: "Permission" | "Question", status: number, sessionID?: string): void {
+  pushNotification({
+    kind: "error",
+    sessionID,
+    title: `${kind} reply not accepted`,
+    detail:
+      `The server rejected the reply (HTTP ${status}) and it was not applied. ` +
+      "The request is still pending — answer again.",
+  });
+}
+
+// Send-net-resilience slice 4a — typed outcome of a human reply through the
+// daemon verbs. The classification is monotone in certainty:
+//   confirmed — a 2xx arrived (possibly an idempotent replay of one).
+//   unknown   — no confirmation: timeout, network error, daemon 5xx (the
+//               upstream transport failed — the reply may have been applied),
+//               or 409 (a concurrent duplicate of THIS attempt's key is still
+//               in flight). The card stays with a Retry.
+//   gone      — 410 Gone (the daemon maps upstream "not pending" 404 → 410),
+//               plus a defensive bare 404. Covers BOTH the upstream
+//               second-reply 404 AND the shutdown-finalizer shape — from here
+//               the two are indistinguishable, so the wording is the honest
+//               "no longer pending; outcome was not confirmed". NEVER success.
+//   rejected  — any other 4xx: a definitive non-apply. The request is still
+//               pending; the card returns to actionable.
+export type ReplyOutcome =
+  | { kind: "confirmed" }
+  | { kind: "unknown"; detail: string }
+  | { kind: "gone" }
+  | { kind: "rejected"; status: number };
+
+// Mint a high-entropy idempotency key (crypto.randomUUID when available; the
+// fallback concatenates random sweeps — same posture as
+// lib/sessionCreateStatus.ts mintCreateKey, which documents why a counter or
+// timestamp alone would be guessable).
+function mintReplyKey(): string {
+  const c: Crypto | undefined = (globalThis as any).crypto;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  let rnd = "";
+  for (let i = 0; i < 4; i++) rnd += Math.random().toString(16).slice(2);
+  return `reply-${rnd}`;
+}
+
+// Map a definitive non-2xx status from the reply verbs to a ReplyOutcome.
+function classifyReplyStatus(status: number): ReplyOutcome {
+  if (status === 410 || status === 404) return { kind: "gone" };
+  // 409 = idempotency in-flight (a duplicate of this attempt is still being
+  // processed — outcome not yet knowable); 5xx = the daemon's upstream
+  // transport failed or erred (the reply may have been applied en route).
+  if (status === 409 || status >= 500) return { kind: "unknown", detail: `HTTP ${status}` };
+  return { kind: "rejected", status };
+}
+
+// Reply to a pending permission request ("once" | "always" | "reject").
+//
+// Send-net-resilience slice 4a: routes through the DAEMON verb
+// POST /vh/reply-permission {permissionID, sessionID, reply, idempotency_key}
+// instead of the bare /oc passthrough. The daemon owns the canonical→legacy
+// upstream fallback (pkg/opencode/client.go ReplyPermission — sessionID is
+// sent so it can) and maps upstream "not pending" 404 → 410.
+//
+// THE CARD IS NO LONGER OPTIMISTICALLY DELETED. It is removed only after a
+// CONFIRMED 2xx (immediate on success) or by the server's permission.delete
+// event (the independent convergence channel — upstream permission.replied
+// clears the card even when the HTTP response is lost). On every failure
+// shape the card survives: unknown keeps it with a Retry; gone keeps it with
+// a visible terminal; rejected returns it to actionable.
+//
+// IDEMPOTENCY KEY POLICY — a FRESH key per attempt (a Retry tap is a new
+// attempt): the FE's 10s abort cancels the daemon's r.Context(), so the
+// daemon caches a 502 under that key — a same-key retry would replay that
+// cached 502 forever and never converge. A fresh key re-executes against the
+// upstream pending map, which is SINGLE-SHOT (a second reply is a benign 404
+// — it can never double-apply), so fresh-key retry is both safe and
+// convergent. Within one attempt the key is stable, so a concurrent duplicate
+// of that attempt (double-fire racing the disabled state) dedupes at the
+// daemon (409 in-flight → reported as unknown).
+export async function respondPermission(
+  sessionID: string,
+  permissionID: string,
+  response: string,
+): Promise<ReplyOutcome> {
+  log.debug("permission", "reply", { sessionID, permissionID, response });
+  const res = await postBounded("/vh/reply-permission", {
+    permissionID,
+    sessionID,
+    reply: response,
+    idempotency_key: mintReplyKey(),
+  });
+  if (res.kind === "ok") {
+    // Confirmed — now (and only now) the card can go.
+    setState(
+      produce((s) => {
+        if (s.permissions[sessionID]) delete s.permissions[sessionID][permissionID];
+      }),
+    );
+    return { kind: "confirmed" };
+  }
+  if (res.kind === "timeout") {
+    replyOutcomeUnknown("Permission", sessionID, "no confirmation within 10s");
+    return { kind: "unknown", detail: "timeout" };
+  }
+  if (res.kind === "network") {
+    replyOutcomeUnknown("Permission", sessionID, `request failed (${String(res.error)})`);
+    return { kind: "unknown", detail: "network" };
+  }
+  const out = classifyReplyStatus(res.status);
+  if (out.kind === "unknown") {
+    replyOutcomeUnknown("Permission", sessionID, `HTTP ${res.status}`);
+  } else if (out.kind === "rejected") {
+    log.error("permission", "reply rejected", { status: res.status });
+    replyRejected("Permission", res.status, sessionID);
+  } else {
+    // gone: the card's terminal state is the surface — no notification.
+    log.warn("permission", "reply no longer pending upstream", { status: res.status });
+  }
+  return out;
+}
+
+// Reply to a pending question. `answers` is one array of chosen labels (or
+// custom strings) per question in the request. `sessionID` scopes the
+// notifications to the owning session (the card itself renders in-session).
+//
+// Same slice-4a contract as respondPermission, via POST /vh/answer-question.
+// The question card is NEVER deleted here on any path — confirmed relies on
+// the server's question.delete event (as before), and failure shapes keep the
+// card (unknown + Retry / gone terminal + dismiss).
+export async function respondQuestion(
+  questionID: string,
+  answers: string[][],
+  sessionID?: string,
+): Promise<ReplyOutcome> {
+  log.debug("question", "reply", { questionID, answers });
+  const res = await postBounded("/vh/answer-question", {
+    questionID,
+    answers,
+    idempotency_key: mintReplyKey(),
+  });
+  if (res.kind === "ok") return { kind: "confirmed" };
+  if (res.kind === "timeout") {
+    replyOutcomeUnknown("Question", sessionID, "no confirmation within 10s");
+    return { kind: "unknown", detail: "timeout" };
+  }
+  if (res.kind === "network") {
+    replyOutcomeUnknown("Question", sessionID, `request failed (${String(res.error)})`);
+    return { kind: "unknown", detail: "network" };
+  }
+  const out = classifyReplyStatus(res.status);
+  if (out.kind === "unknown") {
+    replyOutcomeUnknown("Question", sessionID, `HTTP ${res.status}`);
+  } else if (out.kind === "rejected") {
+    log.error("question", "reply rejected", { status: res.status });
+    replyRejected("Question", res.status, sessionID);
+  } else {
+    log.warn("question", "reply no longer pending upstream", { status: res.status });
+  }
+  return out;
+}
+
+// Acknowledge a gone-terminal reply card (send-net-resilience slice 4a).
+// After a 410/no-longer-pending terminal the request is dead upstream, but
+// the daemon may never deliver a permission.delete/question.delete event for
+// it (the shutdown shape) — Dismiss is the operator's explicit cleanup of the
+// dead card. FE-local store delete; if a later snapshot still carries the
+// request (daemon store not yet reconciled), the card may reappear and can be
+// dismissed again — bounded, honest, never data loss.
+export function dismissPermission(sessionID: string, permissionID: string): void {
   setState(
     produce((s) => {
       if (s.permissions[sessionID]) delete s.permissions[sessionID][permissionID];
     }),
   );
-  log.debug("permission", "reply", { sessionID, permissionID, response });
-  const canonical = await postBounded(
-    `/oc/permission/${encodeURIComponent(permissionID)}/reply`,
-    { reply: response },
-  );
-  if (canonical.kind === "ok") return;
-  if (canonical.kind === "timeout") {
-    // Outcome-unknown: the reply may have landed. Do NOT fall through to the
-    // legacy route (a second reply for the same request doubles the
-    // ambiguity) and do NOT restore the card — notify honestly.
-    replyOutcomeUnknown("Permission", sessionID);
-    return;
-  }
-  if (canonical.kind === "status") {
-    log.warn("permission", "canonical reply not ok → legacy route", { status: canonical.status });
-  } else {
-    log.warn("permission", "canonical reply threw → legacy route", canonical.error);
-  }
-  const legacy = await postBounded(
-    `/oc/session/${encodeURIComponent(sessionID)}/permissions/${encodeURIComponent(permissionID)}`,
-    { response },
-  );
-  if (legacy.kind === "ok") return;
-  if (legacy.kind === "timeout") {
-    replyOutcomeUnknown("Permission", sessionID);
-    return;
-  }
-  log.error("permission", "reply failed on both routes", {
-    status: legacy.kind === "status" ? legacy.status : String(legacy.kind),
-  });
 }
 
-// Reply to a pending question. `answers` is one array of chosen labels (or
-// custom strings) per question in the request.
-export async function respondQuestion(questionID: string, answers: string[][]) {
-  log.debug("question", "reply", { questionID, answers });
-  const res = await postBounded(`/oc/question/${encodeURIComponent(questionID)}/reply`, { answers });
-  if (res.kind === "ok") return;
-  if (res.kind === "timeout") {
-    replyOutcomeUnknown("Question");
-    return;
-  }
-  log.error("question", "reply failed", { status: res.kind === "status" ? res.status : String(res.kind) });
+export function dismissQuestion(sessionID: string, questionID: string): void {
+  setState(
+    produce((s) => {
+      if (s.questions[sessionID]) delete s.questions[sessionID][questionID];
+    }),
+  );
 }
 
 // Abort a session's turn and clear its working indicator. Exposed for the

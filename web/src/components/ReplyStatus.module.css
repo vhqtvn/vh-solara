@@ -1,0 +1,78 @@
+/* ReplyStatus — shared honest-lifecycle surface for the pending-input cards
+   (PermissionCard / QuestionCard), send-net-resilience slice 4a.
+   All classes :global — queried by unit tests (replyResilience.test.ts,
+   PermissionCard.test.tsx, QuestionCard.test.tsx) and e2e
+   (reply-resilience.spec.ts): .reply-status (+ .sending/.unknown/.gone),
+   .reply-retry, .reply-dismiss, .reply-status-text.
+   GPU-cheap by design: plain background tints via color-mix — no masks, no
+   backdrop-filter, no per-element contain (docs/ai/web-css-architecture.md
+   Firefox/WebRender guardrails). */
+
+:global(.reply-status) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 8px 0 2px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+:global(.reply-status-text) {
+  min-width: 0;
+  flex: 1 1 240px;
+}
+/* In flight: quiet, informational — no error semantics (nothing failed yet). */
+:global(.reply-status.sending) {
+  color: var(--fg-dim);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+}
+/* Outcome-unknown: warn posture — the reply may have been applied; never a
+   "failed" claim. The Retry affordance is the recovery path. */
+:global(.reply-status.unknown) {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+}
+:global(.reply-status.unknown .reply-retry) {
+  flex: 0 0 auto;
+}
+/* Gone-pending terminal: danger-adjacent but honest — NOT an error (nothing
+   the operator did failed) and NEVER success. Distinct from .unknown so the
+   two failure classes read differently at a glance. */
+:global(.reply-status.gone) {
+  color: var(--fg-dim);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  border: 1px dashed color-mix(in srgb, var(--danger) 30%, transparent);
+}
+:global(.reply-retry),
+:global(.reply-dismiss) {
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+:global(.reply-retry) {
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+  background: color-mix(in srgb, var(--warn) 14%, var(--bg-2));
+  color: var(--warn);
+}
+:global(.reply-retry:hover) {
+  background: color-mix(in srgb, var(--warn) 22%, var(--bg-2));
+}
+:global(.reply-dismiss) {
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--fg-dim);
+}
+:global(.reply-dismiss:hover) {
+  color: var(--fg);
+}
+:global(.reply-retry:disabled),
+:global(.reply-dismiss:disabled) {
+  opacity: 0.55;
+  cursor: default;
+}

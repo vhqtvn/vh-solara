@@ -303,10 +303,15 @@ export {
   createSessionWithCertainty,
   respondPermission,
   respondQuestion,
+  dismissPermission,
+  dismissQuestion,
   abortSession,
   markSessionIdle,
   consumeEpochChanged,
 } from "./sync/actions";
+// Typed human-reply outcome (send-net-resilience slice 4a) — consumed by the
+// pending-input cards to drive their honest lifecycle surface.
+export type { ReplyOutcome } from "./sync/actions";
 export type { SyncState } from "./sync/store";
 // Persisted per-session agent picks (composer dropdown), per project dir.
 // Consumed by agents.ts's evidence ladder — see sync/store.ts

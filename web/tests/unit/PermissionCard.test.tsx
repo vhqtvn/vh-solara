@@ -5,11 +5,15 @@ import { cleanup, render, waitFor } from "@solidjs/testing-library";
 // PermissionCard has NO markdown path (permissions keep a plain <pre>), so —
 // unlike QuestionCard.test.tsx — there is no renderMarkdown mock to wire.
 
-// Mock respondPermission so the three fast actions do not POST. Capture calls
-// to assert the (sessionID, permissionID, response) payload.
-const respondPermission = vi.fn(() => Promise.resolve());
+// Mock the sync barrel's reply surface so the fast actions do not POST.
+// respondPermission defaults to a confirmed outcome (the happy path the
+// pre-resilience tests pin); the resilience describe overrides the return
+// value per-test to drive unknown/gone/rejected states.
+const respondPermission = vi.fn(() => Promise.resolve({ kind: "confirmed" }));
+const dismissPermission = vi.fn();
 vi.mock("../../src/sync", () => ({
   respondPermission: (...args: unknown[]) => respondPermission(...args),
+  dismissPermission: (...args: unknown[]) => dismissPermission(...args),
 }));
 
 import PermissionCard from "../../src/components/PermissionCard";
@@ -212,5 +216,102 @@ describe("PermissionCard — 'Always' grant-set pinned reveal + hold notificatio
     expect(() =>
       render(() => <PermissionCard sessionID={sessionID} perm={permWithAlways} />),
     ).not.toThrow();
+  });
+});
+
+// Send-net-resilience slice 4a — the reply lifecycle states. The card is the
+// surface that makes a failed/unconfirmed reply RECOVERABLE: it never
+// optimistically destroys itself, it shows an honest outcome-unknown banner
+// with an explicit Retry (safe: upstream replies are single-shot), and a
+// gone-pending reply lands as a visible terminal that is never styled or
+// worded as success.
+describe("PermissionCard — reply resilience lifecycle", () => {
+  afterEach(() => {
+    cleanup();
+    respondPermission.mockClear();
+    dismissPermission.mockClear();
+    respondPermission.mockImplementation(() => Promise.resolve({ kind: "confirmed" }));
+  });
+
+  it("sending disables all three actions and shows a Sending indicator until the verb answers", async () => {
+    let release!: (v: unknown) => void;
+    respondPermission.mockImplementation(
+      () => new Promise((res) => (release = res)),
+    );
+    const { container } = render(() => (
+      <PermissionCard sessionID={sessionID} perm={perm} />
+    ));
+    container.querySelectorAll(".perm-actions button")[0].click();
+    await waitFor(() =>
+      expect(container.querySelector(".reply-status.sending")).toBeTruthy(),
+    );
+    // Single-flight: every action button is disabled while the reply is away.
+    for (const b of container.querySelectorAll(".perm-actions button"))
+      expect((b as HTMLButtonElement).disabled).toBe(true);
+    release({ kind: "confirmed" });
+    await waitFor(() =>
+      expect(container.querySelector(".reply-status")).toBeNull(),
+    );
+    for (const b of container.querySelectorAll(".perm-actions button"))
+      expect((b as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("outcome-unknown keeps the card actionable with an explicit Retry that re-sends the SAME answer", async () => {
+    respondPermission.mockImplementation(() =>
+      Promise.resolve({ kind: "unknown", detail: "timeout" }),
+    );
+    const { container } = render(() => (
+      <PermissionCard sessionID={sessionID} perm={perm} />
+    ));
+    container.querySelectorAll(".perm-actions button")[0].click(); // Allow once
+    await waitFor(() =>
+      expect(container.querySelector(".reply-status.unknown")).not.toBeNull(),
+    );
+    const banner = container.querySelector(".reply-status.unknown") as HTMLElement;
+    expect(banner.textContent).toContain("not confirmed");
+    expect(banner.textContent).toContain("may still have been applied");
+    // The normal actions stay enabled — choosing a different answer is also
+    // safe (upstream is single-shot; a stale request just 410s).
+    for (const b of container.querySelectorAll(".perm-actions button"))
+      expect((b as HTMLButtonElement).disabled).toBe(false);
+    // Retry re-sends the attempted answer.
+    (banner.querySelector(".reply-retry") as HTMLButtonElement).click();
+    await waitFor(() => expect(respondPermission).toHaveBeenCalledTimes(2));
+    expect(respondPermission.mock.calls[1]).toEqual([sessionID, "p1", "once"]);
+  });
+
+  it("gone-pending is a visible honest terminal: never success, actions disabled, Dismiss clears the card", async () => {
+    respondPermission.mockImplementation(() => Promise.resolve({ kind: "gone" }));
+    const { container } = render(() => (
+      <PermissionCard sessionID={sessionID} perm={perm} />
+    ));
+    container.querySelectorAll(".perm-actions button")[0].click();
+    await waitFor(() =>
+      expect(container.querySelector(".reply-status.gone")).not.toBeNull(),
+    );
+    const banner = container.querySelector(".reply-status.gone") as HTMLElement;
+    expect(banner.textContent).toContain("no longer pending");
+    expect(banner.textContent).toContain("not confirmed");
+    expect(banner.textContent).not.toContain("success");
+    // The request is dead upstream — answering again cannot work.
+    for (const b of container.querySelectorAll(".perm-actions button"))
+      expect((b as HTMLButtonElement).disabled).toBe(true);
+    (banner.querySelector(".reply-dismiss") as HTMLButtonElement).click();
+    expect(dismissPermission).toHaveBeenCalledWith(sessionID, "p1");
+  });
+
+  it("a definitive rejection returns the card to idle (still pending upstream, re-answerable)", async () => {
+    respondPermission.mockImplementation(() =>
+      Promise.resolve({ kind: "rejected", status: 400 }),
+    );
+    const { container } = render(() => (
+      <PermissionCard sessionID={sessionID} perm={perm} />
+    ));
+    container.querySelectorAll(".perm-actions button")[2].click(); // Reject
+    await waitFor(() => expect(respondPermission).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(container.querySelector(".reply-status")).toBeNull();
+    for (const b of container.querySelectorAll(".perm-actions button"))
+      expect((b as HTMLButtonElement).disabled).toBe(false);
   });
 });

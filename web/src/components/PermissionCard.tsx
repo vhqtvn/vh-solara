@@ -1,10 +1,11 @@
 import { createEffect, For, Show, createSignal } from "solid-js";
 import { Portal } from "solid-js/web";
 import type { Permission } from "../types";
-import { respondPermission } from "../sync";
+import { dismissPermission, respondPermission } from "../sync";
 import Icon from "./Icon";
 import { useCardPopup } from "./cardPopup";
 import { usePendingInputHold } from "./PendingInput";
+import ReplyStatus from "./ReplyStatus";
 import "./PermissionCard.css";
 
 // Category label for a permission request (best-effort: the structured fields
@@ -32,10 +33,13 @@ function permDetail(p: any): string {
 
 // Extracted permission card. Keeps the three inline fast actions
 // (Allow once / Always / Reject) calling respondPermission with the SAME
-// signature as before. No H/V toggle, no markdown body. Like QuestionCard, it
+// signature as before — but since send-net-resilience slice 4a they drive a
+// component-local reply lifecycle (sending / unknown+Retry / gone terminal,
+// via the shared ReplyStatus surface) instead of optimistically destroying
+// the card. No H/V toggle, no markdown body. Like QuestionCard, it
 // owns a popup-open signal and renders the SAME body() in both the inline
-// surface and a Portal overlay so the two stay synchronized (the body is
-// stateless here, so this is really "a second render surface for focus").
+// surface and a Portal overlay so the two stay synchronized (the body reads
+// this component's signals, so both surfaces mirror the reply state too).
 export default function PermissionCard(props: {
   sessionID: string;
   perm: Permission;
@@ -48,8 +52,46 @@ export default function PermissionCard(props: {
 
   const label = () => permLabel(props.perm);
   const detail = () => permDetail(props.perm);
-  const act = (resp: string) =>
-    respondPermission(props.sessionID, props.perm.id, resp);
+
+  // --- Reply lifecycle (send-net-resilience slice 4a) ---------------------
+  // Component-local attempt state — the honest surface for a reply that
+  // neither confirmed nor definitively failed. The card NEVER optimistically
+  // destroys itself; respondPermission deletes it only after a CONFIRMED 2xx
+  // (or the server's permission.delete event clears it independently).
+  //   sending — in flight; actions single-flighted.
+  //   unknown — outcome unconfirmed (may have been applied); explicit Retry
+  //             re-sends the SAME answer (safe: upstream is single-shot).
+  //   gone    — request no longer pending upstream; visible terminal, never
+  //             success; Dismiss is the operator's cleanup of the dead card.
+  // The signal is owned HERE (not in the global store) and is read by BOTH
+  // render surfaces via the shared body(), so the popup mirrors the state.
+  type ReplyState =
+    | { status: "idle" }
+    | { status: "sending" }
+    | { status: "unknown"; attempted: string }
+    | { status: "gone" };
+  const [replyState, setReplyState] = createSignal<ReplyState>({ status: "idle" });
+  const actionsLocked = () => {
+    const s = replyState().status;
+    return s === "sending" || s === "gone";
+  };
+
+  const act = async (resp: string) => {
+    if (actionsLocked()) return; // single-flight per attempt; gone is dead upstream
+    setReplyState({ status: "sending" });
+    const out = await respondPermission(props.sessionID, props.perm.id, resp);
+    if (out.kind === "unknown") setReplyState({ status: "unknown", attempted: resp });
+    else if (out.kind === "gone") setReplyState({ status: "gone" });
+    // confirmed: the action already deleted the card (it unmounts); rejected:
+    // definitive non-apply, still pending — both return to the actionable idle
+    // card for the mocked-store case where the card lingers.
+    else setReplyState({ status: "idle" });
+  };
+
+  const retry = () => {
+    const cur = replyState();
+    if (cur.status === "unknown") void act(cur.attempted);
+  };
 
   // --- "Always" grant-set reveal ---------------------------------------
   // OpenCode stamps the arity-prefix wildcard patterns a "Always" reply will
@@ -152,13 +194,21 @@ export default function PermissionCard(props: {
       <Show when={detail()}>
         <pre class="perm-detail">{detail()}</pre>
       </Show>
+      <Show when={replyState().status !== "idle"}>
+        <ReplyStatus
+          status={replyState().status as "sending" | "unknown" | "gone"}
+          onRetry={retry}
+          onDismiss={() => dismissPermission(props.sessionID, props.perm.id)}
+        />
+      </Show>
       <div class="perm-actions">
-        <button type="button" onClick={() => act("once")}>
+        <button type="button" disabled={actionsLocked()} onClick={() => act("once")}>
           Allow once
         </button>
         <button
           type="button"
           class="perm-always-btn"
+          disabled={actionsLocked()}
           onClick={() => act("always")}
           // Hover peek is inline-only: the popup always shows the full list
           // (body(true)), so letting the popup's Always button mutate the shared
@@ -190,7 +240,7 @@ export default function PermissionCard(props: {
             <Icon name="eye" size={13} />
           </button>
         </Show>
-        <button type="button" class="reject" onClick={() => act("reject")}>
+        <button type="button" class="reject" disabled={actionsLocked()} onClick={() => act("reject")}>
           Reject
         </button>
       </div>

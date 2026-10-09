@@ -152,6 +152,37 @@ type FakeOpenCode struct {
 	agentHoldMu    sync.Mutex
 	agentHoldBlock chan struct{}
 
+	// --- test-only reply-hold latch (send-net-resilience slice 4a e2e) ---
+	//
+	// One-shot park for the NEXT permission/question reply POST: while armed
+	// for a kind, that kind's canonical reply route neither applies nor
+	// answers — it parks until /fixture/reply-hold/release chooses a posture,
+	// or the request context dies (the daemon cancels the upstream call when
+	// the SPA's 10s reply bound aborts — the parked reply then stays
+	// UNapplied, exactly the unconfirmed-outcome world the slice-4a card
+	// states model). Release postures:
+	//   pass  — discard the parked reply; pending stays intact (the retry
+	//           hits a still-pending request and succeeds — retry-then-
+	//           success e2e);
+	//   apply — process the parked reply post-hoc (clear + emit replied; the
+	//           daemon→FE clear event converges the card with no retry at
+	//           all — the event-convergence e2e);
+	//   drop  — clear pending WITHOUT emitting (the shutdown-finalizer
+	//           world: no event ever comes; the retry 404s → the daemon maps
+	//           it to 410 → the gone-terminal e2e).
+	// All guarded by replyHoldMu; the parked handler blocks OUTSIDE f.mu and
+	// is bounded by its request context (same discipline as agentHoldBlock),
+	// so a parked reply can never stall the SSE fan-out or sibling requests.
+	// Off by default; existing fixtures/tests never arm it.
+	replyHoldMu     sync.Mutex
+	replyHoldArmed  bool
+	replyHoldKind   string        // "permission" | "question" (valid when armed)
+	replyHoldParked bool          // a reply POST is parked right now
+	replyHoldID     string        // the parked reply's request id
+	replyHoldApply  func()        // applies the parked reply (captured payload)
+	replyHoldMode   string        // "" until release: pass | apply | drop
+	replyHoldWake   chan struct{} // closed by release to wake the parked POST
+
 	// --- test-only new-session cold-hold latch (lane-6 new-session reveal e2e) ---
 	//
 	// While armed, the message-LIST GET (GET /session/:sid/message… — the
@@ -1491,6 +1522,13 @@ func (f *FakeOpenCode) Handler() http.Handler {
 	mux.HandleFunc("/fixture/agent-hold/arm", f.handleFixtureAgentHoldArm)
 	mux.HandleFunc("/fixture/agent-hold/release", f.handleFixtureAgentHoldRelease)
 	mux.HandleFunc("/fixture/agent-hold/reset", f.handleFixtureAgentHoldReset)
+	// Reply-hold latch (send-net-resilience slice 4a): park the next
+	// permission/question reply POST so the SPA's reply-resilience surfaces
+	// (outcome-unknown + Retry, gone terminal, event convergence) can be
+	// exercised against the real daemon verb + event stack.
+	mux.HandleFunc("/fixture/reply-hold/arm", f.handleFixtureReplyHoldArm)
+	mux.HandleFunc("/fixture/reply-hold/release", f.handleFixtureReplyHoldRelease)
+	mux.HandleFunc("/fixture/reply-hold/reset", f.handleFixtureReplyHoldReset)
 	mux.HandleFunc("/fixture/new-session-hold/arm", f.handleFixtureNewHoldArm)
 	mux.HandleFunc("/fixture/new-session-hold/release", f.handleFixtureNewHoldRelease)
 	mux.HandleFunc("/fixture/create-hold/arm", f.handleFixtureCreateHoldArm)
@@ -1530,17 +1568,41 @@ func (f *FakeOpenCode) Handler() http.Handler {
 		}
 		id := parts[1]
 		f.mu.Lock()
-		req := f.pendingP[id]
-		delete(f.pendingP, id)
+		_, pending := f.pendingP[id]
 		f.mu.Unlock()
-		sid := ""
-		if req != nil {
-			sid, _ = req["sessionID"].(string)
+		if !pending {
+			// Upstream parity (sst/opencode v1.17.18): the pending map is
+			// in-memory and SINGLE-SHOT — a reply for a request that is no
+			// longer pending 404s (the daemon maps it → 410 for the SPA via
+			// goneOn404, which drives the reply gone-terminal e2e). The old
+			// always-200 shape never existed on a real server.
+			http.Error(w, `{"error":"permission request not pending"}`, http.StatusNotFound)
+			return
 		}
-		f.emit("permission.replied", map[string]any{"sessionID": sid, "requestID": id})
+		apply := func() { f.applyPermissionReply(id) }
+		if f.parkReplyHold(w, r, "permission", id, apply) {
+			return // parked: the release posture decides its fate
+		}
+		apply()
 		writeJSON(w, true)
 	})
 	return mux
+}
+
+// applyPermissionReply resolves a pending permission request: clears it and
+// emits permission.replied (the daemon→FE permission.delete convergence
+// channel). Shared by the live reply routes (canonical + legacy) and the
+// reply-hold release-apply posture (slice 4a).
+func (f *FakeOpenCode) applyPermissionReply(id string) {
+	f.mu.Lock()
+	req := f.pendingP[id]
+	delete(f.pendingP, id)
+	f.mu.Unlock()
+	sid := ""
+	if req != nil {
+		sid, _ = req["sessionID"].(string)
+	}
+	f.emit("permission.replied", map[string]any{"sessionID": sid, "requestID": id})
 }
 
 // handleQuestion answers a pending question: POST /question/:id/reply.
@@ -1556,27 +1618,246 @@ func (f *FakeOpenCode) handleQuestion(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	f.mu.Lock()
+	_, pending := f.pendingQ[id]
+	f.mu.Unlock()
+	if !pending {
+		// Upstream parity (sst/opencode v1.17.18): the question pending map is
+		// in-memory and SINGLE-SHOT — a reply for a request that is no longer
+		// pending 404s (the daemon maps it → 410 for the SPA via goneOn404,
+		// driving the reply gone-terminal e2e). The old always-200 shape never
+		// existed on a real server.
+		http.Error(w, `{"error":"question request not pending"}`, http.StatusNotFound)
+		return
+	}
+	apply := func() { f.applyQuestionReply(id, body.Answers) }
+	if f.parkReplyHold(w, r, "question", id, apply) {
+		return // parked: the release posture decides its fate
+	}
+	apply()
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// applyQuestionReply resolves a pending question: clears it, emits
+// question.replied (the daemon→FE question.delete convergence channel), and
+// continues the turn with a streamed assistant reply. Shared by the live reply
+// route and the reply-hold release-apply posture (slice 4a).
+func (f *FakeOpenCode) applyQuestionReply(id string, answers [][]string) {
+	f.mu.Lock()
 	sid := f.pendingQ[id]
 	delete(f.pendingQ, id)
 	delete(f.pendingQReq, id)
 	f.mu.Unlock()
-	if sid != "" {
-		f.emit("question.replied", map[string]any{
-			"sessionID": sid, "requestID": id, "answers": body.Answers,
-		})
-		// Continue the turn: the assistant acts on the answer and streams a reply,
-		// so the user sees a visible result after replying.
-		chosen := "your choice"
-		if len(body.Answers) > 0 && len(body.Answers[0]) > 0 {
-			chosen = body.Answers[0][0]
-		}
-		f.mu.Lock()
-		f.counter++
-		n := f.counter
-		f.mu.Unlock()
-		go f.streamAssistant(sid, fmt.Sprintf("aq%d", n), fmt.Sprintf("apq%d", n),
-			[]string{"Got it — going with **" + chosen + "**.", "\n\nProceeding now."})
+	if sid == "" {
+		return
 	}
+	f.emit("question.replied", map[string]any{
+		"sessionID": sid, "requestID": id, "answers": answers,
+	})
+	// Continue the turn: the assistant acts on the answer and streams a reply,
+	// so the user sees a visible result after replying.
+	chosen := "your choice"
+	if len(answers) > 0 && len(answers[0]) > 0 {
+		chosen = answers[0][0]
+	}
+	f.mu.Lock()
+	f.counter++
+	n := f.counter
+	f.mu.Unlock()
+	go f.streamAssistant(sid, fmt.Sprintf("aq%d", n), fmt.Sprintf("apq%d", n),
+		[]string{"Got it — going with **" + chosen + "**.", "\n\nProceeding now."})
+}
+
+// parkReplyHold implements the reply-hold latch's PARK side: if the latch is
+// armed for `kind`, this call consumes it, records the reply's {id, apply}
+// payload, and BLOCKS until /fixture/reply-hold/release sets a posture (or the
+// parked request's context dies — the real-world shape when the SPA's 10s
+// bound aborts the fetch and the daemon cancels its upstream call). Returns
+// true when the request was parked (the caller must NOT answer it — the
+// posture, executed here, answers instead).
+//
+// Postures (see handleFixtureReplyHoldRelease):
+//
+//	apply → apply the parked reply (emit + clear pending) and 200 it;
+//	drop  → clear pending SILENTLY (no event — the shutdown/timeout world)
+//	        and 404 it (the daemon maps that to the SPA's 410 gone terminal);
+//	pass/"" → do NOT apply: pending stays intact. Used with an already-dead
+//	        parked request so a RETRY re-executes normally (retry-then-success).
+func (f *FakeOpenCode) parkReplyHold(w http.ResponseWriter, r *http.Request, kind, id string, apply func()) bool {
+	f.replyHoldMu.Lock()
+	if !f.replyHoldArmed || f.replyHoldKind != kind {
+		f.replyHoldMu.Unlock()
+		return false
+	}
+	// Consume the one-shot latch and park.
+	f.replyHoldArmed = false
+	f.replyHoldParked = true
+	f.replyHoldID = id
+	f.replyHoldApply = apply
+	f.replyHoldMode = ""
+	wake := f.replyHoldWake
+	f.replyHoldMu.Unlock()
+
+	select {
+	case <-wake:
+	case <-r.Context().Done():
+		// The client (the daemon, whose ctx the SPA's 10s abort cancelled)
+		// went away. Exit WITHOUT applying and WITHOUT answering: pending
+		// stays intact; the parked payload is kept so a later release with
+		// apply/drop can still posture the world posthumously.
+		f.replyHoldMu.Lock()
+		f.replyHoldParked = false
+		f.replyHoldMu.Unlock()
+		return true
+	}
+
+	f.replyHoldMu.Lock()
+	f.replyHoldParked = false
+	mode := f.replyHoldMode
+	f.replyHoldMu.Unlock()
+	if f.applyReplyHoldPosture(mode, kind, id, apply) {
+		writeJSON(w, true)
+	} else if mode == "drop" {
+		http.Error(w, `{"error":"reply dropped (fixture)"}`, http.StatusNotFound)
+	} else {
+		// "pass" / "": pending intact; the parked POST is not processed. A
+		// still-connected client gets an honest 503 (the daemon surfaces that
+		// as an outcome-unknown 502); the real e2e path is the dead client.
+		http.Error(w, `{"error":"reply parked (pass posture)"}`, http.StatusServiceUnavailable)
+	}
+	return true
+}
+
+// applyReplyHoldPosture runs a release posture's SIDE EFFECTS ONLY (no HTTP
+// answer): apply → run the captured apply (emit + clear pending); drop →
+// clear pending silently (no event — the upstream shutdown/timeout world);
+// pass → nothing (pending stays intact). Returns true when the reply was
+// APPLIED (the caller answers 200), false otherwise. Shared by the live
+// parked handler (after wake) and the posthumous release path (parked request
+// already died; only its captured {id, apply} payload remains).
+func (f *FakeOpenCode) applyReplyHoldPosture(mode, kind, id string, apply func()) bool {
+	switch mode {
+	case "apply":
+		apply()
+		return true
+	case "drop":
+		f.mu.Lock()
+		if kind == "question" {
+			delete(f.pendingQ, id)
+			delete(f.pendingQReq, id)
+		} else {
+			delete(f.pendingP, id)
+		}
+		f.mu.Unlock()
+		return false
+	default: // "pass" / ""
+		return false
+	}
+}
+
+// handleFixtureReplyHoldArm arms the one-shot reply-hold latch: the NEXT
+// pending-valid permission ("permission") or question ("question") reply POST
+// parks instead of applying.
+func (f *FakeOpenCode) handleFixtureReplyHoldArm(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Kind string `json:"kind"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Kind != "permission" && body.Kind != "question" {
+		http.Error(w, `{"error":"kind must be \"permission\" or \"question\""}`, http.StatusBadRequest)
+		return
+	}
+	f.replyHoldMu.Lock()
+	f.replyHoldArmed = true
+	f.replyHoldKind = body.Kind
+	f.replyHoldParked = false
+	f.replyHoldID = ""
+	f.replyHoldApply = nil
+	f.replyHoldMode = ""
+	f.replyHoldWake = make(chan struct{})
+	f.replyHoldMu.Unlock()
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// handleFixtureReplyHoldRelease chooses the parked reply's fate.
+//
+//	mode=pass  → leave pending intact (retry re-executes normally);
+//	mode=apply → apply the parked reply now (emit + clear — the "it landed
+//	             after all" event-convergence shape);
+//	mode=drop  → clear pending silently, emit nothing (the shutdown world).
+//
+// When the parked request already died (the SPA's 10s abort), apply/drop still
+// posture the world POSTHUMOUSLY via the captured payload — the response is
+// reported as {"ok":true,"posthumous":true}.
+func (f *FakeOpenCode) handleFixtureReplyHoldRelease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Mode string `json:"mode"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Mode != "pass" && body.Mode != "apply" && body.Mode != "drop" {
+		http.Error(w, `{"error":"mode must be \"pass\", \"apply\" or \"drop\""}`, http.StatusBadRequest)
+		return
+	}
+	f.replyHoldMu.Lock()
+	parked := f.replyHoldParked
+	id := f.replyHoldID
+	apply := f.replyHoldApply
+	kind := f.replyHoldKind
+	if parked {
+		// Live parked handler: hand it the posture and wake it.
+		f.replyHoldMode = body.Mode
+		close(f.replyHoldWake)
+		f.replyHoldMu.Unlock()
+		writeJSON(w, map[string]any{"ok": true})
+		return
+	}
+	if id == "" || apply == nil {
+		// No park ever happened (or was reset): nothing to posture.
+		f.replyHoldMode = body.Mode
+		f.replyHoldMu.Unlock()
+		writeJSON(w, map[string]any{"ok": true, "noPark": true})
+		return
+	}
+	// Posthumous: the parked request died on ctx cancellation; its captured
+	// payload is the only remnant. Execute the posture's SIDE EFFECTS here
+	// (pass is a no-op — pending was left intact by the dead park); the
+	// release endpoint's own response reports the posthumous execution.
+	f.replyHoldMode = body.Mode
+	f.replyHoldID = ""
+	f.replyHoldApply = nil
+	f.replyHoldMu.Unlock()
+	if body.Mode != "pass" {
+		f.applyReplyHoldPosture(body.Mode, kind, id, apply)
+	}
+	writeJSON(w, map[string]any{"ok": true, "posthumous": true})
+}
+
+// handleFixtureReplyHoldReset clears the latch entirely (test hygiene). A
+// still-parked handler is woken with the "" posture (pass — no apply).
+func (f *FakeOpenCode) handleFixtureReplyHoldReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	f.replyHoldMu.Lock()
+	parked := f.replyHoldParked
+	f.replyHoldArmed = false
+	f.replyHoldKind = ""
+	f.replyHoldParked = false
+	f.replyHoldID = ""
+	f.replyHoldApply = nil
+	f.replyHoldMode = ""
+	if parked {
+		close(f.replyHoldWake)
+	}
+	f.replyHoldMu.Unlock()
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -1799,9 +2080,19 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 	case action == "permissions" && r.Method == http.MethodPost:
 		permID := parts[len(parts)-1]
 		f.mu.Lock()
-		delete(f.pendingP, permID)
+		_, pending := f.pendingP[permID]
 		f.mu.Unlock()
-		f.emit("permission.replied", map[string]any{"sessionID": id, "requestID": permID})
+		if !pending {
+			// Upstream parity (sst/opencode v1.17.18): the session-scoped
+			// legacy permission reply also 404s when the request is no longer
+			// pending. Without this, the daemon's canonical→legacy fallback
+			// (pkg/opencode/client.go ReplyPermission) would see a bogus 200
+			// here after the canonical route 404'd, and the SPA could never
+			// observe the honest 410 gone terminal.
+			http.Error(w, `{"error":"permission request not pending"}`, http.StatusNotFound)
+			return
+		}
+		f.applyPermissionReply(permID)
 		writeJSON(w, map[string]any{"ok": true})
 		return
 	case action == "shell" && r.Method == http.MethodPost:

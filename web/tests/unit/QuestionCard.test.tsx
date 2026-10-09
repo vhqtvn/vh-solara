@@ -10,11 +10,15 @@ vi.mock("../../src/render", () => ({
   renderMarkdown: (text: string) => Promise.resolve(`<p>${text}</p>`),
 }));
 
-// Mock respondQuestion so submit() does not POST. Capture calls to assert the
-// answers[][] payload.
-const respondQuestion = vi.fn(() => Promise.resolve());
+// Mock respondQuestion so submit() does not POST. Defaults to the confirmed
+// happy path; the resilience describe overrides per-test. dismissQuestion is
+// the gone-terminal cleanup the card calls when the operator acknowledges an
+// unconfirmable reply.
+const respondQuestion = vi.fn(() => Promise.resolve({ kind: "confirmed" }));
+const dismissQuestion = vi.fn();
 vi.mock("../../src/sync", () => ({
   respondQuestion: (...args: unknown[]) => respondQuestion(...args),
+  dismissQuestion: (...args: unknown[]) => dismissQuestion(...args),
 }));
 
 import QuestionCard from "../../src/components/QuestionCard";
@@ -227,5 +231,90 @@ describe("QuestionCard — in-stream card + shared-state popup", () => {
     ) as HTMLButtonElement;
     inlineOpt.focus();
     expect(document.activeElement).toBe(inlineOpt);
+  });
+});
+
+// Send-net-resilience slice 4a — the question reply lifecycle states. The
+// question card previously had NO failure surface at all: a timed-out reply
+// left a lingering actionable card with no explicit state. Now the card shows
+// the same honest lifecycle as PermissionCard (shared ReplyStatus surface):
+// unknown keeps the card + an explicit Retry; gone is a visible terminal with
+// a Dismiss; nothing silently disappears.
+describe("QuestionCard — reply resilience lifecycle", () => {
+  afterEach(() => {
+    cleanup();
+    respondQuestion.mockClear();
+    dismissQuestion.mockClear();
+    respondQuestion.mockImplementation(() => Promise.resolve({ kind: "confirmed" }));
+  });
+
+  async function pickAndSubmit(container: HTMLElement) {
+    await waitFor(() =>
+      expect(container.textContent).toContain("Which approach"),
+    );
+    const card = container.querySelector(".question-card") as HTMLElement;
+    (card.querySelector(".question-opt") as HTMLButtonElement).click(); // Refactor
+    const send = card.querySelector(".question-send") as HTMLButtonElement;
+    expect(send.disabled).toBe(false);
+    send.click();
+    await waitFor(() => expect(respondQuestion).toHaveBeenCalledTimes(1));
+    return card;
+  }
+
+  it("passes the sessionID so notifications scope to the owning session", async () => {
+    const { container } = render(() => <QuestionCard question={question} />);
+    await pickAndSubmit(container);
+    expect(respondQuestion.mock.calls[0][2]).toBe("s1");
+  });
+
+  it("outcome-unknown keeps the card with an explicit Retry that re-sends the current answers", async () => {
+    respondQuestion.mockImplementation(() =>
+      Promise.resolve({ kind: "unknown", detail: "timeout" }),
+    );
+    const { container } = render(() => <QuestionCard question={question} />);
+    const card = await pickAndSubmit(container);
+    await waitFor(() =>
+      expect(container.querySelector(".reply-status.unknown")).not.toBeNull(),
+    );
+    const banner = container.querySelector(".reply-status.unknown") as HTMLElement;
+    expect(banner.textContent).toContain("not confirmed");
+    expect(banner.textContent).toContain("may still have been applied");
+    (banner.querySelector(".reply-retry") as HTMLButtonElement).click();
+    await waitFor(() => expect(respondQuestion).toHaveBeenCalledTimes(2));
+    expect(respondQuestion.mock.calls[1][0]).toBe("q1");
+    expect(respondQuestion.mock.calls[1][1]).toEqual([["Refactor"]]);
+    expect(respondQuestion.mock.calls[1][2]).toBe("s1");
+    // The card itself never disappeared.
+    expect(card.isConnected).toBe(true);
+  });
+
+  it("gone-pending is a visible honest terminal with a Dismiss; the card never silently vanishes", async () => {
+    respondQuestion.mockImplementation(() => Promise.resolve({ kind: "gone" }));
+    const { container } = render(() => <QuestionCard question={question} />);
+    const card = await pickAndSubmit(container);
+    await waitFor(() =>
+      expect(container.querySelector(".reply-status.gone")).not.toBeNull(),
+    );
+    const banner = container.querySelector(".reply-status.gone") as HTMLElement;
+    expect(banner.textContent).toContain("no longer pending");
+    expect(banner.textContent).toContain("not confirmed");
+    // Reply is disabled — the request is dead upstream.
+    const send = card.querySelector(".question-send") as HTMLButtonElement;
+    expect(send.disabled).toBe(true);
+    (banner.querySelector(".reply-dismiss") as HTMLButtonElement).click();
+    expect(dismissQuestion).toHaveBeenCalledWith("s1", "q1");
+    expect(card.isConnected).toBe(true); // removal happens via the store
+  });
+
+  it("a definitive rejection returns the card to actionable (still pending upstream)", async () => {
+    respondQuestion.mockImplementation(() =>
+      Promise.resolve({ kind: "rejected", status: 400 }),
+    );
+    const { container } = render(() => <QuestionCard question={question} />);
+    await pickAndSubmit(container);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(container.querySelector(".reply-status")).toBeNull();
+    const send = container.querySelector(".question-send") as HTMLButtonElement;
+    expect(send.disabled).toBe(false);
   });
 });
