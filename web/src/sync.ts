@@ -47,6 +47,7 @@ import {
 import { isPaneVisible, isDocVisible, onPaneVisibilityChange } from "./paneVisibility";
 import { watchdogTick, maybeReconnect, tickHealth, resyncTree, stampTreeResyncBoundary } from "./sync/health";
 import { installSyncDiagGlobal, countRecovery } from "./sync/recovery-reasons";
+import { installFetchSampler } from "./sync/weaklink";
 import { startPeriodicResync } from "./sync/periodic-resync";
 import { setSelectedId, switchProject, openSession } from "./sync/actions";
 
@@ -132,6 +133,12 @@ export function startSync() {
   // Slice 1 (webperf): install the dev-visible recovery counter surface
   // (`window.__vhSyncDiag()`) — a plain getter, zero cost until invoked.
   installSyncDiagGlobal();
+  // Slice 4c (send-net-resilience): the weak-link fetch sampler — a
+  // pass-through counting wrapper around globalThis.fetch feeding the
+  // `weakLink` section of the same __vhSyncDiag snapshot. Instrumentation
+  // only; never behavior. Installed BEFORE any app fetch runs (the boot
+  // connect(true) below) so the baseline denominator is honest from load.
+  installFetchSampler();
   // Slice 2 (webperf): the pane-visibility lifecycle. onPaneVisibilityChange
   // fires only on TRANSITIONS (paneVisibility.notify's last-value guard), so
   // the host's periodic resync messages cannot double-resume.

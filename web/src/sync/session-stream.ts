@@ -71,6 +71,7 @@ import {
 } from "./stream";
 import { captureDiagEntry } from "./diaglog";
 import { countRecovery, countSnapshotBytes } from "./recovery-reasons";
+import { recordStreamDrop } from "./weaklink";
 import { noteLivenessFrame } from "./liveness";
 
 // === Slice 3: part.append suffix streaming client opt-in ====================
@@ -858,6 +859,9 @@ function openSessionES(id: string): void {
         // capped at 15s, reset on a healthy open (ses.onopen). sesCursor resume
         // (f54ffff4) is preserved — backoff gates the REOPEN cadence, not the
         // cursor logic.
+        // Weak-link baseline (slice 4c): the session transport gave up (CLOSED)
+        // — one browser-vantage stream drop. Counted only; never authority.
+        recordStreamDrop("session");
         clearTimeout(sesRetry);
         sesRetry = window.setTimeout(() => openSessionES(id), sesBackoff);
         sesBackoff = Math.min(sesBackoff * 2, 15_000);

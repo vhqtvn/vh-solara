@@ -92,6 +92,7 @@ import {
 } from "./stream";
 import { captureDiagEntry } from "./diaglog";
 import { countRecovery, countSnapshotBytes } from "./recovery-reasons";
+import { recordStreamDrop } from "./weaklink";
 import { noteLivenessFrame } from "./liveness";
 
 // Parse a compound SSE id ("globalSeq.ordinal") or legacy numeric id.
@@ -1288,6 +1289,9 @@ export function connect(fresh = false) {
     if (es && es.readyState === EventSource.CLOSED) {
       treeGen++;
       cancelPendingOwner();
+      // Weak-link baseline (slice 4c): the tree transport gave up (CLOSED) —
+      // one browser-vantage stream drop. Counted only; never authority.
+      recordStreamDrop("tree");
       log.warn("sync", "tree stream closed → reconnecting", { backoff });
       clearTimeout(reconnectTimer);
       reconnectTimer = window.setTimeout(connect, backoff);

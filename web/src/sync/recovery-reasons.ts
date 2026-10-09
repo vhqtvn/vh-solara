@@ -20,7 +20,16 @@
 //
 // Reason codes are STABLE strings — operator evidence packs and dashboards may
 // grep them. Do not rename; extend only.
+//
+// SLICE 4C NOTE (weak-link baseline): the SSE-gap detections live HERE
+// ("seq-gap" / "tree-seq-gap") and the watchdog stales live HERE (the four
+// *-stale codes) — together with weaklink.ts's fetch-failure and stream-drop
+// counters (surfaced as the `weakLink` section of this same snapshot below)
+// they form the FE-VANTAGE weak-link baseline. BINDING: future threshold
+// tuning gates on these FE-vantage counters, never on daemon-only proxy
+// metrics (see weaklink.ts's header for the full rule).
 import { log } from "../lib/log";
+import { readWeakLink, type WeakLinkSnapshot } from "./weaklink";
 
 // The full closed vocabulary of recovery reasons. Each maps 1:1 to an existing
 // distinct force path (they already exist as distinct causes — kept distinct):
@@ -180,6 +189,10 @@ export interface SyncDiagSnapshot {
   recovery: Partial<Record<RecoveryReason, { count: number; lastTs: number }>>;
   /** Cumulative snapshot payload bytes received, per stream, since load. */
   snapshotBytes: { tree: number; session: number };
+  /** Weak-link FE-vantage counters (slice 4c): fetch failures by class +
+   *  transport stream drops. SSE-gap/watchdog-stale signals stay in
+   *  `recovery` above — one snapshot, one console call. */
+  weakLink: WeakLinkSnapshot;
   /** Wall-clock ms when this snapshot was taken. */
   generatedAt: number;
 }
@@ -194,6 +207,7 @@ export function readSyncDiag(): SyncDiagSnapshot {
   return {
     recovery,
     snapshotBytes: { tree: snapBytes.tree, session: snapBytes.session },
+    weakLink: readWeakLink(),
     generatedAt: Date.now(),
   };
 }

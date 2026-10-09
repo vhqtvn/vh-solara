@@ -53,6 +53,25 @@ type Services struct {
 // inspecting headers. The X-VH-Idempotent-Replay header is preserved (backward
 // compat). This is the one write-safety primitive a feature needs; the CAS lives
 // in the verb that wants it (via Agg(...).Store()).
+//
+// ADMISSION RULE (send-net-resilience debate-2 Q6, document-only fold): the
+// cache backing this helper is IN-MEMORY with a 10-minute TTL and dies with the
+// daemon (see the honest-tradeoff note in session_create.go). Every verb
+// currently admitted here is safe under that volatility because its upstream
+// effect is single-shot or a benign no-op on re-fire after a restart:
+//   - /vh/reply-permission, /vh/answer-question — upstream pending maps are
+//     single-shot (a second reply is a benign 404, mapped to 410);
+//   - /vh/send, /vh/spawn, /vh/abort — send/spawn own their own durable queue
+//     custody receipt path; abort on a restarted idle session is a benign
+//     idle-set;
+//   - /vh/session/create — the bound-payload receipt exists precisely to make
+//     a post-restart re-fire converge instead of duplicating.
+//
+// Any FUTURE operation added to this cache whose re-fire after a daemon restart
+// would NOT be benign (i.e. could duplicate a non-single-shot upstream effect)
+// requires durable custody/receipt (the queue-custody pattern) or exclusion
+// from this cache. Reviewers: treat a new WithIdempotency call site whose verb
+// lacks a single-shot/no-op proof as a blocker.
 func (svc Services) WithIdempotency(w http.ResponseWriter, key string, fn func() (int, []byte, string)) {
 	if key == "" {
 		st, b, _ := fn()

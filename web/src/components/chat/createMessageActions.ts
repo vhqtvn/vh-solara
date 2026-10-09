@@ -13,6 +13,7 @@
 import { createSignal, type Accessor } from "solid-js";
 import { markSessionIdle, openSession, setSelectedId, state } from "../../sync";
 import { msgTextOnly, msgTextWithThinking } from "../../lib/msgText";
+import { pushNotification } from "../../notify";
 
 export interface MessageActionsDeps {
   // Session id for revert/unrevert/fork/abort/retry targets.
@@ -66,17 +67,96 @@ export function createMessageActions(deps: MessageActionsDeps): MessageActions {
     return JSON.stringify({ summary, parts: m.partOrder.map((pid: string) => m.parts[pid]) }, null, 2);
   }
 
-  // One-click fork from a turn.
+  // One-click fork from a turn — FE-bound guard (send-net-resilience slice 4c,
+  // DEC-A8 "guard only"). Upstream fork is NOT idempotent and carries NO
+  // caller-supplied id (research-packet-2 §A3: ForkPayload = {messageID} only;
+  // a retry mints a full duplicate session "(fork #N)" with fresh message/part
+  // ids — nothing links or removes the orphan). The /oc reverse proxy imposes
+  // NO server-side bound on this POST (no total Transport timeout), so the FE
+  // AbortController below is the ONLY bound. Three guards, and NOTHING else
+  // changes about the success path:
+  //   1. SINGLE-FLIGHT: one fork POST in flight per controller — a double-tap
+  //      (or a second fork gesture while one runs) is a silent no-op, because
+  //      each in-flight POST is one potentially-duplicating mutation.
+  //   2. BOUND: FORK_TIMEOUT_MS (below) aborts a hung socket.
+  //   3. HONEST OUTCOME-UNKNOWN: on timeout / network failure / 5xx / a 2xx
+  //      whose body carries no session id, surface the outcome-unknown
+  //      notification with the inspect-tree guidance. NEVER auto-retry — an
+  //      automatic re-POST is exactly the duplicate-session machine this
+  //      guard exists to prevent. A definitive non-2xx (4xx) is the one
+  //      non-unknown class: the server answered and no fork was created.
+  //
+  // FORK_TIMEOUT_MS = 15s: fork is a session-CREATING action whose upstream
+  // cost strictly exceeds a plain create (createNext + a durable per-message/
+  // per-part copy of the whole prefix before messageID), so it sits one notch
+  // above CREATE_SESSION_TIMEOUT_MS (12s) in the same bound family (replies
+  // 10s / create 12s / fork 15s) instead of reusing the create bound. The
+  // value is an ASSUMPTION pending weak-link baseline data (weaklink.ts) —
+  // tune only against FE-vantage counters.
+  const FORK_TIMEOUT_MS = 15_000;
+  let forkInFlight = false;
   async function fork(messageID: string) {
-    const res = await fetch(`/oc/session/${encodeURIComponent(deps.sessionId())}/fork`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messageID }),
-    });
-    const s = await res.json().catch(() => null);
-    if (s?.id) {
-      setSelectedId(s.id);
-      void openSession(s.id);
+    if (forkInFlight) return; // single-flight: no double-fire
+    forkInFlight = true;
+    const sessionID = deps.sessionId();
+    // Mirrors replyOutcomeUnknown's honesty discipline (sync/actions.ts): the
+    // POST may have been applied upstream, so this must NOT claim "failed",
+    // and the guidance names the concrete duplicate risk.
+    const outcomeUnknown = (detail: string) => {
+      pushNotification({
+        kind: "error",
+        sessionID,
+        title: "Fork outcome unknown",
+        detail:
+          "The fork was sent but no confirmation arrived — it may still have been created. " +
+          "Inspect the session tree before retrying: a retry may create a duplicate session " +
+          "that cannot be automatically cancelled." +
+          (detail ? ` (${detail})` : ""),
+      });
+    };
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), FORK_TIMEOUT_MS);
+    try {
+      const res = await fetch(`/oc/session/${encodeURIComponent(sessionID)}/fork`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messageID }),
+        signal: ctrl.signal,
+      });
+      if (res.ok) {
+        const s = await res.json().catch(() => null);
+        if (s?.id) {
+          // Success: the pre-guard behavior, unchanged.
+          setSelectedId(s.id);
+          void openSession(s.id);
+          return;
+        }
+        // 2xx whose body has no session id: upstream likely applied the fork
+        // but the answer is unusable — outcome unknown, not "not created".
+        outcomeUnknown("response carried no session id");
+        return;
+      }
+      // 5xx (incl. the proxy's transport-failure 502): the POST may have been
+      // applied en route — outcome unknown. 4xx is a definitive server answer:
+      // no fork exists, and the notice must not manufacture ambiguity.
+      if (res.status >= 500) {
+        outcomeUnknown(`HTTP ${res.status}`);
+      } else {
+        pushNotification({
+          kind: "error",
+          sessionID,
+          title: "Fork not created",
+          detail: `The server rejected the fork (HTTP ${res.status}); no fork was created.`,
+        });
+      }
+    } catch (e) {
+      // Network error or the FORK_TIMEOUT_MS abort — no response confirmed
+      // either way: outcome unknown, never auto-retried here.
+      const aborted = ctrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError");
+      outcomeUnknown(aborted ? `no confirmation within ${FORK_TIMEOUT_MS / 1000}s` : `request failed (${String(e)})`);
+    } finally {
+      clearTimeout(timer);
+      forkInFlight = false;
     }
   }
 
