@@ -27,6 +27,17 @@ import { projectUrl } from "./util";
 //              event channel even though the HTTP response was lost ("it
 //              landed after all" — convergence without retry).
 //
+// The QUESTION-shaped lifecycle (cluster C, defer G1) mirrors the TIMEOUT
+// scenario through the [[ask]] marker + kind:"question" reply-hold arm — the
+// same ReplyStatus surface, plus the question-specific affordances (options +
+// custom answer) staying LIVE under the unknown state, and the retry
+// re-submitting the CURRENT selections (upstream question replies are
+// single-shot, so a retry can never double-apply — it either lands or comes
+// back gone). Posture: PASS (scenario A's shape — pending stays intact
+// upstream, so the retry executes normally and lands; the apply posture's
+// event-convergence shape is already pinned by the permission EVENT test
+// through the same shared channel).
+//
 // The suite is SERIAL (workers:1) over one shared fixtureserver: each test
 // sends its own [[perm]] prompt (fresh permN id) and the afterEach resets the
 // reply-hold latch so no posture leaks across specs.
@@ -175,4 +186,72 @@ test("a reply that landed upstream after the timeout converges via the server ev
   // the event channel, without any retry gesture.
   await releaseReplyHold(request, "apply");
   await expect(page.locator(".perm-card")).toHaveCount(0, { timeout: 8000 });
+});
+
+// --- question-shaped lifecycle (cluster C, defer G1) ----------------------------
+
+// Raise a question card in a FRESH session (the [[ask]] marker — the fixture
+// seeds "Which approach should I take?" with Refactor/Rewrite options + the
+// default-enabled custom answer). raisePermissionCard's shape: draft-mode
+// creation, session id captured for the afterEach /fixture/delete (the
+// question-armed turn never idles on its own).
+async function raiseQuestionCard(page: import("@playwright/test").Page) {
+  currentSession = "";
+  await page.goto(projectUrl("/"));
+  await page.getByRole("button", { name: "Create session" }).click();
+  await page.getByPlaceholder("Message…").fill("[[ask]] please decide");
+  await page.keyboard.press("Enter");
+  const card = page.locator(".question-card");
+  await expect(card).toBeVisible({ timeout: 8000 });
+  await expect
+    .poll(async () => new URL(page.url()).searchParams.get("session") ?? "")
+    .not.toBe("");
+  currentSession = new URL(page.url()).searchParams.get("session") ?? "";
+  return card;
+}
+
+test("timed-out question reply keeps the card (unknown + Retry); options stay live; Retry re-submits the CURRENT selection and clears the card", async ({ page, request }) => {
+  test.setTimeout(60000); // one real 10s abort window + the retry landing
+  await armReplyHold(request, "question");
+  const card = await raiseQuestionCard(page);
+
+  // Question-specific surfaces function BEFORE the failure: the options and
+  // the custom-answer textarea render, and Reply stays disabled until a
+  // selection exists (interactive.spec's shape).
+  await expect(card).toContainText("Which approach should I take?");
+  await expect(card.locator(".question-custom")).toBeVisible();
+  const reply = card.getByRole("button", { name: "Reply" });
+  await expect(reply).toBeDisabled();
+  await card.getByText("Refactor").click();
+  await expect(reply).toBeEnabled();
+
+  // The answer gesture parks on the held question verb → the live sending
+  // state (the Reply button single-flights while the attempt is out).
+  await reply.click();
+  const status = page.locator(".reply-status");
+  await expect(status).toHaveClass(/sending/, { timeout: 3000 });
+  await expect(reply).toBeDisabled();
+
+  // 10s REPLY_TIMEOUT_MS abort → outcome-unknown: the card STAYS (never
+  // silently disappears — the dead end this lifecycle closed), states the
+  // uncertainty honestly, offers Retry.
+  await expect(status).toHaveClass(/unknown/, { timeout: 13000 });
+  await expect(status).toContainText("not confirmed");
+  await expect(status).toContainText("may still have been applied");
+  await expect(page.locator(".question-card")).toHaveCount(1);
+
+  // The question surfaces stay LIVE under unknown (the failure must not
+  // freeze the card): switch the selection and draft a custom answer — the
+  // retry below re-submits the CURRENT selections (unit-pinned safe: upstream
+  // question replies are single-shot).
+  await card.getByText("Rewrite").click();
+  await card.locator(".question-custom").fill("with tests");
+
+  // release(pass): pending stays intact upstream — the retry re-executes
+  // normally (scenario A's shape) and lands: 200 + question.replied → the
+  // card clears, and the turn continues referencing the RE-SUBMITTED answer.
+  await releaseReplyHold(request, "pass");
+  await page.locator(".reply-retry").click();
+  await expect(page.locator(".question-card")).toHaveCount(0, { timeout: 8000 });
+  await expect(page.locator(".msg.assistant").last()).toContainText("Rewrite", { timeout: 8000 });
 });

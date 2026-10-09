@@ -30,6 +30,20 @@
 //      durable record → "Try saving again" re-commits through REAL IDB →
 //      banner clears → re-send proceeds to admission (the RECOVERY half of
 //      the BLK-A3 surface; scenario C proves the failure half from boot)
+//   G. stale two-tap replacement (cluster C, D-F4): a probe session seeded
+//      ambiguous via route-simulated daemon facts (scenario D's shape), whose
+//      live transcript head REALLY moves after the original gesture (a real
+//      prompt_async turn through the fixture + real SSE) → the first tap
+//      renders the INLINE stale-confirm with ZERO enqueues; "Send anyway"
+//      with the head HELD admits exactly ONE replacement under a NEW
+//      intentId (chip → replacement-requested; both display truthfully)
+//   G-drift: the same shape, but the head moves AGAIN during the confirm
+//      window → "Send anyway" REFUSES loudly (notification + zero enqueues +
+//      no second outbox record; the chip stays actionable)
+//   H. two LIVE tabs (cluster C, r3-bF1/gate-aF3+dF1): REAL BroadcastChannel
+//      + the REAL sessionStorage opener-copy — the clone tab's same-text
+//      cross-eval prune is objected over the real channel and BOTH records
+//      coexist (the conservative skip); the opener's record is never deleted
 //
 // Hygiene: part of the serial suite over the shared fixtureserver. Queue
 // state is owned + cleaned per test via the real queue API (queue-recovery
@@ -168,8 +182,20 @@ test.beforeEach(async ({ request }, testInfo) => {
   await cleanQueue(request);
 });
 
+// The popup page scenario H opened (deterministic cleanup — the serial lane
+// must never leak a second live tab into later specs). Declared here so the
+// afterEach below can close it on failure paths.
+let scenarioHPopup: Page | null = null;
+
 test.afterEach(async ({ request }) => {
   await cleanQueue(request);
+  // Scenario H's popup (deterministic two-tab hygiene): close it if the test
+  // failed before its own cleanup. close() on an already-closed page is a
+  // no-op, so this is safe on every path.
+  if (scenarioHPopup) {
+    await scenarioHPopup.close().catch(() => {});
+    scenarioHPopup = null;
+  }
 });
 
 // --- A. tab-kill mid-flow ------------------------------------------------------
@@ -628,4 +654,474 @@ test("F: transient IDB failure → blocking banner + retained text → retry re-
   const finalRecord = (await readOutbox(page))[0];
   expect(finalRecord.queueItemId).toBeTruthy(); // linked to the admitted item
   expect(await page.evaluate(() => (window as any).__reloadCount)).toBe(0); // no-reload recovery
+});
+
+// --- shared machinery for G / G-drift / H (cluster C) ---------------------------
+
+/** Queue-list URL predicate for an arbitrary session id (scenario B/D's
+ *  isQueueListUrl idiom, parameterized): the exact /queue path with optional
+ *  query — never the claim/resolve sub-paths (the SPA's queue URLs carry NO
+ *  query string; the project dir travels in the x-opencode-directory header,
+ *  so a `queue?*` glob can never match — see scenario B's note). */
+const queueUrlPredicate = (sid: string) => (url: URL) =>
+  new RegExp(`/vh/session/${sid}/queue(\\?.*)?$`).test(url.href);
+
+/** Queue list for an arbitrary session (listQueue, parameterized). */
+async function listQueueFor(request: APIRequestContext, sid: string): Promise<any[]> {
+  const res = await request.get(`/vh/session/${sid}/queue?dir=${encodeURIComponent(demoDir)}`);
+  expect(res.ok(), `queue list ${sid}`).toBeTruthy();
+  const j = await res.json();
+  return Array.isArray(j.items) ? j.items : [];
+}
+
+/** Delete one gesture record page-side (the same IDB handle readOutbox
+ *  inspects). Used for post-assertion hygiene: G/H are the first scenarios
+ *  that can leave `saved` records for the SHARED demo session (H) — without
+ *  this, a later serial-suite spec's demo reconcile would age them past the
+ *  60s guard and re-admit them as phantom queue items. */
+async function deleteOutboxRecords(page: Page, intentIds: string[]): Promise<void> {
+  await page.evaluate(
+    (ids) =>
+      new Promise<void>((resolve) => {
+        const open = indexedDB.open("vh-solara-outbox");
+        open.onerror = () => resolve();
+        open.onsuccess = () => {
+          const db = open.result;
+          if (!db.objectStoreNames.contains("gestures")) return resolve();
+          const tx = db.transaction("gestures", "readwrite");
+          for (const id of ids) tx.objectStore("gestures").delete(id);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => resolve();
+          tx.onabort = () => resolve();
+        };
+      }),
+    intentIds,
+  );
+}
+
+/** Remove a probe session's queue items (pending items delete cleanly) and
+ *  then the probe session itself (session-rail's /fixture/delete pattern).
+ *  G's scenarios append REAL transcript turns to the probe; the fixture's
+ *  simulated replies carry NO agent stamp, which would clear a shared
+ *  session's tree agent chip and composer agent evidence for every later
+ *  serial-suite spec — so the probes are ALWAYS hermetic + deleted. */
+async function cleanupProbe(request: APIRequestContext, sid: string): Promise<void> {
+  try {
+    const items = await listQueueFor(request, sid).catch(() => [] as any[]);
+    for (const it of items) {
+      await request.delete(
+        `/vh/session/${sid}/queue/${encodeURIComponent(it.id)}?dir=${encodeURIComponent(demoDir)}`,
+        { headers: jsonCsrf },
+      );
+    }
+  } finally {
+    await request.post(`/oc/fixture/delete?session=${encodeURIComponent(sid)}`, { headers: jsonCsrf });
+  }
+}
+
+/** Move the live transcript head with a REAL second turn: an in-page POST to
+ *  the real prompt_async route (session-rail's prompt() shape) through the
+ *  real fixture, whose user+assistant messages land in the real transcript
+ *  store via real SSE. Waits for the streamed reply to complete — the stable
+ *  head point (no further appends after this returns). */
+async function moveHeadWithRealTurn(page: import("@playwright/test").Page, sid: string, text: string): Promise<void> {
+  await page.evaluate(
+    async ({ sid, text }) => {
+      const res = await fetch(`/oc/session/${encodeURIComponent(sid)}/prompt_async`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
+        body: JSON.stringify({ parts: [{ type: "text", text }] }),
+      });
+      if (!res.ok && res.status !== 204) throw new Error(`prompt -> ${res.status}`);
+    },
+    { sid, text },
+  );
+  await expect(page.locator(".msg.assistant").last()).toContainText("Done. Updated", { timeout: 15_000 });
+}
+
+/** Seed the stale two-tap shape (scenario G family) in a FRESH probe session:
+ *  projection-mode daemon facts route-simulated exactly like scenario D
+ *  (capability advertised, claim/resolve refused, list rewriting the ORIGINAL
+ *  item to the terminal ambiguous marker), one REAL composer gesture whose
+ *  outbox record captures the provably-empty probe head, and the ambiguous
+ *  chip surfaced via a focus-triggered list refetch.
+ *
+ *  WHY A PROBE (never the shared demo session): the head must REALLY move
+ *  after the gesture, and the only honest way to move it is a real prompt
+ *  turn — whose fixture replies carry no agent stamp (they would clear the
+ *  demo session's agent evidence for every later serial-suite spec; the
+ *  session-rail spec documents the same hazard). The probe's transcript
+ *  starts provably empty, so the captured head is DETERMINISTICALLY
+ *  {sid, null, 0} — asserted from the durable record below (the stale gate's
+ *  basis; a null capture would make the whole scenario vacuous, so it must
+ *  fail loudly here, not silently pass later). */
+async function seedStaleAmbiguous(
+  page: Page,
+  request: APIRequestContext,
+  text: string,
+): Promise<{
+  sid: string;
+  originalItemId: string;
+  originalIntentId: string;
+  enqueuePosts: () => number;
+}> {
+  // Hermetic probe (session-rail's mkProbe): a fresh EMPTY session in the
+  // demo project dir.
+  const oc = { "X-VH-CSRF": "1", "x-opencode-directory": demoDir };
+  const created = await request.post("/oc/session", { headers: oc, data: {} });
+  if (!created.ok()) throw new Error(`probe create failed: ${created.status()} ${created.statusText()}`);
+  const sid = ((await created.json()) as { id: string }).id;
+
+  // Scenario D's route-simulated daemon facts, parameterized to the probe +
+  // an enqueue-POST counter (the load-bearing zero/one assertions of the
+  // stale two-tap paths read it).
+  let ambiguousId: string | null = null;
+  let enqueuePosts = 0;
+  await page.route("**/vh/version", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ version: "e2e-projection", daemonDispatchCapable: true }),
+    }),
+  );
+  await page.route(`**/vh/session/${sid}/queue/claim*`, (route) =>
+    route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({ ok: false, error: "queue custody active", code: "queue_custody_active" }),
+    }),
+  );
+  await page.route(`**/vh/session/${sid}/queue/*/resolve*`, (route) =>
+    route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({ ok: false, error: "queue custody active", code: "queue_custody_active" }),
+    }),
+  );
+  const isQueueUrl = queueUrlPredicate(sid);
+  await page.route(isQueueUrl, async (route) => {
+    const method = route.request().method();
+    if (method === "GET") {
+      const res = await route.fetch();
+      const j: any = await res.json();
+      if (Array.isArray(j.items)) {
+        for (const it of j.items) {
+          if (ambiguousId && it.id === ambiguousId && it.state !== "sent") {
+            it.state = "unknown";
+            it.reconcileTerminal = true;
+            it.ambiguousDelivery = true;
+            it.detail = "journal-aware ambiguous-wait (e2e simulated)";
+          }
+        }
+      }
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(j) });
+    }
+    if (method === "POST") enqueuePosts++;
+    return route.continue();
+  });
+
+  await installReloadCounter(page);
+  await page.goto(projectUrl("/?session=" + encodeURIComponent(sid)));
+  // Send-readiness guard (scenario B's rationale): the composer's agent label
+  // resolves only after the empty probe's transcript hydrates "provably
+  // empty" (the config-default agent branch) — which is ALSO the point where
+  // state.messages[sid] is resident, so the gesture below captures a REAL
+  // non-null head.
+  await expect(page.locator(".composer .agent-select .vh-select-label")).toHaveText(/@/, {
+    timeout: 20_000,
+  });
+  const composer = page.getByPlaceholder("Message…");
+  await composer.fill(text);
+  await composer.press("Enter");
+  // The gesture: REAL save + REAL admission through the REAL daemon queue
+  // API — exactly one item, exactly one POST.
+  await expect(page.locator(".queue-chip", { hasText: text })).toBeVisible({ timeout: 10_000 });
+  await expect.poll(async () => (await listQueueFor(request, sid)).length, { timeout: 5000 }).toBe(1);
+  expect(enqueuePosts, "the original gesture admitted exactly once").toBe(1);
+  const item = (await listQueueFor(request, sid))[0];
+  const originalIntentId: string = item.intentId ?? item.attemptId;
+  expect(originalIntentId).toBeTruthy();
+  // The durable record: admitted + linked, and the STALE-GATE BASIS — the
+  // captured head is the provably-empty probe head (non-null, count 0). If
+  // this ever fails, the app changed when the transcript slot becomes
+  // resident and every downstream stale assertion would be vacuous.
+  await expect
+    .poll(
+      async () => {
+        const recs = await readOutbox(page);
+        return recs.find((r) => r.intentId === originalIntentId && r.status === "admitted") ?? null;
+      },
+      { timeout: 5000 },
+    )
+    .toBeTruthy();
+  const record = ((await readOutbox(page)).find((r) => r.intentId === originalIntentId) ?? {}) as any;
+  expect(record.capturedHead).toEqual({ sessionId: sid, lastMessageId: null, count: 0 });
+
+  // Arm the ambiguous marker and surface the chip via a focus-triggered list
+  // refetch (the ~5s poll would also catch it; focus is deterministic).
+  ambiguousId = item.id;
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(page.getByTestId("ambiguous-chip")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("ambiguous-chip")).toHaveAttribute("data-state", "active");
+  return { sid, originalItemId: item.id, originalIntentId, enqueuePosts: () => enqueuePosts };
+}
+
+// --- G. stale two-tap replacement, head holds -----------------------------------
+test("G: stale two-tap — inline confirm on the first tap (no enqueue); 'Send anyway' with the head HELD admits exactly ONE replacement under a NEW intentId", async ({
+  page,
+  request,
+}) => {
+  const text = `stale two tap holds ${Date.now()}`;
+  const seed = await seedStaleAmbiguous(page, request, text);
+  try {
+    // Move the live head AFTER the original gesture captured {sid,null,0}:
+    // a REAL second turn (real prompt_async through the fixture + real SSE
+    // into the real transcript store). The live head deterministically
+    // becomes {sid,<new id>,2} ≠ the captured head.
+    await moveHeadWithRealTurn(page, seed.sid, "e2e head move (holds variant)");
+
+    // FIRST TAP: the inline stale-confirm — NOT an immediate enqueue.
+    await page.getByTestId("ambiguous-replace").click();
+    const confirm = page.getByTestId("ambiguous-stale-confirm");
+    await expect(confirm).toBeVisible({ timeout: 5000 });
+    await expect(confirm).toContainText("The conversation moved on since this message was sent.");
+    await expect(page.getByTestId("ambiguous-replace-anyway")).toBeVisible();
+    await expect(page.getByTestId("ambiguous-stale-cancel")).toBeVisible();
+    // The verbatim warning stays behind the confirm; the chip is still active.
+    await expect(page.getByTestId("ambiguous-warning")).toBeVisible();
+    await expect(page.getByTestId("ambiguous-chip")).toHaveAttribute("data-state", "active");
+    // NON-VACUOUS (the refusal direction): the first tap enqueued NOTHING —
+    // this fails if the controller ever skips the confirmation.
+    expect(seed.enqueuePosts(), "the first tap must NOT enqueue").toBe(1); // 1 = the original gesture only
+
+    // SECOND TAP with the head HELD during the confirm window: the operator
+    // acknowledged exactly this drift → ONE replacement under a NEW intentId.
+    await page.getByTestId("ambiguous-replace-anyway").click();
+    const chip = page.getByTestId("ambiguous-chip");
+    await expect(chip).toHaveAttribute("data-state", "replacement-requested", { timeout: 10_000 });
+    expect(seed.enqueuePosts(), "exactly ONE replacement enqueue (and nothing else)").toBe(2); // original + replacement
+    // The REAL daemon list holds exactly the two items, and the replacement
+    // is a NEW gesture: a different id AND a different intentId.
+    const items = await listQueueFor(request, seed.sid);
+    expect(items).toHaveLength(2);
+    const original = items.find((i: any) => i.id === seed.originalItemId)!;
+    const replacement = items.find((i: any) => i.id !== seed.originalItemId)!;
+    expect(original.intentId ?? original.attemptId).toBe(seed.originalIntentId);
+    expect(replacement.intentId).toBeTruthy();
+    expect(replacement.intentId).not.toBe(seed.originalIntentId);
+    // BOTH display truthfully: the replacement renders as its own pending
+    // chip; the original renders the chip's replacement-requested state.
+    await expect(page.locator('.queue-chip[data-state="pending"]', { hasText: text })).toBeVisible({
+      timeout: 10_000,
+    });
+    await expect(chip).toHaveAttribute("data-state", "replacement-requested");
+    // The durable overlay: the ORIGINAL record carries replacedBy → the NEW
+    // intentId (the FE-owned marker the chip renders across reloads).
+    const recs = await readOutbox(page);
+    const orig = recs.find((r) => r.intentId === seed.originalIntentId) as any;
+    expect(orig?.replacedBy).toBe(replacement.intentId);
+    expect(await page.evaluate(() => (window as any).__reloadCount)).toBe(0);
+  } finally {
+    await cleanupProbe(request, seed.sid);
+  }
+});
+
+// --- G-drift. stale two-tap, drift DURING the confirm window --------------------
+test("G-drift: stale two-tap — the head moving DURING the confirm window makes 'Send anyway' refuse loudly (zero enqueues, chip stays actionable)", async ({
+  page,
+  request,
+}) => {
+  const text = `stale two tap drifts ${Date.now()}`;
+  const seed = await seedStaleAmbiguous(page, request, text);
+  try {
+    // First head move → first tap → the inline confirm renders (the pending
+    // baseline is armed with the first-tap head).
+    await moveHeadWithRealTurn(page, seed.sid, "e2e head move (first drift)");
+    await page.getByTestId("ambiguous-replace").click();
+    await expect(page.getByTestId("ambiguous-stale-confirm")).toBeVisible({ timeout: 5000 });
+    expect(seed.enqueuePosts()).toBe(1); // the original gesture only
+
+    // DRIFT DURING THE CONFIRM WINDOW: the head moves AGAIN before "Send
+    // anyway" — the drift the operator NEVER acknowledged.
+    await moveHeadWithRealTurn(page, seed.sid, "e2e head move (second drift)");
+
+    await page.getByTestId("ambiguous-replace-anyway").click();
+    // LOUD refusal — the real NotificationCenter surface. (Which branch
+    // refused is structurally pinned: the stale-confirm UI above rendered
+    // from the SAME "stale-confirm" tap verdict that arms pendingConfirm, so
+    // the no-pending branch is unreachable here — the refusal can only be
+    // the compare-at-REPLACEMENT drift branch.)
+    const bell = page.getByRole("button", { name: "Notifications" });
+    await expect(bell.locator(".notif-badge")).toBeVisible({ timeout: 8000 });
+    await bell.click();
+    const item = page.locator(".notif-item", { hasText: "Conversation moved on" }).first();
+    await expect(item.locator(".notif-title")).toContainText("Conversation moved on");
+    await expect(item.locator(".notif-detail")).toContainText(
+      "Nothing was sent. The conversation changed again",
+    );
+    // THE load-bearing refusal assertions — this test FAILS if the controller
+    // enqueued: zero replacement POSTs, zero new outbox records, one item.
+    expect(seed.enqueuePosts(), "drift-during-confirm must NOT enqueue").toBe(1);
+    const recs = (await readOutbox(page)).filter((r) => (r as any).sessionId === seed.sid);
+    expect(recs, "no second outbox record was saved").toHaveLength(1);
+    expect(recs[0].intentId).toBe(seed.originalIntentId);
+    expect(await listQueueFor(request, seed.sid)).toHaveLength(1);
+    // The chip stays actionable: back to the three actions behind the warning.
+    const chip = page.getByTestId("ambiguous-chip");
+    await expect(chip).toHaveAttribute("data-state", "active");
+    await expect(page.getByTestId("ambiguous-replace")).toBeVisible();
+    await expect(page.getByTestId("ambiguous-stale-confirm")).toHaveCount(0);
+    expect(await page.evaluate(() => (window as any).__reloadCount)).toBe(0);
+  } finally {
+    await cleanupProbe(request, seed.sid);
+  }
+});
+
+// --- H. two LIVE tabs, REAL BroadcastChannel objection --------------------------
+
+test("H: two LIVE tabs (opener-copied sessionStorage) — the clone's cross-eval prune is objected over the REAL BroadcastChannel; both records coexist", async ({
+  page,
+  request,
+  context,
+}) => {
+  await installReloadCounter(page);
+  // BOTH tabs' admission POSTs are genuinely aborted (predicate
+  // interception, scenario B's idiom): every record stays `saved` — the
+  // status the prune matches — and NO queue churn happens at all.
+  const isQueueListUrl = queueUrlPredicate(SID);
+  let abortedPosts = 0;
+  const blockAdmission = async (p: Page) => {
+    await p.route(isQueueListUrl, (route) => {
+      if (route.request().method() === "POST") {
+        abortedPosts++;
+        return route.abort();
+      }
+      return route.continue();
+    });
+    await p.route(`**/vh/session/${SID}/queue/claim*`, (route) => route.abort());
+    await p.route(`**/oc/session/${SID}/prompt_async*`, (route) => route.abort());
+  };
+  await blockAdmission(page);
+  await openSession(page);
+  // Scenario B's guards: transcript resident + a resolved composer agent.
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 20_000 });
+  await expect(page.locator(".composer .agent-select .vh-select-label")).toHaveText(/@/, {
+    timeout: 10_000,
+  });
+  const text = `two live tabs one text ${Date.now()}`;
+  const composer = page.getByPlaceholder("Message…");
+  await composer.fill(text);
+  await composer.press("Enter");
+  // Tab A's record commits through REAL IDB: status saved (its POST was
+  // genuinely aborted — the crash-window posture), stamped with A's clientId
+  // + bootNonce.
+  await expect
+    .poll(async () => {
+      const recs = await readOutbox(page);
+      return recs.filter((r) => (r as any).payload?.text === text).length;
+    }, { timeout: 5000 })
+    .toBe(1);
+  const recA = ((await readOutbox(page)).find((r) => (r as any).payload?.text === text) ?? {}) as any;
+  expect(recA.status).toBe("saved");
+  expect(recA.clientId).toBeTruthy();
+  expect(recA.bootNonce).toBeTruthy();
+  const intentA = recA.intentId;
+
+  // A PASSIVE sniffer on the REAL claim channel, installed in tab A before
+  // tab B exists. BroadcastChannel delivery is same-origin broadcast to every
+  // open channel object, so the sniffer observes BOTH the clone's 'who-has'
+  // and the app module's 'mine' answer — the honest discriminator between
+  // "objection received → skip" and "no answer → timeout → also skip" (both
+  // end in coexistence; only this makes the objection OBSERVABLE). Purely
+  // passive: receiving changes nothing about the gate under test.
+  await page.evaluate(() => {
+    (window as any).__bcLog = [];
+    const ch = new BroadcastChannel("vh-solara-outbox");
+    ch.onmessage = (ev: MessageEvent) => {
+      const d = ev.data as { type?: string; id?: string } | null;
+      (window as any).__bcLog.push({ type: d?.type, id: d?.id, t: Date.now() });
+    };
+  });
+
+  // Tab B: opener-created same-origin tab — the platform COPIES sessionStorage
+  // into it (the exact shape the bootNonce + uncontested-claim gate exist
+  // for): SAME clientId, DIFFERENT page-evaluation nonce.
+  const popupPromise = context.waitForEvent("page");
+  await page.evaluate(() => window.open(location.href));
+  const pageB = await popupPromise;
+  scenarioHPopup = pageB;
+  await blockAdmission(pageB);
+  // Same session + send-readiness guards as tab A (the prune match is
+  // same-session + same-text).
+  await expect(pageB.locator(".msg").first()).toBeVisible({ timeout: 20_000 });
+  await expect(pageB.locator(".composer .agent-select .vh-select-label")).toHaveText(/@/, {
+    timeout: 10_000,
+  });
+  // The COPY actually happened — otherwise this scenario is vacuous (a
+  // different-clientId tab would never enter the cross-eval branch at all).
+  const [idA, idB] = await Promise.all([
+    page.evaluate(() => sessionStorage.getItem("vh-solara-outbox-client")),
+    pageB.evaluate(() => sessionStorage.getItem("vh-solara-outbox-client")),
+  ]);
+  expect(idB, "sessionStorage was copied into the opener-created tab").toBe(idA);
+  expect(idB).toBe(recA.clientId);
+
+  // Tab B saves the SAME session + SAME text gesture: REAL saveGesture →
+  // REAL put through REAL IDB → pruneSupersededOwnTab finds tab A's record
+  // (same clientId — the copy) under a DIFFERENT nonce → the cross-eval
+  // uncontested-claim gate runs over the REAL channel.
+  const composerB = pageB.getByPlaceholder("Message…");
+  await composerB.fill(text);
+  await composerB.press("Enter");
+  // WAIT STRATEGY (timing honesty): poll the IDB state until the clone's
+  // record EXISTS (the put committed — the prune scan follows inside the
+  // same saveGesture), then a bounded 400ms settle window > CLAIM_WAIT_MS
+  // (120ms) + margin for the gate verdict to land, then assert — never a
+  // bare sleep as the only gate.
+  await expect
+    .poll(async () => {
+      const recs = await readOutbox(page);
+      return recs.filter((r) => (r as any).payload?.text === text).length;
+    }, { timeout: 8000 })
+    .toBe(2);
+  await page.waitForTimeout(400);
+  const recs = (await readOutbox(page)).filter((r) => (r as any).payload?.text === text) as any[];
+  expect(recs).toHaveLength(2);
+  const recB = recs.find((r) => r.intentId !== intentA)!;
+  expect(recB.status).toBe("saved");
+  expect(recB.clientId, "the clone writes under the COPIED tab identity").toBe(recA.clientId);
+  expect(recB.bootNonce).toBeTruthy();
+  expect(recB.bootNonce, "the clone is a DIFFERENT page evaluation").not.toBe(recA.bootNonce);
+  // COEXISTENCE — the conservative skip: tab A's original record SURVIVED the
+  // clone's prune scan (this assertion fails in the gate-less world, where
+  // the clone deletes the live opener's record).
+  const survived = recs.find((r) => r.intentId === intentA);
+  expect(survived?.status).toBe("saved");
+  // No delete of A's record happened at all: still exactly the two records.
+  expect((await readOutbox(page)).filter((r) => (r as any).payload?.text === text)).toHaveLength(2);
+
+  // The handshake genuinely traversed the REAL channel: the clone asked
+  // who-has and the live opener's permanent module listener answered 'mine'
+  // (the objection — proof this is the objected skip, not the timeout skip).
+  const log = (await page.evaluate(() => (window as any).__bcLog)) as Array<{
+    type?: string;
+    id?: string;
+  }>;
+  const whoHas = log.find((e) => e.type === "who-has" && e.id === recA.clientId);
+  const mine = log.find((e) => e.type === "mine" && e.id === recA.clientId);
+  expect(whoHas, "the clone's cross-eval prune posted who-has on the real channel").toBeTruthy();
+  expect(mine, "the live opener's permanent listener objected ('mine')").toBeTruthy();
+
+  // NON-VACUOUS interception: both tabs' admission POSTs really were aborted.
+  expect(abortedPosts).toBeGreaterThanOrEqual(2);
+  // No queue churn whatsoever.
+  expect(await listQueue(request)).toHaveLength(0);
+
+  // Hygiene: close tab B deterministically, and remove BOTH demo-session
+  // `saved` records (this spec's own reconcile would otherwise eventually
+  // re-admit them after the 60s age guard — see deleteOutboxRecords).
+  await pageB.close();
+  scenarioHPopup = null;
+  await deleteOutboxRecords(page, [intentA, recB.intentId]);
+  expect(await page.evaluate(() => (window as any).__reloadCount)).toBe(0);
 });
