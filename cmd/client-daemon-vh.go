@@ -17,6 +17,39 @@ import (
 	"github.com/vhqtvn/vh-solara/pkg/web"
 )
 
+// wireDaemonDispatch applies the --daemon-dispatch opt-in for the --web=vh
+// topology, mirroring local-server's reference wiring (send-net-resilience
+// 2b): the daemon takes exclusive custody-fenced ownership of queue
+// dispatch. Spawned (owned), restart-managed, and detached OpenCode
+// topologies enable normally; the EXTERNAL topology (--opencode-url) is
+// REFUSED — the queue-custody fence is available, but the restart
+// causality barrier is NOT certified for an externally-managed OpenCode
+// (an out-of-band restart this daemon cannot observe breaks the certified
+// auto-recovery ladder's premises), so dispatch stays browser-owned.
+// Non-Linux needs no case here: custody acquisition fails closed
+// platform-side (AcquireQueueCustody refuses; the drain loop treats any
+// non-held acquire as a fail-closed exit), so an enabled capability cannot
+// dispatch on an unsupported platform.
+//
+// It must run BEFORE the first project is opened (aggFor starts the
+// per-project drain loop at project-open time) and before the first
+// /vh/version read (the capability advert reads the live value) — the same
+// ordering local-server guarantees. Returns whether the capability was
+// enabled (pure decision seam: unit-tested in client_daemon_dispatch_test.go
+// because setupVHMode itself spawns a real OpenCode).
+func wireDaemonDispatch(flagSet, external bool) bool {
+	if !flagSet {
+		return false
+	}
+	if external {
+		log.Printf("client-daemon: --daemon-dispatch ignored in --opencode-url (external) mode: the queue-custody fence is available but the restart causality barrier is NOT certified for an externally-managed OpenCode — dispatch stays browser-owned. Re-run without --opencode-url to use daemon dispatch.")
+		return false
+	}
+	web.SetDaemonDispatchEnabled(true)
+	log.Printf("client-daemon: daemon queue dispatch ENABLED (custody-fenced; certified auto-recovery ladder active)")
+	return true
+}
+
 // setupVHMode is the process owner for the --web=vh topology: it spawns (or
 // attaches to) the OpenCode serve process, builds the embedded web Server,
 // wires the managed-project process manager, registers the restart/update/
@@ -104,6 +137,14 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 	setOpenCodeRunningVersion(opencodeCurrentVersion(context.Background(), daemonOpenCodeBin, rt.cwd))
 
 	agg := aggregator.New(rt.opencodeURL, vhEventRingCapacity)
+
+	// Daemon queue dispatch (the --daemon-dispatch opt-in; production
+	// default OFF — the browser stays the dispatcher via the legacy
+	// claim/POST/resolve path). Applied AFTER the aggregator exists and
+	// BEFORE the web server / any project-open so the first /vh/version
+	// read and the first drain loop already see the final capability
+	// posture — the same ordering local-server guarantees.
+	wireDaemonDispatch(daemonDaemonDispatch, rt.external)
 
 	// Build the web server first — it seeds the archived-session overlay
 	// into the store before the aggregator hydrates.

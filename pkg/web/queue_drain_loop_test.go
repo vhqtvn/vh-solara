@@ -495,6 +495,72 @@ func TestDrainLoopReloadProjectTeardownReleasesCustody(t *testing.T) {
 	})
 }
 
+// TestDrainLoopStopDuringPublicationWindow (the slice-5 armed BLOCK defer —
+// the l.cancel publication-window race): a stopQueueDrainLoop issued in the
+// publication window — after the loop entry is visible in the registry but
+// before the loop goroutine is launched — must return PROMPTLY. Pre-fix the
+// derived context + its cancel were created AFTER the registry publication,
+// so a stop racing into that window saw l.cancel == nil, skipped the cancel,
+// and parked on <-l.done forever: only the server-wide bgCtx cancel (never
+// fired by reload-project) or the parked loop's own eventual exit could close
+// done — the stopper hung. Deterministic via the queueDrainPostPublishSeam
+// interleave: the stop is issued inside the exact window, with the stopper
+// COMMITTED past its registry read (observed via the teardown's map deletion)
+// before the window is allowed to close.
+func TestDrainLoopStopDuringPublicationWindow(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("flock semantics — Linux only")
+	}
+	f := newFakeOCForDrain(t)
+	srv, _ := newDrainTestServer(t, f)
+
+	// A NON-DEFAULT dir: stopQueueDrainLoop's teardown path (the default
+	// dir's loop is daemon/process-lifetime owned).
+	dir := t.TempDir()
+
+	stopReturned := make(chan struct{})
+	queueDrainPostPublishSeam = func() {
+		go func() {
+			srv.stopQueueDrainLoop(dir)
+			close(stopReturned)
+		}()
+		// Commit the stopper past its registry read: the teardown deletes
+		// the entry under drainLoopsMu, so poll for the deletion — then
+		// give it a beat to execute its cancel check (pre-fix: the nil
+		// read) and park on done before this seam returns and the window
+		// closes.
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			srv.drainLoopsMu.Lock()
+			_, still := srv.drainLoops[dir]
+			srv.drainLoopsMu.Unlock()
+			if !still {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Cleanup(func() { queueDrainPostPublishSeam = nil })
+
+	// The start, through real HTTP: aggFor(dir) on first touch runs
+	// maybeStartQueueDrainLoop, which executes the seam inside the window.
+	webURL := srvLocalURL(t, srv)
+	resp, err := http.Get(webURL + "/vh/snapshot?dir=" + url.QueryEscape(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	select {
+	case <-stopReturned:
+		// The concurrent stop returned: it observed the RETAINED
+		// per-loop cancel, fired it, and the loop exited.
+	case <-time.After(5 * time.Second):
+		t.Fatal("stopQueueDrainLoop issued in the publication window never returned — it missed the per-loop cancel (the l.cancel publication race)")
+	}
+}
+
 // TestDrainLoopLeavesLegacyItemsToGetOnlyReconcile (slice 5, legacy `unknown`
 // migration pin): a PRE-custody-era item (legacy browser claim:
 // ClaimGeneration==0, no attempt journal) sharing a queue with a custody-era

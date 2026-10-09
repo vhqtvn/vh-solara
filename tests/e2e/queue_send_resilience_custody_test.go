@@ -366,20 +366,34 @@ func TestQueueCustodyReloadProjectTeardownAndReplacementLoop(t *testing.T) {
 
 	// Settle: exactly ONE arrival for the item, converged to sent by the
 	// exact-ID reconcile (accepted 204 → persisted → GET resolves — the
-	// happy-path convergence under the replacement loop).
+	// happy-path convergence under the replacement loop). Phase-specific
+	// deadline (send-net-resilience armed defer): a convergence timeout
+	// must fail HERE — named as this phase, with the item states dumped —
+	// not fall through silently into the duplicate-dispatch invariant
+	// below, which would narrate a slow convergence as a duplicate and
+	// borrow this phase's budget without naming it.
 	var items []custodyItemView
-	deadline = time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
+	settleDeadline := time.Now().Add(10 * time.Second)
+	converged := false
+	for time.Now().Before(settleDeadline) {
 		items = listCustodyQueue(t, sid, dir)
 		if len(items) == 1 && items[0].State == "sent" {
+			converged = true
 			break
 		}
 		time.Sleep(40 * time.Millisecond)
 	}
+	if !converged {
+		for _, it := range items {
+			t.Logf("item %s state=%s terminal=%v ambiguous=%v detail=%q", it.ID, it.State, it.ReconcileTerminal, it.AmbiguousDelivery, it.Detail)
+		}
+		t.Fatalf("replacement-loop item never settled to sent within 10s (arrivals delta=%d, last=%+v)", cluster.Fake.PromptArrivals(sid)-baseArrivals, items)
+	}
+
+	// Settled invariant — checked only AFTER convergence, so a failure here
+	// can only mean a genuine duplicate dispatch across the reload cutover,
+	// never a convergence timeout wearing this message.
 	if got := cluster.Fake.PromptArrivals(sid) - baseArrivals; got != 1 {
 		t.Fatalf("PromptArrivals delta=%d, want exactly 1 (no duplicate dispatch across the reload cutover)", got)
-	}
-	if len(items) != 1 || items[0].State != "sent" {
-		t.Fatalf("post-reload item = %+v, want one item reconciled to sent", items)
 	}
 }

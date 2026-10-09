@@ -50,6 +50,7 @@ var (
 	daemonFrameAncestors   []string
 	daemonProjectConfig    string // --project-config override path for managed projects
 	daemonTrustOnOpen      bool   // headless: auto-approve repo-declared configs
+	daemonDaemonDispatch   bool   // (vh only) --daemon-dispatch: daemon-owned queue dispatch (EXPERIMENTAL, default OFF)
 )
 
 var clientDaemonCmd = &cobra.Command{
@@ -320,6 +321,7 @@ func init() {
 	clientDaemonCmd.Flags().BoolVar(&daemonExternalManaged, "external-managed", false, "(vh only) The vh daemon is run under a supervisor (e.g. systemd, Restart=always); on a 'restart server' request it exits cleanly and lets the supervisor relaunch it, instead of re-exec'ing itself")
 	clientDaemonCmd.Flags().StringVar(&daemonOpenCodeRestart, "opencode-restart-cmd", "", "(vh only, external) Command to restart externally-managed OpenCode, e.g. 'systemctl --user restart opencode'")
 	clientDaemonCmd.Flags().BoolVar(&daemonOpenCodeDetached, "opencode-detached", false, "(vh only) Spawn OpenCode detached and reconnect to it across vh restarts (survives self-update); vh owns it via a pidfile")
+	clientDaemonCmd.Flags().BoolVar(&daemonDaemonDispatch, "daemon-dispatch", false, "(vh only) EXPERIMENTAL (send-net-resilience 2b): the daemon takes exclusive custody-fenced ownership of queue dispatch (certified auto-recovery). Default off: the browser stays the dispatcher. Refuses (no-op) with --opencode-url (external) mode")
 
 	// Managed-project processes + views (repo-declared .vh-solara/project.jsonc).
 	clientDaemonCmd.Flags().StringVar(&daemonProjectConfig, "project-config", "", "(vh only) Override path to the managed-project config (default: <project>/.vh-solara/project.jsonc)")

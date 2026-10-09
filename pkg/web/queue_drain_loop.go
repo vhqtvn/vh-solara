@@ -102,6 +102,11 @@ const (
 // Atomic for the same race reasons as every other tunable in this package.
 var drainTickOverride atomic.Int64 // nanoseconds; 0 = const default
 
+// queueDrainPostPublishSeam — see the invocation site in
+// maybeStartQueueDrainLoop for the contract. TEST-ONLY interleave seam
+// (mirrors queueDrainPrePostSeam): nil in production.
+var queueDrainPostPublishSeam func()
+
 // SetQueueDrainTickForTest overrides the drain loop's base tick for the
 // duration of a test. TEST-ONLY: production code MUST NOT call this. Pass
 // d <= 0 to restore. Callers SHOULD defer-restore.
@@ -154,9 +159,33 @@ func (s *Server) maybeStartQueueDrainLoop(dir string) {
 		vhlog.Warn("queue drain: projectRoot failed; loop not started", "dir", dir, "err", err)
 		return
 	}
-	l := &queueDrainLoop{srv: s, dir: dir, root: root, done: make(chan struct{})}
+	// The derived context + its cancel are created — and the cancel
+	// RETAINED on the loop struct — BEFORE the registry publication (the
+	// slice-5 armed defer's fix, hardened from "retained" to
+	// "retained-before-published"): the loop ctx derives from bgCtx, which
+	// reload-project does NOT cancel, so stopQueueDrainLoop depends on the
+	// per-loop cancel. Publishing the entry first would leave a window in
+	// which a concurrent stop reads l.cancel == nil (a data race AND a
+	// missed cancel), skips the cancel, and parks on <-l.done forever —
+	// only bgCtx (never fired by reload) could ever close it. Assigning
+	// under the publication mutex gives every registry reader a
+	// happens-before edge onto the non-nil cancel.
+	ctx, cancel := context.WithCancel(s.bgCtx)
+	l := &queueDrainLoop{srv: s, dir: dir, root: root, cancel: cancel, done: make(chan struct{})}
 	s.drainLoops[dir] = l
 	s.drainLoopsMu.Unlock()
+
+	// queueDrainPostPublishSeam is a TEST-ONLY interleave seam placed in
+	// the publication window: after the loop entry is visible in the
+	// registry (mutex released) and before the loop goroutine is launched.
+	// It exists to prove the publication-window contract deterministically
+	// (the slice-5 armed defer): a stopQueueDrainLoop issued at this point
+	// must observe the loop's RETAINED per-loop cancel — which therefore
+	// must be assigned BEFORE the registry publication, not after. nil in
+	// production; tests MUST restore nil.
+	if queueDrainPostPublishSeam != nil {
+		queueDrainPostPublishSeam()
+	}
 
 	// Non-default dirs track on lifecycleWG so Reload/Shutdown can await a
 	// full exit (stopQueueDrainLoop waits on done); the default dir's loop
@@ -165,13 +194,6 @@ func (s *Server) maybeStartQueueDrainLoop(dir string) {
 	if dir != "" {
 		s.lifecycleWG.Add(1)
 	}
-	ctx, cancel := context.WithCancel(s.bgCtx)
-	// RETAIN the per-loop cancel (the armed defer's fix): the loop ctx
-	// derives from bgCtx, which reload-project does NOT cancel — without a
-	// retained cancel, stopQueueDrainLoop's <-done wait never completes,
-	// /vh/reload-project hangs, and the custody flock stays wedged until
-	// process exit.
-	l.cancel = cancel
 	go func() {
 		l.run(ctx)
 		cancel()
