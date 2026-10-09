@@ -150,6 +150,7 @@ is **no pytest** anywhere in this repo.
    prove the shell works when `window.__host` is absent. No Go, no fixtureserver.
    Runner (survival + shell; Chromium + Firefox + WebKit): `npm --prefix host-web run test:e2e`.
    Runner (production-build proof; Chromium + Firefox): `npm --prefix host-web run test:e2e:preview`.
+   Typecheck: `npm --prefix host-web run typecheck`.
    Docker route (survival + shell, all three engines; no host Node/browsers needed — host needs only docker, and host-web/node_modules is auto-installed in-container if missing): operator `make test-host-web-docker` (scoped: `make test-host-web-docker ARGS='--project=webkit'`), agent `vh-agent-harness exec make test-host-web-docker`. Image pin: `PLAYWRIGHT_IMAGE` in the Makefile, coupled to the host-web `@playwright/test` pin. See [`docs/ai/docker-test-routes.md`](../docs/ai/docker-test-routes.md).
 
 8. **host-web real-embedding e2e** — `host-web/tests/real-embed-e2e/real-embed.spec.ts`
@@ -174,8 +175,9 @@ is **no pytest** anywhere in this repo.
     `cd host-web && npx playwright test --config=playwright.real-embed.config.ts`
     (after the binary is built; or `bash host-web/scripts/real-embed-run.sh`).
 
-9. **host-web folded-posture restore e2e** — `host-web/tests/folded-e2e/folded-restore.spec.ts`
-   (Playwright). The only lane that runs the host in the PRODUCTION FOLD
+9. **host-web folded-posture restore e2e** — `host-web/tests/folded-e2e/`
+   (`folded-restore.spec.ts`, `folded-sw-narrow.spec.ts`, `layouts-sync.spec.ts`,
+   `folded-theme.spec.ts`; Playwright). The only lane that runs the host in the PRODUCTION FOLD
    posture: the real `local-server` binary (both SPAs built + materialized,
    host-web with `VITE_HOST_FOLDED=1`) serves the host shell at `/` with
    same-origin `/app` pane iframes — no Vite dev server anywhere (every other
