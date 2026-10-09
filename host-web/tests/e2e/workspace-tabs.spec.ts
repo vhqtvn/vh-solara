@@ -761,13 +761,15 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     const seed = (await H.workspaces(page))[0];
     // Two long-capped (~218px) workspaces, each with its own pane (budget
     // ~409px: seed ~96 + one long tab ~218+badge ≈ 340 fits; adding the
-    // second ≈ 580 spills).
-    const unreadWs = await H.addWorkspace(page, "UnreadWsLongNameForWidthPaddingP1x");
-    const unreadPane = await H.addServer(page, H.serverUrl("p1-unread"), "p1-unread");
-    expect(unreadPane).toBeTruthy();
+    // second ≈ 580 spills). The RUNNING one is created FIRST, so canonical
+    // index order alone cannot satisfy the assertions below — only tier
+    // precedence (UNREAD outranks RUNNING) can.
     const runningWs = await H.addWorkspace(page, "RunningWsLongNameForWidthPaddingP1");
     const runningPane = await H.addServer(page, H.serverUrl("p1-running"), "p1-running");
     expect(runningPane).toBeTruthy();
+    const unreadWs = await H.addWorkspace(page, "UnreadWsLongNameForWidthPaddingP1x");
+    const unreadPane = await H.addServer(page, H.serverUrl("p1-unread"), "p1-unread");
+    expect(unreadPane).toBeTruthy();
     await H.setActiveWorkspace(page, seed);
 
     // Neutral handshakes first (last write wins).
