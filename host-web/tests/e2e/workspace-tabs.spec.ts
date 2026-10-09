@@ -449,6 +449,34 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
   });
 
+  // Feature (N3): CONTEXTMENU DEDUP inside the touch arm window — Android
+  // Chrome fires a native contextmenu on long-press too; when that has
+  // ALREADY opened the menu, the 500ms timer's own pass must be a full no-op
+  // (Tabstrip.tsx pressTimer: `if (menu.open()) return;`) — no re-place, no
+  // suppressClick re-flag, no drag arm. Dispatched events through the page's
+  // real pipeline (handler-level truth — the browser's own long-press →
+  // contextmenu synthesis is NOT what this claims to reproduce).
+  test("contextmenu during the touch arm window dedups: menu stays single, later click still toggles", async ({ page }) => {
+    const ws1 = (await H.workspaces(page))[0];
+    const tab = page.locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`);
+
+    // The native long-press contextmenu lands INSIDE the 500ms arm window…
+    await tab.dispatchEvent("pointerdown", { pointerType: "touch" });
+    await tab.dispatchEvent("contextmenu", { button: 2 });
+    await expect(page.locator(`[data-testid="ws-tab-menu"][data-workspace="${ws1}"]`)).toBeVisible();
+    // …then OUR timer fires (700 > 500): the dedup guard returns early —
+    // exactly ONE menu (no double-open, no re-place).
+    await page.waitForTimeout(700);
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(1);
+    // The stationary release is a no-op (the guarded pass armed nothing).
+    await tab.dispatchEvent("pointerup", { pointerType: "touch" });
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(1);
+    // suppressClick was NOT set by the guarded timer: a plain click toggles
+    // the menu CLOSED (a timer that re-flagged would swallow this toggle).
+    await tab.click();
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+  });
+
   // Feature: dismissal — a click OUTSIDE the tab (another tab) closes the menu
   // (the surface stack's outside-click pass) and the click proceeds (switch).
   test("outside click (another tab) closes the menu and switches", async ({ page }) => {
@@ -787,10 +815,12 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     await page.setViewportSize({ width: 800, height: 800 });
     const seed = (await H.workspaces(page))[0];
     // Same measured geometry as the menu/kbd-focus freeze tests above (seed
-    // ~92px ACTIVE + ~60px fillers consume the ~409px budget before the
+    // ~92px ACTIVE + four ~80px fillers (the PressedF1 9-char class,
+    // measured 79px in chromium) consume the ~409px budget before the
     // ~218px long-capped needy tab; a fifth filler created LAST keeps the
-    // one-slot prev-active off the needy workspace). Distinct names in the
-    // same width classes (9-char fillers, a ≥200px-capped needy name) so any
+    // one-slot prev-active off the needy workspace). Distinct names in
+    // adjacent width classes (the freeze fixtures' 9-char fillers measure
+    // 65-79px depending on letter mix, the needy name caps at 218px) so any
     // cross-test leak fails loudly without moving the geometry.
     for (let i = 1; i <= 4; i++) await H.addWorkspace(page, `PressedF${i}`);
     const needy = await H.addWorkspace(page, "NeedyPressedFreezeNameForWidthPadB1");
@@ -826,9 +856,12 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     await expect(cue).toHaveAttribute("data-kind", "needs-you");
     await expect(cue).toHaveAttribute("data-count", "1");
 
-    // …but membership is FROZEN while the strip is pressed (the hold
-    // outlasts MENU_PRESS_MS with no menu opening — the press is on
-    // background, not a tab — so the freeze can only be the pressed arm).
+    // …but membership is FROZEN while the strip is pressed. There is no
+    // MENU_PRESS_MS race to outwait here: the long-press timer is bound
+    // PER-TAB and this press sits on the strip BACKGROUND, so it never even
+    // arms — the 400ms below is merely a stability window for the frozen
+    // state (any wrong-time promotion lands inside it), not an
+    // outlasts-the-threshold argument.
     await page.waitForTimeout(400);
     await expect(needyTab).toHaveCount(0);
     await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
@@ -852,8 +885,8 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     await page.setViewportSize({ width: 800, height: 800 });
     const seed = (await H.workspaces(page))[0];
     // Two long-capped (~218px) workspaces, each with its own pane (budget
-    // ~409px: seed ~96 + one long tab ~218+badge ≈ 340 fits; adding the
-    // second ≈ 580 spills). The RUNNING one is created FIRST, so canonical
+    // ~409px: seed ~92 + one long tab ~218 + its small status badge ≈ ~334
+    // fits; adding the second ≈ ~576 spills — wide margins either way). The RUNNING one is created FIRST, so canonical
     // index order alone cannot satisfy the assertions below — only tier
     // precedence (UNREAD outranks RUNNING) can.
     const runningWs = await H.addWorkspace(page, "RunningWsLongNameForWidthPaddingP1");
@@ -862,6 +895,17 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     const unreadWs = await H.addWorkspace(page, "UnreadWsLongNameForWidthPaddingP1x");
     const unreadPane = await H.addServer(page, H.serverUrl("p1-unread"), "p1-unread");
     expect(unreadPane).toBeTruthy();
+    // DECOLLINEARITY (O1): a THIRD, neutral long-capped workspace created
+    // AFTER both contenders (then re-activating seed) makes the one-slot
+    // prev-active the NEUTRAL ws — BOTH naive deciders a reader might
+    // substitute for tier precedence now point AWAY from the expected
+    // winner: canonical index (Running is earlier) picks Running, and a
+    // recency-only ranking (prev-active outranks tiers) picks the neutral
+    // ws. Only TIER precedence (UNREAD outranks RUNNING) passes below.
+    // Budget still valid: the neutral tab is the same ~218px long-capped
+    // class, ranked AFTER Running (remaining tier vs running tier) — it
+    // spills exactly like Running does.
+    const neutralWs = await H.addWorkspace(page, "NeutralWsLongNameForWidthPaddingP1z");
     await H.setActiveWorkspace(page, seed);
 
     // Neutral handshakes first (last write wins).
@@ -875,9 +919,12 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     // The seed and the UNREAD workspace are visible…
     await expect(page.locator(`[data-testid="ws-tab"][data-workspace="${seed}"]`)).toBeVisible();
     await expect(page.locator(`[data-testid="ws-tab"][data-workspace="${unreadWs}"]`)).toBeVisible();
-    // …the RUNNING workspace is hidden behind the overflow trigger.
+    // …the RUNNING workspace is hidden behind the overflow trigger — and so
+    // is the NEUTRAL contender (fixture sanity: only the unread winner sits
+    // beside the seed, exactly the budget arithmetic above).
     const runningTab = page.locator(`[data-testid="ws-tab"][data-workspace="${runningWs}"]`);
     await expect(runningTab).toHaveCount(0);
+    await expect(page.locator(`[data-testid="ws-tab"][data-workspace="${neutralWs}"]`)).toHaveCount(0);
 
     // Overflow membership agrees: the running workspace is in the list, the
     // unread one is not.
@@ -1191,7 +1238,12 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
   // above). Fixtures are deliberately SMALL (3 short-named workspaces, all
   // visible at the 1280 default viewport) so drag geometry is unambiguous;
   // drop targets aim at tab QUARTERS (≥15px from any center) so engine font
-  // deltas cannot flip the drop slot.
+  // deltas cannot flip the drop slot. The closure tests at the END of this
+  // section deliberately leave that regime: the hidden-crossing and
+  // lostpointercapture tests run an 800px saturation fixture (measured:
+  // avail ~461 − 52 reserve → ~409 budget; seed ~92 + one ~218px long-capped
+  // tab fits, further longs spill behind the ⋯ trigger) and the wide-end-slot
+  // test pins the raw-pointer rule with divergent widths (~92/218/~70px).
 
   /** Center-point of a tab (the drag y + a handy x reference). */
   async function tabCenter(
@@ -1458,5 +1510,249 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     await expect(tab3).toHaveAttribute("data-dragging", "0");
     expect(await renderedTabOrder(page)).toEqual([ws1, ws2, ws3]); // no commit
     await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+  });
+
+  // Feature: HIDDEN-CROSSING drop (N1) — a drag whose VISIBLE drop is one
+  // slot but whose canonical path crosses HIDDEN workspaces: every crossed
+  // hidden ws shifts EXACTLY one canonical slot in the persisted v3 blob
+  // (invisible on the strip — commitDrag's local-id simulation walks the
+  // dragged id one canonical slot at a time until its FROZEN-VISIBLE index
+  // hits the drop slot, so each hidden ws between start and landing costs
+  // one move; Tabstrip.tsx commitDrag). Measured budget (800px): avail ~461
+  // − 52 reserve → ~409; seed ~92 + one ~218px long-capped tab fits, further
+  // longs spill — exactly one long contender stays visible beside the seed.
+  test("drag across hidden workspaces lands the visible slot; each crossed hidden ws shifts exactly one canonical slot", async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 800 });
+    const seed = (await H.workspaces(page))[0];
+    const longs: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const id = await H.addWorkspace(page, `HiddenCrossLongNameForWidthPadN1A${i}`);
+      longs.push(id!);
+    }
+    await H.setActiveWorkspace(page, seed);
+
+    // Canonical [seed, L1, L2, L3]. Ranked: seed (active) → L3 (prev-active,
+    // the last addWorkspace) → L1 → L2 (canonical); the fit admits seed+L3,
+    // L1/L2 sit behind the ⋯ trigger.
+    const l3Tab = page.locator(`[data-testid="ws-tab"][data-workspace="${longs[2]}"]`);
+    await expect.poll(async () => renderedTabOrder(page), { timeout: 5000 }).toEqual([seed, longs[2]]);
+    await expect(page.locator('[data-testid="ws-overflow-trigger"]')).toBeVisible();
+    await expect.poll(async () => persistedWsOrder(page), { timeout: 8000 }).toEqual([seed, ...longs]);
+    const hostBefore = await hostLayerIds(page); // creation order
+
+    // Drag the ACTIVE seed rightward past L3 (the visible edge tab) to the
+    // END visible slot — a one-slot VISIBLE move whose canonical path
+    // crosses the two HIDDEN workspaces sitting between seed and L3.
+    const box3 = await l3Tab.boundingBox();
+    expect(box3).not.toBeNull();
+    const from = await tabCenter(page, seed!);
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(box3!.x + (box3!.width * 3) / 4, from.y, { steps: 12 });
+    const seedTab = page.locator(`[data-testid="ws-tab"][data-workspace="${seed}"]`);
+    await expect(seedTab).toHaveAttribute("data-dragging", "1");
+    expect(Number(await l3Tab.getAttribute("data-shift"))).toBeLessThan(0); // the gap opens before L3
+    await page.mouse.up();
+
+    // (a) the drop landed at the intended VISIBLE slot (the row's end)…
+    await expect.poll(async () => renderedTabOrder(page)).toEqual([longs[2], seed]);
+    // (b) each CROSSED hidden workspace shifted EXACTLY one canonical slot
+    // in the persisted v3 blob — L1 1→0, L2 2→1 — while the dragged seed
+    // moved three canonical slots (3→0) for its one visible slot…
+    await expect.poll(async () => persistedWsOrder(page), { timeout: 8000 }).toEqual([...longs, seed]);
+    const blob = await persistedWsOrder(page);
+    expect(blob.indexOf(longs[0]!), "L1 shifted exactly one slot (1→0)").toBe(0);
+    expect(blob.indexOf(longs[1]!), "L2 shifted exactly one slot (2→1)").toBe(1);
+    // (c) canonical order otherwise INTACT: the blob is exactly the rotated
+    // array (full-equality above), L1/L2 stay hidden behind the trigger (in
+    // canonical order), the host layers keep creation order, no menu opened,
+    // and the drag switched nothing.
+    const trigger = page.locator('[data-testid="ws-overflow-trigger"]');
+    await expect(trigger).toBeVisible();
+    await trigger.click();
+    const rows = page.locator('[data-testid="ws-overflow-row"]');
+    await expect(rows).toHaveCount(2);
+    await expect(rows.nth(0)).toHaveAttribute("data-workspace", longs[0]!);
+    await expect(rows.nth(1)).toHaveAttribute("data-workspace", longs[1]!);
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="ws-overflow-popover"]')).toHaveCount(0);
+    expect(await hostLayerIds(page)).toEqual(hostBefore);
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(seed);
+  });
+
+  // Feature: WIDE-TAB END SLOT (N1, the raw-pointer drop rule) — a dragged
+  // tab WIDER than the edge sibling can still reach the END slot: the VISUAL
+  // follow is clamped inside the row (updateDrag's dx clamp), but the DROP
+  // SLOT follows the RAW pointer center (rawDx, unclamped — Tabstrip.tsx
+  // updateDrag). A slot rule computed from the CLAMPED center could never
+  // cross a narrower edge tab's center — the wide box clamps first — and
+  // the end slot would be unreachable. Divergent measured widths at the
+  // 1280 default: seed ~92, long-capped ~218, ~9-char short ~70.
+  test("drag: wide tab reaches the end slot past a narrow edge tab (raw-pointer rule, clamped preview)", async ({ page }) => {
+    const seed = (await H.workspaces(page))[0];
+    const wide = await H.addWorkspace(page, "WideDraggedTabNameForWidthPaddingN1B"); // ~218px
+    const shortEnd = await H.addWorkspace(page, "NarrowBb9"); // ~70px, the edge tab
+    await H.setActiveWorkspace(page, seed!);
+
+    // Canonical [seed(92), wide(218), shortEnd(70)] — all visible at 1280.
+    await expect.poll(async () => renderedTabOrder(page)).toEqual([seed, wide, shortEnd]);
+    const rights = await page.locator('[data-testid="ws-tab"]').evaluateAll((els) =>
+      (els as HTMLElement[]).map((e) => e.getBoundingClientRect().right),
+    );
+    const rowRight = Math.max(...rights);
+
+    const wideTab = page.locator(`[data-testid="ws-tab"][data-workspace="${wide}"]`);
+    const shortTab = page.locator(`[data-testid="ws-tab"][data-workspace="${shortEnd}"]`);
+    const from = await tabCenter(page, wide!);
+
+    // Press the wide tab and drag the pointer PAST the row's right edge
+    // (the strip never auto-scrolls; the tabs container has tab-free room) —
+    // comfortably past the narrow edge tab's center.
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(rowRight + 40, from.y, { steps: 12 });
+    // The CLAMPED half of the rule: the live preview stays inside the row
+    // (the wide tab's rendered right edge ≤ rowRight) even though the
+    // pointer is 40px beyond it…
+    await expect(wideTab).toHaveAttribute("data-dragging", "1");
+    const midBox = await wideTab.boundingBox();
+    expect(midBox).not.toBeNull();
+    expect(midBox!.x + midBox!.width, "clamped preview never leaves the row").toBeLessThanOrEqual(rowRight + 1);
+    expect(Number(await shortTab.getAttribute("data-shift"))).toBeLessThan(0); // gap opens before the edge tab
+    await page.mouse.up();
+
+    // …and the RAW half: the drop still reaches the END slot. A
+    // clamped-center slot rule would leave k=1 — dropped in place, the
+    // [seed, wide, shortEnd] no-op.
+    await expect.poll(async () => renderedTabOrder(page)).toEqual([seed, shortEnd, wide]);
+    await expect.poll(async () => persistedWsOrder(page)).toEqual([seed, shortEnd, wide]);
+    expect(await hostLayerIds(page)).toEqual([seed, wide, shortEnd]); // creation order
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+  });
+
+  // Feature: LOSTPOINTERCAPTURE teardown (N2) — the browser can release a
+  // captured pointer with `lostpointercapture` and NO terminal pointerup /
+  // pointercancel (the capture holder can even be removed mid-gesture); BOTH
+  // cleanup bundles (press-freeze release + drag-session teardown) now
+  // listen for it on window (capture phase). Dispatched PointerEvents
+  // through the page's real pipeline — handler-level truth: this proves the
+  // HANDLERS run and tear the session down; it does NOT claim any
+  // browser-side capture-taking outcome (that needs a real touchscreen
+  // harness, out of this lane's reach).
+  test("lostpointercapture mid-drag aborts; membership unfreezes; the next drag still works", async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 800 });
+    const seed = (await H.workspaces(page))[0];
+    const longs: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const id = await H.addWorkspace(page, `LpcLongNameForWidthPaddingN2${i}`);
+      longs.push(id!);
+    }
+    await H.setActiveWorkspace(page, seed);
+    await expect.poll(async () => renderedTabOrder(page), { timeout: 5000 }).toEqual([seed, longs[2]]);
+    await expect.poll(async () => persistedWsOrder(page), { timeout: 8000 }).toEqual([seed, ...longs]);
+
+    // Arm a touch drag on the visible edge tab (dispatched pipeline).
+    const l3Tab = page.locator(`[data-testid="ws-tab"][data-workspace="${longs[2]}"]`);
+    const seedTab = page.locator(`[data-testid="ws-tab"][data-workspace="${seed}"]`);
+    const from = await tabCenter(page, longs[2]!);
+    await l3Tab.dispatchEvent("pointerdown", { pointerType: "touch", clientX: from.x, clientY: from.y });
+    await page.waitForTimeout(600); // >500ms hold → armed
+    const seedBox = await seedTab.boundingBox();
+    expect(seedBox).not.toBeNull();
+    await l3Tab.dispatchEvent("pointermove", {
+      pointerType: "touch",
+      clientX: seedBox!.x + seedBox!.width / 4,
+      clientY: from.y,
+    });
+    await expect(l3Tab).toHaveAttribute("data-dragging", "1"); // drag in flight
+
+    // The press FROZE membership: a resize mid-drag cannot re-fit while
+    // frozen. 400ms is far past the re-fit window, so still-2-tabs here
+    // PROVES the freeze is armed (the probe's before-half).
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.waitForTimeout(400);
+    await expect(page.locator('[data-testid="ws-tab"]')).toHaveCount(2);
+
+    // The swallowed terminal event: lostpointercapture, no pointerup/cancel.
+    // Dispatched via an explicit bubbling PointerEvent so the window
+    // capture-phase listeners see it — dispatchEvent's own event-class
+    // mapping for this type is not relied on.
+    await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      el?.dispatchEvent(new PointerEvent("lostpointercapture", { bubbles: true, pointerType: "touch" }));
+    }, `[data-testid="ws-tab"][data-workspace="${longs[2]}"]`);
+
+    // Session TORN DOWN: preview gone, NOTHING committed (blob untouched),
+    // no menu…
+    await expect(l3Tab).toHaveAttribute("data-dragging", "0");
+    expect(await persistedWsOrder(page)).toEqual([seed, ...longs]);
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+    // …membership UNFROZEN (the press arm released too — a stuck `pressed`
+    // would hold the frozen set forever): the queued 1280px avail re-fits
+    // and all FOUR workspaces render.
+    await expect.poll(async () => page.locator('[data-testid="ws-tab"]').count()).toBe(4);
+
+    // The stuck-session guard is clear: a subsequent REAL mouse drag (L3 to
+    // the front) starts and commits — beginDrag() refuses while a session
+    // leaked (`if (drag()) return`).
+    const box1 = await seedTab.boundingBox();
+    expect(box1).not.toBeNull();
+    const dragFrom = await tabCenter(page, longs[2]!);
+    await page.mouse.move(dragFrom.x, dragFrom.y);
+    await page.mouse.down();
+    await page.mouse.move(box1!.x + box1!.width / 4, dragFrom.y, { steps: 12 });
+    await page.mouse.up();
+    await expect.poll(async () => renderedTabOrder(page)).toEqual([longs[2], seed, longs[0], longs[1]]);
+    await expect.poll(async () => persistedWsOrder(page), { timeout: 8000 }).toEqual([longs[2], seed, longs[0], longs[1]]);
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+  });
+
+  // Feature: HOST-LAYER SET MIRROR (O5 probe — spec-level invariant) —
+  // across an interleaved add→rename→reorder→close sequence, the SET of
+  // host-layer divs (<main> children) always EQUALS the SET of live
+  // workspaces: no layer missing after add, none added/removed by a pure
+  // rename, none stale after close, and a reorder (which never touches
+  // hostLayerOrder) leaves the set identical while the store order moves.
+  // Sorted set-equality after EVERY step (order-sensitivity stays pinned by
+  // the dedicated tests above); exact creation order re-pinned after the
+  // close (the mirror-remove convention).
+  test("host layer set mirrors the workspace set across add/rename/reorder/close", async ({ page }) => {
+    const mirror = async () => {
+      const wss = (await H.workspaces(page)).slice().sort();
+      await expect
+        .poll(async () => (await hostLayerIds(page)).slice().sort(), { timeout: 5000 })
+        .toEqual(wss);
+    };
+    const ws1 = (await H.workspaces(page))[0];
+    await mirror();
+
+    const ws2 = await H.addWorkspace(page, "Mirror2");
+    await mirror();
+    const ws3 = await H.addWorkspace(page, "Mirror3");
+    await mirror();
+
+    // RENAME (pure name mutation): the set is unchanged — no layer churn.
+    await H.renameWorkspace(page, ws2!, "Mirror2Renamed");
+    await expect.poll(async () => H.workspaceName(page, ws2!)).toBe("Mirror2Renamed");
+    await mirror();
+
+    // REORDER via the REAL drag (Mirror3 to the front): the store order
+    // moves, the layer set (and creation order) does not.
+    const from = await tabCenter(page, ws3!);
+    const box1 = await page.locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`).boundingBox();
+    expect(box1).not.toBeNull();
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(box1!.x + box1!.width / 4, from.y, { steps: 12 });
+    await page.mouse.up();
+    await expect.poll(async () => renderedTabOrder(page)).toEqual([ws3, ws1, ws2]);
+    await mirror();
+
+    // CLOSE removes exactly the closed workspace's layer; the survivors
+    // keep creation order.
+    expect(await H.closeWorkspace(page, ws2!)).toBe(true);
+    await expect.poll(async () => hostLayerIds(page)).toEqual([ws1, ws3]);
+    await mirror();
   });
 });

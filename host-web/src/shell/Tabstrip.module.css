@@ -9,11 +9,15 @@
   flex: 0 0 auto;
   /* overflow: VISIBLE (not hidden) so the AddServer popover (position:absolute,
    * a child of .wrap here) can drop down over the workspace area below without
-   * being clipped. The .tabs scroller has its own overflow-x:auto, so the tab
-   * row still scrolls independently. This was the "+ does nothing with tabs"
-   * bug: with tabs present the operator uses the tabstrip's AddServer (clipped
-   * by overflow:hidden); with no tabs they used the empty-overlay AddServer
-   * (no clip) so it seemed to work only when empty. */
+   * being clipped. The .tabs rule keeps its overflow-x:auto only as VESTIGIAL
+   * capacity: under PRIORITY-FIT membership the fitted tab row NEVER scrolls
+   * (computeFits admits only what the measured container holds — see the
+   * touch-action note below for the two TRANSIENT windows where the row can
+   * still briefly overflow before the fit corrects it). This was the "+ does
+   * nothing with tabs" bug: with tabs present the operator uses the
+   * tabstrip's AddServer (clipped by overflow:hidden); with no tabs they used
+   * the empty-overlay AddServer (no clip) so it seemed to work only when
+   * empty. */
   overflow: visible;
 }
 .brand {
@@ -77,7 +81,19 @@
    * (was manipulation): the tab is a DRAG surface now — manipulation still
    * allowed panning, which would let the browser steal an armed touch drag
    * for scroll. Nothing is lost: the fitted tab row never scrolls and the
-   * shell is a fixed-viewport app, so there is no pan to keep. */
+   * shell is a fixed-viewport app, so there is no pan to keep.
+   *
+   * HONEST EDGE — the two TRANSIENT windows where the row can overflow yet
+   * touch pan is DEAD here anyway (touch-action:none is unconditional):
+   * (1) the PRE-MEASURE first frame: the visible set initializes to ALL
+   *     workspaces (Tabstrip.tsx's visibleSet seed), so on a narrow viewport
+   *     that first frame renders an overflowing row until the fit effect
+   *     measures and corrects it;
+   * (2) FROZEN-with-live-badges: while membership is frozen (press, open
+   *     strip popover, keyboard focus) a live badge can grow its tab wider
+   *     than the container; the row re-fits only on unfreeze.
+   * Mouse wheel is UNAFFECTED in both windows — .tabs' overflow-x:auto
+   * still wheel/scrollbar-scrolls; only touch panning is denied. */
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;

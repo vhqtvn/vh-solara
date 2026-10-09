@@ -336,9 +336,20 @@ export function Tabstrip() {
     };
     window.addEventListener("pointerup", release, true);
     window.addEventListener("pointercancel", release, true);
+    // lostpointercapture completes the terminal-event set: the browser can
+    // release a captured pointer WITHOUT any pointerup/pointercancel (the
+    // capture holder can be removed mid-press, capture retargeted, …). It
+    // bubbles, so this single window-capture listener covers the tab's
+    // setPointerCapture too. Without it a swallowed terminal release leaves
+    // `pressed` stuck at 1 and the membership freeze hangs forever (the fit
+    // effect is gated on frozen()). Idempotent with pointerup: release() is
+    // a no-op once the listeners are gone (lostpointercapture fires AFTER
+    // pointerup for a normal release, when these are already removed).
+    window.addEventListener("lostpointercapture", release, true);
     releaseCleanup = () => {
       window.removeEventListener("pointerup", release, true);
       window.removeEventListener("pointercancel", release, true);
+      window.removeEventListener("lostpointercapture", release, true);
     };
   };
   onCleanup(() => releaseCleanup?.());
@@ -354,8 +365,10 @@ export function Tabstrip() {
   // component only decides WHEN a press becomes a drag (the pointer-type
   // aware arming model) and calls beginDrag(); from there this session owns
   // the gesture via window capture-phase listeners: pointerup commits,
-  // pointercancel/Escape aborts to the original order. Nothing mutates the
-  // store until commit — abort is trivially clean.
+  // pointercancel/lostpointercapture/Escape abort to the original order
+  // (lostpointercapture = the browser ended the capture without a terminal
+  // pointerup — treating it as abort keeps the session from wedging).
+  // Nothing mutates the store until commit — abort is trivially clean.
   //
   // The membership freeze carries the whole drag: a drag holds the pointer
   // down (the `pressed` arm), so visible membership/order is frozen for the
@@ -541,11 +554,19 @@ export function Tabstrip() {
     window.addEventListener("pointermove", onMove, true);
     window.addEventListener("pointerup", onUp, true);
     window.addEventListener("pointercancel", onCancel, true);
+    // Same terminal-event completeness as the press-freeze release above: a
+    // lostpointercapture with no pointerup/cancel must ABORT the session —
+    // a wedged drag() would make beginDrag's `if (drag())` guard reject
+    // every future drag. Same-abort-as-pointercancel; idempotent after a
+    // normal commit (endDragSession removed these listeners before the
+    // browser fires its post-pointerup lostpointercapture).
+    window.addEventListener("lostpointercapture", onCancel, true);
     window.addEventListener("keydown", onKey, true);
     dragCleanup = () => {
       window.removeEventListener("pointermove", onMove, true);
       window.removeEventListener("pointerup", onUp, true);
       window.removeEventListener("pointercancel", onCancel, true);
+      window.removeEventListener("lostpointercapture", onCancel, true);
       window.removeEventListener("keydown", onKey, true);
     };
   };
