@@ -651,6 +651,246 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     await expect(page.locator('[data-testid="ws-overflow-cue"]')).toHaveCount(0);
   });
 
+  /** Probe a full valid status (counts + attention) for a pane through the
+   *  REAL router — the probeCounts wrapper precedent (tab-pairs.spec.ts /
+   *  overflow-live.spec.ts). Used by the tier/fit tests below. */
+  async function probeStatusCounts(
+    page: import("@playwright/test").Page,
+    paneId: string,
+    runningCount: number,
+    unreadCount: number,
+    attention: "none" | "needs_reply" = "none",
+  ): Promise<void> {
+    const r = await H.probeStatus(page, {
+      sourcePaneId: paneId,
+      origin: H.MOCK_ORIGIN,
+      payload: {
+        type: "status",
+        dir: "",
+        session: "",
+        title: "",
+        attention,
+        activity: "idle",
+        following: true,
+        runningCount,
+        unreadCount,
+      },
+    });
+    expect(r.accepted, `status (${runningCount}|${unreadCount} ${attention}) accepted`).toBe(true);
+  }
+
+  // Feature: MEMBERSHIP FREEZE — the KEYBOARD-FOCUS arm of the freeze
+  // predicate (pressed || openMenu || kbdFocus). Focusing a tab WITHOUT a
+  // preceding pointer (locator.focus moves DOM focus only; the
+  // POINTER_FOCUS_MS attribution gate sees lastPointerAt=0 and passes) arms
+  // kbdFocus exactly like an open menu: a hidden workspace going needs-you
+  // does NOT reshuffle the visible set while the cue updates LIVE; moving
+  // focus back out of the strip (blur) applies the promotion.
+  test("membership freezes while a tab holds keyboard focus; blur unfreezes and promotes the needy workspace", async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 800 });
+    const seed = (await H.workspaces(page))[0];
+    // Same measured geometry as the menu-freeze test above (seed ~100px
+    // ACTIVE + four ~70px fillers consume the ~409px budget before the
+    // ~218px long-capped needy tab at canonical index 5; a fifth filler
+    // created LAST keeps the one-slot prev-active off the needy workspace).
+    // Distinct names so any cross-test leak fails loudly.
+    for (let i = 1; i <= 4; i++) await H.addWorkspace(page, `KbdFill${i}`);
+    const needy = await H.addWorkspace(page, "NeedyKbdFocusFreezeNameForWidthPadA1");
+    const needyPane = await H.addServer(page, H.serverUrl("kbd-freeze"), "kbd-freeze");
+    expect(needyPane).toBeTruthy();
+    await H.addWorkspace(page, "KbdFill5"); // activates it; prev-active ≠ needy
+    await H.setActiveWorkspace(page, seed);
+
+    // Saturated with Needy hidden (quiet, no attention).
+    const needyTab = page.locator(`[data-testid="ws-tab"][data-workspace="${needy}"]`);
+    await expect(page.locator('[data-testid="ws-overflow-trigger"]')).toBeVisible();
+    await expect(needyTab).toHaveCount(0);
+
+    // The neutral handshake must land before the probe (last write wins).
+    await H.waitForReady(page, needyPane!);
+
+    // FREEZE via KEYBOARD FOCUS on the active tab — no pointerdown precedes
+    // it, so the strip's focusin is attributed to the KEYBOARD (not the
+    // pointer) and arms the kbdFocus freeze arm.
+    const seedTab = page.locator(`[data-testid="ws-tab"][data-workspace="${seed}"]`);
+    await seedTab.focus();
+
+    // The hidden workspace goes needs-you: the overflow cue updates LIVE
+    // (counts hidden WORKSPACES, not sessions — exactly 1 here)…
+    await H.probeStatus(page, {
+      sourcePaneId: needyPane!,
+      origin: H.MOCK_ORIGIN,
+      payload: {
+        type: "status",
+        dir: "/proj",
+        session: "sess-1",
+        title: "Needs Reply",
+        attention: "needs_reply",
+        activity: "idle",
+        following: true,
+        runningCount: 0,
+        unreadCount: 0,
+      },
+    });
+    const cue = page.locator('[data-testid="ws-overflow-cue"]');
+    await expect(cue).toBeVisible();
+    await expect(cue).toHaveAttribute("data-kind", "needs-you");
+    await expect(cue).toHaveAttribute("data-count", "1");
+
+    // …but membership is FROZEN while the tab holds keyboard focus.
+    await page.waitForTimeout(400);
+    await expect(needyTab).toHaveCount(0);
+
+    // UNFREEZE: blur the tab (focus leaves the strip) — the needy workspace
+    // is promoted into the strip (attention-selected membership) with its
+    // live badge, and the cue clears.
+    await seedTab.blur();
+    await expect(needyTab).toBeVisible();
+    await expect(
+      page.locator(`[data-testid="ws-needs-you"][data-workspace="${needy}"]`),
+    ).toBeVisible();
+    await expect(page.locator('[data-testid="ws-overflow-cue"]')).toHaveCount(0);
+  });
+
+  // Feature: TIER PRECEDENCE — an UNREAD workspace outranks a RUNNING one at
+  // equal fit (TIER.UNREAD=2 < TIER.RUNNING=3, priorityFit.ts): when only one
+  // of two ~218px long-capped tabs fits beside the active seed, the unread
+  // one is visible and the running one sits behind the overflow trigger.
+  test("priority fit: unread beats running when only one long tab fits", async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 800 });
+    const seed = (await H.workspaces(page))[0];
+    // Two long-capped (~218px) workspaces, each with its own pane (budget
+    // ~409px: seed ~96 + one long tab ~218+badge ≈ 340 fits; adding the
+    // second ≈ 580 spills).
+    const unreadWs = await H.addWorkspace(page, "UnreadWsLongNameForWidthPaddingP1x");
+    const unreadPane = await H.addServer(page, H.serverUrl("p1-unread"), "p1-unread");
+    expect(unreadPane).toBeTruthy();
+    const runningWs = await H.addWorkspace(page, "RunningWsLongNameForWidthPaddingP1");
+    const runningPane = await H.addServer(page, H.serverUrl("p1-running"), "p1-running");
+    expect(runningPane).toBeTruthy();
+    await H.setActiveWorkspace(page, seed);
+
+    // Neutral handshakes first (last write wins).
+    await H.waitForReady(page, unreadPane!);
+    await H.waitForReady(page, runningPane!);
+
+    // UnreadWs: unread only. RunningWs: running only. Neither needs-you.
+    await probeStatusCounts(page, unreadPane!, 0, 3);
+    await probeStatusCounts(page, runningPane!, 2, 0);
+
+    // The seed and the UNREAD workspace are visible…
+    await expect(page.locator(`[data-testid="ws-tab"][data-workspace="${seed}"]`)).toBeVisible();
+    await expect(page.locator(`[data-testid="ws-tab"][data-workspace="${unreadWs}"]`)).toBeVisible();
+    // …the RUNNING workspace is hidden behind the overflow trigger.
+    const runningTab = page.locator(`[data-testid="ws-tab"][data-workspace="${runningWs}"]`);
+    await expect(runningTab).toHaveCount(0);
+
+    // Overflow membership agrees: the running workspace is in the list, the
+    // unread one is not.
+    const trigger = page.locator('[data-testid="ws-overflow-trigger"]');
+    await expect(trigger).toBeVisible();
+    await trigger.click();
+    await expect(
+      page.locator(`[data-testid="ws-overflow-row"][data-workspace="${runningWs}"]`),
+    ).toBeVisible();
+    await expect(
+      page.locator(`[data-testid="ws-overflow-row"][data-workspace="${unreadWs}"]`),
+    ).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="ws-overflow-popover"]')).toHaveCount(0);
+  });
+
+  // Feature: TIE-BREAK — same-tier workspaces tie by CANONICAL index, and
+  // count MAGNITUDE is never a tie-breaker (D4): with two long-capped UNREAD
+  // workspaces where only one fits, the canonically-EARLIER one is visible
+  // even though the later one carries MORE unreads (5 vs 1).
+  test("priority fit: same-tier tie breaks by canonical index, never by count magnitude", async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 800 });
+    const seed = (await H.workspaces(page))[0];
+    // Canonical order: seed, tieEarlier (index 1), tieLater (index 2).
+    const tieEarlier = await H.addWorkspace(page, "TieEarlierLongNameForWidthPaddingP2a");
+    const earlierPane = await H.addServer(page, H.serverUrl("p2-earlier"), "p2-earlier");
+    expect(earlierPane).toBeTruthy();
+    const tieLater = await H.addWorkspace(page, "TieLaterLongNameForWidthPaddingP2bMore");
+    const laterPane = await H.addServer(page, H.serverUrl("p2-later"), "p2-later");
+    expect(laterPane).toBeTruthy();
+    await H.setActiveWorkspace(page, seed);
+
+    // Neutral handshakes first (last write wins).
+    await H.waitForReady(page, earlierPane!);
+    await H.waitForReady(page, laterPane!);
+
+    // BOTH unread tier; the canonically-LATER one carries MORE unreads —
+    // magnitude must NOT decide (only nonzero-ness sets the tier).
+    await probeStatusCounts(page, earlierPane!, 0, 1);
+    await probeStatusCounts(page, laterPane!, 0, 5);
+
+    // The canonically-earlier unread workspace wins the single fitting slot…
+    await expect(page.locator(`[data-testid="ws-tab"][data-workspace="${seed}"]`)).toBeVisible();
+    await expect(page.locator(`[data-testid="ws-tab"][data-workspace="${tieEarlier}"]`)).toBeVisible();
+    await expect(page.locator(`[data-testid="ws-tab"][data-workspace="${tieLater}"]`)).toHaveCount(0);
+
+    // …and the overflow list holds exactly the higher-index one.
+    const trigger = page.locator('[data-testid="ws-overflow-trigger"]');
+    await expect(trigger).toBeVisible();
+    await trigger.click();
+    await expect(
+      page.locator(`[data-testid="ws-overflow-row"][data-workspace="${tieLater}"]`),
+    ).toBeVisible();
+    await expect(
+      page.locator(`[data-testid="ws-overflow-row"][data-workspace="${tieEarlier}"]`),
+    ).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="ws-overflow-popover"]')).toHaveCount(0);
+  });
+
+  // Feature: GREEDY CONTINUATION (D4) — the fit walk does NOT stop at the
+  // first spill: an oversized candidate overflows WHOLE (never truncated or
+  // squeezed), and the walk CONTINUES so a lower-ranked, smaller tab after it
+  // may still fit. A stop-at-first-spill implementation would hide BOTH.
+  test("priority fit: greedy walk continues past an oversized candidate (smaller lower-ranked tab still fits)", async ({ page }) => {
+    // 650px viewport → ~259px budget (the ~409px budget at 800px minus 150
+    // of viewport): the long-capped unread tab (~218 + badge) can NEVER fit
+    // beside the seed (~92), but the short running tab (~70) always can.
+    await page.setViewportSize({ width: 650, height: 800 });
+    const seed = (await H.workspaces(page))[0];
+    const unreadLong = await H.addWorkspace(page, "P3UnreadLongWorkspaceNameForWidthPad");
+    const unreadPane = await H.addServer(page, H.serverUrl("p3-unread"), "p3-unread");
+    expect(unreadPane).toBeTruthy();
+    const runShort = await H.addWorkspace(page, "P3RunShort");
+    const runPane = await H.addServer(page, H.serverUrl("p3-run"), "p3-run");
+    expect(runPane).toBeTruthy();
+    await H.setActiveWorkspace(page, seed);
+
+    // Neutral handshakes first (last write wins).
+    await H.waitForReady(page, unreadPane!);
+    await H.waitForReady(page, runPane!);
+
+    // Ranked: seed (active) → unreadLong (UNREAD tier) → runShort (RUNNING
+    // tier — ranked AFTER, exactly the "lower-ranked" the greedy walk must
+    // still consider).
+    await probeStatusCounts(page, unreadPane!, 0, 2);
+    await probeStatusCounts(page, runPane!, 1, 0);
+
+    // The seed and the SHORT RUNNING tab are visible…
+    await expect(page.locator(`[data-testid="ws-tab"][data-workspace="${seed}"]`)).toBeVisible();
+    await expect(page.locator(`[data-testid="ws-tab"][data-workspace="${runShort}"]`)).toBeVisible();
+    // …the oversized UNREAD tab overflowed WHOLE (a stop-at-first-spill
+    // implementation would hide runShort too).
+    const unreadTab = page.locator(`[data-testid="ws-tab"][data-workspace="${unreadLong}"]`);
+    await expect(unreadTab).toHaveCount(0);
+
+    // Overflow membership agrees: only the long unread workspace is hidden.
+    const trigger = page.locator('[data-testid="ws-overflow-trigger"]');
+    await expect(trigger).toBeVisible();
+    await trigger.click();
+    const rows = page.locator('[data-testid="ws-overflow-row"]');
+    await expect(rows).toHaveCount(1);
+    await expect(rows.first()).toHaveAttribute("data-workspace", unreadLong!);
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="ws-overflow-popover"]')).toHaveCount(0);
+  });
+
   // ---- workspace REORDER (F-A) -------------------------------------------------
   //
   // ORDER TRUTH NOTE: the DEV bridge's __host.workspaces() returns the
