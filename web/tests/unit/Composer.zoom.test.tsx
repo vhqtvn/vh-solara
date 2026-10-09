@@ -20,7 +20,7 @@ import type { AcItem } from "../../src/lib/complete";
 
 const acItems: AcItem[] = [{ kind: "agent", label: "@build", insert: "@build " }];
 
-const rectOf = (o: Partial<DOMRect>) =>
+const rectOf = (o: Partial<DOMRect> = {}) =>
   ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0, ...o }) as DOMRect;
 
 // Minimal controller fakes — only what Composer's JSX actually reads on this
@@ -63,10 +63,11 @@ function makeProps(acVisible: () => boolean): ComposerProps {
       attachments,
       setAttachments,
       uploading: () => false,
+      uploadProgress: () => null,
       addFiles: () => {},
       removeAttachment: () => {},
       reinsertInlineChip: () => {},
-      flushPendingAttachments: async () => {},
+      flushPendingAttachments: async (_id: string) => ({ failed: [] as Attachment[] }),
       uploadFile: async () => null,
       inlineFiles: new Map(),
       presentInlineIds: () => new Set<string>(),

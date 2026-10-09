@@ -31,7 +31,7 @@ import type { TreeNode } from "../../src/sync/treeMap";
 
 const { expandSpy } = vi.hoisted(() => ({ expandSpy: vi.fn() }));
 vi.mock("../../src/sync", async (importActual) => {
-  const actual = await importActual();
+  const actual = (await importActual()) as typeof import("../../src/sync");
   return { ...actual, expandTreeNode: expandSpy };
 });
 

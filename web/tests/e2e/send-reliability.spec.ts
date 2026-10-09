@@ -252,9 +252,15 @@ test("(browser) lost enqueue response → 'Queue confirmation unknown.' + Retry 
   // The handler captures the admission body AFTER route.fetch resolves —
   // poll for it rather than racing the handler's post-fetch assignment.
   await expect.poll(() => firstServerAdmission !== null, { timeout: 10_000 }).toBe(true);
-  expect(firstServerAdmission?.replayed).toBe(false);
+  // The poll above guarantees the closure assigned it; defeat CFA's null
+  // narrowing (closure writes are invisible to flow analysis) with a cast.
+  const admission = firstServerAdmission as unknown as {
+    replayed?: boolean;
+    item?: { attemptId?: string; intentId?: string };
+  };
+  expect(admission?.replayed).toBe(false);
   expect(
-    firstServerAdmission?.item && (firstServerAdmission.item.intentId ?? firstServerAdmission.item.attemptId),
+    admission?.item && (admission.item.intentId ?? admission.item.attemptId),
   ).toBe(wireAttempts[0]);
 
   // The honest outcome-unknown state renders — readable text, payload

@@ -80,7 +80,7 @@ test("rail band (640px): compact rail inline beside chat — no drawer, no persi
   expect(trunc.ox).toBe("hidden");
   expect(trunc.sw).toBeGreaterThan(trunc.cw); // actually truncated, not just styled
   // ~26px compact rows (base is ~30px via the twisty cell + padding).
-  const rowH = await page.locator(`.tree-row:has(.tree-node[data-session-id="${sid}"])`).evaluate((el) => el.offsetHeight);
+  const rowH = await page.locator(`.tree-row:has(.tree-node[data-session-id="${sid}"])`).evaluate((el) => (el as HTMLElement).offsetHeight);
   expect(rowH).toBeGreaterThanOrEqual(18);
   expect(rowH).toBeLessThanOrEqual(30);
 

@@ -284,7 +284,7 @@ describe("SendStatus — retry taxonomy (never an unqualified Retry)", () => {
     expect(r.container.textContent).toContain("Same message: “retry me”");
     expect(r.container.textContent).toContain("notes.md");
     expect(r.container.textContent).toContain("shot.png");
-    const btn = r.container.querySelector(".sendStatusBtn");
+    const btn = r.container.querySelector<HTMLElement>(".sendStatusBtn");
     expect(btn).toBeTruthy();
     expect(btn!.textContent).toContain("Retry same message");
     btn!.click();
@@ -325,7 +325,7 @@ describe("SendStatus — retry taxonomy (never an unqualified Retry)", () => {
     const send = vi.fn(async () => {});
     const r = render(() => <SendStatus {...baseProps({ send })} />);
     expect(r.container.textContent).toContain("Message sent — status save unconfirmed.");
-    const btn = r.container.querySelector(".sendStatusBtn")!;
+    const btn = r.container.querySelector<HTMLElement>(".sendStatusBtn")!;
     expect(btn.textContent).toContain("Retry status save");
     expect(btn.getAttribute("data-tip")).toContain("does not resend the message");
     btn.click();
@@ -344,7 +344,7 @@ describe("SendStatus — retry taxonomy (never an unqualified Retry)", () => {
     resolveQueuedMock.mockImplementation(async () => ({ kind: "unrecorded" } as const));
     markSendAttemptStatusUnsaved("att-save-2", "s1", { itemId: "q-8", state: "failed", detail: "boom" });
     const r = render(() => <SendStatus {...baseProps()} />);
-    r.container.querySelector(".sendStatusBtn")!.click();
+    r.container.querySelector<HTMLElement>(".sendStatusBtn")!.click();
     await vi.waitFor(() => expect(resolveQueuedMock).toHaveBeenCalledTimes(1));
     await vi.waitFor(() => expect(r.container.textContent).toContain("status save unconfirmed"));
     expect(getSendAction("att-save-2")).toBeTruthy();
@@ -362,7 +362,7 @@ describe("SendStatus — retry taxonomy (never an unqualified Retry)", () => {
     markSendAttemptStatusUnsaved("att-save-3", "s1", { itemId: "q-7", state: "failed", detail: "local fail" });
     const send = vi.fn(async () => {});
     const r = render(() => <SendStatus {...baseProps({ send })} />);
-    r.container.querySelector(".sendStatusBtn")!.click();
+    r.container.querySelector<HTMLElement>(".sendStatusBtn")!.click();
     await vi.waitFor(() => expect(resolveQueuedMock).toHaveBeenCalledTimes(1));
     // The user SEES the conflict — the row did not disappear. O2 §3.6: both
     // conflict flavors converge on the actionable check-the-queue guidance.
@@ -453,7 +453,7 @@ describe("SendStatus — a11y + dismissal", () => {
     const b = mintSendAttempt("s1");
     updateSendAction(b.attemptId, { stage: "uncertain", certainty: "unknown", recovery: "retry-same" });
     const r2 = render(() => <SendStatus {...baseProps()} />);
-    r2.container.querySelector(".sendStatusDismiss")!.click();
+    r2.container.querySelector<HTMLElement>(".sendStatusDismiss")!.click();
     // The uncertain ROW is gone and its record finished. (Record `a` is still
     // admitting — retained — so the container itself legitimately remains.)
     expect(r2.container.querySelector('.sendStatusLine[data-kind="uncertain"]')).toBeNull();
@@ -488,7 +488,7 @@ describe("SendStatus — A1 create-linkage affordance (operator-confirmed, never
     const row = r.container.querySelector('.sendStatusLine[data-kind="create-link"]');
     expect(row).toBeTruthy();
     expect(row!.textContent).toContain("Possible sessions — timing is the only match.");
-    const btn = row!.querySelector(".sendStatusBtn")!;
+    const btn = row!.querySelector<HTMLElement>(".sendStatusBtn")!;
     expect(btn.textContent).toMatch(/^Link and open/); // "Link and open it (hh:mm)" — generic title stays generic
     btn.click();
     // Confirm re-keyed the draft-owned record to the candidate session…
@@ -567,7 +567,7 @@ describe("SendStatus — A1 create-linkage affordance (operator-confirmed, never
     ));
     expect(r.container.querySelector('.sendStatusLine[data-kind="create-link"]')).toBeTruthy();
     // The EXISTING per-record dismiss (×) on the uncertain row is the out.
-    r.container.querySelector('.sendStatusLine[data-kind="uncertain"] .sendStatusDismiss')!.click();
+    r.container.querySelector<HTMLElement>('.sendStatusLine[data-kind="uncertain"] .sendStatusDismiss')!.click();
     expect(getSendAction(attemptId)).toBeUndefined();
     expect(r.container.querySelector('.sendStatusLine[data-kind="create-link"]')).toBeNull();
     r.unmount();
@@ -670,7 +670,7 @@ describe("SendStatus — O2 slice 2: severity-ordered stacking with a capped sec
     transferOwnerSendAttempts("tmpB", "s1");
     const r = render(() => <SendStatus {...baseProps()} />);
     expect(r.container.querySelectorAll('.sendStatusLine[data-kind="rejected"]')).toHaveLength(2);
-    const more = r.container.querySelector(".sendStatusMore")!;
+    const more = r.container.querySelector<HTMLElement>(".sendStatusMore")!;
     expect(more.textContent).toContain("Show 1 more notices");
     more.click();
     expect(r.container.querySelectorAll('.sendStatusLine[data-kind="rejected"]')).toHaveLength(3);
@@ -710,7 +710,7 @@ describe("SendStatus — O2 slice 2: ONE polite announcer, batched by mirroring 
     const ann = () => r.container.querySelector(".sendStatusAnnouncer")!.textContent;
     // Primary line ONLY — no payload preview, no control text.
     expect(ann()).toBe("Queue confirmation unknown.");
-    r.container.querySelector(".sendStatusMore")!.click(); // expand full text
+    r.container.querySelector<HTMLElement>(".sendStatusMore")!.click(); // expand full text
     expect(r.container.querySelector(".sendStatusFull")!.textContent).toBe(long);
     expect(ann()).toBe("Queue confirmation unknown."); // unchanged → no announcement
     r.unmount();
@@ -750,13 +750,13 @@ describe("SendStatus — O2 slice 2: bounded full-text payload expansion", () =>
     const row = r.container.querySelector('.sendStatusLine[data-kind="uncertain"]')!;
     expect(row.textContent).toContain("Same message:");
     expect(row.textContent).not.toContain("inline expansion affordance"); // clipped tail absent
-    const btn = row.querySelector(".sendStatusMore")!;
+    const btn = row.querySelector<HTMLElement>(".sendStatusMore")!;
     expect(btn.textContent).toBe("Show full message");
     expect(btn.getAttribute("aria-expanded")).toBe("false");
     btn.click();
     expect(row.querySelector(".sendStatusFull")!.textContent).toContain(LONG);
     expect(row.textContent).toContain("notes.md");
-    const btnAfter = row.querySelector(".sendStatusMore")!;
+    const btnAfter = row.querySelector<HTMLElement>(".sendStatusMore")!;
     expect(btnAfter.textContent).toBe("Hide full message");
     expect(btnAfter.getAttribute("aria-expanded")).toBe("true");
     btnAfter.click();
@@ -804,7 +804,7 @@ describe("SendStatus — O2 slice 2: create-link candidate grouping (2 visible, 
     expect(btns.map((b) => b.getAttribute("data-session-id"))).toEqual(["s-new2", "s-new1"]);
     // The adjacent explanation discloses the all-remaining-records sweep.
     expect(row.textContent).toContain("Confirming moves this draft");
-    const more = row.querySelector(".sendStatusMore")!;
+    const more = row.querySelector<HTMLElement>(".sendStatusMore")!;
     expect(more.textContent).toContain("Show all 5 possible sessions");
     more.click();
     btns = Array.from(row.querySelectorAll(".sendStatusBtn[data-session-id]"));
@@ -885,7 +885,7 @@ describe("SendStatus — create-certainty Slice 2 modern states", () => {
     expect(row.textContent).toContain("may still have created a session");
     expect(row.textContent).toContain("Create new session anyway");
     // Step 2: confirm → the op is abandoned (no longer current → affordances gone).
-    const confirm = Array.from(row.querySelectorAll(".sendStatusBtn")).find((b) =>
+    const confirm = Array.from(row.querySelectorAll<HTMLElement>(".sendStatusBtn")).find((b) =>
       b.textContent!.includes("Create new session anyway"),
     )!;
     confirm.click();

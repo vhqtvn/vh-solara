@@ -48,7 +48,7 @@ describe("decodeSnapshot (gzip+base64 snapshot payload)", () => {
         ],
       },
     };
-    const decoded = await decodeSnapshot({ encoding: "gzip64", data: encodeForTest(snap) });
+    const decoded = (await decodeSnapshot({ encoding: "gzip64", data: encodeForTest(snap) })) as typeof snap;
     expect(decoded).toEqual(snap);
     // Spot-check the transcript survived intact (the whole point of compression
     // is to ship this verbatim, just smaller).
@@ -71,7 +71,7 @@ describe("decodeSnapshot (gzip+base64 snapshot payload)", () => {
       })),
     }));
     const snap = { seq: 7, gate: { big: { messagesLoaded: true } }, messages: { big: messages } };
-    const decoded = await decodeSnapshot({ encoding: "gzip64", data: encodeForTest(snap) });
+    const decoded = (await decodeSnapshot({ encoding: "gzip64", data: encodeForTest(snap) })) as typeof snap;
     expect(decoded.messages.big).toHaveLength(70);
     expect(decoded.messages.big[69].parts).toHaveLength(4);
   });

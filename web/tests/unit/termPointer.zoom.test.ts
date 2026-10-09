@@ -219,16 +219,16 @@ describe("rewriteWheelEvent (in-place wheel-delta rewrite)", () => {
     Object.defineProperty(e, "wheelDeltaY", { configurable: true, value: -360 });
     expect(rewriteWheelEvent(e, 1.25)).toBe(true);
     expect(e.deltaY).toBeCloseTo(96, 6);
-    expect(e.wheelDeltaY).toBeCloseTo(-288, 6); // −360/1.25
-    expect(e.wheelDelta).toBeCloseTo(-288, 6);
-    expect(e.wheelDeltaY).toBeCloseTo(-3 * e.deltaY, 6); // engine factor survives
+    expect((e as WheelEvent & { wheelDeltaY?: number }).wheelDeltaY).toBeCloseTo(-288, 6); // −360/1.25
+    expect((e as WheelEvent & { wheelDelta?: number }).wheelDelta).toBeCloseTo(-288, 6);
+    expect((e as WheelEvent & { wheelDeltaY?: number }).wheelDeltaY).toBeCloseTo(-3 * e.deltaY, 6); // engine factor survives
   });
   it("leaves absent legacy props absent (Firefox/jsdom shape)", () => {
     const e = new WheelEvent("wheel", { deltaY: 120 });
     expect(rewriteWheelEvent(e, 1.25)).toBe(true);
     expect(e.deltaY).toBeCloseTo(96, 6);
     expect(Object.prototype.hasOwnProperty.call(e, "wheelDeltaY")).toBe(false);
-    expect(e.wheelDeltaY).toBeUndefined();
+    expect((e as WheelEvent & { wheelDeltaY?: number }).wheelDeltaY).toBeUndefined();
   });
 });
 
@@ -257,7 +257,7 @@ describe("documentRewriteApplies (drag-escape document seam guard)", () => {
   it("treats unprovable containment (null host / null target / non-Node) as escaped — normalize, never skip", () => {
     expect(documentRewriteApplies(outside, null)).toBe(true);
     expect(documentRewriteApplies(null, host)).toBe(true);
-    expect(documentRewriteApplies({}, host)).toBe(true);
+    expect(documentRewriteApplies({} as unknown as EventTarget, host)).toBe(true);
   });
   it("why the guard exists: rewriting an already-rewritten event would divide twice", () => {
     const screen = screenAt(1.25);
@@ -297,7 +297,7 @@ describe("dogfood: xterm's real wheel formulas on the rewritten event", () => {
     const e = new WheelEvent("wheel", { deltaY: D });
     Object.defineProperty(e, "wheelDeltaY", { configurable: true, value: -3 * D });
     rewriteWheelEvent(e, z);
-    const fixed = scrollbackDeltaLayout(e.deltaY, e.wheelDeltaY ?? -3 * e.deltaY) * z;
+    const fixed = scrollbackDeltaLayout(e.deltaY, (e as WheelEvent & { wheelDeltaY?: number }).wheelDeltaY ?? -3 * e.deltaY) * z;
     expect(fixed).toBeCloseTo(truthVisual, 6);
   });
 

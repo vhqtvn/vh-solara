@@ -59,7 +59,7 @@ import type { DrainOutcome } from "../../src/queueDrain";
 // Harness: a createSend with every dep faked EXCEPT the agent gate, which is
 // the REAL one (agents.ts), so the resolver↔send wiring is what's under test.
 // ---------------------------------------------------------------------------
-const notes: { kind: string; title: string; detail: string }[] = [];
+const notes: { kind: string; title: string; detail?: string }[] = [];
 // D1/D2 tests pin WHICH Attachment objects the enqueued item carries (by
 // identity), so the fake enqueue records the attachments array too.
 let enqueued: { id: string; text: string; sendConfig: any; attachments: Attachment[] }[] = [];
@@ -91,8 +91,9 @@ function makeDeps(overrides: Partial<SendDependencies> = {}): SendDependencies {
     sessionId: () => "ses_gate",
     draft: () => false,
     ensureSession: async () => "ses_gate",
+    materializeSession: () => {},
     input: inputSig,
-    setInput: setInputSig,
+    setInput: setInputSig as SendDependencies["setInput"],
     readyToSend: () => true,
     working: () => false,
     queueMode: () => false,
@@ -118,7 +119,7 @@ function makeDeps(overrides: Partial<SendDependencies> = {}): SendDependencies {
     jumpToLatest: () => {},
     pushHistory: () => {},
     resetHistory: () => {},
-    pushNotification: (n: { kind: string; title: string; detail: string }) => {
+    pushNotification: (n: { kind: string; title: string; detail?: string }) => {
       notes.push(n);
     },
     undo: () => {},
@@ -138,7 +139,7 @@ function seedWindowWithoutAgentStamp(id: string, count = 2): void {
   setState("messages", id, {
     order,
     byId: Object.fromEntries(
-      order.map((mid) => [mid, { id: mid, info: { id: mid, sessionID: id, role: "user" } }]),
+      order.map((mid) => [mid, { id: mid, info: { id: mid, sessionID: id, role: "user" }, partOrder: [], parts: {} }]),
     ),
   });
 }

@@ -22,6 +22,11 @@ import { bindChatTail } from "../../src/tailFollow";
 
 const HOST_ORIGIN = "https://host.example";
 
+// ES2020 lib has no Array.prototype.at — index form (test-only helper).
+function lastOf<T>(arr: readonly T[]): T | undefined {
+  return arr[arr.length - 1];
+}
+
 interface Posted {
   msg: {
     type?: string;
@@ -199,7 +204,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     resident();
     setState("permissions", SID, { p1: { id: "p1", sessionID: SID } });
     vi.advanceTimersByTime(1000);
-    const last = statusMsgs(posted).at(-1)!.msg;
+    const last = lastOf(statusMsgs(posted))!.msg;
     expect(last.attention).toBe("needs_permission");
   });
 
@@ -208,7 +213,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     resident();
     setState("questions", SID, { q1: { id: "q1", sessionID: SID, questions: [] } });
     vi.advanceTimersByTime(1000);
-    const last = statusMsgs(posted).at(-1)!.msg;
+    const last = lastOf(statusMsgs(posted))!.msg;
     expect(last.attention).toBe("needs_reply");
   });
 
@@ -218,7 +223,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     setState("questions", SID, { q1: { id: "q1", sessionID: SID, questions: [] } });
     setState("permissions", SID, { p1: { id: "p1", sessionID: SID } });
     vi.advanceTimersByTime(1000);
-    const last = statusMsgs(posted).at(-1)!.msg;
+    const last = lastOf(statusMsgs(posted))!.msg;
     expect(last.attention, "permission wins over question").toBe("needs_permission");
   });
 
@@ -226,7 +231,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     handshakeAndTick();
     resident();
     vi.advanceTimersByTime(1000);
-    const last = statusMsgs(posted).at(-1)!.msg;
+    const last = lastOf(statusMsgs(posted))!.msg;
     expect(last.attention).toBe("none");
   });
 
@@ -237,7 +242,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     resident();
     setState("activity", SID, "busy");
     vi.advanceTimersByTime(1000);
-    expect(statusMsgs(posted).at(-1)!.msg.activity).toBe("running");
+    expect(lastOf(statusMsgs(posted))!.msg.activity).toBe("running");
   });
 
   it("derives activity=running when own activity is retry", () => {
@@ -245,7 +250,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     resident();
     setState("activity", SID, "retry");
     vi.advanceTimersByTime(1000);
-    expect(statusMsgs(posted).at(-1)!.msg.activity).toBe("running");
+    expect(lastOf(statusMsgs(posted))!.msg.activity).toBe("running");
   });
 
   it("derives activity=error when activity map is error", () => {
@@ -253,7 +258,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     resident();
     setState("activity", SID, "error");
     vi.advanceTimersByTime(1000);
-    expect(statusMsgs(posted).at(-1)!.msg.activity).toBe("error");
+    expect(lastOf(statusMsgs(posted))!.msg.activity).toBe("error");
   });
 
   it("derives activity=done_unread when root unread watermark set + idle", () => {
@@ -262,7 +267,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     setState("activity", SID, "idle");
     setState("unread", SID, true); // SID is its own root
     vi.advanceTimersByTime(1000);
-    expect(statusMsgs(posted).at(-1)!.msg.activity).toBe("done_unread");
+    expect(lastOf(statusMsgs(posted))!.msg.activity).toBe("done_unread");
   });
 
   it("derives activity=idle when idle and root not unread", () => {
@@ -270,7 +275,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     resident();
     setState("activity", SID, "idle");
     vi.advanceTimersByTime(1000);
-    expect(statusMsgs(posted).at(-1)!.msg.activity).toBe("idle");
+    expect(lastOf(statusMsgs(posted))!.msg.activity).toBe("idle");
   });
 
   it("derives activity=running over done_unread (a busy session is not done)", () => {
@@ -279,7 +284,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     setState("activity", SID, "busy");
     setState("unread", SID, true);
     vi.advanceTimersByTime(1000);
-    expect(statusMsgs(posted).at(-1)!.msg.activity).toBe("running");
+    expect(lastOf(statusMsgs(posted))!.msg.activity).toBe("running");
   });
 
   // ---- derivation table: honest unknown ------------------------------------
@@ -290,7 +295,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     // session is in the map — honesty before residency.
     setState("sessions", SID, { id: SID });
     vi.advanceTimersByTime(1000);
-    expect(statusMsgs(posted).at(-1)!.msg.activity).toBe("unknown");
+    expect(lastOf(statusMsgs(posted))!.msg.activity).toBe("unknown");
   });
 
   it("derives activity=unknown when the session is not resident", () => {
@@ -298,7 +303,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     setState("authoritativeReady", true);
     // sessions[SID] absent
     vi.advanceTimersByTime(1000);
-    expect(statusMsgs(posted).at(-1)!.msg.activity).toBe("unknown");
+    expect(lastOf(statusMsgs(posted))!.msg.activity).toBe("unknown");
   });
 
   // ---- title + identifiers -------------------------------------------------
@@ -308,7 +313,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     setState("sessions", "s2", { id: "s2", title: "Refactor parser" });
     setState("authoritativeReady", true);
     handshakeAndTick();
-    const last = statusMsgs(posted).at(-1)!.msg;
+    const last = lastOf(statusMsgs(posted))!.msg;
     expect(last.dir).toBe("/proj-x");
     expect(last.session).toBe("s2");
     expect(last.title).toBe("Refactor parser");
@@ -319,13 +324,13 @@ describe("status emitter — derivation + emission (embedded)", () => {
     setState("sessions", SID, { id: SID }); // no title
     setState("authoritativeReady", true);
     handshakeAndTick();
-    expect(statusMsgs(posted).at(-1)!.msg.title).toBe("");
+    expect(lastOf(statusMsgs(posted))!.msg.title).toBe("");
   });
 
   it("reports the honest no-target state when no session is in the URL", () => {
     setUrl(""); // no session
     handshakeAndTick();
-    const last = statusMsgs(posted).at(-1)!.msg;
+    const last = lastOf(statusMsgs(posted))!.msg;
     expect(last.session).toBe("");
     expect(last.attention).toBe("none");
     expect(last.activity).toBe("unknown");
@@ -347,7 +352,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     setState("activity", SID, "busy");
     vi.advanceTimersByTime(1000);
     expect(statusMsgs(posted).length, "change emits one more").toBe(afterFirst + 1);
-    expect(statusMsgs(posted).at(-1)!.msg.activity).toBe("running");
+    expect(lastOf(statusMsgs(posted))!.msg.activity).toBe("running");
   });
 
   it("re-emits the current status on re-handshake even when unchanged (C-F1)", () => {
@@ -363,7 +368,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     handshakeAndTick();
     const afterFirst = statusMsgs(posted).length;
     expect(afterFirst, "baseline status posted").toBeGreaterThan(0);
-    const emittedStatus = { ...statusMsgs(posted).at(-1)!.msg };
+    const emittedStatus = { ...lastOf(statusMsgs(posted))!.msg };
 
     // Two ticks with NO state change → no additional status (idempotent-on-change).
     vi.advanceTimersByTime(1000);
@@ -375,7 +380,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     sendHandshake(window.parent, HOST_ORIGIN);
     vi.advanceTimersByTime(1000);
     expect(statusMsgs(posted).length, "re-handshake re-emits the current status").toBe(afterFirst + 1);
-    const reEmitted = statusMsgs(posted).at(-1)!.msg;
+    const reEmitted = lastOf(statusMsgs(posted))!.msg;
     expect(reEmitted.attention).toBe(emittedStatus.attention);
     expect(reEmitted.activity).toBe(emittedStatus.activity);
     expect(reEmitted.title).toBe(emittedStatus.title);
@@ -387,7 +392,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
   it("carries following=true when the chat is at the tail (bridge default)", () => {
     resident();
     handshakeAndTick();
-    const last = statusMsgs(posted).at(-1)!.msg;
+    const last = lastOf(statusMsgs(posted))!.msg;
     expect(last.following, "unbound bridge → honest on default").toBe(true);
   });
 
@@ -400,14 +405,14 @@ describe("status emitter — derivation + emission (embedded)", () => {
     );
     resident();
     handshakeAndTick();
-    const last = statusMsgs(posted).at(-1)!.msg;
+    const last = lastOf(statusMsgs(posted))!.msg;
     expect(last.following, "bound accessor false → reported").toBe(false);
   });
 
   it("reports following=true when no session is open (nothing to not-follow)", () => {
     setUrl(""); // no session
     handshakeAndTick();
-    const last = statusMsgs(posted).at(-1)!.msg;
+    const last = lastOf(statusMsgs(posted))!.msg;
     expect(last.session).toBe("");
     expect(last.following, "no session → honest on default").toBe(true);
   });
@@ -418,7 +423,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     handshakeAndTick();
     const afterFirst = statusMsgs(posted).length;
     expect(afterFirst, "baseline status posted").toBeGreaterThan(0);
-    expect(statusMsgs(posted).at(-1)!.msg.following).toBe(true);
+    expect(lastOf(statusMsgs(posted))!.msg.following).toBe(true);
 
     // The operator scrolls up inside the pane → the bridge reports false → the
     // next tick emits exactly one more status (key change), carrying false.
@@ -428,7 +433,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     );
     vi.advanceTimersByTime(1000);
     expect(statusMsgs(posted).length, "following flip re-emits").toBe(afterFirst + 1);
-    expect(statusMsgs(posted).at(-1)!.msg.following).toBe(false);
+    expect(lastOf(statusMsgs(posted))!.msg.following).toBe(false);
 
     // Stable false → no further emissions (idempotent-on-change).
     vi.advanceTimersByTime(1000);
@@ -546,7 +551,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     setState("activity", SID, "busy");
     setState("unread", SID, true);
     handshakeAndTick();
-    const last = statusMsgs(posted).at(-1)!.msg;
+    const last = lastOf(statusMsgs(posted))!.msg;
     expect(last.runningCount).toBe(1);
     expect(last.unreadCount).toBe(1);
   });
@@ -557,7 +562,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     handshakeAndTick();
     const afterFirst = statusMsgs(posted).length;
     expect(afterFirst, "baseline posted").toBeGreaterThan(0);
-    expect(statusMsgs(posted).at(-1)!.msg.runningCount).toBe(0);
+    expect(lastOf(statusMsgs(posted))!.msg.runningCount).toBe(0);
 
     // No change → no re-emit.
     vi.advanceTimersByTime(1000);
@@ -567,7 +572,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     setState("activity", SID, "busy");
     vi.advanceTimersByTime(1000);
     expect(statusMsgs(posted).length, "count change re-emits").toBe(afterFirst + 1);
-    expect(statusMsgs(posted).at(-1)!.msg.runningCount).toBe(1);
+    expect(lastOf(statusMsgs(posted))!.msg.runningCount).toBe(1);
 
     // An unread watermark lands (server busy→idle elsewhere in the dir) →
     // another single re-emit.
@@ -575,7 +580,7 @@ describe("status emitter — derivation + emission (embedded)", () => {
     setState("unread", "r2", true);
     vi.advanceTimersByTime(1000);
     expect(statusMsgs(posted).length, "unread change re-emits").toBe(afterFirst + 2);
-    expect(statusMsgs(posted).at(-1)!.msg.unreadCount).toBe(1);
+    expect(lastOf(statusMsgs(posted))!.msg.unreadCount).toBe(1);
   });
 
   it("host-hidden pane STILL emits count changes (hidden-pane status contract pin)", async () => {
@@ -597,11 +602,11 @@ describe("status emitter — derivation + emission (embedded)", () => {
     setState("activity", SID, "busy");
     vi.advanceTimersByTime(1000);
     expect(statusMsgs(posted).length, "count change posted while host-hidden").toBe(baseline + 1);
-    expect(statusMsgs(posted).at(-1)!.msg.runningCount).toBe(1);
+    expect(lastOf(statusMsgs(posted))!.msg.runningCount).toBe(1);
 
     setState("unread", SID, true);
     vi.advanceTimersByTime(1000);
-    expect(statusMsgs(posted).at(-1)!.msg.unreadCount, "unread change posted while host-hidden").toBe(1);
+    expect(lastOf(statusMsgs(posted))!.msg.unreadCount, "unread change posted while host-hidden").toBe(1);
     paneVis.__setHostVisibleForTest(true); // restore for afterEach hygiene
   });
 });

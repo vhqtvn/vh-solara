@@ -28,6 +28,11 @@ let backSpy: ReturnType<typeof vi.spyOn>;
 let entries: { state: unknown }[];
 
 const top = () => entries[entries.length - 1].state;
+
+// ES2020 lib has no Array.prototype.at — index form (test-only helper).
+function lastOf<T>(arr: readonly T[]): T | undefined {
+  return arr[arr.length - 1];
+}
 const firePop = () =>
   window.dispatchEvent(new PopStateEvent("popstate", { state: top() }));
 // Hardware/browser Back: pop + deliver popstate WITHOUT history.back().
@@ -69,7 +74,7 @@ describe("backStack", () => {
     const s = pushBackSurface(close, "dlg")!;
     expect(s).toBeTruthy();
     expect(pushStateSpy).toHaveBeenCalledTimes(1);
-    const call = pushStateSpy.mock.calls.at(-1)!;
+    const call = lastOf(pushStateSpy.mock.calls)!;
     expect((call[0] as Record<string, unknown>).vhBack).toMatch(/^dlg#\d+$/);
     expect(call[2]).toBeUndefined(); // URL-transparent
     expect(backStackDepth()).toBe(1);
@@ -168,12 +173,12 @@ describe("backStack", () => {
       const close = vi.fn();
       pushBackSurface(close, "dlg");
       hardwareBack(); // dismissed a surface → manager-owned
-      expect(seen.at(-1)).toBeTruthy();
-      expect(wasManagedPopState(seen.at(-1)!)).toBe(true);
+      expect(lastOf(seen)).toBeTruthy();
+      expect(wasManagedPopState(lastOf(seen)!)).toBe(true);
       // A back with NOTHING open falls through to native/session handling —
       // the manager must NOT claim it (sync.ts keeps legacy behavior there).
       hardwareBack();
-      expect(wasManagedPopState(seen.at(-1)!)).toBe(false);
+      expect(wasManagedPopState(lastOf(seen)!)).toBe(false);
     } finally {
       window.removeEventListener("popstate", capture);
     }

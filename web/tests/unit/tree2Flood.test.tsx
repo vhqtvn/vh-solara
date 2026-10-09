@@ -38,7 +38,7 @@ const LS_MODE = "vh.tree.mode.v3"; // the ACTIVE mode-map key (post v2→v3 un-c
 // (selectedId/state, the real treeState store, selectors) stays live.
 const { expandSpy } = vi.hoisted(() => ({ expandSpy: vi.fn() }));
 vi.mock("../../src/sync", async (importActual) => {
-  const actual = await importActual();
+  const actual = (await importActual()) as typeof import("../../src/sync");
   return { ...actual, expandTreeNode: expandSpy };
 });
 

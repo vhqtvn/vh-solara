@@ -87,7 +87,7 @@ test("(browser) create response lost → session lands via SSE → confirmed lin
   // fetch path — new-session-reveal.spec.ts pattern).
   await page.route("**/sw.js*", (route) => route.abort());
   for (const sw of page.context().serviceWorkers()) {
-    await sw.close();
+    await (sw as unknown as { close(): Promise<void> }).close();
   }
 
   // Capture every downstream dispatch — the A1 arc NEVER enqueues or dispatches

@@ -36,6 +36,8 @@ const OWNED_READY = {
   topology: "owned",
   state: "ready",
   state_changed_at: "2026-07-12T19:30:00Z",
+  failure_summary: "",
+  exit_code: null,
   capabilities: {
     can_restart: true,
     has_process_output: true,
@@ -426,7 +428,7 @@ describe("OpenCodeHealthPanel", () => {
     );
     expect(document.body.textContent).not.toContain("will be interrupted");
     expect(
-      fetchMock.mock.calls.find(([u, i]) =>
+      fetchMock.mock.calls.find(([u]) =>
         (u as string).includes("/vh/opencode/restart"),
       ),
     ).toBeUndefined();
@@ -560,7 +562,9 @@ describe("OpenCodeHealthPanel", () => {
   it("ready pill fires on the transition from failed → ready", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
-      const statusBody = { current: { ...OWNED_FAILED } };
+      const statusBody: { current: typeof OWNED_FAILED | typeof OWNED_READY } = {
+        current: { ...OWNED_FAILED },
+      };
       vi.stubGlobal(
         "fetch",
         vi.fn((url: string) => {

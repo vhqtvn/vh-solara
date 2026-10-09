@@ -219,7 +219,7 @@ describe("FleetStatusDialog — edit + save (writable)", () => {
     render(() => <FleetStatusDialog onClose={() => {}} />);
 
     await waitFor(() => expect(inputByLabel("Worker 1 id").value).toBe("build-box"));
-    document.querySelector('button[aria-label="Remove worker 1"]')!.click();
+    document.querySelector<HTMLElement>('button[aria-label="Remove worker 1"]')!.click();
     await waitFor(() => expect(document.querySelector('input[aria-label="Worker 1 id"]')).toBeNull());
 
     btn("Save")!.click();

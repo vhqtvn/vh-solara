@@ -227,7 +227,7 @@ test("B: two tabs one gesture — tab B's reconcile re-admits the saved gesture 
   // (tab A actually admitted). Match by PREDICATE instead (scenario D's
   // isQueueListUrl idiom): the exact /queue path with optional query, never
   // the claim/resolve sub-paths.
-  const isQueueListUrl = (url: string) => /\/vh\/session\/demo\/queue(\?.*)?$/.test(url);
+  const isQueueListUrl = (url: URL) => /\/vh\/session\/demo\/queue(\?.*)?$/.test(url.href);
   let tabAPostsAborted = 0;
   const blockAdmissionInTabA = async (page: Page) => {
     await page.route(isQueueListUrl, (route) => {
@@ -399,7 +399,7 @@ test("D: projection mode — AmbiguousDelivery chip (verbatim warning) → repla
   // The SPA's queue URLs carry NO query (the project dir travels in the
   // x-opencode-directory header), so match by predicate: the LIST endpoint
   // exactly (/queue with optional query), never claim/resolve sub-paths.
-  const isQueueListUrl = (url: string) => /\/vh\/session\/demo\/queue(\?.*)?$/.test(url);
+  const isQueueListUrl = (url: URL) => /\/vh\/session\/demo\/queue(\?.*)?$/.test(url.href);
   await page.route(isQueueListUrl, async (route) => {
     if (route.request().method() === "GET") {
       const res = await route.fetch();

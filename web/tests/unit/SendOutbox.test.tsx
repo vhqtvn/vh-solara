@@ -119,14 +119,14 @@ describe("AREA 7 — the outbox gate (BLK-A3 durability + capture semantics)", (
     // the message actually sat unsent).
     setState("messages", SID, {
       order: ["m-0"],
-      byId: { "m-0": { id: "m-0", info: { id: "m-0" }, partOrder: [], parts: {} } },
+      byId: { "m-0": { id: "m-0", info: { id: "m-0", sessionID: SID, role: "user" }, partOrder: [], parts: {} } },
     });
     mocks.outboxSave.mockImplementation(async (input: any) => {
       setState("messages", SID, {
         order: ["m-0", "m-1"],
         byId: {
-          "m-0": { id: "m-0", info: { id: "m-0" }, partOrder: [], parts: {} },
-          "m-1": { id: "m-1", info: { id: "m-1" }, partOrder: [], parts: {} },
+          "m-0": { id: "m-0", info: { id: "m-0", sessionID: SID, role: "user" }, partOrder: [], parts: {} },
+          "m-1": { id: "m-1", info: { id: "m-1", sessionID: SID, role: "user" }, partOrder: [], parts: {} },
         },
       });
       return { ok: true, input } as any;

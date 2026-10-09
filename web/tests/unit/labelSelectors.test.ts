@@ -513,7 +513,7 @@ describe("groupOfRoot / tagsOfRoot / matchesAllTags — pure helpers", () => {
   it("tagsOfRoot returns the assignment or empty; does not expose a shared empty ref", () => {
     const assign = { R1: ["t1", "t2"] };
     expect(tagsOfRoot(assign, "R1")).toEqual(["t1", "t2"]);
-    const none = tagsOfRoot(assign, "RX");
+    const none = tagsOfRoot(assign, "RX") as string[];
     expect(none).toEqual([]);
     // Mutating the unknown-root result must not affect a subsequent call.
     none.push("dirty");

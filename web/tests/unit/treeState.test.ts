@@ -852,7 +852,7 @@ describe("auto-mutation: cold-load normalization + working edges", () => {
     expect(modeOf("a")).toBe("filtered"); // invalid idle+filtered
     // A title-only facet (no working change, no edge) still triggers the sync
     // absolute-invariant normalization on the affected node:
-    applyTreeOpStore({ op: "node.facet", data: { id: "a", title: "x" } });
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", title: "x" } as { id: string } });
     expect(modeOf("a")).toBe("collapsed"); // repaired synchronously
   });
 

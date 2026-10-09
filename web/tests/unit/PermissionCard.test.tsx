@@ -9,11 +9,15 @@ import { cleanup, render, waitFor } from "@solidjs/testing-library";
 // respondPermission defaults to a confirmed outcome (the happy path the
 // pre-resilience tests pin); the resilience describe overrides the return
 // value per-test to drive unknown/gone/rejected states.
-const respondPermission = vi.fn(() => Promise.resolve({ kind: "confirmed" }));
+const respondPermission = vi.fn(
+  (_sessionID: string, _permID: string, _verb: string) =>
+    Promise.resolve({ kind: "confirmed" }),
+);
 const dismissPermission = vi.fn();
 vi.mock("../../src/sync", () => ({
-  respondPermission: (...args: unknown[]) => respondPermission(...args),
-  dismissPermission: (...args: unknown[]) => dismissPermission(...args),
+  respondPermission:
+    (...args: [string, string, string]) => respondPermission(...args),
+  dismissPermission: (...args: []) => dismissPermission(...args),
 }));
 
 import PermissionCard from "../../src/components/PermissionCard";
@@ -59,7 +63,7 @@ describe("PermissionCard — inline fast actions + shared-state popup", () => {
     expect(pre).toBeTruthy();
     expect(pre.textContent).toBe("rm -rf /tmp/scratch");
     // All three fast actions are present.
-    const actions = container.querySelectorAll(".perm-actions button");
+    const actions = container.querySelectorAll<HTMLButtonElement>(".perm-actions button");
     expect(actions.length).toBe(3);
     expect(actions[0].textContent!.trim()).toBe("Allow once");
     expect(actions[1].textContent!.trim()).toBe("Always");
@@ -70,7 +74,7 @@ describe("PermissionCard — inline fast actions + shared-state popup", () => {
     const { container } = render(() => (
       <PermissionCard sessionID={sessionID} perm={perm} />
     ));
-    const once = container.querySelectorAll(".perm-actions button")[0];
+    const once = container.querySelectorAll<HTMLButtonElement>(".perm-actions button")[0];
     once.click();
     expect(respondPermission).toHaveBeenCalledTimes(1);
     expect(respondPermission.mock.calls[0]).toEqual([sessionID, "p1", "once"]);
@@ -80,7 +84,7 @@ describe("PermissionCard — inline fast actions + shared-state popup", () => {
     const { container } = render(() => (
       <PermissionCard sessionID={sessionID} perm={perm} />
     ));
-    container.querySelectorAll(".perm-actions button")[1].click();
+    container.querySelectorAll<HTMLButtonElement>(".perm-actions button")[1].click();
     expect(respondPermission).toHaveBeenCalledTimes(1);
     expect(respondPermission.mock.calls[0]).toEqual([sessionID, "p1", "always"]);
   });
@@ -89,7 +93,7 @@ describe("PermissionCard — inline fast actions + shared-state popup", () => {
     const { container } = render(() => (
       <PermissionCard sessionID={sessionID} perm={perm} />
     ));
-    container.querySelectorAll(".perm-actions button")[2].click();
+    container.querySelectorAll<HTMLButtonElement>(".perm-actions button")[2].click();
     expect(respondPermission).toHaveBeenCalledTimes(1);
     expect(respondPermission.mock.calls[0]).toEqual([sessionID, "p1", "reject"]);
   });
@@ -99,7 +103,7 @@ describe("PermissionCard — inline fast actions + shared-state popup", () => {
       <PermissionCard sessionID={sessionID} perm={perm} />
     ));
     const card = container.querySelector(".perm-card") as HTMLElement;
-    expect(card.querySelectorAll(".perm-actions button").length).toBe(3);
+    expect(card.querySelectorAll<HTMLButtonElement>(".perm-actions button").length).toBe(3);
 
     // Open the popup (Portaled to document.body, outside `container`).
     (
@@ -112,11 +116,11 @@ describe("PermissionCard — inline fast actions + shared-state popup", () => {
     );
     expect(pop).toBeTruthy();
     // The popup body mirrors the inline surface: same three fast actions.
-    expect(pop.querySelectorAll(".perm-actions button").length).toBe(3);
+    expect(pop.querySelectorAll<HTMLButtonElement>(".perm-actions button").length).toBe(3);
 
     // Click Reject INSIDE the popup → respondPermission fires with 'reject'.
     (
-      pop.querySelectorAll(".perm-actions button")[2] as HTMLButtonElement
+      pop.querySelectorAll<HTMLButtonElement>(".perm-actions button")[2] as HTMLButtonElement
     ).click();
     expect(respondPermission).toHaveBeenCalledTimes(1);
     expect(respondPermission.mock.calls[0]).toEqual([sessionID, "p1", "reject"]);
@@ -234,25 +238,25 @@ describe("PermissionCard — reply resilience lifecycle", () => {
   });
 
   it("sending disables all three actions and shows a Sending indicator until the verb answers", async () => {
-    let release!: (v: unknown) => void;
+    let release!: (v: { kind: string }) => void;
     respondPermission.mockImplementation(
       () => new Promise((res) => (release = res)),
     );
     const { container } = render(() => (
       <PermissionCard sessionID={sessionID} perm={perm} />
     ));
-    container.querySelectorAll(".perm-actions button")[0].click();
+    container.querySelectorAll<HTMLButtonElement>(".perm-actions button")[0].click();
     await waitFor(() =>
       expect(container.querySelector(".reply-status.sending")).toBeTruthy(),
     );
     // Single-flight: every action button is disabled while the reply is away.
-    for (const b of container.querySelectorAll(".perm-actions button"))
+    for (const b of container.querySelectorAll<HTMLButtonElement>(".perm-actions button"))
       expect((b as HTMLButtonElement).disabled).toBe(true);
     release({ kind: "confirmed" });
     await waitFor(() =>
       expect(container.querySelector(".reply-status")).toBeNull(),
     );
-    for (const b of container.querySelectorAll(".perm-actions button"))
+    for (const b of container.querySelectorAll<HTMLButtonElement>(".perm-actions button"))
       expect((b as HTMLButtonElement).disabled).toBe(false);
   });
 
@@ -263,7 +267,7 @@ describe("PermissionCard — reply resilience lifecycle", () => {
     const { container } = render(() => (
       <PermissionCard sessionID={sessionID} perm={perm} />
     ));
-    container.querySelectorAll(".perm-actions button")[0].click(); // Allow once
+    container.querySelectorAll<HTMLButtonElement>(".perm-actions button")[0].click(); // Allow once
     await waitFor(() =>
       expect(container.querySelector(".reply-status.unknown")).not.toBeNull(),
     );
@@ -272,7 +276,7 @@ describe("PermissionCard — reply resilience lifecycle", () => {
     expect(banner.textContent).toContain("may still have been applied");
     // The normal actions stay enabled — choosing a different answer is also
     // safe (upstream is single-shot; a stale request just 410s).
-    for (const b of container.querySelectorAll(".perm-actions button"))
+    for (const b of container.querySelectorAll<HTMLButtonElement>(".perm-actions button"))
       expect((b as HTMLButtonElement).disabled).toBe(false);
     // Retry re-sends the attempted answer.
     (banner.querySelector(".reply-retry") as HTMLButtonElement).click();
@@ -285,7 +289,7 @@ describe("PermissionCard — reply resilience lifecycle", () => {
     const { container } = render(() => (
       <PermissionCard sessionID={sessionID} perm={perm} />
     ));
-    container.querySelectorAll(".perm-actions button")[0].click();
+    container.querySelectorAll<HTMLButtonElement>(".perm-actions button")[0].click();
     await waitFor(() =>
       expect(container.querySelector(".reply-status.gone")).not.toBeNull(),
     );
@@ -294,7 +298,7 @@ describe("PermissionCard — reply resilience lifecycle", () => {
     expect(banner.textContent).toContain("not confirmed");
     expect(banner.textContent).not.toContain("success");
     // The request is dead upstream — answering again cannot work.
-    for (const b of container.querySelectorAll(".perm-actions button"))
+    for (const b of container.querySelectorAll<HTMLButtonElement>(".perm-actions button"))
       expect((b as HTMLButtonElement).disabled).toBe(true);
     (banner.querySelector(".reply-dismiss") as HTMLButtonElement).click();
     expect(dismissPermission).toHaveBeenCalledWith(sessionID, "p1");
@@ -307,11 +311,11 @@ describe("PermissionCard — reply resilience lifecycle", () => {
     const { container } = render(() => (
       <PermissionCard sessionID={sessionID} perm={perm} />
     ));
-    container.querySelectorAll(".perm-actions button")[2].click(); // Reject
+    container.querySelectorAll<HTMLButtonElement>(".perm-actions button")[2].click(); // Reject
     await waitFor(() => expect(respondPermission).toHaveBeenCalledTimes(1));
     await new Promise((r) => setTimeout(r, 10));
     expect(container.querySelector(".reply-status")).toBeNull();
-    for (const b of container.querySelectorAll(".perm-actions button"))
+    for (const b of container.querySelectorAll<HTMLButtonElement>(".perm-actions button"))
       expect((b as HTMLButtonElement).disabled).toBe(false);
   });
 });

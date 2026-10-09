@@ -74,7 +74,7 @@ function receipt(state: string, extra: Record<string, unknown> = {}): StubResp {
   return { status, body: { protocol: "vh-session-create", version: 1, state, ...extra } };
 }
 
-function stubFetch(fn: (url: string, init?: RequestInit & { method?: string }) => RouteResult) {
+function stubFetch(fn: (url: string, init?: RequestInit & { method?: string }) => RouteResult | Promise<RouteResult>) {
   const calls: { url: string; method: string; body?: string }[] = [];
   vi.stubGlobal(
     "fetch",

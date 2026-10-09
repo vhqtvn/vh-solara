@@ -44,6 +44,11 @@ function blobText(b: Blob): Promise<string> {
 
 const SRC = "graph TD\n    A --> B";
 
+// ES2020 lib has no Array.prototype.at — index form (test-only helper).
+function lastOf<T>(arr: readonly T[]): T | undefined {
+  return arr[arr.length - 1];
+}
+
 describe("MermaidViewer", () => {
   let pushStateSpy: ReturnType<typeof vi.spyOn>;
   let backSpy: ReturnType<typeof vi.spyOn>;
@@ -241,7 +246,7 @@ describe("MermaidViewer", () => {
       )!,
     );
     await waitFor(() => expect(createURLMock).toHaveBeenCalled());
-    const blob = createURLMock.mock.calls.at(-1)![0] as Blob;
+    const blob = lastOf(createURLMock.mock.calls)![0] as Blob;
     expect(await blobText(blob)).toBe(`<svg data-mock>rendered:${SRC}</svg>`);
   });
 
@@ -296,7 +301,7 @@ describe("MermaidViewer", () => {
       )!,
     );
     await waitFor(() => expect(pushStateSpy).toHaveBeenCalled());
-    const call = pushStateSpy.mock.calls.at(-1)!;
+    const call = lastOf(pushStateSpy.mock.calls)!;
     // back-stack token state present (mermaid layer); url arg omitted
     // (URL-transparent)
     expect(call[0]).toMatchObject({ vhBack: expect.stringMatching(/^mermaid#/) });

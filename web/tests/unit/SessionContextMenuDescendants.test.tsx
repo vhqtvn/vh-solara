@@ -65,7 +65,7 @@ function descResp(
   return {
     epoch: "e1",
     revision: 1,
-    data: { sessionId: targetId, descendants },
+    data: { sessionId: targetId, descendants, fingerprint: "fp1" },
   };
 }
 

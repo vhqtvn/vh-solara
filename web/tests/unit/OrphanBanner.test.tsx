@@ -156,7 +156,7 @@ describe("OrphanBanner — confirm flow targets only flagged ids", () => {
 
     // Open + confirm (both buttons located by text; .confirm-go is a global class).
     buttonByText(container, "Archive orphans").click();
-    container.querySelector(".confirm-go")!.click();
+    container.querySelector<HTMLElement>(".confirm-go")!.click();
 
     // The confirm loop awaits each archiveSession; flush the microtask chain.
     await vi.waitFor(() => expect(archiveSpy).toHaveBeenCalledTimes(2));
@@ -171,7 +171,7 @@ describe("OrphanBanner — confirm flow targets only flagged ids", () => {
     const { container } = render(() => <OrphanBanner />);
 
     buttonByText(container, "Archive orphans").click();
-    container.querySelector(".confirm-go")!.click();
+    container.querySelector<HTMLElement>(".confirm-go")!.click();
 
     await vi.waitFor(() => expect(archiveSpy).toHaveBeenCalledTimes(1));
     expect(archiveSpy).toHaveBeenCalledWith("only");

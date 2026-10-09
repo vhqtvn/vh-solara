@@ -10,7 +10,7 @@ import { projectUrl } from "./util";
 // initial about:blank entry — the empty-stack case intentionally falls through
 // to native behavior (no exit trapping, by design).
 
-const settingsDialog = (page: { locator: import("@playwright/test").Locator }) =>
+const settingsDialog = (page: import("@playwright/test").Page) =>
   page.locator('div[role="dialog"][aria-label="Settings"]');
 
 async function selectDemoSession(page: import("@playwright/test").Page) {

@@ -220,7 +220,7 @@ describe("Tooltip", () => {
   // → centre 450, clamp bounds [68, 956] on a 1024px viewport → x=450;
   //   520+6+28+8=562 ≤ 768 → below → y=526. (Viewport guard below keeps the
   // 1024x768 jsdom default honest if the environment ever changes.)
-  const rectOf = (o: Partial<DOMRect>) =>
+  const rectOf = (o: Partial<DOMRect> = {}) =>
     ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0, ...o }) as DOMRect;
   const stubTooltipGeometry = (anchor: HTMLElement) =>
     vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {

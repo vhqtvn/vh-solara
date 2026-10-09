@@ -215,7 +215,7 @@ function seedSingleMessage(): void {
     byId: {
       m1: {
         id: "m1",
-        info: { role: "assistant", time: { created: 1000, completed: 2000 } },
+        info: { id: "m1", sessionID: SID, role: "assistant", time: { created: 1000, completed: 2000 } },
         partOrder: [],
         parts: {},
       },

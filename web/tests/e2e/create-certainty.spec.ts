@@ -109,7 +109,7 @@ test("(a+c) create held → unknown row → release → receipt recovery resolve
   let sid: string | null = null;
 
   await page.route("**/sw.js*", (route) => route.abort());
-  for (const sw of page.context().serviceWorkers()) await sw.close();
+  for (const sw of page.context().serviceWorkers()) await (sw as unknown as { close(): Promise<void> }).close();
 
   const wire = instrumentCreateWire(page);
 
@@ -197,8 +197,8 @@ test("(a+c) create held → unknown row → release → receipt recovery resolve
 
   // Cleanup: queue items (the continuing send leaves a durable sent item the
   // FE filters but the daemon keeps) then the session itself.
-  await cleanQueue(request, sid);
-  const del = await request.post(`/oc/fixture/delete?session=${encodeURIComponent(sid)}`, { headers: csrf });
+  await cleanQueue(request, sid!);
+  const del = await request.post(`/oc/fixture/delete?session=${encodeURIComponent(sid!)}`, { headers: csrf });
   if (!del.ok()) console.log(`[create-certainty] WARNING: fixture delete for ${sid} -> ${del.status()}`);
 });
 
@@ -206,7 +206,7 @@ test("(b) create dropped → stays honestly unknown through the whole budget; no
   test.setTimeout(120_000);
 
   await page.route("**/sw.js*", (route) => route.abort());
-  for (const sw of page.context().serviceWorkers()) await sw.close();
+  for (const sw of page.context().serviceWorkers()) await (sw as unknown as { close(): Promise<void> }).close();
 
   const wire = instrumentCreateWire(page);
 
@@ -268,7 +268,7 @@ test("(d) legacy fallback: capability 404 → the old /oc/session path still wor
   let sid: string | null = null;
 
   await page.route("**/sw.js*", (route) => route.abort());
-  for (const sw of page.context().serviceWorkers()) await sw.close();
+  for (const sw of page.context().serviceWorkers()) await (sw as unknown as { close(): Promise<void> }).close();
 
   // Force the LEGACY lane the way an old server presents it: the capability
   // route answers 404 (route-unsupported — the uncertainty ladder's legacy
@@ -329,7 +329,7 @@ test("(d) legacy fallback: capability 404 → the old /oc/session path still wor
 
   // Cleanup (queue first, then the session — model-draft-failure-retry
   // pattern).
-  await cleanQueue(request, sid);
-  const del = await request.post(`/oc/fixture/delete?session=${encodeURIComponent(sid)}`, { headers: csrf });
+  await cleanQueue(request, sid!);
+  const del = await request.post(`/oc/fixture/delete?session=${encodeURIComponent(sid!)}`, { headers: csrf });
   if (!del.ok()) console.log(`[create-certainty] WARNING: fixture delete for ${sid} -> ${del.status()}`);
 });

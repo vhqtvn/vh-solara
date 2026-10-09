@@ -245,7 +245,7 @@ describe("applyLabelsUpdated — revision-monotonicity guard (F1)", () => {
 describe("optimistic mutation — immediate reflect + rollback on failure", () => {
   it("createGroup mints an lg- prefixed id, reflects optimistically, PUTs the full doc", async () => {
     applyLabelsSnapshot(doc(1, [grp("g1")]));
-    const fetchMock = vi.fn(() =>
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) =>
       Promise.resolve(jsonRes(doc(2, [grp("g1"), grp("lg-AAA", { name: "New", color: "red" })]))),
     );
     vi.stubGlobal("fetch", fetchMock);
@@ -299,7 +299,7 @@ describe("bounded retry — 409 conflict", () => {
       jsonRes(doc(2, [grp("gA", { roots: ["r1", "r2"] })], [t1], { r2: ["t1"] })),
     ];
     let i = 0;
-    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(seq[i++]));
     vi.stubGlobal("fetch", fetchMock);
 
     // Seed t1 exists, then assign it to r2.
@@ -322,7 +322,7 @@ describe("bounded retry — 409 conflict", () => {
       jsonRes(doc(2, [grp("gA"), grp("gB"), grp("gC")]), 409), // another beat the retry
     ];
     let i = 0;
-    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(seq[i++]));
     vi.stubGlobal("fetch", fetchMock);
 
     await createGroup("Mine", "red");
@@ -393,7 +393,7 @@ describe("stale-ref correction — 400 self-heal + rebased retry converges", () 
       jsonRes(doc(2, [grp("gA", { roots: ["live"], collapsed: true })], [t1])), // rebased retry wins
     ];
     let i = 0;
-    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(seq[i++]));
     vi.stubGlobal("fetch", fetchMock);
 
     await toggleGroupCollapse("gA"); // intent: flip collapse
@@ -449,7 +449,7 @@ describe("reorderGroup — rebased retry, NOT a blind replay", () => {
       jsonRes(doc(3, [grp("C"), grp("A"), grp("B"), grp("D")])), // rebased retry wins
     ];
     let i = 0;
-    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(seq[i++]));
     vi.stubGlobal("fetch", fetchMock);
 
     await reorderGroup("C", 0);
@@ -509,7 +509,7 @@ describe("intent semantics — full-doc transforms", () => {
 
   it("createTag mints an lt- prefixed id and appends", async () => {
     applyLabelsSnapshot(doc(1, []));
-    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonRes(doc(2, [tag("lt-X", { name: "Bug", color: "red" })])))));
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonRes(doc(2, [], [tag("lt-X", { name: "Bug", color: "red" })])))));
 
     const p = createTag("Bug", "red");
     expect(labelsTags()[0].id.startsWith("lt-")).toBe(true);
@@ -558,7 +558,7 @@ describe("intent semantics — full-doc transforms", () => {
 describe("setGroupColor — change a group's color token", () => {
   it("changes the color optimistically, PUTs the full doc with the new color, bumps revision on 200", async () => {
     applyLabelsSnapshot(doc(1, [grp("g1", { name: "G1", color: "blue" })]));
-    const fetchMock = vi.fn(() =>
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) =>
       Promise.resolve(jsonRes(doc(2, [grp("g1", { name: "G1", color: "red" })]))),
     );
     vi.stubGlobal("fetch", fetchMock);
@@ -617,7 +617,7 @@ describe("setGroupColor — change a group's color token", () => {
       jsonRes(doc(3, [grp("g1", { name: "Renamed", color: "red" })])),
     ];
     let i = 0;
-    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(seq[i++]));
     vi.stubGlobal("fetch", fetchMock);
 
     await setGroupColor("g1", "red");

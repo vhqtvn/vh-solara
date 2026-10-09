@@ -112,7 +112,9 @@ describe("messageMarked — markdown features with angle brackets preserved", ()
 
   it("table structure is preserved", () => {
     const out = messageMarked.parse("| a | b |\n|---|---|\n| <report> | d |", { async: false }) as string;
-    expect(out).toContain("<table") || expect(out).toContain("<th") || expect(out).toContain("<td");
+    expect(out).toContain("<table");
+    expect(out).toContain("<th");
+    expect(out).toContain("<td");
     expect(out).toContain("&lt;report&gt;");
   });
 });

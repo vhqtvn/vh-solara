@@ -161,7 +161,6 @@ describe("prependMessagesIfAbsent (pure)", () => {
 
   it("ignores malformed items (missing info)", () => {
     const sm = buildMessages([item("a")]);
-    // @ts-expect-error — deliberately malformed (no info)
     const added = prependMessagesIfAbsent(sm, [{ parts: [] }]);
     expect(added).toBe(0);
     expect(sm.order).toEqual(["a"]);

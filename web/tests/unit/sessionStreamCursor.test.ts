@@ -37,6 +37,7 @@ describe("applyMessageEvent trackCursor:false — Stream2 replay invariant", () 
       order: ["m1"],
       byId: {
         m1: {
+          id: "m1",
           info: { id: "m1", sessionID: "s1", role: "user", time: { created: 1 } },
           parts: {},
           partOrder: [],
@@ -70,6 +71,7 @@ describe("applyMessageEvent trackCursor:false — Stream2 replay invariant", () 
       order: ["m1"],
       byId: {
         m1: {
+          id: "m1",
           info: { id: "m1", sessionID: "s1", role: "user", time: { created: 1 } },
           parts: {
             p1: { id: "p1", sessionID: "s1", messageID: "m1", type: "text", text: "hi" },
@@ -136,6 +138,7 @@ describe("applyMessageEvent trackCursor:false — Stream2 replay invariant", () 
       order: ["m1"],
       byId: {
         m1: {
+          id: "m1",
           info: { id: "m1", sessionID: "s1", role: "user", time: { created: 1 } },
           parts: {},
           partOrder: [],

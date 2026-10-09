@@ -98,7 +98,7 @@ describe("PerformanceDialog", () => {
   }
 
   it("fetches /vh/diag/latency on open and renders the sectioned body", async () => {
-    const fetchMock = vi.fn((url: string) =>
+    const fetchMock = vi.fn((url: string, _init?: RequestInit) =>
       url.includes("/vh/diag/latency")
         ? Promise.resolve(respJson(SNAP))
         : Promise.resolve(respJson({}, false, 404)),
@@ -133,7 +133,7 @@ describe("PerformanceDialog", () => {
   });
 
   it("Copy JSON copies the verbatim response and flashes confirmation", async () => {
-    const writeText = vi.fn(async () => undefined);
+    const writeText = vi.fn(async (_text: string) => undefined);
     shimClipboard(writeText);
     const fetchMock = vi.fn(() => Promise.resolve(respJson(SNAP)));
     vi.stubGlobal("fetch", fetchMock);
@@ -164,7 +164,7 @@ describe("PerformanceDialog", () => {
   });
 
   it("Copy summary copies a compact digest", async () => {
-    const writeText = vi.fn(async () => undefined);
+    const writeText = vi.fn(async (_text: string) => undefined);
     shimClipboard(writeText);
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(respJson(SNAP))));
 
@@ -264,7 +264,7 @@ describe("PerformanceDialog", () => {
     // First copy (summary) fails → fallback path stages the summary into the
     // off-screen textarea. Then the clipboard starts succeeding and Copy JSON
     // is clicked: it MUST receive the ORIGINAL raw response, not the summary.
-    const writeText = vi.fn(async () => undefined);
+    const writeText = vi.fn(async (_text: string) => undefined);
     // Start with a clipboard that REJECTS so the summary copy takes the fallback.
     writeText.mockRejectedValueOnce(new Error("clipboard unavailable"));
     shimClipboard(writeText);
@@ -506,7 +506,7 @@ describe("PerformanceDialog", () => {
   });
 
   it("Copy JSON copies the verbatim aggregated envelope (F1 across topologies)", async () => {
-    const writeText = vi.fn(async () => undefined);
+    const writeText = vi.fn(async (_text: string) => undefined);
     Object.defineProperty(navigator, "clipboard", {
       value: { writeText },
       configurable: true,
@@ -534,7 +534,7 @@ describe("PerformanceDialog", () => {
   });
 
   it("Copy summary builds the aggregated digest (controller + per-worker sections)", async () => {
-    const writeText = vi.fn(async () => undefined);
+    const writeText = vi.fn(async (_text: string) => undefined);
     Object.defineProperty(navigator, "clipboard", {
       value: { writeText },
       configurable: true,

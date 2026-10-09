@@ -90,7 +90,7 @@ test("explicit draft model/variant pick survives first-send materialization, a t
   // the SW script never loads; existing workers closed) — see header note.
   await page.route("**/sw.js*", (route) => route.abort());
   for (const sw of page.context().serviceWorkers()) {
-    await sw.close();
+    await (sw as unknown as { close(): Promise<void> }).close();
   }
 
   // Page-local interception of the SPA's dispatch POST. The FIRST POST is

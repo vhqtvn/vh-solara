@@ -72,7 +72,7 @@ describe("ackSession — open-at-bottom force flag", () => {
   });
 
   it("posts AND optimistically clears when the FE unread flag IS armed", async () => {
-    setState("unread", "other", true as unknown as undefined);
+    setState("unread", "other", true as unknown as boolean);
     expect(state.unread["other"]).toBeTruthy();
     const fetchMock = vi.fn().mockResolvedValue(new Response("{}"));
     vi.stubGlobal("fetch", fetchMock);
@@ -102,7 +102,7 @@ describe("setSelectedId — ack-on-select alignment", () => {
     // rootOf internally) and POST the raw id (the server resolves root too).
     setState("sessions", "r", { id: "r" });
     setState("sessions", "c", { id: "c", parentID: "r" });
-    setState("unread", "r", true as unknown as undefined);
+    setState("unread", "r", true as unknown as boolean);
     const fetchMock = vi.fn().mockResolvedValue(new Response("{}"));
     vi.stubGlobal("fetch", fetchMock);
 

@@ -35,7 +35,7 @@ describe("pruneSessionDeleted", () => {
     setState("lastAgents", "ghost", "Claude Sonnet");
     setState("messageWindows", "ghost", { hasMore: false, ids: ["m1"] } as any);
     setState("messagesDelivered", "ghost", true);
-    setState("messagesError", "ghost", "something");
+    setState("messagesError", "ghost", "something" as unknown as boolean);
     setState("refreshing", "ghost", true);
 
     expect(state.sessions["ghost"]).toBeDefined();

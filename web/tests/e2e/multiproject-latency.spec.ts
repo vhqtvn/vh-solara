@@ -260,7 +260,7 @@ async function installObserver(page: Page, proj: number) {
         let changed = false;
         for (const m of muts) {
           for (const nd of Array.from(m.addedNodes)) {
-            const txt = nd.nodeType === 3 ? nd.data || "" : nd.textContent || "";
+            const txt = nd.nodeType === 3 ? (nd as Text).data || "" : nd.textContent || "";
             if (txt.length < 12) continue;
             MARK.lastIndex = 0;
             let mm: RegExpExecArray | null;
@@ -760,6 +760,8 @@ test("A2 seven-page sustained demand: fixture-driven browser attribution", async
         return { found: true, t };
       });
       expect(closed.found, "page 0 session EventSource not open at reconnect time").toBe(true);
+      // The found-assert above guarantees the {found:true,t} branch; narrow once.
+      const closedT = (closed as { t: number }).t;
 
       const done = await pollDone(request, start.run_id, 30_000);
       s4Expected = done.expected[1]; // S5 re-checks page 1's transcript after repair
@@ -793,8 +795,8 @@ test("A2 seven-page sustained demand: fixture-driven browser attribution", async
       const retryConn = col0.es.reduce((acc: any, x: any, idx: number) => (x.url.indexOf("cursor=") !== -1 && x.url.indexOf("sessions=mp0_s0") !== -1 ? idx : acc), -1);
       const firstEv = retryConn >= 0 ? col0.connFirst[retryConn] : null;
       const mkLast = (col0.markers[col0.markers.length - 1] || { t: -1 }).t;
-      const reopenMs = firstEv && closed.t >= 0 ? +(firstEv.t - closed.t).toFixed(1) : -1;
-      const caughtUpMs = mkLast >= 0 && closed.t >= 0 ? +(mkLast - closed.t).toFixed(1) : -1;
+      const reopenMs = firstEv && closedT >= 0 ? +(firstEv.t - closedT).toFixed(1) : -1;
+      const caughtUpMs = mkLast >= 0 && closedT >= 0 ? +(mkLast - closedT).toFixed(1) : -1;
       dump.scenarios.reconnect = {
         runId: start.run_id,
         closeT: closed.t,
@@ -864,8 +866,8 @@ test("A2 seven-page sustained demand: fixture-driven browser attribution", async
           repair = await fleet[1].evaluate((fromIdx: number) => {
             const M = (window as any).__mp;
             const idxs = M.es.map((e: any, i: number) => ({ i, url: e.url }))
-              .filter((r) => r.url.indexOf("sessions=mp1_s0") !== -1 && r.i >= fromIdx)
-              .map((r) => r.i);
+              .filter((r: { i: number; url: string }) => r.url.indexOf("sessions=mp1_s0") !== -1 && r.i >= fromIdx)
+              .map((r: { i: number; url: string }) => r.i);
             for (const i of idxs) {
               const evs = M.events.filter((e: any) => e.conn === i);
               if (evs.some((e: any) => e.type === "snapshot")) {

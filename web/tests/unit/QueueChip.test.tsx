@@ -296,7 +296,7 @@ describe("QueueChip — retry action (slice 3: explicit same-messageID re-send)"
     const { container } = render(() => (
       <QueueChip q={q} onRemove={vi.fn()} onRetry={onRetry} />
     ));
-    container.querySelector(".queue-retry")!.click();
+    container.querySelector<HTMLElement>(".queue-retry")!.click();
     expect(onRetry).toHaveBeenCalledTimes(1);
     expect(onRetry).toHaveBeenCalledWith(q);
   });
@@ -319,7 +319,7 @@ describe("QueueChip — dismiss click handler (FIX-QUEUE-GC-4)", () => {
     const { container } = render(() => (
       <QueueChip q={item({ id: "q-42", state: "pending" })} onRemove={onRemove} />
     ));
-    container.querySelector(".queue-dismiss")!.click();
+    container.querySelector<HTMLElement>(".queue-dismiss")!.click();
     expect(onRemove).toHaveBeenCalledTimes(1);
     expect(onRemove).toHaveBeenCalledWith("q-42");
   });
@@ -333,7 +333,7 @@ describe("QueueChip — dismiss click handler (FIX-QUEUE-GC-4)", () => {
         onRetract={vi.fn()}
       />
     ));
-    container.querySelector(".queue-dismiss")!.click();
+    container.querySelector<HTMLElement>(".queue-dismiss")!.click();
     expect(onRemove).toHaveBeenCalledTimes(1);
     expect(onRemove).toHaveBeenCalledWith("q-failed-1");
   });
@@ -348,7 +348,7 @@ describe("QueueChip — dismiss click handler (FIX-QUEUE-GC-4)", () => {
         onMarkSent={vi.fn()}
       />
     ));
-    container.querySelector(".queue-dismiss")!.click();
+    container.querySelector<HTMLElement>(".queue-dismiss")!.click();
     expect(onRemove).toHaveBeenCalledTimes(1);
     expect(onRemove).toHaveBeenCalledWith("q-unknown-1");
   });
@@ -387,7 +387,7 @@ describe("QueueChip — retract action (Bug 1: retract-to-compose)", () => {
     const { container } = render(() => (
       <QueueChip q={q} onRemove={vi.fn()} onRetract={onRetract} />
     ));
-    container.querySelector(".queue-retract")!.click();
+    container.querySelector<HTMLElement>(".queue-retract")!.click();
     expect(onRetract).toHaveBeenCalledTimes(1);
     expect(onRetract).toHaveBeenCalledWith(q);
   });
@@ -443,7 +443,7 @@ describe("QueueChip — mark-sent action (Bug 2: manual mark-sent for unknown)",
     const { container } = render(() => (
       <QueueChip q={q} onRemove={vi.fn()} onMarkSent={onMarkSent} />
     ));
-    container.querySelector(".queue-mark-sent")!.click();
+    container.querySelector<HTMLElement>(".queue-mark-sent")!.click();
     expect(onMarkSent).toHaveBeenCalledTimes(1);
     expect(onMarkSent).toHaveBeenCalledWith(q);
   });

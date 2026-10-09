@@ -132,7 +132,7 @@ describe("applyPinsSnapshot — uninitialized triggers one-shot migration", () =
     localStorage.setItem("vh.pinned.v1", JSON.stringify({ v: 1, data: ["a", "b"] }));
     localStorage.setItem("vh.pinned-order.v1", JSON.stringify({ v: 1, data: ["a", "b"] }));
     __resetPinnedForTest();
-    const fetchMock = vi.fn(() => Promise.resolve(jsonRes(pinDoc(1, true, ["a", "b"]))));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(jsonRes(pinDoc(1, true, ["a", "b"]))));
     vi.stubGlobal("fetch", fetchMock);
 
     applyPinsSnapshot(pinDoc(0, false, []));
@@ -226,7 +226,7 @@ describe("applyPinsUpdated — revision-monotonicity guard (F1)", () => {
 describe("togglePin (server mode) — PUT + bounded 409 retry", () => {
   it("pins via PUT 200 and adopts the confirmed doc", async () => {
     applyPinsSnapshot(pinDoc(1, true, []));
-    const fetchMock = vi.fn(() => Promise.resolve(jsonRes(pinDoc(2, true, ["a"]))));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(jsonRes(pinDoc(2, true, ["a"]))));
     vi.stubGlobal("fetch", fetchMock);
 
     await togglePin("a");
@@ -241,7 +241,7 @@ describe("togglePin (server mode) — PUT + bounded 409 retry", () => {
 
   it("unpins by removing the id from the ordered list", async () => {
     applyPinsSnapshot(pinDoc(1, true, ["a", "b"]));
-    const fetchMock = vi.fn(() => Promise.resolve(jsonRes(pinDoc(2, true, ["a"]))));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(jsonRes(pinDoc(2, true, ["a"]))));
     vi.stubGlobal("fetch", fetchMock);
 
     await togglePin("b");
@@ -259,7 +259,7 @@ describe("togglePin (server mode) — PUT + bounded 409 retry", () => {
       jsonRes(pinDoc(2, true, ["b", "a"])), // our retry wins
     ];
     let i = 0;
-    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(seq[i++]));
     vi.stubGlobal("fetch", fetchMock);
 
     await togglePin("a"); // pin a
@@ -280,7 +280,7 @@ describe("togglePin (server mode) — PUT + bounded 409 retry", () => {
       jsonRes(pinDoc(2, true, ["b", "c"]), 409), // another concurrent change beat the retry
     ];
     let i = 0;
-    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(seq[i++]));
     vi.stubGlobal("fetch", fetchMock);
 
     await togglePin("a");
@@ -317,7 +317,7 @@ describe("togglePin (server mode) — PUT + bounded 409 retry", () => {
 describe("movePinnedByOffset (server mode) — reorder", () => {
   it("movePinnedByOffset translates to a reorder PUT", async () => {
     applyPinsSnapshot(pinDoc(1, true, ["a", "b", "c"]));
-    const fetchMock = vi.fn(() => Promise.resolve(jsonRes(pinDoc(2, true, ["b", "a", "c"]))));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(jsonRes(pinDoc(2, true, ["b", "a", "c"]))));
     vi.stubGlobal("fetch", fetchMock);
 
     await movePinnedByOffset("b", -1); // b up → [b, a, c]
@@ -369,7 +369,7 @@ describe("400 self-heal — stale pinned id dropped + one bounded retry", () => 
       jsonRes(pinDoc(6, true, ["live", "new"]), 200), // retry PUT: cleaned order wins
     ];
     let i = 0;
-    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(seq[i++]));
     vi.stubGlobal("fetch", fetchMock);
 
     await togglePin("new"); // pin "new"
@@ -410,7 +410,7 @@ describe("400 self-heal — stale pinned id dropped + one bounded retry", () => 
     applyPinsSnapshot(pinDoc(5, true, ["stale", "a", "b"]));
     const seq = [unknownRes(["stale"]), jsonRes(pinDoc(6, true, ["b", "a"]), 200)];
     let i = 0;
-    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(seq[i++]));
     vi.stubGlobal("fetch", fetchMock);
 
     await movePinnedByOffset("b", -1); // move b up one slot (before a)
@@ -431,7 +431,7 @@ describe("400 self-heal — stale pinned id dropped + one bounded retry", () => 
       jsonRes(pinDoc(6, true, ["live", "new"]), 200),
     ];
     let i = 0;
-    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(seq[i++]));
     vi.stubGlobal("fetch", fetchMock);
 
     await togglePin("new");
@@ -450,7 +450,7 @@ describe("400 self-heal — stale pinned id dropped + one bounded retry", () => 
     // or a transient). Must NOT retry again.
     const seq = [unknownRes(["stale"]), unknownRes(["live"])];
     let i = 0;
-    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => Promise.resolve(seq[i++]));
     vi.stubGlobal("fetch", fetchMock);
 
     await togglePin("new");

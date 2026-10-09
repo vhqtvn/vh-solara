@@ -90,14 +90,14 @@ describe("applyScopedSnapshot — D3/D4 frontier-scoped partial installer", () =
 
   it("(req 6) globally-complete Q/P/unread authoritatively replace (replied question cleared)", () => {
     // Stale pending Q/P/unread from a prior frame.
-    setState("questions", "front", { staleQ: { id: "staleQ" } });
-    setState("permissions", "front", { staleP: { id: "staleP" } });
+    setState("questions", "front", { staleQ: { id: "staleQ" } as any });
+    setState("permissions", "front", { staleP: { id: "staleP" } as any });
     setState("unread", "buried", true);
     // Incoming partial carries a REPLACED global set: only a new question, no
     // permission, no unread (the replied question must disappear).
     const snap = partialSnap({
       scope: ["front"],
-      questions: { front: [{ id: "newQ" }] },
+      questions: { front: [{ id: "newQ" } as any] },
       permissions: {},
       unread: [],
     });

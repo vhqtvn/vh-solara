@@ -93,7 +93,7 @@ test("terminal offline: typed input is held visibly, survives reconnect, and sen
   // Drop the connection with a clean close: the pane surfaces "disconnected"
   // (no auto-retry) — a stable, deterministic !sendable state.
   up = false;
-  route?.close({ code: 1000, reason: "e2e-simulated-shell-exit" });
+  (route as WebSocketRoute | null)?.close({ code: 1000, reason: "e2e-simulated-shell-exit" });
   await page.waitForSelector(".term-status.disconnected", { timeout: 10000 });
 
   // (1)+(2) The compose strip appears and typing lands in it, visibly not sent.
@@ -191,7 +191,7 @@ test("terminal half-open: staleness is visible, input is held, recovery keeps th
 
   // Recover the SAME socket (a keepalive finally arrives): staleness clears,
   // the buffer HOLDS (no auto-flush — explicit send is the only path).
-  route?.send('{"ka":1}');
+  (route as WebSocketRoute | null)?.send('{"ka":1}');
   await expect(page.locator(".term-compose")).toHaveClass(/restored/);
   await expect(page.locator(".term-compose-send")).toBeEnabled();
   await expect(page.locator(".term-compose-input")).toHaveValue(m1 + m2);
@@ -234,7 +234,7 @@ test("terminal offline: Discard clears the held buffer; the text never reaches t
     .toBe(true);
 
   up = false;
-  route?.close({ code: 1000, reason: "e2e-simulated-shell-exit" });
+  (route as WebSocketRoute | null)?.close({ code: 1000, reason: "e2e-simulated-shell-exit" });
   await page.waitForSelector(".term-status.disconnected", { timeout: 10000 });
   await page.keyboard.type(held);
   await expect(page.locator(".term-compose-input")).toHaveValue(held);

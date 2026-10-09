@@ -12,6 +12,7 @@ const R = (name: string, directory: string): ProjectActivityRow => ({
   directory,
   running: 0,
   idle: 0,
+  unreadIdle: 0,
   active: false,
 });
 

@@ -309,7 +309,7 @@ describe("ChatView draft send — persisted draft cleared on success", () => {
     // Sanity: the send actually happened.
     expect(createSessionMock).toHaveBeenCalledTimes(1);
     expect(enqueueMock).toHaveBeenCalledTimes(1);
-    const [, payload] = enqueueMock.mock.calls[0] as [string, { text: string }];
+    const [, payload] = enqueueMock.mock.calls[0] as unknown as [string, { text: string }];
     expect(payload.text).toBe("hello");
   });
 
@@ -429,7 +429,7 @@ describe("ChatView draft send — persisted draft cleared on success", () => {
     // The enqueue must have happened against the REAL session id (not the
     // draft "" key).
     await waitFor(() => expect(enqueueMock).toHaveBeenCalledTimes(1));
-    const [enqueuedId, payload] = enqueueMock.mock.calls[0] as [
+    const [enqueuedId, payload] = enqueueMock.mock.calls[0] as unknown as [
       string,
       {
         text: string;

@@ -73,7 +73,7 @@ function seedWindow(id: string, msgs: { mid: string; agent?: string }[]): void {
     byId: Object.fromEntries(
       msgs.map((m) => [
         m.mid,
-        { id: m.mid, info: { id: m.mid, sessionID: id, role: "user", ...(m.agent ? { agent: m.agent } : {}) } },
+        { id: m.mid, info: { id: m.mid, sessionID: id, role: "user", ...(m.agent ? { agent: m.agent } : {}) }, partOrder: [], parts: {} },
       ]),
     ),
   }));

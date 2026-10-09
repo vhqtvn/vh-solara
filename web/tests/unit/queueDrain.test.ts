@@ -19,7 +19,7 @@
 // terminal outcome that never repends, and dispatch (the /oc/session/:id/prompt_async
 // POST) is mocked to classify the outcome.
 import { describe, expect, it, vi } from "vitest";
-import { createQueueDrainer, type DrainDeps } from "../../src/queueDrain";
+import { createQueueDrainer, type DrainDeps, type DrainOutcome } from "../../src/queueDrain";
 import type { QueuedMessage } from "../../src/queue";
 
 // A minimal in-memory queue that mirrors the backend lifecycle transitions
@@ -50,7 +50,7 @@ function makeDeps(
   opts: Partial<{
     sessionId: string;
     canDrain: () => boolean;
-    dispatchOutcome: (item: QueuedMessage) => { state: "sent" | "failed" | "unknown"; detail: string };
+    dispatchOutcome: (item: QueuedMessage) => DrainOutcome | Promise<DrainOutcome>;
     onResolved: (id: string) => void;
   }> = {},
 ): { deps: DrainDeps; sending: Record<string, boolean>; claims: number; dispatches: string[]; resolves: string[] } {

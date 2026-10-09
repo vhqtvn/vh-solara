@@ -70,7 +70,7 @@ describe("respondPermission — daemon verb routing", () => {
     vi.stubGlobal("fetch", fetchMock);
     const out = await respondPermission("s1", "p1", "once");
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("/vh/reply-permission");
     expect(init.method).toBe("POST");
     expect(postedBody(fetchMock)).toEqual({
@@ -205,7 +205,7 @@ describe("respondQuestion — daemon verb routing", () => {
     vi.stubGlobal("fetch", fetchMock);
     const out = await respondQuestion("q1", [["Refactor"]], "s1");
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0][0]).toBe("/vh/answer-question");
+    expect((fetchMock.mock.calls[0] as unknown as [string])[0]).toBe("/vh/answer-question");
     expect(postedBody(fetchMock)).toEqual({
       questionID: "q1",
       answers: [["Refactor"]],

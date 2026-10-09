@@ -696,7 +696,7 @@ describe("applyMessageEvent — lastAgent.set tree-node bridge via reconcile-tre
     activity: "idle",
     childCount: 0,
     loaded: true,
-    flags: {},
+    flags: { pendingInput: false, subtreeNeedsInput: false, permission: false, archived: false, orphan: false },
     updatedMs: 0,
   });
 

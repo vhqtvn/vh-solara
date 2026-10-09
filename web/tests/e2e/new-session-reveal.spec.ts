@@ -165,7 +165,7 @@ test("draft → first send → session materializes and the transcript reveals w
   // Block the PWA service worker for THIS test (see header note).
   await page.route("**/sw.js*", (route) => route.abort());
   for (const sw of page.context().serviceWorkers()) {
-    await sw.close();
+    await (sw as unknown as { close(): Promise<void> }).close();
   }
 
   await page.goto(projectUrl("/"));
@@ -195,7 +195,7 @@ test("withheld messages.loaded + live events flowing: the first live message mus
   // Block the PWA service worker for THIS test (see header note).
   await page.route("**/sw.js*", (route) => route.abort());
   for (const sw of page.context().serviceWorkers()) {
-    await sw.close();
+    await (sw as unknown as { close(): Promise<void> }).close();
   }
 
   // Arm the fixture's new-session cold-hold latch (test-only; bare `request`

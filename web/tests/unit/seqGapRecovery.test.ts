@@ -663,8 +663,10 @@ describe("seq-gap recovery — Invariant 2 (tail-integrity on idle)", () => {
       order: ["m1"],
       byId: {
         m1: {
+          id: "m1",
           info: { id: "m1", sessionID: "s1", role: "user", time: { created: 1 } },
-          parts: [],
+          parts: {},
+          partOrder: [],
         },
       },
     });
@@ -698,11 +700,13 @@ describe("seq-gap recovery — Invariant 2 (tail-integrity on idle)", () => {
       order: ["m1"],
       byId: {
         m1: {
+          id: "m1",
           info: {
             id: "m1", sessionID: "s1", role: "assistant",
             time: { created: 1, completed: 2 },
           },
-          parts: [],
+          parts: {},
+          partOrder: [],
         },
       },
     });

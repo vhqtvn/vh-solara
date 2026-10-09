@@ -202,7 +202,7 @@ test("hung prompt_async never silently loses the message (enqueue-first + bounde
   await page.route("**/sw.js*", (route) => route.abort());
   // Likewise drop any SW already registered in this fresh context.
   for (const sw of page.context().serviceWorkers()) {
-    await sw.close();
+    await (sw as unknown as { close(): Promise<void> }).close();
   }
 
   await page.goto(projectUrl("/"));
@@ -334,7 +334,7 @@ test("a slow enqueue does not erase text typed after Send (ownership guard)", as
   // enqueue POST below). Registered before page.goto so the SW never loads.
   await page.route("**/sw.js*", (route) => route.abort());
   for (const sw of page.context().serviceWorkers()) {
-    await sw.close();
+    await (sw as unknown as { close(): Promise<void> }).close();
   }
 
   await page.goto(projectUrl("/"));

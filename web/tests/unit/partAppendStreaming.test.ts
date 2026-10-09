@@ -32,7 +32,7 @@ import {
   prependMessagesIfAbsent,
   type PartAppendPayload,
 } from "../../src/lib/reduce";
-import type { SessionMessages } from "../../src/types";
+import type { SessionMessages, Part } from "../../src/types";
 
 // ---------------------------------------------------------------------------
 // PURE UNIT — utf8ByteLength + appendPartSuffix (no store, no SSE)
@@ -109,14 +109,14 @@ describe("appendPartSuffix — pure suffix apply (offset validation + append)", 
     const sm = smWithPart("Hello"); // 5 ASCII bytes
     const result = appendPartSuffix(sm, appendPay({ start: 5, text: " world" }));
     expect(result).toBe("applied");
-    expect((sm.byId.m1.parts.p1 as { text: string }).text).toBe("Hello world");
+    expect((sm.byId.m1.parts.p1 as Part & { text: string }).text).toBe("Hello world");
   });
 
   it("returns mismatch when start disagrees with the field byte length", () => {
     const sm = smWithPart("Hello"); // 5 bytes
     expect(appendPartSuffix(sm, appendPay({ start: 3, text: " world" }))).toBe("mismatch");
     // Field is UNCHANGED on mismatch (no byte-splice at the wrong offset).
-    expect((sm.byId.m1.parts.p1 as { text: string }).text).toBe("Hello");
+    expect((sm.byId.m1.parts.p1 as Part & { text: string }).text).toBe("Hello");
   });
 
   it("VALIDATES UTF-8 BYTES, not UTF-16 code units (multi-byte field)", () => {
@@ -124,7 +124,7 @@ describe("appendPartSuffix — pure suffix apply (offset validation + append)", 
     const sm = smWithPart("héllo");
     // CORRECT server offset: 6 bytes.
     expect(appendPartSuffix(sm, appendPay({ start: 6, text: "!" }))).toBe("applied");
-    expect((sm.byId.m1.parts.p1 as { text: string }).text).toBe("héllo!");
+    expect((sm.byId.m1.parts.p1 as Part & { text: string }).text).toBe("héllo!");
     // WRONG offset (UTF-16 code-unit length): 5 would falsely mismatch.
     const sm2 = smWithPart("héllo");
     expect(appendPartSuffix(sm2, appendPay({ start: 5, text: "!" }))).toBe("mismatch");
@@ -134,10 +134,10 @@ describe("appendPartSuffix — pure suffix apply (offset validation + append)", 
     const sm = smWithPart("日本語"); // 9 bytes
     // Append "😀" (4 bytes): start must be 9 (byte offset), NOT 3 (.length).
     expect(appendPartSuffix(sm, appendPay({ start: 9, text: "😀" }))).toBe("applied");
-    expect((sm.byId.m1.parts.p1 as { text: string }).text).toBe("日本語😀");
+    expect((sm.byId.m1.parts.p1 as Part & { text: string }).text).toBe("日本語😀");
     // Next suffix: field is now "日本語😀" = 9 + 4 = 13 bytes.
     expect(appendPartSuffix(sm, appendPay({ start: 13, text: "!" }))).toBe("applied");
-    expect((sm.byId.m1.parts.p1 as { text: string }).text).toBe("日本語😀!");
+    expect((sm.byId.m1.parts.p1 as Part & { text: string }).text).toBe("日本語😀!");
   });
 
   it("contiguous resume across several ASCII suffixes (the happy path)", () => {
@@ -145,7 +145,7 @@ describe("appendPartSuffix — pure suffix apply (offset validation + append)", 
     expect(appendPartSuffix(sm, appendPay({ start: 0, text: "Hello" }))).toBe("applied");
     expect(appendPartSuffix(sm, appendPay({ start: 5, text: " world" }))).toBe("applied");
     expect(appendPartSuffix(sm, appendPay({ start: 11, text: "!" }))).toBe("applied");
-    expect((sm.byId.m1.parts.p1 as { text: string }).text).toBe("Hello world!");
+    expect((sm.byId.m1.parts.p1 as Part & { text: string }).text).toBe("Hello world!");
   });
 
   it("PRESERVES the resident Part object identity (in-place mutation)", () => {
@@ -154,14 +154,14 @@ describe("appendPartSuffix — pure suffix apply (offset validation + append)", 
     appendPartSuffix(sm, appendPay({ start: 5, text: " world" }));
     // SAME object reference — no new Part created (chat-row identity + scroll preserved).
     expect(sm.byId.m1.parts.p1).toBe(partRef);
-    expect((sm.byId.m1.parts.p1 as { text: string }).text).toBe("Hello world");
+    expect((sm.byId.m1.parts.p1 as Part & { text: string }).text).toBe("Hello world");
   });
 
   it("upgrade-on-completed: a suffix for a COMPLETED message is SKIPPED (field unchanged)", () => {
     const sm = smWithPart("final", { completed: true });
     expect(appendPartSuffix(sm, appendPay({ start: 5, text: " stale" }))).toBe("skipped");
     // The completed field is authoritative/terminal — the stale suffix is dropped.
-    expect((sm.byId.m1.parts.p1 as { text: string }).text).toBe("final");
+    expect((sm.byId.m1.parts.p1 as Part & { text: string }).text).toBe("final");
   });
 
   it("merge-if-absent: seeds an UNSET field from start===0 (first suffix for the field)", () => {
@@ -169,7 +169,7 @@ describe("appendPartSuffix — pure suffix apply (offset validation + append)", 
     const sm = smWithPart("");
     delete (sm.byId.m1.parts.p1 as { text?: string }).text;
     expect(appendPartSuffix(sm, appendPay({ start: 0, text: "first" }))).toBe("applied");
-    expect((sm.byId.m1.parts.p1 as { text: string }).text).toBe("first");
+    expect((sm.byId.m1.parts.p1 as Part & { text: string }).text).toBe("first");
   });
 
   it("returns mismatch for an unset field when start !== 0", () => {
@@ -211,7 +211,7 @@ describe("appendPartSuffix — pure suffix apply (offset validation + append)", 
       text: " more",
     };
     expect(appendPartSuffix(sm, pay)).toBe("applied");
-    expect((sm.byId.m1.parts.p1 as { reasoning: string }).reasoning).toBe("thinking... more");
+    expect((sm.byId.m1.parts.p1 as Part & { reasoning: string }).reasoning).toBe("thinking... more");
   });
 });
 
@@ -254,7 +254,7 @@ describe("appendPartSuffix × keyless shadow (F4 coverage)", () => {
     expect(sm.order).toEqual([]); // precondition: mSh is a shadow, not rendered
     const res = appendPartSuffix(sm, shadowPay({ start: 5, text: " world" }));
     expect(res).toBe("applied");
-    expect((sm.byId.mSh.parts.p1 as { text: string }).text).toBe("Hello world");
+    expect((sm.byId.mSh.parts.p1 as Part & { text: string }).text).toBe("Hello world");
     // In-place append — the held Part object keeps its identity (promotion
     // later hands the SAME object to the rendered row).
     expect(sm.byId.mSh.parts.p1).toBe(partRef);
@@ -269,7 +269,7 @@ describe("appendPartSuffix × keyless shadow (F4 coverage)", () => {
     // Promoted into order at its chronological slot — with the appended
     // suffix still in the held part.
     expect(sm.order).toEqual(["mSh"]);
-    expect((sm.byId.mSh.parts.p1 as { text: string }).text).toBe("Hello world");
+    expect((sm.byId.mSh.parts.p1 as Part & { text: string }).text).toBe("Hello world");
   });
 
   it("a later page-merge promotion (completed copy) carries the appended text and keeps part identity", () => {
@@ -289,7 +289,7 @@ describe("appendPartSuffix × keyless shadow (F4 coverage)", () => {
     // mergePartsOrdered keeps the resident (held) object and Object.assigns
     // the completed copy onto it — identity preserved, text converged.
     expect(sm.byId.mSh.parts.p1).toBe(partRef);
-    expect((sm.byId.mSh.parts.p1 as { text: string }).text).toBe("Hello world");
+    expect((sm.byId.mSh.parts.p1 as Part & { text: string }).text).toBe("Hello world");
   });
 
   it("UNKNOWN part on a shadow → mismatch (routes to cursorless re-snapshot)", () => {
@@ -299,7 +299,7 @@ describe("appendPartSuffix × keyless shadow (F4 coverage)", () => {
     ).toBe("mismatch");
     // The held part is unchanged (no splice at any offset); the repair is the
     // transport layer's cursorless re-snapshot, already covered above.
-    expect((sm.byId.mSh.parts.p1 as { text: string }).text).toBe("Hello");
+    expect((sm.byId.mSh.parts.p1 as Part & { text: string }).text).toBe("Hello");
     // The shadow itself is untouched by the failed apply.
     expect(sm.order).toEqual([]);
     expect(sm.byId.mSh).toBeDefined();

@@ -504,7 +504,7 @@ test("project switcher close button meets the fine-pointer tap-target floor", as
   // offsetWidth/Height = layout size, unaffected by the dialog's entrance
   // transform. ≥36×36px interactive target; WIDTH is the dimension the scoped
   // rule changes (26→36); height already stretches to the search input.
-  const box = await close.evaluate((el) => ({ width: el.offsetWidth, height: el.offsetHeight }));
+  const box = await close.evaluate((el) => ({ width: (el as HTMLElement).offsetWidth, height: (el as HTMLElement).offsetHeight }));
   expect(box.width).toBeGreaterThanOrEqual(36);
   expect(box.height).toBeGreaterThanOrEqual(36);
 });

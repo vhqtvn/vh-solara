@@ -71,9 +71,14 @@ class MockEventSource {
     this.readyState = CLOSED;
   }
 
-  fire(type: string, data: unknown, lastEventId?: string): void {
+  fire(type: string, data?: unknown, lastEventId?: string): void {
     const ev = new MessageEvent(type, {
-      data: typeof data === "string" ? data : JSON.stringify(data),
+      data:
+        data === undefined
+          ? undefined
+          : typeof data === "string"
+            ? data
+            : JSON.stringify(data),
     });
     if (lastEventId !== undefined) {
       Object.defineProperty(ev, "lastEventId", { value: lastEventId });

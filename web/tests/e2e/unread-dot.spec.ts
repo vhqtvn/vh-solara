@@ -484,11 +484,11 @@ test("in-app switch to an empty uncached session preserves its stored read ancho
       JSON.stringify({ v: 1, data: { slow: "seed-anchor-mid" } }),
     );
     var OrigES = window.EventSource;
-    function DelayedSnapshotES(url, opts) {
+    function DelayedSnapshotES(url: string | URL, opts?: EventSourceInit) {
       var es = opts !== undefined ? new OrigES(url, opts) : new OrigES(url);
       if (typeof url === "string" && url.indexOf("sessions=slow") !== -1) {
         var origAdd = es.addEventListener.bind(es);
-        es.addEventListener = function (type, listener, options) {
+        es.addEventListener = function (type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions) {
           if (listener) {
             return origAdd(type, function (ev) {
               setTimeout(function () {
@@ -497,8 +497,8 @@ test("in-app switch to an empty uncached session preserves its stored read ancho
               }, 2000);
             }, options);
           }
-          return origAdd(type, listener, options);
-        };
+          return origAdd(type, listener as unknown as EventListener, options);
+        } as unknown as EventSource["addEventListener"];
       }
       return es;
     }
@@ -506,7 +506,7 @@ test("in-app switch to an empty uncached session preserves its stored read ancho
     DelayedSnapshotES.CLOSED = OrigES.CLOSED;
     DelayedSnapshotES.OPEN = OrigES.OPEN;
     DelayedSnapshotES.CONNECTING = OrigES.CONNECTING;
-    window.EventSource = DelayedSnapshotES;
+    window.EventSource = DelayedSnapshotES as unknown as typeof EventSource;
   });
 
   // ── FROM session: mount ChatView with seeded content so ready()=true before

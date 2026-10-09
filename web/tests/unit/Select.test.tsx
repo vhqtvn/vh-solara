@@ -276,7 +276,7 @@ describe("Select — mobile sheet (matchMedia reports a mobile viewport)", () =>
 // Trigger rect left=400 top=500 bottom=520 width=100 on the 1024x768 jsdom
 // viewport → maxH=min(340,422)=340; below=248 ≥ 220 → no flip; left=400;
 // top=524. At 125%: 400/1.25=320, 524/1.25=419.2, 100/1.25=80, 340/1.25=272.
-const rectOf = (o: Partial<DOMRect>) =>
+const rectOf = (o: Partial<DOMRect> = {}) =>
   ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0, ...o }) as DOMRect;
 const stubTriggerRect = (trigger: HTMLElement, r: Partial<DOMRect>) =>
   vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {

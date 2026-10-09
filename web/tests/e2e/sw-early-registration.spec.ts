@@ -86,8 +86,8 @@ test("cold boot: SW registers at module eval, claims mid-boot, never reloads", a
   // fired) — and that must NOT have reloaded it: the reload-storm pin.
   expect(t?.controllerAt, "claim() fired controllerchange during cold boot").not.toBeNull();
   const token = await page.evaluate(() => {
-    (window as { __vhBootToken?: number }).__vhBootToken = Math.random();
-    return (window as { __vhBootToken: number }).__vhBootToken;
+    (window as unknown as { __vhBootToken?: number }).__vhBootToken = Math.random();
+    return (window as unknown as { __vhBootToken: number }).__vhBootToken;
   });
   let navs = 0;
   page.on("framenavigated", (f) => {

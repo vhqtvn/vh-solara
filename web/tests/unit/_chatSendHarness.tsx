@@ -20,6 +20,8 @@ import { Show } from "solid-js";
 import type { Accessor } from "solid-js";
 // The real sync store (sync/store is NOT mocked — only the sync facade is).
 import { state, setState, setSelectedIdRaw, setDraft } from "../../src/sync/store";
+import type { QueueInput } from "../../src/queue";
+import type { SaveGestureInput, OutboxSaveResult } from "../../src/lib/outbox";
 import { produce } from "solid-js/store";
 import { __resetSendSingleFlightForTests } from "../../src/lib/sendSingleFlight";
 // ChatView default export. Imported AFTER the vi.mock blocks below are hoisted,
@@ -56,7 +58,7 @@ const H = vi.hoisted(() => ({
   // store (so the drainer does not fire — the drain is area 5; areas 1-4 care
   // only about the enqueue custody + composer-ownership contract). Override
   // per-test to reject (enqueue failure) or hold open (slow enqueue).
-  enqueue: vi.fn(async () => ({
+  enqueue: vi.fn(async (_sessionId: string, _input: QueueInput) => ({
     id: "q-enq",
     order: 1,
     state: "pending" as const,
@@ -106,8 +108,8 @@ const H = vi.hoisted(() => ({
   // fabricates staleness; no replacement overlays), so every pre-slice test
   // sees the old admission behavior through the new gate. Override per-test
   // via mocks.outbox*.
-  outboxSave: vi.fn(async () => ({ ok: true } as const)),
-  outboxMarkAdmitted: vi.fn(async () => {}),
+  outboxSave: vi.fn(async (_input: SaveGestureInput): Promise<OutboxSaveResult> => ({ ok: true })),
+  outboxMarkAdmitted: vi.fn(async (_intentId: string, _queueItemId: string) => {}),
   outboxCapturedHeadFor: vi.fn(async () => null),
   outboxDropGesture: vi.fn(async () => {}),
   outboxReconcile: vi.fn(async () => {}),
@@ -532,9 +534,9 @@ export function seedUserMessage(sessionId: string, messageId: string, text: stri
     byId: {
       [messageId]: {
         id: messageId,
-        info: { role: "user", time: { created: 1 } },
+        info: { id: messageId, sessionID: sessionId, role: "user", time: { created: 1 } },
         partOrder: [partId],
-        parts: { [partId]: { type: "text", text } },
+        parts: { [partId]: { id: partId, sessionID: sessionId, messageID: messageId, type: "text", text } },
       },
     },
   });

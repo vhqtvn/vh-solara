@@ -209,7 +209,9 @@ describe("runWithConcurrency", () => {
     // parallel one would interleave starts before any end.
     const fn = (id: string) => {
       log.push(`start:${id}`);
-      return Promise.resolve().then(() => log.push(`end:${id}`));
+      return Promise.resolve().then(() => {
+        log.push(`end:${id}`);
+      });
     };
     await runWithConcurrency(["a", "b", "c"], 1, fn);
     expect(log).toEqual([
@@ -223,7 +225,9 @@ describe("runWithConcurrency", () => {
     const log: string[] = [];
     const fn = (id: string) => {
       log.push(`start:${id}`);
-      return Promise.resolve().then(() => log.push(`end:${id}`));
+      return Promise.resolve().then(() => {
+        log.push(`end:${id}`);
+      });
     };
     await runWithConcurrency(["a", "b", "c"], 10, fn); // limit=10 >= N=3
     // All three start before any ends: concurrent dispatch across N workers.

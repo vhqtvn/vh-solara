@@ -59,9 +59,14 @@ class MockEventSource {
   // --- test helpers (not part of the EventSource API) ---
 
   /** Fire a named SSE event with a JSON-serializable payload + optional SSE id. */
-  fire(type: string, data: unknown, lastEventId?: string): void {
+  fire(type: string, data?: unknown, lastEventId?: string): void {
     const ev = new MessageEvent(type, {
-      data: typeof data === "string" ? data : JSON.stringify(data),
+      data:
+        data === undefined
+          ? undefined
+          : typeof data === "string"
+            ? data
+            : JSON.stringify(data),
     });
     // jsdom's MessageEvent constructor drops lastEventId from init; set it on the
     // instance so `ev.lastEventId` reads correctly (stream.ts reads it for cursor

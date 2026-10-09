@@ -55,6 +55,8 @@ function baseProps(over: Partial<ComposerProps> = {}): ComposerProps {
     setFocusMode: () => {},
     working: () => false,
     sending: () => false,
+    send: async () => {},
+    abort: () => {},
     sendInFlight: () => false,
     readyToSend: () => true,
     curModel: () => undefined,
@@ -74,12 +76,16 @@ function baseProps(over: Partial<ComposerProps> = {}): ComposerProps {
     },
     att: {
       attachments: () => [],
+      setAttachments: () => [],
       uploading: () => false,
       uploadProgress: () => null,
       presentInlineIds: () => new Set<string>(),
       removeAttachment: () => {},
       reinsertInlineChip: () => {},
       addFiles: () => {},
+      flushPendingAttachments: async (_id: string) => ({ failed: [] }),
+      uploadFile: async (_file: File, _id: string) => null,
+      inlineFiles: new Map<string, File>(),
     },
     paste: {
       onPaste: () => {},
@@ -116,7 +122,7 @@ describe("Composer → SendStatus guarded-retry wiring (row click routes retrySa
     // copy: the "Retry same message" affordance.
     const row = r.container.querySelector('.sendStatusLine[data-kind="uncertain"]');
     expect(row).toBeTruthy();
-    const btn = row!.querySelector(".sendStatusBtn")!;
+    const btn = row!.querySelector<HTMLElement>(".sendStatusBtn")!;
     expect(btn.textContent).toContain("Retry same message");
 
     btn.click();
@@ -147,7 +153,7 @@ describe("Composer → SendStatus guarded-retry wiring (row click routes retrySa
     // and click ITS button.
     const rowA = rows.find((el) => el.textContent!.includes("alpha record"))!;
     expect(rowA).toBeTruthy();
-    rowA.querySelector(".sendStatusBtn")!.click();
+    rowA.querySelector<HTMLElement>(".sendStatusBtn")!.click();
 
     expect(retrySame).toHaveBeenCalledTimes(1);
     expect(retrySame).toHaveBeenCalledWith(idA);
@@ -160,7 +166,7 @@ describe("Composer → SendStatus guarded-retry wiring (row click routes retrySa
     const id = seedUncertainRow("wiring probe");
     const send = vi.fn(async () => {});
     const r = render(() => <Composer {...baseProps({ send })} />);
-    r.container.querySelector('.sendStatusLine[data-kind="uncertain"] .sendStatusBtn')!.click();
+    r.container.querySelector<HTMLElement>('.sendStatusLine[data-kind="uncertain"] .sendStatusBtn')!.click();
     expect(send).toHaveBeenCalledTimes(1);
     // The fallback ignores the argument (its signature is `() => Promise<void>`)
     // — but the row still passes it; the wiring is unchanged.

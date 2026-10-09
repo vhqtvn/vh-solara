@@ -14,11 +14,16 @@ vi.mock("../../src/render", () => ({
 // happy path; the resilience describe overrides per-test. dismissQuestion is
 // the gone-terminal cleanup the card calls when the operator acknowledges an
 // unconfirmable reply.
-const respondQuestion = vi.fn(() => Promise.resolve({ kind: "confirmed" }));
+const respondQuestion = vi.fn(
+  (_questionID: string, _answers: string[][], _sessionID?: string) =>
+    Promise.resolve({ kind: "confirmed" }),
+);
 const dismissQuestion = vi.fn();
 vi.mock("../../src/sync", () => ({
-  respondQuestion: (...args: unknown[]) => respondQuestion(...args),
-  dismissQuestion: (...args: unknown[]) => dismissQuestion(...args),
+  respondQuestion:
+    (...args: [string, string[][], (string | undefined)?]) =>
+      respondQuestion(...args),
+  dismissQuestion: (...args: []) => dismissQuestion(...args),
 }));
 
 import QuestionCard from "../../src/components/QuestionCard";
