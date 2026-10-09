@@ -4,10 +4,10 @@ import { Tabstrip } from "./shell/Tabstrip";
 import { LayoutOverlay } from "./shell/LayoutOverlay";
 import {
   activeWorkspaceId,
+  hostLayerOrder,
   hostOps,
   panes,
   trayIds,
-  workspaces,
 } from "./dockview/store";
 import { AddServer } from "./shell/AddServer";
 import {
@@ -136,7 +136,7 @@ export function App() {
             rename never recreates an existing host. A rename that spread a new
             object would remount the host → cold fromJSON → every iframe
             reloads; the field-only mutation is what keeps rename survival-safe. */}
-        <For each={workspaces()}>
+        <For each={hostLayerOrder()}>
           {(ws) => (
             <div
               class={s.hostLayer}

@@ -5,6 +5,7 @@ import {
   needsYouCount,
   needsYouCountFor,
   renameWorkspace,
+  reorderWorkspace,
   setActiveWorkspace,
   statusPairsFor,
   trayIds,
@@ -515,6 +516,22 @@ function WorkspaceTab(props: { ws: Workspace }) {
       if (w.id !== props.ws.id) closeWorkspace(w.id);
     }
   };
+  // Reorder boundary guards: Move left is a no-op on the first tab, Move right
+  // on the last. The store's reorderWorkspace clamps too — the disabled render
+  // is UX (aria-disabled + full no-op, the Close-last-workspace pattern), not
+  // the safety net.
+  const isLeftmost = () => workspaces()[0]?.id === props.ws.id;
+  const isRightmost = () => {
+    const list = workspaces();
+    return list.length > 0 && list[list.length - 1]?.id === props.ws.id;
+  };
+  const menuMove = (dir: -1 | 1) => () => {
+    // Boundary: a FULL no-op that keeps the menu open (the Close-last
+    // workspace guard pattern).
+    if ((dir === -1 && isLeftmost()) || (dir === 1 && isRightmost())) return;
+    menu.closePopover();
+    reorderWorkspace(props.ws.id, dir);
+  };
   /** Wrap a menu action: swallow the click at the menu (see above), run it. */
   const onMenuItem = (run: () => void) => (e: MouseEvent) => {
     e.stopPropagation();
@@ -725,6 +742,30 @@ function WorkspaceTab(props: { ws: Workspace }) {
             onClick={onMenuItem(menuRename)}
           >
             Rename
+          </button>
+          <button
+            type="button"
+            classList={{ [s.tabMenuItem]: true, [s.tabMenuItemDisabled]: isLeftmost() }}
+            data-testid="ws-menu-move-left"
+            data-workspace={props.ws.id}
+            role="menuitem"
+            aria-disabled={isLeftmost() ? "true" : undefined}
+            title={isLeftmost() ? "Already the first workspace" : `Move "${props.ws.name}" left`}
+            onClick={onMenuItem(menuMove(-1))}
+          >
+            Move left
+          </button>
+          <button
+            type="button"
+            classList={{ [s.tabMenuItem]: true, [s.tabMenuItemDisabled]: isRightmost() }}
+            data-testid="ws-menu-move-right"
+            data-workspace={props.ws.id}
+            role="menuitem"
+            aria-disabled={isRightmost() ? "true" : undefined}
+            title={isRightmost() ? "Already the last workspace" : `Move "${props.ws.name}" right`}
+            onClick={onMenuItem(menuMove(1))}
+          >
+            Move right
           </button>
           <button
             type="button"

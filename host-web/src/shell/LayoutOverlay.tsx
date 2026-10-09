@@ -1,5 +1,12 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
-import { hostOps, overlaySourcePaneId, panes } from "../dockview/store";
+import {
+  activeWorkspaceId,
+  hostOps,
+  movePaneToWorkspace,
+  overlaySourcePaneId,
+  panes,
+  workspaces,
+} from "../dockview/store";
 import type { OverlaySplitDir } from "../dockview/types";
 import { registerSurface, releaseSurface } from "./popover";
 import s from "./LayoutOverlay.module.css";
@@ -70,10 +77,23 @@ export function LayoutOverlay(props: { mainEl: () => HTMLElement | null }) {
   // Split (default) vs Swap mode for the cardinal arrows. Reset to Split on
   // every (re)open so a stale Swap selection never survives a close/reopen.
   const [mode, setMode] = createSignal<"split" | "swap">("split");
+  // Move-to-workspace picker open state. Same reset discipline as mode: a
+  // stale open picker never survives a close/reopen.
+  const [moveMenuOpen, setMoveMenuOpen] = createSignal(false);
   createEffect(() => {
     const id = source();
-    if (id === null) setMode("split");
+    if (id === null) {
+      setMode("split");
+      setMoveMenuOpen(false);
+    }
   });
+
+  // Move-to-workspace targets: every OTHER workspace (a move into the source's
+  // own workspace is a no-op, so it is never offered). Live from the store —
+  // the picker reflects renames and workspace set changes while open.
+  const moveTargets = createMemo(() =>
+    workspaces().filter((w) => w.id !== activeWorkspaceId()),
+  );
 
   // Swap-mode arrow targets: a 4-entry dir→neighbor-id map, or null per dir when
   // there is no swappable neighbor in that direction. Computed live so a layout
@@ -217,6 +237,21 @@ export function LayoutOverlay(props: { mainEl: () => HTMLElement | null }) {
     if (id) hostOps()?.setTail?.(id, true);
   };
 
+  // Move-to-workspace (SERIALIZE-RECREATE — the accepted-loss contract): the
+  // pane's {url,label,route} params are re-created in the target workspace
+  // (an existing one, or a fresh auto-named one via the staged one-panel
+  // layout) and the SOURCE pane is removed. The iframe RELOADS — scroll /
+  // unsaved input / SSE stream do NOT survive; url/route/label do, and the
+  // reloaded badge is the visible signal. Auto-switches to the target, so
+  // closing the overlay here (closePane precedent: no stale-anchor flash)
+  // coincides with the workspace switch anyway.
+  const movePane = (targetWsId: string | null): void => {
+    const id = source();
+    if (!id) return;
+    movePaneToWorkspace(id, targetWsId);
+    close();
+  };
+
   return (
     <Show when={source() !== null} keyed>
       <div class={s.overlay}>
@@ -321,6 +356,58 @@ export function LayoutOverlay(props: { mainEl: () => HTMLElement | null }) {
               >
                 ↓ Jump to latest
               </button>
+            </Show>
+          </div>
+          {/* Move-to-workspace row. The toggle reveals an INLINE picker (a
+              child of this card — no new popover surface registration needed:
+              the card already owns its own dismissal and the capture layer
+              below never sees clicks that stopPropagation at the card). Each
+              entry re-creates the pane in that workspace via
+              serialize-recreate; "New workspace" stages a fresh auto-named
+              one-panel workspace. The pane RELOADS (accepted loss). */}
+          <div class={s.moveRow} data-testid="layout-overlay-move-row">
+            <Show
+              when={moveMenuOpen()}
+              fallback={
+                <button
+                  type="button"
+                  class={s.moveBtn}
+                  data-testid="layout-overlay-move-menu"
+                  aria-expanded="false"
+                  title="Move this pane to another workspace (reloads the pane)"
+                  onClick={() => setMoveMenuOpen(true)}
+                >
+                  Move to workspace…
+                </button>
+              }
+            >
+              <div class={s.moveList} data-testid="layout-overlay-move-list" role="menu" aria-label="Move pane to workspace">
+                <For each={moveTargets()}>
+                  {(w) => (
+                    <button
+                      type="button"
+                      class={s.moveTarget}
+                      data-testid="layout-overlay-move-target"
+                      data-workspace={w.id}
+                      role="menuitem"
+                      title={`Move this pane to "${w.name}" (reloads the pane)`}
+                      onClick={() => movePane(w.id)}
+                    >
+                      {w.name}
+                    </button>
+                  )}
+                </For>
+                <button
+                  type="button"
+                  class={s.moveNew}
+                  data-testid="layout-overlay-move-new"
+                  role="menuitem"
+                  title="Move this pane to a new workspace (reloads the pane)"
+                  onClick={() => movePane(null)}
+                >
+                  + New workspace
+                </button>
+              </div>
             </Show>
           </div>
           <div class={s.actionRow}>

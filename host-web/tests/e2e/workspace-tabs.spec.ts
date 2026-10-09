@@ -650,4 +650,198 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     // With the needy workspace no longer hidden, the needs-you cue clears.
     await expect(page.locator('[data-testid="ws-overflow-cue"]')).toHaveCount(0);
   });
+
+  // ---- workspace REORDER (F-A) -------------------------------------------------
+  //
+  // ORDER TRUTH NOTE: the DEV bridge's __host.workspaces() returns the
+  // controllers map's INSERTION order (hostController.ts), which a reorder
+  // never changes — it is NOT canonical order once reordering exists. The
+  // order truth for assertions is (1) the RENDERED strip/overflow rows (both
+  // derive from the store array order) and (2) the persisted v3 blob's
+  // workspaces array (exactly what reload restores).
+
+  /** The persisted workspace ORDER from the v3 localStorage mirror (the
+   *  store's canonical array order — the thing reload restores). */
+  async function persistedWsOrder(page: import("@playwright/test").Page): Promise<string[]> {
+    return page.evaluate(
+      (key) => {
+        try {
+          const raw = localStorage.getItem(key);
+          if (!raw) return [];
+          const parsed = JSON.parse(raw) as { workspaces?: Array<{ id?: string }> };
+          return (parsed.workspaces ?? []).map((w) => w.id ?? "");
+        } catch {
+          return [];
+        }
+      },
+      H.LAYOUT_STORAGE_KEY,
+    );
+  }
+
+  /** The rendered strip order (visible tabs, canonical order). */
+  async function renderedTabOrder(page: import("@playwright/test").Page): Promise<string[]> {
+    return page.locator('[data-testid="ws-tab"]').evaluateAll((els) =>
+      (els as HTMLElement[]).map((e) => e.dataset.workspace ?? ""),
+    );
+  }
+
+  /** The HOST-LAYER DOM order (creation order — the fence-extension
+   *  observable): the hostLayer divs are direct children of <main>, each
+   *  carrying data-workspace. A reorder must NEVER change this order; a close
+   *  removes exactly the closed workspace's layer. */
+  async function hostLayerIds(page: import("@playwright/test").Page): Promise<string[]> {
+    return page.locator("main > [data-workspace]").evaluateAll((els) =>
+      (els as HTMLElement[]).map((e) => e.dataset.workspace ?? ""),
+    );
+  }
+
+  // Feature: the tab context menu offers Move left / Move right; a move
+  // reflects IMMEDIATELY in the canonical (blob) order AND the rendered strip
+  // order, preserves identity on BOTH dimensions — store identity (<For>
+  // survival: same Workspace refs, no host remount) AND host-layer DOM
+  // stability (the reorder never DOM-moves a host layer, so no iframe
+  // browsing context is re-created) — and the boundary entry (first-left) is
+  // an aria-disabled full no-op. BOTH workspaces carry panes so ANY node move
+  // under the old <For> reconciliation would hit a pane-ful layer (the
+  // 2-workspace paneless-mover fixture passed by accident of Solid's minimal
+  // move — this is the deliberate pin, criterion 11).
+  test("menu Move left/Move right reorder workspaces (rendered + persisted order, identity-preserving)", async ({
+    page,
+  }) => {
+    const ws1 = (await H.workspaces(page))[0];
+    const ws2 = await H.addWorkspace(page, "Second");
+    expect(ws2).toBeTruthy();
+    // Seed a pane into ws2 TOO (it is active right after creation) — every
+    // workspace in the fixture is pane-ful, so any DOM node move reloads.
+    const ws2Pane = await H.addServer(page, H.serverUrl("reorder-ws2"), "reorder-ws2");
+    expect(ws2Pane).toBeTruthy();
+    await H.waitForReady(page, ws2Pane!);
+    const ws2Before = await H.survival(page, ws2Pane!);
+    expect(ws2Before).not.toBeNull();
+    await H.setActiveWorkspace(page, ws1!);
+
+    // Identity probes: ws1's seeded pane must SURVIVE the reorder (reorder
+    // mutates array order only — same Workspace object refs, no host remount).
+    const seedPane = (await H.panes(page))[0];
+    expect(seedPane).toBeTruthy();
+    await H.waitForReady(page, seedPane!);
+    const before = await H.survival(page, seedPane!);
+    expect(before).not.toBeNull();
+
+    // Boundary guard FIRST: ws1 is canonically first — Move left is disabled
+    // and its (forced) activation is a full no-op (menu stays open).
+    await page.locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`).click({ button: "right" });
+    const leftBtn = page.locator('[data-testid="ws-menu-move-left"]');
+    await expect(leftBtn).toHaveAttribute("aria-disabled", "true");
+    await leftBtn.click({ force: true });
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toBeVisible();
+    expect(await renderedTabOrder(page)).toEqual([ws1, ws2]);
+    await page.keyboard.press("Escape");
+
+    // The host-layer DOM order starts at CREATION order [ws1, ws2] (the
+    // hostLayer divs are direct children of <main>, each carrying
+    // data-workspace — the production-safe layer-order observable).
+    expect(await hostLayerIds(page)).toEqual([ws1, ws2]);
+
+    // Move ws1 RIGHT: the rendered strip order flips to [ws2, ws1]…
+    await page.locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`).click({ button: "right" });
+    await page.locator('[data-testid="ws-menu-move-right"]').click();
+    await expect.poll(async () => renderedTabOrder(page)).toEqual([ws2, ws1]);
+    // …the persisted blob carries the SAME canonical order (v3 array order)…
+    await expect.poll(async () => persistedWsOrder(page)).toEqual([ws2, ws1]);
+    // …the host-layer DOM order is UNTOUCHED (creation order — the decoupling:
+    // display reorders, the layer never DOM-moves an iframe)…
+    expect(await hostLayerIds(page)).toEqual([ws1, ws2]);
+    // …and BOTH workspaces' pane iframes SURVIVED (no remount AND no browsing
+    // context recreation — survival identity asserts mountTs continuity).
+    await H.assertSurvived(page, seedPane!, before!, "ws1 seed pane across reorder");
+    await H.assertSurvived(page, ws2Pane!, ws2Before!, "ws2 pane across reorder");
+
+    // Move ws1 LEFT (back): rendered order restores to [ws1, ws2] and ws1 is
+    // canonically FIRST again — Move left is its disabled boundary. The host
+    // layer NEVER moved.
+    await page.locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`).click({ button: "right" });
+    await page.locator('[data-testid="ws-menu-move-left"]').click();
+    await expect.poll(async () => renderedTabOrder(page)).toEqual([ws1, ws2]);
+    await expect.poll(async () => persistedWsOrder(page)).toEqual([ws1, ws2]);
+    expect(await hostLayerIds(page)).toEqual([ws1, ws2]);
+    await H.assertSurvived(page, seedPane!, before!, "ws1 seed pane after move-left back");
+    await H.assertSurvived(page, ws2Pane!, ws2Before!, "ws2 pane after move-left back");
+
+    // Close removes the layer (hostLayerOrder set-equality: no stale layer
+    // for a closed workspace).
+    expect(await H.closeWorkspace(page, ws2!)).toBe(true);
+    await expect.poll(async () => hostLayerIds(page)).toEqual([ws1]);
+  });
+
+  // Feature: a workspace hidden behind ⋯ has NO tab on the strip, so its ONLY
+  // reorder affordance is the ⋮ row menu. Driving it reorders the CANONICAL
+  // order (persisted blob; the swap partner may be a visible tab) and the row
+  // list re-renders in the new canonical order while the popover stays open;
+  // the canonical-first row's Move left is a disabled no-op.
+  test("overflow row menu reorders a hidden workspace (persisted order + live row order)", async ({
+    page,
+  }) => {
+    // 600px viewport: the seed can never fit beside the active long tab —
+    // every quiet workspace sits behind the overflow trigger.
+    await page.setViewportSize({ width: 600, height: 800 });
+    const seed = (await H.workspaces(page))[0];
+    const longs: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      const id = await H.addWorkspace(page, `LongWorkspaceNameForWidthPaddingLongWorkspaceNameFor${i}`);
+      longs.push(id!);
+    }
+    // Canonical creation order: [seed, L0..L5]; active = L5.
+    await expect.poll(async () => persistedWsOrder(page), { timeout: 8000 }).toEqual([seed, ...longs]);
+
+    const trigger = page.locator('[data-testid="ws-overflow-trigger"]');
+    await expect(trigger).toBeVisible();
+    await trigger.click();
+    const rows = page.locator('[data-testid="ws-overflow-row"]');
+    const hiddenBefore = await rows.evaluateAll((els) =>
+      (els as HTMLElement[]).map((e) => e.dataset.workspace ?? ""),
+    );
+    expect(hiddenBefore).toContain(seed);
+    expect(hiddenBefore[0], "rows render in canonical order (seed first)").toBe(seed);
+
+    // ⋮ on the seed row → the row menu opens (a popover surface DISTINCT from
+    // the parent — the parent stays open; no group mutual-exclusion).
+    await page
+      .locator(`[data-testid="ws-overflow-row-menu-trigger"][data-workspace="${seed}"]`)
+      .click();
+    await expect(page.locator('[data-testid="ws-overflow-row-menu"]')).toBeVisible();
+    await expect(page.locator('[data-testid="ws-overflow-popover"]')).toBeVisible();
+    // The seed is canonically FIRST: its Move left is disabled.
+    await expect(
+      page.locator(`[data-testid="ws-menu-move-left"][data-workspace="${seed}"]`),
+    ).toHaveAttribute("aria-disabled", "true");
+
+    // Move the seed RIGHT one slot: canonical order becomes [L0, seed, L1..L5].
+    await page.locator(`[data-testid="ws-menu-move-right"][data-workspace="${seed}"]`).click();
+    await expect.poll(async () => persistedWsOrder(page)).toEqual([longs[0], seed, ...longs.slice(1)]);
+    // The row menu closed with the action; the parent popover is still open…
+    await expect(page.locator('[data-testid="ws-overflow-row-menu"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="ws-overflow-popover"]')).toBeVisible();
+    // …and the row list re-rendered in the NEW canonical order (membership is
+    // frozen while the popover is open, but the row ORDER follows the store).
+    const hiddenAfter = [longs[0], seed, ...hiddenBefore.slice(1).filter((id) => id !== longs[0])];
+    await expect
+      .poll(async () =>
+        rows.evaluateAll((els) => (els as HTMLElement[]).map((e) => e.dataset.workspace ?? "")),
+      )
+      .toEqual(hiddenAfter);
+
+    // The canonical-first row (L0, still hidden) has a disabled Move left.
+    await page
+      .locator(`[data-testid="ws-overflow-row-menu-trigger"][data-workspace="${longs[0]}"]`)
+      .click();
+    const rowLeft = page.locator(`[data-testid="ws-menu-move-left"][data-workspace="${longs[0]}"]`);
+    await expect(rowLeft).toHaveAttribute("aria-disabled", "true");
+    await rowLeft.click({ force: true });
+    await expect(page.locator('[data-testid="ws-overflow-row-menu"]')).toBeVisible();
+    expect(await persistedWsOrder(page)).toEqual([longs[0], seed, ...longs.slice(1)]);
+    await page.keyboard.press("Escape"); // closes the row menu (topmost)
+    await page.keyboard.press("Escape"); // then the parent popover
+    await expect(page.locator('[data-testid="ws-overflow-popover"]')).toHaveCount(0);
+  });
 });

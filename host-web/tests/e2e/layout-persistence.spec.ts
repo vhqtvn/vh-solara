@@ -634,5 +634,74 @@ test.describe("layout persistence — proof-gap closures (F1/F2)", () => {
     const after = normalizeTopology((await H.serialize(page)) as unknown as TopoLayout);
     expect(after, "normalized topology round-trips through reload").toBe(before);
   });
+
+  // WORKSPACE ORDER round-trip (F-A): the v3 blob persists the workspace array
+  // ORDER implicitly (no schema field); a user-driven reorder (the tab context
+  // menu) must survive a reload — the restored strip renders the USER order,
+  // not the creation order. ORDER-SENSITIVE on purpose (every pre-existing
+  // workspace-set assertion here sorts; the order dimension is this test's
+  // additive point).
+  test("the WORKSPACE ORDER round-trips through reload (user reorder restored, order-sensitively)", async ({
+    page,
+  }) => {
+    await H.loadHost(page);
+    const ws1 = (await H.workspaces(page))[0];
+    const ws1PaneCount = (await H.panes(page)).length; // active = ws1 here
+    const ws2 = await H.addWorkspace(page, "Second");
+    const ws3 = await H.addWorkspace(page, "Third");
+    expect(ws2).toBeTruthy();
+    expect(ws3).toBeTruthy();
+
+    // User reorder through the REAL menu: move the seed tab right twice —
+    // canonical order becomes [ws2, ws3, ws1].
+    const tab = page.locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`);
+    await tab.click({ button: "right" });
+    await page.locator('[data-testid="ws-menu-move-right"]').click();
+    await expect
+      .poll(async () =>
+        page.locator('[data-testid="ws-tab"]').evaluateAll((els) =>
+          (els as HTMLElement[]).map((e) => e.dataset.workspace ?? ""),
+        ),
+      )
+      .toEqual([ws2, ws1, ws3]);
+    await tab.click({ button: "right" });
+    await page.locator('[data-testid="ws-menu-move-right"]').click();
+    await expect
+      .poll(async () =>
+        page.locator('[data-testid="ws-tab"]').evaluateAll((els) =>
+          (els as HTMLElement[]).map((e) => e.dataset.workspace ?? ""),
+        ),
+      )
+      .toEqual([ws2, ws3, ws1]);
+
+    // Flush the debounced save (the blob's workspaces array is now in the
+    // user's order — waitForSavedLayout's panel count doubles as the
+    // quiescence gate; the total = ws1's seeded panes, ws2/ws3 are empty).
+    await H.waitForSavedLayout(page, ws1PaneCount);
+
+    // Reload → the restored strip renders the USER order (order-sensitive).
+    await page.reload();
+    await expect.poll(async () => H.connected(page), { timeout: 20000 }).toBe(true);
+    await expect
+      .poll(async () =>
+        page.locator('[data-testid="ws-tab"]').evaluateAll((els) =>
+          (els as HTMLElement[]).map((e) => e.dataset.workspace ?? ""),
+        ),
+      )
+      .toEqual([ws2, ws3, ws1]);
+    // The persisted blob's own array order matches (the two order views —
+    // rendered and persisted — are the same order).
+    const blobOrder = await page.evaluate((key) => {
+      try {
+        const raw = localStorage.getItem(key);
+        if (!raw) return [];
+        const parsed = JSON.parse(raw) as { workspaces?: Array<{ id?: string }> };
+        return (parsed.workspaces ?? []).map((w) => w.id ?? "");
+      } catch {
+        return [];
+      }
+    }, H.LAYOUT_STORAGE_KEY);
+    expect(blobOrder).toEqual([ws2, ws3, ws1]);
+  });
 });
 

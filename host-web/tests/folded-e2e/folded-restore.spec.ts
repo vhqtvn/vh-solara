@@ -607,4 +607,68 @@ test.describe.serial("folded-posture layout restore", () => {
     await expect(restoredTab).toHaveAttribute("data-active", "1");
     await expect(restoredTab).toHaveAttribute("aria-selected", "true");
   });
+
+  // NARROW ORDER-RESTORE CASE (F-A): a user-driven tab REORDER (the context
+  // menu, real UI) must survive a clean folded relaunch — the restored strip
+  // renders the USER order, not the creation order. Production-safe like the
+  // rest of this lane: DOM + localStorage only (no DEV bridges in the folded
+  // build). Wide viewport so all three tabs render (no saturation interplay —
+  // the order dimension is the point, not the fit machinery).
+  test("folded relaunch restores the USER workspace order after a context-menu reorder", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto("/");
+    await expect(page.locator('[data-testid="host-app-root"]')).toBeVisible();
+    await expect
+      .poll(async () => (await paneIds(page)).length, { timeout: 20000 })
+      .toBeGreaterThanOrEqual(1);
+
+    // Two more workspaces via the REAL merged "+" UI: creation order
+    // [Workspace 1, Workspace 2, Workspace 3]; the last is active.
+    for (let i = 0; i < 2; i++) {
+      await page.locator('[data-testid="ws-add"]').click();
+      await page.locator('[data-testid="add-menu-new-workspace"]').click();
+    }
+    const tabOrder = () =>
+      page.locator('[data-testid="ws-tab"]').evaluateAll((els) =>
+        (els as HTMLElement[]).map((e) => e.dataset.workspace ?? ""),
+      );
+    const creationOrder = await tabOrder();
+    expect(creationOrder.length).toBe(3);
+
+    // Reorder through the REAL context menu: move the seed right twice —
+    // user order [ws-2nd, ws-3rd, seed].
+    const seedTab = page.locator('[data-testid="ws-tab"]', { hasText: "Workspace 1" });
+    for (let i = 0; i < 2; i++) {
+      await seedTab.click({ button: "right" });
+      await page.locator('[data-testid="ws-menu-move-right"]').click();
+    }
+    const userOrder = await tabOrder();
+    expect(userOrder, "user order differs from creation order").not.toEqual(creationOrder);
+    expect(userOrder[userOrder.length - 1]).toBe(creationOrder[0]);
+
+    // The v3 blob converges on the USER order (names in order — the mirror is
+    // the relaunch's restore source).
+    await waitForQuiescentMirror(
+      page,
+      (p) => {
+        const o = p as { workspaces?: Array<{ name?: string }> };
+        return (
+          JSON.stringify(o.workspaces?.map((w) => w.name ?? "")) ===
+          JSON.stringify(["Workspace 2", "Workspace 3", "Workspace 1"])
+        );
+      },
+      "blob with the user workspace order",
+    );
+
+    // CLEAN RELAUNCH (goto "/", no hash — the PWA start_url posture).
+    await page.goto("/");
+    await expect(page.locator('[data-testid="host-app-root"]')).toBeVisible();
+    await expect
+      .poll(async () => (await paneIds(page)).length, { timeout: 20000 })
+      .toBeGreaterThanOrEqual(1);
+
+    // The restored strip renders the USER order (order-sensitive; ids restore
+    // verbatim from the blob, so the data-workspace order is comparable).
+    await expect.poll(async () => tabOrder(), { timeout: 10000 }).toEqual(userOrder);
+  });
 });

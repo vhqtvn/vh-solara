@@ -21,6 +21,7 @@ import {
   stageRuntimeWorkspaceLayout,
 } from "./layoutPersistence";
 import { dismissAnchoredSurfaces } from "../shell/popover";
+import { nextPaneId } from "../state/mockData";
 
 // Module-level singleton store. Signals created at module scope are fine in
 // SolidJS: components that read them inside a tracking scope re-render on
@@ -148,6 +149,33 @@ function workspaces(): Workspace[] {
 const [activeWorkspaceId, setActiveWorkspaceIdSignal] = createSignal<string>(
   initial.activeId,
 );
+
+// HOST-LAYER ORDER (creation order — the DOM-stability half of the 2026-10-09
+// order decoupling): a parallel store holding the SAME Workspace object
+// references in CREATION order. App.tsx's host-layer <For> iterates THIS
+// array, never workspaces(): reorderWorkspace reorders the canonical DISPLAY
+// array only, so a reorder never DOM-moves an existing host layer — a
+// DOM-moved iframe re-creates its browsing context and RELOADS (the blocker
+// this decouples; store-level referential identity is necessary but NOT
+// sufficient). Semantics (HOST-LAYER STABILITY RULE): seeded from the
+// restored blob order at cold boot (= last-saved user order); addWorkspace
+// APPENDS; closeWorkspace REMOVES; nothing else ever mutates it. The
+// set-equality obligation hostLayerOrder() ≡ open workspaces() (same ids,
+// never a stale/closed workspace) holds by construction — every mutation
+// site mirrors both stores. Visual neutrality: layers are absolutely
+// positioned inset:0 overlays where only the active one is visible, so DOM
+// order among layers carries no layout meaning; creation order must NEVER
+// leak into display order (strip, overflow, priorityFit, and the blob all
+// stay driven by workspaces()).
+const [hostLayerStore, setHostLayerStore] = createStore<Workspace[]>(
+  initial.list.slice(),
+);
+/** The host-layer render order (creation order — see hostLayerStore). <For>
+ *  keys by the SAME Workspace object references as workspaces(), so add/close
+ *  never remounts other hosts and reorderWorkspace NEVER mutates this array. */
+export function hostLayerOrder(): Workspace[] {
+  return hostLayerStore;
+}
 /** The workspace that should seed the fleet/mock fleet on cold init (the default
  *  workspace when there was no saved blob; null otherwise). Runtime-added workspaces
  *  are never seed targets — they start empty (the empty-workspace affordance). */
@@ -227,9 +255,40 @@ export function addWorkspace(name?: string, layout?: SerializedDockview): string
   };
   if (layout) stageRuntimeWorkspaceLayout(id, layout);
   setWorkspacesStore(produce((list) => { list.push(ws); }));
+  setHostLayerStore(produce((layers) => { layers.push(ws); })); // creation-order append (same ref)
   setActiveWorkspaceIdSignal(id);
   scheduleSave();
   return id;
+}
+
+/**
+ * Move a workspace one slot left (-1) or right (+1) in the canonical order.
+ * IDENTITY-PRESERVING by construction — the same discipline as renameWorkspace:
+ * the produce mutation splices the EXISTING Workspace object out and re-inserts
+ * the SAME reference, so <For> (which keys workspaces by reference) never
+ * remounts a host and no iframe reloads. Boundary moves (first-left /
+ * last-right) are no-ops. The array IS the canonical order everywhere (strip
+ * render, overflow hidden-list, priorityFit tie-break, blob serialization),
+ * so one mutation + scheduleSave is the whole effect — v3 persists order
+ * implicitly as array order; NO schema change. Deliberately does NOT touch
+ * hostLayerOrder(): the host layer renders in CREATION order (store-top
+ * hostLayerStore) — reordering it would DOM-move host layers and a
+ * DOM-moved iframe re-creates its browsing context = RELOAD (the 2026-10-09
+ * fence-extension decoupling; see hostLayerStore's comment).
+ */
+export function reorderWorkspace(id: string, dir: -1 | 1): void {
+  const list = workspaces();
+  const i = list.findIndex((w) => w.id === id);
+  if (i < 0) return; // unknown ws — no-op
+  const j = i + dir;
+  if (j < 0 || j >= list.length) return; // boundary — no-op
+  setWorkspacesStore(
+    produce((arr) => {
+      const [ws] = arr.splice(i, 1);
+      arr.splice(j, 0, ws); // SAME object reference — identity preserved
+    }),
+  );
+  scheduleSave(); // array order is the persisted order (v3 blob, no schema change)
 }
 
 /**
@@ -294,6 +353,14 @@ export function closeWorkspace(id: string): boolean {
     produce((arr) => {
       const i = arr.findIndex((w) => w.id === id);
       if (i >= 0) arr.splice(i, 1);
+    }),
+  );
+  // Mirror the removal into the creation-order host layer (set-equality
+  // obligation: a stale layer would leak an orphaned iframe host).
+  setHostLayerStore(
+    produce((layers) => {
+      const li = layers.findIndex((w) => w.id === id);
+      if (li >= 0) layers.splice(li, 1);
     }),
   );
   // If we closed the active workspace, activate a remaining one (its host's
@@ -778,6 +845,121 @@ export function unregisterPane(id: string): void {
   setTrayIds((list) => list.filter((t) => t !== id));
   setFocusedId((cur) => (cur === id ? null : cur));
   recomputeAggregates();
+}
+
+/**
+ * SEND PANE TO WORKSPACE — serialize-recreate ONLY (operator decision (3), the
+ * accepted-loss contract). dockview-core has no cross-instance move and the
+ * renderer never reparents iframes, so the moved pane is SERIALIZED ({url,
+ * label, route?} params — never iframe DOM state; scroll/unsaved input/SSE do
+ * NOT survive, the reloaded badge is the visible signal) and re-created in the
+ * target:
+ *
+ *  • existing target — target api.addPanel (the addServer precedent:
+ *    renderer:"always", split-right off the target's active panel when one
+ *    exists, else absolute);
+ *  • null target (NEW workspace) — addWorkspace(undefined, one-panel staged
+ *    layout): the staged cold-restore pipeline consumes it at the fresh host's
+ *    mount, RE-MINTING the pane id (reIdLayoutPanels — pane ids are global
+ *    host-store keys, so the live source id must never be reused while the
+ *    source workspace still holds it). Auto-names "Workspace N"; rename is
+ *    available after (decision (4)).
+ *
+ * The source pane is then removed via src api.removePanel, which routes the
+ * controller's onDidRemovePanel hook → unregisterPane (pane-keyed global-state
+ * cleanup) + syncPanes automatically. Finally auto-switches to the target
+ * (decision (5)). Returns the target workspace id, or null when the move was
+ * refused (unknown pane, pane params not serializable, same-workspace target,
+ * or an unmounted target host).
+ */
+export function movePaneToWorkspace(
+  paneId: string,
+  targetWsId: string | null,
+): string | null {
+  // Locate the source api by pane membership (pane ids are globally unique).
+  let srcWsId: string | null = null;
+  let srcApi: DockviewApi | null = null;
+  for (const [wsId, api] of workspaceApis) {
+    if (api.getPanel(paneId)) {
+      srcWsId = wsId;
+      srcApi = api;
+      break;
+    }
+  }
+  if (!srcWsId || !srcApi) return null; // unknown pane — no-op
+  if (targetWsId !== null && targetWsId === srcWsId) return null; // same ws — no-op
+  const panel = srcApi.getPanel(paneId);
+  if (!panel) return null;
+  const params = (panel.params ?? {}) as {
+    url?: string;
+    label?: string;
+    route?: string;
+  };
+  // The serialization contract: {url,label} must be present (isFleetEntry
+  // shape — the same gate the cold-restore pipeline applies to the staged
+  // panel). Without them there is nothing to re-create; refuse rather than
+  // mint a broken pane.
+  if (typeof params.url !== "string" || typeof params.label !== "string") {
+    return null;
+  }
+  const title = panel.title;
+
+  let targetId: string;
+  if (targetWsId === null) {
+    // NEW workspace carrying exactly the moved pane. Saved-shape one-panel
+    // layout (branch root + single leaf; fractions are optional — the
+    // materializer splits fraction-less children into equal shares). The
+    // staged panel entry mirrors dockview's own panel serialization
+    // (toJSON: id/contentComponent/renderer/title/params) so the cold-restore
+    // deserializer recreates it as an iframe pane; reIdLayoutPanels mints the
+    // fresh pane id at consume time (the "pane-move" placeholder never goes
+    // live). Group ids are per-dockview-instance namespaces — a fixed id is
+    // safe in a brand-new host.
+    const pid = "pane-move";
+    const onePanelLayout = {
+      grid: {
+        root: {
+          type: "branch",
+          data: [
+            {
+              type: "leaf",
+              data: { id: "move-group", views: [pid], activeView: pid },
+            },
+          ],
+        },
+      },
+      panels: {
+        [pid]: {
+          id: pid,
+          contentComponent: "iframe",
+          renderer: "always",
+          title,
+          params: { ...params },
+        },
+      },
+    };
+    targetId = addWorkspace(undefined, onePanelLayout as unknown as SerializedDockview);
+  } else {
+    const dst = workspaceApis.get(targetWsId);
+    if (!dst) return null; // target host not mounted — refuse (should not happen for a live ws)
+    const ref = dst.activePanel ?? undefined;
+    const created = dst.addPanel({
+      id: nextPaneId(),
+      component: "iframe",
+      renderer: "always",
+      params: { ...params },
+      position: ref ? { referencePanel: ref, direction: "right" } : undefined,
+    });
+    created.api.setActive();
+    targetId = targetWsId;
+  }
+  // Remove from the SOURCE — the controller's onDidRemovePanel hook routes
+  // unregisterPane (global pane-keyed cleanup) + syncPanes automatically.
+  srcApi.removePanel(panel);
+  // Auto-switch to the target (decision (5)) so the moved pane is in view.
+  setActiveWorkspace(targetId);
+  scheduleSave(); // belt-and-suspenders; onDidLayoutChange already saved both trees
+  return targetId;
 }
 
 // ---- shell view-model mutators (called by the controller from dockview) ----

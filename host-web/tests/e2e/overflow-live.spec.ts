@@ -116,4 +116,71 @@ test.describe("overflow live sync (hidden-workspace badges in the ⋯ select)", 
     // seed workspace is NOT promoted into the strip mid-interaction.
     await expect(page.locator(`[data-testid="ws-tab"][data-workspace="${seed}"]`)).toHaveCount(0);
   });
+
+  // ROW REORDER (F-A): the ⋮ row menu reorders a HIDDEN workspace while the
+  // popover is open — the row list re-renders in the NEW canonical order and
+  // the row's LIVE badge run stays attached to the right workspace (the
+  // badges move with the workspace, not the slot). CONTINUITY CRUX (fence
+  // extension, criterion 9): the reorder must NOT reload the moved
+  // workspace's iframes — asserted DIRECTLY (survival mountTs continuity +
+  // iframe srcs unchanged), not just via the badge echo the cc-1 counter-case
+  // warned about.
+  test("row menu reorder: the hidden workspace moves and its live badges follow", async ({ page }) => {
+    // Saturation geometry: the seed sits behind the overflow trigger.
+    await page.setViewportSize({ width: 600, height: 800 });
+    const seed = (await H.workspaces(page))[0];
+    const seedPanes = await H.panes(page);
+    await H.waitForReady(page, seedPanes[0]);
+    for (let i = 0; i < 6; i++) {
+      await H.addWorkspace(page, `LongWorkspaceNameForWidthPaddingLongWorkspaceNameForWidth${i}`);
+    }
+
+    // The seed carries live counts BEFORE the reorder, plus its survival
+    // identity + iframe srcs (the reorder must preserve ALL three).
+    await probeCounts(page, seedPanes[0], 2, 3);
+    const before = await H.survival(page, seedPanes[0]);
+    expect(before).not.toBeNull();
+    const srcsBefore = await H.iframeSrcs(page);
+    const trigger = page.locator('[data-testid="ws-overflow-trigger"]');
+    await trigger.click();
+    const pairs = page.locator(`[data-testid="ws-overflow-pairs"][data-workspace="${seed}"]`);
+    await expect(pairs).toHaveAttribute("data-pairs", `(2|3)${zeros(seedPanes.length - 1)}`);
+
+    // ⋮ → Move right: canonical order shifts (seed leaves the first slot).
+    await page
+      .locator(`[data-testid="ws-overflow-row-menu-trigger"][data-workspace="${seed}"]`)
+      .click();
+    await expect(page.locator('[data-testid="ws-overflow-row-menu"]')).toBeVisible();
+    await page.locator(`[data-testid="ws-menu-move-right"][data-workspace="${seed}"]`).click();
+
+    // IFRAME CONTINUITY (the crux): the seed's pane kept its browsing context
+    // (survival identity unchanged — a DOM-moved iframe re-creates it) and
+    // every iframe src is byte-identical (no reload navigation happened).
+    await H.assertSurvived(page, seedPanes[0], before!, "seed pane across row-menu reorder");
+    const srcsAfter = await H.iframeSrcs(page);
+    expect(srcsAfter.slice().sort()).toEqual(srcsBefore.slice().sort());
+
+    // The row list re-rendered: the seed is still HIDDEN (membership is
+    // frozen while the popover is open) so it remains LISTED, but it is no
+    // longer the FIRST row — and its badge run still carries its counts.
+    const rows = page.locator('[data-testid="ws-overflow-row"]');
+    await expect
+      .poll(async () =>
+        rows.evaluateAll((els) => (els as HTMLElement[]).map((e) => e.dataset.workspace ?? "")),
+      )
+      .toEqual(expect.arrayContaining([seed]));
+    const order = await rows.evaluateAll((els) =>
+      (els as HTMLElement[]).map((e) => e.dataset.workspace ?? ""),
+    );
+    expect(order).toContain(seed);
+    expect(order[0]).not.toBe(seed);
+    await expect(pairs).toHaveAttribute("data-pairs", `(2|3)${zeros(seedPanes.length - 1)}`);
+
+    // The counts keep updating LIVE on the reordered row (B-class guarantee
+    // holds after the move).
+    await probeCounts(page, seedPanes[0], 7, 0);
+    await expect(pairs).toHaveAttribute("data-pairs", `(7|0)${zeros(seedPanes.length - 1)}`);
+    await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="ws-overflow-popover"]')).toHaveCount(0);
+  });
 });

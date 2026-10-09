@@ -358,6 +358,65 @@ test.describe("PWA kill/relaunch persistence", () => {
       .toBeGreaterThanOrEqual(2);
   });
 
+  // WORKSPACE ORDER through the kill cycle (F-A): a user-driven REORDER
+  // (menu click) must survive the instant-kill + clean-relaunch sequence — the
+  // restored strip renders the USER order (order-sensitive; the set-level
+  // .sort() assertions elsewhere in this spec cannot see order).
+  test("CRUX A (order): instant kill after a menu REORDER — relaunch restores the USER order", async ({
+    page,
+    context,
+  }) => {
+    // ---- Session 1: the "PWA process".
+    await H.loadHost(page);
+    const ws1 = (await H.workspaces(page))[0];
+    const ws2 = await H.addWorkspace(page, "Second");
+    const ws3 = await H.addWorkspace(page, "Third");
+    expect(ws2).toBeTruthy();
+    expect(ws3).toBeTruthy();
+
+    // Reorder through the REAL menu: move the seed right twice → user order
+    // [ws2, ws3, ws1].
+    const tab = page.locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`);
+    await tab.click({ button: "right" });
+    await page.locator('[data-testid="ws-menu-move-right"]').click();
+    await tab.click({ button: "right" });
+    await page.locator('[data-testid="ws-menu-move-right"]').click();
+    await expect
+      .poll(async () =>
+        page.locator('[data-testid="ws-tab"]').evaluateAll((els) =>
+          (els as HTMLElement[]).map((e) => e.dataset.workspace ?? ""),
+        ),
+      )
+      .toEqual([ws2, ws3, ws1]);
+
+    // Sync-mirror guarantee: the reorder is ALREADY in the localStorage blob
+    // (array order — ORDER-SENSITIVE read) before the kill.
+    expect(
+      (await readPersisted(page))?.workspaces?.map((w) => w.id ?? ""),
+      "reordered blob order already mirrored",
+    ).toEqual([ws2, ws3, ws1]);
+
+    // ---- Kill INSTANTLY (no hide grace) + relaunch clean, exactly CRUX A.
+    await page.goto("about:blank");
+    await page.close();
+    const page2 = await context.newPage();
+    await page2.goto("/");
+    await expect.poll(async () => H.connected(page2), { timeout: 20000 }).toBe(true);
+
+    // The restored strip renders the USER order (not the creation order).
+    await expect
+      .poll(async () =>
+        page2.locator('[data-testid="ws-tab"]').evaluateAll((els) =>
+          (els as HTMLElement[]).map((e) => e.dataset.workspace ?? ""),
+        ),
+      )
+      .toEqual([ws2, ws3, ws1]);
+    expect(
+      (await readPersisted(page2))?.workspaces?.map((w) => w.id ?? ""),
+      "relaunched blob carries the user order",
+    ).toEqual([ws2, ws3, ws1]);
+  });
+
   test("CONTROL (guards against a vacuous red): settled kill — save flushed BEFORE the kill — state restored", async ({
     page,
     context,

@@ -492,4 +492,112 @@ test.describe("tab-pairs badges (per-pane running/unread micro-badges in the wor
       await page.screenshot({ path: path.join(VISION_DIR, "tab-pairs-360-scrolled.png") });
     }
   });
+
+  // ---- SEND PANE TO WORKSPACE (F-B): pane membership changes on move --------
+  // Serialize-recreate ONLY: the pane's {url,label,route} params re-create it
+  // in the target; the iframe RELOADS (accepted loss). Asserted here as a
+  // MEMBERSHIP change (source loses the pane, target gains it, auto-switch)
+  // plus the RELOADED outcome: the fresh document reconnects (heartbeat +
+  // WS echo via waitForReady) and its iframe carries the SAME url (the
+  // serialize-recreate contract — url survives, iframe state does not).
+
+  test("move pane to NEW workspace: membership change + auto-switch + pane reloads (url preserved, reconnects)", async ({
+    page,
+  }) => {
+    const ws1 = (await H.workspaces(page))[0];
+    const ws1Panes = await H.panes(page);
+    expect(ws1Panes.length, "ws1 has seeded panes").toBeGreaterThanOrEqual(2);
+    const mover = ws1Panes[0];
+    await H.waitForReady(page, mover);
+    const moverUrl = (await H.paneParams(page)).find((p) => p.id === mover)!.url;
+    expect(moverUrl).toBeTruthy();
+
+    // Open the layout overlay on the mover (production HostOps path) and drive
+    // the move picker: with no other workspace, the ONLY entry is New workspace.
+    await H.openLayoutOverlay(page, mover);
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
+    await page.locator('[data-testid="layout-overlay-move-menu"]').click();
+    await expect(page.locator('[data-testid="layout-overlay-move-list"]')).toBeVisible();
+    await expect(page.locator('[data-testid="layout-overlay-move-target"]')).toHaveCount(0);
+    await page.locator('[data-testid="layout-overlay-move-new"]').click();
+
+    // A fresh auto-named workspace exists, is ACTIVE, and holds EXACTLY the
+    // moved pane (a NEW pane id — serialize-recreate, never id reuse).
+    await expect.poll(async () => (await H.workspaces(page)).length).toBe(2);
+    const target = await H.activeWorkspace(page);
+    expect(target).toBeTruthy();
+    expect(target, "auto-switched to the new workspace").not.toBe(ws1);
+    const targetPanes = await H.panes(page);
+    expect(targetPanes.length, "new workspace holds exactly the moved pane").toBe(1);
+    const moved = targetPanes[0]!;
+    expect(moved, "the moved pane has a FRESH id (serialize-recreate)").not.toBe(mover);
+
+    // The RELOADED outcome: the fresh iframe document reconnects (heartbeat +
+    // WS echo — connId) and liveness settles on "alive"; its src carries the
+    // SAME url (the serialize-recreate contract; scroll/unsaved input do NOT
+    // survive and are never claimed).
+    await H.waitForReady(page, moved);
+    await expect.poll(async () => H.liveness(page, moved), { timeout: 10000 }).toBe("alive");
+    const movedParams = await H.paneParams(page);
+    expect(movedParams[0]!.url, "moved pane keeps its url").toBe(moverUrl);
+    const srcs = await H.iframeSrcs(page);
+    expect(
+      srcs.some((src) => src === moverUrl),
+      "the re-created iframe loads the SAME url",
+    ).toBe(true);
+
+    // The SOURCE lost the pane (membership change; ws1 keeps its other panes).
+    await H.setActiveWorkspace(page, ws1!);
+    await expect
+      .poll(async () => (await H.panes(page)).sort())
+      .toEqual(ws1Panes.filter((id) => id !== mover).sort());
+    // The overlay closed with the move (terminal action).
+    expect(await H.overlaySource(page)).toBeNull();
+  });
+
+  test("move pane to EXISTING workspace: pane lands in the target alongside its panes", async ({
+    page,
+  }) => {
+    const ws1 = (await H.workspaces(page))[0];
+    const ws1Panes = await H.panes(page);
+    expect(ws1Panes.length).toBeGreaterThanOrEqual(2);
+    const mover = ws1Panes[0];
+    await H.waitForReady(page, mover);
+    const moverUrl = (await H.paneParams(page)).find((p) => p.id === mover)!.url;
+
+    // A second workspace with one pane of its own.
+    const ws2 = await H.addWorkspace(page, "Target");
+    const ws2Seed = await H.addServer(page, H.serverUrl("move-target"), "move-target");
+    expect(ws2Seed).toBeTruthy();
+    await H.waitForReady(page, ws2Seed!);
+    await H.setActiveWorkspace(page, ws1!);
+
+    // Move the pane into ws2 through the overlay picker.
+    await H.openLayoutOverlay(page, mover);
+    await page.locator('[data-testid="layout-overlay-move-menu"]').click();
+    const target = page.locator(
+      `[data-testid="layout-overlay-move-target"][data-workspace="${ws2}"]`,
+    );
+    await expect(target).toHaveCount(1);
+    await expect(page.locator('[data-testid="layout-overlay-move-new"]')).toBeVisible();
+    await target.click();
+
+    // Auto-switched to ws2; it now holds its seed pane + the moved pane.
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws2);
+    const ws2Panes = await H.panes(page);
+    expect(ws2Panes.length, "target holds seed + moved pane").toBe(2);
+    expect(ws2Panes).toContain(ws2Seed);
+    const moved = ws2Panes.find((id) => id !== ws2Seed)!;
+    expect(moved).not.toBe(mover);
+    const params = await H.paneParams(page);
+    expect(params.find((p) => p.id === moved)!.url).toBe(moverUrl);
+    // The moved pane reconnected in the target (the reload outcome).
+    await H.waitForReady(page, moved);
+
+    // The source lost exactly the mover.
+    await H.setActiveWorkspace(page, ws1!);
+    await expect
+      .poll(async () => (await H.panes(page)).sort())
+      .toEqual(ws1Panes.filter((id) => id !== mover).sort());
+  });
 });
