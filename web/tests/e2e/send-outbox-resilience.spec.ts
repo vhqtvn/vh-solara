@@ -25,6 +25,11 @@
 //      "replacement requested"
 //   E. legacy regression: daemonDispatchCapable absent → the FE still claims
 //      and delivers (byte-intact legacy drain)
+//   F. transient IDB failure (fail-first wrapper around the REAL indexedDB
+//      factory, released mid-test) → blocking banner + retained text + no
+//      durable record → "Try saving again" re-commits through REAL IDB →
+//      banner clears → re-send proceeds to admission (the RECOVERY half of
+//      the BLK-A3 surface; scenario C proves the failure half from boot)
 //
 // Hygiene: part of the serial suite over the shared fixtureserver. Queue
 // state is owned + cleaned per test via the real queue API (queue-recovery
@@ -512,4 +517,115 @@ test("E: legacy (capability absent) — the FE still claims + dispatches (byte-i
   });
   expect(feClaims).toBeGreaterThanOrEqual(1); // the BROWSER claimed (legacy dispatcher)
   expect(await page.evaluate(() => (window as any).__reloadCount)).toBe(0);
+});
+
+// --- F. transient IDB failure → banner → REAL-IDB recovery ---------------------
+test("F: transient IDB failure → blocking banner + retained text → retry re-commits to REAL IndexedDB → banner clears → re-send proceeds to admission", async ({
+  page,
+  request,
+}) => {
+  await installReloadCounter(page);
+  // HONEST INJECTION SHAPE (D-F5): a fail-first wrapper around the REAL
+  // indexedDB.open — while __vhOutboxIdbReleased is unset, every open of the
+  // vh-solara-outbox DB returns a request whose error fires asynchronously
+  // (exactly the observable shape the store's openDb rejects on); once the
+  // test sets the release flag the wrapper delegates EVERY call (this test's
+  // reads included) to the REAL implementation, so the recovery write and
+  // every post-recovery assertion run against REAL IndexedDB. Limit, stated:
+  // this injects failures at the FACTORY boundary (the honest equivalent of
+  // storage-unavailable/blocked-open transients); a genuinely transient
+  // REAL-engine put failure mid-transaction cannot be scripted from page
+  // script, and the wrapper does not pretend otherwise — recovery itself is
+  // 100% real IDB.
+  await page.addInitScript(() => {
+    (window as any).__vhOutboxIdbReleased = false;
+    (window as any).__vhOutboxIdbFailsObserved = 0;
+    const origOpen = indexedDB.open.bind(indexedDB);
+    const failingRequest = (dbName: string) => {
+      const err = new DOMException("injected transient IDB failure: " + dbName, "UnknownError");
+      const req: any = {
+        error: err,
+        result: undefined,
+        readyState: "pending",
+        onsuccess: null,
+        onerror: null,
+        onupgradeneeded: null,
+        onblocked: null,
+      };
+      setTimeout(() => {
+        (window as any).__vhOutboxIdbFailsObserved++;
+        if (typeof req.onerror === "function") req.onerror({ target: req, type: "error" });
+      }, 0);
+      return req;
+    };
+    indexedDB.open = function (this: IDBFactory, name: string, version?: number) {
+      if (name === "vh-solara-outbox" && !(window as any).__vhOutboxIdbReleased) {
+        return failingRequest(name);
+      }
+      return origOpen(name, version);
+    } as typeof indexedDB.open;
+  });
+  // Keep the admitted item `pending` (no claim → no delivery churn; the
+  // outbox record stays admitted-linked for the final assertion, and the
+  // afterEach cleanup can delete a pending item cleanly).
+  await page.route(`**/vh/session/${SID}/queue/claim*`, (route) => route.abort());
+  await openSession(page);
+  // Session-selection guard (scenario B's rationale): the reconcile/send
+  // paths under test target the SELECTED demo session.
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 20_000 });
+  const composer = page.getByPlaceholder("Message…");
+  await composer.fill("storage fails then recovers");
+  await composer.press("Enter");
+  // The BLK-A3 blocking persistent state — the failure half. Selector fold
+  // (a-F1/d-F3 round 1): the SAME outer `outbox-storage-banner` selector for
+  // BOTH the appear assertions here and the disappear assertion below — the
+  // previous inner-span appear (`outbox-storage-failure`) vs outer-banner
+  // disappear pair could mask a half-unmounted banner (the span gone while
+  // the alert container persisted).
+  const banner = page.getByTestId("outbox-storage-banner");
+  await expect(banner).toBeVisible({ timeout: 10_000 });
+  await expect(banner).toContainText("Not saved — copy your text.");
+  // The compose text is RETAINED in memory.
+  await expect(composer).toHaveValue("storage fails then recovers");
+  // NON-VACUOUS FAILURE (observed BEFORE any recovery is asserted): real
+  // opens of the outbox DB genuinely failed — while every open fails no
+  // transaction can commit, which is also what proves "no durable record"
+  // (a page-side read through the still-failing wrapper cannot distinguish
+  // empty from failed, so the observed-failure counter carries that proof).
+  const failsObserved = await page.evaluate(() => (window as any).__vhOutboxIdbFailsObserved);
+  expect(failsObserved).toBeGreaterThanOrEqual(1);
+  // Nothing was admitted while storage was broken.
+  await expect.poll(async () => (await listQueue(request)).length, { timeout: 3000 }).toBe(0);
+
+  // RECOVERY: release the wrapper → the retry's put goes through REAL IDB.
+  await page.evaluate(() => {
+    (window as any).__vhOutboxIdbReleased = true;
+  });
+  await page.getByRole("button", { name: "Try saving again" }).click();
+  // The banner clears (storage recovered for THIS gesture).
+  await expect(page.getByTestId("outbox-storage-banner")).toHaveCount(0, { timeout: 10_000 });
+  // The re-commit is REAL: a durable record now exists, status `saved`, read
+  // through the released wrapper → REAL IndexedDB.
+  await expect
+    .poll(async () => (await readOutbox(page)).length, { timeout: 5000 })
+    .toBe(1);
+  const recovered = (await readOutbox(page))[0];
+  expect(recovered.status).toBe("saved");
+  expect(recovered.intentId).toBeTruthy();
+  // ADMISSION PROCEEDS: retryFailedSave deliberately never enqueues (its
+  // comment owns that contract) — the operator's re-tap of the retained text
+  // is the send path. This fresh gesture saves (real IDB), SUPERSEDES the
+  // just-retried same-text record (same tab → own-tab supersede, R-F2's
+  // scope, exercised on the real path), and admits through the real daemon.
+  await composer.press("Enter");
+  await expect.poll(async () => (await listQueue(request)).length, { timeout: 20_000 }).toBe(1);
+  await expect
+    .poll(async () => {
+      const recs = await readOutbox(page);
+      return recs.length === 1 && recs[0].status === "admitted" ? recs[0] : null;
+    }, { timeout: 10_000 })
+    .toMatchObject({ status: "admitted" });
+  const finalRecord = (await readOutbox(page))[0];
+  expect(finalRecord.queueItemId).toBeTruthy(); // linked to the admitted item
+  expect(await page.evaluate(() => (window as any).__reloadCount)).toBe(0); // no-reload recovery
 });

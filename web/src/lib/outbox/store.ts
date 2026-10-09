@@ -74,6 +74,44 @@ export interface OutboxGestureRecord {
   // re-tap (the blocked row/banner own the retained text; a new same-text
   // gesture supersedes this record in saveGesture).
   reAdmitHold?: boolean;
+  // R-F2 (cross-tab supersede scoping, 2026-10-10): the page (tab) that wrote
+  // this record — stamped by saveGesture/retryFailedSave from the controller's
+  // per-tab page identity (sessionStorage-backed, b-F2: per-tab AND
+  // reload-stable within the tab — never localStorage, which is shared across
+  // tabs; the b-F1/b-F2 round-2 platform-copy caveat is documented on
+  // `bootNonce` below and in index.ts's identity block). Supersede scans
+  // match ONLY same-clientId records: a tab must never prune another tab's
+  // just-committed durable gesture (the cross-tab mutual-prune interleave
+  // voided BLK-A3 for the pruned gesture). Cross-tab same-text duplicates
+  // are owned by the DESIGNED backstops — reconcile's pass-local same-text
+  // suppression + the daemon's intentId-VALUE admission dedupe (which does
+  // NOT collapse same-text records under distinct intentIds). ABSENT
+  // (records written before this field existed): foreign — never pruned
+  // (migration-safe, errs toward retention).
+  clientId?: string;
+  // b-F1/b-F2 round 2 (2026-10-10): the PAGE EVALUATION nonce of the writer —
+  // a per-eval random stamped at save/retry (deliberately NOT reload-stable:
+  // every page load mints a fresh one; the clientId is the reload-stable
+  // half, this is the eval-distinguishing half). Needed because the platform
+  // COPIES sessionStorage into opener-created tabs (window.open /
+  // target=_blank) and duplicated tabs — a clone then evaluates under the
+  // SAME clientId, and the id alone cannot distinguish "my dead former self
+  // (a reload)" from "a live clone sibling". Same clientId + SAME nonce =
+  // THIS page-eval's record (definitely ours); same clientId + DIFFERENT or
+  // ABSENT nonce = an EARLIER eval of this id (pre-reload self OR clone —
+  // not locally distinguishable; the uncontested-claim gate in index.ts
+  // decides). ABSENT on same-clientId records (pre-upgrade): treated as
+  // cross-eval — never pruned without the claim gate (migration-safe).
+  bootNonce?: string;
+  // R-F3 (admitted twin prune, 2026-10-10): stamped by markAdmitted when the
+  // admission confirmation commits. A still-`saved` same-text record whose
+  // createdAt is OLDER than this timestamp is a pre-admission residual twin
+  // (the crash-separated ~2-IDB-op window) — reconcile prunes it instead of
+  // re-admitting (the daemon does NOT collapse distinct intentIds: two
+  // admissions would be a duplicate send). A same-text record NEWER than
+  // admittedAt is a fresh deliberate gesture — kept. ABSENT (legacy
+  // records): the time gate cannot run — current behavior retained.
+  admittedAt?: number;
 }
 
 /** Typed result of a local save. Never a throw. */

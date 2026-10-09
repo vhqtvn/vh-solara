@@ -43,7 +43,10 @@
 //                                      head — the stale gate cannot run;
 //                                      c-F2 fail-closed) — visible row
 //   admitted + item sent             → delivered → prune
-//   admitted + item absent           → server queue archived/dismissed → prune
+//   admitted + item absent (list     → server queue archived/dismissed → prune
+//     AUTHORITATIVELY empty — [])      — a null list (fetch failed) is a
+//     NO-ANSWER: absence is NOT established, the record is retained + skipped
+//     and the next pass retries (null-vs-empty tighten, 2026-10-10)
 //   any record older than GC_MS      → prune (bounded store)
 import { createSignal } from "solid-js";
 import type { QueuedMessage } from "../../queue";
@@ -105,11 +108,248 @@ const [storageFailure, setStorageFailure] = createSignal<OutboxStorageFailure | 
 const LS_OUTBOX_PENDING = "vh.outbox.pending.v1";
 const [evictionSuspected, setEvictionSuspected] = createSignal(false);
 
+// --- page (tab) identity — R-F2 cross-tab supersede scoping -------------------
+// A stable id for THIS TAB: per-tab (never deliberately shared across tabs)
+// AND stable across RELOADS within the tab (b-F2 round 1: minting per module
+// evaluation made the id reload-unstable — after a reload the operator's
+// fresh same-text re-send could NOT supersede-prune the pre-reload saved
+// record; both then aged past the 60s guard, reconcile sorted oldest-first
+// and admitted the STALE record while the R-F3 twin prune deleted the FRESH
+// gesture: an oldest-wins inversion of same-tab newest-wins). sessionStorage
+// has exactly both required properties; NOT localStorage — it is shared
+// across ALL tabs (it would reintroduce the cross-tab mutual-prune interleave
+// R-F2 closed). Records are stamped with the id at saveGesture/retryFailedSave
+// and supersede scans match only SAME-clientId records: tab B's scan must
+// never prune tab A's just-committed durable record.
+//
+// b-F1/b-F2 round 2 — the platform COPY exception + the uncontested-claim
+// gate: sessionStorage is per-tab EXCEPT that the platform COPIES it into
+// opener-created tabs (window.open / target=_blank) and duplicated tabs — a
+// clone then evaluates under the SAME clientId, so the clientId gate alone
+// cannot tell "my own record" from "another live tab's". The clone's
+// supersede scan matched the ORIGINAL tab's just-saved same-text record as
+// own-tab and DELETED it — a cross-tab prune of a live tab's durable record
+// (the exact BLK-A3-class void R-F2 exists to prevent). Neutralized in two
+// layers:
+//   1. bootNonce (a per-PAGE-EVALUATION random stamped on every save/retry,
+//      re-minted each module evaluation): same clientId + SAME nonce =
+//      written by THIS page-eval → definitely ours → prune directly (the
+//      common same-typing case, zero latency, no channel). Same clientId +
+//      DIFFERENT/absent nonce = written by an EARLIER eval of this id — my
+//      dead former self (the reload shape) OR a live clone sibling; NOT
+//      locally distinguishable.
+//   2. uncontendedClaim() (the cross-eval gate): a one-per-eval
+//      BroadcastChannel('vh-solara-outbox') handshake — post
+//      {type:'who-has', id}, collect objections ({type:'mine', id}) for
+//      ~120ms. No objection → uncontested (the reload shape: the predecessor
+//      is my dead former self) → the prune proceeds. ANY objection → a live
+//      tab holds this id → SKIP the prune: the records coexist and the
+//      DESIGNED cross-tab stance owns them (reconcile's oldest-wins belt +
+//      pass-local same-text suppression, the R-F3 twin prune, and the
+//      daemon's intentId-VALUE admission dedupe — which does NOT collapse
+//      same-text records under distinct intentIds). No BroadcastChannel
+//      available (old browser, exotic embedding, jsdom without a stub) →
+//      the same conservative SKIP, never an error — degradation is to the
+//      SAFE direction.
+// RESIDUAL CORNER (replaces c-F1's scope, stated honestly): a predecessor
+// tab FROZEN by the platform (tab freeze — typically after ≥~5min hidden; no
+// JS runs, so it cannot answer 'mine') + a clone of it + a same-text gesture
+// + a cross-eval prune issued during the freeze window → the handshake sees
+// no objection and the frozen tab's record is pruned. No local signal exists
+// for frozen-tab liveness. Harm stays bounded by the same-text belt (at most
+// ONE re-admission per text per reconcile pass) and the daemon's
+// intentId-value admission dedupe — the same backstops that own every
+// cross-tab duplicate.
+const SS_OUTBOX_CLIENT = "vh-solara-outbox-client";
+
+function mintRandomId(): string {
+  try {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+  } catch {
+    /* fall through to the fallback below */
+  }
+  // crypto.randomUUID is secure-context-only (plain-http LAN origins do not
+  // expose it): time + two random stretches is collision-safe for tab identity.
+  return `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
+/** Resolve THIS tab's identity: adopt the sessionStorage-stored id (a reload
+ *  within this tab re-derives the SAME id), else mint once and store it (the
+ *  tab's first page lifetime). sessionStorage unavailable (storage disabled /
+ *  exotic embeddings): a per-call mint — reload-unstable, but still
+ *  per-tab-unique and NEVER cross-tab shared (degrades to the pre-b-F2
+ *  behavior, never worse). */
+function resolvePageClientId(): string {
+  try {
+    const stored = sessionStorage.getItem(SS_OUTBOX_CLIENT);
+    if (stored) return stored;
+    const minted = mintRandomId();
+    sessionStorage.setItem(SS_OUTBOX_CLIENT, minted);
+    return minted;
+  } catch {
+    return mintRandomId();
+  }
+}
+let pageClientId = resolvePageClientId();
+
+// The page-EVALUATION nonce (b-F1/b-F2 round 2): re-minted every module
+// evaluation — the deliberately reload-UNSTABLE half of the record identity
+// (the clientId above is the reload-stable half). See the identity block.
+const bootNonce = mintRandomId();
+
+// --- cross-eval claim channel (b-F1/b-F2 round 2: the uncontested-claim gate) --
+// ONE BroadcastChannel per page evaluation, opened eagerly at module init:
+// the OBJECTION side of the handshake only works if every live tab is already
+// listening when a sibling posts its 'who-has' query — a channel opened only
+// for the query window would miss every idle sibling and make the
+// "uncontested" verdict a fiction. The channel carries no gesture data, only
+// id-liveness probes. It is a structural-subset interface so unit tests
+// inject a deterministic stub (the node test environment must not depend on
+// the platform API).
+
+/** The channel surface the claim handshake needs (a structural subset of
+ *  BroadcastChannel). */
+export interface OutboxClaimChannel {
+  postMessage(message: unknown): void;
+  close(): void;
+  addEventListener(type: "message", listener: (ev: { data: unknown }) => void): void;
+  removeEventListener(type: "message", listener: (ev: { data: unknown }) => void): void;
+  /** Node only: an open channel must not pin the event loop (test exit). */
+  unref?(): void;
+}
+
+/** Factory seam: returns the channel to claim on, or null when unavailable. */
+export type OutboxClaimChannelFactory = () => OutboxClaimChannel | null;
+
+const CLAIM_CHANNEL_NAME = "vh-solara-outbox";
+const CLAIM_WAIT_MS = 120;
+
+function defaultClaimChannelFactory(): OutboxClaimChannel | null {
+  try {
+    const C = (globalThis as { BroadcastChannel?: unknown }).BroadcastChannel;
+    if (typeof C !== "function") return null; // no BroadcastChannel — conservative-skip path
+    const ch = new (C as new (name: string) => OutboxClaimChannel)(CLAIM_CHANNEL_NAME);
+    ch.unref?.(); // Node: an open channel must not keep the process alive
+    return ch;
+  } catch {
+    return null;
+  }
+}
+
+let claimChannelFactory: OutboxClaimChannelFactory = defaultClaimChannelFactory;
+let claimChannel: OutboxClaimChannel | null = null;
+// The handshake VERDICT, memoized once per page evaluation: the set of live
+// sibling tabs does not observably change within one eval, so every
+// cross-eval prune in the eval reuses the first verdict (a second query
+// would only re-ask the same tabs the same question).
+let claimMemo: Promise<boolean> | null = null;
+
+/** (Re)open the per-eval channel + install the ANSWER listener: when another
+ *  live tab asks who else evaluates under THIS page's id (a clone sibling
+ *  gating its own cross-eval prune), answer 'mine' for as long as this page
+ *  evaluates — its same-id records are not predecessor relics while we run. */
+function openClaimChannel(): void {
+  if (claimChannel) {
+    try {
+      claimChannel.close();
+    } catch {
+      /* best-effort */
+    }
+    claimChannel = null;
+  }
+  let ch: OutboxClaimChannel | null = null;
+  try {
+    ch = claimChannelFactory();
+  } catch {
+    ch = null;
+  }
+  if (!ch) return;
+  claimChannel = ch;
+  try {
+    ch.addEventListener("message", (ev) => {
+      const d = ev.data;
+      if (
+        d &&
+        typeof d === "object" &&
+        (d as { type?: unknown }).type === "who-has" &&
+        (d as { id?: unknown }).id === pageClientId
+      ) {
+        try {
+          claimChannel?.postMessage({ type: "mine", id: pageClientId });
+        } catch {
+          /* best-effort */
+        }
+      }
+    });
+  } catch {
+    // A channel that cannot listen cannot object — claims stay conservative.
+  }
+}
+
+/** The cross-eval prune gate (b-F1/b-F2 round 2): true only when no live
+ *  sibling tab objected to this page's id claim within CLAIM_WAIT_MS. Never
+ *  throws, never rejects; anything unexpected resolves false (the
+ *  conservative-skip direction). */
+function uncontendedClaim(): Promise<boolean> {
+  if (!claimMemo) {
+    claimMemo = (async (): Promise<boolean> => {
+      const ch = claimChannel;
+      if (!ch) return false; // no channel — conservative SKIP, never an error
+      return await new Promise<boolean>((resolve) => {
+        let settled = false;
+        const finish = (uncontested: boolean) => {
+          if (settled) return;
+          settled = true;
+          try {
+            ch.removeEventListener("message", onObjection);
+          } catch {
+            /* best-effort */
+          }
+          resolve(uncontested);
+        };
+        const onObjection = (ev: { data: unknown }) => {
+          const d = ev.data;
+          if (
+            d &&
+            typeof d === "object" &&
+            (d as { type?: unknown }).type === "mine" &&
+            (d as { id?: unknown }).id === pageClientId
+          ) {
+            finish(false);
+          }
+        };
+        try {
+          ch.addEventListener("message", onObjection);
+          ch.postMessage({ type: "who-has", id: pageClientId });
+        } catch {
+          finish(false); // channel broke mid-handshake — conservative skip
+          return;
+        }
+        setTimeout(() => finish(true), CLAIM_WAIT_MS);
+      });
+    })().catch(() => false);
+  }
+  return claimMemo;
+}
+
+openClaimChannel();
+
 export { storageFailure, evictionSuspected };
 
-/** Test-only: swap the store (memory/failing fakes) + reset all module state. */
+/** Test-only: swap the store (memory/failing fakes) + reset all module state.
+ *  The page identity is RE-DERIVED from sessionStorage — a reset models a
+ *  module re-evaluation over the tab's storage state, so tests choose the
+ *  shape they simulate: SEED the sessionStorage id before resetting to model
+ *  the SAME TAB across a reload (the identity is adopted); CLEAR it (key
+ *  absent) to model a DIFFERENT TAB — a fresh mint is stored, exactly what a
+ *  new tab's first page lifetime does (per-tab storage starts empty). */
 export function __resetOutboxForTests(fake?: OutboxStore): void {
   store = fake ?? createIdbOutboxStore();
+  pageClientId = resolvePageClientId();
+  claimMemo = null; // a fresh page evaluation: the claim verdict re-derives
+  openClaimChannel(); // re-open under the (possibly new) identity + factory
   setReplacementOverlays(new Map());
   setStorageFailure(null);
   setEvictionSuspected(false);
@@ -118,6 +358,29 @@ export function __resetOutboxForTests(fake?: OutboxStore): void {
   } catch {
     /* jsdom-less environments */
   }
+}
+
+/** Test-only: the current page (tab) clientId — lets tests assert record
+ *  stamping / model a second tab's writes against a shared store. */
+export function __outboxClientIdForTests(): string {
+  return pageClientId;
+}
+
+/** Test-only: the current page EVALUATION's bootNonce — lets tests assert
+ *  record stamping / model this eval's own vs an earlier eval's writes. */
+export function __outboxBootNonceForTests(): string {
+  return bootNonce;
+}
+
+/** Test-only: inject the claim-channel factory (a deterministic stub), pass
+ *  `() => null` to model an environment with NO BroadcastChannel, or pass
+ *  null to restore the production default. Re-opens the channel and clears
+ *  the memoized verdict so the next cross-eval prune re-queries under the
+ *  new factory. */
+export function __setOutboxClaimChannelForTests(factory: OutboxClaimChannelFactory | null): void {
+  claimChannelFactory = factory ?? defaultClaimChannelFactory;
+  claimMemo = null;
+  openClaimChannel();
 }
 
 function readPendingMarker(): number {
@@ -159,6 +422,64 @@ async function persistPendingMarker(): Promise<void> {
 
 // --- gesture lifecycle --------------------------------------------------------
 
+/** SUPERSEDE PRUNE (double-send guard), R-F2 tab-scoped (2026-10-10) +
+ *  PUT-CONFIRM-THEN-PRUNE (B-F1) + b-F1/b-F2 round 2 cross-eval gate. Callers
+ *  run this ONLY after the replacement record COMMITTED — deleting before
+ *  the put would destroy the prior durable gesture exactly when the put then
+ *  fails (quota/storage-unavailable — the failure mode this slice exists
+ *  for), leaving NEITHER gesture durable. Match: SAME session + status
+ *  `saved` + SAME text + DIFFERENT intentId + SAME clientId (this tab's own
+ *  obsolete unsent gesture — the deliberate re-typed-duplicate case the scan
+ *  exists for). WITHIN the same-clientId matches, the bootNonce splits the
+ *  prune decision (round 2 — the platform COPIES sessionStorage into
+ *  opener-created/duplicated tabs, so a clone runs under the SAME clientId
+ *  and the id alone cannot prove ownership):
+ *    same clientId + SAME bootNonce → THIS page-eval's record — prune
+ *      directly (zero latency, no channel: the common same-typing case).
+ *    same clientId + DIFFERENT/absent nonce → an EARLIER eval of this id —
+ *      my dead former self (reload) OR a live clone sibling, not locally
+ *      distinguishable — prune ONLY after uncontendedClaim() reports no live
+ *      sibling objection. ANY objection / no channel / handshake surprise →
+ *      SKIP (safe direction): the records coexist and the designed
+ *      backstops own them (see the identity block, including the documented
+ *      frozen-predecessor residual corner).
+ *  A record written by a genuinely DIFFERENT tab (different clientId) is
+ *  NEVER pruned here: two tabs saving the same text could otherwise each
+ *  prune the other's just-committed record in a narrow interleave, leaving a
+ *  gesture with NO durable recovery record while its UI said "saved" (a
+ *  BLK-A3 void). Records WITHOUT a clientId (pre-upgrade) are foreign —
+ *  never pruned (migration-safe, errs toward retention). Cross-tab same-text
+ *  duplicates are the designed backstops' job: reconcile's pass-local
+ *  same-text suppression + the daemon's intentId-VALUE admission dedupe.
+ *  Records already `admitted` are never touched (server custody), and a
+ *  different text is a different gesture. The match is TEXT-ONLY by design:
+ *  attachments/config may diverge between the two gestures — a bounded edge
+ *  (the superseded gesture was an unsent re-send whose text the operator
+ *  just re-sent; tightening the match would let a divergent-attachment prior
+ *  escape the guard and double-send). A crash between put and prune leaves
+ *  both same-tab records — the daemon dedupes admission by intentId VALUE
+ *  and does NOT collapse the distinct ids (two same-text records under
+ *  different ids would be TWO admissions); reconcile's same-text suppression
+ *  keeps that residual to exactly ONE admission. */
+async function pruneSupersededOwnTab(sessionId: string, intentId: string, text: string): Promise<void> {
+  for (const r of await store.all()) {
+    if (
+      r.sessionId === sessionId &&
+      r.status === "saved" &&
+      r.intentId !== intentId &&
+      r.payload.text === text &&
+      r.clientId === pageClientId
+    ) {
+      // b-F1/b-F2 round 2: same clientId alone no longer proves ownership —
+      // a cross-eval writer (different/absent nonce) is pruned only when the
+      // uncontested-claim gate says no live sibling holds this id. Skip is
+      // the SAFE direction (retention + designed backstops), never an error.
+      if (r.bootNonce !== bootNonce && !(await uncontendedClaim())) continue;
+      await store.delete(r.intentId);
+    }
+  }
+}
+
 /** Persist one gesture. The ONLY place a "locally saved" claim may originate:
  *  `{ok:true}` resolves strictly after the store transaction committed. On
  *  failure the blocking state is armed (storageFailure) with the retained
@@ -175,6 +496,12 @@ export async function saveGesture(input: SaveGestureInput): Promise<OutboxSaveRe
     queueItemId: existing?.queueItemId,
     replacedBy: existing?.replacedBy,
     replacedAt: existing?.replacedAt,
+    // R-F2: the writing tab owns the record for supersede purposes (a re-save
+    // of an existing gesture adopts it into THIS tab's scan scope).
+    // b-F1/b-F2 round 2: the page-EVALUATION nonce — id + nonce together
+    // identify THIS evaluation as the writer (see the identity block).
+    clientId: pageClientId,
+    bootNonce,
   };
   const res = await store.put(rec);
   if (!res.ok) {
@@ -190,30 +517,13 @@ export async function saveGesture(input: SaveGestureInput): Promise<OutboxSaveRe
     });
     return res;
   }
-  // SUPERSEDE (double-send guard) — PUT-CONFIRM-THEN-PRUNE (B-F1): an older
-  // still-`saved` record for the SAME session + SAME text under a DIFFERENT
-  // intentId is an obsolete unsent gesture — the operator's fresh re-send of
-  // that text replaces it. The prune runs ONLY after the new record
-  // committed: deleting before the put would destroy the prior durable
-  // gesture exactly when the put then fails (quota/storage-unavailable — the
-  // failure mode this slice exists for), leaving NEITHER gesture durable. A
-  // crash between put and prune leaves both records — NOT harmless: the
-  // daemon dedupes admission by intentId VALUE and does NOT collapse
-  // distinct ids (two same-text records under different ids would be TWO
-  // admissions). Reconcile's same-text suppression keeps that residual to
-  // exactly ONE admission. Records already
-  // `admitted` are never touched (server custody), and a different text is a
-  // different gesture. The match is TEXT-ONLY by design: attachments/config
-  // may diverge between the two gestures — a bounded edge (the superseded
-  // gesture was an unsent re-send whose text the operator just re-sent;
-  // tightening the match would let a divergent-attachment prior escape the
-  // guard and double-send).
+  // SUPERSEDE (own-tab double-send guard): an older still-`saved` record for
+  // the SAME session + SAME text under a DIFFERENT intentId is this tab's
+  // obsolete unsent gesture — the operator's fresh re-send of that text
+  // replaces it (put-confirm-then-prune + R-F2 tab scoping: see
+  // pruneSupersededOwnTab).
   if (!existing) {
-    for (const r of await store.all()) {
-      if (r.sessionId === input.sessionId && r.status === "saved" && r.intentId !== input.intentId && r.payload.text === input.payload.text) {
-        await store.delete(r.intentId);
-      }
-    }
+    await pruneSupersededOwnTab(input.sessionId, input.intentId, input.payload.text);
   }
   // A successful save clears the blocking state for THIS gesture (storage
   // recovered — e.g. the operator's retry after freeing quota).
@@ -245,23 +555,23 @@ export async function retryFailedSave(): Promise<boolean> {
     payload: f.payload,
     capturedHead: f.capturedHead,
     ...(f.capturedHead ? {} : { reAdmitHold: true }),
+    clientId: pageClientId, // R-F2: the retry writes THIS tab's record
+    bootNonce, // round 2: stamped by THIS page evaluation
     status: "saved",
   });
   if (res.ok) {
     // SUPERSEDE PRUNE (b-F1 round 3 — duplicate re-admission guard): mirror
-    // saveGesture's put-confirm-then-prune exactly. The failed save could not
-    // run its supersede prune (nothing had committed), so the retry's commit
-    // is where the older same-text `saved` record (same session, different
-    // intentId) is finally pruned. WITHOUT this the store DETERMINISTICALLY
+    // saveGesture's put-confirm-then-prune exactly (own-tab scope, R-F2). The
+    // failed save could not run its supersede prune (nothing had committed),
+    // so the retry's commit is where this tab's older same-text `saved`
+    // record is finally pruned. WITHOUT this the store DETERMINISTICALLY
     // keeps two same-text saved records, and reconcile — whose saved-record
     // loop passes both through the age/head gates (neither has a matching
     // queue item) — would re-admit BOTH: the daemon dedupes admission by
     // intentId VALUE, so distinct ids are two admissions = a duplicate send.
-    for (const r of await store.all()) {
-      if (r.sessionId === f.sessionId && r.status === "saved" && r.intentId !== f.intentId && r.payload.text === f.payload.text) {
-        await store.delete(r.intentId);
-      }
-    }
+    // Another tab's record is NOT matched (R-F2) — the cross-tab backstops
+    // (reconcile same-text suppression + daemon value dedupe) own those.
+    await pruneSupersededOwnTab(f.sessionId, f.intentId, f.payload.text);
     setStorageFailure(null);
     void persistPendingMarker();
   }
@@ -269,12 +579,14 @@ export async function retryFailedSave(): Promise<boolean> {
 }
 
 /** Admission confirmed (2xx receipt): link the queue item and keep the record
- *  for reconcile + overlays until pruned. Best-effort — a failed link write
- *  must never fail the send (the server owns custody now). */
+ *  for reconcile + overlays until pruned. Stamps `admittedAt` (R-F3) — the
+ *  time basis reconcile uses to prune crash-separated pre-admission
+ *  same-text twins. Best-effort — a failed link write must never fail the
+ *  send (the server owns custody now). */
 export async function markAdmitted(intentId: string, queueItemId: string): Promise<void> {
   const rec = await store.get(intentId);
   if (!rec) return;
-  await store.put({ ...rec, status: "admitted", queueItemId });
+  await store.put({ ...rec, status: "admitted", queueItemId, admittedAt: Date.now() });
   void persistPendingMarker();
 }
 
@@ -393,6 +705,19 @@ export async function reconcileOutboxSession(sessionId: string, deps: ReconcileD
   // oldest createdAt first, so among same-text saved twins the OLDEST
   // gesture wins the pass's single re-admission.
   records.sort((a, b) => a.createdAt - b.createdAt);
+  // R-F3 (time-scoped twin prune): the LATEST admission time per text among
+  // this session's ADMITTED records (pre-loop snapshot — an admission
+  // confirmed mid-pass does not retroactively affect this pass; the in-pass
+  // duplicate is the reAdmitTexts belt's job). Existence semantics: a saved
+  // same-text record older than ANY admission of that text is a pre-admission
+  // residual twin. Records without admittedAt (legacy) contribute nothing —
+  // the time gate cannot run for them (current behavior retained).
+  const admittedAtByText = new Map<string, number>();
+  for (const r of records) {
+    if (r.status === "admitted" && typeof r.admittedAt === "number") {
+      admittedAtByText.set(r.payload.text, Math.max(r.admittedAt, admittedAtByText.get(r.payload.text) ?? 0));
+    }
+  }
   const now = Date.now();
   const list = await deps.fetchList(sessionId);
   // b-F1 belt: texts that already reached a re-admission attempt in THIS
@@ -405,7 +730,12 @@ export async function reconcileOutboxSession(sessionId: string, deps: ReconcileD
     }
     const item = list?.find((it) => itemMatchesGesture(it, rec));
     if (rec.status === "admitted") {
-      if (!item || item.state === "sent") {
+      // Null-vs-empty tighten (2026-10-10): list===null is a NO-ANSWER (fetch
+      // failed), never an authoritative empty — absence is NOT established,
+      // so the record is retained + skipped and the next pass retries. Prune
+      // runs only when the list was AUTHORITATIVELY empty ([] — the server
+      // answered and the item is absent) or the item is delivered.
+      if (list !== null && (!item || item.state === "sent")) {
         // Delivered, or the server queue ended (archive/explicit dismissal):
         // server custody is over — prune. Any unknown/failed item keeps its
         // record only for the replacement overlay (below).
@@ -421,6 +751,25 @@ export async function reconcileOutboxSession(sessionId: string, deps: ReconcileD
       continue;
     }
     if (now - rec.createdAt < READMIT_MIN_AGE_MS) continue; // own gesture may be live
+    // R-F3 (time-scoped twin prune, AFTER the age guard — a young record's
+    // own gesture may still be mid-admission in another tab; only a record
+    // that aged past the guard AND predates a completed admission of the
+    // same text is provably a residual): a crash-separated twin of an
+    // ADMITTED gesture — created before that admission's admittedAt stamped
+    // by markAdmitted, still `saved` here. The daemon does NOT collapse
+    // distinct intentIds (it dedupes admission by intentId VALUE — two ids
+    // are two admissions = a duplicate send), so prune the twin instead of
+    // re-admitting it. Slice 3 deliberately did NOT naively register admitted
+    // text into reAdmitTexts: the TIME gate is what keeps a fresh DELIBERATE
+    // same-text re-send (createdAt NEWER than admittedAt) out of this prune.
+    // Residual window (accepted): a twin whose re-admission is already IN
+    // FLIGHT in an overlapping pass when the admission lands is beyond a
+    // pass-local map — the snapshot is pre-loop by design.
+    const twinAdmittedAt = admittedAtByText.get(rec.payload.text);
+    if (twinAdmittedAt !== undefined && rec.createdAt < twinAdmittedAt) {
+      await store.delete(rec.intentId);
+      continue;
+    }
     if (rec.reAdmitHold) {
       // c-F2 (fail-closed): the record was committed WITHOUT a usable
       // captured head (retryFailedSave after a tap with an unknowable head),

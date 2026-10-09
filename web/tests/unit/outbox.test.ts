@@ -11,6 +11,15 @@
 //   - intentId semantics: a gesture's record is keyed by its intentId; a
 //     same-text older `saved` record under a different id is superseded (the
 //     operator's re-send replaces the obsolete unsent gesture).
+//   - page identity (R-F2/b-F2): per-tab + reload-stable via sessionStorage
+//     (NEVER localStorage — shared across tabs); same-tab same-text supersede
+//     is newest-wins ACROSS the reload boundary, and cross-tab same-text
+//     coexistence is resolved by reconcile's DESIGNED backstops.
+//   - copied-storage clones (b-F1/b-F2 round 2): the platform COPIES
+//     sessionStorage into opener-created/duplicated tabs, so a clone runs
+//     under the SAME clientId — a per-eval bootNonce + the uncontested-claim
+//     channel handshake keep a clone's supersede prune off a live sibling's
+//     durable record (objection / no channel → conservative skip).
 //   - reconcile: saved+present → admitted; saved+absent+fresh-head →
 //     re-admit under the SAME intentId; saved+absent+stale-head → visible
 //     row, NO auto-send; admitted+sent/absent → pruned; GC by age.
@@ -23,6 +32,7 @@
 // (send-outbox-resilience.spec.ts reads the real vh-solara-outbox database).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  __outboxClientIdForTests,
   __resetOutboxForTests,
   capturedHeadFor,
   dropGesture,
@@ -57,6 +67,83 @@ const mem: Record<string, string> = {};
   },
 };
 
+// sessionStorage stub (the per-tab page-identity store — R-F2/b-F2). This
+// file runs in the NODE vitest environment (the config default; no jsdom
+// globals — same reason localStorage is stubbed above), so the outbox
+// module's identity resolution needs a hand-rolled stub too. Cleared per
+// test in beforeEach — every test starts as a FRESH TAB (a new tab's per-tab
+// storage starts empty).
+const ssMem: Record<string, string> = {};
+(globalThis as any).sessionStorage = {
+  getItem: (k: string) => (k in ssMem ? ssMem[k] : null),
+  setItem: (k: string, v: string) => {
+    ssMem[k] = v;
+  },
+  removeItem: (k: string) => {
+    delete ssMem[k];
+  },
+};
+
+// The outbox module's sessionStorage key for the page (tab) identity. Tests
+// seed it to simulate the SAME TAB across a reload and clear it to simulate
+// a DIFFERENT TAB (see the b-F2 describe block).
+const SS_OUTBOX_CLIENT_KEY = "vh-solara-outbox-client";
+
+// --- b-F1/b-F2 round 2: the claim-channel test seam ----------------------------
+// Deterministic BroadcastChannel stub: the node test environment must not
+// depend on the platform API. Models the two things the handshake needs —
+// outgoing posts (counted, for the fast-path/memoization pins) and incoming
+// deliveries (a live sibling's 'mine' objection). Default behavior: no
+// sibling answers (the reload shape).
+class ClaimChannelStub {
+  readonly posted: unknown[] = [];
+  closed = false;
+  private listeners: ((ev: { data: unknown }) => void)[] = [];
+  /** Test-side hook fired on every outgoing who-has post. */
+  onWhoHas?: (query: { type: string; id: string }) => void;
+  postMessage(message: unknown): void {
+    this.posted.push(message);
+    const m = message as { type?: string; id?: string } | null;
+    if (m && typeof m === "object" && m.type === "who-has" && typeof m.id === "string") {
+      this.onWhoHas?.({ type: m.type, id: m.id });
+    }
+  }
+  addEventListener(_type: "message", listener: (ev: { data: unknown }) => void): void {
+    this.listeners.push(listener);
+  }
+  removeEventListener(_type: "message", listener: (ev: { data: unknown }) => void): void {
+    this.listeners = this.listeners.filter((l) => l !== listener);
+  }
+  close(): void {
+    this.closed = true;
+  }
+  /** A message ARRIVING at this channel (a sibling's answer). */
+  deliver(data: unknown): void {
+    for (const l of [...this.listeners]) l({ data });
+  }
+}
+
+// The round-2 module seam, accessed through the namespace + optional call so
+// this harness ALSO RUNS against pre-gate code (the copied-storage regression
+// below must demonstrate the prune RED, not an import error).
+import * as outboxMod from "../../src/lib/outbox";
+
+type ClaimSetter = (factory: (() => ClaimChannelStub | null) | null) => void;
+const setClaimChannelForTests: ClaimSetter | undefined = (outboxMod as any).__setOutboxClaimChannelForTests;
+function installClaimChannel(factory: (() => ClaimChannelStub | null) | null): void {
+  setClaimChannelForTests?.(factory);
+}
+const bootNonceForTests = (): string | undefined => (outboxMod as any).__outboxBootNonceForTests?.();
+
+// The harness DEFAULT: a fresh no-objection stub per page evaluation (the
+// reload shape's precondition — no live sibling objects). `latestStub` is the
+// instance the CURRENT evaluation's channel was opened from (reset re-opens
+// via the factory, assigning a fresh instance).
+let latestStub: ClaimChannelStub;
+function installNoObjectionDefault(): void {
+  installClaimChannel(() => (latestStub = new ClaimChannelStub()));
+}
+
 function head(sessionId: string, lastMessageId: string | null, count: number): OutboxContextHead {
   return { sessionId, lastMessageId, count };
 }
@@ -86,7 +173,12 @@ let memoryStore: OutboxStore;
 
 beforeEach(() => {
   for (const k of Object.keys(mem)) delete mem[k];
+  for (const k of Object.keys(ssMem)) delete ssMem[k];
   memoryStore = createMemoryOutboxStore();
+  // Round-2 harness default: a no-objection claim channel (the reload
+  // shape — no live sibling answers the handshake). Tests that model an
+  // objecting sibling / absent channel replace it via installClaimChannel.
+  installNoObjectionDefault();
   __resetOutboxForTests(memoryStore);
   __resetSendActionStatusForTests();
 });
@@ -553,6 +645,437 @@ describe("A-F1 — exactly-one-admission under CONCURRENT reconcile passes", () 
     // also admitted — the duplicate send).
     expect((await memoryStore.get("i-old"))?.status).toBe("admitted");
     expect(await memoryStore.get("i-new")).toBeUndefined();
+  });
+});
+
+describe("R-F2 — cross-tab mutual supersede prune (tab-scoped supersede)", () => {
+  // The defect: saveGesture's supersede scan (and retryFailedSave's) matched
+  // same-session + saved + same-text + different-intentId records regardless
+  // of WHICH TAB wrote them. Two tabs saving the same text in the same session
+  // could each prune the other's just-committed durable record in a narrow
+  // interleave (A commits a1 → B's scan sees a1 → B commits b1 → B prunes a1)
+  // — tab A's gesture then has NO durable recovery record while its UI said
+  // "saved": a BLK-A3 void for that gesture. Fix: every record carries the
+  // WRITING tab's clientId; supersede scans match only SAME-clientId (own-tab)
+  // records. Cross-tab same-text duplicates are owned by the DESIGNED
+  // backstops — reconcile's pass-local same-text suppression + the daemon's
+  // intentId-VALUE admission dedupe (which does NOT collapse same-text
+  // records under distinct intentIds — safety comes from the backstops, not
+  // from cross-tab pruning).
+
+  it("two tabs, same text: tab B's supersede scan MUST NOT prune tab A's just-committed record", async () => {
+    // Tab A: a fresh page lifetime over the shared origin store commits a1.
+    const shared = memoryStore; // beforeEach store = the shared origin's IDB
+    await saveGesture(gesture("a1", "s1", "hello"));
+    expect(await shared.get("a1")).toBeDefined();
+    // Tab B: a NEW page lifetime over the SAME durable store, saving the SAME
+    // text — the interleave under test. A different tab has EMPTY per-tab
+    // storage: clear the sessionStorage identity first so the reset models a
+    // genuinely fresh tab (b-F2: the identity is sessionStorage-backed and a
+    // reset adopts whatever the per-tab storage holds).
+    sessionStorage.removeItem(SS_OUTBOX_CLIENT_KEY);
+    __resetOutboxForTests(shared);
+    const resB = await saveGesture(gesture("b1", "s1", "hello"));
+    expect(resB.ok).toBe(true);
+    // The interleave invariant: BOTH durable records survive. Pre-fix RED:
+    // tab B's scan pruned a1 — tab A's gesture lost its recovery record while
+    // tab A's UI had said "saved" (the BLK-A3 void).
+    expect(await shared.get("a1")).toBeDefined();
+    expect(await shared.get("b1")).toBeDefined();
+  });
+
+  it("same-tab re-typed duplicates still supersede (the case the scan exists for), stamped with the page clientId", async () => {
+    await saveGesture(gesture("i-old"));
+    await saveGesture(gesture("i-new", "s1", "hello"));
+    const recs = await memoryStore.all();
+    expect(recs.map((r) => r.intentId)).toEqual(["i-new"]);
+    // Both records were written by THIS tab's page lifetime: the survivor
+    // carries the CURRENT page identity — the scan's match key (a-F1/d-F3
+    // fold: assert the exact id, not mere presence).
+    expect(recs[0].clientId).toBe(__outboxClientIdForTests());
+  });
+
+  it("retryFailedSave's scan is equally tab-scoped: tab B's retry never prunes tab A's record", async () => {
+    const shared = createMemoryOutboxStore();
+    __resetOutboxForTests(shared);
+    await saveGesture(gesture("a1", "s1", "hello")); // tab A commits
+    // Tab B: a new page lifetime whose first save fails once (transient),
+    // arming the banner; the retry then commits through the SAME durable
+    // store (the once-failing facade delegates to `shared` after the failure).
+    let failNext = true;
+    const onceFailing: OutboxStore = {
+      put: (rec) => {
+        if (failNext) {
+          failNext = false;
+          return Promise.resolve({ ok: false, code: "storage-unavailable", reason: "transient outage" });
+        }
+        return shared.put(rec);
+      },
+      get: (id) => shared.get(id),
+      all: () => shared.all(),
+      delete: (id) => shared.delete(id),
+    };
+    // Tab B = a DIFFERENT tab: empty per-tab storage (b-F2) → fresh identity
+    // at the reset, so b1 is stamped with an id foreign to a1's.
+    sessionStorage.removeItem(SS_OUTBOX_CLIENT_KEY);
+    __resetOutboxForTests(onceFailing);
+    await expect(saveGesture(gesture("b1", "s1", "hello"))).resolves.toMatchObject({ ok: false });
+    await expect(retryFailedSave()).resolves.toBe(true);
+    expect(await shared.get("b1")).toBeDefined();
+    // Tab A's record survives tab B's retry-commit scan. Pre-fix RED: pruned.
+    expect(await shared.get("a1")).toBeDefined();
+  });
+
+  it("records without a clientId (pre-upgrade) are FOREIGN — never pruned (errs toward retention)", async () => {
+    const legacy: OutboxGestureRecord = {
+      intentId: "i-legacy",
+      sessionId: "s1",
+      createdAt: Date.now() - 1000,
+      payload: { text: "hello", attachments: [], sendConfig: { agent: "build" } },
+      capturedHead: head("s1", "m-0", 1),
+      status: "saved",
+    };
+    await memoryStore.put(legacy);
+    await saveGesture(gesture("i-new", "s1", "hello"));
+    expect(await memoryStore.get("i-legacy")).toBeDefined();
+    expect(await memoryStore.get("i-new")).toBeDefined();
+  });
+});
+
+describe("b-F2 round 1 — reload-stable tab identity (sessionStorage-backed)", () => {
+  // The round-1 defect: pageClientId was minted per MODULE EVALUATION, so a
+  // page reload minted a fresh id and a pre-reload saved same-text record
+  // became FOREIGN to the post-reload supersede scan. Both records then aged
+  // past the 60s guard; reconcile (oldest-first) admitted the STALE
+  // pre-reload record while the R-F3 twin prune / same-text belt deleted the
+  // FRESH gesture — the operator's newest gesture silently discarded: an
+  // oldest-wins inversion of same-tab newest-wins. Fix: the identity is
+  // sessionStorage-backed (per-tab + survives reload WITHIN the tab; NEVER
+  // localStorage — it is shared across tabs).
+
+  it("b-F1 regression: the SAME TAB across a reload keeps its identity — a post-reload same-text save prunes the pre-reload saved record (newest-wins at the reload boundary)", async () => {
+    // The reload simulation: the pre-reload page lifetime had stored its id
+    // in this tab's sessionStorage; the reload re-evaluates the module over
+    // the SAME per-tab storage — the page identity IS that stored id.
+    // b-F1/b-F2 round 2 precondition: the seeded record carries NO bootNonce
+    // (an earlier eval's write), so the prune runs through the CROSS-EVAL
+    // gate — uncontended (the harness default stub reports no objection:
+    // the predecessor is this tab's dead former self) → the prune proceeds.
+    sessionStorage.setItem(SS_OUTBOX_CLIENT_KEY, "pre-reload-tab-id");
+    __resetOutboxForTests(memoryStore); // the reload: fresh module state, identity adopted
+    expect(__outboxClientIdForTests()).toBe("pre-reload-tab-id");
+    // What the pre-reload page saved (stamped with the SAME tab id — true
+    // across a reload exactly because the identity lives in sessionStorage).
+    await memoryStore.put({
+      intentId: "i-pre",
+      sessionId: "s1",
+      createdAt: Date.now() - 30_000,
+      payload: { text: "hello", attachments: [], sendConfig: { agent: "build" } },
+      capturedHead: head("s1", "m-0", 1),
+      status: "saved",
+      clientId: "pre-reload-tab-id",
+    });
+    // Post-reload: the operator re-sends the identical text as a NEW gesture.
+    await saveGesture(gesture("i-post", "s1", "hello"));
+    // Same-tab newest-wins ACROSS the reload: the pre-reload record is pruned
+    // at save time and the fresh gesture is the sole survivor. Pre-fix RED:
+    // the module-var mint ignored sessionStorage → the post-reload page id
+    // differed from any seeded record → the prune never fired → BOTH records
+    // survived (and reconcile would then admit the STALE one — the blocker).
+    const recs = await memoryStore.all();
+    expect(recs.map((r) => r.intentId)).toEqual(["i-post"]);
+    expect(recs[0].clientId).toBe("pre-reload-tab-id");
+  });
+
+  it("cross-tab stance pin: two DISTINCT identities, same text → saves COEXIST; the aged reconcile admits the OLDEST and prunes the newer same-text twin (the DESIGNED cross-tab duplicate suppression)", async () => {
+    // Two tabs modeled by direct seeding with foreign clientIds (records
+    // foreign to each other's supersede scans). The module's documented
+    // stance (index.ts, page-identity block): cross-tab same-text duplicates
+    // are NOT resolved by pruning — they coexist, and the DESIGNED backstops
+    // (reconcile's oldest-wins pass + pass-local same-text suppression)
+    // collapse them at re-admission to exactly one send.
+    const t = Date.now() - READMIT_MIN_AGE_MS - 5000;
+    await memoryStore.put({
+      intentId: "i-a",
+      sessionId: "s1",
+      createdAt: t,
+      payload: { text: "hello", attachments: [], sendConfig: { agent: "build" } },
+      capturedHead: head("s1", "m-0", 1),
+      status: "saved",
+      clientId: "tab-a-id", // a DIFFERENT tab's identity
+    });
+    // This tab (its own identity) saves the SAME text: tab A's record is
+    // FOREIGN — never pruned (R-F2); the two coexist by design.
+    await saveGesture(gesture("i-b", "s1", "hello"));
+    expect(await memoryStore.get("i-a")).toBeDefined();
+    expect(await memoryStore.get("i-b")).toBeDefined();
+    // Age this tab's record past the re-admission guard too (backdate in the
+    // store, preserving its stamped clientId) — both now in the crash-window
+    // class reconcile owns.
+    const recB = (await memoryStore.get("i-b"))!;
+    await memoryStore.put({ ...recB, createdAt: Date.now() - READMIT_MIN_AGE_MS - 1000 });
+    // Aged reconcile (unchanged head, authoritative empty list): OLDEST wins
+    // the pass's single re-admission; the newer same-text twin is pruned by
+    // the pass-local same-text belt — exactly one admission, no duplicate.
+    const enq = vi.fn(async (_sid: string, input: any) => qItem("q-new", { intentId: input.intentId }));
+    await reconcileOutboxSession("s1", {
+      fetchList: async () => [] as QueuedMessage[],
+      enqueue: enq,
+      currentHead: () => head("s1", "m-0", 1),
+    });
+    expect(enq).toHaveBeenCalledTimes(1);
+    expect(enq.mock.calls[0][1].intentId).toBe("i-a"); // the OLDEST gesture
+    expect((await memoryStore.get("i-a"))?.status).toBe("admitted");
+    expect(await memoryStore.get("i-b")).toBeUndefined(); // twin pruned
+  });
+});
+
+describe("b-F1/b-F2 round 2 — copied-storage clone (bootNonce + uncontested-claim gate)", () => {
+  // The round-2 defect: sessionStorage identity is COPIED into opener-created
+  // tabs (window.open / target=_blank) and duplicated tabs (platform
+  // semantics), so a clone tab evaluates under the SAME clientId — the R-F2
+  // clientId gate cannot see it. The clone's supersede scan treated the
+  // ORIGINAL tab's just-saved same-text record as own-tab and DELETED it: a
+  // cross-tab prune of a live tab's durable record (the BLK-A3-class void).
+  // Fix: a per-page-eval bootNonce stamps every save/retry; a cross-eval
+  // match (same clientId, different/absent nonce) prunes ONLY when the
+  // BroadcastChannel claim handshake is uncontested — ANY objection from a
+  // live sibling (or no channel / any handshake surprise) skips the prune:
+  // degradation is to the SAFE direction (records coexist; the designed
+  // backstops — reconcile oldest-wins belt + same-text suppression, R-F3
+  // twin prune, daemon intentId-value admission dedupe — own them).
+
+  /** A record written under THIS page's clientId by an arbitrary page
+   *  evaluation (nonce chosen by the caller: this eval's, an earlier eval's,
+   *  or absent). */
+  function pageIdRecord(intentId: string, nonce: string | undefined): OutboxGestureRecord {
+    return {
+      intentId,
+      sessionId: "s1",
+      createdAt: Date.now() - 1000,
+      payload: { text: "hello", attachments: [], sendConfig: { agent: "build" } },
+      capturedHead: head("s1", "m-0", 1),
+      status: "saved",
+      clientId: __outboxClientIdForTests(),
+      ...(nonce === undefined ? {} : { bootNonce: nonce }),
+    };
+  }
+
+  it("copied-storage regression: an OBJECTING live sibling (same clientId, different bootNonce) blocks the cross-eval prune — rA survives", async () => {
+    // rA is the ORIGINAL tab's just-saved record: same clientId as this page
+    // (the platform copy), written by a DIFFERENT page evaluation. The
+    // channel reports the sibling's 'mine' objection — it is live and holds
+    // this id (arrives asynchronously, inside the ~120ms claim window).
+    const objecting = new ClaimChannelStub();
+    objecting.onWhoHas = (q) => setTimeout(() => objecting.deliver({ type: "mine", id: q.id }), 5);
+    installClaimChannel(() => objecting);
+    await memoryStore.put(pageIdRecord("rA", "original-tab-eval-nonce"));
+    // The clone tab saves the same text as a NEW gesture — no throw.
+    await expect(saveGesture(gesture("rB", "s1", "hello"))).resolves.toEqual({ ok: true });
+    // The objection held: the cross-eval prune MUST be skipped — rA (a live
+    // tab's durable record) survives and rB is the sole addition. Pre-fix
+    // RED: rA is deleted (the cross-tab prune of a live tab's record — the
+    // exact blocker this gate exists for).
+    expect(await memoryStore.get("rA")).toBeDefined();
+    expect(await memoryStore.get("rB")).toBeDefined();
+    const recs = await memoryStore.all();
+    expect(recs.map((r) => r.intentId).sort()).toEqual(["rA", "rB"]);
+  });
+
+  it("same-bootNonce fast path: THIS eval's record prunes with ZERO channel traffic", async () => {
+    const nonce = bootNonceForTests();
+    expect(nonce).toBeTruthy(); // the round-2 seam is present (precondition)
+    await memoryStore.put(pageIdRecord("rA", nonce));
+    await saveGesture(gesture("i-new", "s1", "hello"));
+    expect(await memoryStore.get("rA")).toBeUndefined();
+    // The common same-typing case never touches the channel (zero latency).
+    expect(latestStub.posted).toHaveLength(0);
+  });
+
+  it("absent BroadcastChannel: cross-eval prunes are conservatively SKIPPED — no throw, both records survive", async () => {
+    // Model an environment with NO BroadcastChannel global (old browser /
+    // exotic embedding): restore the PRODUCTION default factory and hide the
+    // global, then run a cross-eval prune shape through it.
+    const g = globalThis as { BroadcastChannel?: unknown };
+    const orig = g.BroadcastChannel;
+    g.BroadcastChannel = undefined;
+    installClaimChannel(null); // null restores the production default factory
+    try {
+      __resetOutboxForTests(memoryStore); // fresh eval: memo cleared, channel re-opened → none found
+      await memoryStore.put(pageIdRecord("rA", "earlier-eval-nonce"));
+      const res = await saveGesture(gesture("i-new", "s1", "hello"));
+      expect(res).toEqual({ ok: true }); // never an error
+      expect(await memoryStore.get("rA")).toBeDefined(); // prune skipped — safe direction
+      expect(await memoryStore.get("i-new")).toBeDefined();
+    } finally {
+      g.BroadcastChannel = orig;
+    }
+  });
+
+  it("objection memoization: the handshake runs ONCE per eval — a later cross-eval prune reuses the verdict (no second who-has)", async () => {
+    await memoryStore.put(pageIdRecord("rX", "earlier-eval-nonce-a"));
+    await memoryStore.put(pageIdRecord("rY", "earlier-eval-nonce-b"));
+    // One save matching BOTH cross-eval records: the first match runs the
+    // handshake; the second reuses the memoized verdict mid-save.
+    await saveGesture(gesture("g1", "s1", "hello"));
+    expect(await memoryStore.get("rX")).toBeUndefined();
+    expect(await memoryStore.get("rY")).toBeUndefined();
+    // A LATER cross-eval prune in the SAME eval: no second query.
+    await memoryStore.put(pageIdRecord("rZ", "earlier-eval-nonce-c"));
+    await saveGesture(gesture("g2", "s1", "hello"));
+    expect(await memoryStore.get("rZ")).toBeUndefined();
+    const whoHas = latestStub.posted.filter((m) => (m as { type?: string }).type === "who-has");
+    expect(whoHas).toHaveLength(1);
+  });
+});
+
+describe("R-F3 — admitted+saved crash-separated twin (time-scoped twin prune)", () => {
+  // The defect: reconcile's admitted branch did not register the admitted
+  // record's text, so a crash-separated SAVED same-text twin (created before
+  // the admission but still `saved` when a later pass runs) flowed the
+  // ordinary age/head gates in a later pass (~2-IDB-op window) and was
+  // RE-ADMITTED — two admissions under distinct intentIds, which the daemon
+  // does NOT collapse (it dedupes admission by intentId VALUE). Slice 3
+  // deliberately did NOT naively register admitted text (that would prune a
+  // fresh DELIBERATE same-text re-send created after the admission). Fix:
+  // markAdmitted stamps admittedAt; a still-`saved` same-text record OLDER
+  // than an admission's admittedAt is a pre-admission residual twin → pruned;
+  // NEWER than admittedAt is a fresh gesture → kept. Legacy records without
+  // admittedAt keep the current behavior (the time gate cannot run).
+  function seed(o: Partial<OutboxGestureRecord> & { intentId: string }): OutboxGestureRecord {
+    const r: OutboxGestureRecord = {
+      sessionId: "s1",
+      createdAt: Date.now(),
+      payload: { text: "hello", attachments: [], sendConfig: { agent: "build" } },
+      capturedHead: head("s1", "m-0", 1),
+      status: "saved",
+      ...o,
+    };
+    return r;
+  }
+  function twinDeps(enq: any) {
+    return {
+      fetchList: async () => [qItem("q-adm", { intentId: "i-adm" })],
+      enqueue: enq,
+      currentHead: () => head("s1", "m-0", 1),
+    };
+  }
+
+  it("a saved twin OLDER than the admission's admittedAt is pruned — never re-admitted", async () => {
+    const t = Date.now() - READMIT_MIN_AGE_MS - 60_000;
+    await memoryStore.put(
+      seed({ intentId: "i-adm", createdAt: t, status: "admitted", queueItemId: "q-adm", admittedAt: t + 2000 }),
+    );
+    // The twin: created BEFORE the admission completed (t+1000 < t+2000),
+    // still `saved` when the pass runs (the crash-separated residual).
+    await memoryStore.put(seed({ intentId: "i-twin", createdAt: t + 1000 }));
+    const enq = vi.fn(async (_sid: string, input: any) => qItem("q-new", { intentId: input.intentId }));
+    await reconcileOutboxSession("s1", twinDeps(enq));
+    // The twin is pruned with NO re-admission attempt. Pre-fix RED: the twin
+    // flowed the age/head gates (120s old, head unchanged) and was enqueued —
+    // the duplicate send (the daemon does not collapse distinct intentIds).
+    expect(enq).not.toHaveBeenCalled();
+    expect(await memoryStore.get("i-twin")).toBeUndefined();
+    // The admitted record itself is retained (its item is present + pending).
+    expect(await memoryStore.get("i-adm")).toBeDefined();
+  });
+
+  it("negative: a same-text record NEWER than admittedAt is a fresh deliberate gesture — kept", async () => {
+    const now = Date.now();
+    await memoryStore.put(
+      seed({ intentId: "i-adm", createdAt: now - 30_000, status: "admitted", queueItemId: "q-adm", admittedAt: now - 5000 }),
+    );
+    // Created AFTER the admission completed: a fresh gesture (young — the age
+    // guard owns it; the twin prune must not fire on it).
+    await memoryStore.put(seed({ intentId: "i-fresh", createdAt: now - 1000 }));
+    const enq = vi.fn();
+    await reconcileOutboxSession("s1", twinDeps(enq));
+    expect(enq).not.toHaveBeenCalled();
+    expect(await memoryStore.get("i-fresh")).toBeDefined();
+  });
+
+  it("negative (gate-reaching, d-F1): a saved twin PAST the age guard but NEWER than admittedAt is re-admitted under its OWN intentId — the time comparison's false branch discriminates", async () => {
+    // d-F1: the young-twin negative above is turned away by the AGE guard
+    // BEFORE the R-F3 map lookup runs — it cannot prove the time comparison
+    // itself discriminates. This record REACHES the gate: past the 60s guard
+    // (createdAt = now-61s) yet NEWER than admittedAt (now-180s). Map
+    // presence alone must NOT prune it — `createdAt < admittedAt` is FALSE —
+    // and the record flows the ordinary gates to re-admission under its OWN
+    // intentId. Current code is already correct: a PIN, no red expected.
+    const now = Date.now();
+    await memoryStore.put(
+      seed({ intentId: "i-adm", createdAt: now - 200_000, status: "admitted", queueItemId: "q-adm", admittedAt: now - 180_000 }),
+    );
+    await memoryStore.put(seed({ intentId: "i-late", createdAt: now - 61_000 }));
+    const enq = vi.fn(async (_sid: string, input: any) => qItem("q-new", { intentId: input.intentId }));
+    await reconcileOutboxSession("s1", twinDeps(enq));
+    expect(enq).toHaveBeenCalledTimes(1);
+    expect(enq.mock.calls[0][1].intentId).toBe("i-late"); // its OWN gesture identity
+    expect((await memoryStore.get("i-late"))?.status).toBe("admitted");
+  });
+
+  it("legacy admitted record WITHOUT admittedAt: the time gate cannot run — current behavior kept (pin)", async () => {
+    const t = Date.now() - READMIT_MIN_AGE_MS - 60_000;
+    await memoryStore.put(
+      seed({ intentId: "i-adm", createdAt: t, status: "admitted", queueItemId: "q-adm" /* admittedAt ABSENT */ }),
+    );
+    await memoryStore.put(seed({ intentId: "i-twin", createdAt: t + 1000 }));
+    const enq = vi.fn(async (_sid: string, input: any) => qItem("q-new", { intentId: input.intentId }));
+    await reconcileOutboxSession("s1", twinDeps(enq));
+    // Current behavior: the aged non-stale twin IS re-admitted under its own
+    // gesture identity (retention errs toward the existing path for records
+    // the timestamps cannot classify).
+    expect(enq).toHaveBeenCalledTimes(1);
+    expect(enq.mock.calls[0][1].intentId).toBe("i-twin");
+    expect(await memoryStore.get("i-twin")).toBeDefined();
+  });
+});
+
+describe("null-vs-empty list nuances (fetch-failure ≠ authoritative empty)", () => {
+  // fetchList resolves null when the queue list could not be fetched (never
+  // throws) — a NO-ANSWER, distinct from [] (the server answered: empty).
+  function ndeps(
+    o: Partial<{ listNull: boolean; list: QueuedMessage[]; current: OutboxContextHead | null; enqueueImpl: any }> = {},
+  ) {
+    return {
+      fetchList: async () => (o.listNull ? null : (o.list ?? []).slice()),
+      enqueue: o.enqueueImpl ?? (async (_sid: string, input: any) => qItem("q-new", { intentId: input.intentId })),
+      currentHead: () => o.current ?? null,
+    };
+  }
+
+  it("pin (a): aged SAVED + list===null → the re-admission POST FIRES under the same intentId", async () => {
+    // SAFE BY CONTRACT, pinned deliberately: the daemon dedupes admission by
+    // intentId VALUE — a replay of the SAME gesture identity returns the
+    // ORIGINAL receipt and creates no second queue item. That by-value dedupe
+    // is precisely what makes a no-answer re-admission safe (the saved+absent
+    // branch cannot distinguish "item never admitted" from "list unfetchable";
+    // retaining would strand a genuinely-unadmitted gesture, while re-admitting
+    // the same intentId is idempotent server-side).
+    await saveGesture(gesture("i-1"));
+    const r = (await memoryStore.get("i-1"))!;
+    await memoryStore.put({ ...r, createdAt: Date.now() - READMIT_MIN_AGE_MS - 1000 });
+    const enq = vi.fn(async (_sid: string, input: any) => qItem("q-new", { intentId: input.intentId }));
+    await reconcileOutboxSession("s1", ndeps({ listNull: true, current: head("s1", "m-0", 1), enqueueImpl: enq }));
+    expect(enq).toHaveBeenCalledTimes(1);
+    expect(enq.mock.calls[0][1].intentId).toBe("i-1");
+  });
+
+  it("tighten (b): ADMITTED + list===null → RETAINED (absence is not established by a non-answer)", async () => {
+    await saveGesture(gesture("i-1"));
+    await markAdmitted("i-1", "q-x");
+    await reconcileOutboxSession("s1", ndeps({ listNull: true }));
+    // Pre-fix RED: the admitted branch pruned on !item even when the list was
+    // null — a FETCH FAILURE destroyed the record. Retain + skip: absence is
+    // not established; the next pass (with an authoritative list) re-evaluates.
+    expect(await memoryStore.get("i-1")).toBeDefined();
+  });
+
+  it("pin (b): ADMITTED + list===[] (authoritative empty) → pruned", async () => {
+    await saveGesture(gesture("i-2"));
+    await markAdmitted("i-2", "q-y");
+    await reconcileOutboxSession("s1", ndeps({ list: [] }));
+    expect(await memoryStore.get("i-2")).toBeUndefined();
   });
 });
 
