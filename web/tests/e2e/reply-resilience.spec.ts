@@ -111,6 +111,17 @@ test("timed-out permission reply keeps the card (unknown + Retry); Retry then la
   await expect(status).toContainText("not confirmed");
   await expect(status).toContainText("may still have been applied");
   await expect(page.locator(".perm-card")).toHaveCount(1);
+  // Production-bundle CSS-content guard (slice-4b review c-F1 defect class,
+  // folded fix for 4a — the agent-hydration-send 4d pattern): the webServer
+  // serves the PRODUCTION build (fixture-web.sh runs `npm run build`), so a
+  // computed style here proves co-located ReplyStatus.css reached the bundle
+  // — the former pure-:global ReplyStatus.module.css was tree-shaken from
+  // it (empty locals → moduleSideEffects:false). border-radius comes from
+  // the base .reply-status rule; the solid border exists only on the
+  // .unknown variant — together they prove both rule tiers apply (no
+  // reset/legacy rule touches .reply-status).
+  await expect(status).toHaveCSS("border-radius", "6px");
+  await expect(status).toHaveCSS("border-top-style", "solid");
 
   // release(pass): pending stays intact upstream — a retry must succeed.
   await releaseReplyHold(request, "pass");

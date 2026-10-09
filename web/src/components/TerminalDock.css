@@ -6,7 +6,7 @@
    tree-shakes when the styles binding is unused.
    Carved verbatim from legacy/30-main-terminal.css lines 9-79 (base rules;
    no refinements exist in shard 80 or any other shard). The shared
-   @keyframes pulse stays global in legacy/50-chat-overlays.css (referenced
+   @keyframes pulse stays global in legacy/20-session-tree.css (referenced
    here by bare name). `.term` also appears in a combined user-select rule
    (00-app-globals.css) that sets a different property — left in legacy. */
 

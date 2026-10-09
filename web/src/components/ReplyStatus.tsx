@@ -1,6 +1,8 @@
 import { Show } from "solid-js";
-// Side-effect import: all classes are :global (unit + e2e query them).
-import "./ReplyStatus.module.css";
+// Plain CSS side-effect import: classes are global (unit + e2e query them);
+// a pure-:global .module.css would be tree-shaken from the production bundle
+// (docs/ai/web-css-architecture.md §3 rule 7).
+import "./ReplyStatus.css";
 
 // ReplyStatus — the shared honest-lifecycle surface for the pending-input
 // cards (PermissionCard / QuestionCard), send-net-resilience slice 4a.

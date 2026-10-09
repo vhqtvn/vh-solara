@@ -1,12 +1,25 @@
-import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
+// Plain CSS side-effect import: classes are global (e2e queries them); a
+// pure-:global .module.css would be tree-shaken from the production bundle
+// (docs/ai/web-css-architecture.md §3 rule 7).
+import "./TerminalPane.css";
 import { projectDir } from "../sync";
 import { termKeys } from "../ui";
 import { monoFontStack } from "../font";
 import { uiZoom } from "../lib/zoom";
 import { pointerToCell, documentRewriteApplies, rewriteMouseEvent, rewriteWheelEvent } from "../lib/termPointer";
+import {
+  classifyTermInput,
+  composeStripVisible,
+  isStaleInput,
+  loadTermCompose,
+  saveTermCompose,
+  toComposeText,
+  toWireText,
+} from "../lib/termCompose";
 
 // A real terminal: xterm.js over a WebSocket-backed PTY (/vh/term/ws). Input
 // flows through term.onData() so IME/composition resolves to final bytes (the
@@ -14,6 +27,14 @@ import { pointerToCell, documentRewriteApplies, rewriteMouseEvent, rewriteWheelE
 // vim and width-aware tools work. A mobile key bar supplies Esc/Tab/Ctrl/arrows.
 // `termId` selects which server PTY to attach to (tabs); session/title are
 // optional labels for the management UI.
+//
+// Resilience (send-net-resilience slice 4b): while the private ws is down — or
+// SUSPECTED half-open (OPEN socket, TERM_STALE_MS of silence) — typed text
+// routes into a visible compose buffer shown as NOT SENT and never reaches the
+// PTY/ws except through an explicit user send (debate-2 Q4: queue-and-replay
+// of raw PTY input is prohibited — later blind execution of stale keystrokes
+// is worse than loss). The live path is unchanged: while sendable(), typing
+// passes straight through with zero friction.
 const ARROW_FINAL: Record<string, string> = { up: "A", down: "B", right: "C", left: "D" };
 
 export default function TerminalPane(props: { termId?: string; session?: string; title?: string }) {
@@ -32,26 +53,75 @@ export default function TerminalPane(props: { termId?: string; session?: string;
   let backoff = 500; // ms, doubles per failed attempt up to a cap
   let intentional = false; // true when WE closed it (hide/cleanup) — don't auto-reconnect
   // A half-open link (tunnel/proxy silently dropped, no close frame reaches us)
-  // leaves the socket "open" while no bytes flow — keystrokes vanish with no
-  // error. The server sends a keepalive every ~15s; if we go this long with no
-  // traffic at all, assume the link is dead and reconnect (replays scrollback).
+  // leaves the socket "open" while no bytes flow. The server sends a keepalive
+  // every ~15s; TERM_STALE_MS of silence (lib/termCompose) first flips the pane
+  // to a visible held state so typed input buffers instead of feeding a dead
+  // socket; if we then go this long (LIVENESS_MS) with no traffic at all,
+  // assume the link is dead and reconnect (replays scrollback).
   const LIVENESS_MS = 45000;
   const enc = new TextEncoder();
   // connecting = first/manual attempt; reconnecting = auto-retrying after a drop;
   // disconnected = stopped (shell exited / gave up) and waiting for the user.
   const [status, setStatus] = createSignal<"connecting" | "open" | "reconnecting" | "disconnected">("connecting");
   const [ctrl, setCtrl] = createSignal(false); // sticky Ctrl for the next key
+  // Suspected HALF-OPEN link: the socket still reads OPEN but no byte (PTY
+  // output or the server's 15s text keepalive) has arrived for TERM_STALE_MS.
+  // Reuses the existing lastRecv watchdog bookkeeping — no parallel health
+  // system. While stale (or down), typed TEXT routes into the visible compose
+  // buffer below instead of vanishing; see sendable().
+  const [stale, setStale] = createSignal(false);
+  // Compose buffer (slice 4b): held, visible, explicitly-sent text. Survives
+  // pane remounts (tab switches / dock close) via the module-level store; a
+  // pane-local signal would silently drop held text on those casual gestures.
+  const [compose, setCompose] = createSignal(loadTermCompose(projectDir(), props.termId));
+  let composeEl: HTMLTextAreaElement | undefined;
 
   const send = (s: string) => {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(enc.encode(s));
   };
+  // Input can safely take the live path only while the link is OPEN and not
+  // suspected dead. Everything else buffers — never silently discarded.
+  const sendable = () => status() === "open" && !stale();
+  const updateCompose = (v: string) => {
+    setCompose(v);
+    saveTermCompose(projectDir(), props.termId, v);
+  };
+  const bufferInput = (d: string) => {
+    // Gestures (ESC/TAB/arrows/^C/… control bytes) are NEVER buffered: they
+    // are not reviewable text, and deferring them for later execution is the
+    // prohibited queue-and-replay hazard (debate-2 Q4). The visibly-held pane
+    // state is the honest surface for them; text continues to accumulate.
+    if (classifyTermInput(d) !== "text") return;
+    updateCompose(compose() + toComposeText(d));
+    if (composeEl) composeEl.scrollTop = composeEl.scrollHeight;
+  };
+  // Explicit send — the ONLY path buffered text ever reaches the PTY. One
+  // ws write of exactly what the user reviewed; never automatic.
+  const sendComposed = () => {
+    const t = compose();
+    if (!t || !sendable()) return;
+    send(toWireText(t));
+    updateCompose("");
+    term?.focus();
+  };
+  const clearComposed = () => updateCompose("");
   const sendResize = () => {
     if (term && ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ resize: { cols: term.cols, rows: term.rows } }));
     }
   };
   // Accessory-bar key → escape/control sequence, then refocus the terminal.
-  const key = (seq: string) => { send(seq); term?.focus(); };
+  // While buffering: textual bar keys ("|", "~") append to the compose buffer;
+  // gesture keys are visibly disabled in the bar (nothing silently drops).
+  const key = (seq: string) => {
+    if (sendable()) {
+      send(seq);
+      term?.focus();
+    } else if (classifyTermInput(seq) === "text") {
+      bufferInput(seq);
+      composeEl?.focus();
+    }
+  };
   // Arrow key sequence honoring the app's cursor-key mode: full-screen apps
   // (vim/less/htop) enable DECCKM and then expect ESC O A, not ESC [ A. Physical
   // arrows handle this in xterm automatically; the on-screen bar must mirror it
@@ -62,10 +132,11 @@ export default function TerminalPane(props: { termId?: string; session?: string;
   };
 
   // Reconnect after an *unexpected* drop (proxy/idle timeout, network blip,
-  // laptop sleep) so the terminal doesn't silently go dead — keystrokes are
-  // discarded while the socket is closed, with no recovery, otherwise. The PTY
-  // lives server-side across disconnects and replays its scrollback on attach,
-  // so reconnecting restores the same shell.
+  // laptop sleep) so the terminal doesn't silently go dead. The PTY lives
+  // server-side across disconnects and replays its scrollback on attach, so
+  // reconnecting restores the same shell. While the socket is down, typed
+  // input is NOT discarded — it routes into the visible compose buffer (see
+  // sendable/bufferInput) and only reaches the PTY through an explicit send.
   function scheduleReconnect() {
     if (intentional || !projectDir()) return;
     if (document.visibilityState === "hidden") return; // the visibility handler reconnects on return
@@ -92,10 +163,10 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     ws = new WebSocket(`${proto}://${location.host}/vh/term/ws?${q.toString()}`);
     ws.binaryType = "arraybuffer";
     lastRecv = Date.now();
-    ws.onopen = () => { backoff = 500; lastRecv = Date.now(); setStatus("open"); sendResize(); term?.focus(); };
+    ws.onopen = () => { backoff = 500; lastRecv = Date.now(); setStale(false); setStatus("open"); sendResize(); term?.focus(); };
     // Any frame — PTY output OR the server's text keepalive — proves the link is
     // live; text keepalives are ignored for rendering but refresh the watchdog.
-    ws.onmessage = (e) => { lastRecv = Date.now(); if (e.data instanceof ArrayBuffer && term) term.write(new Uint8Array(e.data)); };
+    ws.onmessage = (e) => { lastRecv = Date.now(); setStale(false); if (e.data instanceof ArrayBuffer && term) term.write(new Uint8Array(e.data)); };
     ws.onclose = (e) => {
       ws = null;
       // 1000 = clean server close (shell exited / session ended) — stay down and
@@ -132,7 +203,17 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     if (intentional || document.visibilityState === "hidden") return;
     if (ws && ws.readyState === WebSocket.OPEN && lastRecv && Date.now() - lastRecv > LIVENESS_MS) {
       forceReconnect();
+      return;
     }
+    // Same watchdog signal, earlier threshold: while the socket still claims
+    // OPEN, TERM_STALE_MS of total silence marks a suspected half-open link.
+    // Input starts buffering (visible) BEFORE the 45s teardown below.
+    const nowStale = isStaleInput(
+      !!(ws && ws.readyState === WebSocket.OPEN),
+      lastRecv,
+      Date.now(),
+    );
+    if (nowStale !== stale()) setStale(nowStale);
   }
 
   // "Size only counts while visible": when the tab is hidden, detach so this
@@ -385,18 +466,40 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     term.parser.registerCsiHandler({ intermediates: "$", final: "p" }, () => true);
     term.parser.registerCsiHandler({ prefix: "?", intermediates: "$", final: "p" }, () => true);
 
-    // onData is IME-safe: composition resolves to final bytes here.
+    // onData is IME-safe: composition resolves to final bytes here. While the
+    // link is live this is the unchanged direct passthrough (zero friction);
+    // while down/suspected-dead, typed TEXT routes into the visible compose
+    // buffer instead of being silently discarded (slice 4b). Ctrl+letter is a
+    // gesture: it is transformed only on the live path — while buffering the
+    // sticky ctrl stays armed and the letter buffers as plain text.
     term.onData((d) => {
-      let out = d;
-      if (ctrl() && d.length === 1) {
-        const c = d.toLowerCase().charCodeAt(0);
-        if (c >= 97 && c <= 122) out = String.fromCharCode(c - 96); // Ctrl+<letter>
-        setCtrl(false);
+      if (sendable()) {
+        let out = d;
+        if (ctrl() && d.length === 1) {
+          const c = d.toLowerCase().charCodeAt(0);
+          if (c >= 97 && c <= 122) out = String.fromCharCode(c - 96); // Ctrl+<letter>
+          setCtrl(false);
+        }
+        send(out);
+      } else {
+        bufferInput(d);
       }
-      send(out);
     });
 
     connect();
+
+    // When the pane LEAVES the sendable state (drop / half-open suspicion),
+    // keystrokes must land somewhere the user can SEE them: if focus was in
+    // the terminal surface, move it to the compose input so typed text shows
+    // up where the user is looking instead of feeding a dead socket. Never
+    // steals focus from other panes/chat — only from this pane's xterm.
+    createEffect(
+      on(sendable, (now, prev) => {
+        if (prev && !now && host.contains(document.activeElement)) {
+          queueMicrotask(() => composeEl?.focus());
+        }
+      }),
+    );
 
     const ro = new ResizeObserver(() => {
       try { fit?.fit(); sendResize(); } catch { /* mid-layout */ }
@@ -434,7 +537,7 @@ export default function TerminalPane(props: { termId?: string; session?: string;
         fallback={<div class="term-empty">Open a project (not the default) to use the terminal.</div>}
       >
         <div class="term-host" ref={host}>
-          <span class="term-status" classList={{ [status()]: true }} data-tip={status()} />
+          <span class="term-status" classList={{ [status()]: true, stale: status() === "open" && stale() }} data-tip={stale() && status() === "open" ? "connection may be down — input held" : status()} />
           {/* Cell-snapped pointer indicator — sized/positioned from JS in
               onMount (termPointer mapping). aria-hidden: purely visual. */}
           <div class="term-cell-cursor" ref={cellCursor} aria-hidden="true" />
@@ -456,15 +559,74 @@ export default function TerminalPane(props: { termId?: string; session?: string;
             </div>
           </Show>
         </div>
-        {/* Toggleable on-screen key bar (esc/tab/ctrl/arrows). */}
+        {/* Compose buffer (slice 4b): held input that has NOT been sent.
+            Visible whenever text is held or input would buffer; hidden on the
+            untouched live path. Send writes to the PTY ONLY on this explicit
+            action — never automatically (debate-2 Q4 binding). */}
+        <Show when={composeStripVisible(compose().length > 0, status(), stale())}>
+          <div
+            class="term-compose"
+            classList={{ held: !sendable(), restored: sendable() && !!compose() }}
+            role="region"
+            aria-label="Unsent terminal input"
+          >
+            <textarea
+              ref={composeEl}
+              class="term-compose-input"
+              aria-label="Held terminal input"
+              value={compose()}
+              rows={Math.max(2, Math.min(6, compose().split("\n").length + (compose().endsWith("\n") ? 1 : 0)))}
+              autocapitalize="off"
+              autocorrect="off"
+              autocomplete="off"
+              spellcheck={false}
+              onInput={(e) => updateCompose(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                // Enter = the explicit send (Shift+Enter = newline). While
+                // still buffering, Enter just adds a newline — the buffer can
+                // only leave through Send or Discard.
+                if (e.key === "Enter" && !e.shiftKey && sendable()) {
+                  e.preventDefault();
+                  sendComposed();
+                }
+              }}
+            />
+            <div class="term-compose-row">
+              <span class="term-compose-badge">
+                {sendable()
+                  ? "Connection restored — input above is still NOT SENT. Review, then send."
+                  : stale() && status() === "open"
+                    ? "Connection may be down — input above is held, not sent."
+                    : "Terminal offline — input above is held, not sent."}
+              </span>
+              <button
+                type="button"
+                class="term-compose-send"
+                disabled={!sendable() || !compose()}
+                onClick={sendComposed}
+                title={sendable() ? "Send to the terminal" : "Waiting for a live connection"}
+              >
+                Send
+              </button>
+              <button type="button" class="term-compose-clear" disabled={!compose()} onClick={clearComposed}>
+                Discard
+              </button>
+            </div>
+          </div>
+        </Show>
+        {/* Toggleable on-screen key bar (esc/tab/ctrl/arrows). Gesture keys are
+            disabled while buffering: they cannot be deferred as text and would
+            otherwise vanish silently. Textual keys ("|", "~") keep working —
+            they append to the compose buffer. The ctrl TOGGLE stays active so
+            an armed sticky Ctrl can still be released. */}
         <Show when={termKeys()}>
         <div class="term-keys">
-          <button type="button" onClick={() => key("\x1b")}>esc</button>
-          <button type="button" onClick={() => key("\t")}>tab</button>
+          <button type="button" disabled={!sendable()} onClick={() => key("\x1b")}>esc</button>
+          <button type="button" disabled={!sendable()} onClick={() => key("\t")}>tab</button>
           <button type="button" classList={{ on: ctrl() }} onClick={() => (setCtrl((v) => !v), term?.focus())}>ctrl</button>
-          <button type="button" onClick={() => key("\x03")}>^C</button>
+          <button type="button" disabled={!sendable()} onClick={() => key("\x03")}>^C</button>
           <For each={["left", "up", "down", "right"]}>
-            {(d) => <button type="button" onClick={() => key(arrowSeq(d))}>{{ up: "↑", down: "↓", left: "←", right: "→" }[d]}</button>}
+            {(d) => <button type="button" disabled={!sendable()} onClick={() => key(arrowSeq(d))}>{ { up: "↑", down: "↓", left: "←", right: "→" }[d]}</button>}
           </For>
           <button type="button" onClick={() => key("|")}>|</button>
           <button type="button" onClick={() => key("~")}>~</button>

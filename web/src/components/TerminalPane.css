@@ -1,0 +1,108 @@
+/* TerminalPane — compose-buffer strip, send-net-resilience slice 4b.
+   A PLAIN stylesheet (NOT a css module): every class is global — queried by
+   e2e (terminal-resilience.spec.ts): .term-compose (+ .held/.restored),
+   .term-compose-badge, .term-compose-input, .term-compose-send,
+   .term-compose-clear; plus the .term-status.stale dot state (base
+   .term-status styles live in TerminalDock.css — this file only adds the
+   stale variant; higher specificity wins regardless of import order).
+   Plain .css on purpose (docs/ai/web-css-architecture.md §3 rule 7): the
+   former pure-:global TerminalPane.module.css, imported only for side
+   effects, was TREE-SHAKEN from the production bundle by the pinned Vite
+   (empty-locals css modules resolve to moduleSideEffects:false, so Rollup
+   drops them — slice-4b review c-F1) while plain .css side-effect imports
+   are always emitted (exemplars: chat/Composer.css / chat/SendStatus.css).
+   GPU-cheap by design: color-mix tints, no masks, no backdrop-filter, no
+   per-element contain (docs/ai/web-css-architecture.md Firefox/WebRender
+   guardrails). */
+
+.term-compose {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 8px 6px 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+/* Held (offline / suspected half-open): warn posture — input is NOT going
+   anywhere. Never styled as an error: nothing the user did failed. */
+.term-compose.held {
+  color: var(--warn);
+}
+/* Restored link with text still waiting: neutral-info posture. Deliberately
+   NOT --ok green — the text is still NOT SENT until the explicit send. */
+.term-compose.restored {
+  color: var(--fg);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+.term-compose-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.term-compose-badge {
+  flex: 1 1 200px;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: inherit;
+}
+.term-compose-input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 44px;
+  max-height: 132px;
+  overflow-y: auto;
+  resize: vertical;
+  padding: 6px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12.5px;
+  font-family: var(--code-font, ui-monospace, monospace);
+  line-height: 1.4;
+}
+.term-compose-send,
+.term-compose-clear {
+  flex: 0 0 auto;
+  padding: 4px 12px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.term-compose-send {
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg-2));
+  color: var(--accent);
+}
+.term-compose-send:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 24%, var(--bg-2));
+}
+.term-compose-clear {
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--fg-dim);
+}
+.term-compose-clear:hover:not(:disabled) {
+  color: var(--fg);
+}
+.term-compose-send:disabled,
+.term-compose-clear:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+/* Suspected half-open link: the socket still reads OPEN, so the status dot
+   would otherwise stay green while bytes vanish. Reuses the global `pulse`
+   keyframes (legacy/20-session-tree.css) exactly like
+   .term-status.reconnecting in TerminalDock.css. Specificity (0,3,0) beats
+   the base .term-host .term-status (0,2,0) regardless of import order. */
+.term-host .term-status.stale {
+  background: var(--warn);
+  animation: pulse 1.1s ease-in-out infinite;
+}
