@@ -64,14 +64,28 @@ import s from "./Tabstrip.module.css";
  * bridge).
  *
  * PER-TAB AFFORDANCES:
- *  - CONTEXT MENU (right-click / long-press / F2): Rename, Close, Close
- *    others. The menu rides the SAME surface stack as AddMenu/Overflow/
- *    Layouts/Settings (popover.ts, mutually exclusive group): Esc closes
- *    topmost-only, a pointerdown outside the tab closes it, a pane tap closes
- *    it, a workspace switch closes it reactively. Last-workspace guard:
- *    Close + Close others are aria-disabled no-ops (the store refuses to
- *    empty the shell anyway). Deleting a workspace DESTROYS its panes
- *    (intentional; not a survival op).
+ *  - CONTEXT MENU (right-click / long-press / F2): Rename, Move left/right,
+ *    Close, Close others. The menu rides the SAME surface stack as
+ *    AddMenu/Overflow/Layouts/Settings (popover.ts, mutually exclusive
+ *    group): Esc closes topmost-only, a pointerdown outside the tab closes
+ *    it, a pane tap closes it, a workspace switch closes it reactively.
+ *    Last-workspace guard: Close + Close others are aria-disabled no-ops (the
+ *    store refuses to empty the shell anyway). Deleting a workspace DESTROYS
+ *    its panes (intentional; not a survival op).
+ *  - DRAG-TO-REORDER (pointer gesture over the landed menu reorder): a
+ *    pressed tab can be dragged along the strip to a new position. MOUSE: a
+ *    >MENU_PRESS_DRIFT_PX move while pressed starts the drag IMMEDIATELY
+ *    (desktop convention; the 500ms stationary hold still opens the menu
+ *    while pressed, and right-click always does). TOUCH: a 500ms stationary
+ *    hold ARMS the drag — movement after arming drags, a STATIONARY release
+ *    opens the menu (the menu-open moment moved to release so a post-hold
+ *    drag can never race an already-open menu); pre-hold movement past the
+ *    threshold is scroll intent (no drag, no menu). The preview is
+ *    transform-only (GPU rules: no layout writes, no mask-image, no
+ *    backdrop-filter); the drop commits through the SAME identity-preserving
+ *    reorderWorkspace the ⋮ menus use — hostLayerOrder is never touched, so
+ *    no iframe ever reloads. Dragging from/to the ⋯ overflow rows is OUT of
+ *    scope (the row menu owns hidden workspaces).
  *  - RENAME: menu → Rename opens the inline edit. Commit on blur/Enter; cancel
  *    on Esc.
  *  - PER-TAB BADGE: needs-you count on EVERY tab (background ws's needy
@@ -86,8 +100,13 @@ import s from "./Tabstrip.module.css";
  * direct-rename long-press used (RENAME_PRESS_MS=500): long enough that a tap
  * never triggers it, short enough to feel responsive on touch. */
 const MENU_PRESS_MS = 500;
-/** Pointer drift (px) that cancels an armed long-press — a touch that moves
- * (scroll intent) must never summon the menu. */
+/** Pointer drift (px) with a DUAL role in the press gesture model: (a) before
+ *  a touch long-press matures it cancels the menu arm (scroll intent — a
+ *  moving touch must never summon the menu), and (b) it is the DRAG-START
+ *  threshold — a mouse move past it while pressed starts a drag immediately,
+ *  and a touch move past it after the 500ms hold armed the press starts the
+ *  drag. Same 12px slop window for every role keeps the disambiguation
+ *  coherent. */
 const MENU_PRESS_DRIFT_PX = 12;
 /** Fixed .tabMenu width (px). Declared here so placeMenu's viewport clamp uses
  * the same number the CSS renders (keep in sync with .tabMenu in
@@ -328,6 +347,210 @@ export function Tabstrip() {
    *  applied visible set holds still (badges/queues keep updating). */
   const frozen = createMemo(() => pressed() > 0 || openMenu() || kbdFocus());
 
+  // ---- DRAG-TO-REORDER session (the gesture layer) ---------------------------
+  // All drag state lives HERE (strip-level): the dragged tab follows the
+  // pointer and SIBLING tabs translate to open the drop gap, so the preview
+  // must coordinate every visible tab, not just the pressed one. The tab
+  // component only decides WHEN a press becomes a drag (the pointer-type
+  // aware arming model) and calls beginDrag(); from there this session owns
+  // the gesture via window capture-phase listeners: pointerup commits,
+  // pointercancel/Escape aborts to the original order. Nothing mutates the
+  // store until commit — abort is trivially clean.
+  //
+  // The membership freeze carries the whole drag: a drag holds the pointer
+  // down (the `pressed` arm), so visible membership/order is frozen for the
+  // gesture's duration and the start-captured geometry below stays valid.
+  // (Badges still update live mid-drag and can change a tab's natural width;
+  // the commit maps by ids through the frozen visible set, never by these
+  // rects — at worst the preview is a few px stale, never wrong about order.)
+
+  /** Immutable capture of the visible row's geometry at drag start. */
+  interface DragSession {
+    id: string;
+    pointerId: number;
+    /** Visible index of the dragged tab at start. */
+    from: number;
+    rects: Array<{ id: string; left: number; width: number; center: number }>;
+    /** Union bounds of the visible row (drag clamping keeps the drop target
+     *  reachable when the pointer leaves the row — the strip never
+     *  auto-scrolls). */
+    rowLeft: number;
+    rowRight: number;
+    /** Pointer clientX at drag start; dx is measured from here. */
+    originX: number;
+    /** The frozen visible set at start (the commit maps the drop through it —
+     *  never a re-derivation that could race the unfreeze). */
+    visible: Set<string>;
+  }
+  const [drag, setDrag] = createSignal<DragSession | null>(null);
+  /** Follow offset of the dragged tab (px, clamped inside the row). */
+  const [dragDx, setDragDx] = createSignal(0);
+  /** Live insertion index among the OTHER visible tabs (the commit target). */
+  const [dropIdx, setDropIdx] = createSignal(0);
+  let dragCleanup: (() => void) | undefined;
+
+  const endDragSession = () => {
+    dragCleanup?.();
+    dragCleanup = undefined;
+    setDrag(null);
+    setDragDx(0);
+    setDropIdx(0);
+  };
+  onCleanup(() => dragCleanup?.());
+
+  /** Per-tab preview: the dragged tab follows the pointer (dx), each sibling
+   *  between the origin and the live drop slot translates by exactly one slot
+   *  to open the gap. Transform-only — no layout writes mid-drag (GPU rules). */
+  const previewFor = (id: string): { dx: number; dragging: boolean } => {
+    const d = drag();
+    if (!d) return { dx: 0, dragging: false };
+    if (d.id === id) return { dx: dragDx(), dragging: true };
+    const i = d.rects.findIndex((r) => r.id === id);
+    if (i < 0) return { dx: 0, dragging: false };
+    const k = dropIdx();
+    const slot = (d.rects[d.from]?.width ?? 0) + TAB_GAP_PX;
+    // Standard insertion-list shift: tabs in [k, from) move right by a slot,
+    // tabs in (from, k] move left by one (their index-1 < k form).
+    if (k <= i && i < d.from) return { dx: slot, dragging: false };
+    if (i > d.from && i - 1 < k) return { dx: -slot, dragging: false };
+    return { dx: 0, dragging: false };
+  };
+
+  /** Dragged-tab offset update + drop-index recompute from pointer x over the
+   *  frozen row geometry: the insertion slot is where the dragged tab's CENTER
+   *  falls among the other tabs' centers. The VISUAL offset is clamped inside
+   *  the row (the preview never leaves the strip — GPU-cheap and the gap stays
+   *  visible), but the DROP SLOT follows the RAW pointer position: a dragged
+   *  tab wider than an edge sibling could otherwise never cross that
+   *  sibling's center (its box clamps first) and the end slots would be
+   *  unreachable. */
+  const updateDrag = (clientX: number) => {
+    const d = drag();
+    if (!d) return;
+    const me = d.rects[d.from];
+    if (!me) return;
+    const rawDx = clientX - d.originX;
+    const dx = Math.max(
+      d.rowLeft - me.left,
+      Math.min(d.rowRight - me.width - me.left, rawDx),
+    );
+    setDragDx(dx);
+    const center = me.center + rawDx;
+    let k = 0;
+    for (let i = 0; i < d.rects.length; i++) {
+      if (i === d.from) continue;
+      const r = d.rects[i];
+      if (r && r.center < center) k++;
+    }
+    setDropIdx(k);
+  };
+
+  /** Commit the drop. The landed store API is DIRECTIONAL
+   *  (reorderWorkspace(id, ±1) — one slot per call, identity-preserving,
+   *  hostLayerOrder untouched), so a multi-slot drop is a SEQUENCE of one-slot
+   *  moves. The move count comes from a local-id SIMULATION (never the
+   *  store): walk the dragged id one canonical slot at a time until its
+   *  position among the FROZEN-visible tabs equals the drop slot. A hidden
+   *  workspace the dragged tab passes shifts one canonical slot as it is
+   *  crossed (invisible on the strip; overflow rows follow the store order) —
+   *  the visible drop position is exact. The whole commit is one synchronous
+   *  batch; scheduleSave is debounced (450ms) so N calls flush once. */
+  const commitDrag = () => {
+    const d = drag();
+    const k = dropIdx();
+    if (!d) return;
+    endDragSession(); // collapse the preview FIRST, then commit — one paint
+    if (k === d.from) return; // dropped in place — nothing to do
+    const arr = workspaces().map((w) => w.id);
+    const visibleIndex = (a: string[]): number => {
+      let c = 0;
+      for (const x of a) {
+        if (x === d.id) return c;
+        if (d.visible.has(x)) c++;
+      }
+      return -1;
+    };
+    const dir: -1 | 1 = k > d.from ? 1 : -1;
+    let moves = 0;
+    while (moves <= arr.length) {
+      if (visibleIndex(arr) === k) break;
+      const i = arr.indexOf(d.id);
+      const j = i + dir;
+      if (j < 0 || j >= arr.length) break; // cannot happen for a valid k
+      arr.splice(i, 1);
+      arr.splice(j, 0, d.id);
+      moves++;
+    }
+    for (let m = 0; m < moves; m++) reorderWorkspace(d.id, dir);
+  };
+
+  /** Begin a drag session for `ws` (called by the tab once its arming model
+   *  says this press is a drag). `originX` is the PRESS x (the tab's grab
+   *  offset is preserved from the press, not the threshold crossing — the
+   *  standard drag feel), and the initiating event's own x seeds the first
+   *  drop-slot computation so the preview is true from move one. Captures the
+   *  frozen row geometry and takes over the gesture with window capture-phase
+   *  listeners (pointer capture on the tab keeps REAL pipeline moves flowing,
+   *  but the session never depends on it — dispatched/synthetic pointers work
+   *  identically). */
+  const beginDrag = (ws: Workspace, e: PointerEvent, originX: number) => {
+    if (drag() || !tabsEl) return;
+    const vis = visibleWorkspaces();
+    const from = vis.findIndex((w) => w.id === ws.id);
+    if (from < 0 || vis.length < 2) return;
+    const rects: DragSession["rects"] = [];
+    for (const el of tabsEl.children) {
+      const id = (el as HTMLElement).dataset.workspace;
+      if (!id) continue;
+      const r = el.getBoundingClientRect();
+      rects.push({ id, left: r.left, width: r.width, center: r.left + r.width / 2 });
+    }
+    if (rects.length !== vis.length) return; // mid-measure anomaly — refuse
+    const first = rects[0];
+    const last = rects[rects.length - 1];
+    if (!first || !last) return;
+    const session: DragSession = {
+      id: ws.id,
+      pointerId: e.pointerId,
+      from,
+      rects,
+      rowLeft: first.left,
+      rowRight: last.left + last.width,
+      originX,
+      visible: new Set(visibleSet()),
+    };
+    setDrag(session);
+    setDropIdx(from);
+    setDragDx(0);
+    updateDrag(e.clientX); // seed dx + drop slot from the initiating move
+    const isMine = (ev: PointerEvent) => ev.pointerId === e.pointerId;
+    const onMove = (ev: PointerEvent) => {
+      if (isMine(ev)) updateDrag(ev.clientX);
+    };
+    const onUp = (ev: PointerEvent) => {
+      if (!isMine(ev)) return;
+      updateDrag(ev.clientX); // a drop with no trailing move still lands true
+      commitDrag();
+    };
+    const onCancel = (ev: PointerEvent) => {
+      if (isMine(ev)) endDragSession(); // system gesture took over — abort
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") endDragSession(); // abort to original order
+    };
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("pointercancel", onCancel, true);
+    window.addEventListener("keydown", onKey, true);
+    dragCleanup = () => {
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointerup", onUp, true);
+      window.removeEventListener("pointercancel", onCancel, true);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  };
+
+
   // prev-active tracking (D1): remember the immediately-previous active
   // workspace. Updates even while frozen (the applied set re-derives on
   // unfreeze with the latest value).
@@ -385,7 +608,13 @@ export function Tabstrip() {
           per-tab role="tab"/aria-selected semantics already imply. */}
       <div class={s.tabs} data-testid="ws-tabs" role="tablist" aria-label="Workspaces" ref={tabsEl}>
         <For each={visibleWorkspaces()}>
-          {(ws) => <WorkspaceTab ws={ws} />}
+          {(ws) => (
+            <WorkspaceTab
+              ws={ws}
+              preview={() => previewFor(ws.id)}
+              beginDrag={(e, originX) => beginDrag(ws, e, originX)}
+            />
+          )}
         </For>
       </div>
       {/* Overflow affordance (only when something is hidden). Lives OUTSIDE
@@ -446,10 +675,33 @@ export function Tabstrip() {
   );
 }
 
-/** One workspace tab. Owns its local interaction state: the context menu
- *  (right-click / long-press / F2 → Rename | Close | Close others) and the
- *  inline rename the menu can open. */
-function WorkspaceTab(props: { ws: Workspace }) {
+/** One workspace tab. Owns its local interaction state: the pointer gesture
+ *  model (press → drag-to-reorder | long-press menu), the context menu
+ *  (right-click / long-press / F2 → Rename | Move left/right | Close | Close
+ *  others) and the inline rename the menu can open.
+ *
+ * PRESS GESTURE MODEL (drag/menu disambiguation — pointer-type aware):
+ *  - MOUSE/PEN: a >MENU_PRESS_DRIFT_PX move while the primary button is held
+ *    starts a drag IMMEDIATELY (desktop convention — no hold required). A
+ *    stationary 500ms hold opens the menu WHILE STILL PRESSED (the landed
+ *    behavior, pinned by e2e), and right-click / F2 / Menu-key open it too.
+ *  - TOUCH: a stationary 500ms hold ARMS the press (no menu yet — the menu
+ *    open moment is deferred to release so a post-hold drag can never race an
+ *    already-open menu). After arming: >drift movement starts the drag; a
+ *    stationary release opens the menu. Movement past the drift threshold
+ *    BEFORE the hold matures cancels the timer (scroll intent — no drag, no
+ *    menu).
+ * When the model says "drag", the tab hands the gesture to the strip's drag
+ *  session via beginDrag() and keeps only a local dragStarted flag (to gate
+ *  its own handlers + suppress the release click). */
+function WorkspaceTab(props: {
+  ws: Workspace;
+  /** Strip-level drag preview for this tab (follow offset / dragging flag). */
+  preview: () => { dx: number; dragging: boolean };
+  /** Hand the press to the strip's drag session (called once per press, at
+   *  drag start — the threshold-crossing pointermove; originX = the press x). */
+  beginDrag: (e: PointerEvent, originX: number) => void;
+}) {
   const active = () => activeWorkspaceId() === props.ws.id;
   // Last-workspace guard: Close + Close others render aria-disabled no-ops in
   // the menu (the store's closeWorkspace refuses to empty the shell anyway).
@@ -565,17 +817,26 @@ function WorkspaceTab(props: { ws: Workspace }) {
     setEditing(false);
   };
 
-  // ---- long-press → menu (the old direct-rename gesture, retargeted) --------
-  // pointerdown arms a timer; if MENU_PRESS_MS elapses while still pressed
-  // (and unmoved), the menu opens. pointerup/leave/cancel clears an unfired
-  // timer so a quick tap never triggers it; moving > MENU_PRESS_DRIFT_PX
-  // (scroll intent) cancels it too.
+  // ---- press gesture model (see the WorkspaceTab docblock) -------------------
+  // pointerdown arms the 500ms timer; pointermove disambiguates (drift
+  // threshold); pointerup resolves (menu / commit / plain click).
   let pressTimer: ReturnType<typeof setTimeout> | undefined;
   let pressX = 0;
   let pressY = 0;
-  // Set when the long-press timer actually fires; consumed by the tab's click
-  // handler so the release click never ALSO switches the workspace. Reset on
-  // every pointerdown so an unconsumed flag can never swallow a later click.
+  // Press context captured at pointerdown (the gesture's pointer type/button
+  // decide which disambiguation rules apply when the drift threshold crosses).
+  let pressButton = 0;
+  let pressType: string = "mouse";
+  /** TOUCH arm: the 500ms timer fired on a still-pressed, unmoved touch — the
+   *  press is now a drag candidate; a stationary release opens the menu. */
+  let dragArmed = false;
+  /** This press became a drag — the strip session owns the gesture from here;
+   *  the flag only gates this tab's own handlers + the release click. */
+  let dragStarted = false;
+  // Set when the press resolves as menu-armed (touch) or drag: consumed by the
+  // tab's click handler so the release click never ALSO switches the
+  // workspace. Reset on every pointerdown so an unconsumed flag can never
+  // swallow a later click.
   let suppressClick = false;
   const clearPressTimer = () => {
     if (pressTimer) {
@@ -585,24 +846,74 @@ function WorkspaceTab(props: { ws: Workspace }) {
   };
   const onTabPointerDown = (e: PointerEvent) => {
     suppressClick = false;
+    dragArmed = false;
+    dragStarted = false;
     if (editing() || menu.open()) return;
     clearPressTimer();
+    pressButton = e.button;
+    pressType = e.pointerType;
     pressX = e.clientX;
     pressY = e.clientY;
+    // Capture the pointer for the press so moves OUTSIDE this tab still feed
+    // these handlers (a mouse drag crosses sibling tabs immediately). Synthetic
+    // (dispatched) pointers are not active — setPointerCapture throws
+    // NotFoundError there; the drag still works because the strip session
+    // listens on window (capture phase sees every dispatched move too).
+    if (e.button === 0 && tabEl) {
+      try {
+        tabEl.setPointerCapture(e.pointerId);
+      } catch {
+        /* synthetic pointer — window-level session listeners cover it */
+      }
+    }
     pressTimer = setTimeout(() => {
       pressTimer = undefined;
       // If a contextmenu event already opened it (Android Chrome fires one on
       // long-press too), this is a duplicate — don't re-place or re-flag.
       if (menu.open()) return;
-      suppressClick = true;
-      menu.openPopover();
+      suppressClick = true; // the release must not ALSO switch the workspace
+      if (pressType === "touch") {
+        // Arm the drag; the menu is deferred to a stationary release so a
+        // post-hold drag can never race an already-open menu.
+        dragArmed = true;
+      } else {
+        // Mouse/pen: the menu opens while still pressed (the landed behavior).
+        menu.openPopover();
+      }
     }, MENU_PRESS_MS);
   };
   const onTabPointerMove = (e: PointerEvent) => {
-    if (!pressTimer) return;
-    if (Math.hypot(e.clientX - pressX, e.clientY - pressY) > MENU_PRESS_DRIFT_PX) {
-      clearPressTimer();
+    if (dragStarted) return; // the strip session owns the gesture
+    if (!pressTimer && !dragArmed) return; // hover / no press in flight
+    const dist = Math.hypot(e.clientX - pressX, e.clientY - pressY);
+    if (dist <= MENU_PRESS_DRIFT_PX) return;
+    // Pre-arm drift cancels the menu arm (scroll intent — the landed rule).
+    clearPressTimer();
+    // Drag start. Only a primary-button press drags, never while a surface is
+    // open on this tab (menu/rename own it then). Mouse/pen drag immediately;
+    // touch only once the hold ARMED the press.
+    if (pressButton !== 0 || editing() || menu.open()) return;
+    if (pressType === "touch" && !dragArmed) return;
+    dragStarted = true;
+    dragArmed = false;
+    suppressClick = true; // a drag release must not ALSO switch the workspace
+    props.beginDrag(e, pressX);
+  };
+  const onTabPointerUp = () => {
+    clearPressTimer();
+    if (dragArmed && !dragStarted) {
+      // Stationary touch release after the hold → the menu (the armed path's
+      // non-drag outcome; suppressClick was set at arm time).
+      dragArmed = false;
+      if (!menu.open()) menu.openPopover();
+      return;
     }
+    dragArmed = false;
+  };
+  const onTabPointerCancel = () => {
+    // A system gesture took the pointer over — neither menu nor drag.
+    clearPressTimer();
+    dragArmed = false;
   };
 
   // Right-click (desktop) — and Android Chrome's native long-press — opens the
@@ -623,12 +934,27 @@ function WorkspaceTab(props: { ws: Workspace }) {
       classList={{
         [s.tab]: true,
         [s.tabActive]: active(),
+        [s.tabDragging]: props.preview().dragging,
       }}
       data-testid="ws-tab"
       data-workspace={props.ws.id}
       data-active={active() ? "1" : "0"}
       data-editing={editing() ? "1" : "0"}
       data-menu-open={menu.open() ? "1" : "0"}
+      // Drag preview observables (e2e): the dragged tab flags data-dragging;
+      // sibling tabs translated by the drop gap carry data-shift (signed px;
+      // absent when at rest). The preview itself is a transform — style-only.
+      data-dragging={props.preview().dragging ? "1" : "0"}
+      data-shift={
+        props.preview().dx !== 0 && !props.preview().dragging
+          ? String(Math.round(props.preview().dx))
+          : undefined
+      }
+      style={
+        props.preview().dx !== 0
+          ? { transform: `translateX(${props.preview().dx}px)` }
+          : undefined
+      }
       // a11y: role=tab + explicit keyboard/AT semantics (the tab hosts nested
       // interactive elements — the rename input + the context menu's items).
       // aria-haspopup/expanded advertise the context menu to AT.
@@ -639,8 +965,9 @@ function WorkspaceTab(props: { ws: Workspace }) {
       aria-haspopup="menu"
       aria-expanded={menu.open() ? "true" : "false"}
       // Clicking the tab switches the workspace — EXCEPT: the release click
-      // after a fired long-press (menu just opened; consumed), while renaming,
-      // and when this tab's own menu is open (tap-again = toggle it closed).
+      // after a fired long-press (menu just opened or armed; consumed), after
+      // a drag (drag ≠ activation; consumed), while renaming, and when this
+      // tab's own menu is open (tap-again = toggle it closed).
       onClick={() => {
         if (suppressClick) {
           suppressClick = false;
@@ -656,12 +983,16 @@ function WorkspaceTab(props: { ws: Workspace }) {
       // Right-click / Menu key / Shift+F10 (the browser synthesizes a
       // contextmenu event for the last two on the focused element).
       onContextMenu={onTabContextMenu}
-      // Long-press arms the menu timer (see onTabPointerDown).
+      // The press gesture model: down arms, move disambiguates (drag vs
+      // scroll-intent), up/cancel resolve (see the WorkspaceTab docblock).
       onPointerDown={onTabPointerDown}
       onPointerMove={onTabPointerMove}
-      onPointerUp={clearPressTimer}
+      onPointerUp={onTabPointerUp}
+      // Leaving the tab while merely PRESSED (pre-arm/pre-threshold) cancels
+      // the menu timer; once a drag started the strip session owns the
+      // gesture, so this can never abort one.
       onPointerLeave={clearPressTimer}
-      onPointerCancel={clearPressTimer}
+      onPointerCancel={onTabPointerCancel}
       onKeyDown={(e) => {
         if (editing()) return;
         // F2 = the standard rename key: it opens the menu that CONTAINS

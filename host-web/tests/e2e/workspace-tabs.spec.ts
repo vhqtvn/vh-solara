@@ -411,18 +411,41 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
   });
 
-  // Feature: TOUCH long-press (pointerType "touch") opens the same menu — the
-  // mobile gesture that replaced direct-rename. Dispatched through the page's
-  // real PointerEvent pipeline (handler-level truth; Playwright cannot hold a
-  // real touchscreen press).
-  test("touch long-press (pointerType touch) opens the menu", async ({ page }) => {
+  // Feature: TOUCH long-press (pointerType "touch") — drag-era semantics: the
+  // 500ms hold ARMS the press (drag candidate); the MENU opens on the
+  // STATIONARY RELEASE (deferred so a post-hold drag can never race an
+  // already-open menu), still carrying the Move left/Move right reorder
+  // items. Pre-arm drift past the threshold cancels the arm (scroll intent —
+  // no menu, no drag). Dispatched through the page's real PointerEvent
+  // pipeline (handler-level truth; Playwright cannot hold a real touchscreen
+  // press, and hasTouch is off in the default projects).
+  test("touch long-press arms, stationary release opens the menu; pre-arm drift cancels", async ({ page }) => {
     const ws1 = (await H.workspaces(page))[0];
     const tab = page.locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`);
     await tab.dispatchEvent("pointerdown", { pointerType: "touch" });
-    await page.waitForTimeout(700); // > 500ms threshold
-    await expect(page.locator('[data-testid="ws-tab-menu"]')).toBeVisible();
+    await page.waitForTimeout(700); // > 500ms threshold — ARMED, menu deferred
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
     await tab.dispatchEvent("pointerup", { pointerType: "touch" });
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toBeVisible();
+    // The hold-opened menu still carries the reorder items (the landed menu,
+    // unchanged by the drag gesture layer).
+    await expect(page.locator('[data-testid="ws-menu-move-left"]')).toBeVisible();
+    await expect(page.locator('[data-testid="ws-menu-move-right"]')).toBeVisible();
     await page.keyboard.press("Escape");
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+
+    // Pre-arm drift: a touch that moves past the threshold inside the 500ms
+    // window is scroll intent — the arm cancels and NOTHING fires at release
+    // (no menu; the drag model also refuses un-armed touch movement).
+    const box = await tab.boundingBox();
+    expect(box).not.toBeNull();
+    const x = box!.x + box!.width / 2;
+    const y = box!.y + box!.height / 2;
+    await tab.dispatchEvent("pointerdown", { pointerType: "touch", clientX: x, clientY: y });
+    await tab.dispatchEvent("pointermove", { pointerType: "touch", clientX: x + 20, clientY: y });
+    await page.waitForTimeout(700);
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+    await tab.dispatchEvent("pointerup", { pointerType: "touch", clientX: x + 20, clientY: y });
     await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
   });
 
@@ -1154,5 +1177,286 @@ test.describe("workspace-tabs (top tabstrip = workspaces)", () => {
     await page.keyboard.press("Escape"); // closes the row menu (topmost)
     await page.keyboard.press("Escape"); // then the parent popover
     await expect(page.locator('[data-testid="ws-overflow-popover"]')).toHaveCount(0);
+  });
+
+  // ---- DRAG-TO-REORDER (gesture layer over the menu reorder) ------------------
+  //
+  // The drag is the GESTURE upgrade over the ⋮ menu moves: a pressed tab
+  // dragged along the strip reorders through the SAME identity-preserving
+  // reorderWorkspace (rendered + persisted order flip; host-layer DOM order
+  // and every pane iframe UNTOUCHED). Disambiguation vs the long-press menu:
+  // movement threshold (12px) + hold time (500ms) — mouse drags start
+  // immediately past the threshold, touch drags only after the hold ARMS the
+  // press, and a stationary touch release still opens the menu (the test
+  // above). Fixtures are deliberately SMALL (3 short-named workspaces, all
+  // visible at the 1280 default viewport) so drag geometry is unambiguous;
+  // drop targets aim at tab QUARTERS (≥15px from any center) so engine font
+  // deltas cannot flip the drop slot.
+
+  /** Center-point of a tab (the drag y + a handy x reference). */
+  async function tabCenter(
+    page: import("@playwright/test").Page,
+    wsId: string,
+  ): Promise<{ x: number; y: number }> {
+    const box = await page
+      .locator(`[data-testid="ws-tab"][data-workspace="${wsId}"]`)
+      .boundingBox();
+    expect(box, `tab ${wsId} has a box`).not.toBeNull();
+    return { x: box!.x + box!.width / 2, y: box!.y + box!.height / 2 };
+  }
+
+  // Feature: MOUSE drag end-to-end (the crux) — press a tab, move several
+  // real steps past the 12px threshold to another tab's quarter, drop:
+  // rendered order flips, persisted blob order flips (the persistence seam),
+  // the HOST-LAYER DOM order is UNCHANGED (creation-stable — no iframe
+  // browsing context re-created), panes SURVIVE (mountTs continuity), the
+  // active workspace is UNCHANGED (drag ≠ activation), and no menu opens
+  // (drag ≠ stationary hold).
+  test("mouse drag reorders (rendered + persisted order; host layer + iframes untouched)", async ({ page }) => {
+    // Canonical [ws1(seed, pane-ful), Second(pane-ful), Third(pane-ful,
+    // ACTIVE — the last addWorkspace activates)]. Every workspace pane-ful so
+    // ANY host-layer node move would reload a pane (the reorder menu test's
+    // deliberate pin).
+    const ws1 = (await H.workspaces(page))[0];
+    const seedPane = (await H.panes(page))[0];
+    expect(seedPane).toBeTruthy();
+    await H.waitForReady(page, seedPane!);
+    const seedBefore = await H.survival(page, seedPane!);
+    expect(seedBefore).not.toBeNull();
+
+    const ws2 = await H.addWorkspace(page, "Second"); // activates ws2
+    const ws2Pane = await H.addServer(page, H.serverUrl("drag-ws2"), "drag-ws2");
+    expect(ws2Pane).toBeTruthy();
+    await H.waitForReady(page, ws2Pane!);
+    const ws2Before = await H.survival(page, ws2Pane!);
+    expect(ws2Before).not.toBeNull();
+
+    const ws3 = await H.addWorkspace(page, "Third"); // activates ws3
+    const ws3Pane = await H.addServer(page, H.serverUrl("drag-ws3"), "drag-ws3");
+    expect(ws3Pane).toBeTruthy();
+    await H.waitForReady(page, ws3Pane!);
+    const ws3Before = await H.survival(page, ws3Pane!);
+    expect(ws3Before).not.toBeNull();
+
+    expect(await renderedTabOrder(page)).toEqual([ws1, ws2, ws3]);
+    const hostBefore = await hostLayerIds(page); // creation order
+
+    // Press Third, drag to ws1's LEFT quarter (unambiguous drop slot 0).
+    const tab3 = page.locator(`[data-testid="ws-tab"][data-workspace="${ws3}"]`);
+    const from = await tabCenter(page, ws3!);
+    const box1 = await page
+      .locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`)
+      .boundingBox();
+    expect(box1).not.toBeNull();
+    const dropX = box1!.x + box1!.width / 4;
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    // Several REAL steps past the 12px threshold: the drag starts and follows.
+    await page.mouse.move(dropX, from.y, { steps: 12 });
+
+    // LIVE PREVIEW (before any commit): the dragged tab is flagged and the
+    // earlier siblings each translated right by one slot (the transform-only
+    // drop gap) — while the canonical DOM order is untouched (preview ≠
+    // commit; the strip never reshuffles mid-gesture).
+    await expect(tab3).toHaveAttribute("data-dragging", "1");
+    expect(
+      Number(
+        await page
+          .locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`)
+          .getAttribute("data-shift"),
+      ),
+    ).toBeGreaterThan(0);
+    expect(
+      Number(
+        await page
+          .locator(`[data-testid="ws-tab"][data-workspace="${ws2}"]`)
+          .getAttribute("data-shift"),
+      ),
+    ).toBeGreaterThan(0);
+    expect(await renderedTabOrder(page)).toEqual([ws1, ws2, ws3]);
+    await page.screenshot({ path: path.join(VISION_DIR, "drag-preview-mouse.png"), fullPage: true });
+
+    // Drop.
+    await page.mouse.up();
+
+    // Commit: rendered + persisted order flip to [Third, ws1, Second]…
+    await expect.poll(async () => renderedTabOrder(page)).toEqual([ws3, ws1, ws2]);
+    await expect.poll(async () => persistedWsOrder(page)).toEqual([ws3, ws1, ws2]);
+    // …the host layer NEVER moved (creation order — the decoupling)…
+    expect(await hostLayerIds(page)).toEqual(hostBefore);
+    // …and EVERY pane iframe SURVIVED (no remount, no browsing-context
+    // recreation — including the DRAGGED workspace's own pane).
+    await H.assertSurvived(page, seedPane!, seedBefore!, "ws1 seed pane across drag reorder");
+    await H.assertSurvived(page, ws2Pane!, ws2Before!, "ws2 pane across drag reorder");
+    await H.assertSurvived(page, ws3Pane!, ws3Before!, "ws3 (dragged) pane across drag reorder");
+    // Drag ≠ hold: no menu on release. Drag ≠ click: active UNCHANGED. The
+    // preview state cleared with the commit.
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws3);
+    await expect(tab3).toHaveAttribute("data-dragging", "0");
+  });
+
+  // Feature: mouse drag in the OTHER direction (left→right) on a BACKGROUND
+  // tab — the dragged workspace stays background (a drag never activates).
+  test("mouse drag right reorders a background tab; drag opens no menu and switches nothing", async ({ page }) => {
+    const ws1 = (await H.workspaces(page))[0];
+    const ws2 = await H.addWorkspace(page, "Second");
+    const ws3 = await H.addWorkspace(page, "Third"); // activates ws3 (stays it)
+
+    expect(await renderedTabOrder(page)).toEqual([ws1, ws2, ws3]);
+    const from = await tabCenter(page, ws2!);
+    const box3 = await page
+      .locator(`[data-testid="ws-tab"][data-workspace="${ws3}"]`)
+      .boundingBox();
+    expect(box3).not.toBeNull();
+
+    // Drag (BACKGROUND) Second to ws3's RIGHT quarter (unambiguous drop slot 2).
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(box3!.x + (box3!.width * 3) / 4, from.y, { steps: 12 });
+    await page.mouse.up();
+
+    await expect.poll(async () => renderedTabOrder(page)).toEqual([ws1, ws3, ws2]);
+    await expect.poll(async () => persistedWsOrder(page)).toEqual([ws1, ws3, ws2]);
+    expect(await hostLayerIds(page)).toEqual([ws1, ws2, ws3]);
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+    // The DRAGGED workspace stayed BACKGROUND (a drag never activates; ws3
+    // remains the active workspace).
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws3);
+  });
+
+  // Feature: TOUCH drag — the armed long-press becomes a drag when the finger
+  // moves past the threshold AFTER the 500ms hold (movement before the hold is
+  // scroll intent). Dispatched pointer events with pointerType "touch" through
+  // the page's real PointerEvent pipeline (handler-level truth — the lane's
+  // established touch idiom; Playwright has no touchscreen drag API and the
+  // default projects run hasTouch off).
+  test("touch drag: armed hold + movement reorders (pointerType touch)", async ({ page }) => {
+    const ws1 = (await H.workspaces(page))[0];
+    const ws2 = await H.addWorkspace(page, "Second");
+    const ws3 = await H.addWorkspace(page, "Third");
+    expect(await renderedTabOrder(page)).toEqual([ws1, ws2, ws3]);
+
+    const tab3 = page.locator(`[data-testid="ws-tab"][data-workspace="${ws3}"]`);
+    const ws1Tab = page.locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`);
+    const ws2Tab = page.locator(`[data-testid="ws-tab"][data-workspace="${ws2}"]`);
+    const from = await tabCenter(page, ws3!);
+    const box1 = await ws1Tab.boundingBox();
+    const box2 = await ws2Tab.boundingBox();
+    expect(box1).not.toBeNull();
+    expect(box2).not.toBeNull();
+    // ws2's LEFT quarter → live drop slot 1 (insert BEFORE ws2: only ws2
+    // shifts right a slot; the dragged tab comes from the right, so hovering
+    // ws2's right half would be the insert-AFTER no-op slot).
+    const midX = box2!.x + box2!.width / 4;
+    const endX = box1!.x + box1!.width / 4; // ws1's LEFT quarter → slot 0
+
+    await tab3.dispatchEvent("pointerdown", {
+      pointerType: "touch",
+      clientX: from.x,
+      clientY: from.y,
+    });
+    // Sub-threshold jitter while pressed: neither cancels the arm nor drags.
+    await tab3.dispatchEvent("pointermove", {
+      pointerType: "touch",
+      clientX: from.x + 5,
+      clientY: from.y,
+    });
+    await page.waitForTimeout(600); // > 500ms hold → ARMED (menu deferred)
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+
+    // Armed + >12px move → the drag starts, already over ws2's left quarter:
+    // live slot 1 (ws2 shifted a slot right; ws1 not yet moved).
+    await tab3.dispatchEvent("pointermove", {
+      pointerType: "touch",
+      clientX: midX,
+      clientY: from.y,
+    });
+    await expect(tab3).toHaveAttribute("data-dragging", "1");
+    expect(Number(await ws2Tab.getAttribute("data-shift"))).toBeGreaterThan(0);
+    expect(await ws1Tab.getAttribute("data-shift")).toBeNull();
+    expect(await renderedTabOrder(page)).toEqual([ws1, ws2, ws3]); // preview ≠ commit
+
+    // Continue to ws1's left quarter (slot 0) and drop.
+    await tab3.dispatchEvent("pointermove", {
+      pointerType: "touch",
+      clientX: endX,
+      clientY: from.y,
+    });
+    expect(Number(await ws1Tab.getAttribute("data-shift"))).toBeGreaterThan(0);
+    await tab3.dispatchEvent("pointerup", { pointerType: "touch", clientX: endX, clientY: from.y });
+
+    await expect.poll(async () => renderedTabOrder(page)).toEqual([ws3, ws1, ws2]);
+    await expect.poll(async () => persistedWsOrder(page)).toEqual([ws3, ws1, ws2]);
+    expect(await hostLayerIds(page)).toEqual([ws1, ws2, ws3]);
+    // Drag ≠ hold: no menu.
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+  });
+
+  // Feature: ABORT — Escape mid-drag collapses the preview and commits
+  // NOTHING (order unchanged); the late release neither reorders, opens the
+  // menu, nor switches the workspace.
+  test("Escape mid-drag aborts to the original order (mouse)", async ({ page }) => {
+    const ws1 = (await H.workspaces(page))[0];
+    const ws2 = await H.addWorkspace(page, "Second");
+    const ws3 = await H.addWorkspace(page, "Third"); // active
+    expect(await renderedTabOrder(page)).toEqual([ws1, ws2, ws3]);
+
+    const tab3 = page.locator(`[data-testid="ws-tab"][data-workspace="${ws3}"]`);
+    const from = await tabCenter(page, ws3!);
+    const box1 = await page
+      .locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`)
+      .boundingBox();
+    expect(box1).not.toBeNull();
+
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(box1!.x + box1!.width / 4, from.y, { steps: 12 });
+    await expect(tab3).toHaveAttribute("data-dragging", "1"); // drag in flight
+
+    await page.keyboard.press("Escape"); // ABORT
+    await expect(tab3).toHaveAttribute("data-dragging", "0"); // preview gone
+    expect(await renderedTabOrder(page)).toEqual([ws1, ws2, ws3]); // no commit
+
+    await page.mouse.up(); // late release — suppressed click, still nothing
+    expect(await renderedTabOrder(page)).toEqual([ws1, ws2, ws3]);
+    expect(await persistedWsOrder(page)).toEqual([ws1, ws2, ws3]);
+    expect(await hostLayerIds(page)).toEqual([ws1, ws2, ws3]);
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws3); // no switch
+  });
+
+  // Feature: ABORT — pointercancel (the system took the pointer over)
+  // collapses the preview and commits NOTHING; no menu either.
+  test("pointercancel mid-drag aborts to the original order (touch)", async ({ page }) => {
+    const ws1 = (await H.workspaces(page))[0];
+    const ws2 = await H.addWorkspace(page, "Second");
+    const ws3 = await H.addWorkspace(page, "Third");
+    expect(await renderedTabOrder(page)).toEqual([ws1, ws2, ws3]);
+
+    const tab3 = page.locator(`[data-testid="ws-tab"][data-workspace="${ws3}"]`);
+    const from = await tabCenter(page, ws3!);
+    const box1 = await page
+      .locator(`[data-testid="ws-tab"][data-workspace="${ws1}"]`)
+      .boundingBox();
+    expect(box1).not.toBeNull();
+
+    await tab3.dispatchEvent("pointerdown", {
+      pointerType: "touch",
+      clientX: from.x,
+      clientY: from.y,
+    });
+    await page.waitForTimeout(600); // armed
+    await tab3.dispatchEvent("pointermove", {
+      pointerType: "touch",
+      clientX: box1!.x + box1!.width / 4,
+      clientY: from.y,
+    });
+    await expect(tab3).toHaveAttribute("data-dragging", "1"); // drag in flight
+
+    await tab3.dispatchEvent("pointercancel", { pointerType: "touch" }); // ABORT
+    await expect(tab3).toHaveAttribute("data-dragging", "0");
+    expect(await renderedTabOrder(page)).toEqual([ws1, ws2, ws3]); // no commit
+    await expect(page.locator('[data-testid="ws-tab-menu"]')).toHaveCount(0);
   });
 });

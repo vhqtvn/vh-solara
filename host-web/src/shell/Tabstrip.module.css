@@ -73,11 +73,15 @@
   /* Prevent text selection / long-press context menu during the menu
    * long-press, and double-tap-to-zoom on rapid tab taps (touch-friendly). The
    * -webkit-touch-callout suppression specifically stops iOS Safari's native
-   * callout from racing the ~500ms MENU_PRESS_MS threshold. */
+   * callout from racing the ~500ms MENU_PRESS_MS threshold. touch-action:NONE
+   * (was manipulation): the tab is a DRAG surface now — manipulation still
+   * allowed panning, which would let the browser steal an armed touch drag
+   * for scroll. Nothing is lost: the fitted tab row never scrolls and the
+   * shell is a fixed-viewport app, so there is no pan to keep. */
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;
-  touch-action: manipulation;
+  touch-action: none;
 }
 .tab:hover {
   border-color: var(--accent);
@@ -95,6 +99,19 @@
   background: var(--accent-soft);
   border-color: var(--accent);
   color: var(--fg);
+}
+/* ---- DRAG-TO-REORDER preview ----------------------------------------------
+ * The dragged tab follows the pointer as a TRANSFORM ONLY (compositor-cheap,
+ * no layout writes mid-drag, no mask-image / backdrop-filter — AGENTS.md
+ * Firefox/WebRender GPU rules). Sibling tabs translate by exactly one slot to
+ * open the drop gap (same transform-only discipline; no transition so e2e
+ * geometry reads are deterministic). z-index applies to flex items, so the
+ * elevated dragged tab needs no positioning change; the shadow is the same
+ * static token the popovers use (--shadow-pop). */
+.tabDragging {
+  z-index: 5;
+  box-shadow: var(--shadow-pop);
+  cursor: grabbing;
 }
 /* TAB-PAIRS badges: per-pane micro-badge groups inside a workspace tab label —
  * e.g. "Workspace 1 [2][3]" where [2] is a neutral running badge and [3] an
