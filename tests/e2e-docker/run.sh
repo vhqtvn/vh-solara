@@ -16,7 +16,18 @@ cd "$repo_root"
 
 IMAGE=vh-solara-e2e
 NAME=vh-e2e-run
-PORT=8099
+# Host side of the shared e2eserver container's -p mapping (flows 1-7). Lane 4
+# (this script) and lane 6 (web Playwright, web/scripts/fixture-web.sh) BOTH
+# default to 8099, so concurrent runs collide on the docker port bind and the
+# run used to die opaquely deep inside boot_e2eserver. Override the HOST side
+# with VH_E2E_PORT when it is contended; the container side stays 8099 and
+# every URL below derives from $BASE (hence $PORT).
+PORT="${VH_E2E_PORT:-8099}"
+case "$PORT" in
+  ''|*[!0-9]*)
+    echo "run.sh: VH_E2E_PORT must be a positive integer (got '${PORT}')" >&2
+    exit 2 ;;
+esac
 BASE="http://127.0.0.1:${PORT}"
 # Flow 8 (death-watch self-heal) runs a SECOND container on the REAL
 # production binary (`vh-solara local-server --opencode-detached`) instead of
@@ -80,19 +91,64 @@ fail() {
   exit 1
 }
 
+# --- host-port pre-flight ------------------------------------------------------
+# Lane 6 (web Playwright, web/scripts/fixture-web.sh) defaults to the same
+# host port as this script; a concurrent lane-6 fixtureserver holding the
+# port made the docker run fail opaquely AFTER the multi-minute image build.
+# Probe the loopback port instead and either wait a bounded time for a
+# transient holder to leave (VH_E2E_PORT_WAIT seconds, default 30; 0 = fail
+# fast) or exit with an actionable message. Port free (the normal path) is
+# unchanged: one ~ms TCP probe, no output.
+VH_E2E_PORT_WAIT="${VH_E2E_PORT_WAIT:-30}"
+case "$VH_E2E_PORT_WAIT" in
+  ''|*[!0-9]*)
+    echo "run.sh: VH_E2E_PORT_WAIT must be a non-negative integer (got '${VH_E2E_PORT_WAIT}')" >&2
+    exit 2 ;;
+esac
+host_port_in_use() {
+  # 0 iff something already ACCEPTS TCP on the host port (python3 is already
+  # a hard dependency of this script's assert helpers; a TCP connect is the
+  # honest occupied-check, unlike an HTTP probe which misreads a bound but
+  # silent listener as free).
+  python3 -c 'import socket,sys
+s = socket.socket()
+s.settimeout(1)
+code = s.connect_ex(("127.0.0.1", int(sys.argv[1])))
+sys.exit(0 if code == 0 else 1)' "$PORT"
+}
+preflight_host_port() {
+  host_port_in_use || return 0
+  echo "==> host port ${PORT} is already in use" >&2
+  echo "    (likely a concurrent lane-6 web-e2e fixtureserver: web/scripts/fixture-web.sh also defaults to 8099; or a leftover e2e container)" >&2
+  waited=0
+  while host_port_in_use; do
+    if [ "$waited" -ge "$VH_E2E_PORT_WAIT" ]; then
+      fail "host port ${PORT} still occupied after ${waited}s -- cannot bind the e2eserver container.
+      Likely culprit: a concurrent lane-6 (web Playwright) fixtureserver, or a leftover ${NAME} / ${NAME_REAL} / ${NAME_BARRIER} container.
+      Escape hatch: run this lane on another host port, e.g.: VH_E2E_PORT=18099 bash tests/e2e-docker/run.sh
+      (or free port ${PORT} and retry; the bounded wait is ${VH_E2E_PORT_WAIT}s via VH_E2E_PORT_WAIT, 0 = fail fast)"
+    fi
+    sleep 1
+    waited=$((waited + 1))
+    echo "    ...waiting for port ${PORT} to free (${waited}/${VH_E2E_PORT_WAIT}s)" >&2
+  done
+  echo "    port ${PORT} freed after ${waited}s -- continuing" >&2
+}
+
 build_image() {
   echo "==> building $IMAGE (real opencode + fake LLM)"
   docker build -f Dockerfile.e2e -t "$IMAGE" . >/dev/null
 }
 
 boot_e2eserver() {
+  preflight_host_port # re-check: the port may have been taken during the build
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   echo "==> starting container"
   docker run -d --name "$NAME" -p "${PORT}:8099" "$IMAGE" >/dev/null
 
   echo "==> waiting for vh web server"
   for i in $(seq 1 60); do
-    if curl -fsS "${BASE}/vh/healthz" >/dev/null 2>&1; then break; fi
+    if curl -fsS --max-time 5 "${BASE}/vh/healthz" >/dev/null 2>&1; then break; fi
     sleep 1
     [ "$i" = 60 ] && fail "vh web server did not become ready"
   done
@@ -106,7 +162,7 @@ ensure_sid() {
   [ -n "$SID" ] && return 0
   echo "==> waiting for opencode session backend (create a session)"
   for i in $(seq 1 60); do
-    SID=$(curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session" -H 'Content-Type: application/json' -d '{"title":"e2e"}' \
+    SID=$(curl -fsS --max-time 10 -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session" -H 'Content-Type: application/json' -d '{"title":"e2e"}' \
           | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
     [ -n "$SID" ] && break
     sleep 1
@@ -115,6 +171,22 @@ ensure_sid() {
   echo "    session id: $SID"
 }
 
+# Docker-free drift guard: decode_check.py extracts the embedded flow-1
+# gzip64 decode block from this script VERBATIM and replays the gate truth
+# table offline (batch-absent / batch-only / mixed / empty wire shapes). Run
+# it before any docker work so drift between the shipped flow-1 assertions
+# and the offline mirror fails fast instead of shipping silently.
+DC_OUT="$(python3 "${repo_root}/tests/e2e-docker/decode_check.py" 2>&1)" \
+  || fail "decode_check.py failed (flow-1 gate/decode drift guard): ${DC_OUT}"
+
+# Pre-flight the shared host port BEFORE the image build: a contended port
+# must fail in seconds with an actionable message, not minutes in as an
+# opaque docker bind error. Flows 8-9 boot their own containers on other
+# host ports and skip this (and the boot_e2eserver re-check).
+case "$FLOW" in
+  8|9) ;;
+  *) preflight_host_port ;;
+esac
 build_image
 # Flows 8-9 boot their own REAL local-server containers (inside their
 # sections below); every other flow (1-7) drives the shared e2eserver
@@ -141,7 +213,7 @@ echo "==> waiting for the created session to surface in the aggregated snapshot"
 SID_VISIBLE=0
 LAST_SNAP=""
 for i in $(seq 1 120); do
-  LAST_SNAP=$(curl -fsS "${BASE}/vh/snapshot" 2>/dev/null || true)
+  LAST_SNAP=$(curl -fsS --max-time 10 "${BASE}/vh/snapshot" 2>/dev/null || true)
   if printf '%s' "$LAST_SNAP" | python3 -c '
 import sys, json
 sid = sys.argv[1]
@@ -172,14 +244,14 @@ STREAM_FILE=$(mktemp)
 sleep 1 # let the stream subscribe before we prompt
 
 echo "==> sending a prompt (real opencode -> fake LLM)"
-curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session/${SID}/message" \
+curl -fsS --max-time 120 -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session/${SID}/message" \
   -H 'Content-Type: application/json' \
   -d '{"parts":[{"type":"text","text":"hello from e2e"}]}' >/dev/null \
   || fail "prompt POST failed"
 
 echo "==> polling for the streamed assistant reply via /vh/snapshot"
 for i in $(seq 1 60); do
-  SNAP=$(curl -fsS "${BASE}/vh/snapshot?sessions=${SID}" 2>/dev/null || true)
+  SNAP=$(curl -fsS --max-time 10 "${BASE}/vh/snapshot?sessions=${SID}" 2>/dev/null || true)
   RESULT=$(printf '%s' "$SNAP" | python3 "${repo_root}/tests/e2e-docker/assert.py" "$SID" 2>/dev/null || true)
   STATUS=$(echo "$RESULT" | sed -n '1p')
   if [ "$STATUS" = "OK" ]; then
@@ -248,13 +320,13 @@ fi # flow 1
 if want_flow 2; then
 ensure_sid
 echo "==> [tool flow] prompting the model to call the write tool"
-curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session/${SID}/message" \
+curl -fsS --max-time 120 -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session/${SID}/message" \
   -H 'Content-Type: application/json' \
   -d '{"parts":[{"type":"text","text":"[[write]] please update the readme"}]}' >/dev/null \
   || fail "write-prompt POST failed"
 
 for i in $(seq 1 60); do
-  SNAP=$(curl -fsS "${BASE}/vh/snapshot?sessions=${SID}" 2>/dev/null || true)
+  SNAP=$(curl -fsS --max-time 10 "${BASE}/vh/snapshot?sessions=${SID}" 2>/dev/null || true)
   RESULT=$(printf '%s' "$SNAP" | python3 "${repo_root}/tests/e2e-docker/assert_tool.py" "$SID" 2>/dev/null || true)
   [ "$(echo "$RESULT" | sed -n 1p)" = "OK" ] && { echo "    $(echo "$RESULT" | sed -n 2p)"; break; }
   sleep 1
@@ -263,7 +335,7 @@ done
 
 echo "==> [tool flow] checking the resulting git diff via /oc/vcs/diff"
 for i in $(seq 1 30); do
-  DIFF=$(curl -fsS "${BASE}/oc/vcs/diff?mode=git" 2>/dev/null || true)
+  DIFF=$(curl -fsS --max-time 10 "${BASE}/oc/vcs/diff?mode=git" 2>/dev/null || true)
   echo "$DIFF" | grep -q 'README.md' && { echo "    diff includes README.md"; break; }
   sleep 1
   [ "$i" = 30 ] && fail "git diff did not include the written file (got: ${DIFF:0:160})"
@@ -274,13 +346,13 @@ fi # flow 2
 if want_flow 3; then
 ensure_sid
 echo "==> [subsession flow] prompting the model to spawn a subagent (task tool)"
-curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session/${SID}/message" \
+curl -fsS --max-time 120 -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session/${SID}/message" \
   -H 'Content-Type: application/json' \
   -d '{"parts":[{"type":"text","text":"[[task]] run a subtask"}]}' >/dev/null \
   || fail "task-prompt POST failed"
 
 for i in $(seq 1 90); do
-  TREE=$(curl -fsS "${BASE}/vh/snapshot?sessions=" 2>/dev/null || true)
+  TREE=$(curl -fsS --max-time 10 "${BASE}/vh/snapshot?sessions=" 2>/dev/null || true)
   RESULT=$(printf '%s' "$TREE" | python3 "${repo_root}/tests/e2e-docker/assert_sub.py" "$SID" 2>/dev/null || true)
   [ "$(echo "$RESULT" | sed -n 1p)" = "OK" ] && { echo "    $(echo "$RESULT" | sed -n 2p)"; break; }
   sleep 1
@@ -298,14 +370,14 @@ ensure_sid
 echo "==> [permission flow] prompting the model to call the bash tool (asks permission)"
 # The /message POST blocks until the turn completes, but this turn pauses on a
 # permission request — so fire it in the background and drive the reply below.
-( curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session/${SID}/message" \
+( curl -fsS --max-time 300 -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session/${SID}/message" \
   -H 'Content-Type: application/json' \
   -d '{"parts":[{"type":"text","text":"[[bash]] run a command"}]}' >/dev/null 2>&1 & )
 
 echo "==> [permission flow] waiting for the aggregator to surface the pending permission"
 PID=""
 for i in $(seq 1 60); do
-  SNAP=$(curl -fsS "${BASE}/vh/snapshot?sessions=${SID}" 2>/dev/null || true)
+  SNAP=$(curl -fsS --max-time 10 "${BASE}/vh/snapshot?sessions=${SID}" 2>/dev/null || true)
   RESULT=$(printf '%s' "$SNAP" | python3 "${repo_root}/tests/e2e-docker/assert_perm.py" "$SID" 2>/dev/null || true)
   if [ "$(echo "$RESULT" | sed -n 1p)" = "OK" ]; then
     PID=$(echo "$RESULT" | sed -n 2p)
@@ -318,17 +390,17 @@ done
 
 echo "==> [permission flow] replying 'once' via /oc/permission/:id/reply (canonical route)"
 # Mirror the frontend respondPermission: canonical route first, legacy fallback.
-if ! curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/permission/${PID}/reply" \
+if ! curl -fsS --max-time 30 -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/permission/${PID}/reply" \
      -H 'Content-Type: application/json' -d '{"reply":"once"}' >/dev/null 2>&1; then
   echo "    canonical route failed; trying legacy session-scoped route"
-  curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session/${SID}/permissions/${PID}" \
+  curl -fsS --max-time 30 -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session/${SID}/permissions/${PID}" \
     -H 'Content-Type: application/json' -d '{"response":"once"}' >/dev/null \
     || fail "permission reply failed on both routes"
 fi
 
 echo "==> [permission flow] verifying the turn resumed and finished"
 for i in $(seq 1 60); do
-  SNAP=$(curl -fsS "${BASE}/vh/snapshot?sessions=${SID}" 2>/dev/null || true)
+  SNAP=$(curl -fsS --max-time 10 "${BASE}/vh/snapshot?sessions=${SID}" 2>/dev/null || true)
   RESULT=$(printf '%s' "$SNAP" | python3 "${repo_root}/tests/e2e-docker/assert_perm_done.py" "$SID" 2>/dev/null || true)
   [ "$(echo "$RESULT" | sed -n 1p)" = "OK" ] && { echo "    $(echo "$RESULT" | sed -n 3p)"; break; }
   sleep 1
@@ -397,7 +469,7 @@ SEED_COUNT=$(docker exec "$NAME" sqlite3 "$DBPATH" \
 echo "    seeded sessions in container opencode DB: $SEED_COUNT"
 
 echo "==> [tree flow] forcing aggregator rehydrate so the seed enters the store (POST /vh/reload)"
-curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/vh/reload" >/dev/null \
+curl -fsS --max-time 30 -H 'X-VH-CSRF: 1' -X POST "${BASE}/vh/reload" >/dev/null \
   || fail "POST /vh/reload failed"
 # Wait for the rehydrate to land the seeded tree in the store by polling the
 # tree=2 snapshot for a known seeded root.
@@ -425,14 +497,14 @@ echo "         $(echo "$A_RES" | sed -n 3p)"
 # --- B. EXPAND --------------------------------------------------------------
 echo "==> [tree flow] B: asserting expand pagination (wide node)"
 B_P1=$(mktemp)
-curl -fsS "${BASE}/vh/tree/children?id=ses_tree_root_wide" > "$B_P1" 2>/dev/null || true
+curl -fsS --max-time 10 "${BASE}/vh/tree/children?id=ses_tree_root_wide" > "$B_P1" 2>/dev/null || true
 B_RES1=$(python3 "$repo_root/tests/e2e-docker/assert_tree_expand.py" page1 < "$B_P1")
 [ "$(echo "$B_RES1" | sed -n 1p)" = "OK" ] || { rm -f "$B_P1"; fail "behavior B page1 failed ($B_RES1)"; }
 WIDE_CURSOR=$(echo "$B_RES1" | sed -n 3p)
 rm -f "$B_P1"
 echo "    B page1 OK: $(echo "$B_RES1" | sed -n 2p) (cursor=$WIDE_CURSOR)"
 B_P2=$(mktemp)
-curl -fsS "${BASE}/vh/tree/children?id=ses_tree_root_wide&cursor=${WIDE_CURSOR}" > "$B_P2" 2>/dev/null || true
+curl -fsS --max-time 10 "${BASE}/vh/tree/children?id=ses_tree_root_wide&cursor=${WIDE_CURSOR}" > "$B_P2" 2>/dev/null || true
 B_RES2=$(python3 "$repo_root/tests/e2e-docker/assert_tree_expand.py" page2 < "$B_P2")
 rm -f "$B_P2"
 [ "$(echo "$B_RES2" | sed -n 1p)" = "OK" ] || fail "behavior B page2 failed ($B_RES2)"
@@ -467,7 +539,7 @@ fi
 
 snap_has_id() {
   # exit 0 iff $1 is present in the live snapshot's sessions[] list
-  curl -fsS "${BASE}/vh/snapshot" 2>/dev/null | python3 -c '
+  curl -fsS --max-time 10 "${BASE}/vh/snapshot" 2>/dev/null | python3 -c '
 import sys, json
 want = sys.argv[1]
 try:
@@ -482,7 +554,7 @@ sys.exit(0 if want in ids else 1)
 echo "==> [tree flow] C: seeding the fast-reconcile tombstone (archive an unrelated disposable session)"
 SEED_SID=""
 for i in $(seq 1 30); do
-  SEED_SID=$(curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session" \
+  SEED_SID=$(curl -fsS --max-time 10 -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session" \
         -H 'Content-Type: application/json' -d '{"title":"archive-seed"}' \
         | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
   [ -n "$SEED_SID" ] && break
@@ -499,7 +571,7 @@ for i in $(seq 1 30); do
   [ "$i" = 30 ] && { rm -f "$C_STREAM"; fail "[tree flow] C: disposable session never surfaced in the live snapshot"; }
 done
 echo "    disposable session visible in the live tree (poll ${i})"
-curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/vh/archive" \
+curl -fsS --max-time 30 -H 'X-VH-CSRF: 1' -X POST "${BASE}/vh/archive" \
      -H 'Content-Type: application/json' -d "{\"sessionID\":\"${SEED_SID}\"}" >/dev/null \
   || { rm -f "$C_STREAM"; fail "[tree flow] C: POST /vh/archive for the disposable session failed"; }
 # Completion = the id GONE from the live tree (NOT the POST 200 — the cascade
@@ -584,7 +656,7 @@ echo "    minted id: $MINTED"
 echo "==> [msgid flow] creating a second session for the isolation check"
 OTHER_SID=""
 for i in $(seq 1 30); do
-  OTHER_SID=$(curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session" \
+  OTHER_SID=$(curl -fsS --max-time 10 -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session" \
         -H 'Content-Type: application/json' -d '{"title":"msgid-iso"}' \
         | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
   [ -n "$OTHER_SID" ] && break
@@ -595,7 +667,7 @@ echo "    other session id: $OTHER_SID"
 
 # --- 1. prompt_async with caller messageID -> 204 ---------------------------
 echo "==> [msgid flow] 1: POST prompt_async with caller messageID (expect 204)"
-PASYNC_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H 'X-VH-CSRF: 1' \
+PASYNC_CODE=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" -H 'X-VH-CSRF: 1' \
   -X POST "${BASE}/oc/session/${SID}/prompt_async" \
   -H 'Content-Type: application/json' \
   -d "{\"messageID\":\"${MINTED}\",\"parts\":[{\"type\":\"text\",\"text\":\"msgid contract probe\"}]}" \
@@ -611,7 +683,7 @@ echo "==> [msgid flow] 2: polling GET .../message/<minted> for the persisted use
 MSGID_OK=""
 for i in $(seq 1 60); do
   G2B=$(mktemp)
-  G2CODE=$(curl -s -o "$G2B" -w "%{http_code}" "${BASE}/oc/session/${SID}/message/${MINTED}" 2>/dev/null || true)
+  G2CODE=$(curl -s --max-time 10 -o "$G2B" -w "%{http_code}" "${BASE}/oc/session/${SID}/message/${MINTED}" 2>/dev/null || true)
   if [ "$G2CODE" = "200" ]; then
     G2RES=$(python3 "$repo_root/tests/e2e-docker/assert_msgid_get.py" "$MINTED" < "$G2B" 2>/dev/null || true)
     if [ "$(echo "$G2RES" | sed -n 1p)" = "OK" ]; then
@@ -634,14 +706,14 @@ done
 # Composite key id AND session_id: the minted id lives under SID, so querying a
 # DIFFERENT session must 404 (cannot accidentally resolve cross-session).
 echo "==> [msgid flow] 3: GET <OTHER_SESSION>/message/<minted> (expect 404 isolation)"
-ISO_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${BASE}/oc/session/${OTHER_SID}/message/${MINTED}" 2>/dev/null || true)
+ISO_CODE=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "${BASE}/oc/session/${OTHER_SID}/message/${MINTED}" 2>/dev/null || true)
 [ "$ISO_CODE" = "404" ] \
   || fail "[msgid flow] cross-session GET did not return 404 (got $ISO_CODE; isolation broken)"
 echo "    3 OK: GET <other session>/message/<minted> -> 404 (composite-key isolation)"
 
 # --- 4. brand rejection: non-msg id -> 400 ---------------------------------
 echo "==> [msgid flow] 4: GET .../message/<non-msg-id> (expect 400 brand rejection)"
-BAD_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${BASE}/oc/session/${SID}/message/not_a_msg_id" 2>/dev/null || true)
+BAD_CODE=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "${BASE}/oc/session/${SID}/message/not_a_msg_id" 2>/dev/null || true)
 [ "$BAD_CODE" = "400" ] \
   || fail "[msgid flow] non-msg id GET did not return 400 (got $BAD_CODE; brand check differs from contract)"
 echo "    4 OK: GET .../message/not_a_msg_id -> 400 (brand rejection)"
@@ -679,7 +751,7 @@ if want_flow 7; then
 echo "==> [queue-claim flow] creating a fresh session for a clean turn-start"
 QSID=""
 for i in $(seq 1 30); do
-  QSID=$(curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session" \
+  QSID=$(curl -fsS --max-time 10 -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session" \
         -H 'Content-Type: application/json' -d '{"title":"queue-claim-ordering"}' \
         | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
   [ -n "$QSID" ] && break
@@ -691,7 +763,7 @@ echo "    queue-claim session id: $QSID"
 # --- 1. enqueue a queue item ------------------------------------------------
 echo "==> [queue-claim flow] 1: POST /vh/session/$QSID/queue (enqueue)"
 QENQ=$(mktemp)
-curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/vh/session/${QSID}/queue" \
+curl -fsS --max-time 30 -H 'X-VH-CSRF: 1' -X POST "${BASE}/vh/session/${QSID}/queue" \
   -H 'Content-Type: application/json' \
   -d '{"text":"queue-ordering probe Q7"}' > "$QENQ" \
   || { rm -f "$QENQ"; fail "[queue-claim flow] enqueue POST failed"; }
@@ -703,7 +775,7 @@ echo "    1 OK: enqueued item id: $QITEM"
 # --- 2. claim -> capture opencodeMsgID, assert state==dispatching -----------
 echo "==> [queue-claim flow] 2: POST /vh/session/$QSID/queue/claim (expect dispatching + opencodeMsgID)"
 QCLAIM=$(mktemp)
-curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/vh/session/${QSID}/queue/claim" > "$QCLAIM" 2>/dev/null \
+curl -fsS --max-time 30 -H 'X-VH-CSRF: 1' -X POST "${BASE}/vh/session/${QSID}/queue/claim" > "$QCLAIM" 2>/dev/null \
   || { rm -f "$QCLAIM"; fail "[queue-claim flow] claim POST failed"; }
 MINTED=$(python3 -c 'import sys,json;it=json.load(sys.stdin).get("item") or {};print(it.get("opencodeMsgID",""))' < "$QCLAIM" 2>/dev/null || true)
 QSTATE=$(python3 -c 'import sys,json;it=json.load(sys.stdin).get("item") or {};print(it.get("state",""))' < "$QCLAIM" 2>/dev/null || true)
@@ -720,7 +792,7 @@ echo "    2 OK: claim -> state=$QSTATE, opencodeMsgID=$MINTED"
 # before a single dispatch byte has hit the network.
 echo "==> [queue-claim flow] 3 (CRUX): GET /vh/session/$QSID/queue BEFORE dispatch (expect id persisted pre-dispatch)"
 QLIST=$(mktemp)
-curl -fsS "${BASE}/vh/session/${QSID}/queue" > "$QLIST" 2>/dev/null \
+curl -fsS --max-time 10 "${BASE}/vh/session/${QSID}/queue" > "$QLIST" 2>/dev/null \
   || { rm -f "$QLIST"; fail "[queue-claim flow] list GET failed"; }
 LIST_ID=$(QITEM="$QITEM" python3 -c 'import sys,json,os;q=os.environ["QITEM"];d=json.load(sys.stdin);print(next((it.get("opencodeMsgID","") for it in d.get("items",[]) if it.get("id")==q),""))' < "$QLIST" 2>/dev/null || true)
 LIST_STATE=$(QITEM="$QITEM" python3 -c 'import sys,json,os;q=os.environ["QITEM"];d=json.load(sys.stdin);print(next((it.get("state","") for it in d.get("items",[]) if it.get("id")==q),""))' < "$QLIST" 2>/dev/null || true)
@@ -733,7 +805,7 @@ echo "    3 OK: list (pre-dispatch) shows opencodeMsgID=$LIST_ID, state=$LIST_ST
 
 # --- 4. dispatch: prompt_async with the Claim-minted messageID -> 204 -------
 echo "==> [queue-claim flow] 4: POST prompt_async with Claim-minted messageID (expect 204)"
-QPASYNC_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H 'X-VH-CSRF: 1' \
+QPASYNC_CODE=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" -H 'X-VH-CSRF: 1' \
   -X POST "${BASE}/oc/session/${QSID}/prompt_async" \
   -H 'Content-Type: application/json' \
   -d "{\"messageID\":\"${MINTED}\",\"parts\":[{\"type\":\"text\",\"text\":\"queue-ordering probe Q7\"}]}" \
@@ -750,7 +822,7 @@ echo "==> [queue-claim flow] 5: polling GET .../message/<claim-minted> for the p
 QMSG_OK=""
 for i in $(seq 1 60); do
   QGB=$(mktemp)
-  QGCODE=$(curl -s -o "$QGB" -w "%{http_code}" "${BASE}/oc/session/${QSID}/message/${MINTED}" 2>/dev/null || true)
+  QGCODE=$(curl -s --max-time 10 -o "$QGB" -w "%{http_code}" "${BASE}/oc/session/${QSID}/message/${MINTED}" 2>/dev/null || true)
   if [ "$QGCODE" = "200" ]; then
     QGRES=$(python3 "$repo_root/tests/e2e-docker/assert_msgid_get.py" "$MINTED" < "$QGB" 2>/dev/null || true)
     if [ "$(echo "$QGRES" | sed -n 1p)" = "OK" ]; then
@@ -772,7 +844,7 @@ done
 # --- 6. the turn started (gate activity -> busy) ----------------------------
 echo "==> [queue-claim flow] 6: polling /vh/snapshot for gate.activity==busy (turn started)"
 for i in $(seq 1 60); do
-  SNAP=$(curl -fsS "${BASE}/vh/snapshot?sessions=${QSID}" 2>/dev/null || true)
+  SNAP=$(curl -fsS --max-time 10 "${BASE}/vh/snapshot?sessions=${QSID}" 2>/dev/null || true)
   RESULT=$(printf '%s' "$SNAP" | python3 "$repo_root/tests/e2e-docker/assert_turn_started.py" "$QSID" 2>/dev/null || true)
   [ "$(echo "$RESULT" | sed -n 1p)" = "OK" ] && { echo "    6 OK: $(echo "$RESULT" | sed -n 2p)"; break; }
   sleep 1
@@ -1008,14 +1080,14 @@ docker run -d --name "$NAME_BARRIER" -p "${PORT_BARRIER}:8099" --entrypoint /bin
 
 echo "==> [restart-barrier flow] waiting for the local-server web listener"
 for i in $(seq 1 60); do
-  if curl -fsS "${BASE_BARRIER}/vh/healthz" >/dev/null 2>&1; then break; fi
+  if curl -fsS --max-time 5 "${BASE_BARRIER}/vh/healthz" >/dev/null 2>&1; then break; fi
   sleep 1
   [ "$i" = "60" ] && fail "[restart-barrier flow] local-server did not become ready"
 done
 
 echo "==> [restart-barrier flow] waiting for detached opencode to reach ready"
 barrier_ready() {
-  curl -fsS "${BASE_BARRIER}/vh/opencode/status" 2>/dev/null \
+  curl -fsS --max-time 10 "${BASE_BARRIER}/vh/opencode/status" 2>/dev/null \
     | grep -q '"state":"ready"'
 }
 # After a kill, wait for the watcher to DETECT the death (failed + down_since)
@@ -1023,7 +1095,7 @@ barrier_ready() {
 # passes immediately and requests hit the dead port (flow-8 lesson).
 barrier_wait_down_then_ready() {
   for i in $(seq 1 30); do
-    S=$(curl -fsS "${BASE_BARRIER}/vh/opencode/status" 2>/dev/null || true)
+    S=$(curl -fsS --max-time 10 "${BASE_BARRIER}/vh/opencode/status" 2>/dev/null || true)
     echo "$S" | grep -q '"state":"failed"' && echo "$S" | grep -q '"down_since"' && break
     sleep 1
     [ "$i" = "30" ] && fail "[restart-barrier flow] watcher never flagged the death (last: $S)"
@@ -1043,7 +1115,7 @@ done
 echo "==> [restart-barrier flow] creating a session"
 BSID=""
 for i in $(seq 1 30); do
-  BSID=$(curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE_BARRIER}/oc/session" \
+  BSID=$(curl -fsS --max-time 10 -H 'X-VH-CSRF: 1' -X POST "${BASE_BARRIER}/oc/session" \
         -H 'Content-Type: application/json' -d '{"title":"restart-barrier"}' \
         | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
   [ -n "$BSID" ] && break
@@ -1053,14 +1125,14 @@ done
 echo "    session id: $BSID"
 
 barrier_post_prompt() { # $1 = messageID, $2 = text -> echoes http code
-  curl -s -o /dev/null -w "%{http_code}" -H 'X-VH-CSRF: 1' \
+  curl -s --max-time 30 -o /dev/null -w "%{http_code}" -H 'X-VH-CSRF: 1' \
     -X POST "${BASE_BARRIER}/oc/session/${BSID}/prompt_async" \
     -H 'Content-Type: application/json' \
     -d "{\"messageID\":\"$1\",\"parts\":[{\"type\":\"text\",\"text\":\"$2\"}]}" \
     || true
 }
 barrier_get_code() { # $1 = messageID -> echoes http code of the exact-ID GET
-  curl -s -o /dev/null -w "%{http_code}" \
+  curl -s --max-time 10 -o /dev/null -w "%{http_code}" \
     "${BASE_BARRIER}/oc/session/${BSID}/message/$1" 2>/dev/null || true
 }
 
@@ -1168,7 +1240,7 @@ echo "==> [restart-barrier flow] killing opencode once more for the dead-window 
 docker exec "$NAME_BARRIER" pkill -x opencode
 C_DOWN=""
 for i in $(seq 1 15); do
-  C_DOWN=$(curl -s -o /dev/null -w "%{http_code}" "${BASE_BARRIER}/oc/session" 2>/dev/null || true)
+  C_DOWN=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" "${BASE_BARRIER}/oc/session" 2>/dev/null || true)
   [ "$C_DOWN" = "502" ] && break
   sleep 0.2
 done
