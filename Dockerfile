@@ -25,6 +25,15 @@ WORKDIR /app
 COPY host-web/package.json host-web/package-lock.json ./host-web/
 RUN cd host-web && npm ci
 COPY host-web ./host-web
+# host-web/src/theme.ts imports the shared pure-data theme catalog across
+# trees (../../web/src/themeCatalog, introduced in 5d24f3f); web/ otherwise
+# lives only in the webbuild stage. Copy JUST that one file so vite can
+# resolve the import here, mirroring the Dockerfile.e2e hostbuild fix
+# (e726b4e): themeCatalog.ts is deliberately import-free (see its header),
+# so a single file is the complete dependency closure. Placed after the
+# host-web COPY (npm ci layer untouched) so catalog edits only invalidate
+# the final build layer.
+COPY web/src/themeCatalog.ts ./web/src/
 RUN cd host-web && VITE_HOST_FOLDED=1 npm run build
 
 # 3) Build the static Go binaries with BOTH freshly built SPAs embedded.
