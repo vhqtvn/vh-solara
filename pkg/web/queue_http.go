@@ -91,13 +91,20 @@ func writeQueueStoreErr(w http.ResponseWriter, err error) {
 		// integrity the operator must investigate, never a client fix).
 		writeJSON(w, http.StatusInternalServerError, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_file_corrupt"}))
 	case errors.Is(err, errQueueCustodyActive):
-		// D-F2 mixed-writer arbitration: a live custody owner dispatches this
-		// project's queue; the legacy browser claim/resolve mutation is
-		// refused with a machine-readable code so the FE can feature-detect
-		// the ownership conflict (the design's migration story: old SPAs
-		// refresh / surface the custody state rather than silently racing the
-		// single writer).
-		writeJSON(w, http.StatusConflict, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_custody_active"}))
+		// D-F2 mixed-writer arbitration + AMEND-A4 cutover recovery: a live
+		// custody owner dispatches this project's queue; the legacy browser
+		// claim/resolve mutation is refused with a machine-readable code so
+		// the FE can feature-detect the ownership conflict. The body carries
+		// the CAPABILITY payload (never a bare error): the queue remains
+		// server-held — nothing is lost — and the recovery path is
+		// upgrade-and-reconnect, never refresh-as-sole-exit (an offline or
+		// stale-SW tab must be able to render that state when it loads).
+		writeJSON(w, http.StatusConflict, jsonBytes(map[string]any{
+			"ok":      false,
+			"error":   err.Error(),
+			"code":    "queue_custody_active",
+			"custody": queueCustodyCapabilityPayload(),
+		}))
 	case errors.Is(err, errQueueArchived):
 		// 410 Gone: the session queue was archived away; the retained pointer
 		// the handler resolved via store() is now a tombstoned store (BLK-1).
@@ -110,6 +117,24 @@ func writeQueueStoreErr(w http.ResponseWriter, err error) {
 		// A malformed/unreadable queue.json surfaces as a 500 so the operator
 		// can investigate instead of silently losing items.
 		writeJSON(w, http.StatusInternalServerError, errResp(err.Error()))
+	}
+}
+
+// queueCustodyCapabilityPayload is the AMEND-A4 machine-readable capability
+// object carried by every 409 queue_custody_active refusal. The binding
+// contract: the queue remains SERVER-HELD (nothing is lost — enqueue and list
+// stay open), and the recovery path is UPGRADE-AND-RECONNECT, never
+// refresh-as-sole-exit. Old cached shells cannot be retro-fixed, but any
+// client that inspects the body gets the full state without parsing prose;
+// the slice-3+ shell additionally latches its observe-only projection off the
+// code alone and needs NO reload (verified: queue.ts claim/resolve 409
+// handlers + queueDrain's projection gate).
+func queueCustodyCapabilityPayload() map[string]any {
+	return map[string]any{
+		"dispatchOwner":   "daemon",
+		"queueHeld":       true,
+		"updateAvailable": true,
+		"guidance":        "This daemon's custody loop owns queue dispatch and holds every queued message server-side (nothing is lost; enqueue and list remain available). Reconnect with an updated app for the observe-only queue projection — a page reload is NOT required.",
 	}
 }
 

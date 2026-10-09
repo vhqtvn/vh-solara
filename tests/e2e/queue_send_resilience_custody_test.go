@@ -19,8 +19,12 @@ package e2e
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -262,4 +266,120 @@ func containsCode(body []byte, code string) bool {
 		return false
 	}
 	return e.Code == code
+}
+
+// e2eFlockHeld probes the project's custody lock from OUTSIDE the worker
+// process (flock LOCK_NB): true while the worker's drain loop holds custody,
+// false once released. A missing lock file reads as not-held.
+func e2eFlockHeld(lockPath string) bool {
+	f, err := os.Open(lockPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil
+}
+
+// waitForFlock polls the dir's custody-lock probe until cond(pass) or the
+// deadline.
+func waitForFlock(t *testing.T, dir, why string, d time.Duration, cond func(held bool) bool) {
+	t.Helper()
+	lockPath := filepath.Join(dir, ".vh-solara", "queue.custody.lock")
+	deadline := time.Now().Add(d)
+	for {
+		if cond(e2eFlockHeld(lockPath)) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for %s (lock probe)", why)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestQueueCustodyReloadProjectTeardownAndReplacementLoop (slice 5, the owed
+// reload-path e2e): with daemon dispatch ON, /vh/reload-project on a
+// NON-DEFAULT project must RETURN promptly (the pre-slice-5 shape hung in
+// stopQueueDrainLoop waiting on a done that only Shutdown could close),
+// RELEASE the custody flock, and let a REPLACEMENT loop — started by the next
+// project open — retake custody and dispatch newly enqueued work. Exactly one
+// prompt arrival per enqueued item (zero duplicates) is asserted throughout.
+func TestQueueCustodyReloadProjectTeardownAndReplacementLoop(t *testing.T) {
+	armCustodyForE2E(t)
+
+	dir := filepath.Join(t.TempDir(), "cust-reload")
+	openProjectForDir(t, dir) // aggFor(dir) → the dir's drain loop starts (flag on)
+	sid := fakeSessionForDir(dir)
+
+	// The loop owns custody (cross-process flock probe).
+	waitForFlock(t, dir, "the drain loop's custody acquisition", 10*time.Second, func(held bool) bool { return held })
+
+	baseArrivals := cluster.Fake.PromptArrivals(sid)
+
+	// THE RELOAD, on a bounded client — the red signal pre-slice-5 was this
+	// request never returning (client timeout) and the flock staying wedged.
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, cluster.WorkerVHURL+"/vh/reload-project?dir="+url.QueryEscape(dir), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeaderName, csrfHeaderValue)
+	rresp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("/vh/reload-project did not return (drain-loop teardown hang): %v", err)
+	}
+	payload, _ := io.ReadAll(rresp.Body)
+	rresp.Body.Close()
+	if rresp.StatusCode != http.StatusOK {
+		t.Fatalf("reload-project: want 200, got %d: %s", rresp.StatusCode, payload)
+	}
+
+	// Custody RELEASED: the flock probe goes free and STAYS free while no
+	// replacement loop runs (settled probe — no retrake race window).
+	waitForFlock(t, dir, "custody release after reload teardown", 5*time.Second, func(held bool) bool { return !held })
+	time.Sleep(150 * time.Millisecond)
+	if e2eFlockHeld(filepath.Join(dir, ".vh-solara", "queue.custody.lock")) {
+		t.Fatal("custody flock re-appeared with no project open — a replacement loop started unbidden")
+	}
+
+	// New work + a fresh project open: the REPLACEMENT loop retakes custody
+	// and dispatches it.
+	resp, body := postJSON(t, queuePath(sid, "", dir), map[string]any{
+		"text":       "post-reload probe",
+		"intentId":   "intent-reload-1",
+		"sendConfig": map[string]any{"agent": "build"},
+	})
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("enqueue: want 200, got resp=%v body=%s", resp, body)
+	}
+	openProjectForDir(t, dir)
+	waitForFlock(t, dir, "the replacement loop's custody acquisition", 10*time.Second, func(held bool) bool { return held })
+
+	deadline := time.Now().Add(15 * time.Second)
+	for cluster.Fake.PromptArrivals(sid)-baseArrivals < 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("replacement loop never dispatched: arrivals delta=%d", cluster.Fake.PromptArrivals(sid)-baseArrivals)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Settle: exactly ONE arrival for the item, converged to sent by the
+	// exact-ID reconcile (accepted 204 → persisted → GET resolves — the
+	// happy-path convergence under the replacement loop).
+	var items []custodyItemView
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		items = listCustodyQueue(t, sid, dir)
+		if len(items) == 1 && items[0].State == "sent" {
+			break
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	if got := cluster.Fake.PromptArrivals(sid) - baseArrivals; got != 1 {
+		t.Fatalf("PromptArrivals delta=%d, want exactly 1 (no duplicate dispatch across the reload cutover)", got)
+	}
+	if len(items) != 1 || items[0].State != "sent" {
+		t.Fatalf("post-reload item = %+v, want one item reconciled to sent", items)
+	}
 }

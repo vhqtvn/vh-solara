@@ -835,11 +835,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.bgCancel() // idempotent; never reassigned after NewServer
 	s.stopAllPermissionWatchers()
 	// Stop the per-dir drain loops (slice 2b phase 2) BEFORE the aggregator
-	// teardown: bgCancel already signalled them, and stopQueueDrainLoop only
-	// WAITS for the exit (the loops' own aggregator lookups take aggMu, so
-	// waiting must happen outside stopServerOwnedAggregators' aggMu hold —
-	// this is that outside point). Non-default loops also retire their
-	// lifecycleWG entries, which the wait below awaits.
+	// teardown: bgCancel already signalled them AND stopAllQueueDrainLoops
+	// fires each loop's retained per-loop cancel, then waits for the exit
+	// (the loops' own aggregator lookups take aggMu, so waiting must happen
+	// outside stopServerOwnedAggregators' aggMu hold — this is that outside
+	// point). Non-default loops also retire their lifecycleWG entries, which
+	// the wait below awaits.
 	s.stopAllQueueDrainLoops()
 	s.stopServerOwnedAggregators()
 	waitDone := make(chan struct{})
@@ -875,9 +876,11 @@ func (s *Server) stopAllPermissionWatchers() {
 	s.watcherMu.Unlock()
 }
 
-// stopAllQueueDrainLoops signals every registered drain loop to stop and
-// waits for each to exit + release custody. Shutdown-only (reload uses the
-// per-dir stopQueueDrainLoop). Safe on an empty registry.
+// stopAllQueueDrainLoops signals every registered drain loop to stop — each
+// loop's RETAINED per-loop cancel first, then the done wait — so the exit +
+// custody release do not depend solely on bgCtx having been cancelled.
+// Shutdown-only (reload uses the per-dir stopQueueDrainLoop). Safe on an
+// empty registry.
 func (s *Server) stopAllQueueDrainLoops() {
 	s.drainLoopsMu.Lock()
 	loops := make([]*queueDrainLoop, 0, len(s.drainLoops))
@@ -887,6 +890,9 @@ func (s *Server) stopAllQueueDrainLoops() {
 	}
 	s.drainLoopsMu.Unlock()
 	for _, l := range loops {
+		if l.cancel != nil {
+			l.cancel()
+		}
 		<-l.done
 	}
 }

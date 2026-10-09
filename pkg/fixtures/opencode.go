@@ -1472,6 +1472,14 @@ func (f *FakeOpenCode) Handler() http.Handler {
 				"patch": "@@ -1,3 +1,4 @@\n func Parse(s string) (*AST, error) {\n-\treturn parse(s)\n+\ttok := tokenize(s)\n+\treturn parse(tok)\n }"},
 		})
 	})
+	// /instance/dispose (slice 5, additive): reload-project's upstream
+	// eviction call. A 204 lets the reload proceed to its aggregator
+	// teardown — required to exercise the drain-loop teardown path in the
+	// e2e cluster (real opencode accepts dispose; the fake previously 404'd,
+	// surfacing as a reload 502 before teardown).
+	mux.HandleFunc("/instance/dispose", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("/fixture/reset", f.handleFixtureReset)
 	mux.HandleFunc("/fixture/busy", f.handleFixtureBusy)
 	mux.HandleFunc("/fixture/slow-tail", f.handleFixtureSlowTail)

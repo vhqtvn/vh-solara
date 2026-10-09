@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,7 +46,47 @@ func refusedBody(t *testing.T, resp *http.Response) map[string]any {
 	if body["ok"] != false {
 		t.Fatalf("refusal ok = %v, want false", body["ok"])
 	}
+	if _, ok := body["error"].(string); !ok || body["error"] == "" {
+		t.Fatalf("refusal error = %v, want a non-empty string (the OLD-TAB shape: a legacy client parsing only ok/error/code must keep working)", body["error"])
+	}
 	return body
+}
+
+// assertCustodyCapabilityPayload pins the AMEND-A4 cutover contract on a
+// 409 queue_custody_active body: the refusal carries a machine-readable
+// CAPABILITY payload — never a bare error. The queue remains server-held
+// (nothing lost), the daemon is the dispatch owner, an updated client exists
+// (the receiving client spoke the pre-custody claim/resolve protocol), and
+// the guidance names upgrade-and-reconnect — refresh is never the sole exit.
+func assertCustodyCapabilityPayload(t *testing.T, body map[string]any) {
+	t.Helper()
+	cust, ok := body["custody"].(map[string]any)
+	if !ok {
+		t.Fatalf("409 body carries no capability payload: %v (AMEND-A4: never a bare error)", body)
+	}
+	if cust["dispatchOwner"] != "daemon" {
+		t.Fatalf("custody.dispatchOwner = %v, want \"daemon\"", cust["dispatchOwner"])
+	}
+	if cust["queueHeld"] != true {
+		t.Fatalf("custody.queueHeld = %v, want true (the queue remains server-held — nothing lost)", cust["queueHeld"])
+	}
+	if cust["updateAvailable"] != true {
+		t.Fatalf("custody.updateAvailable = %v, want true (the claiming client predates the custody era)", cust["updateAvailable"])
+	}
+	g, ok := cust["guidance"].(string)
+	if !ok || g == "" {
+		t.Fatalf("custody.guidance = %v, want non-empty text", cust["guidance"])
+	}
+	// The recovery path is upgrade-and-reconnect — a RELOAD must not be the
+	// prescribed sole exit (offline / stale-SW tabs cannot rely on one).
+	for _, forbidden := range []string{"refresh immediately", "reload required"} {
+		if strings.Contains(strings.ToLower(g), forbidden) {
+			t.Fatalf("custody.guidance prescribes a reload as the exit: %q", g)
+		}
+	}
+	if !strings.Contains(g, "reload is NOT required") {
+		t.Fatalf("custody.guidance must state the no-reload posture explicitly: %q", g)
+	}
 }
 
 func TestQueueHTTPClaimResolveRefusedWhileCustodyHeld(t *testing.T) {
@@ -92,11 +133,13 @@ func TestQueueHTTPClaimResolveRefusedWhileCustodyHeld(t *testing.T) {
 	}
 
 	// Claim: REFUSED — the custody owner is this queue's single dispatcher.
-	refusedBody(t, csrfPost(t, web.URL+"/vh/session/s1/queue/claim", map[string]any{}))
+	claimRefusal := refusedBody(t, csrfPost(t, web.URL+"/vh/session/s1/queue/claim", map[string]any{}))
+	assertCustodyCapabilityPayload(t, claimRefusal)
 
 	// Resolve: REFUSED, BEFORE any store access (a nonexistent item id still
 	// yields the arbitration error, proving the guard precedes the store).
-	refusedBody(t, csrfPost(t, web.URL+"/vh/session/s1/queue/item-does-not-exist/resolve", map[string]any{"state": "sent"}))
+	resolveRefusal := refusedBody(t, csrfPost(t, web.URL+"/vh/session/s1/queue/item-does-not-exist/resolve", map[string]any{"state": "sent"}))
+	assertCustodyCapabilityPayload(t, resolveRefusal)
 
 	// After the custody owner releases, the legacy routes work again.
 	tok.Release()

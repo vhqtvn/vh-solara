@@ -1315,10 +1315,11 @@ func (s *sessionQueueStore) Remove(id string) error {
 // caller wins a given item. Returns (QueueItem{}, nil) when no pending item
 // exists.
 //
-// This is the LEGACY browser-facing claim — unfenced and unchanged
-// (send-net-resilience slice 2a: browser dispatch remains the production
-// path while daemonDispatchCapable is false). The custody-gated variant is
-// ClaimForCustody (queue_custody.go).
+// This is the LEGACY browser-facing claim — unfenced and unchanged (it
+// stays the production dispatch path while the daemon-dispatch capability
+// is off: SetDaemonDispatchEnabled / --daemon-dispatch, default OFF; the
+// drain loop is the custody-era dispatcher when the flag is on). The
+// custody-gated variant is ClaimForCustody (queue_custody.go).
 func (s *sessionQueueStore) Claim() (QueueItem, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

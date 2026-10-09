@@ -89,6 +89,18 @@ const (
 	reconcileTerminalMismatchDetailFmt  = "Reconcile terminal: the correlation id did not map to this session's user message after %d attempt(s). Manual review advised."
 
 	reconcileTerminal400Detail = "Reconcile terminal: OpenCode rejected the message id (HTTP 400) — caller bug; not retrying."
+
+	// SLICE 5 (send-net-resilience) legacy migration (review B-F1): appended
+	// to the class detail when a ClaimGeneration==0 (pre-custody-era) item
+	// budget-terminalizes — the era-marker gate in bumpReconcileAttempt's
+	// default branch is the ONLY writer, so "Pre-custody" is exactly
+	// accurate. Such an item's dispatch predates the custody journal, so
+	// only the exact-ID GET ever spoke for it and it stayed negative: the
+	// designed `ambiguous_absent` posture (design.md "Legacy `unknown` chips
+	// ... upgrade to `ambiguous_absent`, GET-only, never auto-resent").
+	// Custody-era journalless shapes (claimed, interrupted before
+	// BeginDispatchAttempt) are NOT legacy and never get this suffix.
+	reconcileTerminalLegacySuffix = " Pre-custody message (no dispatch journal): whether it arrived cannot be determined; it is never re-sent automatically."
 )
 
 // opencodeMessageResolver looks up a single OpenCode message by exact id. It is
@@ -399,7 +411,33 @@ func (s *sessionQueueStore) bumpReconcileAttempt(id string, genericDetailFmt, re
 				s.items[i].Detail = journalAwareTerminalDetail(s.items[i], s.items[i].ReconcileAttempts)
 				s.items[i].AmbiguousDelivery = true
 			default:
-				s.items[i].Detail = fmt.Sprintf(genericDetailFmt, s.items[i].ReconcileAttempts)
+				// SLICE 5 (send-net-resilience) — the scheduled legacy
+				// migration (review B-F1; design.md "Legacy `unknown` chips
+				// ... upgrade to `ambiguous_absent`, GET-only, never
+				// auto-resent"), gated on the ERA MARKER (round-2 re-review
+				// b-F1/F2): the marker + pre-custody suffix apply ONLY to
+				// ClaimGeneration==0 items — the pre-custody-era messages
+				// whose dispatch predates the custody journal entirely.
+				// Journallessness ALONE no longer suffices: a custody-claimed
+				// item interrupted BEFORE BeginDispatchAttempt (ClaimGeneration
+				// != 0, zero Attempts, unfenced) also reaches this branch and
+				// is NOT legacy — claim→begin is strictly sequential, so its
+				// durable shape PROVES the POST never began (the certified
+				// classifier's classNeverStarted), and the ladder re-opens a
+				// passively-terminalized C1 item for fence-gated redelivery
+				// (snapshotCertifyCandidates). Stamping it ambiguous_absent
+				// would misrepresent a certified class as unknowable and, with
+				// a user replacement-send (new intentID) plus the C1
+				// redelivery, risk TWO user messages for a provably-unstarted
+				// original. Such custody-era journalless shapes terminalize
+				// with the GENERIC detail only (fail-closed, GET-only, NEVER
+				// resent by the reconciler) and remain C1-recoverable.
+				if s.items[i].ClaimGeneration == 0 {
+					s.items[i].Detail = fmt.Sprintf(genericDetailFmt, s.items[i].ReconcileAttempts) + reconcileTerminalLegacySuffix
+					s.items[i].AmbiguousDelivery = true
+				} else {
+					s.items[i].Detail = fmt.Sprintf(genericDetailFmt, s.items[i].ReconcileAttempts)
+				}
 			}
 		}
 		if err := s.save(); err != nil {

@@ -49,12 +49,14 @@ package web
 // owner: fail-closed while it lives (no split-brain), stale-lock reacquire
 // after it dies (the kernel releases the flock).
 //
-// EXIT CONDITIONS: the server's bgCtx cancel (Shutdown), the capability
-// being switched off at runtime (tests flip it off; production never does),
-// a Reload-project teardown of this dir's aggregator, or a compare-and-fence
-// rejection (a newer custody owner exists — this loop must never dispatch
-// again under the stale epoch; the operator or a later acquisition decides
-// what happens next).
+// EXIT CONDITIONS: the server's bgCtx cancel (Shutdown), the loop's OWN
+// per-loop cancel (stopQueueDrainLoop — the reload-project teardown path —
+// and stopAllQueueDrainLoops at Shutdown), the capability being switched off
+// at runtime (tests flip it off; production never does), a Reload-project
+// teardown of this dir's aggregator, or a compare-and-fence rejection (a
+// newer custody owner exists — this loop must never dispatch again under the
+// stale epoch; the operator or a later acquisition decides what happens
+// next).
 
 import (
 	"context"
@@ -120,13 +122,15 @@ func currentDrainTick() time.Duration {
 
 // queueDrainLoop is ONE project's dispatcher. Owned by the Server
 // (s.drainLoops, keyed by dir); runs on a bgCtx-scoped child context so
-// Shutdown reaches it.
+// Shutdown reaches it, with a RETAINED per-loop cancel so teardown callers
+// that do NOT own bgCtx (the reload-project path) can still stop it.
 type queueDrainLoop struct {
-	srv  *Server
-	dir  string
-	root string
-	tok  *QueueCustody
-	done chan struct{} // closed when the loop goroutine has fully exited
+	srv    *Server
+	dir    string
+	root   string
+	tok    *QueueCustody
+	cancel context.CancelFunc // per-loop cancellation (nil for ad-hoc test loops)
+	done   chan struct{}      // closed when the loop goroutine has fully exited
 }
 
 // maybeStartQueueDrainLoop starts this dir's drain loop iff daemon dispatch
@@ -162,6 +166,12 @@ func (s *Server) maybeStartQueueDrainLoop(dir string) {
 		s.lifecycleWG.Add(1)
 	}
 	ctx, cancel := context.WithCancel(s.bgCtx)
+	// RETAIN the per-loop cancel (the armed defer's fix): the loop ctx
+	// derives from bgCtx, which reload-project does NOT cancel — without a
+	// retained cancel, stopQueueDrainLoop's <-done wait never completes,
+	// /vh/reload-project hangs, and the custody flock stays wedged until
+	// process exit.
+	l.cancel = cancel
 	go func() {
 		l.run(ctx)
 		cancel()
@@ -169,9 +179,11 @@ func (s *Server) maybeStartQueueDrainLoop(dir string) {
 }
 
 // stopQueueDrainLoop signals the dir's loop to stop (if any) and waits for
-// its goroutine to finish and release custody. MUST be called WITHOUT aggMu
-// held (the loop's tick takes aggMu via aggForExisting, so waiting under
-// aggMu would deadlock). Safe to call repeatedly / for unknown dirs.
+// its goroutine to finish and release custody: the retained per-loop cancel
+// fires FIRST (reload-project must not depend on the server-wide bgCtx),
+// then the wait. MUST be called WITHOUT aggMu held (the loop's tick takes
+// aggMu via aggForExisting, so waiting under aggMu would deadlock). Safe to
+// call repeatedly / for unknown dirs.
 func (s *Server) stopQueueDrainLoop(dir string) {
 	s.drainLoopsMu.Lock()
 	l, ok := s.drainLoops[dir]
@@ -181,6 +193,9 @@ func (s *Server) stopQueueDrainLoop(dir string) {
 	s.drainLoopsMu.Unlock()
 	if !ok {
 		return
+	}
+	if l.cancel != nil {
+		l.cancel()
 	}
 	<-l.done
 }

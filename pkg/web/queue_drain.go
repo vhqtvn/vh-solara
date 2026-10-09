@@ -1,10 +1,12 @@
 package web
 
 // Daemon-owned dispatch attempt executor — the attempt-journal WRITER
-// (send-net-resilience slice 2a). Behind the capability gate: daemon
-// dispatch ships OFF (daemonDispatchCapable == false, no production caller);
-// this file is the testable unit the later drain loop will drive when the
-// flag flips. It NEVER runs as part of the legacy browser dispatch path.
+// (send-net-resilience slice 2a). Behind the capability gate
+// (SetDaemonDispatchEnabled — the --daemon-dispatch opt-in, default OFF);
+// the DRAIN LOOP (queue_drain_loop.go, slice 2b phase 2) is this file's
+// production driver when the flag is on. It NEVER runs as part of the
+// legacy browser dispatch path (which stays the production path while the
+// flag is off).
 //
 // JOURNAL PROTOCOL (one dispatch attempt = three durable writes around one
 // upstream POST; every write passes the custody compare-and-fence gate):

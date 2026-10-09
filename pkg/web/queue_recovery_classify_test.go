@@ -609,7 +609,10 @@ func TestQueueSessionErrorSignalPipeline(t *testing.T) {
 
 // TestAmbiguousTerminalStampsMarker: the passive bump path terminalizing a
 // journal-bearing item sets the durable AmbiguousDelivery marker (the FE's
-// slice-3 render input); the generic (no-journal) path does not.
+// slice-3 render input); since the slice-5 legacy migration (review B-F1)
+// the no-journal (pre-custody legacy) path stamps the SAME marker — legacy
+// unknown items upgrade to the distinct ambiguous_absent surface — with the
+// pre-custody detail framing.
 func TestAmbiguousTerminalStampsMarker(t *testing.T) {
 	jour := &sessionQueueStore{path: queuePath(t.TempDir(), "jour")}
 	gen := &sessionQueueStore{path: queuePath(t.TempDir(), "gen")}
@@ -640,7 +643,10 @@ func TestAmbiguousTerminalStampsMarker(t *testing.T) {
 	if len(items) != 1 || !items[0].ReconcileTerminal {
 		t.Fatalf("legacy terminal = %+v, want terminal", items)
 	}
-	if items[0].AmbiguousDelivery {
-		t.Fatalf("legacy (no-journal) item got the ambiguous marker: %+v — uncertifiable items are not class-4", items[0])
+	if !items[0].AmbiguousDelivery {
+		t.Fatalf("legacy (no-journal) item missing the ambiguous marker: %+v — slice 5 migrates legacy unknown items to ambiguous_absent (distinct surface, GET-only, never resent)", items[0])
+	}
+	if !strings.Contains(items[0].Detail, "Pre-custody message") {
+		t.Fatalf("legacy terminal detail = %q, want the pre-custody ambiguous framing", items[0].Detail)
 	}
 }

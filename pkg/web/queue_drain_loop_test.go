@@ -10,8 +10,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -33,6 +35,7 @@ type fakeOCForDrain struct {
 	promptSeen int
 	bodies     []map[string]any
 	known      map[string]bool // messageID -> 200-exact
+	disposed   int
 	srv        *httptest.Server
 }
 
@@ -40,6 +43,15 @@ func newFakeOCForDrain(t *testing.T) *fakeOCForDrain {
 	t.Helper()
 	f := &fakeOCForDrain{known: map[string]bool{}}
 	mux := http.NewServeMux()
+	// /instance/dispose: reload-project's upstream eviction (a 204 lets the
+	// handler proceed to the aggregator teardown — the drain-loop reload
+	// test's precondition).
+	mux.HandleFunc("/instance/dispose", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.disposed++
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("/session/{id}/prompt_async", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
@@ -382,5 +394,228 @@ func TestDrainLoopFenceExitsLoop(t *testing.T) {
 	}
 	if len(items[0].Attempts) != 1 || items[0].Attempts[0].TransportClass != "" {
 		t.Fatalf("journal after fenced exit = %+v, want exactly one OPEN attempt", items[0].Attempts)
+	}
+}
+
+// TestDrainLoopReloadProjectTeardownReleasesCustody (the armed BLOCK defer —
+// slice 5): with daemon dispatch ON, reloading a NON-DEFAULT project must tear
+// that dir's drain loop down PROMPTLY — the per-loop cancellation fires, the
+// loop goroutine exits, custody (the flock) is RELEASED, and the replacement
+// loop a fresh project open starts can acquire and dispatch. The pre-fix
+// shape (why this was a BLOCK defer): the loop's ctx derived only from the
+// server bgCtx, which reload does not cancel, so stopQueueDrainLoop's
+// <-l.done wait never completed — /vh/reload-project hung and the custody
+// flock stayed wedged until process exit.
+func TestDrainLoopReloadProjectTeardownReleasesCustody(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("flock semantics — Linux only")
+	}
+	f := newFakeOCForDrain(t)
+	srv, _ := newDrainTestServer(t, f)
+	webURL := srvLocalURL(t, srv)
+
+	// A NON-DEFAULT project dir — reload-project's teardown branch applies
+	// only to dir != "" (the default's loop is daemon/process-lifetime).
+	dir := t.TempDir()
+	root, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Open the project through real HTTP (aggFor(dir) on first touch →
+	// maybeStartQueueDrainLoop registers this dir's loop).
+	resp, err := http.Get(webURL + "/vh/snapshot?dir=" + url.QueryEscape(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// The loop acquires custody: wait for the flock to be HELD (the probe
+	// the D-F2 arbitration uses — proof a live custody owner exists).
+	lockPath := filepath.Join(root, ".vh-solara", custodyLockFileRel)
+	waitForDrain(t, 5*time.Second, "the drain loop's custody acquisition", func() bool {
+		return custodyLockHeld(lockPath)
+	})
+
+	// THE RELOAD, on a bounded client: the pre-fix handler never returned
+	// (stopQueueDrainLoop waited on a done that only bgCtx could close) —
+	// this request is the red signal.
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, webURL+"/vh/reload-project?dir="+url.QueryEscape(dir), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(csrfHeader, "1")
+	rresp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("/vh/reload-project did not return (drain-loop teardown hang): %v", err)
+	}
+	defer rresp.Body.Close()
+	if rresp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(rresp.Body)
+		t.Fatalf("reload-project status = %d, want 200: %s", rresp.StatusCode, b)
+	}
+
+	// Custody RELEASED: the flock probe reports free and the registry entry
+	// is gone (a second owner may now take the project).
+	waitForDrain(t, 5*time.Second, "custody release after teardown", func() bool {
+		return !custodyLockHeld(lockPath)
+	})
+	srv.drainLoopsMu.Lock()
+	_, still := srv.drainLoops[dir]
+	srv.drainLoopsMu.Unlock()
+	if still {
+		t.Fatal("drain loop still registered after reload-project teardown")
+	}
+
+	// A pending item for the REPLACEMENT loop (enqueued after the teardown,
+	// so the first loop never saw it).
+	st := srv.queues.store(root, "reload-sid")
+	if _, err := st.Enqueue("post-reload send", nil, QueueSendConfig{Agent: "build"}, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-open the project: aggFor builds a fresh aggregator and starts the
+	// REPLACEMENT loop, which acquires custody (the released flock is
+	// retakeable — the wedge is gone) and dispatches the item.
+	resp2, err := http.Get(webURL + "/vh/snapshot?dir=" + url.QueryEscape(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	waitForDrain(t, 5*time.Second, "the replacement loop's custody acquisition", func() bool {
+		return custodyLockHeld(lockPath)
+	})
+	waitForDrain(t, 5*time.Second, "the replacement loop's dispatch", func() bool {
+		return f.arrivals() >= 1
+	})
+	waitForDrain(t, 5*time.Second, "the enqueued item to leave pending", func() bool {
+		items, err := st.List()
+		return err == nil && len(items) == 1 && items[0].State == QueueDispatching
+	})
+}
+
+// TestDrainLoopLeavesLegacyItemsToGetOnlyReconcile (slice 5, legacy `unknown`
+// migration pin): a PRE-custody-era item (legacy browser claim:
+// ClaimGeneration==0, no attempt journal) sharing a queue with a custody-era
+// item under a LIVE drain loop. The binding posture (design.md "Legacy
+// unknown chips"): legacy items are UNCERTIFIABLE — the classifier never
+// requeues them (classNone), the loop never claims/requeues them, and their
+// ONLY convergence is the passive exact-ID reconcile on the List/load path,
+// terminalizing GET-only (fail-closed, NEVER resent — zero auto re-POST) as
+// the DISTINCT ambiguous_absent surface (durable AmbiguousDelivery marker —
+// the slice-5 migration, review B-F1; journal-bearing stamping is pinned by
+// TestAmbiguousTerminalStampsMarker); this test pins the MIXED-ERA runtime
+// behavior under the real loop.
+func TestDrainLoopLeavesLegacyItemsToGetOnlyReconcile(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("flock semantics — Linux only")
+	}
+	f := newFakeOCForDrain(t)
+	srv, root := newDrainTestServer(t, f)
+	webURL := srvLocalURL(t, srv)
+
+	SetStaleDispatchThresholdForTest(80 * time.Millisecond)
+	t.Cleanup(func() { SetStaleDispatchThresholdForTest(0) })
+
+	st := srv.queues.store(root, "mixed")
+
+	// Seed the LEGACY item directly into the store (the pre-custody-era
+	// stuck shape the 2026-10-07 incident left behind): a browser claim
+	// (ClaimGeneration=0, no attempt journal) whose dispatch went silent and
+	// whose DispatchStartedAt is already deep-stale. The live loop must
+	// NEVER touch it — not via oldestDispatchable (dispatching without a
+	// RequeuePending marker is not loop work) and not via the certified pass
+	// (ClaimGeneration==0 → uncertifiable).
+	st.mu.Lock()
+	if err := st.load(); err != nil {
+		t.Fatal(err)
+	}
+	st.items = append(st.items, QueueItem{
+		ID:                "legacy-1",
+		Order:             1,
+		State:             QueueDispatching,
+		Text:              "legacy stuck",
+		SendConfig:        QueueSendConfig{Agent: "build"},
+		OpencodeMsgID:     "legacy-mid-404",
+		DispatchStartedAt: time.Now().Add(-time.Hour).UnixMilli(),
+	})
+	if err := st.save(); err != nil {
+		t.Fatal(err)
+	}
+	st.loaded = true
+	st.mu.Unlock()
+
+	// The CUSTODY-era item: the live loop claims + dispatches it.
+	if _, err := st.Enqueue("custody era", nil, QueueSendConfig{Agent: "build"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	waitForDrain(t, 10*time.Second, "the loop's dispatch of the custody-era item", func() bool {
+		return f.arrivals() == 1
+	})
+
+	// Drive the List/load path: the stale legacy dispatching item
+	// stale-recovers to `unknown` (recoverStaleDispatchingLocked) and the
+	// list-spawned passive reconciler GETs its exact id — 404 every pass —
+	// until the bounded budget terminalizes it GET-only.
+	waitForDrain(t, 10*time.Second, "the legacy item's GET-only reconcile terminal", func() bool {
+		resp, err := http.Get(webURL + "/vh/session/mixed/queue")
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		items, err := st.List()
+		if err != nil {
+			return false
+		}
+		for _, it := range items {
+			if it.ID == "legacy-1" {
+				return it.State == QueueUnknown && it.ReconcileTerminal
+			}
+		}
+		return false
+	})
+
+	// NEVER resent — exactly ONE prompt arrival (the custody-era item), and
+	// the legacy correlation id was never POSTed by any path.
+	if n := f.arrivals(); n != 1 {
+		t.Fatalf("prompt arrivals = %d, want exactly 1 (the custody item only — legacy items are never resent)", n)
+	}
+	ids := f.messageIDs()
+	items, err := st.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy, custody QueueItem
+	for _, it := range items {
+		switch it.ID {
+		case "legacy-1":
+			legacy = it
+		default:
+			custody = it
+		}
+	}
+	if len(ids) != 1 || ids[0] == "" || ids[0] != custody.OpencodeMsgID {
+		t.Fatalf("prompt messageIDs = %v, want exactly the custody item's claim-minted id (%q); the legacy id %q must never be re-POSTed", ids, custody.OpencodeMsgID, legacy.OpencodeMsgID)
+	}
+	// The legacy item's terminal is the designed DISTINCT ambiguous_absent
+	// surface (SLICE 5 migration, review B-F1: design.md "Legacy `unknown`
+	// chips ... upgrade to `ambiguous_absent`, GET-only, never auto-resent"):
+	// the durable AmbiguousDelivery marker is stamped by the passive
+	// reconciler's budget terminalization — the FE's slice-3 ambiguous chip
+	// (verbatim warning + Wait/Copy-text/Send-new-message) keys on the marker
+	// alone — while the item stays GET-only, never re-sent, and the era
+	// markers stay intact (never claimed/journaled by the custody loop).
+	if !legacy.AmbiguousDelivery {
+		t.Fatalf("legacy terminal lacks the ambiguous_absent marker: %+v — slice 5 migrates legacy unknown items onto the distinct ambiguous surface", legacy)
+	}
+	if !strings.Contains(legacy.Detail, "Reconcile terminal") {
+		t.Fatalf("legacy terminal detail = %q, want the GET-only reconcile terminal text", legacy.Detail)
+	}
+	if !strings.Contains(legacy.Detail, "Pre-custody message") {
+		t.Fatalf("legacy terminal detail = %q, want the pre-custody ambiguous framing (delivery could not be confirmed; never re-sent)", legacy.Detail)
+	}
+	if legacy.ClaimGeneration != 0 || len(legacy.Attempts) != 0 {
+		t.Fatalf("legacy item was touched by the custody era: ClaimGeneration=%d Attempts=%d", legacy.ClaimGeneration, len(legacy.Attempts))
 	}
 }

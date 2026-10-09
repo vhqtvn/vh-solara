@@ -55,6 +55,16 @@ func main() {
 	// the REAL event path). Test infrastructure only; the default (unset)
 	// behavior is unchanged.
 	fakeOnly := flag.Bool("fake-only", false, "serve only the fake OpenCode API on -addr (no aggregator/web/SPA)")
+	// daemonDispatch (send-net-resilience slice 5): run the fixture under
+	// REAL queue custody — the drain loop owns dispatch, claim/resolve are
+	// 409-arbitrated, and the SPA's observe-only projection is exercisable
+	// in web e2e without route interception. The fixture's OpenCode is an
+	// EXTERNAL loopback server, so the restart causality barrier is NOT
+	// certified here (custody, C1/C2 recovery, arbitration, and the C4
+	// ambiguous path all work; C3 stays excluded — same topology honesty as
+	// cmd/local-server.go's external-mode refusal). Default off: the shared
+	// mutable e2e fixture keeps the browser-dispatch posture.
+	daemonDispatch := flag.Bool("daemon-dispatch", false, "EXPERIMENTAL: the fixture server's daemon takes custody-fenced ownership of queue dispatch (external-OC topology: no restart-barrier certification). Default off")
 	flag.Parse()
 
 	// Resolve + create the consolidated demo project directory BEFORE seeding
@@ -122,6 +132,10 @@ func main() {
 	srv, err := web.NewServer(agg, ocURL, 4096)
 	if err != nil {
 		log.Fatalf("build web server: %v", err)
+	}
+	if *daemonDispatch {
+		web.SetDaemonDispatchEnabled(true)
+		log.Printf("fixture: daemon dispatch ENABLED (queue custody active; external-OC topology — restart barrier not certified)")
 	}
 	// The fixture server backs the WEB e2e lane (web/tests/e2e), which targets
 	// the SINGLE-SERVER SPA at `/`. The production fold mounts the host shell at

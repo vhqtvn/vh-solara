@@ -564,8 +564,12 @@ func TestReconcile_RestartFencedExactMatchStillResolvesSent(t *testing.T) {
 }
 
 // TestReconcile_Unfenced404KeepsGenericDetail: regression pin — WITHOUT the
-// fence marker, the persistent-404 terminal keeps the exact generic text
-// (the detector and its explanation for unrelated 404s are unchanged).
+// fence marker, the persistent-404 terminal keeps the generic 404 text as
+// its class evidence (the detector and its explanation for unrelated 404s
+// are unchanged) — and, since the slice-5 legacy migration (review B-F1),
+// appends the pre-custody framing and stamps the ambiguous_absent marker
+// (a no-journal unfenced item IS a legacy item; the FE's ambiguous chip
+// keys on the marker alone).
 func TestReconcile_Unfenced404KeepsGenericDetail(t *testing.T) {
 	s, it := newStuckUnknownStore(t, "s1", "hello")
 	r := newFakeResolver()
@@ -579,9 +583,12 @@ func TestReconcile_Unfenced404KeepsGenericDetail(t *testing.T) {
 	if !got.ReconcileTerminal {
 		t.Fatalf("unfenced persistent 404 must terminalize (pre-fence behavior)")
 	}
-	want := fmt.Sprintf(reconcileTerminal404DetailFmt, reconcileMaxAttempts)
+	want := fmt.Sprintf(reconcileTerminal404DetailFmt, reconcileMaxAttempts) + reconcileTerminalLegacySuffix
 	if got.Detail != want {
-		t.Fatalf("unfenced terminal detail = %q,\nwant exact GENERIC text: %q", got.Detail, want)
+		t.Fatalf("unfenced terminal detail = %q,\nwant generic 404 text + pre-custody suffix: %q", got.Detail, want)
+	}
+	if !got.AmbiguousDelivery {
+		t.Fatalf("unfenced legacy terminal must carry the ambiguous_absent marker (slice-5 migration): %+v", got)
 	}
 }
 
@@ -757,5 +764,103 @@ func TestQueueMsgReconcile_JournalBearingClassifiedAttemptTerminal(t *testing.T)
 	s.reconcileMessageIDs("s1", r.lookup, t0.Add(4*(reconcileThreshold+time.Second)))
 	if r.count() != 3 {
 		t.Fatalf("resolver calls after terminal = %d, want 3 (never resent)", r.count())
+	}
+}
+
+// newCustodyClaimedJournallessUnknownStore builds the C1 custody shape that
+// reaches bumpReconcileAttempt's DEFAULT terminal branch and is NOT legacy:
+// ClaimForCustody durably stamped the era marker (ClaimGeneration != 0), but
+// the daemon was interrupted BEFORE BeginDispatchAttempt journaled any
+// attempt record — zero Attempts, no restart fence — and the item then aged
+// to `unknown` exactly as stale recovery produces. Claim→begin is strictly
+// sequential, so this durable shape PROVES the POST never began (the
+// certified classifier's classNeverStarted). Linux-gated (flock custody).
+func newCustodyClaimedJournallessUnknownStore(t *testing.T, sid, text string) (*sessionQueueStore, QueueItem) {
+	t.Helper()
+	root := custodyTestRoot(t)
+	s := &sessionQueueStore{path: queuePath(root, sid)}
+	tok, err := AcquireQueueCustody(root)
+	if err != nil {
+		t.Fatalf("acquire custody: %v", err)
+	}
+	defer tok.Release()
+	mustEnqueue(t, s, text)
+	claimed, won, err := s.ClaimForCustody(tok)
+	if err != nil || !won {
+		t.Fatalf("custody claim: err=%v won=%v", err, won)
+	}
+	// Deliberately NO BeginDispatchAttempt — the interrupted-before-journal
+	// shape is the entire point of this fixture.
+	if _, err := s.Resolve(claimed.ID, QueueUnknown, "stuck"); err != nil {
+		t.Fatalf("Resolve(unknown): %v", err)
+	}
+	return s, claimed
+}
+
+// TestReconcile_CustodyClaimedJournallessTerminalStaysUnstamped (re-review
+// b-F1/F2 regression): a custody-claimed-but-journalless item
+// (ClaimGeneration != 0, zero Attempts, unfenced) driven to passive
+// terminalization via persistent 404 must NOT get the legacy
+// ambiguous_absent surface — no AmbiguousDelivery marker, no
+// "Pre-custody message" suffix — because the journal PROVES the POST never
+// began (C1/classNeverStarted) and the certified ladder re-opens
+// passively-terminalized C1 items (snapshotCertifyCandidates; pinned by
+// TestCertifySnapshotReopenRules "c1") for fence-gated redelivery. Stamping
+// the marker here would tell the operator "arrival could not be determined"
+// about a provably-unstarted message, and a user tap of Send-new-message
+// (new intentID) plus the C1 redelivery would be TWO user messages for a
+// provably-unstarted original (zero-surprise-duplicate violation). The item
+// still terminalizes fail-closed with the GENERIC unknown detail, GET-only,
+// never resent by the reconciler, and its durable shape remains
+// C1-recoverable.
+func TestReconcile_CustodyClaimedJournallessTerminalStaysUnstamped(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("flock semantics — Linux only")
+	}
+	s, it := newCustodyClaimedJournallessUnknownStore(t, "s1", "claimed-not-begun")
+	if it.ClaimGeneration == 0 {
+		t.Fatalf("fixture must stamp the custody era marker (ClaimGeneration != 0)")
+	}
+	if len(it.Attempts) != 0 {
+		t.Fatalf("fixture must be journalless (interrupted before BeginDispatchAttempt): %+v", it.Attempts)
+	}
+	r := newFakeResolver()
+	r.setErr("s1", it.OpencodeMsgID, opencode.ErrMessageNotFound)
+
+	t0 := time.Unix(1000000, 0)
+	for i := 0; i < 3; i++ {
+		s.reconcileMessageIDs("s1", r.lookup, t0.Add(time.Duration(i)*(reconcileThreshold+time.Second)))
+	}
+	got := mustListItem(t, s, it.ID)
+	if !got.ReconcileTerminal {
+		t.Fatalf("custody journalless persistent 404 must still terminalize (budget unchanged)")
+	}
+	if got.ReconcileAttempts != reconcileMaxAttempts {
+		t.Fatalf("ReconcileAttempts = %d, want %d (guard must not weaken the budget)", got.ReconcileAttempts, reconcileMaxAttempts)
+	}
+	if got.State != QueueUnknown {
+		t.Fatalf("terminal must stay non-sent: got %q", got.State)
+	}
+	if got.AmbiguousDelivery {
+		t.Fatalf("C1 custody shape must NOT carry the ambiguous marker — the journal PROVES the POST never began (claim→begin strictly sequential); the certified C1 re-open (TestCertifySnapshotReopenRules) owns its disposition: %+v", got)
+	}
+	// Generic unknown detail only — the pre-custody legacy suffix is
+	// reserved for ClaimGeneration==0 items.
+	if want := fmt.Sprintf(reconcileTerminal404DetailFmt, reconcileMaxAttempts); got.Detail != want {
+		t.Fatalf("terminal detail = %q,\nwant the generic 404 text WITHOUT the pre-custody suffix: %q", got.Detail, want)
+	}
+	// NEVER resent by the reconciler: a 4th past-window pass makes no
+	// further lookup (GET-only; terminal stops the budget) — the pinned
+	// no-resend posture of TestReconcile_Persistent404Terminal.
+	s.reconcileMessageIDs("s1", r.lookup, t0.Add(4*(reconcileThreshold+time.Second)))
+	if r.count() != 3 {
+		t.Fatalf("resolver calls after terminal = %d, want 3 (never resent, no endless lookups)", r.count())
+	}
+	// Still C1-recoverable: the terminalized durable shape must keep
+	// classifying as never-started (the actual terminal re-OPEN is pinned
+	// by TestCertifySnapshotReopenRules "c1"); asserted directly so this
+	// regression catches any terminalization that erases the C1 evidence.
+	if class := classifyCertifiedRedelivery(got, 0, false, false); class != classNeverStarted {
+		t.Fatalf("terminalized shape classifies as %q, want %q (C1 re-open prerequisite)", class, classNeverStarted)
 	}
 }

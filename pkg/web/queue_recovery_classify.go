@@ -107,9 +107,9 @@ const (
 // operator-readable record of WHICH certified class authorized the
 // redelivery — each cites its design.md basis).
 const (
-	requeueJustificationNeverStarted  = "Certified redelivery (never started): the dispatch journal has no attempt record for this custody-claimed item, so the prompt POST never ran (claim→begin is strictly sequential). Redelivering under the same correlation id; the id never left this machine. [design.md Certified Redelivery class 1]"
-	requeueJustificationConnectFailed = "Certified redelivery (connect failed): the last attempt's transport receipt proves the connection was never established, so nothing was written to OpenCode. Redelivering under the same correlation id. [design.md Certified Redelivery class 2]"
-	requeueJustificationRestartBarrie = "Certified redelivery (post-restart barrier): OpenCode restarted after this attempt and the post-restart exact-id lookup returned 404 — the upstream persistence transaction never committed (event+projection commit atomically), so the prompt provably never durably landed. Redelivering under the same correlation id. [design.md Certified Redelivery class 3]"
+	requeueJustificationNeverStarted   = "Certified redelivery (never started): the dispatch journal has no attempt record for this custody-claimed item, so the prompt POST never ran (claim→begin is strictly sequential). Redelivering under the same correlation id; the id never left this machine. [design.md Certified Redelivery class 1]"
+	requeueJustificationConnectFailed  = "Certified redelivery (connect failed): the last attempt's transport receipt proves the connection was never established, so nothing was written to OpenCode. Redelivering under the same correlation id. [design.md Certified Redelivery class 2]"
+	requeueJustificationRestartBarrier = "Certified redelivery (post-restart barrier): OpenCode restarted after this attempt and the post-restart exact-id lookup returned 404 — the upstream persistence transaction never committed (event+projection commit atomically), so the prompt provably never durably landed. Redelivering under the same correlation id. [design.md Certified Redelivery class 3]"
 )
 
 // classifyCertifiedRedelivery is the PURE classifier (unit-testable, no I/O):
@@ -313,7 +313,7 @@ func (s *Server) certifiedRecoveryPass(root, sid string, tok *QueueCustody, reso
 				return err
 			}
 		case classRestartBarrier:
-			if err := st.RequeueForCertifiedRedelivery(tok, c.ID, requeueJustificationRestartBarrie); err != nil {
+			if err := st.RequeueForCertifiedRedelivery(tok, c.ID, requeueJustificationRestartBarrier); err != nil {
 				return err
 			}
 		case classServerErrno:

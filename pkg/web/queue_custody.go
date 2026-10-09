@@ -110,15 +110,16 @@ package web
 // dispatched queue items. This fence is the separate, queue-store-resident
 // mechanism for exactly that gap (debate-3 A1). Do not conflate the two.
 //
-// SLICE-2A SCOPE (the capability gate): daemon dispatch ships OFF
-// (daemonDispatchCapable == false) and NO production code path acquires
-// custody — the drain loop that will call this lands with the flag flip in a
-// later slice. queueCustodyAllowed() therefore refuses acquisition unless the
-// capability is on or a test explicitly opts in
-// (SetQueueCustodyEnabledForTest), so with the flag OFF the legacy
-// browser-driven claim/POST/resolve path is byte-equivalent to today: no
-// lock files are created, no generations are allocated, and no journal
-// fields are written.
+// CAPABILITY GATE (the flag-era posture): daemon dispatch is OPT-IN via
+// SetDaemonDispatchEnabled (cmd/local-server.go --daemon-dispatch,
+// default OFF) — with it off, NO production code path acquires custody:
+// queueCustodyAllowed() refuses acquisition unless the capability is on or a
+// test explicitly opts in (SetQueueCustodyEnabledForTest), so with the flag
+// OFF the legacy browser-driven claim/POST/resolve path is byte-equivalent to
+// today: no lock files are created, no generations are allocated, and no
+// journal fields are written. With it on, the DRAIN LOOP
+// (queue_drain_loop.go, started from aggFor) is the production caller — the
+// single daemon worker of the custody protocol.
 
 import (
 	"encoding/json"
@@ -201,12 +202,14 @@ func custodyBarrierCertified(externalOC bool) bool {
 // as a JavaScript number for the FE mirror, as a machine-checked invariant.
 const maxCustodyGeneration = uint64(1)<<53 - 1
 
-// queueCustodyTestEnable is the TEST-ONLY bypass of the daemonDispatchCapable
-// gate (slice 2a ships with the capability OFF and no production caller).
-// Atomic so the test-time write and the acquire-time read never race under
-// `go test -race` (mirrors SetStaleDispatchThresholdForTest). Production
-// never sets it; with it unset, AcquireQueueCustody fails with
-// errQueueCustodyDisabled and the legacy path is byte-equivalent.
+// queueCustodyTestEnable is the TEST-ONLY bypass of the daemon-dispatch
+// capability gate (production gates custody on SetDaemonDispatchEnabled —
+// the --daemon-dispatch opt-in, default OFF; the drain loop in
+// queue_drain_loop.go is the production caller). Atomic so the test-time
+// write and the acquire-time read never race under `go test -race` (mirrors
+// SetStaleDispatchThresholdForTest). Production never sets it; with both it
+// and the flag unset, AcquireQueueCustody fails with errQueueCustodyDisabled
+// and the legacy path is byte-equivalent.
 var queueCustodyTestEnable atomic.Bool
 
 // SetQueueCustodyEnabledForTest arms/disarms the TEST-ONLY capability bypass
