@@ -17,6 +17,7 @@ import { connect } from "../../src/sync/tree-transport";
 import { closeSessionStream } from "../../src/sync/session-stream";
 import { resyncTree, _resetResyncGateForTest, TREE_RESYNC_MIN_GAP_MS } from "../../src/sync/health";
 import { setProjectDirRaw } from "../../src/sync/store";
+import { _resetCascadeForTest } from "../../src/sync/cascade";
 import {
   seedTreeStore,
   setNodeMode,
@@ -81,6 +82,11 @@ beforeEach(() => {
   (globalThis as unknown as { EventSource: unknown }).EventSource = MockEventSource;
   setProjectDirRaw("/test");
   _resetResyncGateForTest();
+  // Slice A: resyncTree now routes through the convergence cascade (a
+  // singleton supervisor) — reset it so a prior test's never-converged pass
+  // cannot coalesce this test's resync into a zombie (same isolation pattern
+  // as _resetResyncGateForTest above).
+  _resetCascadeForTest();
   // The P0-E tests below seed treeState directly; start each test from a clean
   // flat map + userExpanded so a prior test's seed can't leak (mirrors
   // treeState.test.ts). The existing EventSource-only tests don't read treeState.

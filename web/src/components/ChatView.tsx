@@ -108,6 +108,11 @@ import { createComposerAutocomplete } from "./chat/createComposerAutocomplete";
 import { createPromptHistory } from "./chat/createPromptHistory";
 import { createComposerPaste } from "./chat/createComposerPaste";
 import { createQueueSync } from "./chat/createQueueSync";
+import {
+  notifyStreamLive,
+  setQueueReconcileTrigger,
+  clearQueueReconcileTrigger,
+} from "../sync/cascade";
 import { createAttachments } from "./chat/createAttachments";
 import { createQueueRecovery } from "./chat/createQueueRecovery";
 import { createSend } from "./chat/createSend";
@@ -2069,6 +2074,27 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // in isolation. Side-effect-only — it returns nothing; the queue-rendering
   // JSX below reads the cache directly from ../queue. The drainer itself stays
   // here (above); this factory only arms it via the `drain` dep.
+  // The outbox-reconcile surface this view owns — ONE closure reused by the
+  // session-open/focus effects (via createQueueSync's dep) AND the
+  // convergence cascade's queue-reconcile trigger (below): the unified
+  // trigger contract (slice A) — no third caller.
+  const reconcileOutboxFor = (id: string) =>
+    reconcileOutboxSession(id, {
+      fetchList: fetchQueue,
+      enqueue: (sid, input) => enqueue(sid, input),
+      currentHead: captureHead,
+    });
+  // Slice A (send-net-resilience): register the cascade's queue-reconcile
+  // trigger — fired when a convergence pass completes (stream-live reconnect,
+  // server ring-gap, any converging recovery). Token-guarded so a stale
+  // cleanup (session-switch remount) can never clear a newer registration.
+  const cascadeTriggerToken = setQueueReconcileTrigger(() => {
+    const id = props.sessionId;
+    if (!id || props.draft) return;
+    void reconcileOutboxFor(id).catch(() => {});
+    void fetchQueue(id);
+  });
+  onCleanup(() => clearQueueReconcileTrigger(cascadeTriggerToken));
   createQueueSync({
     sessionId: () => props.sessionId,
     draft: () => !!props.draft,
@@ -2083,13 +2109,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // (re-admission of un-admitted gestures under their original intentId /
     // stale-context surfacing / pruning) + the dispatch-mode advertisement
     // refresh (the observe-only feature-detect).
-    reconcileOutbox: (id) =>
-      reconcileOutboxSession(id, {
-        fetchList: fetchQueue,
-        enqueue: (sid, input) => enqueue(sid, input),
-        currentHead: captureHead,
-      }),
+    reconcileOutbox: reconcileOutboxFor,
     refreshDispatchMode,
+    // Slice A (send-net-resilience): the stream-live reconnect reconcile
+    // routes through the convergence cascade (it fires the trigger registered
+    // above once the post-reconnect tree baseline converges).
+    notifyStreamLive,
   });
 
   // Send-net-resilience slice 3: the ambiguous-replacement controller (the

@@ -38,6 +38,7 @@ import {
 import { STALE_MS } from "../../src/sync/stream";
 import { setProjectDirRaw } from "../../src/sync/store";
 import { seedTreeStore, resetTreeStore } from "../../src/sync/treeState";
+import { _resetCascadeForTest } from "../../src/sync/cascade";
 import { withGlobalBusy } from "../../src/busy";
 import type { TreeNode } from "../../src/sync/treeMap";
 
@@ -145,6 +146,10 @@ beforeEach(() => {
   setProjectDirRaw("/test");
   _resetResyncGateForTest();
   _resetPeriodicStateForTest();
+  // Slice A: resyncTree routes through the convergence cascade (a singleton
+  // supervisor) — reset it so a prior test's never-converged pass cannot
+  // coalesce this test's resync into a zombie.
+  _resetCascadeForTest();
   setVisibility("visible");
   setOnline(true);
   resetTreeStore();

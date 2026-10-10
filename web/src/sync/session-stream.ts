@@ -73,6 +73,7 @@ import { captureDiagEntry } from "./diaglog";
 import { countRecovery, countSnapshotBytes } from "./recovery-reasons";
 import { recordStreamDrop } from "./weaklink";
 import { noteLivenessFrame } from "./liveness";
+import { requestRecovery, noteSessionConverged } from "./cascade";
 
 // === Slice 3: part.append suffix streaming client opt-in ====================
 //
@@ -389,7 +390,11 @@ function checkSesOrdinalGap(ordinal: number, kind: string): void {
   // bypasses the "already open" guard, closes the old EventSource (sesGen++),
   // and opens a fresh one starting with an authoritative snapshot (MERGE via
   // prependMessagesIfAbsent — live always wins).
-  if (sid) openSessionStream(sid, true);
+  // Slice A (send-net-resilience): the force feeds the convergence cascade —
+  // coalesced with any overlapping recovery into ONE pass (AMEND-A5); the
+  // direct action runs synchronously when no pass is in flight (unchanged
+  // recovery latency).
+  if (sid) requestRecovery("seq-gap", () => openSessionStream(sid, true), { session: "fresh" });
 }
 
 // Health accessors for ./health's watchdogTick — that module evaluates each
@@ -758,6 +763,10 @@ function openSessionES(id: string): void {
         // reactive tick the fresh data paints. Idempotent on later snapshots.
         setState("refreshing", id, false);
         applySessionSnapshot(id, snap);
+        // Slice A (send-net-resilience): a session baseline landed on the
+        // current session connection — satisfy the convergence cascade's
+        // session step.
+        noteSessionConverged();
       };
       // Compressed path: async decode, gated behind sesSnapshotDecode so live
       // message/part events in the decode window serialize behind it (the
@@ -1542,7 +1551,10 @@ function flushAppends(): void {
         stream: "session",
         sessionId: sid,
       });
-      openSessionStream(sid, true);
+      // Slice A (send-net-resilience): the force feeds the convergence
+      // cascade (ONE coalesced pass; the direct action runs synchronously
+      // when no pass is in flight).
+      requestRecovery("offset-mismatch", () => openSessionStream(sid, true), { session: "fresh" });
     }
   }
 }

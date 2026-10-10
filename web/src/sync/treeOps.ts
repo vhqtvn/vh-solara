@@ -105,11 +105,19 @@ export interface TreeSnapshot {
   // barrier treats a missing epoch as the legacy signal.
   epoch?: string;
   seq?: number;
+  // Slice A (send-net-resilience cascade): the server's capture CAUSE —
+  // "initial" on a fresh connect, "reconnect" when the client HAD a cursor but
+  // the shared replay ring evicted it (server.go hasCursor && !replayOK → the
+  // fresh-snapshot fallback). The convergence cascade consumes
+  // cause:"reconnect" (noteServerRingGap) as the missed-events signal that
+  // fires the unified queue-reconcile trigger. Optional: pre-cascade decoders
+  // stripped it (it was previously dropped on the floor).
+  cause?: string;
 }
 
 export function decodeTreeSnapshot(raw: unknown): TreeSnapshot | null {
   if (!raw || typeof raw !== "object") return null;
-  const obj = raw as { nodes?: unknown; focusedSessionId?: unknown; epoch?: unknown; seq?: unknown };
+  const obj = raw as { nodes?: unknown; focusedSessionId?: unknown; epoch?: unknown; seq?: unknown; cause?: unknown };
   // Ghost-row guard: the server serialized an EMPTY frontier as `"nodes":null`
   // (a nil Go slice) — e.g. the state right after the project's LAST live
   // session was archived. A null nodes array is NOT malformed: it is the
@@ -125,6 +133,8 @@ export function decodeTreeSnapshot(raw: unknown): TreeSnapshot | null {
   // omission on a pre-Q5 daemon) is left undefined → the barrier's legacy path.
   if (typeof obj.epoch === "string" && obj.epoch.length > 0) snap.epoch = obj.epoch;
   if (typeof obj.seq === "number") snap.seq = obj.seq;
+  // Slice A: retain the capture cause (see TreeSnapshot.cause).
+  if (typeof obj.cause === "string" && obj.cause.length > 0) snap.cause = obj.cause;
   return snap;
 }
 

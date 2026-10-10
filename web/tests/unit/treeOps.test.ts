@@ -118,6 +118,17 @@ describe("decodeTreeSnapshot — §5/§7.1 snapshot", () => {
     expect(decodeTreeSnapshot({ nodes: "bogus" })).toBeNull();
     expect(decodeTreeSnapshot({ nodes: { 0: "x" } })).toBeNull();
   });
+
+  // Slice A decode pin (round-1 review D-F4): the capture cause must survive
+  // decoding — noteServerRingGap keys on cause:"reconnect" (a cursor-resume
+  // reconnect, replay OR ring-gap; see cascade.ts). Green on arrival: this
+  // pins already-correct decoder behavior (treeOps.ts retains a non-empty
+  // string cause verbatim) so a future decoder edit cannot silently drop it.
+  it("retains the capture cause through decoding (Slice A pin)", () => {
+    expect(decodeTreeSnapshot({ nodes: [], cause: "reconnect" })?.cause).toBe("reconnect");
+    expect(decodeTreeSnapshot({ nodes: [] })?.cause).toBeUndefined();
+    expect(decodeTreeSnapshot({ nodes: [], cause: "" })?.cause).toBeUndefined();
+  });
 });
 
 // ---- §8 expand fetch (pagination + stale-cursor restart) ------------------

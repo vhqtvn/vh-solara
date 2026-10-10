@@ -58,7 +58,7 @@ interface Handles {
   dispose: () => void;
 }
 
-function setup(o: Partial<{ sessionId: string; draft: boolean; working: boolean }> = {}): Handles {
+function setup(o: Partial<{ sessionId: string; draft: boolean; working: boolean }> = {}, notifyStreamLive?: () => void): Handles {
   const [sessionId, setSid] = createSignal(o.sessionId ?? "s1");
   const [draft, setDraft] = createSignal(o.draft ?? false);
   const [working, setWorking] = createSignal(o.working ?? false);
@@ -85,6 +85,7 @@ function setup(o: Partial<{ sessionId: string; draft: boolean; working: boolean 
     drain: fn.drain,
     reconcileOutbox: fn.reconcileOutbox,
     refreshDispatchMode: fn.refreshDispatchMode,
+    notifyStreamLive,
   };
   const dispose = createRoot((d) => {
     createQueueSync(deps);
@@ -202,6 +203,47 @@ describe("createQueueSync — stream reconnect refresh", () => {
     setStatus("live");
     await flush();
     expect(fn.fetchQueue).not.toHaveBeenCalled();
+  });
+
+  // Slice A (send-net-resilience cascade): the RECONNECT transition hands the
+  // queue reconcile to the convergence cascade (notifyStreamLive) instead of
+  // the immediate fetch; every other live run keeps the legacy fetch.
+  it("routes the reconnecting→live transition through notifyStreamLive (cascade owns the trigger)", async () => {
+    const notify = vi.fn();
+    const { setStatus, fn } = setup({ sessionId: "s1" }, notify);
+    await flush();
+    fn.fetchQueue.mockClear();
+    setStatus("reconnecting");
+    await flush();
+    setStatus("live");
+    await flush();
+    expect(notify).toHaveBeenCalledTimes(1);
+    // The immediate fetch is SUPERSEDED by the cascade's converged
+    // reconcile+fetch trigger (wired in ChatView) — not fired here.
+    expect(fn.fetchQueue).not.toHaveBeenCalled();
+  });
+
+  it("keeps the legacy live fetch when notifyStreamLive is unwired (back-compat)", async () => {
+    const { setStatus, fn } = setup({ sessionId: "s1" });
+    await flush();
+    fn.fetchQueue.mockClear();
+    setStatus("reconnecting");
+    await flush();
+    setStatus("live");
+    await flush();
+    expect(fn.fetchQueue).toHaveBeenCalledWith("s1");
+  });
+
+  it("boot's connecting→live keeps the legacy fetch even when the cascade is wired (additive-only)", async () => {
+    const notify = vi.fn();
+    const { setStatus, fn } = setup({ sessionId: "s1" }, notify);
+    await flush();
+    fn.fetchQueue.mockClear();
+    // Boot shape: never went through "reconnecting".
+    setStatus("live");
+    await flush();
+    expect(notify).not.toHaveBeenCalled();
+    expect(fn.fetchQueue).toHaveBeenCalledWith("s1");
   });
 });
 

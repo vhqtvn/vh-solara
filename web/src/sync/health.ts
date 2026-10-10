@@ -54,6 +54,7 @@ import {
 } from "./session-stream";
 import { captureDiagEntry } from "./diaglog";
 import { classifyStall, countRecovery } from "./recovery-reasons";
+import { requestRecovery } from "./cascade";
 import { isPaneVisible, isDocVisible } from "../paneVisibility";
 import { sessionWorking, anySessionActive } from "./selectors";
 import { issueLivenessProbe, livenessCapabilityAvailable } from "./liveness";
@@ -199,7 +200,12 @@ export function watchdogTick() {
           treeContentSeenAge: getTreeContentSeen() ? Date.now() - getTreeContentSeen() : undefined,
         });
         setState("status", "reconnecting");
-        connect();
+        // Slice A (send-net-resilience): the watchdog force feeds the
+        // convergence cascade (ONE coalesced pass per window; the direct
+        // action runs synchronously when no pass is in flight — unchanged
+        // recovery latency). connect() is cursor-PRESERVING (the server falls
+        // back to a fresh snapshot itself on ring-gap).
+        requestRecovery(reason ?? "tree-transport-stale", () => connect(), { tree: "resume" });
       };
       // Slice 5 (webperf/F7): the liveness SENTINEL replaces both content-
       // stale heuristics (idle-skip AND active-force) whenever the worker
@@ -238,7 +244,8 @@ export function watchdogTick() {
               treeContentSeenAge: getTreeContentSeen() ? Date.now() - getTreeContentSeen() : undefined,
             });
             setState("status", "reconnecting");
-            connect();
+            // Slice A: feeds the convergence cascade; cursor-preserving.
+            requestRecovery("sentinel-timeout", () => connect(), { tree: "resume" });
           },
           onLegacy: () => {
             if (!anySessionActive()) legacyIdleSkip();
@@ -350,7 +357,12 @@ export function watchdogTick() {
             sessionLastSeenAge: getSessionLastSeen() ? Date.now() - getSessionLastSeen() : undefined,
             sessionContentSeenAge: getSessionContentSeen() ? Date.now() - getSessionContentSeen() : undefined,
           });
-          openSessionStream(sesId, true);
+          // Slice A: feeds the convergence cascade; a forced fresh-snapshot
+          // reopen (the direct action runs synchronously when no pass is in
+          // flight).
+          requestRecovery(reason ?? "session-transport-stale", () => openSessionStream(sesId, true), {
+            session: "fresh",
+          });
         };
         // Slice 5 (webperf/F7): the liveness sentinel replaces both content-
         // stale heuristics here too (mirror of the tree branch above). Proven
@@ -381,7 +393,12 @@ export function watchdogTick() {
                 sessionLastSeenAge: getSessionLastSeen() ? Date.now() - getSessionLastSeen() : undefined,
                 sessionContentSeenAge: getSessionContentSeen() ? Date.now() - getSessionContentSeen() : undefined,
               });
-              reopenSessionStreamPreservingCursor();
+              // Slice A: feeds the convergence cascade; cursor-preserving
+              // (NEVER openSessionStream here — its closeSessionStream resets
+              // sesCursor).
+              requestRecovery("sentinel-timeout", () => reopenSessionStreamPreservingCursor(), {
+                session: "resume",
+              });
             },
             onLegacy: () => {
               // Evaluate the CURRENT selection at fire time (the boundary
@@ -487,7 +504,12 @@ export function resyncTree() {
   // suppresses a redundant tick, and reschedule the periodic timer (push the
   // next periodic tick out by a full interval).
   markAuthoritativeRecovery();
-  connect(true);
+  // Slice A (send-net-resilience): the drift self-heal feeds the convergence
+  // cascade — counted (previously invisible to __vhSyncDiag) and coalesced
+  // with any overlapping recovery into ONE pass (the direct action runs
+  // synchronously when no pass is in flight).
+  countRecovery("tree-drift-resync");
+  requestRecovery("tree-drift-resync", () => connect(true), { tree: "fresh" });
 }
 
 // Test-only accessor — resets the resync throttle gate so a test can exercise

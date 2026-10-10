@@ -105,6 +105,38 @@ import { readWeakLink, type WeakLinkSnapshot } from "./weaklink";
 //                           (clears refreshing[id]; MERGE re-seeds). Counted
 //                           once per silent resume; any delivered content
 //                           cancels it (never fires on a served replay).
+//  - tree-drift-resync slice A (send-net-resilience cascade): the on-focus /
+//                           periodic drift self-heal (health.ts resyncTree →
+//                           connect(true)) now routes through the convergence
+//                           cascade — counted where it previously was invisible
+//                           to __vhSyncDiag (only the periodic diff
+//                           instrumentation saw it).
+//  - epoch-reset slice A: the snapshot-apply guard discarded a cross-epoch
+//                           HTTP-provenance snapshot (an expand-children
+//                           detail bundle racing a daemon restart) and
+//                           requested ONE conservative fresh-snapshot re-sync
+//                           (adjudication 1: identity + liveness, never
+//                           ordering).
+//  - server-ring-gap slice A: the daemon stamped cause:"reconnect" on a
+//                           tree.snapshot — a cursor-resume reconnect (replay
+//                           OR ring-gap: the replay-success site hardcodes it
+//                           at server.go ~2931/2933, the fresh-snapshot site
+//                           gates on hasCursor && !replayOK ~2999-3002). The
+//                           missed-events distinction is the detail
+//                           snapshot's partial.ringGap flag (server.go
+//                           ~3015-3021), consumed in Slice B — so until that
+//                           switch this counter counts ALL cursor-resume
+//                           reconnects (the armed pass is idempotent and
+//                           never auto-sends) and is NOT a true-ring-gap
+//                           metric. The cascade fires the unified
+//                           queue-reconcile trigger.
+//  - cascade-queue-reconcile slice A: the convergence cascade completed a
+//                           recovery pass and fired the unified
+//                           queue-reconcile trigger (the same
+//                           reconcileOutbox+fetch surface session-open/focus
+//                           use). Counted per completing pass — the
+//                           observable that the trigger fired FROM the
+//                           cascade (not from the legacy reconnect fetch).
 export const RECOVERY_REASONS = [
   "idle-content-stale",
   "session-transport-stale",
@@ -126,6 +158,10 @@ export const RECOVERY_REASONS = [
   "sentinel-timeout",
   "sentinel-legacy-fallback",
   "resume-silent-fallback",
+  "tree-drift-resync",
+  "epoch-reset",
+  "server-ring-gap",
+  "cascade-queue-reconcile",
 ] as const;
 export type RecoveryReason = (typeof RECOVERY_REASONS)[number];
 

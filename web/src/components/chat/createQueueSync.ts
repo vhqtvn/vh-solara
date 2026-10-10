@@ -85,6 +85,14 @@ export interface QueueSyncDeps {
   // Send-net-resilience slice 3 (OPTIONAL): refresh /vh/version's
   // daemonDispatchCapable advertisement (the projection-mode feature-detect).
   refreshDispatchMode?: () => Promise<void>;
+  // Send-net-resilience slice A (OPTIONAL): hand the stream-live reconnect
+  // reconcile to the convergence cascade. When wired (ChatView), a
+  // live-AFTER-reconnecting transition notifies the cascade, which fires the
+  // registered queue-reconcile trigger (reconcileOutbox + fetchQueue — the
+  // SAME surface session-open/focus use) once the post-reconnect tree
+  // baseline converges. Absent (unit harnesses / older callers) the legacy
+  // immediate fetchQueue fallback runs, unchanged.
+  notifyStreamLive?: () => void;
 }
 
 // Side-effect-only controller: registers its effects + cleanup under the
@@ -122,13 +130,26 @@ export function createQueueSync(deps: QueueSyncDeps): void {
       void deps.fetchQueue(id);
     })();
   });
+  // Slice A (send-net-resilience): the stream-live RECONNECT path routes
+  // through the SAME reconcile surface as session-open/focus — the cascade
+  // owns the trigger (reconcileOutbox + fetchQueue fire when the
+  // post-reconnect tree baseline converges). Only a reconnecting→live
+  // transition notifies; every other live run keeps the PRE-EXISTING
+  // immediate fetch (boot's connecting→live + the session-change re-run —
+  // behavior this suite evolved under; removing it reshuffles unrelated
+  // ack/notification timing). Additive only.
+  let prevStatus: ConnStatus | null = null;
   createEffect(() => {
-    // Reconnect trigger: when the stream goes live after a reconnect, refresh.
     const st = deps.streamStatus();
-    void st; // track status transitions
-    if (st === "live" && !deps.draft() && deps.sessionId()) {
-      void deps.fetchQueue(deps.sessionId());
+    const transitioned = prevStatus === "reconnecting" && st === "live";
+    prevStatus = st;
+    if (st !== "live") return;
+    if (deps.draft() || !deps.sessionId()) return;
+    if (transitioned && deps.notifyStreamLive) {
+      deps.notifyStreamLive(); // the cascade fires reconcile+fetch at convergence
+      return;
     }
+    void deps.fetchQueue(deps.sessionId()); // legacy live fetch (pre-existing)
   });
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   createEffect(() => {

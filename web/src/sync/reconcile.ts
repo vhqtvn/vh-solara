@@ -34,6 +34,20 @@ import { maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
 import { openSessionStream } from "./session-stream";
 import { captureDiagEntry } from "./diaglog";
 import { countRecovery } from "./recovery-reasons";
+import {
+  guardSnapshotApply,
+  requestRecovery,
+  type SnapshotProvenance,
+} from "./cascade";
+import { connect } from "./tree-transport";
+
+// slice A: the shared reaction to a guard discard — the ONLY place an
+// epoch-reset recovery is requested (cross-epoch HTTP-provenance snapshot:
+// identity cannot order the two lifetimes, so the conservative re-sync runs).
+function recoverFromEpochDiscard(): void {
+  countRecovery("epoch-reset");
+  requestRecovery("epoch-reset", () => connect(true), { tree: "fresh" });
+}
 
 // interpretEffects — map factual effects to side-effect policy. sync-state-dirty
 // is intentionally NOT handled here: the entrypoint persists it LAST (after the
@@ -132,7 +146,14 @@ function interpretEffects(effects: ReconcileEffect[]): void {
               msgCount: sm?.order.length ?? 0,
             },
           });
-          openSessionStream(e.sessionID, true);
+          // Slice A (send-net-resilience): the force feeds the convergence
+          // cascade — one coalesced, supersession-aware pass instead of an
+          // independent reconnect (AMEND-A5).
+          requestRecovery(
+            "tail-incomplete",
+            () => openSessionStream(e.sessionID, true),
+            { session: "fresh" },
+          );
         }
         break;
     }
@@ -169,7 +190,10 @@ export function reconcileEvent(event: ReconcileEvent, context: ReconcileContext)
   // Advance the resume cursor AFTER projection (Stream 1 only) so persistence
   // below captures the final value. Nothing reactive reads cursor synchronously,
   // so moving it out of the produce draft is safe.
-  if (context.trackCursor && event.seq) setState("cursor", event.seq);
+  // Slice A (AMEND-A5 ratchet — the session-stream sesCursor guard
+  // generalized): a tracked event with a seq BELOW the accepted cursor is an
+  // out-of-order/replayed frame; it never rewinds the accepted position.
+  if (context.trackCursor && event.seq && event.seq > state.cursor) setState("cursor", event.seq);
   // Persist LAST (sync-state-dirty), after the cursor advance.
   if (effects.some((e) => e.kind === "sync-state-dirty")) persist();
 }
@@ -189,15 +213,29 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
   reconcileEvent({ kind, seq, payload }, { trackCursor });
 }
 
-// applySnapshot — wholesale snapshot reducer. Cursor is set unconditionally to
-// snap.seq (the snapshot is authoritative regardless of stream). Signature
-// preserved for tree-transport.ts + session-stream.ts.
-export function applySnapshot(snap: Snapshot): void {
+// applySnapshot — wholesale snapshot reducer. Signature preserved for
+// tree-transport.ts + session-stream.ts; the OPTIONAL `provenance` (Slice A,
+// send-net-resilience) defaults to "stream" (delivered on the current
+// gen-guarded SSE connection — fresh by construction). The cascade's
+// epoch-identity + seq guard (adjudication 1) runs BEFORE any projection: a
+// same-epoch snapshot below the accepted cursor is DISCARDED (the D1
+// snapshot-clobber closure — never rewinds cursor or state), a cross-epoch
+// stream snapshot is a trusted REBUILD (cursor re-baselines; no cross-epoch
+// seq compare), and a cross-epoch http bundle is discarded with ONE
+// conservative epoch-reset re-sync requested.
+export function applySnapshot(snap: Snapshot, provenance: SnapshotProvenance = "stream"): void {
+  const verdict = guardSnapshotApply(snap, provenance);
+  if (!verdict.apply) {
+    if (verdict.discard === "stale-epoch") recoverFromEpochDiscard();
+    return;
+  }
   bumpUpdating();
   const effects: ReconcileEffect[] = [];
   setState(produce((s) => projectSnapshot(s, snap, effects)));
   interpretEffects(effects);
-  setState("cursor", snap.seq); // snapshot cursor is unconditional
+  // Cursor: a re-baseline (boot/legacy/cross-epoch rebuild) SETS it to
+  // snap.seq; a same-epoch apply advances it MONOTONICALLY (never rewinds).
+  if (verdict.rebaseline || snap.seq > state.cursor) setState("cursor", snap.seq);
   if (effects.some((e) => e.kind === "sync-state-dirty")) persist();
 }
 
@@ -319,15 +357,24 @@ export function projectScopedPartial(s: SyncState, snap: Snapshot, effects: Reco
 // applySnapshot (wholesale) but projects via projectScopedPartial (scoped
 // merge/replace). Selected in BOTH tree-transport install paths
 // (applyDetailIndependent + tryInstall) so an independent OR a staged partial
-// never falls through to wholesale replacement. Cursor set unconditionally to
-// snap.seq (mirrors applySnapshot; the coherent-install path also calls
-// advanceCursor(id.seq) with the same shared value — idempotent).
-export function applyScopedSnapshot(snap: Snapshot): void {
+// never falls through to wholesale replacement. Slice A
+// (send-net-resilience): the OPTIONAL `provenance` (default "stream") feeds
+// the same epoch-identity + seq guard as applySnapshot — the expand-children
+// HTTP detail bundle call site passes "http" (its apply can race a daemon
+// restart in either direction; a cross-epoch discard then requests the
+// conservative epoch-reset re-sync). Cursor follows the same verdict: re-
+// baseline on rebuild, monotonic within an epoch.
+export function applyScopedSnapshot(snap: Snapshot, provenance: SnapshotProvenance = "stream"): void {
+  const verdict = guardSnapshotApply(snap, provenance);
+  if (!verdict.apply) {
+    if (verdict.discard === "stale-epoch") recoverFromEpochDiscard();
+    return;
+  }
   bumpUpdating();
   const effects: ReconcileEffect[] = [];
   setState(produce((s) => projectScopedPartial(s, snap, effects)));
   interpretEffects(effects);
-  setState("cursor", snap.seq);
+  if (verdict.rebaseline || snap.seq > state.cursor) setState("cursor", snap.seq);
   if (effects.some((e) => e.kind === "sync-state-dirty")) persist();
 }
 

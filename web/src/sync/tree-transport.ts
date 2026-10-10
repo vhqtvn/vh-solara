@@ -94,6 +94,12 @@ import { captureDiagEntry } from "./diaglog";
 import { countRecovery, countSnapshotBytes } from "./recovery-reasons";
 import { recordStreamDrop } from "./weaklink";
 import { noteLivenessFrame } from "./liveness";
+import {
+  requestRecovery,
+  noteExternalRecovery,
+  noteTreeConverged,
+  noteServerRingGap,
+} from "./cascade";
 
 // Parse a compound SSE id ("globalSeq.ordinal") or legacy numeric id.
 // O3: the ordinal is a per-connection delivery counter for Inv1 gap detection;
@@ -236,8 +242,12 @@ function maybeMirrorLastSeen(now: number) {
 // advancement with store mutation; this extracts just the cursor+persist so the
 // resume point stays current while the store is left untouched. The gate then
 // latches dirty (if reconciling) so the final coalesced refresh catches up.
+// Slice A (AMEND-A5 ratchet — the session-stream sesCursor guard generalized):
+// the advance is MONOTONIC; a frame with a seq below the accepted cursor is an
+// out-of-order/replayed/stale capture and never rewinds the accepted position
+// (the D1 discipline at the cursor-only seam).
 function advanceCursor(seq: number) {
-  if (seq) {
+  if (seq && seq > state.cursor) {
     setState("cursor", seq);
     persist();
   }
@@ -628,6 +638,9 @@ function applyDetailIndependent(snap: Snapshot): void {
   }
   setState("status", "live");
   void refreshOpenSessions();
+  // Slice A: an authoritative detail baseline landed on the current tree
+  // connection — satisfy the convergence cascade's tree step.
+  noteTreeConverged();
 }
 
 // applyTreeIndependent — the existing tree.snapshot apply path, extracted so the
@@ -657,6 +670,9 @@ function applyTreeIndependent(snap: TreeSnapshot, seq: number, gen: number): voi
   advanceCursor(seq);
   setState("status", "live");
   resolvePeriodicDiff(gen);
+  // Slice A: an authoritative tree projection landed on the current tree
+  // connection — satisfy the convergence cascade's tree step.
+  noteTreeConverged();
 }
 
 // tryInstall — VALIDATE all three staged participants against the bound
@@ -734,6 +750,10 @@ function tryInstall(owner: PendingCaptureOwner): void {
   for (const nid of backfillIds) void expandTreeNode(nid);
   setState("status", "live");
   void refreshOpenSessions();
+  // Slice A: the coherent baseline installed — satisfy the convergence
+  // cascade's tree step (the strongest convergence signal: both projections of
+  // one {epoch, seq} capture landed atomically).
+  noteTreeConverged();
 }
 
 // TREE_STREAM_KINDS — the named SSE events Stream 1 (the tree stream)
@@ -820,7 +840,11 @@ function checkTreeOrdinalGap(ordinal: number, kind: string): void {
   // Force a cursorless fresh-snapshot reconnect. connect(true) bumps treeGen,
   // closes the old EventSource, and opens a fresh one with an authoritative
   // full snapshot (C4 coherent barrier reconciles).
-  connect(true);
+  // Slice A (send-net-resilience): the force feeds the convergence cascade —
+  // coalesced with any overlapping recovery into ONE pass (AMEND-A5); the
+  // direct action runs synchronously when no pass is in flight (unchanged
+  // recovery latency).
+  requestRecovery("tree-seq-gap", () => connect(true), { tree: "fresh" });
 }
 
 export function connect(fresh = false) {
@@ -1047,6 +1071,11 @@ export function connect(fresh = false) {
       // code (window.__vhSyncDiag).
       countRecovery("tree-overlap-capture");
       cancelPendingOwner();
+      // Slice A (send-net-resilience): this connect(true) stays DIRECT (owner
+      // hygiene — the canceled owner's connection MUST obtain a replacement
+      // capture; a coalesced skip would strand it) — the cascade only
+      // OBSERVES the reason so a running pass's generation key stays truthful.
+      noteExternalRecovery("tree-overlap-capture");
       connect(true);
       return;
     }
@@ -1074,6 +1103,13 @@ export function connect(fresh = false) {
         if (pendingOwner === owner && !owner.settled) markOwnerLegacy(owner);
         return;
       }
+      // Slice A (send-net-resilience): consume the server's capture CAUSE.
+      // cause:"reconnect" means the daemon fell back to a fresh snapshot
+      // because our cursor was evicted from the shared replay ring — events
+      // were missed while disconnected, so the cascade arms its unified
+      // queue-reconcile trigger (previously this field was dropped on the
+      // floor; see research-packet-cascade.md Q2).
+      if (snap.cause === "reconnect") noteServerRingGap();
       // If a participant already declared this capture incoherent (a mismatch
       // marked the owner legacy while the tree was decoding), apply the tree
       // independently. The release from that prior markOwnerLegacy was chained
@@ -1723,10 +1759,14 @@ export async function expandTreeNode(id: string): Promise<void> {
         ) {
           void ownerNow.promise.then(() => {
             if (ownerNow.generation !== treeGen) return; // superseded by reconnect
-            applyScopedSnapshot(detail);
+            // Slice A: HTTP provenance — this bundle crossed the network on
+            // its own; it can race a daemon restart, so the epoch-identity
+            // guard treats a cross-epoch identity as untrusted (discard +
+            // conservative epoch-reset re-sync).
+            applyScopedSnapshot(detail, "http");
           });
         } else {
-          applyScopedSnapshot(detail);
+          applyScopedSnapshot(detail, "http");
         }
       }
       return {

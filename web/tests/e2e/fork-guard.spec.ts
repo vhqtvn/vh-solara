@@ -83,11 +83,20 @@ test("network-failed fork: single-flight (ONE request), outcome-unknown + inspec
   expect(forkRequests).toBe(1);
 
   // Release to a connection failure → the honest outcome-unknown surface.
+  // Slice A note (2026-10-10): open the bell BEFORE asserting — the unread
+  // BADGE is legitimately transient here (attending-view acks mark ALL of the
+  // viewed session's notifications read ~300ms after the turn completes, by
+  // design — "viewing a session acks all of its notifications (any kind)",
+  // sync/orchestration.ts ackSession). Asserting an 8s-visible badge required
+  // catching that window and raced with recovery-timing shifts. The durable
+  // observable is the ITEM in the opened panel: the outcome-unknown
+  // notification with its guidance persists in the list (read or not).
   release();
   const bell = page.getByRole("button", { name: "Notifications" });
-  await expect(bell.locator(".notif-badge")).toBeVisible({ timeout: 8000 });
   await bell.click();
-  const item = page.locator(".notif-item").first();
+  // Target the FORK notification specifically (newest-first, but turn
+  // completion can interleave a "Session finished" notification above it).
+  const item = page.locator(".notif-item", { hasText: "Fork outcome unknown" }).first();
   await expect(item.locator(".notif-title")).toContainText("Fork outcome unknown");
   const detail = item.locator(".notif-detail");
   await expect(detail).toContainText("may still have been created");
@@ -161,7 +170,9 @@ test("timed-out fork (parked POST, real 15s bound): outcome-unknown with the tim
   const bell = page.getByRole("button", { name: "Notifications" });
   await expect(bell.locator(".notif-badge")).toBeVisible({ timeout: 20_000 });
   await bell.click();
-  const item = page.locator(".notif-item").first();
+  // Target the FORK notification specifically (turn-completion notifications
+  // can interleave above it in the newest-first list).
+  const item = page.locator(".notif-item", { hasText: "Fork outcome unknown" }).first();
   await expect(item.locator(".notif-title")).toContainText("Fork outcome unknown");
   const detail = item.locator(".notif-detail");
   await expect(detail).toContainText("may still have been created");
