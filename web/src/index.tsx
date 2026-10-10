@@ -1,3 +1,11 @@
+// GENERATED highlight stylesheet — the exact bytes of the daemon's
+// /vh/highlight.css (render.New().HighlightCSS()). Must stay the FIRST CSS
+// import so its rules land unlayered and ahead of all app rules in the hashed
+// app stylesheet; pane docs no longer fetch /vh/highlight.css per pane (the
+// 2026-10-10 P0 serialized-same-URL-fetch fix). Byte parity with the handler
+// is enforced by pkg/web/highlight_parity_test.go; regenerate with
+// VH_REGEN_HIGHLIGHT_CSS=1 go test ./pkg/web/ -run TestHighlightParityGeneratedCSSArtifact
+import "./styles/highlight.generated.css";
 import { render } from "solid-js/web";
 import { createEffect, createRoot, on } from "solid-js";
 import App from "./App";

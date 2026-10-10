@@ -21,8 +21,11 @@
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="VHSolara" />
-    <!-- Chroma theme for server-rendered code blocks (served by the daemon). -->
-    <link rel="stylesheet" href="/vh/highlight.css" />
+    <!-- Chroma theme for server-rendered code blocks ships INSIDE the hashed app
+         stylesheet now (src/styles/highlight.generated.css, imported first by
+         src/index.tsx; parity-gated by pkg/web/highlight_parity_test.go). The
+         daemon's standalone highlight stylesheet handler remains for other
+         consumers. -->
   </head>
   <body>
     <div id="root"></div>
