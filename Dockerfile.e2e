@@ -34,6 +34,13 @@ COPY host-web ./host-web
 # after the host-web COPY (npm ci layer untouched) so catalog edits only
 # invalidate the final build layer.
 COPY web/src/themeCatalog.ts ./web/src/
+# Stage the built single-server SPA for the folded host build: the
+# spaEntryPreload plugin in host-web/vite.config.ts mirrors
+# web/dist-build/index.html's entry tags into the host shell as preload
+# hints, and its P2b guard fails the build LOUDLY when the staging is
+# missing — without this COPY this image build hard-fails. See the
+# production Dockerfile stage 2 for the full rationale.
+COPY --from=webbuild /app/web/dist-build ./web/dist-build
 RUN cd host-web && VITE_HOST_FOLDED=1 npm run build
 
 # 3) Build the Go binaries (e2e server + fake LLM).

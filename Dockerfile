@@ -34,6 +34,18 @@ COPY host-web ./host-web
 # host-web COPY (npm ci layer untouched) so catalog edits only invalidate
 # the final build layer.
 COPY web/src/themeCatalog.ts ./web/src/
+# The folded host build ALSO needs the staged single-server SPA shell: the
+# spaEntryPreload plugin in host-web/vite.config.ts (page-load-perf P2)
+# mirrors web/dist-build/index.html's content-hashed entry tags into the
+# host shell as preload hints, and its P2b guard fails the build LOUDLY when
+# that staging is missing. webbuild (stage 1 above) already produced it, so
+# stage it into this stage too — without this COPY `make docker` hard-fails;
+# with it the image ships a hint-carrying host shell (docker images had
+# shipped hint-less shells since the fold landed in e954114 — the silent
+# no-op that guard exists to catch). Placed with the themeCatalog COPY
+# (after the host-web COPY so the npm ci layer stays untouched, before the
+# build RUN).
+COPY --from=webbuild /app/web/dist-build ./web/dist-build
 RUN cd host-web && VITE_HOST_FOLDED=1 npm run build
 
 # 3) Build the static Go binaries with BOTH freshly built SPAs embedded.

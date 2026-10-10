@@ -32,11 +32,12 @@ const foldedBase = process.env.VITE_HOST_FOLDED ? "/host/" : undefined;
 // FIX: issue the SPA entry fetches from the host shell itself, in parallel
 // with the host's own assets. The asset URLs are content-hashed and only
 // exist after the SPA build, so they CANNOT live statically in this
-// file — but every embed-producing pipeline builds web/ BEFORE host-web/
-// (`make embed-materialize`, harness/build.sh, folded-restore-run.sh), so at
-// THIS build's time the staged SPA shell web/dist-build/index.html already
-// names them. Mirror its entry tags as hints injected into the built host
-// shell:
+// file — but every folded pipeline builds web/ BEFORE host-web/
+// (release.yml; folded-restore-run.sh + deploy-transition-run.sh; the
+// Makefile embed-materialize chain; the Dockerfile / Dockerfile.e2e
+// hostbuild stages via COPY --from=webbuild), so at THIS build's time the
+// staged SPA shell web/dist-build/index.html already names them. Mirror its
+// entry tags as hints injected into the built host shell:
 //   <script type="module" crossorigin src=X>   -> <link rel="modulepreload" crossorigin href=X>
 //   <link rel="stylesheet" crossorigin href=Y> -> <link rel="preload" as="style" crossorigin href=Y>
 // The immutable assets then land in the HTTP cache during the host-asset
@@ -49,9 +50,12 @@ const foldedBase = process.env.VITE_HOST_FOLDED ? "/host/" : undefined;
 //     topology (no same-origin /assets) and must not see phantom hints.
 //   - VITE_HOST_FOLDED only: the hints target same-origin root-level
 //     /assets/*, which exists only in the folded single-server posture.
-//   - missing/unparseable staged shell -> no-op: the sole failure mode is a
-//     browser preload of a URL the server does not know (a 404 the real
-//     fetch path ignores); boot correctness never depends on the hints.
+//   - FOLDED + missing/unparseable staged shell -> LOUD FAILURE (P2b guard,
+//     reviewer c-F1): the folded posture makes the hints load-bearing for
+//     cold-boot page load, so a silently hint-less shell must never build.
+//     Non-folded builds stay a silent no-op — their topology has no
+//     same-origin /assets to hint at and the sole folded failure mode (a
+//     browser preload of an unknown URL) does not apply.
 function spaEntryPreload(): Plugin {
   const stagedSpaShell = (): string | null => {
     try {
@@ -60,12 +64,10 @@ function spaEntryPreload(): Plugin {
         "utf8",
       );
     } catch {
-      return null; // web/ not staged yet (dev / standalone host builds) — no-op
+      return null; // web/ not staged yet (non-folded / dev builds) — no-op
     }
   };
-  const entryHintTags = (): string[] => {
-    const shell = stagedSpaShell();
-    if (!shell) return [];
+  const entryHintTags = (shell: string): string[] => {
     const hints: string[] = [];
     for (const m of shell.matchAll(/<script\b[^>]*\btype="module"[^>]*>/gi)) {
       const src = /\ssrc="([^"]+)"/.exec(m[0]);
@@ -84,13 +86,43 @@ function spaEntryPreload(): Plugin {
   return {
     name: "vh-spa-entry-preload",
     apply: "build",
+    buildStart() {
+      // FOLDED loud-failure guard (P2b precondition, reviewer c-F1 + debate
+      // p1-fork endorsement): every folded pipeline stages web/ BEFORE
+      // host-web/ — release.yml, folded-restore-run.sh,
+      // deploy-transition-run.sh, the Makefile embed-materialize chain
+      // (build / install / fixtures / test-host-web-folded /
+      // test-host-web-deploy-transition), and the Dockerfile +
+      // Dockerfile.e2e hostbuild stages (COPY --from=webbuild) — so a
+      // missing/unparseable staged shell here means the invocation is
+      // wrong: a make -j ordering edge, a broken pipeline, or a bare
+      // `make host-web` with no prior web build (staging absent). Fail the
+      // build instead of silently shipping a hint-less shell. Non-folded
+      // builds (dev / preview / unfolded e2e lanes) return above and stay a
+      // silent no-op.
+      if (!process.env.VITE_HOST_FOLDED) return;
+      const shell = stagedSpaShell();
+      if (shell === null) {
+        this.error(
+          "[vh-spa-entry-preload] VITE_HOST_FOLDED build requires the staged single-server SPA shell at web/dist-build/index.html, but it is MISSING/unreadable. The folded host shell mirrors the SPA's content-hashed entry tags from it (preload hints); building without it silently degrades page-load perf. Remedy: build the SPA first (npm --prefix web run build, or make web) or use the sanctioned full pipeline (make embed-materialize / make build), then rebuild host-web.",
+        );
+      }
+      if (entryHintTags(shell).length === 0) {
+        this.error(
+          "[vh-spa-entry-preload] VITE_HOST_FOLDED build: the staged SPA shell web/dist-build/index.html parsed to ZERO entry tags (<script type=\"module\" src=...> / <link rel=\"stylesheet\" href=...>) — it is unparseable or not a built Vite SPA shell (stale/garbage staging). Remedy: rebuild the SPA (npm --prefix web run build, or make web) or use the sanctioned full pipeline (make embed-materialize / make build), then rebuild host-web.",
+        );
+      }
+    },
     transformIndexHtml: {
       // "post": land AFTER vite's own host asset tags, so the host's entry
       // stays first in document order (both are parse-discovered together).
       order: "post",
       handler(html) {
         if (!process.env.VITE_HOST_FOLDED) return html;
-        const hints = entryHintTags();
+        // buildStart already failed loudly on missing/unparseable staging in
+        // the folded posture; the tolerances here are belt-only.
+        const shell = stagedSpaShell();
+        const hints = shell ? entryHintTags(shell) : [];
         if (hints.length === 0) return html;
         const block = [
           `    <!-- vh-spa-entry-preload: fetch the single-server SPA entry
