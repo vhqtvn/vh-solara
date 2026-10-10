@@ -672,3 +672,42 @@ test.describe.serial("folded-posture layout restore", () => {
     await expect.poll(async () => tabOrder(), { timeout: 10000 }).toEqual(userOrder);
   });
 });
+
+// =============================================================================
+// P2 SHELL-CHAIN PRELOAD PIN (page-load-perf Waterfall slice P2): the folded
+// host shell must carry build-time hints for the single-server SPA's entry
+// assets. The hashed /assets/* URLs are unknowable at host-web authoring
+// time, so host-web/vite.config.ts (vh-spa-entry-preload plugin) reads the
+// staged web/dist-build/index.html during the folded build and mirrors its
+// entry tags (<script type=module> -> modulepreload, <link rel=stylesheet>
+// -> preload as=style) into the host shell. This pins the generated output:
+// hints present, pointing at root-absolute /assets/ URLs, and those URLs
+// actually exist on the folded origin (a stale staging dir would produce a
+// 404 hint — caught here).
+// =============================================================================
+test("folded host shell preloads the SPA entry assets (P2 shell chain)", async ({
+  request,
+}) => {
+  const html = await (await request.get("/")).text();
+
+  const jsHint = html.match(
+    /<link rel="modulepreload" crossorigin href="(\/assets\/[^"]+\.js)"/,
+  );
+  expect(
+    jsHint,
+    "host shell must modulepreload the built SPA entry chunk",
+  ).toBeTruthy();
+
+  const cssHint = html.match(
+    /<link rel="preload" as="style" crossorigin href="(\/assets\/[^"]+\.css)"/,
+  );
+  expect(
+    cssHint,
+    "host shell must preload the built SPA entry stylesheet",
+  ).toBeTruthy();
+
+  for (const href of [jsHint![1], cssHint![1]]) {
+    const res = await request.get(href);
+    expect(res.status(), `${href} must exist on the folded origin`).toBe(200);
+  }
+});
