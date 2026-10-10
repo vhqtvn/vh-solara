@@ -23,6 +23,23 @@
 // loses it (known limit, honest by visibility — whenever the buffer is
 // non-empty the strip is on screen, so there is no window where the user
 // believes held text was sent).
+//
+// ADJUDICATION (defer D-4b-1, closed 2026-10-10 cluster D+E): PIN, don't
+// persist. The held-text strip is always visible while text is held (no
+// false-belief window), persisting raw terminal input to disk carries
+// privacy + complexity costs the program never required, and reload-loses-
+// held-text is honest — the page visibly goes away. Pinned by the
+// fresh-module (reload-model) unit test in termCompose.test.ts.
+//
+// Entry lifecycle (defer D-4b-3 + d-F5, same cluster): entries are disposed
+// when their SHELL dies — at the kill gesture (TerminalDock's tab × =
+// /vh/term/kill; Settings → Terminals Kill) and at the pane-observed clean
+// close (the server's 1000 "exit" close frame reaches TerminalPane's
+// ws.onclose). RESIDUAL: a shell killed with no pane attached and no local
+// kill gesture — another browser's kill, or the server's idle reaper while
+// the tab is backgrounded/detached — is never observed by this client; its
+// entry (if any) lives until the SPA session ends. Bounded by the SPA
+// session, never persisted.
 
 /** No-traffic window while the socket still reads OPEN that marks a SUSPECTED
  *  half-open link. The server sends an app-level keepalive every 15s
@@ -104,4 +121,13 @@ export function saveTermCompose(dir: string | null | undefined, termId: string |
   const k = storeKey(dir, termId);
   if (text) buffers.set(k, text);
   else buffers.delete(k);
+}
+
+/** Dispose the store entry for a DEAD shell (D-4b-3): called at the kill
+ *  gesture (dock tab ×, Settings kill) and at the pane's observed clean
+ *  server close (code 1000). Held text can never reach a dead shell, and a
+ *  same-id shell spawned later is a NEW shell that must not inherit stale
+ *  holds. Idempotent; unknown keys are a no-op. */
+export function disposeTermCompose(dir: string | null | undefined, termId: string | undefined): void {
+  buffers.delete(storeKey(dir, termId));
 }

@@ -14,6 +14,7 @@ import { pointerToCell, documentRewriteApplies, rewriteMouseEvent, rewriteWheelE
 import {
   classifyTermInput,
   composeStripVisible,
+  disposeTermCompose,
   isStaleInput,
   loadTermCompose,
   saveTermCompose,
@@ -169,9 +170,21 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     ws.onmessage = (e) => { lastRecv = Date.now(); setStale(false); if (e.data instanceof ArrayBuffer && term) term.write(new Uint8Array(e.data)); };
     ws.onclose = (e) => {
       ws = null;
-      // 1000 = clean server close (shell exited / session ended) — stay down and
-      // surface it; anything else is an abnormal drop, so auto-retry.
-      if (intentional || e.code === 1000) setStatus("disconnected");
+      // 1000 = clean server close (shell exited / session ended) — stay down
+      // and surface it; anything else is an abnormal drop, so auto-retry.
+      if (e.code === 1000) {
+        // The shell is GONE forever (D-4b-3): dispose the compose-store
+        // entry — held text can never reach a dead shell, and a same-id
+        // shell spawned later is a NEW shell that must not inherit stale
+        // holds. This pane's signal keeps the text VISIBLE for copy; only
+        // the cross-remount store entry dies. (Shells killed with no pane
+        // attached — another browser's kill, the idle reaper — are never
+        // observed here; that residual is documented in lib/termCompose.)
+        disposeTermCompose(projectDir(), props.termId);
+        setStatus("disconnected");
+        return;
+      }
+      if (intentional) setStatus("disconnected");
       else scheduleReconnect();
     };
     ws.onerror = () => {}; // a close event always follows; reconnect is handled there
@@ -181,7 +194,17 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     clearTimeout(reconnectTimer);
     const c = ws;
     ws = null;
-    c?.close();
+    // tier1_c/F1: OUR close() — no code — ends the handshake with close code
+    // 1000 (platform contract) and the server echoes it, so onclose would
+    // observe the SAME shape as shell death and dispose held text on every
+    // pane remount — though the PTY never died. Detach the handler FIRST so
+    // a deliberate teardown is a no-op in onclose terms: the compose-store
+    // entry survives pane-controlled closes (buffer-survives-remounts
+    // contract); only SERVER-initiated 1000 closes dispose (D-4b-3).
+    if (c) {
+      c.onclose = null;
+      c.close();
+    }
   }
   // User-initiated reconnect from the overlay (resets backoff, retries now).
   const reconnectNow = () => { backoff = 500; intentional = false; connect(); };
@@ -193,9 +216,21 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     clearTimeout(reconnectTimer);
     const c = ws;
     ws = null;
-    try { c?.close(); } catch { /* already gone */ }
+    // Same self-close guard as disconnect() (tier1_c/F1): the watchdog's own
+    // close() is echoed back as a 1000 close event — the PTY is alive, we are
+    // only rotating the socket, so held text must survive. Detaching the
+    // handler also keeps the old socket's late close event from clobbering
+    // the fresh ws reference connect() assigns below.
+    if (c) {
+      c.onclose = null;
+      try { c.close(); } catch { /* already gone */ }
+    }
     backoff = 500;
     intentional = false;
+    // Clear the half-open suspicion AT the transition (a-F1): stale must not
+    // survive into the reconnecting window on the pane's own state — the
+    // invariant is enforced here, not left to the next ws.onopen to repair.
+    setStale(false);
     setStatus("reconnecting");
     connect();
   }
@@ -537,7 +572,12 @@ export default function TerminalPane(props: { termId?: string; session?: string;
         fallback={<div class="term-empty">Open a project (not the default) to use the terminal.</div>}
       >
         <div class="term-host" ref={host}>
-          <span class="term-status" classList={{ [status()]: true, stale: status() === "open" && stale() }} data-tip={stale() && status() === "open" ? "connection may be down — input held" : status()} />
+          {/* data-stale reflects the RAW half-open suspicion signal for
+              diagnostics and tests regardless of status; the CSS-visible
+              .stale class renders only while OPEN — the a-F1 invariant that
+              forceReconnect clears stale at the reconnecting transition
+              needs an observable surface. */}
+          <span class="term-status" classList={{ [status()]: true, stale: status() === "open" && stale() }} data-stale={stale() ? "true" : "false"} data-tip={stale() && status() === "open" ? "connection may be down — input held" : status()} />
           {/* Cell-snapped pointer indicator — sized/positioned from JS in
               onMount (termPointer mapping). aria-hidden: purely visual. */}
           <div class="term-cell-cursor" ref={cellCursor} aria-hidden="true" />

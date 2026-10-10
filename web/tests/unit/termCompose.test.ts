@@ -11,11 +11,12 @@
 // The buffering STATE itself (badge + strip) is the honest "not going
 // anywhere" surface for gestures.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   TERM_STALE_MS,
   classifyTermInput,
   composeStripVisible,
+  disposeTermCompose,
   isStaleInput,
   loadTermCompose,
   saveTermCompose,
@@ -118,5 +119,53 @@ describe("termCompose — buffer store survives pane remounts", () => {
     saveTermCompose("/repo3", "t1", "x");
     saveTermCompose("/repo3", "t1", "");
     expect(loadTermCompose("/repo3", "t1")).toBe("");
+  });
+
+  it("saving empty on a never-seen key is a no-op", () => {
+    saveTermCompose("/never", "t9", "");
+    expect(loadTermCompose("/never", "t9")).toBe("");
+  });
+});
+
+describe("termCompose — disposal on shell death (D-4b-3 + d-F5)", () => {
+  it("disposeTermCompose deletes the matching (dir, termId) entry", () => {
+    saveTermCompose("/repoK", "t:1", "held for a dying shell");
+    saveTermCompose("/repoK", "t:2", "another shell's text");
+    disposeTermCompose("/repoK", "t:1");
+    expect(loadTermCompose("/repoK", "t:1")).toBe("");
+    // Sibling entries are untouched — disposal is keyed, not a flush.
+    expect(loadTermCompose("/repoK", "t:2")).toBe("another shell's text");
+  });
+
+  it("disposeTermCompose mirrors the default-id normalization ('shared')", () => {
+    saveTermCompose("/repoN", undefined, "no-id text");
+    disposeTermCompose("/repoN", "shared");
+    expect(loadTermCompose("/repoN", undefined)).toBe("");
+  });
+
+  it("disposeTermCompose is idempotent and safe on unknown keys", () => {
+    expect(() => {
+      disposeTermCompose("/ghost", "t:none");
+      disposeTermCompose("/ghost", "t:none");
+    }).not.toThrow();
+  });
+});
+
+// ADJUDICATION PIN (defer D-4b-1, closed 2026-10-10 cluster D+E): the buffer
+// store is IN-MEMORY ONLY — reload loses held text. This pin models a reload
+// the standard way (vi.resetModules + dynamic import = a fresh module
+// instance, exactly what a page reload produces) and asserts the fresh
+// instance starts with an empty store. If anyone ever "fixes" reload-loss by
+// persisting to storage, this pin goes red and the adjudication (PIN, don't
+// persist — privacy + complexity costs the program never required; the strip
+// is always visible while held, and reload-loses-held-text is honest) must be
+// re-argued, not silently overridden.
+describe("termCompose — in-memory-only contract (D-4b-1 adjudication: PIN, don't persist)", () => {
+  it("a fresh module instance (reload model) starts with an EMPTY store", async () => {
+    saveTermCompose("/reload", "shared", "held across a reload?");
+    expect(loadTermCompose("/reload", "shared")).toBe("held across a reload?"); // same-session survival
+    vi.resetModules();
+    const fresh = await import("../../src/lib/termCompose");
+    expect(fresh.loadTermCompose("/reload", "shared")).toBe(""); // reload → gone
   });
 });

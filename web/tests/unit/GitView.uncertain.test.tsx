@@ -533,3 +533,106 @@ describe("GitView — per-repo uncertain state (A-F1/A-F2 + B-F1/B-F2)", () => {
     expect(container.querySelector(".git-uncertain")).not.toBeNull();
   });
 });
+
+// cF1 (slice-6 defer, closed cluster D): the banner EVIDENCE signals
+// (logEntries / logLoaded / logUnreadable / reconcileFailed) are
+// component-scoped while the ward map (gitUncertainByDir) is per-repo —
+// switching between two warded repos rendered the FIRST repo's stale log
+// rows under the SECOND repo's banner. The contract under test: an
+// active-dir switch resets the evidence and, when the NEW dir is warded,
+// re-reads ITS log — a banner only ever shows its OWN repo's rows. Ward
+// semantics themselves are frozen (reconcile-only exit, per-repo map,
+// commit-precedence) and re-asserted here only as far as display goes.
+describe("GitView — per-repo banner evidence scoping (cF1)", () => {
+  const ROW_A = { hash: "aaa1110000", subject: "repo A landed commit", date: "2026-10-09 10:00:00 +0000" };
+  const ROW_B = { hash: "bbb2220000", subject: "repo B landed commit", date: "2026-10-09 11:00:00 +0000" };
+
+  // Dir-reactive log mock: the row identifies the repo it was read for.
+  function armDirReactiveLog() {
+    let cur = "/repo/a";
+    const setDir = (d: string) => {
+      cur = d;
+      setProjectDir(d);
+    };
+    vi.mocked(gitActions.gitLog).mockImplementation(async () => (cur === "/repo/a" ? [{ ...ROW_A }] : [{ ...ROW_B }]));
+    return setDir;
+  }
+
+  it("switching between two warded repos resets evidence — B's banner never shows A's rows, and A's re-opened banner never shows B's", async () => {
+    const setDir = armDirReactiveLog();
+    vi.mocked(gitActions.gitCommit).mockResolvedValue({ outcome: "uncertain", detail: "commit: no confirmation within 45s" });
+
+    // Ward repo A (banner with A's own evidence).
+    setDir("/repo/a");
+    const { container } = render(() => <GitView />);
+    const btnA = await panel(container);
+    await typeMessage(container, "repo A uncertain");
+    await fireEvent.click(btnA);
+    await waitFor(() => {
+      const banner = container.querySelector(".git-uncertain");
+      expect(banner).not.toBeNull();
+      expect(banner!.textContent).toContain("repo A landed commit");
+    });
+
+    // Switch to repo B (not warded → no banner) and ward it too.
+    setDir("/repo/b");
+    const btnB = await panel(container);
+    await typeMessage(container, "repo B uncertain");
+    await fireEvent.click(btnB);
+    await waitFor(() => {
+      const banner = container.querySelector(".git-uncertain");
+      expect(banner).not.toBeNull();
+      expect(banner!.textContent).toContain("Commit outcome unknown");
+      expect(banner!.textContent).toContain("repo B landed commit");
+    });
+
+    // THE cF1 CRUX: switch BACK to still-warded A — its banner must render
+    // A's OWN (freshly re-read) evidence, never B's foreign rows.
+    setDir("/repo/a");
+    await waitFor(() => {
+      const banner = container.querySelector(".git-uncertain");
+      expect(banner).not.toBeNull();
+      expect(banner!.textContent).toContain("Commit outcome unknown");
+    });
+    await waitFor(() => {
+      const banner = container.querySelector(".git-uncertain")!;
+      expect(banner.textContent).toContain("repo A landed commit");
+      expect(banner.textContent).not.toContain("repo B landed commit");
+    });
+    // Ward semantics untouched by the display fix: A's commit button is
+    // still warded, and a successful reconcile is still the only exit.
+    expect(container.querySelector<HTMLButtonElement>(".git-commit-btn")!.disabled).toBe(true);
+    await fireEvent.click(container.querySelector<HTMLButtonElement>(".git-uncertain .git-mini")!);
+    await waitFor(() => expect(container.querySelector(".git-uncertain")).toBeNull());
+    expect(container.querySelector<HTMLButtonElement>(".git-commit-btn")!.disabled).toBe(false);
+  });
+
+  it("a switch to an UNWARDED dir after a failed reconcile drops the foreign failed-reconcile line until that dir has its own state", async () => {
+    const setDir = armDirReactiveLog();
+    vi.mocked(gitActions.gitCommit).mockResolvedValue({ outcome: "uncertain", detail: "HTTP 502: boom" });
+
+    setDir("/repo/a");
+    const { container } = render(() => <GitView />);
+    const btn = await panel(container);
+    await typeMessage(container, "ward A only");
+    await fireEvent.click(btn);
+    await waitFor(() => expect(container.querySelector(".git-uncertain")).not.toBeNull());
+
+    // Failed reconcile on A → the could-not-refresh line.
+    vi.mocked(gitActions.gitStatus).mockResolvedValueOnce(null);
+    await fireEvent.click(container.querySelector<HTMLButtonElement>(".git-uncertain .git-mini")!);
+    await waitFor(() => expect(container.querySelector(".git-uncertain-refresh-failed")).not.toBeNull());
+
+    // Switch to unwarded B: no banner at all — A's failed-reconcile line
+    // must not leak into B's view (component-level signals reset).
+    setDir("/repo/b");
+    await waitFor(() => expect(container.querySelector(".git-uncertain")).toBeNull());
+    // …and switching back to still-warded A shows a clean evidence state
+    // (rows re-read, no stale failed-reconcile line).
+    setDir("/repo/a");
+    await waitFor(() => {
+      expect(container.querySelector(".git-uncertain")).not.toBeNull();
+      expect(container.querySelector(".git-uncertain-refresh-failed")).toBeNull();
+    });
+  });
+});

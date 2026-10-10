@@ -214,8 +214,11 @@ var queueCustodyTestEnable atomic.Bool
 
 // SetQueueCustodyEnabledForTest arms/disarms the TEST-ONLY capability bypass
 // for the queue-custody fence. TEST-ONLY: production code MUST NOT call this
-// — daemon dispatch custody is gated by daemonDispatchCapable (false in
-// slice 2a) and ships disabled. Callers SHOULD defer-restore (e.g.
+// — daemon dispatch custody is gated at runtime by SetDaemonDispatchEnabled
+// (the --daemon-dispatch opt-in, default OFF: refused for external OpenCode
+// topologies, advertised via /vh/version) and ships OFF until the
+// operator-gated production flip; the drain loop in queue_drain_loop.go is
+// the production caller. Callers SHOULD defer-restore (e.g.
 // `defer SetQueueCustodyEnabledForTest(false)`).
 func SetQueueCustodyEnabledForTest(v bool) {
 	queueCustodyTestEnable.Store(v)

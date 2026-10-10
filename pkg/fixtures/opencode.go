@@ -1694,6 +1694,12 @@ func (f *FakeOpenCode) parkReplyHold(w http.ResponseWriter, r *http.Request, kin
 	f.replyHoldID = id
 	f.replyHoldApply = apply
 	f.replyHoldMode = ""
+	if f.replyHoldWake == nil {
+		// Defensive (G2 close discipline): never park on a nil wake — a
+		// stale nil left by a prior release/reset would block this park
+		// until its context dies.
+		f.replyHoldWake = make(chan struct{})
+	}
 	wake := f.replyHoldWake
 	f.replyHoldMu.Unlock()
 
@@ -1811,11 +1817,25 @@ func (f *FakeOpenCode) handleFixtureReplyHoldRelease(w http.ResponseWriter, r *h
 	apply := f.replyHoldApply
 	kind := f.replyHoldKind
 	if parked {
-		// Live parked handler: hand it the posture and wake it.
-		f.replyHoldMode = body.Mode
-		close(f.replyHoldWake)
+		// Live parked handler: hand it the posture and wake it. The wake
+		// channel is NIL'D under this same mutex when closed (G2 close
+		// discipline): replyHoldParked stays true until the woken handler
+		// re-locks, and a second release — or a reset — arriving in that
+		// window would otherwise close an already-closed channel and panic
+		// the process.
+		if f.replyHoldWake != nil {
+			f.replyHoldMode = body.Mode
+			close(f.replyHoldWake)
+			f.replyHoldWake = nil
+			f.replyHoldMu.Unlock()
+			writeJSON(w, map[string]any{"ok": true})
+			return
+		}
+		// Already released: the parked handler is waking with the first
+		// posture. Overwriting the mode now would race its read; answer ok
+		// (the posture is already dispatched) without touching the latch.
 		f.replyHoldMu.Unlock()
-		writeJSON(w, map[string]any{"ok": true})
+		writeJSON(w, map[string]any{"ok": true, "alreadyReleased": true})
 		return
 	}
 	if id == "" || apply == nil {
@@ -1854,8 +1874,12 @@ func (f *FakeOpenCode) handleFixtureReplyHoldReset(w http.ResponseWriter, r *htt
 	f.replyHoldID = ""
 	f.replyHoldApply = nil
 	f.replyHoldMode = ""
-	if parked {
+	if parked && f.replyHoldWake != nil {
+		// Same nil-guard as release (G2): parked may still read true in the
+		// window before the woken handler re-locks — never close an
+		// already-closed (nil'd) wake.
 		close(f.replyHoldWake)
+		f.replyHoldWake = nil
 	}
 	f.replyHoldMu.Unlock()
 	writeJSON(w, map[string]any{"ok": true})

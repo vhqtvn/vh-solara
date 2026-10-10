@@ -9,6 +9,7 @@ import { inlineAttachForced, setInlineAttachForced } from "../lib/inlineAttach";
 import { canInstall, installed, isIosSafari, promptInstall } from "../pwa-install";
 import { runDiagnostics, chipLabel, type DiagnosticsResult } from "../pwa-diagnostics";
 import { killTerm, listTerms } from "../termApi";
+import { disposeTermCompose } from "../lib/termCompose";
 import { agents, selectedAgent, setSelectedAgent } from "../agents";
 import { displayName } from "../projectSettings";
 import QuotaPanel from "./QuotaPanel";
@@ -512,7 +513,14 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                         <span class={styles["term-sess-meta"]}>
                           {t.title ? displayName(t.title) : (t.id === "shared" ? "Shell" : t.id)} · {t.clients} client{t.clients === 1 ? "" : "s"} · {t.cols}×{t.rows} · idle {t.idleSec}s
                         </span>
-                        <button type="button" class={styles["term-sess-kill"]} onClick={async () => { await killTerm(t.dir, t.id); refetchTerms(); }}>Kill</button>
+                        <button type="button" class={styles["term-sess-kill"]} onClick={async () => {
+                          // D-4b-3: the killed shell's held compose text dies
+                          // with it — dispose the store entry for (dir, id);
+                          // a same-id shell spawned later must start clean.
+                          disposeTermCompose(t.dir, t.id);
+                          await killTerm(t.dir, t.id);
+                          refetchTerms();
+                        }}>Kill</button>
                       </div>
                       <Show when={t.preview}>
                         <pre class="term-sess-preview">{t.preview}</pre>

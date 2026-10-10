@@ -1,4 +1,4 @@
-import { createResource, createSignal, For, Show } from "solid-js";
+import { createEffect, createResource, createSignal, For, on, Show } from "solid-js";
 import { type DiffMode, type FileDiff, fetchVcsDiff, fetchVcsInfo } from "../git";
 import { renderPatch } from "../render";
 import { loadVersioned, saveVersioned } from "../lib/store";
@@ -134,12 +134,37 @@ function StagingPanel(props: { onChanged: () => void }) {
   const uncertain = () => gitUncertainByDir()[projectDir()] ?? null;
   const commitWarded = () => uncertain()?.op === "commit";
 
+  // cF1 (slice-6 defer, closed in the D+E cluster): the banner EVIDENCE
+  // signals above are component-scoped while the ward map
+  // (gitUncertainByDir) is per-repo — switching between two warded repos
+  // rendered the first repo's log rows (and failed-reconcile line) under
+  // the second repo's banner. On an active-dir change, reset the evidence
+  // and, when the NEW dir is warded, re-read ITS log so the banner shows
+  // honest per-repo state. Display/evidence scoping ONLY: the ward map, its
+  // commit-precedence, and the reconcile-only exit are untouched.
+  createEffect(
+    on(projectDir, () => {
+      setLogEntries([]);
+      setLogLoaded(false);
+      setLogUnreadable(false);
+      setReconcileFailed(null);
+      if (gitUncertainByDir()[projectDir()]) void refreshLog();
+    }),
+  );
+
   // Returns whether the read SUCCEEDED. On failure keep any previously
   // rendered rows (stale-but-real evidence beats fabricated emptiness) and
   // mark the log unreadable — the did-NOT-land wording must never appear
   // off a failed read.
   async function refreshLog(): Promise<boolean> {
+    // Evidence is per-ACTIVE-repo (cF1): capture the dir at read time and,
+    // if the operator switched projects while the read was in flight, leave
+    // the NEW dir's evidence alone (the switch effect above owns it) — the
+    // read's success value still returns honestly for reconcile's ward
+    // decision, which binds to the READ's dir, not the viewed one.
+    const dir = projectDir();
     const xs = await gitLog(5);
+    if (projectDir() !== dir) return xs !== null;
     if (xs === null) {
       setLogUnreadable(true);
       setLogLoaded(false);
@@ -171,11 +196,13 @@ function StagingPanel(props: { onChanged: () => void }) {
     const [st, logOk] = await Promise.all([gitStatus(), refreshLog(), refetch()]);
     props.onChanged();
     if (st !== null && logOk) {
-      setReconcileFailed(null);
       clearGitUncertainDir(dir);
+      // cF1: the failed-reconcile line is per-view evidence — only write it
+      // for the banner the reconcile still belongs to.
+      if (projectDir() === dir) setReconcileFailed(null);
     } else {
       const failed = [st === null ? "status" : null, logOk ? null : "log"].filter(Boolean).join(" + ");
-      setReconcileFailed(failed);
+      if (projectDir() === dir) setReconcileFailed(failed);
     }
   }
 

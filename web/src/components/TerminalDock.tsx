@@ -13,6 +13,7 @@ import {
   termTabs,
 } from "../termTabs";
 import { killTerm } from "../termApi";
+import { disposeTermCompose } from "../lib/termCompose";
 import { displayName } from "../projectSettings";
 import TerminalPane from "./TerminalPane";
 import Icon from "./Icon";
@@ -44,6 +45,12 @@ export default function TerminalDock() {
   function killTab(id: string) {
     void killTerm(dir(), id); // end the server shell
     removeTermTab(dir(), id); // and drop the tab (re-seeds a shared tab if it was the last)
+    // The killed shell's held input dies with it (D-4b-3): text can never
+    // reach a dead shell, and a same-id shell spawned later must start clean.
+    // Disposal holds even if the kill POST fails (offline) — the gesture
+    // decided the text is dead. Also covers BACKGROUND tabs (no pane mounted
+    // to observe the server's clean close).
+    disposeTermCompose(dir(), id);
   }
 
   function startResize(e: PointerEvent) {

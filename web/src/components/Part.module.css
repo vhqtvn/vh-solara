@@ -17,11 +17,11 @@
      {[status()]: true}) stay :global — they are shared across components or are
      dynamic strings that cannot be module keys. They appear here only inside
      :global(...) wrappers on compound selectors.
-   - Shared keyframe `pulse` is referenced by BARE NAME (resolves to the global
-     @keyframes pulse in legacy.css) — same convention as ConnectionToast
-     `dialog-in` / RestartOverlay `spin`.
+    - Shared keyframe `pulse` is referenced by BARE NAME (resolves to the
+      global @keyframes pulse in styles/legacy/20-session-tree.css) — same
+      convention as ConnectionToast `dialog-in` / RestartOverlay `spin`.
 
-   DEFERRED (still in legacy.css, intentionally NOT migrated):
+   DEFERRED (still in the styles/legacy/ tree, intentionally NOT migrated):
    - .md* markdown typography — styles innerHTML-generated elements (h1/p/a/code),
      not JSX classes; scoping would be 100% :global with no benefit.
    - .md-raw — shared with GitView.tsx (its loading fallback).
