@@ -26,7 +26,7 @@ web: ## Build the SolidJS single-server SPA into web/dist-build (gitignored, NOT
 web-materialize: web ## Copy staged single-server SPA (web/dist-build) into pkg/web/dist
 	bash web/scripts/materialize.sh
 
-host-web: ## Build the host shell SPA into host-web/dist (gitignored, NOT pkg/web/host-dist). VITE_HOST_FOLDED=1 namespaces assets under /host/ so they do not collide with the single-server /assets/.
+host-web: ## Build the host shell SPA into host-web/dist (gitignored, NOT pkg/web/host-dist). VITE_HOST_FOLDED=1 namespaces assets under /host/ so they do not collide with the single-server /assets/. Note: folded builds require web staging (web/dist-build) since b460ca7; remedy: make web or make embed-materialize.
 	cd host-web && npm ci && VITE_HOST_FOLDED=1 npm run build
 
 host-web-materialize: host-web ## Copy staged host shell (host-web/dist) into pkg/web/host-dist

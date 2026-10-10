@@ -251,8 +251,9 @@ func (r *Renderer) Markdown(src string) string {
 
 // HighlightCSS returns the syntax stylesheet: the dark theme by default, plus
 // the light theme scoped under .theme-light-scoped so a single sheet covers both
-// (the marker class is set on <html> for every light theme). The client fetches
-// this once (GET /vh/highlight.css) and caches it.
+// (the marker class is set on <html> for every light theme). The SPA ships this
+// bundled inside its hashed stylesheet (8a0303c); standalone consumers fetch
+// this via GET /vh/highlight.css.
 func (r *Renderer) HighlightCSS() (string, error) {
 	dark, err := styleCSS(DefaultStyle)
 	if err != nil {

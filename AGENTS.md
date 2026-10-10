@@ -671,10 +671,10 @@ reasoning body):
 > placement, runners, and seam choices from the repository's own verified testing
 > seam localization rather than generic harness defaults — but is deliberately
 > generic about what that localization IS. This section is this repo's actual
-> localization: the nine lanes, their runners, commands, and acceptance signals.
+> localization: the ten lanes, their runners, commands, and acceptance signals.
 
 Every meaningful change should add or update tests. This repo has three test
-trees (Go, web, and host-web) and four runner families across nine lanes. There
+trees (Go, web, and host-web) and four runner families across ten lanes. There
 is **no `tests/unit/` directory** — Go unit tests are co-located in `pkg/`. There
 is **no pytest** anywhere in this repo.
 
@@ -682,7 +682,7 @@ is **no pytest** anywhere in this repo.
 > `export PATH=$PATH:/usr/local/go/bin` (or use the harness equivalent:
 > `vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go ...'`).
 
-### The nine lanes
+### The ten lanes
 
 1. **Go co-located unit** — `pkg/*/*_test.go` beside the source under test.
    Runner: `go test ./pkg/<pkg>/` (whole tree: `go test ./pkg/...`).
@@ -777,6 +777,19 @@ is **no pytest** anywhere in this repo.
    `cd host-web && npx playwright test --config=playwright.folded.config.ts`
    (after `tmp/vh-solara-folded` is built; or `bash host-web/scripts/folded-restore-run.sh`).
 
+10. **host-web deploy-transition e2e** — `host-web/tests/folded-e2e/deploy-transition.spec.ts`
+    (Playwright). Proves BUILD_ID deploy semantics on the real folded binary
+    path: boots binary A on port, warms the folded host + panes, swaps to
+    binary B (carrying a different sw.js BUILD_ID stamp) on the same port
+    mid-test, drives the SW update, and asserts the four transition invariants:
+    exactly-one pane reload, host never reloaded, old-stamp cache reaped with
+    zero residual entries, and SW controller continuity. Dispatchable only,
+    NOT PR-blocking; serial (`workers: 1`); Chromium + Firefox (~2.6m).
+    Runner: `make test-host-web-deploy-transition` (full pipeline: builds web SPA
+    twice with distinct stamps, host folded once, both binaries, runs Playwright),
+    or `bash host-web/scripts/deploy-transition-run.sh` (`VH_DEPLOY_SKIP_BUILD=1`
+    supported for cached binaries).
+
 Execution examples:
 
 ```bash
@@ -803,6 +816,8 @@ vh-agent-harness exec npm --prefix host-web run test:e2e:preview
 vh-agent-harness exec bash host-web/scripts/real-embed-run.sh
 # host-web folded-posture restore e2e (LANE 9: real binary serving the FOLDED host at / — the production fold topology; dispatch on PWA-relaunch layout regressions):
 vh-agent-harness exec bash host-web/scripts/folded-restore-run.sh
+# host-web deploy-transition e2e (LANE 10: BUILD_ID deploy semantics on real folded binary path; port swap mid-test; dispatchable):
+vh-agent-harness exec bash host-web/scripts/deploy-transition-run.sh
 ```
 
 For any substantial boundary change, also update the relevant docs.

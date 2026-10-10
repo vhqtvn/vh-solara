@@ -39,8 +39,12 @@ Diffs are line-level unified HTML (`.vh-diff-add` / `.vh-diff-del` / context),
 content HTML-escaped.
 
 ### `GET /vh/highlight.css`
-The chroma stylesheet for the active theme (class mode), fetched once and cached
-(`Cache-Control: max-age=86400`). Required for highlighted code to be colored.
+The chroma stylesheet for the active theme (class mode). Since `8a0303c`, the
+SPA ships a byte-parity copy (`web/src/styles/highlight.generated.css`, guarded
+by `pkg/web/highlight_parity_test.go`) inside its hashed app stylesheet as the
+primary delivery path. `GET /vh/highlight.css` (`Cache-Control: max-age=86400`)
+remains for standalone consumers (alongside `/vh/code/highlight.css?style=…`,
+which is a distinct per-style endpoint).
 
 ## Client caching
 
