@@ -630,17 +630,22 @@ function applyDetailIndependent(snap: Snapshot): void {
   // via the scoped merge/replace path, NOT wholesale projectSnapshot — so buried
   // detail outside the frontier scope is preserved. Both install paths branch
   // identically (this independent path + the coherent tryInstall path).
-  if (snap.partial) applyScopedSnapshot(snap);
-  else applySnapshot(snap);
+  // Slice B (F3 fold): noteTreeConverged gates on the installer's APPLIED
+  // verdict — a guard discard (stale same-epoch seq below the accepted cursor)
+  // must NOT falsely satisfy a pending cascade tree step. The convergence
+  // signal waits for a baseline that actually landed.
+  let applied = false;
+  if (snap.partial) applied = applyScopedSnapshot(snap);
+  else applied = applySnapshot(snap);
   if (!treeSnapDone) {
     treeSnapDone = true;
     if (treeT1) recordLatency("tree", "snap", performance.now() - treeT1);
   }
   setState("status", "live");
   void refreshOpenSessions();
-  // Slice A: an authoritative detail baseline landed on the current tree
+  // Slice A/B: an authoritative detail baseline APPLIED on the current tree
   // connection — satisfy the convergence cascade's tree step.
-  noteTreeConverged();
+  if (applied) noteTreeConverged();
 }
 
 // applyTreeIndependent — the existing tree.snapshot apply path, extracted so the
@@ -700,6 +705,7 @@ function tryInstall(owner: PendingCaptureOwner): void {
   // sees a mixed old/new projection pair).
   owner.installed = true;
   let backfillIds: string[] = [];
+  let detailApplied = false;
   batch(() => {
     // Detail projection. A frontier-scoped partial (snap.partial present)
     // installs via the scoped merge/replace path (D3) — same branch as the
@@ -707,8 +713,10 @@ function tryInstall(owner: PendingCaptureOwner): void {
     // fall through to wholesale replacement. applySnapshot/applyScopedSnapshot
     // wholesale-replaces (or scoped-merges) state.sessions and sets state.cursor
     // = snap.seq; inside the batch this and the tree seed are ONE reactive flush.
-    if (detail.snap.partial) applyScopedSnapshot(detail.snap);
-    else applySnapshot(detail.snap);
+    // Slice B (F3 fold): capture the guard's APPLIED verdict — the post-batch
+    // noteTreeConverged() must not fire on a stale same-epoch detail discard.
+    if (detail.snap.partial) detailApplied = applyScopedSnapshot(detail.snap);
+    else detailApplied = applySnapshot(detail.snap);
     // Tree projection (existing seedTreeStore path). Replaces treeMap in one
     // signal update; userExpanded preserved.
     seedTreeStore(tree.nodes);
@@ -750,10 +758,12 @@ function tryInstall(owner: PendingCaptureOwner): void {
   for (const nid of backfillIds) void expandTreeNode(nid);
   setState("status", "live");
   void refreshOpenSessions();
-  // Slice A: the coherent baseline installed — satisfy the convergence
-  // cascade's tree step (the strongest convergence signal: both projections of
-  // one {epoch, seq} capture landed atomically).
-  noteTreeConverged();
+  // Slice A/B (F3 fold): the coherent baseline installed — satisfy the
+  // convergence cascade's tree step (the strongest convergence signal: both
+  // projections of one {epoch, seq} capture landed atomically) ONLY when the
+  // guard let the DETAIL projection apply; a stale same-epoch discard leaves
+  // the pass in flight for the next valid baseline (or its timeout).
+  if (detailApplied) noteTreeConverged();
 }
 
 // TREE_STREAM_KINDS — the named SSE events Stream 1 (the tree stream)
@@ -996,6 +1006,15 @@ export function connect(fresh = false) {
           // Generation re-check (mirrors Stream 2's post-await sesGen check):
           // the connection may have been replaced while we were decoding.
           if (gen !== treeGen) return;
+          // Slice B (precise-signal switch): partial.ringGap=true is the
+          // server's SOLE true-gap stamp (`detailSnap.Partial.RingGap` in
+          // handleStream's fresh-snapshot fallback, hasCursor && !replayOK;
+          // field semantics: PartialMeta.RingGap in pkg/state/store.go) —
+          // the replay ring could not serve our cursor, events were
+          // missed. Consume it HERE (frame-in-hand, regardless of how the
+          // detail later stages/applies/discards) so the cascade arms its
+          // tree-await pass and fires the queue-reconcile trigger.
+          if (snap.partial?.ringGap) noteServerRingGap();
           if (stageDetail(snap)) return;
           applyDetailIndependent(snap);
         } finally {
@@ -1005,6 +1024,9 @@ export function connect(fresh = false) {
       })();
     } else {
       const snap = raw as Snapshot;
+      // Slice B (precise-signal switch): same sole true-gap stamp as the
+      // gzip64-decoded path above — see the comment there for citations.
+      if (snap.partial?.ringGap) noteServerRingGap();
       if (!stageDetail(snap)) applyDetailIndependent(snap);
     }
   });
@@ -1103,13 +1125,20 @@ export function connect(fresh = false) {
         if (pendingOwner === owner && !owner.settled) markOwnerLegacy(owner);
         return;
       }
-      // Slice A (send-net-resilience): consume the server's capture CAUSE.
-      // cause:"reconnect" means the daemon fell back to a fresh snapshot
-      // because our cursor was evicted from the shared replay ring — events
-      // were missed while disconnected, so the cascade arms its unified
-      // queue-reconcile trigger (previously this field was dropped on the
-      // floor; see research-packet-cascade.md Q2).
-      if (snap.cause === "reconnect") noteServerRingGap();
+      // Slice B (F1 comment fold + precise-signal switch): consume the
+      // server's capture CAUSE as BENIGN telemetry. cause:"reconnect" is
+      // stamped on EVERY cursor-resume reconnect — the replay-SUCCESS branch
+      // HARDCODES it on its post-replay re-seed snapshots (handleStream's
+      // replay branch), and the fresh-snapshot branch gates it on
+      // hasCursor && !replayOK — so a replay that missed nothing carries it
+      // too. The PRECISE missed-events signal is the detail snapshot's
+      // partial.ringGap flag (`detailSnap.Partial.RingGap`, the sole
+      // stamping site), consumed in the `snapshot` listener above
+      // (noteServerRingGap). A bare cause:"reconnect" therefore only COUNTS
+      // (extend-only reason code; no cascade arming — benign resumes are
+      // already covered by the reconnecting→live transition's
+      // notifyStreamLive path).
+      if (snap.cause === "reconnect") countRecovery("server-reconnect-resume");
       // If a participant already declared this capture incoherent (a mismatch
       // marked the owner legacy while the tree was decoding), apply the tree
       // independently. The release from that prior markOwnerLegacy was chained

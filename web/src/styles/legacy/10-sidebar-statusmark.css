@@ -200,6 +200,16 @@
 .status-mark.stale { --status: var(--warn); --status-soft: color-mix(in srgb, var(--warn) 28%, transparent); --orbital-tint: var(--warn); }
 .status-mark.syncing { --status: var(--ok); --status-soft: color-mix(in srgb, var(--ok) 28%, transparent); --orbital-tint: var(--accent); }
 .status-mark.reconnecting { --status: var(--danger); --status-soft: color-mix(in srgb, var(--danger) 30%, transparent); --orbital-tint: var(--warn); }
+/* Slice B (send-net-resilience): the browser-OFFLINE grade of the shared
+   ConnStatus reduction. Deliberately aliases the reconnecting custom-prop
+   palette (the visual vocabulary is preserved — offline reads as the same
+   hard-down family) while remaining its OWN addressable state so tips/aria
+   can carry the distinction. FULLY STATIC (no entry animations): this is an
+   always-present surface, and offline typically coexists with a backgrounded
+   tab where any running animation is pure waste (same reasoning as the
+   slice-6 reconnecting fix, minus even the one-shot cues). */
+.status-mark.offline { --status: var(--danger); --status-soft: color-mix(in srgb, var(--danger) 30%, transparent); --orbital-tint: var(--warn); }
+.status-mark.offline .halo { border-style: dashed; opacity: .8; }
 
 .status-mark.connecting .brand-mark { animation: mark-breathe 1.25s ease-in-out infinite; }
 .status-mark.connecting .halo { animation: spin 1s linear infinite; }

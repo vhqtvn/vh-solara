@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
+	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 	"github.com/vhqtvn/vh-solara/pkg/oclife"
 	"github.com/vhqtvn/vh-solara/pkg/procmgr"
 	"github.com/vhqtvn/vh-solara/pkg/web"
@@ -164,6 +165,22 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 	// so the controller/operator can observe a failed OpenCode THROUGH
 	// the tunnel without this worker having died with it.
 	srv.SetOpenCodeLifecycle(rt.ocLife)
+	// Slice B (send-net-resilience): stamp the controller-tunnel state on
+	// /vh/* responses (X-VH-Tunnel-State) from the diagnostics singleton the
+	// agent daemon keeps current (diag.Default.Tunnel.CurrentState —
+	// Disconnected at start, Connected while the tunnel is up, back through
+	// reconnect cycles). The daemon ALWAYS has a controller dial in this
+	// topology, so the state is meaningful; local-server (no controller
+	// connection) leaves the provider unwired → the header is absent → the
+	// FE degrades to unknown-tunnel, never "down". OBSERVATIONAL ONLY
+	// (debate-1 Q5, BINDING): a status input for the graded ConnStatus
+	// reduction — never retry/delivery/redelivery authority.
+	srv.SetTunnelStateProvider(func() string {
+		if diag.Default.Tunnel.CurrentState.Load() == diag.TunnelStateConnected {
+			return "connected"
+		}
+		return "disconnected"
+	})
 	// Retry-storm gating (oc-death-watch S2): while the death watcher KNOWS
 	// OpenCode is down (lifecycle DownSince set — observed death, kept
 	// across the failed→starting restart sequence, cleared on ready), every

@@ -223,11 +223,17 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
 // stream snapshot is a trusted REBUILD (cursor re-baselines; no cross-epoch
 // seq compare), and a cross-epoch http bundle is discarded with ONE
 // conservative epoch-reset re-sync requested.
-export function applySnapshot(snap: Snapshot, provenance: SnapshotProvenance = "stream"): void {
+//
+// Slice B (F3 fold): returns the APPLIED verdict — true iff the guard let the
+// baseline project (a discard, including the epoch-discard recovery path,
+// returns false). tree-transport gates noteTreeConverged() on this value so a
+// stale same-epoch discard can never falsely satisfy a pending cascade tree
+// step. Callers ignoring the return keep their exact prior behavior.
+export function applySnapshot(snap: Snapshot, provenance: SnapshotProvenance = "stream"): boolean {
   const verdict = guardSnapshotApply(snap, provenance);
   if (!verdict.apply) {
     if (verdict.discard === "stale-epoch") recoverFromEpochDiscard();
-    return;
+    return false;
   }
   bumpUpdating();
   const effects: ReconcileEffect[] = [];
@@ -237,6 +243,7 @@ export function applySnapshot(snap: Snapshot, provenance: SnapshotProvenance = "
   // snap.seq; a same-epoch apply advances it MONOTONICALLY (never rewinds).
   if (verdict.rebaseline || snap.seq > state.cursor) setState("cursor", snap.seq);
   if (effects.some((e) => e.kind === "sync-state-dirty")) persist();
+  return true;
 }
 
 // projectScopedPartial — Slice-A (D3/D4): the FRONTIER-SCOPED partial detail
@@ -363,12 +370,14 @@ export function projectScopedPartial(s: SyncState, snap: Snapshot, effects: Reco
 // HTTP detail bundle call site passes "http" (its apply can race a daemon
 // restart in either direction; a cross-epoch discard then requests the
 // conservative epoch-reset re-sync). Cursor follows the same verdict: re-
-// baseline on rebuild, monotonic within an epoch.
-export function applyScopedSnapshot(snap: Snapshot, provenance: SnapshotProvenance = "stream"): void {
+// baseline on rebuild, monotonic within an epoch. Slice B (F3 fold): returns
+// the APPLIED verdict (same contract as applySnapshot above) so the transport
+// gates noteTreeConverged() on a truthful install.
+export function applyScopedSnapshot(snap: Snapshot, provenance: SnapshotProvenance = "stream"): boolean {
   const verdict = guardSnapshotApply(snap, provenance);
   if (!verdict.apply) {
     if (verdict.discard === "stale-epoch") recoverFromEpochDiscard();
-    return;
+    return false;
   }
   bumpUpdating();
   const effects: ReconcileEffect[] = [];
@@ -376,6 +385,7 @@ export function applyScopedSnapshot(snap: Snapshot, provenance: SnapshotProvenan
   interpretEffects(effects);
   if (verdict.rebaseline || snap.seq > state.cursor) setState("cursor", snap.seq);
   if (effects.some((e) => e.kind === "sync-state-dirty")) persist();
+  return true;
 }
 
 // pruneSessionDeleted — eager archive prune. Removes a session as if a

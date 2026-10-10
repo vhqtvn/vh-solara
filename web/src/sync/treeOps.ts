@@ -105,13 +105,18 @@ export interface TreeSnapshot {
   // barrier treats a missing epoch as the legacy signal.
   epoch?: string;
   seq?: number;
-  // Slice A (send-net-resilience cascade): the server's capture CAUSE —
-  // "initial" on a fresh connect, "reconnect" when the client HAD a cursor but
-  // the shared replay ring evicted it (server.go hasCursor && !replayOK → the
-  // fresh-snapshot fallback). The convergence cascade consumes
-  // cause:"reconnect" (noteServerRingGap) as the missed-events signal that
-  // fires the unified queue-reconcile trigger. Optional: pre-cascade decoders
-  // stripped it (it was previously dropped on the floor).
+  // Slice A→B (send-net-resilience cascade): the server's capture CAUSE —
+  // stamped on EVERY cursor-resume reconnect, NOT only ring-gap evictions.
+  // Truthful server semantics (pkg/web/server.go): the replay-SUCCESS branch
+  // HARDCODES cause:"reconnect" on its post-replay re-seed snapshots, and
+  // the fresh-snapshot branch gates it on hasCursor && !replayOK — so a
+  // replay that MISSED NOTHING also carries "reconnect". The precise
+  // missed-events signal is the DETAIL snapshot's partial.ringGap flag
+  // (`detailSnap.Partial.RingGap`, the sole stamping site), which Slice
+  // B's noteServerRingGap consumes. A bare cause:"reconnect" (no ringGap)
+  // is counted as benign "server-reconnect-resume" telemetry only.
+  // Optional: pre-cascade decoders stripped it (it was previously dropped
+  // on the floor).
   cause?: string;
 }
 

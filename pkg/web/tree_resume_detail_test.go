@@ -115,6 +115,19 @@ func TestTreeResume_ReconnectBootstrapsDetail(t *testing.T) {
 	if _, hasC2 := eventDataFor(resumed, "snapshot", "C2"); hasC2 {
 		t.Errorf("tree=2 resume: partial snapshot must OMIT buried C2 (arrives via expand); events=%v", eventNames(resumed))
 	}
+
+	// D-F1 green-on-arrival pin (review ses_ed9164bb2): the replay-SUCCESS
+	// re-seed's detail snapshot must NOT carry partial.ringGap — the server
+	// stamps that flag ONLY on the ring-gap fallback (hasCursor && !replayOK);
+	// omitempty drops a false flag from the wire entirely. This is the
+	// benign-reconnect half of the contract: cause:"reconnect" WITHOUT
+	// partial.ringGap is a cursor-resume that missed nothing. Pinning EXISTING
+	// emission — no RED expected or observed.
+	for _, e := range resumed {
+		if e.event == "snapshot" && strings.Contains(e.data, `"ringGap":true`) {
+			t.Errorf("replay-success resume: detail snapshot must NOT carry partial.ringGap (benign reconnect re-seed); data=%.200s", e.data)
+		}
+	}
 }
 
 // TestTreeResume_ReconnectAtHeadBootstrapsDetail is the no-delta variant: the

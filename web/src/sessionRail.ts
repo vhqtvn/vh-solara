@@ -35,8 +35,7 @@ import { state } from "./sync/store";
 import { sessionNeedsInput, sessionWorking } from "./sync/selectors";
 import { treeMap } from "./sync/treeState";
 import { rootNodes } from "./sync/treeMap";
-import { isStale } from "./sync/health";
-import { isUpdating } from "./sync/reconcile";
+import { connModel, railConnFromModel } from "./sync/connstatus";
 
 // REVERSIBLE DEFAULT (operator dials): the avatar hue palette SIZE. The hues
 // themselves are the app's semantic --label-* mid-tones (tokens.css) — the
@@ -149,16 +148,14 @@ export function railNeedsYou(): number {
 }
 
 /**
- * The rail's connection-dot state — the same priority ladder the sidebar's
- * StatusMark uses (Sidebar.tsx indState): hard socket states win; within
- * "live", stale outranks syncing. One state at a time, rendered as a class
- * flip (no animation).
+ * The rail's connection-dot state — Slice B (send-net-resilience): delegates
+ * to the SHARED graded ConnStatus reduction (sync/connstatus.ts), the same
+ * ladder the sidebar's StatusMark now consumes. Hard socket states win;
+ * within "live", stale (the degraded grade) outranks syncing; "offline" (the
+ * browser-offline grade) renders as its own data-state. One state at a time,
+ * rendered as a class flip (no animation). OBSERVATIONAL ONLY (debate-1 Q5).
  */
-export type RailConn = "live" | "syncing" | "stale" | "connecting" | "reconnecting";
+export type RailConn = "live" | "syncing" | "stale" | "connecting" | "reconnecting" | "offline";
 export function railConnState(): RailConn {
-  if (state.status === "reconnecting") return "reconnecting";
-  if (state.status === "connecting") return "connecting";
-  if (isStale()) return "stale";
-  if (isUpdating() && state.status === "live") return "syncing";
-  return "live";
+  return railConnFromModel(connModel());
 }

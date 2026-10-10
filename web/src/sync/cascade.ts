@@ -75,10 +75,11 @@
 // fires the registered queue-reconcile trigger — the SAME reconcileOutbox +
 // fetch surface session-open and focus use; there is NO third caller. Sources
 // that route here: the stream-live reconnect path (createQueueSync →
-// notifyStreamLive), the server reconnect signal (tree.snapshot cause:
-// "reconnect" → noteServerRingGap — a cursor-resume reconnect, replay OR
-// ring-gap; see noteServerRingGap for why the counter is coarse until
-// Slice B), and any converging recovery pass.
+// notifyStreamLive), the server's PRECISE ring-gap signal (detail snapshot
+// partial.ringGap:true → noteServerRingGap — the Slice B switch; the coarse
+// tree.snapshot cause:"reconnect" NO LONGER arms a pass and only counts
+// benign server-reconnect-resume telemetry), and any converging recovery
+// pass.
 // A pass that times out (CASCADE_PASS_TIMEOUT_MS) completes WITHOUT the
 // trigger (convergence unproven; the queue's own 5s poll / focus covers).
 //
@@ -152,6 +153,51 @@ let lastGenKey: { epoch: string; acceptedCursor: number; reasons: CascadeReason[
 // so a stale cleanup can never clear a newer registration.
 let queueReconcileTrigger: (() => void) | null = null;
 let triggerToken = 0;
+
+// ── Slice B: production completion observable (connstatus input) ────────────
+// cascade.ts stays Solid-free (pure supervisor). connstatus.ts mirrors this
+// subscription into its own signal. Listeners are notified on every pass
+// lifecycle transition that can change cascadeRecoveryPending(): pass start
+// (incl. supersession), completion, timeout. Coalesce/reason-unions never
+// change pendingness and do not notify. Exceptions in a listener are logged
+// and never propagate into the supervisor.
+type CascadeStateListener = (pending: boolean) => void;
+const cascadeListeners = new Set<CascadeStateListener>();
+
+/** Subscribe to cascade pendingness transitions. Returns an unsubscribe fn. */
+export function subscribeCascadeState(fn: CascadeStateListener): () => void {
+  cascadeListeners.add(fn);
+  return () => {
+    cascadeListeners.delete(fn);
+  };
+}
+
+/**
+ * True while a recovery pass has an UNCONVERGED awaited baseline — the
+ * "post-reconnect convergence outstanding" input the graded ConnStatus
+ * reduction uses to block the live grade (debate-3 A6). A pass whose steps
+ * all converged (completing on a microtask) is NOT pending. No pass at all
+ * (happy-path boot, idle) is NOT pending.
+ */
+export function cascadeRecoveryPending(): boolean {
+  const pass = inFlight;
+  if (!pass) return false;
+  const t = pass.steps.tree;
+  const s = pass.steps.session;
+  if ((t && t.state === "pending") || (s && s.state === "pending")) return true;
+  return false;
+}
+
+function notifyCascadeState(): void {
+  const pending = cascadeRecoveryPending();
+  for (const fn of cascadeListeners) {
+    try {
+      fn(pending);
+    } catch (err) {
+      log.warn("sync", "cascade state listener threw", { err: String(err) });
+    }
+  }
+}
 
 export function setQueueReconcileTrigger(fn: (() => void) | null): number {
   queueReconcileTrigger = fn;
@@ -245,11 +291,13 @@ function startPass(
     // no-op (its successor owns the cascade now).
     if (pass.gen !== cascadeGen || inFlight !== pass) return;
     inFlight = null;
+    notifyCascadeState();
     log.warn("sync", "cascade pass timed out without convergence", {
       reasons: canon(pass.genKey.reasons),
     });
   }, cascadeTimeoutMs);
   maybeComplete(pass);
+  notifyCascadeState();
 }
 
 // maybeComplete — all awaited baselines landed ⇒ complete the pass and fire
@@ -261,6 +309,7 @@ function maybeComplete(pass: CascadePass): void {
   const s = pass.steps.session;
   if ((t && t.state === "pending") || (s && s.state === "pending")) return;
   inFlight = null;
+  notifyCascadeState();
   window.clearTimeout(pass.timeout);
   syncLastGenKey(pass);
   stats.queueTriggers++;
@@ -360,9 +409,11 @@ export function noteExternalRecovery(reason: CascadeReason): void {
 }
 
 /**
- * noteTreeConverged — an authoritative tree+detail baseline landed on the
- * current tree connection (tryInstall / applyTreeIndependent /
- * applyDetailIndependent). Satisfies the in-flight pass's tree step.
+ * noteTreeConverged — an authoritative tree baseline (the tree-only
+ * independent path — no guard-discard verdict by design) or an APPLIED
+ * tree+detail coherent capture landed on the current tree connection
+ * (tryInstall / the detail-independent installer's applied verdict).
+ * Satisfies the in-flight pass's tree step.
  */
 export function noteTreeConverged(): void {
   if (!inFlight) return;
@@ -385,20 +436,24 @@ export function noteSessionConverged(): void {
 }
 
 /**
- * noteServerRingGap — consume the server's cause:"reconnect" signal. That
- * cause means CURSOR-RESUME RECONNECT — replay OR ring-gap, not only the
- * ring-gap fallback: the server stamps it on BOTH the replay-success re-seed
- * snapshot (hardcoded, server.go ~2931/2933) and the fresh-snapshot branch
- * gated on hasCursor && !replayOK (~2999-3002). The missed-events
- * distinction is carried by the detail snapshot's partial.ringGap flag
- * (server.go ~3015-3021, stamped ONLY when hasCursor && !replayOK) —
- * consumed in Slice B, NOT by this cause path. So the "server-ring-gap"
- * counter below today counts ALL cursor-resume reconnects (benign
- * native-EventSource auto-retries included — harmless: the armed pass is
- * idempotent and never auto-sends) and is NOT a true-ring-gap metric until
- * Slice B switches detection to partial.ringGap. The pass itself: step-less,
- * awaits the pending tree baseline, fires the queue-reconcile trigger (the
- * queue is the missed-output consumer).
+ * noteServerRingGap — consume the server's PRECISE missed-events signal:
+ * partial.ringGap=true on the detail `snapshot` frame (Slice B switch). The
+ * daemon stamps that flag ONLY in handleStream's fresh-snapshot fallback —
+ * `detailSnap.Partial.RingGap`, gated hasCursor && !replayOK (the sole
+ * stamping site; field semantics: PartialMeta.RingGap in pkg/state/store.go):
+ * the client HAD a cursor and the shared replay ring could not serve it —
+ * events were missed while disconnected. The pass: step-less,
+ * awaits the pending tree baseline (F3-gated: only an APPLIED
+ * baseline converges it), fires the queue-reconcile trigger (the queue is
+ * the missed-output consumer).
+ *
+ * The COARSE tree.snapshot cause:"reconnect" is NOT this signal — the server
+ * stamps it on EVERY cursor-resume reconnect (hardcoded on the replay-success
+ * re-seed snapshots in handleStream's replay branch; derived from the
+ * hasCursor && !replayOK gate on the fresh-snapshot branch). A
+ * cause:"reconnect" WITHOUT partial.ringGap is a benign replay resume,
+ * counted as telemetry ("server-reconnect-resume" in recovery-reasons.ts)
+ * with NO cascade arming.
  */
 export function noteServerRingGap(): void {
   countRecovery("server-ring-gap");
@@ -478,6 +533,9 @@ export function _resetCascadeForTest(): void {
   lastGenKey = null;
   queueReconcileTrigger = null;
   triggerToken++;
+  // Slice B: drop state-subscription wiring with the rest of the singleton
+  // (tests re-subscribe after reset; production never resets).
+  cascadeListeners.clear();
   cascadeTimeoutMs = CASCADE_PASS_TIMEOUT_MS;
 }
 

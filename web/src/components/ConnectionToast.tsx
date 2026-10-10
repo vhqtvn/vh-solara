@@ -1,5 +1,5 @@
 import { createEffect, createSignal, onCleanup, Show } from "solid-js";
-import { state, consumeEpochChanged } from "../sync";
+import { state, consumeEpochChanged, connGrade } from "../sync";
 import Icon from "./Icon";
 import styles from "./ConnectionToast.module.css";
 
@@ -17,6 +17,15 @@ import styles from "./ConnectionToast.module.css";
 // never OpenCode; OpenCode lifecycle (starting/failed/…) is surfaced separately
 // by OpenCodeHealthPanel. Keep the wording topology-agnostic so the two can't
 // be conflated.
+//
+// Slice B (send-net-resilience): keyed on the SHARED graded ConnStatus
+// reduction (string-deduped grade — the ~5s health tick re-running the model
+// does not re-fire these transitions). "reconnecting" keeps the prior wording
+// (tunnel-down / socket reconnecting / post-reconnect convergence pending all
+// collapse into it); "offline" gets its own distinct wording (browser has no
+// network); the "Reconnected" ok fires at CONVERGENCE — the live grade
+// requires the post-reconnect cascade to have completed, so recovery is
+// confirmed, not merely socket-open. OBSERVATIONAL ONLY (debate-1 Q5).
 export default function ConnectionToast() {
   const [toast, setToast] = createSignal<{ kind: "warn" | "ok"; text: string } | null>(null);
   let showTimer: number | undefined;
@@ -26,7 +35,7 @@ export default function ConnectionToast() {
   createEffect(() => {
     // Read both so this re-runs on either change. epochChanged is latched by
     // applySnapshot when an epoch transition is detected on a LIVE connection.
-    const st = state.status;
+    const grade = connGrade();
     const ec = state.epochChanged;
     clearTimeout(showTimer);
     clearTimeout(hideTimer);
@@ -41,13 +50,19 @@ export default function ConnectionToast() {
       hideTimer = window.setTimeout(() => setToast(null), 4000);
       return;
     }
-    if (st === "reconnecting") {
+    if (grade === "offline") {
+      // Only surface if it persists — avoids flashing on a quick recovery.
+      showTimer = window.setTimeout(() => {
+        warned = true;
+        setToast({ kind: "warn", text: "You're offline — waiting for network…" });
+      }, 1200);
+    } else if (grade === "reconnecting") {
       // Only surface if it persists — avoids flashing on a quick recovery.
       showTimer = window.setTimeout(() => {
         warned = true;
         setToast({ kind: "warn", text: "Connection lost — reconnecting…" });
       }, 1200);
-    } else if (st === "live") {
+    } else if (grade === "live") {
       if (warned) {
         warned = false;
         setToast({ kind: "ok", text: "Reconnected" });
@@ -56,6 +71,7 @@ export default function ConnectionToast() {
         setToast(null);
       }
     }
+    // "degraded" is a silent observational grade — no toast.
   });
 
   onCleanup(() => {

@@ -211,8 +211,15 @@ func TestTreeReplay_ReconnectReplaysDelta(t *testing.T) {
 
 // TestTreeReplay_RingGapSendsReconnectSnapshot asserts a reconnect where the
 // cursor is too old (ring evicted it) sends a fresh tree.snapshot with cause
-// "reconnect" (NOT "initial"). Uses a tiny ring (cap=4) and applies 5 events so
+// "reconnect" (NOT "initial"), and that the DETAIL snapshot following it
+// carries partial.ringGap:true — the sole true-gap stamp
+// (detailSnap.Partial.RingGap in handleStream's fresh-snapshot fallback,
+// hasCursor && !replayOK). Uses a tiny ring (cap=4) and applies 5 events so
 // Seq=1 is evicted; reconnecting with cursor=0 triggers a genuine ring-gap.
+//
+// The ringGap assertions below are green-on-arrival pins of EXISTING server
+// emission (D-F1, review ses_ed9164bb2): no RED was expected — they pin the
+// wire contract the Slice B client switch (noteServerRingGap) consumes.
 func TestTreeReplay_RingGapSendsReconnectSnapshot(t *testing.T) {
 	oc := httptest.NewServer(http.NotFoundHandler())
 	t.Cleanup(oc.Close)
@@ -239,12 +246,45 @@ func TestTreeReplay_RingGapSendsReconnectSnapshot(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	ev := readFirstEvent(t, resp.Body, 3*time.Second)
-	t.Logf("FULL ev.data length=%d:\n%s", len(ev.data), ev.data)
-	if ev.event != "tree.snapshot" {
-		t.Fatalf("ring-gap reconnect: first event got %q, want tree.snapshot", ev.event)
+	// Drain the full ring-gap burst: coarse tree.snapshot first, then the
+	// DETAIL `snapshot` that follows it (server write order), then the
+	// snapshot.complete boundary.
+	events := drainIdle(startSSEReader(t, resp.Body), 600*time.Millisecond)
+	t.Logf("ring-gap reconnect events: %v", eventNames(events))
+
+	if len(events) == 0 {
+		t.Fatal("ring-gap reconnect: no events received")
 	}
-	if !strings.Contains(ev.data, `"reconnect"`) {
-		t.Errorf("ring-gap snapshot cause should be \"reconnect\", got data=%.200s", ev.data)
+	if events[0].event != "tree.snapshot" {
+		t.Fatalf("ring-gap reconnect: first event got %q, want tree.snapshot", events[0].event)
+	}
+	if !strings.Contains(events[0].data, `"reconnect"`) {
+		t.Errorf("ring-gap snapshot cause should be \"reconnect\", got data=%.200s", events[0].data)
+	}
+
+	// D-F1 green-on-arrival pin (review ses_ed9164bb2): the DETAIL snapshot
+	// that FOLLOWS the coarse tree.snapshot must carry partial.ringGap:true —
+	// the sole stamping site (detailSnap.Partial.RingGap in handleStream's
+	// fresh-snapshot fallback, hasCursor && !replayOK). This is the PRECISE
+	// signal the Slice B client switch (noteServerRingGap) consumes; the
+	// coarse cause:"reconnect" above is stamped on every cursor-resume
+	// reconnect and cannot discriminate. Pinning EXISTING emission — no RED
+	// expected or observed.
+	detailIdx := -1
+	for i, e := range events {
+		if e.event == "snapshot" {
+			detailIdx = i
+			break
+		}
+	}
+	if detailIdx < 0 {
+		t.Fatalf("ring-gap reconnect: no detail `snapshot` event followed tree.snapshot; events=%v", eventNames(events))
+	}
+	detail := events[detailIdx].data
+	if !strings.Contains(detail, `"partial"`) {
+		t.Errorf("ring-gap detail snapshot should be a partial frame (tree-only filter={}); data=%.200s", detail)
+	}
+	if !strings.Contains(detail, `"ringGap":true`) {
+		t.Errorf("ring-gap detail snapshot must carry partial.ringGap:true (sole stamping site: detailSnap.Partial.RingGap, hasCursor && !replayOK); data=%.200s", detail)
 	}
 }

@@ -117,19 +117,35 @@ import { readWeakLink, type WeakLinkSnapshot } from "./weaklink";
 //                           requested ONE conservative fresh-snapshot re-sync
 //                           (adjudication 1: identity + liveness, never
 //                           ordering).
-//  - server-ring-gap slice A: the daemon stamped cause:"reconnect" on a
-//                           tree.snapshot — a cursor-resume reconnect (replay
-//                           OR ring-gap: the replay-success site hardcodes it
-//                           at server.go ~2931/2933, the fresh-snapshot site
-//                           gates on hasCursor && !replayOK ~2999-3002). The
-//                           missed-events distinction is the detail
-//                           snapshot's partial.ringGap flag (server.go
-//                           ~3015-3021), consumed in Slice B — so until that
-//                           switch this counter counts ALL cursor-resume
-//                           reconnects (the armed pass is idempotent and
-//                           never auto-sends) and is NOT a true-ring-gap
-//                           metric. The cascade fires the unified
-//                           queue-reconcile trigger.
+//  - server-ring-gap slice A→B: PRECISE since Slice B — the daemon stamped
+//                           partial.ringGap=true on the detail snapshot
+//                           (`detailSnap.Partial.RingGap` in handleStream's
+//                           fresh-snapshot fallback, hasCursor && !replayOK
+//                           — the SOLE stamping site; field semantics:
+//                           PartialMeta.RingGap in pkg/state/store.go),
+//                           meaning the client HAD a cursor and the replay
+//                           ring could not serve it: events were missed
+//                           while disconnected. Consumed by
+//                           noteServerRingGap (tree-transport's `snapshot`
+//                           listener) → the convergence cascade arms its
+//                           tree-await pass and fires the unified
+//                           queue-reconcile trigger. (Slice A briefly keyed
+//                           this on the COARSE tree.snapshot cause:
+//                           "reconnect", which also fires on every benign
+//                           replay-success resume.)
+//  - server-reconnect-resume slice B: the BENIGN half of the old coarse
+//                           signal — counts EVERY cursor-resume
+//                           tree.snapshot carrying cause:"reconnect"
+//                           (coarse telemetry: the server stamps that cause
+//                           on both the replay-success re-seed and the
+//                           ring-gap fallback, and the flag that separates
+//                           them — partial.ringGap — lives on the DETAIL
+//                           snapshot frame, not this one). True gaps
+//                           ADDITIONALLY increment server-ring-gap via the
+//                           detail-snapshot flag. Telemetry ONLY: no
+//                           cascade arming (the reconnecting→live
+//                           transition already arms notifyStreamLive when
+//                           warranted).
 //  - cascade-queue-reconcile slice A: the convergence cascade completed a
 //                           recovery pass and fired the unified
 //                           queue-reconcile trigger (the same
@@ -162,6 +178,7 @@ export const RECOVERY_REASONS = [
   "epoch-reset",
   "server-ring-gap",
   "cascade-queue-reconcile",
+  "server-reconnect-resume",
 ] as const;
 export type RecoveryReason = (typeof RECOVERY_REASONS)[number];
 

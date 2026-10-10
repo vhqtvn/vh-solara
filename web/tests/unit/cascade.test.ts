@@ -239,8 +239,13 @@ describe("cascade — epoch-reset (cross-epoch discipline, adjudication 1)", () 
   });
 });
 
-describe("cascade — server ring-gap (SSE cause:\"reconnect\" consumption)", () => {
+describe("cascade — server ring-gap (partial.ringGap precise signal, Slice B)", () => {
   it("counts server-ring-gap and fires the queue trigger at tree convergence", async () => {
+    // Slice B: noteServerRingGap is consumed from the transport's `snapshot`
+    // listener on partial.ringGap=true (the server's sole true-gap stamp,
+    // server.go :3019-3021); the coarse tree.snapshot cause:"reconnect" is now
+    // benign telemetry ("server-reconnect-resume"). The cascade surface itself
+    // (count + tree-await pass + trigger-at-convergence) is unchanged.
     setState("epoch", "e1");
     setState("authoritativeReady", false);
     const trigger = vi.fn();

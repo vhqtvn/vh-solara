@@ -48,6 +48,7 @@ import { isPaneVisible, isDocVisible, onPaneVisibilityChange } from "./paneVisib
 import { watchdogTick, maybeReconnect, tickHealth, resyncTree, stampTreeResyncBoundary } from "./sync/health";
 import { installSyncDiagGlobal, countRecovery } from "./sync/recovery-reasons";
 import { installFetchSampler } from "./sync/weaklink";
+import { installTunnelSampler, initConnStatus } from "./sync/connstatus";
 import { startPeriodicResync } from "./sync/periodic-resync";
 import { setSelectedId, switchProject, openSession } from "./sync/actions";
 
@@ -139,6 +140,14 @@ export function startSync() {
   // only; never behavior. Installed BEFORE any app fetch runs (the boot
   // connect(true) below) so the baseline denominator is honest from load.
   installFetchSampler();
+  // Slice B (send-net-resilience): the graded ConnStatus reduction — the
+  // daemon tunnel-state header sampler (X-VH-Tunnel-State off /vh/* fetch
+  // responses; observational only) + the navigator/cascade input wiring.
+  // Installed with the weak-link sampler, before any app fetch runs, so the
+  // tunnel observation is honest from load. BINDING (debate-1 Q5): status
+  // INPUT only — never a retry/delivery trigger.
+  installTunnelSampler();
+  initConnStatus();
   // Slice 2 (webperf): the pane-visibility lifecycle. onPaneVisibilityChange
   // fires only on TRANSITIONS (paneVisibility.notify's last-value guard), so
   // the host's periodic resync messages cannot double-resume.
@@ -349,6 +358,23 @@ export type { SessionModelPick } from "./sync/store";
 export { isStale } from "./sync/health";
 export { isUpdating, UPDATING_DEBOUNCE_MS } from "./sync/reconcile";
 export { STALE_MS } from "./sync/stream";
+// Slice B (send-net-resilience) — the shared graded ConnStatus reduction and
+// its consumer mapping tables (Sidebar StatusMark / SessionRail dot). The
+// grades are OBSERVATIONAL ONLY (debate-1 Q5): never retry/delivery
+// authority. See sync/connstatus.ts for the precedence contract.
+export {
+  connModel,
+  connGrade,
+  statusMarkState,
+  statusMarkTip,
+  railConnFromModel,
+  initConnStatus,
+  installTunnelSampler,
+  TUNNEL_FRESH_MS,
+  DEGRADED_FETCH_FAILURES,
+  DEGRADED_FETCH_WINDOW_MS,
+} from "./sync/connstatus";
+export type { ConnGrade, ConnStatusModel, TunnelSignal } from "./sync/connstatus";
 // Phase 4 — historical-page load-older action (called from ChatView's
 // IntersectionObserver top sentinel + "Load older" button).
 export { loadOlder } from "./sync/history";

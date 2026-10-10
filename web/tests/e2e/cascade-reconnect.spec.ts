@@ -20,12 +20,13 @@ import { projectUrl } from "./util";
 //   3. The reconnect request is ROUTE-ABORTED once (a genuinely failed
 //      reconnect — the browser's native auto-retry follows).
 //   4. The next reconnect is FULFILLED with a synthetic coherent SSE trio
-//      (tree.snapshot cause:"reconnect" + scoped-partial detail snapshot +
-//      snapshot.complete, identity = the LIVE daemon's X-VH-Epoch/X-VH-Seq)
-//      — the exact wire shape the server emits on a ring-gap fallback
-//      (hasCursor && !replayOK). pkg/fixtures is fenced this slice, so the
-//      ring-gap cannot be forced server-side; the synthetic response delivers
-//      the same bytes the server would.
+//      (tree.snapshot cause:"reconnect" + scoped-partial detail snapshot WITH
+//      partial.ringGap:true + snapshot.complete, identity = the LIVE daemon's
+//      X-VH-Epoch/X-VH-Seq) — the exact wire shape the server emits on a
+//      ring-gap fallback (hasCursor && !replayOK; the ringGap flag is the sole
+//      true-gap stamp, server.go :3019-3021). pkg/fixtures is fenced this
+//      slice, so the ring-gap cannot be forced server-side; the synthetic
+//      response delivers the same bytes the server would.
 //   5. The synthetic body ends → the ES native-retries (retry: 300) onto the
 //      REAL fixture stream → live-tail resumes.
 //
@@ -135,7 +136,7 @@ test("tunnel-shape tree-SSE drop converges without reload; ring-gap cause consum
         tree: "2",
         epoch: E,
         seq: S,
-        cause: "reconnect", // the ring-gap signal (server.go hasCursor && !replayOK)
+        cause: "reconnect", // stamped on every cursor-resume reconnect (benign telemetry; the true-gap signal is partial.ringGap below)
         nodes: [node],
       };
       const detailSnap = {
@@ -145,6 +146,11 @@ test("tunnel-shape tree-SSE drop converges without reload; ring-gap cause consum
         partial: {
           mode: "tree-stream-1-frontier",
           scope: ["demo"], // scoped MERGE — buried detail preserved
+          // Slice B (precise-signal switch): the SOLE true-gap stamp is
+          // partial.ringGap:true (server.go :3019-3021); the cascade keys on
+          // THIS flag now, while the bare tree.snapshot cause:"reconnect" is
+          // benign replay-resume telemetry (server-reconnect-resume).
+          ringGap: true,
           authority: {
             sessions: "frontier",
             activity: "frontier",

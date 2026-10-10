@@ -1,5 +1,5 @@
 import { createSignal, createMemo, createEffect, Show, For } from "solid-js";
-import { newSession, state, isStale, isUpdating, STALE_MS, projectDir } from "../sync";
+import { newSession, projectDir, connModel, statusMarkState, statusMarkTip } from "../sync";
 import { searchQuery, setSearchQuery, selectedTagIds, filterOpen, setFilterOpen, toggleTagFilter, clearTagFilter } from "../sidebar";
 import { pinsLastError, clearPinsError } from "../pins";
 import { labelsTags } from "../labels";
@@ -46,35 +46,18 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
   // kept, time/descendant-count/tag-chips hidden, search + tag-filter
   // affordances compacted away, archived foot icon-only.
   const rail = () => sidebarMode() === "rail";
-  // Connection-health facets for the status indicator. `stale` (Feature 1): the
-  // live stream has gone quiet past the heartbeat window but the socket hasn't
-  // dropped yet (the watchdog will force a reconnect shortly). `syncing`
-  // (Feature 2): data is flowing right now — debounced so per-token events
-  // don't flicker, just a subtle pulse while a turn streams. Both read signals
-  // (state.status / healthNow / updating) so the indicator re-renders only on
-  // real transitions, not per SSE byte.
-  const stale = createMemo(() => isStale());
-  const syncing = createMemo(() => isUpdating() && state.status === "live");
-  const statusTip = createMemo(() => {
-    if (stale()) return `Status: stale — no data for over ${Math.round(STALE_MS / 1000)}s`;
-    if (syncing()) return "Status: syncing…";
-    if (state.status === "reconnecting") return "Status: reconnecting…";
-    if (state.status === "connecting") return "Status: connecting…";
-    return "Status: connected";
-  });
-  // Exactly ONE indicator state class at a time. The indicator draws a check
-  // mark in `live` and a minus in `stale`; the naive classList
-  // ({[status]:true, stale, syncing}) would stack `live`+`stale` (status stays
-  // "live" even while stale/syncing are true) and render BOTH symbols at once.
-  // Collapse to a single state by priority: hard socket states win; within
-  // "live", stale outranks syncing (same ordering as statusTip above).
-  const indState = createMemo(() => {
-    if (state.status === "reconnecting") return "reconnecting";
-    if (state.status === "connecting") return "connecting";
-    if (stale()) return "stale";
-    if (syncing()) return "syncing";
-    return "live";
-  });
+  // Connection-health facets for the status indicator — Slice B
+  // (send-net-resilience): the ladder is now the SHARED graded ConnStatus
+  // reduction (sync/connstatus.ts; debate-3 A6 precedence: tunnel-down →
+  // reconnecting, navigator-offline → offline, client observations govern
+  // reachability, live requires post-reconnect convergence). The StatusMark
+  // visual vocabulary is preserved 1:1 with the previous 3-state ladder
+  // (offline maps to a new state class with the reconnecting palette);
+  // OBSERVATIONAL ONLY — never retry/delivery authority (debate-1 Q5).
+  // String-deduped memos so the ~5s health tick re-evaluating the model
+  // (fresh object identity) does not churn the DOM classes.
+  const statusTip = createMemo(() => statusMarkTip(connModel()));
+  const indState = createMemo(() => statusMarkState(connModel()));
   // Search is collapsed by default (rarely used, and it costs a whole row). A
   // header toggle reveals it; an active filter keeps it shown so the filter is
   // never silently hidden.

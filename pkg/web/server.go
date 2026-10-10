@@ -155,6 +155,20 @@ type Server struct {
 	// exactly ONCE and reuses that *Lifecycle for its whole duration.
 	ocLifecycle atomic.Pointer[oclife.Lifecycle]
 
+	// tunnelState, when set, is the daemon→FE TUNNEL STATUS provider (Slice B,
+	// send-net-resilience): a pure func returning the worker↔controller tunnel
+	// state ("connected" / "disconnected") for the X-VH-Tunnel-State response
+	// header stamped by stampMeta on /vh/* responses. nil (local-server, the
+	// fixture server, tests) = the header is OMITTED — the frontend then reads
+	// tunnel state as UNKNOWN (never "down": a controller topology where the
+	// header can't arrive says nothing about the tunnel). Wired only by
+	// client-daemon.go from diagnostics.Default.Tunnel.CurrentState, which the
+	// daemon keeps current across reconnects. OBSERVATIONAL ONLY (debate-1 Q5,
+	// BINDING): this is a STATUS INPUT for the graded ConnStatus reduction —
+	// never retry/delivery/redelivery authority. Atomic for the same
+	// publication-race reason as ocLifecycle (set while serving).
+	tunnelState atomic.Pointer[func() string]
+
 	// corsOrigins is the explicit allowlist of cross-origin callers. Empty =
 	// no CORS (strict same-origin). "*" allows any origin (which disables the
 	// cross-origin half of the CSRF protection — only set it if you mean it).
@@ -533,6 +547,15 @@ func (s *Server) SetExternalOpenCode(external bool) { s.externalOC = external }
 // MarkDown/SetFailed/SetRestartProgress choreography) still sequence those
 // through the Lifecycle's own internal locking.
 func (s *Server) SetOpenCodeLifecycle(l *oclife.Lifecycle) { s.ocLifecycle.Store(l) }
+
+// SetTunnelStateProvider wires the daemon's tunnel-state provider (Slice B,
+// send-net-resilience). The func is loaded per /vh/* request inside stampMeta
+// and its return value stamped as X-VH-Tunnel-State; an empty return omits the
+// header (same as never wiring it). Safe to call while serving (atomic
+// publication). Wired ONLY by client-daemon.go — local-server (no controller
+// connection) and the fixture server leave it nil so the FE degrades to
+// unknown-tunnel, honestly.
+func (s *Server) SetTunnelStateProvider(fn func() string) { s.tunnelState.Store(&fn) }
 
 // SetOpenCodeGenerationFn installs the OpenCode process-generation provider
 // (a monotonic incarnation counter bumped on every observed spawn/respawn)
@@ -1894,7 +1917,8 @@ func (s *Server) Handler() http.Handler {
 // worker restart (epoch change) from any response — not just a snapshot. The seq
 // is the head at request entry (a hint; the authoritative cursor is the snapshot/
 // stream's own seq). Headers are set before the handler writes, so they survive
-// streaming and hijacked (terminal/WebSocket) responses.
+// streaming and hijacked (terminal/WebSocket) responses. Slice B additionally
+// stamps X-VH-Tunnel-State (daemon tunnel status) when a provider is wired.
 func (s *Server) stampMeta(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/vh/") {
@@ -1911,6 +1935,16 @@ func (s *Server) stampMeta(next http.Handler) http.Handler {
 			h := w.Header()
 			h.Set("X-VH-Epoch", st.Epoch())
 			h.Set("X-VH-Seq", strconv.FormatUint(st.Head(), 10))
+			// Slice B (send-net-resilience): stamp the daemon's tunnel state
+			// when a provider is wired (client-daemon only). Omitted
+			// otherwise — absence means UNKNOWN to the FE, never "down".
+			// Observational status input only (debate-1 Q5): nothing gates
+			// delivery on this header.
+			if fn := s.tunnelState.Load(); fn != nil {
+				if v := (*fn)(); v != "" {
+					h.Set("X-VH-Tunnel-State", v)
+				}
+			}
 		}
 		next.ServeHTTP(w, r)
 	})

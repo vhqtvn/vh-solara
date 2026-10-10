@@ -138,12 +138,14 @@
   border-radius: 50%;
   background: var(--fg-dim);
 }
-/* Same state ladder as the sidebar StatusMark (Sidebar indState). */
+/* Same state ladder as the sidebar StatusMark (shared ConnStatus reduction).
+   Slice B: "offline" (browser-offline grade) joins the hard-down family. */
 .rail-conn[data-state="live"] { background: var(--ok); }
 .rail-conn[data-state="syncing"] { background: var(--accent); }
 .rail-conn[data-state="stale"] { background: var(--warn); }
 .rail-conn[data-state="connecting"],
-.rail-conn[data-state="reconnecting"] { background: var(--danger); }
+.rail-conn[data-state="reconnecting"],
+.rail-conn[data-state="offline"] { background: var(--danger); }
 
 .rail-open {
   width: 36px;

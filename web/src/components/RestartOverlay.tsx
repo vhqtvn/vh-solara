@@ -1,5 +1,5 @@
 import { createEffect, Show } from "solid-js";
-import { state } from "../sync";
+import { connGrade } from "../sync";
 import { setVhRestarting, vhRestarting } from "../admin";
 import { snapshot } from "../opencode-lifecycle";
 import styles from "./RestartOverlay.module.css";
@@ -10,18 +10,26 @@ import styles from "./RestartOverlay.module.css";
 export default function RestartOverlay() {
   // Only hide once we've actually seen the connection drop and come back — a
   // restart that's still "live" for a beat shouldn't dismiss prematurely.
+  // Slice B (send-net-resilience): keyed on the SHARED graded ConnStatus
+  // reduction — dismissal waits for the LIVE grade, which requires the
+  // post-reconnect convergence to have completed (not merely the socket
+  // re-opening). OBSERVATIONAL ONLY (debate-1 Q5).
   let sawDrop = false;
   createEffect(() => {
     if (!vhRestarting()) {
       sawDrop = false;
       return;
     }
-    if (state.status !== "live") sawDrop = true;
+    if (connGrade() !== "live") sawDrop = true;
     else if (sawDrop) setVhRestarting(false);
   });
 
   const phase = () =>
-    state.status === "reconnecting" ? "Reconnecting…" : sawDrop ? "Coming back up…" : "Restarting…";
+    connGrade() === "reconnecting" || connGrade() === "offline"
+      ? "Reconnecting…"
+      : sawDrop
+        ? "Coming back up…"
+        : "Restarting…";
 
   // "OpenCode keeps running" is topology-dependent. A DETACHED or EXTERNAL
   // OpenCode is a separate process that survives a vh-solara daemon restart, so
