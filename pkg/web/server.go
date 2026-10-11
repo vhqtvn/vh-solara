@@ -1241,14 +1241,10 @@ func (s *Server) installQueueGCCleanup(dir string, a *aggregator.Aggregator) {
 	// its own goroutine, so it never blocks hydrate or serializes against the
 	// queue reconcile. See pkg/web/pins_lifecycle.go.
 	a.SetOnHydrate(func() {
-		go s.reconcileQueuesForAgg(dir, a)
-		go s.reconcilePinsForAgg(dir, a)
-		go s.reconcileLabelsForAgg(dir, a)
+		s.spawnPostHydrateReconciles(dir, a)
 	})
 	if a.AnyHydrateCompleted() {
-		go s.reconcileQueuesForAgg(dir, a)
-		go s.reconcilePinsForAgg(dir, a)
-		go s.reconcileLabelsForAgg(dir, a)
+		s.spawnPostHydrateReconciles(dir, a)
 	}
 
 	root, err := projectRoot(dir)
@@ -1300,6 +1296,64 @@ func (s *Server) installQueueGCCleanup(dir string, a *aggregator.Aggregator) {
 	}()
 }
 
+// spawnPostHydrateReconciles launches the three post-hydrate reconcile passes
+// — queue GC-3 orphan reaping (reconcileQueuesForAgg), pins L3 backstop
+// (reconcilePinsForAgg), labels L3 backstop (reconcileLabelsForAgg) — for one
+// (dir, aggregator). It is the SINGLE spawn site shared by
+// installQueueGCCleanup's two trigger arms: the onHydrate callback (fires at
+// the tail of every successful hydrate on hydrate's own goroutine — the
+// per-dir aggregators' steady-state path) and the immediate-run branch (the
+// default aggregator, which the daemon starts and hydrates BEFORE the first
+// request reaches aggFor(""), so install-time AnyHydrateCompleted is already
+// true).
+//
+// Ownership contract (the b5d209b list-spawn precedent — same defect class,
+// follow-up slice F7): each pass is server-owned background work tracked on
+// bgWG — Add BEFORE launch, one deferred Done per goroutine on every return
+// path (the archive-cascade pattern). Shutdown awaits bgWG, so an in-flight
+// pass is JOINED before Shutdown returns instead of surviving it and racing
+// the caller's teardown — the 2026-10-11 TempDir RemoveAll ENOTEMPTY race
+// class. All three passes write durably: reconcileQueuesForAgg's orphan reaping
+// deletes/moves <root>/.vh-solara/sessions/<sid>/queue.json via
+// queueRegistry.deleteStore (under qr.mu), and the pins/labels backstops
+// persist doc removals + revision bumps via PinStore.RemoveIDs /
+// LabelStore.RemoveRootIDs when a project-scoped id is absent from the active
+// set.
+//
+// Why bgWG and NOT lifecycleWG: lifecycleWG members are RETIREABLE loops that
+// exit when Shutdown fires their retirement signal (permission-watcher
+// cancels; non-default subscriber channels closed by store.Close during
+// stopServerOwnedAggregators). These passes are bounded one-shot scans that
+// complete on their own — no retirement signal applies, and they terminate
+// promptly even for the DEFAULT aggregator (which Shutdown deliberately does
+// not stop), so awaiting them cannot hang. The passes watch no context, so
+// bgCancel does not shorten them; Shutdown's ctx bounds only the WAIT, not
+// the passes (same as the archive-cascade and b5d209b joins).
+//
+// Admission caveat (accepted — see Server.Shutdown's terminal-teardown
+// contract): there is intentionally NO admission barrier. A hydrate that
+// completes after Shutdown's bgWG.Wait has already observed zero could still
+// spawn an untracked pass — the default aggregator is daemon-owned and keeps
+// hydrating past Shutdown. That window is the same accepted race class as the
+// b5d209b HTTP-driven spawn: production callers drain the HTTP server before
+// srv.Shutdown. What this join closes is the in-flight window — a pass
+// launched before the Wait is awaited before Shutdown returns.
+func (s *Server) spawnPostHydrateReconciles(dir string, a *aggregator.Aggregator) {
+	s.bgWG.Add(3)
+	go func() {
+		defer s.bgWG.Done()
+		s.reconcileQueuesForAgg(dir, a)
+	}()
+	go func() {
+		defer s.bgWG.Done()
+		s.reconcilePinsForAgg(dir, a)
+	}()
+	go func() {
+		defer s.bgWG.Done()
+		s.reconcileLabelsForAgg(dir, a)
+	}()
+}
+
 // reconcileQueuesForAgg is the per-aggregator driver for FIX-QUEUE-GC-3
 // orphan-queue reconciliation. It is the glue between the aggregator's
 // post-hydrate signal (SetOnHydrate / AnyHydrateCompleted, installed in
@@ -1327,9 +1381,12 @@ func (s *Server) installQueueGCCleanup(dir string, a *aggregator.Aggregator) {
 //
 // Concurrency: dispatched to a fresh goroutine by the onHydrate callback (so
 // hydrate's goroutine is never blocked) and by the immediate-run branch in
-// installQueueGCCleanup (default-aggregator boot case). Multiple concurrent
-// invocations for the same dir are safe — reconcileOrphanQueues serializes its
-// per-session work through queueRegistry.mu, and CleanupSession is idempotent.
+// installQueueGCCleanup (default-aggregator boot case) — both arms spawn via
+// spawnPostHydrateReconciles, which tracks the pass on bgWG so Shutdown joins
+// an in-flight pass before returning (its orphan deletions persist via
+// queueRegistry.deleteStore). Multiple concurrent invocations for the same dir
+// are safe — reconcileOrphanQueues serializes its per-session work through
+// queueRegistry.mu, and CleanupSession is idempotent.
 func (s *Server) reconcileQueuesForAgg(dir string, a *aggregator.Aggregator) {
 	// FAIL-CLOSED: no authoritative set yet → delete nothing.
 	if !a.AnyHydrateCompleted() {
@@ -1497,7 +1554,10 @@ func (s *Server) reconcileLabelsForProject(dir string, doc LabelsDoc, projects m
 // analogue of reconcilePinsForAgg. It is dispatched to a fresh goroutine from
 // the aggregator's onHydrate callback (composed into installQueueGCCleanup's
 // single onHydrate slot alongside the queue + pins reconciles) and from the
-// immediate-run branch when the default aggregator already hydrated at boot.
+// immediate-run branch when the default aggregator already hydrated at boot —
+// both arms spawn via spawnPostHydrateReconciles, which tracks the pass on
+// bgWG so Shutdown joins an in-flight pass before returning (its removals
+// persist via LabelStore.RemoveRootIDs).
 //
 // FAIL-CLOSED gate: if a.AnyHydrateCompleted() is false, remove nothing.
 // Active-root source: a.Store().RootInventory() filtered to IsRoot — the STRICT

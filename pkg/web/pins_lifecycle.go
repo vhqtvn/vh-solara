@@ -136,7 +136,10 @@ func (s *Server) reconcilePinsForProject(doc PinsDoc, key string, activeSet map[
 // analogue of reconcileQueuesForAgg (FIX-QUEUE-GC-3). It is dispatched to a
 // fresh goroutine from the aggregator's onHydrate callback at the end of every
 // SUCCESSFUL hydrate, and from the immediate-run branch in installQueueGCCleanup
-// when the default aggregator already hydrated at boot.
+// when the default aggregator already hydrated at boot — both arms spawn via
+// spawnPostHydrateReconciles, which tracks the pass on bgWG so Shutdown joins
+// an in-flight pass before returning (its removals persist via
+// PinStore.RemoveIDs).
 //
 // FAIL-CLOSED gate (the single most important rule, identical to GC-3's): if
 // a.AnyHydrateCompleted() is false, the aggregator has not yet produced an
