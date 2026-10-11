@@ -73,6 +73,23 @@ export function asHostVisibility(data: unknown): boolean | null {
 let installed = false;
 
 /**
+ * Re-derive docVisible from LIVE document.visibilityState (not the cached
+ * signal) and notify. Self-heal for a lost `visibilitychange → visible` event
+ * (iOS standalone PWA lock/unlock, bfcache restore — sync.ts:209-212 hedges
+ * the same class): while the cache is stale-hidden, notify()'s edge dedupe
+ * swallows EVERY later resync — including the host's periodic
+ * vh-host-visibility message — because paneVisible() still reads the stale
+ * signal. Re-deriving from ground truth un-swallows it: the transition fires
+ * exactly when the cache was wrong, so the animation gate un-pauses and the
+ * sync facade resumes like a normal reveal. No-op when the cache was right.
+ */
+export function resyncDocVisibility(): void {
+  if (typeof document === "undefined") return;
+  setDocVisible(document.visibilityState !== "hidden");
+  notify();
+}
+
+/**
  * Install the document-visibility tracker and (when embedded) the host→pane
  * visibility listener. Idempotent. Wire once in index.tsx.
  */
@@ -90,12 +107,17 @@ export function startPaneVisibility(): void {
     const v = asHostVisibility(ev.data);
     if (v === null) return;
     setHostVisible(v);
-    notify();
+    // The host resync arrives periodically (~10s) — ride it to re-derive the
+    // DOCUMENT half from ground truth too, so a lost visibilitychange heals
+    // in embedded panes without waiting for the gate's own periodic pass.
+    resyncDocVisibility();
   });
 }
 
 /** Test-only: reset module state. */
 export function __resetPaneVisibilityForTest(host = true, doc = true): void {
+  gateTeardown?.();
+  gateTeardown = null;
   setHostVisible(host);
   setDocVisible(doc);
   last = host && doc;
@@ -127,6 +149,15 @@ export function __setHostVisibleForTest(v: boolean): void {
 export const PANE_HIDDEN_CLASS = "pane-hidden";
 
 /**
+ * Self-heal cadence for the animation gate (~30s), mirroring the sync-side
+ * self-heals (10s watchdog in sync/health.ts, on-visible resync in sync.ts).
+ * Low frequency on purpose: this is the backstop for a lost show event, not a
+ * hot path — every trigger just re-reads document.visibilityState and
+ * re-applies one class toggle (a no-op when already correct).
+ */
+export const PANE_GATE_RESYNC_MS = 30_000;
+
+/**
  * Install the <html> class gate. Idempotent. Wire once in index.tsx after
  * startPaneVisibility(); it reads paneVisible() initially and on every
  * visibility transition thereafter.
@@ -142,5 +173,28 @@ export function installPaneAnimationGate(): void {
   if (gateInstalled) return;
   gateInstalled = true;
   onPaneVisibilityChange(apply);
+
+  // (2026-10-12 freeze trace) The gate's only resume writer used to be the
+  // single visibilitychange→visible transition; one lost event stranded a
+  // VISIBLE pane paused forever (notify() dedupe swallowed everything later
+  // while docVisible was stale). Mirror the sync-side self-heals: re-derive
+  // ground truth AND re-apply on pageshow (bfcache restore / PWA unlock) and
+  // window focus, plus a low-frequency periodic resync as the standalone
+  // backstop. resyncDocVisibility() fires the paneVisible transition when the
+  // cache was stale — so the sync facade heals through the same edge — and
+  // the direct apply() below heals the class even if no transition fires.
+  const resync = (): void => {
+    resyncDocVisibility();
+    apply();
+  };
+  window.addEventListener("pageshow", resync);
+  window.addEventListener("focus", resync);
+  const timer = window.setInterval(resync, PANE_GATE_RESYNC_MS);
+  gateTeardown = () => {
+    window.removeEventListener("pageshow", resync);
+    window.removeEventListener("focus", resync);
+    window.clearInterval(timer);
+  };
 }
 let gateInstalled = false;
+let gateTeardown: (() => void) | null = null;
