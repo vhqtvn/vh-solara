@@ -2,12 +2,15 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -106,7 +109,12 @@ func (p *Proxy) handleRawProxy(worker *Worker, w http.ResponseWriter, r *http.Re
 	}()
 	// log.Printf("[RawProxy] Yamux stream opened successfully")
 
-	// Send the raw proxy request telling the client which port to connect to
+	// Send the raw proxy request telling the client which port to connect to.
+	// F1 (remote-latency brief): the header frame is PADDED to exactly
+	// tunnel.RawProxyHeaderFrameLen — see that constant for why this is the
+	// load-bearing one-sided-safety mechanism (it keeps the pipelined request
+	// bytes below out of an OLD worker's json.Decoder first-Read window; the
+	// padding residue the decoder does swallow is discardable by design).
 	rawReq := tunnel.RawProxyMessage{
 		BaseMessage: tunnel.BaseMessage{
 			Type: tunnel.TypeRawProxy,
@@ -121,7 +129,7 @@ func (p *Proxy) handleRawProxy(worker *Worker, w http.ResponseWriter, r *http.Re
 	// AckDur (which is where a silently-dead tunnel blocks until yamux's
 	// keepalive/connection-write timeout fires).
 	reqWriteStart := time.Now()
-	if err := stream.WriteJSON(rawReq); err != nil {
+	if err := stream.WriteJSONPadded(rawReq, tunnel.RawProxyHeaderFrameLen); err != nil {
 		diag.Default.Yamux.ReqWriteDur.Observe(int64(time.Since(reqWriteStart)))
 		log.Printf("[RawProxy] Failed to send raw proxy request: %v", err)
 		http.Error(w, "Failed to setup raw proxy", http.StatusBadGateway)
@@ -130,41 +138,25 @@ func (p *Proxy) handleRawProxy(worker *Worker, w http.ResponseWriter, r *http.Re
 	}
 	diag.Default.Yamux.ReqWriteDur.Observe(int64(time.Since(reqWriteStart)))
 
-	// Wait for the client to confirm the connection is established
-	// log.Printf("[RawProxy] Waiting for ACK from agent...")
-	// PROBE 4 (Phase 4): AckDur brackets the ReadJSON wait. This is the
-	// PRIMARY "silently-dead-but-online tunnel" signal — if the worker is
-	// registered but its tunnel is actually dead, OpenStream succeeds (no
-	// round-trip), WriteJSON succeeds (data sits in the local send buffer),
-	// and ReadJSON blocks until yamux's keepalive miss (~10s) +
-	// ConnectionWriteTimeout (~10s) fire and tear the session down. A tail
-	// in AckDur p99/max near 10-20s is the signature of the freeze this slice
-	// is built to capture.
-	var ack tunnel.BaseMessage
-	ackReadStart := time.Now()
-	readErr := stream.ReadJSON(&ack)
-	diag.Default.Yamux.AckDur.Observe(int64(time.Since(ackReadStart)))
-	if readErr != nil {
-		log.Printf("[RawProxy] ACK read failed: %v", readErr)
-		http.Error(w, "Worker failed to connect to local service", http.StatusBadGateway)
-		stream.Close()
-		return
-	}
-	// log.Printf("[RawProxy] Got ACK type: %s", ack.Type)
-	if ack.Type == tunnel.TypeError {
-		log.Printf("[RawProxy] Agent reported error — service not available")
-		http.Error(w, "Worker cannot proxy: service not available", http.StatusBadGateway)
-		stream.Close()
-		return
-	}
-	// ACK accepted — record the full setup duration NOW (before any body /
-	// hijack work) so SetupDur is the clean operator-felt "time from request
-	// arrive to tunnel-setup done" without contamination from request-body
-	// reading or the post-hijack copy phase.
-	recordSetup()
+	// F1 (remote-latency brief, 2026-10-12): PIPELINE the request write ahead
+	// of the ACK read. The pre-F1 order (write header → block on ack → write
+	// request) serializes a full controller↔worker RTT into EVERY proxied
+	// request (measured warm p50 262ms = 3×RTT, of which ~85ms is pure ack
+	// wait). Writing the full request bytes IMMEDIATELY after the padded
+	// header means the request crosses the tunnel in the same flight as the
+	// worker's ack returning: warm ≈ 2×RTT. Wire compatibility (one-sided
+	// safe): the worker's copy loop (pkg/agent/daemon.go handleRawProxy)
+	// drains stream.Raw() — the request bytes simply wait in its yamux recvBuf
+	// until the copy starts — and the padded header keeps those bytes out of
+	// the worker header reader's decoder window (tunnel.RawProxyHeaderFrameLen).
+	// Error paths unchanged: on dial failure the worker sends TypeError JSON
+	// and closes (our already-written request bytes are discarded with the
+	// stream); on a dead tunnel the ack read below still blocks until yamux
+	// keepalive/ConnectionWriteTimeout fires, preserving the AckDur signature.
 
-	// Read the request body BEFORE hijacking (Go forbids reading r.Body after Hijack)
-	// log.Printf("[RawProxy] Reading request body before hijack...")
+	// Read the request body BEFORE the ack read (it feeds the request write
+	// below; also required before hijack — Go forbids reading r.Body after
+	// Hijack).
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Printf("[RawProxy] Failed to read request body: %v", err)
@@ -182,14 +174,6 @@ func (p *Proxy) handleRawProxy(worker *Worker, w http.ResponseWriter, r *http.Re
 		stream.Close()
 		return
 	}
-
-	clientConn, clientBuf, err := hj.Hijack()
-	if err != nil {
-		log.Printf("[RawProxy] Hijack failed: %v", err)
-		stream.Close()
-		return
-	}
-	// log.Printf("[RawProxy] Hijack successful")
 
 	// Write the HTTP request to the yamux stream manually (can't use r.Write after hijack)
 	// log.Printf("[RawProxy] Writing HTTP request to stream...")
@@ -220,7 +204,63 @@ func (p *Proxy) handleRawProxy(worker *Worker, w http.ResponseWriter, r *http.Re
 	if len(bodyBytes) > 0 {
 		yamuxW.Write(bodyBytes)
 	}
-	// log.Printf("[RawProxy] Request written (%d body bytes), starting bidirectional copy", len(bodyBytes))
+	// log.Printf("[RawProxy] Request written (%d body bytes), waiting for ACK", len(bodyBytes))
+
+	// Wait for the client to confirm the connection is established
+	// log.Printf("[RawProxy] Waiting for ACK from agent...")
+	// PROBE 4 (Phase 4): AckDur brackets the ack read. Still the PRIMARY
+	// "silently-dead-but-online tunnel" signal under F1 pipelining for
+	// typical requests: the header AND request bytes sit in the local send
+	// buffer (a request smaller than yamux's 256KB initial send window
+	// buffers without a round trip), and this read blocks until yamux's
+	// keepalive miss (~10s) + ConnectionWriteTimeout (~10s) fire and tear
+	// the session down. A tail in AckDur p99/max near 10-20s remains the
+	// signature of the freeze this probe is built to capture. CAVEAT: a
+	// request body LARGER than the send window on a dead tunnel blocks in
+	// the request write ABOVE instead — that stall lands in ReqWriteDur /
+	// nowhere, not here; the 502 outcome is identical either way.
+	//
+	// F1 decoder-buffer bridge (the known subtlety): with the request
+	// pipelined, the worker's ack and the first response bytes can coalesce in
+	// the stream (the worker's copy loop starts the moment it acks). Reading
+	// the ack with a bare json.Decoder would swallow the response head into
+	// the decoder's private buffer and drop it. decodeAckWithResidue returns
+	// those buffered bytes as a residue reader that is drained — ahead of the
+	// raw stream — by the yamux→browser copy leg below.
+	var ack tunnel.BaseMessage
+	ackReadStart := time.Now()
+	ack, residue, readErr := decodeAckWithResidue(stream.Raw())
+	diag.Default.Yamux.AckDur.Observe(int64(time.Since(ackReadStart)))
+	if readErr != nil {
+		log.Printf("[RawProxy] ACK read failed: %v", readErr)
+		http.Error(w, "Worker failed to connect to local service", http.StatusBadGateway)
+		stream.Close()
+		return
+	}
+	// log.Printf("[RawProxy] Got ACK type: %s", ack.Type)
+	if ack.Type == tunnel.TypeError {
+		log.Printf("[RawProxy] Agent reported error — service not available")
+		http.Error(w, "Worker cannot proxy: service not available", http.StatusBadGateway)
+		stream.Close()
+		return
+	}
+	// ACK accepted — record the full setup duration NOW (before the copy
+	// phase) so SetupDur is the clean operator-felt "time from request arrive
+	// to tunnel-setup done". Under F1 this includes the browser body read AND
+	// the request write (which overlapped the ack transit) — the setup leg is
+	// now ~1 RTT shorter. Probe consumers comparing across the F1 boundary
+	// should note both inclusions: a slow streaming upload now inflates
+	// SetupDur where it previously sat between the ack and this bracket.
+	recordSetup()
+
+	clientConn, clientBuf, err := hj.Hijack()
+	if err != nil {
+		log.Printf("[RawProxy] Hijack failed: %v", err)
+		stream.Close()
+		return
+	}
+	// log.Printf("[RawProxy] Hijack successful")
+	// log.Printf("[RawProxy] Starting bidirectional copy (%d body bytes)", len(bodyBytes))
 
 	// Past setup — copy phase. Upgrade the default close reason to "normal".
 	closeReason = diag.StreamCloseAck
@@ -233,11 +273,57 @@ func (p *Proxy) handleRawProxy(worker *Worker, w http.ResponseWriter, r *http.Re
 	// Probe 4's per-write timing for the browser→yamux direction comes from the
 	// yamuxW wrapper above (the io.Copy destination); reads from yamux are
 	// passive and their blocked time shows up in Copy[yamux_to_browser].Dur.
-	if p.runBidirectionalCopy(clientConn, clientBuf, yamuxW, stream.Raw(), func() { _ = stream.Close() }) {
+	//
+	// The yamux→browser source drains the F1 ack-decode residue FIRST when the
+	// ack read swallowed the head of the response, then the raw stream.
+	yamuxReadSrc := io.MultiReader(residue, stream.Raw())
+	if p.runBidirectionalCopy(clientConn, clientBuf, yamuxW, yamuxReadSrc, func() { _ = stream.Close() }) {
 		closeReason = diag.StreamCloseCopyError
 	}
 	// log.Printf("[RawProxy] Raw proxy session ended for %s", r.URL.Path)
 }
+
+// decodeAckWithResidue reads the worker's ack JSON frame from r, returning the
+// ack plus a bridge reader over the bytes that follow the ack frame. F1
+// pipelining makes this bridge mandatory: the worker's ack and the first
+// bytes of the HTTP response can coalesce in the stream (the worker's copy
+// goroutine starts pumping the local service the instant it sends the ack),
+// and a bare ReadJSON would strand the response head inside the decoder's
+// private buffer — dropped when the decoder is discarded, so the browser
+// would receive a truncated response.
+//
+// The ack frame is value+'\n' (Stream.WriteJSON). Where the decoder's last
+// Read landed decides whether that '\n' sits at the head of dec.Buffered()
+// or is still unread in r — exactly one byte is consumed from the combined
+// (residue ∥ source) stream so the returned bridge starts precisely at the
+// response head (a stray '\n' forwarded ahead of "HTTP/1.1 ..." would be a
+// protocol impurity on the hijacked browser connection). The terminating
+// byte is always in flight with the ack itself, so this one-byte read cannot
+// block beyond the ack's arrival.
+func decodeAckWithResidue(r io.Reader) (tunnel.BaseMessage, io.Reader, error) {
+	dec := json.NewDecoder(r)
+	var ack tunnel.BaseMessage
+	if err := dec.Decode(&ack); err != nil {
+		return ack, emptyReader, err
+	}
+	src := io.MultiReader(dec.Buffered(), r)
+	var first [1]byte
+	n, rerr := src.Read(first[:])
+	if rerr != nil && n == 0 {
+		// Source ended immediately after the ack value — nothing to bridge.
+		return ack, emptyReader, nil
+	}
+	if n == 1 && first[0] == '\n' {
+		// The frame terminator, wherever the read boundary left it: consumed,
+		// never forwarded.
+		return ack, src, nil
+	}
+	// Not the terminator — Decode already consumed it (or a malformed peer
+	// omitted it): this byte is the first response byte, preserve it.
+	return ack, io.MultiReader(bytes.NewReader(first[:n]), src), nil
+}
+
+var emptyReader io.Reader = strings.NewReader("")
 
 // runBidirectionalCopy pumps bytes between the browser connection and the yamux
 // stream, recording Probe 6 copy accounting (bytes / duration / termination
@@ -351,21 +437,19 @@ func (p *Proxy) FetchWorkerSnapshot(ctx context.Context, worker *Worker) ([]byte
 	}
 	defer stream.Close()
 
-	// RawProxy handshake — identical to handleRawProxy. Port=0 → worker's web
-	// port on the agent side (see pkg/agent/daemon.go handleRawProxy).
+	// RawProxy handshake — identical to handleRawProxy, including the F1
+	// pipelining (padded header frame + request bytes written BEFORE the ack
+	// read; see tunnel.RawProxyHeaderFrameLen and decodeAckWithResidue). The
+	// diag aggregator is on-demand only, but it fans out one full handshake per
+	// worker per fetch — pipelining takes the same RTT out of each fan-out
+	// leg. Port=0 → worker's web port on the agent side (see
+	// pkg/agent/daemon.go handleRawProxy).
 	rawReq := tunnel.RawProxyMessage{
 		BaseMessage: tunnel.BaseMessage{Type: tunnel.TypeRawProxy},
 		Port:        0,
 	}
-	if err := stream.WriteJSON(rawReq); err != nil {
+	if err := stream.WriteJSONPadded(rawReq, tunnel.RawProxyHeaderFrameLen); err != nil {
 		return nil, fmt.Errorf("worker %s: send raw-proxy: %w", worker.ID, err)
-	}
-	var ack tunnel.BaseMessage
-	if err := stream.ReadJSON(&ack); err != nil {
-		return nil, fmt.Errorf("worker %s: read ack: %w", worker.ID, err)
-	}
-	if ack.Type == tunnel.TypeError {
-		return nil, fmt.Errorf("worker %s: agent cannot proxy to local web port", worker.ID)
 	}
 
 	// Abort the write side if ctx elapses mid-request. yamux.Stream writes are
@@ -381,16 +465,29 @@ func (p *Proxy) FetchWorkerSnapshot(ctx context.Context, worker *Worker) ([]byte
 		}
 	}()
 
-	// Write the HTTP request as raw bytes onto the stream. Connection: close so
-	// the worker's local web server closes the response after sending it, which
-	// lets http.ReadResponse terminate cleanly without a Content-Length sniff.
+	// Write the HTTP request as raw bytes onto the stream immediately (F1:
+	// no ack wait). Connection: close so the worker's local web server closes
+	// the response after sending it, which lets http.ReadResponse terminate
+	// cleanly without a Content-Length sniff.
 	raw := stream.Raw()
 	reqLine := "GET /vh/diag/latency HTTP/1.1\r\nHost: " + worker.ID + "\r\nConnection: close\r\n\r\n"
 	if _, err := raw.Write([]byte(reqLine)); err != nil {
 		return nil, fmt.Errorf("worker %s: write request: %w", worker.ID, err)
 	}
 
-	br := bufio.NewReader(raw)
+	// Ack read with the F1 decoder-buffer bridge: with the request pipelined,
+	// the ack and the response head can coalesce — the residue reader below is
+	// drained ahead of the raw stream so http.ReadResponse sees a contiguous
+	// response.
+	ack, residue, err := decodeAckWithResidue(raw)
+	if err != nil {
+		return nil, fmt.Errorf("worker %s: read ack: %w", worker.ID, err)
+	}
+	if ack.Type == tunnel.TypeError {
+		return nil, fmt.Errorf("worker %s: agent cannot proxy to local web port", worker.ID)
+	}
+
+	br := bufio.NewReader(io.MultiReader(residue, raw))
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
 		return nil, fmt.Errorf("worker %s: read response: %w", worker.ID, err)

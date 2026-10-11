@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -450,6 +451,55 @@ func (s *Stream) WriteJSON(v interface{}) error {
 	}
 	// Append newline as delimiter
 	data = append(data, '\n')
+	_, err = s.stream.Write(data)
+	return err
+}
+
+// RawProxyHeaderFrameLen is the exact byte length the controller pads the
+// RawProxyMessage header frame to before pipelining the HTTP request bytes
+// behind it on the same stream (remote-latency brief F1).
+//
+// WHY padding is load-bearing (one-sided-safe wire compatibility): the worker
+// reads this header with json.Decoder over the raw yamux stream
+// (pkg/agent/daemon.go handleStream → Stream.ReadJSON). json.Decoder's FIRST
+// Read fills at most its initial 512-byte buffer; everything it slurps beyond
+// the JSON value stays in the decoder's private buffer and is DROPPED when
+// handleStream discards the decoder. Without padding, the pipelined request
+// head — written microseconds after the header, so yamux almost always has
+// both in recvBuf by the time the worker's reader wakes — lands inside that
+// 512-byte window on an OLD worker and is silently swallowed: a race-dependent
+// truncated request head. With the header padded to EXACTLY this many bytes,
+// the decoder's first-Read window [0, 512) can never reach the request bytes
+// (which start at offset 512): the only swallowable residue is the padding,
+// which is discardable by construction. yamux guarantees whole-frame appends
+// (readData io.Copy's the full frame under recvLock before notifying), so the
+// worker's reader can never observe a partial header frame either.
+//
+// The 512 constant is Go's json.Decoder initial buffer capacity (stable since
+// the decoder's introduction). pkg/tunnel/websocket_pipelining_test.go pins
+// the invariant end-to-end over a REAL yamux session replicating the old
+// worker's exact read path — if a future Go toolchain grows that first-Read
+// window, that test fails and this constant must grow with it.
+const RawProxyHeaderFrameLen = 512
+
+// WriteJSONPadded sends a JSON-encoded message padded with trailing spaces to
+// exactly frameLen bytes total (one yamux Write ⇒ one frame), used by the
+// controller to keep pipelined request bytes out of the worker's
+// json.Decoder first-Read window (see RawProxyHeaderFrameLen). Returns an
+// error — rather than silently falling back to an UNPADDED frame, which would
+// reintroduce the decoder-window swallow hazard while callers keep
+// pipelining — when the marshaled message + '\n' does not fit frameLen.
+func (s *Stream) WriteJSONPadded(v interface{}, frameLen int) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if pad := frameLen - len(data); pad > 0 {
+		data = append(data, bytes.Repeat([]byte{' '}, pad)...)
+	} else if len(data) > frameLen {
+		return fmt.Errorf("tunnel: WriteJSONPadded message (%d bytes) exceeds frame length %d — padding invariant would be violated", len(data), frameLen)
+	}
 	_, err = s.stream.Write(data)
 	return err
 }
