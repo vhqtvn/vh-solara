@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math/rand"
 	"mime"
 	"net"
 	"net/http"
@@ -2719,6 +2720,24 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	writeJSONResp(w, map[string]any{"ok": true})
 }
 
+// SSE retry-hint bounds (F3, remote-latency brief 2026-10-12). The hello
+// frame advertises base + uniform per-connection jitter so a fleet of panes
+// reconnecting after a drop spreads its attempts across [base, base+jitter)
+// instead of retrying in lockstep every base ms (measured: 2,254 useless
+// controller-side tunnel-down rejections, 11.3% of stream opens). Kept LOW on
+// purpose: this hint also governs healthy blip recovery (daemon restart), and
+// the heavy damping for sustained outages lives client-side (the SPA's
+// CONNECTING-streak takeover onto its bounded manual backoff).
+const (
+	sseRetryBaseMs   = 2000
+	sseRetryJitterMs = 1000
+)
+
+// sseRetryHintMs returns the per-connection SSE retry hint: base + jitter.
+func sseRetryHintMs() int {
+	return sseRetryBaseMs + rand.Intn(sseRetryJitterMs)
+}
+
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -2761,15 +2780,27 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// in `server/snap`. Do NOT move/remove the existing snapshot flush below.
 	//
 	// SSE retry hint: tells the browser's native EventSource auto-reconnect (the
-	// CONNECTING state on a transient drop) to wait 2s before reconnecting. This
+	// CONNECTING state on a transient drop) to wait before reconnecting. This
 	// is what lets a session stream (Stream2) absorb a transient tunnel blip via
 	// native auto-reconnect — which sends Last-Event-ID → the server's replay
 	// branch → missed deltas are caught up WITHOUT a fresh snapshot. A fatal
 	// CLOSED (non-retryable) still falls to the client's manual retry path,
-	// which passes cursor= explicitly. The hint is harmless for Stream1 (its
-	// onerror only acts on CLOSED; in CONNECTING the same EventSource auto-
-	// reconnects with no JS-level new connection).
-	fmt.Fprintf(w, ": hello\nretry: 2000\n\n")
+	// which passes cursor= explicitly. The hint is harmless for Stream1 in the
+	// transient case (its onerror lets the native CONNECTING retry run; only a
+	// sustained CONNECTING streak or a CLOSED gives up into the manual path).
+	//
+	// F3 (remote-latency brief, 2026-10-12): the retry is now JITTERED
+	// per connection. The fixed 2000 made every pane's EventSource retry in
+	// lockstep during tunnel-down windows — 2,254 controller-side rejections
+	// (11.3% of stream opens) in a ~2.9h snapshot, each a useless instant 502.
+	// Jitter de-synchronizes the fleet (attempt spread over [2s, 3s)); the SPA
+	// side additionally takes over a looping CONNECTING streak after 3 failures
+	// and moves it onto its bounded manual backoff (web/src/sync/{tree-transport,
+	// session-stream}.ts), which caps the native infinite loop. Deliberately NOT
+	// escalated server-side: a tunnel-down storm never reaches this handler (the
+	// controller 502s first), so per-key failure state here would add shared
+	// mutable state without damping the measured storm.
+	fmt.Fprintf(w, ": hello\nretry: %d\n\n", sseRetryHintMs())
 	flusher.Flush()
 
 	// Prefer the Last-Event-ID header (sent automatically by EventSource on

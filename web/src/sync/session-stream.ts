@@ -293,6 +293,16 @@ let sesRetry: number | undefined;
 // so a CLOSED storm would otherwise reopen every 1500ms (Phase 3-F). Doubles per
 // consecutive CLOSED failure, capped at 15s, reset to 1500ms on a healthy open.
 let sesBackoff = 1500;
+// F3 (remote-latency brief 2026-10-12): consecutive CONNECTING-state onerror
+// count for the CURRENT session EventSource — the Stream2 twin of tree-
+// transport's connectingFails. A sustained CONNECTING loop (tunnel down: every
+// attempt 502s at the controller instantly) never reaches CLOSED, so the
+// native retry would run forever at the advertised `retry:` cadence. After
+// SES_CONNECTING_GIVEUP consecutive failures we close the ES and fall into
+// the manual CLOSED-reopen backoff (sesBackoff, ×2 → 15s cap). Reset on a
+// healthy open and on every fresh ES construction.
+let sesConnectingFails = 0;
+const SES_CONNECTING_GIVEUP = 3;
 // sesCursor: the last-received event seq on the CURRENT session stream. Passed
 // as cursor= on retry so the server takes the replay branch (deltas from the
 // ring) instead of the fresh-snapshot branch (full transcript re-ship). This
@@ -668,6 +678,7 @@ function openSessionES(id: string): void {
     // to legacy full part.upsert for this connection (one-reconnect rollback,
     // no server change).
     const partDeltaParam = isPartDeltaEnabled() ? `&part_delta=1` : "";
+    sesConnectingFails = 0; // F3: a fresh ES starts a fresh streak count
     ses = new EventSource(`/vh/stream?${cursorParam}sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}&z=1${partDeltaParam}`);
     // Seed Stream2's liveness deadline from construction (mirrors Stream1's
     // markTreeSeen() right after `new EventSource`): a connection that NEVER
@@ -855,6 +866,7 @@ function openSessionES(id: string): void {
       sesT1 = performance.now();
       if (sesT0) recordLatency("session", "open", sesT1 - sesT0);
       sesBackoff = 1500; // Phase 3-F: healthy open resets the CLOSED-reopen backoff
+      sesConnectingFails = 0; // F3: healthy — native retry loop works again
     };
     registerSessionMessageListeners(ses, gen);
     ses.onerror = () => {
@@ -862,6 +874,22 @@ function openSessionES(id: string): void {
       // behalf of the new (current) connection — the current connection owns
       // its own retry scheduling via its own onerror.
       if (gen !== sesGen) return;
+      // F3 CONNECTING-streak takeover (twin of tree-transport's): a sustained
+      // CONNECTING failure loop never reaches CLOSED on its own — after
+      // SES_CONNECTING_GIVEUP consecutive failures, close the ES and use the
+      // bounded manual reopen below.
+      if (ses && ses.readyState === EventSource.CONNECTING) {
+        sesConnectingFails++;
+        if (sesConnectingFails < SES_CONNECTING_GIVEUP) return;
+        log.warn("sync", "session stream CONNECTING-fail streak → manual backoff takeover", {
+          fails: sesConnectingFails,
+          id,
+        });
+        ses.close(); // now CLOSED-shaped; fall through to the reopen path
+      }
+      // Cleared on EVERY path through here — including the native-CLOSED
+      // branch below (a CLOSED error ends any partial streak too).
+      sesConnectingFails = 0;
       if (ses && ses.readyState === EventSource.CLOSED && sesId === id) {
         // Phase 3-F: exponential backoff (mirrors Stream1 stream.ts ~1862) so a
         // genuine CLOSED storm cannot reopen every 1500ms. Doubles per failure,

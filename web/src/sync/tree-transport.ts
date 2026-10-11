@@ -159,6 +159,17 @@ let treeContentSeen = 0;
 // independent; the session clock's lifecycle is now in its home module.
 let reconnectTimer: number | undefined;
 let backoff = 1000; // grows on repeated failures, reset on a healthy open
+// F3 (remote-latency brief 2026-10-12): consecutive CONNECTING-state onerror
+// count for the CURRENT tree EventSource. Native EventSource auto-retry loops
+// forever on the server-advertised `retry:` cadence — during a tunnel-down
+// window every attempt 502s at the controller instantly, so a fixed 2s hint
+// meant N panes × 2s of useless rejections (2,254 measured, 11.3% of opens).
+// After TREE_CONNECTING_GIVEUP consecutive failures we close the ES and hand
+// the cadence to the bounded manual backoff above (1s ×2 → 15s cap), which
+// the native loop can never reach on its own. Reset on a healthy open and on
+// every fresh connect().
+let connectingFails = 0;
+const TREE_CONNECTING_GIVEUP = 3;
 let everOpened = false; // first stream open is the initial load; later opens are reconnects
 
 // Read-only accessors for the tree clock + tree transport state (consumed by
@@ -859,6 +870,7 @@ function checkTreeOrdinalGap(ordinal: number, kind: string): void {
 
 export function connect(fresh = false) {
   clearTimeout(reconnectTimer);
+  connectingFails = 0;
   // Invalidate any in-flight async gzip64 snapshot decode captured by a PRIOR
   // connection BEFORE we close it. Bumping the generation first means a stale
   // decode's post-await gen check fails and it refuses to mutate the store,
@@ -1321,6 +1333,7 @@ export function connect(fresh = false) {
     treeT1 = performance.now();
     if (treeT0) recordLatency("tree", "open", treeT1 - treeT0);
     backoff = 1000; // healthy — reset backoff
+    connectingFails = 0; // healthy — the native retry loop is working again
     setState("status", "live");
     // A reconnect (not the first open) means the stream dropped and came back —
     // typically a vh restart/self-update. Re-check the version so a new build
@@ -1332,6 +1345,23 @@ export function connect(fresh = false) {
     // EventSource auto-retries while CONNECTING; we only step in once it gives
     // up (CLOSED), with backoff, so a flaky network / daemon restart self-heals.
     setState("status", "reconnecting");
+    // F3 CONNECTING-streak takeover: a sustained CONNECTING failure loop
+    // (tunnel down — every attempt 502s at the controller instantly) never
+    // reaches CLOSED, so without this the native retry runs forever at the
+    // advertised cadence. After TREE_CONNECTING_GIVEUP consecutive failures,
+    // close the ES and fall into the manual CLOSED-reopen path below, whose
+    // bounded backoff (×2, 15s cap) damps the storm.
+    if (es && es.readyState === EventSource.CONNECTING) {
+      connectingFails++;
+      if (connectingFails < TREE_CONNECTING_GIVEUP) return;
+      log.warn("sync", "tree stream CONNECTING-fail streak → manual backoff takeover", {
+        fails: connectingFails,
+      });
+      es.close(); // now CLOSED-shaped; fall through to the reopen path
+    }
+    // Cleared on EVERY path through here — including the native-CLOSED branch
+    // below (a CLOSED error ends any partial streak too).
+    connectingFails = 0;
     // C4: a transport error on this connection means its coherent capture (if
     // pending) will never complete — cancel the blocked owner immediately so
     // covered handlers resume, rather than waiting for the deferred connect()
