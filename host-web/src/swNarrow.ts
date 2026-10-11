@@ -3,10 +3,10 @@
 // LEVER A (narrow host registration): the HOST document registers `/sw.js`
 // with scope `/app`, BEFORE any pane iframe's src is assigned. Registration
 // is started by the earliest caller of paneSrcGate()/ensureNarrowRegistration()
-// — today that is the first pane renderer's init (iframeRenderer.ts) and the
-// notification path (attentionNotify.ts); a boot-module-eval call in
-// index.tsx is a disclosed follow-up (the file is concurrently owned by the
-// theme session). The ordering GUARANTEE does not depend on the call site:
+// — today that is the host entry module (index.tsx), which calls
+// ensureNarrowRegistration() at module-eval before App render; the pane
+// renderer (iframeRenderer.ts paneSrcGate) and attentionNotify follow through
+// the same memo. The ordering GUARANTEE does not depend on the call site:
 // every pane src assignment funnels through the gate below, which waits for
 // the narrow registration's ACTIVE worker, so cold panes are BORN
 // service-worker-controlled either way. The same script URL also backs the
