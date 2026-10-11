@@ -152,7 +152,9 @@ func hasReconcileCandidate(items []QueueItem) bool {
 }
 
 // reconcileSessionQueue is the Server-level reconcile entry point, spawned (as
-// a goroutine) from handleQueueList when hasReconcileCandidate(items) is true.
+// a goroutine) from handleQueueList when hasReconcileCandidate(items) is true
+// — tracked on bgWG at that spawn site, so Shutdown joins an in-flight pass
+// before returning (its mutations persist via st.save()).
 // It binds the store-level reconcileMessageIDs to this dir's opencode client
 // and guards against overlapping passes for the same session via
 // queueReconcileInFlight. It MUST NEVER invoke prompt_async (it only GETs and

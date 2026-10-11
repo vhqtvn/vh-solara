@@ -158,8 +158,21 @@ func (s *Server) handleQueueList(w http.ResponseWriter, r *http.Request) {
 	// FE on its NEXT poll. When nothing is eligible (the common case) there is
 	// no spawn, no aggFor lookup, and no side effect — so existing List
 	// traffic is unaffected.
+	//
+	// The pass is server-owned background work, so it is tracked on bgWG
+	// (Add before launch, Done inside — the archive-cascade ownership
+	// pattern): Shutdown awaits bgWG, so an in-flight pass — whose
+	// bump/Resolve mutations persist via st.save() — is JOINED before
+	// Shutdown returns instead of surviving it and racing the caller's
+	// teardown (the 2026-10-11 TempDir RemoveAll ENOTEMPTY race). The
+	// per-lookup timeout (reconcileLookupTimeout) bounds the wait; the
+	// in-flight guard bounds it to ONE pass per (root, sid).
 	if hasReconcileCandidate(items) {
-		go s.reconcileSessionQueue(reqDir(r), sid, root)
+		s.bgWG.Add(1)
+		go func() {
+			defer s.bgWG.Done()
+			s.reconcileSessionQueue(reqDir(r), sid, root)
+		}()
 	}
 	writeJSONResp(w, map[string]any{"items": items})
 }
