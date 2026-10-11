@@ -15,6 +15,7 @@ import {
   BOOT_TTL_MS,
   SHELL_KEY,
   SHELL_TTL_MS,
+  SHELL_URL,
   STAMP_HEADER,
 } from "../../src/lib/swPolicy";
 
@@ -25,6 +26,9 @@ describe("sw.js mirrors swPolicy tables", () => {
     expect(sw).toContain(`const STAMP_HEADER = "${STAMP_HEADER}";`);
     expect(sw).toContain(`const SHELL_KEY = "${SHELL_KEY}";`);
     expect(sw).toContain(`const SHELL_TTL_MS = ${SHELL_TTL_MS};`);
+    expect(sw).toContain(`const SHELL_URL = "${SHELL_URL}";`);
+    // shellCacheable mirror (swPolicy.shellCacheable): same predicate text.
+    expect(sw).toContain("return res.ok && !res.redirected;");
   });
 
   it("carries the exact boot-data TTL table (enumeration IS the table)", () => {
@@ -186,6 +190,6 @@ describe("sw.js handlers that must survive unchanged", () => {
     // activate claims BEFORE reaping + precache.
     const activate = sw.slice(sw.indexOf('addEventListener("activate"'), sw.indexOf('addEventListener("message"'));
     expect(activate.indexOf("clients.claim()")).toBeLessThan(activate.indexOf("caches.keys()"));
-    expect(activate.indexOf("clients.claim()")).toBeLessThan(activate.indexOf("fetch(SHELL_KEY)"));
+    expect(activate.indexOf("clients.claim()")).toBeLessThan(activate.indexOf("fetch(SHELL_URL)"));
   });
 });

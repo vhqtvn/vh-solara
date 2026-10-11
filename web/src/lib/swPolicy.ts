@@ -28,6 +28,26 @@ export const STAMP_HEADER = "x-vh-sw-at";
 /** Cache key the single-server shell (index.html) is stored under. */
 export const SHELL_KEY = "/index.html";
 
+/**
+ * Network SOURCE of the single-server shell. `/app` is served by Go's
+ * serveAppIndex in every mode and never redirects; the cache KEY stays
+ * SHELL_KEY. (Pre-fix the SW fetched /index.html → Go FileServer `301 ./` →
+ * fetch followed to `/` = the HOST shell, which got cached and served for
+ * every /app pane: host-in-host recursion.)
+ */
+export const SHELL_URL = "/app";
+
+/**
+ * shellCacheable mirrors the SW gate on every shell cache write: only a 2xx
+ * answered DIRECTLY by the shell URL is the shell. fetch() follows redirects
+ * transparently (res.ok stays true), so a redirected response is some OTHER
+ * document (host shell, login page) and must never be cached or served as the
+ * /app shell; the SW hands such a navigation to the network instead.
+ */
+export function shellCacheable(res: { ok: boolean; redirected: boolean }): boolean {
+  return res.ok && !res.redirected;
+}
+
 /** Shell fresh window. Beyond it the shell fetch is network-first again. */
 export const SHELL_TTL_MS = 30_000;
 

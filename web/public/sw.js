@@ -22,6 +22,9 @@
 //     freshness contract is unchanged in kind: a normal reload past the TTL
 //     always pulls the latest shell, and a new BUILD_ID reaps every prior
 //     cache on activate, so cross-deploy staleness is bounded by the TTL.
+//     The shell is FETCHED from /app (SHELL_URL, never redirects) and stored
+//     under the /index.html key; a redirected response is never cached or
+//     served as the shell (shellCacheable — the host-in-host pane bug).
 //   - Hashed assets are immutable → cache-first (unchanged).
 //
 // Host-route exclusion (post-fold): `/` is the multi-server HOST shell
@@ -75,6 +78,14 @@ let hostFocusPort = null;
 // --- Policy tables (mirror of web/src/lib/swPolicy.ts) ----------------------
 const STAMP_HEADER = "x-vh-sw-at"; // store-time stamp on cached entries (ms epoch)
 const SHELL_KEY = "/index.html"; // cache key for the single-server shell
+// Network SOURCE of the single-server shell. `/app` is served by the Go
+// serveAppIndex in EVERY mode (host-at-root and legacy) and never redirects.
+// The cache KEY stays /index.html (stable across deploys/e2e), but the shell
+// is never FETCHED from there: pre-fix the SW fetched /index.html, Go's
+// FileServer answered it with `301 ./`, fetch() followed to `/` — the HOST
+// shell under hostShellAtRoot — and that host document was cached + served
+// for every /app pane (host-in-host recursion). See shellCacheable.
+const SHELL_URL = "/app";
 const SHELL_TTL_MS = 30000;
 const BOOT_TTL_MS = {
   "/oc/provider": 60000, // stale-while-revalidate window
@@ -125,6 +136,16 @@ function entryAge(stampedAt) {
   return Number.isFinite(t) ? Math.max(0, Date.now() - t) : Infinity;
 }
 
+// shellCacheable gates EVERY shell cache write (precache + fetch handler): only
+// a 2xx answered DIRECTLY by the shell URL may become the shell. A redirected
+// response (fetch() follows redirects transparently, so res.ok is true) is some
+// OTHER document — the host shell at `/`, a login page — and must never be
+// cached under SHELL_KEY nor served as the /app shell. Mirrors
+// swPolicy.shellCacheable.
+function shellCacheable(res) {
+  return res.ok && !res.redirected;
+}
+
 self.addEventListener("install", () => {
   // Deliberately NO network work here: on a cold boot this SW registers while
   // the page's own boot traffic is still fighting for the (tunnel-limited)
@@ -151,8 +172,8 @@ self.addEventListener("activate", (e) => {
       // is fine: the fetch handler's network-first branch fills the entry.
       try {
         const c = await caches.open(CACHE);
-        const res = await fetch(SHELL_KEY);
-        if (res.ok) await c.put(SHELL_KEY, await stampedCopy(res, Date.now()));
+        const res = await fetch(SHELL_URL);
+        if (shellCacheable(res)) await c.put(SHELL_KEY, await stampedCopy(res, Date.now()));
       } catch {
         /* offline or busy — the fetch handler will fill it */
       }
@@ -306,8 +327,9 @@ async function shellResponse(req) {
   if (cached && !bypass && age < SHELL_TTL_MS) return cached;
   try {
     const make = await coalesce("shell:" + SHELL_KEY, async () => {
-      const res = await fetch(SHELL_KEY);
-      if (res.ok) {
+      const res = await fetch(SHELL_URL);
+      if (res.redirected) return null; // not the shell — see shellCacheable
+      if (shellCacheable(res)) {
         // One buffered body feeds both the cache entry and every waiter
         // (a Blob is reusable across Response constructors).
         const body = await res.blob();
@@ -322,6 +344,11 @@ async function shellResponse(req) {
       }
       return () => res.clone(); // error pages: per-waiter clone, never cached
     });
+    // Redirected shell fetch: never serve the redirect TARGET as this
+    // navigation's document. Hand the navigation itself to the network so the
+    // browser applies the redirect natively (URL bar / frame URL follow it,
+    // e.g. an /auth login), and leave the cache untouched.
+    if (make === null) return await fetch(req);
     return make();
   } catch {
     if (cached) return cached; // stale-any-age offline fallback

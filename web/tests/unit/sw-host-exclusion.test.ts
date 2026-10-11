@@ -41,7 +41,13 @@ describe("service worker host-route exclusion (post-fold cache-pollution fix)", 
     // latency); the shell precache lives in activate and fetches ONLY the
     // single-server key — never `/`.
     expect(sw.includes("addAll("), "install must stay network-free (no addAll)").toBe(false);
-    expect(sw.includes("fetch(SHELL_KEY)"), "activate precaches the single-server shell only").toBe(true);
+    expect(sw.includes("fetch(SHELL_URL)"), "activate precaches the single-server shell only").toBe(true);
+    expect(sw.includes('const SHELL_URL = "/app";'), "the shell is fetched from /app, never a redirecting path").toBe(true);
+    // Host-in-host regression: fetching /index.html got `301 ./` → `/` (host
+    // shell) and the followed 200 was cached as the shell. No shell fetch may
+    // target the cache key, and every write is gated by shellCacheable.
+    expect(sw.includes("fetch(SHELL_KEY)"), "never FETCH the shell from its cache key").toBe(false);
+    expect(sw.includes("if (shellCacheable(res)) await c.put(SHELL_KEY")).toBe(true);
     expect(
       sw.includes('addAll(["/", "/index.html"])'),
       "precache must NOT include `/` (host shell) — drop it from addAll",

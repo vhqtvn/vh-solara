@@ -4109,7 +4109,13 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Single-server SPA entry: `/app` and any `/app/*` client route.
-	if path == "/app" || strings.HasPrefix(path, "/app/") {
+	// `/index.html` is the single-server shell too (the SW's documented shell
+	// key — web/public/sw.js). It MUST NOT reach the dist FileServer below:
+	// http.FileServer answers any `.../index.html` with `301 Location: ./`,
+	// and `./` is `/` = the HOST shell under hostShellAtRoot — a fetch()
+	// follows that redirect transparently (200), which is how the host shell
+	// got cached as the /app pane document (host-in-host recursion).
+	if path == "/app" || strings.HasPrefix(path, "/app/") || path == "/index.html" {
 		s.serveAppIndex(w, r)
 		return
 	}

@@ -873,3 +873,56 @@ func TestStaticIdentityWithoutAcceptEncodingHeader(t *testing.T) {
 		}
 	})
 }
+
+// TestIndexHTMLServesAppShellNoRedirect pins the host-in-host regression: the
+// single-server SW's shell key is `/index.html`, and pre-fix that path reached
+// the dist http.FileServer, which answers any `.../index.html` with
+// `301 Location: ./` → `/` = the HOST shell under hostShellAtRoot. fetch()
+// follows the redirect transparently (200), so the SW cached the host shell as
+// the /app pane document. `/index.html` must serve the SINGLE-SERVER shell
+// directly (200, no redirect) in both host-at-root and legacy modes, exactly
+// like `/app`.
+func TestIndexHTMLServesAppShellNoRedirect(t *testing.T) {
+	appIndex := "<!doctype html><html><head><title>VHSolara</title></head>" +
+		"<body><div id=\"root\"></div></body></html>"
+	hostIndex := "<!doctype html><html><head><title>VHSolara · Host</title></head>" +
+		"<body><div id=\"root\"></div></body></html>"
+	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	for _, hostAtRoot := range []bool{true, false} {
+		dist := fstest.MapFS{"index.html": {Data: []byte(appIndex)}}
+		host := fstest.MapFS{"index.html": {Data: []byte(hostIndex)}}
+		agg := aggregator.New("http://127.0.0.1:1", 100)
+		srv, err := NewServer(agg, "http://127.0.0.1:1", 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv.staticFS = dist
+		srv.static = http.FileServer(http.FS(dist))
+		srv.hostFS = host
+		srv.hostStatic = http.FileServer(http.FS(host))
+		srv.SetHostShellAtRoot(hostAtRoot)
+		ws := httptest.NewServer(srv.Handler())
+		for _, p := range []string{"/index.html", "/app"} {
+			resp, err := noFollow.Get(ws.URL + p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("hostAtRoot=%v %s status = %d (Location %q), want 200 with no redirect",
+					hostAtRoot, p, resp.StatusCode, resp.Header.Get("Location"))
+				continue
+			}
+			if string(body) != appIndex {
+				t.Errorf("hostAtRoot=%v %s served %q, want the single-server shell", hostAtRoot, p, body)
+			}
+			if cc := resp.Header.Get("Cache-Control"); cc != staticCacheRevalidate {
+				t.Errorf("hostAtRoot=%v %s Cache-Control = %q, want %q", hostAtRoot, p, cc, staticCacheRevalidate)
+			}
+		}
+		ws.Close()
+	}
+}
