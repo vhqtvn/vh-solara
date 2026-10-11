@@ -389,6 +389,20 @@ type Server struct {
 	reassertReadyCh chan struct{}
 	reassertBlockCh chan struct{}
 
+	// Post-hydrate reconcile pass entry counters (atomic). Test observability
+	// for the Shutdown-join rendezvous tests (posthydrate_reconcile_shutdown_
+	// test.go) — the SAME seam pattern as queueRegistry.cleanupCalls: each
+	// counter is incremented in reconcilePinsForAgg / reconcileLabelsForAgg
+	// immediately BEFORE the pass's first store-mutex acquisition (the pin-doc
+	// snapshot / the labels reconcile snapshot), so a test that already holds
+	// that mutex observes counter ≥ 1 exactly when the pass is
+	// deterministically parked on the acquisition — past the fail-closed gate,
+	// with its durable write (PinStore.RemoveIDs / LabelStore.RemoveRootIDs,
+	// persisted under the SAME mutex) still pending. Not read by production
+	// code paths.
+	pinsReconcileEntries   int64
+	labelsReconcileEntries int64
+
 	// Archive cascade job (Defect 1 fix) state. The job is dispatched by
 	// handleArchive under bgCtx/bgWG (same lifecycle as reassert); these fields
 	// configure its retry policy and record operator-visible failures.
@@ -1354,6 +1368,22 @@ func (s *Server) spawnPostHydrateReconciles(dir string, a *aggregator.Aggregator
 	}()
 }
 
+// pinsReconcileEntryCount returns the total number of reconcilePinsForAgg
+// invocations that reached the pin-doc snapshot step (test observability — see
+// the pinsReconcileEntries field doc; the queueRegistry.CleanupCallCount
+// mechanism mirrored for the pins pass).
+func (s *Server) pinsReconcileEntryCount() int64 {
+	return atomic.LoadInt64(&s.pinsReconcileEntries)
+}
+
+// labelsReconcileEntryCount returns the total number of reconcileLabelsForAgg
+// invocations that reached the labels reconcile-snapshot step (test
+// observability — see the labelsReconcileEntries field doc; the
+// queueRegistry.CleanupCallCount mechanism mirrored for the labels pass).
+func (s *Server) labelsReconcileEntryCount() int64 {
+	return atomic.LoadInt64(&s.labelsReconcileEntries)
+}
+
 // reconcileQueuesForAgg is the per-aggregator driver for FIX-QUEUE-GC-3
 // orphan-queue reconciliation. It is the glue between the aggregator's
 // post-hydrate signal (SetOnHydrate / AnyHydrateCompleted, installed in
@@ -1581,6 +1611,11 @@ func (s *Server) reconcileLabelsForAgg(dir string, a *aggregator.Aggregator) {
 	if st == nil {
 		return
 	}
+	// Test seam (queueRegistry.cleanupCalls pattern — see
+	// labelsReconcileEntries): count pass entries immediately BEFORE the
+	// snapshot's mutex acquisition, so the Shutdown-join rendezvous tests can
+	// observe the pass is parked there while they hold the store mutex.
+	atomic.AddInt64(&s.labelsReconcileEntries, 1)
 	// ORDERING INVARIANT (F1 fix): snapshot the doc + sidecar BEFORE reading the
 	// authoritative active-root set. A root added AFTER this snapshot is not in
 	// `doc`/`referenced` and therefore cannot be a removal candidate this pass.

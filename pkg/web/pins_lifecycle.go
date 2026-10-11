@@ -47,6 +47,7 @@ package web
 
 import (
 	"encoding/json"
+	"sync/atomic"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/state"
@@ -184,6 +185,11 @@ func (s *Server) reconcilePinsForAgg(dir string, a *aggregator.Aggregator) {
 	// taken, and for those the active set is at least as current as the snapshot
 	// (a session active at snapshot time that is gone from the active set was
 	// genuinely deleted in between — the correct removal case).
+	// Test seam (queueRegistry.cleanupCalls pattern — see
+	// s.pinsReconcileEntries): count pass entries immediately BEFORE the
+	// snapshot's mutex acquisition, so the Shutdown-join rendezvous tests can
+	// observe the pass is parked there while they hold the store mutex.
+	atomic.AddInt64(&s.pinsReconcileEntries, 1)
 	doc := s.pins.Snapshot()
 	ids := a.Store().SessionIDs()
 	active := make(map[string]bool, len(ids))
