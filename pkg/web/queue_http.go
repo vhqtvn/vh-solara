@@ -168,10 +168,14 @@ func (s *Server) handleQueueList(w http.ResponseWriter, r *http.Request) {
 	// per-lookup timeout (reconcileLookupTimeout) bounds the wait; the
 	// in-flight guard bounds it to ONE pass per (root, sid).
 	if hasReconcileCandidate(items) {
+		// Capture dir while still on the handler's goroutine: reqDir(r) reads
+		// r's URL/header, whose lifetime is only guaranteed for the handler
+		// call itself. Eager evaluation — zero behavior change today.
+		dir := reqDir(r)
 		s.bgWG.Add(1)
 		go func() {
 			defer s.bgWG.Done()
-			s.reconcileSessionQueue(reqDir(r), sid, root)
+			s.reconcileSessionQueue(dir, sid, root)
 		}()
 	}
 	writeJSONResp(w, map[string]any{"items": items})

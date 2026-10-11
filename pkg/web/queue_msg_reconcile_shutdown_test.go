@@ -37,6 +37,13 @@ import (
 // therefore not return while the pass is in flight, and the pass's durable
 // write must have landed by the time Shutdown returns.
 func TestShutdownJoinsListSpawnedReconcile(t *testing.T) {
+	// Fixture hygiene (same as posthydrate_reconcile_shutdown_test.go): isolate
+	// ALL stateBaseDir() persistence — NewServer loads <stateBaseDir>/pins.json
+	// and runs the labels migration, which MkdirAlls + writes its completion
+	// marker even when the legacy file is missing — so this test never reads
+	// the operator's real pins.json nor writes into the real user-config dir.
+	// Must land BEFORE NewServer: stateBaseDir() reads VH_STATE_DIR live.
+	t.Setenv("VH_STATE_DIR", t.TempDir())
 	root := t.TempDir()
 
 	// The rendezvous: the fake OC's exact-message handler signals entry, then
@@ -68,14 +75,18 @@ func TestShutdownJoinsListSpawnedReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Release the held lookup FIRST in teardown (registered last → LIFO-first)
-	// so a failing path cannot deadlock oc.Close on the blocked handler.
-	t.Cleanup(releaseLookup)
+	// Shutdown fallback, then the release — IN that registration order, so
+	// LIFO runs releaseLookup FIRST: a failing path drains the parked pass
+	// before the fallback Shutdown instead of burning its full 5s ctx on the
+	// join. Invariant preserved either way: releaseLookup still runs before
+	// oc.Close (registered above), so the blocked handler can never deadlock
+	// oc.Close.
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx) // idempotent with the explicit Shutdown below
 	})
+	t.Cleanup(releaseLookup)
 	t.Chdir(root) // projectRoot("") → root (the default project)
 	web := httptest.NewServer(srv.Handler())
 	t.Cleanup(web.Close)

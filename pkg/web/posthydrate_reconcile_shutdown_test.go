@@ -147,27 +147,13 @@ func exercisePostHydrateSpawnJoin(t *testing.T, arm string, trigger func(srv *Se
 	// The pass is NOW observably in flight (parked on qr.mu). Shutdown must
 	// join it: no Shutdown phase before the Wait takes qr.mu (no drain loops
 	// are registered, s.aggs is empty, the default aggregator is not stopped),
-	// so the ONLY thing that can hold Shutdown here is the bgWG entry.
-	shutdownDone := make(chan error, 1)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		shutdownDone <- srv.Shutdown(ctx)
-	}()
-	select {
-	case err := <-shutdownDone:
-		t.Fatalf("Shutdown returned (err=%v) while the post-hydrate queue reconcile pass (%s arm) was parked in its durable-delete critical section — the spawn is untracked (not on bgWG), so deleteStore's os.Remove can race the caller's teardown", err, arm)
-	case <-time.After(300 * time.Millisecond):
-		// Still parked on the in-flight pass: the join is holding.
-	}
-
-	// Drain the pass; Shutdown must now complete…
-	releaseRegistry()
-	select {
-	case <-shutdownDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Shutdown did not return after the in-flight post-hydrate reconcile pass drained")
-	}
+	// so the ONLY thing that can hold Shutdown here is the bgWG entry. The
+	// window/release/drain sequence is the shared per-pass discipline factored
+	// out by assertShutdownJoinsParkedPass (same 10s shutdown ctx, 300ms
+	// one-sided negative window, release, 5s drain timeout as before the
+	// dedupe); parkedWhy carries this fixture's arm + park location.
+	assertShutdownJoinsParkedPass(t, srv, releaseRegistry,
+		"queue pass ("+arm+" arm) parked in its durable-delete critical section")
 
 	// …and the durable delete landed BEFORE Shutdown returned (bgWG ordering):
 	// the parked os.Remove could only have run after the release, yet before
