@@ -71,6 +71,10 @@ export function addProject(rawPath: string) {
     save();
   }
   switchProject(directory);
+  // F7: same overlap as selectProject — the Add-project gesture lands on a
+  // project switch too, so warm the activity cache alongside the Stream-1
+  // open instead of paying the /vh/projects round at the next dialog open.
+  refreshProjectActivity();
 }
 
 export function removeProject(directory: string) {
@@ -84,6 +88,12 @@ export function removeProject(directory: string) {
 
 export function selectProject(directory: string) {
   switchProject(directory);
+  // F7 (remote-latency brief 2026-10-12): fire /vh/projects CONCURRENTLY with
+  // the Stream-1 open switchProject just initiated — both requests are in
+  // flight in this same turn, so the activity round no longer serializes into
+  // the next switcher-dialog open. switchProject early-returns on a same-dir
+  // no-op select; the refresh is still harmless (inflight-coalesced GET).
+  refreshProjectActivity();
 }
 
 // Recent projects for the switcher's "Recent (OpenCode)" pick list. TWO legs,
@@ -386,6 +396,40 @@ export async function fetchProjectActivity(): Promise<ActivityMaps> {
     log.warn("projects", "activity fetch failed", e);
     return { roots: new Map(), running: new Map(), unread: new Map() };
   }
+}
+
+// --- Project activity cache (F7, remote-latency brief 2026-10-12) -----------
+//
+// The brief's operator chain paid the /vh/projects round SERIALLY in the
+// project-switch gesture: the switcher refreshed activity only on dialog OPEN,
+// so every switch left the next dialog open waiting a full request round for
+// fresh badges. The cache moves that round OFF the perceived critical path:
+// selectProject/addProject fire refreshProjectActivity() in the SAME
+// synchronous turn as switchProject's Stream-1 open (the requests cross the
+// tunnel concurrently), and the next dialog open renders the already-fresh
+// badges instantly — its own refresh coalesces with any in-flight one via the
+// module-level inflight guard.
+const [activityMaps, setActivityMaps] = createSignal<ActivityMaps | null>(null);
+let activityInflight: Promise<void> | null = null;
+
+/** Fire-and-forget activity refresh (inflight-coalesced, never throws). */
+export function refreshProjectActivity(): void {
+  if (activityInflight) return;
+  activityInflight = fetchProjectActivity()
+    .then((m) => {
+      setActivityMaps(m);
+    })
+    .catch(() => {})
+    .finally(() => {
+      activityInflight = null;
+    });
+}
+
+/** Reactive read of the cached activity maps (null until the first refresh
+ *  resolves). The switcher's rows bind this; the dialog-open refresh keeps it
+ *  fresh. */
+export function projectActivity(): ActivityMaps | null {
+  return activityMaps();
 }
 
 export { projects, projectDir };

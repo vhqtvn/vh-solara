@@ -1,14 +1,14 @@
 import { createEffect, createMemo, createResource, createSignal, For, Show } from "solid-js";
 import {
-  ActivityMaps,
   addProject,
   buildProjectLink,
-  fetchProjectActivity,
   fetchRecentProjects,
   filterProjectRows,
   mergeProjectActivity,
+  projectActivity,
   projectDir,
   projects,
+  refreshProjectActivity,
   removeProject,
   selectProject,
   withActiveProject,
@@ -30,21 +30,14 @@ export default function ProjectSwitcher() {
   const [query, setQuery] = createSignal("");
   const [recents, { refetch }] = createResource(fetchRecentProjects, { initialValue: [] });
 
-  // Activity is fetched ON DIALOG OPEN (coalesced, never a tight loop). Held as a
-  // signal so rows/recent badges react when it resolves; an in-flight guard
-  // dedupes concurrent triggers.
-  const [activity, setActivity] = createSignal<ActivityMaps | null>(null);
-  let inflight: Promise<void> | null = null;
+  // Activity is the module-level cache (projects.ts, F7): refreshed on dialog
+  // open AND warmed by selectProject/addProject in the same turn as the
+  // project switch's Stream-1 open, so a post-switch dialog open renders fresh
+  // badges with zero additional wait. The module's inflight guard dedupes
+  // concurrent triggers (dialog open racing a switch-time refresh).
+  const activity = projectActivity;
   function loadActivity() {
-    if (inflight) return;
-    inflight = fetchProjectActivity()
-      .then((m) => {
-        setActivity(m);
-      })
-      .catch(() => {})
-      .finally(() => {
-        inflight = null;
-      });
+    refreshProjectActivity();
   }
 
   // The pinned list WITH the active project injected when it isn't pinned. The
