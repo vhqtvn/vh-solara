@@ -30,6 +30,13 @@ import { demoDir, projectUrl } from "./util";
 //       unsupported) → the client takes the legacy /oc/session lane with
 //       ZERO /vh/session/create POSTs, the draft send materializes the
 //       session and dispatches exactly once.
+//   (e) MID-FLIGHT PROJECT SWITCH (defer of the draft-project-scoping
+//       change): while a held create's recovery budget is running in project
+//       A, the operator switches to project B through the REAL switcher
+//       dialog. The switch's full orchestration (state resets, stream
+//       reconnect, setDraft(false)) must not break the dir-scoped recovery,
+//       must not leak A's send-status rows into B's draft view, and the
+//       resolution must follow the operator back to A.
 //
 // Serial-suite hygiene (workers:1, one shared fixtureserver): every test
 // arms the one-shot create mode it needs and POSTs /oc/fixture/create-hold/
@@ -54,6 +61,18 @@ async function cleanQueue(request: APIRequestContext, sessionId: string): Promis
   for (const it of items) {
     await request.delete(`${queueUrl(sessionId)}/${encodeURIComponent(it.id)}`, { headers: csrf });
   }
+}
+
+// Session ids as the fake OpenCode sees them for a directory (GET /oc/session
+// scoped by the x-opencode-directory header — the same header the SPA's
+// installCsrf stamps). Used by test (e) to discover the hold-minted session
+// id by diffing the list before/after the release.
+async function sessionIds(request: APIRequestContext, headers: Record<string, string>): Promise<string[]> {
+  const res = await request.get(`/oc/session`, { headers });
+  if (!res.ok()) throw new Error(`GET /oc/session -> ${res.status()}`);
+  const j = await res.json();
+  const arr: Array<{ id?: string }> = Array.isArray(j) ? j : Array.isArray(j.sessions) ? j.sessions : [];
+  return arr.map((s) => s.id ?? "").filter(Boolean);
 }
 
 test.afterEach(async ({ request }) => {
@@ -332,4 +351,127 @@ test("(d) legacy fallback: capability 404 → the old /oc/session path still wor
   await cleanQueue(request, sid!);
   const del = await request.post(`/oc/fixture/delete?session=${encodeURIComponent(sid!)}`, { headers: csrf });
   if (!del.ok()) console.log(`[create-certainty] WARNING: fixture delete for ${sid} -> ${del.status()}`);
+});
+
+test("(e) held create + MID-FLIGHT project switch: recovery stays dir-scoped in B, B's draft never leaks, the resolution follows the operator back to A — ONE create, ZERO dispatches", async ({ page, request }) => {
+  test.setTimeout(120_000);
+
+  await page.route("**/sw.js*", (route) => route.abort());
+  for (const sw of page.context().serviceWorkers()) await (sw as unknown as { close(): Promise<void> }).close();
+
+  const wire = instrumentCreateWire(page);
+
+  // Arm the one-shot delayed-response boundary (same posture as (a)): the
+  // NEXT create commits upstream + emits session.created, then withholds the
+  // response until released.
+  const arm = await request.post(`/oc/fixture/create-hold/arm?mode=hold`, { headers: csrf });
+  if (!arm.ok()) throw new Error(`create-hold arm failed: ${arm.status()}`);
+
+  await page.goto(projectUrl("/"));
+  await openDraftComposer(page);
+
+  // Pre-pin project A (demoDir) through the REAL switcher dialog so the later
+  // switch-back row is a deterministic pinned .proj-pick (the dialog's Recent
+  // section filters out already-pinned dirs, so the row matches uniquely).
+  // addProject on the ACTIVE project is pin-only: switchProject early-returns
+  // on same-dir, so the open draft composer stays mounted untouched.
+  await page.locator(".proj-current").click();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+  await page.getByRole("button", { name: /Add project/ }).click();
+  await page.locator(".vh-prompt-input").fill(demoDir);
+  await page.locator(".vh-prompt .confirm-go").click();
+  await expect(page.locator(".proj-name")).toContainText("fixture-demo");
+
+  // Baseline A session list (the hold-minted id is discovered by diffing).
+  const ocHeaders = { ...csrf, "x-opencode-directory": demoDir };
+  const beforeIds = new Set(await sessionIds(request, ocHeaders));
+
+  // Real user gesture: type + click Send through the real event model.
+  const marker = `cc-switch-${Date.now()}`;
+  const ta = page.getByPlaceholder(/Message/);
+  await ta.fill(marker);
+  await page.locator(".composer-bar .send-btn").click();
+
+  // (1) The 12s POST bound aborts while the fixture still holds the response:
+  // outcome-unknown, the bounded receipt-recovery budget starts (module-level
+  // state), and A's draft shows the honest "Checking session creation." row.
+  const checking = page.locator(".sendStatusLine", { hasText: "Checking session creation." });
+  await expect(checking).toBeVisible({ timeout: 20_000 });
+
+  // (2) THE MID-FLIGHT SWITCH — the real in-app gesture path (switcher dialog
+  // → "Add project…" → a second directory). switchProject's full orchestration
+  // fires while the create is still held: setDraft(false), session/tree/
+  // message state resets, stream reconnect scoped to B. None of that touches
+  // the create-op registry or the draft owner records, and the recovery
+  // lookups carry the MINT-TIME dir, so the budget keeps running scoped to A.
+  const dirB = "/work/cc-switch-b";
+  await page.locator(".proj-current").click();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+  await page.getByRole("button", { name: /Add project/ }).click();
+  await page.locator(".vh-prompt-input").fill(dirB);
+  await page.locator(".vh-prompt .confirm-go").click();
+  await expect(page.locator(".proj-name")).toContainText("cc-switch-b", { timeout: 8_000 });
+  await expect(page.locator(".tree-node", { hasText: "Project: cc-switch-b" })).toBeVisible({ timeout: 8_000 });
+
+  // (3) NO LEAK: B's draft view renders ZERO send-status rows — A's checking
+  // record lives under A's tap-time draft owner key only (the project scoping
+  // this test pins). No agent-ready wait here: nothing is ever sent in B, and
+  // the B-side dance must stay lean so the release lands inside A's
+  // still-running recovery budget (lookups 0/4/8s from budget start).
+  await page.getByRole("button", { name: "Create session" }).click();
+  await expect(page.locator(".composer")).toBeVisible();
+  await expect(page.locator(".sendStatusLine")).toHaveCount(0);
+
+  // (4) Release inside the budget window: the withheld id reaches the worker
+  // and the next dir-scoped receipt LOOKUP resolves the exact id.
+  const getsBefore = wire.receiptGets();
+  const rel = await request.post(`/oc/fixture/create-hold/release`, { headers: csrf });
+  if (!rel.ok()) throw new Error(`create-hold release failed: ${rel.status()}`);
+  await expect
+    .poll(() => wire.receiptGets(), { timeout: 15_000, message: "the post-release receipt lookup ran" })
+    .toBeGreaterThan(getsBefore);
+  const fresh = (await sessionIds(request, ocHeaders)).filter((id) => !beforeIds.has(id) && /^ses_new\d+$/.test(id));
+  expect(fresh).toHaveLength(1);
+  const sid = fresh[0];
+
+  // (5) THE ROUND TRIP — switch back to A through the real dialog. The
+  // committed session lands in A's tree (the snapshot reconciles it), and
+  // opening it IN-APP (real tree-node click — never page.reload: the records
+  // are in-memory singletons) shows the op-scoped TRANSFERRED record: the
+  // proof that the resolution landed on the EXACT id while the app sat in B,
+  // with the record following from A's tap-time draft key to the session's
+  // owner key. Only resolveCreateOp → transferCreateOpRecords can place that
+  // row there (no re-tap Send and no operator confirm-link happened).
+  //
+  // NOTE: the draft view's create-resolved POINTER row ("Session was
+  // created." + Open it, data-kind="create-resolved") is deliberately NOT
+  // asserted after the round trip: re-entering a draft is newSession() →
+  // beginDraftGeneration, which clears currentOp — that pointer row belongs
+  // to the still-open draft generation of the operation and is proven by
+  // test (a). The transferred record row is the operator-visible resolution
+  // surface once the draft has been left and re-entered across a project
+  // switch.
+  await page.locator(".proj-current").click();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+  await page.locator(".proj-pick", { hasText: "fixture-demo" }).click();
+  await expect(page.locator(".proj-name")).toContainText("fixture-demo", { timeout: 8_000 });
+  const createdNode = page.locator(`.tree-node[data-session-id="${sid}"]`);
+  await expect(createdNode).toBeVisible({ timeout: 10_000 });
+  await createdNode.click();
+  const movedRow = page.locator(".sendStatusLine", { hasText: "Session was created — this message was not sent." });
+  await expect(movedRow).toBeVisible({ timeout: 10_000 });
+
+  // Honesty: exactly ONE create POST ever, ZERO dispatches — the switch dance
+  // never re-created and never sent.
+  expect(wire.createPosts()).toBe(1);
+  expect(wire.prompts()).toBe(0);
+
+  // And B's draft is STILL clean after the full round trip.
+  await page.locator(".proj-current").click();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+  await page.locator(".proj-pick", { hasText: "cc-switch-b" }).click();
+  await expect(page.locator(".proj-name")).toContainText("cc-switch-b", { timeout: 8_000 });
+  await page.getByRole("button", { name: "Create session" }).click();
+  await expect(page.locator(".composer")).toBeVisible();
+  await expect(page.locator(".sendStatusLine")).toHaveCount(0);
 });
