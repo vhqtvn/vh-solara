@@ -119,19 +119,41 @@ export type OutboxSaveResult = { ok: true } | { ok: false; code: "storage-unavai
 
 /** The storage seam. All operations resolve (never reject); storage failures
  *  surface as the typed `{ok:false}` result on put and as `undefined`/empty on
- *  reads (a read that cannot observe the store must not fabricate records). */
+ *  reads (a read that cannot observe the store must not fabricate records).
+ *  `snapshot` is the exception: it REJECTS on failure — its caller (the
+ *  pending-marker trust check) must distinguish "read the store, it is empty"
+ *  from "could not read the store" (an unreadable store can establish neither
+ *  emptiness nor eviction, so the caller must conclude nothing at all). */
 export interface OutboxStore {
   put(rec: OutboxGestureRecord): Promise<OutboxSaveResult>;
   get(intentId: string): Promise<OutboxGestureRecord | undefined>;
   all(): Promise<OutboxGestureRecord[]>;
   delete(intentId: string): Promise<void>;
+  /** Consistent {records, epoch} read from ONE transaction. `epoch` is the
+   *  store's mutation epoch — bumped transactionally by EVERY put/delete —
+   *  so a snapshot's record list and its epoch can never disagree. The
+   *  pending-marker trust basis (index.ts): a marker stamped with epoch E is
+   *  provably about the store state at epoch E, and any later mutation
+   *  invalidates it detectably. */
+  snapshot(): Promise<OutboxSnapshot>;
+}
+
+/** One transactionally consistent view of the store. */
+export interface OutboxSnapshot {
+  all: OutboxGestureRecord[];
+  epoch: number;
 }
 
 // --- real IndexedDB implementation -------------------------------------------
 
 const IDB_NAME = "vh-solara-outbox";
-const IDB_VERSION = 1;
+// v2 adds the `meta` object store (the mutation epoch — see snapshot()). v1
+// databases upgrade in place: onupgradeneeded only creates the missing store,
+// existing gesture records are preserved.
+const IDB_VERSION = 2;
 const STORE = "gestures";
+const META_STORE = "meta";
+const META_EPOCH_KEY = "epoch";
 
 /** Open (and once-create) the outbox database. Rejects on ANY failure mode —
  *  the caller wraps it into the typed save result. */
@@ -146,6 +168,9 @@ function openDb(): Promise<IDBDatabase> {
       const db = req.result;
       if (!db.objectStoreNames.contains(STORE)) {
         db.createObjectStore(STORE, { keyPath: "intentId" });
+      }
+      if (!db.objectStoreNames.contains(META_STORE)) {
+        db.createObjectStore(META_STORE);
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -172,6 +197,23 @@ function toPlain<T>(v: T): T {
   return JSON.parse(JSON.stringify(v));
 }
 
+/** Bump the mutation epoch INSIDE a readwrite transaction that also mutates
+ *  the gesture store. Transactionality is the entire point: records and epoch
+ *  move together atomically, so "epoch E" names an exact store state and a
+ *  crash between record-write and epoch-write is impossible. IDB serializes
+ *  write transactions per database, so concurrent tabs can never lose an
+ *  epoch bump (two mutations ⇒ epoch advanced by exactly two). A failing
+ *  epoch write aborts the WHOLE transaction — the caller's put surfaces
+ *  {ok:false} rather than committing a mutation the epoch does not testify
+ *  to (the marker trust basis must never diverge from the records). */
+function txBumpEpoch(tx: IDBTransaction): void {
+  const meta = tx.objectStore(META_STORE);
+  const get = meta.get(META_EPOCH_KEY);
+  get.onsuccess = () => {
+    meta.put((Number(get.result) || 0) + 1, META_EPOCH_KEY);
+  };
+}
+
 /** Real IndexedDB store. A single cached connection is opened lazily; on any
  *  failure the connection is dropped so a later attempt (or a fresh gesture
  *  after the operator frees storage) re-opens cleanly. */
@@ -191,9 +233,11 @@ export function createIdbOutboxStore(): OutboxStore {
       try {
         const d = await db();
         // readwrite + await transaction completion: "saved" means COMMITTED,
-        // not "request queued" (BLK-A3 — the commit is the gate).
-        const tx = d.transaction(STORE, "readwrite");
+        // not "request queued" (BLK-A3 — the commit is the gate). The same
+        // transaction bumps the mutation epoch (see txBumpEpoch).
+        const tx = d.transaction([STORE, META_STORE], "readwrite");
         tx.objectStore(STORE).put(toPlain(rec));
+        txBumpEpoch(tx);
         await txDone(tx);
         return { ok: true } as const;
       } catch (e) {
@@ -224,11 +268,31 @@ export function createIdbOutboxStore(): OutboxStore {
         return [];
       }
     },
+    async snapshot() {
+      const d = await db();
+      // ONE readonly transaction across both stores: the record list and the
+      // epoch cannot disagree (a mutation committed between two separate
+      // reads could otherwise make a snapshot lie about which state it saw).
+      // Rejects on failure — see the interface note.
+      return await new Promise<OutboxSnapshot>((resolve, reject) => {
+        const tx = d.transaction([STORE, META_STORE], "readonly");
+        const reqAll = tx.objectStore(STORE).getAll();
+        const reqEpoch = tx.objectStore(META_STORE).get(META_EPOCH_KEY);
+        tx.oncomplete = () =>
+          resolve({
+            all: (reqAll.result as OutboxGestureRecord[]) ?? [],
+            epoch: Number(reqEpoch.result) || 0,
+          });
+        tx.onerror = () => reject(tx.error ?? new Error("snapshot transaction failed"));
+        tx.onabort = () => reject(tx.error ?? new Error("snapshot transaction aborted"));
+      });
+    },
     async delete(intentId) {
       try {
         const d = await db();
-        const tx = d.transaction(STORE, "readwrite");
+        const tx = d.transaction([STORE, META_STORE], "readwrite");
         tx.objectStore(STORE).delete(intentId);
+        txBumpEpoch(tx);
         await txDone(tx);
       } catch {
         /* best-effort prune; a stuck record is retried by the next reconcile GC */
@@ -241,9 +305,13 @@ export function createIdbOutboxStore(): OutboxStore {
 
 /** Deterministic in-memory OutboxStore for unit tests (jsdom has no IndexedDB
  *  and the repo does not depend on fake-indexeddb). Optionally constructed
- *  with a failing put for the storage-unavailable contract tests. */
+ *  with a failing put for the storage-unavailable contract tests. Mirrors the
+ *  real store's epoch semantics: successful put/delete bump the epoch, a
+ *  failed put does not (the mutation never happened, so the epoch must not
+ *  testify that it did). */
 export function createMemoryOutboxStore(opts: { failPuts?: () => string | null } = {}): OutboxStore {
   const map = new Map<string, OutboxGestureRecord>();
+  let epoch = 0;
   return {
     async put(rec) {
       const reason = opts.failPuts?.();
@@ -253,6 +321,7 @@ export function createMemoryOutboxStore(opts: { failPuts?: () => string | null }
       // Same JSON boundary as the real store (proxy callers behave
       // identically under both implementations).
       map.set(rec.intentId, toPlain(rec));
+      epoch += 1;
       return { ok: true } as const;
     },
     async get(intentId) {
@@ -262,8 +331,11 @@ export function createMemoryOutboxStore(opts: { failPuts?: () => string | null }
     async all() {
       return [...map.values()].map((r) => ({ ...r }));
     },
+    async snapshot() {
+      return { all: [...map.values()].map((r) => ({ ...r })), epoch };
+    },
     async delete(intentId) {
-      map.delete(intentId);
+      if (map.delete(intentId)) epoch += 1;
     },
   };
 }

@@ -57,10 +57,17 @@ import {
   type OutboxGestureRecord,
   type OutboxPayload,
   type OutboxSaveResult,
+  type OutboxSnapshot,
   type OutboxStore,
 } from "./store";
 
-export type { OutboxContextHead, OutboxGestureRecord, OutboxPayload, OutboxSaveResult };
+export type {
+  OutboxContextHead,
+  OutboxGestureRecord,
+  OutboxPayload,
+  OutboxSaveResult,
+  OutboxSnapshot,
+};
 export { createIdbOutboxStore, createMemoryOutboxStore } from "./store";
 
 /** Blocking storage-failure surface state (BLK-A3). `payload` is the retained
@@ -102,9 +109,16 @@ const [replacementOverlays, setReplacementOverlays] = createSignal<ReadonlyMap<s
 const [storageFailure, setStorageFailure] = createSignal<OutboxStorageFailure | null>(null);
 
 // Cleared/evicted-IDB detection: a localStorage marker written after every
-// successful save-while-records-exist. If the marker is set but the durable
-// store reads empty at hydrate, storage was cleared/evicted underneath us —
-// surfaced honestly (the texts are unrecoverable; the operator must know).
+// successful save-while-records-exist. The marker VALUE (v2) carries the
+// pending count AND the store's mutation epoch at snapshot time — see
+// hydrateOutbox for the cross-check. localStorage is SHARED by every tab/pane
+// and uncoordinated, so the last writer wins; the epoch binding is what makes
+// the marker trustworthy: a stale count left by interleaved multi-tab writes
+// (or a drain whose marker persist was lost to a tab kill) is detectably out
+// of date and repairs silently instead of firing the eviction warning in
+// every pane. Legacy bare-number markers (pre-epoch builds) are untrusted —
+// they are exactly the racy cached count this design replaces — and never
+// warn. KEY kept for continuity (old markers are repaired on first hydrate).
 const LS_OUTBOX_PENDING = "vh.outbox.pending.v1";
 const [evictionSuspected, setEvictionSuspected] = createSignal(false);
 
@@ -383,17 +397,45 @@ export function __setOutboxClaimChannelForTests(factory: OutboxClaimChannelFacto
   openClaimChannel();
 }
 
-function readPendingMarker(): number {
+/** Marker VALUE formats (the KEY is kept):
+ *  - v2: JSON `{"n":<count>,"e":<epoch>}` — count bound to the store's
+ *    mutation epoch at snapshot time.
+ *  - legacy: a bare decimal number (pre-epoch builds) — untrusted, never
+ *    warns, repaired on first hydrate.
+ *  - null: absent (drained / never written / read failure). */
+type PendingMarker = { kind: "v2"; n: number; e: number } | { kind: "legacy"; n: number } | null;
+
+function readPendingMarker(): PendingMarker {
+  let raw: string | null = null;
   try {
-    return Number(localStorage.getItem(LS_OUTBOX_PENDING)) || 0;
+    raw = localStorage.getItem(LS_OUTBOX_PENDING);
   } catch {
-    return 0;
+    return null;
   }
+  if (raw === null) return null;
+  if (raw.startsWith("{")) {
+    try {
+      const j = JSON.parse(raw) as { n?: unknown; e?: unknown };
+      if (
+        typeof j.n === "number" &&
+        typeof j.e === "number" &&
+        Number.isFinite(j.n) &&
+        Number.isFinite(j.e)
+      ) {
+        return { kind: "v2", n: j.n, e: j.e };
+      }
+    } catch {
+      /* unparseable v2-shaped value — untrusted, treated as legacy */
+    }
+    return { kind: "legacy", n: 0 };
+  }
+  const legacy = Number(raw);
+  return { kind: "legacy", n: Number.isFinite(legacy) ? legacy : 0 };
 }
 
-function writePendingMarker(n: number): void {
+function writePendingMarker(n: number, e: number): void {
   try {
-    if (n > 0) localStorage.setItem(LS_OUTBOX_PENDING, String(n));
+    if (n > 0) localStorage.setItem(LS_OUTBOX_PENDING, JSON.stringify({ n, e }));
     else localStorage.removeItem(LS_OUTBOX_PENDING);
   } catch {
     /* marker is best-effort diagnostics, never a correctness gate */
@@ -401,23 +443,56 @@ function writePendingMarker(n: number): void {
 }
 
 /** Hydrate overlays + eviction detection from the durable store. Called once
- *  at module init (page boot) and safe to re-run (tests). */
+ *  at module init (page boot) and safe to re-run (tests).
+ *
+ *  Eviction verdict (v2 marker): the marker claims `n>0` records were pending
+ *  when the store was last at epoch `e`, and the store reads empty NOW. Warn
+ *  ONLY when the current epoch still evidentially covers that claim:
+ *   - `epoch === marker.e` — no tracked mutation committed since the
+ *     snapshot, so the records cannot have drained through us: they vanished
+ *     externally (store wiped while the meta epoch survived).
+ *   - `epoch === 0` — the never-mutated state of a fresh database; a `n>0`
+ *     claim against it means the epoch was wiped WITH the store (whole-DB
+ *     eviction).
+ *  Any other epoch means a put/delete committed AFTER the snapshot — the
+ *  marker is stale under interleaved multi-tab writes (shared localStorage,
+ *  last-writer-wins) and is repaired silently. A store we cannot READ earns
+ *  no verdict at all (neither emptiness nor eviction is established). */
 export async function hydrateOutbox(): Promise<void> {
-  const all = await store.all();
+  let snap: OutboxSnapshot;
+  try {
+    snap = await store.snapshot();
+  } catch {
+    return; // store unreadable — nothing honest to hydrate, no verdict either
+  }
   const map = new Map<string, string>();
-  for (const r of all) {
+  for (const r of snap.all) {
     if (r.replacedBy) map.set(r.intentId, r.replacedBy);
   }
   setReplacementOverlays(map);
   const marker = readPendingMarker();
-  setEvictionSuspected(marker > 0 && all.length === 0 && !storageFailure());
-  if (all.length === 0 && marker > 0 && !storageFailure()) writePendingMarker(0);
+  const suspect =
+    marker !== null &&
+    marker.kind === "v2" &&
+    marker.n > 0 &&
+    snap.all.length === 0 &&
+    !storageFailure() &&
+    (snap.epoch === marker.e || snap.epoch === 0);
+  setEvictionSuspected(suspect);
+  const current =
+    marker !== null && marker.kind === "v2" && marker.n === snap.all.length && marker.e === snap.epoch;
+  if (!current) writePendingMarker(snap.all.length, snap.epoch);
 }
 
 void hydrateOutbox();
 
 async function persistPendingMarker(): Promise<void> {
-  writePendingMarker((await store.all()).length);
+  try {
+    const snap = await store.snapshot();
+    writePendingMarker(snap.all.length, snap.epoch);
+  } catch {
+    /* marker is best-effort diagnostics, never a correctness gate */
+  }
 }
 
 // --- gesture lifecycle --------------------------------------------------------

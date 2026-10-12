@@ -202,6 +202,7 @@ describe("BLK-A3 durability contract", () => {
       get: (id) => memoryStore.get(id),
       all: () => memoryStore.all(),
       delete: (id) => memoryStore.delete(id),
+      snapshot: () => memoryStore.snapshot(),
     };
     __resetOutboxForTests(slowStore);
     const p = saveGesture(gesture("i-1"));
@@ -272,7 +273,11 @@ describe("BLK-A3 durability contract", () => {
     await saveGesture(gesture("i-1"));
     expect(await memoryStore.all()).toHaveLength(1);
     const markerAfterSave = mem["vh.outbox.pending.v1"];
-    expect(Number(markerAfterSave)).toBeGreaterThan(0);
+    // v2 marker: {"n":<count>,"e":<epoch>} — count AND the epoch it was taken at.
+    const parsed = JSON.parse(markerAfterSave ?? "null") as { n: number; e: number } | null;
+    expect(parsed).not.toBeNull();
+    expect(parsed!.n).toBeGreaterThan(0);
+    expect(parsed!.e).toBeGreaterThan(0);
     const cleared = createMemoryOutboxStore();
     __resetOutboxForTests(cleared);
     // keep the marker from the previous store life
@@ -714,6 +719,7 @@ describe("R-F2 — cross-tab mutual supersede prune (tab-scoped supersede)", () 
       get: (id) => shared.get(id),
       all: () => shared.all(),
       delete: (id) => shared.delete(id),
+      snapshot: () => shared.snapshot(),
     };
     // Tab B = a DIFFERENT tab: empty per-tab storage (b-F2) → fresh identity
     // at the reset, so b1 is stamped with an id foreign to a1's.
