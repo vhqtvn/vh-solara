@@ -5,6 +5,11 @@ import { projectUrl } from "./util";
 // browser back dismisses the TOPMOST open surface and NEVER walks session
 // selection; forward never reopens; explicit closes leave no ghost entries.
 //
+// The ONE documented carve-out (the compat tail, pinned by the last test
+// below): a popstate onto a LEGACY session entry — pushed by an older build
+// (modern selection is replaceState-only) — still re-selects the session and
+// switches project (sync.ts's legacy-walk handler).
+//
 // Every test keeps at least one surface open (or asserts history.length
 // directly) before pressing back, so back never falls out of the app to the
 // initial about:blank entry — the empty-stack case intentionally falls through
@@ -147,4 +152,46 @@ test("explicit close consumes its entry — no ghosts left behind", async ({ pag
   await page.goBack();
   await expect(settingsDialog(page)).toBeHidden();
   await expect(page.locator(".main-title")).toContainText("Demo session");
+});
+
+test("back onto a LEGACY history entry (old-build pushState) switches project through the popstate compat tail", async ({ page }) => {
+  await page.goto(projectUrl("/"));
+
+  // Seed a LEGACY entry BEHIND the present in the old-build shape: older
+  // builds pushed {session, dir} entries on selection (modern selection is
+  // replaceState-only — sync/url.ts), and sync.ts's popstate wiring preserves
+  // the old session+project walk for exactly those tabs. NO vhBack token in
+  // the state: that marker belongs to the modern back-stack manager
+  // (lib/backStack.ts), which must classify this entry as a non-token and
+  // NOT claim the event as a surface dismissal.
+  const dirB = "/work/cc-popstate-b";
+  await page.evaluate((dir) => {
+    const canonical = location.href;
+    const st = history.state; // the modern app's canonical entry state
+    const u = new URL(location.href);
+    u.searchParams.set("session", "demo");
+    u.searchParams.set("dir", dir);
+    history.pushState({ session: "demo", dir }, "", u); // the legacy entry
+    // Step PAST it (restoring the present) so the legacy entry sits behind
+    // the modern present — the operator's back lands ON the legacy entry.
+    history.pushState(st, "", canonical);
+  }, dirB);
+
+  // Gesture-honest back (a real operator gesture on a pre-upgrade tab), not
+  // a synthetic popstate dispatch — the entry point under test is the
+  // browser-driven popstate path itself.
+  await page.goBack();
+
+  // The popstate handler switched the app to the landed entry's project:
+  // dir !== projectDir() fired switchProject(dir, true) (no history re-push).
+  await expect(page.locator(".proj-name")).toContainText("cc-popstate-b", { timeout: 8_000 });
+  await expect(page.locator(".tree-node", { hasText: "Project: cc-popstate-b" })).toBeVisible({ timeout: 8_000 });
+  await expect(page).toHaveURL(/dir=%2Fwork%2Fcc-popstate-b/);
+
+  // …and B lands in a clean draft context (the switch's resets left nothing
+  // of A behind). Minimal honest set for the ENTRY POINT: the legacy walk is
+  // a compat tail, not a surface to gold-plate.
+  await page.getByRole("button", { name: "Create session" }).click();
+  await expect(page.locator(".composer")).toBeVisible();
+  await expect(page.locator(".sendStatusLine")).toHaveCount(0);
 });
