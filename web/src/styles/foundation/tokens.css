@@ -429,12 +429,13 @@
  * pausing them would freeze mid-flight state changes across a hide/reveal.
  *
  * Resume semantics are pinned by a real-browser contract test
- * (web/tests/e2e/animation-resume.spec.ts, chromium + firefox): an infinite
- * animation CREATED under this rule (Working pill mounted in a hidden pane)
- * and a running animation paused mid-flight both resume on class removal in
- * all probed engines (chromium/firefox/webkit) — the freeze bug class is the
- * CLASS getting stuck, not the play-state mechanics, so keep this rule as
- * play-state (never `animation: none`). */
+ * (web/tests/e2e/animation-resume.spec.ts): created-while-paused AND
+ * paused-mid-flight resume are pinned HEADLESS via class-toggle in chromium
+ * + firefox (the spec's runnable lanes). Webkit evidence came from a
+ * behavior-identical spec copy run through the docker probe — not from the
+ * landed bytes. The freeze bug class is the CLASS getting stuck, not the
+ * play-state mechanics, so keep this rule as play-state (never
+ * `animation: none`). */
 :root.pane-hidden, :root.pane-hidden *, :root.pane-hidden *::before, :root.pane-hidden *::after {
   animation-play-state: paused !important;
 }
