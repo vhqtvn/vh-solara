@@ -1056,6 +1056,13 @@ func (s *Server) handleReloadProject(w http.ResponseWriter, r *http.Request) {
 			s.sessionErrMu.Lock()
 			delete(s.sessionErrOn, dir)
 			s.sessionErrMu.Unlock()
+			// Reset queueDeliverOn for the same reason: the fresh aggregator's
+			// store must get a fresh delivery watcher (queue_delivery_watch.go —
+			// the message-persistence → queue-resolve subscriber). Same
+			// lock-order discipline.
+			s.queueDeliverMu.Lock()
+			delete(s.queueDeliverOn, dir)
+			s.queueDeliverMu.Unlock()
 			// The drain loop stop happens AFTER aggMu is released (below):
 			// the loop's tick takes aggMu via aggForExisting, so waiting for
 			// its exit UNDER aggMu would deadlock.

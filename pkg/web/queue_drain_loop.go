@@ -35,6 +35,15 @@ package web
 // cadence (currentStaleThreshold: 30s production, test-overridable), which
 // is exactly the design's bounded-escalation posture.
 //
+// EARLY DELIVERY RESOLUTION (queue_delivery_watch.go): an accepted_2xx /
+// written_unknown item whose user message OpenCode actually PERSISTED is
+// resolved to `sent` by the delivery watcher the moment the aggregator
+// observes the message event — typically well before the stale threshold.
+// That is positive delivery evidence (the exact correlation id persisted as
+// a user message), NOT a receipt interpretation: items with no such event
+// (the genuinely ambiguous classes — no 2xx, timeouts, crashes) keep the
+// cadence-bounded classification path above, unchanged.
+//
 // The AGENT EVIDENCE GATE (matured phase-1 defer D2/tier1_a-F2) fires at
 // claim time: an item whose captured SendConfig.Agent is empty is NEVER
 // dispatched — the daemon refuses rather than silently falling back to

@@ -58,6 +58,14 @@ export type ReconcileEffect =
   // former inline call, which ran inside the produce() batch). Emitted by the
   // lastAgent.set projection.
   | { kind: "reconcile-tree-agent"; sessionID: string; agent: string }
+  // A persisted USER message was observed on the stream with the given id —
+  // the exact-match delivery evidence for a `dispatching` queue chip that
+  // carries the same id as its opencodeMsgID correlation. Orchestration
+  // clears the chip locally (queue.ts noteDeliveredUserMessage — the
+  // poll-free path; the backend's delivery watcher records the same evidence
+  // durably). Emitted by the message.upsert projection (role === "user"
+  // only).
+  | { kind: "queue-delivery-observed"; sessionID: string; messageID: string }
   // activity=idle arrived for a session whose resident tail's last message is
   // NOT a completed assistant message — the terminal message.upsert
   // (time.completed) was lost in transit. Orchestration force-fetches a fresh

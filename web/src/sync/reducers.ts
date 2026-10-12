@@ -287,6 +287,20 @@ export function projectMessageEvent(
         !!sid && !!sm && sm.order.length === 0 && s.messagesDelivered[sid] !== true;
       if (sm) upsertMessage(sm, payload);
       if (firstLiveForEmptySession) s.messagesDelivered[sid] = true;
+      // Queue delivery observation: a persisted USER message with a top-level
+      // id is the exact-match delivery evidence for a `dispatching` queue
+      // chip carrying the same id as its opencodeMsgID correlation id.
+      // Recorded as a factual effect (the projection owns no cross-store
+      // policy — see the boundary contract); orchestration routes it to
+      // queue.ts's delivered overlay so the chip clears at the same instant
+      // the message enters the transcript, not at the next /queue poll.
+      if (payload?.role === "user" && payload?.id && payload?.sessionID) {
+        effects.push({
+          kind: "queue-delivery-observed",
+          sessionID: payload.sessionID,
+          messageID: payload.id,
+        });
+      }
       // Observe an assistant-error fact. The legacy reducer called
       // notifyFromMessage(payload) here (a direct notification dispatch); the
       // notification policy is now decided by orchestration. The detail string

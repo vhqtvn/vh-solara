@@ -27,6 +27,13 @@ package web
 // It stays strictly passive: no auto-redelivery of ANY class in this slice
 // (the certified classes land in 2b, only after the crash proofs).
 //
+// EARLY DELIVERY RESOLUTION (queue_delivery_watch.go) is the PUSH twin of
+// this PULL reconciler: the same exact-match authority (id + role==="user"),
+// applied the moment the aggregator observes the persisted message on the
+// event stream instead of at the stale-recovery cadence. It resolves only
+// custody-era dispatching items and never touches this file's budget,
+// throttle, or terminal markers.
+//
 // DESIGN DISCIPLINE (invariants — regression = hard fail):
 //  1. No re-dispatch: the reconciler NEVER invokes prompt_async. It only READs
 //     (GET) and Resolve()s (a terminal-state transition, never repend).

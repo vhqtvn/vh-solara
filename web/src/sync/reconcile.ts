@@ -28,6 +28,7 @@ import {
 import { pushNotification } from "../notify";
 import { dropPinnedSession } from "../pins";
 import { dropLabelRoot } from "../labels";
+import { noteDeliveredUserMessage } from "../queue";
 import { resetPageInFlight, reapShadowsIfOverCap } from "./history";
 import { patchTreeAgent, removeTreeNode } from "./treeState";
 import { maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
@@ -64,6 +65,13 @@ function interpretEffects(effects: ReconcileEffect[]): void {
         break;
       case "input-maybe-answered":
         maybeClearWaiting(e.sessionID);
+        break;
+      case "queue-delivery-observed":
+        // The persisted user message is the delivery proof for a dispatching
+        // chip carrying the same correlation id — clear the chip locally NOW
+        // (the backend's delivery watcher records the same evidence
+        // durably; this is the instant, poll-free path).
+        noteDeliveredUserMessage(e.sessionID, e.messageID);
         break;
       case "session-removed":
         // Deletion cascade: reset the in-flight page request + drop the stale

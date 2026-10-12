@@ -275,6 +275,17 @@ type Server struct {
 	sessionErrMu sync.Mutex
 	sessionErrOn map[string]bool
 
+	// queueDeliverMu + queueDeliverOn guard the one-time, per-dir
+	// installation of the message-persistence → queue-resolve subscriber
+	// (queue_delivery_watch.go: the early delivery-resolution watcher — a
+	// user message persisted under a dispatching item's exact correlation id
+	// resolves it to sent immediately, instead of waiting out the 30s stale
+	// pass). Exact same lifecycle shape as sessionErrMu/sessionErrOn:
+	// installed from aggFor, reset by handleReloadProject's teardown and
+	// stopServerOwnedAggregators, retired by store.Close.
+	queueDeliverMu sync.Mutex
+	queueDeliverOn map[string]bool
+
 	// drainLoopsMu + drainLoops hold the per-dir queue drain loops (slice 2b
 	// phase 2, queue_drain_loop.go) — the daemon dispatcher, started from
 	// aggFor when daemon dispatch is enabled (production default OFF).
@@ -708,6 +719,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		watcherCancel:           map[string]context.CancelFunc{},
 		queueGCOn:               map[string]bool{},
 		sessionErrOn:            map[string]bool{},
+		queueDeliverOn:          map[string]bool{},
 		drainLoops:              map[string]*queueDrainLoop{},
 		pinsGCOn:                map[string]bool{},
 		providerFlights:         map[string]*providerFlight{},
@@ -976,6 +988,9 @@ func (s *Server) stopServerOwnedAggregators() {
 		s.sessionErrMu.Lock()
 		delete(s.sessionErrOn, dir)
 		s.sessionErrMu.Unlock()
+		s.queueDeliverMu.Lock()
+		delete(s.queueDeliverOn, dir)
+		s.queueDeliverMu.Unlock()
 		s.pinsGCMu.Lock()
 		delete(s.pinsGCOn, dir)
 		s.pinsGCMu.Unlock()
@@ -1003,6 +1018,7 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 		s.ensurePermissionWatcher("", s.agg)
 		s.installQueueGCCleanup("", s.agg)
 		s.installQueueSessionErrorSignal("", s.agg)
+		s.installQueueDeliveryWatcher("", s.agg)
 		s.installPinsLifecycle("", s.agg)
 		s.installLabelsLifecycle("", s.agg)
 		s.maybeStartQueueDrainLoop("")
@@ -1044,6 +1060,7 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	s.ensurePermissionWatcher(dir, a)
 	s.installQueueGCCleanup(dir, a)
 	s.installQueueSessionErrorSignal(dir, a)
+	s.installQueueDeliveryWatcher(dir, a)
 	s.installPinsLifecycle(dir, a)
 	s.installLabelsLifecycle(dir, a)
 	s.maybeStartQueueDrainLoop(dir)

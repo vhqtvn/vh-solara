@@ -824,6 +824,39 @@ export function clearQueueCache(ids: string[]) {
   }));
 }
 
+// --- delivered-message overlay (2026-10-12 "Sending… ~30s after delivery") --
+//
+// The stream reducer (sync/reducers.ts) observes every persisted USER message
+// on the message.upsert stream and reports its id here (via the
+// queue-delivery-observed effect — the same event that makes the message
+// appear in the transcript). When the id EXACTLY matches a `dispatching`
+// chip's opencodeMsgID (the claim-minted correlation id OpenCode persists the
+// dispatched message under — caller-id-wins), the message IS delivered: the
+// same exact-match authority the backend reconciler applies. The chip clears
+// locally at that instant instead of waiting for the next /queue poll; no
+// network write happens here.
+//
+// This is a knownOutcomes-shaped OVERLAY, not authority: the backend resolves
+// the same evidence on its own event stream (pkg/web/queue_delivery_watch.go),
+// and fetchQueue drops the overlay once the backend item reaches terminal. If
+// the backend event is ever lost, its 30s stale-recovery path still converges
+// the durable state — this overlay only keeps the LOCAL view honest in the
+// meantime. In-memory only; safe in every dispatch mode (the legacy browser
+// path resolves sent itself right after its own 2xx, composing as an
+// identical-state no-op).
+const deliveredOverlayDetail = "Delivered: the message appeared in the transcript.";
+export function noteDeliveredUserMessage(sessionId: string, msgId: string): void {
+  if (!sessionId || !msgId) return;
+  const arr = queues[sessionId];
+  if (!arr) return;
+  for (const m of arr) {
+    if (m.state === "dispatching" && m.opencodeMsgID === msgId) {
+      applyOutcome(sessionId, m.id, "sent", deliveredOverlayDetail, Date.now());
+      return; // opencodeMsgID is unique per item — at most one match
+    }
+  }
+}
+
 // --- legacy migration (vh.queue.v1 → backend) ------------------------------
 //
 // Per session: read legacy entries in local order → enqueue sequentially through
