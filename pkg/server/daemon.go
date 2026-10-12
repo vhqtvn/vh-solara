@@ -472,7 +472,6 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 		matches := pattern.FindStringSubmatch(host)
 		if len(matches) > 1 {
 			workerID := matches[1]
-			log.Printf("[HostInterceptor] Host %q matched pattern, extracted worker ID: %s", host, workerID)
 
 			// Exact match only. A prefix fallback (a subdomain that is a prefix of a
 			// worker ID) would route a request to an unintended worker and let a
@@ -492,13 +491,9 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 				return
 			}
 
-			log.Printf("[HostInterceptor] Proxying to worker %s (transport closed: %v)",
-				worker.ID, worker.Transport == nil || worker.Transport.IsClosed())
 			d.Proxy.HandleWorkerDirect(worker.ID, worker, w, r)
 			return
 		}
-
-		log.Printf("[HostInterceptor] Host %q did not match pattern", host)
 
 		next.ServeHTTP(w, r)
 	}
