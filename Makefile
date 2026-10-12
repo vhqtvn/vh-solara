@@ -5,7 +5,7 @@
 # (copy) BOTH staged bundles into pkg/web/dist + pkg/web/host-dist right before
 # `go build`, so one binary carries both SPAs (`/` → host, `/app` → single-server).
 
-.PHONY: web web-materialize host-web host-web-materialize embed-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-docker test-host-web-preview test-host-web-real-embed test-host-web-folded test-host-web-deploy-transition verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed clean-host-web-embed
+.PHONY: web web-materialize host-web host-web-materialize embed-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-docker test-host-web-preview test-host-web-real-embed test-host-web-folded test-host-web-deploy-transition test-queue-delivery-headed-docker verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed clean-host-web-embed
 
 # Version stamping: local builds set cmd.Version to "<latest v-tag>+dev" (e.g.
 # v1.60.0+dev) so the self-update check never treats them as an already-released
@@ -109,6 +109,45 @@ test-host-web-docker: ## Run host-web Playwright e2e (LANE 7, all three engines)
 		$(PW_DOCKER) bash -c 'mkdir -p "$$HOME" && cd host-web && npm ci'; \
 	fi
 	$(PW_DOCKER) bash -c 'mkdir -p "$$HOME" && cd host-web && npx playwright test $(ARGS)'
+
+# Headed-in-docker route for the DISPATCH-ONLY queue-delivery-custody lane
+# (O3). Same PW_DOCKER pattern as test-host-web-docker, plus:
+#   - a Go BOOTSTRAP mounted read-only from the docker host's /usr/local/go
+#     (the lane's webServer runs scripts/fixture-web.sh, which `go run`s the
+#     fixtureserver — the image ships no go). The bootstrap may be OLDER than
+#     go.mod requires: GOTOOLCHAIN=auto fetches the go.mod-pinned toolchain
+#     into the persistent GOMODCACHE below — one-time, warm after. This
+#     two-phase scheme is required because the harness dev container's
+#     /usr/local/go is a namespace mount the docker daemon cannot see.
+#   - --network=host (deliberate, unlike lane 7): the lane's wipeAndServe
+#     probe-guard serializes invocations by contending on the PINNED
+#     127.0.0.1:8098 — that only works if every invocation (host or docker)
+#     probes and binds the SAME network namespace. Per-container netns would
+#     let a second invocation's probe miss a live lane and wipe its dirs.
+#     The lane binds loopback only, so host networking exposes nothing
+#     beyond loopback.
+#   - --ipc=host: headed Chromium under Xvfb needs more shared memory than
+#     docker's default /dev/shm (the remedy docs/ai/docker-test-routes.md
+#     prescribes for heavier chromium runs).
+#   - Go caches under tmp/queue-delivery-e2e/ (NOT under the lane's wiped
+#     demo/.vh-solara + state dirs): the FIRST run pays toolchain + module
+#     downloads + compile, later runs run warm; the prewarm runs OUTSIDE the
+#     webServer's 180s boot timeout.
+#   - PLAYWRIGHT_JSON_OUTPUT_NAME is inert for the config's list reporter;
+#     pass ARGS='--reporter=list,json' to also retain full results (incl. the
+#     spec's qd-* timing/correlation annotations) in report.json.
+# Version coupling: web/'s caret range (^1.49.1) currently lock-RESOLVES to
+# @playwright/test 1.60.0 — the same version as host-web's exact pin and the
+# PLAYWRIGHT_IMAGE tag. web/ is NOT exactly pinned: any web lock refresh must
+# re-assert resolved version == image tag (see docs/ai/docker-test-routes.md).
+PW_DOCKER_GO = docker run --rm --init --ipc=host --network=host --user "$$(id -u):$$(id -g)" -e HOME=/tmp/pw-home -e PLAYWRIGHT_JSON_OUTPUT_NAME=/repo/tmp/queue-delivery-e2e/report.json -v "$$(pwd)":/repo -v /usr/local/go:/usr/local/go:ro -w /repo $(PLAYWRIGHT_IMAGE)
+
+test-queue-delivery-headed-docker: ## Run the queue-delivery-custody lane (O3, dispatch-only) HEADED under Xvfb inside the pinned Playwright image — real virtual display + real browser, no host X/browsers needed; mounts the host Go toolchain read-only for the webServer's fixtureserver. Installs web/node_modules in-container first if missing. ARGS appends to playwright test (e.g. ARGS='--reporter=list,json' retains timing evidence in tmp/queue-delivery-e2e/report.json).
+	@if [ ! -d web/node_modules ]; then \
+		echo ">> web/node_modules missing — running npm ci inside $(PLAYWRIGHT_IMAGE)"; \
+		$(PW_DOCKER_GO) bash -c 'mkdir -p "$$HOME" && cd web && npm ci'; \
+	fi
+	$(PW_DOCKER_GO) bash -c 'set -euo pipefail; mkdir -p "$$HOME" tmp/queue-delivery-e2e/go-cache tmp/queue-delivery-e2e/go-mod tmp/queue-delivery-e2e/go-path; command -v xvfb-run >/dev/null 2>&1 || { echo "[qdh] xvfb-run missing in image" >&2; exit 1; }; command -v curl >/dev/null 2>&1 || { echo "[qdh] curl missing in image (the lane wipe probe requires it)" >&2; exit 1; }; export PATH=/usr/local/go/bin:$$PATH; command -v go >/dev/null 2>&1 || { echo "[qdh] go missing — docker host /usr/local/go not mounted?" >&2; exit 1; }; export GOCACHE=/repo/tmp/queue-delivery-e2e/go-cache GOMODCACHE=/repo/tmp/queue-delivery-e2e/go-mod GOPATH=/repo/tmp/queue-delivery-e2e/go-path GOTOOLCHAIN=auto; echo "[qdh] prewarming go build (first run pays toolchain + module downloads + compile)"; go build -o /dev/null ./tools/fixtureserver; go version; cd web && xvfb-run --auto-servernum npx playwright test --config=playwright.queue-delivery.config.ts --project=chromium --headed --workers=1 --retries=0 $(ARGS)'
 
 fmt: ## Format all Go source (mirrors CI's gofmt scope)
 	gofmt -w pkg cmd main.go
