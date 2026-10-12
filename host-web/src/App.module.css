@@ -1,9 +1,31 @@
+/* Root = the ACTUALLY visible viewport, never 100vh. 100vh is the LARGE
+ * viewport on mobile (dynamic toolbar retracted), so the root + every pane
+ * iframe overshot the screen bottom by ~one toolbar height and the SPA
+ * composer was clipped (its own innerHeight clamp is inert inside a too-tall
+ * iframe). --host-h is written level-triggered by src/hostViewport.ts;
+ * fallback 100% = the ICB (#root/body/html are height:100%) = small viewport.
+ * keyboardFocus.ts's inline height (keyboard open) still wins; restore clears
+ * it back to this rule.
+ *
+ * Safe-area padding: index.html uses viewport-fit=cover, so on edge-to-edge
+ * Android / notched devices part of the viewport sits under system bars. The
+ * cross-origin pane iframes do not receive env(safe-area-inset-*) (the SPA's
+ * own composer padding is 0 there), so the host must inset its content.
+ * box-sizing:border-box (tokens.css) keeps the padding inside --host-h. While
+ * keyboard focus-mode is open the root is pinned to the band ABOVE the
+ * keyboard, so the bottom inset is dropped there. */
 .app {
   display: flex;
   flex-direction: column;
-  height: 100vh;
-  width: 100vw;
+  height: 100%;
+  height: var(--host-h, 100%);
+  width: 100%;
   overflow: hidden;
+  padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+    env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+}
+.app[data-kbd-focus="open"] {
+  padding-bottom: 0;
 }
 .main {
   flex: 1 1 auto;

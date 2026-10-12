@@ -411,7 +411,8 @@ test.describe("host keyboard focus-mode", () => {
     await expect.poll(async () => H.appRootHeight(page), { timeout: 8000 }).toBe(KEYBOARD_VISIBLE_H);
 
     // --- CLEAN RESTORE on close: offset compensation removed, original
-    //     positioning restored exactly (transform cleared, height → CSS 100vh).
+    //     positioning restored exactly (transform cleared, height → CSS
+    //     var(--host-h) — the visible viewport; see hostViewport.ts).
     await page.evaluate(
       ({ h, offset }) => {
         (window as unknown as { __setMockVv: (h: number, o: number) => void }).__setMockVv(h, offset);

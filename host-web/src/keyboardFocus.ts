@@ -5,6 +5,7 @@ import {
   lookupContentWindow,
   workspaceApiFor,
 } from "./dockview/store";
+import { resyncHostViewport } from "./hostViewport";
 
 // =============================================================================
 // HOST-OWNED KEYBOARD FOCUS-MODE
@@ -202,8 +203,8 @@ export function exitKeyboardFocus(): void {
  *  was rejected: mobile fixed positioning is relative to the layout viewport
  *  with engine-specific caret-scroll interaction, less predictable than an
  *  explicit document-space translate. The host root has overflow:hidden +
- *  height:100vh, so window.scrollY stays 0 and offsetTop IS the full
- *  visible-rect offset; pageTop (the scrollY-robust generalization) is
+ *  height:var(--host-h) (≤ innerHeight), so window.scrollY stays 0 and
+ *  offsetTop IS the full visible-rect offset; pageTop (the scrollY-robust generalization) is
  *  equivalent here — switch to pageTop if a future host layout ever allows
  *  document scroll. Horizontal offset (offsetLeft) and pinch-scale are
  *  non-issues for this app (portrait, no user-zoom) and intentionally ignored. */
@@ -212,7 +213,8 @@ function applyGeometry(height: number, offsetTop: number): void {
   if (!el) return;
   // Capture the current inline height + transform ONCE per open cycle (the flag
   // is distinct from the captured values, which are genuinely "" pre-open), then
-  // pin to the visible rect. The root's CSS is height:100vh + transform:none;
+  // pin to the visible rect. The root's CSS is height:var(--host-h) +
+  // transform:none;
   // inline pixel values win and propagate via the flex column to the Dockview
   // container, whose ResizeObserver recomputes the maximized overlay's geometry.
   if (!geometryCaptured) {
@@ -222,18 +224,27 @@ function applyGeometry(height: number, offsetTop: number): void {
   }
   el.style.height = `${Math.round(height)}px`;
   el.style.transform = `translateY(${Math.round(offsetTop)}px)`;
+  // The pinned band ends at the keyboard's top edge, not at the system bar:
+  // drop the root's safe-area bottom padding while open (App.module.css).
+  el.dataset.kbdFocus = "open";
 }
 
 /** Restore the pre-open inline height + transform exactly ("" clears the inline
- *  override → CSS defaults win: height:100vh, transform:none). */
+ *  override → CSS defaults win: height:var(--host-h) — the level-tracked
+ *  visible viewport, see hostViewport.ts — and transform:none). */
 function restoreGeometry(): void {
   const el = getAppEl?.();
   if (!el) return;
+  delete el.dataset.kbdFocus;
   el.style.height = savedHeight;
   el.style.transform = savedTransform;
   savedHeight = "";
   savedTransform = "";
   geometryCaptured = false;
+  // The root now falls back to var(--host-h). Re-sample it NOW so the restore
+  // lands on the current visible height even if the close edge's vv/window
+  // event was lost or arrived before this debounced close.
+  resyncHostViewport();
 }
 
 /** Continuous re-apply: re-pin the root to the CURRENT visible rect on every
