@@ -72,6 +72,26 @@ export function asHostVisibility(data: unknown): boolean | null {
 
 let installed = false;
 
+// (2026-10-12 v1.77.3 recurrence) The WebKit standalone-PWA failure class is
+// not just a LOST visibilitychange event (healed below) — the browser can
+// strand document.visibilityState ITSELF at "hidden" while the document is
+// visibly in the foreground (first lock/app-switch after load; no further
+// event fires). Every "re-derive from live state" heal then faithfully
+// re-derives the lie forever: freeze with no recovery. The counter-evidence
+// is a TRUSTED pointerdown — genuinely hidden panes cannot be hit-tested
+// (visibility:hidden iframes/background tabs receive no input), so real user
+// input while believed hidden PROVES the state stale. Set by the gate's
+// input listener; cleared by every REAL visibilitychange (the browser's
+// state machine is talking again). While set, derivations treat the
+// document as visible instead of trusting the stuck state.
+let visibilityStateDiscredited = false;
+
+/** Derive docVisible, honoring a discredited visibilityState. */
+function derivedDocVisible(): boolean {
+  if (visibilityStateDiscredited) return true;
+  return document.visibilityState !== "hidden";
+}
+
 /**
  * Re-derive docVisible from LIVE document.visibilityState (not the cached
  * signal) and notify. Self-heal for a lost `visibilitychange → visible` event
@@ -82,10 +102,11 @@ let installed = false;
  * signal. Re-deriving from ground truth un-swallows it: the transition fires
  * exactly when the cache was wrong, so the animation gate un-pauses and the
  * sync facade resumes like a normal reveal. No-op when the cache was right.
+ * A visibilityState discredited by real user input is not re-trusted here.
  */
 export function resyncDocVisibility(): void {
   if (typeof document === "undefined") return;
-  setDocVisible(document.visibilityState !== "hidden");
+  setDocVisible(derivedDocVisible());
   notify();
 }
 
@@ -98,7 +119,10 @@ export function startPaneVisibility(): void {
   installed = true;
   last = isPaneVisible();
   document.addEventListener("visibilitychange", () => {
-    setDocVisible(document.visibilityState !== "hidden");
+    // A real event means the browser's visibility state machine is talking
+    // again — re-trust it (even if this particular event carries "hidden").
+    visibilityStateDiscredited = false;
+    setDocVisible(derivedDocVisible());
     notify();
   });
   if (!isEmbedded()) return;
@@ -120,6 +144,7 @@ export function __resetPaneVisibilityForTest(host = true, doc = true): void {
   gateTeardown = null;
   setHostVisible(host);
   setDocVisible(doc);
+  visibilityStateDiscredited = false;
   last = host && doc;
   listeners.clear();
   gateInstalled = false; // test hygiene: a fresh module is "not installed" again
@@ -161,8 +186,28 @@ export const PANE_GATE_RESYNC_MS = 30_000;
  * Install the <html> class gate. Idempotent. Wire once in index.tsx after
  * startPaneVisibility(); it reads paneVisible() initially and on every
  * visibility transition thereafter.
+ *
+ * (2026-10-12 recurrence fix) Also registers the user-input override: a
+ * TRUSTED pointerdown while the pane is believed hidden un-latches the gate.
+ * Genuinely hidden panes cannot receive one (visibility:hidden iframes are
+ * not hit-testable; background tabs get no input), so trusted input is proof
+ * the operator is looking at this pane right now — it discredits a stuck
+ * document.visibilityState (see visibilityStateDiscredited), heals BOTH
+ * signals, and fires the paneVisible transition so the sync facade resumes
+ * through the same edge. A later genuine hide (real visibilitychange, or the
+ * host's own visible:false) re-pauses normally.
+ *
+ * @param opts.resyncMs test-only accelerator for the periodic self-heal
+ *   interval (production: PANE_GATE_RESYNC_MS). Behavior-identical apart
+ *   from cadence — lets integration tests watch the REAL scheduler fire
+ *   while the pane is believed hidden, without fake timers.
+ * @param opts.testTrustAllInput test-only bypass of the pointerdown
+ *   isTrusted check (isTrusted is LegacyUnforgeable — no engine lets a
+ *   synthetic event claim it, so jsdom cannot drive the trusted path). The
+ *   check itself is covered by the untrusted-input negative test and the
+ *   lane-6 e2e's real click.
  */
-export function installPaneAnimationGate(): void {
+export function installPaneAnimationGate(opts?: { resyncMs?: number; testTrustAllInput?: boolean }): void {
   if (typeof document === "undefined") return;
   const apply = (): void => {
     document.documentElement.classList.toggle(PANE_HIDDEN_CLASS, !isPaneVisible());
@@ -189,11 +234,34 @@ export function installPaneAnimationGate(): void {
   };
   window.addEventListener("pageshow", resync);
   window.addEventListener("focus", resync);
-  const timer = window.setInterval(resync, PANE_GATE_RESYNC_MS);
+  const timer = window.setInterval(resync, opts?.resyncMs ?? PANE_GATE_RESYNC_MS);
+
+  // (2026-10-12 v1.77.3 recurrence) All heals above re-derive from
+  // document.visibilityState — which is exactly the part WebKit can strand
+  // at "hidden" in a foregrounded standalone PWA (first lock/app-switch;
+  // no recovery: every heal re-derives the lie). Trusted pointerdown while
+  // believed hidden is counter-evidence no stuck state can survive: hidden
+  // panes cannot be hit-tested. Narrow on purpose: pointerdown only (a
+  // pointer physically requires the pane under the finger — keydown is
+  // forgeable by host focus routing), isTrusted only (synthetic events are
+  // not evidence), and it only ever transitions hidden→visible.
+  const trustInput = opts?.testTrustAllInput === true;
+  const onUserInput = (ev: Event): void => {
+    if (!trustInput && !ev.isTrusted) return;
+    if (isPaneVisible()) return; // common case: nothing to heal, zero work
+    visibilityStateDiscredited = true;
+    setDocVisible(true);
+    setHostVisible(true); // a tapped pane is on-screen; a lying host resync corrects within ~10s
+    notify(); // fires the reveal edge → apply() + the sync facade heal
+    apply(); // belt-and-suspenders, same shape as resync
+  };
+  window.addEventListener("pointerdown", onUserInput, { capture: true, passive: true });
+
   gateTeardown = () => {
     window.removeEventListener("pageshow", resync);
     window.removeEventListener("focus", resync);
     window.clearInterval(timer);
+    window.removeEventListener("pointerdown", onUserInput, { capture: true });
   };
 }
 let gateInstalled = false;
