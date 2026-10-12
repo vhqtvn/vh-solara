@@ -37,6 +37,13 @@ import { demoDir, projectUrl } from "./util";
 //       reconnect, setDraft(false)) must not break the dir-scoped recovery,
 //       must not leak A's send-status rows into B's draft view, and the
 //       resolution must follow the operator back to A.
+//   (f) CAPABILITY-UNAVAILABLE + MID-PROBE SWITCH: the capability probe
+//       never answers (route-aborted ⇒ UNCERTAIN — NOT the 404⇒legacy
+//       branch test (d) pins) while the operator switches projects. The
+//       rejected mark is ENTRY-keyed (draftKey captured before the
+//       capability await, actions.ts), so it lands under A's draft key
+//       regardless of the switch; B's draft never sees it; ZERO creates on
+//       either route; the row's copy is retry-safe (never duplicate-risk).
 //
 // Serial-suite hygiene (workers:1, one shared fixtureserver): every test
 // arms the one-shot create mode it needs and POSTs /oc/fixture/create-hold/
@@ -482,6 +489,118 @@ test("(e) held create + MID-FLIGHT project switch: recovery stays dir-scoped in 
   await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
   await page.locator(".proj-pick", { hasText: "cc-switch-b" }).click();
   await expect(page.locator(".proj-name")).toContainText("cc-switch-b", { timeout: 8_000 });
+  await page.getByRole("button", { name: "Create session" }).click();
+  await expect(page.locator(".composer")).toBeVisible();
+  await expect(page.locator(".sendStatusLine")).toHaveCount(0);
+});
+
+test("(f) capability-unavailable + mid-probe switch: the rejected mark stays entry-keyed in A, B's draft never sees it, ZERO creates on either route", async ({ page, request }) => {
+  test.setTimeout(90_000);
+
+  await page.route("**/sw.js*", (route) => route.abort());
+  for (const sw of page.context().serviceWorkers()) await (sw as unknown as { close(): Promise<void> }).close();
+
+  // Wire counters FIRST (registration order matters: Playwright matches the
+  // most-recently-registered route first, so the capabilities gate below
+  // must go in LAST or the counter's continue() swallows the probe).
+  const wire = instrumentCreateWire(page);
+  let legacyPosts = 0;
+  await page.route("**/oc/session", async (route: Route) => {
+    if (route.request().method() === "POST") legacyPosts++;
+    await route.continue();
+  });
+
+  // The capability probe PARKS on a gate we control, then ABORTS on release:
+  // a network failure is UNCERTAIN on the ladder (the safety ladder's
+  // "unavailable" branch — actions.ts marks the tap's record
+  // capability-unavailable with the ENTRY-captured draftKey). Deliberately
+  // NOT a 404 fulfill: 404 ⇒ LEGACY is test (d)'s branch. The browser arms
+  // its own 5s capability bound, so even if the switch dance outlives the
+  // park the mark still lands entry-keyed — the assertions hold either way.
+  let probes = 0;
+  let releaseProbe!: () => void;
+  const probeGate = new Promise<void>((res) => (releaseProbe = res));
+  await page.route("**/vh/session/create/capabilities**", async (route) => {
+    probes++;
+    await probeGate;
+    await route.abort();
+  });
+
+  await page.goto(projectUrl("/"));
+  await openDraftComposer(page);
+
+  // Pre-pin project A (demoDir) through the REAL switcher dialog so the
+  // later switch-back row is a deterministic pinned .proj-pick (addProject
+  // on the ACTIVE project is pin-only: switchProject early-returns on
+  // same-dir, so the open draft composer stays mounted untouched).
+  await page.locator(".proj-current").click();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+  await page.getByRole("button", { name: /Add project/ }).click();
+  await page.locator(".vh-prompt-input").fill(demoDir);
+  await page.locator(".vh-prompt .confirm-go").click();
+  await expect(page.locator(".proj-name")).toContainText("fixture-demo");
+
+  // Real user gesture: type + click Send. The capability probe goes out and
+  // PARKS — no create POST exists yet on either route (the ladder's whole
+  // point: capability uncertainty means NO POST).
+  const ta = page.getByPlaceholder(/Message/);
+  await ta.fill(`cc-cap-${Date.now()}`);
+  await page.locator(".composer-bar .send-btn").click();
+  await expect
+    .poll(() => probes, { timeout: 10_000, message: "the capability probe went out and parked" })
+    .toBeGreaterThanOrEqual(1);
+
+  // THE MID-PROBE SWITCH — the same real gesture path as (e). The rejected
+  // mark this send will produce is keyed by the ENTRY-captured draft owner
+  // (captured BEFORE the capability await), so the switch can never re-scope
+  // it into B.
+  const dirB = "/work/cc-cap-b";
+  await page.locator(".proj-current").click();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+  await page.getByRole("button", { name: /Add project/ }).click();
+  await page.locator(".vh-prompt-input").fill(dirB);
+  await page.locator(".vh-prompt .confirm-go").click();
+  await expect(page.locator(".proj-name")).toContainText("cc-cap-b", { timeout: 8_000 });
+  await expect(page.locator(".tree-node", { hasText: "Project: cc-cap-b" })).toBeVisible({ timeout: 8_000 });
+
+  // B's draft view renders ZERO send-status rows (whenever the mark lands,
+  // it lands under A's entry-captured key — never B's draft key).
+  await page.getByRole("button", { name: "Create session" }).click();
+  await expect(page.locator(".composer")).toBeVisible();
+  await expect(page.locator(".sendStatusLine")).toHaveCount(0);
+
+  // Resolve the probe (network failure ⇒ uncertain): nothing was sent on
+  // EITHER route; the definitive capability-unavailable mark lands under A's
+  // tap-time key regardless of the app sitting in B.
+  releaseProbe();
+
+  // Back to A through the real dialog: the rejected row is visible in A's
+  // (re-opened) draft view — the branch-specific retry-safe copy, never the
+  // duplicate-risk copy (no create was ever attempted).
+  await page.locator(".proj-current").click();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+  await page.locator(".proj-pick", { hasText: "fixture-demo" }).click();
+  await expect(page.locator(".proj-name")).toContainText("fixture-demo", { timeout: 8_000 });
+  await page.getByRole("button", { name: "Create session" }).click();
+  await expect(page.locator(".composer")).toBeVisible();
+  const rejectedRow = page.locator('.sendStatusLine[data-kind="rejected"]');
+  await expect(rejectedRow).toBeVisible({ timeout: 10_000 });
+  await expect(rejectedRow).toContainText("Could not reach the server to create the session.");
+  await expect(rejectedRow).not.toContainText("another session");
+
+  // Honesty: the ladder sent NOTHING — no modern create, no legacy fallback,
+  // no dispatch — only the (parked, aborted) probe.
+  expect(wire.createPosts()).toBe(0);
+  expect(legacyPosts).toBe(0);
+  expect(wire.prompts()).toBe(0);
+  expect(probes).toBeGreaterThanOrEqual(1);
+
+  // And B's draft is STILL clean after the mark landed (test (e)'s closing
+  // idiom): the entry-keyed rejection never followed the operator into B.
+  await page.locator(".proj-current").click();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+  await page.locator(".proj-pick", { hasText: "cc-cap-b" }).click();
+  await expect(page.locator(".proj-name")).toContainText("cc-cap-b", { timeout: 8_000 });
   await page.getByRole("button", { name: "Create session" }).click();
   await expect(page.locator(".composer")).toBeVisible();
   await expect(page.locator(".sendStatusLine")).toHaveCount(0);
