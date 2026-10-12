@@ -21,6 +21,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   APP_SHELL_TITLE_MARK,
   CAPABILITY_TIMEOUT_MS,
+  CREATE_EXECUTE_BOUND_MS,
   RECOVERY_BACKOFF_MS,
   RECOVERY_LOOKUP_BOUND_MS,
   RECOVERY_WINDOW_MS,
@@ -290,6 +291,55 @@ describe("createSessionWithCertainty — the tap-time draft key survives the cap
     expect(stamped.createOpId).toBeTruthy(); // stamped, so recovery/transfer can reach it
     expect(stamped.stage).toBe("uncertain"); // marked through markUnknownAndRecover
     expect(sendActionsFor(draftOwnerKey("/proj-other"))).toHaveLength(0); // no leak into B
+  });
+});
+
+describe("createSessionWithCertainty — a project switch DURING the create POST await (the 12s bound)", () => {
+  it("the abort's unknown mark lands under the TAP-TIME project's key and recovery lookups keep the mint-time dir; nothing leaks into B", async () => {
+    // The unpinned window (study item 1): the capability probe already
+    // answered "modern" and the create POST is PARKED (a hung socket) when
+    // the operator switches projects; the POST then dies at its 12s execute
+    // bound. The abort catch routes through markUnknownAndRecover with the
+    // ENTRY-captured draftKey (actions.ts threads it from before the
+    // capability await) and the op's mint-time dir — a post-switch
+    // projectDir() re-derivation would strand the record under B's key and
+    // scope recovery lookups to the wrong directory.
+    const rec = mintSendAttempt(DRAFT_KEY);
+    let postArmed = false;
+    const f = stubFetch((url, init) => {
+      if (url === CAP_URL) return CAP_MODERN;
+      if (url.startsWith(POST_URL) && (init?.method ?? "GET") === "POST") {
+        postArmed = true;
+        // Parked: settles ONLY via the armed 12s abort signal.
+        return new Promise<RouteResult>((_res, rej) => {
+          init?.signal?.addEventListener("abort", () => rej(new DOMException("aborted", "AbortError")));
+        });
+      }
+      if (url.startsWith(RECEIPT_URL)) return receipt("unknown");
+      return { status: 404, body: {} };
+    });
+    vi.useFakeTimers();
+    const p = createSessionWithCertainty();
+    await vi.advanceTimersByTimeAsync(0); // capability settles; the POST arms + parks
+    expect(postArmed).toBe(true); // the switch below happens INSIDE the POST await
+    setProjectDirRaw("/proj-b"); // the MID-POST-AWAIT switch
+    await vi.advanceTimersByTimeAsync(CREATE_EXECUTE_BOUND_MS); // the 12s bound aborts
+    const out = await p;
+    expect(out).toMatchObject({ id: null, certainty: "unknown" });
+    expect(out.detail).toBe("session create timed out");
+    // The unknown mark landed under the TAP-TIME project's key (A)…
+    const stamped = getSendAction(rec.attemptId)!;
+    expect(stamped.ownerKey).toBe(DRAFT_KEY);
+    expect(stamped.stage).toBe("uncertain");
+    expect(stamped.reason).toBe("session-create-unknown");
+    expect(stamped.createOpId).toBeTruthy();
+    // …nothing leaked into B's draft key…
+    expect(sendActionsFor(draftOwnerKey("/proj-b"))).toHaveLength(0);
+    // …and the recovery lookup carries the MINT-TIME dir (A's) + the minted key.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.gets().length).toBeGreaterThanOrEqual(1);
+    expect(f.gets()[0].url).toContain(`dir=${encodeURIComponent(CC)}`);
+    expect(f.gets()[0].url).toContain(`key=${encodeURIComponent(f.postKeys()[0])}`);
   });
 });
 
