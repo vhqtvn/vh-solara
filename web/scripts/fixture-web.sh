@@ -25,4 +25,15 @@ cd "$repo_root"
 export VH_DEMO_DIR="${VH_DEMO_DIR:-$repo_root/tmp/fixture-demo}"
 # Demo quota for the Usage panel is baked into fixtureserver (VH_QUOTA_FIXTURE);
 # export it here only to override.
-exec go run ./tools/fixtureserver -addr "$ADDR"
+#
+# Opt-in daemon dispatch (queue-delivery-custody lane): VH_FIXTURE_DAEMON_DISPATCH=1
+# forwards the fixtureserver's existing -daemon-dispatch flag so the daemon's
+# custody drain loop owns queue dispatch (browser observe-only). DEFAULT
+# UNCHANGED: unset/0 keeps the browser-dispatch posture the ordinary lane-6
+# suite runs under (no extra flag is passed — behaviorally identical).
+extra_args=""
+if [[ "${VH_FIXTURE_DAEMON_DISPATCH:-0}" == "1" ]]; then
+  extra_args="-daemon-dispatch"
+  echo "[fixture-web] daemon dispatch ENABLED (queue custody active)"
+fi
+exec go run ./tools/fixtureserver -addr "$ADDR" $extra_args

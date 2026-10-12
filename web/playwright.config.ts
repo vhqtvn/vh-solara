@@ -27,6 +27,11 @@ const useExistingWebServer = process.env.PLAYWRIGHT_USE_EXISTING_WEB_SERVER === 
 export default defineConfig({
   globalSetup: path.resolve(webRoot, "global-setup.ts"),
   testDir: path.join(webRoot, "tests/e2e"),
+  // The queue-delivery-custody spec needs the DAEMON-DISPATCH fixture posture
+  // (custody drain owns dispatch) — a different server than this config's
+  // webServer boots. It is EXCLUDED from ordinary discovery and runs ONLY via
+  // its dedicated config (playwright.queue-delivery.config.ts, dispatch-only).
+  testIgnore: /queue-delivery-custody\.spec\.ts$/,
   fullyParallel: false,
   // One shared fixture backend with mutable session state -> run serially so
   // state-mutating specs don't perturb each other.

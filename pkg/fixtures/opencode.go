@@ -248,6 +248,47 @@ type FakeOpenCode struct {
 	createArrivals int
 	createHeldIDs  []string
 
+	// --- test-only prompt-hold latch + persistence witness (queue-delivery e2e) ---
+	//
+	// promptHold parks the NEXT normal-mode prompt_async turn for a session
+	// BEFORE simulatePrompt runs (queue-delivery-custody lane): while held,
+	// NEITHER the user-message persistence NOR ANY event emission has
+	// happened — the exact "daemon claimed custody, upstream has not moved"
+	// window the daemon-dispatch e2e must observe. One-shot per arm (the
+	// next matching prompt_async consumes the arm); armed for ONE session id
+	// so sibling sessions never park. The park happens OUTSIDE f.mu inside
+	// the detached prompt_async goroutine (the 204 answers immediately) and
+	// is bounded by a FIXTURE-OWNED deadline — never the POST request
+	// context (the request already returned) and never a silent delivery:
+	// deadline expiry cancels the turn, exactly like reset.
+	//
+	// Channel-per-arm = generation semantics: every ArmPromptHold mints a
+	// fresh done/cancel/parkExit triple, so a stale release/reset from a
+	// consumed or reset arm can never cross-talk with a later arm.
+	// ResetPromptHold cancels and JOINS (outside the mutex) via parkExit —
+	// closed by the parked goroutine when it leaves the park — so a
+	// reset/re-arm can never race a still-parked turn from the previous arm.
+	// All non-witness fields guarded by promptHoldMu.
+	//
+	// persistedUserIDs (f.mu-guarded) is the durable-persistence WITNESS:
+	// the id of every USER message the fake committed, per session, in
+	// order, DUPLICATES PRESERVED — the raw correlation evidence the e2e
+	// asserts against (one persisted occurrence per delivered correlation
+	// id, independent of any HTTP response). Mirrors the promptArrivalIDs
+	// recording pattern; never read by the shipped binary.
+	promptHoldMu       sync.Mutex
+	promptHoldArmed    bool
+	promptHoldSession  string
+	promptHoldToken    uint64
+	promptHoldDeadline time.Time
+	promptHoldDone     chan struct{} // closed by ReleasePromptHold
+	promptHoldCancel   chan struct{} // closed by ResetPromptHold
+	promptHoldParkExit chan struct{} // closed by the parked goroutine on park exit
+	promptHoldHeld     bool          // a turn is parked right now
+	promptHoldReleased bool          // release already fired for this arm
+	// f.mu-guarded witness:
+	persistedUserIDs map[string][]string
+
 	// --- Phase A2 sustained multi-project workload controls (mpworkload.go) ---
 	// emitDroppedTotal counts fixture-subscriber overflows (emit's close-on-full
 	// fanout default branch) across the fixture's lifetime — the SEPARATE
@@ -1359,6 +1400,9 @@ func (f *FakeOpenCode) commitUserMessage(sessionID, text, messageID string) int 
 	userPart := textPart(userID, sessionID, upID, text, now)
 	f.messages[sessionID] = append(f.messages[sessionID],
 		messageWithParts{Info: userInfo, Parts: []map[string]any{userPart}})
+	// Witness (test-only): the delayed/commit paths persist under the same
+	// caller-id-wins contract — record them identically to appendMessage.
+	f.recordPersistedUserLocked(sessionID, userID)
 	return n
 }
 
@@ -1534,6 +1578,15 @@ func (f *FakeOpenCode) Handler() http.Handler {
 	mux.HandleFunc("/fixture/create-hold/arm", f.handleFixtureCreateHoldArm)
 	mux.HandleFunc("/fixture/create-hold/release", f.handleFixtureCreateHoldRelease)
 	mux.HandleFunc("/fixture/create-hold/reset", f.handleFixtureCreateHoldReset)
+	// Prompt-hold latch + delivery witness (queue-delivery-custody e2e):
+	// park the next normal prompt_async turn BEFORE persistence/events;
+	// /state is the raw witness (arrivals + persisted user IDs, duplicates
+	// preserved). Accessed through the daemon's /oc proxy by the e2e's
+	// request client. TEST-ONLY; never reached by the shipped binary.
+	mux.HandleFunc("/fixture/prompt-hold/arm", f.handleFixturePromptHoldArm)
+	mux.HandleFunc("/fixture/prompt-hold/release", f.handleFixturePromptHoldRelease)
+	mux.HandleFunc("/fixture/prompt-hold/reset", f.handleFixturePromptHoldReset)
+	mux.HandleFunc("/fixture/prompt-hold/state", f.handleFixturePromptHoldState)
 	mux.HandleFunc("/fixture/mp-seed", f.handleMPSeed)
 	mux.HandleFunc("/fixture/mp-workload/start", f.handleMPWorkloadStart)
 	mux.HandleFunc("/fixture/mp-workload/release", f.handleMPWorkloadRelease)
@@ -2263,8 +2316,20 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		default:
-			// PromptAsyncNormal: the faithful path.
-			go f.simulatePrompt(id, text, messageID)
+			// PromptAsyncNormal: the faithful path. The queue-delivery-custody
+			// latch (promptHoldGate) parks the turn BEFORE simulatePrompt —
+			// outside f.mu, in the detached goroutine — so while held NEITHER
+			// the user-message persistence NOR any event emission (busy, user
+			// message.updated/part, assistant stream) has happened. Unarmed (the
+			// permanent default for every existing fixture/test) the gate is a
+			// no-op (one uncontended mutex acquire) and this path is
+			// behaviorally identical to the previous
+			// `go f.simulatePrompt(...)`.
+			go func() {
+				if f.promptHoldGate(id) {
+					f.simulatePrompt(id, text, messageID)
+				}
+			}()
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -3797,10 +3862,247 @@ func (f *FakeOpenCode) handleFixtureCreateHoldReset(w http.ResponseWriter, r *ht
 	writeJSON(w, map[string]any{"reset": "create"})
 }
 
+// --- prompt-hold latch (queue-delivery-custody e2e) -------------------------
+
+// promptHoldDefaultTTL bounds every armed hold. Generous by design (the e2e
+// hold window is seconds), but FINITE: a leaked arm can never wedge a
+// simulatePrompt goroutine forever, and expiry CANCELS the turn (never a
+// silent delivery).
+const promptHoldDefaultTTL = 2 * time.Minute
+
+// ArmPromptHold arms the one-shot hold for session's NEXT normal-mode
+// prompt_async turn (TEST-ONLY). ttl <= 0 selects promptHoldDefaultTTL.
+// Returns the arm's token (generation), or 0 if the latch is currently
+// engaged (a turn is parked OR a prior arm has not been consumed/reset) —
+// refusing the re-arm keeps the channel-per-arm generation semantics
+// unambiguous (a mid-arm overwrite could orphan the old channels).
+func (f *FakeOpenCode) ArmPromptHold(session string, ttl time.Duration) uint64 {
+	if ttl <= 0 {
+		ttl = promptHoldDefaultTTL
+	}
+	f.promptHoldMu.Lock()
+	defer f.promptHoldMu.Unlock()
+	if f.promptHoldHeld || f.promptHoldArmed {
+		return 0
+	}
+	f.promptHoldToken++
+	f.promptHoldArmed = true
+	f.promptHoldSession = session
+	f.promptHoldDeadline = time.Now().Add(ttl)
+	f.promptHoldDone = make(chan struct{})
+	f.promptHoldCancel = make(chan struct{})
+	f.promptHoldParkExit = make(chan struct{})
+	f.promptHoldHeld = false
+	f.promptHoldReleased = false
+	return f.promptHoldToken
+}
+
+// promptHoldGate parks the calling (detached prompt_async) goroutine while the
+// one-shot hold for sessionID is armed. Returns true to deliver the turn
+// normally (unarmed, or released), false to drop it (reset or deadline — the
+// turn is cancelled, never silently delivered). The wait is OUTSIDE
+// promptHoldMu and ignores the POST request context entirely: the fixture
+// owns the clock. Release wins races over cancel/deadline (a double-check
+// keeps an already-released turn deliverable even if the timer fired first).
+// The parked goroutine closes parkExit when it LEAVES the park (any path) so
+// ResetPromptHold can join it, and clears `held` at the same point.
+func (f *FakeOpenCode) promptHoldGate(sessionID string) bool {
+	f.promptHoldMu.Lock()
+	if !f.promptHoldArmed || f.promptHoldSession != sessionID || f.promptHoldHeld {
+		f.promptHoldMu.Unlock()
+		return true // unarmed for this arrival: deliver immediately
+	}
+	// One-shot: THIS arrival consumes the arm.
+	f.promptHoldArmed = false
+	f.promptHoldHeld = true
+	done := f.promptHoldDone
+	cancel := f.promptHoldCancel
+	parkExit := f.promptHoldParkExit
+	deadline := f.promptHoldDeadline
+	f.promptHoldMu.Unlock()
+
+	defer func() {
+		f.promptHoldMu.Lock()
+		f.promptHoldHeld = false
+		f.promptHoldMu.Unlock()
+		close(parkExit)
+	}()
+
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true // released: deliver normally
+	case <-cancel:
+		// Reset raced release — release wins if it already fired.
+		select {
+		case <-done:
+			return true
+		default:
+		}
+		return false
+	case <-timer.C:
+		// Deadline raced release — same priority.
+		select {
+		case <-done:
+			return true
+		default:
+		}
+		return false // bounded deadline: cancel, never silently deliver
+	}
+}
+
+// ReleasePromptHold releases a currently-parked turn (it then delivers
+// normally). Returns false when nothing is parked or this arm was already
+// released (idempotent).
+func (f *FakeOpenCode) ReleasePromptHold() bool {
+	f.promptHoldMu.Lock()
+	defer f.promptHoldMu.Unlock()
+	if !f.promptHoldHeld || f.promptHoldReleased || f.promptHoldDone == nil {
+		return false
+	}
+	f.promptHoldReleased = true
+	close(f.promptHoldDone)
+	return true
+}
+
+// ResetPromptHold cancels any armed or parked hold and JOINS a parked
+// goroutine's park-exit (outside the mutex) before returning, so a subsequent
+// re-arm can never race the previous arm's still-parked turn. Idempotent.
+func (f *FakeOpenCode) ResetPromptHold() {
+	f.promptHoldMu.Lock()
+	parked := f.promptHoldHeld
+	var cancel chan struct{}
+	var parkExit chan struct{}
+	if f.promptHoldCancel != nil && (f.promptHoldArmed || parked) {
+		cancel = f.promptHoldCancel
+		parkExit = f.promptHoldParkExit
+		close(cancel)
+	}
+	f.promptHoldArmed = false
+	f.promptHoldSession = ""
+	f.promptHoldDeadline = time.Time{}
+	f.promptHoldDone = nil
+	f.promptHoldCancel = nil
+	f.promptHoldParkExit = nil
+	f.promptHoldHeld = false
+	f.promptHoldReleased = false
+	f.promptHoldMu.Unlock()
+	if parked && parkExit != nil {
+		<-parkExit // join outside the mutex
+	}
+}
+
+// PromptHoldWitness returns the coherent latch + delivery witness for session
+// (TEST-ONLY): latch state, the prompt_async arrival correlation ids, and the
+// persisted user-message ids — both in order with duplicates preserved.
+func (f *FakeOpenCode) PromptHoldWitness(session string) map[string]any {
+	f.promptHoldMu.Lock()
+	out := map[string]any{
+		"armed":  f.promptHoldArmed,
+		"held":   f.promptHoldHeld,
+		"tokens": f.promptHoldToken,
+	}
+	f.promptHoldMu.Unlock()
+	f.mu.Lock()
+	arrivals := []string{}
+	arrivals = append(arrivals, f.promptArrivalIDs[session]...)
+	persisted := []string{}
+	persisted = append(persisted, f.persistedUserIDs[session]...)
+	f.mu.Unlock()
+	// Non-nil empties so the JSON witness carries [] (not null) — the e2e
+	// asserts exact equality against empty arrays.
+	out["arrivals"] = arrivals
+	out["persistedUserIDs"] = persisted
+	return out
+}
+
+// handleFixturePromptHoldArm arms the one-shot prompt hold for ?session= with
+// an optional {"deadlineMs":N} body override.
+func (f *FakeOpenCode) handleFixturePromptHoldArm(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	session := r.URL.Query().Get("session")
+	if session == "" {
+		http.Error(w, "missing session", http.StatusBadRequest)
+		return
+	}
+	ttl := time.Duration(0)
+	if body := map[string]any{}; json.NewDecoder(r.Body).Decode(&body) == nil {
+		if ms, _ := body["deadlineMs"].(float64); ms > 0 {
+			ttl = time.Duration(ms) * time.Millisecond
+		}
+	}
+	tok := f.ArmPromptHold(session, ttl)
+	if tok == 0 {
+		http.Error(w, `{"error":"a prompt hold is currently parked; release or reset first"}`, http.StatusConflict)
+		return
+	}
+	writeJSON(w, map[string]any{"armed": session, "token": tok})
+}
+
+// handleFixturePromptHoldRelease releases the parked turn.
+func (f *FakeOpenCode) handleFixturePromptHoldRelease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, map[string]any{"released": f.ReleasePromptHold()})
+}
+
+// handleFixturePromptHoldReset cancels + joins (teardown hygiene).
+func (f *FakeOpenCode) handleFixturePromptHoldReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	f.ResetPromptHold()
+	writeJSON(w, map[string]any{"reset": true})
+}
+
+// handleFixturePromptHoldState serves the delivery witness (GET). session is
+// required — the e2e asserts per-session, not whole-fake.
+func (f *FakeOpenCode) handleFixturePromptHoldState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+	session := r.URL.Query().Get("session")
+	if session == "" {
+		http.Error(w, "missing session", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, f.PromptHoldWitness(session))
+}
+
+// recordPersistedUserLocked appends id to the per-session persisted-user
+// witness (duplicates preserved). MUST be called with f.mu held. TEST-ONLY
+// observability (see persistedUserIDs): the durable-persistence evidence the
+// queue-delivery e2e asserts against, independent of any HTTP response.
+func (f *FakeOpenCode) recordPersistedUserLocked(sessionID, id string) {
+	if id == "" {
+		return
+	}
+	if f.persistedUserIDs == nil {
+		f.persistedUserIDs = map[string][]string{}
+	}
+	f.persistedUserIDs[sessionID] = append(f.persistedUserIDs[sessionID], id)
+}
+
 func (f *FakeOpenCode) appendMessage(sessionID string, m messageWithParts) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.messages[sessionID] = append(f.messages[sessionID], m)
+	// Witness (test-only): every USER message committed to the durable
+	// in-memory store, id + order + duplicates. Covers simulatePrompt and
+	// every other appendMessage caller.
+	if role, _ := m.Info["role"].(string); role == "user" {
+		if id, _ := m.Info["id"].(string); id != "" {
+			f.recordPersistedUserLocked(sessionID, id)
+		}
+	}
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
