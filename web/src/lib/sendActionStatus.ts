@@ -31,13 +31,17 @@
 // the SAME attemptId + payload (server dedupes admission), and `recovery`
 // names the operator action Slice 3 will render.
 //
-// Ownership: an attempt starts under ownerKey "draft" (a draft send mints it
-// before the session exists) and is EXPLICITLY transferred to the live session
-// id once createSession resolves (createSend's draft→live single-flight handoff
-// — the two single-flight keys are distinct by design, so the transfer must be
-// explicit). The handoff sweeps EVERY still-draft-owned record, not just the
-// in-flight attempt (transferOwnerSendAttempts): retained records from earlier
-// draft taps must follow the user into the session too (F2, slice-3 review).
+// Ownership: an attempt starts under a DRAFT owner key (a draft send mints
+// it before the session exists) — "draft" for the default project, or
+// `draft:<projectDir>` once a project context exists (draft error rows are
+// scoped per project: an in-app project switch must not carry project A's
+// draft errors into project B's draft view) — and is EXPLICITLY transferred
+// to the live session id once createSession resolves (createSend's
+// draft→live single-flight handoff — the two single-flight keys are distinct
+// by design, so the transfer must be explicit). The handoff sweeps EVERY
+// still-draft-owned record of that project, not just the in-flight attempt
+// (transferOwnerSendAttempts): retained records from earlier draft taps must
+// follow the user into the session too (F2, slice-3 review).
 // All reads/writes are keyed by attemptId; UI queries by ownerKey.
 //
 // In-memory only (module singleton, like sendSingleFlight): a reload re-fetches
@@ -208,6 +212,25 @@ function patch(attemptId: string, p: Partial<SendAction>): void {
       Object.assign(cur, p, { updatedAt: Date.now() });
     }),
   );
+}
+
+/** The draft owner key for a project directory. Draft send-status records
+ *  (send-error rows) are scoped PER PROJECT: the app can switch projects
+ *  in place, and a draft send error from project A must not follow the
+ *  operator into project B's draft view. The bare "draft" key is kept for
+ *  the default/no-project context (`dir` empty) — the pre-scoping value —
+ *  so the default project's behavior is byte-identical to before. Shape:
+ *  `draft:<projectDir>` (projectDir as-is, including any trailing slash). */
+export function draftOwnerKey(dir: string): string {
+  return dir ? `draft:${dir}` : "draft";
+}
+
+/** True when `key` is a draft key in EITHER shape (the legacy bare "draft"
+ *  or any project-scoped `draft:<dir>`). Used where the record set being
+ *  matched is already scoped another way (e.g. by createOpId, which is
+ *  per-project by construction). */
+export function isDraftOwnerKey(key: string): boolean {
+  return key === "draft" || key.startsWith("draft:");
 }
 
 /** Mint a new send attempt under `ownerKey` (stage "preparing"). Superseded
@@ -413,7 +436,10 @@ export function transferCreateOpRecords(createOpId: string, toOwnerKey: string):
   setActions(
     produce((map) => {
       for (const a of Object.values(map)) {
-        if (a.createOpId === createOpId && a.ownerKey === "draft") {
+        // Draft-key match in ANY project shape: createOpId already scopes the
+        // match to one operation (per-project by construction), and the
+        // operation's records were minted under that project's draft key.
+        if (a.createOpId === createOpId && isDraftOwnerKey(a.ownerKey)) {
           a.ownerKey = toOwnerKey;
           a.updatedAt = Date.now();
           n++;

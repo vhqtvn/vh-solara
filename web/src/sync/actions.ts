@@ -35,7 +35,7 @@ import { resetArchiveFailuresScope } from "../archiveFailures";
 import { ackSession } from "./orchestration";
 import { pushNotification } from "../notify";
 import { beginDraftGeneration, detectCreateSupport, modernCreateSession } from "../lib/sessionCreateStatus";
-import { markOwnerSessionCreateRejected } from "../lib/sendActionStatus";
+import { draftOwnerKey, markOwnerSessionCreateRejected } from "../lib/sendActionStatus";
 
 // Selecting any real session leaves draft mode.
 //
@@ -264,8 +264,16 @@ export async function createSession(): Promise<string | null> {
 // one navigation per uninterrupted send.
 export async function createSessionWithCertainty(): Promise<CreateSessionOutcome> {
   const startedAt = Date.now();
+  // Draft owner key captured at ENTRY (draft records are project-scoped):
+  // detectCreateSupport can await up to 5s, and the rejected mark below must
+  // land under the project the operator sent from, not a post-switch one.
+  const draftKey = draftOwnerKey(projectDir());
   const support = await detectCreateSupport();
-  if (support === "modern") return modernCreateSession(startedAt);
+  // Thread the ENTRY-captured key into the modern branch: modernCreateSession
+  // runs only after the ≤5s capability await above, and its stamps/marks must
+  // reach the records minted under the project the operator sent from (a
+  // mid-await project switch must not re-scope them — review F1).
+  if (support === "modern") return modernCreateSession(startedAt, draftKey);
   if (support === "legacy") return legacyCreateSession(startedAt);
   // Capability UNCERTAIN (401/403/auth-redirect/arbitrary HTML/malformed
   // JSON/wrong version/502/network/timeout): nothing was sent on EITHER
@@ -274,7 +282,7 @@ export async function createSessionWithCertainty(): Promise<CreateSessionOutcome
   // capability-specific reason; createSend's generic failure mark defers to
   // an already-terminal record.
   markOwnerSessionCreateRejected(
-    "draft",
+    draftKey,
     "session-create capability check unavailable (nothing was sent)",
     "capability-unavailable",
   );

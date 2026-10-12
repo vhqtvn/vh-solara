@@ -23,6 +23,7 @@ import { cleanup, render } from "@solidjs/testing-library";
 import { SendStatus } from "../../src/components/chat/SendStatus";
 import {
   __resetSendActionStatusForTests,
+  draftOwnerKey,
   finishSendAttempt,
   getSendAction,
   markOwnerSessionCreateUnknown,
@@ -843,8 +844,11 @@ describe("SendStatus — create-certainty Slice 2 modern states", () => {
 
   function seedModernUnknown(opOver: Record<string, unknown> = {}): { attemptId: string; opId: string } {
     const opId = __seedCreateOpForTests(CC_DIR, opOver as any);
-    const a = mintSendAttempt("draft");
-    markOwnerSessionCreateUnknown("draft", "create outcome uncertain", 1_000, opId);
+    // Records mint under the CURRENT project's draft key (project-scoped
+    // draft rows): this block runs with projectDir = CC_DIR.
+    const draftKey = draftOwnerKey(CC_DIR);
+    const a = mintSendAttempt(draftKey);
+    markOwnerSessionCreateUnknown(draftKey, "create outcome uncertain", 1_000, opId);
     return { attemptId: a.attemptId, opId };
   }
 
@@ -897,7 +901,10 @@ describe("SendStatus — create-certainty Slice 2 modern states", () => {
   });
 
   it("a LEGACY create-unknown record (no createOpId) keeps the copy WITHOUT modern affordances", () => {
-    seedCreateUnknown(1_000, 2_000); // no createOpId — the legacy shape
+    // The legacy shape seeds under the CURRENT project's draft key (no
+    // createOpId — pre-modern records carry the same project scoping).
+    const a = mintSendAttempt(draftOwnerKey(CC_DIR));
+    markOwnerSessionCreateUnknown(draftOwnerKey(CC_DIR), "session create timed out", 1_000);
     const r = render(() => <SendStatus {...baseProps({ draft: () => true, sessionId: () => "" })} />);
     const row = r.container.querySelector(".sendStatusLine")!;
     expect(row.textContent).toContain("Session creation unconfirmed.");
@@ -907,7 +914,7 @@ describe("SendStatus — create-certainty Slice 2 modern states", () => {
   });
 
   it("capability-unavailable (NO POST was sent) renders the retry-safe copy, never the duplicate-risk copy", () => {
-    const a = mintSendAttempt("draft");
+    const a = mintSendAttempt(draftOwnerKey(CC_DIR));
     updateSendAction(a.attemptId, {
       stage: "rejected", certainty: "definitive", recovery: "restore",
       detail: "capability check unavailable", reason: "capability-unavailable",

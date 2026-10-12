@@ -35,6 +35,7 @@ import {
 import { IGNORED, runSendSingleFlight } from "../../lib/sendSingleFlight";
 import {
   attachmentsSubsetOfPayload,
+  draftOwnerKey,
   findReusableSendAttempt,
   finishSendAttempt,
   getSendAction,
@@ -45,6 +46,7 @@ import {
   type PreparedSendPayload,
 } from "../../lib/sendActionStatus";
 import { modernCreateTransferTarget } from "../../lib/sessionCreateStatus";
+import { projectDir } from "../../sync/store";
 import type { Attachment } from "./createAttachments";
 import { EnqueueError, type QueuedMessage } from "../../queue";
 import type { DrainOutcome } from "../../queueDrain";
@@ -848,6 +850,11 @@ export function createSend(deps: SendDependencies): SendController {
     // across an operator edit: additions made during any wait stay in the
     // composer, and explicit removals are honored (not resurrected).
     const wasDraft = deps.draft();
+    // TAP-TIME owner key: draft records are project-scoped (draftOwnerKey),
+    // and the project at TAP time is the one this send's records are minted
+    // and swept under — a project switch during the (up to 12s) create wait
+    // must not strand the in-flight record under the new project's key.
+    const tapOwnerKey = wasDraft ? draftOwnerKey(projectDir()) : deps.sessionId();
     const ownedText = deps.input();
     const ownedAtts = deps.attachments();
     const owned = new Set<Attachment>(ownedAtts);
@@ -859,7 +866,7 @@ export function createSend(deps: SendDependencies): SendController {
     // genuinely empty tap (no retained retry-same record under this owner)
     // still exits here before ANY state change, exactly as before.
     if (!text && ownedAtts.length === 0) {
-      const earlyReuse = findReusableSendAttempt(wasDraft ? "draft" : deps.sessionId(), text);
+      const earlyReuse = findReusableSendAttempt(tapOwnerKey, text);
       if (!earlyReuse?.payload) return;
     }
     // F2: ONE agent capture at tap, through the SAME resolver the composer's
@@ -914,7 +921,7 @@ export function createSend(deps: SendDependencies): SendController {
     const attempt: SendAttemptRef | undefined = isShell
       ? undefined
       : (() => {
-          const ownerKey = wasDraft ? "draft" : deps.sessionId();
+          const ownerKey = tapOwnerKey;
           const reusable = findReusableSendAttempt(ownerKey, text);
           // attachmentsSubsetOfPayload (NOT a raw includes): the store proxies
           // the retained payload on read, so an inline identity includes is
@@ -1360,7 +1367,11 @@ export function createSend(deps: SendDependencies): SendController {
       //     uncertain records from earlier taps.
       const modernOp = modernCreateTransferTarget(id);
       if (modernOp) transferCreateOpRecords(modernOp, id);
-      else transferOwnerSendAttempts("draft", id);
+      // LEGACY broad sweep runs under the TAP-TIME draft key — the records
+      // being swept were minted under it, and this code runs AFTER the
+      // (up to 12s) create await, by which time an in-app project switch may
+      // have changed projectDir() (tapOwnerKey keeps mint/sweep symmetric).
+      else transferOwnerSendAttempts(tapOwnerKey, id);
       // THEN navigation — exactly once, after ownership (the low-level create
       // action no longer navigates; the draft ChatView unmounts here and the
       // live view's memo reads the live id for the admission single-flight).
@@ -1406,12 +1417,12 @@ export function createSend(deps: SendDependencies): SendController {
   // Record-addressed contract (revalidated AT CLICK TIME — the displayed
   // record is the authority, never the live composer text):
   //   valid   — a retained record for `attemptId` still exists, is still
-  //             owned by the CURRENT ownerKey (draft view: "draft"), is
-  //             still stage "uncertain" with recovery "retry-same", and
-  //             still carries its payload → replay THAT record's STORED
-  //             verbatim payload under ITS attemptId (same classification
-  //             on a second lost response: reconcile-first, the record
-  //             stays uncertain and retryable);
+  //             owned by the CURRENT ownerKey (draft view: the current
+  //             project's draft key), is still stage "uncertain" with
+  //             recovery "retry-same", and still carries its payload →
+  //             replay THAT record's STORED verbatim payload under ITS
+  //             attemptId (same classification on a second lost response:
+  //             reconcile-first, the record stays uncertain and retryable);
   //   invalid — gone (finished/dismissed), re-owned, or no longer an
   //             unresolved retry-same admission → REFUSE LOUDLY
   //             (notification, no enqueue). Nothing is inferred from live
@@ -1425,7 +1436,9 @@ export function createSend(deps: SendDependencies): SendController {
   // The replay runs inside the per-session single-flight, so a concurrent
   // composer send drops it (IGNORED) exactly like a re-tap.
   async function retrySameMessage(attemptId: string): Promise<void> {
-    const ownerKey = deps.draft() ? "draft" : deps.sessionId();
+    // Current owner key at CLICK time: the row being retried is the one the
+    // CURRENT view displays (draft rows are project-scoped — draftOwnerKey).
+    const ownerKey = deps.draft() ? draftOwnerKey(projectDir()) : deps.sessionId();
     const rec = getSendAction(attemptId);
     if (
       !rec ||

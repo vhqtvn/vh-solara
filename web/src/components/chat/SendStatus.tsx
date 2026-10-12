@@ -111,6 +111,7 @@
 import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
 import {
   createLinkCandidates,
+  draftOwnerKey,
   finishSendAttempt,
   markSendAttemptResolveConflict,
   sendActionsFor,
@@ -126,6 +127,7 @@ import {
   isCurrentCreateOp,
 } from "../../lib/sessionCreateStatus";
 import { resolveQueued } from "../../queue";
+import { projectDir } from "../../sync/store";
 import type { Session } from "../../types";
 import "./SendStatus.css";
 
@@ -211,7 +213,12 @@ function isRecoveryStage(stage: SendAction["stage"]): boolean {
 }
 
 export function SendStatus(props: SendStatusProps) {
-  const ownerKey = () => (props.draft() ? "draft" : props.sessionId());
+  // Draft rows are project-scoped (draftOwnerKey): an in-app project switch
+  // changes projectDir(), so the draft view reads the NEW project's records
+  // — project A's send errors must not appear in project B's draft view
+  // (and re-switching to A restores them; the store is in-memory singleton
+  // state, so nothing persisted needs migration).
+  const ownerKey = () => (props.draft() ? draftOwnerKey(projectDir()) : props.sessionId());
   // Memoized (Solid discipline / brief §7): the merged-line and ordering
   // computations below share ONE reactive derivation per store change instead
   // of re-running per render; presentation grouping never mutates the store.
@@ -410,7 +417,7 @@ export function SendStatus(props: SendStatusProps) {
   // unknown record(s) — reactive over BOTH the record store (records()) and
   // the session map (props.sessions(): the SSE-delivered session lands there
   // while the draft view is still mounted, no re-tap needed). Draft-view only:
-  // a live session's ownerKey is its own id and can never be "draft".
+  // a live session's ownerKey is its own id and can never be a draft key.
   const createCandidates = createMemo(() => {
     if (!props.draft() || !props.sessions || !props.openSession) return [];
     return createLinkCandidates(Object.values(props.sessions()), records());
@@ -428,12 +435,14 @@ export function SendStatus(props: SendStatusProps) {
   );
 
   // A1 confirm — NEVER silent: the re-key runs only from the operator's click
-  // on the affordance. The sweep drains EVERY still-draft-owned record (the
-  // study's C2 ride-along: a stale earlier record follows too instead of
-  // stranding under "draft"), then navigation runs (openSessionChat
-  // semantics via props).
+  // on the affordance. The sweep drains EVERY still-draft-owned record of the
+  // CURRENT project's draft key (the study's C2 ride-along: a stale earlier
+  // record follows too instead of stranding under the draft key), then
+  // navigation runs (openSessionChat semantics via props). The candidates
+  // derive from records() — already scoped to this project's draft key — so
+  // ownerKey() at click time is the key those records live under.
   function confirmCreateLink(id: string) {
-    transferOwnerSendAttempts("draft", id);
+    transferOwnerSendAttempts(ownerKey(), id);
     props.openSession!(id);
   }
 
@@ -613,7 +622,7 @@ export function SendStatus(props: SendStatusProps) {
                   {/* Retry STATUS SAVE — stage "unsaved" only, and never for a
                       draft (F8, defense-in-depth: unsaved records are minted
                       under a live session id by the resolve path, so a draft
-                      view — ownerKey "draft" — cannot legitimately hold one).
+                      view — a draft owner key — cannot legitimately hold one).
                       Re-records the known terminal outcome; NEVER resends the
                       message. */}
                   <Show when={!props.draft() && rec.stage === "unsaved" && rec.retrySave}>

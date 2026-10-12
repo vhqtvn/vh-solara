@@ -472,8 +472,17 @@ function wireValid(w: WireReceipt | null): boolean {
 
 /** The modern create lifecycle. MUST only run after detectCreateSupport()
  *  answered "modern" (the safety ladder: capability uncertainty means no
- *  POST). Re-taps of an unresolved operation reuse the key via LOOKUP ONLY. */
-export async function modernCreateSession(startedAt: number): Promise<SessionCreateOutcome> {
+ *  POST). Re-taps of an unresolved operation reuse the key via LOOKUP ONLY.
+ *
+ *  `draftKey` is the CALLER's tap-time capture: createSessionWithCertainty
+ *  awaits detectCreateSupport (up to 5s) BEFORE calling us, and the records
+ *  this operation stamps were minted under the project the operator SENT
+ *  from — re-deriving the key from projectDir() here would miss them after a
+ *  mid-await project switch (review F1: stranded preparing record with no
+ *  createOpId). `dir` below is still captured HERE: it scopes the op mint +
+ *  the create TARGET (`?dir=`), which is pre-existing semantics this must
+ *  not change. */
+export async function modernCreateSession(startedAt: number, draftKey: string): Promise<SessionCreateOutcome> {
   const dir = projectDir();
   let op = dir ? opById(currentOp[dir] ?? "") : undefined;
   if (op && (op.state === "rejected" || op.state === "abandoned")) op = undefined; // fresh key for a corrected attempt
@@ -481,7 +490,7 @@ export async function modernCreateSession(startedAt: number): Promise<SessionCre
   // Re-tap of a LINKED operation: continue in the known session (a separate
   // explicit send interaction may use it — brief §3.3). Never re-POST.
   if (op && op.state === "linked" && op.sessionId) {
-    stampDraftPreparingCreateOp("draft", op.id);
+    stampDraftPreparingCreateOp(draftKey, op.id);
     transferCreateOpRecords(op.id, op.sessionId);
     return { id: op.sessionId, certainty: "definitive", startedAt };
   }
@@ -494,8 +503,8 @@ export async function modernCreateSession(startedAt: number): Promise<SessionCre
     // budget. While a budget run is active it piggybacks on the in-flight
     // lookup (or, between lookups, adds nothing — the running budget
     // answers); when none is running the re-tap STARTS the fresh bounded
-    // budget and awaits that run's first lookup.
-    stampDraftPreparingCreateOp("draft", op.id);
+    //     budget and awaits that run's first lookup.
+    stampDraftPreparingCreateOp(draftKey, op.id);
     let res: ReceiptOutcome | undefined;
     if (op.recoveryActive) {
       const inflight = inflightLookups.get(op.id);
@@ -531,11 +540,11 @@ export async function modernCreateSession(startedAt: number): Promise<SessionCre
     // T1D-F1, mirroring markUnknownAndRecover) so the re-tap's fresh
     // preparing record KEEPS its createOpId — ChatView.ensureSession's
     // legacy-shaped mark (no createOpId argument) follows this return and
-    // its bare Object.assign patch would otherwise overwrite the stamp
-    // with undefined; because this mark runs first, the record is already
-    // uncertain and the legacy mark's preparing-only filter skips it.
+    //     its bare Object.assign patch would otherwise overwrite the stamp
+    //     with undefined; because this mark runs first, the record is already
+    //     uncertain and the legacy mark's preparing-only filter skips it.
     const detail = res && res.kind === "unresolved" ? res.detail : (op.lastDetail ?? "session create outcome unknown");
-    markOwnerSessionCreateUnknown("draft", detail, startedAt, op.id);
+    markOwnerSessionCreateUnknown(draftKey, detail, startedAt, op.id);
     void runLookupBudget(op.id); // no-op while a budget is still running
     return { id: null, certainty: "unknown", detail, startedAt };
   }
@@ -543,7 +552,7 @@ export async function modernCreateSession(startedAt: number): Promise<SessionCre
   // Fresh operation: mint, persist may-have-been-sent BEFORE awaiting fetch,
   // then the one bounded execute POST.
   const fresh = mintCreateOp(dir);
-  stampDraftPreparingCreateOp("draft", fresh.id);
+  stampDraftPreparingCreateOp(draftKey, fresh.id);
   patchOp(fresh.id, { sentAt: Date.now() });
   const url = "/vh/session/create" + (dir ? `?dir=${encodeURIComponent(dir)}` : "");
   const ctrl = new AbortController();
@@ -564,7 +573,7 @@ export async function modernCreateSession(startedAt: number): Promise<SessionCre
     }
     if (ctrl.signal.aborted) {
       // Body stalled past the bound: the POST may have been applied.
-      markUnknownAndRecover(fresh.id, startedPost, "session create response stalled");
+      markUnknownAndRecover(fresh.id, draftKey, startedPost, "session create response stalled");
       return { id: null, certainty: "unknown", detail: "session create response stalled", startedAt };
     }
     if (!wireValid(w)) {
@@ -572,7 +581,7 @@ export async function modernCreateSession(startedAt: number): Promise<SessionCre
       // outcome is UNKNOWN (a mutating response with no valid marker is
       // never permission to act elsewhere).
       const st = (w && typeof (w as any).state === "string") ? ` state=${(w as any).state}` : "";
-      markUnknownAndRecover(fresh.id, startedPost, `session create protocol anomaly (HTTP ${res.status}${st})`);
+      markUnknownAndRecover(fresh.id, draftKey, startedPost, `session create protocol anomaly (HTTP ${res.status}${st})`);
       return { id: null, certainty: "unknown", detail: `session create protocol anomaly (HTTP ${res.status}${st})`, startedAt };
     }
     const wr = w!;
@@ -597,11 +606,11 @@ export async function modernCreateSession(startedAt: number): Promise<SessionCre
       // 409 in_flight: the key is claimed and the server-owned create is
       // still running (our earlier POST, client-abandoned, lives on). Bounded
       // lookup/backoff, retain the key — never a second POST.
-      markUnknownAndRecover(fresh.id, startedPost, "create still in flight (receipt lookup follows)");
+      markUnknownAndRecover(fresh.id, draftKey, startedPost, "create still in flight (receipt lookup follows)");
       return { id: null, certainty: "unknown", detail: "create still in flight (receipt lookup follows)", startedAt };
     }
     if (wr.state === "unknown") {
-      markUnknownAndRecover(fresh.id, startedPost, `create outcome uncertain${wr.error ? `: ${wr.error}` : ""}`);
+      markUnknownAndRecover(fresh.id, draftKey, startedPost, `create outcome uncertain${wr.error ? `: ${wr.error}` : ""}`);
       return { id: null, certainty: "unknown", detail: `create outcome uncertain${wr.error ? `: ${wr.error}` : ""}`, startedAt };
     }
     if (res.status === 404) {
@@ -612,25 +621,28 @@ export async function modernCreateSession(startedAt: number): Promise<SessionCre
       return { id: null, certainty: "definitive", detail: "create route unavailable after capability check", startedAt };
     }
     // Any other envelope shape: unknown, never a license to fall back.
-    markUnknownAndRecover(fresh.id, startedPost, `unexpected create receipt (HTTP ${res.status} state ${String(wr.state)})`);
+    markUnknownAndRecover(fresh.id, draftKey, startedPost, `unexpected create receipt (HTTP ${res.status} state ${String(wr.state)})`);
     return { id: null, certainty: "unknown", detail: `unexpected create receipt (HTTP ${res.status} state ${String(wr.state)})`, startedAt };
   } catch (e) {
     // Network error OR 12s abort — the POST may have been applied. Unknown.
     const aborted = ctrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError");
     const detail = aborted ? "session create timed out" : `session create request failed (${String(e)})`;
-    markUnknownAndRecover(fresh.id, startedPost, detail);
+    markUnknownAndRecover(fresh.id, draftKey, startedPost, detail);
     return { id: null, certainty: "unknown", detail, startedAt };
   } finally {
     clearTimeout(timer);
   }
 }
 
-function markUnknownAndRecover(opId: string, startedAt: number, detail: string): void {
+/** Mark the operation unknown + arm recovery, stamping the uncertain record
+ *  under the create's ENTRY-captured draft key (`draftKey` — the operation's
+ *  own project scope, immune to a mid-flight project switch). */
+function markUnknownAndRecover(opId: string, draftKey: string, startedAt: number, detail: string): void {
   patchOp(opId, { state: "unknown", lastDetail: detail });
   // The create-attempt window [POST-armed, now] feeds the legacy-style timing
   // candidates (the manual fallback retained for modern ambiguity — hidden
   // again the moment an exact receipt resolves this operation).
-  markOwnerSessionCreateUnknown("draft", detail, startedAt, opId);
+  markOwnerSessionCreateUnknown(draftKey, detail, startedAt, opId);
   void runLookupBudget(opId);
 }
 

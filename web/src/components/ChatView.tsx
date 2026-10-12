@@ -1,6 +1,6 @@
 import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
-import { ackSession, createSessionWithCertainty, currentVerb, isSending, openSession, rootOf, sessionWorking, setSelectedId, setSending, state } from "../sync";
-import { markOwnerSessionCreateUnknown } from "../lib/sendActionStatus";
+import { ackSession, createSessionWithCertainty, currentVerb, isSending, openSession, projectDir, rootOf, sessionWorking, setSelectedId, setSending, state } from "../sync";
+import { draftOwnerKey, markOwnerSessionCreateUnknown } from "../lib/sendActionStatus";
 import { setView } from "../ui";
 import {
   bottommostReadWithFallback,
@@ -1915,10 +1915,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // the window (operator-confirmed; never auto-re-keyed).
   async function ensureSession(): Promise<string | null> {
     if (props.draft) {
+      // Capture the draft owner key at ENTRY — the create await below can
+      // run 12s+, and the uncertain mark must land under the project the
+      // operator SENT from, not whichever project is current at resolution.
+      const draftKey = draftOwnerKey(projectDir());
       const r = await createSessionWithCertainty();
       if (r.id) return r.id;
       if (r.certainty === "unknown") {
-        markOwnerSessionCreateUnknown("draft", r.detail || "session create outcome unknown", r.startedAt);
+        markOwnerSessionCreateUnknown(draftKey, r.detail || "session create outcome unknown", r.startedAt);
       }
       return null;
     }

@@ -36,6 +36,7 @@ import {
 } from "../../src/lib/sessionCreateStatus";
 import {
   __resetSendActionStatusForTests,
+  draftOwnerKey,
   finishSendAttempt,
   getSendAction,
   markOwnerSessionCreateRejected,
@@ -46,6 +47,12 @@ import {
   updateSendAction,
 } from "../../src/lib/sendActionStatus";
 import { setProjectDirRaw } from "../../src/sync/store";
+import { createSessionWithCertainty } from "../../src/sync/actions";
+
+// This file models the operator working in ONE project (below); draft
+// records mint/read under that project's SCOPED draft key.
+const CC = "/proj-cc";
+const DRAFT_KEY = draftOwnerKey(CC);
 
 // ── fetch stub ──────────────────────────────────────────────────────────────
 
@@ -119,7 +126,7 @@ function modernRouter(opts: { post?: () => StubResp; receipt?: () => StubResp } 
 beforeEach(() => {
   __resetSessionCreateForTests();
   __resetSendActionStatusForTests();
-  setProjectDirRaw("/proj-cc");
+  setProjectDirRaw(CC);
 });
 
 afterEach(() => {
@@ -214,7 +221,7 @@ describe("detectCreateSupport — the uncertainty ladder", () => {
 describe("modernCreateSession — identity, dir capture, wire shape", () => {
   it("fresh created: POSTs the minted key with ?dir=, returns the id, links the op", async () => {
     const f = stubFetch(modernRouter());
-    const out = await modernCreateSession(1000);
+    const out = await modernCreateSession(1000, DRAFT_KEY);
     expect(out).toMatchObject({ id: "ses_m1", certainty: "definitive" });
     expect(f.posts()).toHaveLength(1);
     expect(f.posts()[0].url).toBe(`${POST_URL}?dir=${encodeURIComponent("/proj-cc")}`);
@@ -229,8 +236,8 @@ describe("modernCreateSession — identity, dir capture, wire shape", () => {
         post: () => receipt("rejected", { error: "validation" }),
       }),
     );
-    await modernCreateSession(1000); // rejected → pointer cleared
-    await modernCreateSession(1001); // fresh op, new key
+    await modernCreateSession(1000, DRAFT_KEY); // rejected → pointer cleared
+    await modernCreateSession(1001, DRAFT_KEY); // fresh op, new key
     const [k1, k2] = f.postKeys();
     expect(k1).not.toBe(k2);
     expect(k1.length).toBeGreaterThanOrEqual(32); // randomUUID-class entropy
@@ -243,7 +250,7 @@ describe("modernCreateSession — identity, dir capture, wire shape", () => {
         receipt: () => receipt("unknown"),
       }),
     );
-    const out = await modernCreateSession(1000);
+    const out = await modernCreateSession(1000, DRAFT_KEY);
     expect(out.certainty).toBe("unknown");
     setProjectDirRaw("/proj-OTHER");
     await vi.waitFor(() => expect(f.gets().length).toBeGreaterThanOrEqual(1));
@@ -252,11 +259,45 @@ describe("modernCreateSession — identity, dir capture, wire shape", () => {
   });
 });
 
+describe("createSessionWithCertainty — the tap-time draft key survives the capability await (review F1)", () => {
+  it("a project switch mid-capability-await still stamps the TAP-time project's preparing record", async () => {
+    // Production shape (review F1 regression): the send tap in /proj-cc
+    // minted the attempt under /proj-cc's scoped draft key (createSend's
+    // tapOwnerKey). The capability probe is PARKED; the operator switches
+    // projects while it is pending; support then answers "modern" and the
+    // create POST returns a 2xx the client cannot validate (protocol
+    // anomaly ⇒ unknown). The preparing record must still receive its
+    // createOpId + uncertain mark under the TAP-TIME key — reachable by
+    // op-scoped recovery, never stranded — and nothing may leak into the
+    // post-switch project's draft view.
+    const rec = mintSendAttempt(DRAFT_KEY);
+    let releaseCap!: (r: RouteResult) => void;
+    const capGate = new Promise<RouteResult>((res) => (releaseCap = res));
+    stubFetch((url, init) => {
+      if (url === CAP_URL) return capGate;
+      if (url.startsWith(POST_URL) && (init?.method ?? "GET") === "POST")
+        return { status: 200, body: {} }; // invalid wire → protocol anomaly → UNKNOWN
+      if (url.startsWith(RECEIPT_URL)) return receipt("unknown");
+      return { status: 404, body: {} };
+    });
+    const p = createSessionWithCertainty();
+    setProjectDirRaw("/proj-other"); // the mid-await switch
+    releaseCap(CAP_MODERN);
+    const out = await p;
+    expect(out.certainty).toBe("unknown");
+    const stamped = getSendAction(rec.attemptId)!;
+    expect(stamped.ownerKey).toBe(DRAFT_KEY); // still the tap-time project's record
+    expect(stamped.createOpId).toBeTruthy(); // stamped, so recovery/transfer can reach it
+    expect(stamped.stage).toBe("uncertain"); // marked through markUnknownAndRecover
+    expect(sendActionsFor(draftOwnerKey("/proj-other"))).toHaveLength(0); // no leak into B
+  });
+});
+
 describe("modernCreateSession — the failure envelope", () => {
   it("202 unknown ⇒ outcome unknown; the record carries the op id + attempt window", async () => {
     stubFetch(modernRouter({ post: () => receipt("unknown"), receipt: () => receipt("unknown") }));
-    const a = mintSendAttempt("draft");
-    const out = await modernCreateSession(Date.now());
+    const a = mintSendAttempt(DRAFT_KEY);
+    const out = await modernCreateSession(Date.now(), DRAFT_KEY);
     expect(out).toMatchObject({ id: null, certainty: "unknown" });
     const rec = getSendAction(a.attemptId)!;
     expect(rec.stage).toBe("uncertain");
@@ -267,10 +308,10 @@ describe("modernCreateSession — the failure envelope", () => {
 
   it("NEVER re-POSTs after an ambiguous outcome: the re-tap is lookup-only", async () => {
     const f = stubFetch(modernRouter({ post: () => receipt("unknown"), receipt: () => receipt("unknown") }));
-    await modernCreateSession(1000);
+    await modernCreateSession(1000, DRAFT_KEY);
     expect(f.posts()).toHaveLength(1);
     vi.useFakeTimers();
-    const second = modernCreateSession(2000);
+    const second = modernCreateSession(2000, DRAFT_KEY);
     await vi.advanceTimersByTimeAsync(0);
     const out = await second;
     expect(out.certainty).toBe("unknown");
@@ -280,11 +321,11 @@ describe("modernCreateSession — the failure envelope", () => {
 
   it("409 in_flight ⇒ unknown + lookup-only (never a second POST)", async () => {
     const f = stubFetch(modernRouter({ post: () => receipt("in_flight", { code: "in_flight" }), receipt: () => receipt("in_flight", { code: "in_flight" }) }));
-    const out = await modernCreateSession(1000);
+    const out = await modernCreateSession(1000, DRAFT_KEY);
     expect(out.certainty).toBe("unknown");
     vi.useFakeTimers();
     await vi.advanceTimersByTimeAsync(0);
-    const out2 = await modernCreateSession(2000);
+    const out2 = await modernCreateSession(2000, DRAFT_KEY);
     expect(out2.certainty).toBe("unknown");
     expect(f.posts()).toHaveLength(1);
   });
@@ -296,18 +337,18 @@ describe("modernCreateSession — the failure envelope", () => {
         post: () => (++n === 1 ? receipt("rejected", { error: "unsupported create parameter" }) : receipt("created", { sessionID: "ses_m2" })),
       }),
     );
-    const out = await modernCreateSession(1000);
+    const out = await modernCreateSession(1000, DRAFT_KEY);
     expect(out).toMatchObject({ id: null, certainty: "definitive" });
     expect(f.posts()).toHaveLength(1);
     // Corrected attempt: a NEW key, and it really executes (created).
-    const out2 = await modernCreateSession(2000);
+    const out2 = await modernCreateSession(2000, DRAFT_KEY);
     expect(out2.id).toBe("ses_m2");
     expect(f.postKeys()[0]).not.toBe(f.postKeys()[1]);
   });
 
   it("identity conflict (409 idempotency_conflict) ⇒ definitive, no execution", async () => {
     stubFetch(modernRouter({ post: () => receipt("rejected", { code: "idempotency_conflict" }) }));
-    const out = await modernCreateSession(1000);
+    const out = await modernCreateSession(1000, DRAFT_KEY);
     expect(out).toMatchObject({ id: null, certainty: "definitive" });
     expect(out.detail).toContain("different create payload");
   });
@@ -318,7 +359,7 @@ describe("modernCreateSession — the failure envelope", () => {
       if (url.startsWith(POST_URL) && init?.method === "POST") return { throw: true };
       return receipt("unknown");
     });
-    const out = await modernCreateSession(1000);
+    const out = await modernCreateSession(1000, DRAFT_KEY);
     expect(out).toMatchObject({ id: null, certainty: "unknown" });
   });
 
@@ -329,7 +370,7 @@ describe("modernCreateSession — the failure envelope", () => {
         receipt: () => receipt("unknown"),
       }),
     );
-    const out = await modernCreateSession(1000);
+    const out = await modernCreateSession(1000, DRAFT_KEY);
     expect(out.certainty).toBe("unknown");
   });
 
@@ -340,7 +381,7 @@ describe("modernCreateSession — the failure envelope", () => {
         receipt: () => receipt("unknown"),
       }),
     );
-    const out = await modernCreateSession(1000);
+    const out = await modernCreateSession(1000, DRAFT_KEY);
     expect(out.certainty).toBe("unknown");
     expect(out.id).toBeNull();
   });
@@ -352,7 +393,7 @@ describe("runLookupBudget — ≤3 lookups, 3s bounds, 12s window, never a creat
   it("runs exactly 3 lookups on the 0/4/8s schedule then STOPS (no infinite polling)", async () => {
     const f = stubFetch(modernRouter({ post: () => receipt("unknown"), receipt: () => receipt("unknown") }));
     vi.useFakeTimers();
-    const p = modernCreateSession(1000);
+    const p = modernCreateSession(1000, DRAFT_KEY);
     await vi.advanceTimersByTimeAsync(0);
     await p;
     await vi.advanceTimersByTimeAsync(0); // immediate first lookup
@@ -390,7 +431,7 @@ describe("runLookupBudget — ≤3 lookups, 3s bounds, 12s window, never a creat
       return { status: 404, body: {} };
     });
     vi.useFakeTimers();
-    const p = modernCreateSession(1000);
+    const p = modernCreateSession(1000, DRAFT_KEY);
     await vi.advanceTimersByTimeAsync(0);
     await p;
     await vi.advanceTimersByTimeAsync(0);
@@ -421,9 +462,9 @@ describe("runLookupBudget — ≤3 lookups, 3s bounds, 12s window, never a creat
         receipt: () => (++n < 2 ? receipt("unknown") : receipt("created", { sessionID: "ses_exact", replayed: true })),
       }),
     );
-    const a = mintSendAttempt("draft");
+    const a = mintSendAttempt(DRAFT_KEY);
     vi.useFakeTimers();
-    const p = modernCreateSession(1000);
+    const p = modernCreateSession(1000, DRAFT_KEY);
     await vi.advanceTimersByTimeAsync(0);
     await p;
     await vi.advanceTimersByTimeAsync(0);
@@ -444,9 +485,9 @@ describe("runLookupBudget — ≤3 lookups, 3s bounds, 12s window, never a creat
 
   it("exhaustion then explicit Check again ⇒ a FRESH bounded budget, still never a create", async () => {
     const f = stubFetch(modernRouter({ post: () => receipt("unknown"), receipt: () => receipt("unknown") }));
-    const a = mintSendAttempt("draft"); // the tap's record (stamped by the flow)
+    const a = mintSendAttempt(DRAFT_KEY); // the tap's record (stamped by the flow)
     vi.useFakeTimers();
-    const p = modernCreateSession(1000);
+    const p = modernCreateSession(1000, DRAFT_KEY);
     await vi.advanceTimersByTimeAsync(0);
     await p;
     await vi.advanceTimersByTimeAsync(0);
@@ -466,9 +507,9 @@ describe("runLookupBudget — ≤3 lookups, 3s bounds, 12s window, never a creat
 
   it("a receipt MISS (404 unavailable) stays honestly unresolved — never re-create", async () => {
     const f = stubFetch(modernRouter({ post: () => receipt("unknown"), receipt: () => receipt("unavailable") }));
-    const a = mintSendAttempt("draft");
+    const a = mintSendAttempt(DRAFT_KEY);
     vi.useFakeTimers();
-    const p = modernCreateSession(1000);
+    const p = modernCreateSession(1000, DRAFT_KEY);
     await vi.advanceTimersByTimeAsync(0);
     await p;
     await vi.advanceTimersByTimeAsync(0);
@@ -500,7 +541,7 @@ describe("runLookupBudget — ≤3 lookups, 3s bounds, 12s window, never a creat
     });
     vi.useFakeTimers();
     // Tap 1: POST unknown → the budget's first lookup goes out and PENDS.
-    const p1 = modernCreateSession(1000);
+    const p1 = modernCreateSession(1000, DRAFT_KEY);
     await vi.advanceTimersByTimeAsync(0);
     await p1;
     await vi.advanceTimersByTimeAsync(0);
@@ -510,10 +551,10 @@ describe("runLookupBudget — ≤3 lookups, 3s bounds, 12s window, never a creat
     // TWO operator re-taps INTO the pending window. Before the fix each
     // issued its own direct GET (concurrent with the budget's — unbounded
     // extra GETs per re-tap); now both must piggyback on the pending one.
-    const t2 = mintSendAttempt("draft");
-    const p2 = modernCreateSession(2000);
-    const t3 = mintSendAttempt("draft");
-    const p3 = modernCreateSession(3000);
+    const t2 = mintSendAttempt(DRAFT_KEY);
+    const p2 = modernCreateSession(2000, DRAFT_KEY);
+    const t3 = mintSendAttempt(DRAFT_KEY);
+    const p3 = modernCreateSession(3000, DRAFT_KEY);
     await vi.advanceTimersByTimeAsync(0);
     expect(f.gets()).toHaveLength(1); // ZERO additional GETs from the re-taps
 
@@ -552,7 +593,7 @@ describe("runLookupBudget — ≤3 lookups, 3s bounds, 12s window, never a creat
 describe("certainty upgrade — scoped transfer + lifecycle", () => {
   it("transfer is OPERATION-scoped: the op's records move, unrelated drafts untouched, finished not resurrected", async () => {
     // Tap 1 of the REAL operation: its record is stamped + marked by the flow.
-    const a1 = mintSendAttempt("draft");
+    const a1 = mintSendAttempt(DRAFT_KEY);
     let lookups = 0;
     stubFetch(
       modernRouter({
@@ -561,7 +602,7 @@ describe("certainty upgrade — scoped transfer + lifecycle", () => {
       }),
     );
     vi.useFakeTimers();
-    const p1 = modernCreateSession(1000);
+    const p1 = modernCreateSession(1000, DRAFT_KEY);
     await vi.advanceTimersByTimeAsync(0);
     await p1;
     await vi.advanceTimersByTimeAsync(0); // budget lookup #1: still unknown
@@ -569,16 +610,16 @@ describe("certainty upgrade — scoped transfer + lifecycle", () => {
     expect(opId).toBeTruthy();
 
     // An earlier tap of the SAME operation went unknown too (same op id)…
-    const a1b = mintSendAttempt("draft");
-    markOwnerSessionCreateUnknown("draft", "op1 first tap unknown", 100, opId);
+    const a1b = mintSendAttempt(DRAFT_KEY);
+    markOwnerSessionCreateUnknown(DRAFT_KEY, "op1 first tap unknown", 100, opId);
     // …then got finished (admitted elsewhere) — removed from the store.
     finishSendAttempt(a1b.attemptId);
     // An UNRELATED draft record (no createOpId — another draft's leftover).
-    const other = mintSendAttempt("draft");
+    const other = mintSendAttempt(DRAFT_KEY);
     updateSendAction(other.attemptId, { stage: "uncertain", recovery: "check" });
     // Another operation's uncertain record.
-    const a2 = mintSendAttempt("draft");
-    markOwnerSessionCreateUnknown("draft", "op2 unknown", 111, "create-op-OTHER");
+    const a2 = mintSendAttempt(DRAFT_KEY);
+    markOwnerSessionCreateUnknown(DRAFT_KEY, "op2 unknown", 111, "create-op-OTHER");
 
     // Budget lookup #2 resolves the REAL operation.
     await vi.advanceTimersByTimeAsync(RECOVERY_BACKOFF_MS);
@@ -587,16 +628,16 @@ describe("certainty upgrade — scoped transfer + lifecycle", () => {
     expect(getSendAction(a1.attemptId)!.ownerKey).toBe("ses_scope");
     expect(getSendAction(a1.attemptId)!.stage).toBe("rejected"); // resolved presentation
     expect(getSendAction(a1b.attemptId)).toBeUndefined(); // finished stays finished
-    expect(getSendAction(other.attemptId)!.ownerKey).toBe("draft"); // unrelated untouched
-    expect(getSendAction(a2.attemptId)!.ownerKey).toBe("draft"); // other op untouched
+    expect(getSendAction(other.attemptId)!.ownerKey).toBe(DRAFT_KEY); // unrelated untouched
+    expect(getSendAction(a2.attemptId)!.ownerKey).toBe(DRAFT_KEY); // other op untouched
   });
 
   it("a re-tap of a LINKED operation returns the same id with ZERO new POSTs and carries the new record", async () => {
     const f = stubFetch(modernRouter());
-    await modernCreateSession(1000); // created ses_m1
+    await modernCreateSession(1000, DRAFT_KEY); // created ses_m1
     expect(f.posts()).toHaveLength(1);
-    const tap2 = mintSendAttempt("draft");
-    const out = await modernCreateSession(2000);
+    const tap2 = mintSendAttempt(DRAFT_KEY);
+    const out = await modernCreateSession(2000, DRAFT_KEY);
     expect(out).toMatchObject({ id: "ses_m1", certainty: "definitive" });
     expect(f.posts()).toHaveLength(1); // linked reuse never re-POSTs
     expect(getSendAction(tap2.attemptId)!.createOpId).toBeTruthy();
@@ -612,9 +653,9 @@ describe("certainty upgrade — scoped transfer + lifecycle", () => {
       }),
     );
     // Tap 1: unknown; the budget's lookup #1 answered still-unknown.
-    const a1 = mintSendAttempt("draft");
+    const a1 = mintSendAttempt(DRAFT_KEY);
     vi.useFakeTimers();
-    const p1 = modernCreateSession(1000);
+    const p1 = modernCreateSession(1000, DRAFT_KEY);
     await vi.advanceTimersByTimeAsync(0);
     await p1;
     await vi.advanceTimersByTimeAsync(0);
@@ -626,8 +667,8 @@ describe("certainty upgrade — scoped transfer + lifecycle", () => {
     // (recoveryActive, no in-flight lookup), so the re-tap returns honestly
     // unknown with ZERO extra GETs — and must mark its fresh record through
     // the module-level mark WITH the op id.
-    const a2 = mintSendAttempt("draft");
-    const p2 = modernCreateSession(2000);
+    const a2 = mintSendAttempt(DRAFT_KEY);
+    const p2 = modernCreateSession(2000, DRAFT_KEY);
     await vi.advanceTimersByTimeAsync(0);
     const out2 = await p2;
     expect(out2.certainty).toBe("unknown");
@@ -635,7 +676,7 @@ describe("certainty upgrade — scoped transfer + lifecycle", () => {
     // ChatView.ensureSession's legacy-shaped mark (NO createOpId argument)
     // — the exact call whose bare Object.assign patch used to overwrite the
     // stamped op id with undefined, stranding the record legacy.
-    markOwnerSessionCreateUnknown("draft", out2.detail || "session create outcome unknown", out2.startedAt);
+    markOwnerSessionCreateUnknown(DRAFT_KEY, out2.detail || "session create outcome unknown", out2.startedAt);
     // THE STAMP SURVIVED: the module-level mark (with opId) ran before the
     // return, so the record was already uncertain and the legacy mark's
     // preparing-only filter skipped it.
@@ -662,9 +703,9 @@ describe("certainty upgrade — scoped transfer + lifecycle", () => {
 
   it("abandon (duplicate-risk acknowledged in the UI) ⇒ next send mints a fresh key", async () => {
     const f = stubFetch(modernRouter({ post: () => receipt("unknown"), receipt: () => receipt("unknown") }));
-    const a = mintSendAttempt("draft"); // the tap's record (stamped by the flow)
+    const a = mintSendAttempt(DRAFT_KEY); // the tap's record (stamped by the flow)
     vi.useFakeTimers();
-    const p = modernCreateSession(1000);
+    const p = modernCreateSession(1000, DRAFT_KEY);
     await vi.advanceTimersByTimeAsync(0);
     await p;
     await vi.advanceTimersByTimeAsync(0);
@@ -678,7 +719,7 @@ describe("certainty upgrade — scoped transfer + lifecycle", () => {
     // answer (the abandon is what UNBLOCKS a fresh POST — that is the crux).
     const key1 = f.postKeys()[0];
     const f2 = stubFetch(modernRouter());
-    const out = await modernCreateSession(3000);
+    const out = await modernCreateSession(3000, DRAFT_KEY);
     expect(out.id).toBe("ses_m1");
     expect(f2.postKeys()).toHaveLength(1);
     expect(f2.postKeys()[0]).not.toBe(key1);
@@ -710,8 +751,8 @@ describe("certainty upgrade — scoped transfer + lifecycle", () => {
     });
     vi.useFakeTimers();
     // Tap 1: POST unknown → the budget's first lookup goes out and PARKS.
-    const a1 = mintSendAttempt("draft");
-    const p1 = modernCreateSession(1000);
+    const a1 = mintSendAttempt(DRAFT_KEY);
+    const p1 = modernCreateSession(1000, DRAFT_KEY);
     await vi.advanceTimersByTimeAsync(0);
     await p1;
     await vi.advanceTimersByTimeAsync(0);
@@ -721,8 +762,8 @@ describe("certainty upgrade — scoped transfer + lifecycle", () => {
     expect(opId).toBeTruthy();
 
     // The re-tap piggybacks on the parked shared lookup (zero new GETs).
-    const a2 = mintSendAttempt("draft");
-    const p2 = modernCreateSession(2000);
+    const a2 = mintSendAttempt(DRAFT_KEY);
+    const p2 = modernCreateSession(2000, DRAFT_KEY);
     await vi.advanceTimersByTimeAsync(0);
     expect(f.gets()).toHaveLength(1);
 
@@ -770,7 +811,7 @@ describe("certainty upgrade — scoped transfer + lifecycle", () => {
     // The subsequent send: a FRESH key with its OWN POST (the abandon — not
     // the later resolution — is what unblocked it).
     const key1 = f.postKeys()[0];
-    const out3 = await modernCreateSession(3000);
+    const out3 = await modernCreateSession(3000, DRAFT_KEY);
     expect(out3).toMatchObject({ id: "ses_fresh", certainty: "definitive" });
     expect(f.posts()).toHaveLength(2);
     expect(f.postKeys()[1]).not.toBe(key1);
@@ -778,12 +819,12 @@ describe("certainty upgrade — scoped transfer + lifecycle", () => {
 
   it("beginDraftGeneration (newSession) retires the current operation pointer", async () => {
     stubFetch(modernRouter({ post: () => receipt("unknown"), receipt: () => receipt("unknown") }));
-    await modernCreateSession(1000);
+    await modernCreateSession(1000, DRAFT_KEY);
     expect(draftResolvedCreateOp()).toBeUndefined(); // not linked — unknown
     beginDraftGeneration("/proj-cc");
     // The old op is no longer current: the next create mints fresh.
     const f2 = stubFetch(modernRouter());
-    const out = await modernCreateSession(2000);
+    const out = await modernCreateSession(2000, DRAFT_KEY);
     expect(out.id).toBe("ses_m1");
     expect(f2.postKeys()).toHaveLength(1);
   });
@@ -793,18 +834,18 @@ describe("certainty upgrade — scoped transfer + lifecycle", () => {
 
 describe("sendActionStatus create-op helpers", () => {
   it("stampDraftPreparingCreateOp stamps only unstamped preparing records of the owner", () => {
-    const a = mintSendAttempt("draft");
+    const a = mintSendAttempt(DRAFT_KEY);
     const live = mintSendAttempt("ses-live");
-    stampDraftPreparingCreateOp("draft", "op-1");
+    stampDraftPreparingCreateOp(DRAFT_KEY, "op-1");
     expect(getSendAction(a.attemptId)!.createOpId).toBe("op-1");
     expect(getSendAction(live.attemptId)!.createOpId).toBeUndefined(); // different owner
-    stampDraftPreparingCreateOp("draft", "op-2");
+    stampDraftPreparingCreateOp(DRAFT_KEY, "op-2");
     expect(getSendAction(a.attemptId)!.createOpId).toBe("op-1"); // not restamped
   });
 
   it("markOwnerSessionCreateRejected pre-marks preparing records terminally (capability-unavailable)", () => {
-    const a = mintSendAttempt("draft");
-    markOwnerSessionCreateRejected("draft", "capability check unavailable", "capability-unavailable");
+    const a = mintSendAttempt(DRAFT_KEY);
+    markOwnerSessionCreateRejected(DRAFT_KEY, "capability check unavailable", "capability-unavailable");
     const rec = getSendAction(a.attemptId)!;
     expect(rec.stage).toBe("rejected");
     expect(rec.certainty).toBe("definitive");
