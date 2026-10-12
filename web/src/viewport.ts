@@ -23,14 +23,72 @@
 // band (~20-25% of screen) filled the gap below the composer, full-width. It
 // is now retired because the host owns the resize and this own-vv-only path
 // tracks the (correctly shrunk) iframe element directly.
+//
+// DRIFT FIX ("the input field keeps overflowing after a while"). --app-h used
+// to be purely EDGE-triggered from resize events and taken verbatim from
+// visualViewport.height. Any missed/stale sample latched a too-tall --app-h
+// with nothing to correct it until the next resize: .app (overflow:hidden
+// inside an overflow:hidden html) then extends past the iframe's bottom and
+// the composer is clipped below the screen. The windows where that happens in
+// the host shell: inactive workspaces / hidden dockview tabs are
+// visibility:hidden (render-throttled iframes whose resize events are deferred
+// or coalesced while the host root is shrunk/restored for the keyboard), app
+// backgrounding/resume, and vv values that lag one frame behind the final
+// layout on keyboard close. The model is now LEVEL-triggered + clamped:
+//   - computeAppHeight() clamps to window.innerHeight (the frame's own LAYOUT
+//     viewport = the iframe element's height when embedded). .app can never be
+//     taller than the box it lives in; a stale-large vv sample cannot overflow.
+//     (vv.height is still the value used whenever it is smaller — that is the
+//     keyboard shrink on standalone iOS, where innerHeight does not shrink.)
+//   - A 0/negative sample (collapsed/hidden frame) is ignored, keeping the last
+//     good value instead of collapsing .app.
+//   - Re-sync on every "the world may have changed" signal, not just resize:
+//     a ResizeObserver on <html> (height:100% → tracks the frame's viewport
+//     box even if a window resize event was lost), visibilitychange, pageshow
+//     (bfcache), window focus, and the host's pane-visibility signal; each
+//     event also re-samples on the next animation frame to catch lagging vv.
+//   - Writes only when the value changes (no redundant style invalidation).
+export function computeAppHeight(win: Window = window): number | null {
+  const layoutH = win.innerHeight;
+  const vvH = win.visualViewport?.height;
+  let h = vvH && vvH > 0 ? vvH : layoutH;
+  if (layoutH > 0 && h > layoutH) h = layoutH;
+  if (!(h > 0)) return null;
+  return Math.round(h);
+}
+
+let resync: (() => void) | null = null;
+
+/** Force an immediate --app-h re-sample (no-op before installViewport). Wired
+ *  to host pane-visibility transitions in index.tsx. */
+export function resyncViewport(): void {
+  resync?.();
+}
+
 export function installViewport() {
   const root = document.documentElement;
-  const apply = () => {
-    const vv = window.visualViewport;
-    const h = vv ? vv.height : window.innerHeight;
-    root.style.setProperty("--app-h", `${Math.round(h)}px`);
+  let last = "";
+  const applyNow = () => {
+    const h = computeAppHeight(window);
+    if (h === null) return;
+    const v = `${h}px`;
+    if (v === last && root.style.getPropertyValue("--app-h") === v) return;
+    last = v;
+    root.style.setProperty("--app-h", v);
   };
-  apply();
+  let raf = 0;
+  const apply = () => {
+    applyNow();
+    // Re-sample once more after the frame settles: vv/innerHeight can lag the
+    // final layout by a frame (keyboard close, resume, iframe resize).
+    if (raf || typeof requestAnimationFrame === "undefined") return;
+    raf = requestAnimationFrame(() => {
+      raf = 0;
+      applyNow();
+    });
+  };
+  resync = apply;
+  applyNow();
   const vv = window.visualViewport;
   if (vv) {
     vv.addEventListener("resize", apply);
@@ -38,6 +96,12 @@ export function installViewport() {
   }
   window.addEventListener("resize", apply);
   window.addEventListener("orientationchange", apply);
+  window.addEventListener("pageshow", apply);
+  window.addEventListener("focus", apply);
+  document.addEventListener("visibilitychange", apply);
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(apply).observe(root);
+  }
 
   // Pinch-zoom is fully disabled. The locked viewport meta in prefs.ts
   // setViewportScale (user-scalable=no, minimum-scale = maximum-scale = the

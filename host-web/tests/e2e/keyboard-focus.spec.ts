@@ -241,6 +241,77 @@ test.describe("host keyboard focus-mode", () => {
     await H.assertSurvived(page, target, before, "real-path detected open→close");
   });
 
+  // ---- 3b. LEVEL RE-SYNC (drift fix: a lost close edge must not latch) -------
+  //
+  // On-device report: "the input field keeps overflowing after a while". A
+  // keyboard-close whose visualViewport event was lost (backgrounding/resume)
+  // left focus-mode latched open. Detection now also re-runs on window
+  // resize/pageshow/focus and force-closes when the document is hidden.
+  //
+  // Both tests below are WIRING proofs (the production listeners fire → the
+  // debounced detection re-runs / force-closes), so they are chromium-only for
+  // the same reason as test 5: under Playwright, firefox does not emulate
+  // navigator.maxTouchPoints for hasTouch (verified: chromium=1, firefox=0),
+  // so isTouchCapable() never passes and installKeyboardFocus wires NO
+  // production listeners headlessly — the DEV bridge (which the firefox-runnable
+  // tests use) bypasses the gate and cannot fire them. The listeners themselves
+  // are engine-agnostic addEventListener calls proven here on chromium; on a
+  // real firefox-android device maxTouchPoints is 1 and the gate passes.
+
+  test("lost vv close edge: pageshow/focus re-sync closes a latched focus-mode", async ({ page, browserName }) => {
+    test.skip(browserName !== "chromium", "listener wiring is chromium-only (firefox: maxTouchPoints not emulated → touch gate wires no listeners; see section header)");
+    await page.evaluate(() => {
+      const real = window.visualViewport!;
+      let mockH = real.height;
+      Object.defineProperty(real, "height", { configurable: true, get: () => mockH });
+      (window as unknown as { __setMockVvHSilent?: (h: number) => void }).__setMockVvHSilent = (
+        h: number,
+      ) => {
+        mockH = h; // NO event: simulates the lost edge
+      };
+    });
+    await page.evaluate((h) => {
+      (window as unknown as { __setMockVvHSilent: (h: number) => void }).__setMockVvHSilent(h);
+    }, KEYBOARD_VISIBLE_H);
+    await H.kbdFocusFlushDetection(page);
+    await expect.poll(async () => (await H.kbdFocusState(page)).open).toBe(true);
+
+    // Keyboard closes but the vv event is lost.
+    await page.evaluate((h) => {
+      (window as unknown as { __setMockVvHSilent: (h: number) => void }).__setMockVvHSilent(h);
+    }, VIEWPORT.height);
+    await page.waitForTimeout(400);
+    expect((await H.kbdFocusState(page)).open, "still latched without a re-sync signal").toBe(true);
+
+    // Resume-style signal → the debounced detection re-runs and closes.
+    await page.evaluate(() => window.dispatchEvent(new Event("pageshow")));
+    await expect
+      .poll(async () => (await H.kbdFocusState(page)).open, { timeout: 8000 })
+      .toBe(false);
+    await expect.poll(async () => H.isMaximized(page), { timeout: 8000 }).toBe(false);
+    await expect
+      .poll(async () => H.appRootHeight(page), { timeout: 8000 })
+      .toBeGreaterThanOrEqual(VIEWPORT.height - 5);
+  });
+
+  test("document hidden while keyboard-open force-closes focus-mode", async ({ page, browserName }) => {
+    test.skip(browserName !== "chromium", "listener wiring is chromium-only (firefox: maxTouchPoints not emulated → touch gate wires no listeners; see section header)");
+    await H.kbdFocusOpen(page, KEYBOARD_VISIBLE_H);
+    await expect.poll(async () => (await H.kbdFocusState(page)).open).toBe(true);
+    await page.evaluate(() => {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "hidden",
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect((await H.kbdFocusState(page)).open).toBe(false);
+    await expect.poll(async () => H.isMaximized(page), { timeout: 8000 }).toBe(false);
+    await expect
+      .poll(async () => H.appRootHeight(page), { timeout: 8000 })
+      .toBeGreaterThanOrEqual(VIEWPORT.height - 5);
+  });
+
   // ---- 4. OFFSET COMPENSATION (root pinned to visible rect, continuous) ------
   //
   // The bug (operator on-device, Fold + soft keyboard): the host root had the

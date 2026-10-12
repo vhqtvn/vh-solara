@@ -89,6 +89,13 @@ describe("installViewport — own-vv-only (host owns keyboard behavior)", () => 
   beforeEach(() => {
     // Reset the root styles so --app-h does not leak from a prior test.
     document.documentElement.style.cssText = "";
+    // Pin the layout viewport to the same 800px baseline as the vv mock: the
+    // drift-fix clamp (viewport.ts) bounds --app-h at min(own vv, innerHeight)
+    // and jsdom's default innerHeight is 768, which would clamp this file's
+    // 800px baseline and mask the own-vv-only contract under test. With both
+    // at 800 the clamp never engages here (all vv values in this file are
+    // ≤ 800); the clamp itself is pinned in viewportAppHeight.test.ts.
+    Object.defineProperty(window, "innerHeight", { configurable: true, get: () => 800 });
     ownVV = makeVV(800);
     parentVV = makeVV(800);
     // Install the iframe's OWN visualViewport (jsdom lacks it).

@@ -359,6 +359,24 @@ export function installKeyboardFocus(appEl: () => HTMLElement | null): void {
   vvListener = onVvEvent;
   window.visualViewport.addEventListener("resize", vvListener);
   window.visualViewport.addEventListener("scroll", vvListener);
+  // LEVEL re-sync (drift fix). Open/close used to be decided ONLY from vv
+  // events; a missed close edge (app backgrounded with the keyboard up, vv
+  // event lost on resume, window resized without a vv event) latched the
+  // shrunk/translated root + the owned maximize. Re-run detection on every
+  // "world may have changed" signal, and force-close on hide: a soft keyboard
+  // cannot stay open while the document is hidden.
+  window.addEventListener("resize", vvListener);
+  window.addEventListener("pageshow", vvListener);
+  window.addEventListener("focus", vvListener);
+  document.addEventListener("visibilitychange", onVisibilityChange);
+}
+
+function onVisibilityChange(): void {
+  if (document.visibilityState === "hidden") {
+    if (keyboardOpen) applyClose();
+    return;
+  }
+  onVvEvent();
 }
 
 /** Tear down the listener + DEV bridge and restore any open keyboard state.
@@ -369,6 +387,12 @@ export function uninstallKeyboardFocus(): void {
   if (vvListener && window.visualViewport) {
     window.visualViewport.removeEventListener("resize", vvListener);
     window.visualViewport.removeEventListener("scroll", vvListener);
+  }
+  if (vvListener) {
+    window.removeEventListener("resize", vvListener);
+    window.removeEventListener("pageshow", vvListener);
+    window.removeEventListener("focus", vvListener);
+    document.removeEventListener("visibilitychange", onVisibilityChange);
   }
   vvListener = null;
   getAppEl = null;

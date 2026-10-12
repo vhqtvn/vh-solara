@@ -23,14 +23,14 @@ import { registerServiceWorker, startVersionCheck } from "./pwa";
 import { initProtocolHandler } from "./protocol";
 import { initPwaInstall } from "./pwa-install";
 import { installCsrf } from "./csrf";
-import { installViewport } from "./viewport";
+import { installViewport, resyncViewport } from "./viewport";
 import { installScrollEdges } from "./lib/scrollEdges";
 import { startPresence } from "./alerts";
 import { startHeartbeat } from "./heartbeat";
 import { startStatusEmitter } from "./statusEmitter";
 import { startSelectListener } from "./selectListener";
 import { startTailListener } from "./tailListener";
-import { startPaneVisibility, installPaneAnimationGate } from "./paneVisibility";
+import { startPaneVisibility, installPaneAnimationGate, onPaneVisibilityChange } from "./paneVisibility";
 import { startHostGesture } from "./hostGesture";
 import { refreshProjectSettings } from "./projectSettings";
 import "./styles/main.css";
@@ -135,6 +135,11 @@ if (standalone === "code") {
   // host posts {type:"vh-host-visibility",visible}; standalone it tracks only
   // document.visibilityState. See web/src/paneVisibility.ts.
   startPaneVisibility();
+  // Re-sample --app-h when the pane is revealed (host tab switch / un-hide):
+  // a size change while host-hidden may not have been observed. See viewport.ts.
+  onPaneVisibilityChange((visible) => {
+    if (visible) resyncViewport();
+  });
   // Animation gate driven by the same signal: toggles .pane-hidden on <html>
   // so ALL CSS animations pause while the operator can't see this pane (a
   // hidden iframe's animations otherwise keep the refresh driver ticking).
