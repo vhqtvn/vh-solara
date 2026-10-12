@@ -720,6 +720,15 @@ is **no pytest** anywhere in this repo.
    config runs `scripts/fixture-web.sh` which builds the SPA and starts
    `go run ./tools/fixtureserver`, so go must be on PATH.
    Runner: `npm --prefix web run test:e2e`.
+   *Dispatch-only queue-delivery variant* (`web/tests/e2e/queue-delivery-custody.spec.ts`):
+   proves daemon-custody queue delivery (`VH_FIXTURE_DAEMON_DISPATCH=1`) with
+   frozen nonterminal browser queue reads, live SSE chip clearance, and
+   watcher attribution. Excluded from ordinary discovery (`web/playwright.config.ts`
+   `testIgnore`); runs isolated via `web/playwright.queue-delivery.config.ts`
+   (pinned 127.0.0.1:8098, fresh probe-guarded dirs, serial, retries: 0; serviceWorkers
+   blocked). Dispatch-only, NOT PR-blocking.
+   Runner (headless): `cd web && npx playwright test --config=playwright.queue-delivery.config.ts --project=chromium --workers=1 --retries=0`.
+   Runner (headed in Docker under Xvfb; real virtual display + real browser): `make test-queue-delivery-headed-docker`.
 
 7. **host-web e2e** — `host-web/tests/e2e/*.spec.ts` (Playwright: iframe survival
    + shell ops) and `host-web/tests/preview-e2e/*.spec.ts` (production-build shell

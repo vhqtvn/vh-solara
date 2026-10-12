@@ -119,3 +119,68 @@ container and never use Docker-in-Docker to "containerize" it. Its route stays
 Phase 1 covers lane 7 only. Extending the same pattern to the remaining lanes
 (Go unit/integration/e2e, web unit/e2e, host-web preview/real-embed) is Phase
 2+ — until those land with receipts, do not claim all-lane host independence.
+
+---
+
+# Docker test routes — lane 6 queue-delivery variant (headed under Xvfb)
+
+Added in commit `357ae4decc7ca7f9fa5b442da75e84cb905cdd5c` to provide a headed
+in-docker execution route for the dispatch-only `queue-delivery-custody` spec
+(`web/tests/e2e/queue-delivery-custody.spec.ts`).
+
+## The command
+
+```bash
+# Operator route — runs the dedicated config HEADED under Xvfb inside Docker:
+make test-queue-delivery-headed-docker
+
+# With JSON report output (retains qd-* timing/correlation annotations in tmp/queue-delivery-e2e/report.json):
+make test-queue-delivery-headed-docker ARGS='--reporter=list,json'
+
+# Agent route (prompt-free under the harness exec family):
+vh-agent-harness exec make test-queue-delivery-headed-docker
+vh-agent-harness exec make test-queue-delivery-headed-docker ARGS='--reporter=list,json'
+```
+
+## Wrapper design and deliberate differences from Lane 7
+
+The target uses the `PW_DOCKER_GO` wrapper, mirroring `test-host-web-docker`'s
+non-root UID/GID containment (`-e HOME=/tmp/pw-home`, user ownership under
+`tmp/`), with three deliberate deviations:
+
+1. **`--network=host` (probe-guard serialization):**
+   The lane's `wipeAndServe` script probe-guards its fresh-dir wipe by probing
+   the pinned loopback address `127.0.0.1:8098`. Contending on this pinned
+   address serializes invocations (host or container). If run in a per-container
+   network namespace, a second invocation's curl probe would miss a running lane
+   and wipe its active state (`VH_STATE_DIR/managed-project`). With
+   `--network=host`, an occupied 8098 causes Playwright's URL pre-check to refuse
+   startup (fail-closed, exit 2, zero wipe). Loopback-only binding ensures no
+   external exposure.
+2. **Host Go bootstrap mount + `GOTOOLCHAIN=auto`:**
+   The `PLAYWRIGHT_IMAGE` ships Node and browsers but no Go toolchain. The
+   lane's Playwright `webServer` executes `scripts/fixture-web.sh`, which runs
+   the Go fixtureserver (`go run ./tools/fixtureserver`). The wrapper mounts the
+   host's `/usr/local/go` read-only as a bootstrap. Because the host Go may be
+   older than `go.mod` requires, `GOTOOLCHAIN=auto` downloads the exact pinned
+   toolchain into a persistent cache at `tmp/queue-delivery-e2e/go-mod` and
+   `tmp/queue-delivery-e2e/go-cache` (isolated from the lane's wiped dirs). A
+   prewarm build (`go build -o /dev/null ./tools/fixtureserver`) runs before
+   Playwright starts so initial downloads never trip the `webServer`'s 180s
+   boot timeout.
+3. **`--ipc=host` (headed Chromium under Xvfb):**
+   Chromium running headed under `xvfb-run --auto-servernum` requires more shared
+   memory than Docker's default 64MB `/dev/shm`. `--ipc=host` prevents renderer
+   crashes under Xvfb.
+4. **Evidence capture via `PLAYWRIGHT_JSON_OUTPUT_NAME`:**
+   `PLAYWRIGHT_JSON_OUTPUT_NAME=/repo/tmp/queue-delivery-e2e/report.json` is
+   preset in the container environment. Passing `ARGS='--reporter=list,json'`
+   records the full test report, including the custom `qd-*` correlation and
+   timing annotations emitted by `queue-delivery-custody.spec.ts`.
+5. **Image tag coupling and riding DEFER:**
+   The wrapper uses the single `PLAYWRIGHT_IMAGE` pin (`mcr.microsoft.com/playwright:v1.60.0-noble`).
+   While `host-web/package.json` pins `@playwright/test` to exact `1.60.0`,
+   `web/package.json` specifies a caret range (`^1.49.1`) that currently
+   lock-resolves to `1.60.0`. Any future lockfile refresh in `web/` must re-assert
+   that the resolved `@playwright/test` version matches `PLAYWRIGHT_IMAGE`.
+
