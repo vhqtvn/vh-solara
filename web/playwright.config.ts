@@ -66,6 +66,16 @@ export default defineConfig({
       testMatch: /zoom-placement\.spec\.ts/,
       grep: /identical pixel wheel events/,
     },
+    // Animation pause/resume contract (the .pane-hidden working-dots freeze
+    // class of bug) on the operator's actual engine too — Firefox is where
+    // the UI runs hot, and the spec is setContent-only (no fixture state).
+    // Scoped via testMatch like firefox-zoom so the serial suite is not
+    // re-run wholesale on a second engine.
+    {
+      name: "firefox-animation",
+      use: { ...devices["Desktop Firefox"] },
+      testMatch: /animation-resume\.spec\.ts/,
+    },
   ],
   webServer: useExistingWebServer
     ? undefined

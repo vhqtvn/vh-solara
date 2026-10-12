@@ -426,7 +426,15 @@
  * Paused animations are not running, so they stop requesting frames.
  * Transitions are deliberately NOT paused (unlike the e-ink switch): they are
  * event-driven and bounded (≤~0.25s), so they cannot keep the driver ticking;
- * pausing them would freeze mid-flight state changes across a hide/reveal. */
+ * pausing them would freeze mid-flight state changes across a hide/reveal.
+ *
+ * Resume semantics are pinned by a real-browser contract test
+ * (web/tests/e2e/animation-resume.spec.ts, chromium + firefox): an infinite
+ * animation CREATED under this rule (Working pill mounted in a hidden pane)
+ * and a running animation paused mid-flight both resume on class removal in
+ * all probed engines (chromium/firefox/webkit) — the freeze bug class is the
+ * CLASS getting stuck, not the play-state mechanics, so keep this rule as
+ * play-state (never `animation: none`). */
 :root.pane-hidden, :root.pane-hidden *, :root.pane-hidden *::before, :root.pane-hidden *::after {
   animation-play-state: paused !important;
 }
