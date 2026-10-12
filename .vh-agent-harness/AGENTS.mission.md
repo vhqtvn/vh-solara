@@ -18,7 +18,7 @@ It lets an operator:
 
 - **`go` may not be on `PATH`.** It lives at `/usr/local/go/bin/go`; prefix:
   `export PATH=$PATH:/usr/local/go/bin`.
-- Module: `github.com/vhqtvn/vh-solara`, Go 1.25.
+- Module: `github.com/vhqtvn/vh-solara`, Go 1.26.
 - Build the CLI: `go build ./...` (uses the committed `pkg/web/dist/` placeholder,
   so no frontend build is needed for a plain build or `go test`).
 - Run Go tests: `go test ./...`. Format check: `gofmt -l pkg cmd main.go`.

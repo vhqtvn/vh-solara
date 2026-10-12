@@ -49,7 +49,7 @@ COPY --from=webbuild /app/web/dist-build ./web/dist-build
 RUN cd host-web && VITE_HOST_FOLDED=1 npm run build
 
 # 3) Build the static Go binaries with BOTH freshly built SPAs embedded.
-FROM golang:1.25-alpine AS gobuild
+FROM golang:1.26-alpine AS gobuild
 WORKDIR /src
 RUN apk add --no-cache git
 COPY go.mod go.sum ./
@@ -69,12 +69,12 @@ RUN rm -rf ./pkg/web/host-dist/assets ./pkg/web/host-dist/index.html \
 COPY --from=hostbuild /app/host-web/dist ./pkg/web/host-dist
 # GOTOOLCHAIN=local is deliberate (hermetic, reproducible builds) and means there is
 # NO auto-download fallback inside this image. Invariant: the base image's Go (FROM
-# golang:1.25-alpine above) MUST be >= the `go` directive in go.mod, or this stage
+# golang:1.26-alpine above) MUST be >= the `go` directive in go.mod, or this stage
 # hard-fails. Local dev and CI stay green via GOTOOLCHAIN=auto / go-version-file, so a
 # go.mod directive bump that outruns the Docker official image is a SILENT TRAP here.
 # Before bumping go.mod's `go` line, confirm the tag already carries that patch:
-#   docker run --rm golang:1.25-alpine go version
-# (As of go.mod 1.25.12 the margin is zero: the image supplies exactly go1.25.12.)
+#   docker run --rm golang:1.26-alpine go version
+# (As of go.mod 1.26.9 the margin is zero: the image supplies exactly go1.26.9.)
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 RUN go build -trimpath -ldflags="-s -w" -o /out/vh-solara . \
  && go build -trimpath -ldflags="-s -w" -o /out/fixtureserver ./tools/fixtureserver
