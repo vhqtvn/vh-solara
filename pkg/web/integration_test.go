@@ -845,6 +845,17 @@ func TestStreamAsyncHydrationContentPrecedenceDuringFetch(t *testing.T) {
 	fake.messages["a"] = `[{"info":{"id":"m1","sessionID":"a","role":"user"},"parts":[{"id":"p1","sessionID":"a","messageID":"m1","type":"text","text":"fetched-stale"}]}]`
 	hold := make(chan struct{})
 	fake.msgHold["a"] = hold
+	// RENDEZVOUS (CF3 — back-ported from the delta/sync siblings, see the CI
+	// failure on 5fbfe9c): the fake non-blocking-signals here once the
+	// full-history GET (?limit=WindowMaxCount) arrives and is about to block
+	// on the hold — at which point the async goroutine has ALREADY run
+	// MarkColdFetchStart (it precedes client MessagesTail inside the
+	// goroutine), so coldFetchActive["a"] is set. Waiting on this before
+	// injecting the live events removes the race where they are applied
+	// before the flag is set (goroutine not yet scheduled) → tags unset →
+	// stale reconcile clobbers the live bodies (intermittent failure).
+	notify := make(chan struct{}, 1)
+	fake.msgFullGetReady = notify
 
 	ocSrv := httptest.NewServer(fake.handler())
 	defer ocSrv.Close()
@@ -860,7 +871,10 @@ func TestStreamAsyncHydrationContentPrecedenceDuringFetch(t *testing.T) {
 	defer web.Close()
 
 	// Open the stream for session "a" → EnsureMessagesAsync → background GET
-	// blocks on the hold. The partial snapshot proves the GET is in flight.
+	// blocks on the hold. The partial snapshot frame alone does NOT prove the
+	// GET is in flight: handleStream spawns the fetch goroutine and sends the
+	// snapshot without waiting, so on a fast machine the test can race ahead
+	// of MarkColdFetchStart (the CI failure shape).
 	resp, err := http.Get(web.URL + "/vh/stream?sessions=a")
 	if err != nil {
 		t.Fatal(err)
@@ -871,6 +885,13 @@ func TestStreamAsyncHydrationContentPrecedenceDuringFetch(t *testing.T) {
 	if ev != "snapshot" {
 		t.Fatalf("first frame want 'snapshot', got %q", ev)
 	}
+
+	// RENDEZVOUS (CF3): block until the async fetch goroutine has reached the
+	// full GET (blocked on the hold). By construction MarkColdFetchStart ran
+	// before the GET, so coldFetchActive["a"] is now deterministically set
+	// and the live events injected below will tag liveTouchedParts /
+	// liveTouchedBody.
+	<-notify
 
 	// Helpers to read reconciled store content.
 	partText := func(msgID, partID string) string {
@@ -922,8 +943,12 @@ func TestStreamAsyncHydrationContentPrecedenceDuringFetch(t *testing.T) {
 	fake.events <- `{"type":"message.updated","properties":{"info":{"id":"m1","sessionID":"a","role":"assistant","agent":"test","time":{"completed":999}}}}`
 
 	// Guarantee the live events have been applied BEFORE releasing the held GET
-	// (removes all timing nondeterminism — the only variable is whether
-	// reconcileMessagesLocked preserves the live content).
+	// (together with the <-notify rendezvous above this now removes ALL timing
+	// nondeterminism: notify establishes the cold-fetch window is OPEN —
+	// coldFetchActive set, so the events tag their entries — and this wait
+	// establishes the tagged content is resident before the reconcile runs.
+	// Content alone was never sufficient: it proves the events were applied,
+	// not that they were applied INSIDE the window.)
 	waitFor(t, func() bool { return partText("m1", "p1") == "live-newer" }, "live part p1 content applied to store during in-flight fetch")
 	waitFor(t, func() bool {
 		role, completed := msgRoleCompleted("m1")
