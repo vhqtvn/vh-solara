@@ -29,12 +29,13 @@ type fakeOpenCode struct {
 	events   chan string    // raw JSON event payloads ({id,type,properties})
 	prompts  []string       // bodies POSTed to /session/:id/message (prompt passthrough)
 	msgGets  map[string]int // GET /session/:id/message hit counts (lazy-hydration test)
-	// msgFullGets counts ONLY full-history GETs (no ?limit= query) — the
-	// single-flight invariant. Cold-seed tail fetches (?limit=) and other
-	// partial GETs are excluded so a test can assert "exactly ONE full fetch
-	// served all concurrent callers" robustly, independent of background
-	// cold-seed tail noise. Mirrors the msgFullGetReady signal's full-vs-tail
-	// discrimination.
+	// msgFullGets counts ONLY cold-load GETs (?limit=<WindowMaxCount>) — the
+	// single-flight invariant (Part-B: cold-load is MessagesTail(WindowMaxCount),
+	// not a no-?limit Messages()). Cold-seed tail GETs (?limit=<coldTailLimit>)
+	// and other partial GETs are excluded so a test can assert "exactly ONE
+	// full fetch served all concurrent callers" robustly, independent of
+	// background cold-seed tail noise. Mirrors the msgFullGetReady signal's
+	// full-vs-tail discrimination.
 	msgFullGets map[string]int
 	holdMu      sync.Mutex
 	// msgHold lets a test BLOCK the full-message GET for a session until the
@@ -42,13 +43,17 @@ type fakeOpenCode struct {
 	// lands BEFORE the upstream fetch completes. nil (default) = no hold.
 	msgHold map[string]chan struct{}
 	// msgFullGetReady, if non-nil, is signalled (non-blocking) once per
-	// FULL-history message GET — a request with no ?limit= query — right
-	// BEFORE it blocks on msgHold[id]. A sync-path test (the /vh/snapshot
-	// EnsureMessages path) uses it to deterministically wait for the GET to be
-	// in flight: by the time the fake receives that request, EnsureMessages
-	// has ALREADY called MarkColdFetchStart, so the test can safely inject
-	// live events that must tag their entries. nil (default) = no signal, so
-	// existing tests are unaffected. Cold-seed tail GETs carry ?limit= and are
+	// cold-load message GET — a request carrying ?limit=<WindowMaxCount>
+	// (Part-B modernization: cold-load is MessagesTail(WindowMaxCount), not a
+	// no-?limit Messages()) — right BEFORE it blocks on msgHold[id]. Five
+	// tests use it to deterministically wait for the cold-load GET to be in
+	// flight (the two async stream precedence tests, the sync snapshot
+	// precedence test, the cross-path single-flight test, and the TOCTOU
+	// recheck test): by the time the fake receives that request, the fetching
+	// path (EnsureMessages or EnsureMessagesAsync's goroutine) has ALREADY
+	// called MarkColdFetchStart, so the test can safely inject live events
+	// that must tag their entries. nil (default) = no signal, so existing
+	// tests are unaffected. Cold-seed tail GETs (?limit=<coldTailLimit>) are
 	// never signalled here.
 	msgFullGetReady chan struct{}
 
@@ -222,6 +227,52 @@ func waitFor(t *testing.T, cond func() bool, msg string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timeout waiting for: %s", msg)
+}
+
+// waitRendezvous blocks until a msgFullGetReady rendezvous fires, bounding
+// the wait (same 3s budget as waitFor) so a regression that keeps the
+// qualifying cold-load GET from ever reaching the fake fails HERE with a
+// localized error instead of hanging the test to the package-wide go-test
+// timeout. `what` names the rendezvous in the failure message.
+//
+// `release` (from holdColdGet) is invoked on timeout BEFORE t.Fatalf: the
+// held GET would otherwise outlive the test body — t.Fatalf then runs the
+// test's deferred httptest.Server.Close(), which blocks on the held request
+// until the package timeout, and t.Cleanup runs only AFTER those defers, so
+// no cleanup could rescue a hung Close (verified empirically: a
+// cleanup-only close still hangs teardown).
+func waitRendezvous(t *testing.T, notify <-chan struct{}, release func(), what string) {
+	t.Helper()
+	select {
+	case <-notify:
+	case <-time.After(3 * time.Second):
+		release()
+		t.Fatalf("timeout waiting for rendezvous: %s (cold-load GET never reached the fake)", what)
+	}
+}
+
+// holdColdGet registers a per-session hold channel on the fake (msgHold) and
+// returns an idempotent release closure. The five rendezvous tests (the two
+// async stream precedence tests, the sync snapshot precedence test, the
+// cross-path single-flight test, and the TOCTOU recheck test) use it to park
+// the cold-load GET deterministically:
+//   - the test calls release() on its success path (replacing bare
+//     close(hold));
+//   - waitRendezvous calls release() on its timeout path (see above) so a
+//     never-firing rendezvous fails fast WITHOUT hanging the deferred server
+//     Close on the still-held request;
+//   - t.Cleanup(release) is the exactly-once backstop for any other exit
+//     (sync.Once makes the deliberate double release a no-op).
+func holdColdGet(t *testing.T, f *fakeOpenCode, id string) (release func()) {
+	t.Helper()
+	hold := make(chan struct{})
+	f.holdMu.Lock()
+	f.msgHold[id] = hold
+	f.holdMu.Unlock()
+	var once sync.Once
+	release = func() { once.Do(func() { close(hold) }) }
+	t.Cleanup(release)
+	return release
 }
 
 // statusBusyEvent builds a session.status busy opencode.Event for a direct
@@ -680,13 +731,16 @@ func TestStreamAsyncHydration(t *testing.T) {
 // GET is in flight, then the stale-but-now-arriving full reconciliation must NOT
 // clobber the newer live state.
 //
-// The store's reconcile (SetSessionMessages -> reconcileMessagesLocked) treats the
-// fetched list as authoritative: messages present in the store but ABSENT from the
-// fetch are deleted (store.go ~2047-2057). When a live event arrives during the
-// in-flight fetch, the fetch snapshot is stale relative to that live state, so the
-// reconciliation must not discard the live message. This test forces the
-// live-arrives-first ordering deterministically (waitFor m2 in store BEFORE
-// releasing the held GET) so the only variable is whether reconcile preserves m2.
+// The store's reconcile (SetSessionMessages -> reconcileMessagesLocked,
+// pkg/state/hydration.go:288) is presence-upsert only: under Option A, absence
+// from a fetched snapshot NEVER deletes a stored message or part
+// (pkg/state/hydration.go:476-487) — messages and parts are removed only by
+// the explicit message.removed / message.part.removed handlers or session
+// deletion. When a live event arrives during the in-flight fetch, the fetch
+// snapshot omits that live state; this test pins that the reconcile leaves the
+// live message and its parts in place. It forces the live-arrives-first
+// ordering deterministically (waitFor m2 in store BEFORE releasing the held
+// GET) so the only variable is whether reconcile preserves m2.
 func TestStreamAsyncHydrationLiveUpdateDuringFetch(t *testing.T) {
 	fake := newFake()
 	fake.sessions = []string{`{"id":"a","title":"A","time":{"updated":1}}`}
@@ -711,8 +765,14 @@ func TestStreamAsyncHydrationLiveUpdateDuringFetch(t *testing.T) {
 	defer web.Close()
 
 	// Open the stream for session "a": this triggers EnsureMessagesAsync, whose
-	// background GET blocks on the hold. The partial snapshot proves the GET is
-	// in flight (the frame lands before the upstream fetch completes).
+	// background GET blocks on the hold. The first frame is the partial
+	// snapshot, sent immediately because triggerMessageLoad is non-blocking —
+	// the frame does NOT rendezvous with the GET, so it proves only that the
+	// stream opened, not that the fetch is in flight. The test's determinism
+	// comes from the waitFor below (live m2/p1b applied to the store BEFORE
+	// the hold is released), and under Option-A never-delete semantics
+	// (pkg/state/hydration.go:484-487) the survival assertions do not depend
+	// on the fetch window.
 	resp, err := http.Get(web.URL + "/vh/stream?sessions=a")
 	if err != nil {
 		t.Fatal(err)
@@ -843,8 +903,7 @@ func TestStreamAsyncHydrationContentPrecedenceDuringFetch(t *testing.T) {
 	// role "user" (the pre-live state). During the in-flight GET, LIVE events
 	// will UPDATE both p1's body and m1's body to NEWER content.
 	fake.messages["a"] = `[{"info":{"id":"m1","sessionID":"a","role":"user"},"parts":[{"id":"p1","sessionID":"a","messageID":"m1","type":"text","text":"fetched-stale"}]}]`
-	hold := make(chan struct{})
-	fake.msgHold["a"] = hold
+	release := holdColdGet(t, fake, "a")
 	// RENDEZVOUS (CF3 — back-ported from the delta/sync siblings, see the CI
 	// failure on 5fbfe9c): the fake non-blocking-signals here once the
 	// full-history GET (?limit=WindowMaxCount) arrives and is about to block
@@ -891,7 +950,7 @@ func TestStreamAsyncHydrationContentPrecedenceDuringFetch(t *testing.T) {
 	// before the GET, so coldFetchActive["a"] is now deterministically set
 	// and the live events injected below will tag liveTouchedParts /
 	// liveTouchedBody.
-	<-notify
+	waitRendezvous(t, notify, release, "async content-precedence: fetch goroutine blocked on the held cold-load GET")
 
 	// Helpers to read reconciled store content.
 	partText := func(msgID, partID string) string {
@@ -956,7 +1015,7 @@ func TestStreamAsyncHydrationContentPrecedenceDuringFetch(t *testing.T) {
 	}, "live message m1 body applied to store during in-flight fetch")
 
 	// Release the held stale GET → the cold reconcile completes.
-	close(hold)
+	release()
 	waitFor(t, func() bool { return agg.Store().IsMessagesLoaded("a") }, "session a loaded after stale reconcile")
 
 	// CONTRACT (C-F2): the LIVE body must survive the stale reconcile. The
@@ -980,38 +1039,43 @@ func TestStreamAsyncHydrationContentPrecedenceDuringFetch(t *testing.T) {
 // streaming-text sibling of TestStreamAsyncHydrationContentPrecedenceDuringFetch
 // (which pins the message.part.updated snapshot path): both exercise the same
 // live-touched-part guard, but this one drives it through the delta accumulator
-// (appendPartDeltaLocked → liveTouchedParts tag at store.go ~1416) instead of an
-// authoritative part snapshot.
+// (appendPartDeltaLocked → liveTouchedParts tag at pkg/state/reducers.go:1417-1427)
+// instead of an authoritative part snapshot.
 //
 // The fetched GET returns p1 with stale text "fetched-stale"; LIVE deltas
 // accumulate "live-newer" on p1 while the GET is held. The cold reconcile must
 // preserve the live-accumulated text, not clobber it with "fetched-stale".
 //
 // NOTE on deltaBuf isolation: the deltaBuf-survives-reconcile guard
-// (store.go ~2090) is exercised only when delta text is STILL UNFLUSHED in the
-// accumulator at reconcile time. Snapshot flushes the accumulator on every read
-// (flushPartDeltasLocked emit=false), and deltaFlushInterval is an unexported
-// pkg/state var this package cannot override without touching store.go. So this
-// test asserts the flushed accumulated-text win (the part-body guard,
-// store.go ~2108, applied to delta-derived content + the appendPartDeltaLocked
-// tag). Asserting the deltaBuf-only path is left as a follow-up (it needs a
-// pkg/state test or an exported test hook).
+// (pkg/state/hydration.go:437) fires only when delta text is STILL UNFLUSHED
+// in the accumulator at reconcile time. Snapshot flushes the accumulator on
+// every read (flushPartDeltasLocked emit=false), and the flush interval is
+// fixed at Store construction from pkg/state's Config — not overridable from
+// this package — so from here only the flushed accumulated-text win is
+// observable (the part-body guard, pkg/state/hydration.go:464, applied to
+// delta-derived content + the appendPartDeltaLocked tag). The deltaBuf-only
+// path IS now covered in-package: TestColdReconcilePreservesUnflushedDeltaBuf
+// (pkg/state/delta_buf_reconcile_test.go) keeps its second delta unflushed
+// deterministically (withFlushInterval(time.Hour)) and pins the cold
+// reconcile preserving the live accumulator, with
+// TestColdReconcileDiscardsDeltaBufWithoutLiveTouch as the negative control.
 func TestStreamAsyncHydrationDeltaPrecedenceDuringFetch(t *testing.T) {
 	fake := newFake()
 	fake.sessions = []string{`{"id":"a","title":"A","time":{"updated":1}}`}
 	// The stale full-history GET returns m1 with p1 text "fetched-stale". LIVE
 	// deltas arriving mid-fetch will accumulate "live-newer" on p1 instead.
 	fake.messages["a"] = `[{"info":{"id":"m1","sessionID":"a","role":"user"},"parts":[{"id":"p1","sessionID":"a","messageID":"m1","type":"text","text":"fetched-stale"}]}]`
-	hold := make(chan struct{})
-	fake.msgHold["a"] = hold
-	// RENDEZVOUS (CF3): the fake non-blocking-signals here once the FULL-history
-	// GET (no ?limit=) arrives and is about to block on the hold — at which
-	// point the async goroutine has ALREADY run MarkColdFetchStart (it precedes
-	// client.Messages inside the goroutine), so coldFetchActive["a"] is set.
-	// Waiting on this before injecting deltas removes the race where the deltas
-	// apply before the flag is set (goroutine not yet scheduled) → tags unset →
-	// intermittent failure. Mirrors the sync test's msgFullGetReady hook. nil by
-	// default so unrelated tests are unaffected.
+	release := holdColdGet(t, fake, "a")
+	// RENDEZVOUS (CF3): the fake non-blocking-signals here once the cold-load
+	// GET (?limit=<WindowMaxCount>) arrives and is about to block on the hold
+	// — at which point the async goroutine has ALREADY run MarkColdFetchStart
+	// (it precedes client.MessagesTail inside the goroutine), so
+	// coldFetchActive["a"] is set. Waiting on this before injecting deltas
+	// removes the race where the deltas apply before the flag is set
+	// (goroutine not yet scheduled) → tags unset → intermittent failure.
+	// Mirrors the sync test's msgFullGetReady hook. Cold-seed tail GETs
+	// (?limit=<coldTailLimit>) are not signalled. nil by default so unrelated
+	// tests are unaffected.
 	notify := make(chan struct{}, 1)
 	fake.msgFullGetReady = notify
 
@@ -1029,7 +1093,10 @@ func TestStreamAsyncHydrationDeltaPrecedenceDuringFetch(t *testing.T) {
 	defer web.Close()
 
 	// Open the stream for session "a" → EnsureMessagesAsync → background GET
-	// blocks on the hold. The partial snapshot proves the GET is in flight.
+	// blocks on the hold. The partial snapshot frame alone does NOT prove the
+	// GET is in flight: handleStream spawns the fetch goroutine and sends the
+	// snapshot without waiting — the notify rendezvous below is what proves
+	// the GET reached the fake.
 	resp, err := http.Get(web.URL + "/vh/stream?sessions=a")
 	if err != nil {
 		t.Fatal(err)
@@ -1043,9 +1110,9 @@ func TestStreamAsyncHydrationDeltaPrecedenceDuringFetch(t *testing.T) {
 
 	// RENDEZVOUS (CF3): block until the async fetch goroutine has reached the
 	// full GET (blocked on the hold). By construction MarkColdFetchStart ran
-	// before client.Messages, so coldFetchActive["a"] is now deterministically
+	// before client.MessagesTail, so coldFetchActive["a"] is now deterministically
 	// set and the live deltas injected below will tag liveTouchedParts.
-	<-notify
+	waitRendezvous(t, notify, release, "async delta-precedence: fetch goroutine blocked on the held cold-load GET")
 
 	partText := func(msgID, partID string) string {
 		for _, mwp := range agg.Store().Snapshot(map[string]bool{"a": true}).Messages["a"] {
@@ -1093,7 +1160,7 @@ func TestStreamAsyncHydrationDeltaPrecedenceDuringFetch(t *testing.T) {
 	waitFor(t, func() bool { return partText("m1", "p1") == "live-newer" }, "live deltas accumulated on p1 during in-flight fetch")
 
 	// Release the held stale GET → the cold reconcile completes.
-	close(hold)
+	release()
 	waitFor(t, func() bool { return agg.Store().IsMessagesLoaded("a") }, "session a loaded after stale reconcile")
 
 	// CONTRACT (C-F2): the LIVE-accumulated delta text must survive the stale
@@ -1128,13 +1195,12 @@ func TestSyncSnapshotContentPrecedenceDuringFetch(t *testing.T) {
 	// role "user" (the pre-live state). During the in-flight GET, LIVE events
 	// UPDATE both p1's body and m1's body to NEWER content.
 	fake.messages["a"] = `[{"info":{"id":"m1","sessionID":"a","role":"user"},"parts":[{"id":"p1","sessionID":"a","messageID":"m1","type":"text","text":"fetched-stale"}]}]`
-	hold := make(chan struct{})
-	fake.msgHold["a"] = hold
-	// Rendezvous: the fake signals here when the FULL-history GET (no ?limit=)
-	// arrives and is about to block on the hold — i.e. EnsureMessages has
-	// reached client.Messages, which means MarkColdFetchStart has run. Cold-seed
-	// tail GETs (?limit=) do not signal, so this specifically captures the
-	// snapshot path's GET.
+	release := holdColdGet(t, fake, "a")
+	// Rendezvous: the fake signals here when the cold-load GET
+	// (?limit=<WindowMaxCount>) arrives and is about to block on the hold —
+	// i.e. EnsureMessages has reached client.MessagesTail, which means
+	// MarkColdFetchStart has run. Cold-seed tail GETs (?limit=<coldTailLimit>)
+	// do not signal, so this specifically captures the snapshot path's GET.
 	notify := make(chan struct{}, 1)
 	fake.msgFullGetReady = notify
 
@@ -1169,7 +1235,7 @@ func TestSyncSnapshotContentPrecedenceDuringFetch(t *testing.T) {
 	// AFTER EnsureMessages called MarkColdFetchStart — so coldFetchActive["a"]
 	// is now set. Injecting the live events here is the deterministic
 	// equivalent of "a live update lands during the in-flight sync GET".
-	<-notify
+	waitRendezvous(t, notify, release, "sync content-precedence: EnsureMessages blocked on the held cold-load GET")
 
 	// Helpers to read reconciled store content.
 	partText := func(msgID, partID string) string {
@@ -1228,7 +1294,7 @@ func TestSyncSnapshotContentPrecedenceDuringFetch(t *testing.T) {
 
 	// Release the held stale GET → the sync reconcile completes and the
 	// snapshot endpoint returns its response.
-	close(hold)
+	release()
 	res := <-resCh
 	if res.err != nil {
 		t.Fatalf("snapshot GET: %v", res.err)
@@ -1309,8 +1375,7 @@ func TestSyncSnapshotAsyncCrossPathSingleFlight(t *testing.T) {
 	// The stale full-history GET returns m1/p1 "fetched-stale" + role "user".
 	// LIVE events during the in-flight fetch update both to NEWER content.
 	fake.messages["a"] = `[{"info":{"id":"m1","sessionID":"a","role":"user"},"parts":[{"id":"p1","sessionID":"a","messageID":"m1","type":"text","text":"fetched-stale"}]}]`
-	hold := make(chan struct{})
-	fake.msgHold["a"] = hold
+	release := holdColdGet(t, fake, "a")
 	// Rendezvous: signals when the async winner's full GET is in flight (blocked
 	// on the hold) — by then MarkColdFetchStart has run AND the msgInflight slot
 	// is registered, so the sync caller is guaranteed to observe the slot.
@@ -1332,7 +1397,10 @@ func TestSyncSnapshotAsyncCrossPathSingleFlight(t *testing.T) {
 
 	// (1) ASYNC winner: open the stream for session "a" → EnsureMessagesAsync
 	// registers the msgInflight slot synchronously and launches the background
-	// GET, which blocks on the hold. The partial snapshot proves it is in flight.
+	// GET, which blocks on the hold. The partial snapshot frame alone does NOT
+	// prove the GET is in flight: handleStream spawns the fetch goroutine and
+	// sends the snapshot without waiting — the waitRendezvous below is what
+	// proves the GET reached the fake (and that the slot is registered).
 	resp, err := http.Get(web.URL + "/vh/stream?sessions=a")
 	if err != nil {
 		t.Fatal(err)
@@ -1345,7 +1413,7 @@ func TestSyncSnapshotAsyncCrossPathSingleFlight(t *testing.T) {
 	}
 	// Wait until the async winner's GET is blocked on the hold — the slot is
 	// registered and coldFetchActive is set.
-	<-notify
+	waitRendezvous(t, notify, release, "cross-path single-flight: async winner blocked on the held cold-load GET")
 
 	// (2) SYNC caller: drive GET /vh/snapshot for the SAME cold session in a
 	// goroutine. With C-F2 EnsureMessages finds the async slot and WAITS (no
@@ -1409,7 +1477,7 @@ func TestSyncSnapshotAsyncCrossPathSingleFlight(t *testing.T) {
 	// (4) Release the held stale GET → the async winner's cold reconcile completes
 	// (preserving the live content). The sync waiter wakes (IsMessagesLoaded →
 	// true) and the snapshot endpoint returns the reconciled LIVE content.
-	close(hold)
+	release()
 	res := <-resCh
 	if res.err != nil {
 		t.Fatalf("snapshot GET: %v", res.err)
@@ -1466,9 +1534,9 @@ func TestSyncSnapshotAsyncCrossPathSingleFlight(t *testing.T) {
 	// DIRECT GET-count assertion (single-flight dedup observed at the upstream,
 	// not just via the clobber symptom): exactly ONE full-history GET for session
 	// a — the async winner's. The sync caller found the in-flight slot and
-	// WAITED (no second GET). msgFullGets counts ONLY full GETs (no ?limit=), so
-	// the cold-seed tail fetch from agg.Run is excluded and the assertion is
-	// robust to background hydration ordering.
+	// WAITED (no second GET). msgFullGets counts ONLY cold-load GETs
+	// (?limit=<WindowMaxCount>), so the cold-seed tail fetch from agg.Run is
+	// excluded and the assertion is robust to background hydration ordering.
 	fake.mu.Lock()
 	fullGets := fake.msgFullGets["a"]
 	fake.mu.Unlock()
@@ -1506,8 +1574,7 @@ func TestEnsureMessagesTOCTOURecheckUnderLock(t *testing.T) {
 	fake := newFake()
 	fake.messages["a"] = `[{"info":{"id":"m1","sessionID":"a","role":"user"},"parts":[{"id":"p1","sessionID":"a","messageID":"m1","type":"text","text":"fetched"}]}]`
 	// Hold the full-history GET so the test controls B's fetch lifecycle.
-	hold := make(chan struct{})
-	fake.msgHold["a"] = hold
+	release := holdColdGet(t, fake, "a")
 	// notify fires when B's full GET arrives at the fake (about to block on the
 	// hold) — by then EnsureMessages has run MarkColdFetchStart, so
 	// coldFetchActive["a"] is set and a live part injected now will be tagged.
@@ -1543,7 +1610,7 @@ func TestEnsureMessagesTOCTOURecheckUnderLock(t *testing.T) {
 	// coldFetchActive["a"] is now set.
 	bDone := make(chan error, 1)
 	go func() { bDone <- agg.EnsureMessages(context.Background(), "a") }()
-	<-notify
+	waitRendezvous(t, notify, release, "TOCTOU recheck: winner B blocked on the held cold-load GET")
 
 	// (2) Inject LIVE content while B's GET is held. coldFetchActive is set, so
 	// the part is tagged live-touched and B's subsequent cold reconcile preserves
@@ -1561,7 +1628,7 @@ func TestEnsureMessagesTOCTOURecheckUnderLock(t *testing.T) {
 	// (4) Release B's hold → B completes its FULL lifecycle: GET returns, cold
 	// reconcile (preserves the live part), SetSessionMessages sets
 	// msgLoaded["a"]=true, defer deletes the slot under msgMu. A is still parked.
-	close(hold)
+	release()
 	if err := <-bDone; err != nil {
 		t.Fatalf("B EnsureMessages: %v", err)
 	}
