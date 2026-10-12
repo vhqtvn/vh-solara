@@ -413,20 +413,31 @@ test("(e) held create + MID-FLIGHT project switch: recovery stays dir-scoped in 
   await expect(page.locator(".proj-name")).toContainText("cc-switch-b", { timeout: 8_000 });
   await expect(page.locator(".tree-node", { hasText: "Project: cc-switch-b" })).toBeVisible({ timeout: 8_000 });
 
-  // (3) NO LEAK: B's draft view renders ZERO send-status rows — A's checking
+  // (3) RELEASE IMMEDIATELY after the switch lands — before any B-side
+  // assertions. The budget's lookups run on the 0/4/8s schedule anchored to
+  // the budget start (last ends ≤11s), so releasing at the earliest moment
+  // keeps the remaining schedule margin wide on slow CI. (The old order held
+  // the release until after the B-side dance; a slow dance could push the
+  // release past budget exhaustion, where resolution becomes UNREACHABLE —
+  // Check-again is currentOp-gated and re-entering A's draft clears the
+  // pointer — making receiptGets/movedRow fail on wall-clock luck, not on
+  // the scoping this test exists to pin.)
+  const getsBefore = wire.receiptGets();
+  const rel = await request.post(`/oc/fixture/create-hold/release`, { headers: csrf });
+  if (!rel.ok()) throw new Error(`create-hold release failed: ${rel.status()}`);
+
+  // (4) NO LEAK: B's draft view renders ZERO send-status rows — A's checking
   // record lives under A's tap-time draft owner key only (the project scoping
-  // this test pins). No agent-ready wait here: nothing is ever sent in B, and
-  // the B-side dance must stay lean so the release lands inside A's
-  // still-running recovery budget (lookups 0/4/8s from budget start).
+  // this test pins). Post-release is equally probative: the records are
+  // key-scoped module state observable at any time, and the resolution
+  // transfers op-scoped records onto the session, never into B's draft key.
+  // No agent-ready wait here: nothing is ever sent in B.
   await page.getByRole("button", { name: "Create session" }).click();
   await expect(page.locator(".composer")).toBeVisible();
   await expect(page.locator(".sendStatusLine")).toHaveCount(0);
 
-  // (4) Release inside the budget window: the withheld id reaches the worker
-  // and the next dir-scoped receipt LOOKUP resolves the exact id.
-  const getsBefore = wire.receiptGets();
-  const rel = await request.post(`/oc/fixture/create-hold/release`, { headers: csrf });
-  if (!rel.ok()) throw new Error(`create-hold release failed: ${rel.status()}`);
+  // (5) The release landed inside the budget window: the withheld id reached
+  // the worker and the next dir-scoped receipt LOOKUP resolves the exact id.
   await expect
     .poll(() => wire.receiptGets(), { timeout: 15_000, message: "the post-release receipt lookup ran" })
     .toBeGreaterThan(getsBefore);
@@ -434,7 +445,7 @@ test("(e) held create + MID-FLIGHT project switch: recovery stays dir-scoped in 
   expect(fresh).toHaveLength(1);
   const sid = fresh[0];
 
-  // (5) THE ROUND TRIP — switch back to A through the real dialog. The
+  // (6) THE ROUND TRIP — switch back to A through the real dialog. The
   // committed session lands in A's tree (the snapshot reconciles it), and
   // opening it IN-APP (real tree-node click — never page.reload: the records
   // are in-memory singletons) shows the op-scoped TRANSFERRED record: the
