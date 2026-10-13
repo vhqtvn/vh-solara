@@ -55,8 +55,10 @@ const STYLE = `
   }
   .working-dots::after { content: "..."; }
   @keyframes working-dots-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-  /* One-shot mount cue (the .vh-current trace) — same created-while-paused
-   * exposure inside the Working pill. */
+  /* One-shot mount cue (this spec's own synthetic one-shot — the production
+   * .vh-current trace it originally mirrored was removed by the concept-ring
+   * redesign; the created-while-paused exposure it probes is generic) —
+   * same created-while-paused exposure inside the Working pill. */
   .vh-current-like { animation: one-shot 0.3s linear 1; }
   @keyframes one-shot { from { opacity: 0; } to { opacity: 1; } }
 `;

@@ -189,18 +189,22 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
    localization. */
 @keyframes empty-float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-5px); } }
 
-/* Working indicator: a pill with the VHSolara monogram whose accent stroke
-   highlights the glyph as a STATIC dash (see the slice-2 note at .vh-current:
-   the dash traces once on mount, then rests), plus a static "Working…"
+/* Working indicator: a pill with the static VHSolara monogram (the six base
+   fills, dim at --glyph-opacity .42) plus the "concept-ring" — an HTML overlay
+   ring rotating forever as the liveness cue — and a static "Working…"
    ellipsis pulsing in opacity. Every color is a theme token — the accent
-   drives the stroke + glow; nothing is hardcoded.
-   Perf note (see AGENTS.md Firefox/WebRender gotchas): stroke-dashoffset and
-   content are NOT compositor-animatable — they must never loop (the former
-   infinite march was a per-frame MAIN-THREAD restyle; profile evidence in
-   tmp/agent-runs/webperf-paint/mechanism.md). The only surviving loop is the
-   opacity pulse (compositor), and the whole pill unmounts with the working
-   state. The static drop-shadow glow does not animate; drop it first if GPU
-   heat ever returns. */
+   drives the glyph + the ring; nothing is hardcoded.
+   Perf note (see AGENTS.md Firefox/WebRender gotchas): the ring's loop is
+   transform-only on an HTML element (border colors are constant, rotation is
+   compositor-only — no per-frame repaint, no main-thread restyle). The former
+   stroke-dashoffset trace and the drop-shadow glow are REMOVED. The infinite
+   loop is justified because the pill unmounts with the working state
+   (ChatTasksStatus renders it under Show when working()) and the global
+   :root.pane-hidden gate (tokens.css) pauses all animation while the pane is
+   hidden. Standing rule: stroke-dashoffset, content, and filter must NEVER
+   loop — none are compositor-animatable, and looping them is a per-frame
+   MAIN-THREAD restyle (profile evidence in
+   tmp/agent-runs/webperf-paint/mechanism.md). */
 .working {
   display: inline-flex; align-items: center; gap: 8px; min-width: 0;
   /* Cap width so a long tool subject truncates instead of pushing the Tasks
@@ -209,37 +213,27 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
   font-size: var(--text-sm); font-weight: 650; line-height: 1;
   color: var(--fg);
 }
-.vh-inline-mark {
-  width: 22px; height: 22px; flex: 0 0 auto;
-  color: var(--accent); /* drives currentColor for the dim base glyph */
-  overflow: visible;
+/* The original six base fills only; the former accent-overlay trace paths are
+   gone (removed with the concept-ring redesign). */
+.vh-lockup { position: relative; display: inline-block; width: 22px; height: 22px; flex: 0 0 22px; }
+.vh-shell { display: block; width: 22px; height: 22px; }
+.vh-inline-mark { display: block; width: 22px; height: 22px; color: var(--accent); }
+.vh-base { fill: currentColor; opacity: var(--glyph-opacity, .42); }
+.vh-indicator { position: absolute; display: block; pointer-events: none; }
+.concept-ring .ring {
+  position: absolute;
+  left: -2.5px; top: -2.5px;
+  width: 27px; height: 27px;
+  border-radius: 50%;
+  border: 1.4px solid transparent;
+  border-top-color: var(--accent);
+  border-right-color: color-mix(in srgb, var(--accent) 32%, transparent);
+  animation: vh-ring 6.5s linear infinite;
 }
-.vh-base { fill: currentColor; opacity: 0.22; }
-.vh-current {
-  fill: none;
-  stroke: var(--accent);
-  stroke-width: 8; stroke-linecap: round; stroke-linejoin: round;
-  stroke-dasharray: 28 180; stroke-dashoffset: 0;
-  filter:
-    drop-shadow(0 0 3px color-mix(in srgb, var(--accent) 90%, transparent))
-    drop-shadow(0 0 8px color-mix(in srgb, var(--accent) 45%, transparent));
-  /* (webperf paint slice 2) stroke-dashoffset is NOT compositor-animatable —
-     the former 1.15s infinite march was a per-frame MAIN-THREAD restyle in
-     every pane with a running session (profile: the live panes styled 4–20
-     elements every tick). The mark now rests as a STATIC dash highlight and
-     traces once on mount (single sweep from the old base offset 180 to the
-     new resting offset 0 — no fill, no retained animation). The working
-     semantics survive: accent color + glow + dash pattern + the elapsed
-     timer + the pulsing dots beside it. */
-  animation: vh-inline-current 1.15s linear 1;
+@keyframes vh-ring {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
 }
-.vh-current.hot {
-  stroke: color-mix(in srgb, var(--accent) 42%, var(--fg-strong, #fff));
-  stroke-width: 3;
-  stroke-dasharray: 12 196;
-  animation-duration: 0.85s;
-}
-@keyframes vh-inline-current { from { stroke-dashoffset: 180; } to { stroke-dashoffset: 0; } }
 .working-text { display: inline-flex; align-items: baseline; min-width: 0; color: var(--fg); }
 .working-verb { flex: 0 0 auto; }
 /* Subject truncates like .tool-subject (overflow ellipsis) so a long command or
@@ -264,7 +258,9 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 .working-dots::after { content: "..."; }
 @keyframes working-dots-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 @media (prefers-reduced-motion: reduce) {
-  .vh-current { animation: none; stroke-dasharray: none; }
+  .vh-motion { animation: none !important; }
+  .vh-indicator { display: none !important; }
+  .vh-shell { opacity: 1 !important; transform: none !important; }
   .working-dots { animation: none; }
 }
 
