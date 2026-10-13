@@ -110,3 +110,113 @@ test("Preferences: session-names editor adds a rule and previews the transform",
   expect(committed.nameReplacements[0].pattern).toBe("\\[\\[IMPORTANT\\]\\]");
   expect(committed.nameReplacements[0].replacement).toBe("❗");
 });
+
+// ----------------------------------------------------------------------------
+// E Ink display-signal check (requested diagnostics) — the app-preferences
+// side of this spec. The check runs ONLY on the explicit "Check display
+// signals" click (never at startup), reports CLUES (never identification),
+// and can never change the profile by itself. Test 1 mocks the two positive
+// display media queries through the sanctioned matchMedia patch seam (the
+// terminal.spec.ts forceCoarsePointer pattern: addInitScript wraps the REAL
+// matchMedia before any app code, delegating everything except the two
+// e-ink queries) and proves positive clues leave the profile OFF until a
+// SECOND explicit "Enable E Ink mode" click — which writes the same pref the
+// manual toggle uses. Test 2 runs the check against the REAL unmocked
+// desktop display (no positive signals) and proves the neutral copy plus a
+// still-fully-usable manual toggle.
+
+test("E Ink display-signal check: clues never auto-enable; Enable is a second explicit click", async ({ page }) => {
+  await page.addInitScript(() => {
+    const orig = window.matchMedia.bind(window);
+    const positive = new Set(["(update: slow)", "(monochrome)"]);
+    window.matchMedia = ((q: string) => {
+      if (positive.has(q)) {
+        return {
+          matches: true,
+          media: q,
+          onchange: null,
+          addListener() {},
+          removeListener() {},
+          addEventListener() {},
+          removeEventListener() {},
+          dispatchEvent: () => false,
+        } as MediaQueryList;
+      }
+      return orig(q);
+    }) as typeof window.matchMedia;
+  });
+  await page.goto(projectUrl("/"));
+
+  // Default boot: profile OFF, nothing persisted.
+  expect(await page.evaluate(() => localStorage.getItem("vh.prefs.einkProfile.v1"))).toBeNull();
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await dialog.getByRole("button", { name: "Appearance" }).click();
+  const einkToggle = dialog.getByRole("checkbox", { name: "E Ink mode" });
+  await expect(einkToggle).toBeVisible();
+  await expect(einkToggle).not.toBeChecked();
+  // Nothing ran on its own: no results and no Enable affordance render
+  // before the explicit check click.
+  await expect(dialog.locator("[data-eink-check-summary]")).toHaveCount(0);
+  await expect(dialog.locator("[data-eink-check-clue]")).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "Enable E Ink mode" })).toHaveCount(0);
+
+  // Explicit click #1: the check runs and reports the mocked positive
+  // signals as CLUES.
+  await dialog.getByRole("button", { name: "Check display signals" }).click();
+  const summary = dialog.locator("[data-eink-check-summary]");
+  await expect(summary).toBeVisible();
+  await expect(summary).toContainText("compatible with an e-ink panel");
+  await expect(dialog.locator("[data-eink-check-clue]")).toHaveCount(2);
+
+  // Clues never identify and never auto-enable: the toggle is still OFF,
+  // nothing was persisted by the check, and no theme class changed.
+  await expect(einkToggle).not.toBeChecked();
+  expect(await page.evaluate(() => localStorage.getItem("vh.prefs.einkProfile.v1"))).toBeNull();
+  let classes = await page.evaluate(() => Array.from(document.documentElement.classList));
+  expect(classes).not.toContain("theme-eink");
+
+  // Explicit click #2 (Enable): flips the same pref the manual toggle uses.
+  await dialog.getByRole("button", { name: "Enable E Ink mode" }).click();
+  await expect(einkToggle).toBeChecked();
+  expect(await page.evaluate(() => localStorage.getItem("vh.prefs.einkProfile.v1"))).toBe(
+    JSON.stringify({ v: 1, data: true }),
+  );
+  classes = await page.evaluate(() => Array.from(document.documentElement.classList));
+  expect(classes).toContain("theme-eink");
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+});
+
+test("E Ink display-signal check: real display with no signals → neutral copy, manual toggle intact", async ({ page }) => {
+  // No matchMedia patch: the check consults the real display. A desktop
+  // color display answers (update: fast) and (monochrome: 0) — no positive
+  // clues, so the copy must be neutral and the manual path untouched.
+  await page.goto(projectUrl("/"));
+  await page.getByRole("button", { name: "Settings" }).click();
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await dialog.getByRole("button", { name: "Appearance" }).click();
+  const einkToggle = dialog.getByRole("checkbox", { name: "E Ink mode" });
+  await expect(einkToggle).not.toBeChecked();
+
+  await dialog.getByRole("button", { name: "Check display signals" }).click();
+  const summary = dialog.locator("[data-eink-check-summary]");
+  await expect(summary).toBeVisible();
+  await expect(summary).toContainText("No e-ink signals reported");
+  await expect(summary).toContainText("enable E Ink mode manually");
+  // No clues, no Enable affordance on a negative result.
+  await expect(dialog.locator("[data-eink-check-clue]")).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "Enable E Ink mode" })).toHaveCount(0);
+
+  // Manual ON stays fully usable when every signal is negative.
+  await einkToggle.click();
+  await expect(einkToggle).toBeChecked();
+  expect(await page.evaluate(() => localStorage.getItem("vh.prefs.einkProfile.v1"))).toBe(
+    JSON.stringify({ v: 1, data: true }),
+  );
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+});

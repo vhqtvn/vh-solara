@@ -6,6 +6,7 @@ import { hideBuiltin, setHideBuiltin } from "../models";
 import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE, chatWidth, setChatWidth, chatBubbles, setChatBubbles, notesEnabled, setNotesEnabled, tabStyle, setTabStyle, perfDiagEnabled, setPerfDiagEnabled, einkProfile, setEinkProfile, type ChatWidth, type TabStyle } from "../prefs";
 import { queueMode, setQueueMode } from "../queue";
 import { inlineAttachForced, setInlineAttachForced } from "../lib/inlineAttach";
+import { runEinkDisplayCheck, type EinkCheckResult, type MatchMediaLike } from "../lib/einkCheck";
 import { canInstall, installed, isIosSafari, promptInstall } from "../pwa-install";
 import { runDiagnostics, chipLabel, type DiagnosticsResult } from "../pwa-diagnostics";
 import { killTerm, listTerms } from "../termApi";
@@ -66,6 +67,24 @@ export default function SettingsDialog(props: { onClose: () => void }) {
     } else {
       setThemeNote({ ok: false, msg: "Not a valid theme — expected JSON with #rrggbb colors." });
     }
+  };
+  // E Ink display-signal check (requested diagnostics): runs ONLY on the
+  // explicit "Check display signals" click — no startup, background, or
+  // telemetry path. Results are CLUES, never identification, and no result
+  // ever changes the profile by itself; positive clues may reveal a second,
+  // explicit "Enable E Ink mode" button that calls the same setEinkProfile
+  // the manual toggle uses. Display media queries only — no UA/client-hint
+  // reads anywhere.
+  const [einkCheck, setEinkCheck] = createSignal<EinkCheckResult | null>(null);
+  const runEinkSignals = () => {
+    // Read window.matchMedia lazily, at click time: a missing or throwing
+    // implementation degrades to the "signals unavailable" copy instead of
+    // crashing the dialog (see lib/einkCheck.ts).
+    const mm: MatchMediaLike | null =
+      typeof window !== "undefined" && typeof window.matchMedia === "function"
+        ? (q) => window.matchMedia(q)
+        : null;
+    setEinkCheck(runEinkDisplayCheck(mm));
   };
   // Terminal sessions (fetched when the Terminals tab is open).
   const [terms, { refetch: refetchTerms }] = createResource(sec, (s) => (s === "terminals" ? listTerms() : Promise.resolve([])));
@@ -305,6 +324,34 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                 Working marker shows progress, with a Show live button on the reply to watch it stream.
                 Your theme and streaming preferences are kept and return when this is off.
               </p>
+              <div class="setting-row" style={{ "justify-content": "space-between" }}>
+                <label>Display signals</label>
+                <button type="button" class="theme-select" onClick={runEinkSignals}>Check display signals</button>
+              </div>
+              <p class="setting-hint">
+                Optional: asks this display which update and color signals it reports. Results are
+                clues only — nothing is detected or changed for you.
+              </p>
+              <Show when={einkCheck()}>
+                {(r) => (
+                  <>
+                    <p class="setting-hint" data-eink-check-summary>{r().summary}</p>
+                    <For each={r().clues}>
+                      {(clue) => <p class="setting-hint" data-eink-check-clue>{clue}</p>}
+                    </For>
+                    <Show when={r().suggests && !einkProfile()}>
+                      <button
+                        type="button"
+                        class="theme-select"
+                        data-eink-check-enable
+                        onClick={() => setEinkProfile(true)}
+                      >
+                        Enable E Ink mode
+                      </button>
+                    </Show>
+                  </>
+                )}
+              </Show>
               <div class="setting-row">
                 <label>Orientation</label>
                 <Select
