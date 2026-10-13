@@ -2,7 +2,13 @@
 // custom-theme idea, kept lean): chrome palettes via CSS-variable classes on
 // <html>. Code syntax uses the dark chroma sheet by default and the
 // .theme-light-scoped light sheet for light themes (see /vh/highlight.css).
+import { createRenderEffect, createRoot, untrack } from "solid-js";
 import { persistedSignal } from "./lib/store";
+// The e-ink display profile preference (prefs.ts owns the persisted signal so
+// it composes with the rest of the preference machinery; theme.ts owns the
+// EFFECT — the effective-theme composition below). Import direction is
+// one-way: prefs.ts never imports theme.ts.
+import { EINK_PROFILE_KEY, einkProfile } from "./prefs";
 // The theme CATALOG (ThemeDef + THEMES) now lives in ./themeCatalog — a pure
 // data module shared with the host shell (host-web/src/theme.ts imports it
 // across the tree boundary). Re-exported here so every SPA consumer of
@@ -161,10 +167,25 @@ const [theme, setThemeSaved] = persistedSignal<string>(
   { onRemoteChange: () => applyTheme() },
 );
 
+// The e-ink display profile resolves an EFFECTIVE theme id for rendering: when
+// the profile is on, an e-ink theme renders INSTEAD of the saved one — the
+// color variant is kept when the user explicitly picked it, everything else
+// maps to the monochrome one — so the existing e-ink kill-switch (animation /
+// transition / smooth-scroll / shadow suppression) and max-contrast palette in
+// tokens.css attach via the plain theme classes. The SAVED theme preference is
+// never touched: turning the profile off restores it exactly, and while the
+// profile is off (the default) every user — including e-ink-theme users —
+// renders exactly as before.
+export function effectiveThemeId(): string {
+  const saved = theme();
+  if (!einkProfile()) return saved;
+  return saved === "eink-color" ? "eink-color" : "eink";
+}
+
 export function applyTheme() {
   const el = document.documentElement;
   for (const t of THEMES) el.classList.remove("theme-" + t.id);
-  const id = theme();
+  const id = effectiveThemeId();
   el.classList.add("theme-" + id);
 
   let light: boolean;
@@ -226,11 +247,12 @@ export { theme };
 // tabs, but a fully FROZEN tab (browsers freeze heavy background tabs; mobile
 // backgrounded views) may never run the listener — it thaws with stale
 // in-memory signals while the shared localStorage already holds the newer
-// value. On becoming visible, re-run the exact storage-event path for both
-// theme keys: dispatch a synthetic `storage` event, which the persistedSignal
-// listeners treat identically to a real one (re-read, update signal, re-apply
-// via onRemoteChange). Idempotent — if nothing was missed, the re-read yields
-// the same values and applyTheme() rewrites identical classes/vars.
+// value. On becoming visible, re-run the exact storage-event path for the
+// theme keys AND the e-ink profile key: dispatch a synthetic `storage` event,
+// which the persistedSignal listeners treat identically to a real one (re-read,
+// update signal, re-apply via onRemoteChange / the reactive effect below).
+// Idempotent — if nothing was missed, the re-read yields the same values and
+// applyTheme() rewrites identical classes/vars.
 if (
   typeof document !== "undefined" &&
   typeof document.addEventListener === "function" &&
@@ -238,8 +260,27 @@ if (
 ) {
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
-    for (const key of [LS_THEME, LS_CUSTOM]) {
+    for (const key of [LS_THEME, LS_CUSTOM, EINK_PROFILE_KEY]) {
       window.dispatchEvent(new StorageEvent("storage", { key }));
     }
+  });
+}
+
+// E-ink profile reactive apply (same shape as prefs.ts's reactive block: the
+// signal is the single source of truth, setters just set it). Runs once now
+// (synchronous initial apply) and again whenever the profile signal changes —
+// which covers BOTH the local setEinkProfile toggle and the cross-tab
+// `storage` path, where persistedSignal's listener updates the signal from
+// another same-origin document (tab / host pane iframe) and this effect
+// re-applies the effective theme here live. applyTheme is wrapped in untrack
+// so the effect subscribes ONLY to the profile signal — theme/customTheme
+// writes keep their own explicit apply paths. Guarded for non-DOM (unit-test)
+// contexts.
+if (typeof document !== "undefined") {
+  createRoot(() => {
+    createRenderEffect(() => {
+      einkProfile();
+      untrack(() => applyTheme());
+    });
   });
 }

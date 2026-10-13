@@ -273,3 +273,137 @@ test("mermaid overlay scrim resolves from --scrim-strong", async ({ page }) => {
     await probeBackground(page, "background: var(--scrim-strong)"),
   );
 });
+
+// ----------------------------------------------------------------------------
+// E Ink display profile — a manual, default-OFF preference that applies an
+// EFFECTIVE e-ink theme while preserving the saved theme preference. This test
+// proves, through the real Settings UI in a real browser: the default-off
+// boot, that selecting an e-ink THEME alone never enables the profile, that
+// toggling it ON attaches the effective e-ink class AND the motion/shadow
+// kill-switch (computed, not just class-list), that the saved theme preference
+// is preserved, that a second tab follows profile AND theme changes live
+// (same-context storage events, no reload), and that toggling OFF restores the
+// pre-toggle appearance exactly.
+
+// Probe with INLINE animation/transition/scroll-behavior declarations. Under a
+// normal theme the computed values are exactly what was declared; under the
+// e-ink kill-switch (tokens.css targets `:root.theme-eink *` with !important —
+// it exists precisely to override inline styles like Spinner's) they compute to
+// none / none / auto. Running the SAME probe before and after the profile
+// toggle proves the kill-switch attached BECAUSE of the profile.
+async function motionProbe(page: import("@playwright/test").Page) {
+  return page.evaluate(() => {
+    const el = document.createElement("div");
+    el.style.cssText =
+      "animation: probe-motion-eink 1s linear infinite; transition: opacity 0.3s ease; scroll-behavior: smooth; position:fixed; left:-9999px;";
+    document.body.appendChild(el);
+    const cs = getComputedStyle(el);
+    const out = {
+      animationName: cs.animationName,
+      transitionProperty: cs.transitionProperty,
+      scrollBehavior: cs.scrollBehavior,
+    };
+    el.remove();
+    return out;
+  });
+}
+
+test("e ink profile: default-off manual toggle composes a reversible effective theme across tabs", async ({ page }) => {
+  await page.goto(projectUrl("/"));
+
+  // ---- Default boot: profile OFF (no storage key), saved default theme renders.
+  let classes = await htmlClasses(page);
+  expect(classes).toContain("theme-dark");
+  expect(classes).not.toContain("theme-eink");
+  expect(await page.evaluate(() => localStorage.getItem("vh.prefs.einkProfile.v1"))).toBeNull();
+
+  // Baseline motion probe under dark: declarations compute exactly as written.
+  const base = await motionProbe(page);
+  expect(base).toEqual({ animationName: "probe-motion-eink", transitionProperty: "opacity", scrollBehavior: "smooth" });
+
+  // Second tab in the SAME context: shares localStorage, receives its storage
+  // events — the cross-tab consistency witness.
+  const p2 = await page.context().newPage();
+  await p2.goto(projectUrl("/"));
+  await expect.poll(() => htmlClasses(p2)).toContain("theme-dark");
+
+  // ---- Selecting an e-ink THEME (profile OFF) must NOT enable the profile.
+  await page.getByRole("button", { name: "Settings" }).click();
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await expect(dialog).toBeVisible();
+  await dialog.locator('[role="option"][title="E Ink"]').click();
+  classes = await htmlClasses(page);
+  expect(classes).toContain("theme-eink"); // via the SAVED theme, not the profile
+  expect(await page.evaluate(() => localStorage.getItem("vh.prefs.einkProfile.v1"))).toBeNull();
+  // The profile's own toggle stays unchecked.
+  await dialog.getByRole("button", { name: "Appearance" }).click();
+  const einkToggle = dialog.getByRole("checkbox", { name: "E Ink mode" });
+  await expect(einkToggle).toBeVisible();
+  await expect(einkToggle).not.toBeChecked();
+
+  // Back to the dark saved theme on both tabs before the profile phase, so the
+  // later assertions can't pass on a stale class.
+  await dialog.getByRole("button", { name: "Theme" }).click();
+  await dialog.locator('[role="option"][title="Dark"]').click();
+  await expect.poll(() => htmlClasses(page)).toContain("theme-dark");
+  await expect.poll(() => htmlClasses(p2)).toContain("theme-dark");
+  expect(await htmlClasses(p2)).not.toContain("theme-eink");
+
+  // ---- Profile ON (manual toggle through the real Settings UI).
+  await dialog.getByRole("button", { name: "Appearance" }).click();
+  await einkToggle.click();
+  classes = await htmlClasses(page);
+  expect(classes).toContain("theme-eink"); // effective e-ink theme attached
+  expect(classes).not.toContain("theme-dark"); // …in place of the saved class
+  expect(classes).toContain("theme-light-scoped"); // e-ink themes are light
+  // The SAVED theme preference is preserved untouched.
+  expect(await page.evaluate(() => localStorage.getItem("vh.theme.v1"))).toBe(
+    JSON.stringify({ v: 1, data: "dark" }),
+  );
+  // Kill-switch attached BY THE PROFILE: computed none/none/auto on the probe.
+  const killed = await motionProbe(page);
+  expect(killed).toEqual({ animationName: "none", transitionProperty: "none", scrollBehavior: "auto" });
+  // Shadow tokens resolve to none (borders carry elevation on e-ink).
+  const on = await themeVars(page);
+  expect(on.sm).toBe("none");
+  expect(on.md).toBe("none");
+  expect(on.lg).toBe("none");
+
+  // Cross-tab: tab 2 followed the toggle live (storage event, no reload).
+  await expect.poll(() => htmlClasses(p2)).toContain("theme-eink");
+
+  // ---- While ON, the SAVED theme still drives which e-ink variant renders:
+  // the color variant when explicitly picked…
+  await dialog.getByRole("button", { name: "Theme" }).click();
+  await dialog.locator('[role="option"][title="E Ink Color"]').click();
+  await expect.poll(() => htmlClasses(page)).toContain("theme-eink-color");
+  await expect.poll(() => htmlClasses(p2)).toContain("theme-eink-color");
+  // …monochrome for anything else (back to dark).
+  await dialog.locator('[role="option"][title="Dark"]').click();
+  await expect.poll(() => htmlClasses(page)).toContain("theme-eink");
+  await expect.poll(() => htmlClasses(p2)).toContain("theme-eink");
+  expect(await htmlClasses(p2)).not.toContain("theme-eink-color");
+
+  // ---- Profile OFF restores the saved appearance exactly.
+  await dialog.getByRole("button", { name: "Appearance" }).click();
+  await einkToggle.click(); // uncheck
+  classes = await htmlClasses(page);
+  expect(classes).toContain("theme-dark");
+  expect(classes).not.toContain("theme-eink");
+  expect(classes).not.toContain("theme-eink-color");
+  expect(await page.evaluate(() => localStorage.getItem("vh.theme.v1"))).toBe(
+    JSON.stringify({ v: 1, data: "dark" }),
+  );
+  expect(await page.evaluate(() => localStorage.getItem("vh.prefs.einkProfile.v1"))).toBe(
+    JSON.stringify({ v: 1, data: false }),
+  );
+  // The kill-switch is gone: the probe computes exactly the pre-toggle baseline.
+  expect(await motionProbe(page)).toEqual(base);
+  // Tab 2 restores too.
+  await expect.poll(() => htmlClasses(p2)).toContain("theme-dark");
+  expect(await htmlClasses(p2)).not.toContain("theme-eink");
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await p2.close();
+});

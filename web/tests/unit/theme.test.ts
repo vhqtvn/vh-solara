@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   applyTheme,
   CUSTOM_FIELDS,
   customTheme,
+  effectiveThemeId,
   exportCustomTheme,
   importCustomTheme,
   resetCustomTheme,
@@ -11,7 +12,9 @@ import {
   setCustomTheme,
   setThemeId,
   THEMES,
+  theme,
 } from "../../src/theme";
+import { einkProfile, setEinkProfile } from "../../src/prefs";
 
 describe("themes", () => {
   it("ships the expanded preset set plus a custom slot", () => {
@@ -107,5 +110,99 @@ describe("themes", () => {
     // a partial but valid import applies only the recognized keys
     expect(importCustomTheme(JSON.stringify({ accent: "#123123", bogus: 1 }))).toBe(true);
     expect(customTheme().accent).toBe("#123123");
+  });
+});
+
+// The e-ink display profile: a manual, default-OFF preference that composes an
+// EFFECTIVE theme (an e-ink theme renders in place of the saved one while the
+// saved preference stays untouched). These tests pin the resolution table, the
+// DOM composition, and the exact OFF round-trip. The signals are module-level
+// singletons shared across this file, so every test sets its state explicitly
+// and the afterEach resets the profile so later describes never inherit ON.
+describe("e ink profile — effective theme composition", () => {
+  afterEach(() => {
+    setEinkProfile(false);
+  });
+
+  it("resolves the saved theme unchanged while the profile is off", () => {
+    setEinkProfile(false);
+    for (const id of ["dark", "nord", "eink", "eink-color", "custom", "light"]) {
+      setThemeId(id);
+      expect(theme()).toBe(id); // saved preference is the source of truth
+      expect(effectiveThemeId()).toBe(id); // …and renders as-is
+    }
+  });
+
+  it("resolves an e-ink theme while on: color variant kept, everything else monochrome", () => {
+    setEinkProfile(true);
+    // The color variant is kept only when the user explicitly picked it.
+    setThemeId("eink-color");
+    expect(effectiveThemeId()).toBe("eink-color");
+    // Every other saved theme maps to the monochrome e-ink theme…
+    for (const id of ["dark", "nord", "eink", "light", "custom"]) {
+      setThemeId(id);
+      expect(effectiveThemeId()).toBe("eink");
+    }
+    // …and the saved preference itself is never rewritten by the profile.
+    expect(theme()).toBe("custom");
+  });
+
+  it("applyTheme renders the effective e-ink theme and OFF restores the saved one exactly", () => {
+    setEinkProfile(false);
+    setThemeId("nord");
+    const el = document.documentElement;
+    expect(el.classList.contains("theme-nord")).toBe(true);
+
+    setEinkProfile(true);
+    applyTheme();
+    expect(el.classList.contains("theme-eink")).toBe(true); // effective attached
+    expect(el.classList.contains("theme-nord")).toBe(false); // saved class replaced
+    expect(el.classList.contains("theme-light-scoped")).toBe(true); // e-ink is light
+    expect(el.style.colorScheme).toBe("light");
+    // The saved preference is untouched, in signal AND in storage.
+    expect(theme()).toBe("nord");
+    expect(localStorage.getItem("vh.theme.v1")).toBe(JSON.stringify({ v: 1, data: "nord" }));
+
+    setEinkProfile(false);
+    applyTheme();
+    expect(el.classList.contains("theme-nord")).toBe(true);
+    expect(el.classList.contains("theme-eink")).toBe(false);
+    expect(el.classList.contains("theme-light-scoped")).toBe(false); // nord is dark
+    expect(el.style.colorScheme).toBe("dark");
+  });
+
+  it("a custom saved theme round-trips: inline vars cleared while on, restored on OFF", () => {
+    setEinkProfile(false);
+    setCustomTheme({ bg: "#123456" });
+    setThemeId("custom");
+    const el = document.documentElement;
+    expect(el.style.getPropertyValue("--bg").trim()).toBe("#123456");
+
+    setEinkProfile(true);
+    applyTheme();
+    expect(el.classList.contains("theme-eink")).toBe(true);
+    // Effective e-ink is not custom: the inline vars must not pollute it.
+    for (const f of CUSTOM_FIELDS) expect(el.style.getPropertyValue(f.cssVar)).toBe("");
+
+    setEinkProfile(false);
+    applyTheme();
+    expect(el.classList.contains("theme-custom")).toBe(true);
+    expect(el.style.getPropertyValue("--bg").trim()).toBe("#123456");
+  });
+
+  it("re-applies reactively on the profile toggle alone (the Settings/cross-tab path)", () => {
+    // No explicit applyTheme() calls here: toggling the profile signal must
+    // re-run the composition by itself (theme.ts's reactive effect) — this is
+    // the path the Settings checkbox and the cross-tab storage event rely on.
+    setEinkProfile(false);
+    setThemeId("nord");
+    expect(document.documentElement.classList.contains("theme-nord")).toBe(true);
+
+    setEinkProfile(true);
+    expect(document.documentElement.classList.contains("theme-eink")).toBe(true);
+
+    setEinkProfile(false);
+    expect(document.documentElement.classList.contains("theme-nord")).toBe(true);
+    expect(document.documentElement.classList.contains("theme-eink")).toBe(false);
   });
 });

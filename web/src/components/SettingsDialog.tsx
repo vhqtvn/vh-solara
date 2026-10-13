@@ -3,7 +3,7 @@ import { CUSTOM_FIELDS, customTheme, exportCustomTheme, importCustomTheme, reset
 import ThemePicker from "./ThemePicker";
 import { customFont, font, FONTS, monoFont, MONO_FONTS, setCustomFont, setFontId, setMonoFontId } from "../font";
 import { hideBuiltin, setHideBuiltin } from "../models";
-import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE, chatWidth, setChatWidth, chatBubbles, setChatBubbles, notesEnabled, setNotesEnabled, tabStyle, setTabStyle, perfDiagEnabled, setPerfDiagEnabled, type ChatWidth, type TabStyle } from "../prefs";
+import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE, chatWidth, setChatWidth, chatBubbles, setChatBubbles, notesEnabled, setNotesEnabled, tabStyle, setTabStyle, perfDiagEnabled, setPerfDiagEnabled, einkProfile, setEinkProfile, type ChatWidth, type TabStyle } from "../prefs";
 import { queueMode, setQueueMode } from "../queue";
 import { inlineAttachForced, setInlineAttachForced } from "../lib/inlineAttach";
 import { canInstall, installed, isIosSafari, promptInstall } from "../pwa-install";
@@ -288,6 +288,20 @@ export default function SettingsDialog(props: { onClose: () => void }) {
               <p class="setting-hint">
                 Scales the whole interface. On mobile this sets the viewport zoom (pinch-zoom is off, so
                 this is how you scale the app). Click the % to reset.
+              </p>
+              <div class="setting-row">
+                <label>E Ink mode</label>
+                <input
+                  type="checkbox"
+                  aria-label="E Ink mode"
+                  checked={einkProfile()}
+                  onChange={(e) => setEinkProfile(e.currentTarget.checked)}
+                />
+              </div>
+              <p class="setting-hint">
+                Optimizes rendering for e-ink displays: a high-contrast E Ink theme is applied in place
+                of your theme (the E Ink Color theme if that is your pick), with animations, transitions,
+                and shadows disabled. Your theme preference is kept and returns when this is off.
               </p>
               <div class="setting-row">
                 <label>Orientation</label>

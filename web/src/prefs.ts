@@ -243,6 +243,22 @@ export const [perfDiagEnabled, setPerfDiagEnabled] = persistedSignal<boolean>(
   boolMigrate(false),
 );
 
+// E Ink display profile: a MANUAL, default-OFF profile that optimizes rendering
+// for e-ink displays. When on, an e-ink theme is applied as the EFFECTIVE theme
+// in place of the user's saved one (the composition lives in theme.ts —
+// applyTheme resolves it); when off, the saved theme renders exactly as before.
+// The saved theme preference is never modified by the profile. Purely manual:
+// nothing turns it on but the user — no media-query, user-agent, or
+// client-hint detection of any kind. Key exported for theme.ts's frozen-tab
+// catch-up (same pattern as its own theme keys).
+export const EINK_PROFILE_KEY = "vh.prefs.einkProfile.v1";
+export const [einkProfile, setEinkProfile] = persistedSignal<boolean>(
+  EINK_PROFILE_KEY,
+  1,
+  false,
+  boolMigrate(false),
+);
+
 // Apply the DOM-affecting prefs reactively: each render-effect runs once now
 // (synchronous initial apply, before first paint) and again whenever its signal
 // changes. Replaces the manual apply() calls in setters + the boot list in

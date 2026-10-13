@@ -134,3 +134,95 @@ describe("perfDiagEnabled is global and durable", () => {
     expect(localStorage.getItem(KEY)).toBe(JSON.stringify({ v: 1, data: false }));
   });
 });
+
+// The e-ink display profile preference: manual, default-OFF, detection-free.
+// These tests pin the preference-layer contract: fresh storage defaults OFF,
+// nothing but the explicit setter can turn it on (in particular selecting an
+// e-ink THEME), the toggle persists, and enabling it leaves every other saved
+// preference byte-identical.
+describe("einkProfile preference", () => {
+  const KEY = "vh.prefs.einkProfile.v1";
+  const THEME_KEY = "vh.theme.v1";
+  const SCALE_KEY = "vh.prefs.uiScale.v1";
+  const STREAM_KEY = "vh.prefs.streamLive.v1";
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.resetModules();
+  });
+
+  it("defaults to OFF from cleared storage and writes nothing on read", async () => {
+    const { einkProfile } = await import("../../src/prefs");
+    expect(einkProfile()).toBe(false);
+    expect(localStorage.getItem(KEY)).toBeNull();
+  });
+
+  it("is enabled only by the explicit setter — selecting an e-ink theme never enables it", async () => {
+    const prefs = await import("../../src/prefs");
+    const themeMod = await import("../../src/theme");
+    // Picking each e-ink theme as the SAVED theme (the full user path)…
+    themeMod.setThemeId("eink");
+    expect(themeMod.theme()).toBe("eink");
+    themeMod.setThemeId("eink-color");
+    expect(themeMod.theme()).toBe("eink-color");
+    // …leaves the profile OFF and its storage key unwritten.
+    expect(prefs.einkProfile()).toBe(false);
+    expect(localStorage.getItem(KEY)).toBeNull();
+
+    // The manual setter is the only activator, and it persists both ways.
+    prefs.setEinkProfile(true);
+    expect(prefs.einkProfile()).toBe(true);
+    expect(localStorage.getItem(KEY)).toBe(JSON.stringify({ v: 1, data: true }));
+    prefs.setEinkProfile(false);
+    expect(localStorage.getItem(KEY)).toBe(JSON.stringify({ v: 1, data: false }));
+  });
+
+  it("works with zero detection signals available (no matchMedia, no client hints)", async () => {
+    // jsdom exposes neither window.matchMedia nor navigator.userAgentData —
+    // a maximally signal-free environment. If the profile consulted ANY
+    // detection signal this would be impossible to satisfy: the manual toggle
+    // alone must apply the effective e-ink theme.
+    expect(typeof matchMedia).toBe("undefined");
+    expect((navigator as any).userAgentData).toBeUndefined();
+    const prefs = await import("../../src/prefs");
+    const themeMod = await import("../../src/theme");
+    themeMod.setThemeId("dark");
+    prefs.setEinkProfile(true);
+    themeMod.applyTheme();
+    expect(document.documentElement.classList.contains("theme-eink")).toBe(true);
+    expect(themeMod.effectiveThemeId()).toBe("eink");
+  });
+
+  it("leaves the saved theme, scale, and streaming preferences byte-identical while ON", async () => {
+    const prefs = await import("../../src/prefs");
+    const themeMod = await import("../../src/theme");
+    themeMod.setThemeId("nord");
+    prefs.setUiScale(1.25);
+    prefs.setStreamLive(false);
+    const before = {
+      theme: localStorage.getItem(THEME_KEY),
+      scale: localStorage.getItem(SCALE_KEY),
+      stream: localStorage.getItem(STREAM_KEY),
+    };
+
+    prefs.setEinkProfile(true);
+    themeMod.applyTheme();
+    expect({
+      theme: localStorage.getItem(THEME_KEY),
+      scale: localStorage.getItem(SCALE_KEY),
+      stream: localStorage.getItem(STREAM_KEY),
+    }).toEqual(before);
+    // …and the in-memory signals too.
+    expect(themeMod.theme()).toBe("nord");
+    expect(prefs.uiScale()).toBe(1.25);
+    expect(prefs.streamLive()).toBe(false);
+
+    prefs.setEinkProfile(false);
+    themeMod.applyTheme();
+    expect({
+      theme: localStorage.getItem(THEME_KEY),
+      scale: localStorage.getItem(SCALE_KEY),
+      stream: localStorage.getItem(STREAM_KEY),
+    }).toEqual(before);
+  });
+});
