@@ -26,7 +26,14 @@ export default defineConfig({
   testDir: path.join(hostRoot, "tests/preview-e2e"),
   fullyParallel: false,
   workers: 1,
-  retries: 0,
+  // CI retries absorb runner-level transients (browser/context killed at test
+  // start — e.g. "Target page, context or browser has been closed" at the first
+  // page.goto, seen on GitHub runners where this lane runs second, after the
+  // 3-engine survival lane, on a memory-pressured box). Same pattern as
+  // host-web/playwright.config.ts and web/playwright.config.ts — a dead browser
+  // fixture is only recoverable by a test-level retry in a fresh worker, never
+  // by an in-test goto retry. Local runs stay at 0 retries.
+  retries: process.env.CI ? 2 : 0,
   reporter: [
     ["list"],
     ["html", { open: "never", outputFolder: path.join(artifactRoot, "report") }],
