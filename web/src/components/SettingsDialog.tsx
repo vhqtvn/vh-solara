@@ -301,7 +301,9 @@ export default function SettingsDialog(props: { onClose: () => void }) {
               <p class="setting-hint">
                 Optimizes rendering for e-ink displays: a high-contrast E Ink theme is applied in place
                 of your theme (the E Ink Color theme if that is your pick), with animations, transitions,
-                and shadows disabled. Your theme preference is kept and returns when this is off.
+                and shadows disabled. While on, streaming replies appear only once complete — a quiet
+                Working marker shows progress, with a Show live button on the reply to watch it stream.
+                Your theme and streaming preferences are kept and return when this is off.
               </p>
               <div class="setting-row">
                 <label>Orientation</label>

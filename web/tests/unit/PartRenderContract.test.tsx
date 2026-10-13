@@ -3,9 +3,12 @@
 // window.matchMedia at module load. Import the shared stub BEFORE the component
 // import is evaluated — see _matchMedia.ts.
 import "./_matchMedia";
-import { cleanup, render } from "@solidjs/testing-library";
-import { afterEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render } from "@solidjs/testing-library";
+import { createSignal } from "solid-js";
+import { createStore } from "solid-js/store";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import PartView from "../../src/components/Part";
+import { einkProfile, setEinkProfile, setStreamLive, streamLive } from "../../src/prefs";
 import type { Part } from "../../src/types";
 
 // INV-7 render contract: every opencode part kind must render a defined,
@@ -126,5 +129,219 @@ describe.skip("INV-5: a dropped part.upsert frame is detected or recovered", () 
     //   assert EITHER a gap is detected (an error/notice) OR a recovery fetch
     //   is triggered. Today neither happens — the cursor silently advances.
     expect(true).toBe(true); // placeholder; real assertion lives behind the skip
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E-ink display profile — settled-part streaming presentation
+// ---------------------------------------------------------------------------
+// While the profile is ON, a streaming markdown part is held back by default
+// (the existing not-live-previewed path — the same presentation semantics as
+// the saved block-by-block preference) behind a static accessible working
+// indication, settles losslessly, and offers a profile-local live escape that
+// must not touch the profile signal or the saved streamLive preference.
+// Profile OFF must keep the historical behavior byte-identical: the same
+// ~200ms live cadence with the pref on, the same empty hold-back with it off,
+// and none of the profile UI. Cadence behavior is driven with fake timers
+// (the FRAME_MS=200 coalesce window in Part.tsx MarkdownLive).
+describe("e-ink profile — settled-part streaming presentation", () => {
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    setEinkProfile(false);
+    setStreamLive(true);
+  });
+
+  // Mount one streaming TEXT part whose text/settled state is driven
+  // reactively — the way the chat store drives a part during a real stream.
+  function mountStreamingText(id: string) {
+    const [part, setPart] = createStore<Part>({
+      id,
+      sessionID: "s1",
+      messageID: "m1",
+      type: "text",
+      text: "",
+    } as Part);
+    const [settled, setSettled] = createSignal(false);
+    const res = render(() => <PartView part={part} settled={settled()} />);
+    return { ...res, setPart, setSettled };
+  }
+
+  // Advance the streaming cadence by ms: let Solid's effects flush (they
+  // schedule the FRAME_MS setTimeout on text change), then fire fake timers.
+  const tick = async (ms: number) => {
+    await Promise.resolve();
+    vi.advanceTimersByTime(ms);
+    await Promise.resolve();
+  };
+
+  it("ON: streaming text is held back (no live churn) behind a static accessible working indication, and settles losslessly", async () => {
+    vi.useFakeTimers();
+    setStreamLive(true);
+    setEinkProfile(true);
+    const { container, setPart, setSettled } = mountStreamingText("eink-hold");
+
+    // Held back from the first token: the working indication is mounted, the
+    // live engine is not, and no streamed text is visible.
+    const working = container.querySelector('[data-eink="working"]');
+    expect(working).not.toBeNull();
+    expect(container.querySelector(".md-stream")).toBeNull();
+    // Static + accessible: a status role carrying plain text — legible with
+    // animations disabled (the e-ink theme kill-switch), no motion needed.
+    expect(working!.querySelector('[role="status"]')?.textContent).toContain("Working");
+
+    // Deltas keep arriving (several cadence frames' worth of fake time) —
+    // none may leak into the DOM: no live preview churn under the profile.
+    setPart("text", "first chunk of a long reply");
+    await tick(200);
+    await tick(200);
+    await tick(200);
+    expect(container.querySelector(".md-stream")).toBeNull();
+    expect(container.textContent || "").not.toContain("first chunk");
+    // …and the escape affordance is offered exactly here (profile-scoped).
+    expect(container.querySelector('[data-eink="show-live"]')).not.toBeNull();
+
+    // Lossless settle: the FULL text appears once the part settles (through
+    // the existing settled presentation branch).
+    setPart("text", "first chunk of a long reply and the final sentence");
+    setSettled(true);
+    await tick(1);
+    expect(container.textContent || "").toContain("first chunk");
+    expect(container.textContent || "").toContain("final sentence");
+    // The indication is gone once settled.
+    expect(container.querySelector('[data-eink="working"]')).toBeNull();
+    expect(container.querySelector('[data-eink="show-live"]')).toBeNull();
+  });
+
+  it("ON: the live escape returns the live preview for that part without mutating the profile or saved streaming prefs", async () => {
+    vi.useFakeTimers();
+    setStreamLive(true);
+    setEinkProfile(true);
+    const savedBefore = localStorage.getItem("vh.prefs.streamLive.v1");
+    const { container, setPart } = mountStreamingText("eink-escape");
+
+    setPart("text", "streaming under the profile");
+    await tick(250);
+    expect(container.textContent || "").not.toContain("streaming under");
+
+    // Real click on the escape affordance (Solid's delegated onClick).
+    fireEvent.click(container.querySelector('[data-eink="show-live"]')!);
+
+    // The live engine mounts for THIS part and the existing ~200ms cadence
+    // renders the accumulated text.
+    expect(container.querySelector(".md-stream")).not.toBeNull();
+    await tick(250);
+    expect(container.textContent || "").toContain("streaming under");
+
+    // Profile-local: neither the profile nor the SAVED streaming preference
+    // was written by the escape (byte-identical storage).
+    expect(einkProfile()).toBe(true);
+    expect(streamLive()).toBe(true);
+    expect(localStorage.getItem("vh.prefs.streamLive.v1")).toBe(savedBefore);
+  });
+
+  it("ON: urgent surfaces are never deferred — a tool part renders its error state immediately while streaming", () => {
+    setEinkProfile(true);
+    // The hold-back gates ONLY the markdown live preview. Tool parts render
+    // their status (including error) as soon as state arrives; questions and
+    // permissions render outside PartView entirely (ChatView-level cards) and
+    // never pass through the gate either.
+    const { container } = render(() => (
+      <PartView
+        part={mk("tool", { tool: "bash", state: { status: "error", title: "command failed" } })}
+        settled={false}
+      />
+    ));
+    const tool = container.querySelector(".tool");
+    expect(tool).not.toBeNull();
+    expect(tool!.classList.contains("error")).toBe(true);
+    expect(container.textContent || "").toContain("command failed");
+    // The held-back markdown indication is a markdown-only surface: absent
+    // for a tool part even under ON.
+    expect(container.querySelector('[data-eink="working"]')).toBeNull();
+  });
+
+  it("ON with the streaming pref off: the profile's working indication still shows and the escape still works (profile-driven, not pref-driven)", async () => {
+    vi.useFakeTimers();
+    setEinkProfile(true);
+    setStreamLive(false);
+    const savedBefore = localStorage.getItem("vh.prefs.streamLive.v1");
+    const { container, setPart } = mountStreamingText("eink-on-block");
+
+    setPart("text", "held by both the pref and the profile");
+    await tick(500);
+    // Held back (no engine) behind the profile's indication + escape.
+    expect(container.querySelector(".md-stream")).toBeNull();
+    expect(container.textContent || "").not.toContain("held by both");
+    expect(container.querySelector('[data-eink="working"]')).not.toBeNull();
+    expect(container.querySelector('[data-eink="show-live"]')).not.toBeNull();
+
+    // The escape still works from here — and the saved pref (false) is never
+    // rewritten by either the hold-back or the escape.
+    fireEvent.click(container.querySelector('[data-eink="show-live"]')!);
+    expect(container.querySelector(".md-stream")).not.toBeNull();
+    await tick(250);
+    expect(container.textContent || "").toContain("held by both");
+    expect(streamLive()).toBe(false);
+    expect(localStorage.getItem("vh.prefs.streamLive.v1")).toBe(savedBefore);
+  });
+
+  it("OFF: the live ~200ms cadence is unchanged and no profile UI exists", async () => {
+    vi.useFakeTimers();
+    setEinkProfile(false);
+    setStreamLive(true);
+    const { container, setPart } = mountStreamingText("eink-off-live");
+
+    setPart("text", "alpha");
+    await tick(250);
+    expect(container.querySelector(".md-stream")).not.toBeNull();
+    expect(container.textContent || "").toContain("alpha");
+
+    // A later delta lands on a LATER cadence frame — coalescing preserved.
+    setPart("text", "alpha beta");
+    await tick(250);
+    expect(container.textContent || "").toContain("beta");
+
+    // Profile UI (indication + escape) exists only under the profile.
+    expect(container.querySelector('[data-eink="working"]')).toBeNull();
+    expect(container.querySelector('[data-eink="show-live"]')).toBeNull();
+  });
+
+  it("OFF with the streaming pref off: the block-by-block hold-back is unchanged (no profile UI)", async () => {
+    vi.useFakeTimers();
+    setEinkProfile(false);
+    setStreamLive(false);
+    const { container, setPart } = mountStreamingText("eink-off-block");
+
+    setPart("text", "held block text");
+    await tick(500);
+    expect(container.querySelector(".md-stream")).toBeNull();
+    expect(container.textContent || "").not.toContain("held block text");
+    // The e-ink indication/escape are profile-scoped: absent with it off —
+    // OFF rendering stays byte-identical to the pre-profile behavior.
+    expect(container.querySelector('[data-eink="working"]')).toBeNull();
+    expect(container.querySelector('[data-eink="show-live"]')).toBeNull();
+  });
+
+  it("toggling the profile mid-stream flips the presentation reactively in both directions", async () => {
+    vi.useFakeTimers();
+    setStreamLive(true);
+    setEinkProfile(false);
+    const { container, setPart } = mountStreamingText("eink-midflip");
+
+    setPart("text", "live before the flip");
+    await tick(250);
+    expect(container.querySelector(".md-stream")).not.toBeNull();
+
+    // Profile on (the Settings/cross-tab path — the same signal): the engine
+    // unmounts, the held-back indication mounts.
+    setEinkProfile(true);
+    expect(container.querySelector(".md-stream")).toBeNull();
+    expect(container.querySelector('[data-eink="working"]')).not.toBeNull();
+
+    // Profile off again: back to the live engine (the escape was never used).
+    setEinkProfile(false);
+    expect(container.querySelector(".md-stream")).not.toBeNull();
+    expect(container.querySelector('[data-eink="working"]')).toBeNull();
   });
 });

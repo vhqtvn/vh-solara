@@ -324,3 +324,39 @@
   text-overflow: ellipsis;
   max-width: 40ch;
 }
+
+/* --- e-ink profile: held-back streaming presentation --- */
+/* Shown while the e-ink display profile holds a streaming markdown block back
+   (settled-part default, Part.tsx EinkWorking). Deliberately STATIC: the
+   e-ink themes' kill-switch nulls animation/transition, so the indication
+   must be legible without motion — a glyph + text, no shimmer. Cheap inline
+   content only — no mask-image/backdrop-filter/contain (this sits in the
+   GPU-hot chat-scroll surface; see AGENTS.md GPU-perf bans). */
+.eink-working {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 0;
+  font-size: 13px;
+  color: var(--fg-dim);
+}
+.eink-working-glyph { color: var(--accent); font-size: 9px; line-height: 1; flex: 0 0 auto; }
+.eink-working-text { color: var(--fg-dim); }
+/* Profile-local live escape: a quiet text button rendered only inside the
+   held-back indication (profile on, block unsettled). */
+.eink-live-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg-dim);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.eink-live-btn:hover {
+  color: var(--fg);
+  border-color: var(--fg-dim);
+  background: color-mix(in srgb, var(--fg) 6%, transparent);
+}

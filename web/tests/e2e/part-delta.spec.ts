@@ -360,3 +360,169 @@ test("part.append: live SSE suffix streaming — negotiated, delivered, incremen
       `sseTypes=${JSON.stringify(sseTypes)}`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// E-ink display profile — settled-part streaming + profile-local live escape
+// ---------------------------------------------------------------------------
+// While the profile is ON (booted here through its SAVED preference — the
+// manual Settings activation path, no detection), a streaming text part is
+// held back by default behind a static working indication (the existing
+// not-live-previewed presentation path: no ~5fps live preview churn), the
+// final content appears complete on settle, and a per-part "Show live" escape
+// restores the live preview for that part WITHOUT disabling the profile or
+// mutating the saved streaming preference. Profile OFF behavior is pinned by
+// the live-wire test above (it boots with the profile off by default).
+
+// Boot the SPA with the e-ink profile already enabled in storage, and seed the
+// saved streaming preference explicitly so "the escape never mutates it" is a
+// byte-identity check against a real stored value (not just absence).
+async function bootWithEinkProfile(page: Page) {
+  await page.addInitScript(() => {
+    localStorage.setItem("vh.prefs.einkProfile.v1", JSON.stringify({ v: 1, data: true }));
+    localStorage.setItem("vh.prefs.streamLive.v1", JSON.stringify({ v: 1, data: true }));
+  });
+}
+
+// Sampled DOM timeline (20ms + mutation-driven, like the sampler above) with
+// the e-ink presentation fields. Post-hoc record assertions are robust to
+// assertion latency — the mid-stream evidence lives in the samples, not in
+// raced live queries.
+async function installEinkTimeline(page: Page) {
+  await page.addInitScript(() => {
+    (window as any).__vhEinkSamples = [];
+    const sample = () => {
+      const msgs = Array.from(document.querySelectorAll(".msg[data-mid]"));
+      const last = msgs[msgs.length - 1] as HTMLElement | undefined;
+      const text = last ? (last.textContent || "") : "";
+      (window as any).__vhEinkSamples.push({
+        t: performance.now(),
+        hasPrefix: text.indexOf("Working on it") !== -1,
+        hasFinal: text.indexOf("added a test") !== -1,
+        einkWorking: document.querySelectorAll('[data-eink="working"]').length,
+        mdStream: document.querySelectorAll(".md-stream").length,
+      });
+      const arr = (window as any).__vhEinkSamples;
+      if (arr.length > 800) (window as any).__vhEinkSamples = arr.slice(-800);
+    };
+    const obs = new MutationObserver(() => sample());
+    const start = () => {
+      if (!document.body) { setTimeout(start, 16); return; }
+      obs.observe(document.body, { childList: true, subtree: true });
+      setInterval(sample, 20);
+    };
+    start();
+  });
+}
+
+const readEinkTimeline = (page: Page) =>
+  page.evaluate(() => (window as any).__vhEinkSamples as any[]);
+
+const storedPrefs = (page: Page) =>
+  page.evaluate(() => ({
+    eink: localStorage.getItem("vh.prefs.einkProfile.v1"),
+    stream: localStorage.getItem("vh.prefs.streamLive.v1"),
+  }));
+
+test("e-ink profile ON: streaming held back behind a static working indication; lossless settle; saved prefs untouched", async ({ page }) => {
+  test.setTimeout(30_000);
+  await page.setViewportSize(VP);
+  await resetSession(page, "other");
+  await bootWithEinkProfile(page);
+  await installEinkTimeline(page);
+  await page.goto(projectUrl("/?session=other"));
+  await expect(page.locator(".chat-scroll")).toBeVisible({ timeout: 10000 });
+
+  await promptSession(page, "other", "eink settled probe");
+  // The held-back indication mounts while the part streams. It is
+  // profile-scoped: this element only exists while the profile is on and a
+  // markdown block is unsettled — its visibility IS the gating proof.
+  const working = page.locator('[data-eink="working"]').first();
+  await expect(working).toBeVisible({ timeout: 8000 });
+  // The live engine is NOT mounted while held back.
+  await expect(page.locator(".md-stream")).toHaveCount(0);
+
+  // Settle: session idle → the indication unmounts.
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 12000 });
+  await expect(page.locator("[data-eink='working']")).toHaveCount(0);
+
+  // Lossless settle: every streamed chunk is present in the final render.
+  const last = page.locator(".msg[data-mid]").last();
+  await expect(last).toContainText(PREFIX);
+  await expect(last).toContainText(SUFFIX);
+  await expect(last).toContainText(FINAL);
+
+  // Held-back proof from the sampled timeline: while the indication was
+  // mounted, no streamed text was visible and no live engine existed.
+  const samples = await readEinkTimeline(page);
+  const held = samples.filter((s) => s.einkWorking > 0);
+  expect(
+    held.length,
+    `no held-back samples observed; timeline head=${JSON.stringify(samples.slice(0, 20))}`,
+  ).toBeGreaterThan(0);
+  expect(
+    held.every((s) => !s.hasPrefix && !s.hasFinal && s.mdStream === 0),
+    `streamed text or a live engine leaked while held back; held samples=${JSON.stringify(held.slice(0, 20))}`,
+  ).toBe(true);
+
+  // Saved preferences byte-untouched: the profile key stays on; the streaming
+  // preference keeps its seeded bytes (the hold-back is presentation-only).
+  const stored = await storedPrefs(page);
+  expect(stored.eink).toBe(JSON.stringify({ v: 1, data: true }));
+  expect(stored.stream).toBe(JSON.stringify({ v: 1, data: true }));
+});
+
+test("e-ink profile ON: profile-local live escape (real click) restores live preview without mutating saved prefs", async ({ page }) => {
+  test.setTimeout(30_000);
+  await page.setViewportSize(VP);
+  await resetSession(page, "other");
+  await bootWithEinkProfile(page);
+  await installEinkTimeline(page);
+  await page.goto(projectUrl("/?session=other"));
+  await expect(page.locator(".chat-scroll")).toBeVisible({ timeout: 10000 });
+
+  await promptSession(page, "other", "eink live escape probe");
+  await expect(page.locator('[data-eink="working"]').first()).toBeVisible({ timeout: 8000 });
+
+  // REAL user click on the escape affordance — the interaction path. Click as
+  // soon as the affordance appears to land inside the fixture's ~720ms stream
+  // (chunks at 180ms intervals; the empty part mounts at stream start).
+  await page.locator('[data-eink="show-live"]').first().click();
+
+  // The turn still completes (the escape changes presentation only).
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 12000 });
+
+  // Lossless final content.
+  const last = page.locator(".msg[data-mid]").last();
+  await expect(last).toContainText(PREFIX);
+  await expect(last).toContainText(SUFFIX);
+  await expect(last).toContainText(FINAL);
+
+  // Escape evidence from the sampled timeline (robust to click latency):
+  // 1. a held-back phase existed, then the live engine mounted AFTER it;
+  // 2. while the engine was mounted, INTERMEDIATE streamed text was visible
+  //    before the final chunk — the live preview genuinely engaged mid-part.
+  const samples = await readEinkTimeline(page);
+  const firstLive = samples.findIndex((s) => s.mdStream > 0);
+  const lastHeld = samples.map((s) => s.einkWorking > 0).lastIndexOf(true);
+  expect(
+    firstLive,
+    `live engine never mounted after the escape click; timeline head=${JSON.stringify(samples.slice(0, 40))}`,
+  ).toBeGreaterThan(-1);
+  expect(lastHeld).toBeGreaterThan(-1);
+  expect(
+    firstLive > lastHeld,
+    `live engine mounted before/outside the escape (firstLive=${firstLive}, lastHeld=${lastHeld})`,
+  ).toBe(true);
+  const liveIntermediate = samples.filter((s) => s.mdStream > 0 && s.hasPrefix && !s.hasFinal);
+  expect(
+    liveIntermediate.length,
+    `no intermediate live-preview samples (engine mounted + prefix visible + final absent); ` +
+      `timeline head=${JSON.stringify(samples.slice(0, 40))}`,
+  ).toBeGreaterThan(0);
+
+  // Profile-local: neither the profile nor the saved streaming preference
+  // was mutated by the escape.
+  const stored = await storedPrefs(page);
+  expect(stored.eink).toBe(JSON.stringify({ v: 1, data: true }));
+  expect(stored.stream).toBe(JSON.stringify({ v: 1, data: true }));
+});

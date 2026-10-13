@@ -14,7 +14,7 @@ import {
   THEMES,
   theme,
 } from "../../src/theme";
-import { einkProfile, setEinkProfile } from "../../src/prefs";
+import { EINK_PROFILE_KEY, einkProfile, setEinkProfile } from "../../src/prefs";
 
 describe("themes", () => {
   it("ships the expanded preset set plus a custom slot", () => {
@@ -204,5 +204,48 @@ describe("e ink profile — effective theme composition", () => {
     setEinkProfile(false);
     expect(document.documentElement.classList.contains("theme-nord")).toBe(true);
     expect(document.documentElement.classList.contains("theme-eink")).toBe(false);
+  });
+
+  // Slice-1 review DEFER B1+C1: the frozen-tab thaw simulation for the e-ink
+  // profile key. A fully frozen background tab never runs the `storage`
+  // listener while ANOTHER same-origin document (tab / host pane iframe)
+  // toggles the profile — it thaws with a stale in-memory signal while the
+  // shared localStorage already holds the newer value. theme.ts registers a
+  // visibilitychange catch-up that re-runs the exact storage-event path for
+  // the theme + profile keys; this test simulates the whole sequence (frozen
+  // miss → thaw) and asserts the effective theme catches up, reactively,
+  // without any explicit applyTheme() call.
+  it("a tab frozen while another tab toggles the profile catches up on thaw (frozen-tab simulation)", () => {
+    // Arrange: this tab rendered the saved theme with the profile off.
+    setEinkProfile(false);
+    setThemeId("nord");
+    const el = document.documentElement;
+    expect(el.classList.contains("theme-nord")).toBe(true);
+
+    // Frozen miss: another same-origin document writes the shared key directly.
+    // No `storage` event is delivered here (the tab is frozen — that is the
+    // point), so the in-memory signal and the rendered DOM are now stale.
+    localStorage.setItem(EINK_PROFILE_KEY, JSON.stringify({ v: 1, data: true }));
+    expect(einkProfile()).toBe(false); // stale: the write was missed
+    expect(el.classList.contains("theme-nord")).toBe(true); // still rendering the saved theme
+
+    // Thaw: visibility returns to "visible" → theme.ts's catch-up dispatches
+    // the synthetic storage events → the signal re-reads → the reactive
+    // effect re-applies the EFFECTIVE theme. No explicit applyTheme().
+    try {
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+      document.dispatchEvent(new Event("visibilitychange"));
+    } finally {
+      // Restore jsdom's native getter for later tests.
+      delete (document as { visibilityState?: string }).visibilityState;
+    }
+
+    expect(einkProfile()).toBe(true); // signal caught up from storage
+    expect(el.classList.contains("theme-eink")).toBe(true); // effective theme applied
+    expect(el.classList.contains("theme-nord")).toBe(false); // saved theme class replaced
+    expect(el.classList.contains("theme-light-scoped")).toBe(true); // e-ink is light
+    // The SAVED theme preference itself is still untouched.
+    expect(theme()).toBe("nord");
+    expect(localStorage.getItem("vh.theme.v1")).toBe(JSON.stringify({ v: 1, data: "nord" }));
   });
 });

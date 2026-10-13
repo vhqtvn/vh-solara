@@ -5,7 +5,7 @@ import { renderStreamMd } from "../lib/md";
 import { StreamMd } from "../lib/streamMd";
 import { placeStreamCaret } from "../lib/streamCaret";
 import { renderMathIn } from "../lib/math";
-import { streamLive } from "../prefs";
+import { einkProfile, streamLive } from "../prefs";
 import { openFileAt } from "../code/frame";
 import { looksLikePath } from "../lib/pathlike";
 import { addCodeCopyButtons, linkifyPaths, splitMermaid, tagInlineCodePaths } from "../lib/markdownEnhance";
@@ -23,6 +23,17 @@ import styles from "./Part.module.css";
 const [partOpen, setPartOpenStore] = createStore<Record<string, boolean>>({});
 export { partOpen };
 export const setPartOpen = (id: string, v: boolean) => setPartOpenStore(id, v);
+
+// E-ink profile live-escape state, keyed by part id and held outside the
+// components for the same reason as `partOpen` above (streaming re-groups
+// parts into fresh arrays, re-creating row components). While the e-ink
+// display profile holds streaming markdown back (settled-part default, see
+// Markdown below), the user can still watch ONE part stream live. Deliberately
+// session-ephemeral: plain module state, never persisted, and neither the
+// profile signal nor the saved streamLive preference is ever written through
+// it. Keyed by part id so the escape covers exactly the part it was clicked
+// on and every NEW streaming part starts held back again (the profile default).
+const [einkLiveParts, setEinkLiveParts] = createStore<Record<string, boolean>>({});
 
 // One prose segment: daemon-rendered, syntax-highlighted HTML with copy buttons
 // and clickable file paths.
@@ -82,71 +93,121 @@ export function MarkdownHtml(props: { text: string; live?: boolean }) {
 // While streaming, render markdown live on the client (debounced — re-parsing
 // the whole text per token is O(n²)) so the in-flight reply is formatted, not
 // raw. The settled view re-renders it server-side (highlighting + mermaid).
-function Markdown(props: { text: string; settled: boolean; caret?: boolean }) {
+// E-ink profile: while the profile is on, a streaming block is held back by
+// default and shows a static working indication instead — the same
+// presentation semantics as the existing not-live-previewed path (content
+// appears settled; no ~5fps live preview churn) — with a profile-local
+// escape (EinkWorking's button) back to the live engine below.
+function Markdown(props: { text: string; settled: boolean; caret?: boolean; partId: string }) {
   // Captured at creation: true only for a block that started while streaming
   // (the message the user is watching). History blocks are created already
   // settled → false → cheap raw fallback (no per-block client parse on load).
   const live = !props.settled;
-  const streamingView = () => {
-    if (!streamLive()) return <></>;
-    let host: HTMLDivElement | undefined;
-    let engine: StreamMd | undefined;
-    // A detached caret node re-attached after each render (the active block is
-    // rebuilt each render, which removes it), placed at the end of the last line.
-    const caretEl = document.createElement("span");
-    caretEl.className = "stream-caret";
-    caretEl.setAttribute("aria-hidden", "true");
-
-    // Render via the incremental engine, coalesced to a fixed rate and only when
-    // the text actually changes (idle between deltas). 5fps keeps the live
-    // formatted reveal smooth while bounding paint work per second.
-    const FRAME_MS = 200; // ~5fps
-    let timer: number | undefined;
-    let lastRender = 0;
-    // `force` re-formats the trailing block on demand (used on tab-resume so
-    // inline markdown snaps in with the raw text, not up to REPARSE_MS later).
-    // Steady-state flushes pass false and stay throttled by the REPARSE_MS cap
-    // (heat guardrail — forced reparse is once-per-resume, never per-frame).
-    const flush = (force = false) => {
-      timer = undefined;
-      if (!host) return;
-      lastRender = performance.now();
-      (engine ||= new StreamMd(host)).push(props.text, lastRender, force);
-      if (props.caret) placeStreamCaret(host, caretEl);
-    };
-    createEffect(() => {
-      void props.text;  // re-run as deltas arrive
-      void props.caret; // and when this stops/starts being the tail
-      if (props.settled || timer !== undefined) return; // a render is already queued — coalesce
-      timer = window.setTimeout(flush, Math.max(0, FRAME_MS - (performance.now() - lastRender)));
-    });
-    // Snap-on-resume: while the tab is hidden the browser throttles setTimeout
-    // to ≥1s (intensive throttling → ~once/30s), so flush() rarely fires and the
-    // rendered length falls behind the store's text. On return to visible, cancel
-    // any queued (throttled) tick and flush now — StreamMd.push drains an
-    // arbitrarily large delta in one call, so the part snaps to the latest text
-    // in a single frame instead of slowly floating in.
-    const onVisible = () => {
-      if (document.visibilityState !== "visible") return;
-      if (props.settled) return; // live engine is unmounted on settle — nothing to snap
-      if (timer === undefined) return; // nothing queued → renderer is current, nothing to snap
-      clearTimeout(timer);
-      timer = undefined;
-      flush(true);
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    onCleanup(() => {
-      document.removeEventListener("visibilitychange", onVisible);
-      if (timer !== undefined) clearTimeout(timer);
-    });
-    return <div class="md md-stream" ref={host} />;
-  };
+  // True while the e-ink profile holds this streaming block back (not escaped
+  // to live). Profile off → always false → the inner Show below is a
+  // pass-through and profile-OFF rendering is byte-identical.
+  const einkHoldBack = () => einkProfile() && !einkLiveParts[props.partId];
+  const streamingView = () => (
+    // Outer Show: with the saved streaming pref off AND the profile off, this
+    // stays the historical empty hold-back (block-by-block — the message-level
+    // Working pill covers progress). Reactively resolved so toggling either
+    // signal mid-stream still lands on the right presentation.
+    <Show when={streamLive() || einkProfile()} fallback={<></>}>
+      <Show when={!einkHoldBack()} fallback={<EinkWorking partId={props.partId} />}>
+        <MarkdownLive text={props.text} caret={props.caret} settled={props.settled} />
+      </Show>
+    </Show>
+  );
   return (
     <Show when={props.settled} fallback={streamingView()}>
       <For each={splitMermaid(props.text)}>
         {(seg) => (seg.type === "mermaid" ? <MermaidViewer src={seg.content} /> : <MarkdownHtml text={seg.content} live={live} />)}
       </For>
     </Show>
+  );
+}
+
+// The live streaming engine (the existing ~5fps coalesced client render),
+// extracted into its own component so the e-ink hold-back Show can mount and
+// unmount it cleanly: engine/host/caret state must be created fresh per mount,
+// never reused across a hold-back ↔ live flip. Body is the verbatim former
+// inline streamingView — no behavior change.
+function MarkdownLive(props: { text: string; settled: boolean; caret?: boolean }) {
+  let host: HTMLDivElement | undefined;
+  let engine: StreamMd | undefined;
+  // A detached caret node re-attached after each render (the active block is
+  // rebuilt each render, which removes it), placed at the end of the last line.
+  const caretEl = document.createElement("span");
+  caretEl.className = "stream-caret";
+  caretEl.setAttribute("aria-hidden", "true");
+
+  // Render via the incremental engine, coalesced to a fixed rate and only when
+  // the text actually changes (idle between deltas). 5fps keeps the live
+  // formatted reveal smooth while bounding paint work per second.
+  const FRAME_MS = 200; // ~5fps
+  let timer: number | undefined;
+  let lastRender = 0;
+  // `force` re-formats the trailing block on demand (used on tab-resume so
+  // inline markdown snaps in with the raw text, not up to REPARSE_MS later).
+  // Steady-state flushes pass false and stay throttled by the REPARSE_MS cap
+  // (heat guardrail — forced reparse is once-per-resume, never per-frame).
+  const flush = (force = false) => {
+    timer = undefined;
+    if (!host) return;
+    lastRender = performance.now();
+    (engine ||= new StreamMd(host)).push(props.text, lastRender, force);
+    if (props.caret) placeStreamCaret(host, caretEl);
+  };
+  createEffect(() => {
+    void props.text;  // re-run as deltas arrive
+    void props.caret; // and when this stops/starts being the tail
+    if (props.settled || timer !== undefined) return; // a render is already queued — coalesce
+    timer = window.setTimeout(flush, Math.max(0, FRAME_MS - (performance.now() - lastRender)));
+  });
+  // Snap-on-resume: while the tab is hidden the browser throttles setTimeout
+  // to ≥1s (intensive throttling → ~once/30s), so flush() rarely fires and the
+  // rendered length falls behind the store's text. On return to visible, cancel
+  // any queued (throttled) tick and flush now — StreamMd.push drains an
+  // arbitrarily large delta in one call, so the part snaps to the latest text
+  // in a single frame instead of slowly floating in.
+  const onVisible = () => {
+    if (document.visibilityState !== "visible") return;
+    if (props.settled) return; // live engine is unmounted on settle — nothing to snap
+    if (timer === undefined) return; // nothing queued → renderer is current, nothing to snap
+    clearTimeout(timer);
+    timer = undefined;
+    flush(true);
+  };
+  document.addEventListener("visibilitychange", onVisible);
+  onCleanup(() => {
+    document.removeEventListener("visibilitychange", onVisible);
+    if (timer !== undefined) clearTimeout(timer);
+  });
+  return <div class="md md-stream" ref={host} />;
+}
+
+// Held-back streaming presentation under the e-ink profile: a static,
+// accessible working indication plus the profile-local live escape. The
+// indication is deliberately motion-free (glyph + text): the e-ink themes'
+// kill-switch nulls CSS animation/transition, so legibility must not depend
+// on motion. Rendered ONLY while the profile is on and the block unsettled —
+// profile off never mounts any of this (OFF behavior of the affordance:
+// absent).
+function EinkWorking(props: { partId: string }) {
+  return (
+    <div class={styles["eink-working"]} data-eink="working">
+      <span class={styles["eink-working-glyph"]} aria-hidden="true">●</span>
+      <span class={styles["eink-working-text"]} role="status">Working…</span>
+      <button
+        type="button"
+        class={styles["eink-live-btn"]}
+        data-eink="show-live"
+        title="Watch this reply stream live (keeps the e-ink profile on)"
+        onClick={() => setEinkLiveParts(props.partId, true)}
+      >
+        Show live
+      </button>
+    </div>
   );
 }
 
@@ -220,7 +281,7 @@ function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) 
           <Show when={revealed()}>
             <div class="reasoning-body" ref={bodyEl} onScroll={onScroll}>
               <div ref={contentEl}>
-                <Markdown text={(props.part.text as string) || ""} settled={props.settled} caret={props.tail} />
+                <Markdown text={(props.part.text as string) || ""} settled={props.settled} caret={props.tail} partId={props.part.id} />
               </div>
             </div>
           </Show>
@@ -270,7 +331,7 @@ export default function PartView(props: { part: Part; settled?: boolean; tail?: 
   return (
     <Switch>
       <Match when={p().type === "text"}>
-        <Markdown text={(p().text as string) || ""} settled={settled()} caret={props.tail} />
+        <Markdown text={(p().text as string) || ""} settled={settled()} caret={props.tail} partId={p().id} />
       </Match>
       <Match when={p().type === "reasoning"}>
         <ReasoningPart part={p()} settled={settled()} tail={props.tail} />
