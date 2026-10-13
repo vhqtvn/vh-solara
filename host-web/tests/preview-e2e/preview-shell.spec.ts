@@ -39,9 +39,10 @@ test.describe("host shell — production build (vite preview)", () => {
   test("production build has NO window.__host (and no DEV bridges)", async ({ page }) => {
     // The DEV-only test bridges (host + keyboard-focus + viewport auto-transpose
     // + proportions re-normalizer + needs-you notification manager + the
-    // layout-diag bridge) and their destructive hooks must be entirely absent
-    // from the running production app. (The i3-keys bridge was removed when the
-    // Alt-shortcut module was dropped.)
+    // layout-diag bridge + the visible-viewport sampler bridge) and their
+    // destructive hooks must be entirely absent from the running production
+    // app. (The i3-keys bridge was removed when the Alt-shortcut module was
+    // dropped.)
     const hasBridge = await page.evaluate(() => {
       const w = window as unknown as {
         __host?: unknown;
@@ -50,6 +51,7 @@ test.describe("host shell — production build (vite preview)", () => {
         __hostProportions?: unknown;
         __hostAttention?: unknown;
         __hostLayoutDiag?: unknown;
+        __hostVisibleViewport?: unknown;
       };
       return {
         host: typeof w.__host !== "undefined",
@@ -58,6 +60,7 @@ test.describe("host shell — production build (vite preview)", () => {
         proportions: typeof w.__hostProportions !== "undefined",
         attention: typeof w.__hostAttention !== "undefined",
         layoutDiag: typeof w.__hostLayoutDiag !== "undefined",
+        visibleViewport: typeof w.__hostVisibleViewport !== "undefined",
       };
     });
     expect(hasBridge.host, "window.__host must be absent in production").toBe(false);
@@ -66,6 +69,7 @@ test.describe("host shell — production build (vite preview)", () => {
     expect(hasBridge.proportions, "window.__hostProportions must be absent in production").toBe(false);
     expect(hasBridge.attention, "window.__hostAttention must be absent in production").toBe(false);
     expect(hasBridge.layoutDiag, "window.__hostLayoutDiag must be absent in production").toBe(false);
+    expect(hasBridge.visibleViewport, "window.__hostVisibleViewport must be absent in production").toBe(false);
 
     // The diag RING itself is production-always-on (only the bridge is
     // DEV-gated): by the time the shell is ready, the module-init `read` event

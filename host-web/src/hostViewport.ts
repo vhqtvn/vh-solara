@@ -152,7 +152,8 @@ export function uninstallHostViewport(): void {
 // ---- DEV bridge (window.__hostVisibleViewport) ------------------------------
 // Lets the e2e read the computed value and force a re-sample. (Distinct from
 // viewportShape.ts's window.__hostViewport.) DEV-gated like
-// window.__hostKbdFocus.
+// window.__hostKbdFocus; absent in prod (the preview e2e asserts
+// __host*=0 — this bridge follows the same rule).
 
 const DEV_BRIDGE_KEY = "__hostVisibleViewport";
 
