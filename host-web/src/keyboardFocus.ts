@@ -49,7 +49,9 @@ import { resyncHostViewport } from "./hostViewport";
 const KEYBOARD_THRESHOLD = 0.7;
 /** Debounce so rapid/transient visualViewport fluctuations (address-bar
  *  show/hide, scroll bounce) do not flicker the maximize. ~180ms is below the
- *  keyboard open/close animation (~250-300ms) but above a frame's jitter. */
+ *  keyboard open/close animation (~250-300ms) but above a frame's jitter.
+ *  (During the open-debounce window hostViewport.ts keeps tracking — see its
+ *  ACCEPTED TRANSIENT note for why that is fine.) */
 const DEBOUNCE_MS = 180;
 
 // ---- module state (singleton; one keyboard per host window) ----------------

@@ -48,6 +48,20 @@
 //     (bfcache), window focus, and the host's pane-visibility signal; each
 //     event also re-samples on the next animation frame to catch lagging vv.
 //   - Writes only when the value changes (no redundant style invalidation).
+//
+// SIBLING MODULE: host-web/src/hostViewport.ts tracks the HOST root's height
+// (--host-h) with the same sampler skeleton. Shared invariants — keep both in
+// lockstep: the event family (vv resize/scroll, window resize/
+// orientationchange/pageshow/focus, visibilitychange), write-only-on-change
+// with the style-value dedupe, the rAF-settle re-sample, and a ResizeObserver
+// on <html> as the lost-event backstop. Deliberate divergences: HERE the
+// sample is vv-primary (vv.height wins when smaller — the standalone iOS
+// keyboard shrinks vv, not innerHeight), pinch zoom is suppressed (the SPA
+// must never zoom), and there is no teardown (single mount for the app's
+// lifetime); the host sample is innerHeight-primary with a visible-band-bottom
+// clamp (vv.offsetTop + vv.height, pinch-zoomed samples ignored), installs a
+// teardown (hot-reload/tests), and carries a DEV bridge. Mirror rule: change
+// the sampler skeleton in one → mirror the change in the other.
 export function computeAppHeight(win: Window = window): number | null {
   const layoutH = win.innerHeight;
   const vvH = win.visualViewport?.height;

@@ -45,6 +45,34 @@
 // and re-fires the observer — a lost window resize edge cannot leave --host-h
 // stale). The var() fallback (100% = the ICB = small viewport) is itself the
 // correct static answer on engines without dvh — better than a 100vh fallback.
+//
+// SIBLING MODULE: web/src/viewport.ts (the embedded SPA's own --app-h
+// tracker) runs the same sampler skeleton. Shared invariants — keep both in
+// lockstep: the event family (vv resize/scroll, window resize/
+// orientationchange/pageshow/focus, visibilitychange), write-only-on-change
+// with the style-value dedupe, the rAF-settle re-sample, and a ResizeObserver
+// on <html> as the lost-event backstop. Deliberate divergences: HERE the
+// sample is innerHeight-primary with the visible-band-bottom clamp
+// (vv.offsetTop + vv.height; pinch-zoomed vv samples ignored), a teardown
+// exists (hot-reload/tests), and a DEV bridge is installed; the SPA sample is
+// vv-primary (its standalone iOS keyboard shrinks vv, not innerHeight),
+// suppresses pinch zoom, and never tears down. Mirror rule: change the
+// sampler skeleton in one → mirror the change in the other.
+//
+// ACCEPTED TRANSIENT (keyboard-open, one debounce window ≈180ms): while
+// keyboardFocus.ts's open-debounce is pending, this tracker keeps sampling,
+// so --host-h follows the shrinking visual band and ALL panes briefly resize
+// before applyOpen pins the host root's inline geometry and maximizes the
+// focused pane. Accepted as-is: bounded (one window), self-correcting, ends
+// in the correct state, and overlapped by the keyboard's own open animation.
+// Suppressing --host-h writes during the window was REJECTED: it couples this
+// module to keyboardFocus's state machine and delays address-bar/toolbar/
+// rotation tracking — exactly the cases the level-triggered design serves.
+// There is no close-side transient: while open the pinned geometry re-applies
+// immediately on every vv event (the debounce gates only the open↔close
+// transition, not the geometry), and the debounced close's restoreGeometry
+// re-samples --host-h (resyncHostViewport) so the root lands on the current
+// visible height.
 // =============================================================================
 
 /** Visible viewport height in CSS px for the host root, or null when no
