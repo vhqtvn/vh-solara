@@ -63,8 +63,26 @@ const { FakeTerm } = vi.hoisted(() => {
     onDataCb: ((d: string) => void) | undefined;
     focused = 0;
     written = 0;
-    constructor(_opts: unknown) {
+    // Constructor options, recorded (the e-ink posture tests read the
+    // INITIAL theme/cursorBlink from here).
+    readonly opts: Record<string, any>;
+    // LIVE term.options.* writes (xterm's option-update path), in order —
+    // constructor-time values never appear here.
+    optionSets: { prop: string; value: unknown }[] = [];
+    constructor(opts: unknown) {
+      this.opts = { ...(opts as Record<string, any>) };
       FakeTerm.instances.push(this);
+    }
+    // xterm's public live-update surface: per-option getters/setters over
+    // the core options. Model exactly the two props this pane writes live.
+    get options(): Record<string, any> {
+      const t = this;
+      return {
+        get cursorBlink() { return t.opts.cursorBlink; },
+        set cursorBlink(v: boolean) { t.opts.cursorBlink = v; t.optionSets.push({ prop: "cursorBlink", value: v }); },
+        get theme() { return t.opts.theme; },
+        set theme(v: unknown) { t.opts.theme = v; t.optionSets.push({ prop: "theme", value: v }); },
+      };
     }
     loadAddon() {}
     open() {}
@@ -81,6 +99,7 @@ vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
 
 import TerminalPane from "../../src/components/TerminalPane";
 import { disposeTermCompose, loadTermCompose } from "../../src/lib/termCompose";
+import { setEinkProfile } from "../../src/prefs";
 
 // WebSocket stub: lifecycle driven from the tests.
 class FakeWS {
@@ -394,5 +413,143 @@ describe("TerminalPane — pane-SELF teardown preserves the compose store (tier1
     expect(loadTermCompose("/repo", TERM_ID)).toBe("echo hidden\n"); // PRESERVED
     // And the still-mounted pane keeps the text VISIBLE for copy.
     expect(container.querySelector<HTMLTextAreaElement>(".term-compose-input")!.value).toBe("echo hidden\n");
+  });
+});
+
+describe("TerminalPane — e-ink display profile: live terminal posture", () => {
+  // Slice 3 pins. The profile is a plain saved preference (default OFF; the
+  // manual Settings activation path — no detection). These tests drive the
+  // REAL preference signal (setEinkProfile) against the pane's REAL xterm
+  // lifecycle seam (the recorded FakeTerm constructor options + the live
+  // term.options.* surface), pinning:
+  //   1. OFF default = today's exact posture (dark palette {background:
+  //      "#0b0f17"} + cursorBlink:true) with zero live option writes.
+  //   2. ON toggle updates an ALREADY-OPEN terminal through the
+  //      option-update path — no remount (one Terminal instance), no
+  //      reconnect (one WebSocket).
+  //   3. The ON palette is light + legible by construction (mechanical
+  //      WCAG contrast over the recorded option values — no dark-on-dark).
+  //   4. OFF restores the dark posture the same live way.
+  //   5. A terminal CREATED while ON starts in the ON posture.
+  beforeEach(() => setEinkProfile(false));
+  afterEach(() => setEinkProfile(false));
+
+  // WCAG relative-luminance / contrast helpers over the recorded option
+  // values (hex strings). Small local copies — no dependency needed.
+  const parseHex = (hex: string) => {
+    const n = parseInt(hex.replace("#", ""), 16);
+    return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+  };
+  const luminance = ({ r, g, b }: { r: number; g: number; b: number }) => {
+    const ch = [r, g, b].map((c) => {
+      c /= 255;
+      return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2];
+  };
+  const contrast = (a: string, b: string) => {
+    const la = luminance(parseHex(a));
+    const lb = luminance(parseHex(b));
+    return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+  };
+  // Every ink an app can paint text with (default fg + the 16 ANSI colors).
+  const ANSI_INKS = [
+    "foreground", "black", "red", "green", "yellow", "blue", "magenta",
+    "cyan", "white", "brightBlack", "brightRed", "brightGreen", "brightYellow",
+    "brightBlue", "brightMagenta", "brightCyan", "brightWhite",
+  ] as const;
+
+  it("profile OFF (default): today's exact constructor posture — dark palette + blinking cursor — and zero live option writes", () => {
+    render(() => <TerminalPane termId={TERM_ID} />);
+    const t = FakeTerm.instances[0];
+    expect(t).toBeDefined();
+    expect(t.opts.theme).toEqual({ background: "#0b0f17" }); // byte-identical pre-profile palette
+    expect(t.opts.cursorBlink).toBe(true);
+    expect(t.optionSets).toEqual([]); // no live writes while OFF
+  });
+
+  it("toggling ON updates an ALREADY-OPEN terminal live: light palette + steady cursor via term.options — no remount, no reconnect", async () => {
+    const { container } = render(() => <TerminalPane termId={TERM_ID} />);
+    const ws = FakeWS.last;
+    ws.driveOpen();
+    await waitFor(() => {
+      expect(container.querySelector(".term-status")!.classList.contains("open")).toBe(true);
+    });
+    const t = FakeTerm.instances[0];
+
+    setEinkProfile(true);
+    await waitFor(() => {
+      expect(t.optionSets.some((s) => s.prop === "cursorBlink" && s.value === false)).toBe(true);
+    });
+    // Steady cursor + light paper — through the OPTION-UPDATE path only.
+    expect(t.opts.cursorBlink).toBe(false);
+    expect(t.opts.theme).toMatchObject({ background: "#ffffff", foreground: "#000000" });
+    expect(t.optionSets.map((s) => s.prop)).toEqual(["cursorBlink", "theme"]);
+    // NO remount and NO reconnect: one xterm instance, one socket, still open.
+    expect(FakeTerm.instances.length).toBe(1);
+    expect(FakeWS.instances.length).toBe(1);
+    expect(container.querySelector(".term-status")!.classList.contains("open")).toBe(true);
+  });
+
+  it("the ON palette is light + legible: every ANSI ink ≥AA contrast on the paper; solid ink cursor with legible accent", async () => {
+    const { container } = render(() => <TerminalPane termId={TERM_ID} />);
+    FakeWS.last.driveOpen();
+    await waitFor(() => {
+      expect(container.querySelector(".term-status")!.classList.contains("open")).toBe(true);
+    });
+    const t = FakeTerm.instances[0];
+    setEinkProfile(true);
+    await waitFor(() => {
+      expect(t.opts.theme).toMatchObject({ background: "#ffffff" });
+    });
+    const theme = t.opts.theme as Record<string, string>;
+
+    // Light paper: the background is near-white (a dark background here
+    // would silently reproduce the dark-on-dark failure mode).
+    expect(luminance(parseHex(theme.background))).toBeGreaterThan(0.9);
+    // No dark-on-dark / unresolved-gray ink: every ANSI ink clears AA
+    // (≥4.5:1) against the paper.
+    for (const ink of ANSI_INKS) {
+      expect(contrast(theme[ink], theme.background)).toBeGreaterThanOrEqual(4.5);
+    }
+    // The cursor is visible on the paper AND the accent (text inside the
+    // block cursor) is legible against the cursor fill.
+    expect(contrast(theme.cursor, theme.background)).toBeGreaterThanOrEqual(4.5);
+    expect(contrast(theme.cursorAccent, theme.cursor)).toBeGreaterThanOrEqual(4.5);
+    // Selected text stays legible: default ink on the selection fill…
+    expect(contrast(theme.foreground, theme.selectionBackground)).toBeGreaterThanOrEqual(4.5);
+    // …and the selection fill is distinguishable from the paper.
+    expect(theme.selectionBackground).not.toBe(theme.background);
+  });
+
+  it("toggling OFF restores the dark palette + blink the same live way (same terminal, same socket)", async () => {
+    const { container } = render(() => <TerminalPane termId={TERM_ID} />);
+    FakeWS.last.driveOpen();
+    await waitFor(() => {
+      expect(container.querySelector(".term-status")!.classList.contains("open")).toBe(true);
+    });
+    const t = FakeTerm.instances[0];
+    setEinkProfile(true);
+    await waitFor(() => {
+      expect(t.opts.cursorBlink).toBe(false);
+    });
+
+    setEinkProfile(false);
+    await waitFor(() => {
+      expect(t.optionSets.some((s) => s.prop === "cursorBlink" && s.value === true)).toBe(true);
+    });
+    expect(t.opts.theme).toEqual({ background: "#0b0f17" }); // exact restoration
+    expect(t.opts.cursorBlink).toBe(true);
+    expect(FakeTerm.instances.length).toBe(1); // still the SAME terminal
+    expect(FakeWS.instances.length).toBe(1); // still the SAME connection
+  });
+
+  it("a terminal CREATED while ON starts light + steady (constructor posture, no live writes needed)", () => {
+    setEinkProfile(true);
+    render(() => <TerminalPane termId={TERM_ID} />);
+    const t = FakeTerm.instances[0];
+    expect(t).toBeDefined();
+    expect(t.opts.cursorBlink).toBe(false);
+    expect(t.opts.theme).toMatchObject({ background: "#ffffff", foreground: "#000000" });
   });
 });

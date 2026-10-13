@@ -7,7 +7,8 @@
 // The factory owns the navigator's reactive state + scheduling discipline:
 //   - userTurns():  the user-role subset of the transcript (one dot each)
 //   - turnText(m):  the dot's tooltip / preview-bubble label (first text part)
-//   - jumpToMsg(id): scrollIntoView the [data-mid=id] row (click-to-jump)
+//   - jumpToMsg(id):  scrollIntoView the [data-mid=id] row (click-to-jump;
+//                     instant under the e-ink display profile, smooth otherwise)
 //   - activeTurn:   the user turn currently at the top of the viewport
 //   - navPreview:   the hover/focus preview bubble ({text,y}|null)
 //   - navCap / navWindow: how many ticks fit + the centered visible window
@@ -25,6 +26,7 @@
 
 import { createMemo, createSignal, type Accessor } from "solid-js";
 import type { MessageView } from "../../types";
+import { einkProfile } from "../../prefs";
 
 export interface NavigatorDeps {
   // The full transcript (userTurns() filters to role === "user"). Defined after
@@ -73,7 +75,14 @@ export function createNavigator(deps: NavigatorDeps): NavigatorController {
     return t.replace(/\s+/g, " ").trim().slice(0, 140) || "(message)";
   };
   const jumpToMsg = (id: string) => {
-    deps.scrollEl()?.querySelector(`[data-mid="${deps.cssEsc(id)}"]`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    // E-ink display profile: jump INSTANTLY (a smooth scroll animates the
+    // whole transcript — churn on slow-updating panels). Profile OFF keeps
+    // the smooth jump byte-identical; this is the profile's ONLY scroll
+    // change (reduced-motion behavior elsewhere is untouched).
+    deps.scrollEl()?.querySelector(`[data-mid="${deps.cssEsc(id)}"]`)?.scrollIntoView({
+      behavior: einkProfile() ? "auto" : "smooth",
+      block: "start",
+    });
   };
   // Navigator highlight: the user turn currently at the top of the viewport, plus
   // a hover-preview bubble. Recomputed on scroll (rAF-throttled) — desktop only.

@@ -170,6 +170,7 @@ function stubRect(el: Element, top: number): void {
 // Import ChatView AFTER the mocks + matchMedia stub are registered.
 import ChatView from "../../src/components/ChatView";
 import { setState } from "../../src/sync/store";
+import { setEinkProfile } from "../../src/prefs";
 // lib/scroll's read-anchor `cache` is a MODULE-level map loaded from localStorage
 // once at import. ChatView's onCleanup runs flushReadCursor() on unmount, which
 // writes that in-memory cache; localStorage.clear() does NOT reset the
@@ -305,6 +306,10 @@ describe("ChatView navigator (characterization)", () => {
     setState("messagesDelivered", SID, undefined as any);
     clearReadAnchor(SID);
     localStorage.clear();
+    // The e-ink profile signal is module state that survives
+    // localStorage.clear() (it hydrated once at import); reset it so the
+    // profile-scoped test below cannot leak ON into anything else.
+    setEinkProfile(false);
   });
 
   it("activeTurn tracks the scroll position: the turn at the top of the viewport is marked aria-current", async () => {
@@ -406,6 +411,35 @@ describe("ChatView navigator (characterization)", () => {
     // changes the scroll options.
     expect(spy).toHaveBeenCalledTimes(1);
     expect(spy).toHaveBeenCalledWith({ behavior: "smooth", block: "start" });
+  });
+
+  it("e-ink display profile: jumps are INSTANT under ON (behavior auto) and return to smooth when OFF", async () => {
+    // Slice 3 pin: jumpToMsg is the chat's ONLY smooth-scroll site, and the
+    // profile's ONLY scroll change is the behavior conditional there. The
+    // real preference signal drives the real ChatView → createNavigator
+    // path (same mount + spy shape as the smooth pin above).
+    const { container, scroll } = await mountNav(3);
+    const target = scroll().querySelector('[data-mid="u1"]') as HTMLElement;
+    expect(target).toBeTruthy();
+    const spy = vi.fn();
+    target.scrollIntoView = spy as typeof target.scrollIntoView;
+    const dot = () =>
+      ([...container.querySelectorAll(".chat-nav-dot")] as HTMLButtonElement[]).find(
+        (d) => d.getAttribute("aria-label") === "Turn 1",
+      )!;
+
+    // Profile ON → the jump is instant (behavior "auto"; no smooth scroll
+    // animation churn).
+    setEinkProfile(true);
+    await flushMicro();
+    fireEvent.click(dot());
+    expect(spy).toHaveBeenCalledWith({ behavior: "auto", block: "start" });
+
+    // Profile OFF → byte-identical smooth jump restored.
+    setEinkProfile(false);
+    await flushMicro();
+    fireEvent.click(dot());
+    expect(spy).toHaveBeenLastCalledWith({ behavior: "smooth", block: "start" });
   });
 
   it("navPreview is a hover/focus bubble: shown on enter/focus, cleared on leave/blur (click does NOT clear it)", async () => {

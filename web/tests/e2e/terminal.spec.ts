@@ -374,3 +374,100 @@ test("terminal: full-screen TUI (vim) stays live — xterm DECRQM stall regressi
     timeout: 15000,
   }).toBe(true);
 });
+
+// ---------------------------------------------------------------------------
+// E-ink display profile — terminal light palette + steady cursor, LIVE
+// ---------------------------------------------------------------------------
+// While the profile is toggled through the REAL Settings UI (Slice 1's manual
+// path — no detection), an ALREADY-OPEN terminal must switch posture IN PLACE
+// through xterm v6's option-update path: no remount (the same .term-host DOM
+// node), no reconnect (.term-status stays open), no renderer change. The
+// observables below are the REAL DOM renderer's feature-verified surfaces
+// (checked against the installed @xterm/xterm sources):
+//   - theme → an injected `.xterm-rows { color: <foreground> }` rule + an
+//     INLINE backgroundColor on the viewport's scrollable element (Viewport
+//     syncs it on color change);
+//   - cursorBlink → the `.xterm-cursor` span carries `xterm-cursor-blink`
+//     iff the option was ON at row render — and only while the terminal is
+//     FOCUSED, so each phase clicks the host before reading.
+// Physical e-ink outcomes (ghosting, panel churn) are not observable in CI —
+// operator device verification only.
+
+async function termAppearance(page: import("@playwright/test").Page) {
+  return page.evaluate(() => {
+    const host = document.querySelector(".term-host")!;
+    const rows = host.querySelector(".xterm-rows");
+    const cursor = host.querySelector(".xterm-cursor");
+    const inlineBgs = Array.from(host.querySelectorAll<HTMLElement>("*"))
+      .map((el) => el.style.backgroundColor)
+      .filter(Boolean);
+    return {
+      fg: rows ? getComputedStyle(rows).color : null,
+      inlineBgs,
+      cursorBlinkClass: cursor ? cursor.classList.contains("xterm-cursor-blink") : null,
+      cursorAnim: cursor ? getComputedStyle(cursor).animationName : null,
+    };
+  });
+}
+
+test("e-ink profile: an open terminal flips to light ink + steady cursor live (no remount/reconnect); OFF restores", async ({ page }) => {
+  await openTerminal(page);
+  await page.locator(".term-host").click(); // focus the surface (blink class is focus-gated)
+
+  // ---- OFF baseline: today's exact dark posture.
+  let look = await termAppearance(page);
+  expect(look.inlineBgs).toContain("rgb(11, 15, 23)"); // theme background #0b0f17
+  expect(look.fg).toBe("rgb(255, 255, 255)"); // xterm default ink on the dark palette
+  expect(look.cursorBlinkClass).toBe(true);
+  expect(look.cursorAnim).toMatch(/^blink_/); // …and the blink animation runs
+
+  // Mark the LIVE host node — the no-remount witness (a remount would lose
+  // the expando; renderers never copy them).
+  await page.evaluate(() => {
+    (document.querySelector(".term-host") as unknown as { __vhEinkMark?: string }).__vhEinkMark = "live";
+  });
+
+  // ---- Toggle the profile ON through the real Settings UI.
+  await page.getByRole("button", { name: "Settings" }).click();
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Appearance" }).click();
+  await dialog.getByRole("checkbox", { name: "E Ink mode" }).click();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+
+  await page.locator(".term-host").click(); // refocus (the dialog had it)
+  await expect.poll(() => termAppearance(page)).toMatchObject({
+    fg: "rgb(0, 0, 0)", // dark ink…
+    inlineBgs: expect.arrayContaining(["rgb(255, 255, 255)"]), // …on light paper
+    cursorBlinkClass: false, // steady cursor
+  });
+  look = await termAppearance(page);
+  expect(look.cursorAnim).toBe("none");
+  // Live option update ONLY: same terminal node, same connection.
+  expect(
+    await page.evaluate(() => (document.querySelector(".term-host") as unknown as { __vhEinkMark?: string }).__vhEinkMark),
+  ).toBe("live");
+  await expect(page.locator(".term-status.open")).toHaveCount(1);
+
+  // ---- Toggle OFF through the UI: the dark posture returns the same way.
+  await page.getByRole("button", { name: "Settings" }).click();
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Appearance" }).click();
+  await dialog.getByRole("checkbox", { name: "E Ink mode" }).click();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+
+  await page.locator(".term-host").click(); // refocus for the blink baseline
+  await expect.poll(() => termAppearance(page)).toMatchObject({
+    fg: "rgb(255, 255, 255)",
+    cursorBlinkClass: true,
+  });
+  look = await termAppearance(page);
+  expect(look.inlineBgs).toContain("rgb(11, 15, 23)");
+  expect(look.cursorAnim).toMatch(/^blink_/);
+  // Still the same node across the full ON→OFF cycle.
+  expect(
+    await page.evaluate(() => (document.querySelector(".term-host") as unknown as { __vhEinkMark?: string }).__vhEinkMark),
+  ).toBe("live");
+});

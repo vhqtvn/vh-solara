@@ -21,6 +21,7 @@ import {
   toComposeText,
   toWireText,
 } from "../lib/termCompose";
+import { einkProfile } from "../prefs";
 
 // A real terminal: xterm.js over a WebSocket-backed PTY (/vh/term/ws). Input
 // flows through term.onData() so IME/composition resolves to final bytes (the
@@ -37,6 +38,40 @@ import {
 // is worse than loss). The live path is unchanged: while sendable(), typing
 // passes straight through with zero friction.
 const ARROW_FINAL: Record<string, string> = { up: "A", down: "B", right: "C", left: "D" };
+
+// E-ink terminal posture (display profile, default OFF): a light "dark ink
+// on light paper" palette + a steady cursor. Every ANSI ink is drawn from
+// the e-ink theme's grayscale ramp (#000/#3a3a3a/#555555/#6e6e6e) — all ≥AA
+// contrast on #ffffff paper, so nothing is dark-on-dark and no ink is a
+// subtle gray a monochrome panel cannot resolve. "White"/"yellow" (light
+// inks written against the default dark background) collapse to dark inks
+// to stay legible on paper. Surface appearance only — PTY traffic, input,
+// and the renderer are untouched.
+const TERM_THEME_DARK = { background: "#0b0f17" }; // exact pre-profile palette
+const TERM_THEME_EINK = {
+  background: "#ffffff",
+  foreground: "#000000",
+  cursor: "#000000",
+  cursorAccent: "#ffffff",
+  selectionBackground: "#c8c8c8",
+  black: "#000000",
+  red: "#3a3a3a",
+  green: "#3a3a3a",
+  yellow: "#555555",
+  blue: "#000000",
+  magenta: "#555555",
+  cyan: "#555555",
+  white: "#555555",
+  brightBlack: "#6e6e6e",
+  brightRed: "#000000",
+  brightGreen: "#3a3a3a",
+  brightYellow: "#6e6e6e",
+  brightBlue: "#000000",
+  brightMagenta: "#555555",
+  brightCyan: "#555555",
+  brightWhite: "#000000",
+};
+const termTheme = (eink: boolean) => (eink ? TERM_THEME_EINK : TERM_THEME_DARK);
 
 export default function TerminalPane(props: { termId?: string; session?: string; title?: string }) {
   let host!: HTMLDivElement;
@@ -265,7 +300,10 @@ export default function TerminalPane(props: { termId?: string; session?: string;
 
   onMount(() => {
     term = new Xterm({
-      cursorBlink: true,
+      // E-ink profile: steady cursor (no blink repaints) + the light ink
+      // palette while ON; OFF is today's exact posture. Live profile
+      // transitions are handled by the option-update effect below.
+      cursorBlink: !einkProfile(),
       fontSize: 13,
       // Drive the terminal from the same mono font the user picks in Settings
       // → Code font, for consistency. xterm takes a literal fontFamily at
@@ -273,7 +311,7 @@ export default function TerminalPane(props: { termId?: string; session?: string;
       // applies on the next terminal creation (tab switch/reconnect), not live.
       fontFamily: monoFontStack(),
       allowProposedApi: true,
-      theme: { background: "#0b0f17" },
+      theme: termTheme(einkProfile()),
       scrollback: 5000,
     });
     fit = new FitAddon();
@@ -534,6 +572,27 @@ export default function TerminalPane(props: { termId?: string; session?: string;
           queueMicrotask(() => composeEl?.focus());
         }
       }),
+    );
+
+    // E-ink profile transitions apply to an ALREADY-OPEN terminal through
+    // xterm's option-update path (term.options.*): palette + cursorBlink
+    // flip in place — no remount, no reconnect, no renderer change — and
+    // the OFF direction restores today's exact dark palette + blink the
+    // same live way. defer: the constructor above already applied the
+    // current profile state at creation. Honest limit: an app inside the
+    // terminal can re-enable blinking via ANSI cursor modes (DECSCUSR /
+    // DECSET 12), which xterm resolves AHEAD of this option — sequences
+    // are deliberately not intercepted.
+    createEffect(
+      on(
+        einkProfile,
+        (eink) => {
+          if (!term) return;
+          term.options.cursorBlink = !eink;
+          term.options.theme = termTheme(eink);
+        },
+        { defer: true },
+      ),
     );
 
     const ro = new ResizeObserver(() => {
