@@ -16,7 +16,7 @@ Scope: the **worker daemon's** `/vh/notify/*` routes and its FCM (Firebase
 Cloud Messaging) HTTP v1 sender — the channel that reaches the vh-agent-pulse
 Android app when it is closed or backgrounded. It complements (and mirrors the
 gating of) the existing Web Push channel; it does not replace it. See §7 for
-the unresolved controller-route-ownership question.
+the settled network-path decision (direct-to-worker in V1; controller proxy deferred).
 
 ## 1. v1 → v2 changelog
 
@@ -271,7 +271,28 @@ inferred from either implementation):
   the oldest end, and the persisted counter never regresses (ids are never
   reused across restarts).
 
-## 7. OPEN ITEM — controller route ownership (unresolved)
+## 7. Network path & controller route ownership (settled 2026-10-14)
+
+### 7.1 Settled decision: V1 network path is direct-to-worker
+
+The network path question is **settled** (confirmed by the client
+`vh-agent-pulse`, 2026-10-14):
+
+- **V1 network path: DIRECT-TO-WORKER.** The phone reaches the worker origin
+  directly — LAN when on-network, plus the operator's existing tunnel/VPN to the
+  worker host when off-LAN. Worker-local auth (session cookie + `X-VH-CSRF: 1`)
+  as specced in §3.1.
+- **No controller-mediated access in V1** → the server-side route-ownership /
+  proxy change is **explicitly deferred**, not abandoned.
+  - **Rationale:** FCM delivers independently of daemon reachability
+    (Google → phone); the client's on-push flow degrades by design (render from
+    payload; reconcile history/fleet when the worker is reachable;
+    staleness-render otherwise) — a controller proxy buys nothing critical today.
+- **Release posture confirmed:** Client confirmed untagged release is fine;
+  they target integration against a tagged release when it exists. The contract
+  is settled on both sides.
+
+### 7.2 Controller route-ownership facts & future proxy conditions
 
 `pkg/server/daemon.go` (`hostInterceptor`, ~lines 434–469 — the controller)
 intercepts **every** `/vh/notify/*` request — including requests arriving on
@@ -280,20 +301,20 @@ notification handlers (the 2026-09-28 controller notify program: token CRUD
 with masked ids, `/vh/notify/test`, controller-side history). Those handlers
 are **NOT this contract**: a different surface, vocabulary, and storage.
 
-Consequences:
+Because V1 is direct-to-worker (LAN/VPN), this interception is a non-issue for
+V1: worker daemon routes are accessed directly on the worker daemon origin,
+which is how the integration test drives them.
 
-- All current validation of THIS contract is worker-local. The routes are
-  reachable on the worker daemon directly (LAN, or via the controller's raw
-  tunnel proxy), which is how the integration test drives them.
-- **Pending client decision:** does vh-agent-pulse reach the worker daemon
-  directly (LAN/tunnel), or via the controller URL? Controller-mediated
-  access requires a server-side proxy / route-ownership change in
-  `pkg/server/daemon.go` **before** this contract is reachable through the
-  controller — the two surfaces cannot silently share the `/vh/notify/`
-  prefix.
+**Future proxy conditions (if no-VPN off-LAN reconciliation is ever requested):**
+If no-VPN off-LAN reconciliation is ever requested by the client, that will be
+the scope, subject to two client-stated conditions:
+1. **Partition integrity:** the proxy must not disturb the pre-existing
+   controller notification surface (clean route-ownership partition;
+   `pkg/server/daemon.go:434-469` stays intact).
+2. **Auth compatibility:** auth must remain worker-compatible (cookie + CSRF
+   semantics), else a client auth-mode extension is required.
 
-This item is deliberately not papered over; it must be resolved (and this
-section updated) before any controller-mediated deployment of this contract.
+**Rule:** Size and design the controller proxy **only when the client asks**.
 
 ## 8. Testing posture
 

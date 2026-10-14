@@ -108,3 +108,18 @@ Settled cross-repo contract points confirmed between `vh-solara` and `vh-agent-p
 
 <!-- List any contradictions encountered, or "None detected." -->
 None detected.
+
+---
+
+## 10. Addendum: §7 settled (2026-10-14)
+
+The open item in §5 above (and `docs/architecture/notify-fcm.md` §7) regarding controller route ownership and client network path was settled on 2026-10-14:
+
+- **Settled Network Path:** V1 is **DIRECT-TO-WORKER**. `vh-agent-pulse` reaches the worker daemon directly (on-LAN, or via the operator's existing tunnel/VPN to the worker host off-LAN). Worker-local auth (session cookie + `X-VH-CSRF: 1`) is preserved without modification.
+- **Controller Proxy Deferred:** No controller-mediated access in V1; the server-side route-ownership / proxy change in `pkg/server/daemon.go:434-469` is explicitly deferred, not abandoned.
+  - *Rationale:* FCM delivers independently of daemon reachability (Google → phone). The client's on-push flow degrades gracefully by design: it renders immediately from payload, reconciles history/fleet when the worker is reachable, and renders staleness indicators otherwise. A controller proxy adds no critical value for V1.
+- **Conditions if No-VPN Off-LAN Reconciliation Is Ever Requested:**
+  1. *Clean partition:* The proxy must not disturb the pre-existing controller notification surface (`pkg/server/daemon.go:434-469` remains intact).
+  2. *Auth compatibility:* Auth must remain worker-compatible (cookie + CSRF semantics), or a client auth-mode extension must be defined.
+  - *Discipline:* Size and implement this only when the client explicitly asks.
+- **Release Posture & Contract Settlement:** The client confirmed untagged release on `main` is acceptable now; integration will target the first tagged release (`v*`) once published. The v2 contract is now settled on both sides (`vh-solara` and `vh-agent-pulse`).
