@@ -91,6 +91,74 @@ const { FakeTerm } = vi.hoisted(() => {
     focus() { this.focused++; }
     dispose() {}
     onData(cb: (d: string) => void) { this.onDataCb = cb; }
+    // --- History-paging seam (UX Slice 2): minimal faithful model of the
+    // xterm 6 scroll/buffer surfaces the pane consumes (verified against
+    // web/node_modules/@xterm/xterm/src/common/services/BufferService.ts):
+    // scrollLines clamps ydisp to [0, ybase], sets isUserScrolling on any
+    // upward scroll and clears it when a downward scroll reaches the tail;
+    // BufferService.scroll() (new output) grows the buffer and only drags
+    // ydisp to the tail when the user is NOT parked. The alt buffer is
+    // modeled by activeType only (the pane reads buffer.active.type and
+    // buffer.normal.{viewportY,baseY} through the public surface). ---
+    rows = 24;
+    scrollCalls: number[] = []; // every scrollLines() arg (viewport audit)
+    scrollToBottomCalls = 0;
+    onScrollCb: ((y: number) => void) | undefined;
+    onResizeCb: ((e: { cols: number; rows: number }) => void) | undefined;
+    onBufferChangeCb: ((b: unknown) => void) | undefined;
+    buf = { lines: 0, ydisp: 0, ybase: 0, userScrolling: false };
+    activeType: "normal" | "alternate" = "normal";
+    get buffer() {
+      const t = this;
+      return {
+        get active() {
+          return { get type() { return t.activeType; } };
+        },
+        get normal() {
+          return {
+            get viewportY() { return t.buf.ydisp; },
+            get baseY() { return t.buf.ybase; },
+            get length() { return t.buf.lines; },
+          };
+        },
+        onBufferChange(cb: (b: unknown) => void) { t.onBufferChangeCb = cb; },
+      };
+    }
+    scrollLines(disp: number) {
+      this.scrollCalls.push(disp);
+      const b = this.buf;
+      if (disp < 0) {
+        if (b.ydisp === 0) return; // at top: no-op (real early return)
+        b.userScrolling = true;
+      } else if (disp + b.ydisp >= b.ybase) {
+        b.userScrolling = false;
+      }
+      const old = b.ydisp;
+      b.ydisp = Math.max(Math.min(b.ydisp + disp, b.ybase), 0);
+      if (old === b.ydisp) return; // no change → no event (real behavior)
+      this.onScrollCb?.(b.ydisp);
+    }
+    scrollToBottom() {
+      this.scrollToBottomCalls++;
+      this.scrollLines(this.buf.ybase - this.buf.ydisp);
+    }
+    onScroll(cb: (y: number) => void) { this.onScrollCb = cb; }
+    onResize(cb: (e: { cols: number; rows: number }) => void) { this.onResizeCb = cb; }
+    // Test driver: BufferService.scroll() per arriving output line — the
+    // parked reader's ydisp is preserved; the tail reader follows.
+    simulateOutputLines(n: number) {
+      const b = this.buf;
+      for (let i = 0; i < n; i++) {
+        b.lines++;
+        b.ybase = Math.max(0, b.lines - this.rows);
+        if (!b.userScrolling) b.ydisp = b.ybase;
+        this.onScrollCb?.(b.ydisp); // scroll() always fires onScroll
+      }
+    }
+    switchBuffer(type: "normal" | "alternate") {
+      this.activeType = type;
+      this.onBufferChangeCb?.(this.buffer.active);
+    }
   }
   return { FakeTerm };
 });
@@ -551,5 +619,155 @@ describe("TerminalPane — e-ink display profile: live terminal posture", () => 
     expect(t).toBeDefined();
     expect(t.opts.cursorBlink).toBe(false);
     expect(t.opts.theme).toMatchObject({ background: "#ffffff", foreground: "#000000" });
+  });
+});
+
+describe("TerminalPane — e-ink history paging (UX Slice 2)", () => {
+  // Pins the terminal history toolbar over the FakeTerm scroll/buffer model
+  // (which mirrors the inspected xterm 6 BufferService semantics). The
+  // real-Chromium proof of traversal/parking lives in the e2e suites; these
+  // are the mechanical pins:
+  //   1. OFF: no toolbar node, zero viewport API calls; live ON toggle
+  //      mounts it without remount (one Terminal) or reconnect (one WS);
+  //      live OFF toggle unmounts it.
+  //   2. Paging clicks move ONLY the viewport: zero term.write, zero ws
+  //      frames — the spied write/send paths stay silent through
+  //      prev/next/latest.
+  //   3. Parked position survives new streamed output (no auto-jump; the
+  //      pane never calls scrollToBottom on its own).
+  //   4. Alternate buffer: all controls disabled + visible explanation;
+  //      leaving alt-screen restores them.
+  //   5. The input path is untouched while parked: onData still routes to
+  //      send() on the live link (parking never intercepts typing).
+  beforeEach(() => setEinkProfile(false));
+  afterEach(() => setEinkProfile(false));
+
+  const barEl = (c: HTMLElement) => c.querySelector<HTMLElement>('[data-eink="term-paging"]');
+  const btn = (c: HTMLElement, which: string) => {
+    const b = c.querySelector<HTMLButtonElement>(`[data-eink="${which}"]`);
+    expect(b, `paging button ${which}`).toBeDefined();
+    return b!;
+  };
+  const parkedAttr = async (c: HTMLElement, v: string) => {
+    await waitFor(() => expect(barEl(c)!.getAttribute("data-parked")).toBe(v));
+  };
+
+  async function openPaneParked(container: HTMLElement): Promise<InstanceType<typeof FakeTerm>> {
+    const ws = FakeWS.last;
+    ws.driveOpen();
+    await waitFor(() => {
+      expect(container.querySelector(".term-status")!.classList.contains("open")).toBe(true);
+    });
+    const t = FakeTerm.instances[0];
+    t.rows = 10;
+    t.simulateOutputLines(50); // 50 lines, 10 rows → 40 lines of scrollback
+    await parkedAttr(container, "false");
+    fireEvent.click(btn(container, "term-prev"));
+    await parkedAttr(container, "true");
+    return t;
+  }
+
+  it("OFF: no toolbar and zero viewport API calls; live ON toggle mounts it without remount/reconnect; OFF unmounts", async () => {
+    const { container } = render(() => <TerminalPane termId={TERM_ID} />);
+    const ws = FakeWS.last;
+    ws.driveOpen();
+    await waitFor(() => {
+      expect(container.querySelector(".term-status")!.classList.contains("open")).toBe(true);
+    });
+    expect(barEl(container)).toBeNull(); // absent under OFF
+    const t = FakeTerm.instances[0];
+    expect(t.scrollCalls).toEqual([]); // no viewport activity
+
+    setEinkProfile(true);
+    await waitFor(() => expect(barEl(container)).not.toBeNull());
+    expect(btn(container, "term-prev")).toBeDefined();
+    expect(btn(container, "term-next")).toBeDefined();
+    expect(btn(container, "term-latest")).toBeDefined();
+    // no remount and no reconnect from the toggle
+    expect(FakeTerm.instances.length).toBe(1);
+    expect(FakeWS.instances.length).toBe(1);
+    expect(container.querySelector(".term-status")!.classList.contains("open")).toBe(true);
+
+    setEinkProfile(false);
+    await waitFor(() => expect(barEl(container)).toBeNull());
+  });
+
+  it("paging clicks move ONLY the viewport: zero term.write, zero ws frames, zero focus churn across prev/next/latest", async () => {
+    setEinkProfile(true);
+    const { container } = render(() => <TerminalPane termId={TERM_ID} />);
+    const t = await openPaneParked(container);
+    const ws = FakeWS.last;
+    const writtenBefore = t.written;
+    const sentBefore = ws.sent.length;
+    const focusedBefore = t.focused;
+
+    fireEvent.click(btn(container, "term-next"));
+    await parkedAttr(container, "false");
+    fireEvent.click(btn(container, "term-prev"));
+    await parkedAttr(container, "true");
+    fireEvent.click(btn(container, "term-latest"));
+    await parkedAttr(container, "false");
+
+    expect(t.written).toBe(writtenBefore); // ZERO renders forced by paging
+    expect(ws.sent.length).toBe(sentBefore); // ZERO PTY/ws bytes from paging
+    expect(t.focused).toBe(focusedBefore); // focus never touched: under an
+    // app's DECSET 1004 focus reporting, term.focus() would emit ESC[O/ESC[I
+    // PTY bytes — the buttons preventDefault pointerdown instead.
+    expect(t.scrollToBottomCalls).toBe(1); // exactly the Latest click
+  });
+
+  it("new output while PARKED keeps the reader parked (no auto-jump to the tail)", async () => {
+    setEinkProfile(true);
+    const { container } = render(() => <TerminalPane termId={TERM_ID} />);
+    const t = await openPaneParked(container);
+    const yBefore = t.buf.ydisp;
+    t.simulateOutputLines(30); // real streamed output arriving while parked
+    expect(t.buf.ydisp).toBe(yBefore); // the model parks (xterm semantics)
+    expect(t.scrollToBottomCalls).toBe(0); // the pane never forced a jump
+    await parkedAttr(container, "true");
+    // …and the toolbar's Latest is the explicit way back to the tail.
+    fireEvent.click(btn(container, "term-latest"));
+    await parkedAttr(container, "false");
+    expect(t.buf.ydisp).toBe(t.buf.ybase);
+  });
+
+  it("alternate buffer: controls disabled with a visible explanation; leaving alt-screen restores them", async () => {
+    setEinkProfile(true);
+    const { container } = render(() => <TerminalPane termId={TERM_ID} />);
+    const t = await openPaneParked(container);
+
+    t.switchBuffer("alternate");
+    await waitFor(() => expect(barEl(container)!.getAttribute("data-alt")).toBe("true"));
+    expect(btn(container, "term-prev").disabled).toBe(true);
+    expect(btn(container, "term-next").disabled).toBe(true);
+    expect(btn(container, "term-latest").disabled).toBe(true);
+    const note = container.querySelector<HTMLElement>('[data-eink="term-alt-note"]');
+    expect(note).not.toBeNull();
+    expect(note!.textContent).toMatch(/history unavailable/i);
+    // the parked state from the normal buffer persists through the alt detour
+    expect(barEl(container)!.getAttribute("data-parked")).toBe("true");
+
+    t.switchBuffer("normal");
+    await waitFor(() => expect(barEl(container)!.getAttribute("data-alt")).toBe("false"));
+    expect(btn(container, "term-prev").disabled).toBe(false);
+    expect(btn(container, "term-next").disabled).toBe(false);
+    expect(btn(container, "term-latest").disabled).toBe(false); // parked → Latest enabled
+    expect(container.querySelector('[data-eink="term-alt-note"]')).toBeNull();
+  });
+
+  it("input path untouched while parked: onData still routes to send() on the live link", async () => {
+    setEinkProfile(true);
+    const { container } = render(() => <TerminalPane termId={TERM_ID} />);
+    const t = await openPaneParked(container);
+    const ws = FakeWS.last;
+    const sentBefore = ws.sent.length;
+    t.onDataCb!("ls\r"); // the REAL input seam (xterm onData → send)
+    await waitFor(() => expect(ws.sent.length).toBe(sentBefore + 1));
+    expect(new TextDecoder().decode(ws.sent[ws.sent.length - 1] as Uint8Array)).toBe("ls\r");
+    // streamed response arrives while parked: position holds
+    const yBefore = t.buf.ydisp;
+    t.simulateOutputLines(5);
+    expect(t.buf.ydisp).toBe(yBefore);
+    await parkedAttr(container, "true");
   });
 });

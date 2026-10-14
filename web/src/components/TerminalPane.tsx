@@ -22,6 +22,8 @@ import {
   toWireText,
 } from "../lib/termCompose";
 import { einkProfile } from "../prefs";
+import { PAGE_OVERLAP_FRACTION } from "../lib/paging";
+import { TerminalPanePagingControls } from "./TerminalPanePagingControls";
 
 // A real terminal: xterm.js over a WebSocket-backed PTY (/vh/term/ws). Input
 // flows through term.onData() so IME/composition resolves to final bytes (the
@@ -73,6 +75,19 @@ const TERM_THEME_EINK = {
 };
 const termTheme = (eink: boolean) => (eink ? TERM_THEME_EINK : TERM_THEME_DARK);
 
+// Terminal history-paging geometry (eink UX Slice 2) — the LINE-domain
+// translation of web/src/lib/paging.ts. The chat helpers are px-based
+// (scrollTop/scrollHeight/clientHeight); the xterm normal buffer pages in
+// whole LINES (scrollLines/scrollToBottom over viewportY/baseY), so only the
+// design constant PAGE_OVERLAP_FRACTION (15% context retained across a page
+// boundary) ports over unchanged — the px clamp bands [24,96] and the 24px
+// step floor are viewport-pixel choices with no line equivalent (a 1-line
+// overlap floor replaces them: at least one context row survives every turn,
+// and the step can never degenerate to ≤ 0 lines).
+const termPageOverlapLines = (rows: number): number =>
+  Number.isFinite(rows) && rows > 0 ? Math.max(1, Math.round(rows * PAGE_OVERLAP_FRACTION)) : 1;
+const termPageStepLines = (rows: number): number => Math.max(1, rows - termPageOverlapLines(rows));
+
 export default function TerminalPane(props: { termId?: string; session?: string; title?: string }) {
   let host!: HTMLDivElement;
   let cellCursor!: HTMLDivElement;
@@ -111,6 +126,45 @@ export default function TerminalPane(props: { termId?: string; session?: string;
   // pane-local signal would silently drop held text on those casual gestures.
   const [compose, setCompose] = createSignal(loadTermCompose(projectDir(), props.termId));
   let composeEl: HTMLTextAreaElement | undefined;
+  // E-ink history paging (UX Slice 2): render state for the paging toolbar,
+  // mounted ONLY while einkProfile() is ON. parked = the reader is viewing
+  // history (normal-buffer viewportY < baseY — xterm's isUserScrolling
+  // posture, where new output does NOT drag the viewport to the tail);
+  // alt = a full-screen application owns the ALTERNATE buffer, which has no
+  // scrollback (BufferSet builds it with maxLength = rows), so history
+  // paging is unavailable there. Both derive from the documented xterm
+  // buffer/scroll surfaces only — no escape-sequence interception.
+  const [histParked, setHistParked] = createSignal(false);
+  const [histAlt, setHistAlt] = createSignal(false);
+  const syncHist = () => {
+    if (!term) return;
+    setHistAlt(term.buffer.active.type === "alternate");
+    const n = term.buffer.normal;
+    setHistParked(n.viewportY < n.baseY);
+  };
+  // Paging actions: viewport-only xterm APIs — ZERO PTY/ws bytes (no
+  // term.write, no ws.send), no reconnect, no remount. scrollLines(-step)
+  // parks the reader (isUserScrolling=true in BufferService); scrollToBottom
+  // (and any downward page that reaches the tail) resumes following. In the
+  // alternate buffer the buttons are disabled with a visible explanation;
+  // the guards here are defense-in-depth (the alt screen has no scrollback,
+  // so scrollLines there is a no-op anyway). The actions NEVER touch focus:
+  // the toolbar buttons preventDefault pointerdown (no focus transfer out of
+  // the xterm textarea), so the terminal keeps focus across paging clicks —
+  // deliberate, because refocusing would emit ESC[O/ESC[I PTY bytes under
+  // an app's DECSET 1004 focus reporting (see TerminalPanePagingControls).
+  const histPrev = () => {
+    if (!term || term.buffer.active.type === "alternate") return;
+    term.scrollLines(-termPageStepLines(term.rows));
+  };
+  const histNext = () => {
+    if (!term || term.buffer.active.type === "alternate") return;
+    term.scrollLines(termPageStepLines(term.rows));
+  };
+  const histLatest = () => {
+    if (!term || term.buffer.active.type === "alternate") return;
+    term.scrollToBottom();
+  };
 
   const send = (s: string) => {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(enc.encode(s));
@@ -595,6 +649,23 @@ export default function TerminalPane(props: { termId?: string; session?: string;
       ),
     );
 
+    // History-paging state feed (UX Slice 2): track the normal-buffer
+    // viewport and buffer switches through the DOCUMENTED xterm events —
+    // onScroll (viewport moved: button page, wheel, or new output —
+    // BufferService.scroll fires it on every scrolled output line, whether
+    // or not the parked reader moved), onResize (reflow can re-shape
+    // baseY/ydisp), and buffer.onBufferChange (app enters/leaves the
+    // alternate screen). Subscribed unconditionally so a mid-session profile
+    // toggle finds correct state immediately; under OFF the handlers are
+    // inert bookkeeping (two signal writes, no DOM — the toolbar that reads
+    // them is not mounted), so the OFF path stays behaviorally identical.
+    // No explicit disposal: the subscriptions die with term.dispose() in
+    // this mount's cleanup.
+    term.onScroll(() => syncHist());
+    term.onResize(() => syncHist());
+    term.buffer.onBufferChange(() => syncHist());
+    syncHist();
+
     const ro = new ResizeObserver(() => {
       try { fit?.fit(); sendResize(); } catch { /* mid-layout */ }
     });
@@ -630,6 +701,20 @@ export default function TerminalPane(props: { termId?: string; session?: string;
         when={projectDir()}
         fallback={<div class="term-empty">Open a project (not the default) to use the terminal.</div>}
       >
+        {/* E-ink history paging (UX Slice 2): reserved in-flow toolbar row,
+            mounted ONLY while the profile is ON — OFF renders no node, and
+            the buffer subscriptions at the mount site are inert signal
+            bookkeeping (documented there), so the OFF observable path is
+            untouched. */}
+        <Show when={einkProfile()}>
+          <TerminalPanePagingControls
+            onPrev={histPrev}
+            onNext={histNext}
+            onLatest={histLatest}
+            parked={histParked}
+            alt={histAlt}
+          />
+        </Show>
         <div class="term-host" ref={host}>
           {/* data-stale reflects the RAW half-open suspicion signal for
               diagnostics and tests regardless of status; the CSS-visible

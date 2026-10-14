@@ -250,3 +250,129 @@ test("terminal offline: Discard clears the held buffer; the text never reaches t
     .toBe(true);
   expect(await page.locator(".xterm-rows").innerText()).not.toContain(held);
 });
+
+// D. E-ink history paging (UX Slice 2) — the spied-write transport contract:
+// paging actions page the xterm normal-buffer scrollback through viewport
+// APIs ONLY. Every client→server frame is counted at the routeWebSocket seam
+// (the same spy surface test B uses): prev/next/latest must emit ZERO frames
+// — no PTY input, no resize chatter — while real typing still produces a
+// frame (proving the spy is live, so the zero is meaningful). Transport
+// continuity: one open status throughout, and the .term-host node is never
+// remounted (expando witness). The profile is enabled via its saved
+// preference BEFORE boot so the toolbar is present from the first layout
+// (mounting it mid-session legitimately fires one PTY resize — that is the
+// toggle's cost, not a paging action's).
+test("e-ink history paging: zero PTY/ws bytes from paging actions; no reconnect, no remount", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("vh.prefs.einkProfile.v1", JSON.stringify({ v: 1, data: true }));
+  });
+  let clientFrames = 0;
+  await page.routeWebSocket(/\/vh\/term\/ws/, (ws) => {
+    const server = ws.connectToServer();
+    ws.onMessage((message) => {
+      clientFrames++;
+      // Registering onMessage on the page-side route DISABLES Playwright's
+      // automatic page→server forwarding — re-send every frame through the
+      // server-side handle or the PTY never sees keystrokes (the documented
+      // routeWebSocket forwarding contract).
+      server.send(message);
+    });
+  });
+
+  await openTerminal(page);
+  await page.locator(".term-host").click();
+
+  // Deep scrollback: 200 numbered marker lines, tail visible afterwards.
+  await page.keyboard.type("seq -f 'HISTLINE_%g' 1 200");
+  await page.keyboard.press("Enter");
+  await expect
+    .poll(async () => (await page.locator(".xterm-rows").innerText()).includes("HISTLINE_200"), { timeout: 15000 })
+    .toBe(true);
+
+  await page.evaluate(() => {
+    (document.querySelector(".term-host") as unknown as { __vhPageMark?: string }).__vhPageMark = "live";
+  });
+
+  // THE SPY: pure paging actions — deep page-ups through history, a page
+  // down, and back to the tail — must not write a single frame.
+  const bar = page.locator('[data-eink="term-paging"]');
+  const framesBefore = clientFrames;
+  for (let i = 0; i < 3; i++) await page.locator('[data-eink="term-prev"]').click();
+  await expect(bar).toHaveAttribute("data-parked", "true");
+  await expect
+    .poll(async () => (await page.locator(".xterm-rows").innerText()).includes("HISTLINE_200"), { timeout: 5000 })
+    .toBe(false); // real traversal: the tail scrolled offscreen
+  await page.locator('[data-eink="term-next"]').click();
+  await page.locator('[data-eink="term-latest"]').click();
+  await expect(bar).toHaveAttribute("data-parked", "false");
+  await expect
+    .poll(async () => (await page.locator(".xterm-rows").innerText()).includes("HISTLINE_200"), { timeout: 5000 })
+    .toBe(true);
+  await page.waitForTimeout(300); // settle: any deferred write would land here
+  expect(clientFrames - framesBefore, "paging actions must emit zero PTY/ws frames").toBe(0);
+
+  // Transport continuity: still open, still the same terminal host node.
+  await expect(page.locator(".term-status.open")).toHaveCount(1);
+  expect(
+    await page.evaluate(() => (document.querySelector(".term-host") as unknown as { __vhPageMark?: string }).__vhPageMark),
+  ).toBe("live");
+
+  // Control: real typing DOES produce a frame — the spy is live, so the
+  // zero above is a real absence, not a dead counter. The control char is
+  // SUBMITTED and the prompt settles before the 1004 phase, so its line
+  // cannot contaminate the printf below (an unsubmitted "x" would make the
+  // shell run "xprintf" and silently skip enabling the mode — review A1).
+  await page.keyboard.type("x");
+  await page.waitForTimeout(300);
+  expect(clientFrames - framesBefore).toBeGreaterThanOrEqual(1);
+  await page.keyboard.press("Enter"); // execute the stray line; prompt returns
+  await page.waitForTimeout(400);
+
+  // THE FOCUS-REPORTING MODE (review a-F1/a-F2): an application that enables
+  // DECSET 1004 (vim/less/tmux and shell integrations commonly do) makes
+  // xterm report textarea blur/refocus as ESC[O / ESC[I PTY bytes. The
+  // toolbar buttons preventDefault pointerdown so a paging click never
+  // transfers focus out of the terminal — under 1004, paging must STILL be
+  // byte-silent. Enable the mode from the APP side (printf emits the
+  // sequence; we never intercept).
+  await page.keyboard.type("printf '\\033[?1004h'");
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(600); // enabling frame(s) + echo settle
+
+  // POSITIVE mode establishment: one deliberate focus cycle (click a
+  // non-interactive dock element → blur; click the terminal → refocus)
+  // MUST produce frames under 1004 — proving focus reporting is actually
+  // active before the paging battery claims zero frames in it.
+  const establishBase = clientFrames;
+  await page.locator(".term-dock-head > svg").first().click(); // neutral icon → textarea blurs
+  await page.locator(".term-host").click(); // terminal refocus
+  await page.waitForTimeout(400);
+  expect(
+    clientFrames - establishBase,
+    "focus cycle under DECSET 1004 must report ESC[O/ESC[I — mode proven active",
+  ).toBeGreaterThanOrEqual(1);
+
+  const framesBeforeFocusMode = clientFrames;
+  await page.locator('[data-eink="term-prev"]').click();
+  await page.locator('[data-eink="term-prev"]').click();
+  await expect(bar).toHaveAttribute("data-parked", "true");
+  await page.locator('[data-eink="term-next"]').click(); // one page back down: still parked
+  await expect(bar).toHaveAttribute("data-parked", "true");
+  await page.locator('[data-eink="term-latest"]').click();
+  await expect(bar).toHaveAttribute("data-parked", "false");
+  await page.waitForTimeout(300);
+  expect(
+    clientFrames - framesBeforeFocusMode,
+    "paging under DECSET 1004 focus reporting must emit zero frames (no blur/refocus)",
+  ).toBe(0);
+  // Focus stayed in the terminal throughout: the xterm helper textarea is
+  // still the active element (no button stole it).
+  expect(
+    await page.evaluate(() => document.activeElement?.classList.contains("xterm-helper-textarea")),
+  ).toBe(true);
+
+  // Restore default (no focus reporting) for the shared-PTY hygiene.
+  await page.keyboard.type("printf '\\033[?1004l'");
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(300);
+});

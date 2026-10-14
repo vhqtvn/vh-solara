@@ -1,0 +1,92 @@
+/* TerminalPanePagingControls — e-ink profile terminal history-paging toolbar
+   (UX Slice 2). Co-located CSS Module (AI-first CSS architecture; no legacy
+   growth), the terminal sibling of chat/ChatPagingControls.module.css.
+   Mounted ONLY while the e-ink profile is ON — profile OFF never renders any
+   of these classes (TerminalPane's <Show> gate). The e2e seams are the
+   data-eink attributes (term-paging / term-prev / term-next / term-latest),
+   not global class names.
+
+   Placement: a RESERVED in-flow row at the TOP of .term (a flex column;
+   .term-host is flex:1 and yields the height) — the chat toolbar's "reserve
+   space, never cover" rule: no occlusion of terminal rows or of the
+   .term-status dot / overlays anchored inside .term-host. Mounting under ON
+   shrinks the terminal viewport; the pane's existing ResizeObserver owns
+   that resize class (refit + PTY resize control frame).
+
+   Design constraints (e-ink UX brief §2, same as the chat toolbar):
+   - ~44 CSS px touch targets (a design choice, not a measured device fact);
+   - STATIC presentation: no transitions/animations, solid backgrounds,
+     explicit borders — legibility must not depend on motion;
+   - GPU-cheap: no mask-image, no backdrop-filter, no per-element contain /
+     content-visibility (AGENTS.md "Web frontend performance" bans). */
+
+.bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 4px 8px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.btn {
+  min-width: 44px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-2);
+  color: var(--fg);
+  font: inherit;
+  font-size: var(--text-xs, 12px);
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) { background: var(--bg-3, var(--bg-2)); }
+.btn:disabled { color: var(--fg-dim); cursor: default; }
+.btn:disabled:hover { background: var(--bg-2); }
+
+/* The "go to tail / resume following" action: accent-tinted to read as the
+   escape hatch (the toolbar's sibling of the chat Latest button). */
+.latest {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  color: var(--accent);
+}
+
+/* Narrow viewports: keep the ~44px targets but drop the Latest text (the
+   accent arrow + title/aria-label carry the semantics; the row must fit a
+   400px-wide pane alongside the alt-screen note). */
+@media (max-width: 480px) {
+  .bar { gap: 4px; padding: 4px 6px; }
+  .latestText { display: none; }
+}
+
+/* Visible explanation while a full-screen application owns the ALTERNATE
+   buffer: the alt screen has no scrollback, so history paging is impossible
+   — disable-with-explanation, never silently-dead buttons. Solid pill, no
+   animation, non-interactive (its action equivalent is leaving the app).
+   Pushed to the row's start (margin-right:auto) so it never crowds the
+   action buttons on a narrow viewport. */
+.altNote {
+  margin-right: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border));
+  background: var(--bg);
+  color: var(--warn);
+  font-size: var(--text-xs, 12px);
+  font-weight: 600;
+  white-space: nowrap;
+  pointer-events: none;
+}

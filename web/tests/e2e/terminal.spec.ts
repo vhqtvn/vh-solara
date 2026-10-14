@@ -471,3 +471,189 @@ test("e-ink profile: an open terminal flips to light ink + steady cursor live (n
     await page.evaluate(() => (document.querySelector(".term-host") as unknown as { __vhEinkMark?: string }).__vhEinkMark),
   ).toBe("live");
 });
+
+// ---------------------------------------------------------------------------
+// E-ink display profile — terminal HISTORY PAGING (UX Slice 2)
+// ---------------------------------------------------------------------------
+// While the profile is ON, a reserved toolbar row (data-eink="term-paging")
+// pages the xterm NORMAL-buffer scrollback through the documented viewport
+// APIs only (scrollLines/scrollToBottom — inspected in the installed
+// @xterm/xterm 6 sources): zero PTY/ws bytes, no reconnect, no remount. An
+// upward page parks the reader (xterm's isUserScrolling), so new streamed
+// output must NOT drag the viewport to the tail. In the ALTERNATE buffer
+// (a full-screen app, entered here via printf emitting DECSET 1049h — the
+// app side of the sequence, never intercepted by us) the controls disable
+// with a visible explanation and restore on exit.
+//
+// Physical e-ink outcomes (panel ghosting, refresh) are not observable in
+// CI — operator device verification only.
+
+// Boot with the profile pre-enabled (the manual saved-preference path).
+async function openEinkTerminal(page: import("@playwright/test").Page) {
+  await page.addInitScript(() => {
+    localStorage.setItem("vh.prefs.einkProfile.v1", JSON.stringify({ v: 1, data: true }));
+  });
+  await openTerminal(page);
+}
+
+// The DOM renderer draws only the viewport rows — split .xterm-rows innerText
+// into exact lines so an early-marker check cannot substring-match a longer
+// number (HISTLINE_1 vs HISTLINE_100).
+async function termLines(page: import("@playwright/test").Page): Promise<string[]> {
+  return (await page.locator(".xterm-rows").innerText()).split("\n").map((l) => l.trim());
+}
+
+async function toggleEinkProfile(page: import("@playwright/test").Page, on: boolean) {
+  await page.getByRole("button", { name: "Settings" }).click();
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Appearance" }).click();
+  await dialog.getByRole("checkbox", { name: "E Ink mode" }).click();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  const bar = page.locator('[data-eink="term-paging"]');
+  await (on ? expect(bar).toHaveCount(1) : expect(bar).toHaveCount(0));
+}
+
+test("e-ink terminal paging: controls visible under ON, absent under OFF (live toggle, no remount/reconnect)", async ({ page }) => {
+  await openTerminal(page); // default OFF
+  await expect(page.locator('[data-eink="term-paging"]')).toHaveCount(0);
+  await expect(page.locator('[data-eink="term-prev"]')).toHaveCount(0);
+  await expect(page.locator('[data-eink="term-next"]')).toHaveCount(0);
+  await expect(page.locator('[data-eink="term-latest"]')).toHaveCount(0);
+
+  // No-remount witness on the live host node.
+  await page.evaluate(() => {
+    (document.querySelector(".term-host") as unknown as { __vhEinkMark?: string }).__vhEinkMark = "live";
+  });
+
+  await toggleEinkProfile(page, true);
+  await expect(page.locator('[data-eink="term-prev"]')).toBeVisible();
+  await expect(page.locator('[data-eink="term-next"]')).toBeVisible();
+  await expect(page.locator('[data-eink="term-latest"]')).toBeVisible();
+  await expect(page.locator('[data-eink="term-paging"]')).toHaveAttribute("data-parked", "false");
+  await expect(page.locator(".term-status.open")).toHaveCount(1);
+
+  await toggleEinkProfile(page, false);
+  await expect(page.locator('[data-eink="term-prev"]')).toHaveCount(0);
+  // Same terminal node and connection across the whole cycle.
+  expect(
+    await page.evaluate(() => (document.querySelector(".term-host") as unknown as { __vhEinkMark?: string }).__vhEinkMark),
+  ).toBe("live");
+  await expect(page.locator(".term-status.open")).toHaveCount(1);
+});
+
+test("e-ink terminal paging: button-only traversal reaches offscreen history; parked survives new output; input+output stay live", async ({ page }) => {
+  await openEinkTerminal(page);
+  await page.locator(".term-host").click();
+
+  // A delayed TICK producer: 5s of silence, then one numbered marker line
+  // per second for 15s — the "new output arriving while parked" stimulus
+  // with a CADENCE (review a-F3: a single fixed-delay echo can complete
+  // before parking or after Latest, passing without proving anything; a 1s
+  // tick train guarantees output lands INSIDE the multi-second parked
+  // window on any run speed, and the numbered ticks are independent
+  // evidence of delivery). Started BEFORE parking so NO user input happens
+  // during the parked window — xterm's documented default scrollOnUserInput
+  // scrolls a parked reader to the tail when the user TYPES (typing
+  // behavior, asserted separately below), while pure OUTPUT must leave the
+  // parked reader parked. That distinction is exactly what the phases pin.
+  const tick = `TICKED_OUT_${Date.now()}`;
+  await page.keyboard.type(`(sleep 5; for i in $(seq 1 15); do echo ${tick}_$i; sleep 1; done) &`);
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(400); // prompt returns; producer runs in background
+
+  // Fill the scrollback with 200 numbered marker lines, then return to a
+  // fresh prompt (the tail shows the last markers; the first tick fires at
+  // ~5s, after this fill has completed).
+  await page.keyboard.type("seq -f 'HISTLINE_%g' 1 200");
+  await page.keyboard.press("Enter");
+  await expect
+    .poll(async () => (await termLines(page)).includes("HISTLINE_200"), { timeout: 15000 })
+    .toBe(true);
+
+  // At the tail: not parked, Latest disabled (nothing to resume).
+  const bar = page.locator('[data-eink="term-paging"]');
+  await expect(bar).toHaveAttribute("data-parked", "false");
+  await expect(page.locator('[data-eink="term-latest"]')).toBeDisabled();
+
+  // BUTTON-ONLY traversal: page up until the earliest marker lines — well
+  // offscreen in a ~200-line scrollback — are visible. No keyboard, no
+  // wheel, no direct handler calls.
+  let reached = false;
+  for (let i = 0; i < 60 && !reached; i++) {
+    await page.locator('[data-eink="term-prev"]').click();
+    reached = (await termLines(page)).includes("HISTLINE_2");
+  }
+  expect(reached, "button-only paging never reached the top of the scrollback").toBe(true);
+  await expect(bar).toHaveAttribute("data-parked", "true");
+  await expect(page.locator('[data-eink="term-latest"]')).toBeEnabled();
+  // Transport continuity through the paging: still open.
+  await expect(page.locator(".term-status.open")).toHaveCount(1);
+
+  // Parked window: the tick train (1s cadence, running until ~20s) delivers
+  // new output while the reader is parked — several ticks MUST land inside
+  // this multi-second window. The reader must STAY parked (no jump to the
+  // tail) at the SAME position, and the ticks must stay offscreen below.
+  // NOTE: tick output can interleave with the shell prompt (background
+  // output prints AT the cursor — a line may read "❯ TICKED_OUT_…_7"), so
+  // "tick output visible" = a line carrying the token that is NOT the typed
+  // command (…sleep…) and NOT zsh's job-done notice (…done…); the command
+  // line legitimately sits near the top of the scrollback while parked.
+  const tickOutOnScreen = async () =>
+    (await termLines(page)).some((l) => l.includes(tick) && !l.includes("sleep") && !l.includes("done"));
+  await page.waitForTimeout(3500);
+  await expect(bar).toHaveAttribute("data-parked", "true");
+  expect((await termLines(page)).includes("HISTLINE_2")).toBe(true); // same position
+  expect(await tickOutOnScreen()).toBe(false); // ticks still offscreen
+
+  // Latest: the one explicit way back — the ticks that streamed while the
+  // reader was parked are there (only the viewport had not moved).
+  await page.locator('[data-eink="term-latest"]').click();
+  await expect(bar).toHaveAttribute("data-parked", "false");
+  await expect.poll(tickOutOnScreen, { timeout: 5000 }).toBe(true);
+
+  // Input path while parked: park again, then type. xterm's default
+  // scrollOnUserInput DOES return the reader to the tail on typing — that
+  // is the documented typing posture (you type, you see the prompt), NOT a
+  // paging defect — and the keystrokes must reach the PTY and execute:
+  // the typed command's output renders right after the auto-return.
+  await page.locator('[data-eink="term-prev"]').click();
+  await expect(bar).toHaveAttribute("data-parked", "true");
+  const typed = `TYPED_LIVE_${Date.now()}`;
+  await page.keyboard.type(`echo ${typed}`);
+  await page.keyboard.press("Enter");
+  await expect(bar).toHaveAttribute("data-parked", "false"); // documented auto-return
+  await expect
+    .poll(async () => (await termLines(page)).some((l) => l.includes(typed)), { timeout: 5000 })
+    .toBe(true);
+  await expect(page.locator(".term-status.open")).toHaveCount(1);
+});
+
+test("e-ink terminal paging: alternate buffer disables controls with an explanation; leaving restores them", async ({ page }) => {
+  await openEinkTerminal(page);
+  await page.locator(".term-host").click();
+
+  // Enter the alternate screen the way a real full-screen app does: the APP
+  // emits DECSET 1049h (printf is the app here — we never intercept escape
+  // sequences; xterm switches buffers and the pane only OBSERVES
+  // buffer.onBufferChange).
+  await page.keyboard.type("printf '\\033[?1049h'");
+  await page.keyboard.press("Enter");
+  const bar = page.locator('[data-eink="term-paging"]');
+  await expect(bar).toHaveAttribute("data-alt", "true");
+  await expect(page.locator('[data-eink="term-prev"]')).toBeDisabled();
+  await expect(page.locator('[data-eink="term-next"]')).toBeDisabled();
+  await expect(page.locator('[data-eink="term-latest"]')).toBeDisabled();
+  await expect(page.locator('[data-eink="term-alt-note"]')).toBeVisible();
+  await expect(page.locator('[data-eink="term-alt-note"]')).toContainText(/history unavailable/i);
+
+  // Leave the alternate screen (same app-side path) — controls restore.
+  await page.keyboard.type("printf '\\033[?1049l'");
+  await page.keyboard.press("Enter");
+  await expect(bar).toHaveAttribute("data-alt", "false");
+  await expect(page.locator('[data-eink="term-prev"]')).toBeEnabled();
+  await expect(page.locator('[data-eink="term-next"]')).toBeEnabled();
+  await expect(page.locator('[data-eink="term-alt-note"]')).toHaveCount(0);
+  await expect(page.locator(".term-status.open")).toHaveCount(1);
+});
