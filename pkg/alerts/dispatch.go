@@ -18,10 +18,20 @@ import (
 	"time"
 )
 
+// Waiting sub-kinds (Notice.Kind): which flavor of human input the session
+// needs. The distinction exists at the emission site (KindPermissionSet vs
+// KindQuestionSet events); Kind carries it downstream so delivery channels
+// (the FCM notify sender) can map it without re-deriving it.
+const (
+	KindPermission = "permission"
+	KindQuestion   = "question"
+)
+
 // Notice is the typed alert payload emitted on the store bus (for in-app
 // delivery) and POSTed to webhook channels.
 type Notice struct {
 	Type      string `json:"type"`             // finished | waiting | stuck-thinking | runaway | stalled
+	Kind      string `json:"kind,omitempty"`   // waiting sub-kind: permission | question (empty for other types)
 	SessionID string `json:"sessionID"`        // the session the notice is about
 	Root      string `json:"root"`             // its root session
 	Project   string `json:"project"`          // project dir

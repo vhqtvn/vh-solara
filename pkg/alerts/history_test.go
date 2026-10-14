@@ -202,6 +202,38 @@ func TestHistoryPersistenceShape(t *testing.T) {
 	}
 }
 
+// TestHistoryLimitClampedToMax pins the `limit` clamp: a query above
+// HistoryMaxLimit (200) serves exactly the newest 200 events — never more,
+// even when the ring holds them.
+func TestHistoryLimitClampedToMax(t *testing.T) {
+	h := newHistory(filepath.Join(t.TempDir(), "notify-history.json"), 300)
+	for i := 0; i < 250; i++ {
+		rec(h, TypeWaiting, "s")
+	}
+	events, lastID := h.Query(0, 201) // > HistoryMaxLimit → clamped
+	if len(events) != 200 {
+		t.Fatalf("limit=201 must clamp to 200 events, got %d", len(events))
+	}
+	if lastID != 250 {
+		t.Fatalf("lastID = %d, want 250", lastID)
+	}
+	// The newest window: ids 51..250.
+	eqIDs(t, ids(events)[:3], 51, 52, 53)
+	eqIDs(t, ids(events)[198:], 249, 250)
+
+	// Exactly 200 is at the cap, not clamped away.
+	events, _ = h.Query(0, 200)
+	if len(events) != 200 {
+		t.Fatalf("limit=200 must serve 200 events, got %d", len(events))
+	}
+	// The clamp also applies to the since-paging form.
+	events, _ = h.Query(10, 500)
+	if len(events) != 200 {
+		t.Fatalf("since=10&limit=500 must clamp to 200 events, got %d", len(events))
+	}
+	eqIDs(t, ids(events)[:2], 11, 12)
+}
+
 // TestEngineTapRecordsSuppressedNotices is the alerts-level crux: notices the
 // engine detects are recorded into history BEFORE delivery gating — here the
 // active profile is "Silent" (PolicyNever), so the dispatcher suppresses ALL

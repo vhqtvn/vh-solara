@@ -1,9 +1,9 @@
 package web
 
-// notify_feature.go — the /vh/notify/* routes (Slice 1 of the FCM notify
-// channel): the notice-history reader, the token-registry probe, and the
-// token upsert endpoint. The FCM sender itself lands in Slice 2; until it is
-// attached Engine.NotifyReady() is false, so the probe reports
+// notify_feature.go — the /vh/notify/* routes: the notice-history reader,
+// the token-registry probe, and the token upsert endpoint. The FCM sender
+// (Slice 2) attaches in InitAlerts when the config carries a credentials
+// file; until then Engine.NotifyReady() is false, so the probe reports
 // {"enabled":false,"count":0} and POST /vh/notify/tokens answers 503 —
 // exactly the unconfigured-channel contract.
 //
@@ -11,6 +11,7 @@ package web
 // (the probe returns enabled+count only) and are never logged.
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -49,7 +50,13 @@ func (f notifyFeature) Routes(svc Services) map[string]http.HandlerFunc {
 					return
 				}
 				if err := f.tokens.Upsert(in.Token, in.Label); err != nil {
-					writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+					// Client errors (sentinel registry errors) answer 400;
+					// anything else is an I/O/persistence failure → 500.
+					status := http.StatusInternalServerError
+					if errors.Is(err, alerts.ErrNotifyTokenRequired) || errors.Is(err, alerts.ErrNotifyTokenCap) {
+						status = http.StatusBadRequest
+					}
+					writeJSON(w, status, errResp(err.Error()))
 					return
 				}
 				writeJSON(w, http.StatusOK, jsonBytes(map[string]any{"ok": true}))

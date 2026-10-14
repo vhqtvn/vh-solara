@@ -115,6 +115,19 @@ func (r *TokenRegistry) Count() int {
 	return len(r.tokens)
 }
 
+// List returns a snapshot of the registered tokens for the notify sender's
+// fan-out (Slice 2). Token VALUES are delivery secrets: callers must never
+// expose or log them — they go straight into FCM message requests.
+func (r *TokenRegistry) List() []NotifyToken {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]NotifyToken, 0, len(r.tokens))
+	for _, t := range r.tokens {
+		out = append(out, t)
+	}
+	return out
+}
+
 // persistLocked writes the registry atomically (tmp + rename, 0600), sorted by
 // token for deterministic files. Caller holds mu.
 func (r *TokenRegistry) persistLocked() error {

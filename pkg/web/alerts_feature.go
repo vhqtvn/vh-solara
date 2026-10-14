@@ -29,13 +29,21 @@ func (s *Server) InitAlerts(ctx context.Context) (*alerts.Engine, error) {
 	if pusher, perr := alerts.NewPusher(store, presence, stateBaseDir()); perr == nil {
 		engine.SetPusher(pusher)
 	}
-	// Notify channel (Slice 1): daemon-global notice-history ring + FCM token
-	// registry + the /vh/notify/* routes. No sender is attached yet —
-	// Engine.NotifyReady() stays false, so the probe reports enabled:false and
-	// token upserts answer 503 (the unconfigured-channel contract) until
-	// Slice 2 adds the FCM sender.
+	// Notify channel: daemon-global notice-history ring + FCM token registry
+	// + the /vh/notify/* routes, plus (Slice 2) the FCM sender itself. The
+	// registry is shared between the routes and the sender — the sender fans
+	// out to List() and prunes dead tokens via Prune(). The sender attaches
+	// ONLY when the config carries a credentials file AND it loads; a load
+	// failure silently disables the channel (NotifyReady false → probe
+	// enabled:false, upserts 503) without touching anything else in alerts.
+	tokens := alerts.NewTokenRegistry(stateBaseDir())
+	if store.Get().NotifyConfigured() {
+		if notifier, nerr := alerts.NewNotifier(store, presence, tokens); nerr == nil {
+			engine.SetNotifier(notifier)
+		}
+	}
 	engine.SetHistory(alerts.NewHistory(stateBaseDir()))
-	s.RegisterFeature(notifyFeature{engine: engine, tokens: alerts.NewTokenRegistry(stateBaseDir())})
+	s.RegisterFeature(notifyFeature{engine: engine, tokens: tokens})
 	s.RegisterFeature(alertsFeature{engine: engine})
 	s.SetAggHook(func(dir string, a *aggregator.Aggregator) {
 		engine.Attach(ctx, dir, a.Store())

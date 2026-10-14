@@ -20,8 +20,9 @@ type Engine struct {
 	cfg        *Store
 	presence   *Presence
 	dispatcher *Dispatcher
-	pusher     *Pusher  // optional; nil if Web Push is unavailable
-	history    *History // optional; nil until SetHistory (notice history ring)
+	pusher     *Pusher   // optional; nil if Web Push is unavailable
+	notifier   *Notifier // optional; nil until SetNotifier (FCM notify channel)
+	history    *History  // optional; nil until SetHistory (notice history ring)
 
 	mu       sync.Mutex
 	watchers map[string]*watcher // dir -> watcher
@@ -48,6 +49,15 @@ func (e *Engine) SetPusher(p *Pusher) { e.pusher = p }
 // Pusher exposes the Web Push sender (for the subscribe/key endpoints). May be nil.
 func (e *Engine) Pusher() *Pusher { return e.pusher }
 
+// SetNotifier attaches the FCM notify sender (Slice 2). Optional: without it
+// the notify channel reports unconfigured (NotifyReady false). Set before
+// Attach in production wiring (the pusher pattern: the field is read by the
+// delivery fan-out without a lock).
+func (e *Engine) SetNotifier(n *Notifier) { e.notifier = n }
+
+// Notifier exposes the FCM notify sender. May be nil when never attached.
+func (e *Engine) Notifier() *Notifier { return e.notifier }
+
 // SetHistory attaches the notice-history ring (/vh/notify/history backing
 // store). Optional: without it the engine runs unchanged (tests construct it
 // bare) and notices simply aren't retained.
@@ -57,14 +67,13 @@ func (e *Engine) SetHistory(h *History) { e.history = h }
 // nil when never attached; History.Query is nil-safe.
 func (e *Engine) History() *History { return e.history }
 
-// NotifyReady reports whether the FCM notify channel is configured AND its
-// sender attached. Slice 1 ships only the config shape (Config.Notify) — no
-// sender exists yet, so this is always false: the /vh/notify/tokens probe
-// reports enabled:false and token upserts answer 503. Slice 2 attaches the
-// sender in InitAlerts and flips this to
-// e.cfg.Get().NotifyConfigured() && e.notifier != nil.
+// NotifyReady reports whether the FCM notify channel is BOTH configured in
+// the alerts config (a notify section with a credentials file) AND has its
+// sender attached. The /vh/notify/tokens probe reports enabled:false and
+// token upserts answer 503 until both hold — a credentials-load failure at
+// init leaves the channel silently disabled (nothing else in alerts breaks).
 func (e *Engine) NotifyReady() bool {
-	return false
+	return e.cfg.Get().NotifyConfigured() && e.notifier != nil
 }
 
 // recordNotice enters a detected notice into the daemon-global history ring
@@ -101,14 +110,17 @@ func (e *Engine) Attach(ctx context.Context, dir string, store *state.Store) {
 		firedReq: map[string]bool{},
 		now:      time.Now,
 	}
-	// Default delivery: in-app fan-out + outbound channels + Web Push. Tests swap
-	// this for a capturing sink to assert which notices fire.
+	// Default delivery: in-app fan-out + outbound channels + Web Push + FCM
+	// notify. Tests swap this for a capturing sink to assert which notices fire.
 	w.deliver = func(n Notice) {
 		payload, _ := json.Marshal(n)
 		store.EmitNotice(payload)
 		e.dispatcher.Dispatch(n)
 		if e.pusher != nil {
 			e.pusher.Send(n)
+		}
+		if e.notifier != nil {
+			e.notifier.Send(n)
 		}
 	}
 	e.watchers[dir] = w
@@ -152,6 +164,9 @@ func (e *Engine) EmitDaemonNotice(detail string) {
 	e.dispatcher.Dispatch(n)
 	if e.pusher != nil {
 		e.pusher.Send(n)
+	}
+	if e.notifier != nil {
+		e.notifier.Send(n)
 	}
 }
 
@@ -365,7 +380,11 @@ func (w *watcher) onEvent(ev state.ClientEvent) {
 			t.lastEventAt = now
 			if live && s.ID != "" && !w.firedReq[s.ID] {
 				w.firedReq[s.ID] = true
-				w.fire(s.SessionID, TypeWaiting, "Waiting for your input")
+				kind := KindPermission
+				if ev.Kind == state.KindQuestionSet {
+					kind = KindQuestion
+				}
+				w.fire(s.SessionID, TypeWaiting, kind, "Waiting for your input")
 			}
 		}
 	case state.KindPermissionClear, state.KindQuestionClear:
@@ -451,7 +470,7 @@ func (w *watcher) sweep() {
 
 	for _, f := range fires {
 		w.mu.Lock()
-		w.fire(f.sid, f.typ, f.detail)
+		w.fire(f.sid, f.typ, "", f.detail)
 		w.mu.Unlock()
 	}
 }
@@ -507,8 +526,9 @@ func (w *watcher) rootOfLocked(sid string) string {
 }
 
 // fire emits a notice in-app (store fan-out) and to webhook channels. Caller
-// holds mu (for tracker reads); the dispatch itself is non-blocking.
-func (w *watcher) fire(sid, typ, detail string) {
+// holds mu (for tracker reads); the dispatch itself is non-blocking. kind
+// carries the waiting sub-kind (permission | question); "" for other types.
+func (w *watcher) fire(sid, typ, kind, detail string) {
 	t := w.sessions[sid]
 	title := ""
 	if t != nil {
@@ -517,6 +537,7 @@ func (w *watcher) fire(sid, typ, detail string) {
 	root := w.rootOfLocked(sid)
 	n := Notice{
 		Type:      typ,
+		Kind:      kind,
 		SessionID: sid,
 		Root:      root,
 		Project:   w.dir,

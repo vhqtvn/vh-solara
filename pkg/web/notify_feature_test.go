@@ -7,10 +7,16 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -321,5 +327,218 @@ func TestNotifyHistoryRouteEndToEnd(t *testing.T) {
 	}
 	if code, _ := notifyGet(t, web.URL+"/vh/notify/history?limit=0"); code != http.StatusOK {
 		t.Fatalf("limit=0 (default): want 200, got %d", code)
+	}
+}
+
+// newConfiguredNotifyTestServer boots the same stack as
+// newNotifyTestServer but with the FCM notify channel CONFIGURED and its
+// sender attached: a mock OAuth2 token endpoint (via the credentials file's
+// token_uri), a real service-account credentials file, the notify config
+// section, and engine.SetNotifier — the InitAlerts wiring. Returns the
+// server, the engine, and the shared token registry (for pre-filling).
+func newConfiguredNotifyTestServer(t *testing.T) (*httptest.Server, *alerts.Engine, *alerts.TokenRegistry) {
+	t.Helper()
+	stateDir := t.TempDir()
+
+	// Mock OAuth2 token endpoint; no FCM send happens in these route tests,
+	// so the default FCM base is never hit.
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"test-token","expires_in":3600,"token_type":"Bearer"}`))
+	}))
+	t.Cleanup(tokenSrv.Close)
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa keygen: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatalf("marshal pkcs8: %v", err)
+	}
+	creds := map[string]string{
+		"type":         "service_account",
+		"project_id":   "proj-web",
+		"private_key":  string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})),
+		"client_email": "bot@proj-web.iam.gserviceaccount.com",
+		"token_uri":    tokenSrv.URL,
+	}
+	cj, _ := json.Marshal(creds)
+	credsPath := filepath.Join(stateDir, "fcm-creds.json")
+	if err := os.WriteFile(credsPath, cj, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := alerts.NewStore(stateDir + "/alerts.jsonc")
+	if err != nil {
+		t.Fatalf("alerts.NewStore: %v", err)
+	}
+	c := cfg.Get()
+	c.Notify = &alerts.NotifyConfig{CredentialsFile: credsPath, ProjectID: "proj-web"}
+	if err := cfg.Replace(c); err != nil {
+		t.Fatalf("cfg.Replace: %v", err)
+	}
+
+	pres := alerts.NewPresence()
+	engine := alerts.NewEngine(cfg, pres, alerts.NewDispatcher(cfg, pres))
+	engine.SetHistory(alerts.NewHistory(stateDir))
+	tokens := alerts.NewTokenRegistry(stateDir)
+	// Premise: the CONFIG half is ready (sender attaches next; NotifyReady
+	// needs both halves).
+	if !cfg.Get().NotifyConfigured() {
+		t.Fatal("test premise: notify config section must be present")
+	}
+	notifier, err := alerts.NewNotifier(cfg, pres, tokens)
+	if err != nil {
+		t.Fatalf("alerts.NewNotifier: %v", err)
+	}
+	engine.SetNotifier(notifier)
+	if !engine.NotifyReady() {
+		t.Fatal("test premise: NotifyReady must be true with sender attached")
+	}
+
+	oc := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(oc.Close)
+	srv, err := NewServer(aggregator.New(oc.URL, 100), oc.URL, 100)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	srv.RegisterFeature(notifyFeature{engine: engine, tokens: tokens})
+	web := httptest.NewServer(srv.Handler())
+	t.Cleanup(web.Close)
+	return web, engine, tokens
+}
+
+// TestNotifyTokensConfiguredChannel pins the CONFIGURED-channel contract
+// (Slice 2): the probe answers enabled:true, a token POST round-trips 200,
+// and the probe reflects the new count — and an empty token is a 400 (the
+// sentinel mapping), not a 503.
+func TestNotifyTokensConfiguredChannel(t *testing.T) {
+	web, _, _ := newConfiguredNotifyTestServer(t)
+
+	code, body := notifyGet(t, web.URL+"/vh/notify/tokens")
+	if code != http.StatusOK {
+		t.Fatalf("probe: want 200, got %d (body=%s)", code, body)
+	}
+	var probe notifyProbe
+	if err := json.Unmarshal(body, &probe); err != nil {
+		t.Fatalf("probe body: %v (%s)", err, body)
+	}
+	if !probe.Enabled || probe.Count != 0 {
+		t.Fatalf("configured probe = %+v, want enabled:true count:0", probe)
+	}
+
+	code, body = notifyPost(t, web.URL+"/vh/notify/tokens", `{"token":"a-valid-fcm-token","label":"phone"}`, true)
+	if code != http.StatusOK {
+		t.Fatalf("token POST: want 200, got %d (body=%s)", code, body)
+	}
+	if !strings.Contains(string(body), `"ok":true`) {
+		t.Fatalf("token POST body = %s, want ok:true", body)
+	}
+
+	code, body = notifyGet(t, web.URL+"/vh/notify/tokens")
+	if err := json.Unmarshal(body, &probe); err != nil {
+		t.Fatalf("probe body: %v (%s)", err, body)
+	}
+	if !probe.Enabled || probe.Count != 1 {
+		t.Fatalf("post-upsert probe = %+v, want enabled:true count:1", probe)
+	}
+
+	// Empty token now maps to 400 (the channel is live, so validation runs).
+	if code, body = notifyPost(t, web.URL+"/vh/notify/tokens", `{"token":""}`, true); code != http.StatusBadRequest {
+		t.Fatalf("empty token: want 400, got %d (body=%s)", code, body)
+	}
+}
+
+// TestNotifyTokensUpsertErrorMapping pins the 400-vs-500 mapping (review
+// DEFERs C-F1/A-F1): sentinel registry errors (missing token, cap) answer
+// 400; an unexpected persistence failure answers 500.
+func TestNotifyTokensUpsertErrorMapping(t *testing.T) {
+	web, _, tokens := newConfiguredNotifyTestServer(t)
+
+	// Sentinel: missing token → 400 with the sentinel message.
+	code, body := notifyPost(t, web.URL+"/vh/notify/tokens", `{"token":""}`, true)
+	if code != http.StatusBadRequest || !strings.Contains(string(body), "token required") {
+		t.Fatalf("empty token: want 400 \"token required\", got %d %s", code, body)
+	}
+
+	// Sentinel: cap reached → 400. Pre-fill the registry (shared instance) to
+	// the cap of 32 through the direct API.
+	for i := 0; i < alerts.NotifyTokenCap; i++ {
+		if err := tokens.Upsert("cap-token-"+strings.Repeat("x", i+1), ""); err != nil {
+			t.Fatalf("prefill %d: %v", i, err)
+		}
+	}
+	code, body = notifyPost(t, web.URL+"/vh/notify/tokens", `{"token":"token-over-cap"}`, true)
+	if code != http.StatusBadRequest || !strings.Contains(string(body), "token limit reached") {
+		t.Fatalf("cap token: want 400 \"token limit reached\", got %d %s", code, body)
+	}
+}
+
+// TestNotifyTokensUpsertPersistence500 isolates the 500 path on its own
+// server: the registry's target path is occupied by a directory, so the
+// atomic persist fails and the route answers 500 (not 400).
+func TestNotifyTokensUpsertPersistence500(t *testing.T) {
+	// Build the fixture manually (the registry path must be sabotaged BEFORE
+	// NewTokenRegistry loads) — same wiring as newConfiguredNotifyTestServer.
+	stateDir := t.TempDir()
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"access_token":"t","expires_in":3600}`))
+	}))
+	defer tokenSrv.Close()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, _ := x509.MarshalPKCS8PrivateKey(priv)
+	cj, _ := json.Marshal(map[string]string{
+		"project_id":   "p",
+		"private_key":  string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})),
+		"client_email": "bot@p.iam.gserviceaccount.com",
+		"token_uri":    tokenSrv.URL,
+	})
+	credsPath := filepath.Join(stateDir, "creds.json")
+	if err := os.WriteFile(credsPath, cj, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := alerts.NewStore(stateDir + "/alerts.jsonc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := cfg.Get()
+	c.Notify = &alerts.NotifyConfig{CredentialsFile: credsPath, ProjectID: "p"}
+	if err := cfg.Replace(c); err != nil {
+		t.Fatal(err)
+	}
+	// Sabotage: the registry's persistence target is a directory → rename
+	// fails → Upsert returns a non-sentinel error.
+	if err := os.Mkdir(filepath.Join(stateDir, "notify-tokens.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pres := alerts.NewPresence()
+	engine := alerts.NewEngine(cfg, pres, alerts.NewDispatcher(cfg, pres))
+	tokens := alerts.NewTokenRegistry(stateDir)
+	notifier, err := alerts.NewNotifier(cfg, pres, tokens)
+	if err != nil {
+		t.Fatalf("NewNotifier: %v", err)
+	}
+	engine.SetNotifier(notifier)
+
+	oc := httptest.NewServer(http.NotFoundHandler())
+	defer oc.Close()
+	srv, err := NewServer(aggregator.New(oc.URL, 100), oc.URL, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.RegisterFeature(notifyFeature{engine: engine, tokens: tokens})
+	web := httptest.NewServer(srv.Handler())
+	defer web.Close()
+
+	code, body := notifyPost(t, web.URL+"/vh/notify/tokens", `{"token":"persist-will-fail"}`, true)
+	if code != http.StatusInternalServerError {
+		t.Fatalf("persistence failure: want 500, got %d (body=%s)", code, body)
+	}
+	if strings.Contains(string(body), "token required") || strings.Contains(string(body), "token limit") {
+		t.Fatalf("500 body must not carry a sentinel message: %s", body)
 	}
 }

@@ -132,7 +132,7 @@ func DefaultConfig() Config {
 // sender-attached half is Engine.NotifyReady; the channel is enabled only
 // when BOTH hold (Slice 2 wires the sender; until then this stays false
 // end-to-end even if an operator hand-writes the section).
-func (c *Config) NotifyConfigured() bool {
+func (c Config) NotifyConfigured() bool {
 	return c.Notify != nil && c.Notify.CredentialsFile != ""
 }
 
@@ -188,7 +188,7 @@ func ConfigPath(stateDir string) string { return filepath.Join(stateDir, "alerts
 
 // topOrder fixes the key order for a freshly-seeded file and for any key that
 // has to be appended to a hand-written file missing it.
-var topOrder = []string{"detect", "active_profile", "profiles", "channels"}
+var topOrder = []string{"detect", "active_profile", "profiles", "channels", "notify"}
 
 // NewStore loads the config from path, seeding a default file if absent.
 func NewStore(path string) (*Store, error) {
@@ -238,6 +238,11 @@ func (s *Store) save() error {
 		add("profiles", s.cfg.Profiles)
 		add("active_profile", s.cfg.Active)
 		add("detect", s.cfg.Detect)
+		// The fresh render must reflect the FULL config, notify included — a
+		// nil section is omitted (the key never appears in a default seed).
+		if s.cfg.Notify != nil {
+			add("notify", s.cfg.Notify)
+		}
 		body, err := marshalOrdered(merged, topOrder)
 		if err != nil {
 			return err
