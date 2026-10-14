@@ -463,11 +463,18 @@ type fcmErrorBody struct {
 }
 
 // fcmIsUnregistered reports whether an FCM error body carries the
-// UNREGISTERED error code (the device token is no longer valid).
+// UNREGISTERED error code (the device token is no longer valid). Two shapes
+// count: a details[].errorCode entry (the FcmError detail) or a top-level
+// error.status of UNREGISTERED with no details array — FCM answers dead
+// tokens both ways, and pruning on either keeps the registry from retaining
+// dead tokens forever.
 func fcmIsUnregistered(body []byte) bool {
 	var e fcmErrorBody
 	if json.Unmarshal(body, &e) != nil {
 		return false
+	}
+	if e.Error.Status == "UNREGISTERED" {
+		return true
 	}
 	for _, d := range e.Error.Details {
 		if d.ErrorCode == "UNREGISTERED" {

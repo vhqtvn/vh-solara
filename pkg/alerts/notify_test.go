@@ -14,6 +14,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -171,9 +172,17 @@ type notifyFixture struct {
 	tmu    *tokenMock
 	priv   *rsa.PrivateKey
 	clk    *fakeClock
+	dir    string // state dir — registry/history reload assertions
 }
 
 func newNotifyFixture(t *testing.T) *notifyFixture {
+	return newNotifyFixtureExpiry(t, 3600)
+}
+
+// newNotifyFixtureExpiry is newNotifyFixture with a configurable OAuth
+// expires_in (seconds) — the token-cache boundary tests drive the frozen
+// clock across the 5-min-early refresh edge with a short-lived token.
+func newNotifyFixtureExpiry(t *testing.T, expiresIn int) *notifyFixture {
 	t.Helper()
 	dir := t.TempDir()
 
@@ -192,7 +201,7 @@ func newNotifyFixture(t *testing.T) *notifyFixture {
 		_ = r.ParseForm()
 		tmu.add(r.PostFormValue("grant_type"), r.PostFormValue("assertion"))
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"access_token":"test-access-token","expires_in":3600,"token_type":"Bearer"}`))
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"access_token":"test-access-token","expires_in":%d,"token_type":"Bearer"}`, expiresIn)))
 	}))
 	t.Cleanup(tokenSrv.Close)
 
@@ -234,7 +243,7 @@ func newNotifyFixture(t *testing.T) *notifyFixture {
 	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
 	nt.now = clk.Now
 
-	return &notifyFixture{cfg: cfg, pres: pres, tokens: tokens, nt: nt, fcm: fcm, tmu: tmu, priv: priv, clk: clk}
+	return &notifyFixture{cfg: cfg, pres: pres, tokens: tokens, nt: nt, fcm: fcm, tmu: tmu, priv: priv, clk: clk, dir: dir}
 }
 
 // notice is a small builder for distinct test notices (distinct types dodge
@@ -496,35 +505,53 @@ func TestNotifierGatingCooldown(t *testing.T) {
 
 // TestNotifierPrunesUnregisteredTokens pins the delivery-hygiene contract:
 // a token is pruned ONLY on FCM responses carrying explicit UNREGISTERED
-// evidence in the error body's details — 400 INVALID_ARGUMENT or 404
-// NOT_FOUND with the FcmError detail. A generic 404 NOT_FOUND (FCM's answer
-// to sender-side misconfiguration, e.g. a wrong/deleted project ID) and a
-// 400 with another reason must NOT prune: pruning on those would mass-erase
-// every valid registration.
+// evidence in the error body — 400 INVALID_ARGUMENT or 404 NOT_FOUND with
+// the FcmError detail (or a top-level error.status of UNREGISTERED, the
+// details-less shape FCM also answers dead tokens with). A generic 404
+// NOT_FOUND (FCM's answer to sender-side misconfiguration, e.g. a wrong/
+// deleted project ID) and a 400 with another reason must NOT prune: pruning
+// on those would mass-erase every valid registration. Every case also
+// asserts the PERSISTED registry: a second TokenRegistry reloaded from the
+// same state dir must agree (prunes are deletions on disk, retentions are
+// retentions on disk).
 func TestNotifierPrunesUnregisteredTokens(t *testing.T) {
 	const unregistered400Body = `{"error":{"code":400,"status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"UNREGISTERED"}]}}`
 	const invalidBody = `{"error":{"code":400,"status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"INVALID_ARGUMENT"}]}}`
 	const unregistered404Body = `{"error":{"code":404,"status":"NOT_FOUND","details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"UNREGISTERED"}]}}`
 	const projectNotFoundBody = `{"error":{"code":404,"status":"NOT_FOUND","message":"Requested entity was not found"}}`
+	const topLevelUnregisteredBody = `{"error":{"code":404,"status":"UNREGISTERED"}}`
 
-	// Case 1: 400 + UNREGISTERED detail → pruned.
+	// reloadCount builds a fresh TokenRegistry over the same state dir and
+	// returns its Count() — the daemon-restart view of the registry.
+	reloadCount := func(f *notifyFixture) int {
+		return NewTokenRegistry(f.dir).Count()
+	}
+
+	// Case 1: 400 + UNREGISTERED detail → pruned, and persisted-absent.
 	f := newNotifyFixture(t)
 	f.fcm.setRespond(func(int) (int, string) { return 400, unregistered400Body })
 	_ = f.tokens.Upsert("tok-a", "")
 	f.nt.Send(notice(TypeFinished, "", 1))
 	f.fcm.waitNext(t)
 	eventually(t, func() bool { return f.tokens.Count() == 0 }, "400 UNREGISTERED must prune the token")
+	if got := reloadCount(f); got != 0 {
+		t.Fatalf("case 1 reload: registry count = %d, want 0 (prune must persist)", got)
+	}
 
-	// Case 2: 404 + UNREGISTERED detail → pruned.
+	// Case 2: 404 + UNREGISTERED detail → pruned, and persisted-absent.
 	f2 := newNotifyFixture(t)
 	f2.fcm.setRespond(func(int) (int, string) { return 404, unregistered404Body })
 	_ = f2.tokens.Upsert("tok-b", "")
 	f2.nt.Send(notice(TypeFinished, "", 1))
 	f2.fcm.waitNext(t)
 	eventually(t, func() bool { return f2.tokens.Count() == 0 }, "404 UNREGISTERED must prune the token")
+	if got := reloadCount(f2); got != 0 {
+		t.Fatalf("case 2 reload: registry count = %d, want 0 (prune must persist)", got)
+	}
 
-	// Case 3: 404 generic/project NOT_FOUND (no UNREGISTERED detail) →
-	// RETAINED — sender-side misconfiguration must not erase registrations.
+	// Case 3: 404 generic/project NOT_FOUND (no UNREGISTERED evidence) →
+	// RETAINED — sender-side misconfiguration must not erase registrations —
+	// and the retention must persist.
 	f3 := newNotifyFixture(t)
 	f3.fcm.setRespond(func(int) (int, string) { return 404, projectNotFoundBody })
 	_ = f3.tokens.Upsert("tok-c", "")
@@ -534,8 +561,11 @@ func TestNotifierPrunesUnregisteredTokens(t *testing.T) {
 	if f3.tokens.Count() != 1 {
 		t.Fatal("404 without UNREGISTERED detail must NOT prune the token")
 	}
+	if got := reloadCount(f3); got != 1 {
+		t.Fatalf("case 3 reload: registry count = %d, want 1 (retention must persist)", got)
+	}
 
-	// Case 4: 400 with another reason → kept.
+	// Case 4: 400 with another reason → kept, and persisted-kept.
 	f4 := newNotifyFixture(t)
 	f4.fcm.setRespond(func(int) (int, string) { return 400, invalidBody })
 	_ = f4.tokens.Upsert("tok-d", "")
@@ -544,6 +574,21 @@ func TestNotifierPrunesUnregisteredTokens(t *testing.T) {
 	time.Sleep(300 * time.Millisecond) // give the prune path (wrongly) a chance
 	if f4.tokens.Count() != 1 {
 		t.Fatal("400 non-UNREGISTERED must NOT prune the token")
+	}
+	if got := reloadCount(f4); got != 1 {
+		t.Fatalf("case 4 reload: registry count = %d, want 1 (retention must persist)", got)
+	}
+
+	// Case 5 (F4): top-level error.status UNREGISTERED, no details array —
+	// the details-less shape FCM also answers dead tokens with → pruned.
+	f5 := newNotifyFixture(t)
+	f5.fcm.setRespond(func(int) (int, string) { return 404, topLevelUnregisteredBody })
+	_ = f5.tokens.Upsert("tok-e", "")
+	f5.nt.Send(notice(TypeFinished, "", 1))
+	f5.fcm.waitNext(t)
+	eventually(t, func() bool { return f5.tokens.Count() == 0 }, "404 top-level UNREGISTERED status must prune the token")
+	if got := reloadCount(f5); got != 0 {
+		t.Fatalf("case 5 reload: registry count = %d, want 0 (prune must persist)", got)
 	}
 }
 
@@ -602,6 +647,124 @@ func TestNotifier5xxSingleRetry(t *testing.T) {
 	}
 	if f.tokens.Count() != 1 {
 		t.Fatal("5xx must not prune the token")
+	}
+}
+
+// --- concurrency + OAuth cache boundaries (review defers A-F1 / B-F2) ---
+
+// TestNotifierConcurrentSendCooldownAndTokenCache (A-F1): two Sends racing
+// from simultaneous goroutines against one notifier. The per-(type,token)
+// cooldown map must account correctly under the race — each token is allowed
+// EXACTLY once across both fan-outs (mutex-serialized onCooldown: first
+// caller records, loser is suppressed) — and the OAuth cache must be
+// race-safe: exactly ONE token exchange total serves both delivery
+// goroutines. A follow-up same-type send inside the window stays suppressed.
+func TestNotifierConcurrentSendCooldownAndTokenCache(t *testing.T) {
+	f := newNotifyFixture(t)
+	_ = f.tokens.Upsert("tok-concurrent-a", "")
+	_ = f.tokens.Upsert("tok-concurrent-b", "")
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			f.nt.Send(notice(TypeFinished, "", int64(1000+i)))
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	r1 := f.fcm.waitNext(t)
+	r2 := f.fcm.waitNext(t)
+	toks := map[string]bool{r1.Body.Message.Token: true, r2.Body.Message.Token: true}
+	if len(toks) != 2 || !toks["tok-concurrent-a"] || !toks["tok-concurrent-b"] {
+		t.Fatalf("concurrent fan-out tokens = %v, want each registered token exactly once", toks)
+	}
+
+	// Cache race-safety: both delivery goroutines shared ONE exchange.
+	if got := f.tmu.count(); got != 1 {
+		t.Fatalf("token exchanges = %d, want 1 (concurrent sends must share the cached token)", got)
+	}
+
+	// Cooldown accounting under the race: no third delivery leaked through.
+	time.Sleep(200 * time.Millisecond)
+	if got := f.fcm.requests(); got != 2 {
+		t.Fatalf("fcm requests = %d, want exactly 2 (each (type,token) allowed once)", got)
+	}
+
+	// And a sequential same-type send inside the window is suppressed.
+	f.nt.Send(notice(TypeFinished, "", 2000))
+	f.fcm.assertNoRequest(t, "same-type send within cooldown after the race")
+}
+
+// TestNotifierTokenCacheRefreshBoundary (B-F2a): with a short-lived OAuth
+// token (expires_in=400s), the cache is reused strictly BEFORE the 5-min-early
+// refresh boundary (now+300s < exp) and re-exchanged exactly AT it
+// (now+300s == exp is already stale). The frozen clock makes every step
+// deterministic.
+func TestNotifierTokenCacheRefreshBoundary(t *testing.T) {
+	f := newNotifyFixtureExpiry(t, 400)
+	_ = f.tokens.Upsert("tok-expiry", "")
+
+	// t0: first send — exchange #1; cache exp = t0+400s.
+	f.nt.Send(notice(TypeFinished, "", 1))
+	f.fcm.waitNext(t)
+	if got := f.tmu.count(); got != 1 {
+		t.Fatalf("exchanges = %d, want 1 after first send", got)
+	}
+
+	// t0+90s: now+300 = t0+390 < t0+400 → cached token reused. A different
+	// notice type dodges the per-(type,token) cooldown.
+	f.clk.advance(90 * time.Second)
+	f.nt.Send(notice(TypeRunaway, "", 2))
+	f.fcm.waitNext(t)
+	if got := f.tmu.count(); got != 1 {
+		t.Fatalf("exchanges after +90s = %d, want 1 (cache reused before the boundary)", got)
+	}
+
+	// t0+100s: now+300 == exp → NOT Before(exp) → refresh (exchange #2).
+	f.clk.advance(10 * time.Second)
+	f.nt.Send(notice(TypeStuckThinking, "", 3))
+	f.fcm.waitNext(t)
+	if got := f.tmu.count(); got != 2 {
+		t.Fatalf("exchanges after +100s = %d, want 2 (refresh exactly at the 5-min-early boundary)", got)
+	}
+
+	// t0+150s: refreshed cache (exp = t0+500s) is served again — no third exchange.
+	f.clk.advance(50 * time.Second)
+	f.nt.Send(notice(TypeStalled, "", 4))
+	f.fcm.waitNext(t)
+	if got := f.tmu.count(); got != 2 {
+		t.Fatalf("exchanges after +150s = %d, want 2 (refreshed cache reused)", got)
+	}
+}
+
+// TestNotifierPersistent401Bounded (B-F2b): when EVERY FCM attempt answers
+// 401 — even after the forced token refresh — the sender terminates
+// bounded: exactly 2 FCM requests (initial + one refreshed retry), exactly 2
+// exchanges (initial + one forced refresh), no retry loop, and the
+// registration is RETAINED (a 401 is an auth problem, not dead-token
+// evidence).
+func TestNotifierPersistent401Bounded(t *testing.T) {
+	f := newNotifyFixture(t)
+	_ = f.tokens.Upsert("tok-401", "")
+	f.fcm.setRespond(func(int) (int, string) { return 401, `{"error":{"code":401,"status":"UNAUTHENTICATED"}}` })
+
+	f.nt.Send(notice(TypeFinished, "", 1))
+	f.fcm.waitNext(t) // the initial 401
+	eventually(t, func() bool { return f.fcm.requests() == 2 }, "persistent 401 must force-refresh and retry exactly once")
+	time.Sleep(300 * time.Millisecond)
+	if got := f.fcm.requests(); got != 2 {
+		t.Fatalf("fcm requests = %d, want exactly 2 (bounded termination, no loop)", got)
+	}
+	if got := f.tmu.count(); got != 2 {
+		t.Fatalf("token exchanges = %d, want exactly 2 (initial + forced refresh, no further)", got)
+	}
+	if f.tokens.Count() != 1 {
+		t.Fatal("persistent 401 must NOT prune the registration")
 	}
 }
 
