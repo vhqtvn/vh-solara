@@ -1,0 +1,109 @@
+/* ChatPagingControls — e-ink profile viewport-paging toolbar (UX Slice 1).
+   Co-located CSS Module (AI-first CSS architecture; no legacy growth).
+   Mounted ONLY while the e-ink profile is ON — profile OFF never renders any
+   of these classes (ChatView's <Show> gate).
+
+   Placement: a RESERVED in-flow row at the TOP of .chat-main (a flex column;
+   .chat-scroll is flex:1 and yields the height). This is the brief's "reserve
+   toolbar space rather than obscure content": zero occlusion of transcript
+   content or of the bottom-anchored overlays (".jump" / ".chat-live" /
+   PendingInput's pill), which an overlay bar at 400px would cover. Mounting
+   under ON shrinks the scroll viewport — the existing scrollEl
+   ResizeObserver owns exactly that resize class.
+
+   Design constraints (e-ink UX brief §2):
+   - ~44 CSS px touch targets (a design choice, not a measured device fact);
+   - STATIC presentation: no transitions/animations (the e-ink themes'
+     animation kill-switch would null them anyway — legibility must not
+     depend on motion), solid backgrounds, explicit borders;
+   - GPU-cheap: no mask-image, no backdrop-filter, no per-element contain /
+     content-visibility (AGENTS.md "Web frontend performance" bans). */
+
+.bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 4px 8px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.btn {
+  min-width: 44px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-2);
+  color: var(--fg);
+  font: inherit;
+  font-size: var(--text-xs, 12px);
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.btn:hover { background: var(--bg-3, var(--bg-2)); }
+.btn:disabled { color: var(--fg-dim); cursor: default; }
+.btn:disabled:hover { background: var(--bg-2); }
+
+/* The "go to tail" action: accent-tinted to read as the resume-follow escape
+   (the toolbar's sibling of the "↓ Latest" pill). */
+.latest {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  color: var(--accent);
+}
+
+/* Narrow viewports: keep the ~44px targets but drop the Latest text (the
+   accent arrow + title/aria-label carry the semantics; the row must fit
+   alongside the turn-navigation group and the chip at 400px). */
+@media (max-width: 480px) {
+  .bar { gap: 4px; padding: 4px 6px; }
+  .latestText { display: none; }
+}
+
+/* Static "New below" status chip (leftmost element of the toolbar while the
+   reader is parked in history during streaming). Solid pill, no animation;
+   updated only on meaningful arrival (message boundary / part settle), never
+   per token. Non-interactive (pointer-events: none) — its action equivalents
+   are the Next-page button and Latest. Pushed to the row's start (margin-
+   right:auto) so it never crowds the action buttons on a narrow viewport. */
+.newbelow {
+  margin-right: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  background: var(--bg);
+  color: var(--accent);
+  font-size: var(--text-xs, 12px);
+  font-weight: 600;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* Narrow-screen compact semantic turn navigation (the desktop dot navigator
+   does not render below the 721px breakpoint — these fill that gap, routed
+   through the SAME navigator controller machinery). Rendered by the
+   component's own !isDesktop() gate. */
+.turns {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.turnLabel {
+  color: var(--fg-dim);
+  font-size: var(--text-xs, 12px);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}

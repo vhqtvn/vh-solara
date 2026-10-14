@@ -40,6 +40,13 @@ export interface NavigatorDeps {
   // Shared pure CSS.escape helper (also used by ChatView's scroll/anchor logic);
   // injected rather than duplicated.
   cssEsc: (id: string) => string;
+  // E-ink reading-intent seam (optional; profile-gated by the CALLER'S shape —
+  // ChatView passes its establishReadingIntent). When present, an INSTANT
+  // (e-ink profile) jumpToMsg invokes it with the PRE-jump scrollTop so the
+  // owner can treat an effective jump as persistent reading intent (the same
+  // contract as a page action). Never invoked for the profile-OFF smooth
+  // jump — OFF behavior is unchanged.
+  onInstantJump?: (fromScrollTop: number) => void;
 }
 
 export interface NavigatorController {
@@ -75,14 +82,21 @@ export function createNavigator(deps: NavigatorDeps): NavigatorController {
     return t.replace(/\s+/g, " ").trim().slice(0, 140) || "(message)";
   };
   const jumpToMsg = (id: string) => {
+    const el = deps.scrollEl()?.querySelector(`[data-mid="${deps.cssEsc(id)}"]`) as HTMLElement | null;
+    if (!el) return;
     // E-ink display profile: jump INSTANTLY (a smooth scroll animates the
     // whole transcript — churn on slow-updating panels). Profile OFF keeps
-    // the smooth jump byte-identical; this is the profile's ONLY scroll
-    // change (reduced-motion behavior elsewhere is untouched).
-    deps.scrollEl()?.querySelector(`[data-mid="${deps.cssEsc(id)}"]`)?.scrollIntoView({
+    // the smooth jump byte-identical. Under the profile an EFFECTIVE jump
+    // also establishes persistent reading intent via the onInstantJump seam
+    // (the profile now also owns instant paging + reading-intent semantics —
+    // see ChatPagingControls; the "only scroll change" note predates those).
+    const container = deps.scrollEl();
+    const before = container ? container.scrollTop : 0;
+    el.scrollIntoView({
       behavior: einkProfile() ? "auto" : "smooth",
       block: "start",
     });
+    if (einkProfile() && container) deps.onInstantJump?.(before);
   };
   // Navigator highlight: the user turn currently at the top of the viewport, plus
   // a hover-preview bubble. Recomputed on scroll (rAF-throttled) — desktop only.

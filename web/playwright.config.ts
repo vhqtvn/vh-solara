@@ -81,6 +81,20 @@ export default defineConfig({
       use: { ...devices["Desktop Firefox"] },
       testMatch: /animation-resume\.spec\.ts/,
     },
+    // E-ink scroll-follow lane on Firefox — closes the slice-5 F4 DEFER
+    // ("Firefox pass for the new scroll-follow e-ink tests before
+    // cross-browser claims"): the tests are titles-prefixed "e-ink ON:" in
+    // scroll-follow.spec.ts (the settle block (19)–(25) from 914b18c plus
+    // the UX-Slice-1 paging/reading-intent block (27)–(30)). Scoped by
+    // testMatch + grep so the serial, fixture-state-shared suite is NOT
+    // re-run wholesale on a second engine; the OFF-absence probe (26) stays
+    // chromium-only (profile-off is engine-agnostic by construction).
+    {
+      name: "firefox-eink-scroll",
+      use: { ...devices["Desktop Firefox"] },
+      testMatch: /scroll-follow\.spec\.ts/,
+      grep: /e-ink ON:/,
+    },
   ],
   webServer: useExistingWebServer
     ? undefined

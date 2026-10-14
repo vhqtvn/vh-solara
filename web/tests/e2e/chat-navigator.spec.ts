@@ -97,3 +97,101 @@ test("navigator jump is smooth by default and instant under the e-ink profile (r
     )
     .toBe(true);
 });
+
+// ---------------------------------------------------------------------------
+// E-ink display profile — compact semantic turn navigation on NARROW
+// viewports (UX Slice 1). The desktop dot navigator does not render below the
+// 721px breakpoint; the e-ink paging bar fills that gap with prev/next turn
+// buttons routed through the SAME navigator controller machinery
+// (userTurns/activeTurn/jumpToMsg). An effective instant jump establishes
+// persistent reading intent (createNavigator's onInstantJump seam).
+// ---------------------------------------------------------------------------
+test("e-ink ON narrow viewport: compact turn navigation jumps between user turns", async ({ page }) => {
+  // Boot the profile via its saved preference (the manual activation path)
+  // and shrink below the desktop breakpoint (721px).
+  await page.addInitScript(() => {
+    localStorage.setItem("vh.prefs.einkProfile.v1", JSON.stringify({ v: 1, data: true }));
+    localStorage.setItem("vh.prefs.streamLive.v1", JSON.stringify({ v: 1, data: true }));
+  });
+  await page.setViewportSize({ width: 400, height: 600 });
+  await page.goto(projectUrl("/?session=demo"));
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 8000 });
+  await expect(page.locator(".chat-content.ready")).toBeVisible({ timeout: 10000 });
+  // Glue deterministically to the tail (mirrors scroll-follow's openDemo).
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+
+  // Narrow posture: no desktop dot navigator, but the paging bar + its
+  // compact turn navigation ARE reachable.
+  await expect(page.locator(".chat-nav")).toHaveCount(0);
+  await expect(page.locator('[data-eink="paging"]')).toBeVisible();
+  await expect(page.locator('[data-eink="prev-turn"]')).toBeVisible();
+  await expect(page.locator('[data-eink="next-turn"]')).toBeVisible();
+
+  // Expected target, derived from the app's OWN position label — the same
+  // navigator.activeTurn signal stepTurn targets (never a parallel
+  // computation that can race it). The shared demo transcript grows across
+  // the serial suite, so turn indexes are never hardcoded; the label is
+  // polled until STABLE (two reads 250ms apart agree) because activeTurn
+  // updates on a rAF after the glue scroll.
+  const label = page.locator('[data-eink="turn-pos"]');
+  await expect(label).toBeVisible();
+  const stableLabel = async (): Promise<string | null> => {
+    const a = await label.textContent();
+    await page.waitForTimeout(250);
+    const b = await label.textContent();
+    return a && a === b ? a : null;
+  };
+  await expect.poll(stableLabel, { timeout: 8000 }).toMatch(/^\d+\/\d+$/);
+  const posText = (await label.textContent())!;
+  const activeIdx = parseInt(posText.split("/")[0], 10) - 1;
+  const total = parseInt(posText.split("/")[1], 10);
+  expect(activeIdx).toBeGreaterThan(0); // non-vacuous: a previous turn exists
+  const prevMid = await page.evaluate((i) => {
+    const turns = Array.from(document.querySelectorAll(".chat-content .msg.user")) as HTMLElement[];
+    return turns[i]?.dataset.mid ?? null;
+  }, activeIdx - 1);
+  expect(prevMid).not.toBeNull();
+
+  // REAL click on Previous turn: instant jump to that turn's row...
+  await page.locator('[data-eink="prev-turn"]').click();
+  await expect
+    .poll(() =>
+      page.evaluate((wantMid) => {
+        const scroll = document.querySelector(".chat-scroll") as HTMLElement | null;
+        const row = scroll?.querySelector(`.msg[data-mid="${wantMid}"]`) as HTMLElement | null;
+        if (!scroll || !row) return false;
+        const r = row.getBoundingClientRect();
+        const c = scroll.getBoundingClientRect();
+        return r.top >= c.top - 2 && r.top <= c.top + 40 && r.height > 0;
+      }, prevMid!),
+    )
+    .toBe(true);
+  // ...and the jump established persistent reading intent ("↓ Latest" pill).
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+
+  // The position label tracks the active turn (1-based "n/total").
+  await expect(label).toHaveText(`${activeIdx}/${total}`);
+
+  // Next turn jumps back down to the turn we came from (same rule, forward).
+  const cameFromMid = await page.evaluate((i) => {
+    const turns = Array.from(document.querySelectorAll(".chat-content .msg.user")) as HTMLElement[];
+    return turns[i + 1]?.dataset.mid ?? null;
+  }, activeIdx - 1);
+  expect(cameFromMid).not.toBeNull();
+  await page.locator('[data-eink="next-turn"]').click();
+  await expect
+    .poll(() =>
+      page.evaluate((wantMid) => {
+        const scroll = document.querySelector(".chat-scroll") as HTMLElement | null;
+        const row = scroll?.querySelector(`.msg[data-mid="${wantMid}"]`) as HTMLElement | null;
+        if (!scroll || !row) return false;
+        const r = row.getBoundingClientRect();
+        const c = scroll.getBoundingClientRect();
+        return r.top >= c.top - 2 && r.top <= c.top + 40 && r.height > 0;
+      }, cameFromMid!),
+    )
+    .toBe(true);
+  await expect(label).toHaveText(`${activeIdx + 1}/${total}`);
+});

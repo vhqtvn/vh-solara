@@ -27,9 +27,17 @@ import {
 import { isSendInFlight } from "../lib/sendSingleFlight";
 import { bindBackDismiss } from "../lib/backStack";
 import { einkProfile } from "../prefs";
+import { isDesktop } from "../layout";
+import {
+  isEffectivePageMove,
+  pageBackward,
+  pageForward,
+  type PagingGeometry,
+} from "../lib/paging";
 import PartView, { ActivityGroup, bindEinkSettleListener } from "./Part";
 import ChatTasksStatus from "./ChatTasksStatus";
 import { bindChatTail } from "../tailFollow";
+import { ChatPagingControls } from "./chat/ChatPagingControls";
 
 // scrollEl ResizeObserver "stuck on ↓ Latest" recovery admission window: the
 // largest PRE-resize (pinnedGeom) gap-from-bottom for which a pure clientHeight
@@ -174,6 +182,36 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // so skipping the write does NOT arm userScrolledUp; on release the next cycle
   // still classifies shouldScroll=true and a single re-pin lands cleanly.
   const [holdActive, setHoldActive] = createSignal(false);
+  // ── E-ink viewport paging + reading intent (UX Slice 1) ──────────────────
+  // Under the e-ink profile an EFFECTIVE page/turn/jump action establishes
+  // PERSISTENT reading intent by adapting this component's existing follow
+  // machine — NO parallel controller. `readingParked` is the reading-mode
+  // marker those actions arm (and every re-engage site clears, mirroring
+  // `userScrolledUp`'s lifecycle): it (a) keeps a page write that lands at
+  // the tail in READING mode (Next-at-tail stays reading — the "↓ Latest"
+  // pill or the bar's Latest is the only resume), and (b) gates the static
+  // "New below" chip for a deliberate history reader during streaming.
+  // GATING BOUNDARY (accurate claim): the marker has NO OFF-observable
+  // effect — under OFF it may still be armed by genuine reader actions
+  // (a mid-history restore, an input-backed scroll-away), but its only
+  // consumers are ON-only: the chip never mounts under OFF, and the
+  // reached-bottom suppression additionally requires a fresh pagingWriteAt,
+  // which only profile-gated page/turn actions stamp.
+  const [readingParked, setReadingParked] = createSignal(false);
+  // ms timestamp of the last effective page/turn/jump WRITE; onScrolled's
+  // reached-bottom re-engage suppresses for our own writes within the same
+  // INPUT_FRESHNESS_MS window (a genuine reader scroll back to the bottom
+  // carries no fresh page write and still re-engages).
+  let pagingWriteAt = 0;
+  // messages().length captured at park time — the baseline for the "New
+  // below" arrival count (message-boundary updates only, never per token).
+  let parkedAtMsgCount = 0;
+  // Meaningful-arrival refresh for the chip (part settle / held-back chip
+  // mount — the settle-lifecycle bridge ticks these, NOT streamed tokens).
+  const [arrivalTick, setArrivalTick] = createSignal(0);
+  // Parked-geometry refresh (page writes + parked scroll events) so the
+  // chip's off-tail check re-evaluates as the reader moves.
+  const [readingTick, setReadingTick] = createSignal(0);
   // Hide the transcript until it's positioned for the current session, so the
   // initial scroll jump (top → restored/bottom) is never painted — switching
   // sessions reveals the content already in place instead of flashing.
@@ -321,7 +359,15 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // shared with this view's own [data-mid] scroll/anchor logic, so it stays here
   // and is injected into the controller (single source of truth).
   const cssEsc = (id: string) => (typeof CSS !== "undefined" && CSS.escape ? CSS.escape(id) : id);
-  const navigator = createNavigator({ messages, scrollEl: () => scrollEl, cssEsc });
+  const navigator = createNavigator({
+    messages,
+    scrollEl: () => scrollEl,
+    cssEsc,
+    // E-ink paging (UX Slice 1): an effective INSTANT (profile ON) turn jump
+    // establishes persistent reading intent — same contract as a page action.
+    // Profile OFF never invokes this (jumpToMsg gates on einkProfile()).
+    onInstantJump: (from) => establishReadingIntent(from),
+  });
 
   const pendingPermissions = createMemo(() => Object.values(state.permissions[props.sessionId] || {}));
   const pendingQuestions = createMemo(() => Object.values(state.questions[props.sessionId] || {}));
@@ -582,6 +628,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       if (gap < TURN_FINISH_RECOVERY_GAP && !inputBackedAway && !restoredAnchorId) {
         setFollowing(true);
         setUserScrolledUp(false);
+        setReadingParked(false); // re-engage ended reading mode
         contentROArmedLatch = false;
         preArmGap = Infinity;
         endAnchorServo(); // re-engage following ⇒ anchor servo state is stale, drop it
@@ -651,11 +698,97 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   function jumpToLatest() {
     setFollowing(true);
     setUserScrolledUp(false); // user explicitly chose to follow again
+    setReadingParked(false); // ...and explicitly ended reading mode
     inputBackedAway = false; // Approach A: explicit re-engage clears the veto
     pendingInputAt = 0;
     endAnchorServo(); // explicit jump = restore contract AND anchor state ended
     pin();
   }
+
+  // ── E-ink paging actions (UX Slice 1; all entry points profile-scoped) ───
+  // establishReadingIntent: arm READING mode for an already-performed
+  // effective write (page step or instant turn jump). Sets exactly the fields
+  // onScrolled's GENUINE user-scroll-away branch arms — the deliberate-reader
+  // state the existing recoveries already respect — plus the page-write
+  // marker that keeps our own tail-landing writes from auto re-engaging.
+  // restoredAnchorId tracking deliberately PERSISTS (same as a genuine
+  // scroll): the content RO's read-mode corrections keep the viewport stable.
+  function establishReadingIntent(fromScrollTop: number) {
+    const el = scrollEl;
+    if (!el) return;
+    if (!isEffectivePageMove(fromScrollTop, el.scrollTop)) return; // no-op action preserves the prior mode
+    setFollowing(false);
+    setUserScrolledUp(true); // persistent reading intent: the busy-edge self-heal must not yank
+    setReadingParked(true);
+    parkedAtMsgCount = messages().length;
+    contentROArmedLatch = false; // genuine reader action → not eligible for the RO recoveries
+    preArmGap = Infinity;
+    anchorServoArmed = false; // the reader owns the viewport now
+    inputBackedAway = true; // deliberate input-backed episode: settle-glue + turn-finish recovery never yank
+    pendingInputAt = Date.now(); // explicit provenance (clicks/keys also stamp via the .chat-main sensors)
+    pagingWriteAt = Date.now(); // our write — a tail landing must NOT auto re-engage follow
+    pinnedGeom = geom(el); // advance the baseline to the post-write truth (pin()'s idiom)
+    setReadingTick((t) => t + 1);
+  }
+
+  // One discrete viewport page under the e-ink profile: measure the CURRENT
+  // usable height, step by (usable − bounded overlap), clamp to the current
+  // extent, write INSTANTLY (never smooth). At the extent the step is a
+  // no-op that preserves whatever mode the reader is in (criterion: Next at
+  // the tail stays reading / keeps following alike).
+  function applyPage(dir: 1 | -1) {
+    const el = scrollEl;
+    if (!el || !einkProfile()) return; // profile-scoped (controls mount only under ON; double gate)
+    const from = el.scrollTop;
+    const g: PagingGeometry = {
+      scrollTop: el.scrollTop,
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+    };
+    const to = dir > 0 ? pageForward(g) : pageBackward(g);
+    if (!isEffectivePageMove(from, to)) return;
+    el.scrollTop = to; // instant write
+    establishReadingIntent(from);
+  }
+
+  // Compact semantic turn navigation for NARROW viewports (the desktop dot
+  // navigator does not render below the 721px breakpoint): step through the
+  // SAME navigator controller's user turns; an effective instant jump
+  // establishes reading intent (createNavigator's onInstantJump seam). At
+  // the first/last turn the step is a no-op that preserves mode.
+  function stepTurn(dir: 1 | -1) {
+    const turns = navigator.userTurns();
+    if (!turns.length || !einkProfile()) return;
+    const active = navigator.activeTurn();
+    const cur = active ? Math.max(0, turns.findIndex((t: any) => t.id === active)) : 0;
+    const next = cur + dir;
+    if (next < 0 || next >= turns.length) return;
+    navigator.jumpToMsg(turns[next].id);
+  }
+  const turnPosition = createMemo(() => {
+    const turns = navigator.userTurns();
+    if (!turns.length) return "";
+    const active = navigator.activeTurn();
+    const cur = active ? Math.max(0, turns.findIndex((t: any) => t.id === active)) : 0;
+    return `${cur + 1}/${turns.length}`;
+  });
+  const showTurnNav = createMemo(() => !isDesktop() && navigator.userTurns().length > 1);
+  // Static "New below" chip label (null = hidden). Visible ONLY while a
+  // deliberate reader is parked off-tail during streaming; the count is the
+  // messages that arrived since park (message-boundary granularity). The
+  // ticks re-evaluate the GEOMETRY on meaningful arrival (settle lifecycle)
+  // and on parked movement — never per streamed token.
+  const newBelowLabel = createMemo((): string | null => {
+    void arrivalTick();
+    void readingTick();
+    if (!working() || !readingParked()) return null;
+    const el = scrollEl;
+    if (!el) return null;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight <= 24) return null; // at/near the tail: nothing below
+    const arrived = Math.max(0, messages().length - parkedAtMsgCount);
+    return arrived > 1 ? `New below \u00b7 ${arrived}` : "New below";
+  });
+
   // Tail-follow bridge (host tail/follow control): expose the active chat's
   // following state + jumpToLatest to out-of-component consumers (the embed-
   // gated statusEmitter reports `following` in {type:"status"}; the host-driven
@@ -693,11 +826,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   const onEinkSettleEvent = () => {
     if (!einkProfile()) return; // profile-scoped (double gate with Part.tsx)
     if (!scrollEl || !ready()) return; // not positioned — maybeRestore owns the viewport
+    // E-ink paging (UX Slice 1): a settle-lifecycle event is a MEANINGFUL
+    // arrival — refresh the parked reader's "New below" chip BEFORE the
+    // follow gates below (a parked reader returns at inputBackedAway, but
+    // the arrival still counts for the chip).
+    if (readingParked()) setArrivalTick((t) => t + 1);
     if (restoredAnchorId) return; // restore contract owns the viewport (mirror of the busy→idle gate)
     if (inputBackedAway) return; // genuine input-backed reader (mirror of the busy→idle veto)
     if (holdActive()) return; // blocker-card interaction hold (mirror of the content RO re-pin suppression)
     setFollowing(true);
     setUserScrolledUp(false);
+    setReadingParked(false); // re-engage ended reading mode
     contentROArmedLatch = false;
     preArmGap = Infinity;
     endAnchorServo(); // re-engage following ⇒ anchor servo state is stale, drop it
@@ -919,6 +1058,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // session. The stale/no-anchor branches below arm false because they
         // land AT the bottom (system restore = follow intent reset).
         setUserScrolledUp(true);
+        // E-ink paging (UX Slice 1): a mid-history restore is also PARKED
+        // reading — the "New below" regime applies during streaming.
+        setReadingParked(true);
+        parkedAtMsgCount = messages().length;
         // Reset any system-arm recovery state armed BEFORE the restore (the
         // contentEl RO's user-scroll-up misclassification can arm
         // contentROArmedLatch + a small preArmGap during the pre-restore
@@ -953,12 +1096,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // Stale anchor (message since deleted) — fall back to the bottom.
         setFollowing(true);
         setUserScrolledUp(false); // system restore to bottom — not user intent
+        setReadingParked(false); // ...and not reading mode
         pin();
       }
     } else {
       restoredFor = props.sessionId;
       setFollowing(true);
       setUserScrolledUp(false); // opened at the bottom — not user intent
+      setReadingParked(false); // ...and not reading mode
       pin();
       // Pinned to the bottom on open — no scroll event fires for a programmatic
       // position, so onScrolled/ackSession never runs (and even a synthetic
@@ -1042,6 +1187,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // recovery, or yank if polarity were ever inverted).
         pendingInputAt = 0;
         inputBackedAway = false;
+        // E-ink paging (UX Slice 1): same cross-session reset for the reading
+        // mode marker + the page-write marker (a stale marker could suppress
+        // the entering session's reached-bottom re-engage for one write).
+        setReadingParked(false);
+        pagingWriteAt = 0;
+        parkedAtMsgCount = 0;
         setReady(false);
         // Fallback reveal: if no content change fires the ResizeObserver (so
         // maybeRestore never runs), position + reveal on the next frame anyway.
@@ -1277,6 +1428,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         if (preArmGap < RECOVERY_TAIL_GAP) {
           setFollowing(true);
           setUserScrolledUp(false);
+          setReadingParked(false); // re-engage ended reading mode
           contentROArmedLatch = false;
           preArmGap = Infinity;
           inputBackedAway = false; // Approach A: re-engage clears the veto
@@ -1376,6 +1528,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         if (contentROArmedLatch && preArmGap < RECOVERY_TAIL_GAP) {
           setFollowing(true);
           setUserScrolledUp(false);
+          setReadingParked(false); // re-engage ended reading mode
           contentROArmedLatch = false;
           preArmGap = Infinity;
           inputBackedAway = false; // Approach A: re-engage clears the veto
@@ -1404,6 +1557,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         if (!nearBottom()) return; // (1)
         setFollowing(true);
         setUserScrolledUp(false);
+        setReadingParked(false); // re-engage ended reading mode
         contentROArmedLatch = false;
         preArmGap = Infinity;
         inputBackedAway = false; // Approach A: re-engage clears the veto
@@ -1488,6 +1642,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   function onScrolled() {
     if (!scrollEl) return;
     if (!ready()) return;
+    // E-ink paging (UX Slice 1): while parked, refresh the chip's geometry
+    // evaluation on every scroll event (the off-tail check is a plain DOM
+    // read; this tick is what makes it reactive). OFF/parked-false: no-op.
+    if (readingParked()) setReadingTick((t) => t + 1);
     const current = geom(scrollEl);
     // Own-pin bail (perf guard): a scroll event whose offset matches our last
     // programmatic pin is our own write, not user input — skip the per-frame
@@ -1523,7 +1681,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // re-engage. System frames (restore landings, content-shrink clamps,
       // browser scroll-anchoring) fabricate no input and cannot arm it.
       const freshInput = pendingInputAt !== 0 && Date.now() - pendingInputAt < INPUT_FRESHNESS_MS;
-      if (restoredAnchorId && !freshInput) {
+      // E-ink paging (UX Slice 1): OUR OWN page/turn write landing at the
+      // tail must NOT re-engage follow — "Next reaching the tail remains
+      // reading". The marker is fresh only within the same input window as
+      // the write, so a GENUINE reader scroll back to the bottom (which
+      // carries no fresh page write) keeps the full re-engage path below.
+      const pagingWriteFresh = pagingWriteAt !== 0 && Date.now() - pagingWriteAt < INPUT_FRESHNESS_MS;
+      if (readingParked() && pagingWriteFresh) {
+        // Preserve reading mode: no following flip, no servo end, no anchor
+        // clear, no read ack. The baseline advance + drift code below still
+        // runs (the geometric truth is recorded).
+      } else if (restoredAnchorId && !freshInput) {
         // Preserve the contract: no following flip, no servo end, no anchor
         // clear, no read ack. The baseline advance + drift-servo code below
         // still runs (the geometric truth is recorded); the read-mode RO
@@ -1533,6 +1701,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // us at the bottom). Clear the intent latch + ack unread.
         setFollowing(true);
         setUserScrolledUp(false);
+        setReadingParked(false); // back at the tail by genuine intent — reading mode ended
         inputBackedAway = false; // Approach A: re-engage clears the input veto
         endAnchorServo(); // bottom re-glue = restore contract AND anchor state ended
         if (!props.draft) {
@@ -1559,6 +1728,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // only bound, so continuous gestures keep their provenance.)
       if (pendingInputAt && Date.now() - pendingInputAt < INPUT_FRESHNESS_MS) {
         inputBackedAway = true;
+        // E-ink paging (UX Slice 1): an input-backed scroll-away is ALSO
+        // parked reading (deliberate history position) — arm the marker so
+        // the "New below" regime applies to a wheel/touch reader too.
+        setReadingParked(true);
+        parkedAtMsgCount = messages().length;
       }
       if (!props.draft) scheduleReadCursor();
     } else {
@@ -1873,6 +2047,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           if (!wasFollowing || !scrollEl || !ready()) return;
           setFollowing(true);
           setUserScrolledUp(false);
+          setReadingParked(false); // re-engage ended reading mode
           pin();
         });
       },
@@ -2183,6 +2358,36 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       </Show>
       <Show when={!props.draft}>
       <div class="chat-main" ref={chatMainEl}>
+        {/*
+          E-ink paging toolbar (UX Slice 1): a RESERVED in-flow row (see
+          ChatPagingControls.module.css — .chat-main is a flex column, so
+          .chat-scroll yields the height; no occlusion of transcript content
+          or the bottom-anchored pills). Mounted ONLY under the display
+          profile — OFF never mounts these controls or their listeners (the
+          OFF render/event path is unchanged). Inside .chat-main so the
+          input-provenance sensors cover its buttons. Turn navigation renders
+          only on narrow viewports (the desktop dot navigator covers desktop)
+          through the SAME navigator machinery; an effective instant jump
+          establishes reading intent via createNavigator's onInstantJump seam.
+        */}
+        <Show when={einkProfile() && !focusMode() && messages().length > 0}>
+          <ChatPagingControls
+            onPrevPage={() => applyPage(-1)}
+            onNextPage={() => applyPage(1)}
+            onLatest={jumpToLatest}
+            following={following}
+            newBelowLabel={newBelowLabel}
+            turnNav={
+              showTurnNav()
+                ? {
+                    onPrevTurn: () => stepTurn(-1),
+                    onNextTurn: () => stepTurn(1),
+                    position: turnPosition,
+                  }
+                : undefined
+            }
+          />
+        </Show>
       <div class="chat-scroll" ref={scrollEl} onScroll={onScrolled}>
         <div class="chat-content" ref={contentEl} classList={{ ready: revealed() }}>
           {/* Phase-4 load-older affordance. Rendered only when the server says

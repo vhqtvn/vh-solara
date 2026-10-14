@@ -2141,3 +2141,316 @@ test("e-ink ON: a mid-turn non-input-backed following drop re-glues at the settl
   await expectNewestInView(page);
   await expect(page.locator("button.jump")).toHaveCount(0);
 });
+
+// ---------------------------------------------------------------------------
+// E-ink display profile — viewport paging + reading intent (UX Slice 1)
+// ---------------------------------------------------------------------------
+// Under the profile a visible paging toolbar mounts ([data-eink="paging"], a
+// RESERVED in-flow row at the TOP of .chat-main — .chat-scroll yields the
+// height, so nothing is occluded) with Prev page / Next page / Latest
+// (~44px targets), plus a static "New below" chip ([data-eink="new-below"])
+// and — on narrow viewports, where the desktop dot navigator does not render
+// — compact semantic turn navigation. An EFFECTIVE page/turn/jump action
+// adapts the existing follow machine into persistent READING intent; a
+// no-op action preserves the prior mode; Latest is the explicit resume. All
+// these tests drive REAL button clicks (the real Chromium event path), never
+// direct handler calls, and never drag.
+
+// Read .chat-scroll geometry in one round trip.
+function scrollGeom(page: import("@playwright/test").Page) {
+  return page.locator(".chat-scroll").evaluate((el: HTMLElement) => ({
+    scrollTop: el.scrollTop,
+    scrollHeight: el.scrollHeight,
+    clientHeight: el.clientHeight,
+  }));
+}
+
+// (26) OFF baseline: the paging bar, the "New below" chip, and the turn-nav
+//      buttons NEVER mount while the profile is off — the OFF render/event
+//      path is unchanged (byte-identity of rebuilt assets is NOT the claim).
+test("paging controls and New-below chip are absent while the e-ink profile is off", async ({ page }) => {
+  // The file beforeEach already loaded demo WITHOUT the profile key.
+  await expect(page.locator('[data-eink="paging"]')).toHaveCount(0);
+  await expect(page.locator('[data-eink="new-below"]')).toHaveCount(0);
+  // Also absent mid-stream and off-tail (the chip's only show conditions).
+  await promptDemo(page, "off profile absence probe");
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 8000 });
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = Math.max(0, el.scrollTop - 400);
+  });
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  await expect(page.locator('[data-eink="paging"]')).toHaveCount(0);
+  await expect(page.locator('[data-eink="new-below"]')).toHaveCount(0);
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 15000 });
+});
+
+// (27) Coverage: EVERY marked passage in the transcript — including an
+//      exceptionally tall message (several viewports tall at the traversal
+//      viewport) — is reachable via repeated REAL page-button presses, with
+//      no dragging. Also pins: instant landing (no smooth interpolation),
+//      bounded per-press advance (≤ one viewport, so no skipped band), ~44px
+//      targets, and reading intent during traversal.
+test("e-ink ON: every marked passage reachable via repeated page presses (no dragging), instant + bounded steps", async ({ page }) => {
+  test.setTimeout(40_000);
+  await openEinkDemo(page);
+  await promptDemo(page, "eink paging coverage probe");
+  await expect(page.locator('[data-eink="working"]').first()).toBeVisible({ timeout: 8000 });
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 15000 });
+  await page.waitForTimeout(300); // settle swap + server-render upgrade
+
+  // Shrink the viewport so the transcript's tall turn (its Activity timeline
+  // renders expanded by default) spans SEVERAL pages — the "exceptionally
+  // tall message" regime — and every geometry is re-measured per action.
+  await page.setViewportSize({ width: 400, height: 380 });
+  await page.waitForTimeout(300); // RO re-glue at the new size
+  await expectFollowingTail(page);
+
+  const clientHeight = (await scrollGeom(page)).clientHeight;
+  const tallest = await page.evaluate(() => {
+    return Math.max(
+      ...Array.from(document.querySelectorAll(".chat-content .msg")).map(
+        (el) => (el as HTMLElement).offsetHeight,
+      ),
+    );
+  });
+  expect(tallest).toBeGreaterThan(clientHeight * 2); // a genuinely multi-page message
+
+  const bar = page.locator('[data-eink="paging"]');
+  await expect(bar).toBeVisible();
+  // ~44 CSS px targets (design choice, brief §2).
+  const prevBox = await page.locator('[data-eink="prev-page"]').boundingBox();
+  expect(prevBox!.height).toBeGreaterThanOrEqual(44);
+
+  // Park at the TOP via repeated REAL Prev presses (no programmatic scroll
+  // anywhere in this test — "no dragging" includes no synthetic parking).
+  for (let i = 0; i < 80; i++) {
+    const before = (await scrollGeom(page)).scrollTop;
+    await page.locator('[data-eink="prev-page"]').click();
+    const after = (await scrollGeom(page)).scrollTop;
+    if (after === 0) break;
+    expect(after).toBeLessThan(before); // strictly retreating until the top
+  }
+  expect((await scrollGeom(page)).scrollTop).toBe(0);
+
+  // Reading intent is established by the page actions: "↓ Latest" visible.
+  await expect(page.locator("button.jump")).toBeVisible();
+
+  // No smooth interpolation: computed scroll-behavior is auto under the profile.
+  const behavior = await page.locator(".chat-scroll").evaluate((e: HTMLElement) => getComputedStyle(e).scrollBehavior);
+  expect(behavior).toBe("auto");
+
+  // Marked passages: every message row + every rendered block child of every
+  // markdown body + every tool/activity row — in document order (the same
+  // selector list everywhere, so indexes are stable across the traversal).
+  const MARKERS = ".chat-content .msg, .chat-content .md > *, .chat-content .tool, .chat-content .activity";
+  const markerCount = await page.evaluate((sel) => {
+    return Array.from(document.querySelectorAll(sel)).filter((el) => (el as HTMLElement).offsetHeight > 0).length;
+  }, MARKERS);
+  expect(markerCount).toBeGreaterThan(4);
+
+  // Traverse DOWN with real Next presses, recording which marker indexes are
+  // (even partially) in the viewport at each stop, until the extent is
+  // reached and a further press is a no-op.
+  const seen = new Set<number>();
+  const stops: number[] = [];
+  for (let i = 0; i < 80; i++) {
+    const g = await scrollGeom(page);
+    stops.push(g.scrollTop);
+    const visible = await page.evaluate((sel) => {
+      const scroll = document.querySelector(".chat-scroll") as HTMLElement | null;
+      if (!scroll) return [] as number[];
+      const vp = scroll.getBoundingClientRect();
+      const out: number[] = [];
+      document.querySelectorAll(sel).forEach((el, idx) => {
+        const r = el.getBoundingClientRect();
+        if (r.height > 0 && r.bottom > vp.top + 1 && r.top < vp.bottom - 1) out.push(idx);
+      });
+      return out;
+    }, MARKERS);
+    visible.forEach((idx) => seen.add(idx));
+    // INSTANT landing on the first press: read the offset right after the
+    // click resolution — a smooth scroll would still be mid-flight.
+    const before = g.scrollTop;
+    await page.locator('[data-eink="next-page"]').click();
+    const after = (await scrollGeom(page)).scrollTop;
+    if (i === 0) {
+      expect(after - before).toBeGreaterThanOrEqual(24); // a real page, landed now
+    }
+    if (Math.abs(after - before) <= 1) break; // no-op Next: extent reached
+  }
+
+  // Bounded advance: no stop skipped a band taller than one viewport.
+  for (let i = 1; i < stops.length; i++) {
+    const delta = stops[i] - stops[i - 1];
+    expect(delta).toBeGreaterThan(0);
+    expect(delta).toBeLessThanOrEqual(clientHeight + 1);
+  }
+
+  // Full coverage: every rendered marker intersected the viewport at some
+  // stop — the whole transcript, the multi-page tall turn included, was
+  // readable via the page buttons alone.
+  const total = await page.evaluate((sel) => {
+    return Array.from(document.querySelectorAll(sel)).filter((el) => (el as HTMLElement).offsetHeight > 0).length;
+  }, MARKERS);
+  const missed: number[] = [];
+  for (let idx = 0; idx < total; idx++) if (!seen.has(idx)) missed.push(idx);
+  expect(missed, `markers never in view across the traversal: ${missed.join(",")}`).toEqual([]);
+});
+
+// (28) Reading intent is PERSISTENT: a page-parked history reader survives a
+//      settle (not pulled to the tail), is not auto-advanced by new content,
+//      and sees the static "New below" chip appear/update on meaningful
+//      arrival (message boundary), absent when idle.
+test("e-ink ON: page-parked reading intent persists through settle and new turns; New-below chip updates on arrival", async ({ page }) => {
+  test.setTimeout(40_000);
+  await openEinkDemo(page);
+  await promptDemo(page, "eink reading intent probe");
+  await expect(page.locator('[data-eink="working"]').first()).toBeVisible({ timeout: 8000 });
+
+  // Park with ONE real Prev-page press mid-turn.
+  await page.locator('[data-eink="prev-page"]').click();
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  const parked = await scrollGeom(page);
+  expect(parked.scrollHeight - parked.scrollTop - parked.clientHeight).toBeGreaterThan(24);
+
+  // While streaming + parked off-tail: the static "New below" chip shows.
+  const chip = page.locator('[data-eink="new-below"]');
+  await expect(chip).toBeVisible({ timeout: 5000 });
+  await expect(chip).toContainText("New below");
+
+  // The settle must NOT pull the parked reader to the tail.
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 15000 });
+  await page.waitForTimeout(300);
+  const afterSettle = await scrollGeom(page);
+  expect(
+    afterSettle.scrollHeight - afterSettle.scrollTop - afterSettle.clientHeight,
+    "parked reader was yanked to the tail at settle",
+  ).toBeGreaterThan(24);
+  await expect(page.locator("button.jump")).toBeVisible();
+  // Idle (not streaming): the chip hides (its regime is streaming-only).
+  await expect(chip).toHaveCount(0);
+
+  // A NEW turn must not auto-advance the parked reader...
+  await promptDemo(page, "eink reading intent second probe");
+  await expect(page.locator('[data-eink="working"]').first()).toBeVisible({ timeout: 8000 });
+  // ...and its message-boundary arrivals update the chip (2 new messages:
+  // the user turn + the assistant turn — the count is message-granular, and
+  // under the profile tokens never touch the DOM anyway).
+  await expect(chip).toBeVisible({ timeout: 5000 });
+  await expect
+    .poll(async () => chip.textContent(), { timeout: 10000 })
+    .toMatch(/New below · [2-9]/);
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 15000 });
+  await page.waitForTimeout(300);
+  const afterSecond = await scrollGeom(page);
+  expect(
+    afterSecond.scrollHeight - afterSecond.scrollTop - afterSecond.clientHeight,
+    "parked reader was yanked or auto-advanced by the new turn",
+  ).toBeGreaterThan(24);
+  expect(Math.abs(afterSecond.scrollTop - afterSettle.scrollTop)).toBeLessThan(60);
+  await expect(page.locator("button.jump")).toBeVisible();
+});
+
+// (29) Next-at-tail semantics: paging FORWARD to the tail stays READING (no
+//      auto follow re-engage), a no-op Next preserves the prior mode (both
+//      reading and following), and the bar's Latest resumes follow.
+test("e-ink ON: Next reaching the tail stays reading; no-op Next preserves mode; bar Latest resumes follow", async ({ page }) => {
+  test.setTimeout(40_000);
+  await openEinkDemo(page);
+  await promptDemo(page, "eink next-at-tail probe");
+  await expect(page.locator('[data-eink="working"]').first()).toBeVisible({ timeout: 8000 });
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 15000 });
+  await page.waitForTimeout(300);
+
+  // Park in history with one real Prev press.
+  await page.locator('[data-eink="prev-page"]').click();
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+
+  // Page FORWARD with real presses until the tail (extent) is reached.
+  let atTail = false;
+  for (let i = 0; i < 30; i++) {
+    const before = (await scrollGeom(page)).scrollTop;
+    await page.locator('[data-eink="next-page"]').click();
+    const g = await scrollGeom(page);
+    if (g.scrollHeight - g.scrollTop - g.clientHeight < 24) {
+      atTail = true;
+      break;
+    }
+    expect(g.scrollTop).toBeGreaterThan(before);
+  }
+  expect(atTail, "never reached the tail via Next presses").toBe(true);
+
+  // AT the tail but still READING: follow did NOT re-engage ("↓ Latest" pill
+  // still rendered; the bar's Latest is still enabled).
+  await expect(page.locator("button.jump")).toBeVisible();
+  const barLatest = page.locator('[data-eink="latest"]');
+  await expect(barLatest).toBeEnabled();
+
+  // A no-op Next at the tail preserves reading mode...
+  await page.locator('[data-eink="next-page"]').click();
+  await expect(page.locator("button.jump")).toBeVisible();
+  await expect(page.locator('[data-eink="new-below"]')).toHaveCount(0); // nothing below at the tail
+
+  // ...and the bar's Latest RESUMES follow (the explicit escape).
+  await barLatest.click();
+  await expectFollowingTail(page);
+  await expect(page.locator("button.jump")).toHaveCount(0);
+  await expect(page.locator('[data-eink="latest"]')).toBeDisabled(); // following again
+
+  // A no-op Next while FOLLOWING at the tail preserves follow (no mode flip).
+  await page.locator('[data-eink="next-page"]').click();
+  await expect(page.locator("button.jump")).toHaveCount(0);
+  const g = await scrollGeom(page);
+  expect(g.scrollHeight - g.scrollTop - g.clientHeight).toBeLessThan(24);
+});
+
+// (30) Latest resumes follow SUBJECT TO the existing holds: a reader parked
+//      from a RESTORED anchor (restoredAnchorId contract) pages without being
+//      yanked by the settle, and Latest then ends the contract (anchor
+//      cleared, tail followed).
+test("e-ink ON: restored-anchor reader pages unperturbed and Latest ends the restore contract", async ({ page }) => {
+  test.setTimeout(40_000);
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "vh.scroll.v2",
+      JSON.stringify({ v: 1, data: { demo: "m4" } }),
+    );
+  });
+  await bootWithEinkProfile(page);
+  await page.setViewportSize(VP);
+  await page.goto(projectUrl("/?session=demo"));
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  await waitForReady(page);
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 }); // restored mid-history
+
+  // An effective page action (real press, AWAY from the tail so no extent
+  // clamp can land at the bottom) establishes reading intent ON TOP of the
+  // restore contract — and the settle of a concurrent turn must not yank
+  // either way.
+  await promptDemo(page, "eink restored paging probe");
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 8000 });
+  await page.locator('[data-eink="prev-page"]').click();
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 15000 });
+  await page.waitForTimeout(300);
+  const g = await scrollGeom(page);
+  expect(g.scrollHeight - g.scrollTop - g.clientHeight, "reader was yanked to the tail").toBeGreaterThan(24);
+
+  // Latest: the explicit resume — follow re-engages and the restore-contract
+  // servo ends. (The jump itself bails onScrolled's own-pin guard, so the
+  // PERSISTED anchor is consumed through the machine's established path —
+  // the reader's first genuine bottom contact afterwards; staged here as a
+  // real wheel-away-and-back, mirroring the O4 escape.)
+  await page.locator('[data-eink="latest"]').click();
+  await expectFollowingTail(page);
+  const center = await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+  await page.mouse.move(center.x, center.y);
+  await page.mouse.wheel(0, -60);
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  await page.mouse.wheel(0, 100);
+  await expectFollowingTail(page);
+  const anchors = await page.evaluate(() => window.localStorage.getItem("vh.scroll.v2"));
+  expect(anchors ?? "").not.toContain("m4");
+});
