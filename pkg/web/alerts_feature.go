@@ -29,6 +29,13 @@ func (s *Server) InitAlerts(ctx context.Context) (*alerts.Engine, error) {
 	if pusher, perr := alerts.NewPusher(store, presence, stateBaseDir()); perr == nil {
 		engine.SetPusher(pusher)
 	}
+	// Notify channel (Slice 1): daemon-global notice-history ring + FCM token
+	// registry + the /vh/notify/* routes. No sender is attached yet —
+	// Engine.NotifyReady() stays false, so the probe reports enabled:false and
+	// token upserts answer 503 (the unconfigured-channel contract) until
+	// Slice 2 adds the FCM sender.
+	engine.SetHistory(alerts.NewHistory(stateBaseDir()))
+	s.RegisterFeature(notifyFeature{engine: engine, tokens: alerts.NewTokenRegistry(stateBaseDir())})
 	s.RegisterFeature(alertsFeature{engine: engine})
 	s.SetAggHook(func(dir string, a *aggregator.Aggregator) {
 		engine.Attach(ctx, dir, a.Store())
@@ -90,13 +97,16 @@ func maskConfig(c alerts.Config) wireConfig {
 }
 
 // mergeConfig folds an inbound wireConfig onto the current config, preserving
-// each channel's stored secret when the client sends an empty one.
+// each channel's stored secret when the client sends an empty one. The notify
+// section is carried over from prev, not the wire shape (the alerts settings
+// UI doesn't edit it) — without this, a UI save would silently STRIP a
+// hand-written notify block from alerts.jsonc.
 func mergeConfig(prev alerts.Config, in wireConfig) alerts.Config {
 	prevSecret := map[string]string{}
 	for _, ch := range prev.Channels {
 		prevSecret[ch.ID] = ch.Secret
 	}
-	out := alerts.Config{Profiles: in.Profiles, Active: in.Active, Detect: in.Detect}
+	out := alerts.Config{Profiles: in.Profiles, Active: in.Active, Detect: in.Detect, Notify: prev.Notify}
 	for _, ch := range in.Channels {
 		secret := ch.Secret
 		if secret == "" {

@@ -86,12 +86,23 @@ type Detect struct {
 	IdleSec           int `json:"idle_sec"`            // no device interaction this long → unattended
 }
 
+// NotifyConfig is the FCM (Firebase Cloud Messaging) notify-channel section
+// of the alerts config (Slice 1: shape only — no sender exists yet, so the
+// section is absent/nil by default and the channel reports unconfigured).
+// Slice 2 attaches the FCM sender that consumes it.
+type NotifyConfig struct {
+	CredentialsFile string `json:"credentials_file,omitempty"` // service-account JSON path
+	ProjectID       string `json:"project_id,omitempty"`
+	TtlSec          int    `json:"ttl_sec,omitempty"` // FCM message TTL (seconds)
+}
+
 // Config is the full alerts/notifications config (VH_STATE_DIR/alerts.jsonc).
 type Config struct {
-	Channels []Channel `json:"channels"`
-	Profiles []Profile `json:"profiles"`
-	Active   string    `json:"active_profile"`
-	Detect   Detect    `json:"detect"`
+	Channels []Channel     `json:"channels"`
+	Profiles []Profile     `json:"profiles"`
+	Active   string        `json:"active_profile"`
+	Detect   Detect        `json:"detect"`
+	Notify   *NotifyConfig `json:"notify,omitempty"`
 }
 
 // DefaultConfig is the seed written when no file exists: detectors at sane
@@ -114,6 +125,15 @@ func DefaultConfig() Config {
 			{Name: "Silent", ChannelPolicy: PolicyNever, DeviceScope: ScopeOff, Types: nil},
 		},
 	}
+}
+
+// NotifyConfigured reports whether the notify section is present with a
+// credentials file — the config-presence half of "notify configured?". The
+// sender-attached half is Engine.NotifyReady; the channel is enabled only
+// when BOTH hold (Slice 2 wires the sender; until then this stays false
+// end-to-end even if an operator hand-writes the section).
+func (c *Config) NotifyConfigured() bool {
+	return c.Notify != nil && c.Notify.CredentialsFile != ""
 }
 
 // profileByName returns the active profile, falling back to the first, then a

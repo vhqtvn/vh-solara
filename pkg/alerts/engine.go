@@ -20,7 +20,8 @@ type Engine struct {
 	cfg        *Store
 	presence   *Presence
 	dispatcher *Dispatcher
-	pusher     *Pusher // optional; nil if Web Push is unavailable
+	pusher     *Pusher  // optional; nil if Web Push is unavailable
+	history    *History // optional; nil until SetHistory (notice history ring)
 
 	mu       sync.Mutex
 	watchers map[string]*watcher // dir -> watcher
@@ -46,6 +47,38 @@ func (e *Engine) SetPusher(p *Pusher) { e.pusher = p }
 
 // Pusher exposes the Web Push sender (for the subscribe/key endpoints). May be nil.
 func (e *Engine) Pusher() *Pusher { return e.pusher }
+
+// SetHistory attaches the notice-history ring (/vh/notify/history backing
+// store). Optional: without it the engine runs unchanged (tests construct it
+// bare) and notices simply aren't retained.
+func (e *Engine) SetHistory(h *History) { e.history = h }
+
+// History exposes the notice-history ring (for the /vh/notify routes). May be
+// nil when never attached; History.Query is nil-safe.
+func (e *Engine) History() *History { return e.history }
+
+// NotifyReady reports whether the FCM notify channel is configured AND its
+// sender attached. Slice 1 ships only the config shape (Config.Notify) — no
+// sender exists yet, so this is always false: the /vh/notify/tokens probe
+// reports enabled:false and token upserts answer 503. Slice 2 attaches the
+// sender in InitAlerts and flips this to
+// e.cfg.Get().NotifyConfigured() && e.notifier != nil.
+func (e *Engine) NotifyReady() bool {
+	return false
+}
+
+// recordNotice enters a detected notice into the daemon-global history ring
+// BEFORE any delivery gating — the dispatcher and pusher apply profile /
+// attendance / cooldown suppression downstream, and the history contract
+// requires suppressed notices to be retained too. Nil history is a no-op
+// (bare engines in tests). A persistence failure inside Record is swallowed
+// there: retention must never block delivery.
+func (e *Engine) recordNotice(n Notice) {
+	if e.history == nil {
+		return
+	}
+	_ = e.history.Record(n)
+}
 
 // Config exposes the config store (for settings endpoints).
 func (e *Engine) Config() *Store { return e.cfg }
@@ -105,6 +138,7 @@ func (e *Engine) EmitDaemonNotice(detail string) {
 		Detail: detail,
 		Ts:     time.Now().UnixMilli(),
 	}
+	e.recordNotice(n) // history tap: BEFORE any delivery gating
 	payload, _ := json.Marshal(n)
 	e.mu.Lock()
 	attached := make([]*watcher, 0, len(e.watchers))
@@ -490,5 +524,6 @@ func (w *watcher) fire(sid, typ, detail string) {
 		Detail:    detail,
 		Ts:        w.now().UnixMilli(),
 	}
+	w.engine.recordNotice(n) // history tap: every detected notice, BEFORE gating
 	w.deliver(n)
 }
