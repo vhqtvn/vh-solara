@@ -1757,3 +1757,387 @@ test("epsilon threshold: small scroll-ups drop following (data for the DEFER car
     expect(dropped[dpx]).toBe(true);
   }
 });
+
+// ---------------------------------------------------------------------------
+// E-ink display profile — auto-follow on settle (slice 5)
+// ---------------------------------------------------------------------------
+// While the profile is ON (booted via its SAVED preference — the manual
+// Settings activation path, no detection), streaming content is held back and
+// the tail's layout moves in ONE-SHOT lifecycle jumps instead of the live
+// path's continuous growth: the held-back working indication mounting, and a
+// held-back block settling into its full content. The mission: when following
+// is engaged the view stays glued to the tail across that lifecycle with ZERO
+// user scrolling; a GENUINE reader (real wheel — input-backed) is never
+// yanked; and "↓ Latest" lands instantly (a direct scrollTop write — no CSS
+// scroll-behavior exists on .chat-scroll, and the e-ink themes additionally
+// force scroll-behavior:auto, so every re-glue is instant by construction).
+//
+// These tests boot the profile per-test via addInitScript + their own goto
+// (mirroring test 12's pattern — the file beforeEach already reset demo +
+// absorbed leaked stall goroutines before its own goto). Each Playwright test
+// gets a fresh browser context, so the profile key and any read anchors a
+// test writes never leak across tests.
+
+// Boot the SPA with the e-ink profile already enabled in storage (the saved
+// preference — the manual activation path). Seeds the streaming preference
+// too so the hold-back is the profile's doing, not the saved pref's.
+async function bootWithEinkProfile(page: import("@playwright/test").Page) {
+  await page.addInitScript(() => {
+    localStorage.setItem("vh.prefs.einkProfile.v1", JSON.stringify({ v: 1, data: true }));
+    localStorage.setItem("vh.prefs.streamLive.v1", JSON.stringify({ v: 1, data: true }));
+  });
+}
+
+// Prompt demo through the raw async route (mirrors part-delta.spec.ts's
+// promptSession): no composer interaction, so no send-time jumpToLatest and
+// no typing/autosize churn — the ONLY follow events during the turn are the
+// app's own (self-heal busy edge, content RO, the settle-lifecycle glue).
+async function promptDemo(page: import("@playwright/test").Page, text: string) {
+  await page.evaluate(
+    async ({ text }) => {
+      const res = await fetch(`/oc/session/demo/prompt_async`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
+        body: JSON.stringify({ parts: [{ type: "text", text }] }),
+      });
+      if (!res.ok && res.status !== 204) throw new Error(`prompt_async demo -> ${res.status}`);
+    },
+    { text },
+  );
+}
+
+// Common open-under-profile: fresh context storage already has the profile
+// key; (re)load demo, wait for the app's restore to complete, and glue to the
+// tail deterministically (scroll-to-bottom — this file's established pattern;
+// the test's own setup, distinct from the ZERO-user-scroll invariant asserted
+// across the SETTLE LIFECYCLE below).
+async function openEinkDemo(page: import("@playwright/test").Page) {
+  await bootWithEinkProfile(page);
+  await page.setViewportSize(VP);
+  await page.goto(projectUrl("/?session=demo"));
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  await waitForReady(page);
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expectFollowingTail(page);
+}
+
+// The settle-lifecycle sampler: records (t, gap, chip, busy) on every DOM
+// mutation + a 20ms interval, so mid-lifecycle evidence survives assertion
+// latency. Installed before the goto like every sampler in this suite.
+async function installEinkSampler(page: import("@playwright/test").Page) {
+  await page.addInitScript(() => {
+    (window as any).__vhEinkFollowSamples = [];
+    const sample = () => {
+      const el = document.querySelector(".chat-scroll") as HTMLElement | null;
+      if (!el) return;
+      (window as any).__vhEinkFollowSamples.push({
+        t: Math.round(performance.now()),
+        gap: Math.round(el.scrollHeight - el.scrollTop - el.clientHeight),
+        ew: document.querySelectorAll('[data-eink="working"]').length,
+        wt: document.querySelectorAll(".working-text").length,
+      });
+      const arr = (window as any).__vhEinkFollowSamples;
+      if (arr.length > 1500) (window as any).__vhEinkFollowSamples = arr.slice(-1500);
+    };
+    const obs = new MutationObserver(() => sample());
+    const start = () => {
+      if (!document.body) { setTimeout(start, 16); return; }
+      obs.observe(document.body, { childList: true, subtree: true });
+      setInterval(sample, 20);
+    };
+    start();
+  });
+}
+const readEinkSamples = (page: import("@playwright/test").Page) =>
+  page.evaluate(() => (window as any).__vhEinkFollowSamples as any[]);
+
+// The fixture's final streamed text — identifies the newest content in the DOM.
+const EINK_FINAL = "added a test";
+
+// Newest-content-fully-in-view: the LAST message row's bottom edge sits at or
+// above the scroll viewport's bottom (within the app's own 24px nearBottom
+// band), i.e. the settled newest content is actually visible — not merely
+// "following=true".
+async function expectNewestInView(page: import("@playwright/test").Page) {
+  const visible = await page.locator(".msg[data-mid]").last().evaluate((el: HTMLElement) => {
+    const scroll = el.closest(".chat-scroll") as HTMLElement | null;
+    if (!scroll) return false;
+    return el.getBoundingClientRect().bottom <= scroll.getBoundingClientRect().bottom + 24;
+  });
+  expect(visible, "newest message row is not fully in view").toBe(true);
+}
+
+// (19) Profile ON + following: a held-back part settling (Working… → full
+//      content) keeps the newest content fully in view with ZERO user scroll.
+//
+// Drives one REAL turn through the fixture's streaming path (held back under
+// the profile, then settled at turn end) and asserts the outcome: glued at
+// the tail (geometry + no "↓ Latest" button), the settled newest content
+// actually visible in the viewport, and — from the sampled timeline — no
+// SUSTAINED off-tail window across the lifecycle (sub-frame transients
+// between a layout change and its re-pin are bounded; a stuck state is not).
+test("e-ink ON: settle keeps the newest content in view while following (zero user scroll)", async ({ page }) => {
+  test.setTimeout(30_000);
+  await installEinkSampler(page);
+  await openEinkDemo(page);
+  await promptDemo(page, "eink settle follow probe");
+  await expect(page.locator('[data-eink="working"]').first()).toBeVisible({ timeout: 8000 });
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 15000 });
+  await page.waitForTimeout(300); // settle swaps + the server-render upgrade
+
+  // Glued at the tail, newest settled content visible, never dropped.
+  await expectFollowingTail(page);
+  await expectNewestInView(page);
+  const last = page.locator(".msg[data-mid]").last();
+  await expect(last).toContainText(EINK_FINAL);
+
+  // Sampled lifecycle: from the first busy sample on, no ~200ms window of a
+  // continuously-off-tail viewport (10 consecutive 20ms samples with
+  // gap > 24). Transient between-frame states are shorter; a lost follow is
+  // not — this is the "zero hand-scrolling" timeline proof.
+  const samples = await readEinkSamples(page);
+  const firstBusy = samples.findIndex((s) => s.wt > 0);
+  expect(firstBusy, "no busy samples recorded").toBeGreaterThan(-1);
+  let run = 0;
+  let maxRun = 0;
+  for (let i = firstBusy; i < samples.length; i++) {
+    run = samples[i].gap > 24 ? run + 1 : 0;
+    maxRun = Math.max(maxRun, run);
+  }
+  expect(
+    maxRun,
+    `off-tail stretch of ${maxRun} consecutive samples (~${maxRun * 20}ms) during the settle lifecycle; ` +
+      `timeline tail=${JSON.stringify(samples.slice(-30))}`,
+  ).toBeLessThan(10);
+});
+
+// (20) Profile ON + following: the held-back working indication mounting at
+//      the transcript tail stays visible — never below the fold. The chip
+//      mount is a one-shot content grow; the settle-lifecycle glue re-pins in
+//      the same flush, so the indication is on-screen from the moment it
+//      exists.
+test("e-ink ON: held-back working indication mounts at the tail, never below the fold", async ({ page }) => {
+  test.setTimeout(30_000);
+  await openEinkDemo(page);
+  await promptDemo(page, "eink chip mount probe");
+  const chip = page.locator('[data-eink="working"]').first();
+  await expect(chip).toBeVisible({ timeout: 8000 });
+  // Chip fully inside the scroll viewport (its bottom edge above the fold).
+  const inView = await chip.evaluate((el: HTMLElement) => {
+    const scroll = el.closest(".chat-scroll") as HTMLElement | null;
+    if (!scroll) return false;
+    return el.getBoundingClientRect().bottom <= scroll.getBoundingClientRect().bottom + 1;
+  });
+  expect(inView, "working indication mounted below the fold").toBe(true);
+  // And the viewport re-glued at the tail through the mount.
+  await expectFollowingTail(page);
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 15000 });
+});
+
+// (21) Profile ON + following: the profile-local live escape (Show live)
+//      restores the live engine mid-part; its content growth keeps the tail
+//      glued (the live path's own continuous re-render + content-RO
+//      anchoring — reused, not duplicated) and the settle still lands in view.
+test("e-ink ON: live-escape (Show live) content growth keeps the tail glued", async ({ page }) => {
+  test.setTimeout(30_000);
+  await installEinkSampler(page);
+  await openEinkDemo(page);
+  await promptDemo(page, "eink live escape follow probe");
+  await expect(page.locator('[data-eink="working"]').first()).toBeVisible({ timeout: 8000 });
+  // REAL click on the escape affordance (the interaction path).
+  await page.locator('[data-eink="show-live"]').first().click();
+  await expect(page.locator(".md-stream").first()).toBeVisible({ timeout: 5000 });
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 15000 });
+  await page.waitForTimeout(300);
+  await expectFollowingTail(page);
+  await expectNewestInView(page);
+  // MID-GROWTH anchoring (not just the settle outcome): from the first
+  // live-engine sample (the chip is gone) on, the viewport was never
+  // SUSTAINEDLY off-tail (~200ms) — the live path's continuous re-render +
+  // content-RO anchoring held through the actual streamed-chunk growth.
+  const samples = await readEinkSamples(page);
+  const lastHeld = samples.map((s) => s.ew > 0).lastIndexOf(true);
+  expect(lastHeld, "no held-back samples before the escape").toBeGreaterThan(-1);
+  let run = 0;
+  let maxRun = 0;
+  for (let i = lastHeld + 1; i < samples.length; i++) {
+    run = samples[i].gap > 24 ? run + 1 : 0;
+    maxRun = Math.max(maxRun, run);
+  }
+  expect(
+    maxRun,
+    `off-tail stretch of ${maxRun} consecutive samples (~${maxRun * 20}ms) during live growth; ` +
+      `timeline tail=${JSON.stringify(samples.slice(-30))}`,
+  ).toBeLessThan(10);
+});
+
+// (22) Profile ON: a GENUINE reader (real wheel — physical-input provenance)
+//      is not yanked by the settle; "↓ Latest" stays available as the one-tap
+//      return and lands INSTANTLY (direct scrollTop write; the e-ink themes
+//      additionally force scroll-behavior:auto). Mirrors the genuine-takeover
+//      contract (10b/17b) on the settle edge.
+test("e-ink ON: genuine reader not yanked at settle; Latest lands instantly", async ({ page }) => {
+  test.setTimeout(30_000);
+  await openEinkDemo(page);
+  await promptDemo(page, "eink reader no-yank probe");
+  await expect(page.locator('[data-eink="working"]').first()).toBeVisible({ timeout: 8000 });
+  // REAL upward wheel over the viewport (the input-provenance path; a
+  // programmatic scrollTop would carry none — that shape is (23)'s subject).
+  const center = await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+  await page.mouse.move(center.x, center.y);
+  await page.mouse.wheel(0, -150);
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+
+  // The settle must NOT yank: still off-tail after the turn finishes.
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 15000 });
+  await page.waitForTimeout(300);
+  const postGap = await page.locator(".chat-scroll").evaluate(
+    (e: HTMLElement) => e.scrollHeight - e.scrollTop - e.clientHeight,
+  );
+  expect(postGap, "genuine reader was yanked to the tail at settle").toBeGreaterThan(24);
+  await expect(page.locator("button.jump")).toBeVisible();
+
+  // INSTANT assertion 1: no smooth scrolling is in play under the profile —
+  // the scroll container's computed scroll-behavior is auto (the e-ink
+  // kill-switch forces it; nothing sets smooth in the first place).
+  const behavior = await page.locator(".chat-scroll").evaluate(
+    (e: HTMLElement) => getComputedStyle(e).scrollBehavior,
+  );
+  expect(behavior).toBe("auto");
+
+  // INSTANT assertion 2: the ↓ Latest jump lands in the SAME event dispatch —
+  // read the geometry immediately after the click with no waiting. A smooth
+  // jump would still be mid-flight here (~150px of travel).
+  await page.locator("button.jump").click({ timeout: 5000 });
+  const gapNow = await page.locator(".chat-scroll").evaluate(
+    (e: HTMLElement) => e.scrollHeight - e.scrollTop - e.clientHeight,
+  );
+  expect(gapNow, "Latest jump did not land instantly").toBeLessThan(24);
+  await expect(page.locator("button.jump")).toHaveCount(0);
+});
+
+// (23) Profile ON: a following drop WITHOUT reader intent re-glues at the
+//      next settle-lifecycle event — the operator's defect. A keyboard-dismiss
+//      clamp / concurrent composer-grow + content-grow frame classifies as a
+//      scroll-up and drops following with NO physical-input provenance; under
+//      the profile's held-back presentation nothing re-engages (self-heal is
+//      latch-gated; the busy→idle recovery rejects a settle taller than
+//      TURN_FINISH_RECOVERY_GAP), so the newest content strands below the
+//      fold and the operator must hand-scroll. Staged deterministically with
+//      a PROGRAMMATIC scroll-up (no input provenance — the same shape 17b
+//      documents for setScrollTop; a real wheel would arm the input-backed
+//      veto and is (22)'s no-yank case): the next turn's held-back indication
+//      mount must re-engage following and pin, INSTANTLY, mid-busy.
+test("e-ink ON: a non-input-backed following drop re-glues at the next settle lifecycle event", async ({ page }) => {
+  test.setTimeout(30_000);
+  await openEinkDemo(page);
+  // Stage the system-arm shape: programmatic scroll-up (no wheel, no pointer,
+  // no key) → onScrolled classifies user-scroll-up, following=false, latch
+  // armed, inputBackedAway NOT armed. 400px keeps the eventual settle gap
+  // firmly outside the busy→idle recovery's 200px band, so without the
+  // settle-glue this state strands for the whole turn.
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = Math.max(0, el.scrollTop - 400);
+  });
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+
+  // New turn: busy edge self-heal is latch-gated (skips); the user message
+  // and assistant row grow below; the held-back indication mounts at the
+  // tail → the settle-lifecycle glue re-engages + pins in that flush.
+  await promptDemo(page, "eink rescue probe");
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 8000 });
+
+  // Re-glued MID-BUSY (before any turn-finish recovery could fire): at the
+  // tail, no "↓ Latest" button, and the mounted indication visible.
+  await expectFollowingTail(page);
+  const chip = page.locator('[data-eink="working"]').first();
+  await expect(chip).toBeVisible({ timeout: 5000 });
+  const inView = await chip.evaluate((el: HTMLElement) => {
+    const scroll = el.closest(".chat-scroll") as HTMLElement | null;
+    if (!scroll) return false;
+    return el.getBoundingClientRect().bottom <= scroll.getBoundingClientRect().bottom + 1;
+  });
+  expect(inView, "working indication below the fold after re-glue").toBe(true);
+
+  // And the settle still lands in view with zero user scroll.
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 15000 });
+  await page.waitForTimeout(300);
+  await expectFollowingTail(page);
+  await expectNewestInView(page);
+});
+
+// (24) Profile ON: a reader RESTORED at a stored anchor is not yanked by a
+//      settling turn (the restore-contract mirror of 12b under the profile).
+//      The settle-glue and every other re-engage are gated on the active
+//      restore contract (restoredAnchorId), so a mid-history restored reader
+//      keeps their anchor through a busy turn's held-back mount AND settle.
+test("e-ink ON: a reader restored at an anchor is not yanked by a settling turn", async ({ page }) => {
+  test.setTimeout(30_000);
+  // Seed a mid-history read anchor (m4) BEFORE the SPA imports scroll.ts
+  // (test 12's pattern; fresh context per test, so nothing leaks).
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "vh.scroll.v2",
+      JSON.stringify({ v: 1, data: { demo: "m4" } }),
+    );
+  });
+  await bootWithEinkProfile(page);
+  await page.setViewportSize(VP);
+  await page.goto(projectUrl("/?session=demo"));
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  await waitForReady(page);
+  // Non-vacuity: the restore actually landed mid-history (NOT at the bottom).
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+
+  // Busy turn with a held-back part, then settle — the reader keeps the
+  // anchor throughout.
+  await promptDemo(page, "eink restored anchor probe");
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 8000 });
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 15000 });
+  await page.waitForTimeout(300);
+  const atBottom = await page.locator(".chat-scroll").evaluate(
+    (e: HTMLElement) => e.scrollHeight - e.scrollTop - e.clientHeight < 24,
+  );
+  expect(atBottom, "restored reader was yanked to the tail").toBe(false);
+  await expect(page.locator("button.jump")).toBeVisible();
+  // The persistent anchor survived (the contract, not a transient).
+  const anchors = await page.evaluate(() => window.localStorage.getItem("vh.scroll.v2"));
+  expect(anchors).toContain("m4");
+});
+
+// (25) Profile ON: a non-input-backed following drop staged MID-TURN — after
+//      the held-back indication has mounted (its lifecycle emit already fired
+//      while following) — is rescued at the SETTLE EDGE itself: the
+//      unsettled→settled transition emit is the only remaining lifecycle
+//      event of the turn. Sibling of (23) with the drop moved after the chip
+//      mount, so the chip-mount emit alone cannot perform the rescue and the
+//      settle-transition emit is exercised discriminatingly. Without it the
+//      state strands: self-heal is latch-gated with no further busy edge, the
+//      busy→idle recovery rejects the >200px gap, and the RO recoveries have
+//      no eligible arm.
+test("e-ink ON: a mid-turn non-input-backed following drop re-glues at the settle edge", async ({ page }) => {
+  test.setTimeout(30_000);
+  await openEinkDemo(page);
+  await promptDemo(page, "eink settle-edge rescue probe");
+  // Wait until the held-back indication is UP (its mount emit has fired while
+  // following) before staging the drop.
+  await expect(page.locator('[data-eink="working"]').first()).toBeVisible({ timeout: 8000 });
+  // The non-intent drop: programmatic scroll-up (no wheel/pointer/key — no
+  // input provenance), 400px so the post-settle gap stays outside the
+  // busy→idle recovery's 200px band.
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = Math.max(0, el.scrollTop - 400);
+  });
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+
+  // The turn settles — the settle-transition emit re-engages + pins.
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 15000 });
+  await expectFollowingTail(page);
+  await expectNewestInView(page);
+  await expect(page.locator("button.jump")).toHaveCount(0);
+});

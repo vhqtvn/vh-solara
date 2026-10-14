@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, Match, on, onCleanup, onMount, Show, Switch } from "solid-js";
 import { createStore } from "solid-js/store";
 import { renderMarkdown } from "../render";
 import { renderStreamMd } from "../lib/md";
@@ -34,6 +34,29 @@ export const setPartOpen = (id: string, v: boolean) => setPartOpenStore(id, v);
 // it. Keyed by part id so the escape covers exactly the part it was clicked
 // on and every NEW streaming part starts held back again (the profile default).
 const [einkLiveParts, setEinkLiveParts] = createStore<Record<string, boolean>>({});
+
+// E-ink profile settle-lifecycle bridge (auto-follow on settle): while the
+// profile holds streaming content back, the tail's layout moves in ONE-SHOT
+// lifecycle jumps — the working indication mounting, a held-back block
+// settling into its full content — instead of the live path's continuous
+// growth. The content ResizeObserver already re-pins a following viewport on
+// those height changes; this seam closes the remaining gap for a viewport
+// whose following was dropped WITHOUT reader intent (the same churn frames
+// the existing recoveries service): at each lifecycle event, ChatView
+// re-engages through the existing follow path and pins INSTANTLY. ChatView
+// registers ONE listener here (the same late-binding pattern as
+// bindChatTail). Profile OFF never emits — live-path behavior is unchanged.
+let einkSettleListener: (() => void) | undefined;
+export function bindEinkSettleListener(fn: () => void): () => void {
+  einkSettleListener = fn;
+  return () => {
+    einkSettleListener = undefined;
+  };
+}
+function emitEinkSettle() {
+  if (!einkProfile()) return; // profile-scoped: OFF never reaches ChatView
+  einkSettleListener?.();
+}
 
 // One prose segment: daemon-rendered, syntax-highlighted HTML with copy buttons
 // and clickable file paths.
@@ -118,6 +141,20 @@ function Markdown(props: { text: string; settled: boolean; caret?: boolean; part
       </Show>
     </Show>
   );
+  // Settle lifecycle → tail re-glue seam (profile ON only; see the bridge at
+  // the module top). Fires on the unsettled→settled TRANSITION — a block
+  // mounted already-settled (history hydration) has prev===undefined and never
+  // fires — so ChatView can re-engage following and pin in the SAME flush the
+  // full held-back content lands (the content RO covers the already-following
+  // viewport; this closes the one-shot swap for a non-intent-dropped one).
+  createEffect(
+    on(
+      () => props.settled,
+      (s, prev) => {
+        if (s && prev === false) emitEinkSettle();
+      },
+    ),
+  );
   return (
     <Show when={props.settled} fallback={streamingView()}>
       <For each={splitMermaid(props.text)}>
@@ -194,6 +231,11 @@ function MarkdownLive(props: { text: string; settled: boolean; caret?: boolean }
 // profile off never mounts any of this (OFF behavior of the affordance:
 // absent).
 function EinkWorking(props: { partId: string }) {
+  // Mount = a held-back block appeared at the tail (turn start / a new
+  // streaming part): emit the settle-lifecycle event so a following viewport
+  // re-glues in this flush and the indication is never left below the fold
+  // (profile ON only — emitEinkSettle gates on the profile).
+  onMount(emitEinkSettle);
   return (
     <div class={styles["eink-working"]} data-eink="working">
       <span class={styles["eink-working-glyph"]} aria-hidden="true">●</span>

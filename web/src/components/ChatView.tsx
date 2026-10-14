@@ -26,7 +26,8 @@ import {
 } from "../lib/inlineAttach";
 import { isSendInFlight } from "../lib/sendSingleFlight";
 import { bindBackDismiss } from "../lib/backStack";
-import PartView, { ActivityGroup } from "./Part";
+import { einkProfile } from "../prefs";
+import PartView, { ActivityGroup, bindEinkSettleListener } from "./Part";
 import ChatTasksStatus from "./ChatTasksStatus";
 import { bindChatTail } from "../tailFollow";
 
@@ -666,6 +667,43 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // mounts exactly one ChatView at a time (draft XOR session, in a Switch), so
   // this single late binding is the active instance by construction.
   onCleanup(bindChatTail(following, jumpToLatest));
+
+  // E-ink profile settle-glue (auto-follow on settle): under the profile the
+  // tail's layout moves in one-shot lifecycle jumps (the held-back working
+  // indication mounting; a held-back block settling into full content — see
+  // Part.tsx's settle-lifecycle bridge). The content RO re-pins a viewport
+  // that is STILL following; this seam closes the remaining gap for a
+  // viewport whose following was dropped WITHOUT reader intent — the same
+  // churn frames the existing recoveries service (a keyboard-dismiss clamp /
+  // concurrent composer-grow + content-grow frame classified as a scroll-up
+  // leaves no physical-input provenance, so nothing else re-engages and a
+  // settle taller than TURN_FINISH_RECOVERY_GAP strands the newest content
+  // below the fold). Gates mirror the busy→idle recovery's DISCRIMINATION
+  // (an input-backed reader — inputBackedAway, armed only by real
+  // wheel/pointer/key input — and an active restore contract —
+  // restoredAnchorId — are never yanked); the geometric gap gate is
+  // deliberately dropped (an unbounded settle is exactly the stranding this
+  // seam exists for) and the blocker-card hold suppression added (mirroring
+  // the content RO re-pin). The intent latch itself is NOT a gate because
+  // every following-drop site arms it, including the system-driven ones this
+  // exists to recover. All resets
+  // are the established re-engage idiom (see jumpToLatest / the RO
+  // recoveries). Profile OFF never reaches here — Part.tsx gates the emit on
+  // the profile and this double-checks — so live-path behavior is unchanged.
+  const onEinkSettleEvent = () => {
+    if (!einkProfile()) return; // profile-scoped (double gate with Part.tsx)
+    if (!scrollEl || !ready()) return; // not positioned — maybeRestore owns the viewport
+    if (restoredAnchorId) return; // restore contract owns the viewport (mirror of the busy→idle gate)
+    if (inputBackedAway) return; // genuine input-backed reader (mirror of the busy→idle veto)
+    if (holdActive()) return; // blocker-card interaction hold (mirror of the content RO re-pin suppression)
+    setFollowing(true);
+    setUserScrolledUp(false);
+    contentROArmedLatch = false;
+    preArmGap = Infinity;
+    endAnchorServo(); // re-engage following ⇒ anchor servo state is stale, drop it
+    pin(); // INSTANT (a direct scrollTop write — no smooth scrolling anywhere)
+  };
+  onCleanup(bindEinkSettleListener(onEinkSettleEvent));
 
   // ── Phase-4 load-older (historical page prepend) ─────────────────────────
   // The server (Phase 1-3) ships only a bounded recent tail of a session's
