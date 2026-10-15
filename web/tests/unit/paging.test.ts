@@ -138,3 +138,71 @@ describe("isEffectivePageMove — the reading-intent discriminator", () => {
     expect(isEffectivePageMove(1400, 1401.5)).toBe(true);
   });
 });
+
+// UX Slice 3 — the shared surface adapter's axis mapping (node env; plain
+// structural objects stand in for scroller elements — SurfaceScroller is an
+// interface on exactly the six fields the adapter reads, so no DOM/jsdom is
+// needed). This is the ONLY geometry the adapters add: the x axis is a field
+// rename onto the same pure functions above (no second paging engine).
+import {
+  axisGeometry,
+  axisOverflows,
+  type SurfaceScroller,
+} from "../../src/components/einkSurfacePagingAxis";
+
+const scroller = (o: Partial<SurfaceScroller>): SurfaceScroller => ({
+  scrollTop: 0,
+  scrollHeight: 0,
+  clientHeight: 0,
+  scrollLeft: 0,
+  scrollWidth: 0,
+  clientWidth: 0,
+  ...o,
+});
+
+describe("axisGeometry — mapping a scroller onto PagingGeometry per axis", () => {
+  it("maps the vertical axis 1:1", () => {
+    const el = scroller({ scrollTop: 120, scrollHeight: 1500, clientHeight: 400 });
+    expect(axisGeometry(el, "y")).toEqual({ scrollTop: 120, scrollHeight: 1500, clientHeight: 400 });
+  });
+
+  it("maps the horizontal axis onto the same numbers (field rename)", () => {
+    const el = scroller({ scrollLeft: 80, scrollWidth: 2400, clientWidth: 360 });
+    expect(axisGeometry(el, "x")).toEqual({ scrollTop: 80, scrollHeight: 2400, clientHeight: 360 });
+  });
+
+  it("feeds the pure stepper: one x page = clientWidth minus bounded overlap, clamped", () => {
+    // 360px-wide pane, 2400px-wide code: overlap 54 (15% of 360), step 306.
+    const el = scroller({ scrollLeft: 0, scrollWidth: 2400, clientWidth: 360 });
+    const g = axisGeometry(el, "x");
+    expect(pageForward(g)).toBe(360 - pageOverlap(360));
+    // At the extent (2400 - 360 = 2040): forward is a no-op target.
+    const atEnd = scroller({ scrollLeft: 2040, scrollWidth: 2400, clientWidth: 360 });
+    const gEnd = axisGeometry(atEnd, "x");
+    expect(pageForward(gEnd)).toBe(2040);
+    expect(isEffectivePageMove(gEnd.scrollTop, pageForward(gEnd))).toBe(false);
+  });
+
+  it("keeps a bounded positive x step on a degenerate narrow pane", () => {
+    const el = scroller({ scrollLeft: 0, scrollWidth: 900, clientWidth: 10 });
+    expect(pageForward(axisGeometry(el, "x"))).toBe(MIN_PAGE_STEP_PX);
+  });
+});
+
+describe("axisOverflows — the adapter's overflow gate", () => {
+  it("is true only when the axis actually overflows (>1px, absorbing rounding)", () => {
+    expect(axisOverflows(scroller({ scrollHeight: 1000, clientHeight: 300 }), "y")).toBe(true);
+    expect(axisOverflows(scroller({ scrollHeight: 300, clientHeight: 300 }), "y")).toBe(false);
+    expect(axisOverflows(scroller({ scrollHeight: 301, clientHeight: 300 }), "y")).toBe(false); // 1px = rounding
+    expect(axisOverflows(scroller({ scrollHeight: 302.5, clientHeight: 300 }), "y")).toBe(true);
+    expect(axisOverflows(scroller({ scrollWidth: 800, clientWidth: 300 }), "x")).toBe(true);
+    expect(axisOverflows(scroller({ scrollWidth: 300, clientWidth: 300 }), "x")).toBe(false);
+  });
+
+  it("never gates ON for a fitting surface on the OTHER axis", () => {
+    // Tall-but-narrow surface: vertical pager shows, horizontal does not.
+    const el = scroller({ scrollHeight: 2000, clientHeight: 400, scrollWidth: 380, clientWidth: 400 });
+    expect(axisOverflows(el, "y")).toBe(true);
+    expect(axisOverflows(el, "x")).toBe(false);
+  });
+});

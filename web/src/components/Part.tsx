@@ -13,6 +13,7 @@ import type { Part } from "../types";
 import Icon from "./Icon";
 import { ToolPart } from "./ToolPart";
 import MermaidViewer from "./MermaidViewer";
+import { EinkSurfacePaging } from "./EinkSurfacePaging";
 import styles from "./Part.module.css";
 
 // Per-part expand state, keyed by part id and held OUTSIDE the components.
@@ -326,6 +327,16 @@ function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) 
                 <Markdown text={(props.part.text as string) || ""} settled={props.settled} caret={props.tail} partId={props.part.id} />
               </div>
             </div>
+            {/* E-ink profile (UX Slice 3): discrete vertical paging for this
+                nested scroller — a RESERVED in-flow row under the bounded
+                body, mounted ONLY while the profile is ON. Its action writes
+                bodyEl.scrollTop ONLY, so the surrounding transcript never
+                moves (nested surfaces page independently); the disclosure
+                toggle above is untouched. Overflow-gated by the adapter —
+                absent when the thinking fits the bounded body. */}
+            <Show when={einkProfile()}>
+              <EinkSurfacePaging name="reasoning" axis="y" label="Reasoning paging" target={() => bodyEl} />
+            </Show>
           </Show>
         </div>
       </div>

@@ -1,0 +1,61 @@
+/* EinkSurfacePaging — e-ink profile generic surface-paging toolbar (UX
+   Slice 3). Co-located CSS Module (AI-first CSS architecture; no legacy
+   growth), the shared sibling of chat/ChatPagingControls.module.css and
+   TerminalPanePagingControls.module.css. Mounted ONLY while the e-ink
+   profile is ON AND the target surface actually overflows along its axis
+   (the component's own gates) — profile OFF never renders any of these
+     classes.
+
+   Placement: a RESERVED in-flow row ADJACENT to the scroller (below the
+   session tree / reasoning body / code pane / filter rail; above the dialog
+   foot). flex:0 0 auto so the scroller (flex:1) yields the height — the
+   S1/S2 "reserve space, never cover" rule: zero occlusion.
+
+   Design constraints (e-ink UX brief §2, same as the S1/S2 toolbars):
+   - ~44 CSS px touch targets (a design choice, not a measured device fact);
+   - STATIC presentation: no transitions/animations (the e-ink themes'
+     animation kill-switch would null them anyway — legibility must not
+     depend on motion), solid backgrounds, explicit borders;
+   - GPU-cheap: no mask-image, no backdrop-filter, no per-element contain /
+     content-visibility (AGENTS.md "Web frontend performance" bans). */
+
+/* border-top, not border-bottom: the bar normally sits BELOW its scroller
+   (tree / reasoning / code / rail) so the rule separates it from the content
+   it pages. At the dialog foot the same rule separates it from the body. */
+.bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 3px 8px;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+}
+
+.btn {
+  min-width: 44px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-2);
+  color: var(--fg);
+  font: inherit;
+  font-size: 17px; /* the ‹ › ↑ ↓ glyphs are the whole label — size for legibility */
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.btn:hover { background: var(--bg-3, var(--bg-2)); }
+
+/* Narrow viewports: keep the ~44px targets but slim the row's own padding so
+   the bar never crowds its surface at 400px. */
+@media (max-width: 480px) {
+  .bar { gap: 4px; padding: 3px 6px; }
+}

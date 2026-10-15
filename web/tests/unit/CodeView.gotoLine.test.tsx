@@ -54,6 +54,7 @@ vi.mock("../../src/prefs", () => ({
   codeShowSearch: () => false,
   setCodeShowSearch: () => {},
   codeSidebarOpen: () => true,
+  einkProfile: () => false, // e-ink paging adapter gate (UX S3): OFF in unit tests
   setCodeSidebarOpen: () => {},
 }));
 

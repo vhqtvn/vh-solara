@@ -4,6 +4,7 @@ import { searchQuery, setSearchQuery, selectedTagIds, filterOpen, setFilterOpen,
 import { pinsLastError, clearPinsError } from "../pins";
 import { labelsTags } from "../labels";
 import { setSidebarWidth, sidebarMode } from "../layout";
+import { einkProfile } from "../prefs";
 import SessionTree from "./SessionTree";
 import ArchivedDialog from "./ArchivedDialog";
 import ProjectSwitcher from "./ProjectSwitcher";
@@ -17,6 +18,7 @@ import { dismiss } from "../lib/a11y";
 import { bindBackDismiss } from "../lib/backStack";
 import { layoutPx } from "../lib/zoom";
 import { labelColorVar } from "./labelPalette";
+import { EinkSurfacePaging } from "./EinkSurfacePaging";
 import styles from "./Sidebar.module.css";
 
 // Pin sync error → human label for the sidebar's dismissible banner. Slightly
@@ -139,6 +141,18 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
     }
   };
 
+  // E-ink profile (UX Slice 3) — discrete paging for the sidebar's two owned
+  // scroll surfaces, both mounted ONLY while the profile is ON (the
+  // ChatPagingControls <Show> idiom; OFF never mounts the bars/observers):
+  //   - the session tree (`.tree`, rendered by SessionTree below — resolved
+  //     by LOCATOR at each action rather than a forwarded ref, so tree
+  //     remounts on project switch/search never strand a stale element);
+  //   - the tag-filter chip rail (horizontal overflow on narrow viewports).
+  // Both reuse the shared EinkSurfacePaging adapter over lib/paging.ts.
+  let asideEl: HTMLElement | undefined;
+  let filterRailEl: HTMLDivElement | undefined;
+  const treeScroller = () => asideEl?.querySelector<HTMLElement>(".tree") ?? null;
+
   // Drag the right edge to resize; the sidebar sits at the viewport's left, so
   // the new width is just the pointer's X — converted from viewport px to
   // zoomed-layout px (UI zoom is CSS `zoom` on :root; see lib/zoom), since the
@@ -167,7 +181,7 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
     handle.addEventListener("pointercancel", up);
   }
   return (
-    <aside class="sidebar" classList={{ open: props.open }}>
+    <aside class="sidebar" classList={{ open: props.open }} ref={asideEl}>
       <div class="sidebar-head">
         <StatusMark state={indState()} tip={statusTip()} />
         {/* Rail compaction (S2b): the wordmark, the drag-to-inspect helper and
@@ -282,7 +296,7 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
           uses the tag's own color. "Clear" resets the whole AND selection.
           Hidden when no tags exist and none are selected (nothing to filter). */}
       <Show when={(filterOpen() || selectedTagIds().length > 0) && !rail()}>
-        <div class={styles.filterRail} role="group" aria-label="Filter sessions by tag">
+        <div class={styles.filterRail} role="group" aria-label="Filter sessions by tag" ref={filterRailEl}>
           <For each={labelsTags()}>
             {(t) => {
               const on = () => selectedTagIds().includes(t.id);
@@ -310,6 +324,13 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
             <span class={styles.filterEmpty}>No tags yet — tag a root session to filter.</span>
           </Show>
         </div>
+        {/* E-ink profile (UX S3): discrete horizontal steps for the chip rail
+            when it overflows (narrow viewport + enough tags). Overflow-gated
+            by the adapter itself — absent when the rail fits and entirely
+            absent while the profile is OFF. */}
+        <Show when={einkProfile()}>
+          <EinkSurfacePaging name="filter-rail" axis="x" label="Tag filter paging" target={() => filterRailEl ?? null} />
+        </Show>
       </Show>
       <OrphanBanner />
       {/* Archive-failure banner (Slice 1): surfaces PERMANENTLY-STUCK archive
@@ -340,6 +361,14 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
       </Show>
       <Show when={projectDir()}>
         <SessionTree />
+        {/* E-ink profile (UX S3): discrete vertical paging for the session
+            tree, in the SAME Show boundary as the tree itself (a project
+            switch remounts both together, so the locator never goes stale).
+            Reserved in-flow row above the foot — the tree yields the height,
+            nothing is covered. Absent while the profile is OFF. */}
+        <Show when={einkProfile()}>
+          <EinkSurfacePaging name="tree" axis="y" label="Session list paging" target={treeScroller} />
+        </Show>
       </Show>
       <div class="sidebar-foot">
         {/* Rail compaction: icon-only (the "Archived" label drops; CSS centers

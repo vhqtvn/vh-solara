@@ -18,6 +18,7 @@ import NotificationsSettings from "./NotificationsSettings";
 import { modal } from "../lib/a11y";
 import Icon from "./Icon";
 import Select from "./Select";
+import { EinkSurfacePaging } from "./EinkSurfacePaging";
 import styles from "./SettingsDialog.module.css";
 
 // "App" (install + orientation) only shows in a plain browser tab — once
@@ -102,6 +103,15 @@ export default function SettingsDialog(props: { onClose: () => void }) {
   onMount(() => document.addEventListener("keydown", onKey));
   onCleanup(() => document.removeEventListener("keydown", onKey));
 
+  // E-ink profile (UX Slice 3): discrete vertical paging for the ACTIVE
+  // dialog body (`.settings-content` scrolls per section). The toolbar is a
+  // RESERVED in-flow row at the dialog FOOT — inside the focus-trapped
+  // dialog (action buttons stay reachable) and OUTSIDE the scroller, so it
+  // never scrolls away. Its action writes scrollTop on the body element
+  // ONLY: the chat behind the overlay never moves. Absent while the profile
+  // is OFF.
+  let contentEl: HTMLDivElement | undefined;
+
   return (
     <div class="dialog-overlay" onClick={props.onClose}>
       <div class="dialog settings" role="dialog" aria-label="Settings" use:modal onClick={(e) => e.stopPropagation()}>
@@ -126,7 +136,7 @@ export default function SettingsDialog(props: { onClose: () => void }) {
               )}
             </For>
           </nav>
-          <div class={styles["settings-content"]}>
+          <div class={styles["settings-content"]} ref={contentEl}>
             <Show when={sec() === "theme"}>
               <ThemePicker />
               <p class="setting-hint">Light themes also switch code syntax highlighting.</p>
@@ -322,7 +332,10 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                 of your theme (the E Ink Color theme if that is your pick), with animations, transitions,
                 and shadows disabled. While on, streaming replies appear only once complete — a quiet
                 Working marker shows progress, with a Show live button on the reply to watch it stream.
-                Your theme and streaming preferences are kept and return when this is off.
+                Scrolling panels (chat, terminal, session list, settings, code) also gain page buttons
+                that step through their content — including sideways through wide code — so reading
+                never depends on continuous scrolling. Your theme and streaming preferences are kept
+                and return when this is off.
               </p>
               <div class="setting-row" style={{ "justify-content": "space-between" }}>
                 <label>Display signals</label>
@@ -606,6 +619,9 @@ export default function SettingsDialog(props: { onClose: () => void }) {
             </Show>
           </div>
         </div>
+        <Show when={einkProfile()}>
+          <EinkSurfacePaging name="settings" axis="y" label="Settings paging" target={() => contentEl} />
+        </Show>
       </div>
     </div>
   );

@@ -4,11 +4,12 @@ import { codeDownloadUrl, codeFile, codeLangs, codeRawUrl, codeSearch, codeStatu
 import { codeOpenPath, setCodeOpenPath, codeOpenLine, setCodeOpenLine, codeTabs, addCodeTab, closeCodeTab, resolvePicker, setResolvePicker, openResolved } from "../code/state";
 import { bindBackDismiss } from "../lib/backStack";
 import { layoutPx } from "../lib/zoom";
-import { codeStyle, setCodeStyle, codeWrap, setCodeWrap, codeShowIgnored, setCodeShowIgnored, codeFlatten, setCodeFlatten, codeShowSearch, setCodeShowSearch, codeSidebarOpen, setCodeSidebarOpen } from "../prefs";
+import { codeStyle, setCodeStyle, codeWrap, setCodeWrap, codeShowIgnored, setCodeShowIgnored, codeFlatten, setCodeFlatten, codeShowSearch, setCodeShowSearch, codeSidebarOpen, setCodeSidebarOpen, einkProfile } from "../prefs";
 import Icon from "./Icon";
 import Select from "./Select";
 import Spinner from "./Spinner";
 import TextPromptDialog from "./TextPromptDialog";
+import { EinkSurfacePaging } from "./EinkSurfacePaging";
 
 // Read-only codebase view: lazy file tree + git-grep search on the left, a
 // server-highlighted file on the right. Heavy work (tree, search, highlight) is
@@ -457,6 +458,18 @@ export default function CodeView() {
                 </Show>
               </Show>
             </div>
+            {/* E-ink profile (UX Slice 3): HORIZONTAL discrete paging for
+                overflowing code/diff lines — wide lines are otherwise
+                drag-only under the profile. Mounted ONLY while the profile
+                is ON, inside the same Show as the pane (a file open ⇒ the
+                pane exists ⇒ the locator resolves); the action writes
+                paneEl.scrollLeft ONLY via the shared lib/paging.ts geometry,
+                so content (+/- diff sigils included) is never rewritten.
+                Overflow-gated: turning the existing Wrap control on makes
+                the pager disappear (nothing overflows); off, it returns. */}
+            <Show when={einkProfile()}>
+              <EinkSurfacePaging name="code" axis="x" label="Code pane paging" target={() => paneEl} />
+            </Show>
           </Show>
         </main>
         {/* ctxMenu x/y are pointer client coords (viewport px); the
