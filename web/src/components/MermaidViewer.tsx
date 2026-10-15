@@ -3,6 +3,8 @@ import { Portal } from "solid-js/web";
 import { renderMermaid } from "../lib/mermaid";
 import { trapTab } from "../lib/a11y";
 import { pushBackSurface, releaseBackSurface, type BackSurface } from "../lib/backStack";
+import { einkProfile } from "../prefs";
+import { EinkSurfacePaging } from "./EinkSurfacePaging";
 import Icon from "./Icon";
 import styles from "./MermaidViewer.module.css";
 
@@ -70,6 +72,8 @@ export default function MermaidViewer(props: { src: string }) {
   let prevFocus: HTMLElement | null = null;
   let closeRef: HTMLButtonElement | undefined;
   let overlayRef: HTMLDivElement | undefined;
+  // The overlay's diagram scroller (.viewport — see the paging bar below).
+  let viewportRef: HTMLDivElement | undefined;
 
   const onKey = (e: KeyboardEvent) => {
     if (e.key === "Escape") {
@@ -241,9 +245,30 @@ export default function MermaidViewer(props: { src: string }) {
                 <Icon name="x" />
               </button>
             </div>
-            <div class={styles.viewport}>
+            <div class={styles.viewport} ref={viewportRef}>
               <div class={styles.viewportSvg} data-mermaid-diagram innerHTML={snapshot()} />
             </div>
+            {/* E-ink profile (UX Slice 3b): discrete vertical step-paging for
+                the overlay's diagram viewport. The overlay is PORTALED to
+                <body>, so the controls live INSIDE it (below the viewport, a
+                reserved in-flow row of the overlay's column — the viewport is
+                flex:1 and yields the bar's height; nothing is occluded). The
+                adapter writes viewportRef.scrollTop ONLY: close/Escape/Back,
+                the focus trap, the body scroll-lock, and the transcript
+                behind the scrim never move. Vertical-only on purpose: the
+                viewport's own CSS (max-width: 100% on .viewportSvg and its
+                svg) constrains the diagram to the overlay's width, so
+                horizontal overflow is structurally prevented here — only the
+                vertical axis can overflow. Overflow-gated by the adapter:
+                absent when the diagram fits (the common case). */}
+            <Show when={einkProfile()}>
+              <EinkSurfacePaging
+                name="mermaid-overlay"
+                axis="y"
+                label="Expanded diagram paging"
+                target={() => viewportRef}
+              />
+            </Show>
           </div>
         </Portal>
       </Show>

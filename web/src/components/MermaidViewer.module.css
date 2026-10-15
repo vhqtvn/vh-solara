@@ -99,3 +99,16 @@
   max-width: 100%;
   height: auto;
 }
+
+/* E-ink profile (UX Slice 3b): the shared EinkSurfacePaging row the overlay
+ * mounts under the profile while the diagram overflows .viewport (a reserved
+ * in-flow row at the overlay's foot — layout/targeting come entirely from the
+ * adapter's own module). Scoped RESTYLE only: the generic bar's page
+ * background + theme border read wrong sitting on the overlay's dark scrim,
+ * so here it goes transparent with the same hairline the overlay's own
+ * controls use. The buttons keep their shared token styling (identical to
+ * every other paged surface); still no mask/backdrop-filter/contain. */
+.overlay > :global([data-eink="surface-paging"]) {
+  background: transparent;
+  border-top: 1px solid rgba(255, 255, 255, 0.2);
+}

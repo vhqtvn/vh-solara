@@ -12,6 +12,14 @@ import { demoDir, projectUrl, resetLabels } from "./util";
 //   body (vertical) · nested reasoning bodies (vertical, independent of the
 //   transcript) · code/diff pane (HORIZONTAL, +/- sigils preserved).
 //
+// Slice 3b (this file's later tests) completes the three surfaces S3 stopped
+// on — same adapter, same coverage-loop style:
+//
+//   notes pane (vertical; editing semantics untouched) · mermaid expand
+//   overlay (vertical, INSIDE the portaled overlay; Esc/close/zoom-escape
+//   preserved) · ToolPart's nested .tool-output / .tool-edit scrollers
+//   (vertical, independent of the transcript; disclosures preserved).
+//
 // All traversal is REAL button clicks on the real Chromium event path — never
 // direct handler calls, never dragging, never synthetic scrollTop parking for
 // the states under test. Physical e-ink panel outcomes (flash/ghosting, real
@@ -20,7 +28,8 @@ import { demoDir, projectUrl, resetLabels } from "./util";
 //
 // Serial lane (workers:1, one shared mutable fixture backend): every test
 // reloads the demo session; label state seeded via the real /vh/labels API is
-// bracketed with resetLabels so nothing leaks into sibling specs.
+// bracketed with resetLabels (and notes-doc state with resetNotes) so nothing
+// leaks into sibling specs.
 
 // ── shared helpers ──────────────────────────────────────────────────────────
 
@@ -169,14 +178,73 @@ function axisGeom(loc: import("@playwright/test").Locator, axis: "x" | "y") {
   }, axis);
 }
 
+// Which of the given needle substrings are VISIBLE inside one scroller (a
+// Range over the owning text node, rect intersecting the scroller's box on
+// BOTH axes) — the coverage-loop primitive for text-marked surfaces (the
+// code-pane sentinel check, generalized off the x axis).
+function visibleNeedles(loc: import("@playwright/test").Locator, needles: string[]) {
+  return loc.evaluate((el, ns) => {
+    const h = el as HTMLElement;
+    const vp = h.getBoundingClientRect();
+    const walker = document.createTreeWalker(h, NodeFilter.SHOW_TEXT);
+    const found: string[] = [];
+    let n: Node | null;
+    while ((n = walker.nextNode())) {
+      const text = n.textContent ?? "";
+      for (const s of ns) {
+        if (found.includes(s)) continue;
+        const at = text.indexOf(s);
+        if (at < 0) continue;
+        const range = document.createRange();
+        range.setStart(n, at);
+        range.setEnd(n, at + s.length);
+        const r = range.getBoundingClientRect();
+        if (
+          r.width > 0 &&
+          r.right > vp.left + 1 && r.left < vp.right - 1 &&
+          r.bottom > vp.top + 1 && r.top < vp.bottom - 1
+        ) found.push(s);
+      }
+    }
+    return found;
+  }, needles);
+}
+
+// Reset the notes doc (todos + markdown) to empty via the real /vh/notes API —
+// the same serial-suite bracket discipline as resetLabels: the notes test
+// creates todos through the real form (they persist daemon-side), and the
+// suite shares one backend. Scoped to the demo project key via
+// x-opencode-directory (the header the SPA's installCsrf stamps on every
+// request; the notes doc is per-project).
+async function resetNotes(request: APIRequestContext) {
+  const put = await request.put("/vh/notes", {
+    headers: { "X-VH-CSRF": "1", "x-opencode-directory": demoDir },
+    data: { notes: "", todos: [] },
+  });
+  if (!put.ok()) throw new Error(`resetNotes: PUT /vh/notes -> ${put.status}`);
+}
+
+// Restore a session's seeded baseline (serial-suite hygiene; part-delta.spec's
+// resetSession shape). NOTE: the shell-simulation turns the tool-output test
+// injects are NOT persisted by the fake, so reset cannot remove them from the
+// aggregator store — that test keeps its markers run-unique and scopes its
+// locators to them instead (disclosed in the test).
+async function resetSession(page: Page, id: string) {
+  const res = await page.request.post(`/oc/fixture/reset?session=${id}`, {
+    headers: { "X-VH-CSRF": "1" },
+  });
+  if (!res.ok()) throw new Error(`resetSession(${id}) -> ${res.status} ${res.statusText()}`);
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
-// (1) OFF baseline: NONE of the Slice-3 paging bars ever mount while the
-//     profile is off — on any owned surface, in any overflowing state. The
-//     OFF render/event path is unchanged (behavioral contract; bundle bytes
-//     necessarily differ).
+// (1) OFF baseline: NONE of the Slice-3/3b paging bars ever mount while the
+//     profile is off — on any owned surface, in any overflowing state (the
+//     mermaid leg drives a viewport where the overlay genuinely overflows, so
+//     its absent bar is non-vacuous). The OFF render/event path is unchanged
+//     (behavioral contract; bundle bytes necessarily differ).
 test("e-ink OFF: surface paging bars are absent on every owned surface", async ({ page, request }) => {
-  test.setTimeout(60_000);
+  test.setTimeout(90_000);
   writeFixtureFiles();
   try {
     await openDemo(page); // boots WITHOUT the profile key
@@ -213,6 +281,46 @@ test("e-ink OFF: surface paging bars are absent on every owned surface", async (
     await expect(page.locator('[data-eink="surface-paging"]')).toHaveCount(0);
     await expect(code.locator('[data-eink="surface-paging"]')).toHaveCount(0);
     await expect(page.locator('[data-eink="paging"]')).toHaveCount(0); // the S1 bar too
+
+    // …the 3b surfaces too. Notes tab enabled (an independent pref — the
+    // profile stays OFF): an overflowing notes pane still mounts no bar…
+    // (1280 default width: the tab must be OUT of the TabBar's "⋯" overflow
+    // menu to be clickable — same posture as interactive.spec's notes test.)
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.addInitScript(() => {
+      localStorage.setItem("vh.prefs.notesEnabled.v1", JSON.stringify({ v: 1, data: true }));
+    });
+    await openDemo(page);
+    await page.getByRole("button", { name: "Notes", exact: true }).click();
+    await expect(page.locator(".notes-view")).toBeVisible();
+    // Seed todos through the real form so the pane GENUINELY overflows —
+    // otherwise the absent-bar assertion below would be vacuous for this
+    // surface (the mermaid-overlay leg is the other non-vacuous OFF proof).
+    for (let i = 0; i < 14; i++) {
+      await page.getByPlaceholder("Add a to-do…").fill(`eink-off-${i}`);
+      await page.getByRole("button", { name: "Add to-do" }).click();
+    }
+    const offNotesExtent = await page.locator(".notes-view").evaluate((el: HTMLElement) => el.scrollHeight - el.clientHeight);
+    expect(offNotesExtent, "notes pane must overflow for this leg to be meaningful").toBeGreaterThan(0);
+    await expect(page.locator('[data-eink="surface-paging"]')).toHaveCount(0);
+    // …and the mermaid overlay at a SHORT viewport — where its diagram
+    // viewport GENUINELY overflows, so a non-gated bar would mount — mounts
+    // none (the strong OFF form for the overlay surface).
+    await page.setViewportSize({ width: 780, height: 340 });
+    await page.locator(".tree-row", { hasText: "Mermaid diagrams" }).click();
+    await expect(page.locator('[data-mermaid="inline"] svg').first()).toBeVisible({ timeout: 8000 });
+    await page.locator('[data-mermaid="inline"]').getByTitle("Expand diagram").click();
+    const offOverlay = page.locator('[data-mermaid="overlay"]');
+    await expect(offOverlay).toBeVisible();
+    // Precondition: the overlay's diagram really overflows at this viewport
+    // (otherwise the absent bar would be vacuous).
+    const offOverlayExtent = await offOverlay
+      .locator('[class*="viewport"]:not([class*="viewportSvg"])')
+      .evaluate((el: HTMLElement) => el.scrollHeight - el.clientHeight);
+    expect(offOverlayExtent, "overlay viewport must overflow for this leg to be meaningful").toBeGreaterThan(0);
+    await expect(page.locator('[data-eink="surface-paging"]')).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await expect(offOverlay).toHaveCount(0);
   } finally {
     removeFixtureFiles();
   }
@@ -728,7 +836,9 @@ test("e-ink ON: code pane pages horizontally; +/- preserved; wrap interacts; ima
 // (7) Diagrams: the mermaid expand overlay (the fit/detail + zoom escape)
 //     still works under the profile, and the diagram keeps original fidelity
 //     (no blanket filters). Discrete STEPPING inside the overlay viewport is
-//     NOT implemented in this slice — see the closeout's scope disclosure.
+//     Slice 3b's "mermaid overlay pages discretely" test below (it needs a
+//     SHORT viewport to overflow; this test keeps the roomy one and covers
+//     only the preserved escape semantics).
 test("e-ink ON: mermaid expand/escape preserved; diagram unfiltered", async ({ page }) => {
   test.setTimeout(60_000);
   await bootEink(page);
@@ -820,12 +930,423 @@ test("e-ink ON: composer growth and viewport resize remeasure chat paging; no st
   expect(await ta.inputValue()).toBe(draft);
 });
 
+// (9) Notes pane (Slice 3b): the pane's OWN overflow (todos + notes doc over
+//     the bounded pane) pages discretely — marked content (todo texts
+//     first…last, plus the notes textarea at the pane's foot) reachable via
+//     real button presses only. Note-editing semantics are exercised THROUGH
+//     the paged pane afterwards (form submit, todo toggle, notes typing) to
+//     pin that paging changed no editing behavior.
+test("e-ink ON: notes pane pages discretely; note editing preserved", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.addInitScript(() => {
+    localStorage.setItem("vh.prefs.einkProfile.v1", JSON.stringify({ v: 1, data: true }));
+    localStorage.setItem("vh.prefs.notesEnabled.v1", JSON.stringify({ v: 1, data: true }));
+  });
+  // Default 1280x720 viewport (the Notes tab is a TabBar item, and TabBar
+  // collapses whatever doesn't fit into its "⋯" overflow menu at narrower
+  // widths — interactive.spec's notes test clicks the tab at this default
+  // width; 14 todos guarantee the pane's owned overflow at this height).
+  await openDemo(page);
+  await page.getByRole("button", { name: "Notes", exact: true }).click();
+  const notes = page.locator(".notes-view");
+  await expect(notes).toBeVisible();
+
+  // Grow the pane's owned overflow through the REAL form (typing + submit —
+  // this is also the editing-preserved path under test): 14 todos.
+  const TODO_N = 14;
+  for (let i = 0; i < TODO_N; i++) {
+    await page.getByPlaceholder("Add a to-do…").fill(`eink-notes-${i}`);
+    await page.getByRole("button", { name: "Add to-do" }).click();
+  }
+  await expect(page.locator(".todo-item", { hasText: "eink-notes-0" })).toBeVisible();
+  await expect(page.locator(".todo-item", { hasText: `eink-notes-${TODO_N - 1}` })).toBeVisible();
+
+  const bar = page.locator('[data-eink-surface="notes"]');
+  await expect(bar).toBeVisible({ timeout: 5000 });
+  // The pane scroller is the bar's reserved-row sibling (the pane column's
+  // first child — the adapter mounted under it).
+  const pane = page.locator('[data-eink-surface="notes"] >> xpath=preceding-sibling::*[1]');
+  const g0 = await axisGeom(pane, "y");
+  expect(g0.extent, "notes pane must overflow at this viewport").toBeGreaterThan(0);
+
+  // Park at the pane's top via real Prev presses (fresh geometry each press).
+  for (let i = 0; i < 40; i++) {
+    const before = (await axisGeom(pane, "y")).pos;
+    await bar.locator('[data-eink="surface-prev"]').click();
+    const after = (await axisGeom(pane, "y")).pos;
+    if (after === 0) break;
+    expect(after).toBeLessThan(before);
+  }
+  expect((await axisGeom(pane, "y")).pos).toBe(0);
+
+  // Traverse with real Next presses; at every stop record which todo texts
+  // are visible inside the pane scroller (rect intersection) and whether the
+  // notes textarea (the pane's foot) is on screen. All 14 todos + the
+  // textarea must be covered, steps bounded by the pane viewport, extent
+  // reached.
+  const seen = new Set<string>();
+  let notesSeen = false;
+  const stops: number[] = [];
+  for (let i = 0; i < 40; i++) {
+    const g = await axisGeom(pane, "y");
+    stops.push(g.pos);
+    const vis = await page.evaluate(() => {
+      const scroller = (document.querySelector('[data-eink-surface="notes"]') as HTMLElement | null)
+        ?.previousElementSibling as HTMLElement | null;
+      if (!scroller) return { todos: [] as string[], notes: false };
+      const vp = scroller.getBoundingClientRect();
+      const todos: string[] = [];
+      document.querySelectorAll(".notes-view .todo-item .todo-text").forEach((el) => {
+        const r = el.getBoundingClientRect();
+        if (r.height > 0 && r.bottom > vp.top + 1 && r.top < vp.bottom - 1) todos.push(el.textContent || "");
+      });
+      const tr = document.querySelector(".notes-text")?.getBoundingClientRect();
+      const notesVisible = !!tr && tr.bottom > vp.top + 1 && tr.top < vp.bottom - 1;
+      return { todos, notes: notesVisible };
+    });
+    vis.todos.forEach((t) => seen.add(t));
+    if (vis.notes) notesSeen = true;
+    const before = g.pos;
+    await bar.locator('[data-eink="surface-next"]').click();
+    const after = (await axisGeom(pane, "y")).pos;
+    if (Math.abs(after - before) <= 1) break;
+  }
+  for (let i = 0; i < TODO_N; i++) {
+    expect(seen, `todo eink-notes-${i} never visible`).toContain(`eink-notes-${i}`);
+  }
+  expect(notesSeen, "notes textarea never visible").toBe(true);
+  const gEnd = await axisGeom(pane, "y");
+  expect(gEnd.extent - gEnd.pos, "traversal reached the pane extent").toBeLessThanOrEqual(1);
+  for (let i = 1; i < stops.length; i++) {
+    expect(stops[i] - stops[i - 1]).toBeGreaterThan(0);
+    expect(stops[i] - stops[i - 1]).toBeLessThanOrEqual(gEnd.client + 1);
+  }
+
+  // Editing preserved THROUGH the paged pane — real interactions only (these
+  // may scroll the pane as a side effect; every invariant above is already
+  // asserted): toggle the last todo via its checkbox (aria flips)…
+  await page.locator(".todo-item", { hasText: `eink-notes-${TODO_N - 1}` }).getByRole("button", { name: "Mark done" }).click();
+  await expect(page.locator(".todo-item.done", { hasText: `eink-notes-${TODO_N - 1}` })).toBeVisible();
+  await page.locator(".todo-item.done", { hasText: `eink-notes-${TODO_N - 1}` }).getByRole("button", { name: "Mark not done" }).click();
+  await expect(page.locator(".todo-item.done", { hasText: `eink-notes-${TODO_N - 1}` })).toHaveCount(0);
+  // …and the notes textarea still accepts typing.
+  await page.locator(".notes-text").fill("eink notes survive paging");
+  await expect(page.locator(".notes-text")).toHaveValue("eink notes survive paging");
+});
+
+// (10) Mermaid overlay (Slice 3b): at a SHORT viewport the expanded diagram
+//     genuinely overflows the overlay's viewport — discrete vertical steps
+//     (mounted INSIDE the portaled overlay, below the viewport) traverse the
+//     marked nodes (Start top · Decision/Run/Skip middle · End bottom) via
+//     real button presses. Only the overlay moves (transcript + page scroll
+//     untouched), and the overlay's own close semantics — Esc, the explicit
+//     Close button, the body scroll lock — are preserved.
+test("e-ink ON: mermaid overlay pages discretely; Esc/close preserved; only the overlay moves", async ({ page }) => {
+  test.setTimeout(60_000);
+  await bootEink(page);
+  await page.setViewportSize({ width: 780, height: 340 });
+  await openDemo(page);
+  await page.locator(".tree-row", { hasText: "Mermaid diagrams" }).click();
+  const inline = page.locator('[data-mermaid="inline"]');
+  await expect(inline.locator("svg").first()).toBeVisible({ timeout: 8000 });
+  await inline.getByTitle("Expand diagram").click();
+  const overlay = page.locator('[data-mermaid="overlay"]');
+  await expect(overlay).toBeVisible({ timeout: 10_000 });
+
+  const bar = page.locator('[data-eink-surface="mermaid-overlay"]');
+  await expect(bar).toBeVisible({ timeout: 5000 });
+  const vp = page.locator('[data-mermaid="overlay"] [class*="viewport"]:not([class*="viewportSvg"])');
+  const g0 = await axisGeom(vp, "y");
+  expect(g0.extent, "overlay viewport must overflow at this short viewport").toBeGreaterThan(0);
+
+  // The transcript behind the scrim never moves while the overlay pages.
+  const chatScroll = page.locator(".chat-scroll");
+  const chatBefore = await chatScroll.evaluate((el: HTMLElement) => el.scrollTop);
+
+  // Park at the diagram's top via real Prev presses…
+  for (let i = 0; i < 20; i++) {
+    const before = (await axisGeom(vp, "y")).pos;
+    await bar.locator('[data-eink="surface-prev"]').click();
+    const after = (await axisGeom(vp, "y")).pos;
+    if (after === 0) break;
+    expect(after).toBeLessThan(before);
+  }
+  expect((await axisGeom(vp, "y")).pos).toBe(0);
+
+  // …then traverse with real Next presses, recording which of the seeded
+  // diagram's node labels are visible at each stop.
+  const LABELS = ["Start", "Decision", "Run", "Skip", "End"];
+  const seen = new Set<string>();
+  const stops: number[] = [];
+  for (let i = 0; i < 30; i++) {
+    const g = await axisGeom(vp, "y");
+    stops.push(g.pos);
+    const visible = await visibleNeedles(vp, LABELS);
+    visible.forEach((l) => seen.add(l));
+    const before = g.pos;
+    await bar.locator('[data-eink="surface-next"]').click();
+    const after = (await axisGeom(vp, "y")).pos;
+    if (Math.abs(after - before) <= 1) break;
+  }
+  for (const l of LABELS) expect(seen, `diagram label ${l} never visible`).toContain(l);
+  const gEnd = await axisGeom(vp, "y");
+  expect(gEnd.extent - gEnd.pos, "traversal reached the overlay extent").toBeLessThanOrEqual(1);
+  for (let i = 1; i < stops.length; i++) {
+    expect(stops[i] - stops[i - 1]).toBeGreaterThan(0);
+    expect(stops[i] - stops[i - 1]).toBeLessThanOrEqual(gEnd.client + 1);
+  }
+
+  // Only the overlay moved: the transcript's scroll position is unchanged.
+  expect(await chatScroll.evaluate((el: HTMLElement) => el.scrollTop)).toBe(chatBefore);
+
+  // Esc (the overlay's key path) still closes…
+  await page.keyboard.press("Escape");
+  await expect(overlay).toHaveCount(0);
+  // …and so does the explicit Close button after a re-expand.
+  await inline.getByTitle("Expand diagram").click();
+  await expect(overlay).toBeVisible({ timeout: 10_000 });
+  await overlay.getByRole("button", { name: "Close" }).click();
+  await expect(overlay).toHaveCount(0);
+  // The body scroll lock is released after close (unchanged close semantics).
+  await expect.poll(() => page.evaluate(() => document.body.style.overflow)).toBe("");
+});
+
+// (11) Tool output (Slice 3b): a tool body's OWN bounded scroller (.tool-output,
+//     max-height 320) pages discretely, independent of the transcript. The
+//     overflowing output is produced through the REAL shell-simulation route
+//     (POST /oc/session/:id/shell — the fake answers with a completed bash
+//     tool whose output carries the command); marker substrings placed at the
+//     start/middle/end of that output are the marked content. The disclosure
+//     still collapses afterwards (tool action preserved).
+test("e-ink ON: tool output pages discretely, independent of the transcript", async ({ page }) => {
+  test.setTimeout(60_000);
+  await bootEink(page);
+  await page.setViewportSize({ width: 400, height: 600 });
+  // Serial-suite hygiene: restore the seeded editpvw baseline first. The
+  // shell turns injected below are NOT persisted by the fake, so a later
+  // reset cannot remove them from the aggregator store — the markers are
+  // kept run-unique and every locator is scoped to them instead.
+  await resetSession(page, "editpvw");
+  await page.goto(projectUrl("/?session=editpvw"));
+  await expect(page.locator(".chat-scroll")).toBeVisible({ timeout: 10_000 });
+
+  const run = Date.now().toString(36);
+  const OUT_MARKS = [`EINKOUT-START-${run}`, `EINKOUT-MID-${run}`, `EINKOUT-END-${run}`];
+  // Short space-separated words (NOT long unbroken runs): .tool-output is
+  // white-space: pre-wrap, which wraps only at soft break opportunities — a
+  // single 1400-char "word" would overflow HORIZONTALLY instead (measured
+  // scrollWidth 10k, vertical extent 0). ~150 short words wrap to ~60 lines
+  // and genuinely overflow the 320px bound.
+  const words = Array.from({ length: 150 }, (_, i) => `einkout${i}`);
+  words[0] = OUT_MARKS[0];
+  words[75] = OUT_MARKS[1];
+  words[149] = OUT_MARKS[2];
+  const cmd = words.join(" ");
+  await page.evaluate(async (command) => {
+    const res = await fetch("/oc/session/editpvw/shell", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
+      body: JSON.stringify({ command }),
+    });
+    if (!res.ok) throw new Error(`shell route -> ${res.status}`);
+  }, cmd);
+
+  const row = page.locator(".tool", { hasText: OUT_MARKS[0] }).last();
+  await expect(row).toBeVisible({ timeout: 10_000 });
+  // Ensure the disclosure is OPEN (the injected turn is the session tail and
+  // auto-opens, but do not rely on that — open it for real if it is closed).
+  const wrap = row.locator('[class*="disclosure"]:not([class*="disclosure-"])');
+  if (!(await wrap.evaluate((el) => el.classList.contains("open")))) {
+    await row.locator(".tool-head").click();
+  }
+  // The plain-text bash body is the <pre> carrying the hashed tool-output class.
+  const out = row.locator("pre[class*='tool-output']");
+  await expect(out).toBeVisible();
+  const g0 = await axisGeom(out, "y");
+  expect(g0.extent, "tool output must overflow its 320px bound").toBeGreaterThan(0);
+  const bar = row.locator('[data-eink-surface="tool-output"]');
+  await expect(bar).toBeVisible({ timeout: 5000 });
+
+  // Park the reader in history first (one real S1 prev press): a
+  // tail-following reader is legitimately re-pinned by the app's own recovery
+  // as the disclosure settles — parking ends that regime (test 5's rationale).
+  await page.locator('[data-eink="prev-page"]').click();
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+
+  // Bring the whole row (output + bar) into the chat viewport BEFORE the
+  // stationarity window: otherwise Playwright's own actionability scrolling
+  // would move .chat-scroll to reveal the bar — legitimate TEST-driven
+  // movement (a one-time setup scroll; the invariant is asserted across the
+  // paging CLICKS only).
+  await bar.evaluate((el: HTMLElement) => el.scrollIntoView({ block: "end" }));
+  await page.waitForTimeout(250);
+  const chatScroll = page.locator(".chat-scroll");
+  const chatBefore = await chatScroll.evaluate((el: HTMLElement) => el.scrollTop);
+  const barInView = await bar.evaluate((el: HTMLElement) => {
+    const chat = el.closest(".chat-scroll") as HTMLElement | null;
+    if (!chat) return false;
+    const r = el.getBoundingClientRect();
+    const c = chat.getBoundingClientRect();
+    return r.bottom <= c.bottom && r.top >= c.top;
+  });
+  expect(barInView, "paging bar must sit inside the chat viewport for the click loop").toBe(true);
+
+  // Park at the output's top via real Prev presses…
+  for (let i = 0; i < 30; i++) {
+    const before = (await axisGeom(out, "y")).pos;
+    await bar.locator('[data-eink="surface-prev"]').click();
+    const after = (await axisGeom(out, "y")).pos;
+    if (after === 0) break;
+    expect(after).toBeLessThan(before);
+  }
+  expect((await axisGeom(out, "y")).pos).toBe(0);
+
+  // …then traverse, recording which output markers are visible at each stop.
+  const seen = new Set<string>();
+  const stops: number[] = [];
+  for (let i = 0; i < 60; i++) {
+    const g = await axisGeom(out, "y");
+    stops.push(g.pos);
+    const visible = await visibleNeedles(out, OUT_MARKS);
+    visible.forEach((m) => seen.add(m));
+    const before = g.pos;
+    await bar.locator('[data-eink="surface-next"]').click();
+    const after = (await axisGeom(out, "y")).pos;
+    if (Math.abs(after - before) <= 1) break;
+  }
+  for (const m of OUT_MARKS) expect(seen, `output marker ${m} never visible`).toContain(m);
+  const gEnd = await axisGeom(out, "y");
+  expect(gEnd.extent - gEnd.pos, "traversal reached the output extent").toBeLessThanOrEqual(1);
+  for (let i = 1; i < stops.length; i++) {
+    expect(stops[i] - stops[i - 1]).toBeGreaterThan(0);
+    expect(stops[i] - stops[i - 1]).toBeLessThanOrEqual(gEnd.client + 1);
+  }
+
+  // Independence: the transcript did not move across the paging clicks.
+  expect(await chatScroll.evaluate((el: HTMLElement) => el.scrollTop)).toBe(chatBefore);
+
+  // The disclosure still collapses (the tool action preserved).
+  await row.locator(".tool-head").click();
+  await page.waitForTimeout(350); // close animation (the 0fr grid transition)
+  const collapsed = await out.evaluate((el) => {
+    const clip = el.closest('[class*="disclosure-clip"]') as HTMLElement | null;
+    const wrapEl = clip?.parentElement as HTMLElement | null;
+    return { clipH: clip?.getBoundingClientRect().height ?? -1, wrapOpen: !!wrapEl?.classList.contains("open") };
+  });
+  expect(collapsed.wrapOpen).toBe(false);
+  expect(collapsed.clipH).toBeLessThanOrEqual(1);
+});
+
+// (12) Tool edit preview (Slice 3b): the edit preview's own bounded scroller
+//     (.tool-edit, max-height 320) pages discretely, same independence and
+//     disclosure-preservation contract as the output body.
+//
+//     DISCLOSED SETUP — extent fabrication: no fixture path produces an
+//     overflowing edit preview (editDiffLines caps blocks at 30 lines and no
+//     seeded edit input reaches that bound), so the overflow is fabricated
+//     IN-DOM by cloning the row's own preview lines with marker texts.
+//     Everything after that setup is the real path: the adapter's observers
+//     genuinely react to the growth, the bar mounts through the real overflow
+//     gate, and every traversal step is a real button click on the real event
+//     path.
+test("e-ink ON: tool edit preview pages discretely, independent of the transcript", async ({ page }) => {
+  test.setTimeout(60_000);
+  await bootEink(page);
+  await page.setViewportSize({ width: 400, height: 600 });
+  await page.goto(projectUrl("/?session=editpvw"));
+  await expect(page.locator(".chat-scroll")).toBeVisible({ timeout: 10_000 });
+
+  // The seeded replaceAll edit row. Expand it for real (a non-tail row starts
+  // closed).
+  const row = page.locator(".tool", { hasText: "Edit File" }).first();
+  await row.locator(".tool-head").click();
+  const edit = row.locator('[class*="tool-edit"]:not([class*="tool-edit-"])');
+  await expect(edit).toBeVisible();
+
+  // Fabricate the extent (see the DISCLOSED SETUP note above).
+  const EDIT_MARKS = ["EINKEDIT-FIRST", "EINKEDIT-MIDDLE", "EINKEDIT-LAST"];
+  await edit.evaluate((el, marks) => {
+    const h = el as HTMLElement;
+    const lines = h.querySelectorAll('[class*="tool-edit-line"]');
+    const proto = lines[lines.length - 1];
+    if (!proto) throw new Error("no preview line to clone");
+    for (let i = 0; i < 40; i++) {
+      const c = proto.cloneNode(true) as HTMLElement;
+      c.textContent = i === 0 ? marks[0] : i === 20 ? marks[1] : i === 39 ? marks[2] : `eink edit preview line ${i}`;
+      h.appendChild(c);
+    }
+  }, EDIT_MARKS);
+
+  const bar = row.locator('[data-eink-surface="tool-edit"]');
+  await expect(bar).toBeVisible({ timeout: 5000 });
+  const g0 = await axisGeom(edit, "y");
+  expect(g0.extent, "edit preview must overflow its 320px bound").toBeGreaterThan(0);
+
+  // Park in history + bring the row into the chat viewport (test 11's setup
+  // rationale: keep Playwright's actionability scrolls out of the
+  // stationarity window).
+  await page.locator('[data-eink="prev-page"]').click();
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  await bar.evaluate((el: HTMLElement) => el.scrollIntoView({ block: "end" }));
+  await page.waitForTimeout(250);
+  const chatScroll = page.locator(".chat-scroll");
+  const chatBefore = await chatScroll.evaluate((el: HTMLElement) => el.scrollTop);
+
+  // Park at the preview's top via real Prev presses…
+  for (let i = 0; i < 30; i++) {
+    const before = (await axisGeom(edit, "y")).pos;
+    await bar.locator('[data-eink="surface-prev"]').click();
+    const after = (await axisGeom(edit, "y")).pos;
+    if (after === 0) break;
+    expect(after).toBeLessThan(before);
+  }
+  expect((await axisGeom(edit, "y")).pos).toBe(0);
+
+  // …then traverse, recording which clone markers are visible at each stop.
+  const seen = new Set<string>();
+  const stops: number[] = [];
+  for (let i = 0; i < 60; i++) {
+    const g = await axisGeom(edit, "y");
+    stops.push(g.pos);
+    const visible = await visibleNeedles(edit, EDIT_MARKS);
+    visible.forEach((m) => seen.add(m));
+    const before = g.pos;
+    await bar.locator('[data-eink="surface-next"]').click();
+    const after = (await axisGeom(edit, "y")).pos;
+    if (Math.abs(after - before) <= 1) break;
+  }
+  for (const m of EDIT_MARKS) expect(seen, `edit marker ${m} never visible`).toContain(m);
+  const gEnd = await axisGeom(edit, "y");
+  expect(gEnd.extent - gEnd.pos, "traversal reached the preview extent").toBeLessThanOrEqual(1);
+  for (let i = 1; i < stops.length; i++) {
+    expect(stops[i] - stops[i - 1]).toBeGreaterThan(0);
+    expect(stops[i] - stops[i - 1]).toBeLessThanOrEqual(gEnd.client + 1);
+  }
+
+  // Independence: the transcript did not move across the paging clicks.
+  expect(await chatScroll.evaluate((el: HTMLElement) => el.scrollTop)).toBe(chatBefore);
+
+  // The disclosure still collapses (the tool action preserved).
+  await row.locator(".tool-head").click();
+  await page.waitForTimeout(350); // close animation
+  const collapsed = await edit.evaluate((el) => {
+    const clip = el.closest('[class*="disclosure-clip"]') as HTMLElement | null;
+    const wrapEl = clip?.parentElement as HTMLElement | null;
+    return { clipH: clip?.getBoundingClientRect().height ?? -1, wrapOpen: !!wrapEl?.classList.contains("open") };
+  });
+  expect(collapsed.wrapOpen).toBe(false);
+  expect(collapsed.clipH).toBeLessThanOrEqual(1);
+});
+
 // Label state is bracketed: this spec seeds tags/groups via the real API, and
 // the serial suite shares one backend — reset before AND after so neither this
-// spec's earlier tests nor sibling specs see leaked label state.
+// spec's earlier tests nor sibling specs see leaked label state. The notes doc
+// gets the same bracket (the notes test creates todos through the real form).
 test.beforeEach(async ({ request }) => {
   await resetLabels(request);
+  await resetNotes(request);
 });
 test.afterEach(async ({ request }) => {
   await resetLabels(request);
+  await resetNotes(request);
 });

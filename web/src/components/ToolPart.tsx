@@ -23,9 +23,11 @@ import { createEffect, createMemo, createSignal, For, Match, Show, Switch, onCle
 import { openFileAt } from "../code/frame";
 import { onActionKey } from "../lib/a11y";
 import { toolLabel, toolSubject } from "../lib/toolLabel";
+import { einkProfile } from "../prefs";
 import { openSession, projectDir, sessionNeedsInput, sessionWorking, setSelectedId, state as syncState, currentVerb } from "../sync";
 import type { CurrentVerb } from "../sync";
 import type { Part } from "../types";
+import { EinkSurfacePaging } from "./EinkSurfacePaging";
 import Icon from "./Icon";
 import Spinner from "./Spinner";
 import { MarkdownHtml, partOpen, setPartOpen } from "./Part";
@@ -165,19 +167,47 @@ export function editDiffLines(
 
 // Tool output body: highlight valid JSON / XML through the markdown code path,
 // otherwise show it as plain preformatted text.
+//
+// E-ink profile (UX Slice 3b): the body's OWN bounded scroller gains discrete
+// vertical paging via the shared EinkSurfacePaging adapter (lib/paging.ts
+// geometry, reused verbatim), mounted under it as a reserved in-flow row
+// inside the disclosure — the scroller (.tool-output is max-height-bounded,
+// the disclosure grows to fit the bar; nothing is occluded). The adapter
+// writes that one element's scrollTop ONLY: the surrounding transcript never
+// moves (nested surfaces page independently of .chat-scroll) and the
+// disclosure/tool actions are untouched. Which element scrolls depends on the
+// variant: the plain <pre> itself, or — for the JSON/XML variant whose wrapper
+// deliberately drops its own max-height/overflow (.tool-output-code) — the
+// markdown path's inner <pre> (its global .md pre overflow-x:auto plus
+// max-height make the y axis scrollable too). scroller() re-resolves at every
+// observer tick/action, so the late-rendered inner <pre> is picked up.
 function ToolBody(props: { text: string }) {
+  let outEl: HTMLElement | undefined;
   const fenced = (): string | null => {
     const j = jsonPretty(props.text);
     if (j) return "```json\n" + j + "\n```";
     if (looksXML(props.text)) return "```xml\n" + props.text.trim() + "\n```";
     return null;
   };
+  const scroller = () => {
+    const el = outEl;
+    if (!el) return null;
+    if (el.classList.contains(styles["tool-output-code"]!)) {
+      return el.querySelector<HTMLElement>("pre") ?? el;
+    }
+    return el;
+  };
   return (
-    <Show when={fenced()} fallback={<pre class={styles["tool-output"]}>{props.text}</pre>}>
-      <div class={`${styles["tool-output"]} ${styles["tool-output-code"]}`}>
-        <MarkdownHtml text={fenced()!} />
-      </div>
-    </Show>
+    <>
+      <Show when={fenced()} fallback={<pre class={styles["tool-output"]} ref={(el) => (outEl = el)}>{props.text}</pre>}>
+        <div class={`${styles["tool-output"]} ${styles["tool-output-code"]}`} ref={(el) => (outEl = el)}>
+          <MarkdownHtml text={fenced()!} />
+        </div>
+      </Show>
+      <Show when={einkProfile()}>
+        <EinkSurfacePaging name="tool-output" axis="y" label="Tool output paging" target={scroller} />
+      </Show>
+    </>
   );
 }
 
@@ -318,6 +348,8 @@ export function ToolPart(props: { part: Part; tail?: boolean }) {
   createEffect(() => {
     if (expanded()) setRevealed(true);
   });
+  // The edit-preview scroller (EinkSurfacePaging target; see the disclosure).
+  let editEl: HTMLDivElement | undefined;
   return (
     <div class="tool" classList={{ [status()]: true }}>
       <div
@@ -404,9 +436,14 @@ export function ToolPart(props: { part: Part; tail?: boolean }) {
             </Show>
             {/* Edit contents sit between the command line and the tool output —
                 what changed, then what the tool reported. Renders only inside
-                the disclosure gate, with per-block line caps (editDiffLines). */}
+                the disclosure gate, with per-block line caps (editDiffLines).
+                E-ink profile (UX Slice 3b): the preview's own bounded scroller
+                (.tool-edit, max-height 320 + overflow-y auto) pages discretely
+                via the shared adapter mounted right under it — a reserved
+                in-flow row inside the disclosure. Writes its scrollTop ONLY;
+                the transcript and the disclosure toggle are untouched. */}
             <Show when={editPreview()}>
-              <div class={styles["tool-edit"]}>
+              <div class={styles["tool-edit"]} ref={editEl}>
                 <For each={editPreview()}>
                   {(l) => (
                     <div
@@ -422,6 +459,9 @@ export function ToolPart(props: { part: Part; tail?: boolean }) {
                   )}
                 </For>
               </div>
+              <Show when={einkProfile()}>
+                <EinkSurfacePaging name="tool-edit" axis="y" label="Edit preview paging" target={() => editEl} />
+              </Show>
             </Show>
             <Show when={output()}>
               <ToolBody text={output()} />
