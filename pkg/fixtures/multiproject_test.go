@@ -589,6 +589,76 @@ func TestMPWorkloadOverflowAccounting(t *testing.T) {
 	}
 }
 
+// TestMPWorkloadSlowSubscriberBackpressure pins the CI failure mechanism of
+// web/tests/e2e/multiproject-latency.spec.ts:446 (A2 S5 filler): an ALIVE but
+// slow /event consumer — the aggregator on a loaded 2-core runner, sustaining
+// well under the filler's 1ms-cadence 2-events-per-tick (2000 ev/s) rate —
+// overflows the 64-slot subscriber channel after a mere ~32ms stall. emit's
+// close-on-full then silently converts normal scheduler backpressure into a
+// lost event + severed connection (dropped_run>0; and events emitted during
+// the overflow-triggered reconnect gap reach nobody, which is what poisoned
+// retry #2's S2 suffix accounting — contiguous frames, 2048 bytes short).
+//
+// Deterministic local repro of that CI-only shape: one subscriber that
+// burst-drains (drain everything buffered, sleep 5ms, repeat — sustained
+// ~200 ev/s, far below the pump). Real OpenCode streams over SSE/TCP, where
+// a slow-but-alive consumer BACKPRESSOURCES the producer and no events are
+// lost — so the contract under test is: the sustained pump is LOSSLESS for
+// any consumer that keeps making progress (dropped_run==0, every event
+// delivered); only a grace-long wedge severs (TestMPWorkloadOverflowAccounting).
+func TestMPWorkloadSlowSubscriberBackpressure(t *testing.T) {
+	f := New()
+	f.SeedMultiProject(MultiProjectSpec{Projects: 2, SessionsPerProj: 1, BulkSessions: 0, TurnsPerSession: 1, SmallPartBytes: 64, BulkPartBytes: 64})
+	srv := startFixtureHTTP(t, f)
+
+	slow, unslow := f.subscribe()
+	defer unslow()
+	type tally struct{ n int }
+	received := make(chan tally, 1)
+	go func() {
+		n := 0
+		for {
+			select {
+			case _, ok := <-slow:
+				if !ok {
+					received <- tally{n}
+					return
+				}
+				n++
+				// Rate-capped consumer: ~500 ev/s sustained — alive and always
+				// progressing, but well under the pump's 2000 ev/s (the CI
+				// aggregator's apply loop on a loaded 2-core runner). A burst
+				// gap here would NOT overflow (full throughput available per
+				// burst); the rate cap is what makes the 64-slot buffer decay.
+				time.Sleep(2 * time.Millisecond)
+			default:
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+	}()
+
+	// 2 projects × 150 events at 1ms cadence = the filler's load shape.
+	start := mpWLStart(t, srv, MPWorkloadSpec{Projects: 2, Events: 150, ChunkBytes: 64, BulkProject: -1, CadenceMs: 1})
+	mpWLPost(t, srv, "release", start.RunID, http.StatusOK)
+	done := mpWLStatus(t, srv, start.RunID, "done", 15*time.Second)
+
+	if done.DroppedRun != 0 {
+		t.Fatalf("slow-but-alive subscriber lost events: dropped_run=%d, want 0 (backpressure must make the sustained pump lossless)", done.DroppedRun)
+	}
+	if done.Emitted != 300 {
+		t.Fatalf("emitted=%d, want 300", done.Emitted)
+	}
+	unslow()
+	select {
+	case r := <-received:
+		if r.n != int(done.Emitted+done.Bookends) {
+			t.Fatalf("slow subscriber received %d events, want emitted+bookends=%d (lossless delivery)", r.n, done.Emitted+done.Bookends)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("slow subscriber channel never closed")
+	}
+}
+
 func TestMPWorkloadStartValidationAndSeedIdempotence(t *testing.T) {
 	f := New()
 	srv := startFixtureHTTP(t, f)

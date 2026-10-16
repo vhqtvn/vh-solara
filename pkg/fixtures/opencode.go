@@ -2781,6 +2781,88 @@ func (f *FakeOpenCode) emit(eventType string, props any) {
 	}
 }
 
+// emitBackpressure is emit with bounded producer backpressure: per subscriber
+// it waits up to grace for the bounded channel to regain capacity before
+// taking emit's overflow path (counted drop + close + unsubscribe). Returns
+// false when cancel fires while waiting (the event was NOT sent; the caller
+// must not count it as emitted).
+//
+// Why: real OpenCode streams events over SSE/TCP — a slow-but-alive consumer
+// (the aggregator on a loaded CI runner) backpressures the producer and no
+// events are lost. emit's 64-slot close-on-full channel models a DEAD
+// connection, but at the mp filler's 1ms cadence (2 events/ms) a mere ~32ms
+// consumer stall trips it, silently converting normal scheduler contention
+// into a lost event plus a severed connection (the CI-only A2 failures:
+// dropped_run>0 in S5, and events emitted during the overflow-triggered
+// reconnect gap reach nobody — which is what poisoned retry #2's S2 suffix
+// accounting: contiguous frames exactly one 2048-byte chunk short). This
+// variant is lossless for any consumer that makes progress within grace;
+// only a grace-long wedge severs (the contract pinned by
+// TestMPWorkloadOverflowAccounting / TestEventStreamHandlerReturnsAfterOverflowClose).
+//
+// No busy-map mirroring here: the sustained pump emits only message.* events,
+// which emit's mirror never touches.
+//
+// Send-safety: every close of a subscriber channel happens under f.mu
+// (subscribe's unsubscribe, emit's overflow, and the grace-exhaustion path
+// below), and sends happen only under f.mu on channels still present in
+// f.subs — a channel present in the map can never be closed concurrently.
+func (f *FakeOpenCode) emitBackpressure(cancel <-chan struct{}, eventType string, props any, grace time.Duration) bool {
+	payload, _ := json.Marshal(map[string]any{"type": eventType, "properties": props})
+	// Round 0: non-blocking fan-out to every subscriber, identical to emit.
+	f.mu.Lock()
+	full := make([]int, 0, len(f.subs))
+	for id, ch := range f.subs {
+		select {
+		case ch <- string(payload):
+		default:
+			full = append(full, id)
+		}
+	}
+	f.mu.Unlock()
+	// Later rounds: retry only the still-full subscribers (already-served ids
+	// must not receive a duplicate).
+	deadline := time.Now().Add(grace)
+	for len(full) > 0 {
+		select {
+		case <-cancel:
+			return false
+		default:
+		}
+		if time.Now().After(deadline) {
+			// Grace exhausted: this consumer is wedged, not slow — treat it
+			// exactly like emit's overflow (counted drop + close + delete).
+			f.mu.Lock()
+			for _, id := range full {
+				if ch, ok := f.subs[id]; ok {
+					atomic.AddUint64(&f.emitDroppedTotal, 1)
+					close(ch)
+					delete(f.subs, id)
+				}
+			}
+			f.mu.Unlock()
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+		f.mu.Lock()
+		still := full[:0]
+		for _, id := range full {
+			ch, ok := f.subs[id]
+			if !ok {
+				continue // closed/unsubscribed elsewhere — nothing to do
+			}
+			select {
+			case ch <- string(payload):
+			default:
+				still = append(still, id)
+			}
+		}
+		f.mu.Unlock()
+		full = still
+	}
+	return true
+}
+
 // simulatePrompt mimics a live turn: append the user message, then stream an
 // assistant text part in chunks, then mark it complete. Also persists to the
 // message store so a reload reflects the turn.

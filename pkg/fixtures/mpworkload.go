@@ -35,7 +35,11 @@ package fixtures
 //     bounded capacity) is counted SEPARATELY (emitDroppedTotal, reported as
 //     dropped_total and per-run dropped_run) from anything the application
 //     layer does. "Delivered" is the consumer's observation (browser frames /
-//     store content), not a fixture-side claim.
+//     store content), not a fixture-side claim. Pump emits are BACKPRESSURED
+//     (emitBackpressure, mpEmitGrace): a slow-but-alive /event consumer — the
+//     aggregator under CI load — delays the pump instead of losing events
+//     (real SSE/TCP fidelity), so dropped_run>0 now means a consumer was
+//     wedged past grace, not merely slower than the pump.
 //   - One active run: a second start while a run is armed/running is a 409,
 //     keeping serial-suite semantics deterministic.
 //   - Reset is surgical: it removes exactly the messages the run created
@@ -108,6 +112,21 @@ type mpWorkloadRun struct {
 const (
 	mpWorkloadMinChunk = 32
 	mpWorkloadMaxChunk = 256 * 1024
+
+	// mpEmitGrace bounds how long a sustained-workload emit waits for a slow
+	// /event subscriber before declaring it wedged (emit's close-on-full
+	// sever, counted as dropped). Real OpenCode streams over SSE/TCP, where a
+	// slow-but-alive consumer BACKPRESSURES the producer losslessly; the
+	// fixture's 64-slot channel must approximate that for sustained pumps —
+	// at the filler's 1ms cadence (2 events/ms) a mere ~32ms consumer stall
+	// otherwise converts ordinary CI scheduler contention into lost events
+	// (dropped_run>0) plus a severed connection whose reconnect gap loses
+	// mid-gap events (the retry-2 S2 suffix-hole signature). 2s is far above
+	// any alive-consumer stall (CI bursts: tens of ms) and far below
+	// pollDone's 15s no-progress stall detector, so a wedged consumer still
+	// severs quickly enough for TestMPWorkloadOverflowAccounting's 10s
+	// done-wait.
+	mpEmitGrace = 2 * time.Second
 )
 
 // mpWorkloadMarker returns the deterministic per-chunk ASCII marker
@@ -551,16 +570,23 @@ func (f *FakeOpenCode) mpWorkloadRunLoop(run *mpWorkloadRun) {
 
 	// Opening bookends: assistant message row + empty streaming part (mirrors
 	// streamAssistant's shape — the SPA/store create the row from these).
+	// All pump emits are backpressured (mpEmitGrace): a slow-but-alive
+	// subscriber delays the pump instead of losing events (TCP fidelity); a
+	// cancel during the wait aborts the run without counting the event.
 	for i := range run.perSession {
 		e := &run.perSession[i]
-		f.emit("message.updated", map[string]any{"info": map[string]any{
+		if !f.emitBackpressure(run.cancel, "message.updated", map[string]any{"info": map[string]any{
 			"id": e.MessageID, "sessionID": e.SID, "role": "assistant",
 			"time": map[string]any{"created": now()},
-		}})
-		f.emit("message.part.updated", map[string]any{"part": map[string]any{
+		}}, mpEmitGrace) {
+			return
+		}
+		if !f.emitBackpressure(run.cancel, "message.part.updated", map[string]any{"part": map[string]any{
 			"id": e.PartID, "sessionID": e.SID, "messageID": e.MessageID, "type": "text",
 			"text": "", "time": map[string]any{"start": now()},
-		}})
+		}}, mpEmitGrace) {
+			return
+		}
 	}
 	atomic.AddInt64(&run.bookends, int64(2*len(run.perSession)))
 
@@ -574,10 +600,12 @@ func (f *FakeOpenCode) mpWorkloadRunLoop(run *mpWorkloadRun) {
 		}
 		for i := range run.perSession {
 			e := &run.perSession[i]
-			f.emit("message.part.delta", map[string]any{
+			if !f.emitBackpressure(run.cancel, "message.part.delta", map[string]any{
 				"sessionID": e.SID, "messageID": e.MessageID, "partID": e.PartID,
 				"field": "text", "delta": mpWorkloadChunk(i, int(run.id), tick, e.ChunkBytes),
-			})
+			}, mpEmitGrace) {
+				return
+			}
 			atomic.AddInt64(&run.emitted, 1)
 		}
 	}
@@ -596,8 +624,12 @@ func (f *FakeOpenCode) mpWorkloadRunLoop(run *mpWorkloadRun) {
 			"time": map[string]any{"created": now(), "completed": now()},
 		}
 		f.appendMessage(e.SID, messageWithParts{Info: info, Parts: []map[string]any{part}})
-		f.emit("message.part.updated", map[string]any{"part": part})
-		f.emit("message.updated", map[string]any{"info": info})
+		if !f.emitBackpressure(run.cancel, "message.part.updated", map[string]any{"part": part}, mpEmitGrace) {
+			return
+		}
+		if !f.emitBackpressure(run.cancel, "message.updated", map[string]any{"info": info}, mpEmitGrace) {
+			return
+		}
 		atomic.AddInt64(&run.bookends, 2) // appendMessage persists; the two emits are the bookends
 	}
 }
