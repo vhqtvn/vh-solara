@@ -1,5 +1,6 @@
 import { createEffect, createSignal, onCleanup, Show } from "solid-js";
 import { state, consumeEpochChanged, connGrade } from "../sync";
+import { einkProfile } from "../prefs";
 import Icon from "./Icon";
 import styles from "./ConnectionToast.module.css";
 
@@ -26,17 +27,61 @@ import styles from "./ConnectionToast.module.css";
 // network); the "Reconnected" ok fires at CONVERGENCE — the live grade
 // requires the post-reconnect cascade to have completed, so recovery is
 // confirmed, not merely socket-open. OBSERVATIONAL ONLY (debate-1 Q5).
+//
+// E-ink display profile (UX Slice 4 — quiet UI): while the profile is ON the
+// auto-expiry timers (4s restart warn / 2.5s "Reconnected" ok) are NOT armed —
+// on a slow-refresh panel those windows are unreadable. IMPORTANT notices
+// (disconnect/offline/restart warns) persist until RESOLVED (the grade
+// returning to live replaces the warn with the recovery ok) or DISMISSED (an
+// ON-only × button); the benign recovery ok coalesces into a stable status —
+// it stays until dismissed or superseded by the next warn, never piling up
+// (the component holds one toast at a time by construction). Profile OFF is
+// unchanged: same timers, same wording, no dismiss affordance.
+//
+// Latent-defect fix riding this slice (disclosed): the epoch/restart branch
+// previously consumed the latch (a store write) inside the effect that had
+// just read it — Solid's immediate re-run landed in the live branch and
+// cleared the toast in the SAME flush, so the restart notice was stillborn
+// exactly in its designed firing condition (epoch transition detected on a
+// live connection). The epochSelfReentry guard turns that one self-scheduled
+// re-run into a no-op; the notice now displays as documented (4s under OFF,
+// until-dismissed under ON). Verified against a verbatim HEAD copy of the
+// component (scratch probe) before fixing.
 export default function ConnectionToast() {
   const [toast, setToast] = createSignal<{ kind: "warn" | "ok"; text: string } | null>(null);
   let showTimer: number | undefined;
   let hideTimer: number | undefined;
   let warned = false;
+  // True only between "the epoch branch armed the restart notice" and the
+  // effect re-run that arming ITSELF schedules: consumeEpochChanged() writes
+  // state.epochChanged inside the effect that just read it, so Solid re-runs
+  // this effect immediately — and that re-run would land in the live branch,
+  // CLEAR the just-armed hide timer, and setToast(null): the restart notice
+  // was set and hidden-forever in the same flush (a latent stillborn-toast
+  // defect at HEAD, verified by component-level probe: latch-while-live, the
+  // branch's designed firing condition, never displayed anything). When set,
+  // the very next run is a complete NO-OP (timers from the arming run stay
+  // armed, the toast stays); every later, genuine transition runs normally.
+  let epochSelfReentry = false;
 
   createEffect(() => {
-    // Read both so this re-runs on either change. epochChanged is latched by
-    // applySnapshot when an epoch transition is detected on a LIVE connection.
+    // Reactive reads FIRST, on EVERY run — Solid tears an effect's dependency
+    // set down before each re-run and re-establishes it only from what the
+    // run actually reads. A run that reads nothing (the no-op re-run below)
+    // would leave the set EMPTY and permanently kill this effect after the
+    // first epoch event (no later warns, no "Reconnected", no profile-flip
+    // re-run) — so the reads are hoisted ABOVE the guard, and the guard's
+    // early return stays a pure no-op.
     const grade = connGrade();
     const ec = state.epochChanged;
+    // The e-ink quiet-UI switch: ON skips every auto-expiry arming below.
+    const quiet = einkProfile();
+    if (epochSelfReentry) {
+      // The one self-scheduled re-run after the epoch latch was consumed:
+      // a no-op (timers from the arming run stay armed, the toast stays).
+      epochSelfReentry = false;
+      return;
+    }
     clearTimeout(showTimer);
     clearTimeout(hideTimer);
     if (ec) {
@@ -44,10 +89,13 @@ export default function ConnectionToast() {
       // the subsequent live transition does NOT also fire a "Reconnected".
       consumeEpochChanged();
       warned = false;
+      epochSelfReentry = true; // the consume-write schedules the no-op re-run
       // Say "vh-solara" explicitly so this can't be read as an OpenCode event
       // (the OpenCodeHealthPanel owns OpenCode lifecycle separately).
       setToast({ kind: "warn", text: "vh-solara restarted — re-syncing…" });
-      hideTimer = window.setTimeout(() => setToast(null), 4000);
+      // Under the profile the restart notice persists until dismissed (there
+      // is no distinct resync-complete signal this toast can observe).
+      if (!quiet) hideTimer = window.setTimeout(() => setToast(null), 4000);
       return;
     }
     if (grade === "offline") {
@@ -66,13 +114,26 @@ export default function ConnectionToast() {
       if (warned) {
         warned = false;
         setToast({ kind: "ok", text: "Reconnected" });
-        hideTimer = window.setTimeout(() => setToast(null), 2500);
+        // Resolution of the warn above. Under the profile the ok is a stable
+        // status (no 2.5s flash): it clears on dismiss or the next warn.
+        if (!quiet) hideTimer = window.setTimeout(() => setToast(null), 2500);
       } else {
         setToast(null);
       }
     }
     // "degraded" is a silent observational grade — no toast.
   });
+
+  // ON-only explicit dismissal: clears the current notice and any pending
+  // arming. A warn dismissed while its condition still holds STAYS gone until
+  // the grade actually changes (the effect re-fires only on grade/epoch/
+  // profile transitions — connGrade is string-deduped), so dismissal never
+  // loops.
+  const dismiss = () => {
+    clearTimeout(showTimer);
+    clearTimeout(hideTimer);
+    setToast(null);
+  };
 
   onCleanup(() => {
     clearTimeout(showTimer);
@@ -84,6 +145,25 @@ export default function ConnectionToast() {
       <div class={styles["conn-toast"]} classList={{ [toast()!.kind]: true }} role="status">
         <Icon name={toast()!.kind === "warn" ? "help" : "check"} size={15} />
         <span>{toast()!.text}</span>
+        <Show when={einkProfile()}>
+          <button
+            type="button"
+            class="icon-btn"
+            aria-label="Dismiss notice"
+            title="Dismiss notice"
+            style={{
+              padding: "2px 4px",
+              margin: "-2px -2px -2px 4px",
+              border: "0",
+              background: "transparent",
+              color: "inherit",
+              cursor: "pointer",
+            }}
+            onClick={dismiss}
+          >
+            <Icon name="x" size={13} />
+          </button>
+        </Show>
       </div>
     </Show>
   );

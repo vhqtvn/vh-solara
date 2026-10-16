@@ -407,3 +407,106 @@ test("e ink profile: default-off manual toggle composes a reversible effective t
   await expect(dialog).toHaveCount(0);
   await p2.close();
 });
+
+// ----------------------------------------------------------------------------
+// E Ink COLOR theme — computed probe (UX Slice 4). This closes the standing
+// DEFER from the profile's Slice 1 review: the `theme-eink-color` variant had
+// NO computed coverage (its monochrome sibling theme-eink was probed, this
+// variant only had class-name checks). The contract, asserted COMPUTED (never
+// by class presence):
+//   - the motion/shadow/scroll kill-switch attaches to THIS variant too
+//     (animation/transition/scroll-behavior → none/none/auto; --shadow-* →
+//     none) — the whole point of the variant family is that both share the
+//     stillness treatment;
+//   - AND the property that makes this variant DISTINCT — saturated semantic
+//     COLOR tokens that survive a colour-filter panel: --accent/--danger/
+//     --ok/--warn/--sel are pairwise distinct and CHROMATIC (each has a
+//     nonzero channel spread — none collapsed to the monochrome greys),
+//     with token-level (--focus-ring === --accent) and real-surface (the
+//     active settings nav item renders in --accent) wiring.
+// Theme-scoped by design: the E Ink Color SAVED theme is picked through the
+// real ThemePicker with the profile OFF (the kill-switch keys on the theme,
+// not the profile), mirroring the matrix test's selection path.
+
+function parseRgb(s: string): [number, number, number] | null {
+  const m = /^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*[\d.]+)?\)$/.exec(s.trim());
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+test("e ink color theme: computed motion/shadow kill-switch AND saturated semantic colors", async ({ page }) => {
+  await page.goto(projectUrl("/"));
+  await page.getByRole("button", { name: "Settings" }).click();
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await expect(dialog).toBeVisible();
+  // Default section is Theme — pick the color variant through the real UI.
+  await dialog.locator('[role="option"][title="E Ink Color"]').click();
+  const classes = await htmlClasses(page);
+  expect(classes).toContain("theme-eink-color");
+  expect(classes).toContain("theme-light-scoped");
+  expect(classes).not.toContain("theme-eink"); // the monochrome sibling is absent
+
+  // ---- Kill-switch attaches to the COLOR variant too (computed). ----
+  expect(await motionProbe(page)).toEqual({
+    animationName: "none",
+    transitionProperty: "none",
+    scrollBehavior: "auto",
+  });
+  const vars = await themeVars(page);
+  expect(vars.sm).toBe("none");
+  expect(vars.md).toBe("none");
+  expect(vars.lg).toBe("none");
+
+  // ---- Saturated semantic colors (the variant's reason to exist). ----
+  const colors = await page.evaluate(() => {
+    const cs = getComputedStyle(document.documentElement);
+    const g = (n: string) => cs.getPropertyValue(n).trim();
+    return { accent: g("--accent"), danger: g("--danger"), ok: g("--ok"), warn: g("--warn"), sel: g("--sel"), mdLink: g("--md-link") };
+  });
+  // Computed values are hex per the tokens.css declarations — resolve each
+  // through the SAME engine serialization a consumer sees (probe element).
+  const resolve = (decl: string) =>
+    page.evaluate((d) => {
+      const el = document.createElement("div");
+      el.style.cssText = `${d};position:fixed;left:-9999px;top:-9999px;`;
+      document.body.appendChild(el);
+      const v = getComputedStyle(el).color;
+      el.remove();
+      return v;
+    }, decl);
+  const chroma = (v: string) => {
+    const rgb = parseRgb(v);
+    return rgb ? Math.max(...rgb) - Math.min(...rgb) : -1;
+  };
+  const [accent, danger, ok, warn, sel, mdLink] = await Promise.all([
+    resolve("color: var(--accent)"),
+    resolve("color: var(--danger)"),
+    resolve("color: var(--ok)"),
+    resolve("color: var(--warn)"),
+    resolve("color: var(--sel)"),
+    resolve("color: var(--md-link)"),
+  ]);
+  // Chromatic: every semantic token carries real hue (channel spread > 8 —
+  // comfortably above rendering noise, far below the designed saturation).
+  for (const [name, v] of Object.entries({ accent, danger, ok, warn, sel })) {
+    expect(chroma(v), `${name} must stay saturated under e-ink-color (got ${v})`).toBeGreaterThan(8);
+  }
+  // Pairwise distinct hues among the status meanings (the monochrome collapse
+  // is what this rules out). --sel is EXEMPT: the eink-color block defines it
+  // as accent's sibling (#0b5cad === --accent) by design, so it is asserted
+  // as wiring (below), not as a distinct fifth hue.
+  const setStatuses = new Set([accent, danger, ok, warn]);
+  expect(setStatuses.size).toBe(4);
+  expect(sel).toBe(accent); // the documented sel===accent wiring, computed
+  // Token wiring: focus ring and the markdown link both resolve to accent.
+  expect(vars.focusRing).toBe(colors.accent);
+  expect(mdLink).toBe(accent);
+
+  // ---- Real-surface color consumer: the ACTIVE settings nav item renders
+  // in --accent (computed, through the real ThemePicker-selected theme). ----
+  const activeNav = dialog.locator(".settings-nav-item.on");
+  await expect(activeNav).toBeVisible();
+  expect(await activeNav.evaluate((el) => getComputedStyle(el).color)).toBe(accent);
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+});

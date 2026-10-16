@@ -256,6 +256,8 @@ function EinkWorking(props: { partId: string }) {
 
 // Reasoning block with a live "thinking" duration. While the part is still
 // streaming the timer ticks (created → now); once it ends it shows the total.
+// (Under the e-ink profile the ticker is quiet — see the effect below: static
+// elapsed while live, the settle transition carries the final update.)
 function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) {
   const start = () => props.part.time?.start;
   const end = () => props.part.time?.end;
@@ -263,6 +265,16 @@ function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) 
   const [now, setNow] = createSignal(Date.now());
   createEffect(() => {
     if (!live() || !start()) return;
+    // E-ink display profile (UX Slice 4 — quiet UI): a per-second duration
+    // repaint is gratuitous churn on a slow-refresh panel. Under the profile
+    // the elapsed time is STATIC: one meaningful refresh at the moment the
+    // ticker goes quiet, then no interval. Quiet ≠ silent — the settle
+    // transition still updates the label (elapsed() switches to time.end),
+    // and a profile flip re-runs this effect (ticking resumes under OFF).
+    if (einkProfile()) {
+      setNow(Date.now());
+      return;
+    }
     const t = setInterval(() => setNow(Date.now()), 1000);
     onCleanup(() => clearInterval(t));
   });

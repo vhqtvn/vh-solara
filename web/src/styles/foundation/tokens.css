@@ -391,6 +391,26 @@
   --md-quote: #3a3a3a; --md-quote-border: #6e6e6e;
   --chat-user-bg: #f2f2f2; --chat-user-border: #6e6e6e;
 }
+/* Monochrome diff semantics (e-ink UX Slice 4): the tokenized diff surfaces
+   (.vh-diff-add/-del/-hunk) carry added/removed/changed meaning by HUE
+   (--ok green / --danger red / --accent blue tints — see the base rules in
+   legacy/80-professional-pass.css). Under theme-eink those tokens collapse
+   to near-identical greys (--ok #5e5e5e vs --danger #000 at 14–15% alpha),
+   so the distinction is lost exactly where it must not be. Scoped to the
+   MONOCHROME variant only (theme-eink-color keeps its saturated hues by
+   design): borders and luminance steps carry the meaning instead —
+     added   → white row + solid black left bar;
+     removed → grey row + dashed black left bar (two independent non-hue
+               distinctions from added, alongside the +/− line sigils);
+     hunk    → inverted black band (maximum luminance contrast).
+   Solid fills and borders only — no dithering patterns or filters (blanket
+   grayscale filters are rejected by the e-ink brief: they destroy
+   information). Placed AFTER the theme-light-scoped .vh-diff-* overrides
+   above (equal specificity — source order decides; e-ink themes carry the
+   light marker too, and the e-ink reading wins). */
+:root.theme-eink .vh-diff-add { background: #ffffff; border-left: 4px solid #000000; }
+:root.theme-eink .vh-diff-del { background: #d6d6d6; border-left: 4px dashed #000000; }
+:root.theme-eink .vh-diff-hunk { background: #000000; color: #ffffff; }
 /* E Ink Colour (Kaleido): same crisp B&W base, with bold, saturated accents so
    they survive the panel's colour filter and still read as colour. */
 :root.theme-eink-color {

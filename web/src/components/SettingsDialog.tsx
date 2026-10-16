@@ -327,15 +327,17 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                   onChange={(e) => setEinkProfile(e.currentTarget.checked)}
                 />
               </div>
-              <p class="setting-hint">
-                Optimizes rendering for e-ink displays: a high-contrast E Ink theme is applied in place
-                of your theme (the E Ink Color theme if that is your pick), with animations, transitions,
-                and shadows disabled. While on, streaming replies appear only once complete — a quiet
-                Working marker shows progress, with a Show live button on the reply to watch it stream.
-                Scrolling panels (chat, terminal, session list, settings, code) also gain page buttons
-                that step through their content — including sideways through wide code — so reading
-                never depends on continuous scrolling. Your theme and streaming preferences are kept
-                and return when this is off.
+              <p class="setting-hint" data-eink-profile-hint>
+                Optimizes rendering for e-ink displays: a high-contrast E Ink theme is applied in
+                place of your theme (the E Ink Color theme if that is your pick), with animations,
+                transitions, and shadows disabled. While on, a streaming reply renders part by part
+                — each block appears once it settles (a quiet Working marker shows progress, with a
+                Show live button on the reply to watch it stream). Scrolling panels (chat, terminal,
+                session list, notes, settings, code, tool and reasoning bodies) gain page buttons
+                that step through their content — including sideways through wide code. Connection
+                notices stay visible until the connection recovers or you dismiss them, and periodic
+                timers (relative times, thinking durations) go quiet. Your theme and streaming
+                preferences are kept and return when this is off.
               </p>
               <div class="setting-row" style={{ "justify-content": "space-between" }}>
                 <label>Display signals</label>

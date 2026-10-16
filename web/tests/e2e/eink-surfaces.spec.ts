@@ -1,6 +1,11 @@
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
+import { execSync } from "node:child_process";
 import * as nodeFs from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import * as nodePath from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { demoDir, projectUrl, resetLabels } from "./util";
 
 // E-ink UX Slice 3 — discrete paging for the remaining owned scroll surfaces
@@ -1336,6 +1341,209 @@ test("e-ink ON: tool edit preview pages discretely, independent of the transcrip
   });
   expect(collapsed.wrapOpen).toBe(false);
   expect(collapsed.clipH).toBeLessThanOrEqual(1);
+});
+
+// (13) Monochrome diff semantics (Slice 4): under the profile's effective
+//     theme-eink, diff meaning must survive the loss of hue — the base
+//     surfaces (.vh-diff-add/-del/-hunk in legacy/80-professional-pass.css)
+//     tint by --ok/--danger/--accent, which collapse to near-identical greys
+//     under the monochrome theme. The ON-scoped tokens.css rules carry the
+//     meaning with borders and luminance instead, asserted COMPUTED on a REAL
+//     diff render (a real throwaway git repo served by the real daemon's
+//     /vh/git + /vh/render — git-safety.spec.ts's topology): added = white +
+//     solid bar; removed = grey + dashed bar; hunk = inverted band. The OFF
+//     leg proves the reinforcements are truly scoped: no borders, and the
+//     hue-tinted baseline backgrounds remain pairwise distinct.
+test("e-ink ON: diff add/del/hunk stay distinguishable without hue (computed); OFF keeps the hue baseline", async ({ page }) => {
+  test.setTimeout(90_000);
+  // Throwaway repo with a staged modification whose patch carries hunk
+  // headers, added lines, and removed lines.
+  const base = mkdtempSync(join(tmpdir(), "vh-eink-diff-"));
+  const repo = join(base, "repo");
+  const git = (args: string) => execSync(`git ${args}`, { cwd: repo, stdio: "pipe" });
+  execSync(`git init ${JSON.stringify(repo)}`, { stdio: "pipe" });
+  git('config user.email "t@t"');
+  git('config user.name "t"');
+  writeFileSync(join(repo, "notes.txt"), ["alpha line", "beta line", "gamma line", ""].join("\n"));
+  git("add notes.txt");
+  git('commit -m "base"');
+  // Change beta (del+add), append two additions → add/del/hunk all present.
+  writeFileSync(
+    join(repo, "notes.txt"),
+    ["alpha line", "BETA CHANGED", "gamma line", "delta added", "epsilon added", ""].join("\n"),
+  );
+  git("add notes.txt");
+  try {
+    const openChanges = async () => {
+      await page.goto(`/?dir=${encodeURIComponent(repo)}`);
+      await page.getByRole("button", { name: "Changes" }).click();
+      await expect(page.locator(".git-commit-btn")).toBeVisible({ timeout: 8_000 });
+      await page.locator(".gitfile-head").first().click(); // expand the file diff
+      await expect(page.locator(".gitfile-diff .vh-diff-line")).not.toHaveCount(0);
+    };
+    const diffStyles = () =>
+      page.locator(".gitfile-diff").evaluate((el) => {
+        const pick = (cls: string) => {
+          const line = el.querySelector(`.vh-diff-line.vh-diff-${cls}`) as HTMLElement | null;
+          if (!line) return null;
+          const cs = getComputedStyle(line);
+          return {
+            borderLeftStyle: cs.borderLeftStyle,
+            borderLeftWidth: cs.borderLeftWidth,
+            background: cs.backgroundColor,
+            color: cs.color,
+          };
+        };
+        return { add: pick("add"), del: pick("del"), hunk: pick("hunk") };
+      });
+
+    // ---- ON (profile effective theme = monochrome theme-eink). ----
+    await bootEink(page);
+    await openChanges();
+    await expect
+      .poll(() => page.evaluate(() => Array.from(document.documentElement.classList).includes("theme-eink")))
+      .toBe(true);
+    const on = await diffStyles();
+    expect(on.add, "added lines must render").not.toBeNull();
+    expect(on.del, "removed lines must render").not.toBeNull();
+    expect(on.hunk, "hunk headers must render").not.toBeNull();
+    // Added: white row + SOLID black bar.
+    expect(on.add!.background).toBe("rgb(255, 255, 255)");
+    expect(on.add!.borderLeftStyle).toBe("solid");
+    // Removed: grey row + DASHED black bar — two independent non-hue
+    // distinctions from added.
+    expect(on.del!.background).toBe("rgb(214, 214, 214)");
+    expect(on.del!.borderLeftStyle).toBe("dashed");
+    // Hunk/changed: inverted black band with white text — maximum luminance
+    // separation from both row kinds.
+    expect(on.hunk!.background).toBe("rgb(0, 0, 0)");
+    expect(on.hunk!.color).toBe("rgb(255, 255, 255)");
+    // Pairwise distinguishability, hue-free: every pair differs in border
+    // style and/or background luminance.
+    expect(on.add!.borderLeftStyle).not.toBe(on.del!.borderLeftStyle);
+    expect(on.add!.background).not.toBe(on.del!.background);
+    expect(on.add!.background).not.toBe(on.hunk!.background);
+    expect(on.del!.background).not.toBe(on.hunk!.background);
+
+    // ---- OFF (default dark theme): the reinforcements are absent and the
+    // hue baseline renders unchanged. A second page in the same context
+    // shares localStorage — it strips the profile key BEFORE app boot (the
+    // ON page keeps its in-memory ON state; storage events don't re-hydrate
+    // an already-booted page's persistedSignal).
+    const p2 = await page.context().newPage();
+    await p2.addInitScript(() => {
+      localStorage.removeItem("vh.prefs.einkProfile.v1");
+    });
+    await openChangesOn(p2);
+    const off = await diffStylesOn(p2);
+    expect(off.add).not.toBeNull();
+    expect(off.del).not.toBeNull();
+    expect(off.hunk).not.toBeNull();
+    for (const l of [off.add!, off.del!, off.hunk!]) {
+      expect(l.borderLeftStyle).toBe("none"); // the ON bars never fire OFF
+    }
+    // The hue-tinted baseline backgrounds remain pairwise distinct (the
+    // pre-profile rendering this slice must not disturb).
+    expect(off.add!.background).not.toBe(off.del!.background);
+    expect(off.add!.background).not.toBe(off.hunk!.background);
+    expect(off.del!.background).not.toBe(off.hunk!.background);
+    await p2.close();
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+
+  // p2 helpers (a second page in the same context boots WITHOUT the profile
+  // key — the OFF leg; declared after use for locality, hoisted functions).
+  async function openChangesOn(p: import("@playwright/test").Page) {
+    await p.goto(`/?dir=${encodeURIComponent(repo)}`);
+    await p.getByRole("button", { name: "Changes" }).click();
+    await expect(p.locator(".git-commit-btn")).toBeVisible({ timeout: 8_000 });
+    await p.locator(".gitfile-head").first().click();
+    await expect(p.locator(".gitfile-diff .vh-diff-line")).not.toHaveCount(0);
+  }
+  function diffStylesOn(p: import("@playwright/test").Page) {
+    return p.locator(".gitfile-diff").evaluate((el) => {
+      const pick = (cls: string) => {
+        const line = el.querySelector(`.vh-diff-line.vh-diff-${cls}`) as HTMLElement | null;
+        if (!line) return null;
+        const cs = getComputedStyle(line);
+        return { borderLeftStyle: cs.borderLeftStyle, background: cs.backgroundColor, color: cs.color };
+      };
+      return { add: pick("add"), del: pick("del"), hunk: pick("hunk") };
+    });
+  }
+});
+
+// (14) Target reachability (Slice 4 acceptance): every ON-only PAGING
+//     control the program added — the S1 chat paging toolbar, the S3 surface
+//     adapters (settings body, nested reasoning), and the S2 terminal
+//     history toolbar — meets the ~44 CSS px target (the brief's DESIGN
+//     choice) in RENDERED bounding boxes and sits inside the viewport
+//     (reachable, not clipped).
+//     Deliberate exception: the connection toast's inline dismiss action is
+//     NOT a paging control and is intentionally compact (an in-pill glyph
+//     button, ~21px) — it is behaviorally covered by the unit dismiss tests
+//     and the preferences e2e dismiss leg; only the paging/navigation
+//     controls carry the 44px target contract here.
+test("e-ink ON: chat paging, surface adapters, and terminal history controls meet ~44px targets in-viewport", async ({ page }) => {
+  test.setTimeout(90_000);
+  await bootEink(page);
+
+  // Bounding-box contract: ≥44px (½px float slack) on BOTH axes, fully
+  // inside the viewport (null box = not rendered → fails loudly).
+  const assertTarget = async (loc: import("@playwright/test").Locator, name: string) => {
+    const box = await loc.boundingBox();
+    expect(box, `${name} must render`).not.toBeNull();
+    expect(box!.width, `${name} width ~44px target`).toBeGreaterThanOrEqual(43.5);
+    expect(box!.height, `${name} height ~44px target`).toBeGreaterThanOrEqual(43.5);
+    const vp = page.viewportSize()!;
+    expect(box!.x, `${name} inside viewport (left)`).toBeGreaterThanOrEqual(-0.5);
+    expect(box!.y, `${name} inside viewport (top)`).toBeGreaterThanOrEqual(-0.5);
+    expect(box!.x + box!.width, `${name} inside viewport (right)`).toBeLessThanOrEqual(vp.width + 0.5);
+    expect(box!.y + box!.height, `${name} inside viewport (bottom)`).toBeLessThanOrEqual(vp.height + 0.5);
+  };
+
+  // ---- Chat paging toolbar (S1) + the reasoning surface adapter (S3). ----
+  await page.setViewportSize({ width: 400, height: 600 });
+  await openDemo(page);
+  await expect(page.locator('[data-eink="paging"]')).toBeVisible();
+  for (const sel of ['[data-eink="prev-page"]', '[data-eink="next-page"]', '[data-eink="latest"]']) {
+    await assertTarget(page.locator(sel), `chat ${sel}`);
+  }
+  // The demo's last turn carries a long settled reasoning (test 5's p10);
+  // expand it and bring its bar on screen — its adapter buttons are targets.
+  const head = page.locator("button.tool-head", { hasText: "Thinking" }).last();
+  await head.click();
+  await expect(page.locator(".reasoning-body").last()).toBeVisible();
+  const reasoningBar = page.locator('[data-eink-surface="reasoning"]');
+  await expect(reasoningBar).toBeVisible({ timeout: 5_000 });
+  await reasoningBar.evaluate((el: HTMLElement) => el.scrollIntoView({ block: "end" }));
+  await page.waitForTimeout(250);
+  await assertTarget(reasoningBar.locator('[data-eink="surface-prev"]'), "reasoning surface-prev");
+  await assertTarget(reasoningBar.locator('[data-eink="surface-next"]'), "reasoning surface-next");
+
+  // ---- Settings body adapter (S3) at the dialog foot. ----
+  await page.getByRole("button", { name: "Settings" }).click();
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Appearance" }).click();
+  const settingsBar = page.locator('[data-eink-surface="settings"]');
+  await expect(settingsBar).toBeVisible({ timeout: 5_000 });
+  await assertTarget(settingsBar.locator('[data-eink="surface-prev"]'), "settings surface-prev");
+  await assertTarget(settingsBar.locator('[data-eink="surface-next"]'), "settings surface-next");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+
+  // ---- Terminal history toolbar (S2), booted like terminal.spec's
+  // openTerminal (the repo checkout dir — its PTY is served by the real
+  // daemon; nothing is typed into it). ----
+  const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+  await page.goto(`/?dir=${encodeURIComponent(repoRoot)}`);
+  await page.getByRole("button", { name: "Terminal", exact: true }).click();
+  await page.waitForSelector('[data-eink="term-paging"]', { timeout: 15_000 });
+  for (const sel of ['[data-eink="term-prev"]', '[data-eink="term-next"]', '[data-eink="term-latest"]']) {
+    await assertTarget(page.locator(sel), `terminal ${sel}`);
+  }
 });
 
 // Label state is bracketed: this spec seeds tags/groups via the real API, and

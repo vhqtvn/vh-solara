@@ -6,7 +6,7 @@ import "./_matchMedia";
 import { cleanup, fireEvent, render } from "@solidjs/testing-library";
 import { createSignal } from "solid-js";
 import { createStore } from "solid-js/store";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import PartView from "../../src/components/Part";
 import { einkProfile, setEinkProfile, setStreamLive, streamLive } from "../../src/prefs";
 import type { Part } from "../../src/types";
@@ -343,5 +343,119 @@ describe("e-ink profile — settled-part streaming presentation", () => {
     setEinkProfile(false);
     expect(container.querySelector(".md-stream")).not.toBeNull();
     expect(container.querySelector('[data-eink="working"]')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E-ink display profile (UX Slice 4 — quiet UI) — reasoning duration ticker
+// ---------------------------------------------------------------------------
+// The live "thinking" duration label ticks every second while a reasoning part
+// streams. Under the profile the ticker is QUIET: a static elapsed time (one
+// meaningful refresh when the ticker goes quiet), no per-second repaint.
+// Quiet ≠ silent: the settle transition (time.end stamped) still updates the
+// label to the final total, and the profile signal re-runs the effect live
+// (ticking resumes immediately under OFF). OFF keeps the per-second tick
+// byte-identically. Driven with fake timers (Date faked — the label derives
+// from Date.now()).
+describe("e-ink profile — reasoning duration ticker quieting", () => {
+  const T0 = 1_700_000_000_000;
+
+  function durText(container: HTMLElement): string {
+    return (container.querySelector(".tool-dur")?.textContent ?? "").trim();
+  }
+
+  // Mount one LIVE (unsettled, no end) reasoning part whose time store the
+  // test stamps reactively — the way the chat store drives a real stream.
+  function mountLiveReasoning(id: string) {
+    const [part, setPart] = createStore<Part>({
+      id,
+      sessionID: "s1",
+      messageID: "m1",
+      type: "reasoning",
+      text: "thinking hard",
+      time: { start: T0 - 5_000 },
+    } as Part);
+    const [settled, setSettled] = createSignal(false);
+    const res = render(() => <PartView part={part} settled={settled()} tail={true} />);
+    return { ...res, setPart, setSettled };
+  }
+
+  afterEach(() => {
+    cleanup();
+    setEinkProfile(false);
+    vi.useRealTimers();
+  });
+
+  beforeEach(() => {
+    // jsdom lacks ResizeObserver (the reasoning body's stick-to-bottom
+    // observer, and EinkSurfacePaging under the profile). No-op stub — the
+    // same pattern as ChatViewPartlessMessage.test.tsx.
+    (globalThis as any).ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+  });
+
+  it("OFF: the duration ticks per second (baseline unchanged)", async () => {
+    vi.useFakeTimers({ now: T0, toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    setEinkProfile(false);
+    const { container } = mountLiveReasoning("ticker-off");
+    expect(durText(container)).toBe("5s");
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(durText(container)).toBe("7s");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(durText(container)).toBe("8s");
+  });
+
+  it("ON: the duration is static — no per-second churn — with one refresh when the ticker goes quiet", async () => {
+    vi.useFakeTimers({ now: T0, toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    setEinkProfile(true);
+    const { container } = mountLiveReasoning("ticker-on");
+    expect(durText(container)).toBe("5s");
+
+    // Half a minute of streaming: the label never repaints under the profile.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(durText(container)).toBe("5s");
+  });
+
+  it("ON: the settle transition still updates the label to the final total (quiet ≠ silent)", async () => {
+    vi.useFakeTimers({ now: T0, toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    setEinkProfile(true);
+    const { container, setPart } = mountLiveReasoning("ticker-settle");
+    expect(durText(container)).toBe("5s");
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(durText(container)).toBe("5s"); // still static
+
+    // The part ends 35s in (end - start = 35s): the label shows the FINAL
+    // total immediately — the meaningful transition is never suppressed.
+    setPart("time", { start: T0 - 5_000, end: T0 + 30_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(durText(container)).toBe("35s");
+    // …and it stays put afterwards (nothing left to tick).
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(durText(container)).toBe("35s");
+  });
+
+  it("toggles live: OFF ticks now; ON freezes; OFF again resumes ticking", async () => {
+    vi.useFakeTimers({ now: T0, toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    setEinkProfile(false);
+    const { container } = mountLiveReasoning("ticker-flip");
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(durText(container)).toBe("8s");
+
+    // OFF → ON mid-stream: one catch-up refresh, then stillness.
+    setEinkProfile(true);
+    expect(durText(container)).toBe("8s");
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(durText(container)).toBe("8s");
+
+    // ON → OFF: the per-second tick resumes at once (start was T0-5s, so the
+    // wall clock at T0+10s reads a 15s elapsed — ticking, not frozen).
+    setEinkProfile(false);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(durText(container)).toBe("15s");
   });
 });
