@@ -5,6 +5,16 @@
 
 .ambiguousChip {
   display: inline-flex;
+  /* Wrapping is LOAD-BEARING: the verbatim .warning / .stale notes are
+     full-width flex lines (flex-basis:100%, the .queue-detail-note idiom in
+     70-composer-diff-git.css). Without wrap they would be same-row flex items
+     whose overflow-wrap:anywhere gives them a ONE-CHARACTER min-content width
+     — at a 400px viewport the row overflow shrank the note to ~1ch and its
+     ~170-char text wrapped one char per line, making the chip unboundedly
+     tall, collapsing .chat-main (flex:1, min-height:0) over the e-ink paging
+     toolbar and making the transcript unreachable (scroll-follow firefox-eink
+     failures, 2026-10-16). */
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   max-width: 100%;
@@ -33,9 +43,13 @@
 }
 
 /* The BINDING verbatim warning (debate-4 B1) — always visible while the
-   three actions are shown; readable, never tooltip-only. */
+   three actions are shown; readable, never tooltip-only. Own full-width line
+   inside the wrapping chip (.queue-detail-note idiom): it wraps at the
+   CONTAINER width, never at a 1ch flex min-content (see .ambiguousChip). */
 .warning {
   display: inline;
+  flex-basis: 100%;
+  width: 100%;
   color: var(--fg-dim);
   max-width: 480px;
   white-space: normal;
@@ -71,11 +85,14 @@
 }
 
 /* The inline stale-context confirmation note (paired with Send anyway /
-   Cancel while active). */
+Cancel while active). Own full-width line — same 1ch-min-content hazard as
+.warning, same .queue-detail-note idiom fix. */
 .stale {
   color: var(--fg);
   font-style: italic;
   white-space: normal;
   overflow-wrap: anywhere;
+  flex-basis: 100%;
+  width: 100%;
   max-width: 360px;
 }
