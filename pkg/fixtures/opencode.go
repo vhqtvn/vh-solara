@@ -12,6 +12,8 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -2917,6 +2919,89 @@ func (f *FakeOpenCode) streamAssistant(sessionID, asstID, apID string, chunks []
 	f.emit("session.idle", map[string]any{"sessionID": sessionID})
 }
 
+// fixtureSafeSessionID mirrors the daemon-side safeID character class
+// (pkg/web) for session ids used as filesystem path segments by the reset's
+// queue-state sweep. Collapsing the same traversal shapes ("", ".", "..")
+// keeps a hostile ?session= value from escaping the sessions/ dir.
+var fixtureSafeSessionID = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
+
+// resetSessionQueueState returns the reset scope's daemon-side
+// queue/delivery-custody state to clean (the serial-e2e de-flaker contract):
+//
+//  1. FILE: best-effort removal of <demoDir>/.vh-solara/sessions/<sid>/queue.json
+//     (+ empty-only rmdir of the session dir — attachments survive, mirroring
+//     the daemon's deleteStore contract). This half is deterministic and
+//     covers states the live daemon has not materialized (fresh boots, the
+//     next fixtureserver process) — the e2e global-setup's cross-run wipe for
+//     the WITHIN-run case.
+//
+//  2. LIVE DAEMON: emit session.deleted for the scope. Every listening
+//     aggregator's store drops the session's cached state, and the daemon's
+//     queue-GC (FIX-QUEUE-GC-2) reacts to the store's session.delete by
+//     running CleanupSession on the scope's project root — tombstoning the
+//     loaded queue store (in-memory items included) and removing queue.json.
+//     This is the only fixture-reachable lever that clears the daemon's
+//     IN-MEMORY registry copy; file deletion alone cannot (load() is
+//     lazy-once, so a loaded store would keep serving stale items and even
+//     re-save them).
+//
+//     Delivery-custody state rides in the same file: queue.json carries the
+//     per-item Attempts journal (dispatch attempts + transport-class
+//     receipts), so removing it resets the journal along with the items — no
+//     surviving queue items, no armed ambiguity, no reconcile budget residue.
+//     The project-level custody fence artifacts (queue.custody.lock/gen) are
+//     deliberately NOT touched: they are project-shared (not per-session)
+//     and carry no ambiguity-arming state.
+//
+//  3. RECREATE: re-emit session.created with the session row so the session
+//     list/tree survive for the next consumer — the store's explicitly
+//     supported deleted-then-recreated shape (reducers.go: "live
+//     session.deleted then session.created"). The re-created id starts fresh
+//     (messages re-hydrate from the restored baseline on next open), which is
+//     exactly what a reset means.
+//
+// Reset consumers run between serial e2e tests (no SPA connected) or after a
+// test's assertions (cleanup resets), so the delete→recreate blip is not
+// observed mid-assertion anywhere in the lane.
+func (f *FakeOpenCode) resetSessionQueueState(session string, recreateInfo map[string]any) {
+	// In-flight custody sweep FIRST: a prompt-hold-parked turn for this scope
+	// is cancelled and JOINED so it can never deliver (persist + emit) into a
+	// later test's session state.
+	f.resetPromptHoldIfScoped(session)
+
+	// File half. demoDir is the project root the daemon resolves for the
+	// fixture's sessions (?dir=), so this is the same path the daemon's
+	// queuePath would compute for the scope.
+	if demoDir != "" {
+		sid := fixtureSafeSessionID.ReplaceAllString(session, "")
+		if sid == "" || sid == "." || sid == ".." {
+			sid = "_"
+		}
+		qPath := filepath.Join(demoDir, ".vh-solara", "sessions", sid, "queue.json")
+		_ = os.Remove(qPath)
+		_ = os.Remove(filepath.Dir(qPath)) // empty-only (os.Remove fails if attachments/ survive)
+	}
+
+	// Live-daemon half + recreate.
+	f.emit("session.deleted", map[string]any{"info": map[string]any{"id": session}})
+	if recreateInfo != nil {
+		f.emit("session.created", map[string]any{"info": recreateInfo})
+	}
+}
+
+// resetPromptHoldIfScoped disarms the one-shot prompt-hold latch when it
+// targets the reset scope (armed OR parked), via the cancel-and-JOIN
+// ResetPromptHold — the parked turn is dropped, never silently delivered.
+// A latch targeting a DIFFERENT session is left alone (scope discipline).
+func (f *FakeOpenCode) resetPromptHoldIfScoped(session string) {
+	f.promptHoldMu.Lock()
+	scoped := (f.promptHoldArmed || f.promptHoldHeld) && f.promptHoldSession == session
+	f.promptHoldMu.Unlock()
+	if scoped {
+		f.ResetPromptHold()
+	}
+}
+
 // handleFixtureReset restores a session's message list to its seeded baseline,
 // clears any mirrored busy status, and emits session.idle. It lets a serial
 // Playwright suite absorb leaked [[stall]] busy goroutines and transcript
@@ -2992,6 +3077,16 @@ func (f *FakeOpenCode) handleFixtureReset(w http.ResponseWriter, r *http.Request
 			clearedP = append(clearedP, pid)
 		}
 	}
+	// Snapshot the session row (archived posture preserved) for the
+	// queue-custody reset's session.created re-emit below — read under f.mu
+	// because emit() takes the lock itself.
+	var recreateInfo map[string]any
+	for _, s := range f.sessions {
+		if id, _ := s["id"].(string); id == session {
+			recreateInfo = f.withArchivedTime(s)
+			break
+		}
+	}
 	f.mu.Unlock()
 	// Emit the resolve events so the AGGREGATOR store (pkg/state/store.go — the
 	// SPA's snapshot source) drops the leaked blocker too. Clearing only the
@@ -3036,6 +3131,12 @@ func (f *FakeOpenCode) handleFixtureReset(w http.ResponseWriter, r *http.Request
 	// Notify any connected client the session is idle; a fresh page.goto re-reads
 	// the cleared status regardless, so this is belt-and-suspenders.
 	f.emit("session.idle", map[string]any{"sessionID": session})
+	// Queue/delivery-custody clean (the serial-e2e de-flaker contract — see
+	// resetSessionQueueState): file sweep + session.deleted → daemon queue-GC
+	// (registry tombstone + queue.json removal, journal included) +
+	// session.created recreate. Runs LAST so the store applies the structural
+	// delete after this reset's per-message clears above.
+	f.resetSessionQueueState(session, recreateInfo)
 	writeJSON(w, map[string]any{"reset": session})
 }
 
