@@ -168,6 +168,64 @@ func (a *Aggregator) seedColdLastAgents(ctx context.Context, sessions []json.Raw
 	}
 }
 
+// startCreatedSessionReseed launches the single-id re-seed for a session that
+// was just (re-)created by a live session.created event. It exists because
+// startColdSeed runs ONLY from hydrate: a daemon whose event stream stays
+// connected (the normal production shape, and the serial web-e2e lane shape)
+// never rehydrates, so an entry deleted+recreated mid-stream — e.g. by the
+// fixture reset's session.deleted/session.created dance, or in production any
+// remove/recreate of the same id — used to keep lastAgent empty forever, even
+// though deleteSessionLocked invalidates the seeded memo precisely so a fresh
+// tail fetch can re-seed it. This completes that documented intent.
+//
+// Guards (mirroring seedColdLastAgents' semantics for one id):
+//   - unknown or already-seeded sessions do nothing (ColdSeedNeeded), so this
+//     is idempotent and safe for genuinely-new sessions (their tail is empty
+//     → no agent → no SetLastAgents — identical to today's post-hydrate state);
+//   - LOADED sessions are skipped — the message-recompute path owns their
+//     lastAgent authoritatively;
+//   - a failed fetch is NOT marked seeded, so the next hydrate retries
+//     (same grace as seedColdLastAgents).
+//
+// Lifetime binding mirrors startColdSeed: runCtx read under seedMu; the
+// fallback context.Background() only fires when Run has not run yet, which
+// cannot happen for the lifecycle.go trigger (it fires from Run's own
+// subscription callback). No seedDone arbitration: that at-most-one gate
+// exists to bound the hydrate fan-out, not single cheap goroutines.
+func (a *Aggregator) startCreatedSessionReseed(id string) {
+	a.seedMu.Lock()
+	ctx := a.runCtx
+	a.seedMu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go a.reseedCreatedSessionAgent(ctx, id)
+}
+
+// reseedCreatedSessionAgent is the body of the single-id re-seed. See
+// startCreatedSessionReseed for the guard rationale.
+func (a *Aggregator) reseedCreatedSessionAgent(ctx context.Context, id string) {
+	for _, loaded := range a.store.LoadedSessions() {
+		if loaded == id {
+			return // messages already reconciled authoritatively
+		}
+	}
+	if len(a.store.ColdSeedNeeded([]string{id})) == 0 {
+		return // unknown session, or memo already seeded
+	}
+	items, _, err := a.client.MessagesTail(ctx, id, coldTailLimit)
+	if err != nil {
+		log.Printf("[aggregator] lastAgent re-seed tail fetch failed for %s: %v", id, err)
+		return // unmarked: the next hydrate retries, mirroring cold-seed grace
+	}
+	// No-op if the session was deleted again in the fetch race window — the
+	// memo stays correct across remove/recreate, same as seedColdLastAgents.
+	a.store.MarkColdSeeded(id)
+	if agent := lastAssistantAgent(items); agent != "" {
+		a.store.SetLastAgents(map[string]string{id: agent})
+	}
+}
+
 // lastAssistantAgent scans a list of raw {info,parts} messages from the END
 // backward and returns the info.agent of the most recent assistant message, or "".
 // The opencode message page is newest-window, oldest-first within the window, so

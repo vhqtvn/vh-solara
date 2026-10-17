@@ -2,6 +2,7 @@ package aggregator
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"time"
 
@@ -288,6 +289,24 @@ func (a *Aggregator) Run(ctx context.Context) {
 					vhlog.Debug("oc event", "type", ev.Type, "bytes", len(ev.Properties))
 				}
 				a.store.Apply(ev)
+				// A live session.created may be re-creating an entry that a
+				// session.deleted just wiped (mid-stream remove/recreate — the
+				// fixture reset's deleted→created dance is the e2e-lane shape).
+				// The delete cleared the entry's cold-seed memo + lastAgent, and
+				// nothing else re-seeds a connected daemon (startColdSeed runs
+				// only from hydrate), so kick the single-id background re-seed.
+				// No-op for genuinely-new sessions (empty tail → no agent) and
+				// for loaded sessions (recompute owns them). See cold-seed.go.
+				if ev.Type == "session.created" {
+					var p struct {
+						Info struct {
+							ID string `json:"id"`
+						} `json:"info"`
+					}
+					if json.Unmarshal(ev.Properties, &p) == nil && p.Info.ID != "" {
+						a.startCreatedSessionReseed(p.Info.ID)
+					}
+				}
 				return nil
 			})
 		}()
