@@ -335,6 +335,31 @@ describe("fetchQueue — authoritative refresh (open/focus/reconnect)", () => {
     await fetchQueue(sid);
     expect(queueFor(sid)).toHaveLength(1); // stale retained
   });
+
+  // 2026-10-17 daemon-dispatch convergence: a non-OK response is a NO-ANSWER,
+  // not an answer. Returning the stale cache as a truthy list conflated the
+  // two: the outbox reconcile's `list !== null` gate then treated a failed
+  // LIST as an authoritative (possibly empty) list and could mis-prune
+  // admitted records on a 500. null must mean "no authoritative list".
+  it("resolves null (not the stale cache) on a non-ok response — no-answer ≠ answer", async () => {
+    const sid = "s-fetch-3";
+    touched.push(sid);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(200, { items: [item("a")] }))));
+    await fetchQueue(sid);
+    expect(queueFor(sid)).toHaveLength(1);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(500, {}))));
+    const got = await fetchQueue(sid);
+    expect(got).toBeNull(); // no authoritative list arrived
+    expect(queueFor(sid)).toHaveLength(1); // cache still stale-retained
+  });
+
+  it("resolves null on a non-ok response even when the cache is empty (never a fabricated empty list)", async () => {
+    const sid = "s-fetch-4";
+    touched.push(sid);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(503, {}))));
+    const got = await fetchQueue(sid);
+    expect(got).toBeNull(); // NOT [] — an authoritative-empty shape would mis-prune the outbox
+  });
 });
 
 describe("claimQueued — single-winner dispatch boundary", () => {

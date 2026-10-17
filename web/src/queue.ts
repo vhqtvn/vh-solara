@@ -244,6 +244,14 @@ function isTerminalStateFE(s: QueueItemState): boolean {
   return s === "sent" || s === "failed" || s === "unknown";
 }
 
+// State lattice for monotonic cache merges: pending(0) < dispatching(1) <
+// terminal(2). A cached state at least as advanced as an incoming echo must
+// never be regressed by the echo (admission receipts replay the ORIGINAL
+// admission-time snapshot forever — see enqueue's upsert).
+function stateRank(s: QueueItemState): number {
+  return isTerminalStateFE(s) ? 2 : s === "dispatching" ? 1 : 0;
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -263,9 +271,13 @@ const FETCH_QUEUE_TIMEOUT_MS = 10000;
 
 // fetchQueue replaces the cache for a session with the backend's authoritative
 // list. Idempotent; safe to call frequently. Resolves null when the list
-// could not be fetched in time (timeout / network) — the cache is left
+// could not be fetched (timeout / network / non-OK) — the cache is left
 // untouched (stale-but-honest beats a fabricated refresh) and callers treat
-// null as no-answer, never as an empty list.
+// null as no-answer, never as an empty list. A non-OK response used to
+// resolve the STALE cache as a truthy list, conflating no-answer with answer:
+// the outbox reconcile's `list !== null` gate then read a failed LIST as an
+// authoritative (possibly empty) list and could mis-prune admitted records
+// on a 500 (2026-10-17 daemon-dispatch convergence fix).
 //
 // Reconcile: if the backend still reports a NON-terminal state (e.g.
 // dispatching) for an item whose dispatch already reached a known terminal
@@ -277,7 +289,7 @@ export async function fetchQueue(sessionId: string): Promise<QueuedMessage[] | n
   const timer = setTimeout(() => ctrl.abort(), FETCH_QUEUE_TIMEOUT_MS);
   try {
     const res = await fetch(queueUrl(sessionId), { signal: ctrl.signal });
-    if (!res.ok) return queues[sessionId] || [];
+    if (!res.ok) return null;
     // Body read INSIDE the armed timeout window (the D-F2 hang class, same as
     // enqueue/claim): headers arriving with a stalled body used to leave the
     // read unarmed past any timer — inside the window the aborting signal
@@ -434,15 +446,48 @@ export async function enqueue(sessionId: string, input: QueueInput): Promise<Que
     if (sendAttempt) {
       attemptSupport = "replayed" in j ? "supported" : "legacy";
     }
+    // Upsert by id: a replayed receipt (or a raced duplicate response) must
+    // never yield two cache entries for one server item — and never REGRESS a
+    // state the cache already knows to be more advanced. The server answers
+    // an idempotent-admission replay with the ORIGINAL admission-time
+    // snapshot VERBATIM (forever — the receipt is immutable, independent of
+    // the live item's later claim/resolve), so a re-admission ≥60s later
+    // (another host-shell pane replaying the shared outbox) used to
+    // resurrect a phantom `pending` chip over known-sent truth. Merge
+    // monotonically on the state lattice pending < dispatching < terminal;
+    // existing fields win, identity fields missing on the cached copy are
+    // filled from the fresh echo.
+    const cur = (queues[sessionId] || []).find((m) => m.id === item.id);
+    const merged: QueuedMessage = cur
+      ? {
+          ...item,
+          ...cur,
+          opencodeMsgID: cur.opencodeMsgID ?? item.opencodeMsgID,
+          attemptId: cur.attemptId ?? item.attemptId,
+          intentId: cur.intentId ?? item.intentId,
+          originClientId: cur.originClientId ?? item.originClientId,
+          state: stateRank(cur.state) >= stateRank(item.state) ? cur.state : item.state,
+        }
+      : item;
     setQueues(produce((q) => {
       const arr = (q[sessionId] ||= []);
-      // Upsert by id: a replayed receipt (or a raced duplicate response) must
-      // never yield two cache entries for one server item.
-      const i = arr.findIndex((m) => m.id === item.id);
-      if (i >= 0) arr[i] = item;
-      else arr.push(item);
+      const i = arr.findIndex((m) => m.id === merged.id);
+      if (i >= 0) arr[i] = merged;
+      else arr.push(merged);
     }));
-    return item;
+    // Daemon-dispatch convergence, ordering (ii): the delivery event can
+    // arrive over the tunnel BEFORE this (stale) admission response — the
+    // upsert above then introduces a non-terminal chip the delivery already
+    // falsified. A recent unmatched-delivery marker plus a non-terminal
+    // upsert means exactly that: converge to backend truth now rather than
+    // waiting for the ~5s poll.
+    if (!isTerminalStateFE(merged.state)) {
+      const last = lastUnmatchedDelivery.get(sessionId);
+      if (last !== undefined && Date.now() - last < RECENT_UNMATCHED_DELIVERY_MS) {
+        scheduleDeliveryConvergenceFetch(sessionId);
+      }
+    }
+    return merged;
   } finally {
     clearTimeout(timer);
   }
@@ -813,8 +858,11 @@ async function resolveWithRetry(
 
 // clearQueueCache drops cache entries for the given sessions (used on archive:
 // the backend deletes the queue file server-side, so this is just a local
-// cache prune — NOT a write to queue authority).
+// cache prune — NOT a write to queue authority). Also cancels any pending
+// daemon-dispatch convergence fetch: a dead session must not re-populate its
+// cache from a fetch racing the archive.
 export function clearQueueCache(ids: string[]) {
+  for (const id of ids) cancelDeliveryConvergenceFetch(id);
   setQueues(produce((q) => {
     for (const id of ids) {
       const arr = q[id];
@@ -845,15 +893,72 @@ export function clearQueueCache(ids: string[]) {
 // path resolves sent itself right after its own 2xx, composing as an
 // identical-state no-op).
 const deliveredOverlayDetail = "Delivered: the message appeared in the transcript.";
+
+// --- daemon-dispatch convergence (2026-10-17 "QUEUED chip persists >1–2min") --
+//
+// In daemon-dispatch mode the browser never claims: the FE's ONLY copy of a
+// queued item is the enqueue (admission) response — a `pending` snapshot that
+// never carries opencodeMsgID (the backend mints it at claim time, inside the
+// daemon). The exact-match overlay below therefore matches NOTHING in daemon
+// mode, so clearance used to depend entirely on the next successful LIST
+// (~5s poll while visible / focus / reconnect). When that poll is ineffective
+// (failing fetches are silent; a hidden host pane never polls), the chip
+// persisted for minutes while backend truth was already `sent`.
+//
+// Convergence is made EVENT-DRIVEN at the delivery instant (whose SSE arrival
+// proves connectivity): an unmatched delivery records a timestamp and, while
+// the session shows non-terminal chips, schedules ONE debounced fetchQueue
+// that full-replaces the cache with backend truth. The enqueue upsert's
+// recent-delivery arm (see enqueue) covers the mirrored ordering where the
+// delivery arrives BEFORE the stale admission response. Both arms are
+// no-answers-tolerant: fetchQueue resolves null and leaves the cache honest;
+// the ~5s poll and every other pull path remain as backstops. In-memory only.
+// In legacy browser-drain mode a delivery normally exact-matches the
+// dispatching chip the drainer itself upserted; an unmatched delivery there
+// (e.g. an ordinary typed send racing a queued chip) at worst schedules one
+// poll-equivalent GET — effect-inert, never a dispatch.
+const DELIVERY_CONVERGENCE_DELAY_MS = 400;
+const RECENT_UNMATCHED_DELIVERY_MS = 2500;
+const lastUnmatchedDelivery = new Map<string, number>();
+const deliveryFetchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleDeliveryConvergenceFetch(sessionId: string): void {
+  if (deliveryFetchTimers.has(sessionId)) return; // one in-flight debounce per session
+  const t = setTimeout(() => {
+    deliveryFetchTimers.delete(sessionId);
+    void fetchQueue(sessionId);
+  }, DELIVERY_CONVERGENCE_DELAY_MS);
+  deliveryFetchTimers.set(sessionId, t);
+}
+
+function cancelDeliveryConvergenceFetch(sessionId: string): void {
+  const t = deliveryFetchTimers.get(sessionId);
+  if (t !== undefined) {
+    clearTimeout(t);
+    deliveryFetchTimers.delete(sessionId);
+  }
+  lastUnmatchedDelivery.delete(sessionId);
+}
+
 export function noteDeliveredUserMessage(sessionId: string, msgId: string): void {
   if (!sessionId || !msgId) return;
-  const arr = queues[sessionId];
-  if (!arr) return;
+  const arr = queues[sessionId] || [];
   for (const m of arr) {
     if (m.state === "dispatching" && m.opencodeMsgID === msgId) {
       applyOutcome(sessionId, m.id, "sent", deliveredOverlayDetail, Date.now());
       return; // opencodeMsgID is unique per item — at most one match
     }
+  }
+  // No exact match (daemon mode: the chip is the admission-time `pending`
+  // snapshot with no correlation id yet). Record the delivery and, while
+  // there is something on screen the delivery might falsify, converge to
+  // backend truth on a short debounce instead of waiting for the poll.
+  // (Also fires for ordinary typed messages with no queued chip — harmless:
+  // the timestamp is only read within RECENT_UNMATCHED_DELIVERY_MS of an
+  // enqueue upsert, and the fetch is gated on non-terminal chips existing.)
+  lastUnmatchedDelivery.set(sessionId, Date.now());
+  if (arr.some((m) => !isTerminalStateFE(m.state))) {
+    scheduleDeliveryConvergenceFetch(sessionId);
   }
 }
 
