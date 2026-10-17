@@ -376,7 +376,17 @@
 :root.theme-eink, :root.theme-eink-color {
   --bg: #ffffff; --bg-2: #f2f2f2; --code-bg: #f2f2f2; --code-surface: #ffffff;
   --fg: #000000; --fg-dim: #555555; --fg-strong: #000000;
-  --accent-fg: #ffffff; --danger-fg: #ffffff;
+  /* --danger-fg is deliberately NOT set here: the e-ink variants split it per
+     family below (device-feedback round 2). It used to be #ffffff for both —
+     correct only for the few SOLID --danger fills, and catastrophically wrong
+     for the (much larger) class of FLAT danger consumers that paint
+     var(--danger-fg) TEXT with no dark fill behind it (menu Archive… entries,
+     confirm titles, error hints, quota/health failure text): white text on
+     the white e-ink page = invisible. Each variant now defaults the token
+     for flat TEXT (mono: ink; colour: the saturated danger hue), and the
+     solid-fill consumers keep their light text via the explicit e-ink-scoped
+     rules in the danger-semantics block below. */
+  --accent-fg: #ffffff;
   --bg-input: #ffffff; --bg-elev: #ffffff;
   /* Borders carry elevation here (see block comment); shadows only ghost. */
   --shadow-sm: none; --shadow-md: none; --shadow-lg: none;
@@ -385,7 +395,7 @@
    apart only by darkness — there is no colour on a Carta panel. */
 :root.theme-eink {
   --border: #6e6e6e; --accent: #000000; --accent-2: #000000;
-  --danger: #000000; --warn: #3a3a3a; --ok: #5e5e5e; --sel: #000000; --info: #4c4c4c;
+  --danger: #000000; --danger-fg: #000000; --warn: #3a3a3a; --ok: #5e5e5e; --sel: #000000; --info: #4c4c4c;
   --md-h1: #000000; --md-h2: #000000; --md-h3: #000000;
   --md-link: #000000; --md-code: #000000; --md-marker: #000000;
   --md-quote: #3a3a3a; --md-quote-border: #6e6e6e;
@@ -412,15 +422,84 @@
 :root.theme-eink .vh-diff-del { background: #d6d6d6; border-left: 4px dashed #000000; }
 :root.theme-eink .vh-diff-hunk { background: #000000; color: #ffffff; }
 /* E Ink Colour (Kaleido): same crisp B&W base, with bold, saturated accents so
-   they survive the panel's colour filter and still read as colour. */
+   they survive the panel's colour filter and still read as colour. Danger
+   keeps CHROMATIC semantics here by design (this variant exists to keep
+   hues): --danger-fg follows --danger so flat danger TEXT renders the
+   saturated red-on-white (≥4.5:1), not the old invisible white-on-white. */
 :root.theme-eink-color {
   --border: #7a7a7a; --accent: #0b5cad; --accent-2: #b3431a;
-  --danger: #c0271b; --warn: #9a6400; --ok: #2e7d32; --sel: #0b5cad;
+  --danger: #c0271b; --danger-fg: var(--danger); --warn: #9a6400; --ok: #2e7d32; --sel: #0b5cad;
   --md-h1: #b3431a; --md-h2: #0b5cad; --md-h3: #000000;
   --md-link: #0b5cad; --md-code: #2e7d32; --md-marker: #b3431a;
   --md-quote: #555555; --md-quote-border: #7a7a7a;
   --chat-user-bg: #eaf2fb; --chat-user-border: #9cc0e8;
 }
+
+/* Monochrome danger SEMANTICS (device-feedback round 2, mirrors the S4 diff
+   treatment above): red-tinted destructive affordances lost both visibility
+   and meaning on the monochrome panel — the operator cannot see Archive /
+   Delete at all. The token flip above repairs the CLASS (every flat
+   var(--danger-fg) text consumer becomes ink/red on white); these scoped
+   rules then make the NAMED destructive affordances distinguishable from
+   neutral actions by NON-hue properties, on a strict luminance ladder
+   (neutral = 1px grey border / transparent; destructive-recoverable
+   [archive] = 2px solid ink OUTLINE on white; destructive-irreversible
+   [delete] = solid ink FILL with paper text; the menu's Archive… entry = a
+   fully inverted row, the .vh-diff-hunk idiom). theme-eink-color keeps its
+   chromatic semantics BY DESIGN (the variant's reason to exist): the same
+   shapes carry saturated --danger / --warn hues that survive the Kaleido
+   colour filter. Solid fills and borders only — no glyphs required, no
+   dithering, no filters (blanket grayscale filters destroy information).
+   All selectors are theme-scoped: OFF/other themes never match. */
+/* Solid --danger fills keep their light text (the flipped --danger-fg token
+   now serves FLAT text; these are the only filled danger consumers). */
+:root.theme-eink .send-btn.stop,
+:root.theme-eink .notif-badge { color: #ffffff; }
+:root.theme-eink-color .send-btn.stop,
+:root.theme-eink-color .notif-badge { color: #ffffff; }
+/* Session-menu destructive entry (Archive… — tap archives, hold deletes):
+   inverted solid row, maximum separation from the flat neutral items. */
+:root.theme-eink .ctxm-item.danger { background: #000000; color: #ffffff; }
+:root.theme-eink .ctxm-item.danger:hover { background: #1f1f1f; }
+:root.theme-eink-color .ctxm-item.danger { background: var(--danger); color: #ffffff; }
+:root.theme-eink-color .ctxm-item.danger:hover { background: color-mix(in srgb, var(--danger) 85%, #000000); }
+/* Delete confirm (irreversible): heavy 2px border + SOLID fill confirm
+   button. The title fixes itself via the flipped token (ink / chromatic
+   danger on the white dialog — the old white-on-white). */
+:root.theme-eink .dialog.confirm.danger { border: 2px solid #000000; }
+:root.theme-eink .dialog.confirm.danger .confirm-go {
+  background: #000000; border: 2px solid #000000; color: #ffffff;
+}
+:root.theme-eink .dialog.confirm.danger .confirm-go:hover { background: #1f1f1f; }
+:root.theme-eink-color .dialog.confirm.danger { border: 2px solid var(--danger); }
+:root.theme-eink-color .dialog.confirm.danger .confirm-go {
+  background: var(--danger); border: 2px solid var(--danger); color: #ffffff;
+}
+:root.theme-eink-color .dialog.confirm.danger .confirm-go:hover { background: color-mix(in srgb, var(--danger) 85%, #000000); }
+/* Archive confirm (recoverable caution — the `.caution` marker is added to
+   the archive dialog's markup in SessionContextMenu.tsx; no non-e-ink rule
+   matches it, so OFF rendering is unchanged): heavy OUTLINE grade, one rung
+   below Delete's solid fill, one above Cancel's 1px neutral border. */
+:root.theme-eink .dialog.confirm.caution .confirm-go {
+  background: #ffffff; border: 2px solid #000000; color: #000000;
+}
+:root.theme-eink .dialog.confirm.caution .confirm-go:hover { background: #ededed; }
+:root.theme-eink-color .dialog.confirm.caution .confirm-go {
+  background: #ffffff; border: 2px solid var(--warn); color: var(--fg);
+}
+:root.theme-eink-color .dialog.confirm.caution .confirm-go:hover { background: color-mix(in srgb, var(--warn) 10%, #ffffff); }
+/* Session-inspector archive button (SessionInspector.css classes are
+   :global, so this tokens-level scope reaches them): the same
+   outline = caution grade. */
+:root.theme-eink .insp-archive {
+  background: #ffffff; border: 2px solid #000000; color: #000000;
+}
+:root.theme-eink .insp-archive:hover { background: #ededed; }
+:root.theme-eink-color .insp-archive {
+  background: #ffffff; border: 2px solid var(--warn); color: var(--fg);
+}
+:root.theme-eink-color .insp-archive:hover { background: color-mix(in srgb, var(--warn) 10%, #ffffff); }
+
 /* E-ink panels ghost and refresh slowly, so motion looks broken and wears the
    screen. Fully DISABLE animation + transition (spinners, shimmer, the stream
    caret, expand tweens, entrance fades) — not just speed them up — so there is

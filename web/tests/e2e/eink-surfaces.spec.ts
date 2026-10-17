@@ -1507,9 +1507,13 @@ test("e-ink ON: chat paging, surface adapters, and terminal history controls mee
   await page.setViewportSize({ width: 400, height: 600 });
   await openDemo(page);
   await expect(page.locator('[data-eink="paging"]')).toBeVisible();
-  for (const sel of ['[data-eink="prev-page"]', '[data-eink="next-page"]', '[data-eink="latest"]']) {
+  // Device-feedback round 2: the toolbar is Prev/Next ONLY — its Latest
+  // button was removed as a redundant duplicate of the "↓ Latest" pill (the
+  // link interface the operator uses); the pill is covered by scroll-follow.
+  for (const sel of ['[data-eink="prev-page"]', '[data-eink="next-page"]']) {
     await assertTarget(page.locator(sel), `chat ${sel}`);
   }
+  await expect(page.locator('[data-eink="latest"]')).toHaveCount(0);
   // The demo's last turn carries a long settled reasoning (test 5's p10);
   // expand it and bring its bar on screen — its adapter buttons are targets.
   const head = page.locator("button.tool-head", { hasText: "Thinking" }).last();
@@ -1544,6 +1548,303 @@ test("e-ink ON: chat paging, surface adapters, and terminal history controls mee
   for (const sel of ['[data-eink="term-prev"]', '[data-eink="term-next"]', '[data-eink="term-latest"]']) {
     await assertTarget(page.locator(sel), `terminal ${sel}`);
   }
+});
+
+// ── device-feedback round 2 — destructive (danger) affordance visibility ────
+// Operator feedback (verbatim): "the red parts - buttons like archive or
+// delete isn't visible". Root cause: --danger-fg was #ffffff under BOTH e-ink
+// variants — correct only for solid --danger fills, invisible-on-white for
+// every FLAT danger-text consumer. The fix flips the token per variant (mono:
+// ink; colour: the saturated danger hue) and adds theme-scoped monochrome
+// SEMANTICS on a luminance ladder (neutral 1px border < recoverable-archive
+// 2px ink outline < irreversible-delete solid ink fill; the menu entry is a
+// fully inverted row). This test proves, COMPUTED on the REAL event paths
+// (real right-click menu, real tap → Archive confirm, real ≥450ms hold →
+// Delete confirm, real Usage→Session-details inspector, real streaming stop
+// button), that every named destructive affordance is (a) ≥4.5:1 text
+// contrast against its ACTUAL background and (b) distinguishable from the
+// adjacent neutral action by a NON-hue property (border weight or solid
+// fill) — under theme-eink AND theme-eink-color — and that the OFF (default
+// dark) rendering of the same consumers is untouched (no solid fills, 1px
+// borders, the pre-change flat red/pink text). Physical e-ink panel outcomes
+// remain out of scope (browser automation proves browser properties only).
+
+// WCAG 2.x contrast ratio for two css color strings. Handles both engine
+// serializations a consumer can see: rgb()/rgba() and the color(srgb r g b)
+// form Chromium computes color-mix() tints to (0–1 float channels).
+function dangerParseChannels(color: string): [number, number, number] | null {
+  let m = /rgba?\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)(?:,\s*[\d.]+)?\)/.exec(color);
+  if (m) return [Number(m[1]), Number(m[2]), Number(m[3])];
+  m = /color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*[\d.]+)?\)/.exec(color);
+  if (m) return [Number(m[1]) * 255, Number(m[2]) * 255, Number(m[3]) * 255];
+  return null;
+}
+function dangerContrast(fg: string, bg: string): number {
+  const f = dangerParseChannels(fg);
+  const b = dangerParseChannels(bg);
+  if (!f || !b) return -1;
+  const lum = (c: [number, number, number]) => {
+    const ch = c.map((v) => {
+      const s = v / 255;
+      return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2];
+  };
+  const l1 = lum(f);
+  const l2 = lum(b);
+  return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+}
+
+// One element's danger-relevant computed shape: text color, its EFFECTIVE
+// background (walks ancestors until an opaque bg — flat titles/buttons sit on
+// the dialog or sheet surface), own background, and the top border width.
+function dangerShape(loc: import("@playwright/test").Locator) {
+  return loc.evaluate((target) => {
+    const el = target as HTMLElement;
+    const cs = getComputedStyle(el);
+    let node: HTMLElement | null = el;
+    let effectiveBg = "rgba(0, 0, 0, 0)";
+    while (node) {
+      const b = getComputedStyle(node).backgroundColor;
+      const m = /rgba?\(\d+(?:\.\d+)?,\s*\d+(?:\.\d+)?,\s*\d+(?:\.\d+)?(?:,\s*([\d.]+))?\)/.exec(b);
+      if (!m || Number(m[1] ?? 1) >= 1) {
+        effectiveBg = b;
+        break;
+      }
+      node = node.parentElement;
+    }
+    return {
+      color: cs.color,
+      backgroundColor: cs.backgroundColor,
+      effectiveBg,
+      borderTopWidth: cs.borderTopWidth,
+      borderTopColor: cs.borderTopColor,
+    };
+  });
+}
+
+// Resolve a declaration through the same engine serialization a consumer
+// sees (theme-tokens.spec.ts's probe idiom).
+function dangerResolve(page: import("@playwright/test").Page, decl: string) {
+  return page.evaluate((d) => {
+    const el = document.createElement("div");
+    el.style.cssText = `${d};position:fixed;left:-9999px;top:-9999px;`;
+    document.body.appendChild(el);
+    const v = getComputedStyle(el).color;
+    el.remove();
+    return v;
+  }, decl);
+}
+
+async function dangerOpenSessionMenu(page: import("@playwright/test").Page) {
+  const title = page.locator(".main-title.has-menu");
+  await expect(title).toBeVisible({ timeout: 8000 });
+  await title.click({ button: "right" });
+  const menu = page.locator(".ctxm-menu");
+  await expect(menu).toBeVisible();
+  return menu;
+}
+
+test("e-ink danger semantics: destructive affordances visible + non-hue distinguishable under both e-ink variants; OFF untouched", async ({ page }) => {
+  test.setTimeout(120_000);
+
+  // ---------- MONOCHROME (profile ON, default saved theme → theme-eink) ----------
+  await bootEink(page);
+  await openDemo(page);
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.classList.contains("theme-eink")))
+    .toBe(true);
+
+  // The token flip itself: flat danger text now resolves to INK on the white
+  // page (was #ffffff — white-on-white, the invisibility the operator hit).
+  expect(await dangerResolve(page, "color: var(--danger-fg)")).toBe("rgb(0, 0, 0)");
+
+  // ---- Session menu, REAL right-click on the chat header title. ----
+  let menu = await dangerOpenSessionMenu(page);
+  const monoEntry = await dangerShape(menu.locator(".ctxm-item.danger"));
+  const monoNeutral = await dangerShape(menu.locator(".ctxm-item").first());
+  expect(monoEntry.backgroundColor).toBe("rgb(0, 0, 0)"); // inverted solid row
+  expect(monoEntry.color).toBe("rgb(255, 255, 255)");
+  expect(dangerContrast(monoEntry.color, monoEntry.backgroundColor)).toBeGreaterThanOrEqual(4.5);
+  // Non-color distinguishability: solid fill + light text vs the flat neutral
+  // item (transparent bg, ink text).
+  expect(monoEntry.backgroundColor).not.toBe(monoNeutral.backgroundColor);
+  expect(monoEntry.color).not.toBe(monoNeutral.color);
+
+  // ---- Archive confirm (real TAP on Archive… — the recoverable path). ----
+  await menu.getByText("Archive…").click();
+  let confirm = page.getByRole("dialog", { name: "Confirm archive" });
+  await expect(confirm).toBeVisible();
+  const monoCaution = await dangerShape(confirm.locator(".confirm-go"));
+  const monoCancel = await dangerShape(confirm.locator(".confirm-cancel"));
+  expect(monoCaution.backgroundColor).toBe("rgb(255, 255, 255)"); // outline grade
+  expect(monoCaution.color).toBe("rgb(0, 0, 0)");
+  expect(monoCaution.borderTopWidth).toBe("2px"); // heavy outline…
+  expect(monoCancel.borderTopWidth).toBe("1px"); // …vs the neutral 1px rung
+  expect(dangerContrast(monoCaution.color, monoCaution.backgroundColor)).toBeGreaterThanOrEqual(4.5);
+  await confirm.getByRole("button", { name: "Cancel" }).click();
+  await expect(confirm).toHaveCount(0);
+
+  // ---- Delete confirm (real ≥450ms HOLD on Archive… — the irreversible
+  // path; the gesture the menu's pointer/timer machinery classifies). ----
+  menu = await dangerOpenSessionMenu(page);
+  await menu.getByText("Archive…").click({ delay: 520 });
+  confirm = page.getByRole("dialog", { name: "Confirm delete" });
+  await expect(confirm).toBeVisible();
+  const monoDangerDialog = await dangerShape(confirm);
+  const monoDangerTitle = await dangerShape(confirm.locator(".dialog-title"));
+  const monoDangerGo = await dangerShape(confirm.locator(".confirm-go"));
+  expect(monoDangerDialog.borderTopWidth).toBe("2px"); // dialog-level weight cue
+  expect(monoDangerTitle.color).toBe("rgb(0, 0, 0)"); // visible (was white-on-white)
+  expect(dangerContrast(monoDangerTitle.color, monoDangerTitle.effectiveBg)).toBeGreaterThanOrEqual(4.5);
+  expect(monoDangerGo.backgroundColor).toBe("rgb(0, 0, 0)"); // SOLID fill rung
+  expect(monoDangerGo.color).toBe("rgb(255, 255, 255)");
+  expect(dangerContrast(monoDangerGo.color, monoDangerGo.backgroundColor)).toBeGreaterThanOrEqual(4.5);
+  expect(monoDangerGo.backgroundColor).not.toBe(monoCaution.backgroundColor); // ladder rungs differ
+  await page.keyboard.press("Escape");
+  await expect(confirm).toHaveCount(0);
+
+  // ---- Session inspector archive button (real Usage → Session details). ----
+  await page.getByRole("button", { name: "Usage", exact: true }).click();
+  await page.getByRole("dialog", { name: "Usage" }).getByRole("button", { name: "Session details →" }).click();
+  const insp = page.getByRole("dialog", { name: "Session inspector" });
+  await expect(insp).toBeVisible();
+  const monoInsp = await dangerShape(insp.locator(".insp-archive"));
+  expect(monoInsp.backgroundColor).toBe("rgb(255, 255, 255)");
+  expect(monoInsp.color).toBe("rgb(0, 0, 0)");
+  expect(monoInsp.borderTopWidth).toBe("2px"); // the caution outline grade
+  expect(dangerContrast(monoInsp.color, monoInsp.backgroundColor)).toBeGreaterThanOrEqual(4.5);
+  await page.keyboard.press("Escape");
+  await expect(insp).toHaveCount(0);
+
+  // ---- Global danger consumer, REAL streaming state: the composer's stop
+  // button (solid --danger fill) must keep its light text after the token
+  // flip (the explicit solid-fill keep). ----
+  await page.evaluate(async () => {
+    const res = await fetch(`/oc/session/demo/prompt_async`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
+      body: JSON.stringify({ parts: [{ type: "text", text: "eink danger stop-button probe" }] }),
+    });
+    if (!res.ok && res.status !== 204) throw new Error(`prompt_async -> ${res.status}`);
+  });
+  const stop = page.locator(".send-btn.stop");
+  await expect(stop).toBeVisible({ timeout: 8000 });
+  const monoStop = await dangerShape(stop);
+  expect(monoStop.backgroundColor).toBe("rgb(0, 0, 0)");
+  expect(monoStop.color).toBe("rgb(255, 255, 255)");
+  expect(dangerContrast(monoStop.color, monoStop.backgroundColor)).toBeGreaterThanOrEqual(4.5);
+
+  // ---- Representative GLOBAL flat-danger consumers, probe-mounted with
+  // their REAL classes in the live document (the cascade is what's under
+  // test): the chat failure result box (.msg-error — tinted bg +
+  // --danger-fg text, white-on-grey before the flip) and the update
+  // dialog's error text (.ocu-err — flat --danger text on the white page). ----
+  const probed = await page.evaluate(() => {
+    const mk = (cls: string) => {
+      const el = document.createElement("p");
+      el.className = cls;
+      el.style.cssText = "position:fixed;left:-9999px;top:-9999px;";
+      document.body.appendChild(el);
+      const cs = getComputedStyle(el);
+      const out = { color: cs.color, backgroundColor: cs.backgroundColor };
+      el.remove();
+      return out;
+    };
+    return { msgError: mk("msg-error"), ocuErr: mk("ocu-err") };
+  });
+  // .msg-error paints its own opaque tinted background — contrast against it.
+  expect(dangerContrast(probed.msgError.color, probed.msgError.backgroundColor)).toBeGreaterThanOrEqual(4.5);
+  expect(probed.msgError.color).toBe("rgb(0, 0, 0)"); // the flipped token (was #ffffff)
+  // .ocu-err is flat text on the e-ink page (--bg #ffffff by construction).
+  expect(probed.ocuErr.color).toBe("rgb(0, 0, 0)");
+  expect(dangerContrast(probed.ocuErr.color, "rgb(255, 255, 255)")).toBeGreaterThanOrEqual(4.5);
+  // Settle + reset (serial-suite hygiene: no busy goroutine / transcript leak).
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 20000 });
+  await resetSession(page, "demo");
+
+  // ---------- OFF (default dark theme): the same consumers render the
+  // pre-change baseline — no solid fills, no heavy borders (a second page in
+  // the same context strips the profile key BEFORE boot; S4's p2 idiom). ----
+  const p2 = await page.context().newPage();
+  await p2.addInitScript(() => {
+    localStorage.removeItem("vh.prefs.einkProfile.v1");
+  });
+  await p2.goto(projectUrl("/?session=demo"));
+  await expect(p2.locator(".msg").first()).toBeVisible({ timeout: 10_000 });
+  await expect
+    .poll(() => p2.evaluate((c) => document.documentElement.classList.contains(c), "theme-dark"))
+    .toBe(true);
+  menu = await dangerOpenSessionMenu(p2);
+  const offEntry = await dangerShape(menu.locator(".ctxm-item.danger"));
+  expect(offEntry.backgroundColor).toBe("rgba(0, 0, 0, 0)"); // flat, NOT the e-ink solid row
+  const offEntryRgb = dangerParseChannels(offEntry.color);
+  expect(offEntryRgb, `dark-theme danger text must parse (${offEntry.color})`).not.toBeNull();
+  expect(offEntryRgb![0]).toBeGreaterThan(200); // the dark theme's light red (#ffb4ba)
+  await menu.getByText("Archive…").click();
+  const offConfirm = p2.getByRole("dialog", { name: "Confirm archive" });
+  await expect(offConfirm).toBeVisible();
+  const offCaution = await dangerShape(offConfirm.locator(".confirm-go"));
+  expect(offCaution.borderTopWidth).toBe("1px"); // no outline grade OFF
+  expect(offCaution.backgroundColor).not.toBe("rgb(255, 255, 255)"); // warn tint, not paper
+  await offConfirm.getByRole("button", { name: "Cancel" }).click();
+  await expect(offConfirm).toHaveCount(0);
+  await p2.getByRole("button", { name: "Usage", exact: true }).click();
+  await p2.getByRole("dialog", { name: "Usage" }).getByRole("button", { name: "Session details →" }).click();
+  const offInsp = p2.getByRole("dialog", { name: "Session inspector" });
+  await expect(offInsp).toBeVisible();
+  expect((await dangerShape(offInsp.locator(".insp-archive"))).borderTopWidth).toBe("1px");
+  await p2.keyboard.press("Escape");
+  await expect(offInsp).toHaveCount(0);
+  await p2.close();
+
+  // ---------- E INK COLOR (profile ON + saved eink-color theme →
+  // theme-eink-color): chromatic semantics KEPT by design — the same shapes
+  // carry the saturated --danger / --warn hues. ----
+  const p3 = await page.context().newPage();
+  await p3.addInitScript(() => {
+    localStorage.setItem("vh.prefs.einkProfile.v1", JSON.stringify({ v: 1, data: true }));
+    localStorage.setItem("vh.theme.v1", JSON.stringify({ v: 1, data: "eink-color" }));
+  });
+  await p3.goto(projectUrl("/?session=demo"));
+  await expect(p3.locator(".msg").first()).toBeVisible({ timeout: 10_000 });
+  await expect
+    .poll(() => p3.evaluate((c) => document.documentElement.classList.contains(c), "theme-eink-color"))
+    .toBe(true);
+  // Token: flat danger text follows the saturated danger hue (not ink, not
+  // the old invisible white).
+  const colorFg = await dangerResolve(p3, "color: var(--danger-fg)");
+  expect(colorFg).toBe(await dangerResolve(p3, "color: var(--danger)"));
+  expect(colorFg).not.toBe("rgb(255, 255, 255)");
+  expect(colorFg).not.toBe("rgb(0, 0, 0)");
+  menu = await dangerOpenSessionMenu(p3);
+  const colorEntry = await dangerShape(menu.locator(".ctxm-item.danger"));
+  expect(colorEntry.backgroundColor).toBe("rgb(192, 39, 27)"); // solid --danger row
+  expect(colorEntry.color).toBe("rgb(255, 255, 255)");
+  expect(dangerContrast(colorEntry.color, colorEntry.backgroundColor)).toBeGreaterThanOrEqual(4.5);
+  await menu.getByText("Archive…").click();
+  const colorCautionConfirm = p3.getByRole("dialog", { name: "Confirm archive" });
+  await expect(colorCautionConfirm).toBeVisible();
+  const colorCaution = await dangerShape(colorCautionConfirm.locator(".confirm-go"));
+  expect(colorCaution.backgroundColor).toBe("rgb(255, 255, 255)");
+  expect(colorCaution.color).toBe("rgb(0, 0, 0)");
+  expect(colorCaution.borderTopWidth).toBe("2px"); // weight cue survives (hue-independent)
+  expect(dangerContrast(colorCaution.color, colorCaution.backgroundColor)).toBeGreaterThanOrEqual(4.5);
+  await colorCautionConfirm.getByRole("button", { name: "Cancel" }).click();
+  await expect(colorCautionConfirm).toHaveCount(0);
+  menu = await dangerOpenSessionMenu(p3);
+  await menu.getByText("Archive…").click({ delay: 520 });
+  const colorDangerConfirm = p3.getByRole("dialog", { name: "Confirm delete" });
+  await expect(colorDangerConfirm).toBeVisible();
+  const colorDangerGo = await dangerShape(colorDangerConfirm.locator(".confirm-go"));
+  const colorDangerTitle = await dangerShape(colorDangerConfirm.locator(".dialog-title"));
+  expect(colorDangerGo.backgroundColor).toBe("rgb(192, 39, 27)"); // solid chromatic fill
+  expect(colorDangerGo.color).toBe("rgb(255, 255, 255)");
+  expect(dangerContrast(colorDangerGo.color, colorDangerGo.backgroundColor)).toBeGreaterThanOrEqual(4.5);
+  expect(dangerContrast(colorDangerTitle.color, colorDangerTitle.effectiveBg)).toBeGreaterThanOrEqual(4.5);
+  await p3.keyboard.press("Escape");
+  await expect(colorDangerConfirm).toHaveCount(0);
+  await p3.close();
 });
 
 // Label state is bracketed: this spec seeds tags/groups via the real API, and

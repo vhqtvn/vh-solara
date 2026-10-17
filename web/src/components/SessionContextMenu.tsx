@@ -786,10 +786,14 @@ export default function SessionContextMenu() {
         </div>
       </Show>
 
-      {/* Archive confirmation listing all related sessions */}
+      {/* Archive confirmation listing all related sessions. The `caution`
+          marker class carries the e-ink themes' destructive-recoverable
+          treatment (tokens.css: heavy outline grade — see the monochrome
+          danger-semantics block); NO non-e-ink rule matches it, so default
+          themes render exactly as before. */}
       <Show when={archiveTarget()}>
         <div class="dialog-overlay" onClick={closeArchiveConfirm}>
-          <div class="dialog confirm" role="dialog" aria-label="Confirm archive" onClick={(e) => e.stopPropagation()}>
+          <div class="dialog confirm caution" role="dialog" aria-label="Confirm archive" onClick={(e) => e.stopPropagation()}>
             <div class="dialog-head">
               <span class="dialog-title">Archive session</span>
               <button type="button" class="icon-btn" aria-label="Close" onClick={closeArchiveConfirm}>

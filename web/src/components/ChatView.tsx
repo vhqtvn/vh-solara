@@ -2369,13 +2369,16 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           only on narrow viewports (the desktop dot navigator covers desktop)
           through the SAME navigator machinery; an effective instant jump
           establishes reading intent via createNavigator's onInstantJump seam.
+          Device-feedback round 2: the toolbar renders Prev/Next only — its
+          Latest button was removed as a redundant duplicate of the "↓ Latest"
+          pill (.jump below, untouched); the "New below" chip carries the
+          toolbar's jump-to-latest when parked (same jumpToLatest).
         */}
         <Show when={einkProfile() && !focusMode() && messages().length > 0}>
           <ChatPagingControls
             onPrevPage={() => applyPage(-1)}
             onNextPage={() => applyPage(1)}
             onLatest={jumpToLatest}
-            following={following}
             newBelowLabel={newBelowLabel}
             turnNav={
               showTurnNav()

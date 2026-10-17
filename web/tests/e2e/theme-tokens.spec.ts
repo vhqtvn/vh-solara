@@ -241,6 +241,21 @@ test("shadow + focus tokens drive dialog, toast, and tree focus across dark, lig
   expect(eink.focusRing).toBe(eink.accent);
   expect(eink.scrim).toBe(dark.scrim);
   expect(eink.scrimStrong).toBe(dark.scrimStrong);
+  // Device-feedback round 2: the flat danger-TEXT token resolves to INK
+  // under theme-eink (the flipped --danger-fg). The old #ffffff mapping was
+  // correct only for solid danger fills and rendered every flat danger
+  // consumer (menu Archive…, confirm titles, error hints) white-on-white —
+  // the operator's "archive or delete isn't visible" report.
+  expect(
+    await page.evaluate(() => {
+      const el = document.createElement("div");
+      el.style.cssText = "color: var(--danger-fg);position:fixed;left:-9999px;top:-9999px;";
+      document.body.appendChild(el);
+      const v = getComputedStyle(el).color;
+      el.remove();
+      return v;
+    }),
+  ).toBe("rgb(0, 0, 0)");
 
   // Dialog + toast compute to none via the same tokens (probe returns "none").
   expect(await dialog.evaluate((el) => getComputedStyle(el).boxShadow)).toBe(
@@ -500,6 +515,12 @@ test("e ink color theme: computed motion/shadow kill-switch AND saturated semant
   // Token wiring: focus ring and the markdown link both resolve to accent.
   expect(vars.focusRing).toBe(colors.accent);
   expect(mdLink).toBe(accent);
+  // Device-feedback round 2: --danger-fg FOLLOWS the saturated danger hue
+  // (chromatic flat danger text on the white page — not the old invisible
+  // white-on-white, and not the monochrome sibling's ink).
+  const dangerFg = await resolve("color: var(--danger-fg)");
+  expect(dangerFg).toBe(danger);
+  expect(chroma(dangerFg)).toBeGreaterThan(8);
 
   // ---- Real-surface color consumer: the ACTIVE settings nav item renders
   // in --accent (computed, through the real ThemePicker-selected theme). ----

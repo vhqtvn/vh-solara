@@ -2147,14 +2147,16 @@ test("e-ink ON: a mid-turn non-input-backed following drop re-glues at the settl
 // ---------------------------------------------------------------------------
 // Under the profile a visible paging toolbar mounts ([data-eink="paging"], a
 // RESERVED in-flow row at the TOP of .chat-main — .chat-scroll yields the
-// height, so nothing is occluded) with Prev page / Next page / Latest
-// (~44px targets), plus a static "New below" chip ([data-eink="new-below"])
-// and — on narrow viewports, where the desktop dot navigator does not render
-// — compact semantic turn navigation. An EFFECTIVE page/turn/jump action
-// adapts the existing follow machine into persistent READING intent; a
-// no-op action preserves the prior mode; Latest is the explicit resume. All
-// these tests drive REAL button clicks (the real Chromium event path), never
-// direct handler calls, and never drag.
+// height, so nothing is occluded) with Prev page / Next page (~44px targets),
+// plus the tappable "New below" chip ([data-eink="new-below"], device-feedback
+// round 2: a real button performing the pill's jumpToLatest — the toolbar's
+// own Latest button was removed as a redundant duplicate of the "↓ Latest"
+// pill) and — on narrow viewports, where the desktop dot navigator does not
+// render — compact semantic turn navigation. An EFFECTIVE page/turn/jump
+// action adapts the existing follow machine into persistent READING intent;
+// a no-op action preserves the prior mode; the pill/chip jump is the
+// explicit resume. All these tests drive REAL button clicks (the real
+// Chromium event path), never direct handler calls, and never drag.
 
 // Read .chat-scroll geometry in one round trip.
 function scrollGeom(page: import("@playwright/test").Page) {
@@ -2299,8 +2301,10 @@ test("e-ink ON: every marked passage reachable via repeated page presses (no dra
 
 // (28) Reading intent is PERSISTENT: a page-parked history reader survives a
 //      settle (not pulled to the tail), is not auto-advanced by new content,
-//      and sees the static "New below" chip appear/update on meaningful
-//      arrival (message boundary), absent when idle.
+//      and sees the "New below" chip appear/update on meaningful arrival
+//      (message boundary), absent when idle. (The chip became a tappable
+//      jump button in device-feedback round 2 — its tap behavior is test 31;
+//      this test pins the park-persistence + arrival-update semantics.)
 test("e-ink ON: page-parked reading intent persists through settle and new turns; New-below chip updates on arrival", async ({ page }) => {
   test.setTimeout(40_000);
   await openEinkDemo(page);
@@ -2313,7 +2317,7 @@ test("e-ink ON: page-parked reading intent persists through settle and new turns
   const parked = await scrollGeom(page);
   expect(parked.scrollHeight - parked.scrollTop - parked.clientHeight).toBeGreaterThan(24);
 
-  // While streaming + parked off-tail: the static "New below" chip shows.
+  // While streaming + parked off-tail: the "New below" chip shows.
   const chip = page.locator('[data-eink="new-below"]');
   await expect(chip).toBeVisible({ timeout: 5000 });
   await expect(chip).toContainText("New below");
@@ -2353,8 +2357,11 @@ test("e-ink ON: page-parked reading intent persists through settle and new turns
 
 // (29) Next-at-tail semantics: paging FORWARD to the tail stays READING (no
 //      auto follow re-engage), a no-op Next preserves the prior mode (both
-//      reading and following), and the bar's Latest resumes follow.
-test("e-ink ON: Next reaching the tail stays reading; no-op Next preserves mode; bar Latest resumes follow", async ({ page }) => {
+//      reading and following), and the "↓ Latest" pill resumes follow. (The
+//      toolbar's own Latest button was removed in device-feedback round 2 —
+//      the pill is the jump interface; the "New below" chip covers the
+//      parked-during-streaming moment, see test 31.)
+test("e-ink ON: Next reaching the tail stays reading; no-op Next preserves mode; the pill resumes follow", async ({ page }) => {
   test.setTimeout(40_000);
   await openEinkDemo(page);
   await promptDemo(page, "eink next-at-tail probe");
@@ -2381,21 +2388,22 @@ test("e-ink ON: Next reaching the tail stays reading; no-op Next preserves mode;
   expect(atTail, "never reached the tail via Next presses").toBe(true);
 
   // AT the tail but still READING: follow did NOT re-engage ("↓ Latest" pill
-  // still rendered; the bar's Latest is still enabled).
+  // still rendered). The toolbar keeps ONLY Prev/Next — its Latest button is
+  // gone (device-feedback round 2; the chip is streaming-parked-only, so at
+  // the reading tail neither toolbar jump affordance renders).
   await expect(page.locator("button.jump")).toBeVisible();
-  const barLatest = page.locator('[data-eink="latest"]');
-  await expect(barLatest).toBeEnabled();
+  await expect(page.locator('[data-eink="latest"]')).toHaveCount(0);
+  await expect(page.locator('[data-eink="new-below"]')).toHaveCount(0);
 
   // A no-op Next at the tail preserves reading mode...
   await page.locator('[data-eink="next-page"]').click();
   await expect(page.locator("button.jump")).toBeVisible();
-  await expect(page.locator('[data-eink="new-below"]')).toHaveCount(0); // nothing below at the tail
 
-  // ...and the bar's Latest RESUMES follow (the explicit escape).
-  await barLatest.click();
+  // ...and the pill RESUMES follow (the explicit escape — the same
+  // jumpToLatest the removed toolbar button used).
+  await page.locator("button.jump").click({ timeout: 5000 });
   await expectFollowingTail(page);
   await expect(page.locator("button.jump")).toHaveCount(0);
-  await expect(page.locator('[data-eink="latest"]')).toBeDisabled(); // following again
 
   // A no-op Next while FOLLOWING at the tail preserves follow (no mode flip).
   await page.locator('[data-eink="next-page"]').click();
@@ -2404,10 +2412,10 @@ test("e-ink ON: Next reaching the tail stays reading; no-op Next preserves mode;
   expect(g.scrollHeight - g.scrollTop - g.clientHeight).toBeLessThan(24);
 });
 
-// (30) Latest resumes follow SUBJECT TO the existing holds: a reader parked
-//      from a RESTORED anchor (restoredAnchorId contract) pages without being
-//      yanked by the settle, and Latest then ends the contract (anchor
-//      cleared, tail followed).
+// (30) The pill's jumpToLatest resumes follow SUBJECT TO the existing holds:
+//      a reader parked from a RESTORED anchor (restoredAnchorId contract)
+//      pages without being yanked by the settle, and the pill's Latest jump
+//      then ends the contract (anchor cleared, tail followed).
 test("e-ink ON: restored-anchor reader pages unperturbed and Latest ends the restore contract", async ({ page }) => {
   test.setTimeout(40_000);
   await page.addInitScript(() => {
@@ -2435,12 +2443,13 @@ test("e-ink ON: restored-anchor reader pages unperturbed and Latest ends the res
   const g = await scrollGeom(page);
   expect(g.scrollHeight - g.scrollTop - g.clientHeight, "reader was yanked to the tail").toBeGreaterThan(24);
 
-  // Latest: the explicit resume — follow re-engages and the restore-contract
-  // servo ends. (The jump itself bails onScrolled's own-pin guard, so the
-  // PERSISTED anchor is consumed through the machine's established path —
-  // the reader's first genuine bottom contact afterwards; staged here as a
-  // real wheel-away-and-back, mirroring the O4 escape.)
-  await page.locator('[data-eink="latest"]').click();
+  // Latest: the explicit resume — via the pill now (the toolbar's Latest
+  // button is gone; the pill is the same jumpToLatest). Follow re-engages and
+  // the restore-contract servo ends. (The jump itself bails onScrolled's
+  // own-pin guard, so the PERSISTED anchor is consumed through the machine's
+  // established path — the reader's first genuine bottom contact afterwards;
+  // staged here as a real wheel-away-and-back, mirroring the O4 escape.)
+  await page.locator("button.jump").click({ timeout: 5000 });
   await expectFollowingTail(page);
   const center = await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     const r = el.getBoundingClientRect();
@@ -2453,4 +2462,49 @@ test("e-ink ON: restored-anchor reader pages unperturbed and Latest ends the res
   await expectFollowingTail(page);
   const anchors = await page.evaluate(() => window.localStorage.getItem("vh.scroll.v2"));
   expect(anchors ?? "").not.toContain("m4");
+});
+
+// (31) Device-feedback round 2: the toolbar's redundant Latest button is GONE
+//      (Prev/Next only), and the "New below" chip — the one affordance that
+//      renders exactly while a reader is parked in history during streaming —
+//      is now a REAL BUTTON performing the same jumpToLatest + follow as the
+//      "↓ Latest" pill. All real clicks on the real event path; the pill
+//      renders INDEPENDENTLY alongside the chip while parked (both fine —
+//      exactly one toolbar affordance + the pill, no second toolbar Latest).
+test("e-ink ON: toolbar shows Prev/Next only; the New-below chip button jumps to latest and resumes follow", async ({ page }) => {
+  test.setTimeout(40_000);
+  await openEinkDemo(page);
+  await promptDemo(page, "eink chip-jump probe");
+  await expect(page.locator('[data-eink="working"]').first()).toBeVisible({ timeout: 8000 });
+
+  // Toolbar shape: Prev/Next present, NO Latest button (device-feedback
+  // round 2). The turn-nav group may or may not render (viewport-gated) —
+  // not this test's subject.
+  await expect(page.locator('[data-eink="prev-page"]')).toBeVisible();
+  await expect(page.locator('[data-eink="next-page"]')).toBeVisible();
+  await expect(page.locator('[data-eink="latest"]')).toHaveCount(0);
+
+  // Park with ONE real Prev-page press mid-turn.
+  await page.locator('[data-eink="prev-page"]').click();
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  const parked = await scrollGeom(page);
+  expect(parked.scrollHeight - parked.scrollTop - parked.clientHeight).toBeGreaterThan(24);
+
+  // The chip is now a real button with an accessible name (its label text).
+  const chip = page.locator('[data-eink="new-below"]');
+  await expect(chip).toBeVisible({ timeout: 5000 });
+  await expect(chip).toHaveText(/New below/);
+  await expect(chip).toHaveAttribute("type", "button");
+  // The pill still renders INDEPENDENTLY while parked (untouched interface).
+  await expect(page.locator("button.jump")).toBeVisible();
+
+  // REAL click on the chip: same jumpToLatest + follow semantics as the pill.
+  await chip.click();
+  await expectFollowingTail(page);
+  await expect(page.locator("button.jump")).toHaveCount(0);
+  // Following again: the chip's streaming-parked regime is over — unmounted.
+  await expect(chip).toHaveCount(0);
+
+  // Settle the turn (serial-suite hygiene: no busy goroutine leaks out).
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 15000 });
 });

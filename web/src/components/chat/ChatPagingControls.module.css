@@ -53,42 +53,44 @@
 .btn:disabled { color: var(--fg-dim); cursor: default; }
 .btn:disabled:hover { background: var(--bg-2); }
 
-/* The "go to tail" action: accent-tinted to read as the resume-follow escape
-   (the toolbar's sibling of the "↓ Latest" pill). */
-.latest {
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-  color: var(--accent);
-}
-
-/* Narrow viewports: keep the ~44px targets but drop the Latest text (the
-   accent arrow + title/aria-label carry the semantics; the row must fit
-   alongside the turn-navigation group and the chip at 400px). */
+/* Narrow viewports: keep the ~44px targets but tighten the row rhythm (the
+   row must fit alongside the turn-navigation group and the chip at 400px). */
 @media (max-width: 480px) {
   .bar { gap: 4px; padding: 4px 6px; }
-  .latestText { display: none; }
 }
 
-/* Static "New below" status chip (leftmost element of the toolbar while the
-   reader is parked in history during streaming). Solid pill, no animation;
-   updated only on meaningful arrival (message boundary / part settle), never
-   per token. Non-interactive (pointer-events: none) — its action equivalents
-   are the Next-page button and Latest. Pushed to the row's start (margin-
-   right:auto) so it never crowds the action buttons on a narrow viewport. */
+/* "New below" chip (leftmost element of the toolbar while the reader is
+   parked in history during streaming). Device-feedback round 2: this is now
+   a REAL BUTTON — the toolbar's single jump-to-latest affordance (the
+   toolbar's own Latest button was removed as a redundant duplicate of the
+   "↓ Latest" pill; the pill remains the primary control). Same
+   jumpToLatest + follow semantics; the label text ("New below · N") is the
+   accessible name, and aria-live="polite" keeps the arrival announcements
+   the old role="status" span carried. Solid pill, no animation; label
+   updated only on meaningful arrival (message boundary / part settle),
+   never per token. ~44 CSS px touch target (the row is ≥44px tall anyway —
+   the chip adds no height). Pushed to the row's start (margin-right:auto)
+   so it never crowds the action buttons on a narrow viewport. */
 .newbelow {
   margin-right: auto;
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  min-width: 44px;
+  min-height: 44px;
+  box-sizing: border-box;
   padding: 5px 11px;
   border-radius: 999px;
   border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
   background: var(--bg);
   color: var(--accent);
+  font: inherit;
   font-size: var(--text-xs, 12px);
   font-weight: 600;
   white-space: nowrap;
-  pointer-events: none;
+  cursor: pointer;
 }
+.newbelow:hover { background: var(--bg-2); }
 
 /* Narrow-screen compact semantic turn navigation (the desktop dot navigator
    does not render below the 721px breakpoint — these fill that gap, routed
