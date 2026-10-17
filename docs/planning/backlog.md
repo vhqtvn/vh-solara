@@ -55,6 +55,7 @@ Older `done` and `cancelled` history lives under [docs/planning/archive/index.md
 | P0-API-001 | todo | API | Tighten CSP `script-src` to `'self'` (drop `unsafe-inline` / `eval`) once stable. |  | From TODO at pkg/web/server.go:601. |  |
 | P0-API-002 | todo | API | Map opencode session alias / share slug into `shapeSessions` once the pinned opencode version exposes it in session JSON. |  | From TODO at pkg/web/sessions.go:283. |  |
 | P1-API-001 | todo | API | Re-add code-fence info-string attribute support (hl_lines / linenos / linenostart / nohl / hl_style) to the custom render NodeRenderer if it ever becomes user-facing; intentionally dropped today. |  | F2 from commit-review of 28d32c68. pkg/render/renderer.go renderFencedCodeBlock treats the info string as a language name only; the compact chroma-routing renderer replaced stock goldmark-highlighting/v2. The dropped attributes are documentation-style and not authored in OpenCode chat content. |  |
+| P2-CI-003 | todo | CI | Export VH_MP_A2_OUT in ci.yml to a CI artifact on e2e failure (enables same-day diagnosis of multiproject contention / SSE drop issues directly from CI artifacts). |  | source:p2-followup; boundary:owner-change; studied:2026-10-17; ref: task-ci-export-vh-mp-a2-out |  |
 
 ## Later
 
