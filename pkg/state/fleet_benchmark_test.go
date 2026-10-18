@@ -28,7 +28,7 @@ package state
 //     benchmark outputs and vary per machine/run; variance is reported by
 //     running with -count=N, not asserted in-test.
 //   - The gzip64 replication below must stay byte-shape-identical to
-//     pkg/web/server.go maybeCompressSnapshot: gzip.NewWriter (DEFAULT
+//     pkg/web/stream_wire.go maybeCompressSnapshot: gzip.NewWriter (DEFAULT
 //     compression level — NOT level 1; "z=1" is the query-param opt-in, not
 //     a level), then {"encoding":"gzip64","data":base64(...)}. The lean-body
 //     struct replicates pkg/web handleFleetGates' marshal (same fields, same
@@ -438,7 +438,7 @@ func max1(v int) int {
 // Wire-shape replications (must stay byte-shape-identical to pkg/web)
 // ----------------------------------------------------------------------------
 
-// gzip64EnvelopeForTest replicates pkg/web/server.go maybeCompressSnapshot
+// gzip64EnvelopeForTest replicates pkg/web/stream_wire.go maybeCompressSnapshot
 // byte-for-byte: gzip at the DEFAULT level (gzip.NewWriter — the "z=1" query
 // param is the opt-in FLAG, not a compression level), then the
 // {"encoding":"gzip64","data":base64} envelope. Returns the exact HTTP body

@@ -1055,7 +1055,8 @@ func (s *Store) captureMessagesBatchLocked(sid string) ([]MessageWithParts, uint
 // outside it. Returns nil on any marshal/gzip error (already logged) so the
 // caller can skip emitting a malformed batch.
 //
-// The payload shape (mirroring the SSE snapshot precedent at server.go:1075-1093,
+// The payload shape (mirroring the SSE snapshot precedent at
+// pkg/web/stream_http.go (handleStream's snapshot branch),
 // which also marshals/compresses AFTER returning from the store lock):
 //
 //	{"sessionID": sid, "encoding":"gzip64", "data":"<base64-gzip>", "window": {...}}

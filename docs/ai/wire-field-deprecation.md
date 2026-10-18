@@ -88,7 +88,7 @@ actually the sticky historical "permission blocking occurred" fact.
 `runningRoots` names exactly what the value is: the number of root sessions
 whose subtree has ≥1 busy/retry session.
 
-- **Go:** `pkg/web/server.go` (`projectInfo.Running` +
+- **Go:** `pkg/web/projects_http.go` (`projectInfo.Running` +
   `projectInfo.RunningRoots`); populated from one computed value
   (`st.RunningRoots()`) assigned to both.
 - **SPA:** reads `runningRoots` (`web/src/projects.ts`, `buildActivityMaps`).

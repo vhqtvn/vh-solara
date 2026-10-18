@@ -105,7 +105,7 @@ func TestRouteAwareCSP(t *testing.T) {
 			{"host_namespaced_asset", "/host/assets/host.js", true},
 
 			// Non-host routes — the STRICT single-server CSP is unchanged.
-			// cspDirectives (server.go) has NO frame-src entry at all, so these
+			// cspDirectives (http_security.go) has NO frame-src entry at all, so these
 			// assert not just "not the host frame-src" but "no frame-src
 			// directive whatsoever".
 			{"single_server_app_entry", "/app", false},

@@ -133,7 +133,7 @@ func (a *Aggregator) RunManaged(ctx context.Context) {
 // SetOnHydrate installs a callback fired at the end of every successful hydrate
 // (see the onHydrate field doc for the exact timing and constraints). Production
 // code installs ONE callback per aggregator, inside the queueGCOn-guarded block
-// of installQueueGCCleanup (pkg/web/server.go), so it shares that guard's
+// of installQueueGCCleanup (pkg/web/queue_lifecycle.go), so it shares that guard's
 // lifecycle: installed once per (dir, aggregator) and reset on project reload
 // (handleReloadProject drops the aggregator and aggFor builds a fresh one).
 // Guarded by seedMu to match the read side in hydrate; safe to install before

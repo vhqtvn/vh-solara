@@ -6,8 +6,8 @@ package web
 // statusWriter wrapper that captures the response status while forwarding
 // http.Flusher and http.Hijacker so streamed/proxied responses keep flushing
 // and the terminal WebSocket upgrade can take over the connection.
-// streamClassLabel, which sat between these two blocks in server.go, belongs
-// to the stream slice and stays in server.go.
+// streamClassLabel, which sat between these two blocks in server.go, moved
+// with the stream slice to stream_http.go.
 
 import (
 	"bufio"

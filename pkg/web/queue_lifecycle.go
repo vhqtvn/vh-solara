@@ -9,9 +9,10 @@ package web
 // (reconcileQueuesForAgg → queueRegistry.reconcileOrphanQueues). The shared
 // post-hydrate orchestration between the two regions
 // (spawnPostHydrateReconciles, pinsReconcileEntryCount,
-// labelsReconcileEntryCount — slice 10) and the Server fields used here
-// (queues, queueGCMu/queueGCOn, lifecycleWG, bgWG) stay in server.go, as do
-// the aggFor call sites and Shutdown's lifecycleWG join.
+// labelsReconcileEntryCount — slice 10) lives in posthydrate_lifecycle.go;
+// the Server fields used here (queues, queueGCMu/queueGCOn, lifecycleWG,
+// bgWG) stay in server.go, while the aggFor call sites and Shutdown's
+// lifecycleWG join live in server_aggregators.go.
 //
 // Known contradiction, moved as-is: the queueGCSubscribeBuffer doc below calls
 // authoritative filesystem reconciliation "future work" (the deferred GC-3

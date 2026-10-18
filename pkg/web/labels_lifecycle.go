@@ -8,9 +8,10 @@ package web
 // fanOutLabelsUpdate), and the LabelStore reconcile accessor
 // labelsReconcileSnapshot (a *LabelStore method — the LabelStore type itself
 // stays in labels.go). The Server fields these helpers use (labelsReg,
-// labelsGCMu/labelsGCOn, labelsReconcileEntries, lifecycleWG) and the call
-// sites (aggFor / spawnPostHydrateReconciles / Shutdown's lifecycleWG join)
-// stay in server.go.
+// labelsGCMu/labelsGCOn, labelsReconcileEntries, lifecycleWG) stay in
+// server.go; the call sites (aggFor / Shutdown's lifecycleWG join) live in
+// server_aggregators.go, and spawnPostHydrateReconciles (slice 10) in
+// posthydrate_lifecycle.go.
 //
 // The direct structural mirror of the pins lifecycle helpers
 // (pkg/web/pins_lifecycle.go). The ONE labels-specific difference from pins is
@@ -43,7 +44,7 @@ const labelsGCSubscribeBuffer = 128
 // includes ProjectBySessionID: because LabelStore.Snapshot() deliberately hides
 // the sidecar (it is cleanup metadata, never on the wire), the reconcile path
 // needs a combined accessor that exposes both projections atomically. Defined
-// here in server.go (same package web) so it can read the private labelsFile
+// here (same package web) so it can read the private labelsFile
 // fields without editing labels.go (out of scope this slice). Both the returned
 // LabelsDoc and the projects map are deep copies the caller may mutate freely.
 func (s *LabelStore) labelsReconcileSnapshot() (LabelsDoc, map[string]string) {

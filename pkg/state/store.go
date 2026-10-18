@@ -1014,7 +1014,7 @@ type Store struct {
 	// message_window.go for the matching token contract.) It backs the
 	// stale-batch guard: cold-load messages.batch packaging (JSON
 	// marshal + gzip + base64) runs OUTSIDE s.mu (mirroring the SSE snapshot
-	// precedent in pkg/web/server.go), so a live mutation landing during
+	// precedent in pkg/web/stream_http.go), so a live mutation landing during
 	// packaging would otherwise let a STALE prepared batch overwrite newer
 	// live deltas on the client — and the client treats messages.batch as a
 	// WHOLESALE REPLACEMENT (web/src/sync/stream.ts). publishColdBatch

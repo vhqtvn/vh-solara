@@ -89,7 +89,7 @@ func (i Interest) wants(kind, sid string) bool {
 //
 // O3 SINGLE SOURCE OF TRUTH: this is the canonical ordinal-counted kind set
 // shared between the store's Interest filter (wants, below) and the web
-// layer's per-connection delivery ordinal (pkg/web/server.go Stream-2
+// layer's per-connection delivery ordinal (pkg/web/stream_http.go Stream-2
 // stamping). The FE session-stream listener (web/src/sync/session-stream.ts
 // registerSessionMessageListeners) registers exactly these kinds; a future
 // change to one side MUST update the other.

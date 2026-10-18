@@ -1657,7 +1657,7 @@ func (qr *queueRegistry) CleanupCallCount() int64 {
 //     sessions' queues. The empty non-nil map (map with zero entries) is the
 //     OPPOSITE case — "hydrate succeeded and reported zero active sessions" —
 //     and correctly results in every on-disk queue being treated as an orphan.
-//   - The caller (reconcileQueuesForAgg in server.go) is responsible for
+//   - The caller (reconcileQueuesForAgg in queue_lifecycle.go) is responsible for
 //     producing activeSessions ONLY from a successful post-hydrate
 //     store.SessionIDs() call and for gating on AnyHydrateCompleted() before calling.
 //     The nil-check here is the second line of defense.

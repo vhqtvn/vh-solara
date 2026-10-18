@@ -134,7 +134,7 @@ func TestShutdownRetiresServerOwnedPerDirLifetimes(t *testing.T) {
 // auto-reject RPC is held GENUINELY in-flight inside reconcileFailFastPerms
 // (blocked on the upstream), and Server.Shutdown's watcher-ctx cancellation
 // must propagate into the RPC's derived timeout ctx
-// (context.WithTimeout(ctx, permRejectTimeout) at server.go reconcileFailFastPerms)
+// (context.WithTimeout(ctx, permRejectTimeout) at permission_watch.go reconcileFailFastPerms)
 // and ABORT the stalled RPC, so Shutdown returns WELL BEFORE the 10s
 // permRejectTimeout — instead of blocking the full 10s on a stallable upstream.
 //

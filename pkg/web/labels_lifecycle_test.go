@@ -12,7 +12,7 @@ package web
 //     authored group/tag definitions survive the root-reference strip.
 //   - SIDECAR ACCESSOR: the private projectByRootSessionId sidecar (cleanup
 //     metadata, never on the wire) is accessed via labelsReconcileSnapshot (an
-//     atomic doc+sidecar snapshot defined in server.go, same package) rather
+//     atomic doc+sidecar snapshot defined in labels_lifecycle.go, same package) rather
 //     than through the public Snapshot (which deliberately hides it).
 //
 // THREE cleanup layers (archive.go doc block has the full model), with ONE
@@ -185,7 +185,7 @@ func labelDefaultRoots(t *testing.T, srv *Server, web *httptest.Server, ids ...s
 }
 
 // ============================================================================
-// Layer 2 — session.delete subscriber (server.go installLabelsLifecycle)
+// Layer 2 — session.delete subscriber (labels_lifecycle.go installLabelsLifecycle)
 // ============================================================================
 
 // TestLabelsL2_SessionDeleteRemovesRootRefs: a store-emitted KindSessionDelete
@@ -322,7 +322,7 @@ func TestLabelsL2_SubscriberBroadcastsUpdate(t *testing.T) {
 }
 
 // ============================================================================
-// Layer 3 — post-hydrate backstop (server.go reconcileLabelsForAgg / Project)
+// Layer 3 — post-hydrate backstop (labels_lifecycle.go reconcileLabelsForAgg / Project)
 // ============================================================================
 //
 // The driver reconcileLabelsForAgg gates fail-closed on AnyHydrateCompleted()
