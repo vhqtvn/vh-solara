@@ -9,7 +9,7 @@ package server
 // not a transition log. No deltas, no replay buffer, no Last-Event-ID
 // recovery: a reconnect simply receives the current generation. The wire
 // shape (retry hint, named events, no ids) mirrors the worker's SSE surface
-// (pkg/web/server.go handleStream) per the brief's E13.
+// (pkg/web/stream_http.go handleStream) per the brief's E13.
 //
 // Refresh driving: the stream does NOT rely on the notify watcher (it starts
 // only with a configured store AND transport and calls the TTL-cached serve

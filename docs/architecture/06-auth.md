@@ -109,7 +109,7 @@ defenses close this **only if** they hold end-to-end:
 2. **The CSRF token must stay per-origin.** Never deliver it via the shared (`.example.com`)
    cookie — keep it in per-origin `localStorage` or a host-only cookie. If a sibling could
    read the token, the custom-header defense collapses.
-3. **Cookies change the "no credentials" CORS assumption** (`pkg/web/server.go` cors()).
+3. **Cookies change the "no credentials" CORS assumption** (`pkg/web/http_security.go` cors()).
    Keep cross-origin credentialed CORS **off** — the SPA is same-origin with its server, so
    the cookie is sent without any `Access-Control-Allow-Credentials`. Only revisit if a
    genuine cross-origin credentialed caller appears, and then never with `Allow-Origin: *`.

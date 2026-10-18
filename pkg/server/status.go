@@ -1523,7 +1523,7 @@ type fleetDiscoveredProject struct {
 }
 
 // fetchLeanGates tries the worker's lean batched gate endpoint
-// (GET /vh/gates?z=1&dir=…, pkg/web server.go handleFleetGates) for exactly
+// (GET /vh/gates?z=1&dir=…, pkg/web/projects_http.go handleFleetGates) for exactly
 // the (already capped, roster-filtered) project list and returns the
 // per-dir gate maps plus the decoded response length (for the cumulative
 // byte budget). ok=false means "lean unavailable or broken — use the

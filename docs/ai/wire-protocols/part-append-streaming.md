@@ -39,8 +39,9 @@ Code anchors (re-verify line numbers before editing; they drift):
   256-event per-subscriber channel, and the close-on-overflow slow-reader drop.
 - `pkg/state/translate.go` — the `message.part.delta` → `NormPartDelta`
   translator that sources `Field` straight from the upstream payload.
-- `pkg/web/server.go` — `wantsCompress(r)` (`z=1`, the capability-negotiation
-  pattern this spec mirrors) and the `/vh/diag/latency` mount.
+- `pkg/web/stream_wire.go` — `wantsCompress(r)` (`z=1`, the capability-negotiation
+  pattern this spec mirrors); the `/vh/diag/latency` mount is registered in
+  `pkg/web/server.go` (Handler).
 - `pkg/diagnostics/handler.go` — the authenticated GET `/vh/diag/latency`
   snapshot surface.
 
@@ -131,7 +132,7 @@ Mirror the existing `z=1` (gzip64 snapshot) pattern exactly:
 - **Opt-in:** client appends `part_delta=1` to the `/vh/stream` query string.
   The server reads it via a `wantsPartDelta(r *http.Request) bool` helper that
   returns `r.URL.Query().Get("part_delta") == "1"` — the same shape as
-  `wantsCompress` (`pkg/web/server.go`).
+  `wantsCompress` (`pkg/web/stream_wire.go`).
 - **One encoding per connection.** A connection either gets `part.append`
   suffix frames (opted-in) OR legacy full `part.upsert` frames (not opted-in),
   NEVER both for the same `(part,field)`. This is the "no dual-emit" rule from

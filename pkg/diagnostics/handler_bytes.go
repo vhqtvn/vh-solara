@@ -126,7 +126,7 @@ func RecordHandlerBytes(class int, n int) {
 
 // IncStream2ReplayFallback notes a Stream2 (projected /vh/stream) resume that
 // had a client cursor (hasCursor) but fell back to a fresh full snapshot.
-// Incremented at the single unified PROBE 8 site (pkg/web/server.go handleStream
+// Incremented at the single unified PROBE 8 site (pkg/web/stream_http.go handleStream
 // `hasCursor && !replayOK` branch) for BOTH fallback causes:
 //
 //	(a) shared-ring cursor eviction on reconnect — Replay returned ok=false

@@ -32,7 +32,7 @@ func ClassifyEmitKind(kind string) int {
 
 // ClassifyStream derives the SSE stream class from the handleStream message
 // filter: nil → firehose, empty → tree, non-empty → selected. The same logic
-// pkg/web/server.go uses to choose the store Interest.
+// pkg/web/stream_http.go uses to choose the store Interest.
 func ClassifyStream(filter map[string]bool) int {
 	if filter == nil {
 		return StreamClassFirehose

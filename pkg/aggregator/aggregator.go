@@ -39,7 +39,7 @@ type Aggregator struct {
 	// Arming happens via ONE of two production paths, BOTH under seedMu:
 	//
 	//   1. Synchronously via Arm(), called by the web layer's aggFor
-	//      (pkg/web/server.go) BEFORE the freshly-built per-directory
+	//      (pkg/web/server_aggregators.go) BEFORE the freshly-built per-directory
 	//      aggregator is stored in s.aggs / returned to the caller. This
 	//      closes the first-request TOCTOU: without it, aggFor would return
 	//      the aggregator before the RunManaged goroutine even schedules, so

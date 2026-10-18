@@ -125,7 +125,7 @@ func IsMessageClassKind(kind string) bool {
 //     hasOps term (not this classifier) advances the ordinal for those.
 //
 // O3 SINGLE SOURCE OF TRUTH: shared between the store (this classifier) and the
-// web layer's per-connection tree delivery ordinal (pkg/web/server.go Stream-1
+// web layer's per-connection tree delivery ordinal (pkg/web/stream_http.go Stream-1
 // stamping, treeEmitter != nil replay + live-tail branches). The FE tree-stream
 // listeners (registerTreeStreamListeners TREE_STREAM_KINDS loop +
 // registerAuxiliaryListeners session.upsert/delete loop) register exactly these

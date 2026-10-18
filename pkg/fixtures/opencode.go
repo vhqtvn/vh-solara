@@ -1237,7 +1237,7 @@ func (f *FakeOpenCode) UserMessageCount(sessionID string) int {
 // handleEvent's subscribe/unsub, so this reads existing state with NO behavior
 // change — it lets a regression test deterministically confirm a per-directory
 // aggregator's /event connection was accepted by the fake (the exact antecedent
-// for the teardown-SSE-hang bound, pkg/web/server.go aggFor→RunManaged). Mirrors
+// for the teardown-SSE-hang bound, pkg/web/server_aggregators.go aggFor→RunManaged). Mirrors
 // the f.mu-guarded read pattern of UserMessageCount above.
 func (f *FakeOpenCode) ActiveEventSubs() int {
 	f.mu.Lock()
