@@ -11,7 +11,7 @@
 // history.state reads the top, history.back() pops + fires popstate
 // synchronously (the manager sets pendingTraversal before calling back(), so
 // sync delivery is ordering-equivalent to the browser's async delivery).
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import {
   backStackDepth,
   bindBackDismiss,
@@ -23,7 +23,7 @@ import {
 } from "../../src/lib/backStack";
 import { createRoot, createSignal } from "solid-js";
 
-let pushStateSpy: ReturnType<typeof vi.spyOn>;
+let pushStateSpy: Mock<typeof history.pushState>;
 let backSpy: ReturnType<typeof vi.spyOn>;
 let entries: { state: unknown }[];
 

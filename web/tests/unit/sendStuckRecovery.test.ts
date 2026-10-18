@@ -26,7 +26,7 @@
 // body-read gap (see the D-F2 describe block below). These tests pin the
 // same bounded-settles contract for every guard-held site, using the same
 // fake-timer + abort-rejecting-fetch harness as the enqueue-timeout test.
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import { claimQueued, resolveQueued, clearQueueCache, enqueue, queueFor } from "../../src/queue";
 import { createQueueDrainer, type DrainDeps } from "../../src/queueDrain";
 import type { QueuedMessage } from "../../src/queue";
@@ -36,15 +36,20 @@ import { createAttachments, type Attachments } from "../../src/components/chat/c
 
 // In-memory localStorage for the jsdom test env (matches queue.test.ts).
 const mem: Record<string, string> = {};
-(globalThis as any).localStorage = {
-  getItem: (k: string) => (k in mem ? mem[k] : null),
-  setItem: (k: string, v: string) => {
-    mem[k] = v;
+// jsdom 30 made window.localStorage a getter-only accessor — install the
+// in-memory shim via defineProperty (plain assignment throws).
+Object.defineProperty(globalThis, "localStorage", {
+  configurable: true,
+  value: {
+    getItem: (k: string) => (k in mem ? mem[k] : null),
+    setItem: (k: string, v: string) => {
+      mem[k] = v;
+    },
+    removeItem: (k: string) => {
+      delete mem[k];
+    },
   },
-  removeItem: (k: string) => {
-    delete mem[k];
-  },
-};
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -54,7 +59,7 @@ afterEach(() => {
 
 // A fetch that NEVER settles on its own and rejects with AbortError when the
 // caller's signal aborts — the native hung-socket shape (same as queue.test.ts).
-function hungFetch(): ReturnType<typeof vi.fn> {
+function hungFetch(): Mock<(url: string, init?: any) => Promise<unknown>> {
   return vi.fn((_url: string, init?: any) =>
     new Promise((_resolve, reject) => {
       init?.signal?.addEventListener("abort", () =>

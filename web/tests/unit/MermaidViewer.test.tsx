@@ -7,7 +7,7 @@
 // The real mermaid renderer is mocked so jsdom never loads the browser-bound
 // lib. jsdom's history is replaced with a small fake (state stack) so the
 // manager's current-entry checks observe real token state.
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@solidjs/testing-library";
 import { createSignal } from "solid-js";
 
@@ -50,7 +50,7 @@ function lastOf<T>(arr: readonly T[]): T | undefined {
 }
 
 describe("MermaidViewer", () => {
-  let pushStateSpy: ReturnType<typeof vi.spyOn>;
+  let pushStateSpy: Mock<typeof history.pushState>;
   let backSpy: ReturnType<typeof vi.spyOn>;
   let clipWrite: ReturnType<typeof vi.fn>;
   let createURLMock: ReturnType<typeof vi.fn>;

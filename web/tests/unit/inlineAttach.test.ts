@@ -41,15 +41,20 @@ import {
 // initializes against an empty/undefined store (default OFF); the setter then
 // writes through this shim so round-trip/envelope assertions can inspect `mem`.
 const mem: Record<string, string> = {};
-(globalThis as any).localStorage = {
-  getItem: (k: string) => (k in mem ? mem[k] : null),
-  setItem: (k: string, v: string) => {
-    mem[k] = v;
+// jsdom 30 made window.localStorage a getter-only accessor — install the
+// in-memory shim via defineProperty (plain assignment throws).
+Object.defineProperty(globalThis, "localStorage", {
+  configurable: true,
+  value: {
+    getItem: (k: string) => (k in mem ? mem[k] : null),
+    setItem: (k: string, v: string) => {
+      mem[k] = v;
+    },
+    removeItem: (k: string) => {
+      delete mem[k];
+    },
   },
-  removeItem: (k: string) => {
-    delete mem[k];
-  },
-};
+});
 
 const LS_INLINE_ATTACH = "vh.prefs.inlineAttach.v1";
 

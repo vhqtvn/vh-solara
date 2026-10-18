@@ -98,7 +98,7 @@ test-host-web-deploy-transition: ## Run host-web DEPLOY-TRANSITION e2e (BUILD_ID
 # Official Playwright image, pinned to the exact @playwright/test version in
 # host-web/package.json (browsers ship inside the image; PLAYWRIGHT_BROWSERS_PATH
 # is preset). Host prerequisites: docker + repo checkout. Nothing else.
-PLAYWRIGHT_IMAGE ?= mcr.microsoft.com/playwright:v1.60.0-noble
+PLAYWRIGHT_IMAGE ?= mcr.microsoft.com/playwright:v1.64.1-noble
 # Run as the invoking uid/gid with a writable HOME so artifacts under tmp/ and
 # host-web/node_modules/.vite stay user-owned (never root-owned).
 PW_DOCKER = docker run --rm --init --user "$$(id -u):$$(id -g)" -e HOME=/tmp/pw-home -v "$$(pwd)":/repo -w /repo $(PLAYWRIGHT_IMAGE)
@@ -136,8 +136,8 @@ test-host-web-docker: ## Run host-web Playwright e2e (LANE 7, all three engines)
 #   - PLAYWRIGHT_JSON_OUTPUT_NAME is inert for the config's list reporter;
 #     pass ARGS='--reporter=list,json' to also retain full results (incl. the
 #     spec's qd-* timing/correlation annotations) in report.json.
-# Version coupling: web/'s caret range (^1.49.1) currently lock-RESOLVES to
-# @playwright/test 1.60.0 — the same version as host-web's exact pin and the
+# Version coupling: web/'s caret range (^1.64.1) currently lock-RESOLVES to
+# @playwright/test 1.64.1 — the same version as host-web's exact pin and the
 # PLAYWRIGHT_IMAGE tag. web/ is NOT exactly pinned: any web lock refresh must
 # re-assert resolved version == image tag (see docs/ai/docker-test-routes.md).
 PW_DOCKER_GO = docker run --rm --init --ipc=host --network=host --user "$$(id -u):$$(id -g)" -e HOME=/tmp/pw-home -e PLAYWRIGHT_JSON_OUTPUT_NAME=/repo/tmp/queue-delivery-e2e/report.json -v "$$(pwd)":/repo -v /usr/local/go:/usr/local/go:ro -w /repo $(PLAYWRIGHT_IMAGE)

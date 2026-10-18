@@ -48,7 +48,12 @@ function ambiguousItem(o: Partial<QueuedMessage> = {}): QueuedMessage {
 const noop = async () => "confirmed" as const;
 
 beforeEach(() => {
-  (globalThis as any).navigator = { ...(globalThis as any).navigator };
+  // jsdom 30 made window.navigator getter-only — clone-and-override via
+  // defineProperty instead of plain assignment.
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { ...(globalThis as any).navigator },
+  });
   Object.assign(navigator, {
     clipboard: { writeText: vi.fn(async () => {}) },
   });

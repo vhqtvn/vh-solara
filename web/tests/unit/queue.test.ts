@@ -38,15 +38,20 @@ import { saveVersioned } from "../../src/lib/store";
 
 // In-memory localStorage for the node test env (matches store.test.ts).
 const mem: Record<string, string> = {};
-(globalThis as any).localStorage = {
-  getItem: (k: string) => (k in mem ? mem[k] : null),
-  setItem: (k: string, v: string) => {
-    mem[k] = v;
+// jsdom 30 made window.localStorage a getter-only accessor — install the
+// in-memory shim via defineProperty (plain assignment throws).
+Object.defineProperty(globalThis, "localStorage", {
+  configurable: true,
+  value: {
+    getItem: (k: string) => (k in mem ? mem[k] : null),
+    setItem: (k: string, v: string) => {
+      mem[k] = v;
+    },
+    removeItem: (k: string) => {
+      delete mem[k];
+    },
   },
-  removeItem: (k: string) => {
-    delete mem[k];
-  },
-};
+});
 
 // Tracked sessions per-test so afterEach can reset the module-level cache
 // (queue.ts owns a singleton store, like sync/store). Migration guard state

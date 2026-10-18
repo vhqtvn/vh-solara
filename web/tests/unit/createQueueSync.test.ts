@@ -22,7 +22,7 @@
 // Each setup() registers its root dispose so afterEach tears them down —
 // undisposed roots leak Solid owners across tests and corrupt the scheduler
 // (effects stop re-running on signal writes).
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { createRoot, createSignal } from "solid-js";
 import { createQueueSync, type QueueSyncDeps } from "../../src/components/chat/createQueueSync";
 import type { QueuedMessage } from "../../src/queue";
@@ -40,11 +40,11 @@ async function flush() {
 const disposes: Array<() => void> = [];
 
 interface Fakes {
-  migrateLegacyQueue: ReturnType<typeof vi.fn>;
-  fetchQueue: ReturnType<typeof vi.fn>;
-  drain: ReturnType<typeof vi.fn>;
-  reconcileOutbox: ReturnType<typeof vi.fn>;
-  refreshDispatchMode: ReturnType<typeof vi.fn>;
+  migrateLegacyQueue: Mock<(id: string) => Promise<unknown>>;
+  fetchQueue: Mock<(id: string) => Promise<unknown>>;
+  drain: Mock<() => Promise<void>>;
+  reconcileOutbox: Mock<(id: string) => Promise<void>>;
+  refreshDispatchMode: Mock<() => Promise<void>>;
 }
 
 interface Handles {
@@ -65,11 +65,11 @@ function setup(o: Partial<{ sessionId: string; draft: boolean; working: boolean 
   const [status, setStatus] = createSignal<"connecting" | "live" | "reconnecting">("connecting");
   const [queue, setQueue] = createSignal<QueuedMessage[]>([]);
   const fn: Fakes = {
-    migrateLegacyQueue: vi.fn().mockResolvedValue(undefined),
-    fetchQueue: vi.fn().mockResolvedValue(undefined),
-    drain: vi.fn().mockResolvedValue(undefined),
-    reconcileOutbox: vi.fn().mockResolvedValue(undefined),
-    refreshDispatchMode: vi.fn().mockResolvedValue(undefined),
+    migrateLegacyQueue: vi.fn<(id: string) => Promise<unknown>>().mockResolvedValue(undefined),
+    fetchQueue: vi.fn<(id: string) => Promise<unknown>>().mockResolvedValue(undefined),
+    drain: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
+    reconcileOutbox: vi.fn<(id: string) => Promise<void>>().mockResolvedValue(undefined),
+    refreshDispatchMode: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
   };
   const deps: QueueSyncDeps = {
     sessionId,
