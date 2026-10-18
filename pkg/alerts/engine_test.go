@@ -319,3 +319,156 @@ func TestEmitDaemonNoticeFansOutToAllProjects(t *testing.T) {
 		// good — no replay
 	}
 }
+
+// --- session_started (v3 change 3) ---
+
+// lastOfType returns the most recent notice of typ (nil when none fired).
+func lastOfType(fired []Notice, typ string) *Notice {
+	for i := len(fired) - 1; i >= 0; i-- {
+		if fired[i].Type == typ {
+			return &fired[i]
+		}
+	}
+	return nil
+}
+
+// TestEngineSessionStartedBaselineThenIncrease pins the core contract: the
+// FIRST sweep establishes the running-root baseline WITHOUT firing (sessions
+// already running at startup never alert), an unchanged set never fires, and
+// an INCREASE fires exactly ONE notice carrying the representative
+// newly-running root (sessionID/root/title from the new root, human-readable
+// detail).
+func TestEngineSessionStartedBaselineThenIncrease(t *testing.T) {
+	w, _, fired, _ := newTestWatcher(t)
+
+	// root-a is already running at the first sweep → baseline, not a fire.
+	w.onEvent(session(1, "root-a", ""))
+	w.onEvent(activity(2, "root-a", state.ActivityBusy))
+	w.sweep() // first sweep: baseline
+	if has(*fired, TypeSessionStarted, "") {
+		t.Fatalf("first sweep must baseline, not fire: %+v", *fired)
+	}
+	// Unchanged on the next sweep: still nothing.
+	w.sweep()
+	if has(*fired, TypeSessionStarted, "") {
+		t.Fatalf("unchanged running set must not fire: %+v", *fired)
+	}
+
+	// A second root goes running → increase → exactly one notice, and the
+	// representative is the NEWLY running root (not the baselined one).
+	w.onEvent(session(3, "root-b", ""))
+	w.onEvent(activity(4, "root-b", state.ActivityBusy))
+	w.sweep()
+	if c := count(*fired, TypeSessionStarted, ""); c != 1 {
+		t.Fatalf("session_started fired %d times, want exactly 1: %+v", c, *fired)
+	}
+	n := lastOfType(*fired, TypeSessionStarted)
+	if n.SessionID != "root-b" || n.Root != "root-b" {
+		t.Errorf("notice must carry the newly-running root: %+v", n)
+	}
+	if n.Title != "root-b" { // the session() helper stamps title=id
+		t.Errorf("notice title = %q, want the root's title", n.Title)
+	}
+	if n.Detail == "" {
+		t.Errorf("notice detail must be human-readable, got empty")
+	}
+}
+
+// TestEngineSessionStartedMultipleNewOneNotice: several new running roots in
+// ONE sweep collapse to ONE notice (the representative is deterministic —
+// the lexicographically first new root).
+func TestEngineSessionStartedMultipleNewOneNotice(t *testing.T) {
+	w, _, fired, _ := newTestWatcher(t)
+	w.sweep() // baseline: empty
+	w.onEvent(session(1, "r2", ""))
+	w.onEvent(activity(2, "r2", state.ActivityBusy))
+	w.onEvent(session(3, "r1", ""))
+	w.onEvent(activity(4, "r1", state.ActivityBusy))
+	w.sweep()
+	if c := count(*fired, TypeSessionStarted, ""); c != 1 {
+		t.Fatalf("multiple new roots in one sweep must fire exactly once, got %d: %+v", c, *fired)
+	}
+	if n := lastOfType(*fired, TypeSessionStarted); n.SessionID != "r1" {
+		t.Errorf("representative = %q, want the deterministic first new root r1", n.SessionID)
+	}
+}
+
+// TestEngineSessionStartedNotOnDecreaseOrReplacement: a decrease never fires,
+// and a REPLACEMENT (one stops, another starts — count unchanged between
+// sweeps) never fires either; the detector is count-increase-only.
+func TestEngineSessionStartedNotOnDecreaseOrReplacement(t *testing.T) {
+	w, _, fired, _ := newTestWatcher(t)
+	w.onEvent(session(1, "a", ""))
+	w.onEvent(activity(2, "a", state.ActivityBusy))
+	w.onEvent(session(3, "b", ""))
+	w.onEvent(activity(4, "b", state.ActivityBusy))
+	w.sweep() // baseline {a, b}
+
+	// Decrease: a stops → {b}, no fire.
+	w.onEvent(activity(5, "a", state.ActivityIdle))
+	w.sweep()
+	if has(*fired, TypeSessionStarted, "") {
+		t.Fatalf("decrease must not fire: %+v", *fired)
+	}
+
+	// Replacement: c starts and b stops → {c} vs {b}, count equal → no fire.
+	w.onEvent(session(6, "c", ""))
+	w.onEvent(activity(7, "c", state.ActivityBusy))
+	w.onEvent(activity(8, "b", state.ActivityIdle))
+	w.sweep()
+	if has(*fired, TypeSessionStarted, "") {
+		t.Fatalf("count-preserving replacement must not fire: %+v", *fired)
+	}
+}
+
+// TestEngineSessionStartedRestartFiresAgain: a root that stops running and
+// later runs again is a NEW increase (0 → 1) and fires again — subject to
+// the downstream per-(type,session)/(type,token) cooldowns, not to any
+// detector-side once-ever latch.
+func TestEngineSessionStartedRestartFiresAgain(t *testing.T) {
+	w, _, fired, _ := newTestWatcher(t)
+	w.onEvent(session(1, "a", ""))
+	w.sweep() // baseline: a exists but idle → {}
+
+	w.onEvent(activity(2, "a", state.ActivityBusy))
+	w.sweep() // {} → {a}: fire #1
+	if c := count(*fired, TypeSessionStarted, ""); c != 1 {
+		t.Fatalf("first increase must fire, got %d: %+v", c, *fired)
+	}
+	w.onEvent(activity(3, "a", state.ActivityIdle))
+	w.sweep() // {a} → {}: no fire
+	if c := count(*fired, TypeSessionStarted, ""); c != 1 {
+		t.Fatalf("decrease must not add a fire: %+v", *fired)
+	}
+	w.onEvent(activity(4, "a", state.ActivityBusy))
+	w.sweep() // {} → {a}: fire #2 — restart is a new increase
+	if c := count(*fired, TypeSessionStarted, ""); c != 2 {
+		t.Fatalf("restart must fire again, got %d total: %+v", c, *fired)
+	}
+}
+
+// TestEngineSessionStartedBusyChildIsNotARunningRoot: "running ROOT sessions"
+// counts roots by their OWN activity. A busy child under an idle root is the
+// root's ongoing turn (delegation), not a new session start; when the root
+// itself goes busy the increase fires with the ROOT carried.
+func TestEngineSessionStartedBusyChildIsNotARunningRoot(t *testing.T) {
+	w, _, fired, _ := newTestWatcher(t)
+	w.onEvent(session(1, "root", ""))
+	w.onEvent(session(2, "child", "root"))
+	w.sweep() // baseline: {}
+
+	w.onEvent(activity(3, "child", state.ActivityBusy)) // child runs, root idle
+	w.sweep()
+	if has(*fired, TypeSessionStarted, "") {
+		t.Fatalf("a busy child under an idle root is not a new running root: %+v", *fired)
+	}
+
+	w.onEvent(activity(4, "root", state.ActivityBusy)) // the root itself runs
+	w.sweep()
+	if c := count(*fired, TypeSessionStarted, ""); c != 1 {
+		t.Fatalf("root going busy must fire once, got %d: %+v", c, *fired)
+	}
+	if n := lastOfType(*fired, TypeSessionStarted); n.SessionID != "root" || n.Root != "root" {
+		t.Errorf("notice must carry the root, got %+v", n)
+	}
+}

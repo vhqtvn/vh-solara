@@ -414,6 +414,52 @@ func TestNotifierWaitingQuestionFCMReceipt(t *testing.T) {
 	}
 }
 
+// TestNotifierSessionStartedFCMReceipt pins the v3-change-3 message shape:
+// session_started maps to vh_condition=session_started, NORMAL priority
+// (only waiting is HIGH), collapse_key=session_started (derives from
+// vh_event), data-only, vh_count fixed "1".
+func TestNotifierSessionStartedFCMReceipt(t *testing.T) {
+	f := newNotifyFixture(t)
+	if err := f.tokens.Upsert("device-token-1", "phone", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	f.nt.Send(Notice{
+		Type:      TypeSessionStarted,
+		SessionID: "s1",
+		Root:      "s1",
+		Project:   "proj",
+		Title:     "Fix login",
+		Detail:    "Session started",
+		Ts:        1_700_000_000_123,
+	})
+
+	r := f.fcm.waitNext(t)
+	m := r.Body.Message
+	wantData := map[string]string{
+		"vh_kind":      "notice",
+		"vh_event":     TypeSessionStarted,
+		"vh_condition": condSessionStarted,
+		"vh_count":     "1",
+		"vh_ts":        "1700000000123",
+	}
+	if !reflect.DeepEqual(m.Data, wantData) {
+		t.Fatalf("data = %+v\nwant %+v", m.Data, wantData)
+	}
+	if m.Android == nil {
+		t.Fatal("missing android config")
+	}
+	if m.Android.Priority != "NORMAL" {
+		t.Fatalf("android.priority = %q, want NORMAL (only waiting is HIGH)", m.Android.Priority)
+	}
+	if m.Android.CollapseKey != TypeSessionStarted {
+		t.Fatalf("android.collapse_key = %q, want %q", m.Android.CollapseKey, TypeSessionStarted)
+	}
+	if strings.Contains(string(r.Raw), `"notification"`) {
+		t.Fatalf("message must be data-only (no notification block): %s", r.Raw)
+	}
+}
+
 // --- condition + priority mapping table ---
 
 // TestNotifierConditionAndPriorityMapping pins the full vh_condition table
@@ -435,7 +481,8 @@ func TestNotifierConditionAndPriorityMapping(t *testing.T) {
 		{notice(TypeStuckThinking, "", 104), condDegradedThinking, "NORMAL"},
 		{notice(TypeRunaway, "", 105), condDegradedRunaway, "NORMAL"},
 		{notice(TypeStalled, "", 106), condDegradedStalled, "NORMAL"},
-		{Notice{Type: TypeStalled, Title: "OpenCode", Ts: 107}, condWorkerDown, "NORMAL"},
+		{notice(TypeSessionStarted, "", 107), condSessionStarted, "NORMAL"},
+		{Notice{Type: TypeStalled, Title: "OpenCode", Ts: 108}, condWorkerDown, "NORMAL"},
 	}
 
 	byTS := map[string]fcmReceipt{}
@@ -444,8 +491,9 @@ func TestNotifierConditionAndPriorityMapping(t *testing.T) {
 		r := f.fcm.waitNext(t)
 		byTS[r.Body.Message.Data["vh_ts"]] = r
 		// Step the frozen clock past cooldown_sec (300s) so the next send —
-		// including another waiting — is a fresh cooldown window. 7 steps of
-		// 301s stay inside the cached OAuth token's 3600s validity.
+		// including another waiting — is a fresh cooldown window. The last
+		// send lands 7×301s past t0 (well inside the cached OAuth token's
+		// 3600s validity, even with the post-last advance).
 		f.clk.advance(301 * time.Second)
 	}
 	for _, c := range cases {
@@ -1050,9 +1098,30 @@ func TestNotifierAlwaysPolicyDeliversWhileAttended(t *testing.T) {
 	f.fcm.assertNoRequest(t, "when_unattended token stays suppressed while attended")
 
 	// (Unattended fan-out to BOTH policies — when_unattended is the default
-	// posture and always only ADDS delivery — is pinned by
-	// TestNotifierTokenCacheReuse's two-token fan-out; presence here stays
-	// attended on the real clock, so this test cannot flip it.)
+	// posture and always only ADDS delivery — is pinned by the a-F1
+	// companion, TestNotifierAlwaysPolicyDeliversWhileUnattended; presence
+	// here stays attended on the real clock, so this test cannot flip it.)
+}
+
+// TestNotifierAlwaysPolicyDeliversWhileUnattended (a-F1): the companion pin
+// to TestNotifierAlwaysPolicyDeliversWhileAttended — UNATTENDED (no presence
+// heartbeats), an always-policy token is delivered ALONGSIDE the default
+// when_unattended token in the same send. always only ADDS delivery on top
+// of the default away path; it never replaces it.
+func TestNotifierAlwaysPolicyDeliversWhileUnattended(t *testing.T) {
+	f := newNotifyFixture(t)
+	_ = f.tokens.Upsert("tok-always-un", "on-call phone", "always")
+	_ = f.tokens.Upsert("tok-wu-un", "tablet", "") // default: when_unattended
+	// No heartbeat → unattended (fresh Presence).
+
+	f.nt.Send(notice(TypeFinished, "", 1))
+
+	r1 := f.fcm.waitNext(t)
+	r2 := f.fcm.waitNext(t)
+	toks := map[string]bool{r1.Body.Message.Token: true, r2.Body.Message.Token: true}
+	if len(toks) != 2 || !toks["tok-always-un"] || !toks["tok-wu-un"] {
+		t.Fatalf("unattended fan-out tokens = %v, want BOTH the always and when_unattended tokens exactly once", toks)
+	}
 }
 
 // TestNotifierFailureLogging pins the one-line-per-failure contract across
@@ -1291,6 +1360,145 @@ func TestNotifierHealthLastAttemptError(t *testing.T) {
 		at, lastErr := f.nt.Health()
 		return lastErr == "" && at.Unix() == 1_700_000_301
 	}, "success must clear last_error and advance last_attempt")
+}
+
+// TestNotifierOverlappingAttemptsProbePairing pins the pair-publication
+// contract (b-F1 fix): last_attempt/last_error describe the most recent
+// COMPLETED attempt — published together, under one lock hold, only at
+// completion. Attempt A (slow: held at the mock until released, then 429)
+// starts at t0; attempt B (fast 404) starts at t0+301 and completes while A
+// is still in flight. At every observation point the timestamp and the error
+// must belong to the SAME attempt: the zero state while nothing has
+// completed (an in-flight attempt is invisible), exactly B's pair once B
+// completes, then exactly A's pair — with A's EARLIER start time — once A
+// completes. Completion order is gated by channels, not sleeps; a background
+// sampler additionally rejects any mixed pairing it ever observes.
+func TestNotifierOverlappingAttemptsProbePairing(t *testing.T) {
+	f := newNotifyFixture(t)
+	captureLogger(f) // A and B both fail — keep their lines out of stderr
+	_ = f.tokens.Upsert("tok-ov", "", "")
+
+	const t0 = int64(1_700_000_000) // the fixture clock's frozen start
+
+	// A dedicated mock gated per attempt (the stock fcmMock serializes
+	// handlers under its mutex, so a blocking responder there would block
+	// B too): attempt A (vh_ts=1) is HELD until released, then answers 429;
+	// any other request (attempt B, vh_ts=2) answers a generic 404 at once.
+	arrivedA := make(chan struct{}, 1)
+	releaseACh := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseA := func() { releaseOnce.Do(func() { close(releaseACh) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var body fcmRequestBody
+		_ = json.Unmarshal(b, &body)
+		if body.Message.Data["vh_ts"] == "1" {
+			arrivedA <- struct{}{}
+			<-releaseACh
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"code":404,"status":"NOT_FOUND","message":"x"}}`))
+	}))
+	t.Cleanup(srv.Close)
+	// Failure-path liveness: if the test fatals while A is still held,
+	// release it so srv.Close (registered above; cleanups run LIFO) can
+	// finish instead of deadlocking on the held handler.
+	t.Cleanup(releaseA)
+	f.nt.fcmBase = srv.URL
+
+	// The sampler records every (timestamp, error) tuple Health() ever
+	// exposes; each observed tuple must be one attempt's OWN pair.
+	healthPair := struct {
+		mu   sync.Mutex
+		seen map[[2]string]int
+	}{seen: map[[2]string]int{}}
+	stopSample := make(chan struct{})
+	sampleDone := make(chan struct{})
+	go func() {
+		defer close(sampleDone)
+		tick := time.NewTicker(200 * time.Microsecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stopSample:
+				return
+			case <-tick.C:
+				at, lastErr := f.nt.Health()
+				ts := "0" // the pre-completion zero state (time.Time{}.Unix() is -62135596800)
+				if !at.IsZero() {
+					ts = strconv.FormatInt(at.Unix(), 10)
+				}
+				p := [2]string{ts, lastErr}
+				healthPair.mu.Lock()
+				healthPair.seen[p]++
+				healthPair.mu.Unlock()
+			}
+		}
+	}()
+
+	// Attempt A (slow): finished at t0 — held at the mock before its response.
+	f.nt.Send(notice(TypeFinished, "", 1))
+	select {
+	case <-arrivedA:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attempt A never reached the mock FCM endpoint")
+	}
+
+	// While A is in flight and NOTHING has completed, the probe must show
+	// the untouched zero state — an in-flight attempt is invisible.
+	if at, lastErr := f.nt.Health(); !at.IsZero() || lastErr != "" {
+		t.Fatalf("A in flight, none completed: probe = (%v, %q), want zero/empty", at, lastErr)
+	}
+
+	// Attempt B (fast): runaway at t0+301 (clock advanced past cooldown; a
+	// different type is a different cooldown key) — completes while A is held.
+	f.clk.advance(301 * time.Second)
+	f.nt.Send(notice(TypeRunaway, "", 2))
+	eventually(t, func() bool {
+		at, lastErr := f.nt.Health()
+		return at.Unix() == t0+301 && lastErr == "404 NOT_FOUND"
+	}, "while A is in flight and B has completed, the probe must show exactly B's pair")
+
+	// Release A: it completes AFTER B and the probe must flip to A's own
+	// pair — A's earlier start time with A's outcome, never B's timestamp
+	// paired with A's error.
+	releaseA()
+	eventually(t, func() bool {
+		at, lastErr := f.nt.Health()
+		return at.Unix() == t0 && lastErr == "429 RESOURCE_EXHAUSTED"
+	}, "after A completes, the probe must show exactly A's pair (earlier start time, its own outcome)")
+
+	// Counters are unchanged by the pair-publication move: two attempts,
+	// both failed (429 quota, 404 rejected), nothing pruned or succeeded.
+	f.nt.statMu.Lock()
+	attempted, succeeded, failed, pruned := f.nt.attempted, f.nt.succeeded, f.nt.failed, f.nt.pruned
+	f.nt.statMu.Unlock()
+	if attempted != 2 || succeeded != 0 || failed != 2 || pruned != 0 {
+		t.Fatalf("window counters = attempted:%d succeeded:%d failed:%d pruned:%d, want 2/0/2/0", attempted, succeeded, failed, pruned)
+	}
+	if f.tokens.Count() != 1 {
+		t.Fatal("neither a 429 nor a generic 404 may prune the registration")
+	}
+
+	// Every tuple the sampler ever observed must be a legal same-attempt pair:
+	// the zero state, B's pair, or A's pair — never a mix.
+	close(stopSample)
+	<-sampleDone
+	legal := map[[2]string]bool{
+		{"0", ""}:                                true,
+		{"1700000301", "404 NOT_FOUND"}:          true, // B's pair
+		{"1700000000", "429 RESOURCE_EXHAUSTED"}: true, // A's pair
+	}
+	healthPair.mu.Lock()
+	defer healthPair.mu.Unlock()
+	for p := range healthPair.seen {
+		if !legal[p] {
+			t.Fatalf("probe exposed a mixed pair (%s, %q) — timestamp and error must belong to the same attempt", p[0], p[1])
+		}
+	}
 }
 
 // TestNotifierHealthLoopLine pins the periodic channel-health line: a short

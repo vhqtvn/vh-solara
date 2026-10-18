@@ -48,6 +48,7 @@ import (
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/alerts"
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
+	"github.com/vhqtvn/vh-solara/pkg/state"
 	"github.com/vhqtvn/vh-solara/pkg/web"
 )
 
@@ -381,4 +382,239 @@ func jsonHasNotificationBlock(raw []byte) bool {
 	}
 	_, ok := probe["notification"]
 	return ok
+}
+
+// bootNotifyLifecycle assembles the same production fixture
+// TestNotifyLifecycleThroughRealInitAlerts builds inline (state dir, mock
+// OAuth token endpoint, service-account credentials, notify-configured
+// alerts.jsonc, mock FCM server via the DefaultTransport redirect, aggregator
+// + web.NewServer + the REAL InitAlerts wiring + an HTTP server). Returns
+// the live pieces the caller drives. The existing test is left untouched;
+// this helper exists so later legs (the v3 session_started sweep proof) can
+// share the exact same boot order without duplicating it a second time.
+func bootNotifyLifecycle(t *testing.T) (*httptest.Server, *notifyFCMMock, *state.Store) {
+	t.Helper()
+	stateDir := t.TempDir()
+	t.Setenv("VH_STATE_DIR", stateDir) // stateBaseDir() reads it live
+
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"integration-access-token","expires_in":3600,"token_type":"Bearer"}`))
+	}))
+	t.Cleanup(tokenSrv.Close)
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa keygen: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatalf("marshal pkcs8: %v", err)
+	}
+	cj, _ := json.Marshal(map[string]string{
+		"type":         "service_account",
+		"project_id":   "proj-int",
+		"private_key":  string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})),
+		"client_email": "bot@proj-int.iam.gserviceaccount.com",
+		"token_uri":    tokenSrv.URL,
+	})
+	credsPath := filepath.Join(stateDir, "fcm-creds.json")
+	if err := os.WriteFile(credsPath, cj, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfgStore, err := alerts.NewStore(alerts.ConfigPath(stateDir))
+	if err != nil {
+		t.Fatalf("alerts.NewStore: %v", err)
+	}
+	c := cfgStore.Get()
+	c.Notify = &alerts.NotifyConfig{CredentialsFile: credsPath, ProjectID: "proj-int", TtlSec: 3600}
+	if err := cfgStore.Replace(c); err != nil {
+		t.Fatalf("alerts Replace: %v", err)
+	}
+
+	fcm := &notifyFCMMock{receipts: make(chan notifyFCMReceipt, 8)}
+	fcmSrv := httptest.NewServer(fcm)
+	t.Cleanup(fcmSrv.Close)
+
+	fcmURL, err := url.Parse(fcmSrv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prevTransport := http.DefaultTransport
+	http.DefaultTransport = fcmRedirectTransport{inner: prevTransport, target: fcmURL.Host}
+	t.Cleanup(func() { http.DefaultTransport = prevTransport })
+
+	oc := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(oc.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	agg := aggregator.New(oc.URL, 512)
+	go agg.Run(ctx)
+
+	srv, err := web.NewServer(agg, oc.URL, 512)
+	if err != nil {
+		t.Fatalf("web.NewServer: %v", err)
+	}
+	engine, err := srv.InitAlerts(ctx) // the REAL production wiring
+	if err != nil {
+		t.Fatalf("InitAlerts: %v", err)
+	}
+	if !engine.NotifyReady() {
+		t.Fatal("test premise: NotifyReady must be true with a loadable notify section at init")
+	}
+	webSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(webSrv.Close)
+	return webSrv, fcm, agg.Store()
+}
+
+// TestNotifySessionStartedSweepToFCM is the v3-change-3 lane-2 behavioral
+// closure: a root session going RUNNING after the watcher's first-sweep
+// baseline produces a session_started FCM receipt (data-only, NORMAL,
+// collapse_key=session_started) through the REAL InitAlerts wiring and the
+// REAL 20s sweep ticker — no detector shortcut, no test hook.
+//
+// Timing (the honest cost of riding the production ticker): the watcher
+// attaches when the first snapshot request fires SetAggHook (t0); its FIRST
+// tick (t0+20s) establishes the running-root baseline WITHOUT firing, so the
+// busy status is applied only after that tick has certainly passed (sleep
+// > one sweep interval); the SECOND tick (t0+40s) detects the increase and
+// fires. Wall time ≈ 50s.
+func TestNotifySessionStartedSweepToFCM(t *testing.T) {
+	log.SetOutput(io.Discard) // keep test output clean (dir convention)
+
+	webSrv, fcm, store := bootNotifyLifecycle(t)
+
+	// Register a device token through the real route (mutation → CSRF).
+	code, body := notifyHTTPPost(t, webSrv.URL+"/vh/notify/tokens", `{"token":"integration-device-token","label":"ci-phone"}`)
+	if code != http.StatusOK {
+		t.Fatalf("POST /vh/notify/tokens: %d %s", code, body)
+	}
+
+	// Attach the engine watcher: touch the default project (aggFor("") fires
+	// InitAlerts' SetAggHook → engine.Attach over the shared store).
+	if code, body := notifyHTTPGet(t, webSrv.URL+"/vh/snapshot"); code != http.StatusOK {
+		t.Fatalf("GET /vh/snapshot (attaches the engine watcher): %d %s", code, body)
+	}
+
+	// Wait past the FIRST sweep tick (20s + margin): the baseline (zero
+	// running roots) must be established before the session goes running,
+	// or the increase would be swallowed by the baseline rule.
+	time.Sleep(22 * time.Second)
+
+	// A NEW root session goes RUNNING after the baseline: session.updated
+	// (title — properties wrap the session in {info}, the wire shape the
+	// translator/reducer parse) then session.status busy — the same Apply
+	// the aggregator's SSE loop performs on live OpenCode events.
+	store.Apply(opencode.Event{Type: "session.updated", Properties: json.RawMessage(`{"info":{"id":"sess-started-1","title":"Kick off the release"}}`)})
+	store.Apply(opencode.Event{Type: "session.status", Properties: json.RawMessage(`{"sessionID":"sess-started-1","status":{"type":"busy"}}`)})
+
+	// The next sweep tick (t0+40s) detects the increase and fires; the FCM
+	// delivery goroutine follows within seconds.
+	var receipt *notifyFCMReceipt
+	deadline := time.Now().Add(30 * time.Second)
+	for receipt == nil && time.Now().Before(deadline) {
+		select {
+		case r := <-fcm.receipts:
+			receipt = &r
+		case <-time.After(400 * time.Millisecond):
+		}
+	}
+	if receipt == nil {
+		t.Fatal("no session_started FCM message arrived within the sweep budget (tick at t0+40s)")
+	}
+
+	// --- the message contract (data-only, NORMAL, session_started) ---
+	if receipt.Path != "/v1/projects/proj-int/messages:send" {
+		t.Fatalf("FCM path = %q", receipt.Path)
+	}
+	if receipt.Authorization != "Bearer integration-access-token" {
+		t.Fatalf("Authorization = %q", receipt.Authorization)
+	}
+	var env struct {
+		Message struct {
+			Token   string            `json:"token"`
+			Data    map[string]string `json:"data"`
+			Android *struct {
+				Priority    string `json:"priority"`
+				CollapseKey string `json:"collapse_key"`
+				TTL         string `json:"ttl"`
+			} `json:"android"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(receipt.Raw, &env); err != nil {
+		t.Fatalf("FCM body decode (all-strings data contract): %v (%s)", err, receipt.Raw)
+	}
+	m := env.Message
+	if m.Token != "integration-device-token" {
+		t.Fatalf("message.token = %q", m.Token)
+	}
+	for k, want := range map[string]string{
+		"vh_kind":      "notice",
+		"vh_event":     "session_started",
+		"vh_condition": "session_started",
+		"vh_count":     "1",
+	} {
+		if got := m.Data[k]; got != want {
+			t.Fatalf("data[%s] = %q, want %q", k, got, want)
+		}
+	}
+	if ts := m.Data["vh_ts"]; len(ts) < 13 { // unix millis from the fire site
+		t.Fatalf("vh_ts = %q, want unix-millis digits", ts)
+	}
+	if m.Android == nil {
+		t.Fatal("missing android config")
+	}
+	if m.Android.Priority != "NORMAL" {
+		t.Fatalf("android.priority = %q, want NORMAL (only waiting is HIGH)", m.Android.Priority)
+	}
+	if m.Android.CollapseKey != "session_started" {
+		t.Fatalf("android.collapse_key = %q, want session_started", m.Android.CollapseKey)
+	}
+	if m.Android.TTL != "3600s" {
+		t.Fatalf("android.ttl = %q, want 3600s (config ttl_sec)", m.Android.TTL)
+	}
+	if jsonHasNotificationBlock(receipt.Raw) {
+		t.Fatalf("message must be data-only (no notification block): %s", receipt.Raw)
+	}
+
+	// --- history: the session_started notice is retained (pre-gating tap)
+	// and carries the newly-running root's identity + title ---
+	code, body = notifyHTTPGet(t, webSrv.URL+"/vh/notify/history")
+	if code != http.StatusOK {
+		t.Fatalf("GET /vh/notify/history: %d %s", code, body)
+	}
+	var hist struct {
+		Events []struct {
+			Type      string `json:"type"`
+			SessionID string `json:"sessionID"`
+			Root      string `json:"root"`
+			Title     string `json:"title"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(body, &hist); err != nil {
+		t.Fatalf("history decode: %v (%s)", err, body)
+	}
+	found := false
+	for _, ev := range hist.Events {
+		if ev.Type == "session_started" {
+			found = true
+			if ev.SessionID != "sess-started-1" || ev.Root != "sess-started-1" {
+				t.Fatalf("session_started history event drift: %+v", ev)
+			}
+			if ev.Title != "Kick off the release" {
+				t.Fatalf("session_started title = %q, want the root's title", ev.Title)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("history must retain the session_started notice: %s", body)
+	}
+
+	// --- delivery hygiene: exactly ONE FCM request (once-per-increase;
+	// subsequent sweeps see an unchanged running set) ---
+	time.Sleep(300 * time.Millisecond) // let any stray duplicate surface
+	if got := fcm.requests(); got != 1 {
+		t.Fatalf("FCM requests = %d, want exactly 1 (once per increase)", got)
+	}
 }

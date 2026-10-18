@@ -3,6 +3,7 @@ package alerts
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"sync"
 	"time"
 
@@ -208,6 +209,14 @@ type watcher struct {
 	finishAt map[string]time.Time // root -> time its subtree went idle (pending settle)
 	firedRun map[string]bool      // partID -> runaway already fired
 	firedReq map[string]bool      // permission/question id -> waiting already fired
+
+	// session_started detector state (v3): the set of RUNNING root sessions
+	// observed at the previous sweep. runBased flips on the FIRST sweep —
+	// that sweep establishes the baseline WITHOUT firing (sessions already
+	// running at startup never alert; the only-events-after-startup rule),
+	// mirroring the event-baseline precedent in run()/seed().
+	runBase  map[string]bool
+	runBased bool
 }
 
 func isBusy(a string) bool { return a == state.ActivityBusy || a == state.ActivityRetry }
@@ -424,6 +433,41 @@ func (w *watcher) sweep() {
 		sid, typ, detail string
 	}
 	var fires []pending
+
+	// session_started (v3): compare the set of RUNNING root sessions (a root
+	// whose OWN activity is busy/retry — a busy child is its root's turn, not
+	// a new session) against the previous sweep. The FIRST sweep establishes
+	// the baseline WITHOUT firing; after that, an INCREASE fires exactly ONE
+	// notice carrying a representative newly-running root (deterministic: the
+	// lexicographically first new root — multiple new sessions in one sweep
+	// collapse to one notice; the per-(type,token)/(type,session) cooldowns
+	// bound repeats anyway). Decrease or unchanged count never fires; a root
+	// that stops and later runs again IS a new increase (fires again). The
+	// detector is sweep-based by contract: detection latency is up to ~one
+	// sweep interval (20s) plus propagation.
+	{
+		cur := map[string]bool{}
+		for sid, t := range w.sessions {
+			if isBusy(t.activity) && w.rootOfLocked(sid) == sid {
+				cur[sid] = true
+			}
+		}
+		if !w.runBased {
+			w.runBase, w.runBased = cur, true
+		} else {
+			if len(cur) > len(w.runBase) {
+				newRoots := make([]string, 0, len(cur))
+				for sid := range cur {
+					if !w.runBase[sid] {
+						newRoots = append(newRoots, sid)
+					}
+				}
+				sort.Strings(newRoots)
+				fires = append(fires, pending{newRoots[0], TypeSessionStarted, "Session started"})
+			}
+			w.runBase = cur
+		}
+	}
 
 	// finished: confirm settled root turns via the store's send gate.
 	for root, at := range w.finishAt {

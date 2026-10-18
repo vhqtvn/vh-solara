@@ -22,15 +22,16 @@ import (
 
 // Notice types.
 const (
-	TypeFinished      = "finished"       // a root turn completed (settled)
-	TypeWaiting       = "waiting"        // a session needs human input (permission/question)
-	TypeStuckThinking = "stuck-thinking" // reasoning has streamed too long (loop)
-	TypeRunaway       = "runaway"        // a non-task tool has run too long
-	TypeStalled       = "stalled"        // busy but no output for too long (hang)
+	TypeFinished       = "finished"        // a root turn completed (settled)
+	TypeWaiting        = "waiting"         // a session needs human input (permission/question)
+	TypeStuckThinking  = "stuck-thinking"  // reasoning has streamed too long (loop)
+	TypeRunaway        = "runaway"         // a non-task tool has run too long
+	TypeStalled        = "stalled"         // busy but no output for too long (hang)
+	TypeSessionStarted = "session_started" // a root session started running (v3; sweep-detected)
 )
 
 // AllTypes is the canonical ordered set, used as the default `types` filter.
-var AllTypes = []string{TypeFinished, TypeWaiting, TypeStuckThinking, TypeRunaway, TypeStalled}
+var AllTypes = []string{TypeFinished, TypeWaiting, TypeStuckThinking, TypeRunaway, TypeStalled, TypeSessionStarted}
 
 // Channel policy values (when a profile lets a channel fire).
 const (

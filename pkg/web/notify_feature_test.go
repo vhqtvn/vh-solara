@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -678,6 +679,12 @@ func TestNotifyTokensProbeHealthSurface(t *testing.T) {
 	if err != nil {
 		t.Fatalf("alerts.NewNotifier: %v", err)
 	}
+	// d-F4: no production stderr — the notifier's default logger is the
+	// daemon's shared vhlog logger, and this test deliberately drives a
+	// FAILED send (oauthFail below), which would emit a real Warn line per
+	// attempt into the test run's output. Swap to a discard handler; the
+	// assertions read the sanitized probe surface, not the log stream.
+	notifier.SetLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	engine.SetNotifier(notifier)
 	if !engine.NotifyReady() {
 		t.Fatal("test premise: NotifyReady must be true")

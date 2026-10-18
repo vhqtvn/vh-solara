@@ -83,6 +83,7 @@ const (
 	condDegradedRunaway   = "degraded_runaway"
 	condDegradedStalled   = "degraded_stalled"
 	condWorkerDown        = "worker_down"
+	condSessionStarted    = "session_started" // v3: a root session started running
 )
 
 // serviceAccount is the subset of a Google service-account credentials file
@@ -124,14 +125,16 @@ type Notifier struct {
 
 	// statMu guards the observability surface: window counters for the
 	// periodic health line plus the operator-checkable last_attempt /
-	// last_error pair. Failures still never block delivery.
+	// last_error pair. The pair is published TOGETHER, under one lock hold,
+	// only when an attempt COMPLETES — an in-flight attempt stays invisible
+	// to the probe. Failures still never block delivery.
 	statMu      sync.Mutex
 	attempted   int64     // delivery units started since the last health line
 	succeeded   int64     // delivered OK since the last health line
 	failed      int64     // failed (any class) since the last health line
 	pruned      int64     // pruned as UNREGISTERED since the last health line
-	lastAttempt time.Time // last FCM send attempt (any outcome)
-	lastErr     string    // sanitized summary of the latest attempt if it failed ("" after a success)
+	lastAttempt time.Time // start time of the most recent COMPLETED attempt (zero before any completes)
+	lastErr     string    // sanitized outcome of that same completed attempt ("" when it succeeded)
 }
 
 // NewNotifier loads the service-account credentials named by the config's
@@ -334,6 +337,10 @@ func notifyCondition(n Notice) string {
 		return condDegradedThinking
 	case TypeRunaway:
 		return condDegradedRunaway
+	case TypeSessionStarted:
+		// v3 change 3: a root session started running. Identity mapping
+		// (vh_event == vh_condition); NORMAL priority (only waiting is HIGH).
+		return condSessionStarted
 	case TypeStalled:
 		if n.SessionID == "" && n.Root == "" && n.Title == "OpenCode" {
 			return condWorkerDown
@@ -468,18 +475,25 @@ func (f *sendFailure) summary() string {
 // ONE token refresh + retry; a 5xx gets ONE cheap retry; there is no queue
 // and no backoff loop.
 func (n *Notifier) deliver(tok NotifyToken, msg fcmMessage) {
+	started := n.now() // this attempt's start time, published with its own outcome below
+
 	n.statMu.Lock()
 	n.attempted++
-	n.lastAttempt = n.now()
 	n.statMu.Unlock()
 
 	f := n.send(tok.Token, msg, 0, false)
 
+	// Publish last_attempt and last_error TOGETHER, only at attempt
+	// COMPLETION: the pair always describes ONE whole attempt — its start
+	// time plus its own outcome (a success clears the error). Until then
+	// the probe shows the untouched zero state, and overlapping attempts
+	// can never pair one attempt's timestamp with another's outcome.
 	n.statMu.Lock()
+	n.lastAttempt = started
 	switch {
 	case f == nil:
 		n.succeeded++
-		n.lastErr = "" // latest attempt succeeded — current channel health is OK
+		n.lastErr = "" // the completed attempt succeeded — current channel health is OK
 	case f.pruned:
 		n.pruned++
 		n.lastErr = f.summary()
@@ -643,10 +657,22 @@ func fcmErrorStatus(body []byte) string {
 // notifyHealthInterval is the default period of the channel-health log line.
 const notifyHealthInterval = 10 * time.Minute
 
-// Health returns the operator-checkable channel state: the time of the last
-// FCM send attempt (zero when none) and the sanitized last_error (empty when
-// the latest attempt succeeded or none has happened). Safe for concurrent
-// use; never carries token material.
+// SetLogger swaps the failure/health log target. Production keeps the
+// daemon's shared vhlog logger; cross-package tests (pkg/web route tests)
+// use a discard or buffered handler so failure-path coverage never writes
+// real Warn lines into the test run's stderr. Call before the first Send —
+// the per-token delivery goroutines read the field without a lock.
+func (n *Notifier) SetLogger(l *slog.Logger) {
+	if l != nil {
+		n.logger = l
+	}
+}
+
+// Health returns the operator-checkable channel state: the start time of the
+// most recent COMPLETED FCM send attempt and that same attempt's sanitized
+// outcome (empty when it succeeded). Both stay zero values until some
+// attempt has completed — an in-flight attempt is invisible. Safe for
+// concurrent use; never carries token material.
 func (n *Notifier) Health() (time.Time, string) {
 	n.statMu.Lock()
 	defer n.statMu.Unlock()
