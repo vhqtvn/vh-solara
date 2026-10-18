@@ -46,6 +46,27 @@ async function bootEink(page: Page) {
   });
 }
 
+// "Paging bar fully inside the chat viewport" setup invariant, with a 1px
+// sub-pixel slack. scrollIntoView({ block: "end" }) aligns the bar's bottom to
+// the scrollport bottom EXACTLY in ideal math, but Chromium quantizes the
+// programmatic scroll offset to whole device pixels (DPR 1), leaving a
+// residual of up to ±0.5px whose SIGN depends on the fractional layout
+// heights of the environment — CI's freshly installed font set shifts text
+// metrics, so the same alignment that reads −0.34px locally reads +0.2…0.5px
+// on the runner (run 39108418154: 3/3 deterministic false with the bar
+// PAINTED fully at the viewport bottom — an invisible sub-pixel overshoot the
+// zero-tolerance `r.bottom <= c.bottom` turned into a hard failure). The
+// invariant's meaning is "Playwright's click actionability never needs to
+// scroll for the bar" — a sub-pixel-adjacent rect does not trigger it, so the
+// 1px slack preserves the invariant exactly while killing the coin flip.
+function inChatViewport(el: HTMLElement): boolean {
+  const chat = el.closest(".chat-scroll") as HTMLElement | null;
+  if (!chat) return false;
+  const r = el.getBoundingClientRect();
+  const c = chat.getBoundingClientRect();
+  return r.bottom <= c.bottom + 1 && r.top >= c.top - 1;
+}
+
 async function openDemo(page: Page) {
   await page.goto(projectUrl("/?session=demo"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10_000 });
@@ -717,13 +738,8 @@ test("e-ink ON: reasoning body pages independently of the transcript", async ({ 
   const chatBefore = await page.locator(".chat-scroll").evaluate((el: HTMLElement) => el.scrollTop);
   // The bar must be fully inside the chat viewport for the invariant to be
   // attributable to the clicks (Playwright never needs to scroll for them).
-  const barInChatView = await page.locator('[data-eink-surface="reasoning"]').evaluate((el: HTMLElement) => {
-    const chat = el.closest(".chat-scroll") as HTMLElement | null;
-    if (!chat) return false;
-    const r = el.getBoundingClientRect();
-    const c = chat.getBoundingClientRect();
-    return r.bottom <= c.bottom && r.top >= c.top;
-  });
+  // inChatViewport carries the 1px sub-pixel slack (see its comment).
+  const barInChatView = await page.locator('[data-eink-surface="reasoning"]').evaluate(inChatViewport);
   expect(barInChatView).toBe(true);
 
   // Park at the body's top via real Prev presses.
@@ -1224,13 +1240,7 @@ test("e-ink ON: tool output pages discretely, independent of the transcript", as
   await page.waitForTimeout(250);
   const chatScroll = page.locator(".chat-scroll");
   const chatBefore = await chatScroll.evaluate((el: HTMLElement) => el.scrollTop);
-  const barInView = await bar.evaluate((el: HTMLElement) => {
-    const chat = el.closest(".chat-scroll") as HTMLElement | null;
-    if (!chat) return false;
-    const r = el.getBoundingClientRect();
-    const c = chat.getBoundingClientRect();
-    return r.bottom <= c.bottom && r.top >= c.top;
-  });
+  const barInView = await bar.evaluate(inChatViewport);
   expect(barInView, "paging bar must sit inside the chat viewport for the click loop").toBe(true);
 
   // Park at the output's top via real Prev presses…
