@@ -118,9 +118,9 @@ func completeSnapshotFrame(s string) bool {
 // ackSnapshotFrame is the subscription-sync barrier (kill-verification
 // brief F1): it blocks until the stream has delivered one complete
 // `event: snapshot` frame, proving the server registered this
-// connection's subscription. Grounding (pkg/web/server.go): the handler
-// calls store.SubscribeWith (~:2597) BEFORE it computes and writes the
-// fresh-subscribe snapshot (~:2931-2961, writeRaw at ~:2957), so receipt
+// connection's subscription. Grounding (pkg/web/stream_http.go): the handler
+// calls store.SubscribeWith BEFORE it computes and writes the
+// fresh-subscribe snapshot (via writeRaw), so receipt
 // of the full frame ⇒ subscription registered ⇒ any later
 // store.EmitNotice (the death notice) is queued to this connection after
 // that point. On failure it says "no snapshot within Ns" up front, with
