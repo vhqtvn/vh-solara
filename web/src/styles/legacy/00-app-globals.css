@@ -8,6 +8,18 @@
   /* Divided by --ui-zoom so desktop CSS `zoom` (which scales this fixed px
      height to <100%) still fills the viewport instead of leaving dead space. */
   height: calc(var(--app-h, 100dvh) / var(--ui-zoom, 1));
+  /* INVARIANT: the app root may never be taller than the frame's viewport.
+     --app-h is floored by viewport.ts, but whatever ELSE could push it past
+     the viewport on device (a stale-large sample, an engine rounding
+     disagreement) stops here: a root 1px over the viewport gives the document
+     a scroll range, and a touch drag pans the whole document instead of the
+     intended gesture (the host-shell Chrome PWA standalone report — mirrored
+     from host-web App.module.css, commit 82360d1; the shell's own
+     overflow:hidden clip did NOT reliably prevent that pan on the host).
+     100% resolves against #root (height:100%) in the same coordinate space
+     as the height calc above, so --ui-zoom cancels: this binds exactly when
+     --app-h exceeds the viewport, never under legitimate zoom (<1 included). */
+  max-height: 100%;
   overflow: hidden;
   /* App-like: the chrome (sidebar, header, buttons, tree) isn't selectable, so a
      long-press doesn't pop text selection / the callout on touch (Android Edge,

@@ -62,13 +62,32 @@
 // clamp (vv.offsetTop + vv.height, pinch-zoomed samples ignored), installs a
 // teardown (hot-reload/tests), and carries a DEV bridge. Mirror rule: change
 // the sampler skeleton in one → mirror the change in the other.
+/** App-root height in CSS px (written as --app-h; consumed by .app in
+ * styles/legacy/00-app-globals.css), or null when no usable sample exists
+ * (keep the last good value).
+ *
+ *  - vv-primary with an innerHeight clamp: vv.height wins when smaller (the
+ *    standalone iOS keyboard shrinks vv, not innerHeight); a stale-large vv
+ *    sample is clamped to the frame's layout viewport (the iframe element's
+ *    height when embedded).
+ *  - 0/negative samples (collapsed/hidden frame) are ignored.
+ *  - FLOORED, never rounded up: the tracker may only ever make the app root
+ *    SHORTER than the frame's viewport (the vv/innerHeight clamps), never
+ *    taller. On fractional-CSS-px viewports (Android DPRs like 2.625 →
+ *    innerHeight N.6) Math.round produced N+1 → `.app` 1px taller than the
+ *    viewport → scrollingElement.scrollHeight > clientHeight → the same
+ *    1px scroll-range/touch-pan class the host shell hit in the Chrome PWA
+ *    standalone report (mirrored from host-web/src/hostViewport.ts, 82360d1).
+ *    The sub-pixel loss is invisible; the scroll range it prevents is not.
+ *    (Belt-and-braces: 00-app-globals.css caps `.app` with max-height:100%
+ *    for any non-rounding over-viewport source.) */
 export function computeAppHeight(win: Window = window): number | null {
   const layoutH = win.innerHeight;
   const vvH = win.visualViewport?.height;
   let h = vvH && vvH > 0 ? vvH : layoutH;
   if (layoutH > 0 && h > layoutH) h = layoutH;
   if (!(h > 0)) return null;
-  return Math.round(h);
+  return Math.floor(h);
 }
 
 let resync: (() => void) | null = null;

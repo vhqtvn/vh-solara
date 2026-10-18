@@ -5,7 +5,10 @@
 // correction, so .app overflowed the iframe and clipped the composer below the
 // screen. Pins: (1) the height is clamped to the frame's layout viewport and
 // ignores 0 samples; (2) it re-syncs on non-resize signals (visibilitychange,
-// pageshow, focus, explicit resyncViewport) instead of only on resize edges.
+// pageshow, focus, explicit resyncViewport) instead of only on resize edges;
+// (3) fractional-DPR geometry is FLOORED, never rounded past the viewport —
+// the sampler may only make the app root shorter than the viewport, never
+// taller (mirror of the host-shell fix, commit 82360d1).
 import { describe, it, expect, beforeAll, beforeEach } from "vitest";
 import { computeAppHeight, installViewport, resyncViewport } from "../../src/viewport";
 
@@ -31,6 +34,22 @@ describe("computeAppHeight", () => {
   });
   it("returns null for a collapsed frame (keep last good value)", () => {
     expect(computeAppHeight(win(0, 0))).toBeNull();
+  });
+  it("floors a fractional layout viewport (never rounds past it)", () => {
+    // Fractional-DPR viewports (e.g. Android DPR 2.625) report innerHeight
+    // N.6. Math.round produced N+1 → .app 1px taller than the frame's
+    // viewport → scrollingElement.scrollHeight > clientHeight → a 1px scroll
+    // range (the host-shell 82360d1 bug class). The sampler may only make
+    // the app root SHORTER than the viewport, never taller.
+    expect(computeAppHeight(win(740.6))).toBe(740);
+  });
+  it("floors a fractional visual-viewport (keyboard) sample", () => {
+    // vv 421.6 with the keyboard open: round → 422 would sit 0.4px past the
+    // visible band's bottom edge.
+    expect(computeAppHeight(win(800, 421.6))).toBe(421);
+  });
+  it("floors after clamping a stale-large vv to a fractional layout viewport", () => {
+    expect(computeAppHeight(win(740.6, 900))).toBe(740);
   });
 });
 
@@ -83,6 +102,14 @@ describe("installViewport re-sync", () => {
     vvHeight = 0;
     resyncViewport();
     expect(appH()).toBe("300px");
+    Object.defineProperty(window, "innerHeight", { configurable: true, get: () => 800 });
+  });
+
+  it("writes a floored --app-h on fractional geometry (never N+1)", () => {
+    Object.defineProperty(window, "innerHeight", { configurable: true, get: () => 740.6 });
+    vvHeight = 740.6;
+    resyncViewport();
+    expect(appH()).toBe("740px");
     Object.defineProperty(window, "innerHeight", { configurable: true, get: () => 800 });
   });
 });
