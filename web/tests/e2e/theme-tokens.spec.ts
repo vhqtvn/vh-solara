@@ -93,6 +93,19 @@ async function probeBackground(page: import("@playwright/test").Page, decl: stri
   }, decl);
 }
 
+// Same probe idiom for text color (the --danger-fg split pins resolve
+// declarations through the engine's serialization, never hardcoded strings).
+async function probeColor(page: import("@playwright/test").Page, decl: string): Promise<string> {
+  return page.evaluate((d) => {
+    const el = document.createElement("div");
+    el.style.cssText = `${d};position:fixed;left:-9999px;top:-9999px;`;
+    document.body.appendChild(el);
+    const v = getComputedStyle(el).color;
+    el.remove();
+    return v;
+  }, decl);
+}
+
 // Real keyboard focus: press Tab (a genuine user keypress, so :focus-visible
 // matches) until activeElement is a session-tree row. Bounded so a changed tab
 // order fails loudly instead of hanging.
@@ -527,6 +540,50 @@ test("e ink color theme: computed motion/shadow kill-switch AND saturated semant
   const activeNav = dialog.locator(".settings-nav-item.on");
   await expect(activeNav).toBeVisible();
   expect(await activeNav.evaluate((el) => getComputedStyle(el).color)).toBe(accent);
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+});
+
+// ----------------------------------------------------------------------------
+// Paper themes --danger-fg split (device-feedback round-2 follow-up). The
+// paper variants used to force --danger-fg: #ffffff — correct only for the
+// solid danger fills, and the same white-on-light invisibility class the
+// e-ink round fixed, for every FLAT danger-text consumer on the paper page
+// (chips, error hints, confirm titles). The split mirrors the e-ink
+// treatment: the token serves flat text (Paper: its ink — grayscale by
+// design; Paper Colour: the muted danger rust darkened 30%, because the raw
+// #a8503f reads <4.5:1 on the darker paper surfaces), while the solid fills
+// keep white via paper-scoped keeps (their COMPUTED contrast is asserted in
+// eink-surfaces.spec.ts). Selection goes through the real ThemePicker, and
+// every value is resolved through the engine's serialization (probe
+// elements) — never a hardcoded string on the theme side.
+
+test("paper themes: --danger-fg serves flat danger text (ink / darkened rust), not white", async ({ page }) => {
+  await page.goto(projectUrl("/"));
+  await page.getByRole("button", { name: "Settings" }).click();
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await expect(dialog).toBeVisible();
+
+  // ---- Paper (monochrome): flat danger text is the variant's own ink,
+  //      matching --danger exactly — NOT white (the old override) and NOT
+  //      the light-scoped red (paper is grayscale by design). ----
+  await dialog.locator('[role="option"][title="Paper"]').click();
+  await expect.poll(() => htmlClasses(page)).toContain("theme-paper");
+  const paperFg = await probeColor(page, "color: var(--danger-fg)");
+  expect(paperFg).toBe(await probeColor(page, "color: var(--danger)"));
+  expect(paperFg).not.toBe("rgb(255, 255, 255)");
+  expect(paperFg).not.toBe("rgb(207, 34, 46)"); // the light-scoped #cf222e
+
+  // ---- Paper Colour: flat danger text is the danger rust DARKENED (30%
+  //      toward black) — distinct from both the raw rust and white. ----
+  await dialog.getByRole("button", { name: "Theme" }).click();
+  await dialog.locator('[role="option"][title="Paper Color"]').click();
+  await expect.poll(() => htmlClasses(page)).toContain("theme-paper-color");
+  const paperColorFg = await probeColor(page, "color: var(--danger-fg)");
+  expect(paperColorFg).toBe(await probeColor(page, "color: color-mix(in srgb, var(--danger) 70%, #000000)"));
+  expect(paperColorFg).not.toBe("rgb(255, 255, 255)");
+  expect(paperColorFg).not.toBe(await probeColor(page, "color: var(--danger)"));
 
   await page.keyboard.press("Escape");
   await expect(dialog).toHaveCount(0);

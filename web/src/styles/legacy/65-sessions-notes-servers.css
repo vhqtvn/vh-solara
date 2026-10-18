@@ -109,6 +109,12 @@
 /* The dismiss (×) rides the shared global .icon-btn; inherit the danger color. */
 .ctxm-pinerr-x { flex: none; color: inherit; }
 .ctxm-pinerr-x:hover { background: color-mix(in srgb, var(--danger) 22%, transparent); }
+/* E Ink Colour only: the saturated --danger-fg text on this 12% danger tint
+   (composited over the bg-2 menu) computes <4.5:1. Darken the TEXT, not the
+   tint, so the chromatic-by-design posture keeps its hue (device-feedback
+   round-2 follow-up; the monochrome sibling needs no rule — its ink text
+   passes everywhere). Theme-scoped: OFF/other themes never match. */
+:root.theme-eink-color .ctxm-pinerr { color: color-mix(in srgb, var(--danger) 70%, #000000); }
 
 .dialog.confirm { max-width: 440px; }
 .confirm-lead { margin: 0 4px 10px; line-height: 1.5; }

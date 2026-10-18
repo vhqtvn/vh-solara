@@ -65,6 +65,15 @@
 .pwa-diag-chip[data-status="ok"] { background: color-mix(in srgb, var(--ok) 22%, var(--bg-2)); color: var(--ok); }
 .pwa-diag-chip[data-status="warn"] { background: color-mix(in srgb, var(--warn) 22%, var(--bg-2)); color: var(--warn); }
 .pwa-diag-chip[data-status="bad"] { background: color-mix(in srgb, var(--danger) 22%, var(--bg-2)); color: var(--danger-fg); }
+/* E Ink Colour only: the 22% danger tint flattens the chip against the
+   saturated --danger-fg text (<4.5:1). Darken the TEXT, not the tint, so the
+   chromatic-by-design posture keeps its hue (device-feedback round-2
+   follow-up). :global because the theme class lives on <html>, outside this
+   module — the local .pwa-diag-chip stays hashed; OFF/other themes never
+   match. */
+:global(:root.theme-eink-color) .pwa-diag-chip[data-status="bad"] {
+  color: color-mix(in srgb, var(--danger) 70%, #000000);
+}
 .pwa-diag-chip[data-status="info"] { background: var(--bg-2); color: var(--fg-dim); }
 .pwa-diag-value { flex: 1 1 auto; min-width: 0; color: var(--fg); word-break: break-word; }
 .pwa-diag-detail { color: var(--fg-dim); }

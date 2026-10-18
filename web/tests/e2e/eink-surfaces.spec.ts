@@ -1595,6 +1595,28 @@ function dangerContrast(fg: string, bg: string): number {
   return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
 }
 
+// Alpha channel of a serialized color (1 when absent/opaque) — the tinted
+// flats (.ctxm-pinerr) mix var(--danger) with TRANSPARENT, so their computed
+// background carries alpha and must be composited over the surface behind
+// before any contrast claim.
+function dangerParseAlpha(color: string): number {
+  let m = /rgba?\(\d+(?:\.\d+)?,\s*\d+(?:\.\d+)?,\s*\d+(?:\.\d+)?,\s*([\d.]+)\)/.exec(color);
+  if (m) return Number(m[1]);
+  m = /color\(srgb[^)]*\/\s*([\d.]+)\)/.exec(color);
+  return m ? Number(m[1]) : 1;
+}
+// Composite a (possibly translucent) color over an opaque backdrop, in the
+// same serialization vocabulary dangerParseChannels reads.
+function dangerComposite(over: string, backdrop: string): string {
+  const a = dangerParseAlpha(over);
+  if (a >= 1) return over;
+  const o = dangerParseChannels(over);
+  const b = dangerParseChannels(backdrop);
+  if (!o || !b) return over;
+  const mixed = o.map((c, i) => c * a + b[i] * (1 - a));
+  return `rgb(${mixed.map((v) => Math.round(v)).join(", ")})`;
+}
+
 // One element's danger-relevant computed shape: text color, its EFFECTIVE
 // background (walks ancestors until an opaque bg — flat titles/buttons sit on
 // the dialog or sheet surface), own background, and the top border width.
@@ -1624,16 +1646,22 @@ function dangerShape(loc: import("@playwright/test").Locator) {
 }
 
 // Resolve a declaration through the same engine serialization a consumer
-// sees (theme-tokens.spec.ts's probe idiom).
-function dangerResolve(page: import("@playwright/test").Page, decl: string) {
-  return page.evaluate((d) => {
+// sees (theme-tokens.spec.ts's probe idiom). `prop` picks which computed
+// property to read back (color by default; backgroundColor for fills).
+function dangerResolve(
+  page: import("@playwright/test").Page,
+  decl: string,
+  prop: "color" | "backgroundColor" = "color",
+) {
+  return page.evaluate(([d, p]) => {
     const el = document.createElement("div");
     el.style.cssText = `${d};position:fixed;left:-9999px;top:-9999px;`;
     document.body.appendChild(el);
-    const v = getComputedStyle(el).color;
+    const cs = getComputedStyle(el);
+    const v = p === "backgroundColor" ? cs.backgroundColor : cs.color;
     el.remove();
     return v;
-  }, decl);
+  }, [decl, prop] as const);
 }
 
 async function dangerOpenSessionMenu(page: import("@playwright/test").Page) {
@@ -1845,6 +1873,283 @@ test("e-ink danger semantics: destructive affordances visible + non-hue distingu
   await p3.keyboard.press("Escape");
   await expect(colorDangerConfirm).toHaveCount(0);
   await p3.close();
+});
+
+// ── device-feedback round 2 follow-up — paper flat-danger split + e-ink-colour
+//    tinted flats. Two parked repairs from the DF2 review, both COMPUTED here
+//    on the real rendered surfaces:
+//    (1) the paper themes forced --danger-fg: #ffffff for their solid fills —
+//        the same latent class DF2 fixed for e-ink: every FLAT danger-text
+//        consumer (tinted chips, error hints) rendered white-on-light. The
+//        split mirrors DF2: the token serves flat text (Paper: ink; Paper
+//        Colour: the danger rust darkened 30%), and the solid fills keep
+//        white via explicit paper-scoped keeps.
+//    (2) under theme-eink-color the tinted flats (.ctxm-pinerr 12% tint,
+//        .pwa-diag-chip[bad] 22% tint) against the saturated --danger-fg text
+//        computed <4.5:1 — darkened TEXT via theme-scoped rules (the chromatic
+//        posture keeps its hue by design).
+//    Also pins that the DEFAULT dark theme is untouched: the flat consumers
+//    still resolve exactly the base --danger-fg token (no new rule reaches
+//    them). Physical panel outcomes remain out of scope.
+test("paper danger split + eink-color tinted flats: flat text ≥4.5:1, solid fills keep white, dark untouched", async ({ browser }) => {
+  test.setTimeout(150_000);
+
+  // Own context, service workers blocked, ONE LIVE PAGE AT A TIME. Root
+  // cause found while writing this test: each app page holds several
+  // long-lived same-origin streams (tree + selected session + queue), and a
+  // SECOND live page in the context pushes past the browser's 6-connections-
+  // per-origin HTTP/1.1 budget — every further fetch (including the Settings
+  // → App diagnostics' manifest fetch, which is what renders the chip rows)
+  // then queues forever ("Gathering install signals…" sticks). Proven: with
+  // two pages up, BOTH /manifest.webmanifest and /oc/agent time out on page 2
+  // and closing page 1 unblocks them immediately. So each themed page below
+  // is CLOSED before the next opens — every page then runs comfortably under
+  // the budget. (SW block is belt-and-braces determinism for the diag's
+  // service-worker row; see the closeout report for the two-tab note.)
+  const ctx = await browser.newContext({ serviceWorkers: "block" });
+  const page = await ctx.newPage();
+
+  // Boot with a SAVED theme (no e-ink profile — the paper themes are ordinary
+  // saved themes; the scoping under test keys on the theme class alone).
+  const bootSavedTheme = (p: import("@playwright/test").Page, themeId: string) =>
+    p.addInitScript((t) => {
+      localStorage.setItem("vh.theme.v1", JSON.stringify({ v: 1, data: t }));
+    }, themeId);
+
+  // Harvest the REAL hashed .pwa-diag-chip module class from the mounted
+  // Settings → App diagnostics rows (the class is module-hashed, so a plain
+  // probe className would match nothing; the attribute is set on the probe —
+  // the cascade rule keys on class+attr, which is what's under test).
+  const harvestChipClass = async (p: import("@playwright/test").Page) => {
+    await p.getByRole("button", { name: "Settings" }).click();
+    const dialog = p.getByRole("dialog", { name: "Settings" });
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", { name: "App", exact: true }).click();
+    await expect
+      .poll(() => p.evaluate(() => document.querySelector('[class*="pwa-diag-chip"]')?.className ?? null), { timeout: 10_000 })
+      .toBeTruthy();
+    const cls = await p.evaluate(() => document.querySelector('[class*="pwa-diag-chip"]')!.className);
+    await p.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+    return cls;
+  };
+
+  // Probe a chip-shaped element (real harvested class + data-status="bad")
+  // off-screen on the body and return its computed danger shape.
+  const probeChip = (p: import("@playwright/test").Page, chipClass: string) =>
+    p.evaluate((cls) => {
+      const el = document.createElement("span");
+      el.className = cls;
+      el.setAttribute("data-status", "bad");
+      el.style.cssText = "position:fixed;left:-9999px;top:-9999px;";
+      document.body.appendChild(el);
+      const cs = getComputedStyle(el);
+      const out = { color: cs.color, backgroundColor: cs.backgroundColor };
+      el.remove();
+      return out;
+    }, chipClass);
+
+  // Probe .ctxm-pinerr appended INSIDE the real open context menu, so the
+  // translucent 12% tint composites over the menu's actual bg-2 surface.
+  // The menu's own computed backgroundColor is read EXPLICITLY as the
+  // backdrop — dangerShape's ancestor walk terminates on the probe itself
+  // when its tint serializes as color(srgb … / a) (non-rgb forms read as
+  // terminal there), which would composite the tint over itself.
+  const probePinerrInMenu = async (p: import("@playwright/test").Page) => {
+    const menu = await dangerOpenSessionMenu(p);
+    await menu.evaluate((host) => {
+      const el = document.createElement("div");
+      el.className = "ctxm-pinerr";
+      el.setAttribute("data-danger-probe", "pinerr");
+      (host as HTMLElement).appendChild(el);
+    });
+    const menuBg = await menu.evaluate((host) => getComputedStyle(host as HTMLElement).backgroundColor);
+    const shape = await dangerShape(menu.locator("[data-danger-probe='pinerr']"));
+    await menu.locator("[data-danger-probe='pinerr']").evaluate((el) => el.remove());
+    return { shape, menuBg, menu };
+  };
+
+  // Measured ratios, logged as the run's receipt (visible in runner stdout).
+  const measured: Record<string, number> = {};
+  const atLeast = (name: string, ratio: number) => {
+    measured[name] = ratio;
+    expect(ratio, `${name} contrast ${ratio} must be ≥4.5 (and parse — a -1 means unparseable colors)`).toBeGreaterThanOrEqual(4.5);
+  };
+
+  // ---------- PAPER (monochrome saved theme) ----------
+  await bootSavedTheme(page, "paper");
+  await openDemo(page);
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.classList.contains("theme-paper")))
+    .toBe(true);
+  {
+    // Flat tinted consumer, REAL menu surface: .ctxm-pinerr (12% ink tint).
+    const { shape, menuBg, menu } = await probePinerrInMenu(page);
+    atLeast(
+      "paper .ctxm-pinerr",
+      dangerContrast(shape.color, dangerComposite(shape.backgroundColor, menuBg)),
+    );
+    // Solid-fill keep, real gesture path: hold Archive… → Delete confirm —
+    // the .confirm-go solid --danger fill keeps WHITE text (not ink-on-ink).
+    await menu.getByText("Archive…").click({ delay: 520 });
+    const confirm = page.getByRole("dialog", { name: "Confirm delete" });
+    await expect(confirm).toBeVisible();
+    const go = await dangerShape(confirm.locator(".confirm-go"));
+    atLeast("paper delete .confirm-go (white on fill)", dangerContrast(go.color, go.backgroundColor));
+    expect(go.color).toBe("rgb(255, 255, 255)");
+    expect(go.backgroundColor).toBe(await dangerResolve(page, "background: var(--danger)", "backgroundColor"));
+    await page.keyboard.press("Escape");
+    await expect(confirm).toHaveCount(0);
+  }
+  // Flat consumers: the bad chip (22% ink tint over bg-2) + .ocu-err (flat
+  // --danger text on the elevated bg-2 dialog surface).
+  const chipClassPaper = await harvestChipClass(page);
+  {
+    const chip = await probeChip(page, chipClassPaper);
+    atLeast("paper .pwa-diag-chip[bad]", dangerContrast(chip.color, chip.backgroundColor));
+    const ocuErr = await page.evaluate(() => {
+      const el = document.createElement("p");
+      el.className = "ocu-err";
+      el.style.cssText = "position:fixed;left:-9999px;top:-9999px;";
+      document.body.appendChild(el);
+      const v = getComputedStyle(el).color;
+      el.remove();
+      return v;
+    });
+    atLeast("paper .ocu-err", dangerContrast(ocuErr, await dangerResolve(page, "background: var(--bg-2)", "backgroundColor")));
+  }
+  // Free the paper page's streams before the next themed page boots
+  // (connection budget — see the context comment above).
+  await page.close();
+
+  // ---------- PAPER COLOUR (muted-chromatic saved theme) ----------
+  const p2 = await ctx.newPage();
+  await bootSavedTheme(p2, "paper-color");
+  await openDemo(p2);
+  await expect
+    .poll(() => p2.evaluate(() => document.documentElement.classList.contains("theme-paper-color")))
+    .toBe(true);
+  {
+    const { shape, menuBg, menu } = await probePinerrInMenu(p2);
+    atLeast(
+      "paper-color .ctxm-pinerr",
+      dangerContrast(shape.color, dangerComposite(shape.backgroundColor, menuBg)),
+    );
+    await menu.getByText("Archive…").click({ delay: 520 });
+    const confirm = p2.getByRole("dialog", { name: "Confirm delete" });
+    await expect(confirm).toBeVisible();
+    const go = await dangerShape(confirm.locator(".confirm-go"));
+    atLeast("paper-color delete .confirm-go (white on fill)", dangerContrast(go.color, go.backgroundColor));
+    expect(go.color).toBe("rgb(255, 255, 255)");
+    expect(go.backgroundColor).toBe(await dangerResolve(p2, "background: var(--danger)", "backgroundColor"));
+    await p2.keyboard.press("Escape");
+    await expect(confirm).toHaveCount(0);
+  }
+  const chipClassColor = await harvestChipClass(p2);
+  {
+    const chip = await probeChip(p2, chipClassColor);
+    atLeast("paper-color .pwa-diag-chip[bad]", dangerContrast(chip.color, chip.backgroundColor));
+    const ocuErr = await p2.evaluate(() => {
+      const el = document.createElement("p");
+      el.className = "ocu-err";
+      el.style.cssText = "position:fixed;left:-9999px;top:-9999px;";
+      document.body.appendChild(el);
+      const v = getComputedStyle(el).color;
+      el.remove();
+      return v;
+    });
+    // The raw rust (#a8503f) was <4.5:1 here — the paper-color keep routes
+    // .ocu-err through the darkened flat-text token.
+    atLeast("paper-color .ocu-err", dangerContrast(ocuErr, await dangerResolve(p2, "background: var(--bg-2)", "backgroundColor")));
+  }
+  // Solid-fill keep, REAL streaming state: the composer Stop button (solid
+  // --danger fill) keeps white text under the tighter paper-color fill.
+  await p2.evaluate(async () => {
+    const res = await fetch(`/oc/session/demo/prompt_async`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
+      body: JSON.stringify({ parts: [{ type: "text", text: "paper danger stop-button probe" }] }),
+    });
+    if (!res.ok && res.status !== 204) throw new Error(`prompt_async -> ${res.status}`);
+  });
+  const stop = p2.locator(".send-btn.stop");
+  await expect(stop).toBeVisible({ timeout: 8000 });
+  const stopShape = await dangerShape(stop);
+  atLeast("paper-color .send-btn.stop (white on fill)", dangerContrast(stopShape.color, stopShape.backgroundColor));
+  expect(stopShape.color).toBe("rgb(255, 255, 255)");
+  expect(stopShape.backgroundColor).toBe(await dangerResolve(p2, "background: var(--danger)", "backgroundColor"));
+  await expect(p2.locator(".working-text")).toHaveCount(0, { timeout: 20000 });
+  await resetSession(p2, "demo");
+  await p2.close();
+
+  // ---------- E INK COLOUR (saved theme, no profile): the tinted flats were
+  // the ~3.5:1 DF2 closeout finding — the scoped darkened text clears 4.5:1
+  // while the variant keeps its chromatic-by-design hues. ----------
+  const p3 = await ctx.newPage();
+  await bootSavedTheme(p3, "eink-color");
+  await openDemo(p3);
+  await expect
+    .poll(() => p3.evaluate(() => document.documentElement.classList.contains("theme-eink-color")))
+    .toBe(true);
+  {
+    const { shape, menuBg, menu } = await probePinerrInMenu(p3);
+    atLeast(
+      "eink-color .ctxm-pinerr",
+      dangerContrast(shape.color, dangerComposite(shape.backgroundColor, menuBg)),
+    );
+    // Dismiss the menu via a real outside click (bottom-right corner — far
+    // from the title-anchored menu; the scrim closes it).
+    await p3.mouse.click(1270, 700);
+    await expect(menu).toHaveCount(0);
+  }
+  const chipClassEink = await harvestChipClass(p3);
+  {
+    const chip = await probeChip(p3, chipClassEink);
+    atLeast("eink-color .pwa-diag-chip[bad]", dangerContrast(chip.color, chip.backgroundColor));
+  }
+  await p3.close();
+
+  // ---------- DEFAULT DARK untouched: the flat consumers resolve exactly
+  // the base --danger-fg token (no paper/eink-color rule reaches them), and
+  // the token is still the base light pink — not white, not any split value.
+  // ----------
+  const p4 = await ctx.newPage();
+  // The paper-color page's ThemePicker pick PERSISTED to this context's
+  // shared localStorage — clear it so p4 boots the true default (dark).
+  await p4.addInitScript(() => {
+    localStorage.removeItem("vh.theme.v1");
+    localStorage.removeItem("vh.prefs.einkProfile.v1");
+  });
+  await p4.goto(projectUrl("/?session=demo"));
+  await expect(p4.locator(".msg").first()).toBeVisible({ timeout: 10_000 });
+  await expect
+    .poll(() => p4.evaluate(() => document.documentElement.classList.contains("theme-dark")))
+    .toBe(true);
+  const darkToken = await dangerResolve(p4, "color: var(--danger-fg)");
+  const darkTokenRgb = dangerParseChannels(darkToken);
+  expect(darkTokenRgb, `dark token must parse (${darkToken})`).not.toBeNull();
+  expect(darkTokenRgb![0]).toBeGreaterThan(200); // the base light pink (#ffb4ba)
+  const chipClassDark = await harvestChipClass(p4);
+  const darkProbes = await p4.evaluate((cls) => {
+    const mk = (className: string, attr?: [string, string]) => {
+      const el = document.createElement(cls === "ocu-err" ? "p" : "span");
+      el.className = className;
+      if (attr) el.setAttribute(attr[0], attr[1]);
+      el.style.cssText = "position:fixed;left:-9999px;top:-9999px;";
+      document.body.appendChild(el);
+      const v = getComputedStyle(el).color;
+      el.remove();
+      return v;
+    };
+    return { pinerr: mk("ctxm-pinerr"), chip: mk(cls, ["data-status", "bad"]) };
+  }, chipClassDark);
+  expect(darkProbes.pinerr).toBe(darkToken); // byte-identical: token drives it
+  expect(darkProbes.chip).toBe(darkToken);
+  await p4.close();
+  await ctx.close();
+
+  // The run's measured-contrast receipt (stdout — closeout evidence).
+  console.log(`[danger-contrast] ${JSON.stringify(measured)}`);
 });
 
 // Label state is bracketed: this spec seeds tags/groups via the real API, and
