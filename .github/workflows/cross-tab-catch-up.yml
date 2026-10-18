@@ -132,7 +132,7 @@ jobs:
         # The lane command from the brief + --reporter=list,json:
         #   list → human-readable Actions log
         #   json → redirected to the file below (PLAYWRIGHT_JSON_OUTPUT_FILE,
-        #          supported by the installed 1.60.0 json reporter, which
+        #          supported by the installed 1.64.1 json reporter, which
         #          mkdirs + writes the file at onEnd), keeping stdout clean.
         # The bash -c wrapper only logs the DISPLAY the run actually got; the
         # playwright invocation itself is exactly the brief's command.
@@ -163,8 +163,8 @@ jobs:
       # Stdlib-only python3; parses the classic Playwright JSON report
       # (annotations land in BOTH tests[].annotations and
       # results[].annotations across the supported lockfile range —
-      # web/package.json allows @playwright/test ^1.49.1, so any installed
-      # >= 1.49.1, and these field paths are stable across that range —
+      # web/package.json allows @playwright/test ^1.64.1, so any installed
+      # >= 1.64.1, and these field paths are stable across that range —
       # both are read).
       - name: proof-mode receipt check (skipped catch-up = failed experiment)
         if: always()
@@ -196,7 +196,7 @@ jobs:
               # Mid-test test.info().annotations.push(...) entries land in BOTH
               # tests[].annotations and results[].annotations (test-end
               # payload replaces both; stable across the supported lockfile
-              # range — @playwright/test ^1.49.1 / installed >= 1.49.1) —
+              # range — @playwright/test ^1.64.1 / installed >= 1.64.1) —
               # union them, deduped.
               seen = []
               def add(ann):

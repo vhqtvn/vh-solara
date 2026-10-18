@@ -39,13 +39,13 @@ The image pin lives in exactly one place — the `PLAYWRIGHT_IMAGE` Make
 variable — and can be overridden for experiments:
 
 ```bash
-make test-host-web-docker PLAYWRIGHT_IMAGE=mcr.microsoft.com/playwright:v1.61.0-noble
+make test-host-web-docker PLAYWRIGHT_IMAGE=mcr.microsoft.com/playwright:v1.64.1-noble
 ```
 
 **Pin coupling:** the image tag MUST track the exact `@playwright/test` version
-pinned in `host-web/package.json` (currently `1.60.0`). The official image
+pinned in `host-web/package.json` (currently `1.64.1`). The official image
 ships the matching browser builds (chromium 1223 / firefox 1522 / webkit 2287
-for 1.60.0) with `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright` preset — no browser
+for 1.64.1) with `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright` preset — no browser
 download ever runs. When bumping the package version, bump the tag in the same
 change. Note: the `web/` package has its own Playwright version range — this
 image is proven for host-web (lanes 7) only; do not assume lane 6 reuse without
@@ -78,7 +78,7 @@ once with a root container (symmetric with how they were created; no host sudo
 needed):
 
 ```bash
-docker run --rm -v "$PWD":/repo -w /repo mcr.microsoft.com/playwright:v1.60.0-noble \
+docker run --rm -v "$PWD":/repo -w /repo mcr.microsoft.com/playwright:v1.64.1-noble \
   bash -c 'rm -rf tmp/agent-runs/host-web-playwright/output tmp/agent-runs/host-web-playwright/report host-web/node_modules/.vite'
 ```
 
@@ -178,9 +178,9 @@ non-root UID/GID containment (`-e HOME=/tmp/pw-home`, user ownership under
    records the full test report, including the custom `qd-*` correlation and
    timing annotations emitted by `queue-delivery-custody.spec.ts`.
 5. **Image tag coupling and riding DEFER:**
-   The wrapper uses the single `PLAYWRIGHT_IMAGE` pin (`mcr.microsoft.com/playwright:v1.60.0-noble`).
-   While `host-web/package.json` pins `@playwright/test` to exact `1.60.0`,
-   `web/package.json` specifies a caret range (`^1.49.1`) that currently
-   lock-resolves to `1.60.0`. Any future lockfile refresh in `web/` must re-assert
+   The wrapper uses the single `PLAYWRIGHT_IMAGE` pin (`mcr.microsoft.com/playwright:v1.64.1-noble`).
+   While `host-web/package.json` pins `@playwright/test` to exact `1.64.1`,
+   `web/package.json` specifies a caret range (`^1.64.1`) that currently
+   lock-resolves to `1.64.1`. Any future lockfile refresh in `web/` must re-assert
    that the resolved `@playwright/test` version matches `PLAYWRIGHT_IMAGE`.
 
