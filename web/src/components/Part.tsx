@@ -59,6 +59,30 @@ function emitEinkSettle() {
   einkSettleListener?.();
 }
 
+// E-ink live-escape bridge (the escape's mirror of the settle seam above):
+// EinkWorking's Show-live click is about to swap the held-back chip for the
+// live .md-stream — an APP-DRIVEN presentation transition, not reader scroll
+// input. The tap itself stamped ChatView's Approach-A input provenance
+// (pointerdown over .chat-main fires for button taps too), and the swap's
+// layout churn can classify as a user-scroll-away while that stamp is fresh
+// — arming the DURABLE inputBackedAway veto + reading-parked mode, which
+// vetoes every recovery (busy→idle, settle-glue, RO re-pins) and strands the
+// escaped reader off-tail (the e2e scroll-follow test 21 CI failure). ChatView
+// registers ONE listener here that clears the stamp at the escape, the same
+// idiom jumpToLatest uses for app-driven viewport actions. Profile OFF never
+// emits — the button only exists under the profile (double gate).
+let einkEscapeListener: (() => void) | undefined;
+export function bindEinkEscapeListener(fn: () => void): () => void {
+  einkEscapeListener = fn;
+  return () => {
+    einkEscapeListener = undefined;
+  };
+}
+function emitEinkEscape() {
+  if (!einkProfile()) return; // profile-scoped: OFF never reaches ChatView
+  einkEscapeListener?.();
+}
+
 // One prose segment: daemon-rendered, syntax-highlighted HTML with copy buttons
 // and clickable file paths.
 export function MarkdownHtml(props: { text: string; live?: boolean }) {
@@ -246,7 +270,10 @@ function EinkWorking(props: { partId: string }) {
         class={styles["eink-live-btn"]}
         data-eink="show-live"
         title="Watch this reply stream live (keeps the e-ink profile on)"
-        onClick={() => setEinkLiveParts(props.partId, true)}
+        onClick={() => {
+          setEinkLiveParts(props.partId, true);
+          emitEinkEscape(); // the tap is not scroll provenance — see the bridge above
+        }}
       >
         Show live
       </button>

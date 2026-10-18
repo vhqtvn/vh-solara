@@ -34,7 +34,7 @@ import {
   pageForward,
   type PagingGeometry,
 } from "../lib/paging";
-import PartView, { ActivityGroup, bindEinkSettleListener } from "./Part";
+import PartView, { ActivityGroup, bindEinkSettleListener, bindEinkEscapeListener } from "./Part";
 import ChatTasksStatus from "./ChatTasksStatus";
 import { bindChatTail } from "../tailFollow";
 import { ChatPagingControls } from "./chat/ChatPagingControls";
@@ -843,6 +843,25 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     pin(); // INSTANT (a direct scrollTop write — no smooth scrolling anywhere)
   };
   onCleanup(bindEinkSettleListener(onEinkSettleEvent));
+
+  // The Show-live escape (Part.tsx's EinkWorking button) is an app-driven
+  // presentation swap (held-back chip → live stream), not reader scroll
+  // input. The tap that triggers it stamped `pendingInputAt` (pointerdown
+  // over .chat-main covers button taps), and the swap's own layout churn can
+  // classify as a user-scroll-away while that stamp is fresh (<300ms) —
+  // arming the DURABLE inputBackedAway veto + reading-parked mode, which
+  // vetoes every recovery (busy→idle, settle-glue, RO re-pins): the escaped
+  // reader strands off-tail with a stuck "↓ Latest" (e2e scroll-follow test
+  // 21's CI failure — slow-machine timing; deterministic unit pin in
+  // ChatViewEinkEscapeFollow.test.tsx). Clearing the stamp keeps the churn a
+  // TRANSIENT drop the settle-lifecycle glue heals (test 23's contract);
+  // genuine reader input (wheel — test 22) is untouched, and an
+  // already-armed genuine park is NOT released (the reader who wheeled away
+  // before tapping keeps their protection). Same idiom as jumpToLatest's
+  // `pendingInputAt = 0` for app-driven viewport actions.
+  onCleanup(bindEinkEscapeListener(() => {
+    pendingInputAt = 0;
+  }));
 
   // ── Phase-4 load-older (historical page prepend) ─────────────────────────
   // The server (Phase 1-3) ships only a bounded recent tail of a session's
