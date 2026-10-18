@@ -3,7 +3,7 @@ package web
 // The end-to-end liveness sentinel probe (webperf slice 4 / F7 residual).
 //
 // PROBLEM (F7): liveness today is INFERRED. The 15s SSE `ping` is written by
-// the per-connection handler's own ticker (pkg/web/server.go handleStream
+// the per-connection handler's own ticker (pkg/web/stream_http.go handleStream
 // `case <-ticker.C`), so it proves only that the handler goroutine and the
 // socket are alive — NOT that the worker's ingest pipeline (opencode /event →
 // aggregator → state.Store emit fanout) still works. A worker whose pipeline

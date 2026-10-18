@@ -72,7 +72,7 @@ type archiveFailuresDoc struct {
 }
 
 // archiveFailuresDocForDir is the public per-project wire-DTO builder for the
-// SSE bootstrap snapshot (server.go handleStream). It locks the registry,
+// SSE bootstrap snapshot (stream_http.go handleStream). It locks the registry,
 // builds the doc via archiveFailuresDocForDirLocked, and unlocks. The fan-out
 // path (recordArchiveFailure / clearArchiveFailure) calls the Locked variant
 // inline under a held lock to avoid a double lock/unlock.

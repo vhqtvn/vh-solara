@@ -67,7 +67,7 @@ func todoUpdatedEvent(sid string) opencode.Event {
 // the tree-stream defect class is closed.
 //
 // T1C-F2 (live-tail branch coverage): DEFERRED. The live-tail tree branch
-// (server.go ~line 2580) uses the STATICALLY IDENTICAL gate
+// (stream_http.go) uses the STATICALLY IDENTICAL gate
 // (`hasOps || state.IsTreeCountedKind(ev.Kind)` → writeEvent; else
 // writeRawNoID) — same condition, same writeEvent/writeRawNoID split, verified
 // by the dual-branch audit in the O3 closeout. Driving it through the real

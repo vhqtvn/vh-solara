@@ -7,8 +7,9 @@ package web
 // handleFleetGates), and GET /vh/running-sessions (the cross-workspace
 // running aggregate: runningWorkspaceInfo + runningSessionsResp +
 // handleRunningSessions). Routes are registered in server.go (Handler); the
-// aggregator map under aggMu and the snapshot compression helpers
-// (maybeCompressSnapshot) stay in server.go — this file only calls them.
+// aggregator map under aggMu stays in server.go (Server struct), and the
+// snapshot compression helpers (maybeCompressSnapshot) live in
+// stream_wire.go — this file only calls them.
 
 import (
 	"encoding/json"

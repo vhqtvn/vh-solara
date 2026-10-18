@@ -1896,7 +1896,7 @@ func TestStreamTreeOnlySurvivesTokenFlood(t *testing.T) {
 }
 
 // isMessageClassSSE mirrors state.IsMessageClassKind over the SSE event names
-// the server emits (see server.go sendable()). Kept local to avoid a web→state
+// the server emits (see stream_http.go sendable()). Kept local to avoid a web→state
 // kind-name dependency in test code.
 func isMessageClassSSE(event string) bool {
 	switch event {

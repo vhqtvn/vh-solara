@@ -15,9 +15,10 @@ package web
 //
 // The Server fields these helpers use (failFastMu/failFast, watcherMu/
 // watcherOn/watcherCancel, lifecycleWG, and the test rendezvous channels
-// reconcileReadyCh/reconcileBlockCh) and the call sites (aggFor /
-// handleReloadProject / Shutdown via stopAllPermissionWatchers, which stays
-// in server.go with the shutdown choreography) stay in server.go.
+// reconcileReadyCh/reconcileBlockCh) stay in server.go (Server struct); the
+// call sites live in the post-split files — aggFor and Shutdown via
+// stopAllPermissionWatchers in server_aggregators.go (with the shutdown
+// choreography), handleReloadProject in archive.go.
 
 import (
 	"context"

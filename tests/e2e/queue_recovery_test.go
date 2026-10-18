@@ -43,7 +43,7 @@ import (
 
 // csrfHeaderValue is the value the SPA sends for X-VH-CSRF. The header name
 // constant lives unexported in pkg/web; the e2e package mirrors the literal
-// (server.go csrfGuard requires it on all unsafe-method /vh/* AND /oc/* POSTs).
+// (http_security.go csrfGuard requires it on all unsafe-method /vh/* AND /oc/* POSTs).
 const csrfHeaderValue = "1"
 
 const csrfHeaderName = "X-VH-CSRF"

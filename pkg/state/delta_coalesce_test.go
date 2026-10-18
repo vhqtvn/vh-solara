@@ -338,7 +338,7 @@ func TestDeltaCoalesce_ColdLoadPreservesUnflushedDeltaBuf(t *testing.T) {
 // Advisory finding D1 from the P1-AGG-003 review.
 
 // hasMessageClassPrefix replicates the web layer's sendable() prefix match
-// (pkg/web/server.go). Kept local (not imported from pkg/web) so this test
+// (pkg/web/stream_http.go). Kept local (not imported from pkg/web) so this test
 // stays a pure pkg/state unit test with no import cycle.
 func hasMessageClassPrefix(kind string) bool {
 	return strings.HasPrefix(kind, "message.") ||

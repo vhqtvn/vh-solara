@@ -4,10 +4,10 @@ package web
 // must bootstrap the FULL session-detail snapshot (and re-seed the tree
 // frontier), mirroring the fresh-connect path (GAP 3, committed 3903b131).
 //
-// The fresh-connect path (else branch, server.go ~1562) and the ring-gap path
+// The fresh-connect path (else branch, stream_http.go) and the ring-gap path
 // already emit BOTH tree.snapshot (structure) AND the legacy detail snapshot
 // (state.sessions/permissions/questions/todos bootstrap). The replay branch
-// (hasCursor && replayOK, server.go ~1480) emitted ONLY tree.op deltas + legacy
+// (hasCursor && replayOK, stream_http.go) emitted ONLY tree.op deltas + legacy
 // writeEvent detail frames for the replayed window — it did NOT re-bootstrap a
 // tree.snapshot frontier NOR a fresh legacy detail snapshot.
 //

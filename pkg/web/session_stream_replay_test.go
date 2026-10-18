@@ -4,7 +4,7 @@ package web
 //
 // The handleStream handler is SHARED between Stream1 (?sessions= tree) and
 // Stream2 (?sessions=<id> selected session). The replay-vs-snapshot branch
-// (server.go ~1394-1467) already honors Last-Event-ID / cursor= for ANY filter
+// (stream_http.go) already honors Last-Event-ID / cursor= for ANY filter
 // — but the Stream2 CLIENT never sent a cursor (stream.ts openSessionStream
 // constructed a cursorless URL), so the server ALWAYS took the fresh-snapshot
 // branch for session streams. The client fix (this phase) tracks a local

@@ -6,7 +6,7 @@ package e2e
 //
 // ANTECEDENT: opening a non-default directory starts a per-directory aggregator
 // whose always-on /event SSE subscription to fakeSrv is held open for the life
-// of the aggregator (pkg/web/server.go aggFor → RunManaged). Cluster.Close →
+// of the aggregator (pkg/web/server_aggregators.go aggFor → RunManaged). Cluster.Close →
 // webSrv.Shutdown must reach and release that subscription so fakeSrv.Close()
 // can complete; an unreleased /event handler blocks httptest's per-connection
 // wg.Wait() forever. Shutdown now owns this release two ways — bgCancel cancels

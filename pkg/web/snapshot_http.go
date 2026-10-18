@@ -4,7 +4,7 @@
 // distinction), projectScopedFilter (project-isolation guard at the HTTP
 // boundary), ensureMessages (synchronous lazy hydration for the one-shot GET)
 // and triggerMessageLoad (non-blocking counterpart for the stream first-open
-// path, see server.go handleStream), plus handleAck (POST /vh/ack unread
+// path, see stream_http.go handleStream), plus handleAck (POST /vh/ack unread
 // clear). Routes are registered in server.go (Handler).
 package web
 

@@ -1,7 +1,7 @@
 package web
 
 // gates_http_test.go — lane-1 tests for GET /vh/gates, the lean fleet-rollup
-// acquisition endpoint (pkg/web/server.go handleFleetGates). The controller's
+// acquisition endpoint (pkg/web/projects_http.go handleFleetGates). The controller's
 // GET /vh/fleet/status consumes ONLY the gate map per project; this endpoint
 // exists so that acquisition stops moving whole session trees over the WAN
 // tunnel. Pins: the response contract (schema/shape/sorting), gate parity

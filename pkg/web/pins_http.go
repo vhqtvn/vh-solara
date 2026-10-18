@@ -11,7 +11,7 @@ package web
 // Phase 3 (this slice) adds the worker-wide broadcast after a committed PUT:
 // FanOutPinsUpdate fans the committed public doc to EVERY s.aggs project store's
 // live subscribers via state.Store.EmitTransient(kindPinsUpdated, …), and the
-// live-tail loop in server.go forwards it as a transient `pins.updated` SSE
+// live-tail loop in stream_http.go forwards it as a transient `pins.updated` SSE
 // frame (no id line, not replayed — reconnecting clients catch up via the
 // pins.snapshot bootstrap frame also added in Phase 3).
 //

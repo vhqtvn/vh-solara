@@ -326,7 +326,7 @@ func TestE2E_Tree_ArchiveLastSessionEmptySnapshotHeal(t *testing.T) {
 	// --- 5. Reconnect #1 with the pre-archive cursor. On a valid-cursor
 	// tree=2 reconnect the server replays missed ring deltas and THEN always
 	// emits an authoritative tree.snapshot (cause "reconnect") —
-	// pkg/web/server.go's resume path — so the empty-frontier re-seed frame
+	// pkg/web/stream_http.go's resume path — so the empty-frontier re-seed frame
 	// deterministically arrives on every reconnect flavor (replay or
 	// ring-gap); scan until it does.
 	rec1 := openTreeStreamAt(t, base, cursorID)

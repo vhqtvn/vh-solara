@@ -98,7 +98,7 @@ func newIsolationServer(t *testing.T) (
 	// (fake.sessions is empty), and never knows about leakMe — so its store's
 	// HasSession("leakMe") is false even though an upstream GET would still
 	// return content. aggFor arms the aggregator SYNCHRONOUSLY before
-	// returning (see server.go), so dirBAgg is already armed at this point;
+	// returning (see server_aggregators.go), so dirBAgg is already armed at this point;
 	// the waitFor below is belt-and-suspenders defense.
 	dirBAgg = srv.aggFor(dirBPath)
 

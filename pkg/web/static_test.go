@@ -87,7 +87,7 @@ func newStaticTestServer(t *testing.T, distFS, hostFS fs.FS) *httptest.Server {
 }
 
 // TestServesIndexOverPlaceholder pins handleStatic's index-preferred /
-// placeholder-fallback contract for BOTH shells (server.go fallback paths). CI
+// placeholder-fallback contract for BOTH shells (static_assets.go fallback paths). CI
 // only ever runs in cold-build state where the placeholders alone are embedded,
 // so without an injected FS the index-wins ordering is untested: a future edit
 // that inverts the two ReadFile blocks would silently serve a "not built" banner

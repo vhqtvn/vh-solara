@@ -46,7 +46,7 @@ func newFaviconTestServer(t *testing.T, distFS, hostFS fstest.MapFS) (*Server, *
 // Browsers auto-request `/favicon.ico` for any page regardless of
 // <link rel="icon">; this route makes it resolve to a real icon instead of
 // falling through to the SPA index HTML (which a browser cannot use as an
-// icon). See server.go serveFavicon.
+// icon). See static_assets.go serveFavicon.
 func TestFaviconRoute(t *testing.T) {
 	hostIcon := `<svg id="host-icon" xmlns="http://www.w3.org/2000/svg"></svg>`
 	appIcon := `<svg id="app-icon" xmlns="http://www.w3.org/2000/svg"></svg>`
