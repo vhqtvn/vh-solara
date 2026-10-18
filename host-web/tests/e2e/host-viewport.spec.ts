@@ -148,6 +148,49 @@ test.describe("host root tracks the visible viewport", () => {
     expect(await H.appRootHeight(page)).toBeGreaterThan(0);
   });
 
+  test("root never exceeds the layout viewport — fractional innerHeight must not round the root past the ICB", async ({ page }) => {
+    // On-device bug class (Chrome PWA standalone, DPR 2.625-class fractional
+    // CSS viewport): innerHeight/ICB = N.6 → Math.round(N.6) = N+1 made `.app`
+    // 1px taller than the viewport → scrollingElement.scrollHeight (N+1) >
+    // clientHeight (N) → a touch drag on the tabstrip panned the whole
+    // document instead of performing the drag gesture. Invariant: the tracker
+    // may only ever make the root SHORTER than the ICB (toolbar/visible-band
+    // clamps), never taller — hence FLOOR here, plus the .app max-height:100%
+    // CSS cap proven by the next test as the stale-sample backstop.
+    const frac = VIEWPORT.height + 0.6;
+    await setMock(page, { ih: frac, vh: frac });
+    await fire(page, "resize");
+    // Floor, not round: N.6 → N (root ≤ ICB).
+    await expect
+      .poll(() =>
+        page.evaluate(() => document.documentElement.style.getPropertyValue("--host-h")),
+      )
+      .toBe(`${VIEWPORT.height}px`);
+    expect(await H.appRootHeight(page)).toBeLessThanOrEqual(VIEWPORT.height);
+    const doc = await page.evaluate(() => {
+      const se = document.scrollingElement!;
+      return { sh: se.scrollHeight, ch: se.clientHeight };
+    });
+    expect(doc.sh, "document must never be taller than the viewport").toBeLessThanOrEqual(doc.ch);
+  });
+
+  test("CSS cap: even a stale-large --host-h cannot make the document scrollable", async ({ page }) => {
+    // Whatever makes --host-h exceed the ICB on device (a stale sample that
+    // missed a shrink edge, an engine rounding disagreement), `.app`'s
+    // max-height:100% caps the root at the ICB: the document never gains a
+    // scroll range, so no touch drag on the shell can pan it.
+    await page.evaluate((h) => {
+      document.documentElement.style.setProperty("--host-h", `${h}px`);
+    }, VIEWPORT.height + 12);
+    await page.waitForTimeout(80); // a frame; no world-event fires a resample
+    expect(await H.appRootHeight(page), "root capped at the ICB").toBe(VIEWPORT.height);
+    const doc = await page.evaluate(() => {
+      const se = document.scrollingElement!;
+      return { sh: se.scrollHeight, ch: se.clientHeight };
+    });
+    expect(doc.sh, "document never scrollable").toBeLessThanOrEqual(doc.ch);
+  });
+
   test("keyboard-focus restore lands on the CURRENT visible height (not 100vh / a stale sample)", async ({ page }) => {
     await H.kbdFocusOpen(page, 360);
     await expect.poll(async () => H.appRootHeight(page), { timeout: 8000 }).toBe(360);

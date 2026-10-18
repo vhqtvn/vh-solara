@@ -19,6 +19,13 @@
   flex-direction: column;
   height: 100%;
   height: var(--host-h, 100%);
+  /* INVARIANT: the root may never be taller than the ICB. --host-h is floored
+   * by hostViewport.ts, but whatever ELSE could push it past the viewport on
+   * device (a stale-large sample, an engine rounding disagreement) stops here:
+   * a root 1px over the viewport gives the document a scroll range, and a
+   * touch drag on the tabstrip pans the whole document instead of performing
+   * the drag gesture (the Chrome PWA standalone report). */
+  max-height: 100%;
   width: 100%;
   overflow: hidden;
   padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)

@@ -86,7 +86,16 @@
  *    stale-large vv sample can never grow the root past the layout viewport.
  *  - vv is ignored while pinch-zoomed (scale ≠ 1): a zoomed vv is smaller by
  *    the zoom factor, not because the screen is.
- *  - 0/negative samples (hidden/collapsed window) are ignored. */
+ *  - 0/negative samples (hidden/collapsed window) are ignored.
+ *  - FLOORED, never rounded up: the tracker may only ever make the root
+ *    SHORTER than the ICB (toolbar/visible-band clamps), never taller. On
+ *    fractional-CSS-px viewports (Android DPRs like 2.625 → innerHeight N.6)
+ *    Math.round produced N+1 → `.app` 1px taller than the viewport →
+ *    scrollingElement.scrollHeight > clientHeight → a touch drag on the
+ *    tabstrip panned the whole document instead of the drag gesture (the
+ *    Chrome PWA standalone report). The sub-pixel loss is invisible; the
+ *    scroll range it prevents is not. (Belt-and-braces: App.module.css caps
+ *    `.app` with max-height:100% for any non-rounding over-ICB source.) */
 export function computeHostHeight(win: Window = window): number | null {
   const layoutH = win.innerHeight;
   let h = layoutH > 0 ? layoutH : 0;
@@ -96,7 +105,7 @@ export function computeHostHeight(win: Window = window): number | null {
     h = h > 0 ? Math.min(h, visibleBottom) : visibleBottom;
   }
   if (!(h > 0)) return null;
-  return Math.round(h);
+  return Math.floor(h);
 }
 
 export const HOST_HEIGHT_VAR = "--host-h";
