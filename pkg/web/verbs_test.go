@@ -82,7 +82,7 @@ type fakeOC struct {
 	// continue to work). The RT4 partial-resume test (Slice 4) sets this to the
 	// archived-session list (with time.archived set) so resumeArchiveAffected can
 	// confirm the root is archived and derive live stragglers. Mirrors the real
-	// fixture's behavior (pkg/fixtures/opencode.go:929-937) which distinguishes
+	// fixture's behavior (pkg/fixtures/opencode.go) which distinguishes
 	// the two endpoints server-side.
 	listArchivedReply []byte
 
@@ -176,7 +176,7 @@ func (f *fakeOC) handler() http.Handler {
 		}
 		// GET /session (ListSessions) and GET /session?archived=true
 		// (ListArchivedSessions) both hit this handler. The real OpenCode
-		// fixture (pkg/fixtures/opencode.go:929-937) DISTINGUISHES them:
+		// fixture (pkg/fixtures/opencode.go) DISTINGUISHES them:
 		// /session returns live-only, ?archived=true returns archived-only.
 		// Mirror that split here: return listArchivedReply for the archived
 		// endpoint when set, falling back to listSessionsReply for backward-
@@ -1449,7 +1449,7 @@ func TestReplyPermissionAlreadyClearedMapsTo410(t *testing.T) {
 // (TestP7_SendCASAwaitAbortSettling) only exercises the LIVE idle and LIVE error
 // release paths; this adds the RECONCILE-CLEAR release: SetActivityFromStatuses
 // idling a TurnStopping session opens the gate via the clearActivity closure
-// (reducers.go:337-356 → setAbortSettlingLocked(false) under s.mu). The waiter
+// (reducers.go → setAbortSettlingLocked(false) under s.mu). The waiter
 // must unblock, the post-await FULL SendCASState+seq CAS recheck must run, and
 // the documented outcome holds: a fresh CAS (large If-Idle-Seq) forwards EXACTLY
 // ONE prompt (TurnIdle + activity idle → sendable).
@@ -1521,7 +1521,7 @@ func TestP7_SendCASAwaitAbortSettling_ReconcileClearRelease(t *testing.T) {
 
 	// Release via reconcile-clear: the periodic /session/status snapshot reports
 	// "a" as idle. SetActivityFromStatuses's clearActivity closure
-	// (reducers.go:337-356) sees !busy["a"], idles activity, and — because the
+	// (reducers.go) sees !busy["a"], idles activity, and — because the
 	// session is TurnStopping — settles the abort: cancelStopTimerLocked +
 	// setAbortSettlingLocked(false) (opens the gate + wakes the waiter) +
 	// TurnIdle. This is the bounded-latency backstop for the case OpenCode did
@@ -1546,8 +1546,8 @@ func TestP7_SendCASAwaitAbortSettling_ReconcileClearRelease(t *testing.T) {
 
 // TestP7_SendCASAwaitAbortSettling_SessionDeleteYields404 pins DEFER finding
 // p7-d2 (session-delete release path). At session teardown,
-// deleteSessionLocked (reducers.go:592) deletes s.sessions[id] and THEN calls
-// signalAbortWaitersLocked (reducers.go:717), which closes the wait channel —
+// deleteSessionLocked (reducers.go) deletes s.sessions[id] and THEN calls
+// signalAbortWaitersLocked (turn_state.go), which closes the wait channel —
 // waking any blocked WaitAbortSettling caller — before the turn-state records
 // are deleted. The woken caller's post-await SendCASState recheck then sees
 // exists=false (the session is gone) and the handler returns a clean 404, NOT a
@@ -1608,8 +1608,8 @@ func TestP7_SendCASAwaitAbortSettling_SessionDeleteYields404(t *testing.T) {
 	}
 
 	// Release via session teardown: session.deleted → deleteSessionLocked. It
-	// deletes s.sessions["a"] (line 668) and then calls signalAbortWaitersLocked
-	// (line 717), closing the wait channel the waiter is parked on. The waiter's
+	// deletes s.sessions["a"] and then calls signalAbortWaitersLocked,
+	// closing the wait channel the waiter is parked on. The waiter's
 	// recheck SendCASState → se == nil → exists=false → 404.
 	s.Apply(ev("session.deleted", `{"info":{"id":"a"}}`))
 

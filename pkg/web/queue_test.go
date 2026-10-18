@@ -180,7 +180,8 @@ func TestQueueAttachmentsAlwaysArrayOnWire(t *testing.T) {
 	s, _ := newTestStore(t, "s1")
 
 	// nil is the common case: mustEnqueue passes nil, and an HTTP body with no
-	// attachments field decodes to nil (queue_http.go:94, no omitempty on decode).
+	// attachments field decodes to nil (the handleQueueEnqueue body struct in
+	// queue_http.go — no omitempty on decode).
 	it, err := s.Enqueue("no-atts", nil, QueueSendConfig{}, "")
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
@@ -1201,7 +1202,8 @@ func TestQueueArchivedStoreConcurrentNoResurrection(t *testing.T) {
 //
 // Session IDs reaching queuePath are always pre-sanitized by safeID
 // (attach.go: `[^A-Za-z0-9_.-]` → ""), which strips '/' among others, at every
-// entry point (queue_http.go:28, archive.go:94). The cases below cover the full
+// entry point (resolveQueueCtx in queue_http.go, the cascade cleanup in
+// archive.go). The cases below cover the full
 // safeID-allowed character set; multi-segment slash-bearing IDs are intentionally
 // NOT tested here because they cannot reach queuePath in production. (Historically
 // a latent fragility — vhSolaraDir's three-nested-filepath.Dir derivation is
@@ -1856,10 +1858,9 @@ func TestQueueCleanupIdempotentNoDir(t *testing.T) {
 //
 // st.mu is held around save() to mirror the happens-before discipline every
 // production caller follows (e.g. Enqueue/Claim/Resolve/Remove and the
-// seedDispatchingItem helper at L1032): save() reads s.archived at queue.go:198
-// relying on the caller's lock, and deleteStore writes st.archived under st.mu
-// at queue.go:585. Without the test-side lock the read would race with that
-// write under `go test -race`.
+// seedDispatchingItem helper): save() reads s.archived relying on the caller's
+// lock, and deleteStore writes st.archived under st.mu. Without the test-side
+// lock the read would race with that write under `go test -race`.
 func TestQueueCleanupRetainedPointerCannotRecreate(t *testing.T) {
 	root := t.TempDir()
 	qr := newQueueRegistry()

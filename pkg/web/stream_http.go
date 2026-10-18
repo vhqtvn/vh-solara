@@ -406,7 +406,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		// ring-gap). The replayed tree.op/detail events above (seq N+1..head)
 		// are superseded by these authoritative snapshots at head; the live-tail
 		// baseline guard (ev.Seq > baseline) prevents re-forwarding. Mirrors the
-		// fresh-connect block at ~1562-1605. Under tree=2 this reconnect block
+		// fresh-connect block below. Under tree=2 this reconnect block
 		// runs whenever a treeEmitter is attached (the `if treeEmitter != nil`
 		// guard below); the proj=1 reconnect snapshot that earlier revisions
 		// gated on wantsProject(r) was deleted in Phase 4 (commit a0e825c), so
@@ -597,8 +597,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// the catch-up (live pin mutations arrive later as transient pins.updated
 	// frames, which are also not replayed). Emitted with NO id line (orthogonal
 	// to the state-store resume cursor) AFTER the state bootstrap block and
-	// BEFORE the live-tail loop drains the subscribe channel (SubscribeWith at
-	// ~L1445 already created `ch`, so a mutation landing between this snapshot
+	// BEFORE the live-tail loop drains the subscribe channel (the SubscribeWith
+	// call above already created `ch`, so a mutation landing between this snapshot
 	// read and the live-tail drain is covered EITHER by this snapshot OR by the
 	// queued live pins.updated frame already waiting in `ch`). The payload is
 	// the public pin projection ({revision, initialized, orderedSessionIds});

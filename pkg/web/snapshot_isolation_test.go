@@ -305,7 +305,7 @@ func TestCloseoutProjectIsolation(t *testing.T) {
 }
 
 // TestSessionMessagesNoColdFetchRegression pins the existing safety comment
-// at messages_http.go:93 ("deliberately NOT calling EnsureMessages"). A
+// in messages_http.go ("deliberately NOT calling EnsureMessages"). A
 // foreign-id request against the page endpoint must return an empty page
 // (boundary_found=false) WITHOUT issuing an upstream GET — the same
 // project-isolation contract as the snapshot path, enforced today by the

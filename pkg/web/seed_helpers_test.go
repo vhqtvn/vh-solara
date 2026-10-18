@@ -6,7 +6,7 @@ package web
 // WHY THIS EXISTS (the ghost-delete race, 2026-08-23 CI flake): newReloadServer
 // starts `go agg.Run(...)`, whose initial hydrate fetches the fake's /session
 // list and state.Store.Hydrate DELETES every store session absent from that
-// list (pkg/state/hydration.go:127-131 — "a session absent from the fetch is
+// list (pkg/state/hydration.go — "a session absent from the fetch is
 // deleted"). The 5s tree-reconcile tick ghost-removes the same way
 // (ReconcileSessions). Directly Apply()-ing a session.created event therefore
 // races BOTH: on a slow/loaded CI runner the initial hydrate can complete AFTER
@@ -23,7 +23,7 @@ package web
 //     (race-safe setter, mirroring setMessage), so every LATER fetch — the 5s
 //     tree-reconcile tick, any reconnect hydrate — preserves it. The envelope
 //     is byte-identical to the info blob sessionCreatedEvent seeds, so a
-//     re-hydrate's bytes.Equal comparison (hydration.go:107) emits no spurious
+//     re-hydrate's bytes.Equal comparison (hydration.go) emits no spurious
 //     session.upsert into the replay window.
 //
 // Every test that needs a seeded session must go through seedSession — a bare

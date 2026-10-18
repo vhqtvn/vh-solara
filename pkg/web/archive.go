@@ -765,8 +765,8 @@ func (s *Server) reassertArchiveWork(bgCtx context.Context, delay time.Duration,
 //     TestQueueGC_ReissueArchiveIsIdempotent covers this path).
 //
 // Fetch authority (build-validate 1): BOTH lists are required. The VERIFIED
-// OpenCode behavior (pkg/fixtures/opencode.go:929-937, confirmed by Slice 1's
-// hydration.go:132-135 comment "The /session list excludes archived entries") is
+// OpenCode behavior (pkg/fixtures/opencode.go, confirmed by Slice 1's
+// hydration.go comment "archived sessions are not part of the live tree") is
 // that /session returns LIVE-only and /session?archived=true returns ARCHIVED-
 // only. A live straggler's parent chain may pass through ARCHIVED intermediates
 // (a partial cascade that aborted at a deep child); the live list alone lacks

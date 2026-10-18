@@ -463,7 +463,7 @@ func TestArchiveJob_ReissueOnPartiallyArchivedRootCompletesRemainder(t *testing.
 	agg.Store().RemoveSessionIfPresent("r")
 
 	// Configure the fakeOC's authoritative lists to mirror the real OpenCode
-	// split (pkg/fixtures/opencode.go:929-937): /session returns LIVE-only,
+	// split (pkg/fixtures/opencode.go): /session returns LIVE-only,
 	// /session?archived=true returns ARCHIVED-only.
 	//
 	// LIVE list: c, g, other, otherC (all time.archived absent → live). r is NOT

@@ -439,7 +439,7 @@ type Server struct {
 	// lifecycle, and the backstop must not race it. Keyed by the SAME composite
 	// (archiveFailureKey) as archiveFailures so the backstop's "is (dir,root)
 	// active?" lookup is a direct map hit. NOT archiveJobsActive (the atomic
-	// counter at line ~312): that has no dir/id and is a test-only seam.
+	// counter declared above): that has no dir/id and is a test-only seam.
 	archiveJobsActiveRoots map[archiveFailureKey]bool
 
 	// archiveBackstopInterval is the cadence of the Slice-2 OOB-reconcile

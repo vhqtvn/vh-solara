@@ -339,7 +339,7 @@ func (h coordHandlers) spawn(w http.ResponseWriter, r *http.Request) {
 // abort cancels a session's in-flight turn. Body: {sessionID, idempotency_key?}.
 // The turn-boundary state machine (pkg/state/turn_state.go) enters TurnStopping
 // and closes the session-scoped abort gate (Store.AbortSettling). OpenCode does
-// NOT emit session.idle on abort (reducers.go:249), so the gate's settle relies
+// NOT emit session.idle on abort (reducers.go), so the gate's settle relies
 // on the state layer's settle-timer fallback (Store.Stop arms it) plus the
 // periodic /session/status reconcile — NOT on a synchronous force-idle. The
 // canceled run's pendingCancellationTurnID is the inflight assistant message id

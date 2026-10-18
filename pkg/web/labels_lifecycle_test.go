@@ -611,8 +611,8 @@ func TestLabelsL3_ReconcileBroadcastsUpdate(t *testing.T) {
 // Reload-reinstall — handleReloadProject resets labelsGCOn (Slice 3 F1 fix)
 // ============================================================================
 //
-// Mirrors TestQueueGC_ReloadProjectReinstallsSubscriber at
-// queue_lifecycle_test.go:290. handleReloadProject resets queueGCOn[dir] and
+// Mirrors TestQueueGC_ReloadProjectReinstallsSubscriber in
+// queue_lifecycle_test.go. handleReloadProject resets queueGCOn[dir] and
 // pinsGCOn[dir] inside its cur==a teardown block; Slice 3 added labelsGCOn[dir]
 // (the idempotency guard for installLabelsLifecycle) and this test pins the F1
 // fix that handleReloadProject resets it too. Without the reset, the rebuilt
