@@ -44,7 +44,7 @@ make test-host-web-docker PLAYWRIGHT_IMAGE=mcr.microsoft.com/playwright:v1.64.1-
 
 **Pin coupling:** the image tag MUST track the exact `@playwright/test` version
 pinned in `host-web/package.json` (currently `1.64.1`). The official image
-ships the matching browser builds (chromium 1223 / firefox 1522 / webkit 2287
+ships the matching browser builds (chromium 1248 / firefox 1555 / webkit 2370
 for 1.64.1) with `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright` preset — no browser
 download ever runs. When bumping the package version, bump the tag in the same
 change. Note: the `web/` package has its own Playwright version range — this
