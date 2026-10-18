@@ -31,6 +31,9 @@ var localGitignoreGlobs = []string{
 	"# adopter-declared sockets/logs):",
 	"/sessions/",
 	"/run/",
+	"# Queue-custody fence (lock + generation authority, and their atomic-write temps):",
+	"/queue.custody.*",
+	"/.queue.custody.*",
 }
 
 // EnsureLocalSetup performs the one-time, idempotent local-preferences setup for

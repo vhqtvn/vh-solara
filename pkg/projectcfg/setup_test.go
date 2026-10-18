@@ -233,7 +233,10 @@ func TestEnsureLocalSetup_GitignoreCreate(t *testing.T) {
 		"# Runtime data vh-solara writes for any project (attachments, queue,\n" +
 		"# adopter-declared sockets/logs):\n" +
 		"/sessions/\n" +
-		"/run/\n"
+		"/run/\n" +
+		"# Queue-custody fence (lock + generation authority, and their atomic-write temps):\n" +
+		"/queue.custody.*\n" +
+		"/.queue.custody.*\n"
 	if string(gi) != want {
 		t.Fatalf("gitignore content mismatch:\nwant: %q\ngot:  %q", want, string(gi))
 	}
@@ -262,7 +265,7 @@ func TestEnsureLocalSetup_GitignoreAppendMissing(t *testing.T) {
 		t.Fatalf("missing glob not appended:\n%s", got)
 	}
 	// The new runtime-data globs are appended alongside the prefs globs.
-	for _, want := range []string{"/sessions/", "/run/"} {
+	for _, want := range []string{"/sessions/", "/run/", "/queue.custody.*", "/.queue.custody.*"} {
 		if !strings.Contains(string(got), want) {
 			t.Fatalf("runtime glob not appended: %q\n%s", want, got)
 		}
@@ -283,7 +286,10 @@ func TestEnsureLocalSetup_GitignoreNoDuplicate(t *testing.T) {
 		"# Runtime data vh-solara writes for any project (attachments, queue,\n" +
 		"# adopter-declared sockets/logs):\n" +
 		"/sessions/\n" +
-		"/run/\n"
+		"/run/\n" +
+		"# Queue-custody fence (lock + generation authority, and their atomic-write temps):\n" +
+		"/queue.custody.*\n" +
+		"/.queue.custody.*\n"
 	giPath := filepath.Join(root, ".vh-solara", ".gitignore")
 	if err := os.WriteFile(giPath, []byte(full), 0o644); err != nil {
 		t.Fatal(err)

@@ -132,6 +132,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/vhqtvn/vh-solara/pkg/projectcfg"
+	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
 // custodyLock is the held platform-lock handle (flock on Linux; the non-Linux
@@ -288,6 +291,11 @@ func AcquireQueueCustody(root string) (*QueueCustody, error) {
 	vhDir := filepath.Join(root, ".vh-solara")
 	if err := os.MkdirAll(vhDir, 0o755); err != nil {
 		return nil, fmt.Errorf("queue custody: mkdir %s: %w", vhDir, err)
+	}
+	// The lock/generation files below land at the .vh-solara root, possibly
+	// before any queue save ensures the gitignore. Best-effort, as in save().
+	if err := projectcfg.EnsureRuntimeGitignore(vhDir); err != nil {
+		vhlog.Warn("queue custody: ensure .vh-solara/.gitignore failed", "err", err)
 	}
 	// Platform lock FIRST: everything below runs while the flock is held, so
 	// the generation read-bump-write sequence is serialized across owners.
