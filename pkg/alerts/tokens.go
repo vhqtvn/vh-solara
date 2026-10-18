@@ -28,13 +28,28 @@ const (
 var (
 	ErrNotifyTokenRequired = errors.New("token required")
 	ErrNotifyTokenCap      = errors.New("token limit reached")
+	// ErrNotifyTokenPolicy rejects a push_policy other than
+	// PolicyWhenUnattended or PolicyAlways (an empty policy is the
+	// when_unattended default — backward compatible with old POST bodies).
+	ErrNotifyTokenPolicy = errors.New("invalid push_policy")
 )
 
 // NotifyToken is one registered FCM delivery token.
 type NotifyToken struct {
-	Token string `json:"token"`
-	Label string `json:"label,omitempty"` // optional device label (≤64 chars)
-	Ts    int64  `json:"ts"`              // first registered, unix millis
+	Token      string `json:"token"`
+	Label      string `json:"label,omitempty"`       // optional device label (≤64 chars)
+	PushPolicy string `json:"push_policy,omitempty"` // when_unattended (default, omitted) | always
+	Ts         int64  `json:"ts"`                    // first registered, unix millis
+}
+
+// normalizePushPolicy canonicalizes a stored/loaded policy: empty or unknown
+// values become PolicyWhenUnattended (the fail-closed default — a hand-edited
+// file entry never widens delivery to always).
+func normalizePushPolicy(p string) string {
+	if p == PolicyAlways {
+		return PolicyAlways
+	}
+	return PolicyWhenUnattended
 }
 
 // TokenRegistry stores the tokens at <stateDir>/notify-tokens.json.
@@ -60,6 +75,7 @@ func NewTokenRegistry(stateDir string) *TokenRegistry {
 	}
 	for _, t := range list {
 		if t.Token != "" {
+			t.PushPolicy = normalizePushPolicy(t.PushPolicy)
 			r.tokens[t.Token] = t
 		}
 	}
@@ -67,26 +83,34 @@ func NewTokenRegistry(stateDir string) *TokenRegistry {
 }
 
 // Upsert registers a token, idempotent by token: an existing entry keeps its
-// first-seen ts and gets its label refreshed; a NEW entry beyond
-// NotifyTokenCap fails with ErrNotifyTokenCap. An empty token fails with
-// ErrNotifyTokenRequired. Labels longer than NotifyLabelMax runes are
+// first-seen ts and gets its label AND push policy refreshed (the POST body is
+// the full desired state — a re-POST without push_policy resets an always
+// token to when_unattended); a NEW entry beyond NotifyTokenCap fails with
+// ErrNotifyTokenCap. An empty token fails with ErrNotifyTokenRequired; a
+// policy other than "" | when_unattended | always fails with
+// ErrNotifyTokenPolicy. Labels longer than NotifyLabelMax runes are
 // truncated. Persistence errors are returned to the caller.
-func (r *TokenRegistry) Upsert(token, label string) error {
+func (r *TokenRegistry) Upsert(token, label, policy string) error {
 	if token == "" {
 		return ErrNotifyTokenRequired
 	}
+	if policy != "" && policy != PolicyWhenUnattended && policy != PolicyAlways {
+		return ErrNotifyTokenPolicy
+	}
+	policy = normalizePushPolicy(policy)
 	label = truncateRunes(label, NotifyLabelMax)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if prev, ok := r.tokens[token]; ok {
 		prev.Label = label
+		prev.PushPolicy = policy
 		r.tokens[token] = prev
 		return r.persistLocked()
 	}
 	if len(r.tokens) >= NotifyTokenCap {
 		return ErrNotifyTokenCap
 	}
-	r.tokens[token] = NotifyToken{Token: token, Label: label, Ts: time.Now().UnixMilli()}
+	r.tokens[token] = NotifyToken{Token: token, Label: label, PushPolicy: policy, Ts: time.Now().UnixMilli()}
 	return r.persistLocked()
 }
 
@@ -115,6 +139,19 @@ func (r *TokenRegistry) Count() int {
 	return len(r.tokens)
 }
 
+// PolicyCounts returns the token counts by push policy — the probe's
+// "policies" object (counts only, never values or labels). Both keys are
+// always present.
+func (r *TokenRegistry) PolicyCounts() map[string]int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := map[string]int{PolicyWhenUnattended: 0, PolicyAlways: 0}
+	for _, t := range r.tokens {
+		out[normalizePushPolicy(t.PushPolicy)]++
+	}
+	return out
+}
+
 // List returns a snapshot of the registered tokens for the notify sender's
 // fan-out (Slice 2). Token VALUES are delivery secrets: callers must never
 // expose or log them — they go straight into FCM message requests.
@@ -129,10 +166,16 @@ func (r *TokenRegistry) List() []NotifyToken {
 }
 
 // persistLocked writes the registry atomically (tmp + rename, 0600), sorted by
-// token for deterministic files. Caller holds mu.
+// token for deterministic files. The default policy is written ABSENT (the
+// omitempty legacy shape) so a pre-v3 file and a v3 file differ only for
+// always tokens; the reload normalizes absence back to when_unattended.
+// Caller holds mu.
 func (r *TokenRegistry) persistLocked() error {
 	list := make([]NotifyToken, 0, len(r.tokens))
 	for _, t := range r.tokens {
+		if t.PushPolicy == PolicyWhenUnattended {
+			t.PushPolicy = ""
+		}
 		list = append(list, t)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Token < list[j].Token })

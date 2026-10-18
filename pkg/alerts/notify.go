@@ -13,9 +13,22 @@ package alerts
 // best-effort in per-token goroutines (the pusher fan-out pattern): a send
 // failure never blocks or breaks the rest of alerts.
 //
+// Delivery policy is PER TOKEN (v3): a token registered with
+// push_policy=always bypasses the attendance gate entirely (it still gets
+// type-filtered and cooldown'd, mirroring the webhook channel_policy=always
+// semantics); when_unattended tokens (the default, backward compatible) are
+// suppressed while a device attends.
+//
+// Observability (v3): every send failure is logged (one line, channel=notify,
+// classified reason, HTTP status, token identified as label-or-hash — never
+// the token value), a periodic channel-health line reports window counters,
+// and the probe exposes last_attempt/last_error. The failure-swallowing
+// delivery POSTURE is unchanged: nothing here blocks or crashes the engine.
+//
 // Secrets discipline: the credentials file contents, the private key, the
 // OAuth access token, and the device tokens are never logged and never
-// appear in an error message — errors carry status codes and paths only.
+// appear in an error message — errors and log lines carry status codes,
+// canonical error names, and paths only.
 
 import (
 	"bytes"
@@ -31,6 +44,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -38,6 +52,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
 const (
@@ -78,16 +94,19 @@ type serviceAccount struct {
 	TokenURI    string `json:"token_uri"`
 }
 
-// Notifier is the FCM HTTP v1 sender. Delivery gating mirrors Web Push
-// exactly: active-profile type filter, no attending device, and a
-// per-(type, token) cooldown reading the SAME cooldown_sec knob as Web Push
-// (but from a separate cooldown map, keyed by type|tokenHash).
+// Notifier is the FCM HTTP v1 sender. Delivery gating mirrors Web Push with
+// one v3 change: attendance is evaluated PER TOKEN — an active-profile type
+// filter applies channel-wide, but only when_unattended tokens are suppressed
+// by attendance (always tokens proceed, still cooldown'd per (type, token)
+// via the SAME cooldown_sec knob as Web Push, from a separate map keyed by
+// type|tokenHash).
 type Notifier struct {
 	cfg      *Store
 	presence *Presence
 	tokens   *TokenRegistry // shared with the /vh/notify routes (enumerate + Prune)
 	client   *http.Client
 	now      func() time.Time
+	logger   *slog.Logger // vhlog's shared logger by default; overridable in tests
 
 	projectID string
 	creds     serviceAccount
@@ -102,6 +121,17 @@ type Notifier struct {
 	tokMu  sync.Mutex
 	tokVal string
 	tokExp time.Time
+
+	// statMu guards the observability surface: window counters for the
+	// periodic health line plus the operator-checkable last_attempt /
+	// last_error pair. Failures still never block delivery.
+	statMu      sync.Mutex
+	attempted   int64     // delivery units started since the last health line
+	succeeded   int64     // delivered OK since the last health line
+	failed      int64     // failed (any class) since the last health line
+	pruned      int64     // pruned as UNREGISTERED since the last health line
+	lastAttempt time.Time // last FCM send attempt (any outcome)
+	lastErr     string    // sanitized summary of the latest attempt if it failed ("" after a success)
 }
 
 // NewNotifier loads the service-account credentials named by the config's
@@ -138,6 +168,7 @@ func NewNotifier(cfg *Store, presence *Presence, tokens *TokenRegistry) (*Notifi
 		tokens:    tokens,
 		client:    &http.Client{Timeout: 10 * time.Second},
 		now:       time.Now,
+		logger:    vhlog.Logger(), // the daemon's shared logger (single config, VH_DEBUG toggle)
 		projectID: project,
 		creds:     creds,
 		signer:    key,
@@ -340,11 +371,15 @@ func (n *Notifier) buildMessage(notice Notice, token string) fcmMessage {
 
 // --- gating + fan-out (mirrors Pusher.Send) ---
 
-// Send delivers a notice to every eligible registered token. Gating mirrors
-// Web Push exactly: the channel must still be configured, the active profile
-// must want the type, no device may be attending (FCM is the away path), and
-// each (type, token) must be past its cooldown — the SAME cooldown_sec knob
-// as Web Push, from a separate map keyed type|tokenHash. Non-blocking.
+// Send delivers a notice to every eligible registered token. Gate order:
+// the channel must still be configured, the active profile must want the
+// type, then attendance is applied PER TOKEN — a when_unattended token (the
+// default) is suppressed while a device attends (FCM is the away path), an
+// always token proceeds regardless (mirroring the webhook channel_policy
+// semantics: attendance-exempt, still type-filtered and cooldown'd). Each
+// (type, token) must be past its cooldown — the SAME cooldown_sec knob as
+// Web Push, from a separate map keyed type|tokenHash, applying to BOTH
+// policies. Non-blocking.
 func (n *Notifier) Send(notice Notice) {
 	cfg := n.cfg.Get()
 	if !cfg.NotifyConfigured() {
@@ -354,15 +389,16 @@ func (n *Notifier) Send(notice Notice) {
 	if !prof.wantsType(notice.Type) {
 		return
 	}
-	if n.presence.Attended(time.Duration(cfg.Detect.IdleSec) * time.Second) {
-		return // someone's here — the open app handles delivery
-	}
+	attended := n.presence.Attended(time.Duration(cfg.Detect.IdleSec) * time.Second)
 	cooldown := time.Duration(cfg.Detect.CooldownSec) * time.Second
 	for _, tok := range n.tokens.List() {
+		if attended && normalizePushPolicy(tok.PushPolicy) != PolicyAlways {
+			continue // someone's here and this token only pushes when unattended
+		}
 		if n.onCooldown(notice.Type, tok.Token, cooldown) {
 			continue
 		}
-		go n.deliver(tok.Token, n.buildMessage(notice, tok.Token))
+		go n.deliver(tok, n.buildMessage(notice, tok.Token))
 	}
 }
 
@@ -385,40 +421,128 @@ func (n *Notifier) onCooldown(typ, token string, window time.Duration) bool {
 	return false
 }
 
-// deliver sends one message, best-effort (errors swallowed — the pusher
-// posture). A 401 forces ONE token refresh + retry; a 5xx gets ONE cheap
-// retry; there is no queue and no backoff loop.
-func (n *Notifier) deliver(token string, msg fcmMessage) {
-	_ = n.send(token, msg, 0, false)
+// tokenRef renders a token for log lines: the LABEL when present, else the
+// same sha256 hash prefix the cooldown map keys on (sum[:16] bytes, hex).
+// The token VALUE never enters a log line or error string.
+func tokenRef(tok NotifyToken) string {
+	if tok.Label != "" {
+		return tok.Label
+	}
+	sum := sha256.Sum256([]byte(tok.Token))
+	return hex.EncodeToString(sum[:16])
+}
+
+// sendFailure classifies one failed delivery for the log line, the window
+// counters, and the probe's sanitized last_error. reason is a short
+// classified phrase; status is the HTTP status when the failure came from a
+// response (0 otherwise); canonical is FCM's google error.status name when
+// the body carried one (e.g. NOT_FOUND, UNREGISTERED); err optionally
+// carries the underlying transport error (which never contains token or key
+// material — only URLs, timeouts, and status lines).
+type sendFailure struct {
+	reason    string
+	status    int
+	canonical string
+	err       error
+	pruned    bool // the UNREGISTERED prune path (counted separately, still logged)
+}
+
+// summary renders the sanitized operator-facing error string for the probe:
+// "404 NOT_FOUND" when a status and canonical name exist, "429 rate limited
+// (quota)" when only a status does, or the bare reason (no status), e.g.
+// "oauth exchange failed".
+func (f *sendFailure) summary() string {
+	switch {
+	case f.status > 0 && f.canonical != "":
+		return strconv.Itoa(f.status) + " " + f.canonical
+	case f.status > 0:
+		return strconv.Itoa(f.status) + " " + f.reason
+	default:
+		return f.reason
+	}
+}
+
+// deliver sends one message, best-effort — the pusher posture is unchanged:
+// a failure never blocks or breaks anything, but it is now OBSERVED (one log
+// line per failure, window counters, last_attempt/last_error). A 401 forces
+// ONE token refresh + retry; a 5xx gets ONE cheap retry; there is no queue
+// and no backoff loop.
+func (n *Notifier) deliver(tok NotifyToken, msg fcmMessage) {
+	n.statMu.Lock()
+	n.attempted++
+	n.lastAttempt = n.now()
+	n.statMu.Unlock()
+
+	f := n.send(tok.Token, msg, 0, false)
+
+	n.statMu.Lock()
+	switch {
+	case f == nil:
+		n.succeeded++
+		n.lastErr = "" // latest attempt succeeded — current channel health is OK
+	case f.pruned:
+		n.pruned++
+		n.lastErr = f.summary()
+	default:
+		n.failed++
+		n.lastErr = f.summary()
+	}
+	n.statMu.Unlock()
+
+	if f != nil {
+		n.logFailure(tok, f)
+	}
+}
+
+// logFailure emits the one-line-per-failure record. channel=notify, the
+// classified reason, the HTTP status where applicable, and the token as
+// label-or-hash — never the value, credentials material, or response bodies.
+func (n *Notifier) logFailure(tok NotifyToken, f *sendFailure) {
+	attrs := []any{"channel", "notify", "token", tokenRef(tok), "reason", f.reason}
+	if f.status > 0 {
+		attrs = append(attrs, "status", f.status)
+	}
+	if f.canonical != "" {
+		attrs = append(attrs, "code", f.canonical)
+	}
+	if f.err != nil {
+		attrs = append(attrs, "err", f.err.Error())
+	}
+	if f.pruned {
+		n.logger.Warn("notify: token unregistered, pruned", attrs...)
+		return
+	}
+	n.logger.Warn("notify: fcm send failed", attrs...)
 }
 
 // send posts the message, applying the retry/prune policy. attempt counts
 // posts so far (0 = first); refreshed marks that the OAuth token was already
-// force-refreshed for this message (a second 401 is a failure).
-func (n *Notifier) send(token string, msg fcmMessage, attempt int, refreshed bool) error {
+// force-refreshed for this message (a second 401 is a failure). It returns
+// nil on success or a classified *sendFailure.
+func (n *Notifier) send(token string, msg fcmMessage, attempt int, refreshed bool) *sendFailure {
 	access, err := n.accessToken(refreshed)
 	if err != nil {
-		return err
+		return &sendFailure{reason: "oauth exchange failed", err: err}
 	}
 	body, err := json.Marshal(struct {
 		Message fcmMessage `json:"message"`
 	}{msg})
 	if err != nil {
-		return err
+		return &sendFailure{reason: "marshal message failed", err: err}
 	}
 	endpoint := n.fcmBase + "/v1/projects/" + url.PathEscape(n.projectID) + "/messages:send"
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return &sendFailure{reason: "request build failed", err: err}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+access)
 	req.Header.Set("User-Agent", "vh-solara-notify/1")
 	resp, err := n.client.Do(req)
 	if err != nil {
-		return err
+		return &sendFailure{reason: "transport error", err: err}
 	}
 	defer resp.Body.Close()
 
@@ -430,21 +554,40 @@ func (n *Notifier) send(token string, msg fcmMessage, attempt int, refreshed boo
 	if resp.StatusCode >= 500 && attempt < 1 {
 		return n.send(token, msg, attempt+1, refreshed)
 	}
+	// Terminal non-2xx: read (bounded) body once for the canonical error
+	// name and the UNREGISTERED inspection. Only parsed fields are used —
+	// the raw body is never surfaced.
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+	canonical := fcmErrorStatus(raw)
+
 	// Token gone: 400 or 404 carrying error detail UNREGISTERED → prune.
 	// A generic 404 NOT_FOUND (FCM's answer to sender-side misconfiguration,
 	// e.g. a wrong/deleted project ID) carries no UNREGISTERED evidence and
 	// must leave registrations intact — pruning on it would mass-erase every
 	// valid token. Both statuses share the same body-inspection rule.
 	if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 		if fcmIsUnregistered(raw) {
-			_ = n.tokens.Prune(token)
-			return nil
+			// The operator-facing canonical name for the prune decision is
+			// the UNREGISTERED evidence itself (the body's top-level status
+			// is a generic NOT_FOUND/INVALID_ARGUMENT).
+			if perr := n.tokens.Prune(token); perr != nil {
+				return &sendFailure{reason: "token unregistered but prune failed", status: resp.StatusCode, canonical: "UNREGISTERED", err: perr}
+			}
+			return &sendFailure{reason: "token unregistered (pruned)", status: resp.StatusCode, canonical: "UNREGISTERED", pruned: true}
 		}
-		return fmt.Errorf("notify: fcm rejected message: status %d", resp.StatusCode)
+		return &sendFailure{reason: "fcm rejected message", status: resp.StatusCode, canonical: canonical}
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return &sendFailure{reason: "rate limited (quota)", status: resp.StatusCode, canonical: canonical}
 	}
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("notify: fcm status %d", resp.StatusCode)
+		if resp.StatusCode == http.StatusUnauthorized {
+			return &sendFailure{reason: "unauthenticated after refresh", status: resp.StatusCode, canonical: canonical}
+		}
+		if resp.StatusCode >= 500 {
+			return &sendFailure{reason: "fcm 5xx retry exhausted", status: resp.StatusCode, canonical: canonical}
+		}
+		return &sendFailure{reason: "fcm error", status: resp.StatusCode, canonical: canonical}
 	}
 	return nil
 }
@@ -482,4 +625,73 @@ func fcmIsUnregistered(body []byte) bool {
 		}
 	}
 	return false
+}
+
+// fcmErrorStatus extracts FCM's google canonical error.status name (e.g.
+// NOT_FOUND, UNREGISTERED, RESOURCE_EXHAUSTED) for the sanitized last_error
+// surface. Only the parsed name is used — the raw body never surfaces.
+func fcmErrorStatus(body []byte) string {
+	var e fcmErrorBody
+	if json.Unmarshal(body, &e) != nil {
+		return ""
+	}
+	return e.Error.Status
+}
+
+// --- observability surface (v3) ---
+
+// notifyHealthInterval is the default period of the channel-health log line.
+const notifyHealthInterval = 10 * time.Minute
+
+// Health returns the operator-checkable channel state: the time of the last
+// FCM send attempt (zero when none) and the sanitized last_error (empty when
+// the latest attempt succeeded or none has happened). Safe for concurrent
+// use; never carries token material.
+func (n *Notifier) Health() (time.Time, string) {
+	n.statMu.Lock()
+	defer n.statMu.Unlock()
+	return n.lastAttempt, n.lastErr
+}
+
+// StartHealthLoop launches the periodic channel-health line: enabled, token
+// counts by policy, and attempted/succeeded/failed/pruned counters since the
+// previous line (window counters reset on each line). interval <= 0 means
+// the daemon default (notifyHealthInterval). Returns immediately; the loop
+// exits when ctx is cancelled (daemon teardown).
+func (n *Notifier) StartHealthLoop(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = notifyHealthInterval
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				n.logHealth()
+			}
+		}
+	}()
+}
+
+// logHealth snapshots-and-resets the window counters and emits the health
+// line. The counters are maintained under statMu by deliver(); this reader
+// takes the same lock, so no new races.
+func (n *Notifier) logHealth() {
+	n.statMu.Lock()
+	attempted, succeeded, failed, pruned := n.attempted, n.succeeded, n.failed, n.pruned
+	n.attempted, n.succeeded, n.failed, n.pruned = 0, 0, 0, 0
+	n.statMu.Unlock()
+	counts := n.tokens.PolicyCounts()
+	n.logger.Info("notify: channel health",
+		"channel", "notify",
+		"enabled", n.cfg.Get().NotifyConfigured(),
+		"tokens_when_unattended", counts[PolicyWhenUnattended],
+		"tokens_always", counts[PolicyAlways],
+		"attempted", attempted,
+		"succeeded", succeeded,
+		"failed", failed,
+		"pruned", pruned)
 }

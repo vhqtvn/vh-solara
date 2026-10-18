@@ -18,7 +18,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/alerts"
@@ -149,14 +151,25 @@ func TestNotifyTokensProbeUnconfigured(t *testing.T) {
 		t.Fatalf("GET /vh/notify/tokens: want 200, got %d (body=%s)", code, body)
 	}
 	var probe struct {
-		Enabled bool `json:"enabled"`
-		Count   int  `json:"count"`
+		Enabled     bool           `json:"enabled"`
+		Count       int            `json:"count"`
+		Policies    map[string]int `json:"policies"`
+		LastAttempt string         `json:"last_attempt"`
+		LastError   string         `json:"last_error"`
 	}
 	if err := json.Unmarshal(body, &probe); err != nil {
 		t.Fatalf("probe body: %v (%s)", err, body)
 	}
 	if probe.Enabled || probe.Count != 0 {
 		t.Fatalf("unconfigured probe = %+v, want enabled:false count:0", probe)
+	}
+	// v3: the shape is stable in the unconfigured state — both policy keys
+	// present (zeroed) and empty observability fields.
+	if probe.Policies == nil || probe.Policies["when_unattended"] != 0 || probe.Policies["always"] != 0 {
+		t.Fatalf("unconfigured policies = %+v, want {when_unattended:0, always:0}", probe.Policies)
+	}
+	if probe.LastAttempt != "" || probe.LastError != "" {
+		t.Fatalf("unconfigured observability = (%q, %q), want empty/empty", probe.LastAttempt, probe.LastError)
 	}
 }
 
@@ -465,7 +478,7 @@ func TestNotifyTokensUpsertErrorMapping(t *testing.T) {
 	// Sentinel: cap reached → 400. Pre-fill the registry (shared instance) to
 	// the cap of 32 through the direct API.
 	for i := 0; i < alerts.NotifyTokenCap; i++ {
-		if err := tokens.Upsert("cap-token-"+strings.Repeat("x", i+1), ""); err != nil {
+		if err := tokens.Upsert("cap-token-"+strings.Repeat("x", i+1), "", ""); err != nil {
 			t.Fatalf("prefill %d: %v", i, err)
 		}
 	}
@@ -540,5 +553,198 @@ func TestNotifyTokensUpsertPersistence500(t *testing.T) {
 	}
 	if strings.Contains(string(body), "token required") || strings.Contains(string(body), "token limit") {
 		t.Fatalf("500 body must not carry a sentinel message: %s", body)
+	}
+}
+
+// --- v3: push_policy + probe observability surface ---
+
+// TestNotifyTokensPushPolicy pins the route contract for per-token push
+// policy: a legacy POST without push_policy registers when_unattended
+// (backward compatible), push_policy=always counts under "always", a re-POST
+// without the field resets the policy (upsert = full desired state), and an
+// invalid policy answers 400 with the contract body.
+func TestNotifyTokensPushPolicy(t *testing.T) {
+	web, _, _ := newConfiguredNotifyTestServer(t)
+
+	getPolicies := func() (int, map[string]int, string, string) {
+		t.Helper()
+		code, body := notifyGet(t, web.URL+"/vh/notify/tokens")
+		if code != http.StatusOK {
+			t.Fatalf("probe: want 200, got %d (body=%s)", code, body)
+		}
+		var probe struct {
+			Count       int            `json:"count"`
+			Policies    map[string]int `json:"policies"`
+			LastAttempt string         `json:"last_attempt"`
+			LastError   string         `json:"last_error"`
+		}
+		if err := json.Unmarshal(body, &probe); err != nil {
+			t.Fatalf("probe body: %v (%s)", err, body)
+		}
+		return probe.Count, probe.Policies, probe.LastAttempt, probe.LastError
+	}
+
+	// Legacy POST (no push_policy) → when_unattended, 200.
+	code, body := notifyPost(t, web.URL+"/vh/notify/tokens", `{"token":"tok-wu","label":"pixel"}`, true)
+	if code != http.StatusOK || !strings.Contains(string(body), `"ok":true`) {
+		t.Fatalf("legacy POST: want 200 ok:true, got %d %s", code, body)
+	}
+	// always POST → 200 and both buckets counted.
+	if code, _ := notifyPost(t, web.URL+"/vh/notify/tokens", `{"token":"tok-always","label":"tab","push_policy":"always"}`, true); code != http.StatusOK {
+		t.Fatalf("always POST: want 200, got %d", code)
+	}
+	count, policies, lastAttempt, lastErr := getPolicies()
+	if count != 2 || policies["when_unattended"] != 1 || policies["always"] != 1 {
+		t.Fatalf("probe = count %d policies %v, want 2 {wu:1 always:1}", count, policies)
+	}
+	if lastAttempt != "" || lastErr != "" {
+		t.Fatalf("before any send attempt: last_attempt/last_error = (%q, %q), want empty", lastAttempt, lastErr)
+	}
+
+	// Re-POST the always token WITHOUT push_policy → policy resets to the
+	// default (the POST body is the full desired state).
+	if code, _ := notifyPost(t, web.URL+"/vh/notify/tokens", `{"token":"tok-always","label":"tab"}`, true); code != http.StatusOK {
+		t.Fatalf("policy-reset POST: want 200, got %d", code)
+	}
+	_, policies, _, _ = getPolicies()
+	if policies["when_unattended"] != 2 || policies["always"] != 0 {
+		t.Fatalf("post-reset policies = %v, want {wu:2 always:0}", policies)
+	}
+
+	// Invalid policies answer 400 with the contract body.
+	code, body = notifyPost(t, web.URL+"/vh/notify/tokens", `{"token":"tok-x","push_policy":"never"}`, true)
+	if code != http.StatusBadRequest {
+		t.Fatalf("push_policy=never: want 400, got %d (body=%s)", code, body)
+	}
+	var e struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &e); err != nil || e.OK || e.Error != "invalid push_policy" {
+		t.Fatalf("invalid-policy body = %s, want {\"ok\":false,\"error\":\"invalid push_policy\"}", body)
+	}
+	if code, _ := notifyPost(t, web.URL+"/vh/notify/tokens", `{"token":"tok-x","push_policy":"Sometimes"}`, true); code != http.StatusBadRequest {
+		t.Fatalf("mixed-case invalid policy: want 400, got %d", code)
+	}
+}
+
+// TestNotifyTokensProbeHealthSurface pins the operator-checkable channel
+// surface over HTTP: last_attempt/last_error are empty before any attempt,
+// then a failed send (OAuth exchange failure — the mock token endpoint
+// answers 500) surfaces a RFC3339 last_attempt and the sanitized
+// last_error, with NO token material anywhere in the probe body.
+func TestNotifyTokensProbeHealthSurface(t *testing.T) {
+	stateDir := t.TempDir()
+
+	var oauthFail atomic.Bool
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if oauthFail.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"internal"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"access_token":"t","expires_in":3600}`))
+	}))
+	t.Cleanup(tokenSrv.Close)
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa keygen: %v", err)
+	}
+	der, _ := x509.MarshalPKCS8PrivateKey(priv)
+	cj, _ := json.Marshal(map[string]string{
+		"project_id":   "p",
+		"private_key":  string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})),
+		"client_email": "bot@p.iam.gserviceaccount.com",
+		"token_uri":    tokenSrv.URL,
+	})
+	credsPath := filepath.Join(stateDir, "creds.json")
+	if err := os.WriteFile(credsPath, cj, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := alerts.NewStore(stateDir + "/alerts.jsonc")
+	if err != nil {
+		t.Fatalf("alerts.NewStore: %v", err)
+	}
+	c := cfg.Get()
+	c.Notify = &alerts.NotifyConfig{CredentialsFile: credsPath, ProjectID: "p"}
+	if err := cfg.Replace(c); err != nil {
+		t.Fatal(err)
+	}
+	pres := alerts.NewPresence()
+	engine := alerts.NewEngine(cfg, pres, alerts.NewDispatcher(cfg, pres))
+	tokens := alerts.NewTokenRegistry(stateDir)
+	notifier, err := alerts.NewNotifier(cfg, pres, tokens)
+	if err != nil {
+		t.Fatalf("alerts.NewNotifier: %v", err)
+	}
+	engine.SetNotifier(notifier)
+	if !engine.NotifyReady() {
+		t.Fatal("test premise: NotifyReady must be true")
+	}
+
+	oc := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(oc.Close)
+	srv, err := NewServer(aggregator.New(oc.URL, 100), oc.URL, 100)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	srv.RegisterFeature(notifyFeature{engine: engine, tokens: tokens})
+	web := httptest.NewServer(srv.Handler())
+	t.Cleanup(web.Close)
+
+	probeState := func() (string, string, []byte) {
+		t.Helper()
+		code, body := notifyGet(t, web.URL+"/vh/notify/tokens")
+		if code != http.StatusOK {
+			t.Fatalf("probe: want 200, got %d (body=%s)", code, body)
+		}
+		var probe struct {
+			LastAttempt string `json:"last_attempt"`
+			LastError   string `json:"last_error"`
+		}
+		if err := json.Unmarshal(body, &probe); err != nil {
+			t.Fatalf("probe body: %v (%s)", err, body)
+		}
+		return probe.LastAttempt, probe.LastError, body
+	}
+
+	// Before any attempt: empty/empty.
+	if at, le, _ := probeState(); at != "" || le != "" {
+		t.Fatalf("before any attempt: (%q, %q), want empty/empty", at, le)
+	}
+
+	// Register a distinctive token through the ROUTE (with a label), flip
+	// the OAuth endpoint to failing, and drive one send through the real
+	// notifier.
+	const secret = "SECRET-PROBE-TOKEN-never-in-body"
+	if code, body := notifyPost(t, web.URL+"/vh/notify/tokens", `{"token":"`+secret+`","label":"pixel","push_policy":"always"}`, true); code != http.StatusOK {
+		t.Fatalf("token POST: want 200, got %d (body=%s)", code, body)
+	}
+	oauthFail.Store(true)
+	engine.Notifier().Send(alerts.Notice{Type: alerts.TypeFinished, SessionID: "s1", Root: "s1", Project: "p", Ts: 1})
+
+	// The failed attempt must surface: RFC3339 last_attempt + sanitized
+	// last_error ("oauth exchange failed").
+	deadline := time.Now().Add(2 * time.Second)
+	var lastAttempt, lastErr string
+	var raw []byte
+	for time.Now().Before(deadline) {
+		lastAttempt, lastErr, raw = probeState()
+		if lastErr == "oauth exchange failed" && lastAttempt != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if lastErr != "oauth exchange failed" || lastAttempt == "" {
+		t.Fatalf("probe after failed send: last_attempt=%q last_error=%q", lastAttempt, lastErr)
+	}
+	if _, err := time.Parse(time.RFC3339, lastAttempt); err != nil {
+		t.Fatalf("last_attempt %q is not RFC3339: %v", lastAttempt, err)
+	}
+	// Secrets discipline: neither the token VALUE nor its label appears in
+	// the probe body.
+	if strings.Contains(string(raw), secret) || strings.Contains(string(raw), `"pixel"`) {
+		t.Fatalf("probe body carries token material: %s", raw)
 	}
 }

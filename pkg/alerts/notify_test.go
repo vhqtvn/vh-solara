@@ -7,15 +7,19 @@ package alerts
 // init-failure → channel-disabled semantics.
 
 import (
+	"bytes"
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -90,6 +94,10 @@ type fcmMock struct {
 	count    int
 	receipts chan fcmReceipt
 	respond  func(n int) (status int, body string)
+	// respondToken, when set, wins over respond and keys on the TARGET
+	// TOKEN — for tests where the per-token outcome must be deterministic
+	// (fan-out order is not).
+	respondToken func(token string) (status int, body string)
 }
 
 func newFCMMock() *fcmMock {
@@ -105,6 +113,12 @@ func (m *fcmMock) setRespond(f func(n int) (int, string)) {
 	m.respond = f
 }
 
+func (m *fcmMock) setRespondToken(f func(token string) (int, string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.respondToken = f
+}
+
 func (m *fcmMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b, _ := io.ReadAll(r.Body)
 	rec := fcmReceipt{Path: r.URL.Path, Authorization: r.Header.Get("Authorization"), Raw: b}
@@ -112,6 +126,9 @@ func (m *fcmMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	m.count++
 	status, body := m.respond(m.count)
+	if m.respondToken != nil {
+		status, body = m.respondToken(rec.Body.Message.Token)
+	}
 	m.mu.Unlock()
 	m.receipts <- rec
 	w.Header().Set("Content-Type", "application/json")
@@ -242,6 +259,10 @@ func newNotifyFixtureExpiry(t *testing.T, expiresIn int) *notifyFixture {
 	nt.fcmBase = fcmSrv.URL
 	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
 	nt.now = clk.Now
+	// Default the fixture logger to a discard handler: failure-path tests
+	// without a captureLogger call would otherwise write real warn lines to
+	// the test run's stderr (production default is vhlog's shared logger).
+	nt.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	return &notifyFixture{cfg: cfg, pres: pres, tokens: tokens, nt: nt, fcm: fcm, tmu: tmu, priv: priv, clk: clk, dir: dir}
 }
@@ -260,7 +281,7 @@ func notice(typ, kind string, ts int64) Notice {
 // verifies against the credentials' public key.
 func TestNotifierJWTFlow(t *testing.T) {
 	f := newNotifyFixture(t)
-	if err := f.tokens.Upsert("device-token-1", ""); err != nil {
+	if err := f.tokens.Upsert("device-token-1", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	f.nt.Send(notice(TypeFinished, "", 1))
@@ -338,7 +359,7 @@ func TestNotifierJWTFlow(t *testing.T) {
 // values strings, and no `notification` block.
 func TestNotifierWaitingQuestionFCMReceipt(t *testing.T) {
 	f := newNotifyFixture(t)
-	if err := f.tokens.Upsert("device-token-1", "phone"); err != nil {
+	if err := f.tokens.Upsert("device-token-1", "phone", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -399,7 +420,7 @@ func TestNotifierWaitingQuestionFCMReceipt(t *testing.T) {
 // and the HIGH-only-for-waiting priority rule, end to end through Send.
 func TestNotifierConditionAndPriorityMapping(t *testing.T) {
 	f := newNotifyFixture(t)
-	if err := f.tokens.Upsert("device-token-1", ""); err != nil {
+	if err := f.tokens.Upsert("device-token-1", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -455,7 +476,7 @@ func TestNotifierConditionAndPriorityMapping(t *testing.T) {
 // the notice → no FCM request, no cooldown consumption.
 func TestNotifierGatingTypeFilter(t *testing.T) {
 	f := newNotifyFixture(t)
-	if err := f.tokens.Upsert("device-token-1", ""); err != nil {
+	if err := f.tokens.Upsert("device-token-1", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	c := f.cfg.Get()
@@ -472,7 +493,7 @@ func TestNotifierGatingTypeFilter(t *testing.T) {
 // path only).
 func TestNotifierGatingAttended(t *testing.T) {
 	f := newNotifyFixture(t)
-	if err := f.tokens.Upsert("device-token-1", ""); err != nil {
+	if err := f.tokens.Upsert("device-token-1", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	f.pres.Heartbeat(Device{ID: "d1", LastInteraction: time.Now()})
@@ -485,7 +506,7 @@ func TestNotifierGatingAttended(t *testing.T) {
 // SAME knob as Web Push, from the notify channel's own map.
 func TestNotifierGatingCooldown(t *testing.T) {
 	f := newNotifyFixture(t)
-	if err := f.tokens.Upsert("device-token-1", ""); err != nil {
+	if err := f.tokens.Upsert("device-token-1", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.cfg.Get().Detect.CooldownSec; got != 300 {
@@ -530,7 +551,7 @@ func TestNotifierPrunesUnregisteredTokens(t *testing.T) {
 	// Case 1: 400 + UNREGISTERED detail → pruned, and persisted-absent.
 	f := newNotifyFixture(t)
 	f.fcm.setRespond(func(int) (int, string) { return 400, unregistered400Body })
-	_ = f.tokens.Upsert("tok-a", "")
+	_ = f.tokens.Upsert("tok-a", "", "")
 	f.nt.Send(notice(TypeFinished, "", 1))
 	f.fcm.waitNext(t)
 	eventually(t, func() bool { return f.tokens.Count() == 0 }, "400 UNREGISTERED must prune the token")
@@ -541,7 +562,7 @@ func TestNotifierPrunesUnregisteredTokens(t *testing.T) {
 	// Case 2: 404 + UNREGISTERED detail → pruned, and persisted-absent.
 	f2 := newNotifyFixture(t)
 	f2.fcm.setRespond(func(int) (int, string) { return 404, unregistered404Body })
-	_ = f2.tokens.Upsert("tok-b", "")
+	_ = f2.tokens.Upsert("tok-b", "", "")
 	f2.nt.Send(notice(TypeFinished, "", 1))
 	f2.fcm.waitNext(t)
 	eventually(t, func() bool { return f2.tokens.Count() == 0 }, "404 UNREGISTERED must prune the token")
@@ -554,7 +575,7 @@ func TestNotifierPrunesUnregisteredTokens(t *testing.T) {
 	// and the retention must persist.
 	f3 := newNotifyFixture(t)
 	f3.fcm.setRespond(func(int) (int, string) { return 404, projectNotFoundBody })
-	_ = f3.tokens.Upsert("tok-c", "")
+	_ = f3.tokens.Upsert("tok-c", "", "")
 	f3.nt.Send(notice(TypeFinished, "", 1))
 	f3.fcm.waitNext(t)
 	time.Sleep(300 * time.Millisecond) // give a (wrong) prune path a chance
@@ -568,7 +589,7 @@ func TestNotifierPrunesUnregisteredTokens(t *testing.T) {
 	// Case 4: 400 with another reason → kept, and persisted-kept.
 	f4 := newNotifyFixture(t)
 	f4.fcm.setRespond(func(int) (int, string) { return 400, invalidBody })
-	_ = f4.tokens.Upsert("tok-d", "")
+	_ = f4.tokens.Upsert("tok-d", "", "")
 	f4.nt.Send(notice(TypeFinished, "", 1))
 	f4.fcm.waitNext(t)
 	time.Sleep(300 * time.Millisecond) // give the prune path (wrongly) a chance
@@ -583,7 +604,7 @@ func TestNotifierPrunesUnregisteredTokens(t *testing.T) {
 	// the details-less shape FCM also answers dead tokens with → pruned.
 	f5 := newNotifyFixture(t)
 	f5.fcm.setRespond(func(int) (int, string) { return 404, topLevelUnregisteredBody })
-	_ = f5.tokens.Upsert("tok-e", "")
+	_ = f5.tokens.Upsert("tok-e", "", "")
 	f5.nt.Send(notice(TypeFinished, "", 1))
 	f5.fcm.waitNext(t)
 	eventually(t, func() bool { return f5.tokens.Count() == 0 }, "404 top-level UNREGISTERED status must prune the token")
@@ -598,8 +619,8 @@ func TestNotifierPrunesUnregisteredTokens(t *testing.T) {
 // cached access token serves the second send.
 func TestNotifierTokenCacheReuse(t *testing.T) {
 	f := newNotifyFixture(t)
-	_ = f.tokens.Upsert("tok-a", "")
-	_ = f.tokens.Upsert("tok-b", "")
+	_ = f.tokens.Upsert("tok-a", "", "")
+	_ = f.tokens.Upsert("tok-b", "", "")
 
 	f.nt.Send(notice(TypeFinished, "", 1)) // fans out to BOTH tokens
 	f.fcm.waitNext(t)
@@ -615,7 +636,7 @@ func TestNotifierTokenCacheReuse(t *testing.T) {
 // refresh and the retried send then succeeds.
 func TestNotifierAuth401ForceRefresh(t *testing.T) {
 	f := newNotifyFixture(t)
-	_ = f.tokens.Upsert("tok-a", "")
+	_ = f.tokens.Upsert("tok-a", "", "")
 	f.fcm.setRespond(func(n int) (int, string) {
 		if n == 1 {
 			return 401, `{"error":{"code":401,"status":"UNAUTHENTICATED"}}`
@@ -636,7 +657,7 @@ func TestNotifierAuth401ForceRefresh(t *testing.T) {
 // TestNotifier5xxSingleRetry: a 5xx gets exactly one cheap retry and no more.
 func TestNotifier5xxSingleRetry(t *testing.T) {
 	f := newNotifyFixture(t)
-	_ = f.tokens.Upsert("tok-a", "")
+	_ = f.tokens.Upsert("tok-a", "", "")
 	f.fcm.setRespond(func(int) (int, string) { return 500, `{"error":{"code":500}}` })
 	f.nt.Send(notice(TypeFinished, "", 1))
 	f.fcm.waitNext(t)
@@ -661,8 +682,8 @@ func TestNotifier5xxSingleRetry(t *testing.T) {
 // goroutines. A follow-up same-type send inside the window stays suppressed.
 func TestNotifierConcurrentSendCooldownAndTokenCache(t *testing.T) {
 	f := newNotifyFixture(t)
-	_ = f.tokens.Upsert("tok-concurrent-a", "")
-	_ = f.tokens.Upsert("tok-concurrent-b", "")
+	_ = f.tokens.Upsert("tok-concurrent-a", "", "")
+	_ = f.tokens.Upsert("tok-concurrent-b", "", "")
 
 	var wg sync.WaitGroup
 	start := make(chan struct{})
@@ -707,7 +728,7 @@ func TestNotifierConcurrentSendCooldownAndTokenCache(t *testing.T) {
 // deterministic.
 func TestNotifierTokenCacheRefreshBoundary(t *testing.T) {
 	f := newNotifyFixtureExpiry(t, 400)
-	_ = f.tokens.Upsert("tok-expiry", "")
+	_ = f.tokens.Upsert("tok-expiry", "", "")
 
 	// t0: first send — exchange #1; cache exp = t0+400s.
 	f.nt.Send(notice(TypeFinished, "", 1))
@@ -750,7 +771,7 @@ func TestNotifierTokenCacheRefreshBoundary(t *testing.T) {
 // evidence).
 func TestNotifierPersistent401Bounded(t *testing.T) {
 	f := newNotifyFixture(t)
-	_ = f.tokens.Upsert("tok-401", "")
+	_ = f.tokens.Upsert("tok-401", "", "")
 	f.fcm.setRespond(func(int) (int, string) { return 401, `{"error":{"code":401,"status":"UNAUTHENTICATED"}}` })
 
 	f.nt.Send(notice(TypeFinished, "", 1))
@@ -843,7 +864,7 @@ func TestNotifierProjectAndTTLDefaults(t *testing.T) {
 	}
 	nt.fcmBase = f.nt.fcmBase
 	nt.now = f.nt.now
-	_ = f.tokens.Upsert("tok-default", "")
+	_ = f.tokens.Upsert("tok-default", "", "")
 
 	nt.Send(notice(TypeFinished, "", 1))
 	r := f.fcm.waitNext(t)
@@ -924,7 +945,7 @@ func TestEngineNotifyReady(t *testing.T) {
 // dispatcher suppresses all outbound channels ("Silent" profile).
 func TestEngineDaemonNoticeReachesNotifier(t *testing.T) {
 	f := newNotifyFixture(t)
-	_ = f.tokens.Upsert("tok-engine", "")
+	_ = f.tokens.Upsert("tok-engine", "", "")
 	if err := f.cfg.SetActive("Silent"); err != nil { // PolicyNever
 		t.Fatal(err)
 	}
@@ -965,4 +986,355 @@ func TestEngineWaitingNoticeCarriesKind(t *testing.T) {
 	if strings.Contains(string(b), `"kind"`) {
 		t.Fatalf("kind must be omitempty: %s", b)
 	}
+}
+
+// --- v3: per-token push policy + send-failure observability ---
+
+// syncBuf is a mutex-guarded log buffer: the failure logger writes from
+// per-token delivery goroutines while the test reads.
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// captureLogger swaps the notifier's logger for a buffered one.
+func captureLogger(f *notifyFixture) *syncBuf {
+	sb := &syncBuf{}
+	f.nt.logger = slog.New(slog.NewTextHandler(sb, nil))
+	return sb
+}
+
+// TestNotifierAlwaysPolicyDeliversWhileAttended is the LOAD-BEARING crux for
+// v3 change 1: with a device actively attending, an always-policy token
+// RECEIVES its push while a when_unattended token in the SAME registry is
+// suppressed in the same send. Cooldown still applies to always tokens
+// (attendance-exempt, not cooldown-exempt); a different type escapes the
+// cooldown key and still delivers while attended.
+func TestNotifierAlwaysPolicyDeliversWhileAttended(t *testing.T) {
+	f := newNotifyFixture(t)
+	_ = f.tokens.Upsert("tok-always-1", "on-call phone", "always")
+	_ = f.tokens.Upsert("tok-wu-1", "", "") // default: when_unattended
+	f.pres.Heartbeat(Device{ID: "d1", LastInteraction: time.Now()})
+
+	f.nt.Send(notice(TypeWaiting, KindQuestion, 1))
+
+	r := f.fcm.waitNext(t)
+	if r.Body.Message.Token != "tok-always-1" {
+		t.Fatalf("delivered token = %q, want tok-always-1 (always policy bypasses attendance)", r.Body.Message.Token)
+	}
+	f.fcm.assertNoRequest(t, "when_unattended token must be suppressed in the same attended send")
+
+	// Cooldown applies to the always token too: same (type, token) within
+	// cooldown_sec is suppressed even though attendance is bypassed.
+	f.nt.Send(notice(TypeWaiting, KindPermission, 2)) // same type → same cooldown key
+	f.fcm.assertNoRequest(t, "cooldown must still gate always-policy tokens")
+
+	// A different type escapes the cooldown and still delivers while attended.
+	f.nt.Send(notice(TypeFinished, "", 3))
+	r = f.fcm.waitNext(t)
+	if r.Body.Message.Token != "tok-always-1" {
+		t.Fatalf("second delivery token = %q, want tok-always-1", r.Body.Message.Token)
+	}
+	f.fcm.assertNoRequest(t, "when_unattended token stays suppressed while attended")
+
+	// (Unattended fan-out to BOTH policies — when_unattended is the default
+	// posture and always only ADDS delivery — is pinned by
+	// TestNotifierTokenCacheReuse's two-token fan-out; presence here stays
+	// attended on the real clock, so this test cannot flip it.)
+}
+
+// TestNotifierFailureLogging pins the one-line-per-failure contract across
+// every failure class: channel=notify, a classified reason, the HTTP status
+// where applicable, and the token identified as label-or-hash — plus the
+// sanitized last_error each class leaves on the operator surface.
+func TestNotifierFailureLogging(t *testing.T) {
+	const projectNotFound = `{"error":{"code":404,"status":"NOT_FOUND","message":"Requested entity was not found"}}`
+
+	t.Run("oauth exchange failed", func(t *testing.T) {
+		f := newNotifyFixture(t)
+		sb := captureLogger(f)
+		f.nt.creds.TokenURI = "http://127.0.0.1:1/token" // unreachable
+		_ = f.tokens.Upsert("tok-oauth", "pixel", "")
+		f.nt.Send(notice(TypeFinished, "", 1))
+		eventually(t, func() bool {
+			_, lastErr := f.nt.Health()
+			return lastErr == "oauth exchange failed"
+		}, "oauth failure must set last_error")
+		line := sb.String()
+		for _, want := range []string{
+			`msg="notify: fcm send failed"`,
+			"channel=notify",
+			"reason=\"oauth exchange failed\"",
+			"token=pixel",
+		} {
+			if !strings.Contains(line, want) {
+				t.Fatalf("oauth log line missing %q:\n%s", want, line)
+			}
+		}
+		if strings.Contains(line, "status=") {
+			t.Fatalf("oauth failure has no HTTP status; got:\n%s", line)
+		}
+	})
+
+	t.Run("401 refresh exhaustion", func(t *testing.T) {
+		f := newNotifyFixture(t)
+		sb := captureLogger(f)
+		_ = f.tokens.Upsert("tok-401x", "phone-401", "")
+		f.fcm.setRespond(func(int) (int, string) {
+			return 401, `{"error":{"code":401,"status":"UNAUTHENTICATED"}}`
+		})
+		f.nt.Send(notice(TypeFinished, "", 1))
+		f.fcm.waitNext(t)
+		eventually(t, func() bool {
+			_, lastErr := f.nt.Health()
+			return lastErr == "401 UNAUTHENTICATED"
+		}, "persistent 401 must set last_error")
+		line := sb.String()
+		for _, want := range []string{
+			`msg="notify: fcm send failed"`,
+			"reason=\"unauthenticated after refresh\"",
+			"status=401",
+			"code=UNAUTHENTICATED",
+			"token=phone-401",
+		} {
+			if !strings.Contains(line, want) {
+				t.Fatalf("401 log line missing %q:\n%s", want, line)
+			}
+		}
+	})
+
+	t.Run("5xx retry exhaustion", func(t *testing.T) {
+		f := newNotifyFixture(t)
+		sb := captureLogger(f)
+		_ = f.tokens.Upsert("tok-5xx", "phone-5xx", "")
+		f.fcm.setRespond(func(int) (int, string) { return 500, `{"error":{"code":500}}` })
+		f.nt.Send(notice(TypeFinished, "", 1))
+		f.fcm.waitNext(t)
+		eventually(t, func() bool {
+			_, lastErr := f.nt.Health()
+			return lastErr == "500 fcm 5xx retry exhausted"
+		}, "5xx exhaustion must set last_error")
+		line := sb.String()
+		for _, want := range []string{
+			"reason=\"fcm 5xx retry exhausted\"",
+			"status=500",
+			"token=phone-5xx",
+		} {
+			if !strings.Contains(line, want) {
+				t.Fatalf("5xx log line missing %q:\n%s", want, line)
+			}
+		}
+	})
+
+	t.Run("429 quota", func(t *testing.T) {
+		f := newNotifyFixture(t)
+		sb := captureLogger(f)
+		_ = f.tokens.Upsert("tok-429", "phone-429", "")
+		f.fcm.setRespond(func(int) (int, string) {
+			return 429, `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}`
+		})
+		f.nt.Send(notice(TypeFinished, "", 1))
+		f.fcm.waitNext(t)
+		eventually(t, func() bool {
+			_, lastErr := f.nt.Health()
+			return lastErr == "429 RESOURCE_EXHAUSTED"
+		}, "429 must set last_error")
+		line := sb.String()
+		for _, want := range []string{"reason=\"rate limited (quota)\"", "status=429"} {
+			if !strings.Contains(line, want) {
+				t.Fatalf("429 log line missing %q:\n%s", want, line)
+			}
+		}
+	})
+
+	t.Run("404 rejected", func(t *testing.T) {
+		f := newNotifyFixture(t)
+		sb := captureLogger(f)
+		_ = f.tokens.Upsert("tok-404", "phone-404", "")
+		f.fcm.setRespond(func(int) (int, string) { return 404, projectNotFound })
+		f.nt.Send(notice(TypeFinished, "", 1))
+		f.fcm.waitNext(t)
+		eventually(t, func() bool {
+			_, lastErr := f.nt.Health()
+			return lastErr == "404 NOT_FOUND"
+		}, "404 must set last_error (status + canonical name)")
+		line := sb.String()
+		for _, want := range []string{"reason=\"fcm rejected message\"", "status=404", "code=NOT_FOUND"} {
+			if !strings.Contains(line, want) {
+				t.Fatalf("404 log line missing %q:\n%s", want, line)
+			}
+		}
+		// The raw response body must not be echoed.
+		if strings.Contains(line, "Requested entity") {
+			t.Fatalf("log must not carry response body text:\n%s", line)
+		}
+	})
+
+	t.Run("404 unregistered prune decision", func(t *testing.T) {
+		f := newNotifyFixture(t)
+		sb := captureLogger(f)
+		_ = f.tokens.Upsert("tok-dead", "phone-dead", "")
+		f.fcm.setRespond(func(int) (int, string) {
+			return 404, `{"error":{"code":404,"status":"NOT_FOUND","details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"UNREGISTERED"}]}}`
+		})
+		f.nt.Send(notice(TypeFinished, "", 1))
+		f.fcm.waitNext(t)
+		eventually(t, func() bool { return f.tokens.Count() == 0 }, "UNREGISTERED must prune")
+		eventually(t, func() bool {
+			_, lastErr := f.nt.Health()
+			return lastErr == "404 UNREGISTERED"
+		}, "prune must still set last_error (delivery failed)")
+		line := sb.String()
+		for _, want := range []string{
+			`msg="notify: token unregistered, pruned"`,
+			"reason=\"token unregistered (pruned)\"",
+			"code=UNREGISTERED",
+			"token=phone-dead",
+		} {
+			if !strings.Contains(line, want) {
+				t.Fatalf("prune log line missing %q:\n%s", want, line)
+			}
+		}
+	})
+
+	t.Run("transport error", func(t *testing.T) {
+		f := newNotifyFixture(t)
+		sb := captureLogger(f)
+		f.nt.fcmBase = "http://127.0.0.1:1" // unreachable FCM endpoint
+		_ = f.tokens.Upsert("tok-transport", "phone-xport", "")
+		f.nt.Send(notice(TypeFinished, "", 1))
+		eventually(t, func() bool {
+			_, lastErr := f.nt.Health()
+			return lastErr == "transport error"
+		}, "transport failure must set last_error")
+		line := sb.String()
+		for _, want := range []string{"reason=\"transport error\"", "token=phone-xport", "err="} {
+			if !strings.Contains(line, want) {
+				t.Fatalf("transport log line missing %q:\n%s", want, line)
+			}
+		}
+	})
+}
+
+// TestNotifierLogSecretHygiene is the SECRET-HYGIENE crux: register a known
+// distinctive token VALUE, force a failed send, and assert the value appears
+// in NO log line — the token is identified by its sha256 hash prefix (the
+// same derivation the cooldown map keys on) when no label exists.
+func TestNotifierLogSecretHygiene(t *testing.T) {
+	const secret = "SECRET-TOKEN-VALUE-Zq9x-never-log-me"
+	f := newNotifyFixture(t)
+	sb := captureLogger(f)
+	_ = f.tokens.Upsert(secret, "", "") // no label → hash identification
+	f.fcm.setRespond(func(int) (int, string) {
+		return 404, `{"error":{"code":404,"status":"NOT_FOUND","message":"Requested entity was not found"}}`
+	})
+	f.nt.Send(notice(TypeFinished, "", 1))
+	f.fcm.waitNext(t)
+	eventually(t, func() bool {
+		_, lastErr := f.nt.Health()
+		return lastErr == "404 NOT_FOUND"
+	}, "failed send must settle")
+
+	line := sb.String()
+	if strings.Contains(line, secret) {
+		t.Fatalf("token VALUE leaked into a log line:\n%s", line)
+	}
+	sum := sha256.Sum256([]byte(secret))
+	wantRef := hex.EncodeToString(sum[:16])
+	if !strings.Contains(line, "token="+wantRef) {
+		t.Fatalf("log must identify the token by its hash prefix %q:\n%s", wantRef, line)
+	}
+	// The sanitized operator surface carries no token material either.
+	if _, lastErr := f.nt.Health(); strings.Contains(lastErr, secret) {
+		t.Fatalf("token VALUE leaked into last_error: %q", lastErr)
+	}
+}
+
+// TestNotifierHealthLastAttemptError pins the operator-checkable surface:
+// zero/empty before any attempt, set by a failed attempt (RFC3339-formattable
+// time + sanitized error), cleared by a later success.
+func TestNotifierHealthLastAttemptError(t *testing.T) {
+	f := newNotifyFixture(t)
+	captureLogger(f) // keep failure lines out of the test run's stderr
+	if at, lastErr := f.nt.Health(); !at.IsZero() || lastErr != "" {
+		t.Fatalf("before any attempt: (%v, %q), want zero/empty", at, lastErr)
+	}
+	_ = f.tokens.Upsert("tok-h", "", "")
+	f.fcm.setRespond(func(int) (int, string) {
+		return 404, `{"error":{"code":404,"status":"NOT_FOUND","message":"x"}}`
+	})
+	f.nt.Send(notice(TypeFinished, "", 1))
+	f.fcm.waitNext(t)
+	eventually(t, func() bool {
+		at, lastErr := f.nt.Health()
+		return lastErr == "404 NOT_FOUND" && at.Unix() == 1_700_000_000
+	}, "failed attempt must set last_attempt (notifier clock) + last_error")
+
+	// A later success clears last_error and advances last_attempt.
+	f.fcm.setRespond(func(int) (int, string) { return 200, "{}" })
+	f.clk.advance(301 * time.Second) // past cooldown for the same type
+	f.nt.Send(notice(TypeFinished, "", 2))
+	f.fcm.waitNext(t)
+	eventually(t, func() bool {
+		at, lastErr := f.nt.Health()
+		return lastErr == "" && at.Unix() == 1_700_000_301
+	}, "success must clear last_error and advance last_attempt")
+}
+
+// TestNotifierHealthLoopLine pins the periodic channel-health line: a short
+// ticker fires a summary carrying enabled, token counts by policy, and the
+// attempted/succeeded/failed/pruned window counters (which reset per line).
+func TestNotifierHealthLoopLine(t *testing.T) {
+	f := newNotifyFixture(t)
+	sb := captureLogger(f)
+	_ = f.tokens.Upsert("tok-h-a", "", "always")
+	_ = f.tokens.Upsert("tok-h-b", "", "") // when_unattended
+
+	// Deterministic per-token outcomes (fan-out order is not): tok-h-a
+	// succeeds, tok-h-b is UNREGISTERED and pruned.
+	f.fcm.setRespondToken(func(token string) (int, string) {
+		if token == "tok-h-a" {
+			return 200, "{}"
+		}
+		return 404, `{"error":{"code":404,"status":"NOT_FOUND","details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"UNREGISTERED"}]}}`
+	})
+	f.nt.Send(notice(TypeFinished, "", 1))
+	f.fcm.waitNext(t)
+	f.fcm.waitNext(t)
+	// Wait for the counters to settle BEFORE starting the loop so the first
+	// health line observes the full window (logHealth resets on each line).
+	eventually(t, func() bool {
+		f.nt.statMu.Lock()
+		defer f.nt.statMu.Unlock()
+		return f.nt.attempted == 2 && f.nt.succeeded == 1 && f.nt.pruned == 1 && f.nt.failed == 0
+	}, "window counters must settle at 2 attempted / 1 succeeded / 1 pruned")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.nt.StartHealthLoop(ctx, 20*time.Millisecond)
+
+	eventually(t, func() bool {
+		line := sb.String()
+		return strings.Contains(line, `msg="notify: channel health"`) &&
+			strings.Contains(line, "enabled=true") &&
+			strings.Contains(line, "tokens_always=1") &&
+			strings.Contains(line, "tokens_when_unattended=0") && // tok-h-b was pruned
+			strings.Contains(line, "attempted=2") &&
+			strings.Contains(line, "succeeded=1") &&
+			strings.Contains(line, "failed=0") &&
+			strings.Contains(line, "pruned=1")
+	}, "health line must fire with the window counters")
+	cancel() // loop exits on ctx cancellation
 }

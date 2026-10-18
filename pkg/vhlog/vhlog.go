@@ -44,6 +44,12 @@ var logger = func() *slog.Logger {
 // argument construction before a Debug call.
 func Enabled() bool { return debugOn }
 
+// Logger returns the shared *slog.Logger for packages that need an
+// injectable logger field (e.g. pkg/alerts' Notifier) while keeping the
+// daemon's single logging configuration (one handler, one VH_DEBUG toggle).
+// The returned logger is shared, never nil, and not configurable at runtime.
+func Logger() *slog.Logger { return logger }
+
 func Debug(msg string, args ...any) { logger.Debug(msg, args...) }
 func Info(msg string, args ...any)  { logger.Info(msg, args...) }
 func Warn(msg string, args ...any)  { logger.Warn(msg, args...) }

@@ -36,10 +36,14 @@ func (s *Server) InitAlerts(ctx context.Context) (*alerts.Engine, error) {
 	// ONLY when the config carries a credentials file AND it loads; a load
 	// failure silently disables the channel (NotifyReady false → probe
 	// enabled:false, upserts 503) without touching anything else in alerts.
+	// (v3) The attached sender also runs the periodic channel-health log
+	// line (window counters) until ctx is cancelled; its per-failure logging
+	// rides the daemon's shared vhlog logger (see pkg/vhlog).
 	tokens := alerts.NewTokenRegistry(stateBaseDir())
 	if store.Get().NotifyConfigured() {
 		if notifier, nerr := alerts.NewNotifier(store, presence, tokens); nerr == nil {
 			engine.SetNotifier(notifier)
+			notifier.StartHealthLoop(ctx, 0) // daemon default interval
 		}
 	}
 	engine.SetHistory(alerts.NewHistory(stateBaseDir()))
