@@ -49,6 +49,43 @@ async function bootEink(page: Page) {
 async function openDemo(page: Page) {
   await page.goto(projectUrl("/?session=demo"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10_000 });
+  // CI cold-daemon guard (2026-10-17 run 39028326511: test 5 failed 3/3 with
+  // the reasoning paging bar tens of px below the chat viewport after its
+  // one-time setup scroll): on a slow first boot the daemon's opencode
+  // status route 503s and the demo transcript hydrates PROGRESSIVELY — a
+  // park/expand/scrollIntoView executed mid-arrival lands on stale
+  // geometry, and content arriving after the one-time setup scroll shifts
+  // the bar below the viewport before the assertion reads it. Locally (warm
+  // daemon) hydration beats the test, which is why the failure never
+  // reproduced in isolation. Wait for the transcript to QUIESCE — message
+  // count + chat scrollHeight stable across three 150ms samples — before
+  // any test interacts with it. Purely additive (~300ms) when already
+  // settled; bounded at ~15s so a wedged stream cannot hang a test.
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        const chat = document.querySelector(".chat-scroll");
+        if (!chat) return resolve();
+        let m = -1;
+        let s = -1;
+        let stable = 0;
+        let tries = 0;
+        const tick = () => {
+          const m2 = document.querySelectorAll(".msg").length;
+          const s2 = Math.round((chat as HTMLElement).scrollHeight);
+          if (m2 === m && s2 === s) {
+            if (++stable >= 3) return resolve();
+          } else {
+            stable = 0;
+          }
+          m = m2;
+          s = s2;
+          if (++tries > 100) return resolve();
+          setTimeout(tick, 150);
+        };
+        tick();
+      }),
+  );
 }
 
 // Fixture source files written into the demo project dir so the CODE viewer
