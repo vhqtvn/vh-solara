@@ -1,16 +1,19 @@
 package web
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
+	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
 // providerUpstream is a counting fake for the upstream GET /provider that
@@ -360,11 +363,28 @@ func (failingProviderRW) WriteHeader(int)     {}
 
 // TestWriteCapturedProviderFailingWriter: a replay onto a broken connection
 // (every Write fails) must not panic and must not change control flow — the
-// function completes and the write error is logged instead of discarded.
-// This pins the no-panic / branch-taken half only: vhlog binds os.Stderr at
-// package init and exposes no swappable sink, so the emitted log line itself
-// is not asserted here.
+// function completes — and the write error must be logged, not discarded.
+// vhlog.SetOutput captures the WARN line, so the log outcome is asserted
+// directly: deleting the vhlog.Warn call (or losing its status/bytes
+// fields) now fails this test, closing the assertion gap this test
+// previously documented (vhlog once offered no swappable sink).
 func TestWriteCapturedProviderFailingWriter(t *testing.T) {
+	var logBuf bytes.Buffer
+	prev := vhlog.SetOutput(&logBuf)
+	defer vhlog.SetOutput(prev)
+
 	writeCapturedProvider(failingProviderRW{}, http.StatusOK,
 		http.Header{"Content-Type": {"application/json"}}, []byte(`{"ok":true}`))
+
+	out := logBuf.String()
+	for _, want := range []string{
+		"provider single-flight: replay write to waiter failed",
+		"level=WARN",
+		"status=200",
+		"bytes=11",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("captured log missing %q; got:\n%s", want, out)
+		}
+	}
 }
