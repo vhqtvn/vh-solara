@@ -346,6 +346,8 @@ type Server struct {
 	// aggHook, when set, is invoked for each project aggregator as it is touched
 	// (default project and every lazily-created one) — the alerts engine uses it
 	// to subscribe its detector to the project's store. Idempotent per dir.
+	// Guarded by aggMu on all access sites: written under lock by SetAggHook,
+	// read under lock by aggFor's default-project and lazy-create paths.
 	aggHook func(dir string, a *aggregator.Aggregator)
 	// upstreamDownProbe, when set by the daemon (oc-death-watch S2), is
 	// installed on the default aggregator immediately and on every per-dir

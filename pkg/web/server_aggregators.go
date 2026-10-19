@@ -107,9 +107,10 @@ func (s *Server) RetargetOpenCode(baseURL string) {
 // production both callers (cmd/client-daemon-vh, cmd/local-server) drain the HTTP
 // server (vhHTTP.Shutdown) BEFORE srv.Shutdown, so no concurrent aggFor can
 // install fresh lifecycle work during teardown; tests call Shutdown in cleanup.
-// There is intentionally no admission barrier: the default aggFor path is
-// lock-free for per-request performance, and the only race that could install
-// post-signal work cannot occur at the actual call sites.
+// There is intentionally no admission barrier: the default aggFor path does
+// not consult the aggregator map and takes no persistent lock (aggMu is
+// acquired briefly for the aggHook read+invoke only), and the only race that
+// could install post-signal work cannot occur at the actual call sites.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.bgCancel() // idempotent; never reassigned after NewServer
 	s.stopAllPermissionWatchers()
@@ -228,9 +229,16 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 		if s.managed != nil {
 			s.managedDefaultOnce.Do(func() { s.managed.OpenProject("") })
 		}
+		// aggHook read + invoke under aggMu — the same critical-section
+		// discipline as the lazy-create path below, which fires the hook
+		// inside its lock. The alerts hook attaches a detector to the store
+		// (pkg/alerts cannot re-enter pkg/web), so holding aggMu across the
+		// invoke is deadlock-free.
+		s.aggMu.Lock()
 		if s.aggHook != nil {
 			s.aggHook("", s.agg)
 		}
+		s.aggMu.Unlock()
 		s.ensurePermissionWatcher("", s.agg)
 		s.installQueueGCCleanup("", s.agg)
 		s.installQueueSessionErrorSignal("", s.agg)
@@ -319,7 +327,17 @@ func (s *Server) aggForExisting(dir string) *aggregator.Aggregator {
 
 // SetAggHook installs a per-project callback fired as each aggregator is touched
 // (default + lazily-created). The alerts engine uses it to subscribe. Optional.
-func (s *Server) SetAggHook(fn func(dir string, a *aggregator.Aggregator)) { s.aggHook = fn }
+// The field write is aggMu-guarded to match aggFor's locked reads, so safety
+// does not rest on the daemon's once-at-boot, before-serving install discipline
+// (the daemons do still call it that way). Note the lock fixes the data race
+// only: a swap made after per-dir aggregators exist still hooks future touches
+// only — already-created per-dir aggregators are not re-hooked (the default
+// project re-fires on every touch).
+func (s *Server) SetAggHook(fn func(dir string, a *aggregator.Aggregator)) {
+	s.aggMu.Lock()
+	s.aggHook = fn
+	s.aggMu.Unlock()
+}
 
 // SetUpstreamDownProbe installs the daemon's "OpenCode is known down right now"
 // predicate (oc-death-watch S2): applied to the default aggregator immediately
