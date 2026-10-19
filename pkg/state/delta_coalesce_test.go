@@ -322,7 +322,7 @@ func TestDeltaCoalesce_ColdLoadPreservesUnflushedDeltaBuf(t *testing.T) {
 	// mechanism switched to a read-only projection overlay.)
 	if got := partText(s.Snapshot(nil), "sess", "p1"); got != "live-tail" {
 		t.Fatalf("unflushed deltaBuf lost across cold-load reconcile: want %q, got %q "+
-			"(store.go:2090 guard failed — only the flushed prefix survived)", "live-tail", got)
+			"(reconcileMessagesLocked guard failed — only the flushed prefix survived)", "live-tail", got)
 	}
 }
 

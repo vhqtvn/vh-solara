@@ -26,7 +26,7 @@ package state
 //     (orphaned) child, AFTER the topology change is fully applied.
 //
 // Before this file, exactly ONE test covered the delete path at all
-// (TestReducerDeleteSession in store_test.go:57) and it asserted only that
+// (TestReducerDeleteSession in store_test.go) and it asserted only that
 // sessions+messages are gone after delete — NONE of the grace-cancel,
 // busyCount-decrement, finish-cascade-emit-order, or orphan-check contracts.
 // These tests are the mandatory pre-split gate for any concern extraction that
@@ -172,7 +172,7 @@ func TestDeleteSession_CancelsArmedGrace(t *testing.T) {
 
 	st := s.deleteCleanupSnapshot("R")
 	if st.graceArmed {
-		t.Fatalf("after delete: graceTimers[R] should be deleted (cancelGraceLocked at store.go:1586), still armed")
+		t.Fatalf("after delete: graceTimers[R] should be deleted (cancelGraceLocked in grace.go), still armed")
 	}
 	if st.graceGen <= armGen {
 		t.Fatalf("after delete: graceGen=%d, want > %d (cancel must bump past the armGen so a racing fire aborts)", st.graceGen, armGen)
@@ -181,7 +181,7 @@ func TestDeleteSession_CancelsArmedGrace(t *testing.T) {
 		t.Fatalf("after delete: sessions[R] should be gone")
 	}
 	if st.authoritative {
-		t.Fatalf("after delete: completionAuthoritative[R] should be cleared (delete at store.go:1587)")
+		t.Fatalf("after delete: completionAuthoritative[R] should be cleared (delete in deleteSessionLocked, reducers.go)")
 	}
 
 	// Wait WELL past the grace window. The armGen-captured timer callback
@@ -417,7 +417,7 @@ func TestDeleteSession_ErrorSessionEmitsIdleCascadeWithoutTouchingBusyCount(t *t
 	}
 	if !sawIdleCascade {
 		t.Fatalf("after delete errored child: expected a KindActivity(child, idle) finish-cascade event "+
-			"(error-mirror branch at store.go:1555), got events=%v", eventKinds(events))
+			"(error-mirror branch in deleteSessionLocked, reducers.go), got events=%v", eventKinds(events))
 	}
 
 	// busyCount[root] must STILL be 1 — the error branch is a separate
@@ -428,7 +428,7 @@ func TestDeleteSession_ErrorSessionEmitsIdleCascadeWithoutTouchingBusyCount(t *t
 	if rootBusyAfter != 1 {
 		t.Fatalf("after delete errored child: busyCount[root]=%d, want 1 "+
 			"(error MUST NOT touch busyCount — sib's contribution must survive; "+
-			"see SUBTLETY at store.go:1543-1554)", rootBusyAfter)
+			"see SUBTLETY in reducers.go)", rootBusyAfter)
 	}
 	if got := s.RunningRoots(); got != 1 {
 		t.Fatalf("after delete errored child: RunningRoots=%d, want 1 (sib still busy)", got)
@@ -520,7 +520,7 @@ func TestDeleteSession_EmitOrderActivityBeforeDeleteBeforeOrphanCheck(t *testing
 	}
 	if !(idxActivity < idxDelete && idxDelete < idxOrphan) {
 		t.Fatalf("emit order wrong: activity@%d, delete@%d, orphan@%d "+
-			"(want activity < delete < orphan per store.go:1529/1594/1600); events=%v",
+			"(want activity < delete < orphan per deleteSessionLocked in reducers.go); events=%v",
 			idxActivity, idxDelete, idxOrphan, eventKinds(events))
 	}
 }

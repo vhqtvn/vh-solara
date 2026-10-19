@@ -203,7 +203,7 @@ func TestSubtreeBusy_ActivityAncestorFacetWalk(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestSubtreeBusy_ActivitySelfFacetClearsOwnStaleFlag is the regression test for
-// the /vh/abort stale-spinner bug (web/tests/e2e/ux.spec.ts:59 "Stop clears the
+// the /vh/abort stale-spinner bug (web/tests/e2e/ux.spec.ts "Stop clears the
 // working indicator immediately"). A ROOT node (no ancestors) whose own activity
 // flips busy→idle must have its OWN current subtreeBusy value re-emitted on the
 // activity facet, mirroring buildNodeLocked.

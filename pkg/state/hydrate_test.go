@@ -153,7 +153,7 @@ func TestHydrate_SessionAssignedDirectly(t *testing.T) {
 	if got := s.RootCount(); got != 1 {
 		t.Fatalf("RootCount=%d, want 1 (R is the only root; C is its child)", got)
 	}
-	// Descendants(id) INCLUDES id itself (snapshots.go:43 — "id plus every
+	// Descendants(id) INCLUDES id itself (snapshots.go — "id plus every
 	// live session transitively parented by it"). So R's descendant set is
 	// {R, C}, len 2.
 	descR := s.Descendants("R")
@@ -527,7 +527,7 @@ func TestHydrate_IdempotentOnIdenticalInfo_ReplaceOnChangedInfo(t *testing.T) {
 	assertSubtreeBusyCount(t, s, "replace hydrate (topology changed)")
 
 	// Public-API confirmation of the replaced topology. Descendants(id)
-	// INCLUDES id itself (snapshots.go:43), so Descendants("R") is {R} after
+	// INCLUDES id itself (snapshots.go), so Descendants("R") is {R} after
 	// C moves away, and Descendants("R2") is {R2, C}.
 	if got := s.RootCount(); got != 2 {
 		t.Fatalf("replace hydrate: RootCount=%d, want 2 (R, R2)", got)

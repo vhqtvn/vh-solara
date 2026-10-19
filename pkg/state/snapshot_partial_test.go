@@ -109,7 +109,7 @@ func TestSnapshotWithTreePartial_FrontierScopeAndGlobalMaps(t *testing.T) {
 	s.Apply(ev("session.created", evSessionCreated("G1", "D1"))) // buried (no pending input)
 
 	// Pending question + permission on a FRONTIER session (D2). NOTE: by design
-	// (tree_emitter.go isActiveLocked ~:283), ANY session with pending Q/P is
+	// (tree_emitter.go isActiveLocked), ANY session with pending Q/P is
 	// promoted into the active path → frontier. So Q/P/unread are ALWAYS subsets
 	// of the frontier; the "global" authority tag exists for client-side
 	// AUTHORITATIVE-REPLACE semantics (clearing replied questions), not to

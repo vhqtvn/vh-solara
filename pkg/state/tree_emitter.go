@@ -870,7 +870,7 @@ func (e *TreeEmitter) onActivityLocked(ev ClientEvent) []TreeOp {
 	// later goes idle this self facet is the clearing moment — and for a ROOT
 	// (no ancestors) it is the ONLY clearing path. Without it a stale client
 	// flags.subtreeBusy=true survives the idle transition and the spinner
-	// persists after /vh/abort (web/tests/e2e/ux.spec.ts:59 "Stop clears the
+	// persists after /vh/abort (web/tests/e2e/ux.spec.ts "Stop clears the
 	// working indicator"). busy↔retry is busy-neutral (subtreeBusyCount
 	// unchanged) so the emitted value is correct in both directions.
 	op := NodeFacetOp(p.SessionID, FacetData{

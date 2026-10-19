@@ -17,7 +17,7 @@ import (
 // projected — §3.2). The emitter (tree_emitter.go) populates them from the
 // existing store + subtree indexes; it does NOT rebuild the tree.
 
-// VerbFacet (defined in store.go:790) is reused as the Node.verb shape —
+// VerbFacet (defined in store.go) is reused as the Node.verb shape —
 // {tool, state?}. A nil *VerbFacet on Node means "no active tool facet" (omitted
 // on the wire); the verb CLEAR sentinel on a facet op is FacetVerb (below).
 

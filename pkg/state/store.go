@@ -1635,7 +1635,7 @@ func (s *Store) noteArchivedLocked(id string) {
 
 // rebuildArchivedSnapshotLocked rebuilds s.archivedSnapshot from rawArchived. An
 // id is archived iff its session info carries time.archived != 0 — the SAME
-// filter archivedDescendants (pkg/web/archive.go:356-408) applies, reused here so
+// filter archivedDescendants (pkg/web/archive.go) applies, reused here so
 // the snapshot and the unarchive walk agree on what "archived" means. The map is
 // rebuilt wholesale (not merged) so ids that left the archived set (a legitimate
 // un-archive) are dropped on the next refresh. Caller holds s.mu.
