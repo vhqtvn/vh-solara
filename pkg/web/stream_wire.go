@@ -122,14 +122,17 @@ func deliverTreeOps(w io.Writer, treeEmitter *state.TreeEmitter, prepared *state
 
 // snapshotComplete is the Q5 truthful completion boundary. Emitted on the wire
 // ONLY after BOTH projections of a single SnapshotWithTree capture have been
-// written: tree.snapshot (structure, gzip64/async) and the legacy detail
-// snapshot (raw/sync). Because SnapshotWithTree derived both under ONE store
-// RLock, both carry the SAME {epoch, seq}; this event truthfully asserts that
+// handed to (unchecked) writeRaw — the gate is successful marshal of both:
+// tree.snapshot (structure, gzip64/async) and the legacy detail snapshot
+// (raw/sync); write errors on these frames are undetected (only the tree.op
+// path via deliverTreeOps is write-checked). Because SnapshotWithTree derived
+// both under ONE store WRITE lock (the B-F1 buffered-delta flush + capture),
+// both carry the SAME {epoch, seq}; this event truthfully asserts that
 // cross-projection atomicity. The FE stages tree+detail by {epoch, revision}
 // and marks authoritativeReady on receipt — the verifiable convergence
 // boundary that resyncTree/reconcile needed. Before the single-capture
 // consolidation (commit B), stamping this label would have been false
-// confidence (two independent RLocks could diverge across a writer).
+// confidence (two independent lock spans could diverge across a writer).
 type snapshotComplete struct {
 	Epoch       string   `json:"epoch"`
 	Revision    uint64   `json:"revision"`
@@ -140,6 +143,8 @@ type snapshotComplete struct {
 // stamped with the capture's {epoch, seq} (revision == seq). The SSE id is the
 // compound id passed by the caller (same globalSeq as both projections; ordinal
 // is 0 for tree-stream snapshots since the FE does not gap-check snapshots).
+// The frame write itself is an unchecked writeRaw: a marshal failure is logged
+// and skips the frame; a write failure is silent.
 func writeSnapshotComplete(w io.Writer, epoch string, seq uint64, id string) {
 	cb, err := json.Marshal(snapshotComplete{
 		Epoch:       epoch,

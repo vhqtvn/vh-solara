@@ -120,14 +120,13 @@ const permRejectTimeout = 10 * time.Second
 // runPermissionReconcile is the per-directory fail-closed backstop. It does NOT
 // depend on the store's lossy live-tail channel.
 //
-// Lifetime: the DEFAULT dir's sweep ("") is PROCESS-LIFETIME — the goroutine
-// runs for as long as this daemon owns the default aggregator's store, and its
-// ctx is never cancelled by Reload (handleReloadProject skips teardown for the
-// default dir). A NON-DEFAULT dir's sweep is STOPPABLE: stopPermissionWatcher
-// cancels its ctx when handleReloadProject drops that dir's aggregator, so the
-// goroutine exits promptly instead of ticking forever on an orphaned store. On
-// daemon exit the whole process (and the local opencode server it drives) goes
-// away together, so any still-running sweep's ticker simply stops.
+// Lifetime: the DEFAULT dir's sweep ("") runs until an explicit Server
+// Shutdown — Reload never cancels it (handleReloadProject skips teardown for
+// the default dir), but Shutdown's stopAllPermissionWatchers cancels EVERY
+// watcher including the default's and awaits it via lifecycleWG. A NON-DEFAULT
+// dir's sweep is ALSO STOPPABLE by Reload: stopPermissionWatcher cancels its
+// ctx when handleReloadProject drops that dir's aggregator, so the goroutine
+// exits promptly instead of ticking forever on an orphaned store.
 //
 // There is no per-re-arm leak: ensurePermissionWatcher registers the sweep
 // exactly once per dir (guarded by watcherOn), and after Reload clears
@@ -170,7 +169,8 @@ func (s *Server) runPermissionReconcile(ctx context.Context, a *aggregator.Aggre
 // reconcile sweep for dir. It is a safe no-op if dir has no armed sweep. Called
 // from handleReloadProject's non-default teardown branch so the sweep goroutine
 // exits instead of ticking forever on the dropped aggregator's orphaned store.
-// The DEFAULT dir ("") is never passed here — its sweep is process-lifetime.
+// The DEFAULT dir ("") is never passed here — Reload leaves its sweep alone;
+// Shutdown retires it via stopAllPermissionWatchers instead.
 func (s *Server) stopPermissionWatcher(dir string) {
 	s.watcherMu.Lock()
 	defer s.watcherMu.Unlock()

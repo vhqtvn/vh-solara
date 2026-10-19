@@ -189,13 +189,16 @@ func (s *Server) cors(next http.Handler) http.Handler {
 const csrfHeader = "X-VH-CSRF"
 
 // csrfGuard requires a custom header on state-changing requests to the API
-// (/oc/* and mutating /vh/*). A cross-site page cannot set a custom header
-// without a CORS preflight, which this server never approves — so only the
-// same-origin SPA can reach these endpoints. This needs no auth and is
-// proxy-agnostic (no Origin/Host comparison). The /oc/* passthrough can run
-// shell commands, so this is the line that stops a malicious page from doing so
-// through the user's browser. Read methods and the side-effect-free /vh/render
-// are exempt.
+// (/oc/* and mutating /vh/*) — the check is PRESENCE only (any non-empty
+// X-VH-CSRF value passes; the SPA's installCsrf sends "1", but the guard does
+// not compare values). A cross-site page cannot set a custom header without a
+// CORS preflight, which this server approves only for operator-configured
+// origins (the cors allowlist also permits them the X-VH-CSRF header) — so
+// beyond that allowlist, only the same-origin SPA can reach these endpoints.
+// This needs no auth and is proxy-agnostic (no Origin/Host comparison). The
+// /oc/* passthrough can run shell commands, so this is the line that stops a
+// malicious page from doing so through the user's browser. Read methods and
+// the side-effect-free /vh/render are exempt.
 func csrfGuard(next http.Handler) http.Handler {
 	unsafe := map[string]bool{http.MethodPost: true, http.MethodPut: true, http.MethodPatch: true, http.MethodDelete: true}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

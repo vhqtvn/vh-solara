@@ -89,8 +89,8 @@ actually the sticky historical "permission blocking occurred" fact.
 whose subtree has ≥1 busy/retry session.
 
 - **Go:** `pkg/web/projects_http.go` (`projectInfo.Running` +
-  `projectInfo.RunningRoots`); populated from one computed value
-  (`st.RunningRoots()`) assigned to both.
+  `projectInfo.RunningRoots`); populated from one computed value (the `running`
+  count of `st.ProjectCounts()`) assigned to both.
 - **SPA:** reads `runningRoots` (`web/src/projects.ts`, `buildActivityMaps`).
   The old `p.running` wire read was migrated. (Internal `ActivityMaps.running`
   map and `ProjectActivityRow.running` are *not* wire reads and keep their

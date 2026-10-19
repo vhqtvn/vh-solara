@@ -412,17 +412,19 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		// gated on wantsProject(r) was deleted in Phase 4 (commit a0e825c), so
 		// there is no proj=1 path here.
 		if treeEmitter != nil {
-			// Q5 capture consolidation: ONE s.mu.RLock derives BOTH the tree
-			// frontier and the detail snapshot with the SAME {epoch, seq}, so
-			// the two projections can no longer diverge across an interleaving
-			// writer (the false-confidence failure that blocked a truthworthy
-			// completion signal). baseline is the captured seq (tree.Seq ==
-			// detail.Seq), dropping the third store.Head() lock.
+			// Q5 capture consolidation: ONE store WRITE-lock span (the B-F1
+			// buffered-delta flush + capture inside SnapshotWithTree/Partial)
+			// derives BOTH the tree frontier and the detail snapshot with the
+			// SAME {epoch, seq}, so the two projections can no longer diverge
+			// across an interleaving writer (the false-confidence failure that
+			// blocked a truthworthy completion signal). baseline is the captured
+			// seq (tree.Seq == detail.Seq), dropping the third store.Head() lock.
 			// Slice-A D7: tree-only reconnect (sessions absent → filter={}) ships a
 			// FRONTIER-SCOPED partial detail (global Q/P/unread + frontier
 			// sessions/gate/activity/lastAgents/currentVerbs; messages omitted).
 			// Session-selected/firehose reconnect keeps the full capture. Both
-			// paths share ONE RLock + {epoch,seq} with the tree projection.
+			// paths share ONE write-lock capture + {epoch,seq} with the tree
+			// projection.
 			var detailSnap state.Snapshot
 			var treeSnap *state.TreeSnapshot
 			if filter != nil && len(filter) == 0 {
@@ -449,9 +451,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			} else {
 				vhlog.Warn("tree=2 resume detail snapshot: marshal failed", "err", err)
 			}
-			// Q5 completion signal: emitted ONLY when BOTH projections were
-			// written — the contract is "both projections of this capture are
-			// on the wire." A marshal failure skips a projection, so the
+			// Q5 completion signal: emitted ONLY when BOTH projections marshaled
+			// and were handed to (unchecked) writeRaw — the contract is "both
+			// projections of this capture were sent"; write errors on these
+			// frames are undetected (only the tree.op path via deliverTreeOps
+			// is write-checked). A marshal failure skips a projection, so the
 			// boundary must NOT fire (no false atomicity claim).
 			if treeOK && detailOK {
 				writeSnapshotComplete(w, treeSnap.Epoch, treeSnap.Seq, compoundSSEID(treeSnap.Seq, 0))
@@ -498,11 +502,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if hasCursor && !replayOK {
 				cause = "reconnect"
 			}
-			// Q5 capture consolidation: ONE s.mu.RLock derives BOTH the tree
-			// frontier and the detail snapshot with the SAME {epoch, seq} — the
-			// hard prerequisite for the truthworthy completion signal. baseline
-			// is the captured seq (tree.Seq == detail.Seq), dropping the third
-			// store.Head() lock.
+			// Q5 capture consolidation: ONE store WRITE-lock span (the B-F1
+			// buffered-delta flush + capture inside SnapshotWithTree/Partial)
+			// derives BOTH the tree frontier and the detail snapshot with the
+			// SAME {epoch, seq} — the hard prerequisite for the truthworthy
+			// completion signal. baseline is the captured seq (tree.Seq ==
+			// detail.Seq), dropping the third store.Head() lock.
 			// Slice-A D7: tree-only cold/ring-gap (sessions absent → filter={})
 			// ships the frontier-scoped partial detail (see reconnect-site comment
 			// above). Session-selected/firehose keeps the full capture.
@@ -548,9 +553,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			} else {
 				vhlog.Warn("tree=2 detail snapshot: marshal failed", "err", err)
 			}
-			// Q5 completion signal: emitted ONLY when BOTH projections were
-			// written — the contract is "both projections of this capture are
-			// on the wire." A marshal failure skips a projection, so the
+			// Q5 completion signal: emitted ONLY when BOTH projections marshaled
+			// and were handed to (unchecked) writeRaw — the contract is "both
+			// projections of this capture were sent"; write errors on these
+			// frames are undetected (only the tree.op path via deliverTreeOps
+			// is write-checked). A marshal failure skips a projection, so the
 			// boundary must NOT fire (no false atomicity claim).
 			if treeOK && detailOK {
 				writeSnapshotComplete(w, treeSnap.Epoch, treeSnap.Seq, compoundSSEID(treeSnap.Seq, 0))

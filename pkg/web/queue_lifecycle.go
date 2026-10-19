@@ -13,12 +13,6 @@ package web
 // the Server fields used here (queues, queueGCMu/queueGCOn, lifecycleWG,
 // bgWG) stay in server.go, while the aggFor call sites and Shutdown's
 // lifecycleWG join live in server_aggregators.go.
-//
-// Known contradiction, moved as-is: the queueGCSubscribeBuffer doc below calls
-// authoritative filesystem reconciliation "future work" (the deferred GC-3
-// slice) although reconcileQueuesForAgg IS installed and wired through the
-// onHydrate callback — the commentary predates GC-3 landing and is preserved
-// byte-for-byte per move-only discipline.
 
 import (
 	"encoding/json"
@@ -43,9 +37,11 @@ import (
 // until process restart (default aggregator) or Reload-project (per-dir
 // aggregator) rebuilds it. This is INTENTIONAL and accepted: queue cleanup is
 // also driven DIRECTLY by the /vh/archive handler (so archive correctness never
-// depends on subscriber delivery), and the deferred GC-3 slice will add
-// authoritative filesystem reconciliation as a periodic backstop that catches
-// orphans regardless of subscriber state. Per Settled Assumption #8 the
+// depends on subscriber delivery), and the INSTALLED GC-3 backstop
+// (reconcileQueuesForAgg, dispatched from the onHydrate callback at the end of
+// every successful hydrate — startup, reconnect, post-reload) reconciles the
+// filesystem against the authoritative session set and catches orphans
+// regardless of subscriber state. Per Settled Assumption #8 the
 // subscriber is best-effort only.
 const queueGCSubscribeBuffer = 128
 

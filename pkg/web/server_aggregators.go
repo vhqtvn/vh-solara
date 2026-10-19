@@ -258,8 +258,10 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	a.Arm()
 	// Upstream-down gating (oc-death-watch S2): propagate the daemon's
 	// lifecycle-derived predicate so this per-dir Run loop also skips the
-	// 1s retry ramp while OpenCode is known down. Read outside aggMu — the
-	// daemon installs it once at boot, before any request can reach aggFor.
+	// 1s retry ramp while OpenCode is known down. Read INSIDE aggMu (this
+	// critical section); the boot-time write in SetUpstreamDownProbe takes no
+	// aggMu — safety rests on the daemon installing the probe once at boot,
+	// before any request can reach aggFor.
 	if s.upstreamDownProbe != nil {
 		a.SetUpstreamDownProbe(s.upstreamDownProbe)
 	}

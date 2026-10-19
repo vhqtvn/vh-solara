@@ -90,9 +90,10 @@ func (s *Server) Handler() http.Handler {
 	// middleware wrapping every /vh/* route (no per-handler CSRF check
 	// needed). No SSE fan-out in v1. See pkg/web/named_layouts_http.go.
 	mux.HandleFunc("/vh/layouts", s.handleNamedLayouts)
-	// Server-managed root-session labels (Slice 2): GET reads the worker-wide
-	// labels doc (groups + tags + per-root tag assignments), PUT applies a
-	// CAS-guarded replace. PUT is state-changing and is guarded by the
+	// Server-managed root-session labels (Slice 2): GET reads the PER-PROJECT
+	// labels doc (groups + tags + per-root tag assignments; resolved via
+	// labelsForDir — see labels_registry.go), PUT applies a CAS-guarded
+	// replace. PUT is state-changing and is guarded by the
 	// csrfGuard middleware wrapping every /vh/* route (no per-handler CSRF
 	// check needed). See pkg/web/labels_http.go.
 	mux.HandleFunc("/vh/labels", s.handleLabels)
