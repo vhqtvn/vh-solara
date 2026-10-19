@@ -1184,7 +1184,7 @@ type SessionMessagesResult struct {
 // mutates under the lock and returns coldLoad=true; the caller then invokes this.
 //
 // The risk it mitigates: the client treats messages.batch as a WHOLESALE
-// REPLACEMENT (stream.ts:201-217). If the projection were captured under the
+// REPLACEMENT (web/src/sync/reducers.ts). If the projection were captured under the
 // lock, the lock released, compressed outside, and then emitted under a NEW
 // sequence number, a live part/message delta that landed during compression
 // would be OVERWRITTEN by the stale batch on the client. The per-session message

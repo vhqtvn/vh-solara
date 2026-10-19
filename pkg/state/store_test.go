@@ -1486,7 +1486,7 @@ func partTextFromBatch(t *testing.T, payload json.RawMessage, sid, mid, pid stri
 // (publishColdBatch). It deterministically reproduces the race this slice
 // eliminates: a stale prepared batch MUST NOT overwrite a newer live delta on
 // the client (which treats messages.batch as a wholesale replacement —
-// stream.ts:201-217).
+// web/src/sync/reducers.ts).
 //
 // Mechanism, via the coldBatchAfterCaptureHook test seam:
 //  1. SetSessionMessages(OLD) runs in a goroutine; publishColdBatch captures the

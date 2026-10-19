@@ -64,7 +64,7 @@
 //	      invariant (a reopener card tracks gating it too).
 //
 //	settle-timer fallback (stopFire): OpenCode does NOT emit session.idle on
-//	  abort (reducers.go:249 / verbs.go:261), so the terminal that opens the
+//	  abort (reducers.go / verbs.go), so the terminal that opens the
 //	  gate may never arrive. The settle timer (completionGrace, the same tunable
 //	  the completion-grace window uses for the identical "missed session.idle"
 //	  case) force-opens the gate and idles activity after the grace window if no
@@ -264,8 +264,8 @@ func (s *Store) settleTerminalLocked(sessionID string) {
 // Rationale + asymmetry (Deviation 2 of the P7 slice): an inference must never
 // BLOCK a turn (over-blocks, suppresses real work) but MAY UNBLOCK after a
 // bounded wait — otherwise a missing terminal wedges the session in Stopping
-// forever. OpenCode does NOT emit session.idle on abort (reducers.go:249 /
-// verbs.go:261), so the gate's settle cannot rely on a terminal arriving after
+// forever. OpenCode does NOT emit session.idle on abort (reducers.go /
+// verbs.go), so the gate's settle cannot rely on a terminal arriving after
 // an abort verb. stopFire is therefore a LIVENESS fallback, not a settle
 // authority. Different fail-safe directions, same observed-vs-inferred
 // principle as the #2696 guard: never BLOCK on an inference (liveIdleObserved),
@@ -278,7 +278,7 @@ func (s *Store) settleTerminalLocked(sessionID string) {
 // corrector. The timer is a liveness backstop; the reconcile is the settle
 // authority.
 //
-// Duration: completionGrace (default defaultCompletionGrace = 5s, store.go:1377)
+// Duration: completionGrace (default defaultCompletionGrace = 5s, store.go)
 // — generous on purpose (a too-short timer re-introduces the abort-mid-flight
 // race). The supersede generation counter (stopGen) closes the timer-vs-cancel
 // race. After completionGrace with no terminal arriving, stopFire force-opens
@@ -451,7 +451,7 @@ func SetWaitAbortSettlingParkHookForTest(fn func(string)) {
 // session.idle, so there is no live-idle observation to pin the guard on here.
 // The session.error terminal path — the other OBSERVED-terminal half of the F4
 // question — DOES arm completionAuthoritative now (the session.error companion
-// in reducers.go mirrors session.idle's :421 arm, so a stale reconcile busy
+// in reducers.go mirrors session.idle's completionAuthoritative arm, so a stale reconcile busy
 // cannot re-adopt an error-settled session). stopFire alone stays un-armed by
 // this F5 omission; a stale busy snapshot after a stopFire settle is handled by
 // the SetActivityFromStatuses completionAuthoritative guard only when

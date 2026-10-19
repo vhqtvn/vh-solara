@@ -507,7 +507,7 @@ func (s *Store) Apply(ev opencode.Event) {
 			// terminal kinds) rather than by convention.
 			s.liveIdleObserved[ne.SessionID] = true
 			// session.error companion (mirrors session.idle's
-			// completionAuthoritative at :421): an OBSERVED error terminal is
+			// completionAuthoritative arm): an OBSERVED error terminal is
 			// AUTHORITATIVELY over, so a stale reconcile busy from /session/status
 			// must NOT re-adopt the just-error-settled session as TurnRunning.
 			// Without this, the D4 TurnStopping check does not catch the re-adoption
@@ -700,7 +700,7 @@ func (s *Store) deleteSessionLocked(id string) {
 		// Finish-cascade (error mirror): emit a terminal KindActivity(idle)
 		// for a session that was observably in the ERROR state so every
 		// observer (chat + tree) drops the error signal in the same
-		// transition. isActiveLocked (tree_emitter.go:201-213) treats
+		// transition. isActiveLocked (tree_emitter.go) treats
 		// ActivityError as active (a client that held activity[id]="error"
 		// has an observable active signal), so the symmetric finish-side
 		// cascade must cover it too — otherwise deleting an errored

@@ -10,7 +10,7 @@ package state
 // authority.
 //
 // Root cause hypothesis: deleteSessionLocked (the archive/prune path — the
-// "finish cascade" referenced by pkg/state/store.go:1983 Descendants) deletes
+// "finish cascade" referenced by pkg/state/snapshots.go Descendants) deletes
 // s.activity[id] silently and emits only KindSessionDelete. It does NOT emit a
 // terminal KindActivity event, so a client that held a stale activity="busy"
 // for the id (from the last busy event / snapshot seed) is never told the id
@@ -144,7 +144,7 @@ func TestFinishCascade_BusySubsessionDeletedEmitsTerminalActivity(t *testing.T) 
 // client processing events in order must see KindActivity(idle) BEFORE
 // KindSessionDelete, so the chat activity map is cleared while the id is still
 // "known". (Mirrors the cross-stream completion bridge rationale in
-// stream.ts:734 — the activity clear and the structural removal should land in
+// session-stream.ts — the activity clear and the structural removal should land in
 // the right order.)
 func TestFinishCascade_TerminalActivityBeforeDelete(t *testing.T) {
 	s := New(100)
@@ -198,7 +198,7 @@ func TestFinishCascade_TerminalActivityBeforeDelete(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // ERROR-PATH mirror — an ERROR subsession deleted/archived must cascade the
-// same terminal KindActivity(idle). isActiveLocked (tree_emitter.go:201-213)
+// same terminal KindActivity(idle). isActiveLocked (tree_emitter.go)
 // treats ActivityError as active (a client that held activity[id]="error" has
 // an observable active signal), but the finish-cascade guard above only covers
 // {Busy, Retry} — so deleting an errored subsession left the chat-side
@@ -215,7 +215,7 @@ func TestFinishCascade_TerminalActivityBeforeDelete(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // evError is the session.error event payload (parallel to evIdle). Routes
-// through store.go:1662-1663 → setActivityLocked(sid, ActivityError). NOT
+// through reducers.go → setActivityLocked(sid, ActivityError). NOT
 // evStatus(id,"error"): normalizeActivity maps unknown status types to Idle,
 // so only the dedicated session.error event type seeds ActivityError.
 func evError(id string) string {
@@ -370,21 +370,21 @@ func TestFinishCascade_ErrorTerminalActivityBeforeDelete(t *testing.T) {
 // ---------------------------------------------------------------------------
 // BUSY-SIBLING carve-out guard — the error-delete branch MUST NOT touch
 // busyCount[root]. Dedicated regression guard for the F2 deferred-fix
-// carve-out: the deliberate SEPARATE else-if at store.go:1938-1964, NOT a
-// widening of the outer `if a == ActivityBusy || a == ActivityRetry` at
-// store.go:1908. Error never contributed to busyCount — the
-// setActivityAtLocked chokepoint at store.go:1351-1352 only flags
+// carve-out: the deliberate SEPARATE else-if in reducers.go, NOT a
+// widening of the outer `if a == ActivityBusy || a == ActivityRetry` in
+// reducers.go. Error never contributed to busyCount — the
+// setActivityAtLocked chokepoint (reducers.go) only flags
 // {Busy, Retry} (an idle→error transition has wasBusy=false AND isBusy=false,
 // a busy-neutral no-op on busyCount) — so decrementing on an error delete
 // would corrupt the count for a busy sibling sharing the root and
 // under-report RunningRoots().
 //
-// The realistic regression this guards: someone widens line 1908 to
+// The realistic regression this guards: someone widens the outer if to
 // `|| a == ActivityError` and drops the separate else-if emit → an error
 // delete wrongly decrements busyCount[root] of a busy sibling. That
 // regression is ONLY observable when a busy sibling exists under the same
 // root — the existing error-delete tests above use a single error child
-// whose busyCount was already 0, so the `>0` floor at store.go:1911 absorbs
+// whose busyCount was already 0, so the `>0` floor absorbs
 // any spurious decrement and they would NOT catch it.
 // ---------------------------------------------------------------------------
 
@@ -402,7 +402,7 @@ func TestFinishCascade_ErrorTerminalActivityBeforeDelete(t *testing.T) {
 //     KindSessionDelete(C) — re-confirms the G1 fix holds in the
 //     busy-sibling scenario.
 //
-// This test FAILS if the outer if at store.go:1908 is widened to
+// This test FAILS if the outer if in reducers.go is widened to
 // `|| a == ActivityError` and the separate else-if emit is dropped:
 // assertion (1) would then observe busyCount["R"]==0 (the busy sibling's
 // count stolen by the errored sibling's delete).

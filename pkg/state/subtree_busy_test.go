@@ -174,7 +174,7 @@ func evIdle(id string) string {
 
 // evAssistantInflight upserts an assistant message with NO time.completed so
 // assistantInflightLocked returns true → upsertMessageLocked escalates to busy
-// via setActivityLocked (store.go line ~1712). Exercises the message-stream
+// via setActivityLocked (reducers.go). Exercises the message-stream
 // busy-escalation site the research gate missed.
 func evAssistantInflight(id, msgID string) string {
 	return fmt.Sprintf(`{"info":{"id":%q,"sessionID":%q,"role":"assistant"}}`, msgID, id)
@@ -309,7 +309,7 @@ func TestSubtreeBusyCount_TargetedScenarios(t *testing.T) {
 	t.Run("message_stream_busy_escalation", func(t *testing.T) {
 		// The two sites the research gate MISSED: upsertMessageLocked and
 		// appendPartDeltaLocked both escalate to busy via setActivityLocked
-		// (store.go ~1712, ~2235). The incremental index must track them —
+		// (reducers.go). The incremental index must track them —
 		// and does, because they funnel through setActivityLocked.
 		s := New(100)
 		// Cancel the grace timer armed by evAssistantCompleted below (the

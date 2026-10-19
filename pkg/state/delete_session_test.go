@@ -1,7 +1,7 @@
 package state
 
 // This file pins deleteSessionLocked's grace/busy cleanup discipline (GAP-S2
-// from the store concurrency map). deleteSessionLocked (store.go:1455) is the
+// from the store concurrency map). deleteSessionLocked (reducers.go) is the
 // single session-removal chokepoint: live session.deleted, archive via
 // time.archived, and hydrate prune all funnel here. It must, in order:
 //
@@ -13,7 +13,7 @@ package state
 //     only other site that touches this map is delete(s.busyCount, id) below,
 //     which clears id's OWN entry but not the root's).
 //  3. Emit a terminal KindActivity(idle) finish-cascade for a session that was
-//     observably busy/retry (line 1529) OR error (line 1555) — BEFORE the
+//     observably busy/retry OR error — BEFORE the
 //     structural KindSessionDelete so a client applying events in seq order
 //     clears the chat activity map BEFORE the prune lands.
 //  4. Delete from ~22 internal maps (sessions, messages, activity, busyCount,
@@ -133,7 +133,7 @@ func eventKinds(events []ClientEvent) []string {
 
 // TestDeleteSession_CancelsArmedGrace is GAP-S2 case 1 (grace-cancel on
 // delete). Arms a completion-grace timer on a root, deletes the root, and
-// asserts deleteSessionLocked's cancelGraceLocked(id) call (store.go:1586)
+// asserts deleteSessionLocked's cancelGraceLocked(id) call (reducers.go)
 // disarmed the timer + bumped graceGen past the arm generation — so the
 // armGen-captured callback, if it runs at all past the grace window, detects
 // the supersede and aborts without re-materializing phantom state for the
@@ -350,12 +350,12 @@ func TestDeleteSession_BusyRootClearsOwnEntryNoNegativeArtifact(t *testing.T) {
 // TestDeleteSession_ErrorSessionEmitsIdleCascadeWithoutTouchingBusyCount is
 // GAP-S2 case 4 (the error-mirror finish-cascade). A session in the ERROR
 // state that is deleted must still get a terminal KindActivity(idle) emit
-// (store.go:1530-1555) so every observer drops the error signal in the same
+// (the error-mirror finish-cascade in reducers.go) so every observer drops the error signal in the same
 // transition — but the error branch is a SEPARATE else-if precisely because
 // it MUST NOT touch busyCount (error never incremented busyCount on entry —
 // setActivityAtLocked's wasBusy/isBusy flags only cover {Busy, Retry} — so
 // decrementing on exit would corrupt the count and under-report
-// RunningRoots). Documented at store.go:1543-1554 ("SUBTLETY: error MUST NOT
+// RunningRoots). Documented in reducers.go ("SUBTLETY: error MUST NOT
 // touch busyCount").
 //
 // To make the busyCount corruption OBSERVABLE, this fixture seeds a SECOND
@@ -439,16 +439,16 @@ func TestDeleteSession_ErrorSessionEmitsIdleCascadeWithoutTouchingBusyCount(t *t
 // case 5 (the finish-cascade emit order). deleteSessionLocked emits, in
 // sequence:
 //
-//  1. KindActivity(id, idle) — finish-cascade, at store.go:1529 (busy/retry)
-//     or :1555 (error). MUST precede KindSessionDelete so a client applying
+//  1. KindActivity(id, idle) — finish-cascade (busy/retry or error branch,
+//     reducers.go). MUST precede KindSessionDelete so a client applying
 //     events in seq order clears the chat-side syncState.activity map BEFORE
 //     the structural node.remove lands (Part.tsx reads activity for the
 //     parent's task-tool status; a stale "busy" would keep a finished
 //     subsession looking "running").
-//  2. KindSessionDelete(id) — the structural prune, at store.go:1594. Fires
-//     AFTER all internal maps are consistent (deletes at :1557-1593 ran first).
+//  2. KindSessionDelete(id) — the structural prune (reducers.go). Fires
+//     AFTER all internal maps are consistent (the map deletes above ran first).
 //  3. KindTreeOrphanCheck(descendant) — for each descendant of every newly-
-//     rooted (orphaned) child, at store.go:1600-1604. Fires AFTER the topology
+//     rooted (orphaned) child, in reducers.go. Fires AFTER the topology
 //     change is fully applied (s.sessions[id] deleted, KindSessionDelete
 //     emitted) so effectiveParentOfLocked returns "" for the reparented
 //     children.

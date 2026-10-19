@@ -69,7 +69,7 @@ func withCompletionGrace(cfg Config, d time.Duration) Config {
 // arm a grace timer, cancel it via a new inflight assistant message (the
 // production cancel path), and assert the stale fire is a no-op.
 //
-// The contract (store.go:1641-1655, documented at 886-889): graceFire
+// The contract (grace.go's graceFire, documented in its doc comment): graceFire
 // re-checks graceGen[sessionID] != gen and returns without clearing busy or
 // arming completionAuthoritative when a cancel superseded the captured
 // generation. time.Timer.Stop() losing the race (callback already running)
@@ -332,7 +332,7 @@ func TestGraceTimer_MultiStepRearmLatestWins(t *testing.T) {
 }
 
 // TestGraceTimer_CloseCancelsArmed is GAP-S1 case 3 (Close cancels armed):
-// Close() MUST call cancelAllGraceLocked() (store.go:4133) so no grace
+// Close() MUST call cancelAllGraceLocked() (grace.go) so no grace
 // callback fires after teardown against a torn-down store.
 //
 // Arms grace, calls Close() while the timer is pending, waits past the grace
@@ -400,11 +400,11 @@ func TestGraceTimer_CloseCancelsArmed(t *testing.T) {
 // case 4 (completionAuthoritative-vs-stale-status): the authority map must
 // reflect the LATEST grace decision, not a stale one.
 //
-// completionAuthoritative[sid] is the permanent guard (store.go:892-897):
+// completionAuthoritative[sid] is the permanent guard (store.go):
 // set when grace fires (clearOnCompletionLocked) OR session.idle is
 // observed; cleared when a new inflight starts. While set, a stale busy
 // from /session/status (the ~60s HTTP poll) must NOT re-escalate the
-// session — the SetActivityFromStatuses guard at store.go:1698 clears it
+// session — the SetActivityFromStatuses guard in reducers.go clears it
 // to idle when authority is set. This test asserts the authority map's
 // set/clear lifecycle directly (not just the observable RunningRoots) so a
 // split that moves the guard cannot silently regress it.

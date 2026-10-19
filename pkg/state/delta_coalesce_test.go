@@ -277,8 +277,8 @@ func TestDeltaCoalesce_HistoryFetchResetsAccumulator(t *testing.T) {
 	}
 }
 
-// TestDeltaCoalesce_ColdLoadPreservesUnflushedDeltaBuf pins the store.go:2090
-// guard INDEPENDENTLY of the part-body guard (store.go:2108): on a cold-load
+// TestDeltaCoalesce_ColdLoadPreservesUnflushedDeltaBuf pins the hydration.go
+// guard INDEPENDENTLY of the part-body guard (also hydration.go): on a cold-load
 // reconcile, a message whose part was LIVE-touched during the in-flight cold GET
 // must NOT have its unflushed deltaBuf accumulator wiped — the buffered streaming
 // text is newer than the stale fetched body and must survive the reconcile so a
@@ -287,9 +287,9 @@ func TestDeltaCoalesce_HistoryFetchResetsAccumulator(t *testing.T) {
 // case (NO cold-fetch-active marker → the accumulator IS correctly reset by the
 // authoritative history fetch).
 //
-// Removing the `coldLoad && len(me.liveTouchedParts) > 0` condition at
-// store.go:2090 makes this test fail: the unflushed "tail" is nil'd and only the
-// already-flushed "live-" prefix survives (the part-body guard at 2108 still
+// Removing the `coldLoad && len(me.liveTouchedParts) > 0` condition in
+// hydration.go makes this test fail: the unflushed "tail" is nil'd and only the
+// already-flushed "live-" prefix survives (the part-body guard in hydration.go still
 // keeps "live-", so the failure is specifically "live-" ≠ "live-tail").
 func TestDeltaCoalesce_ColdLoadPreservesUnflushedDeltaBuf(t *testing.T) {
 	s := mustNew(t, withFlushInterval(DefaultConfig(1000), time.Hour))
@@ -303,7 +303,7 @@ func TestDeltaCoalesce_ColdLoadPreservesUnflushedDeltaBuf(t *testing.T) {
 
 	// First delta flushes immediately (deltaLastEmit zero → elapsed huge); the
 	// SECOND delta lands genuinely UNFLUSHED in deltaBuf, held by the hour-long
-	// throttle window — this is the accumulator the store.go:2090 guard protects.
+	// throttle window — this is the accumulator the hydration.go guard protects.
 	applyDelta(s, "sess", "m1", "p1", "text", "live-")
 	applyDelta(s, "sess", "m1", "p1", "text", "tail")
 

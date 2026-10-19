@@ -270,7 +270,7 @@ func (s *Store) stopStateSnapshot(id string) (gen uint64, armed bool, settling b
 // TestP7_StopFireSettlesGateWhenNoTerminalArrives pins the stopFire settle-timer
 // fallback (turn_state.go armStopTimerLocked/stopFire). This is NOT an edge path
 // — it is the NORMAL production gate-open path, because OpenCode does NOT emit
-// session.idle on abort (reducers.go:249 / verbs.go:261). An untested primary
+// session.idle on abort (reducers.go / verbs.go). An untested primary
 // path is worse than an untested fallback, and the operator's stated timer
 // failure-mode (a too-short timer unblocks while the runner is still aborting
 // mid-flight = the old synchronous MarkIdle bug) is unverifiable without this
@@ -400,7 +400,7 @@ func TestP7_D4_ReconcileSnapshotBusyPreservesStopping_LiveBusyAdopts(t *testing.
 
 // TestP7_SessionErrorCompanion_CompletionAuthoritativeBlocksStaleReconcile pins
 // the session.error companion to the #2696 fold: session.idle arms
-// completionAuthoritative (reducers.go:421) so a stale reconcile busy cannot
+// completionAuthoritative (reducers.go) so a stale reconcile busy cannot
 // re-adopt the just-completed turn; session.error must do the SAME (mirror), or
 // a stale reconcile busy arriving after an error terminal re-adopts the
 // error-settled session as TurnRunning (completionAuthoritative is the only
@@ -457,21 +457,21 @@ func TestP7_SessionErrorCompanion_CompletionAuthoritativeBlocksStaleReconcile(t 
 //  5. The stale waiter (parked on channel A from step 2) wakes — channel A was
 //     closed by release#1.
 //  6. The post-await FULL SendCASState+seq CAS recheck (the exact call the
-//     /vh/send handler makes at verbs.go:162) sees the NEW TurnStopping →
+//     /vh/send handler makes in verbs.go) sees the NEW TurnStopping →
 //     sendable=false, abortSettling=true → the handler 409s with ZERO prompts
 //     forwarded.
 //
 // WHY THE STATE LAYER (not the verbs layer): pinning this EXACT interleaving at
 // the verbs layer requires Stop#2's re-arm to land in the race window between
 // channel-A-close (release#1) and the handler's recheck — a window inside
-// production code (verbs.go:159-162) with no test hook, and non-deterministic
+// production code (verbs.go) with no test hook, and non-deterministic
 // under -race (the waiter goroutine's SendCASState RLock can win against Stop#2's
 // Lock, observing TurnIdle and forwarding instead of 409). The state layer runs
 // the WHOLE interleaving sequentially on one goroutine (the channel close +
 // re-arm are synchronous under s.mu), so the recheck deterministically observes
 // Stop#2's TurnStopping. The recheck here is the SAME SendCASState call the
-// verbs handler uses (snapshots.go:1062), so a sendable=false result is EXACTLY
-// what produces 409 + zero prompts at the verbs layer (verbs.go:174-177). No
+// verbs handler uses (snapshots.go), so a sendable=false result is EXACTLY
+// what produces 409 + zero prompts at the verbs layer (verbs.go). No
 // production code is modified.
 func TestP7_WaitAbortSettling_SpuriousWakeAfterRearm_RecheckAuthoritative(t *testing.T) {
 	s := New(100)
@@ -486,7 +486,7 @@ func TestP7_WaitAbortSettling_SpuriousWakeAfterRearm_RecheckAuthoritative(t *tes
 	}
 
 	// Capture channel A — exactly what WaitAbortSettling does internally
-	// (turn_state.go:382: ch := s.abortWaitCh[sessionID] under RLock, then parks
+	// (turn_state.go — ch := s.abortWaitCh[sessionID] under RLock, then parks
 	// on <-ch). The stale waiter holds this reference for the whole wait.
 	s.mu.RLock()
 	chA := s.abortWaitCh["R"]
@@ -540,9 +540,9 @@ func TestP7_WaitAbortSettling_SpuriousWakeAfterRearm_RecheckAuthoritative(t *tes
 
 	// Step 6 — the caller's AUTHORITATIVE recheck. This is the exact SendCASState
 	// call the /vh/send handler makes after WaitAbortSettling returns
-	// (verbs.go:162). It must see Stop#2's NEW TurnStopping → sendable=false.
+	// (verbs.go). It must see Stop#2's NEW TurnStopping → sendable=false.
 	// That sendable=false is what yields 409 + ZERO prompts at the verbs layer
-	// (verbs.go:174-177); the spurious wake does NOT become send authority.
+	// (verbs.go); the spurious wake does NOT become send authority.
 	sendable, _, exists, abortSettling := s.SendCASState("R")
 	if !exists {
 		t.Fatalf("recheck: session should still exist (Stop#2 did not delete it)")
@@ -566,12 +566,12 @@ func TestP7_WaitAbortSettling_SpuriousWakeAfterRearm_RecheckAuthoritative(t *tes
 }
 
 // TestP7_StopFireReleasesWaiter pins DEFER finding p7-d2 (settle-timer release
-// path): stopFire (the settle-timer callback, turn_state.go:420-435) opens the
+// path): stopFire (the settle-timer callback in turn_state.go) opens the
 // abort gate + idles activity under s.mu, which must wake a blocked
 // WaitAbortSettling caller so its post-await SendCASState recheck runs and
 // observes the now-idle, sendable session. This is the NORMAL production
 // gate-open path because OpenCode does NOT emit session.idle on abort
-// (reducers.go:249 / verbs.go:261), so the terminal that opens the gate may
+// (reducers.go / verbs.go), so the terminal that opens the gate may
 // never arrive — stopFire is the bounded-latency backstop.
 //
 // Determinism (p7-d2 hardened): the waitAbortSettlingParkHook fires at the
@@ -612,7 +612,7 @@ func TestP7_StopFireReleasesWaiter(t *testing.T) {
 	t.Cleanup(func() { waitAbortSettlingParkHook = nil })
 
 	// Launch the waiter: WaitAbortSettling + the post-await SendCASState recheck
-	// (the exact pair the /vh/send handler runs at verbs.go:159-162). It parks on
+	// (the exact pair the /vh/send handler runs in verbs.go). It parks on
 	// the abort wait channel until stopFire closes it. A bounded ctx guards
 	// against a wedge leaking the goroutine if the test fails mid-flight.
 	type recheck struct {
@@ -747,7 +747,7 @@ func TestP7_ReconcileBusyReAdoptsAfterStopFire(t *testing.T) {
 	// F5-B CONSEQUENCE: a subsequent reconcile-snapshot busy (the periodic
 	// /session/status poll) RE-ADOPTS the session as TurnRunning. Because
 	// completionAuthoritative is NOT armed, the SetActivityFromStatuses guard
-	// (blockedByAuthority, reducers.go:300) does not force the busy to idle;
+	// (blockedByAuthority, reducers.go) does not force the busy to idle;
 	// because the session is TurnIdle (not TurnStopping), the D4 early-return in
 	// markTurnRunningLocked (turn_state.go:222) does not fire either. The full
 	// adoption body runs: clears the (already-clear) gate, cancels the
@@ -761,7 +761,7 @@ func TestP7_ReconcileBusyReAdoptsAfterStopFire(t *testing.T) {
 		t.Errorf("F5-B: reconcile-snapshot busy after stopFire should set activity busy, got %q", got)
 	}
 
-	// The /vh/send consumer's CAS gate (SendCASState, snapshots.go:1062): after
+	// The /vh/send consumer's CAS gate (SendCASState, snapshots.go): after
 	// the busy re-adoption the session is NOT sendable (a turn is in flight).
 	// This is the same single-atomic snapshot the /vh/send handler reads; a busy
 	// re-adoption yields sendable=false. The abort gate is open (a TurnRunning

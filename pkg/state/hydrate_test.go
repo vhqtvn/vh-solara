@@ -6,7 +6,7 @@ package state
 // maintenance discipline is the gate for the hydration concern extraction
 // (concern d in the map's §6).
 //
-// Hydrate (store.go:2593) bypasses the normal upsertSessionLocked path and
+// Hydrate (hydration.go) bypasses the normal upsertSessionLocked path and
 // assigns s.sessions[sid] DIRECTLY. It then owns the consistency of every
 // derived map itself — a subtly different maintenance surface than Apply's
 // reducer path. The load-bearing sequence, ALL under s.mu and in this exact
@@ -79,11 +79,11 @@ func (s *Store) hydrateAssignSnapshot(id string) (present bool, parentID string,
 }
 
 // msgRevSnapshot reads s.msgRev[sid] under s.mu. The msgRev token is a private
-// map read in the cold-batch ABA tests (store_test.go:1749 reads it bare);
+// map read in the cold-batch ABA tests (store_test.go reads it bare);
 // this helper centralizes the locked read for the Hydrate characterization so
 // the comparison is race-clean under -race. Returns 0 when the session was
 // never mutated (Go map zero value — a valid "never bumped" baseline, see the
-// msgRev field comment at store.go:599-628).
+// msgRev field comment in store.go).
 func (s *Store) msgRevSnapshot(sid string) uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -105,12 +105,12 @@ func containsString(haystack []string, needle string) bool {
 
 // TestHydrate_SessionAssignedDirectly is GAP-S3 case 1: the direct-assign
 // path. Hydrate writes &sessionEntry{id, parentID, info} straight into
-// s.sessions (store.go:2633), bypassing upsertSessionLocked. This test pins
+// s.sessions (hydration.go), bypassing upsertSessionLocked. This test pins
 // the field shape so a split that reroutes Hydrate through a different
 // constructor (or drops the denormalized parentID/info) is caught.
 //
 // Mutation-observability: if the line `s.sessions[env.ID] = &sessionEntry{...}`
-// (store.go:2633) were removed, no entry would land in s.sessions — the
+// (hydration.go) were removed, no entry would land in s.sessions — the
 // present/parentID/info assertions fail immediately, and HasSession returns
 // false. If the entry were constructed without parentID, the reparent
 // assertion (child under root) fails.
@@ -167,7 +167,7 @@ func TestHydrate_SessionAssignedDirectly(t *testing.T) {
 
 // TestHydrate_IndexesConsistent is GAP-S3 case 2 — THE LOAD-BEARING TEST.
 // Hydrate calls 6 subtree-index maintainers after every direct-assign
-// (store.go:2639-2648). This test drives Hydrate across the full matrix of
+// (hydration.go). This test drives Hydrate across the full matrix of
 // shapes that exercise every maintainer (create, reparent, replace-with-
 // changed-info, drop-unseen) AND interleaves Apply to seed busy / pending
 // state so the maintainers have non-trivial values to preserve across the
@@ -287,10 +287,10 @@ func TestHydrate_IndexesConsistent(t *testing.T) {
 }
 
 // TestHydrate_DoesNotLeakGraceTimers is GAP-S3 case 3 — the namesake concern.
-// Hydrate MUST call cancelAllGraceLocked (store.go:2605) before its session
+// Hydrate MUST call cancelAllGraceLocked (hydration.go) before its session
 // loop, so a grace timer armed against the pre-reconnect live message stream
 // cannot fire post-hydrate and strand/corrupt busy state. The comment at
-// store.go:2602-2604 documents the contract; before this file NO test
+// hydration.go documents the contract; before this file NO test
 // asserted it (TestHydrateDiffEmitsOnlyChanges does not touch grace state).
 //
 // cancelAllGraceLocked stops every pending timer, bumps graceGen for every
@@ -458,7 +458,7 @@ func TestHydrate_DoesNotLeakStopTimers(t *testing.T) {
 
 // TestHydrate_IdempotentOnIdenticalInfo_ReplaceOnChangedInfo is GAP-S3 case 4.
 // Hydrate's direct-assign is guarded by `old == nil || !bytes.Equal(old.info,
-// info)` (store.go:2632). Two contracts flow from that guard:
+// info)` (hydration.go). Two contracts flow from that guard:
 //
 //   - IDEMPOTENT: re-hydrating a session with byte-identical info MUST be a
 //     no-op for that session — no re-assign, no maintainer calls, no emit.
@@ -549,8 +549,8 @@ func TestHydrate_IdempotentOnIdenticalInfo_ReplaceOnChangedInfo(t *testing.T) {
 }
 
 // TestHydrate_MsgRevConsistent is GAP-S3 case 5. Hydrate's messages loop
-// calls reconcileMessagesLocked (store.go:2666), which unconditionally calls
-// bumpMsgRev(sid) (store.go:2719) under s.mu. The msgRev token (store.go:599)
+// calls reconcileMessagesLocked (hydration.go), which unconditionally calls
+// bumpMsgRev(sid) (message_window.go) under s.mu. The msgRev token (store.go)
 // is the cold-batch ABA guard: publishColdBatch captures it at batch-capture
 // time and re-validates after packaging, discarding a stale batch whose
 // capture point predates a later mutation. A Hydrate that reconciles
@@ -561,10 +561,10 @@ func TestHydrate_IdempotentOnIdenticalInfo_ReplaceOnChangedInfo(t *testing.T) {
 //
 // Contract pinned here:
 //   - a session reconciled via Hydrate has msgRev > 0 (bumpMsgRev handed out
-//     a fresh Store-wide-monotonic token, never zero — store.go:633)
+//     a fresh Store-wide-monotonic token, never zero — message_window.go)
 //   - re-hydrating the SAME messages (warm path, msgLoaded already true) bumps
 //     the token AGAIN (reconcileMessagesLocked bumps unconditionally on both
-//     cold and warm paths — store.go:2712-2718)
+//     cold and warm paths — hydration.go)
 //   - a session hydrated WITHOUT messages (absent from the messages map) is
 //     NOT reconciled and its msgRev stays at the prior value (Hydrate's
 //     session loop does not bump msgRev — only reconcile does)
@@ -613,7 +613,7 @@ func TestHydrate_MsgRevConsistent(t *testing.T) {
 
 	// Warm re-reconcile: hydrate R's messages AGAIN (msgLoaded already true).
 	// reconcileMessagesLocked bumps the token unconditionally on BOTH paths
-	// (store.go:2712-2718 — a warm reconcile's present-message merge can
+	// (hydration.go — a warm reconcile's present-message merge can
 	// change the projection, so the token must move). The new token must be
 	// STRICTLY GREATER than the cold token (Store-wide monotonic nextMsgRev).
 	s.Hydrate(
@@ -633,7 +633,7 @@ func TestHydrate_MsgRevConsistent(t *testing.T) {
 
 	// Sanity: the Store-wide monotonic source advanced by exactly the number
 	// of bumps (2 reconciles × 1 bump each = 2). nextMsgRev never hands out
-	// zero (store.go:633), so the cold token is >= 1 and the warm token is
+	// zero (message_window.go), so the cold token is >= 1 and the warm token is
 	// >= 2. This is the ABA guard's invariant surface.
 	if coldRev < 1 || warmRev < 2 {
 		t.Fatalf("ABA token shape: cold=%d warm=%d; want cold>=1, warm>=2 (nextMsgRev never hands out zero)", coldRev, warmRev)

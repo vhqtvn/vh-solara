@@ -669,7 +669,7 @@ func (e *TreeEmitter) Translate(ev ClientEvent) []TreeOp {
 // node.move; applies the §5.4 loaded-set decision to child pushes.
 //
 // Payload note: the store emits KindSessionUpsert with the RAW session info
-// (store.go:1989 `s.emit(KindSessionUpsert, p.Info)`), NOT wrapped in
+// (reducers.go `s.emit(KindSessionUpsert, p.Info)`), NOT wrapped in
 // {"info":...}. So we unmarshal the envelope directly off the payload.
 func (e *TreeEmitter) onSessionUpsertLocked(ev ClientEvent) []TreeOp {
 	s := e.store
@@ -764,7 +764,7 @@ func (e *TreeEmitter) parentCountFacetLocked(parent string, hint string) []TreeO
 // every formerly-known child (the store re-roots them; §6 delete row).
 //
 // Payload note: the store emits KindSessionDelete with `{"id":id}`
-// (store.go:2050 `s.emit(KindSessionDelete, rawObj(...{"id": id}))`).
+// (reducers.go `s.emit(KindSessionDelete, rawObj(...{"id": id}))`).
 func (e *TreeEmitter) onSessionDeleteLocked(ev ClientEvent) []TreeOp {
 	var p struct {
 		ID string `json:"id"`
