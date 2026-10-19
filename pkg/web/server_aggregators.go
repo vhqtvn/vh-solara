@@ -258,10 +258,11 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	a.Arm()
 	// Upstream-down gating (oc-death-watch S2): propagate the daemon's
 	// lifecycle-derived predicate so this per-dir Run loop also skips the
-	// 1s retry ramp while OpenCode is known down. Read INSIDE aggMu (this
-	// critical section); the boot-time write in SetUpstreamDownProbe takes no
-	// aggMu — safety rests on the daemon installing the probe once at boot,
-	// before any request can reach aggFor.
+	// 1s retry ramp while OpenCode is known down. Both access sites are
+	// aggMu-guarded — this read runs INSIDE the critical section and
+	// SetUpstreamDownProbe's write takes aggMu too — so the field is
+	// properly synchronized; the daemon's boot-before-serve install
+	// ordering is no longer load-bearing for safety.
 	if s.upstreamDownProbe != nil {
 		a.SetUpstreamDownProbe(s.upstreamDownProbe)
 	}
@@ -325,11 +326,17 @@ func (s *Server) SetAggHook(fn func(dir string, a *aggregator.Aggregator)) { s.a
 // and to every per-dir aggregator aggFor lazily creates, so all aggregator Run
 // loops cap their reconnect/hydrate retry backoffs while the daemon knows the
 // upstream is dead instead of ramping from 1s against the dead port (N+1
-// per-project loops otherwise hammer it every second). The daemon calls this
-// once at boot, before serving requests; not calling it (external
-// --opencode-url mode) leaves every aggregator's behavior unchanged.
+// per-project loops otherwise hammer it every second). The field write is
+// aggMu-guarded to match aggFor's locked read, so safety does not rest on the
+// daemon's once-at-boot, before-serving install discipline (the daemons do
+// still call it that way); not calling it (external --opencode-url mode)
+// leaves every aggregator's behavior unchanged. Note the lock fixes the data
+// race only: a call made after per-dir aggregators exist still installs on
+// the default and FUTURE aggregators only — no retro-propagation.
 func (s *Server) SetUpstreamDownProbe(fn func() bool) {
+	s.aggMu.Lock()
 	s.upstreamDownProbe = fn
+	s.aggMu.Unlock()
 	if s.agg != nil && fn != nil {
 		s.agg.SetUpstreamDownProbe(fn)
 	}

@@ -351,7 +351,9 @@ type Server struct {
 	// installed on the default aggregator immediately and on every per-dir
 	// aggregator aggFor lazily creates, so ALL Run loops quiet their retry
 	// ramp while the daemon knows OpenCode is down. nil (external
-	// --opencode-url mode) leaves aggregator behavior untouched.
+	// --opencode-url mode) leaves aggregator behavior untouched. Guarded by
+	// aggMu on both access sites: written under lock by SetUpstreamDownProbe,
+	// read under lock by aggFor's lazy-create path.
 	upstreamDownProbe func() bool
 	// managedDefaultOnce guards the one-time managed-project open of the default
 	// project (daemon cwd), triggered by the first request that touches it.
