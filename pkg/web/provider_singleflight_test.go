@@ -349,3 +349,22 @@ func TestProviderNoCachingBeyondInFlight(t *testing.T) {
 		t.Fatalf("upstream gets = %d, want 2 (no caching)", got)
 	}
 }
+
+// failingProviderRW is an http.ResponseWriter whose every Write fails
+// (embedding the tree-delivery tests' errWriter for the Write method), so
+// writeCapturedProvider's error branch can be exercised directly.
+type failingProviderRW struct{ errWriter }
+
+func (failingProviderRW) Header() http.Header { return http.Header{} }
+func (failingProviderRW) WriteHeader(int)     {}
+
+// TestWriteCapturedProviderFailingWriter: a replay onto a broken connection
+// (every Write fails) must not panic and must not change control flow — the
+// function completes and the write error is logged instead of discarded.
+// This pins the no-panic / branch-taken half only: vhlog binds os.Stderr at
+// package init and exposes no swappable sink, so the emitted log line itself
+// is not asserted here.
+func TestWriteCapturedProviderFailingWriter(t *testing.T) {
+	writeCapturedProvider(failingProviderRW{}, http.StatusOK,
+		http.Header{"Content-Type": {"application/json"}}, []byte(`{"ok":true}`))
+}

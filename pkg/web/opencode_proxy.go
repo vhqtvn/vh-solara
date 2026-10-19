@@ -107,7 +107,14 @@ func writeCapturedProvider(w http.ResponseWriter, status int, header http.Header
 	if status != 0 {
 		w.WriteHeader(status)
 	}
-	w.Write(body)
+	if _, err := w.Write(body); err != nil {
+		// The waiter's (or leader's) connection is broken — nothing is
+		// recoverable, but the failure must not be invisible. Client
+		// delivery failures log at Warn (matching the stream delivery
+		// path), unlike upstream errors (Error).
+		vhlog.Warn("provider single-flight: replay write to waiter failed",
+			"status", status, "bytes", len(body), "err", err)
+	}
 }
 
 // serveProviderSingleFlight runs GET /provider under single-flight: the
