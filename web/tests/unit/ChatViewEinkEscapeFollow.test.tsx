@@ -1,47 +1,46 @@
 // @vitest-environment jsdom
 //
 // E-ink live-escape follow regression (e2e scroll-follow.spec.ts test 21 —
-// "live-escape (Show live) content growth keeps the tail glued", the CI
-// failure after the Playwright 1.64.1 / Firefox 157 bump, reproducing on the
-// PW 1.60 / Firefox 150 runner generation too):
+// "live-escape (Show live) content growth keeps the tail glued").
 //
-//   CI evidence (failed-attempt video + failure screenshot): after the REAL
-//   click on the Show-live escape, the viewport ends up parked a small gap
-//   (~10-15% of the viewport, BELOW the busy→idle recovery's 200px band)
-//   off the tail with the "↓ Latest" button present and the paging toolbar
-//   reading 3/4 — and it NEVER re-glues: neither the busy→idle geometric
-//   recovery (gap < 200 would yank) nor the e-ink settle-lifecycle glue
-//   (onEinkSettleEvent) fires. Both are vetoed by `inputBackedAway`, the
-//   DURABLE input-provenance veto — so the failure requires that veto to be
-//   armed, and the ONLY physical input in the test is the Show-live TAP.
+// ROUND 1 (commit 6184f53): the Show-live TAP's pointerdown stamp made the
+// swap churn arm the DURABLE inputBackedAway park → settle-glue vetoed
+// forever. Fix: the escape binding clears pendingInputAt. Pinned by test 3's
+// veto assertion (genuine wheel still parks) + test 1's settle path.
 //
-//   Mechanism under test (unit-modelled deterministically here):
-//     1. A pointerdown lands on .chat-main (the Show-live tap — Playwright's
-//        click is mousemove+down+up) → ChatView's Approach-A sensor stamps
-//        `pendingInputAt` (ChatView.tsx onPointerDown). A button tap is NOT
-//        scroll input, but the stamp cannot tell.
-//     2. The escape swaps the held-back EinkWorking chip for the live
-//        .md-stream; on a slow machine the swap's layout churn produces a
-//        scroll frame whose residual classifies as `user-scroll-up` (the
-//        churn guards in lib/scroll.ts are DOWN-only / viewport-bounded —
-//        an up-residual is unabsorbed by construction).
-//     3. onScrolled's user-scroll-away branch sees "fresh" input (the tap,
-//        <300ms) → arms inputBackedAway=true + readingParked=true — a
-//        DURABLE park that vetoes every recovery (busy→idle, settle-glue,
-//        RO re-pins). The escaped reader strands off-tail.
+// ROUND 2 (the CI failure at :1973, run 39302084770, firefox only): trace
+// forensics + a taskset-pinned local repro showed the NEXT layer — with the
+// veto no longer armed, the churn frame's following-drop STILL strands the
+// reader for the whole turn:
 //
-//   The contract this pins: the escape's own churn must stay a TRANSIENT,
-//   non-input-backed following drop — exactly the class the settle-lifecycle
-//   glue exists to re-glue (e2e test 23's contract). The genuine-reader
-//   protection (real wheel → never yanked, e2e test 22) is untouched: wheel
-//   listeners still stamp, and only the ESCAPE clears its own tap's stamp.
+//   Mechanism (timeline r4, deterministic under `taskset -c 0,1`):
+//     1. Escape tap → chip unmount SHRINKS content (browser clamps scrollTop
+//        down) and the first live-flush REGROW (+px) coalesce into ONE
+//        rendering update on a contended machine.
+//     2. The compound scroll event reports net contentDelta ≈ 0 with
+//        scrollTop sitting the clamp below the expected value — an UP
+//        residual that NEITHER churn guard in classifyScrollDelta absorbs
+//        (viewport-guard needs a viewport delta; the insert-guard is
+//        DOWN-only + grow-only) → classified `user-scroll-up` with NO input
+//        provenance.
+//     3. onScrolled's user-scroll-away branch drops following AND clears
+//        contentROArmedLatch — the one dead-end state: the content RO
+//        no-ops while !following, so the escaped live stream grows below
+//        the fold for the WHOLE turn (~30+ off-tail samples = the CI red)
+//        until settle-glue re-engages at turn end.
 //
-// Fixture pattern follows ChatViewScrollResize.test.tsx (jsdom + controllable
-// ResizeObserver / scroll geometry / requestAnimationFrame; following()
-// observed via the "↓ Latest" jump pill) and ChatViewPartlessMessage.test.tsx
-// (setState message seeding — here WITH a streaming text part so Part.tsx's
-// real e-ink hold-back path, EinkWorking chip, Show-live button, and settle
-// seam all run for real).
+//   Fix under test: the escape binding stamps `einkEscapeAt`, and for
+//   EINK_ESCAPE_CHURN_MS (500ms) afterwards onScrolled treats a
+//   NO-PROVENANCE scroll-up/down as the swap's own churn — re-engage +
+//   re-pin (the onEinkSettleEvent idiom) instead of dropping. Gates keep
+//   every genuine-reader protection intact (see test 3).
+//
+// Fixture pattern follows ChatViewScrollResize.test.tsx (jsdom +
+// controllable ResizeObserver / scroll geometry / requestAnimationFrame;
+// following() observed via the "↓ Latest" jump pill) and
+// ChatViewPartlessMessage.test.tsx (setState message seeding — here WITH a
+// streaming text part so Part.tsx's real e-ink hold-back path, EinkWorking
+// chip, Show-live button, and settle seam all run for real).
 
 // jsdom lacks window.matchMedia (read at module-load time by layout.ts via
 // ChatView's transitive deps). Import the shared stub BEFORE any import that
@@ -136,17 +135,19 @@ const MID = "m1";
 
 // One assistant message with a SINGLE streaming text part (no
 // info.time.completed → unsettled → newest → Part renders the e-ink
-// hold-back path once the profile is on).
-const seedStreamingTextPart = (): void => {
+// hold-back path once the profile is on). partId is per-test UNIQUE: Part's
+// eink live-escape store (einkLiveParts) is module-global and keyed by
+// partId — a shared id would leak test 1's escape into the later tests.
+const seedStreamingTextPart = (partId: string): void => {
   setState("messages", SID, {
     order: [MID],
     byId: {
       [MID]: {
         id: MID,
         info: { id: MID, sessionID: SID, role: "assistant", time: { created: 1000 } },
-        partOrder: ["p1"],
+        partOrder: [partId],
         parts: {
-          p1: { id: "p1", sessionID: SID, messageID: MID, type: "text", text: "streaming body text" },
+          [partId]: { id: partId, sessionID: SID, messageID: MID, type: "text", text: "streaming body text" },
         },
       },
     },
@@ -155,7 +156,7 @@ const seedStreamingTextPart = (): void => {
 };
 // Flip the message to settled (authoritative completion) — Part's
 // `on(() => props.settled)` effect fires emitEinkSettle → ChatView's
-// onEinkSettleEvent (the settle-lifecycle glue under test).
+// onEinkSettleEvent (the settle-lifecycle glue).
 const settleMessage = (): void => {
   setState("messages", SID, "byId", MID, "info", "time", "completed", 2000);
 };
@@ -165,13 +166,14 @@ const settleMessage = (): void => {
 // harness quirk), then the swap-churn frame grows content (+200) while the
 // browser's anchoring moves the viewport UP by 60px past the clamped
 // expectation — residual −60, no viewport delta, and the churn guards in
-// classifyScrollDelta are DOWN-only → `user-scroll-up` by construction.
+// classifyScrollDelta are DOWN-only → `user-scroll-up` by construction (the
+// exact compound-frame class from the CI trace).
 const SH = 1000;
 const PORT = 400;
 const CHURN_SH = 1200;
 const CHURN_TOP = 740; // expected clampTop(SH, CHURN_SH-PORT)=800; residual −60
 
-describe("e-ink live-escape: the swap's churn must not arm the durable input-backed park", () => {
+describe("e-ink live-escape: the swap's churn must keep the tail glued (absorbed at source)", () => {
   let rafSaved: typeof window.requestAnimationFrame;
 
   beforeEach(() => {
@@ -220,11 +222,10 @@ describe("e-ink live-escape: the swap's churn must not arm the durable input-bac
     setEinkProfile(false);
   });
 
-  it("Show-live tap → swap-churn scroll-away → settle re-glues (the tap is not scroll provenance)", async () => {
+  it("Show-live tap → swap-churn scroll-away is ABSORBED: following never drops, tail re-pinned instantly, settle keeps it glued", async () => {
     const { container } = render(() => <ChatView sessionId={SID} />);
-    seedStreamingTextPart();
+    seedStreamingTextPart("p1");
     const scroll = () => container.querySelector(".chat-scroll") as HTMLDivElement;
-    const chatMain = () => container.querySelector(".chat-main") as HTMLDivElement;
 
     await flushMicro();
     expect(scroll()).toBeTruthy();
@@ -243,7 +244,9 @@ describe("e-ink live-escape: the swap's churn must not arm the durable input-bac
     expect(showLive()).toBeTruthy();
 
     // 1. THE TAP: pointerdown over .chat-main (the real sensor stamps
-    //    pendingInputAt), then the click that escapes the part to live.
+    //    pendingInputAt), then the click that escapes the part to live. The
+    //    escape binding clears the stamp (round 1) and stamps einkEscapeAt
+    //    (round 2 — opens the churn-absorption window).
     showLive()!.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
     showLive()!.click();
     await flushMicro();
@@ -252,29 +255,94 @@ describe("e-ink live-escape: the swap's churn must not arm the durable input-bac
     expect(container.querySelector('[data-eink="working"]')).toBeNull();
     expect(container.querySelector(".md-stream")).toBeTruthy();
 
-    // 2. THE SWAP CHURN: content grew (+200) while the anchored viewport
-    //    moved UP past the clamped expectation (residual −60 → the
-    //    unabsorbed up-residual class) → onScrolled classifies
-    //    user-scroll-away and drops following. This drop itself is EXPECTED
-    //    in both worlds (the classifier's guard coverage is not under test
-    //    here); the question is whether it is a TRANSIENT drop the settle
-    //    can heal, or a DURABLE input-backed park.
+    // 2. THE SWAP CHURN (the CI compound frame): content grew (+200) while
+    //    the anchored viewport moved UP past the clamped expectation
+    //    (residual −60 → the unabsorbed up-residual class). Round 2's
+    //    contract: within the escape window with NO input provenance this is
+    //    the swap's OWN churn — following must NOT drop (no .jump), and the
+    //    tail is re-pinned IMMEDIATELY (the whole-turn stranding below the
+    //    fold was the CI red: 30+ consecutive off-tail samples).
     setGeom(scroll(), { scrollTop: CHURN_TOP, scrollHeight: CHURN_SH });
     scroll().dispatchEvent(new Event("scroll"));
     await flushMicro();
-    expect(container.querySelector(".jump")).toBeTruthy(); // following dropped
-    // The churn left a small (~60px) gap: inside the busy→idle recovery's
-    // geometric band, so ONLY the input veto (or its absence) decides.
-    expect(CHURN_SH - CHURN_TOP - PORT).toBeLessThan(200);
+    expect(container.querySelector(".jump"), "escape churn dropped following: the compound frame stranded the live stream below the fold for the whole turn (CI :1973)").toBeNull();
+    expect(scroll().scrollTop).toBe(CHURN_SH); // instant re-pin at the tail
 
-    // 3. THE SETTLE: the part completes → emitEinkSettle → the settle-
-    //    lifecycle glue must re-engage + pin (the tap was not scroll input;
-    //    the drop was system churn). With the bug, the tap's stamp armed
-    //    inputBackedAway and the glue vetoes forever → .jump stays.
+    // 3. THE SETTLE: the part completes → emitEinkSettle → settle-glue runs
+    //    with following already engaged (no-op re-engage) — still glued.
     settleMessage();
     await flushMicro();
+    expect(container.querySelector(".jump")).toBeNull();
+    expect(scroll().scrollTop).toBe(CHURN_SH);
+  });
 
-    expect(container.querySelector(".jump"), "settle-glue vetoed: the Show-live tap's pointerdown stamp armed the durable input-backed park").toBeNull();
-    expect(scroll().scrollTop).toBe(CHURN_SH); // re-pinned at the tail
+  it("no escape: the SAME churn frame still drops following (no drive-by behavior change)", async () => {
+    const { container } = render(() => <ChatView sessionId={SID} />);
+    seedStreamingTextPart("p2");
+    const scroll = () => container.querySelector(".chat-scroll") as HTMLDivElement;
+
+    await flushMicro();
+    setGeom(scroll(), { scrollTop: 0, scrollHeight: SH, clientHeight: PORT });
+    flushRaf();
+    await flushMicro();
+    expect(scroll().scrollTop).toBe(SH);
+    expect(container.querySelector(".jump")).toBeNull();
+
+    // No escape tapped: the chip stays held back and einkEscapeAt stays 0 —
+    // the absorption window NEVER opens. The identical up-residual frame
+    // must keep its round-0 semantics: a real following drop (transient —
+    // no input veto, so the settle can heal it).
+    expect(container.querySelector('[data-eink="working"]')).toBeTruthy();
+    setGeom(scroll(), { scrollTop: CHURN_TOP, scrollHeight: CHURN_SH });
+    scroll().dispatchEvent(new Event("scroll"));
+    await flushMicro();
+    expect(container.querySelector(".jump"), "no-escape churn must still drop following — the absorption window is escape-scoped only").toBeTruthy();
+
+    // Transient (not input-backed): the settle-glue re-engages.
+    settleMessage();
+    await flushMicro();
+    expect(container.querySelector(".jump")).toBeNull();
+    expect(scroll().scrollTop).toBe(CHURN_SH);
+  });
+
+  it("genuine wheel within the escape window still drops + parks (the provenance gate keeps real reader intent)", async () => {
+    const { container } = render(() => <ChatView sessionId={SID} />);
+    seedStreamingTextPart("p3");
+    const scroll = () => container.querySelector(".chat-scroll") as HTMLDivElement;
+    const chatMain = () => container.querySelector(".chat-main") as HTMLDivElement;
+
+    await flushMicro();
+    setGeom(scroll(), { scrollTop: 0, scrollHeight: SH, clientHeight: PORT });
+    flushRaf();
+    await flushMicro();
+    expect(scroll().scrollTop).toBe(SH);
+    expect(container.querySelector(".jump")).toBeNull();
+
+    const showLive = () => container.querySelector('[data-eink="show-live"]') as HTMLButtonElement | null;
+    expect(showLive()).toBeTruthy();
+
+    // Escape, then a GENUINE wheel over the chat viewport — physical input
+    // INSIDE the 500ms absorption window. The provenance gate (fresh
+    // pendingInputAt) must keep the REAL drop path: absorption is for
+    // no-provenance churn only. A reader who wheels away after tapping Show
+    // live still parks (e2e test 22's contract, round 1's protections).
+    showLive()!.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    showLive()!.click();
+    await flushMicro();
+    expect(container.querySelector(".md-stream")).toBeTruthy();
+
+    chatMain().dispatchEvent(new Event("wheel", { bubbles: true })); // stamps pendingInputAt (fresh)
+
+    setGeom(scroll(), { scrollTop: CHURN_TOP, scrollHeight: CHURN_SH });
+    scroll().dispatchEvent(new Event("scroll"));
+    await flushMicro();
+    expect(container.querySelector(".jump"), "fresh wheel input within the escape window must still drop following (no yank)").toBeTruthy();
+
+    // And the drop is DURABLE (inputBackedAway armed — Approach A): even the
+    // settle-glue must not yank a genuine reader back (round 1's veto,
+    // preserved by round 2).
+    settleMessage();
+    await flushMicro();
+    expect(container.querySelector(".jump"), "settle-glue vetoed: the genuine wheel armed the durable input-backed park").toBeTruthy();
   });
 });

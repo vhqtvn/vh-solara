@@ -80,6 +80,16 @@ const TURN_FINISH_RECOVERY_GAP = 200;
 // provenance from the rest of the gesture, letting the trusted drift servo
 // yank the reader mid-gesture.
 const INPUT_FRESHNESS_MS = 300;
+// Max age (ms) of a Show-live escape for its swap churn to still be absorbed
+// by onScrolled (see the escape-churn branch there). The churn frame in
+// question — the held-back chip unmount's shrink clamp + the live engine's
+// FIRST flush regrow coalesced into one rendering update — lands within ~a
+// frame or two of the tap; under load the first flush's layout can slip a few
+// hundred ms later, and 500ms covers that while staying far below any
+// post-escape reader action that is NOT already excluded by the input-
+// provenance gate (a genuine wheel/key within the window carries fresh input
+// and keeps the real drop path).
+const EINK_ESCAPE_CHURN_MS = 500;
 // Keys that scroll a scroll container when focus is inside it (arrows,
 // PageUp/PageDown, Home/End, Space) or activate the focused control
 // (Enter/Space — e.g. a navigator dot fired from the keyboard). The
@@ -859,8 +869,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // already-armed genuine park is NOT released (the reader who wheeled away
   // before tapping keeps their protection). Same idiom as jumpToLatest's
   // `pendingInputAt = 0` for app-driven viewport actions.
+  // Timestamp of the last Show-live escape (0 = none). Opens the short window
+  // during which onScrolled treats a NO-PROVENANCE scroll-up/down as the
+  // escape swap's own layout churn instead of reader intent — see the
+  // escape-churn branch in onScrolled for the full mechanism.
+  let einkEscapeAt = 0;
   onCleanup(bindEinkEscapeListener(() => {
     pendingInputAt = 0;
+    einkEscapeAt = Date.now(); // opens the swap-churn absorption window (onScrolled)
   }));
 
   // ── Phase-4 load-older (historical page prepend) ─────────────────────────
@@ -1683,7 +1699,53 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       mode: following() ? "tail" : "read",
       following: following(),
     });
-    if (d.intent === "reached-bottom") {
+    // E-ink escape churn absorption (round 2 of the e2e scroll-follow test-21
+    // CI failure): the Show-live escape swaps the held-back chip for the live
+    // engine, and on a contended machine the chip-unmount SHRINK (browser
+    // clamps scrollTop down to the smaller range) and the first live-flush
+    // REGROW land inside the SAME rendering update — so the compound scroll
+    // event reports a net contentDelta ≈ 0 with scrollTop sitting the clamp
+    // below the (barely-moved) expected value, i.e. an UP residual that
+    // neither churn guard in classifyScrollDelta absorbs (viewport-guard needs
+    // a viewport delta; the insert-guard is DOWN-only + grow-only). Classified
+    // user-scroll-up with NO input provenance, this frame used to drop
+    // following AND clear contentROArmedLatch — the one dead-end state: the
+    // escaped live stream then grew below the fold for the WHOLE turn (the
+    // content-RO re-pin only runs while following; the recovery branches are
+    // latch/anchor-gated) until the settle-glue re-engaged at turn end.
+    // Within the short window after the escape, a no-provenance scroll-up is
+    // the swap's own churn — re-engage + re-pin (the onEinkSettleEvent idiom)
+    // instead of dropping. Gates keep every genuine-reader protection intact:
+    // fresh physical input in the window keeps the REAL drop path (provenance
+    // gate — a wheel after tapping Show live still parks the reader), an
+    // already-armed inputBackedAway park is never released (veto gate — the
+    // reader who wheeled away before escaping keeps their park), and the
+    // window only opens on an actual escape (profile-gated seam: OFF never
+    // emits, and this double-checks the profile).
+    const escapeFreshInput =
+      pendingInputAt !== 0 && Date.now() - pendingInputAt < INPUT_FRESHNESS_MS;
+    // Same veto set as onEinkSettleEvent, minus the not-positioned check
+    // (onScrolled runs on the live element): restore contract owns the
+    // viewport, genuine input-backed park keeps its protection, a
+    // blocker-card hold suppresses re-engagement, fresh physical input keeps
+    // the REAL drop path.
+    const escapeChurn =
+      einkProfile() &&
+      !inputBackedAway &&
+      !restoredAnchorId &&
+      !holdActive() &&
+      !escapeFreshInput &&
+      einkEscapeAt !== 0 &&
+      Date.now() - einkEscapeAt < EINK_ESCAPE_CHURN_MS;
+    if (escapeChurn && (d.intent === "user-scroll-up" || d.intent === "user-scroll-down")) {
+      setFollowing(true);
+      setUserScrolledUp(false);
+      setReadingParked(false); // the churn never ended following in intent
+      contentROArmedLatch = false;
+      preArmGap = Infinity;
+      endAnchorServo(); // re-engage following ⇒ anchor servo state is stale, drop it
+      pin(); // INSTANT re-glue (direct scrollTop write)
+    } else if (d.intent === "reached-bottom") {
       // Restored-reader ownership (O4, the landing-contract fix): while a
       // restored contract is active (restoredAnchorId set), SYSTEM-driven
       // geometric bottom contact must NOT transfer the reader to
