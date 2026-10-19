@@ -136,8 +136,15 @@ func (s *Server) ocGeneration() uint64 {
 func (s *Server) SetRestartServer(fn func()) { s.restartServer = fn }
 
 // SetManaged installs the managed-project orchestrator (repo-declared processes
-// + views). Optional; nil leaves managed projects disabled.
-func (s *Server) SetManaged(o *Orchestrator) { s.managed = o }
+// + views). Optional; nil leaves managed projects disabled. The field write is
+// aggMu-guarded to match aggFor's locked reads, so safety does not rest on the
+// daemon's once-at-boot, before-serving install discipline (the daemons do
+// still call it that way).
+func (s *Server) SetManaged(o *Orchestrator) {
+	s.aggMu.Lock()
+	s.managed = o
+	s.aggMu.Unlock()
+}
 
 // InitManaged builds and installs the managed-project orchestrator over the
 // given process manager and trust store, sharing this server's view registry.
@@ -145,11 +152,14 @@ func (s *Server) SetManaged(o *Orchestrator) { s.managed = o }
 // autoTrust is the headless escape hatch that approves configs without a prompt.
 // Discovery is lazy for every project (default + ?dir=): the aggFor open hook
 // fires on the first browser request that touches a project, so the returned
-// orchestrator need not be driven by the caller.
+// orchestrator need not be driven by the caller. Like SetManaged, the field
+// install is aggMu-guarded (aggFor reads the field under the same lock).
 func (s *Server) InitManaged(mgr *procmgr.Manager, trust *TrustStore, cfgOverride string, autoTrust bool) *Orchestrator {
 	o := NewOrchestrator(mgr, trust, s.views, cfgOverride)
 	o.autoTrust = autoTrust
+	s.aggMu.Lock()
 	s.managed = o
+	s.aggMu.Unlock()
 	return o
 }
 

@@ -109,8 +109,9 @@ func (s *Server) RetargetOpenCode(baseURL string) {
 // install fresh lifecycle work during teardown; tests call Shutdown in cleanup.
 // There is intentionally no admission barrier: the default aggFor path does
 // not consult the aggregator map and takes no persistent lock (aggMu is
-// acquired briefly for the aggHook read+invoke only), and the only race that
-// could install post-signal work cannot occur at the actual call sites.
+// acquired briefly for the managed-project and aggHook read+invoke only), and
+// the only race that could install post-signal work cannot occur at the
+// actual call sites.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.bgCancel() // idempotent; never reassigned after NewServer
 	s.stopAllPermissionWatchers()
@@ -225,7 +226,15 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 		// Managed-project hook for the DEFAULT project (daemon cwd). Fired on the
 		// first request that touches it — i.e. an authenticated browser actually
 		// opening the project — NOT at daemon boot, so a restart never silently
-		// runs repo-declared commands with no operator present.
+		// runs repo-declared commands with no operator present. managed read +
+		// invoke under aggMu — the same critical-section discipline as the
+		// lazy-create path below, which calls OpenProject inside its lock (and
+		// as the aggHook invoke below). OpenProject touches only
+		// Orchestrator-owned state (its own mu, the procmgr manager, the trust
+		// store, the filesystem — the orchestrator holds no Server reference
+		// and cannot re-enter aggMu), so holding aggMu across the invoke is
+		// deadlock-free.
+		s.aggMu.Lock()
 		if s.managed != nil {
 			s.managedDefaultOnce.Do(func() { s.managed.OpenProject("") })
 		}
@@ -234,7 +243,6 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 		// inside its lock. The alerts hook attaches a detector to the store
 		// (pkg/alerts cannot re-enter pkg/web), so holding aggMu across the
 		// invoke is deadlock-free.
-		s.aggMu.Lock()
 		if s.aggHook != nil {
 			s.aggHook("", s.agg)
 		}
@@ -277,7 +285,11 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	s.aggs[dir] = a
 	// Managed-project hook: discover .vh-solara/project.jsonc, gate on trust, and
 	// (if trusted) start declared processes + register views. Non-blocking; nil
-	// when the daemon hasn't enabled managed projects.
+	// when the daemon hasn't enabled managed projects. Both access sites are
+	// aggMu-guarded — this read runs INSIDE the critical section and
+	// SetManaged/InitManaged's writes take aggMu too — so the field is properly
+	// synchronized; the daemon's boot-before-serve install ordering is no
+	// longer load-bearing for safety (mirrors the default path's guarded read).
 	if s.managed != nil {
 		s.managed.OpenProject(dir)
 	}
