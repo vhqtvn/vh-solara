@@ -163,6 +163,20 @@ func (s *Server) InitManaged(mgr *procmgr.Manager, trust *TrustStore, cfgOverrid
 	return o
 }
 
+// managedOrchestrator returns the current managed-project orchestrator under
+// aggMu — the same lock guarding SetManaged/InitManaged's writes and aggFor's
+// in-critical-section reads — closing the last bare reads (the managed.go HTTP
+// handlers). aggMu is a plain Mutex, so this is a brief exclusive hold that
+// copies the pointer. Callers must NOT hold aggMu: aggFor's default-project
+// and lazy-create paths read the field directly inside their own critical
+// section instead of via this accessor.
+func (s *Server) managedOrchestrator() *Orchestrator {
+	s.aggMu.Lock()
+	o := s.managed
+	s.aggMu.Unlock()
+	return o
+}
+
 // SetReassertDelay overrides the per-Server re-assert delay (a test seam that
 // replaces the prior mutable package global). Must be called before the archive
 // request whose re-assert it should affect; the delay is captured under bgMu at

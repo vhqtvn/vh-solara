@@ -495,7 +495,8 @@ func sortedKeys(m map[string]string) []string {
 // POST ?dir=&id=&action=start|stop|restart → control a declared process.
 // GET ?dir=&id=&logs[&max=N] → tailed process logs.
 func (s *Server) handleManaged(w http.ResponseWriter, r *http.Request) {
-	if s.managed == nil {
+	o := s.managedOrchestrator()
+	if o == nil {
 		writeJSONResp(w, ManagedProject{State: StateNone})
 		return
 	}
@@ -505,7 +506,7 @@ func (s *Server) handleManaged(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Has("logs") {
 			id := r.URL.Query().Get("id")
 			max := 64 * 1024
-			b, ok := s.managed.mgr.Logs(absDir(dir), id, max)
+			b, ok := o.mgr.Logs(absDir(dir), id, max)
 			if !ok {
 				http.Error(w, "no logs", http.StatusNotFound)
 				return
@@ -514,7 +515,7 @@ func (s *Server) handleManaged(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write(b)
 			return
 		}
-		writeJSONResp(w, s.managed.Snapshot(dir))
+		writeJSONResp(w, o.Snapshot(dir))
 	case http.MethodPost:
 		id := r.URL.Query().Get("id")
 		action := r.URL.Query().Get("action")
@@ -522,7 +523,7 @@ func (s *Server) handleManaged(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "id and action required", http.StatusBadRequest)
 			return
 		}
-		if err := s.managed.Control(dir, id, action); err != nil {
+		if err := o.Control(dir, id, action); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -565,8 +566,8 @@ func (s *Server) handleManaged(w http.ResponseWriter, r *http.Request) {
 // otherwise the new text is written (creating .vh-solara/ as needed).
 func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
 	override := ""
-	if s.managed != nil {
-		override = s.managed.cfgOverride
+	if o := s.managedOrchestrator(); o != nil {
+		override = o.cfgOverride
 	}
 	switch r.Method {
 	case http.MethodGet:
@@ -705,8 +706,8 @@ func (s *Server) handleProjectSettingsWatch(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	override := ""
-	if s.managed != nil {
-		override = s.managed.cfgOverride
+	if o := s.managedOrchestrator(); o != nil {
+		override = o.cfgOverride
 	}
 	root, err := projectRoot(reqDir(r))
 	if err != nil {
@@ -780,7 +781,8 @@ func (s *Server) handleProjectSettingsWatch(w http.ResponseWriter, r *http.Reque
 // handleTrust: GET ?dir= → {state, config_hash}. POST {dir} → approve current
 // config + start the project.
 func (s *Server) handleTrust(w http.ResponseWriter, r *http.Request) {
-	if s.managed == nil {
+	o := s.managedOrchestrator()
+	if o == nil {
 		http.Error(w, "managed projects disabled", http.StatusNotFound)
 		return
 	}
@@ -792,12 +794,12 @@ func (s *Server) handleTrust(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		lr, err := projectcfg.Load(root, s.managed.cfgOverride)
+		lr, err := projectcfg.Load(root, o.cfgOverride)
 		if err != nil {
 			writeJSONResp(w, map[string]any{"state": StateNone})
 			return
 		}
-		writeJSONResp(w, map[string]any{"state": s.managed.trust.State(root, lr.Hash), "config_hash": lr.Hash})
+		writeJSONResp(w, map[string]any{"state": o.trust.State(root, lr.Hash), "config_hash": lr.Hash})
 	case http.MethodPost:
 		var in struct {
 			Dir string `json:"dir"`
@@ -805,7 +807,7 @@ func (s *Server) handleTrust(w http.ResponseWriter, r *http.Request) {
 		if !decodeBody(w, r, &in) {
 			return
 		}
-		if err := s.managed.Grant(in.Dir); err != nil {
+		if err := o.Grant(in.Dir); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}

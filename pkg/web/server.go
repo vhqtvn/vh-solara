@@ -341,11 +341,11 @@ type Server struct {
 
 	// managed, when set by the daemon, owns repo-declared processes+views for
 	// projects (.vh-solara/project.jsonc). nil = managed-projects disabled.
-	// Guarded by aggMu on the aggFor access sites: written under lock by
+	// Guarded by aggMu on ALL access sites: written under lock by
 	// SetManaged/InitManaged, read under lock by aggFor's default-project and
-	// lazy-create paths. (The managed.go HTTP handlers additionally read the
-	// field bare at request time — those still rest on the boot-before-serve
-	// install discipline of the boot-glue writers, unchanged by that guard.)
+	// lazy-create paths (in-critical-section) and by the managedOrchestrator
+	// accessor the managed.go HTTP handlers use — no read rests on the
+	// boot-before-serve install discipline of the boot-glue writers.
 	managed *Orchestrator
 
 	// aggHook, when set, is invoked for each project aggregator as it is touched

@@ -113,7 +113,7 @@ func TestManagedHTTP_TrustGateThenProxy(t *testing.T) {
 	t.Cleanup(func() { web.CloseClientConnections(); web.Close() })
 
 	// Trigger the project-open hook (same call aggFor makes on first ?dir=).
-	srv.managed.OpenProject(root)
+	srv.managedOrchestrator().OpenProject(root)
 
 	// 1. Before trust: state is awaiting-trust and the review payload is present.
 	resp := doManaged(t, web.URL, http.MethodGet, "/vh/managed?dir="+root, "")
