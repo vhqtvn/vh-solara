@@ -785,7 +785,7 @@ verified: `pkg/aggregator/reconciliation.go`
 `:848` (the `hydrate` path → `a.store.SetActivityFromStatuses`, inside the
 `run("SessionStatuses", ...)` goroutine at `:843`). That call descends to
 `store.SetActivityFromStatuses` (`pkg/state/store.go:1703`) → per-session
-`setActivityLocked` (`pkg/state/store.go:1421`), which captures
+`setActivityLocked` (`pkg/state/reducers.go`), which captures
 `now := time.Now()` (`store.go:1446`) and writes `lastActivityAt[sessionID]=now`
 via `touchActivityTimeLocked` (the comment at `store.go:1443` notes the
 override-to-now). Note this is the activity TIME stamp, not the busy/idle

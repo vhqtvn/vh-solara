@@ -49,7 +49,7 @@ auditable.
 
 ## Verified facts (from live incident investigation 2026-08-11 — trust; re-verify if something looks off)
 
-- The store accumulates `message.part.delta` server-side and each throttled flush (`deltaFlushInterval=30ms`, `pkg/state/store.go:1633`) emits `KindPartUpsert` carrying the ENTIRE accumulated part text (`flushPartDeltasLocked`, `pkg/state/reducers.go:~1350-1417`). Wire bytes per part are O(L²) over its lifetime; `partTextCap=1MiB`; live frames are raw JSON (only snapshots are gzip64).
+- The store accumulates `message.part.delta` server-side and each throttled flush (`deltaFlushInterval=30ms`, `pkg/state/store.go`) emits `KindPartUpsert` carrying the ENTIRE accumulated part text (`flushPartDeltasLocked`, `pkg/state/reducers.go:~1350-1417`). Wire bytes per part are O(L²) over its lifetime; `partTextCap=1MiB`; live frames are raw JSON (only snapshots are gzip64).
 - Incident session `ses_00fb2defcffed6hfrLInqG6oCL` streamed in large lumps, then looked stuck >60s; manual reload was instantly current. Largest part ~41KB (390 parts / 1.3MB total) — so the failure needs no monster part.
 - Daemon exonerated: `/vh/diag/latency` showed `slow_writes=null` (no SSE write ever blocked, max 653µs), `subscriber_drops=6` lifetime, daemon journal silent. Backlog formed DOWNSTREAM.
 - No existing self-heal covers a late-but-flowing stream: 60s status-reconcile fixes stuck-idle only; `STALE_MS=45s` needs pings absent; `CONTENT_STALE_MS=120s` needs zero content and lumps keep resetting it.
