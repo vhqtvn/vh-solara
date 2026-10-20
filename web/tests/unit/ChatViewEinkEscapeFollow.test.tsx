@@ -45,6 +45,12 @@
 //   (6) a session switch resets einkEscapeAt — the entering session's first
 //       no-provenance scroll must NOT be absorbed by the leaving session's
 //       escape window.
+//   HARDENING (same review cycle): (7) the window is BOUNDED — the gate reads
+//       Date.now() on both sides, so the test freezes exactly that clock and
+//       proves the IDENTICAL churn frame flips from absorbed (in-window) to
+//       dropped (window expired) with the clock as the only variable. The
+//       real-time pins can only ever prove the in-window direction (their
+//       wall clock is sub-500ms by construction).
 //
 // Fixture pattern follows ChatViewScrollResize.test.tsx (jsdom +
 // controllable ResizeObserver / scroll geometry / requestAnimationFrame;
@@ -480,9 +486,18 @@ describe("e-ink live-escape: the swap's churn must keep the tail glued (absorbed
     await flushMicro();
 
     const scroll2 = () => second.container.querySelector(".chat-scroll") as HTMLDivElement;
-    const card = second.container.querySelector(".pending-input") as HTMLElement;
-    expect(card, "blocker mounted with the seeded question").toBeTruthy();
-    card.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+    // Pin 5b locator contract: the blocker host is PendingInput.tsx's wrapper
+    // div, whose ONLY public hook is the `.pending-input` class (no data-* /
+    // testid contract exists on it — adding one just for this test is out of
+    // scope). Resolve the locator explicitly and fail HERE with a message
+    // naming the coupling, so a class rename surfaces as a self-explaining
+    // assertion failure instead of a confusing null-dereference below.
+    const card = second.container.querySelector<HTMLElement>(".pending-input");
+    expect(
+      card,
+      "blocker card not found via `.pending-input` — that class is PendingInput.tsx's host wrapper and its only hook. Either it was renamed (update this selector) or the seeded s2 question did not mount the card.",
+    ).toBeTruthy();
+    card!.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
     await flushMicro(); // held → onHoldChange(true) → holdActive
 
     setGeom(scroll2(), { scrollTop: 0, scrollHeight: SH, clientHeight: PORT });
@@ -548,5 +563,60 @@ describe("e-ink live-escape: the swap's churn must keep the tail glued (absorbed
     await flushMicro();
     expect(container.querySelector(".jump"), "stale escape window leaked across the session switch and absorbed s2's scroll").toBeTruthy();
     expect(scroll().scrollTop).toBe(CHURN_TOP); // NOT re-pinned to the tail
+  });
+
+  it("the escape window is BOUNDED: the identical churn frame DROPS following once EINK_ESCAPE_CHURN_MS has elapsed", async () => {
+    // The window gate reads Date.now() on BOTH sides — ChatView.tsx stamps
+    // `einkEscapeAt = Date.now()` in the escape binding and compares
+    // `Date.now() - einkEscapeAt < EINK_ESCAPE_CHURN_MS` in onScrolled. Freeze
+    // exactly that source (performance.now and the real timers driving
+    // flushMicro/flushRaf stay real) so the window boundary is deterministic:
+    // the expiry direction is unreachable for the real-time pins above, whose
+    // wall clock is sub-500ms by construction (false-green-only coverage).
+    let now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      const { container } = render(() => <ChatView sessionId={SID} />);
+      seedStreamingTextPart("p9");
+      const scroll = () => container.querySelector(".chat-scroll") as HTMLDivElement;
+
+      await flushMicro();
+      setGeom(scroll(), { scrollTop: 0, scrollHeight: SH, clientHeight: PORT });
+      flushRaf();
+      await flushMicro();
+      expect(scroll().scrollTop).toBe(SH);
+      expect(container.querySelector(".jump")).toBeNull();
+
+      const showLive = () => container.querySelector('[data-eink="show-live"]') as HTMLButtonElement | null;
+      expect(showLive()).toBeTruthy();
+      showLive()!.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      showLive()!.click(); // stamps einkEscapeAt = now (frozen)
+      await flushMicro();
+      expect(container.querySelector(".md-stream")).toBeTruthy();
+
+      // CONTROL — in-window under the frozen clock: the churn frame is
+      // absorbed (following kept, instant re-pin). This frame is its own
+      // control for the expiry phase below: same geometry, same provenance.
+      setGeom(scroll(), { scrollTop: CHURN_TOP, scrollHeight: CHURN_SH });
+      scroll().dispatchEvent(new Event("scroll"));
+      await flushMicro();
+      expect(container.querySelector(".jump")).toBeNull();
+      expect(scroll().scrollTop).toBe(CHURN_SH);
+
+      // EXPIRY — advance the SAME clock the gate reads past the churn window
+      // (ChatView.tsx EINK_ESCAPE_CHURN_MS = 500). The clock is now the ONLY
+      // variable that changed; the identical no-provenance churn frame must
+      // fall back to its round-0 semantics and DROP following. An unbounded
+      // (or widened) window leaves the frame absorbed — pill absent and
+      // scrollTop re-pinned to CHURN_SH — and this assertion fails.
+      now += 501;
+      setGeom(scroll(), { scrollTop: CHURN_TOP, scrollHeight: CHURN_SH });
+      scroll().dispatchEvent(new Event("scroll"));
+      await flushMicro();
+      expect(container.querySelector(".jump"), "escape churn window never expired: the identical frame was still absorbed past EINK_ESCAPE_CHURN_MS").toBeTruthy();
+      expect(scroll().scrollTop).toBe(CHURN_TOP); // NOT re-pinned to the tail
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 });

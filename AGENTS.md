@@ -598,7 +598,7 @@ It lets an operator:
 
 - **`go` may not be on `PATH`.** It lives at `/usr/local/go/bin/go`; prefix:
   `export PATH=$PATH:/usr/local/go/bin`.
-- Module: `github.com/vhqtvn/vh-solara`, Go 1.25.
+- Module: `github.com/vhqtvn/vh-solara`, Go 1.26.
 - Build the CLI: `go build ./...` (uses the committed `pkg/web/dist/` placeholder,
   so no frontend build is needed for a plain build or `go test`).
 - Run Go tests: `go test ./...`. Format check: `gofmt -l pkg cmd main.go`.
@@ -624,7 +624,7 @@ It lets an operator:
   since those are gitignored, `git status` stays clean; `make clean-web-embed`
   removes the generated artifacts and returns to the true cold-fallback embed
   state (placeholder.html only).
-- Full build (Node ≥ 24): `make build` (or `make web` for the SPA only).
+- Full build (Node `^24.15.0 || >=26.0.0`, per `web/package.json` engines): `make build` (or `make web` for the SPA only).
 - SPA unit tests: `cd web && npm run test:unit` (preferred over bare `npx vitest run`, which from the repo root can resolve to a cached vitest that lacks the project jsdom config). Typecheck: `npm run typecheck`.
 - Playwright e2e: `cd web && export PATH=$PATH:/usr/local/go/bin && npx playwright
   test` (the `webServer` runs `scripts/fixture-web.sh`, which builds the SPA and
