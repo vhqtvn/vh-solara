@@ -36,6 +36,7 @@ beforeEach(() => {
   setState("messagesDelivered", reconcile({}));
   setState("messagesError", reconcile({}));
   setState("refreshing", reconcile({}));
+  setState("unread", reconcile({}));
   setState("cursor", 0);
 });
 
@@ -48,6 +49,7 @@ function seedRemovalSlices(): void {
   setState("messagesDelivered", "x", true);
   setState("messagesError", "x", true);
   setState("refreshing", "x", true);
+  setState("unread", "x", true);
 }
 
 // Capture exactly the shared removal slices (cursor is intentionally excluded —
@@ -60,6 +62,7 @@ function snapshotRemovalSlices() {
     messagesDelivered: state.messagesDelivered.x,
     messagesError: state.messagesError.x,
     refreshing: state.refreshing.x,
+    unread: state.unread.x,
   };
 }
 
@@ -91,6 +94,7 @@ describe("deletion-cascade parity (L-08/M4)", () => {
     expect(slicesDelete.messagesDelivered).toBeUndefined();
     expect(slicesDelete.messagesError).toBeUndefined();
     expect(slicesDelete.refreshing).toBeUndefined();
+    expect(slicesDelete.unread).toBeUndefined();
   });
 
   it("orchestration-level: session.delete event and eager archive prune leave equivalent store slices", () => {
@@ -118,6 +122,7 @@ describe("deletion-cascade parity (L-08/M4)", () => {
     expect(afterEvent.messagesDelivered).toBeUndefined();
     expect(afterEvent.messagesError).toBeUndefined();
     expect(afterEvent.refreshing).toBeUndefined();
+    expect(afterEvent.unread).toBeUndefined();
     // Cursor parity is OUT OF SCOPE by design: only the tracked event advances
     // it (99), the archive prune does not (0). Pinning this keeps the contract
     // explicit so a future change that accidentally advances the prune cursor is
@@ -139,6 +144,24 @@ describe("deletion-cascade parity (L-08/M4)", () => {
     ]);
     // The orchestration path is also a safe re-prune.
     expect(() => pruneSessionDeleted("neverexisted")).not.toThrow();
+  });
+
+  it("session removal prunes the local unread entry with NO unread.clear event (defense-in-depth)", () => {
+    // Post-33d1f43 the Go store guarantees the wire unread.clear is emitted
+    // BEFORE session.delete, so the wire path never leaks. This pins the LOCAL
+    // prune instead: the removal projection itself drops the entry (same state
+    // shape as the unread.clear case — a plain key delete), so the SPA stays
+    // correct even against a backend that omits the clear event. Scoped: only
+    // the removed session's entry goes; a sibling's entry survives.
+    seedRemovalSlices();
+    setState("unread", "sibling", true);
+    expect(state.unread.x).toBe(true);
+
+    const effects: ReconcileEffect[] = [];
+    setState(produce((s) => projectSessionRemoval(s, "x", effects)));
+
+    expect(state.unread.x).toBeUndefined();
+    expect(state.unread.sibling).toBe(true);
   });
 });
 

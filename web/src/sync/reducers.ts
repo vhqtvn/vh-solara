@@ -212,6 +212,12 @@ export function projectSessionRemoval(s: SyncState, id: string, effects: Reconci
   delete s.messagesDelivered[id];
   delete s.messagesError[id];
   delete s.refreshing[id];
+  // Defense-in-depth (post-33d1f43): the Go store guarantees the wire
+  // unread.clear is emitted BEFORE session.delete, so the wire path never
+  // leaks — but don't rely on the event. Prune the local unread entry here
+  // too (the same plain key delete the unread.clear case performs), so the
+  // SPA stays correct even against a backend that omits the clear event.
+  delete s.unread[id];
   effects.push({ kind: "session-removed", sessionID: id });
   effects.push({ kind: "sync-state-dirty" });
 }
