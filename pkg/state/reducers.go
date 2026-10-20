@@ -754,7 +754,20 @@ func (s *Store) deleteSessionLocked(id string) {
 	delete(s.statuses, id)
 	delete(s.activity, id)
 	delete(s.activitySeq, id)
-	delete(s.unread, id)
+	// Unread teardown must be CLIENT-VISIBLE. Removing s.unread[id] silently
+	// leaves a ghost flag on every client that already applied the unread.set
+	// event: the ack route (AckUnread → clearUnreadLocked) no-ops on the
+	// now-absent entry and emits NOTHING, so no wire event ever clears the
+	// flag (the fixture /fixture/reset queue-custody session.deleted+recreate
+	// exposed exactly this — connected clients' unread badge stuck at 1
+	// forever). Route the delete through the exclusive owner so a flagged id
+	// emits KindUnreadClear BEFORE the KindSessionDelete emit below (a client
+	// applying events in seq order drops the flag before the structural prune
+	// lands — the same ordering discipline as the finish-cascade
+	// KindActivity(idle) emits above). clearUnreadLocked self-guards:
+	// unflagged ids emit nothing.
+	s.clearUnreadLocked(id)
+	delete(s.unread, id) // belt-and-suspenders: clearUnreadLocked already removed a flagged entry
 	delete(s.subtreeBusyCount, id) // per-root busy aggregate is derived from this index (single source of truth)
 	// Phase 1 (Gate C extension): drop id's own entries from each new index.
 	delete(s.children, id) // direct-child list (already emptied by orphaning)

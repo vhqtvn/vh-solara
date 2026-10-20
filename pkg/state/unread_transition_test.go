@@ -157,6 +157,75 @@ func TestStatusReconcileSuppressesUnreadOnlyForItsTransitions(t *testing.T) {
 	})
 }
 
+// TestSessionDeleteClearsUnreadVisibly pins the delete-path unread teardown:
+// deleting a session whose id carries the finished-unread watermark must emit
+// KindUnreadClear ON THE WIRE, BEFORE the structural KindSessionDelete prune,
+// so a client that applied the earlier unread.set cannot keep a ghost flag.
+// With the visible clear, the ack route's no-op (AckUnread on an absent entry
+// emits nothing) is harmless — clients were already cleared by this emit.
+//
+// Regression (lane-8 real-embed nightly 2026-10-20): the fixture
+// /fixture/reset queue-custody path (d41f0bf — session.deleted +
+// session.created recreate) ran AFTER the reset's own session.idle had MARKED
+// the root unread; the silent delete dropped s.unread[root], the test's
+// POST /vh/ack then no-op'd with no unread.clear on the wire, and the SPA's
+// unread badge stuck at 1 (tab pair (1|1) instead of (1|0); the next test's
+// baseline never settled).
+func TestSessionDeleteClearsUnreadVisibly(t *testing.T) {
+	s := New(100)
+	defer s.Close()
+	ch, unsub := s.Subscribe(128)
+	defer unsub()
+	s.Apply(ev("session.created", `{"info":{"id":"R"}}`))
+	drainEvents(ch)
+
+	// Mark R unread via the ordinary session.status busy→idle family
+	// (markOnIdle=true — same setup discipline as the subtests above).
+	s.Apply(ev("session.status", evStatus("R", "busy")))
+	s.Apply(ev("session.status", evStatus("R", "idle")))
+	drainEvents(ch)
+	if !s.unread["R"] {
+		t.Fatal("precondition: R must be unread before the delete")
+	}
+
+	// Delete R: the flag must clear VISIBLY, and the clear must precede the
+	// structural prune on the wire (seq order discipline).
+	s.Apply(ev("session.deleted", `{"info":{"id":"R"}}`))
+	if s.unread["R"] {
+		t.Fatal("delete must drop s.unread[R]")
+	}
+	var kinds []string
+	for len(ch) > 0 {
+		kinds = append(kinds, (<-ch).Kind)
+	}
+	clearAt, deleteAt := -1, -1
+	for i, k := range kinds {
+		if k == KindUnreadClear && clearAt == -1 {
+			clearAt = i
+		}
+		if k == KindSessionDelete {
+			deleteAt = i
+		}
+	}
+	if clearAt == -1 {
+		t.Fatalf("delete of an unread root must emit KindUnreadClear, got kinds %v", kinds)
+	}
+	if deleteAt == -1 {
+		t.Fatalf("delete must emit KindSessionDelete, got kinds %v", kinds)
+	}
+	if clearAt > deleteAt {
+		t.Fatalf("KindUnreadClear (index %d) must precede KindSessionDelete (index %d): %v", clearAt, deleteAt, kinds)
+	}
+
+	// The ack on the now-absent entry must stay a SILENT no-op — with the
+	// visible delete clear above, a second clear event would be redundant
+	// churn, and its absence is what keeps AckUnread idempotent.
+	s.AckUnread("R")
+	if evs := drainKind(ch, KindUnreadClear); len(evs) != 0 {
+		t.Fatalf("ack after delete must emit nothing (clients already cleared), got %d", len(evs))
+	}
+}
+
 // unreadHas reports whether the snapshot's Unread list contains id. Test-local
 // helper (the tree_emitter_test.go `contains` is a substring check, distinct).
 func unreadHas(xs []string, id string) bool {

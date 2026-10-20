@@ -988,7 +988,12 @@ test.describe("lane 8: hidden-pane status liveness (real upstream → hidden rea
     // The workspace stays ACTIVE (visible) throughout.
     await ocFixture(page, "/oc/fixture/busy?session=slow");
     await expect.poll(pairsOf, { timeout: 8_000, message: "visible badge picks up running (+1)" }).toBe("(1|0)");
-    await ocFixture(page, "/oc/fixture/reset?session=slow");
+    // /fixture/idle, NOT /fixture/reset: reset's queue-custody wipe (d41f0bf)
+    // deletes+recreates the session, and a session delete now clears its
+    // unread VISIBLY (pkg/state ghost-flag fix), so reset ends unread-wiped
+    // ((0|0), no badge) and cannot produce the turn-completed shape. busy +
+    // idle is the purpose-built zero-side-effect busy→idle cycle.
+    await ocFixture(page, "/oc/fixture/idle?session=slow");
     await expect.poll(pairsOf, { timeout: 8_000, message: "visible badge: running cleared + unread bumped" }).toBe("(0|1)");
   });
 
@@ -1071,10 +1076,13 @@ test.describe("lane 8: hidden-pane status liveness (real upstream → hidden rea
       })
       .toBe("(1|0)");
 
-    // ---- FRESHNESS (terminal transition): reset → session.idle clears the
-    // busy AND marks the root unread (the ordinary turn-completed shape) →
-    // badge (0|1) while still hidden.
-    await ocFixture(page, "/oc/fixture/reset?session=slow");
+    // ---- FRESHNESS (terminal transition): /fixture/idle clears the busy AND
+    // marks the root unread (the ordinary turn-completed shape) → badge (0|1)
+    // while still hidden. (NOT /fixture/reset: its queue-custody wipe
+    // (d41f0bf) deletes+recreates the session — the delete now clears unread
+    // VISIBLY (pkg/state ghost-flag fix) — so reset ends unread-wiped and
+    // cannot produce this shape.)
+    await ocFixture(page, "/oc/fixture/idle?session=slow");
     await expect
       .poll(pairsOf, {
         timeout: 8_000,
@@ -1111,7 +1119,9 @@ test.describe("lane 8: hidden-pane status liveness (real upstream → hidden rea
         message: "revealed pane's badge picks up running (+1) live",
       })
       .toBe("(1|0)");
-    await ocFixture(page, "/oc/fixture/reset?session=slow");
+    // /fixture/idle for the same turn-completed shape as above (reset would
+    // wipe the unread its own idle leg sets — see the hidden-step note).
+    await ocFixture(page, "/oc/fixture/idle?session=slow");
     await expect
       .poll(pairsOf, {
         timeout: 8_000,
