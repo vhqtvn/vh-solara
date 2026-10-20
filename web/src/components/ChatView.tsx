@@ -1228,6 +1228,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         setReadingParked(false);
         pagingWriteAt = 0;
         parkedAtMsgCount = 0;
+        // Same cross-session hygiene for the escape-churn window: a stale
+        // einkEscapeAt from the leaving session would mis-absorb the entering
+        // session's first no-provenance scroll as the swap's own churn (a
+        // wrong re-pin at the tail). The window is escape-scoped, and the
+        // entering session has had no escape.
+        einkEscapeAt = 0;
         setReady(false);
         // Fallback reveal: if no content change fires the ResizeObserver (so
         // maybeRestore never runs), position + reveal on the next frame anyway.

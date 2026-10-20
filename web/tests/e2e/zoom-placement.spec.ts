@@ -58,7 +58,7 @@ import { projectUrl, settledTopLineNumber, topLineNumber } from "./util";
 // PathSelectionAction, code-view folder ctxm) was closed by surfaces 5-10.
 //
 // Engines: spec-compliant CSS zoom needs Chromium ≥ 128 (lane bundles
-// playwright-core 1.60.0 → Chrome for Testing 148.0.7778.96, see
+// playwright-core 1.64.1 → Chrome for Testing 156.0.8078.4, see
 // node_modules/playwright-core/browsers.json) or Firefox ≥ 126. The lane runs
 // this file on the `chromium` project only — the `firefox` project is
 // testMatch-scoped to codeview.spec.ts (playwright.config.ts) — so no engine
