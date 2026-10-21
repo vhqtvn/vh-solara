@@ -15,13 +15,15 @@
 //   2. ORCHESTRATION-level — drive applySessionEvent vs pruneSessionDeleted and
 //      compare the observable store slices (cursor intentionally excluded — the
 //      event path advances it, the archive path carries no seq).
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { produce, reconcile } from "solid-js/store";
 import { projectSessionEvent, projectSessionRemoval } from "../../src/sync/reducers";
 import { applySessionEvent, applyScopedSnapshot, applySnapshot, pruneSessionDeleted } from "../../src/sync/reconcile";
 import type { ReconcileEffect } from "../../src/sync/reducers.types";
 import {
+  lsActivity,
   lsSessionAgents,
+  loadActivity,
   resetSessionAgentPicks,
   sessionAgentPicks,
   setSessionAgentPick,
@@ -37,6 +39,11 @@ beforeEach(() => {
   setState("messagesError", reconcile({}));
   setState("refreshing", reconcile({}));
   setState("unread", reconcile({}));
+  setState("gate", reconcile({}));
+  setState("activity", reconcile({}));
+  setState("currentVerbs", reconcile({}));
+  setState("permissions", reconcile({}));
+  setState("questions", reconcile({}));
   setState("cursor", 0);
 });
 
@@ -50,6 +57,11 @@ function seedRemovalSlices(): void {
   setState("messagesError", "x", true);
   setState("refreshing", "x", true);
   setState("unread", "x", true);
+  setState("gate", "x", { hasMessages: true, permissionWasBlocked: true });
+  setState("activity", "x", "busy");
+  setState("currentVerbs", "x", { tool: "read", state: { status: "running" } });
+  setState("permissions", "x", { p1: { id: "p1", sessionID: "x", type: "bash" } });
+  setState("questions", "x", { q1: { id: "q1", sessionID: "x", questions: [{ question: "Proceed?" }] } });
 }
 
 // Capture exactly the shared removal slices (cursor is intentionally excluded —
@@ -63,6 +75,11 @@ function snapshotRemovalSlices() {
     messagesError: state.messagesError.x,
     refreshing: state.refreshing.x,
     unread: state.unread.x,
+    gate: state.gate.x,
+    activity: state.activity.x,
+    currentVerbs: state.currentVerbs.x,
+    permissions: state.permissions.x,
+    questions: state.questions.x,
   };
 }
 
@@ -95,6 +112,11 @@ describe("deletion-cascade parity (L-08/M4)", () => {
     expect(slicesDelete.messagesError).toBeUndefined();
     expect(slicesDelete.refreshing).toBeUndefined();
     expect(slicesDelete.unread).toBeUndefined();
+    expect(slicesDelete.gate).toBeUndefined();
+    expect(slicesDelete.activity).toBeUndefined();
+    expect(slicesDelete.currentVerbs).toBeUndefined();
+    expect(slicesDelete.permissions).toBeUndefined();
+    expect(slicesDelete.questions).toBeUndefined();
   });
 
   it("orchestration-level: session.delete event and eager archive prune leave equivalent store slices", () => {
@@ -123,6 +145,11 @@ describe("deletion-cascade parity (L-08/M4)", () => {
     expect(afterEvent.messagesError).toBeUndefined();
     expect(afterEvent.refreshing).toBeUndefined();
     expect(afterEvent.unread).toBeUndefined();
+    expect(afterEvent.gate).toBeUndefined();
+    expect(afterEvent.activity).toBeUndefined();
+    expect(afterEvent.currentVerbs).toBeUndefined();
+    expect(afterEvent.permissions).toBeUndefined();
+    expect(afterEvent.questions).toBeUndefined();
     // Cursor parity is OUT OF SCOPE by design: only the tracked event advances
     // it (99), the archive prune does not (0). Pinning this keeps the contract
     // explicit so a future change that accidentally advances the prune cursor is
@@ -162,6 +189,66 @@ describe("deletion-cascade parity (L-08/M4)", () => {
 
     expect(state.unread.x).toBeUndefined();
     expect(state.unread.sibling).toBe(true);
+  });
+
+  it("session removal prunes activity/currentVerbs/permissions/questions (B2b — no stale facets, no phantom input entries)", () => {
+    // Completing the B2b audit post-87e766a: these four maps were the removal
+    // seam's unpruned siblings. Nothing heals them (the frontier-scoped partial
+    // — the dominant snapshot frame — global-replaces only questions/
+    // permissions/unread and MERGES activity/currentVerbs), and activity is
+    // PERSISTED, so a deleted session's stale busy flag survived reloads — the
+    // observable leaks: a permanent stale badge on the deleted child's task row
+    // (ToolPart's fallback read), a phantom "Action needed" bell entry, and a
+    // persistently-armed content-stale watchdog. This pins the LOCAL prune with
+    // the same shape as the unread defense-in-depth test above: the removed
+    // session's entries go; a sibling's entries survive in every map.
+    seedRemovalSlices();
+    setState("activity", "sibling", "idle");
+    setState("currentVerbs", "sibling", { tool: "edit", state: { status: "running" } });
+    setState("permissions", "sibling", { p9: { id: "p9", sessionID: "sibling", type: "edit" } });
+    setState("questions", "sibling", { q9: { id: "q9", sessionID: "sibling", questions: [{ question: "Ok?" }] } });
+    expect(state.activity.x).toBe("busy");
+    expect(state.currentVerbs.x?.tool).toBe("read");
+    expect(state.permissions.x?.p1?.id).toBe("p1");
+    expect(state.questions.x?.q1?.id).toBe("q1");
+
+    const effects: ReconcileEffect[] = [];
+    setState(produce((s) => projectSessionRemoval(s, "x", effects)));
+
+    expect(state.activity.x).toBeUndefined();
+    expect(state.currentVerbs.x).toBeUndefined();
+    expect(state.permissions.x).toBeUndefined();
+    expect(state.questions.x).toBeUndefined();
+    // Scoped: only the removed session's facets go; the sibling keeps each one.
+    expect(state.activity.sibling).toBe("idle");
+    expect(state.currentVerbs.sibling?.tool).toBe("edit");
+    expect(state.permissions.sibling?.p9?.id).toBe("p9");
+    expect(state.questions.sibling?.q9?.id).toBe("q9");
+  });
+
+  it("the persisted activity map drops the deleted session's entry after a persist flush", () => {
+    // activity is the one pruned facet that is PERSISTED (lsActivity, store.ts
+    // persist()): without the removal prune, a reload re-seeds the deleted
+    // session's stale busy flag from localStorage (loadActivity in the store
+    // init / switchProject re-seed). Drive the REAL orchestration path —
+    // session.delete → session-removed + sync-state-dirty → persist() — and
+    // flush the 250ms debounce; the wholesale persist write must carry the
+    // pruned map.
+    vi.useFakeTimers();
+    try {
+      seedRemovalSlices();
+      setState("activity", "sibling", "busy");
+      localStorage.removeItem(lsActivity(""));
+
+      applySessionEvent("session.delete", 42, { id: "x" });
+      vi.advanceTimersByTime(250); // flush the persist debounce
+
+      const persisted = loadActivity("");
+      expect(persisted.x).toBeUndefined();
+      expect(persisted.sibling).toBe("busy");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

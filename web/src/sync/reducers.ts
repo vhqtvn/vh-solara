@@ -212,6 +212,24 @@ export function projectSessionRemoval(s: SyncState, id: string, effects: Reconci
   delete s.messagesDelivered[id];
   delete s.messagesError[id];
   delete s.refreshing[id];
+  // B2b (post-87e766a, completing the audit): prune the remaining per-session
+  // facet maps — activity, currentVerbs, permissions, questions — with the same
+  // no-leak / no-resurrect-on-id-reuse rationale as lastAgents. Nothing heals
+  // these entries once the session is gone: the frontier-scoped partial (the
+  // dominant snapshot frame) global-replaces only questions/permissions/unread
+  // and MERGES activity/currentVerbs, and activity is PERSISTED (lsActivity) so
+  // a deleted session's stale busy flag even survived reloads. The observable
+  // leaks this closes: a permanent stale activity badge on the deleted child's
+  // task row (ToolPart's fallback read), a phantom "Action needed" bell entry,
+  // and a persistently-armed content-stale watchdog. Every reader tolerates
+  // absence (ToolPart falls to idle/hidden; sessionNeedsInput → false;
+  // anySessionActive stops counting stale busy), and late out-of-order
+  // permission.delete/question.delete events are already guarded on the map's
+  // presence below.
+  delete s.activity[id];
+  delete s.currentVerbs[id];
+  delete s.permissions[id];
+  delete s.questions[id];
   // Defense-in-depth (post-33d1f43): the Go store guarantees the wire
   // unread.clear is emitted BEFORE session.delete, so the wire path never
   // leaks — but don't rely on the event. Prune the local unread entry here
