@@ -303,13 +303,19 @@ export function applyTreeFrame(
 // (sessions=""), so a busy project's background token-delta flood never delays
 // these important events. Resumable via cursor; watchdog + backoff guarded.
 //
-// `fresh` forces a full snapshot (no cursor) instead of resuming. Used on a page
-// load / project switch, where in-memory state was just hydrated from
-// localStorage and is INCOMPLETE — only sessions+activity are persisted, not
-// pending permissions/questions/unread. Resuming from the saved cursor would
-// replay only events AFTER it, so any state established before the cursor (a
-// busy activity, a pending permission/question) would be invisible. A snapshot
-// reconciles all current state authoritatively. Transient in-page reconnects
+// `fresh` omits the saved cursor and requests a fresh baseline instead of
+// resuming. Used on a page load / project switch, where in-memory state was
+// just hydrated from localStorage and is INCOMPLETE — only sessions+activity
+// are persisted, not pending permissions/questions/unread. Resuming from the
+// saved cursor would replay only events AFTER it, so any state established
+// before the cursor (a busy activity, a pending permission/question) would be
+// invisible. The baseline snapshot reconciles current state per its authority
+// scopes, NOT wholesale:
+// since Slice-A D7 a tree-only fresh connect (tree=2) ships a frontier-scoped
+// PARTIAL — questions/permissions/unread are global-replaced, but sessions/
+// activity/gate/lastAgents/currentVerbs are MERGED for frontier ids only, so
+// buried detail outside the frontier scope is preserved, not reconciled.
+// Transient in-page reconnects
 // (watchdog/onerror/visibility) resume normally: in-memory state is intact, and
 // the server falls back to a snapshot itself if the gap exceeds its ring buffer.
 // --- Feature 3: connection-vs-first-snapshot latency diagnostic (L1, FE-only) -

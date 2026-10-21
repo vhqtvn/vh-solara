@@ -106,6 +106,19 @@ export function switchProject(dir: string, fromUrl = false) {
       s.messageWindows = {};
       s.messagesDelivered = {};
       s.messagesError = {};
+      // B2b parity with the removal cascade (projectSessionRemoval, c14703e):
+      // gate/currentVerbs/refreshing are per-session facets that must NOT
+      // carry over from the outgoing project. The wire does not heal them —
+      // the fresh tree=2 connect ships a frontier-scoped partial that only
+      // MERGES in-scope ids, an epoch-change clear can't fire at a project
+      // switch (epochs live for the daemon store's lifetime), and the
+      // no-project branch receives no frame at all — so a project-A fact
+      // could otherwise leak into B or resurrect on id-reuse. All three maps
+      // are ephemeral (never persisted) and every reader tolerates absence,
+      // mirroring the removal side.
+      s.gate = {};
+      s.currentVerbs = {};
+      s.refreshing = {};
       s.activity = loadActivity(dir);
       // B2b audit: lastAgents is a per-session facet that must NOT carry over
       // from the previous project (orphan-map gap). Like activity, it is
