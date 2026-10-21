@@ -867,6 +867,16 @@ func (d *Daemon) LoadNotifyStore(path string) error {
 	if err := d.notifyHistory.setPath(path + ".history"); err != nil {
 		return err
 	}
+	// Notify-source registry anchor (notify controller-hub S2): the same
+	// derived-path convention as the history file. Set-but-bad fails
+	// startup — never a silent memory-only fallback for a configured
+	// controller. A lazy-built Daemon (zero value) gets its registry here.
+	if d.notifySources == nil {
+		d.notifySources = newNotifySourceRegistry()
+	}
+	if err := d.notifySources.armNotifySources(path + ".sources"); err != nil {
+		return err
+	}
 	d.notifyStore.setLoaded(path, f)
 	return nil
 }

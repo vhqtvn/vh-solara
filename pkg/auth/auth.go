@@ -193,10 +193,25 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 	// old passphrase/OIDC-only exemption could run). Exempt it as the very
 	// first check, before any mode logic, so no mode-specific 401 or challenge
 	// can fire on it. Exact-path match: both binaries register /vh/healthz
-	// verbatim with no sub-paths, so a string-equal comparison is both
+	// verbatim with no subpaths, so a string-equal comparison is both
 	// necessary and sufficient.
+	//
+	// /vh/internal/notify/ (exact prefix — notify controller-hub S2) is the
+	// worker's PRIVATE controller-facing surface: the fetch arrives over the
+	// yamux tunnel with a bearer token and NO browser session, so the
+	// session gate would reject the legitimate caller. The route's own
+	// constant-time bearer check (pkg/web notify_internal.go) IS the
+	// authentication for this surface — a request without the token gets
+	// the plain-404 unmounted answer, stricter than the 401 this middleware
+	// would give. On the controller edge the prefix is exempted but NOT
+	// MOUNTED (no userMux route), so it still 404s there — the exemption
+	// grants nothing publicly.
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/vh/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/vh/internal/notify/") {
 			next.ServeHTTP(w, r)
 			return
 		}

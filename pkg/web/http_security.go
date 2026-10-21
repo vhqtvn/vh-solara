@@ -204,6 +204,16 @@ func csrfGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		guarded := (strings.HasPrefix(p, "/oc/") || strings.HasPrefix(p, "/vh/")) && p != "/vh/render"
+		// /vh/internal/notify/* (notify controller-hub S2) is the bearer-
+		// token-authenticated controller surface, not a browser surface: the
+		// POST ACK carries the private token (constant-time checked in the
+		// handler), which a cross-site page cannot know or set — the CSRF
+		// threat model does not apply, and the controller sends no
+		// X-VH-CSRF header. Exempted from the header requirement only; the
+		// token check still rejects everything else with the plain 404.
+		if strings.HasPrefix(p, "/vh/internal/notify/") {
+			guarded = false
+		}
 		if unsafe[r.Method] && guarded && r.Header.Get(csrfHeader) == "" {
 			http.Error(w, "missing "+csrfHeader+" header (CSRF protection)", http.StatusForbidden)
 			return

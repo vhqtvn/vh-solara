@@ -47,6 +47,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -110,39 +111,50 @@ const (
 	fetchHeadWireBudget = 64 << 10
 )
 
-// FetchWorkerJSONBounded performs ONE bounded GET of a worker-local JSON path
-// through the real yamux tunnel and returns the response body bytes.
-//
-// Containment contract (the S1 properties, each proven in
-// tests/e2e/status_transport_s1_test.go):
-//
-//  1. stream open: bounded by min(ctx, timeout) via a race (see below);
-//  2. handshake (RawProxy write + ACK read): bounded by stream deadlines;
-//  3. response head read: bounded by stream deadlines AND a wire budget;
-//  4. body read: bounded by stream deadlines AND maxBodyBytes (cap-plus-one
-//     excess detection, never silent truncation);
-//  5. cleanup: the stream is closed on every return path; no watcher
-//     goroutine is used at all — deadlines do the unblocking — so a
-//     completed (failed or successful) fetch retains no goroutines;
-//  6. the parent tunnel is never closed; unrelated streams on the same
-//     session keep working during and after a contained failure.
-//
-// The residual cost of bounding stream-open: if the caller's bound fires
-// while OpenStream is still parked (remote backlog full — 256 unaccepted
-// streams), exactly one opener goroutine remains parked inside OpenStream
-// (plus a janitor that closes the stream when the open eventually resolves).
-// The pair resolves as soon as the backlog drains or the session closes; it
-// does not grow per call beyond that one pair.
-//
-// Total worst-case wall-clock cost is ~2× timeout unless ctx clamps it
-// tighter: the stream-open race is bounded by `timeout`, and every subsequent
-// stage is bounded by one absolute deadline at now+timeout (clamped to the
-// ctx deadline when earlier). The two windows overlap only in the pathological
-// case where the open resolves just before the timer fires.
-//
-// Read-only: this function mutates no controller state; it opens one stream,
-// performs one GET, and closes the stream.
-func (p *Proxy) FetchWorkerJSONBounded(ctx context.Context, worker *Worker, path string, timeout time.Duration, maxBodyBytes int64) ([]byte, error) {
+// workerHTTPRequest describes ONE bounded HTTP exchange to perform over the
+// raw-proxy stream. The path must pass validFetchPath; extra headers must be
+// single-line (validated here — header values are interpolated into the
+// request wire, so CR/LF or a malformed name must never reach the write).
+type workerHTTPRequest struct {
+	method  string
+	path    string
+	headers [][2]string
+	body    []byte
+	gzip64  bool // request opted into the gzip64 response envelope (z=1 paths)
+}
+
+// validWorkerHTTP guards the request-line/header surface of a
+// workerHTTPRequest before any byte reaches the stream. Server-authored in
+// practice; validated by construction so the primitive stays honest.
+func validWorkerHTTP(spec workerHTTPRequest) error {
+	switch spec.method {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch:
+	default:
+		return fmt.Errorf("invalid method %q", spec.method)
+	}
+	if err := validFetchPath(spec.path); err != nil {
+		return err
+	}
+	for _, h := range spec.headers {
+		name, val := h[0], h[1]
+		if name == "" || strings.ContainsAny(name, ": \r\n") {
+			return fmt.Errorf("invalid header name %q", name)
+		}
+		if strings.ContainsAny(val, "\r\n") {
+			return fmt.Errorf("header %q value carries CR/LF", name)
+		}
+	}
+	return nil
+}
+
+// workerHTTPBounded performs ONE bounded HTTP round trip against a worker's
+// local web port through the real yamux tunnel and returns the response body
+// bytes. This is the generalized core of FetchWorkerJSONBounded (same wire
+// framing, same containment contract — see that function's contract block);
+// the notify-hub internal fetches (FetchNotifyFeedPage / PostNotifyAck,
+// S2) ride it with method/header/body extensions. A non-200 response is an
+// error ("HTTP <status>"); only 200 bodies are returned.
+func (p *Proxy) workerHTTPBounded(ctx context.Context, worker *Worker, spec workerHTTPRequest, timeout time.Duration, maxBodyBytes int64) ([]byte, error) {
 	if worker == nil {
 		return nil, fmt.Errorf("nil worker")
 	}
@@ -166,7 +178,7 @@ func (p *Proxy) FetchWorkerJSONBounded(ctx context.Context, worker *Worker, path
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("worker %s: %w", worker.ID, err)
 	}
-	if err := validFetchPath(path); err != nil {
+	if err := validWorkerHTTP(spec); err != nil {
 		return nil, fmt.Errorf("worker %s: %w", worker.ID, err)
 	}
 	// A3: worker.ID is interpolated into the Host header below (and error
@@ -260,7 +272,7 @@ func (p *Proxy) FetchWorkerJSONBounded(ctx context.Context, worker *Worker, path
 	// but this helper only DECODES when the request opted in — a worker that
 	// envelopes unasked gets its bytes passed through raw (the JSON caller
 	// then reports them honestly as malformed).
-	gzip64 := fetchWantsGzip64(path)
+	gzip64 := spec.gzip64
 
 	// The wire cap bounds TOTAL bytes read from the stream for the whole
 	// exchange (head + framing + body): a fast-sending peer cannot push
@@ -276,9 +288,36 @@ func (p *Proxy) FetchWorkerJSONBounded(ctx context.Context, worker *Worker, path
 	wire := &budgetReader{r: stream.Raw(), budget: fetchHeadWireBudget + bodyWireCap + 1}
 	br := bufio.NewReaderSize(wire, 16<<10)
 
-	req := "GET " + path + " HTTP/1.1\r\nHost: " + worker.ID + "\r\nConnection: close\r\n\r\n"
-	if _, err := stream.Raw().Write([]byte(req)); err != nil {
+	// Request assembly: request line, Host, caller headers, Content-Length
+	// (body exchanges only), Connection: close. For the plain GET shape
+	// (no headers, no body) the bytes are IDENTICAL to the historical
+	// FetchWorkerJSONBounded request — the wrapper depends on that.
+	var req strings.Builder
+	req.WriteString(spec.method)
+	req.WriteString(" ")
+	req.WriteString(spec.path)
+	req.WriteString(" HTTP/1.1\r\nHost: ")
+	req.WriteString(worker.ID)
+	req.WriteString("\r\n")
+	for _, h := range spec.headers {
+		req.WriteString(h[0])
+		req.WriteString(": ")
+		req.WriteString(h[1])
+		req.WriteString("\r\n")
+	}
+	if len(spec.body) > 0 {
+		req.WriteString("Content-Length: ")
+		req.WriteString(strconv.Itoa(len(spec.body)))
+		req.WriteString("\r\n")
+	}
+	req.WriteString("Connection: close\r\n\r\n")
+	if _, err := stream.Raw().Write([]byte(req.String())); err != nil {
 		return nil, fetchStageErr(worker.ID, "write request", err)
+	}
+	if len(spec.body) > 0 {
+		if _, err := stream.Raw().Write(spec.body); err != nil {
+			return nil, fetchStageErr(worker.ID, "write request body", err)
+		}
 	}
 
 	resp, err := http.ReadResponse(br, nil)
@@ -316,6 +355,105 @@ func (p *Proxy) FetchWorkerJSONBounded(ctx context.Context, worker *Worker, path
 		return nil, &FetchResponseTooLargeError{WorkerID: worker.ID, Got: int64(len(body)), Cap: maxBodyBytes}
 	}
 	return body, nil
+}
+
+// FetchWorkerJSONBounded performs ONE bounded GET of a worker-local JSON path
+// through the real yamux tunnel and returns the response body bytes.
+//
+// Containment contract (the S1 properties, each proven in
+// tests/e2e/status_transport_s1_test.go):
+//
+//  1. stream open: bounded by min(ctx, timeout) via a race (see below);
+//  2. handshake (RawProxy write + ACK read): bounded by stream deadlines;
+//  3. response head read: bounded by stream deadlines AND a wire budget;
+//  4. body read: bounded by stream deadlines AND maxBodyBytes (cap-plus-one
+//     excess detection, never silent truncation);
+//  5. cleanup: the stream is closed on every return path; no watcher
+//     goroutine is used at all — deadlines do the unblocking — so a
+//     completed (failed or successful) fetch retains no goroutines;
+//  6. the parent tunnel is never closed; unrelated streams on the same
+//     session keep working during and after a contained failure.
+//
+// The residual cost of bounding stream-open: if the caller's bound fires
+// while OpenStream is still parked (remote backlog full — 256 unaccepted
+// streams), exactly one opener goroutine remains parked inside OpenStream
+// (plus a janitor that closes the stream when the open eventually resolves).
+// The pair resolves as soon as the backlog drains or the session closes; it
+// does not grow per call beyond that one pair.
+//
+// Total worst-case wall-clock cost is ~2× timeout unless ctx clamps it
+// tighter: the stream-open race is bounded by `timeout`, and every subsequent
+// stage is bounded by one absolute deadline at now+timeout (clamped to the
+// ctx deadline when earlier). The two windows overlap only in the pathological
+// case where the open resolves just before the timer fires.
+//
+// Read-only: this function mutates no controller state; it opens one stream,
+// performs one GET, and closes the stream.
+func (p *Proxy) FetchWorkerJSONBounded(ctx context.Context, worker *Worker, path string, timeout time.Duration, maxBodyBytes int64) ([]byte, error) {
+	return p.workerHTTPBounded(ctx, worker, workerHTTPRequest{
+		method: http.MethodGet,
+		path:   path,
+		gzip64: fetchWantsGzip64(path),
+	}, timeout, maxBodyBytes)
+}
+
+// validInternalNotifyToken guards the enrollment-carried feed token before
+// it is interpolated into an Authorization header value. Validate() already
+// enforces the charset at enrollment; this is the construction-side backstop
+// (defense in depth against a registry hand-planted entry).
+func validInternalNotifyToken(token string) error {
+	if token == "" {
+		return fmt.Errorf("empty internal notify token")
+	}
+	if strings.ContainsAny(token, " \r\n\"") {
+		return fmt.Errorf("internal notify token carries header-unsafe characters")
+	}
+	return nil
+}
+
+// FetchNotifyFeedPage fetches ONE page of a worker's private notify feed
+// (notify controller-hub S2 / v4 §2 step 3) through the real yamux tunnel:
+// GET /vh/internal/notify/feed?since_seq=<n>&limit=<n> with the enrolled
+// source's bearer token. The same bounded-exchange containment contract as
+// FetchWorkerJSONBounded applies (deadlines, wire budget, body cap,
+// stream-not-tunnel cleanup). maxBodyBytes must cover a full max-size page
+// (500 lean records ≈ a few hundred KiB; callers should pass MiB-scale caps).
+// The PULL LOOP that schedules these fetches is S3 — S2 proves the transport.
+func (p *Proxy) FetchNotifyFeedPage(ctx context.Context, worker *Worker, token string, sinceSeq int64, limit int, timeout time.Duration, maxBodyBytes int64) ([]byte, error) {
+	if err := validInternalNotifyToken(token); err != nil {
+		return nil, fmt.Errorf("worker %s: %w", worker.ID, err)
+	}
+	path := fmt.Sprintf("%s?since_seq=%d&limit=%d", tunnel.InternalNotifyFeedPath, sinceSeq, limit)
+	return p.workerHTTPBounded(ctx, worker, workerHTTPRequest{
+		method:  http.MethodGet,
+		path:    path,
+		headers: [][2]string{{"Authorization", "Bearer " + token}},
+	}, timeout, maxBodyBytes)
+}
+
+// PostNotifyAck delivers the controller's durable-commit watermark to a
+// worker (notify controller-hub S2 / v4 §2 step 4): POST
+// /vh/internal/notify/ack {"watermark":N} with the enrolled source's bearer
+// token. The exchange is an authenticated CONTROL MUTATION (not a
+// side-effecting GET), bounded exactly like the feed fetch. A non-200 answer
+// (e.g. the worker's 409 for a watermark beyond its durable head) surfaces
+// as a "worker %s: HTTP %d" error for the caller to classify.
+func (p *Proxy) PostNotifyAck(ctx context.Context, worker *Worker, token string, watermark int64, timeout time.Duration, maxBodyBytes int64) ([]byte, error) {
+	if err := validInternalNotifyToken(token); err != nil {
+		return nil, fmt.Errorf("worker %s: %w", worker.ID, err)
+	}
+	body, err := json.Marshal(struct {
+		Watermark int64 `json:"watermark"`
+	}{Watermark: watermark})
+	if err != nil {
+		return nil, err
+	}
+	return p.workerHTTPBounded(ctx, worker, workerHTTPRequest{
+		method:  http.MethodPost,
+		path:    tunnel.InternalNotifyAckPath,
+		headers: [][2]string{{"Authorization", "Bearer " + token}, {"Content-Type", "application/json"}},
+		body:    body,
+	}, timeout, maxBodyBytes)
 }
 
 // fetchStageErr wraps a stage failure, upgrading deadline/timeout causes to

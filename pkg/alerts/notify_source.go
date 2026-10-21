@@ -121,12 +121,23 @@ type DetectionContext struct {
 // sourceFile is the persisted document: identity + accounting + the records
 // (oldest -> newest, len <= cap).
 type sourceFile struct {
-	Epoch     string         `json:"epoch"`
-	PrevEpoch string         `json:"prevEpoch,omitempty"` // set only across a rotation whose old epoch was known
-	RotatedAt int64          `json:"rotatedAt,omitempty"` // epoch rotation time (millis), if ever rotated
-	LastSeq   int64          `json:"lastSeq"`             // highest seq ever allocated in this epoch
-	FirstSeq  int64          `json:"firstSeq"`            // seq of the oldest RETAINED record (gap floor)
-	Overflow  int64          `json:"overflow"`            // total records evicted from the head, ever (this epoch)
+	Epoch     string `json:"epoch"`
+	PrevEpoch string `json:"prevEpoch,omitempty"` // set only across a rotation whose old epoch was known
+	RotatedAt int64  `json:"rotatedAt,omitempty"` // epoch rotation time (millis), if ever rotated
+	LastSeq   int64  `json:"lastSeq"`             // highest seq ever allocated in this epoch
+	FirstSeq  int64  `json:"firstSeq"`            // seq of the oldest RETAINED record (gap floor)
+	Overflow  int64  `json:"overflow"`            // total records evicted from the head by the CAPACITY bound, ever (this epoch)
+	// AckedSeq is the controller's durable-commit watermark: the controller
+	// confirmed central ingestion through this seq (S2 / v4 §2 step 4).
+	// 0 = never ACKed.
+	AckedSeq int64 `json:"ackedSeq"`
+	// AckedTrim counts records dropped from the retained slice BY ACK
+	// trims (records ≤ a watermark the controller confirmed consumed) —
+	// deliberately separate from Overflow so capacity evictions (potential
+	// coverage gaps) never masquerade as confirmed-consumed trims. Identity:
+	// overflow + ackedTrim == firstSeq-1 (every allocated record is
+	// retained, capacity-evicted, or ack-trimmed).
+	AckedTrim int64          `json:"ackedTrim"`
 	Records   []SourceRecord `json:"records"`
 }
 
@@ -144,6 +155,8 @@ type SourceSpool struct {
 	lastSeq   int64
 	firstSeq  int64
 	overflow  int64
+	ackedSeq  int64
+	ackedTrim int64
 	records   []SourceRecord
 
 	// durableSeq is the highest seq known to be in a PERSISTED document
@@ -152,8 +165,18 @@ type SourceSpool struct {
 	// in memory: they were appended while persists were failing and become
 	// durable only when a later persist succeeds (the whole-document write
 	// carries them along). UndurableSeqRange() exposes that range for the
-	// coverage surface (B1).
+	// coverage surface (B1). ALL spool READS are bounded to durableSeq
+	// (S2): LookupBySeq and the private feed never serve the undurable
+	// tail — a record that is not durable is not feedable.
 	durableSeq int64
+
+	// ackDirty records that the current ackedSeq was applied in memory but
+	// its persist never landed (a failed AckWatermark write). The next
+	// AckWatermark call — including an otherwise-idempotent replay —
+	// retries the persist, so a watermark is never acknowledged as durable
+	// while it exists in memory only. Cleared by any successful persist
+	// (AckWatermark's own or a later Append's whole-document write).
+	ackDirty bool
 
 	// preserveFile is armed at construction when the spool file EXISTS but
 	// could not be READ (a non-IsNotExist read error, b-F1). While armed,
@@ -232,6 +255,12 @@ func loadSourceSpool(path, sourceID string, capacity int) *SourceSpool {
 				// an unparseable file takes.
 				vhlog.Logger().Error("notify source spool: persisted document failed validation — replacing source state (fresh epoch, visible rotation)",
 					"reason", verr.Error(), "file", filepath.Base(path))
+				// DEFER F1 (S1-gate follow-up): the document READ — its epoch
+				// is knowable — so the rotation names the OLD epoch in
+				// prevEpoch. The coverage surface (v4Coverage) then labels the
+				// rotation gap with the departed epoch instead of the fresh
+				// one, making the discontinuity centrally attributable.
+				s.prevEpoch = f.Epoch
 			} else {
 				s.epoch = f.Epoch
 				s.prevEpoch = f.PrevEpoch
@@ -239,6 +268,8 @@ func loadSourceSpool(path, sourceID string, capacity int) *SourceSpool {
 				s.lastSeq = f.LastSeq
 				s.firstSeq = f.FirstSeq
 				s.overflow = f.Overflow
+				s.ackedSeq = f.AckedSeq
+				s.ackedTrim = f.AckedTrim
 				s.records = append([]SourceRecord{}, f.Records...)
 				if s.firstSeq == 0 {
 					s.firstSeq = 1
@@ -312,18 +343,23 @@ func loadSourceSpool(path, sourceID string, capacity int) *SourceSpool {
 // when invalid; nil when the document is coherent, i.e. exactly the shapes
 // persistLocked writes:
 //   - lastSeq PRESENT (a missing field is invalid, not zero) and >= 0;
+//   - ackedSeq in [0, lastSeq] (the watermark can never exceed what was
+//     allocated, and is only set for durably-headable seqs);
 //   - every record seq > 0, strictly increasing in slice order (no
 //     duplicates, no reordering), and <= lastSeq;
 //   - with records retained: firstSeq == records[0].Seq, the slice is
-//     consecutive (records[i].Seq == firstSeq+i — head-only eviction leaves
+//     consecutive (records[i].Seq == firstSeq+i — head-only removal leaves
 //     no interior gaps), and it ends AT lastSeq (cap >= 1 always retains the
 //     newest allocation);
-//   - with no records retained: lastSeq == 0 and overflow == 0 (nothing was
-//     ever allocated in this epoch; firstSeq 0 is tolerated and normalized
-//     by the caller — 1 is what this code persists);
-//   - retention accounting coherent: overflow == firstSeq-1 (every evicted
-//     record advanced firstSeq once, from a base-1 sequence), which also
-//     bounds firstSeq <= lastSeq+1 on every path above.
+//   - with no records retained: EITHER nothing was ever allocated (lastSeq
+//     == 0, overflow == 0, ackedTrim == 0, firstSeq <= 1) OR every allocated
+//     record was consumed by ACK trims (S2 "ACK all": firstSeq ==
+//     lastSeq+1, ackedSeq == lastSeq, overflow+ackedTrim == lastSeq);
+//   - retention accounting coherent: overflow + ackedTrim == firstSeq-1
+//     (every not-retained record is either a capacity eviction or an
+//     ACK-trimmed one; an S1 document carries ackedTrim 0 and degenerates
+//     to the old overflow == firstSeq-1 rule), which also bounds firstSeq
+//     <= lastSeq+1 on every path above.
 func validateSourceFile(raw []byte, f *sourceFile) error {
 	// Presence probe: a MISSING lastSeq unmarshals into the value struct as
 	// 0 — indistinguishable from a persisted 0 without the pointer probe.
@@ -338,15 +374,32 @@ func validateSourceFile(raw []byte, f *sourceFile) error {
 	if f.LastSeq < 0 {
 		return fmt.Errorf("lastSeq %d is negative", f.LastSeq)
 	}
+	if f.AckedSeq < 0 || f.AckedSeq > f.LastSeq {
+		return fmt.Errorf("ackedSeq %d outside [0, lastSeq %d]", f.AckedSeq, f.LastSeq)
+	}
 	if len(f.Records) == 0 {
-		if f.LastSeq != 0 {
-			return fmt.Errorf("no records retained but lastSeq %d > 0", f.LastSeq)
+		if f.LastSeq == 0 {
+			// Fresh epoch: nothing allocated, nothing removed.
+			if f.Overflow != 0 {
+				return fmt.Errorf("no records retained but overflow %d > 0", f.Overflow)
+			}
+			if f.AckedTrim != 0 || f.AckedSeq != 0 {
+				return fmt.Errorf("no records retained but ackedTrim %d / ackedSeq %d set", f.AckedTrim, f.AckedSeq)
+			}
+			if f.FirstSeq < 0 || f.FirstSeq > 1 {
+				return fmt.Errorf("no records retained but firstSeq %d", f.FirstSeq)
+			}
+			return nil
 		}
-		if f.Overflow != 0 {
-			return fmt.Errorf("no records retained but overflow %d > 0", f.Overflow)
+		// S2 ACK-all shape: the watermark consumed everything allocated.
+		if f.AckedSeq != f.LastSeq {
+			return fmt.Errorf("no records retained with lastSeq %d but ackedSeq %d (ACK-all requires equality)", f.LastSeq, f.AckedSeq)
 		}
-		if f.FirstSeq < 0 || f.FirstSeq > 1 {
-			return fmt.Errorf("no records retained but firstSeq %d", f.FirstSeq)
+		if f.FirstSeq != f.LastSeq+1 {
+			return fmt.Errorf("no records retained but firstSeq %d != lastSeq+1 %d", f.FirstSeq, f.LastSeq+1)
+		}
+		if f.Overflow+f.AckedTrim != f.LastSeq {
+			return fmt.Errorf("no records retained but overflow %d + ackedTrim %d != lastSeq %d", f.Overflow, f.AckedTrim, f.LastSeq)
 		}
 		return nil
 	}
@@ -375,8 +428,8 @@ func validateSourceFile(raw []byte, f *sourceFile) error {
 			return fmt.Errorf("record %d seq %d breaks the consecutive run from firstSeq %d", i, got, first)
 		}
 	}
-	if f.Overflow != f.FirstSeq-1 {
-		return fmt.Errorf("overflow %d contradicts firstSeq %d (head-eviction accounting)", f.Overflow, f.FirstSeq)
+	if f.Overflow+f.AckedTrim != f.FirstSeq-1 {
+		return fmt.Errorf("overflow %d + ackedTrim %d contradicts firstSeq %d (head-removal accounting)", f.Overflow, f.AckedTrim, f.FirstSeq)
 	}
 	return nil
 }
@@ -453,9 +506,12 @@ func (s *SourceSpool) Append(n Notice, dctx DetectionContext) (SourceRecord, err
 	// Clean persist: the whole document (this record AND any earlier
 	// in-memory-only ones) is now durable, and the visible error surface
 	// must report "" — LastPersistError documents empty-when-last-clean.
+	// A clean whole-document write also lands any in-memory-only ACK
+	// watermark (ackDirty), so it is cleared here too.
 	s.durableSeq = rec.Seq
 	s.lastErr = nil
 	s.lastErrAt = time.Time{}
+	s.ackDirty = false
 	return rec, nil
 }
 
@@ -492,6 +548,7 @@ func (s *SourceSpool) persistLocked() error {
 	out, err := json.MarshalIndent(sourceFile{
 		Epoch: s.epoch, PrevEpoch: s.prevEpoch, RotatedAt: s.rotatedAt,
 		LastSeq: s.lastSeq, FirstSeq: s.firstSeq, Overflow: s.overflow,
+		AckedSeq: s.ackedSeq, AckedTrim: s.ackedTrim,
 		Records: s.records,
 	}, "", "  ")
 	if err != nil {
@@ -515,13 +572,22 @@ func (s *SourceSpool) persistLocked() error {
 // rotated spool re-allocates seqs from 1 under a fresh epoch, and an
 // old-epoch seq must not join a new-epoch record — post-rotation lookups
 // fail on the epoch check and the event serves source-omitted, the documented
-// ring-only behavior. ok=false also for seqs evicted by overflow and for
-// ring-only legacy events that predate the spool (seq 0 is never looked up).
+// ring-only behavior. ok=false also for seqs evicted by overflow, for ring-only
+// legacy events that predate the spool (seq 0 is never looked up), and — made
+// EXPLICIT in S2 — for any seq in the UNDURABLE tail (seq > the durable head):
+// the public join already refuses undurable keys by construction (the ring
+// stamps a seq only on durable success), so this bound changes no observable
+// join behavior; it makes the no-undurable-reads rule structural for ALL
+// spool reads, LookupBySeq and the private feed alike.
 //
 // Records are ordered by strictly-increasing seq, so the search is binary.
 func (s *SourceSpool) LookupBySeq(seq int64) (SourceRecord, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if seq > s.durableSeq {
+		// Durable-bound read (S2): an undurable record is never served.
+		return SourceRecord{}, false
+	}
 	lo, hi := 0, len(s.records)
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
@@ -613,4 +679,252 @@ func (s *SourceSpool) LastPersistError() string {
 		return ""
 	}
 	return s.lastErr.Error()
+}
+
+// SourceID returns the stable source identity the spool was seeded with
+// (the daemon --id — the same identity tunnel enrollment advertises).
+func (s *SourceSpool) SourceID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sourceID
+}
+
+// DurableSeq returns the durable head: the highest seq known to be inside a
+// PERSISTED document. ALL feedable reads are bounded to it (S2) — records in
+// (DurableSeq, LastSeq] exist in memory only and are never served.
+func (s *SourceSpool) DurableSeq() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.durableSeq
+}
+
+// AckedSeq returns the controller's durable-commit watermark (0 = never
+// ACKed) — the retention hint the private ACK endpoint advances.
+func (s *SourceSpool) AckedSeq() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ackedSeq
+}
+
+// AckedTrimTotal returns how many records were dropped from the retained
+// slice by ACK trims (centrally confirmed consumed), kept separate from
+// OverflowTotal's capacity evictions so coverage never mistakes a consumed
+// trim for a lost gap.
+func (s *SourceSpool) AckedTrimTotal() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ackedTrim
+}
+
+// feedPageDefaultLimit mirrors the private feed's documented page default
+// (the HTTP layer owns the client-facing constant; the spool applies the same
+// floor so a zero/negative limit can never request an unbounded page).
+const feedPageDefaultLimit = 200
+
+// FeedPage returns up to limit DURABLE records with seq strictly greater
+// than sinceSeq, ascending (the private feed's page-forward cursor
+// semantics, S2 / v4 §2 step 3): records ≤ sinceSeq are already consumed by
+// the cursor, records > the durable head are not feedable, and the page is
+// bounded by limit (≤ 0 defensively becomes the documented default). The
+// returned slice is a copy — callers cannot alias spool state.
+func (s *SourceSpool) FeedPage(sinceSeq int64, limit int) []SourceRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 {
+		limit = feedPageDefaultLimit
+	}
+	// Binary search for the first retained record with seq > sinceSeq.
+	lo, hi := 0, len(s.records)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if s.records[mid].Seq <= sinceSeq {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	out := make([]SourceRecord, 0, min(limit, len(s.records)-lo))
+	for i := lo; i < len(s.records) && len(out) < limit; i++ {
+		if s.records[i].Seq > s.durableSeq {
+			break // durable-bound read: the undurable tail is never fed
+		}
+		out = append(out, s.records[i])
+	}
+	return out
+}
+
+// SourceMeta is the durable-source state block served alongside a feed page
+// (v4 §9): identity, retention/eviction accounting, and durability state —
+// everything the controller needs to compute coverage/gaps without another
+// round trip. It is captured ATOMICALLY with the page it rides (FeedSnapshot)
+// so every number describes the SAME spool state (B1: the feed response must
+// never mix numbers from independently-locked reads).
+type SourceMeta struct {
+	SourceID         string
+	Epoch            string
+	PrevEpoch        string
+	RotatedAt        int64
+	FirstSeq         int64
+	LastSeq          int64
+	DurableSeq       int64
+	Overflow         int64
+	AckedSeq         int64
+	AckedTrim        int64
+	LastPersistError string
+}
+
+// FeedSnapshot is ONE atomic view of the private feed: a page of records,
+// the source metadata, and the resume cursor, all computed under a SINGLE
+// hold of the spool mutex (B1 — the empty-page cursor race). The old
+// two-lock composition (FeedPage, then DurableSeq as a separate critical
+// section) could interleave with a concurrent Append: an empty page read at
+// durable head N, then an Append landing N+1 durably, then DurableSeq
+// reading N+1 produced records=[] + nextSince=N+1 — and the next fetch
+// (seq > N+1) skipped record N+1 forever, with no overflow/trim marker. A
+// snapshot cannot observe half-state: NextSince is the LAST RETURNED
+// record's seq, or max(sinceSeq, the snapshot's OWN durable head) when the
+// page is empty — so an empty page always parks the cursor at the durable
+// head the EMPTY PAGE was taken at, and a record that becomes durable after
+// the snapshot is simply served by the next fetch.
+type FeedSnapshot struct {
+	Records   []SourceRecord
+	Meta      SourceMeta
+	NextSince int64
+}
+
+// FeedSnapshot returns up to limit DURABLE records with seq strictly greater
+// than sinceSeq (FeedPage's page-forward semantics), TOGETHER with the
+// source metadata and the resume cursor, all under one lock hold (B1). The
+// returned slice is a copy — callers cannot alias spool state.
+func (s *SourceSpool) FeedSnapshot(sinceSeq int64, limit int) FeedSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 {
+		limit = feedPageDefaultLimit
+	}
+	// Binary search for the first retained record with seq > sinceSeq.
+	lo, hi := 0, len(s.records)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if s.records[mid].Seq <= sinceSeq {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	out := make([]SourceRecord, 0, min(limit, len(s.records)-lo))
+	for i := lo; i < len(s.records) && len(out) < limit; i++ {
+		if s.records[i].Seq > s.durableSeq {
+			break // durable-bound read: the undurable tail is never fed
+		}
+		out = append(out, s.records[i])
+	}
+	// Cursor: the last returned record's seq, else max(since, THIS
+	// snapshot's durable head) — the max() floor keeps a stale cursor
+	// (since_seq behind an already-consumed trimmed prefix) from re-serving,
+	// while never naming a durable seq the page itself did not observe.
+	next := sinceSeq
+	if s.durableSeq > next {
+		next = s.durableSeq
+	}
+	if n := len(out); n > 0 {
+		next = out[n-1].Seq
+	}
+	firstSeq := s.firstSeq
+	if len(s.records) == 0 {
+		firstSeq = s.lastSeq + 1
+	}
+	meta := SourceMeta{
+		SourceID:   s.sourceID,
+		Epoch:      s.epoch,
+		PrevEpoch:  s.prevEpoch,
+		RotatedAt:  s.rotatedAt,
+		FirstSeq:   firstSeq,
+		LastSeq:    s.lastSeq,
+		DurableSeq: s.durableSeq,
+		Overflow:   s.overflow,
+		AckedSeq:   s.ackedSeq,
+		AckedTrim:  s.ackedTrim,
+	}
+	if s.lastErr != nil {
+		meta.LastPersistError = s.lastErr.Error()
+	}
+	return FeedSnapshot{Records: out, Meta: meta, NextSince: next}
+}
+
+// ErrAckBeyondDurableHead marks an ACK watermark the spool refuses to apply:
+// the controller may only confirm central commit through seqs that are
+// durable HERE (v4 §9.8: never ACK non-durable events). The HTTP layer maps
+// it to 409 so the controller can treat it as a retryable protocol signal,
+// not a server failure.
+var ErrAckBeyondDurableHead = errors.New("ack watermark beyond the durable head")
+
+// AckWatermark records the controller's durable-commit watermark N (central
+// ingestion succeeded through N) and MAY trim retained records ≤ N
+// (retention reclamation — optional-lazy by design; correctness lives in the
+// controller's cursor, not in the trim). Accounting stays coherent: firstSeq
+// advances past the trimmed prefix, overflow is UNTOUCHED (a consumed trim is
+// not a capacity gap), and ackedTrim accumulates the trimmed count so the
+// file invariant overflow+ackedTrim == firstSeq-1 holds.
+//
+// Idempotent and monotone: N == the current watermark is a no-op success;
+// N < the current watermark never regresses the recorded value (also a
+// no-op success — a delayed/duplicated ACK is the normal loss-retry shape,
+// v4 §3 "Tunnel drop mid-page / ACK loss"). N > the durable head is refused
+// with ErrAckBeyondDurableHead. A persist failure returns the error WITH the
+// in-memory state applied and ackDirty armed — the visible-error posture
+// (never silently acknowledge durability); the next call, including an
+// idempotent replay, retries the persist.
+func (s *SourceSpool) AckWatermark(seq int64) (trimmed int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if seq < 0 {
+		return 0, fmt.Errorf("negative watermark %d", seq)
+	}
+	if seq > s.durableSeq {
+		return 0, fmt.Errorf("%w: %d > durable head %d", ErrAckBeyondDurableHead, seq, s.durableSeq)
+	}
+	applied := false
+	if seq > s.ackedSeq {
+		s.ackedSeq = seq
+		applied = true
+		// Trim the confirmed-consumed prefix. Records ≤ seq are durable by
+		// the bound above, so this can never drop an undurable record.
+		drop := 0
+		for drop < len(s.records) && s.records[drop].Seq <= seq {
+			drop++
+		}
+		if drop > 0 {
+			s.records = s.records[drop:]
+			s.ackedTrim += int64(drop)
+			trimmed = drop
+			if len(s.records) > 0 {
+				s.firstSeq = s.records[0].Seq
+			} else {
+				s.firstSeq = s.lastSeq + 1
+			}
+		}
+	}
+	if !applied && !s.ackDirty {
+		// Pure idempotent replay of an already-persisted watermark.
+		return 0, nil
+	}
+	// Applied now, or applied earlier but never persisted (ackDirty): one
+	// whole-document persist lands the watermark (plus any in-memory-only
+	// records) durably.
+	if perr := s.persistLocked(); perr != nil {
+		s.lastErr = perr
+		s.lastErrAt = time.Now()
+		s.ackDirty = true
+		return trimmed, fmt.Errorf("notify source spool: ack persist failed: %w", perr)
+	}
+	// A1: the persist SUCCEEDED — the visible error surface must report the
+	// clean persist regardless of whether THIS call applied a new watermark
+	// or only retried a dirty one. The old `if applied` guard left the
+	// stale "ack persist failed" error on the ackDirty-retry path (a
+	// successful retry still advertised the failure it had just repaired).
+	s.ackDirty = false
+	s.lastErr = nil
+	s.lastErrAt = time.Time{}
+	return trimmed, nil
 }

@@ -80,6 +80,15 @@ type Daemon struct {
 	// zero value = unconfigured (the family's 409 posture).
 	notifyHistory notifyHistoryHolder
 
+	// notifySources is the enrolled notify-source registry (see
+	// notify_registry.go — notify controller-hub S2): which workers
+	// advertised the notify capability, their durable source identity,
+	// ownership-handshake START state, and private-feed token. Memory-only
+	// until LoadNotifyStore arms the `<notify-store>.sources` anchor; the
+	// groundwork store for S3's pull loop. HandleWorkerWS records/removes
+	// entries as registrations arrive.
+	notifySources *notifySourceRegistry
+
 	// notifyTransport is the configured push transport (see
 	// notify_transport.go): an *FCMNotifier built from
 	// --notify-fcm-credentials, a nullNotifier when the flag is unset, or
@@ -187,6 +196,11 @@ func NewDaemon(addr, daemonAddr, hostPattern string) *Daemon {
 	// eagerly so the service exists before the first request can race the
 	// lazy path; see status.go.
 	d.fleetStatus = newFleetStatusService(d)
+
+	// Enrolled notify-source registry (notify controller-hub S2): memory-only
+	// until LoadNotifyStore arms the `<notify-store>.sources` anchor.
+	// Created eagerly so handleWorkerWS never races a lazy path.
+	d.notifySources = newNotifySourceRegistry()
 	return d
 }
 
@@ -615,6 +629,24 @@ func (d *Daemon) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Worker registered: %s (%s) [Original ID: %s]", worker.ID, worker.Name, reg.WorkerID)
 	defer d.Registry.MarkWorkerOffline(worker.ID)
 
+	// Notify capability enrollment (S2 / v4 §2 step 2): record, reject, or
+	// remove the worker's source entry — GATED on the authenticated
+	// registration posture (B2: brief §2 step 2 "Require authenticated
+	// enrollment … a self-asserted worker ID is not sufficient security
+	// evidence"). With RegSecret configured, any registration that reached
+	// this point passed the constant-time secret check above, so its
+	// enrollment may be recorded. With RegSecret UNSET (open registration —
+	// the historical default posture), ANY peer can dial and self-assert a
+	// worker ID: the enrollment is then refused and the worker is
+	// explicitly represented as notify-INELIGIBLE (tunnel registration
+	// itself is unaffected — only the notify capability is refused).
+	// Runs on EVERY registration (each reconnect) so the registry tracks
+	// the CURRENT capability: a nil block is the mixed-version/disappeared
+	// path, a malformed or mismatched block is rejected without taking the
+	// tunnel down. nil registry = a Daemon built through the zero value
+	// (not NewDaemon); enrollment is skipped, never crashed on.
+	d.recordNotifyEnrollment(&reg)
+
 	// Accept streams from the client (heartbeats, responses, etc.)
 	// In the yamux model, responses come back on the stream they were sent on,
 	// so the server only needs to accept streams that the client initiates
@@ -642,6 +674,27 @@ func (d *Daemon) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 	}
+}
+
+// recordNotifyEnrollment applies the B2 authenticated-enrollment gate to one
+// arrived registration: an enrollment block is recorded ONLY when the
+// registration posture is authenticated (RegSecret configured AND the
+// constant-time check in handleWorkerWS already passed — reaching here with
+// a secret configured means it verified). In the open posture (RegSecret
+// unset) a carried notify block is refused and the worker is explicitly
+// marked notify-INELIGIBLE in the registry; a nil block takes the ordinary
+// capability-disappeared/removal path in EITHER posture (the legacy wire
+// shape — absence stays the ineligible representation for workers that
+// never advertised the capability at all).
+func (d *Daemon) recordNotifyEnrollment(reg *tunnel.RegisterMessage) {
+	if d.notifySources == nil {
+		return
+	}
+	if reg.Notify != nil && d.RegSecret == "" {
+		d.notifySources.MarkNotifyIneligible(reg.WorkerID, reg.WorkerName)
+		return
+	}
+	d.notifySources.RecordNotifyEnrollment(reg.Notify, reg.WorkerID, reg.WorkerName)
 }
 
 // placeholder handlers for API routes

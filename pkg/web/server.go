@@ -168,6 +168,13 @@ type Server struct {
 	// (only safe on a loopback bind; see auth.CheckBindSafety).
 	auth *auth.Authenticator
 
+	// internalNotify, when armed (EnableInternalNotify — notify controller-
+	// hub S2), holds the private /vh/internal/notify/* surface: the bearer
+	// token, the alerts engine whose durable source spool the feed serves,
+	// and the enrollment context NotifyEnrollment() reads. nil = the surface
+	// is not armed and those paths answer the plain unmounted 404.
+	internalNotify *internalNotifyFeature
+
 	// idem dedups typed write verbs by their idempotency_key (A1).
 	idem *idemCache
 

@@ -71,6 +71,10 @@ var clientDaemonCmd = &cobra.Command{
 		// true worker versions). Was a hardcoded "0.1.0" placeholder.
 		proxy := agent.NewProxy(rt.webPort)
 		daemon := agent.NewDaemon(daemonController, rt.workerID, rt.workerName, Version, rt.headerMap, proxy)
+		// Notify capability enrollment (controller-hub S2): the provider is
+		// armed by setupVHMode after InitAlerts; nil (web-mode error, or a
+		// non-vh web mode) registers without the block — the pre-S2 shape.
+		daemon.SetNotifyEnroll(rt.notifyEnroll)
 
 		// Teardown + health owners.
 		rt.attachKillFunc(daemon)

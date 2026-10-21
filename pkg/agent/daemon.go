@@ -29,11 +29,27 @@ type Daemon struct {
 	KillFunc      func()
 	HealthCheck   func() bool
 
+	// notifyEnroll, when set (notify controller-hub S2), is the live
+	// provider for the notify capability advertisement attached to EVERY
+	// tunnel registration. A func (not a snapshot) so each reconnect reads
+	// the CURRENT source epoch and ownership state — a mid-run spool
+	// rotation must not re-advertise a stale epoch. Set BEFORE Start; nil
+	// (or a nil return) registers WITHOUT the block — the pre-S2 wire
+	// shape, which every controller still accepts.
+	notifyEnroll func() *tunnel.NotifyEnrollment
+
 	healthCheckMu sync.Mutex
 	lastHealthCh  time.Time
 
 	ctx    context.Context
 	cancel context.CancelFunc
+}
+
+// SetNotifyEnrollment installs the notify capability advertisement provider
+// read at each tunnel registration. Safe to call before Start only — the
+// reconnect loop reads the field without a lock.
+func (d *Daemon) SetNotifyEnroll(fn func() *tunnel.NotifyEnrollment) {
+	d.notifyEnroll = fn
 }
 
 func NewDaemon(controller string, id string, name string, version string, headers map[string]string, proxy *Proxy) *Daemon {
@@ -284,6 +300,13 @@ func (d *Daemon) handleTunnel(conn *websocket.Conn, deflate tunnel.DeflatePolicy
 		},
 		WorkerName: d.WorkerName,
 		Version:    d.Version,
+	}
+	// Notify capability enrollment (S2): attach the CURRENT advertisement —
+	// nil (no provider, or the surface not armed) keeps the legacy wire
+	// shape, which old controllers ignore and new controllers treat as
+	// notify-ineligible (v4 §9.7 mixed-version row).
+	if d.notifyEnroll != nil {
+		reg.Notify = d.notifyEnroll()
 	}
 	if err := regStream.WriteJSON(reg); err != nil {
 		log.Printf("Failed to send register: %v", err)

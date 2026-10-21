@@ -11,6 +11,7 @@ import (
 
 	"github.com/vhqtvn/vh-solara/pkg/oclife"
 	"github.com/vhqtvn/vh-solara/pkg/procmgr"
+	"github.com/vhqtvn/vh-solara/pkg/tunnel"
 	"github.com/vhqtvn/vh-solara/pkg/web"
 )
 
@@ -55,6 +56,12 @@ type clientDaemonRuntime struct {
 	// The death watchers are bound to it, so daemon shutdown stops them.
 	vhCtx  context.Context
 	vhHTTP *http.Server
+	// notifyEnroll, when set (notify controller-hub S2), is the web Server's
+	// live notify-enrollment provider handed to the tunnel agent — read at
+	// every tunnel registration so reconnects advertise the CURRENT source
+	// epoch and ownership state. nil in standalone/error postures (the agent
+	// then registers without the notify block — the pre-S2 wire shape).
+	notifyEnroll func() *tunnel.NotifyEnrollment
 	// vhSrv is the vh web Server (set only in the WebOpenChamber case where
 	// the daemon builds it). Hoisted to this scope so daemon.KillFunc (after
 	// the switch) can cancel + await its owned background goroutines.

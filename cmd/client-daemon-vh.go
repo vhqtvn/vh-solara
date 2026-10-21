@@ -314,12 +314,13 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 	// this function returns, which is before agent.NewDaemon (client-daemon
 	// .go:73) starts the tunnel. The identity is the same --id/--name the
 	// RegisterMessage carries (no parallel identity).
-	if alertEngine, err := srv.InitAlerts(vhCtx, web.AlertsOptions{
+	alertEngine, alertErr := srv.InitAlerts(vhCtx, web.AlertsOptions{
 		ControllerURL: daemonController,
 		WorkerID:      rt.workerID,
 		WorkerName:    rt.workerName,
-	}); err != nil {
-		log.Printf("alerts engine disabled: %v", err)
+	})
+	if alertErr != nil {
+		log.Printf("alerts engine disabled: %v", alertErr)
 	} else if rt.ocWatcher != nil {
 		// oc-death-watch S2: route the death watcher's notifications
 		// through the alerts engine — exactly one "OpenCode down" notice
@@ -330,6 +331,19 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 		rt.ocWatcher.SetAlert(func(event, detail string) {
 			alertEngine.EmitDaemonNotice(detail)
 		})
+	}
+
+	// Notify controller-hub S2: arm the PRIVATE notify surface (the
+	// bearer-gated /vh/internal/notify/feed + /ack routes over the worker's
+	// single web port) and record the live enrollment provider the tunnel
+	// agent reads at every registration. The token is minted per process and
+	// shared ONLY through the tunnel-carried registration block — it never
+	// appears on a public surface. Armed in standalone mode too (harmless
+	// there: no controller means no registration carries it); a controller-
+	// mode daemon fenced local FCM before this point — the S1 invariant.
+	if alertEngine != nil {
+		srv.EnableInternalNotify(alertEngine, web.NewInternalNotifyToken(), daemonController != "")
+		rt.notifyEnroll = srv.NotifyEnrollment
 	}
 
 	handler := srv.Handler()

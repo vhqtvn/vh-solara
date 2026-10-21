@@ -23,6 +23,7 @@ import (
 
 	"github.com/vhqtvn/vh-solara/pkg/agent"
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
+	"github.com/vhqtvn/vh-solara/pkg/alerts"
 	"github.com/vhqtvn/vh-solara/pkg/auth"
 	"github.com/vhqtvn/vh-solara/pkg/fixtures"
 	"github.com/vhqtvn/vh-solara/pkg/server"
@@ -47,6 +48,18 @@ type Cluster struct {
 	// tunnel). Always set before StartCluster returns.
 	Daemon *server.Daemon
 
+	// AlertsEngine is the worker-side alerts engine, set ONLY when the
+	// cluster was started WithNotifyEnrollment (notify controller-hub S2):
+	// its Source() spool is the private feed's record store, and tests use
+	// it to append feed records directly (detection integration is
+	// S1-proven; the feed tests need only durable records in the spool).
+	AlertsEngine *alerts.Engine
+	// NotifyToken is the worker's private-surface bearer token (set ONLY
+	// with WithNotifyEnrollment) — the SAME value the controller's source
+	// registry holds after enrollment. Tests use it to drive authenticated
+	// fetches and to assert denial when it is withheld.
+	NotifyToken string
+
 	fakeSrv   *httptest.Server
 	workerSrv *httptest.Server
 	webSrv    *web.Server
@@ -60,8 +73,10 @@ const ringCap = 1000
 type ClusterOption func(*clusterOptions)
 
 type clusterOptions struct {
-	hostPattern string
-	passphrase  string
+	hostPattern  string
+	passphrase   string
+	notifyEnroll bool
+	regSecret    string
 }
 
 // WithHostPattern sets the controller daemon's host-based provisioning
@@ -80,6 +95,30 @@ func WithHostPattern(pattern string) ClusterOption {
 // harness's own readiness polling is unaffected.
 func WithPassphraseAuth(passphrase string) ClusterOption {
 	return func(o *clusterOptions) { o.passphrase = passphrase }
+}
+
+// WithNotifyEnrollment arms the worker's notify-hub S2 surface: the harness
+// web server runs InitAlerts (durable source spool + ownership fence,
+// grounded at VH_STATE_DIR) and EnableInternalNotify (the bearer-gated
+// private /vh/internal/notify/* routes), and the tunnel agent attaches the
+// live enrollment to EVERY registration — exactly the production wiring of
+// cmd/client-daemon-vh.go, in-process. IMPORTANT: the caller must pin
+// VH_STATE_DIR (t.Setenv) to a temp dir BEFORE StartCluster — the alerts
+// config, spool, and ownership state ground there; without it the harness
+// would touch the operator's real state directory.
+func WithNotifyEnrollment() ClusterOption {
+	return func(o *clusterOptions) { o.notifyEnroll = true }
+}
+
+// WithRegSecret sets the controller daemon's worker-registration secret
+// (X-VH-Worker-Secret) AND arms the harness agent's dial with the matching
+// header — the AUTHENTICATED registration posture (notify controller-hub
+// B2: notify enrollment is recorded only from an authenticated
+// registration). Default "" keeps the historical open-registration posture
+// (existing clusters unchanged; under it a carried notify block is refused
+// and the worker is marked notify-ineligible).
+func WithRegSecret(secret string) ClusterOption {
+	return func(o *clusterOptions) { o.regSecret = secret }
 }
 
 // StartCluster brings the whole stack up and waits until the worker is online.
@@ -106,6 +145,18 @@ func StartClusterWithOptions(opts ...ClusterOption) (*Cluster, error) {
 	c.Fake = fixtures.New()
 	c.fakeSrv = httptest.NewServer(c.Fake.Handler())
 
+	// 1b. Reserve the controller's loopback ports up front (independent of
+	// the worker section; the notify-hub S2 arming below needs the real
+	// daemon address for the controller-mode posture).
+	userAddr, err := freeAddr()
+	if err != nil {
+		return nil, err
+	}
+	daemonAddr, err := freeAddr()
+	if err != nil {
+		return nil, err
+	}
+
 	// 2. Worker: vh-solara's own web server (--web vh) over the fake, aggregator
 	//    running so the store hydrates from the fixture sessions.
 	agg := aggregator.New(c.fakeSrv.URL, ringCap)
@@ -115,6 +166,26 @@ func StartClusterWithOptions(opts ...ClusterOption) (*Cluster, error) {
 		return nil, err
 	}
 	c.webSrv = wsrv
+
+	// Notify-hub S2 option: arm the durable source + private surface on the
+	// harness web server BEFORE the tunnel agent exists (the production
+	// order — InitAlerts fences local FCM before agent.NewDaemon). The
+	// enrollment provider is attached to the agent below, once it exists.
+	if cfg.notifyEnroll {
+		token := web.NewInternalNotifyToken()
+		eng, aerr := wsrv.InitAlerts(ctx, web.AlertsOptions{
+			ControllerURL: "ws://" + daemonAddr + "/vh-solara/ws",
+			WorkerID:      c.WorkerID,
+			WorkerName:    "worker",
+		})
+		if aerr != nil {
+			return nil, fmt.Errorf("harness InitAlerts: %w", aerr)
+		}
+		wsrv.EnableInternalNotify(eng, token, true)
+		c.AlertsEngine = eng
+		c.NotifyToken = token
+	}
+
 	c.workerSrv = httptest.NewServer(wsrv.Handler())
 	c.WorkerVHURL = c.workerSrv.URL
 	webPort, err := portOf(c.workerSrv.URL)
@@ -122,17 +193,15 @@ func StartClusterWithOptions(opts ...ClusterOption) (*Cluster, error) {
 		return nil, err
 	}
 
-	// 3. Controller daemon on free loopback ports.
-	userAddr, err := freeAddr()
-	if err != nil {
-		return nil, err
-	}
-	daemonAddr, err := freeAddr()
-	if err != nil {
-		return nil, err
-	}
+	// 3. Controller daemon on free loopback ports (reserved in 1b).
 	d := server.NewDaemon(userAddr, daemonAddr, cfg.hostPattern)
 	d.APIToken = c.APIToken
+	if cfg.regSecret != "" {
+		// B2: the authenticated registration posture — handleWorkerWS then
+		// requires the constant-time secret match before any enrollment is
+		// recorded.
+		d.RegSecret = cfg.regSecret
+	}
 	if cfg.passphrase != "" {
 		a, err := auth.New(ctx, auth.Config{Mode: auth.ModePassphrase, Passphrase: cfg.passphrase})
 		if err != nil {
@@ -150,7 +219,16 @@ func StartClusterWithOptions(opts ...ClusterOption) (*Cluster, error) {
 	// 4. Worker agent: dial the controller's tunnel endpoint, proxy to the worker
 	//    vh server's port.
 	proxy := agent.NewProxy(webPort)
-	ag := agent.NewDaemon("ws://"+daemonAddr+"/vh-solara/ws", c.WorkerID, "worker", "test", nil, proxy)
+	var dialHeaders map[string]string
+	if cfg.regSecret != "" {
+		dialHeaders = map[string]string{"X-VH-Worker-Secret": cfg.regSecret}
+	}
+	ag := agent.NewDaemon("ws://"+daemonAddr+"/vh-solara/ws", c.WorkerID, "worker", "test", dialHeaders, proxy)
+	if cfg.notifyEnroll {
+		// The live enrollment provider — every (re)connect advertises the
+		// CURRENT source epoch/ownership state, exactly like production.
+		ag.SetNotifyEnroll(wsrv.NotifyEnrollment)
+	}
 	go ag.Start()
 
 	// 5. Wait until the worker registers and shows online.
