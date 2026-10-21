@@ -2,7 +2,7 @@
 
 **Status.** v4 is **approved design / pre-implementation** (operator-approved
 2026-10-20/21; design authority: the consolidated controller-hub brief at
-`tmp/notify-controller-hub-brief.md` — a researcher → debate → planner chain —
+`docs/architecture/notify-controller-hub-brief.md` — a researcher → debate → planner chain —
 with the open timestamp gate subsequently executed and settled as Position C,
 §7.2). Server-side, v1–v3 are implemented at commits `70607590` (slice 1:
 history ring + token registry + routes), `26cd6add` (slice 2: FCM HTTP v1
@@ -84,7 +84,7 @@ Three additive changes, client-approved; no v2 field changed shape.
 
 Centralization per the operator's controller-hub requirement, plus one
 negotiated breaking type change. Design authority:
-`tmp/notify-controller-hub-brief.md`; timestamp verdict in §7.2.
+`docs/architecture/notify-controller-hub-brief.md`; timestamp verdict in §7.2.
 
 - **(a) Centralization.** The controller owns the public `/vh/notify/*`
   surface on **every host it serves** — the main host and every per-worker
@@ -678,7 +678,7 @@ unchanged cookie + CSRF semantics on the central routes.
 
 - **Superseded:** direct-to-worker (2026-10-14) → controller-owned public
   surface (operator directive, 2026-10-20/21; brief
-  `tmp/notify-controller-hub-brief.md`; this v4 bump).
+  `docs/architecture/notify-controller-hub-brief.md`; this v4 bump).
 - **Timestamp gate (executed after the brief):** the brief flagged
   `ts`-number-vs-string as a **release gate** — Pulse declares
   `ts: String?` while v3 emitted a JSON number; the brief required running
