@@ -181,7 +181,7 @@ func TestNotifyLifecycleThroughRealInitAlerts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("web.NewServer: %v", err)
 	}
-	engine, err := srv.InitAlerts(ctx) // the REAL production wiring
+	engine, err := srv.InitAlerts(ctx, web.AlertsOptions{}) // the REAL production wiring (standalone posture: local FCM active)
 	if err != nil {
 		t.Fatalf("InitAlerts: %v", err)
 	}
@@ -456,7 +456,7 @@ func bootNotifyLifecycle(t *testing.T) (*httptest.Server, *notifyFCMMock, *state
 	if err != nil {
 		t.Fatalf("web.NewServer: %v", err)
 	}
-	engine, err := srv.InitAlerts(ctx) // the REAL production wiring
+	engine, err := srv.InitAlerts(ctx, web.AlertsOptions{}) // the REAL production wiring (standalone posture: local FCM active)
 	if err != nil {
 		t.Fatalf("InitAlerts: %v", err)
 	}

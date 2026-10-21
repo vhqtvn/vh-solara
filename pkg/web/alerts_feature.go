@@ -2,21 +2,45 @@ package web
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/alerts"
+	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
 func durSec(s int) time.Duration { return time.Duration(s) * time.Second }
+
+// AlertsOptions carries the daemon's controller posture and worker identity
+// into the alerts stack (notify controller-hub S1). The zero value is the
+// standalone/v3 posture: no controller URL, default local identity — exactly
+// what fixtureserver and the integration tests run with.
+type AlertsOptions struct {
+	// ControllerURL is the daemon's --controller connect configuration.
+	// Non-empty ⇒ controller mode ⇒ local FCM fenced at init (v4 (j)).
+	ControllerURL string
+	// WorkerID is the daemon's stable controller identity (--id, the same
+	// value RegisterMessage carries — not a parallel identity). Defaults to
+	// "local" when empty.
+	WorkerID string
+	// WorkerName is the display name (--name). Defaults to "local".
+	WorkerName string
+}
 
 // InitAlerts builds the daemon-side notifications engine, mounts its management
 // API, and wires it to subscribe each project store as it comes up. The config
 // lives at VH_STATE_DIR/alerts.jsonc (seeded with defaults on first run). The
 // detector watchers run until ctx is cancelled (daemon teardown). Returns the
 // engine (nil on config load error, which is non-fatal to the daemon).
-func (s *Server) InitAlerts(ctx context.Context) (*alerts.Engine, error) {
+//
+// S1 additions: the durable source spool (the feed's authoritative record
+// store) attaches unconditionally, and the ownership fence runs BEFORE the
+// notifier could attach — in controller mode local FCM is disabled at this
+// point, which is before the tunnel agent starts (InitAlerts runs inside
+// setupWebMode at client-daemon.go:65; agent.NewDaemon at :73 starts later).
+func (s *Server) InitAlerts(ctx context.Context, opts AlertsOptions) (*alerts.Engine, error) {
 	store, err := alerts.NewStore(alerts.ConfigPath(stateBaseDir()))
 	if err != nil {
 		return nil, err
@@ -29,25 +53,51 @@ func (s *Server) InitAlerts(ctx context.Context) (*alerts.Engine, error) {
 	if pusher, perr := alerts.NewPusher(store, presence, stateBaseDir()); perr == nil {
 		engine.SetPusher(pusher)
 	}
+	// Durable source (S1): every emitted notice gets a durable
+	// (source_id, epoch, seq) record — the ring stays the public id space,
+	// the spool is the authoritative feed source going forward.
+	workerID := opts.WorkerID
+	if workerID == "" {
+		workerID = "local"
+	}
+	workerName := opts.WorkerName
+	if workerName == "" {
+		workerName = "local"
+	}
+	engine.SetSource(alerts.NewSourceSpool(stateBaseDir(), workerID, alerts.SourceSpoolCap))
+
+	// Ownership fence (S1, v4 (j)/§9.4): controller mode ⇒ local FCM never
+	// attaches — structurally, so no later reconnect/timeout path can revive
+	// it. Fail-closed: missing/corrupt ownership state in controller mode
+	// also leaves it disabled (with the visible disposition note below).
+	own := alerts.DecideNotifyOwnership(stateBaseDir(), opts.ControllerURL != "")
+	if own.LocalFCMFenced {
+		level := slog.LevelInfo
+		if own.Healed {
+			level = slog.LevelWarn
+		}
+		vhlog.Logger().Log(ctx, level, "notify: local FCM fenced", "controller_mode", own.ControllerMode, "healed", own.Healed, "disposition", own.Note)
+	}
 	// Notify channel: daemon-global notice-history ring + FCM token registry
 	// + the /vh/notify/* routes, plus (Slice 2) the FCM sender itself. The
 	// registry is shared between the routes and the sender — the sender fans
 	// out to List() and prunes dead tokens via Prune(). The sender attaches
-	// ONLY when the config carries a credentials file AND it loads; a load
-	// failure silently disables the channel (NotifyReady false → probe
-	// enabled:false, upserts 503) without touching anything else in alerts.
+	// ONLY when the config carries a credentials file AND it loads AND the
+	// ownership fence permits local sending; a load failure silently
+	// disables the channel (NotifyReady false → probe enabled:false, upserts
+	// 503) without touching anything else in alerts.
 	// (v3) The attached sender also runs the periodic channel-health log
 	// line (window counters) until ctx is cancelled; its per-failure logging
 	// rides the daemon's shared vhlog logger (see pkg/vhlog).
 	tokens := alerts.NewTokenRegistry(stateBaseDir())
-	if store.Get().NotifyConfigured() {
+	if store.Get().NotifyConfigured() && !own.LocalFCMFenced {
 		if notifier, nerr := alerts.NewNotifier(store, presence, tokens); nerr == nil {
 			engine.SetNotifier(notifier)
 			notifier.StartHealthLoop(ctx, 0) // daemon default interval
 		}
 	}
 	engine.SetHistory(alerts.NewHistory(stateBaseDir()))
-	s.RegisterFeature(notifyFeature{engine: engine, tokens: tokens})
+	s.RegisterFeature(notifyFeature{engine: engine, tokens: tokens, workerID: workerID, workerName: workerName})
 	s.RegisterFeature(alertsFeature{engine: engine})
 	s.SetAggHook(func(dir string, a *aggregator.Aggregator) {
 		engine.Attach(ctx, dir, a.Store())

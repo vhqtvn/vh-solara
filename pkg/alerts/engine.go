@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/state"
+	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
 const sweepInterval = 20 * time.Second
@@ -21,9 +22,10 @@ type Engine struct {
 	cfg        *Store
 	presence   *Presence
 	dispatcher *Dispatcher
-	pusher     *Pusher   // optional; nil if Web Push is unavailable
-	notifier   *Notifier // optional; nil until SetNotifier (FCM notify channel)
-	history    *History  // optional; nil until SetHistory (notice history ring)
+	pusher     *Pusher      // optional; nil if Web Push is unavailable
+	notifier   *Notifier    // optional; nil until SetNotifier (FCM notify channel)
+	history    *History     // optional; nil until SetHistory (notice history ring)
+	source     *SourceSpool // optional; nil until SetSource (durable feed source, S1)
 
 	mu       sync.Mutex
 	watchers map[string]*watcher // dir -> watcher
@@ -68,6 +70,14 @@ func (e *Engine) SetHistory(h *History) { e.history = h }
 // nil when never attached; History.Query is nil-safe.
 func (e *Engine) History() *History { return e.history }
 
+// SetSource attaches the durable notice source (the controller-hub feed's
+// authoritative record store). Optional: without it the engine runs unchanged
+// (tests construct it bare) and notices simply aren't durably sourced.
+func (e *Engine) SetSource(s *SourceSpool) { e.source = s }
+
+// Source exposes the durable notice source. May be nil when never attached.
+func (e *Engine) Source() *SourceSpool { return e.source }
+
 // NotifyReady reports whether the FCM notify channel is BOTH configured in
 // the alerts config (a notify section with a credentials file) AND has its
 // sender attached. The /vh/notify/tokens probe reports enabled:false and
@@ -77,17 +87,62 @@ func (e *Engine) NotifyReady() bool {
 	return e.cfg.Get().NotifyConfigured() && e.notifier != nil
 }
 
-// recordNotice enters a detected notice into the daemon-global history ring
-// BEFORE any delivery gating — the dispatcher and pusher apply profile /
-// attendance / cooldown suppression downstream, and the history contract
-// requires suppressed notices to be retained too. Nil history is a no-op
-// (bare engines in tests). A persistence failure inside Record is swallowed
-// there: retention must never block delivery.
+// recordNotice enters a detected notice into the durable source spool AND the
+// daemon-global history ring BEFORE any delivery gating — the dispatcher and
+// pusher apply profile / attendance / cooldown suppression downstream, and
+// the history contract requires suppressed notices to be retained too. Nil
+// history/spool is a no-op (bare engines in tests). The spool append carries
+// the detection-time snapshot (attendance + idle window + profile
+// eligibility, v4 (h)) captured HERE, once, before any downstream gating
+// could observe a different state.
+//
+// Correlation ownership (t1b-F1): the SPOOL appends FIRST and its durable seq
+// is the correlation key — the ring event then CARRIES (spoolSeq, spoolEpoch)
+// so public history joins the spool BY SEQ. The seq is stamped ONLY when the
+// append durably succeeded: an undurable seq can be re-allocated to a
+// different notice after a crash, so a failed append leaves the ring event
+// key-less (source omitted — documented). This makes ring id reuse — after a
+// ring-file loss, corrupt recovery, or a persist failure rolled back to the
+// last readable file — structurally unable to re-join an older record.
+//
+// The ring event retains n.Kind (the detection-time waiting subtype) ALWAYS —
+// not only on spool success: the notice's true condition (§9.1 waiting
+// kind=question ⇒ question_pending) is servable from the ring alone when the
+// spool record is unavailable (failed append, or a later rotation/eviction
+// dropped it).
+//
+// Persistence failures on BOTH stores are logged visibly (the spool's
+// §9.8 posture): neither a failed spool append nor a failed ring write is
+// ever silently assumed durable.
 func (e *Engine) recordNotice(n Notice) {
-	if e.history == nil {
+	if e.history == nil && e.source == nil {
 		return
 	}
-	_ = e.history.Record(n)
+	var dctx DetectionContext
+	if e.source != nil {
+		cfg := e.cfg.Get()
+		dctx = DetectionContext{
+			Attended:        e.presence.Attended(time.Duration(cfg.Detect.IdleSec) * time.Second),
+			IdleSec:         cfg.Detect.IdleSec,
+			ProfileEligible: cfg.ActiveProfile().wantsType(n.Type),
+		}
+	}
+	var spoolSeq int64
+	var spoolEpoch string
+	if e.source != nil {
+		rec, err := e.source.Append(n, dctx)
+		if err != nil {
+			vhlog.Logger().Error("notify source spool: notice NOT durably recorded", "error", err, "type", n.Type, "sessionID", n.SessionID)
+		} else {
+			spoolSeq = rec.Seq // durable: safe for the ring event to join by
+			spoolEpoch = e.source.Epoch()
+		}
+	}
+	if e.history != nil {
+		if _, err := e.history.Record(n, spoolSeq, spoolEpoch); err != nil {
+			vhlog.Logger().Error("notify history ring: notice NOT persisted", "error", err, "type", n.Type, "sessionID", n.SessionID)
+		}
+	}
 }
 
 // Config exposes the config store (for settings endpoints).

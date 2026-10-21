@@ -351,6 +351,14 @@ func notifyCondition(n Notice) string {
 	}
 }
 
+// ConditionOf is the exported view of the §9.1 notice-type → condition
+// mapping, for surfaces that render history records (the v4 public history
+// DTO's `kind` field). It is a pure function over the notice fields the ring
+// and spool records carry; a ring-only legacy waiting record (no Kind — the
+// distinction was push-only before v4) maps to permission_pending, the
+// documented default.
+func ConditionOf(n Notice) string { return notifyCondition(n) }
+
 // buildMessage renders the data-only FCM message for one token. All data
 // values are strings (FCM requirement). `waiting` goes out HIGH priority —
 // load-bearing: normal-priority FCM is deferred by Android Doze.

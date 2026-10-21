@@ -16,7 +16,10 @@ import (
 )
 
 func rec(h *History, typ, sid string) HistoryEvent {
-	return h.Record(Notice{
+	// spoolSeq 0 / "" epoch: recorded without a durable source record (the
+	// bare-ring posture; the spool-carrying tap is pinned in
+	// notify_source_test.go).
+	ev, err := h.Record(Notice{
 		Type:      typ,
 		SessionID: sid,
 		Root:      sid,
@@ -24,7 +27,11 @@ func rec(h *History, typ, sid string) HistoryEvent {
 		Title:     "T-" + sid,
 		Detail:    "d",
 		Ts:        time.Now().UnixMilli(),
-	})
+	}, 0, "")
+	if err != nil {
+		panic("record: " + err.Error()) // test helper: a tmp-dir persist must succeed
+	}
+	return ev
 }
 
 func ids(events []HistoryEvent) []int64 {
@@ -202,6 +209,156 @@ func TestHistoryPersistenceShape(t *testing.T) {
 	}
 }
 
+// TestHistoryRecordCarriesSpoolCorrelationKey pins the reversed correlation
+// (t1b-F1): Record stamps the spool-owned (epoch, seq) into the INTERNAL
+// ring record and persists it — the key public history joins by. Zero-key
+// records (bare ring / failed spool append) persist with the fields omitted.
+func TestHistoryRecordCarriesSpoolCorrelationKey(t *testing.T) {
+	dir := t.TempDir()
+	h := NewHistory(dir)
+	rec(h, TypeWaiting, "s1") // zero-key posture
+	ev, err := h.Record(Notice{Type: TypeWaiting, Kind: KindQuestion, SessionID: "s2", Root: "s2",
+		Project: "p", Title: "t", Detail: "d", Ts: 7}, 9, "ep-1")
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if ev.SpoolSeq != 9 || ev.SpoolEpoch != "ep-1" {
+		t.Fatalf("event key = (%d, %q), want (9, \"ep-1\")", ev.SpoolSeq, ev.SpoolEpoch)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "notify-history.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f historyFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Events) != 2 {
+		t.Fatalf("want 2 events, got %d", len(f.Events))
+	}
+	if f.Events[0].SpoolSeq != 0 || f.Events[0].SpoolEpoch != "" {
+		t.Fatalf("zero-key record must persist key-less: %+v", f.Events[0])
+	}
+	if f.Events[1].SpoolSeq != 9 || f.Events[1].SpoolEpoch != "ep-1" {
+		t.Fatalf("persisted key drift: %+v", f.Events[1])
+	}
+	// omitempty keeps the zero-key record lean in the document: exactly one
+	// spoolSeq occurrence for the two events.
+	if n := strings.Count(string(raw), `"spoolSeq"`); n != 1 {
+		t.Fatalf("spoolSeq occurrences = %d, want 1 (zero-key records omit it): %s", n, raw)
+	}
+}
+
+// TestHistoryRecordRetainsNoticeKind pins the ring's INDEPENDENT subtype
+// retention (the F3 fix): Record stamps n.Kind into the event ALWAYS — with a
+// correlation key, with a zero key (spool append failed), and the persisted
+// document carries it. A pre-S1 legacy document without the field loads with
+// "" (the additive omitempty format rule), and Kind-less records persist
+// without the field.
+func TestHistoryRecordRetainsNoticeKind(t *testing.T) {
+	dir := t.TempDir()
+	h := NewHistory(dir)
+
+	// Zero-key posture (the failed-spool-append shape): the subtype is
+	// retained regardless of the correlation key.
+	ev, err := h.Record(Notice{Type: TypeWaiting, Kind: KindQuestion, SessionID: "s1", Root: "s1",
+		Project: "p", Title: "t", Detail: "d", Ts: 1}, 0, "")
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if ev.Kind != KindQuestion {
+		t.Fatalf("zero-key event Kind = %q, want %q (retention is key-independent)", ev.Kind, KindQuestion)
+	}
+	// Keyed posture: same retention.
+	ev2, err := h.Record(Notice{Type: TypeWaiting, Kind: KindPermission, SessionID: "s2", Root: "s2",
+		Project: "p", Title: "t", Detail: "d", Ts: 2}, 4, "ep")
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if ev2.Kind != KindPermission {
+		t.Fatalf("keyed event Kind = %q, want %q", ev2.Kind, KindPermission)
+	}
+
+	// Persisted document carries the retained subtype; the Kind-less
+	// non-waiting records below omit the field (omitempty).
+	if _, err := h.Record(Notice{Type: TypeFinished, SessionID: "s3", Root: "s3", Ts: 3}, 0, ""); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "notify-history.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f historyFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("persisted doc: %v", err)
+	}
+	if len(f.Events) != 3 || f.Events[0].Kind != KindQuestion || f.Events[1].Kind != KindPermission {
+		t.Fatalf("persisted kinds drift: %+v", f.Events)
+	}
+	if f.Events[2].Kind != "" || !strings.Contains(string(raw), `"kind": "question"`) {
+		t.Fatalf("kind retention/persistence drift: events=%+v raw=%s", f.Events, raw)
+	}
+	if n := strings.Count(string(raw), `"kind"`); n != 2 {
+		t.Fatalf("kind occurrences = %d, want 2 (the Kind-less record omits it): %s", n, raw)
+	}
+
+	// Legacy load: a pre-S1 document without the field loads with "".
+	legacy := `{"lastId":1,"events":[{"id":1,"type":"waiting","sessionID":"s1","root":"s1","project":"p","title":"t","detail":"d","ts":9}],"generation":"g"}`
+	legacyDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(legacyDir, "notify-history.json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h2 := NewHistory(legacyDir)
+	events, _ := h2.Query(0, 50)
+	if len(events) != 1 || events[0].Kind != "" {
+		t.Fatalf("legacy doc must load with empty Kind: %+v", events)
+	}
+}
+
+// TestHistoryRecordSurfacesPersistFailure pins t1b-F1's visibility bar for
+// the RING: a failed persist is RETURNED from Record and exposed on
+// LastPersistError (the spool's posture) — the silently swallowed ring write
+// failure was the enabling condition of the rollback mis-attribution bug.
+// The event still lands in memory (retention never blocks delivery); after a
+// restart from the last READABLE file the failed event is gone and its id is
+// re-allocated — the premise the spool-owned key makes harmless.
+func TestHistoryRecordSurfacesPersistFailure(t *testing.T) {
+	dir := t.TempDir()
+	h := NewHistory(dir)
+	rec(h, TypeWaiting, "s1") // durable pre-state: the file exists with lastID=1
+
+	// Sabotage ONLY the ring's tmp-write target: the real file stays
+	// readable — the rollback premise.
+	if err := os.Mkdir(filepath.Join(dir, "notify-history.json.tmp"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ev, err := h.Record(Notice{Type: TypeWaiting, SessionID: "s2", Root: "s2", Ts: 2}, 2, "ep")
+	if err == nil {
+		t.Fatal("Record must surface the persist failure")
+	}
+	if ev.ID != 2 {
+		t.Fatalf("event still lands in memory with its id: %+v", ev)
+	}
+	if h.LastPersistError() == "" {
+		t.Fatal("LastPersistError must expose the ring persist failure")
+	}
+
+	// Rollback: a fresh ring loads the last READABLE file (lastID 1) — the
+	// failed event is gone, id 2 is re-allocated, and the reloaded ring
+	// starts with a clean error surface.
+	if err := os.Remove(filepath.Join(dir, "notify-history.json.tmp")); err != nil {
+		t.Fatal(err)
+	}
+	h2 := NewHistory(dir)
+	if got := h2.LastPersistError(); got != "" {
+		t.Fatalf("reloaded ring starts clean, got %q", got)
+	}
+	if ev := rec(h2, TypeFinished, "s3"); ev.ID != 2 {
+		t.Fatalf("re-allocated id = %d, want 2 (the rollback premise)", ev.ID)
+	}
+}
+
 // TestHistoryLimitClampedToMax pins the `limit` clamp: a query above
 // HistoryMaxLimit (200) serves exactly the newest 200 events — never more,
 // even when the ring holds them.
@@ -309,5 +466,93 @@ func TestEngineWithoutHistoryRunsUnchanged(t *testing.T) {
 	events, lastID := eng.History().Query(0, 50) // nil-safe query
 	if len(events) != 0 || lastID != 0 {
 		t.Fatalf("nil history query: want empty, got %d events lastID=%d", len(events), lastID)
+	}
+	if eng.History().Generation() != "" {
+		t.Fatal("nil history generation must be nil-safe \"\"")
+	}
+}
+
+// TestHistoryGenerationLifecycle pins the generation era (now the post-S1
+// witness, t1b-F2 — no longer a join key): the ring generation is minted on a
+// fresh start, STABLE across ordinary restarts (persisted with the document,
+// "" preserved for pre-generation docs), and ROTATED on ring-file loss or
+// corrupt recovery. The spool's missing-file init reads exactly this field to
+// decide lost-vs-first-run.
+func TestHistoryGenerationLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	h1 := NewHistory(dir)
+	g1 := h1.Generation()
+	if g1 == "" {
+		t.Fatal("a fresh ring must mint a non-empty generation")
+	}
+	rec(h1, TypeWaiting, "s1")
+	rec(h1, TypeFinished, "s2")
+
+	// Ordinary restart: generation preserved (persisted with the doc).
+	h2 := NewHistory(dir)
+	if h2.Generation() != g1 {
+		t.Fatalf("generation rotated across ordinary restart: %q -> %q", g1, h2.Generation())
+	}
+
+	// The persisted document carries the generation.
+	raw, err := os.ReadFile(filepath.Join(dir, "notify-history.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f historyFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	if f.Generation != g1 {
+		t.Fatalf("persisted generation = %q, want %q", f.Generation, g1)
+	}
+
+	// Corrupt recovery: ids reset AND the generation rotates.
+	if err := os.WriteFile(filepath.Join(dir, "notify-history.json"), []byte("{not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h3 := NewHistory(dir)
+	if h3.Generation() == g1 || h3.Generation() == "" {
+		t.Fatalf("corrupt recovery must mint a fresh generation, got %q", h3.Generation())
+	}
+	if ev := rec(h3, TypeWaiting, "s3"); ev.ID != 1 {
+		t.Fatalf("corrupt recovery restarts ids at 1, got %d", ev.ID)
+	}
+
+	// Loss (file deleted — indistinguishable from first run): also a fresh
+	// generation, never a reuse of any prior one.
+	if err := os.Remove(filepath.Join(dir, "notify-history.json")); err != nil {
+		t.Fatal(err)
+	}
+	h4 := NewHistory(dir)
+	if h4.Generation() == g1 || h4.Generation() == h3.Generation() || h4.Generation() == "" {
+		t.Fatalf("ring loss must mint a fresh generation, got %q", h4.Generation())
+	}
+}
+
+// TestHistoryGenerationLegacyDocKeepsEmptyEra pins the upgrade posture: a
+// persisted doc from before generations existed loads with "" and KEEPS ""
+// (its era identity — the witness then falls back to per-event SpoolSeq
+// evidence) rather than re-minting on every load.
+func TestHistoryGenerationLegacyDocKeepsEmptyEra(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "notify-history.json")
+	legacy := `{"lastId":2,"events":[{"id":1,"type":"waiting","sessionID":"s1","root":"s1","project":"p","title":"t","detail":"d","ts":1},{"id":2,"type":"finished","sessionID":"s2","root":"s2","project":"p","title":"t","detail":"d","ts":2}]}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHistory(dir)
+	if h.Generation() != "" {
+		t.Fatalf("legacy doc must keep its empty era, got %q", h.Generation())
+	}
+	rec(h, TypeFinished, "s3")
+	// The re-persisted doc still carries the empty era (stable across
+	// further restarts — never re-minted while the file stays readable).
+	h2 := NewHistory(dir)
+	if h2.Generation() != "" {
+		t.Fatalf("legacy era must stay \"\" across restarts, got %q", h2.Generation())
+	}
+	if events, _ := h2.Query(0, 50); len(events) != 3 {
+		t.Fatalf("legacy events must survive the re-persist, got %d", len(events))
 	}
 }

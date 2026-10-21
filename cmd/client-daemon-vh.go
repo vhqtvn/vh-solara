@@ -309,7 +309,16 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 
 	// Notifications/alerts engine: daemon-side detection + outbound webhooks,
 	// plus the in-app notice bus. Non-fatal if its config can't load.
-	if alertEngine, err := srv.InitAlerts(vhCtx); err != nil {
+	// Controller-hub S1: pass the daemon's controller posture + worker
+	// identity — a non-empty controller URL fences local FCM HERE, before
+	// this function returns, which is before agent.NewDaemon (client-daemon
+	// .go:73) starts the tunnel. The identity is the same --id/--name the
+	// RegisterMessage carries (no parallel identity).
+	if alertEngine, err := srv.InitAlerts(vhCtx, web.AlertsOptions{
+		ControllerURL: daemonController,
+		WorkerID:      rt.workerID,
+		WorkerName:    rt.workerName,
+	}); err != nil {
 		log.Printf("alerts engine disabled: %v", err)
 	} else if rt.ocWatcher != nil {
 		// oc-death-watch S2: route the death watcher's notifications

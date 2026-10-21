@@ -191,7 +191,9 @@ func main() {
 
 	// Notifications/alerts engine, exactly as the daemon wires it — so the
 	// Settings → Notifications page and the in-app notice flow are demoable.
-	if _, err := srv.InitAlerts(context.Background()); err != nil {
+	// Standalone posture (zero AlertsOptions): local FCM unfenced, default
+	// "local" worker identity.
+	if _, err := srv.InitAlerts(context.Background(), web.AlertsOptions{}); err != nil {
 		log.Printf("(fixture) alerts engine disabled: %v", err)
 	}
 
