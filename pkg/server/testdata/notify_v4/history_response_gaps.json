@@ -1,0 +1,54 @@
+{
+  "events": [
+    {
+      "id": 52,
+      "type": "finished",
+      "sessionID": "ses_bason_1",
+      "root": "ses_bason_1",
+      "project": "/home/op/repo-alpha",
+      "title": "Review requested",
+      "detail": "Root turn finished",
+      "ts": "1792455300000",
+      "kind": "session_unread",
+      "count": 1,
+      "label": "bason — Review requested",
+      "worker": { "id": "bason", "name": "bason" },
+      "source": { "epoch": "bason-epoch-0007", "seq": 141 },
+      "ui_url": "https://bason.example/app?session=ses_bason_1&dir=%2Fhome%2Fop%2Frepo-alpha"
+    },
+    {
+      "id": 53,
+      "type": "waiting",
+      "sessionID": "ses_iris_8",
+      "root": "ses_iris_8",
+      "project": "/home/op/repo-gamma",
+      "title": "Deploy blocked",
+      "detail": "Permission pending",
+      "ts": "1792455330000",
+      "kind": "permission_pending",
+      "count": 1,
+      "label": "iris — Deploy blocked",
+      "worker": { "id": "iris", "name": "iris" },
+      "source": { "epoch": "iris-epoch-0002", "seq": 62 },
+      "ui_url": "https://iris.example/app?session=ses_iris_8&dir=%2Fhome%2Fop%2Frepo-gamma"
+    }
+  ],
+  "lastId": 53,
+  "coverage": {
+    "complete": false,
+    "gaps": [
+      {
+        "source_id": "bason",
+        "epoch": "bason-epoch-0007",
+        "from_seq": 132,
+        "to_seq": 136
+      },
+      {
+        "source_id": "iris",
+        "epoch": "iris-epoch-0002",
+        "from_seq": 61,
+        "to_seq": 61
+      }
+    ]
+  }
+}

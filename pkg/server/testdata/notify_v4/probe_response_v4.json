@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "count": 1,
+  "policies": { "when_unattended": 0, "always": 1 },
+  "last_attempt": "",
+  "last_error": ""
+}

@@ -1,0 +1,5 @@
+{
+  "token": "fcm-device-token-example-0001-not-a-real-token",
+  "label": "Operator phone",
+  "push_policy": "always"
+}

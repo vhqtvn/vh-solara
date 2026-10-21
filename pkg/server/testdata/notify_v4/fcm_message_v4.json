@@ -1,0 +1,22 @@
+{
+  "message": {
+    "token": "fcm-device-token-example-0001-not-a-real-token",
+    "data": {
+      "vh_kind": "notice",
+      "vh_event": "waiting",
+      "vh_condition": "question_pending",
+      "vh_count": "1",
+      "vh_ts": "1792454400000",
+      "vh_worker_id": "bason",
+      "vh_worker_name": "bason",
+      "vh_session_id": "ses_example",
+      "vh_history_id": "41",
+      "vh_ui_url": "https://worker.example/app?session=ses_example&dir=%2Fworkspace%2Fexample"
+    },
+    "android": {
+      "priority": "HIGH",
+      "collapse_key": "waiting",
+      "ttl": "3600s"
+    }
+  }
+}

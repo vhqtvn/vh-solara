@@ -1,0 +1,70 @@
+{
+  "events": [
+    {
+      "id": 38,
+      "type": "waiting",
+      "sessionID": "ses_bason_1",
+      "root": "ses_bason_1",
+      "project": "/home/op/repo-alpha",
+      "title": "Review requested",
+      "detail": "Question pending",
+      "ts": "1792454330000",
+      "kind": "question_pending",
+      "count": 1,
+      "label": "bason — Review requested",
+      "worker": { "id": "bason", "name": "bason" },
+      "source": { "epoch": "bason-epoch-0007", "seq": 125 },
+      "ui_url": "https://bason.example/app?session=ses_bason_1&dir=%2Fhome%2Fop%2Frepo-alpha"
+    },
+    {
+      "id": 39,
+      "type": "session_started",
+      "sessionID": "ses_bason_2",
+      "root": "ses_bason_2",
+      "project": "/home/op/repo-beta",
+      "title": "Fix login",
+      "detail": "Root session started running",
+      "ts": "1792454355000",
+      "kind": "session_started",
+      "count": 1,
+      "label": "bason — Fix login",
+      "worker": { "id": "bason", "name": "bason" },
+      "source": { "epoch": "bason-epoch-0007", "seq": 126 },
+      "ui_url": "https://bason.example/app?session=ses_bason_2&dir=%2Fhome%2Fop%2Frepo-beta"
+    },
+    {
+      "id": 40,
+      "type": "finished",
+      "sessionID": "ses_bason_1",
+      "root": "ses_bason_1",
+      "project": "/home/op/repo-alpha",
+      "title": "Review requested",
+      "detail": "Root turn finished",
+      "ts": "1792454385000",
+      "kind": "session_unread",
+      "count": 1,
+      "label": "bason — Review requested",
+      "worker": { "id": "bason", "name": "bason" },
+      "source": { "epoch": "bason-epoch-0007", "seq": 127 },
+      "ui_url": "https://bason.example/app?session=ses_bason_1&dir=%2Fhome%2Fop%2Frepo-alpha"
+    },
+    {
+      "id": 41,
+      "type": "stalled",
+      "sessionID": "",
+      "root": "",
+      "project": "",
+      "title": "OpenCode",
+      "detail": "opencode serve pid 9 exited (signal TERM/15)",
+      "ts": "1792454400000",
+      "kind": "worker_down",
+      "count": 1,
+      "label": "bason — OpenCode",
+      "worker": { "id": "bason", "name": "bason" },
+      "source": { "epoch": "bason-epoch-0007", "seq": 128 },
+      "ui_url": "https://bason.example/app"
+    }
+  ],
+  "lastId": 41,
+  "coverage": { "complete": true, "gaps": [] }
+}
