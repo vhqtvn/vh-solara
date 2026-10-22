@@ -768,10 +768,12 @@ function openSessionES(id: string): void {
           // a warm snapshot never fires it, so they must read "—" until then.
           recordSessionFetchSplit(undefined, undefined);
         }
-        // Authoritative snapshot for THIS connection landed — the cached/stale
-        // render is now superseded; clear the per-session refresh indicator
-        // BEFORE reconciling so the row's .dot.refreshing drops in the same
-        // reactive tick the fresh data paints. Idempotent on later snapshots.
+        // Authoritative snapshot for THIS connection landed — clear the
+        // per-session refresh flag before reconciling (idempotent on later
+        // snapshots). NO UI render reads it (the per-row .dot.refreshing
+        // indicator died with the old SessionTree rewrite); readership is
+        // this set/clear, the project-switch reset, and the reset-parity
+        // unit suites — see store.ts's `refreshing` note.
         setState("refreshing", id, false);
         applySessionSnapshot(id, snap);
         // Slice A (send-net-resilience): a session baseline landed on the
@@ -962,9 +964,8 @@ export function resumeSessionStreamForVisibility(): void {
   // Reopen THROUGH the retry seam (NOT openSessionStream, whose
   // closeSessionStream() call would reset sesCursor → cursorless full
   // snapshot). openSessionES preserves the cursor → ring replay. Arms the
-  // existing `refreshing[id]` indicator (cleared on first snapshot) — the
-  // UI-honesty invariant: a resumed pane never shows stale data as fresh
-  // without the per-session refresh dot until the first event reconciles.
+  // existing `refreshing[id]` flag (cleared on first snapshot) — no UI
+  // render reads it; see store.ts's `refreshing` readership note.
   openSessionES(sesId);
 }
 
