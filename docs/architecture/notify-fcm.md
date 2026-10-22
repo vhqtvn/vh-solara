@@ -643,6 +643,22 @@ v4 notes:
   ids (§9).
 - **The fleet-condition watcher no longer delivers aggregate
   notifications** ((m)); fleet status itself is kept.
+- **S4 implementation posture (landed):** the central dispatcher
+  (`pkg/server/notify_dispatch.go`) is **opt-in** — it starts only with
+  `--notify-dispatch` (plus `--notify-store` and
+  `--notify-fcm-credentials`), because the legacy fleet watcher keeps
+  running until the S5 cutover retires it. **Documented enable order:**
+  (1) deploy the S4 controller with dispatch OFF; (2) verify the schema-1
+  → schema-2 token migration (admin masked list / probe counts) and let
+  Pulse re-register (full-state POSTs set policies without touching
+  administrative disable/scopes); (3) enable `--notify-dispatch`,
+  accepting the bounded overlap with the legacy watcher until S5.
+  Dispatch freshness (`--notify-stale-after`, default 24h per §9.8) and
+  the central cooldown (`--notify-dispatch-cooldown`, default 300s) are
+   operator-tunable. The interim admin home for the masked list is
+   `GET /vh/admin/notify/tokens` (S4) — the management UI (NotifyDialog)
+   consumes it since the S4 route swap; PATCH/DELETE/test-send (the
+   remaining admin operations) relocate there in S5.
 
 ## 7. Network path & controller route ownership (settled 2026-10-14 — **superseded 2026-10-21**)
 

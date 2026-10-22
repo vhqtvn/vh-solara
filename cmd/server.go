@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/vhqtvn/vh-solara/pkg/alerts"
 	"github.com/vhqtvn/vh-solara/pkg/server"
 )
 
@@ -45,6 +46,19 @@ var (
 	serverNotifyIngestPoll        time.Duration
 	serverNotifyIngestConcurrency int
 	serverNotifyLedgerRetention   int
+)
+
+// Notify controller-hub S4 knobs: the central FCM dispatcher (per-event
+// pushes from the central ledger). Dispatch is DISABLED BY DEFAULT while
+// the legacy fleet-condition watcher still runs (S5 retires it): enable
+// only after the token migration is verified and Pulse has re-registered
+// — see --notify-dispatch's help for the documented enable order.
+var (
+	serverNotifyDispatch       bool
+	serverNotifyDispatchPoll   time.Duration
+	serverNotifyStaleAfter     time.Duration
+	serverNotifyDispatchCool   time.Duration
+	serverNotifyDispatchTTLSec int
 )
 
 var serverCmd = &cobra.Command{
@@ -124,6 +138,33 @@ var serverCmd = &cobra.Command{
 				log.Fatalf("--notify-store: ingest loop: %v", err)
 			}
 		}
+		// Central FCM dispatcher (notify controller-hub S4,
+		// pkg/server/notify_dispatch.go): per-event pushes from the central
+		// ledger through the CONTROLLER's own shared-sender instance (the
+		// worker sender machinery, controller credentials — v4 (a)).
+		// OPT-IN by design while the legacy watcher runs: the double-
+		// delivery risk during the S4 window is bounded by this flag. The
+		// enable order is documented on the flag itself.
+		if serverNotifyDispatch {
+			if serverNotifyStore == "" {
+				log.Fatalf("--notify-dispatch requires --notify-store (the central ledger + token registry)")
+			}
+			if serverNotifyFCMCreds == "" {
+				log.Fatalf("--notify-dispatch requires --notify-fcm-credentials (the controller's FCM credentials)")
+			}
+			transport, err := alerts.NewFCMTransportFromFile(serverNotifyFCMCreds, "", serverNotifyDispatchTTLSec)
+			if err != nil {
+				log.Fatalf("--notify-dispatch: FCM credentials: %v", err)
+			}
+			if err := daemon.StartNotifyDispatch(server.NotifyDispatchConfig{
+				PollInterval: serverNotifyDispatchPoll,
+				StaleAfter:   serverNotifyStaleAfter,
+				Cooldown:     serverNotifyDispatchCool,
+				TTLSec:       serverNotifyDispatchTTLSec,
+			}, transport); err != nil {
+				log.Fatalf("--notify-dispatch: %v", err)
+			}
+		}
 		if err := daemon.Start(); err != nil {
 			log.Fatalf("Server failed: %v", err)
 		}
@@ -142,6 +183,11 @@ func init() {
 	serverCmd.Flags().DurationVar(&serverNotifyIngestPoll, "notify-ingest-poll", 3*time.Second, "Poll interval for the controller notify pull loop (per enrolled source; unmeasured default — tune per fleet). Requires --notify-store.")
 	serverCmd.Flags().IntVar(&serverNotifyIngestConcurrency, "notify-ingest-concurrency", 4, "Maximum simultaneous notify feed fetches across the fleet (bounded fleet concurrency for the pull loop).")
 	serverCmd.Flags().IntVar(&serverNotifyLedgerRetention, "notify-ledger-retention", 50000, "Central notify ledger retention bound: the number of newest committed events retained before prefix compaction (prefix truncation only; dedupe knowledge survives truncation). 0 = default.")
+	serverCmd.Flags().BoolVar(&serverNotifyDispatch, "notify-dispatch", false, "Enable the central per-event FCM dispatcher (notify controller-hub S4): pushes committed ledger events through the controller's FCM credentials under the v4 gating ladder (detection-time attendance snapshot, freshness, persisted cooldown). Requires --notify-store and --notify-fcm-credentials. DISABLED by default while the legacy fleet watcher runs — documented enable order: (1) deploy with dispatch off, (2) verify the token migration and let Pulse re-register, (3) enable this flag accepting bounded overlap with the legacy watcher until the S5 cutover retires it.")
+	serverCmd.Flags().DurationVar(&serverNotifyDispatchPoll, "notify-dispatch-poll", 3*time.Second, "Poll interval for the central FCM dispatcher (unmeasured default — tune per fleet).")
+	serverCmd.Flags().DurationVar(&serverNotifyStaleAfter, "notify-stale-after", 24*time.Hour, "Stale-push threshold: ledger events older than this are history-only (never pushed, however much TTL remains; v4 §9.8 default 24h, operator-tunable).")
+	serverCmd.Flags().DurationVar(&serverNotifyDispatchCool, "notify-dispatch-cooldown", 300*time.Second, "Central push cooldown per (source, notice type, token hash): a second push of the same key within this window is suppressed; decisions persist across controller restarts (the shared cooldown_sec knob; default 300s).")
+	serverCmd.Flags().IntVar(&serverNotifyDispatchTTLSec, "notify-dispatch-ttl-sec", 86400, "Configured FCM TTL for central pushes, bounded by each event's remaining freshness (an old replay never gets a fresh full TTL).")
 	registerAuthFlags(serverCmd, &serverAuth)
 	rootCmd.AddCommand(serverCmd)
 }

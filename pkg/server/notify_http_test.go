@@ -18,6 +18,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -96,6 +97,7 @@ type notifyTokenWireView struct {
 		ID           string     `json:"id"`
 		Label        string     `json:"label"`
 		TokenPreview string     `json:"token_preview"`
+		PushPolicy   string     `json:"push_policy"`
 		CreatedAt    time.Time  `json:"created_at"`
 		LastUsedAt   *time.Time `json:"last_used_at"`
 		LastError    string     `json:"last_error"`
@@ -112,6 +114,7 @@ type notifyListWireView struct {
 		ID           string     `json:"id"`
 		Label        string     `json:"label"`
 		TokenPreview string     `json:"token_preview"`
+		PushPolicy   string     `json:"push_policy"`
 		LastUsedAt   *time.Time `json:"last_used_at"`
 		LastError    string     `json:"last_error"`
 		Scope        struct {
@@ -119,6 +122,15 @@ type notifyListWireView struct {
 			Conditions []string `json:"conditions"`
 		} `json:"scope"`
 	} `json:"tokens"`
+}
+
+// notifyProbeView mirrors the v4 public probe (GET /vh/notify/tokens).
+type notifyProbeView struct {
+	Enabled     bool           `json:"enabled"`
+	Count       int            `json:"count"`
+	Policies    map[string]int `json:"policies"`
+	LastAttempt string         `json:"last_attempt"`
+	LastError   string         `json:"last_error"`
 }
 
 type notifyTestWireView struct {
@@ -215,49 +227,40 @@ func TestNotifyHTTP_CSRFLadder(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestNotifyHTTP_TokenLifecycle is the registry's behavioral pin through
-// the real chain: 201 create, idempotent 200 re-submit, masked list,
-// strict PATCH, 404/204 delete — and the RAW TOKEN never appears in ANY
-// response body along the way.
+// the real chain under the v4 contract: public registration answers
+// {"ok":true} (never a token echo), the full-state POST rule refreshes
+// label+policy (a re-POST without push_policy RESETS to when_unattended)
+// without touching administrative scopes, the ADMIN masked list shows the
+// policy, strict PATCH keeps working, 404/204 delete — and the RAW TOKEN
+// never appears in ANY response body along the way.
 func TestNotifyHTTP_TokenLifecycle(t *testing.T) {
 	d, h, session := newNotifyAuthDaemon(t)
 	loadNotifyStore(t, d)
 	raw := "fcm-lifecycle-token-0001"
 
+	// v4 public registration: 200 {"ok":true} — no masked echo.
 	rec := doNotify(t, h, http.MethodPost, "/vh/notify/tokens",
-		`{"token":"`+raw+`","label":"Operator phone"}`, withCookie(session), withCSRF())
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("create: want 201, got %d (body=%q)", rec.Code, rec.Body.String())
+		`{"token":"`+raw+`","label":"Operator phone","push_policy":"always"}`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
 	}
-	var created notifyTokenWireView
-	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
-		t.Fatalf("decode create body: %v", err)
-	}
-	if created.Token.ID == "" || !created.Created {
-		t.Fatalf("create body = %+v", created)
-	}
-	if created.Token.Label != "Operator phone" {
-		t.Errorf("create label = %q", created.Token.Label)
-	}
-	if !strings.Contains(rec.Body.String(), "token_preview") || strings.Contains(rec.Body.String(), raw) {
-		t.Errorf("create response must carry a masked preview and NEVER the raw token: %s", rec.Body.String())
+	if got, want := strings.TrimSpace(rec.Body.String()), `{"ok":true}`; got != want {
+		t.Fatalf("create body = %s, want %s", got, want)
 	}
 
-	// Idempotent re-submit → 200, created=false, SAME id.
+	// Full-state re-POST without push_policy: 200, and the ADMIN list
+	// shows the policy RESET to when_unattended with the label refreshed.
 	rec = doNotify(t, h, http.MethodPost, "/vh/notify/tokens",
-		`{"token":"`+raw+`"}`, withCookie(session), withCSRF())
+		`{"token":"`+raw+`","label":"Tablet"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusOK {
 		t.Fatalf("re-submit: want 200, got %d", rec.Code)
 	}
-	var resub notifyTokenWireView
-	_ = json.Unmarshal(rec.Body.Bytes(), &resub)
-	if resub.Created || resub.Token.ID != created.Token.ID {
-		t.Errorf("re-submit = created:%v id:%s (want created:false, same id)", resub.Created, resub.Token.ID)
-	}
 
-	// Masked list.
-	rec = doNotify(t, h, http.MethodGet, "/vh/notify/tokens", "", withCookie(session))
+	// The ADMIN masked list (the S4 home of the S1 list; S5 relocates the
+	// rest of the admin family here and points NotifyDialog at it).
+	rec = doNotify(t, h, http.MethodGet, "/vh/admin/notify/tokens", "", withCookie(session))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("list: want 200, got %d", rec.Code)
+		t.Fatalf("admin list: want 200, got %d", rec.Code)
 	}
 	var list notifyListWireView
 	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
@@ -267,7 +270,7 @@ func TestNotifyHTTP_TokenLifecycle(t *testing.T) {
 		t.Fatalf("list holds %d tokens, want 1 (body=%s)", len(list.Tokens), rec.Body.String())
 	}
 	if strings.Contains(rec.Body.String(), raw) {
-		t.Fatalf("MASKING LEAK: raw token appears in GET /vh/notify/tokens: %s", rec.Body.String())
+		t.Fatalf("MASKING LEAK: raw token appears in GET /vh/admin/notify/tokens: %s", rec.Body.String())
 	}
 	if list.Tokens[0].TokenPreview == "" || list.Tokens[0].TokenPreview == raw {
 		t.Errorf("token_preview = %q, want a masked preview", list.Tokens[0].TokenPreview)
@@ -275,9 +278,16 @@ func TestNotifyHTTP_TokenLifecycle(t *testing.T) {
 	if want := "fcm-li" + string('…') + "0001"; list.Tokens[0].TokenPreview != want {
 		t.Errorf("token_preview = %q, want %q", list.Tokens[0].TokenPreview, want)
 	}
+	if list.Tokens[0].PushPolicy != "when_unattended" {
+		t.Errorf("full-state re-POST without push_policy must RESET the policy, got %q", list.Tokens[0].PushPolicy)
+	}
+	if list.Tokens[0].Label != "Tablet" {
+		t.Errorf("full-state re-POST must refresh the label, got %q", list.Tokens[0].Label)
+	}
 	id := list.Tokens[0].ID
 
-	// PATCH label + scope (wholesale).
+	// PATCH label + scope (wholesale) — the administrative surface keeps
+	// working against the migrated store.
 	rec = doNotify(t, h, http.MethodPatch, "/vh/notify/tokens/"+id,
 		`{"label":"Tablet","scope":{"enabled":false,"conditions":["worker_down"]}}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusOK {
@@ -291,6 +301,22 @@ func TestNotifyHTTP_TokenLifecycle(t *testing.T) {
 	if patched.Token.Label != "Tablet" || patched.Token.Scope.Enabled ||
 		len(patched.Token.Scope.Conditions) != 1 || patched.Token.Scope.Conditions[0] != "worker_down" {
 		t.Errorf("patched = %+v", patched.Token)
+	}
+
+	// A later full-state POST setting always must NOT override the
+	// administrative disable (v4 §3.2).
+	rec = doNotify(t, h, http.MethodPost, "/vh/notify/tokens",
+		`{"token":"`+raw+`","push_policy":"always"}`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("re-POST over disabled: want 200, got %d", rec.Code)
+	}
+	rec = doNotify(t, h, http.MethodGet, "/vh/admin/notify/tokens", "", withCookie(session))
+	_ = json.Unmarshal(rec.Body.Bytes(), &list)
+	if list.Tokens[0].Scope.Enabled || len(list.Tokens[0].Scope.Conditions) != 1 {
+		t.Fatalf("a full-state POST must not override administrative disable/scopes: %+v", list.Tokens[0].Scope)
+	}
+	if list.Tokens[0].PushPolicy != "always" {
+		t.Errorf("re-POST with push_policy=always must set the policy: %+v", list.Tokens[0])
 	}
 
 	// PATCH refusals: unknown field / empty patch / missing scope member /
@@ -318,15 +344,15 @@ func TestNotifyHTTP_TokenLifecycle(t *testing.T) {
 	}
 
 	// Create refusals: unknown field, bad token charset, too-short token,
-	// oversize body, trailing document.
+	// oversize body, trailing document, invalid push_policy (the v4 400).
 	for _, tc := range []struct {
 		name, body, marker string
 	}{
 		{"unknown key", `{"token":"ok-token-aaaaaaaaaa","x":1}`, "unknown field"},
 		{"token with space", `{"token":"abc defghijklmnop"}`, "printable ASCII"},
 		{"token too short", `{"token":"short"}`, "outside the"},
-		{"token missing", `{"label":"x"}`, "outside the"},
-		{"label too long", `{"token":"ok-token-aaaaaaaaaa","label":"` + strings.Repeat("L", 65) + `"}`, "code points exceeds"},
+		{"token missing", `{"label":"x"}`, "token required"},
+		{"invalid push_policy", `{"token":"ok-token-aaaaaaaaaa","push_policy":"sometimes"}`, "invalid push_policy"},
 		{"trailing doc", `{"token":"ok-token-aaaaaaaaaa"} {}`, "exactly one JSON document"},
 		{"oversize", `{"token":"` + strings.Repeat("A", 5000) + `"}`, "byte cap"},
 	} {
@@ -340,7 +366,7 @@ func TestNotifyHTTP_TokenLifecycle(t *testing.T) {
 		}
 	}
 
-	// DELETE: 204, then the entry is gone (list empty, id now 404).
+	// DELETE: 204, then the entry is gone (admin list empty, id now 404).
 	rec = doNotify(t, h, http.MethodDelete, "/vh/notify/tokens/"+id, "", withCookie(session), withCSRF())
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete: want 204, got %d (body=%q)", rec.Code, rec.Body.String())
@@ -349,7 +375,7 @@ func TestNotifyHTTP_TokenLifecycle(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("re-delete: want 404, got %d", rec.Code)
 	}
-	rec = doNotify(t, h, http.MethodGet, "/vh/notify/tokens", "", withCookie(session))
+	rec = doNotify(t, h, http.MethodGet, "/vh/admin/notify/tokens", "", withCookie(session))
 	var after notifyListWireView
 	_ = json.Unmarshal(rec.Body.Bytes(), &after)
 	if len(after.Tokens) != 0 {
@@ -360,15 +386,43 @@ func TestNotifyHTTP_TokenLifecycle(t *testing.T) {
 	// (Round-trip covered in notify_store_test.go.)
 }
 
-// TestNotifyHTTP_DisabledStorePosture pins the honest disabled posture:
-// with no --notify-store path, EVERY family endpoint answers 409 naming
-// the flag — including GET (an empty 200 list would read as "zero devices
+// TestNotifyHTTP_DisabledStorePosture pins the honest disabled posture
+// under the v4 split: the PUBLIC routes answer the central-channel
+// posture (POST 503 "notify unavailable" BEFORE body validation; the
+// probe 200-always with the disabled shape — the app's connectivity
+// check must keep working), while the ADMIN family keeps its honest 409
+// naming the flag (an empty list would read as "zero devices
 // registered", which is a lie).
 func TestNotifyHTTP_DisabledStorePosture(t *testing.T) {
 	_, h, session := newNotifyAuthDaemon(t)
+
+	// Public POST: 503 notify-unavailable, BEFORE body validation (even a
+	// malformed body answers 503 while the channel is down).
+	rec := doNotify(t, h, http.MethodPost, "/vh/notify/tokens", `{"token":"fcm-disabled-aaaaaaaaa"`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("public POST (disabled store): want 503, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "notify unavailable") {
+		t.Errorf("public POST 503 body must say notify unavailable, got %q", rec.Body.String())
+	}
+
+	// Public probe: 200-always with the honest disabled shape.
+	rec = doNotify(t, h, http.MethodGet, "/vh/notify/tokens", "", withCookie(session))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("probe (disabled store): want 200-always, got %d", rec.Code)
+	}
+	var probe notifyProbeView
+	if err := json.Unmarshal(rec.Body.Bytes(), &probe); err != nil {
+		t.Fatalf("probe body: %v (%s)", err, rec.Body.String())
+	}
+	if probe.Enabled || probe.Count != 0 || probe.Policies["when_unattended"] != 0 || probe.Policies["always"] != 0 ||
+		probe.LastAttempt != "" || probe.LastError != "" {
+		t.Fatalf("disabled probe = %+v, want the honest disabled shape", probe)
+	}
+
+	// Admin family: honest 409s naming the flag.
 	for _, tc := range []struct{ method, path, body string }{
-		{http.MethodGet, "/vh/notify/tokens", ""},
-		{http.MethodPost, "/vh/notify/tokens", `{"token":"fcm-disabled-aaaaaaaaa"}`},
+		{http.MethodGet, "/vh/admin/notify/tokens", ""},
 		{http.MethodDelete, "/vh/notify/tokens/0011223344556677", ""},
 		{http.MethodPatch, "/vh/notify/tokens/0011223344556677", `{"label":"x"}`},
 	} {
@@ -393,8 +447,8 @@ func TestNotifyHTTP_DisabledTransportPosture(t *testing.T) {
 	// d.notifyTransport is nil (never set) — the literal-Daemon posture.
 
 	rec := doNotify(t, h, http.MethodPost, "/vh/notify/tokens", `{"token":"fcm-credless-aaaaaaaa"}`, withCookie(session), withCSRF())
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("enroll without transport: want 201 (registry is independent), got %d", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enroll without transport: want 200 (registry is independent), got %d", rec.Code)
 	}
 	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"fcm-credless-aaaaaaaa"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusConflict {
@@ -450,15 +504,19 @@ func TestNotifyHTTP_TestSendThroughRealChain(t *testing.T) {
 		t.Fatalf("bare-token response = %+v, want sent/fcm/no-error", view)
 	}
 
-	// Register the token, then exercise the by-id path.
+	// Register the token, then exercise the by-id path (the v4 public POST
+	// answers {"ok":true}; the ID comes from the admin masked list).
 	rec = doNotify(t, h, http.MethodPost, "/vh/notify/tokens",
 		`{"token":"fcm-byid-00000000000001","label":"Phone"}`, withCookie(session), withCSRF())
-	if rec.Code != http.StatusCreated {
+	if rec.Code != http.StatusOK {
 		t.Fatalf("enroll: %d %s", rec.Code, rec.Body.String())
 	}
-	var enrolled notifyTokenWireView
-	_ = json.Unmarshal(rec.Body.Bytes(), &enrolled)
-	id := enrolled.Token.ID
+	rec = doNotify(t, h, http.MethodGet, "/vh/admin/notify/tokens", "", withCookie(session))
+	var enrolledList notifyListWireView
+	if err := json.Unmarshal(rec.Body.Bytes(), &enrolledList); err != nil || len(enrolledList.Tokens) != 1 {
+		t.Fatalf("admin list after enroll: err=%v body=%s", err, rec.Body.String())
+	}
+	id := enrolledList.Tokens[0].ID
 
 	advance(notifyTestSendInterval) // rate limit: the bare send just consumed the slot
 	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test",
@@ -572,9 +630,14 @@ func TestNotifyHTTP_TestSendThroughRealChain(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestNotifyHTTP_HostInterceptorPrecedence pins the /vh/notify/ prefix
-// carve-out: a request on a per-worker SUBDOMAIN host must be served by
-// the CONTROLLER (masked JSON), never proxied down to the worker (which
-// has no /vh/notify/ route — its catch-all would serve the SPA shell).
+// carve-out AND the /vh/admin/notify/ family-prefix carve-out
+// (tier1_b/F1): a request on a per-worker SUBDOMAIN host must be served
+// by the CONTROLLER (masked JSON), never proxied down to the worker
+// (which has no /vh/notify/ route — its catch-all would serve the SPA
+// shell) and never 502'd for an offline/unknown worker BEFORE userMux
+// runs. The admin half is the dialog's actual fetch: NotifyDialog GETs
+// /vh/admin/notify/tokens from worker-subdomain hosts, so the masked
+// list must come from the controller there too.
 // Mirrors TestHostInterceptorFleetConfigRoutePrecedence.
 func TestNotifyHTTP_HostInterceptorPrecedence(t *testing.T) {
 	// Host pattern armed (matches any single-label subdomain of
@@ -588,8 +651,18 @@ func TestNotifyHTTP_HostInterceptorPrecedence(t *testing.T) {
 	h := d.buildRootHandler()
 	session := loginPassphrase(t, h, "secret")
 
+	// Seed ONE registered device so the admin masked list has visible
+	// content to assert against (preview, label — never the raw token).
+	raw := "fcm-hostint-0000000001"
 	path := filepath.Join(t.TempDir(), "notify-tokens.json")
-	if err := persistNotifyStore(path, &notifyStoreFile{Schema: 1, Tokens: []notifyStoreEntry{}}); err != nil {
+	if err := persistNotifyStore(path, &notifyStoreFile{Schema: 2, Tokens: []notifyStoreEntry{{
+		ID:         "0011223344556677",
+		Token:      raw,
+		Label:      "Operator phone",
+		PushPolicy: "always",
+		CreatedAt:  time.Now().UTC().Truncate(time.Second),
+		Scope:      notifyScope{Enabled: true, Conditions: []string{}},
+	}}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.LoadNotifyStore(path); err != nil {
@@ -602,15 +675,77 @@ func TestNotifyHTTP_HostInterceptorPrecedence(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("worker-subdomain GET /vh/notify/tokens: want controller 200, got %d (body=%q)", rec.Code, rec.Body.String())
 	}
-	var list notifyListWireView
-	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil || list.Schema != 1 {
-		t.Fatalf("worker-subdomain response must be the controller's JSON: err=%v body=%s", err, rec.Body.String())
+	var probe notifyProbeView
+	if err := json.Unmarshal(rec.Body.Bytes(), &probe); err != nil || probe.Enabled {
+		t.Fatalf("worker-subdomain response must be the controller's v4 probe (transport unconfigured ⇒ enabled:false): err=%v body=%s", err, rec.Body.String())
+	}
+	if probe.Count != 1 || probe.Policies["always"] != 1 {
+		t.Fatalf("worker-subdomain probe must reflect the seeded device (count/policies), got %+v", probe)
 	}
 
 	// The subpath shape ({id}) is covered by the PREFIX carve-out too.
-	rec = doNotify(t, h, http.MethodDelete, "/vh/notify/tokens/0011223344556677", "", withHost("alpha.example.test"), withCookie(session), withCSRF())
+	// (8899… is NOT the seeded id — this stays the unknown-id 404 pin,
+	// not a real delete of the seeded device below.)
+	rec = doNotify(t, h, http.MethodDelete, "/vh/notify/tokens/8899aabbccddeeff", "", withHost("alpha.example.test"), withCookie(session), withCSRF())
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("worker-subdomain DELETE unknown id: want controller 404, got %d", rec.Code)
+	}
+
+	// THE BLOCKER PIN (tier1_b/F1): the ADMIN masked list is
+	// controller-served on a worker-subdomain host. Unknown subdomain
+	// ("alpha" is not registered): without the /vh/admin/notify/ prefix
+	// carve-out the interceptor 502s ("Worker alpha not found or
+	// offline") BEFORE userMux — the exact NotifyDialog failure this
+	// pins.
+	rec = doNotify(t, h, http.MethodGet, "/vh/admin/notify/tokens", "", withHost("alpha.example.test"), withCookie(session))
+	if rec.Code == http.StatusBadGateway {
+		t.Fatalf("hostInterceptor proxied GET /vh/admin/notify/tokens (502) — admin-notify carve-out missing or broken")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("worker-subdomain GET /vh/admin/notify/tokens: want controller 200, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	assertMaskedControllerList(t, rec, raw)
+
+	// The OFFLINE-worker case (no 502): a REGISTERED worker whose tunnel
+	// is down — the interceptor's "not found or offline" fast-fail branch
+	// would 502 without the carve-out. NotifyDialog must still get the
+	// masked list.
+	d.Registry.AddWorker(&Worker{ID: "beta", Name: "beta-worker", Status: "offline", Version: "v1"})
+	rec = doNotify(t, h, http.MethodGet, "/vh/admin/notify/tokens", "", withHost("beta.example.test"), withCookie(session))
+	if rec.Code == http.StatusBadGateway {
+		t.Fatalf("hostInterceptor 502'd GET /vh/admin/notify/tokens for an OFFLINE worker — admin-notify carve-out missing or broken")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("offline-worker-subdomain GET /vh/admin/notify/tokens: want controller 200, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	assertMaskedControllerList(t, rec, raw)
+}
+
+// assertMaskedControllerList checks that rec carries the CONTROLLER's
+// masked admin list for the seeded device — the JSON envelope with the
+// masked preview + label, and NEVER the raw token (a proxied worker
+// would answer its SPA shell; a 502 never reaches here).
+func assertMaskedControllerList(t *testing.T, rec *httptest.ResponseRecorder, raw string) {
+	t.Helper()
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("admin list Content-Type: want application/json (controller handler), got %q", ct)
+	}
+	var list notifyListWireView
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("admin list must decode as the controller's masked JSON: %v (body=%s)", err, rec.Body.String())
+	}
+	if list.Schema != 1 || len(list.Tokens) != 1 {
+		t.Fatalf("admin list = schema %d with %d tokens, want the controller's 1-token envelope (body=%s)", list.Schema, len(list.Tokens), rec.Body.String())
+	}
+	got := list.Tokens[0]
+	if got.Label != "Operator phone" || got.PushPolicy != "always" {
+		t.Fatalf("admin list entry = %q/%q, want the seeded device (label/policy)", got.Label, got.PushPolicy)
+	}
+	if want := "fcm-ho" + string('…') + "0001"; got.TokenPreview != want {
+		t.Fatalf("token_preview = %q, want the masked %q", got.TokenPreview, want)
+	}
+	if strings.Contains(rec.Body.String(), raw) {
+		t.Fatalf("MASKING LEAK: raw token appears in the worker-subdomain admin list: %s", rec.Body.String())
 	}
 }
 
@@ -622,7 +757,7 @@ func TestNotifyHTTP_RegistryFilePersistsThroughChain(t *testing.T) {
 	path := loadNotifyStore(t, d)
 	rec := doNotify(t, h, http.MethodPost, "/vh/notify/tokens",
 		`{"token":"fcm-persist-0000000001","label":" disk "}`, withCookie(session), withCSRF())
-	if rec.Code != http.StatusCreated {
+	if rec.Code != http.StatusOK {
 		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
 	}
 	data, err := os.ReadFile(path)
@@ -643,9 +778,10 @@ func TestNotifyHTTP_RegistryFilePersistsThroughChain(t *testing.T) {
 
 // TestNotifyHTTP_EmptyStartGetPosture pins the GET posture after a
 // missing-file empty start through the REAL chain: the registry is
-// configured (not the 409 disabled posture), GET serves the honest empty
-// envelope {"schema":1,"tokens":[]}, the file itself is still absent
-// (lazy create), and the first create through the chain materializes it.
+// configured (not the 503/409 disabled postures), the public probe
+// serves the honest enabled:false + zero-count shape, the file itself is
+// still absent (lazy create), and the first create through the chain
+// materializes it.
 func TestNotifyHTTP_EmptyStartGetPosture(t *testing.T) {
 	d, h, session := newNotifyAuthDaemon(t)
 	path := loadNotifyStore(t, d)
@@ -657,15 +793,19 @@ func TestNotifyHTTP_EmptyStartGetPosture(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET after empty start: want 200 (configured, empty), got %d (body=%q)", rec.Code, rec.Body.String())
 	}
-	if got, want := strings.TrimSpace(rec.Body.String()), `{"schema":1,"tokens":[]}`; got != want {
-		t.Fatalf("GET after empty start: want %s, got %s", want, got)
+	var probe notifyProbeView
+	if err := json.Unmarshal(rec.Body.Bytes(), &probe); err != nil {
+		t.Fatalf("probe after empty start: %v (%s)", err, rec.Body.String())
+	}
+	if probe.Enabled || probe.Count != 0 || probe.Policies["when_unattended"] != 0 || probe.Policies["always"] != 0 {
+		t.Fatalf("empty-start probe = %+v, want disabled + zero counts", probe)
 	}
 
 	// First mutation through the real chain creates the file.
 	rec = doNotify(t, h, http.MethodPost, "/vh/notify/tokens",
 		`{"token":"fcm-token-empty-start-1","label":"Phone"}`, withCookie(session), withCSRF())
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("first create after empty start: want 201, got %d (body=%q)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first create after empty start: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("first mutation through the chain must create the store file: %v", err)
@@ -689,15 +829,19 @@ func TestNotifyHTTP_TestSendRateLimit(t *testing.T) {
 	d.SetNotifyTransport(stub)
 	advance := fakeNotifyClock(t)
 
-	// Enroll one token so the by-id path is exercisable.
+	// Enroll one token so the by-id path is exercisable (the v4 public
+	// POST answers {"ok":true}; the ID comes from the admin masked list).
 	rec := doNotify(t, h, http.MethodPost, "/vh/notify/tokens",
 		`{"token":"fcm-ratelimit-000001","label":"Phone"}`, withCookie(session), withCSRF())
-	if rec.Code != http.StatusCreated {
+	if rec.Code != http.StatusOK {
 		t.Fatalf("enroll: %d %s", rec.Code, rec.Body.String())
 	}
-	var enrolled notifyTokenWireView
-	_ = json.Unmarshal(rec.Body.Bytes(), &enrolled)
-	id := enrolled.Token.ID
+	rec = doNotify(t, h, http.MethodGet, "/vh/admin/notify/tokens", "", withCookie(session))
+	var enrolledList notifyListWireView
+	if err := json.Unmarshal(rec.Body.Bytes(), &enrolledList); err != nil || len(enrolledList.Tokens) != 1 {
+		t.Fatalf("admin list after enroll: err=%v body=%s", err, rec.Body.String())
+	}
+	id := enrolledList.Tokens[0].ID
 
 	// First send: allowed, reaches the stub transport.
 	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"fcm-ratelimit-000001"}`, withCookie(session), withCSRF())
@@ -780,10 +924,90 @@ func TestNotifyHTTP_TestSendRateLimit(t *testing.T) {
 	}
 }
 
-// TestNotifyRead_TokensGetUnchanged pins the Slice-2 additivity fence:
-// the shared read cursor lives in the HISTORY surface only — the tokens
-// GET response carries no read_id/unread_count keys and its envelope
-// shape is byte-stable across an ack.
+// TestNotifyHTTP_RegisterPersistFailureV4Envelope pins t1a-F2: a store
+// persistence failure on the PUBLIC registration route answers the v4
+// error envelope — 500, Content-Type application/json, decoded
+// {"ok":false,"error":…} (the notify-fcm.md §3.1 response table) — never
+// a plain-text http.Error. The persist failure is forced through the
+// notifyCreateExcl seam; the registry itself stays untouched
+// (persist-before-swap).
+func TestNotifyHTTP_RegisterPersistFailureV4Envelope(t *testing.T) {
+	d, h, session := newNotifyAuthDaemon(t)
+	loadNotifyStore(t, d)
+	orig := notifyCreateExcl
+	notifyCreateExcl = func(name string) (*os.File, error) {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrPermission}
+	}
+	t.Cleanup(func() { notifyCreateExcl = orig })
+
+	rec := doNotify(t, h, http.MethodPost, "/vh/notify/tokens",
+		`{"token":"fcm-persist-fail-0001","label":"x"}`, withCookie(session), withCSRF())
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("persistence failure: want 500, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json (the v4 envelope)", ct)
+	}
+	var body struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("the 500 body must decode as the v4 JSON envelope: %v (%s)", err, rec.Body.String())
+	}
+	if body.OK || body.Error == "" || !strings.Contains(body.Error, "notification registry") {
+		t.Fatalf("v4 500 envelope = %+v, want ok:false + a non-empty registry error", body)
+	}
+	// Persist-before-swap: the failed submit left running state untouched.
+	if snap := d.notifyStore.snapshot(); len(snap.entries) != 0 {
+		t.Fatalf("failed persist must leave running state untouched, got %d entries", len(snap.entries))
+	}
+}
+
+// TestNotifyHTTP_RegisterRefusalEnvelopeUniformity pins the t1c-F2
+// rider: the invalid-token 400 (validNotifyToken failure) and every
+// decode-failure 400 on the PUBLIC registration route answer the v4 JSON
+// envelope (Content-Type application/json, {"ok":false,"error":…}) like
+// the mirrored worker route — no plain-text http.Error remains on the
+// handler's 4xx paths, and the status codes are unchanged (400).
+func TestNotifyHTTP_RegisterRefusalEnvelopeUniformity(t *testing.T) {
+	d, h, session := newNotifyAuthDaemon(t)
+	loadNotifyStore(t, d) // the store must be configured or the 503 gate wins over decode
+	for _, tc := range []struct{ name, body, marker string }{
+		{"invalid token charset", `{"token":"abc defghijklmnop"}`, "printable ASCII"},
+		{"token too short", `{"token":"short"}`, "outside the"},
+		{"decode: unknown field", `{"token":"ok-token-aaaaaaaaaa","x":1}`, "unknown field"},
+		{"decode: trailing document", `{"token":"ok-token-aaaaaaaaaa"} {}`, "exactly one JSON document"},
+		{"decode: empty document", ``, "empty document"},
+		{"decode: oversize body", `{"token":"` + strings.Repeat("A", 5000) + `"}`, "byte cap"},
+	} {
+		rec := doNotify(t, h, http.MethodPost, "/vh/notify/tokens", tc.body, withCookie(session), withCSRF())
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: want 400 (status unchanged), got %d (body=%q)", tc.name, rec.Code, rec.Body.String())
+			continue
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+			t.Errorf("%s: Content-Type = %q, want application/json (the v4 envelope)", tc.name, ct)
+			continue
+		}
+		var body struct {
+			OK    bool   `json:"ok"`
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Errorf("%s: body must decode as the v4 JSON envelope: %v (%s)", tc.name, err, rec.Body.String())
+			continue
+		}
+		if body.OK || !strings.Contains(body.Error, tc.marker) {
+			t.Errorf("%s: v4 envelope = %+v, want ok:false + error containing %q", tc.name, body, tc.marker)
+		}
+	}
+}
+
+// TestNotifyRead_TokensGetUnchanged pins the Slice-2 additivity fence
+// under the S4 probe: the shared read cursor lives in the HISTORY surface
+// only — the public probe response carries no read_id/unread_count keys
+// and its shape is byte-stable across an ack.
 func TestNotifyRead_TokensGetUnchanged(t *testing.T) {
 	d, h, session := newNotifyAuthDaemon(t)
 	loadNotifyStore(t, d)
@@ -810,8 +1034,10 @@ func TestNotifyRead_TokensGetUnchanged(t *testing.T) {
 			t.Errorf("tokens GET must not carry %q (history-surface only): %s", key, after.Body.String())
 		}
 	}
-	if _, ok := probe["schema"]; !ok {
-		t.Errorf("tokens GET envelope lost its schema field: %s", after.Body.String())
+	for _, key := range []string{"enabled", "count", "policies", "last_attempt", "last_error"} {
+		if _, ok := probe[key]; !ok {
+			t.Errorf("probe lost required field %q: %s", key, after.Body.String())
+		}
 	}
 	if before.Body.String() != after.Body.String() {
 		t.Errorf("tokens GET body changed across an ack:\nbefore: %s\nafter:  %s", before.Body.String(), after.Body.String())

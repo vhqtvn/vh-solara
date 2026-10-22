@@ -96,7 +96,16 @@ type Daemon struct {
 	// dedupe, and coverage gaps. Memory-only (tests, pre-load zero value)
 	// until LoadNotifyStore arms the `<notify-store>.ledger` journal —
 	// StartNotifyIngest refuses a memory-only ledger.
-	notifyLedger *notifyLedger
+	//
+	// c-F2/d-F1 (S4): the pointer is synchronized — every read goes
+	// through ledger() under notifyLedgerMu.RLock and every swap
+	// (armNotifyLedgerFor) holds the write lock, so LoadNotifyStore's
+	// re-arm can never race the S4 dispatch loop's reads (or any other
+	// reader). Swap ordering is still join-first (StopNotifyIngest +
+	// StopNotifyDispatch) — the mutex closes the data race; the joins
+	// close the logical race.
+	notifyLedger   *notifyLedger
+	notifyLedgerMu sync.RWMutex
 
 	// notifyLedgerRetain is the ledger retention bound applied when the
 	// journal is armed (SetNotifyLedgerRetention overrides; 0 = default).
@@ -109,6 +118,15 @@ type Daemon struct {
 	notifyIngest       *notifyIngestManager
 	notifyIngestCancel context.CancelFunc
 	notifyIngestMu     sync.Mutex
+
+	// notifyDispatch/notifyDispatchCancel/notifyDispatchMu gate the central
+	// FCM dispatcher (see notify_dispatch.go — S4): StartNotifyDispatch
+	// arms at most one loop per Daemon; StopNotifyDispatch cancels AND
+	// JOINS it (LoadNotifyStore re-arm safety). The dispatcher is opt-in
+	// (--notify-dispatch) while the legacy watcher runs.
+	notifyDispatch       *notifyDispatchManager
+	notifyDispatchCancel context.CancelFunc
+	notifyDispatchMu     sync.Mutex
 
 	// notifyTransport is the configured push transport (see
 	// notify_transport.go): an *FCMNotifier built from
@@ -131,9 +149,19 @@ type Daemon struct {
 	// (notify_watcher.go): the fleet-condition watcher starts at most
 	// once per Daemon, only when the registry AND a real transport are
 	// configured. The sync.Once synchronizes the write; readers after
-	// Do observe the final value.
+	// Do observe the final value. (running stays true once started —
+	// the Once record; StopNotifyWatcher does not reset it, it cannot
+	// restart.) notifyWatcher/notifyWatcherCancel/notifyWatcherMu carry
+	// the STOP side (B-F1): StopNotifyWatcher cancels AND JOINS the run
+	// loop — the same discipline as the ingest/dispatch stops above —
+	// and is a safe no-op while both are nil (cmd/server.go loads the
+	// store, and thus stop-joins a never-started watcher, BEFORE
+	// StartNotifyWatcher runs).
 	notifyWatchOnce      sync.Once
 	notifyWatcherRunning bool
+	notifyWatcher        *notifyWatcher
+	notifyWatcherCancel  context.CancelFunc
+	notifyWatcherMu      sync.Mutex
 
 	// tunnelDeflate is the controller-side permessage-deflate write policy
 	// for the worker tunnel WebSocket (Q4c experiment). Parsed once from
@@ -177,6 +205,18 @@ func (d *Daemon) fleetStatusService() *fleetStatusService {
 		}
 	})
 	return d.fleetStatus
+}
+
+// ledger returns the CURRENT central notify ledger under the read lock —
+// the one synchronized read path for the d.notifyLedger pointer (c-F2/d-F1,
+// S4): armNotifyLedgerFor swaps it under the write lock, and every reader
+// (the S4 dispatch loop's wiring, the ledger read API, the ingest start)
+// resolves through here so a LoadNotifyStore re-arm can never race a
+// dispatch read.
+func (d *Daemon) ledger() *notifyLedger {
+	d.notifyLedgerMu.RLock()
+	defer d.notifyLedgerMu.RUnlock()
+	return d.notifyLedger
 }
 
 // NewDaemon initialises a new server daemon.
@@ -324,21 +364,31 @@ func (d *Daemon) buildRootHandler() http.Handler {
 	userMux.HandleFunc("GET /vh/fleet/config/options", d.handleFleetOptionsGet)
 
 	// Push-notification family (/vh/notify/*; see notify_http.go +
-	// notify_store.go + notify_transport.go): the companion-app token
-	// registry (enroll/list/revoke/patch) and the test-send verb. Same
+	// notify_store.go + notify_transport.go + notify_dispatch.go): since
+	// notify controller-hub S4 the PUBLIC prefix carries the v4 central
+	// contract — POST /vh/notify/tokens is the app registration (full-state
+	// {token,label,push_policy}, {"ok":true}, never a token echo) and GET
+	// /vh/notify/tokens is the channel probe (enabled/count/policies/
+	// last_attempt/last_error; 200-always). The ADMIN surface keeps working
+	// unchanged until S5 relocates it to /vh/admin/notify/*: the masked
+	// list is ALREADY served there (GET /vh/admin/notify/tokens), while
+	// DELETE/PATCH/{id} and test-send keep their S1 paths. Same
 	// session-cookie auth family as the fleet routes above (the whole
 	// userMux chain is auth-gated; API-class /vh/* means unauthenticated
 	// requests get a clean 401). Mutations (POST/DELETE/PATCH) carry the
 	// in-handler X-VH-CSRF check — the same /vh/-mutation convention as
 	// PUT /vh/fleet/config, since the controller csrfGuard only gates
-	// unsafe methods under /api/. GET /vh/notify/tokens is read-only and
-	// CSRF-exempt. The whole /vh/notify/ prefix is carved out of the
-	// worker-subdomain proxy below (controller-owned family). Disabled
-	// postures are honest 409s: no --notify-store ⇒ every endpoint names
-	// the flag; no --notify-fcm-credentials ⇒ test-send names the flag
-	// (the registry still works — tokens can be enrolled before creds).
+	// unsafe methods under /api/. GETs are read-only and CSRF-exempt. The
+	// whole /vh/notify/ prefix AND the /vh/admin/notify/ family prefix are
+	// carved out of the worker-subdomain proxy below (controller-owned
+	// family; NotifyDialog fetches the masked admin list from
+	// worker-subdomain hosts). Honest disabled postures: no
+	// --notify-store ⇒ the public POST answers 503 "notify unavailable"
+	// (before body validation) and the admin family 409s naming the flag;
+	// no --notify-fcm-credentials ⇒ test-send names the flag.
 	userMux.HandleFunc("POST /vh/notify/tokens", d.handleNotifyTokenCreate)
-	userMux.HandleFunc("GET /vh/notify/tokens", d.handleNotifyTokenList)
+	userMux.HandleFunc("GET /vh/notify/tokens", d.handleNotifyTokenProbe)
+	userMux.HandleFunc("GET /vh/admin/notify/tokens", d.handleNotifyAdminTokenList)
 	userMux.HandleFunc("DELETE /vh/notify/tokens/{id}", d.handleNotifyTokenDelete)
 	userMux.HandleFunc("PATCH /vh/notify/tokens/{id}", d.handleNotifyTokenPatch)
 	userMux.HandleFunc("POST /vh/notify/test", d.handleNotifyTest)
@@ -472,8 +522,9 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 
 		// Route precedence: the aggregated /vh/diag/latency, the fleet-wide
 		// /vh/fleet/status + /vh/fleet/config family (including the SSE
-		// stream /vh/fleet/stream), and the whole /vh/notify/
-		// push-notification family are CONTROLLER-OWNED and must be served
+		// stream /vh/fleet/stream), the whole /vh/notify/
+		// push-notification family, and the /vh/admin/notify/ admin-family
+		// prefix are CONTROLLER-OWNED and must be served
 		// by the controller even when the browser's host is a per-worker
 		// subdomain (e.g. "workerID.controller.example.com").
 		// Without this carve-out the hostInterceptor would proxy the request
@@ -494,7 +545,16 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 		// catch-all would likewise serve the unparseable SPA shell — same
 		// carve-out list discipline as /vh/fleet/*, with the same
 		// method-agnostic fall-through (methods enforced by userMux
-		// patterns; mutations keep their in-handler CSRF checks).
+		// patterns; mutations keep their in-handler CSRF checks). The
+		// /vh/admin/notify/ carve-out extends the same prefix discipline
+		// to the ADMIN family home: the masked list already lives there
+		// (S4) and S5 relocates PATCH/DELETE/{id} + test-send onto it.
+		// NotifyDialog fetches /vh/admin/notify/tokens from
+		// worker-subdomain hosts — without the carve-out the interceptor
+		// would proxy it down to the worker (SPA shell when online, 502
+		// when the worker is offline/not found) BEFORE userMux could
+		// serve the masked list, breaking the dialog in exactly the
+		// deployment it must work in.
 		// Falling through to `next` (the userMux chain) serves the global
 		// controller-owned view regardless of host. Per-worker
 		// /vh/diag/latency remains reachable on the worker for the
@@ -503,7 +563,8 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 		if r.URL.Path == "/vh/diag/latency" || r.URL.Path == "/vh/fleet/status" ||
 			r.URL.Path == "/vh/fleet/stream" ||
 			r.URL.Path == "/vh/fleet/config" || r.URL.Path == "/vh/fleet/config/options" ||
-			strings.HasPrefix(r.URL.Path, "/vh/notify/") {
+			strings.HasPrefix(r.URL.Path, "/vh/notify/") ||
+			strings.HasPrefix(r.URL.Path, "/vh/admin/notify/") {
 			next.ServeHTTP(w, r)
 			return
 		}

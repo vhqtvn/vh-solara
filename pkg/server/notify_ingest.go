@@ -211,6 +211,10 @@ type notifyIngestManager struct {
 	done chan struct{}
 
 	mu sync.Mutex
+	// fatal marks the GF2/c-F1 FATAL stop: a poisoned ledger refuses all
+	// mutations until a successful reopen; feeding it per-source backoff
+	// (or ticking on) would be wrong on both counts. Run exits once set.
+	fatal bool
 	// inflight marks sources whose pull has not returned (one active fetch
 	// per source).
 	inflight map[string]bool
@@ -253,7 +257,8 @@ func (r *notifySourceRegistry) entries() []NotifySourceEntry {
 	return out
 }
 
-// Run ticks until ctx is done. The first tick is immediate (a freshly
+// Run ticks until ctx is done or a FATAL condition (GF2/c-F1: a poisoned
+// ledger) stops the loop. The first tick is immediate (a freshly
 // started controller catches up at once, not after one interval). Run
 // closes m.done on exit — the join StopNotifyIngest waits on (b-F2).
 func (m *notifyIngestManager) Run(ctx context.Context) {
@@ -261,6 +266,9 @@ func (m *notifyIngestManager) Run(ctx context.Context) {
 	t := time.NewTicker(m.cfg.PollInterval)
 	defer t.Stop()
 	for {
+		if m.isFatal() {
+			return
+		}
 		m.tickOnce(ctx)
 		select {
 		case <-ctx.Done():
@@ -270,11 +278,36 @@ func (m *notifyIngestManager) Run(ctx context.Context) {
 	}
 }
 
+// isFatal reports the GF2/c-F1 fatal-stop state.
+func (m *notifyIngestManager) isFatal() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.fatal
+}
+
+// markFatal sets the fatal stop and logs loudly ONCE (the first poison
+// observation). A poisoned ledger refuses every mutation until a
+// successful reopen (armNotifyLedger via LoadNotifyStore) — the loop must
+// STOP, never feed per-source backoff, never silently retry.
+func (m *notifyIngestManager) markFatal(err error) {
+	m.mu.Lock()
+	already := m.fatal
+	m.fatal = true
+	m.mu.Unlock()
+	if !already {
+		log.Printf("notify ingest: FATAL — central ledger poisoned, stopping the pull loop (restart required): %v", err)
+	}
+}
+
 // tickOnce sweeps every eligible source once: skips ineligible/legacy
 // entries (no token by construction), sources under backoff, sources with an
 // active fetch, and workers currently offline; pulls the rest with bounded
 // concurrency and waits for the sweep to drain (deterministic for tests).
+// A FATAL (poisoned-ledger) stop ends sweeps immediately — no new pulls.
 func (m *notifyIngestManager) tickOnce(ctx context.Context) {
+	if m.isFatal() {
+		return
+	}
 	var wg sync.WaitGroup
 	for _, e := range m.sources.entries() {
 		if e.Ineligible || e.Token == "" {
@@ -321,7 +354,12 @@ func (m *notifyIngestManager) release(sourceID string) {
 }
 
 // pull runs one source's fetch→reconcile→commit→ACK pass under a fleet
-// concurrency slot, classifying the outcome for backoff.
+// concurrency slot, classifying the outcome. GF2/c-F1: a POISONED ledger
+// (errors.Is ErrNotifyLedgerPoisoned through pullOnce's %w wraps) is
+// FATAL — stop the whole loop with a loud log; it is NOT a per-source
+// failure and must never reach recordFailure/backoff (retrying cannot
+// repair the journal fragment; only recovery from the durable prefix
+// can).
 func (m *notifyIngestManager) pull(ctx context.Context, entry NotifySourceEntry) {
 	select {
 	case m.sem <- struct{}{}:
@@ -332,6 +370,10 @@ func (m *notifyIngestManager) pull(ctx context.Context, entry NotifySourceEntry)
 	if err := m.pullOnce(ctx, entry); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return // shutdown is not a source failure
+		}
+		if errors.Is(err, ErrNotifyLedgerPoisoned) {
+			m.markFatal(err)
+			return
 		}
 		m.recordFailure(entry, err)
 		return
@@ -576,16 +618,22 @@ func (d *Daemon) SetNotifyLedgerRetention(n int) {
 
 // armNotifyLedgerFor arms (or re-arms) the central ledger journal for an
 // armed notify-store path. Called by LoadNotifyStore and by controller-
-// restart tests; exported surfaces go through those.
+// restart tests; exported surfaces go through those. The swap happens
+// under notifyLedgerMu's WRITE lock (c-F2/d-F1): concurrent readers route
+// through d.ledger(), so the pointer swap is race-free; the JOIN-first
+// stops (StopNotifyIngest + StopNotifyDispatch in LoadNotifyStore) ensure
+// no in-flight commit or dispatch touches the object being replaced.
 func (d *Daemon) armNotifyLedgerFor(storePath string) error {
 	led, err := armNotifyLedger(storePath+".ledger", storePath+".sources", d.notifyLedgerRetain)
 	if err != nil {
 		return err
 	}
+	d.notifyLedgerMu.Lock()
 	if d.notifyLedger != nil {
 		_ = d.notifyLedger.Close()
 	}
 	d.notifyLedger = led
+	d.notifyLedgerMu.Unlock()
 	return nil
 }
 
@@ -600,13 +648,14 @@ func (d *Daemon) StartNotifyIngest(cfg NotifyIngestConfig) error {
 	if d.notifyIngest != nil {
 		return nil
 	}
-	if d.notifyLedger == nil || d.notifyLedger.path == "" {
+	led := d.ledger()
+	if led == nil || led.path == "" {
 		return fmt.Errorf("notify ingest: no durable ledger armed (--notify-store must load before the pull loop starts)")
 	}
 	if d.notifySources == nil {
 		return fmt.Errorf("notify ingest: no source registry")
 	}
-	m := newNotifyIngestManager(d.notifyLedger, d.notifySources, d.Registry, d.Proxy, cfg)
+	m := newNotifyIngestManager(led, d.notifySources, d.Registry, d.Proxy, cfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	d.notifyIngest = m
 	d.notifyIngestCancel = cancel
@@ -641,53 +690,52 @@ func (d *Daemon) StopNotifyIngest() {
 }
 
 // Internal ledger read surface for S4/S5 and tests (no public routes in S3;
-// the public history DTO is S5's hostInterceptor work).
+// the public history DTO is S5's hostInterceptor work). Every read routes
+// through d.ledger() — the c-F2/d-F1 synchronized access path.
 
 // NotifyLedgerHead is the committed global head — the v4 lastId semantics.
 func (d *Daemon) NotifyLedgerHead() int64 {
-	if d == nil || d.notifyLedger == nil {
-		return 0
+	if led := d.ledger(); led != nil {
+		return led.Head()
 	}
-	return d.notifyLedger.Head()
+	return 0
 }
 
 // NotifyLedgerFirstID is the oldest RETAINED central id (0 when empty) —
 // prefix truncation makes [FirstID..Head] contiguous.
 func (d *Daemon) NotifyLedgerFirstID() int64 {
-	if d == nil || d.notifyLedger == nil {
-		return 0
+	if led := d.ledger(); led != nil {
+		return led.FirstID()
 	}
-	return d.notifyLedger.FirstID()
+	return 0
 }
 
 // NotifyEventsSince pages central events with the v4 public semantics:
 // since > 0 → up to limit events with id > since ascending; since == 0 →
 // the NEWEST limit events ascending; limit <= 0 → 50.
 func (d *Daemon) NotifyEventsSince(since int64, limit int) []NotifyEvent {
-	if d == nil || d.notifyLedger == nil {
-		return nil
+	if led := d.ledger(); led != nil {
+		return led.EventsSince(since, limit)
 	}
-	return d.notifyLedger.EventsSince(since, limit)
+	return nil
 }
 
 // NotifyCoverage returns the coverage snapshot (head, truncation marker,
 // per-source cursor/ack/gaps) S5 will serve as the public coverage block.
 func (d *Daemon) NotifyCoverage() NotifyCoverage {
-	if d == nil || d.notifyLedger == nil {
-		return NotifyCoverage{Sources: []NotifyCoverageSource{}}
+	if led := d.ledger(); led != nil {
+		return led.Coverage()
 	}
-	return d.notifyLedger.Coverage()
+	return NotifyCoverage{Sources: []NotifyCoverageSource{}}
 }
 
 // NotifySourceCursor reads one source's committed ingest state — the resume
 // cursor and accepted watermark (tests, S4/S5, diagnostics).
 func (d *Daemon) NotifySourceCursor(sourceID string) (epoch string, cursor, acked int64, ok bool) {
-	if d == nil || d.notifyLedger == nil {
-		return "", 0, 0, false
+	if led := d.ledger(); led != nil {
+		if st, ok := led.SourceState(sourceID); ok {
+			return st.Epoch, st.HighSeq, st.AckedSeq, true
+		}
 	}
-	st, ok := d.notifyLedger.SourceState(sourceID)
-	if !ok {
-		return "", 0, 0, false
-	}
-	return st.Epoch, st.HighSeq, st.AckedSeq, true
+	return "", 0, 0, false
 }

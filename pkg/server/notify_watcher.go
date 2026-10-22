@@ -57,10 +57,14 @@ package server
 // send critical path never waits on a file write.
 //
 // Retirement: a *NotifyUnregisteredError outcome removes the token from
-// the registry (holder delete: persist-before-swap + structural gen
-// bump) and marks the delivery row retired. A BARE 404 (plain class
-// since the S2 split) records a failed delivery ONLY — a misconfigured
-// FCM project answering 404 must never mass-retire the registry.
+// the registry — GENERATION-FENCED like the dispatcher (t1b-F1): the
+// prune runs deleteIfRegistrationCurrent against the (id, token, RegGen)
+// captured in the pre-send snapshot (persist-before-swap + structural
+// gen bump on delete), so a registration REFRESHED while the send was in
+// flight survives; a same-generation response retires and marks the
+// delivery row retired. A BARE 404 (plain class since the S2 split)
+// records a failed delivery ONLY — a misconfigured FCM project answering
+// 404 must never mass-retire the registry.
 //
 // FCM data vocabulary for fleet events (the Android app contract; the
 // test-send keeps vh_kind "test" unchanged):
@@ -77,10 +81,11 @@ package server
 // Baseline: the watcher's FIRST observation is a SILENT state adoption
 // (no pushes, no history) — a controller restart over standing
 // conditions is not news. Lifetime: run() parks on its context; the
-// daemon wiring starts it with context.Background() because this
-// daemon HAS no shutdown path (Start → ListenAndServe forever; the
-// DaemonAddr listener goroutine is equally immortal) — the context
-// seam exists so a future graceful-shutdown path can cancel it.
+// daemon wiring starts it with a cancellable context whose cancel is
+// held for StopNotifyWatcher (B-F1: LoadNotifyStore stop-joins this
+// loop before the registry read) — and otherwise this daemon HAS no
+// shutdown path (Start → ListenAndServe forever; the DaemonAddr
+// listener goroutine is equally immortal).
 
 import (
 	"context"
@@ -132,15 +137,22 @@ type notifyWatcher struct {
 	// last maps each of the nine kinds to its state; nil until the
 	// first tick adopts the baseline.
 	last map[string]*notifyCondState
+
+	// done closes when run returns; StopNotifyWatcher joins on it
+	// (B-F1 — the same discipline as the ingest/dispatch managers'
+	// done channels). Created with the watcher; closed ONLY by run,
+	// so a tick-driven (run-less) test watcher simply never closes it.
+	done chan struct{}
 }
 
 func newNotifyWatcher(d *Daemon, interval, cooldown time.Duration) *notifyWatcher {
-	return &notifyWatcher{d: d, interval: interval, cooldown: cooldown}
+	return &notifyWatcher{d: d, interval: interval, cooldown: cooldown, done: make(chan struct{})}
 }
 
 // run observes immediately (silent baseline) and then every interval
 // until ctx is cancelled.
 func (w *notifyWatcher) run(ctx context.Context) {
+	defer close(w.done) // StopNotifyWatcher's join drains here (B-F1)
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 	w.tick(ctx)
@@ -314,15 +326,27 @@ func (w *notifyWatcher) dispatch(ctx context.Context, kind, action string, count
 			}
 			var unreg *NotifyUnregisteredError
 			if errors.As(sendErr, &unreg) {
-				// Confirmed dead registration: retire it. A persist
-				// failure is logged (the token stays and will retry the
-				// retirement on its next send); a bare 404 never reaches
-				// here — that class does not retire.
-				if gone, err := w.d.notifyStore.delete(e.ID); err != nil {
+				// Confirmed dead registration: retire it — but only the
+				// incarnation this send CLAIMED (t1b-F1): the (id, token,
+				// RegGen) captured in the pre-send snapshot above is
+				// checked and deleted ATOMICALLY under the store lock
+				// (deleteIfRegistrationCurrent), so a registration
+				// REFRESHED while this send was in flight (same id+token
+				// re-POST re-mints RegGen) SURVIVES the stale
+				// UNREGISTERED; a same-generation response retires. A
+				// persist failure is logged (the token stays and will
+				// retry the retirement on its next send); a bare 404
+				// never reaches here — that class does not retire.
+				if gone, err := w.d.notifyStore.deleteIfRegistrationCurrent(e.ID, e.Token, e.RegGen); err != nil {
 					log.Printf("notify: retiring unregistered token %s failed: %v", e.ID, err)
 				} else if gone {
 					rec.Retired = true
 					log.Printf("notify: retired unregistered token %s (%s)", e.ID, e.Label)
+				} else {
+					// Retain verdict: the live registration moved past the
+					// claimed incarnation (refreshed/replaced/re-registered
+					// since the send) — it outranks the stale answer.
+					log.Printf("notify: kept registration %s — refreshed or replaced since the send (stale UNREGISTERED)", e.ID)
 				}
 			}
 			// Registry telemetry off the send critical path (async
@@ -377,9 +401,52 @@ func (d *Daemon) StartNotifyWatcher() bool {
 			return
 		}
 		w := newNotifyWatcher(d, notifyWatchInterval, notifyCooldown)
-		go w.run(context.Background())
+		ctx, cancel := context.WithCancel(context.Background())
+		// Publish the stop handles BEFORE launching the loop, under the
+		// stop mutex (the same ordering discipline as the ingest and
+		// dispatch starts): a concurrent StopNotifyWatcher either sees
+		// both handles — cancels the not-yet-scheduled run and joins its
+		// prompt exit — or ran earlier as a no-op on a never-started
+		// watcher. cmd/server.go relies on that no-op: LoadNotifyStore
+		// (which stop-joins the watcher, B-F1) runs BEFORE this call.
+		d.notifyWatcherMu.Lock()
+		d.notifyWatcher = w
+		d.notifyWatcherCancel = cancel
+		d.notifyWatcherMu.Unlock()
+		go w.run(ctx)
 		d.notifyWatcherRunning = true
 		log.Printf("notify: fleet watcher started (interval %s, cooldown %s)", notifyWatchInterval, notifyCooldown)
 	})
 	return d.notifyWatcherRunning
+}
+
+// StopNotifyWatcher stops the fleet-condition watcher AND JOINS IT (B-F1 —
+// the same cancel+join discipline as StopNotifyIngest/StopNotifyDispatch):
+// run returns only after the in-flight tick — INCLUDING every concurrent
+// fan-out send and its generation-fenced UNREGISTERED prune
+// (deleteIfRegistrationCurrent: persist-before-swap) — has drained, so
+// when this returns no watcher goroutine exists anywhere. LoadNotifyStore
+// stop-joins ALL THREE notify writers BEFORE the registry read; an
+// in-flight watcher send whose canonical UNREGISTERED answer lands while
+// the reload is parked in this join durably retires the token BEFORE the
+// file is read, so the installed snapshot can never resurrect it. (A send
+// ABORTED by the cancel prunes nothing — a cancelled send is not a
+// confirmed-unregistered answer; one whose response already arrived
+// completes its prune inside the join.) Idempotent, and a safe no-op on a
+// never-started watcher (nil handles — the cmd/server.go load-then-start
+// startup order).
+func (d *Daemon) StopNotifyWatcher() {
+	d.notifyWatcherMu.Lock()
+	defer d.notifyWatcherMu.Unlock()
+	if d.notifyWatcherCancel != nil {
+		d.notifyWatcherCancel()
+		d.notifyWatcherCancel = nil
+	}
+	if w := d.notifyWatcher; w != nil {
+		// Join the run loop: bounded by the tick's sends (the transport
+		// adds its own per-request timeout, and the cancel above
+		// propagates into every in-flight send).
+		<-w.done
+		d.notifyWatcher = nil
+	}
 }

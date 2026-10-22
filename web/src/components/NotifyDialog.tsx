@@ -3,6 +3,7 @@ import { Portal } from "solid-js/web";
 import { useBackEntry } from "../lib/backStack";
 import { modal } from "../lib/a11y";
 import Icon from "./Icon";
+import Select from "./Select";
 import styles from "./NotifyDialog.module.css";
 
 // Push-notification admin (slice S3 of the Android-push program; server
@@ -13,12 +14,25 @@ import styles from "./NotifyDialog.module.css";
 // registry and shows the delivery history.
 //
 // Wire contract (mirror of pkg/server — FROZEN from S1/S2):
-//   GET    /vh/notify/tokens            → {schema, tokens:[masked]} —
-//     409 when no --notify-store: the WHOLE dialog then flips to the
-//     read-only posture + the off-hint (family convention: an empty
-//     list would read as "zero devices", which is a lie).
-//   POST   /vh/notify/tokens {token,label?} (CSRF) → 201 {created:true}
-//     / 200 {created:false} (idempotent re-registration).
+//   GET    /vh/admin/notify/tokens      → {schema, tokens:[masked]} —
+//     the masked ADMIN list. Since the S4 route swap, GET
+//     /vh/notify/tokens is the v4 PUBLIC probe ({enabled, count,
+//     policies, last_attempt, last_error} — never a token list), so
+//     the dialog reads the admin home instead (S5 relocates the
+//     remaining admin ops there). 409 when no --notify-store: the
+//     WHOLE dialog then flips to the read-only posture + the off-hint
+//     (family convention: an empty list would read as "zero devices",
+//     which is a lie).
+//   POST   /vh/notify/tokens {token,label?,push_policy} (CSRF) → 200
+//     {"ok":true} (v4 public registration; idempotent by token). The
+//     body is the token's COMPLETE desired state (the full-state POST
+//     rule): push_policy must ALWAYS be sent — omitting it RESETS an
+//     existing always device to when_unattended. 503
+//     {"ok":false,"error":"notify unavailable"} when the central
+//     channel is unconfigured (checked before body validation — the
+//     dialog flips to the read-only disabled posture, same hint as the
+//     admin 409); 400s answer the same JSON envelope and their error
+//     text lands verbatim.
 //   PATCH  /vh/notify/tokens/{id} {label?, scope?} (CSRF) — scope is
 //     WHOLESALE: BOTH enabled and conditions required when present;
 //     conditions [] MEANS ALL NINE KINDS (there is no "none" on the
@@ -115,6 +129,18 @@ const CONDITION_LABELS: Record<string, string> = {
   session_done: "finished",
 };
 
+// The v4 push policies (notify-fcm.md §3.1: when_unattended | always,
+// default when_unattended), labeled with the contract vocabulary. The
+// registration POST is FULL-STATE: the dialog must send the field on
+// every add — omitting it would RESET an existing always device to
+// when_unattended.
+type PushPolicy = "when_unattended" | "always";
+const DEFAULT_PUSH_POLICY: PushPolicy = "when_unattended";
+const PUSH_POLICY_OPTIONS = [
+  { value: "when_unattended", label: "when unattended (default)" },
+  { value: "always", label: "always" },
+];
+
 // Client mirrors of the server token/label rules (validNotifyToken /
 // validateNotifyLabel in pkg/server/notify_store.go). Returns null when
 // acceptable, a short message when not.
@@ -149,6 +175,21 @@ async function parseJSON<T>(r: Response): Promise<T> {
 
 async function errText(r: Response): Promise<string> {
   return (await r.text()).trim() || `HTTP ${r.status}`;
+}
+
+// The v4 public registration route answers EVERY post-CSRF error as the
+// JSON envelope {"ok":false,"error":…} (never plain text) — surface the
+// envelope's error field verbatim, falling back to the raw body for a
+// non-JSON (misrouted proxy) response.
+async function v4ErrText(r: Response): Promise<string> {
+  const text = await r.text();
+  try {
+    const v = JSON.parse(text) as { ok?: boolean; error?: string };
+    if (v && typeof v.error === "string" && v.error !== "") return v.error;
+  } catch {
+    // not JSON — fall through to the trimmed raw text
+  }
+  return text.trim() || `HTTP ${r.status}`;
 }
 
 function shortDate(iso: string): string {
@@ -196,6 +237,7 @@ export default function NotifyDialog(props: { onClose: () => void }) {
   // Add-device form.
   const [newToken, setNewToken] = createSignal("");
   const [newLabel, setNewLabel] = createSignal("");
+  const [newPolicy, setNewPolicy] = createSignal<PushPolicy>(DEFAULT_PUSH_POLICY);
   const [addError, setAddError] = createSignal<string | null>(null);
   const [addNote, setAddNote] = createSignal<string | null>(null);
   const [adding, setAdding] = createSignal(false);
@@ -223,7 +265,10 @@ export default function NotifyDialog(props: { onClose: () => void }) {
   // --- Loads -----------------------------------------------------------------
 
   async function fetchTokens(): Promise<void> {
-    const r = await fetch("/vh/notify/tokens");
+    // Masked list from the ADMIN home (S4): the public GET
+    // /vh/notify/tokens is now the v4 probe and never carries a list.
+    // Same session-auth family as before; GET is CSRF-exempt.
+    const r = await fetch("/vh/admin/notify/tokens");
     if (r.status === 409) {
       setDisabled(true); // honest posture: no --notify-store
       return;
@@ -302,7 +347,13 @@ export default function NotifyDialog(props: { onClose: () => void }) {
   }
 
   // --- Add device --------------------------------------------------------------
-
+  //
+  // v4 POST /vh/notify/tokens (the app-registration route): the body is
+  // the token's full desired state, so the chosen push_policy is ALWAYS
+  // sent (omitting it would reset an existing always device). Success
+  // answers exactly {"ok":true}; 503 {"ok":false,"error":"notify
+  // unavailable"} means the central channel is unconfigured — the same
+  // read-only disabled posture + hint as the admin 409.
   async function addDevice(): Promise<void> {
     setAddError(null);
     setAddNote(null);
@@ -323,20 +374,27 @@ export default function NotifyDialog(props: { onClose: () => void }) {
       const r = await fetch("/vh/notify/tokens", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
-        body: JSON.stringify({ token: tok, label }),
+        body: JSON.stringify({ token: tok, label, push_policy: newPolicy() }),
       });
-      if (r.status === 409) {
-        setDisabled(true);
+      if (r.status === 503) {
+        setDisabled(true); // v4 channel-unconfigured posture (like the admin 409)
         return;
       }
       if (!r.ok) {
-        setAddError(await errText(r)); // server 400 verbatim
+        setAddError(await v4ErrText(r)); // the v4 envelope's error text verbatim
         return;
       }
-      const v = await parseJSON<{ created?: boolean }>(r);
-      setAddNote(v.created === false ? "Already registered — existing entry kept" : "✓ Device added");
+      const v = await parseJSON<{ ok?: boolean; error?: string }>(r);
+      if (!v.ok) {
+        // Not a shape the route emits on 200 — surface it honestly
+        // instead of claiming success.
+        setAddError(v.error || "unexpected registration response");
+        return;
+      }
+      setAddNote("✓ Device added");
       setNewToken("");
       setNewLabel("");
+      setNewPolicy(DEFAULT_PUSH_POLICY);
       await refreshTokens();
     } catch (e) {
       setAddError(e instanceof Error ? e.message : String(e));
@@ -797,6 +855,13 @@ export default function NotifyDialog(props: { onClose: () => void }) {
                       onInput={(e) => setNewLabel(e.currentTarget.value)}
                       aria-label="New device label"
                     />
+                    <Select
+                      class="theme-select"
+                      ariaLabel="New device push policy"
+                      value={newPolicy()}
+                      options={PUSH_POLICY_OPTIONS}
+                      onChange={(v) => setNewPolicy(v as PushPolicy)}
+                    />
                     <button
                       type="button"
                       class="btn btn-primary"
@@ -827,6 +892,11 @@ export default function NotifyDialog(props: { onClose: () => void }) {
                       {rawTest()!.text}
                     </div>
                   </Show>
+                  <div class={styles.hint}>
+                    Push policy — when unattended: deliveries only while you're away;
+                    always: deliveries regardless of attendance. Re-submitting a token
+                    overwrites its label and policy (the registration is full-state).
+                  </div>
                   <div class={styles.hint}>
                     Test sends to the token above WITHOUT registering it — paste a token from the
                     app to verify push first.

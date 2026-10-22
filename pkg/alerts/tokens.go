@@ -42,15 +42,20 @@ type NotifyToken struct {
 	Ts         int64  `json:"ts"`                    // first registered, unix millis
 }
 
-// normalizePushPolicy canonicalizes a stored/loaded policy: empty or unknown
+// NormalizePushPolicy canonicalizes a stored/loaded policy: empty or unknown
 // values become PolicyWhenUnattended (the fail-closed default — a hand-edited
-// file entry never widens delivery to always).
-func normalizePushPolicy(p string) string {
+// file entry never widens delivery to always). Exported in S4: the
+// controller's central registry (pkg/server) shares the same v3/v4 policy
+// vocabulary and the same fail-closed normalization.
+func NormalizePushPolicy(p string) string {
 	if p == PolicyAlways {
 		return PolicyAlways
 	}
 	return PolicyWhenUnattended
 }
+
+// normalizePushPolicy is the in-package spelling (unchanged call sites).
+func normalizePushPolicy(p string) string { return NormalizePushPolicy(p) }
 
 // TokenRegistry stores the tokens at <stateDir>/notify-tokens.json.
 type TokenRegistry struct {

@@ -9,7 +9,10 @@ package server
 //   - mutex-guarded holder with coherent deep-copied snapshot reads and a
 //     generation counter (bumped on STRUCTURAL changes only — create,
 //     delete, patch; last_used_at/last_error bookkeeping deliberately does
-//     NOT bump it, so send telemetry cannot churn S2's policy fencing);
+//     NOT bump it, so send telemetry cannot churn S2's policy fencing).
+//     SEPARATELY, every entry carries an in-memory per-REGISTRATION
+//     generation (RegGen, t1a-F1) re-minted on each successful
+//     registration refresh — see notifyStoreEntry.RegGen;
 //   - atomic persist: canonical 2-space JSON + trailing newline, sibling
 //     tmp file created EXCLUSIVELY at 0600 (write→sync→rename; a stale
 //     loose-mode .tmp crash artifact is cleared and the create retried
@@ -24,12 +27,13 @@ package server
 //     only repairs the mode on the first registry mutation, which may
 //     never come. A chmod failure fails startup loudly (b-F1).
 //
-// Entry shape (file + memory):
+// Entry shape (file + memory; schema 2 — notify controller-hub S4):
 //
-//	{"schema":1,"tokens":[{
+//	{"schema":2,"tokens":[{
 //	  "id":"16-hex-chars",          // server-generated, 8 random bytes
 //	  "token":"<raw FCM token>",    // stored VERBATIM — needed to send
 //	  "label":"Operator phone",     // free text, ≤64 code points
+//	  "push_policy":"when_unattended", // when_unattended (default) | always (v4 §3.1)
 //	  "created_at":"RFC3339",
 //	  "last_used_at":null,          // set on send attempts (best-effort)
 //	  "last_error":"",              // last send failure text ("" = ok)
@@ -43,6 +47,22 @@ package server
 // kind automatically reaches scope-all devices without a migration).
 // Uniqueness: submitting the same raw token twice returns the EXISTING
 // entry (idempotent) — never a duplicate.
+//
+// SCHEMA-1 MIGRATION (v4 §3.2, brief §5): a schema-1 file (the pre-S4
+// controller registry — object with token records + scopes, no policies)
+// migrates at load: every entry DEFAULTS conservatively to
+// push_policy=when_unattended; ids/values/labels/creation/use/error
+// metadata and scopes are preserved verbatim; scope.enabled=false stays
+// disabled; unsupported legacy condition restrictions stay dormant and
+// visible (never broadened). The migration is versioned, BACKUP-FIRST
+// (the original bytes land at <path>.schema1.bak before anything is
+// replaced), atomic (tmp+rename persist), and fail-closed (a backup or
+// persist failure fails startup — the original file is left untouched).
+// Re-migration is idempotent: the replaced file is schema-2 and reloads
+// without a migration. A schema the build does not know (future) is
+// REFUSED — a legacy binary equally refuses schema 2 ("schema version 2
+// not supported (want 1)"), so a migrated store is never silently
+// reopened by rollback (v4 §9.7).
 //
 // The raw token NEVER leaves this file + memory except as the Send()
 // argument: every HTTP response shape renders notifyTokenWire (masked
@@ -64,12 +84,21 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/vhqtvn/vh-solara/pkg/alerts"
 	"github.com/vhqtvn/vh-solara/pkg/projectcfg"
 )
 
 const (
 	// notifyStoreSchema is the file/schema version this build reads+writes.
-	notifyStoreSchema = 1
+	// Schema 2 (S4) adds the per-token push_policy; schema 1 migrates at
+	// load (see the file header).
+	notifyStoreSchema = 2
+	// notifyStoreSchemaV1 is the pre-S4 controller registry version (no
+	// push_policy). Accepted at load for migration only; never written.
+	notifyStoreSchemaV1 = 1
+	// notifyStoreBackupSuffix names the schema-1 pre-migration backup the
+	// v4 migration writes BESIDE the store before replacing it.
+	notifyStoreBackupSuffix = ".schema1.bak"
 	// notifyTokenMinBytes / notifyTokenMaxBytes bound a submitted token:
 	// real FCM registration tokens are ~152-163 printable-ASCII chars;
 	// the floor stops trivial garbage and the ceiling (deliberately under
@@ -83,6 +112,11 @@ const (
 	maxNotifyLastErrorBytes = 512
 	// notifyIDBytes is the entry-ID entropy (8 bytes → 16 hex chars).
 	notifyIDBytes = 8
+	// notifyTokenCap is the registry cap (v4 §3.1: the shared 32-token
+	// bound — the same number as the worker registry's alerts.NotifyTokenCap).
+	// Upserts of NEW tokens beyond it fail; an already-registered token
+	// always succeeds (idempotent by token).
+	notifyTokenCap = alerts.NotifyTokenCap
 )
 
 // notifyConditionSet is the selectable condition vocabulary — exactly the
@@ -112,10 +146,28 @@ type notifyStoreEntry struct {
 	ID         string      `json:"id"`
 	Token      string      `json:"token"`
 	Label      string      `json:"label,omitempty"`
+	PushPolicy string      `json:"push_policy"` // when_unattended (default) | always — always written explicitly (visible migration posture)
 	CreatedAt  time.Time   `json:"created_at"`
 	LastUsedAt *time.Time  `json:"last_used_at,omitempty"`
 	LastError  string      `json:"last_error,omitempty"`
 	Scope      notifyScope `json:"scope"`
+
+	// RegGen is the IN-MEMORY per-registration generation (t1a-F1; never
+	// persisted — json:"-"): the identity of the entry's CURRENT
+	// incarnation, minted from the holder's counter whenever an entry is
+	// installed (load, create) and RE-MINTED on every successful
+	// registration refresh (the submit merge path: same id+token, new
+	// label/policy). It feeds generation-bound pruning
+	// (notify_dispatch.go): a prune closure captures it at send-claim
+	// time and the atomic check-and-delete
+	// (deleteIfRegistrationCurrent) refuses to prune when the incarnation
+	// has moved — a stale in-flight UNREGISTERED must not delete a
+	// since-REFRESHED registration (v4 §3.5 "older token generation").
+	// Administrative patches and send telemetry deliberately PRESERVE it
+	// (neither is a re-registration). Memory-only is sound:
+	// StopNotifyDispatch joins every in-flight send before a reload can
+	// re-mint, so no captured generation is ever compared across a load.
+	RegGen uint64 `json:"-"`
 }
 
 // notifyStoreFile is the whole persisted document.
@@ -195,6 +247,9 @@ func validateNotifyEntry(e *notifyStoreEntry) error {
 	if err := validateNotifyLabel(e.Label); err != nil {
 		return err
 	}
+	if p := e.PushPolicy; p != "" && p != alerts.PolicyWhenUnattended && p != alerts.PolicyAlways {
+		return fmt.Errorf("push_policy %q is not %q or %q", p, alerts.PolicyWhenUnattended, alerts.PolicyAlways)
+	}
 	if e.CreatedAt.IsZero() {
 		return errors.New("created_at is required")
 	}
@@ -216,52 +271,72 @@ func newNotifyID() (string, error) {
 
 // decodeNotifyStore strictly decodes exactly ONE JSONC document into a
 // validated store. Shared by the startup file load; the same parser would
-// catch a hand-corrupted file at startup instead of mid-send.
-func decodeNotifyStore(data []byte) (*notifyStoreFile, error) {
+// catch a hand-corrupted file at startup instead of mid-send. Schema 1
+// (the pre-S4 shape, no push_policy) and schema 2 are accepted: a schema-1
+// document returns the MIGRATED shape (schema 2, every policy defaulted to
+// when_unattended) with migrated=true — the caller (loadNotifyStoreFile)
+// then performs the backup-first, atomic, fail-closed file migration. A
+// schema outside {1,2} is refused.
+func decodeNotifyStore(data []byte) (f *notifyStoreFile, migrated bool, err error) {
 	stripped := projectcfg.StripJSONC(data)
 	dec := json.NewDecoder(bytes.NewReader(stripped))
 	dec.DisallowUnknownFields()
-	var f *notifyStoreFile
-	if err := dec.Decode(&f); err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil, errors.New("empty document")
+	if derr := dec.Decode(&f); derr != nil {
+		if errors.Is(derr, io.EOF) {
+			return nil, false, errors.New("empty document")
 		}
-		return nil, fmt.Errorf("invalid JSON: %v", err)
+		return nil, false, fmt.Errorf("invalid JSON: %v", derr)
 	}
 	if f == nil {
-		return nil, errors.New("document must be a JSON object, not null")
+		return nil, false, errors.New("document must be a JSON object, not null")
 	}
 	var trailing json.RawMessage
-	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return nil, errors.New("expected exactly one JSON document (trailing content)")
+	if terr := dec.Decode(&trailing); !errors.Is(terr, io.EOF) {
+		return nil, false, errors.New("expected exactly one JSON document (trailing content)")
 	}
-	if f.Schema != notifyStoreSchema {
-		return nil, fmt.Errorf("schema version %d not supported (want %d)", f.Schema, notifyStoreSchema)
+	switch f.Schema {
+	case notifyStoreSchema:
+	case notifyStoreSchemaV1:
+		migrated = true
+	default:
+		return nil, false, fmt.Errorf("schema version %d not supported (this build reads %d and migrates %d)", f.Schema, notifyStoreSchema, notifyStoreSchemaV1)
 	}
 	seenID := make(map[string]bool, len(f.Tokens))
 	seenToken := make(map[string]bool, len(f.Tokens))
 	for i := range f.Tokens {
 		e := &f.Tokens[i]
-		if err := validateNotifyEntry(e); err != nil {
-			return nil, fmt.Errorf("tokens[%d]: %v", i, err)
+		if migrated {
+			// Schema-1 documents predate push_policy: the conservative v4
+			// §3.2 migration default. (A schema-1 file cannot carry a
+			// policy — DisallowUnknownFields rejected the key in that
+			// document shape — so this cannot override anything.)
+			e.PushPolicy = alerts.PolicyWhenUnattended
+		}
+		if verr := validateNotifyEntry(e); verr != nil {
+			return nil, false, fmt.Errorf("tokens[%d]: %v", i, verr)
 		}
 		if seenID[e.ID] {
-			return nil, fmt.Errorf("tokens[%d]: duplicate id %q", i, e.ID)
+			return nil, false, fmt.Errorf("tokens[%d]: duplicate id %q", i, e.ID)
 		}
 		seenID[e.ID] = true
 		if seenToken[e.Token] {
-			return nil, fmt.Errorf("tokens[%d]: duplicate token", i)
+			return nil, false, fmt.Errorf("tokens[%d]: duplicate token", i)
 		}
 		seenToken[e.Token] = true
 		// Normalize nil conditions to the explicit empty list ("all nine").
 		if e.Scope.Conditions == nil {
 			e.Scope.Conditions = []string{}
 		}
+		// Canonical in-memory policy: the fail-closed default when absent.
+		e.PushPolicy = alerts.NormalizePushPolicy(e.PushPolicy)
 	}
 	if f.Tokens == nil {
 		f.Tokens = []notifyStoreEntry{}
 	}
-	return f, nil
+	if migrated {
+		f.Schema = notifyStoreSchema
+	}
+	return f, migrated, nil
 }
 
 // notifyChmod is os.Chmod as a var so lane-1 tests can force the
@@ -272,12 +347,20 @@ var notifyChmod = os.Chmod
 // loadNotifyStoreFile reads and strictly decodes the registry at path.
 // A MISSING file inside an existing directory is the one tolerated
 // posture: it loads as the empty registry (exactly what decoding
-// {"schema":1,"tokens":[]} produces); the file is created lazily by the
+// {"schema":2,"tokens":[]} produces); the file is created lazily by the
 // first mutation through the existing atomic persist path. A missing or
 // non-directory PARENT is a typo and returns an error naming the
 // directory — fail at boot, not at first write. Every other error names
 // the path plus the precise reason — a set-but-bad --notify-store is a
 // startup failure, never a silent empty registry.
+//
+// A schema-1 document migrates (v4 §3.2 / brief §5): the ORIGINAL bytes
+// are backed up to <path>.schema1.bak FIRST, then the migrated schema-2
+// document replaces the file atomically (tmp+rename). Backup or persist
+// failure returns an error — startup fails closed with the original file
+// untouched. Re-loading a migrated file is a plain schema-2 load (the
+// backup is not rewritten). See decodeNotifyStore for the field mapping.
+//
 // A successfully loaded file also has its mode secured: any bit beyond
 // 0600 (group/other read/write/exec) is repaired with a one-line warning,
 // because the file holds raw FCM bearer tokens (b-F1). Repair, not fatal
@@ -303,9 +386,14 @@ func loadNotifyStoreFile(path string) (*notifyStoreFile, error) {
 		}
 		return nil, fmt.Errorf("read notify store %s: %v", path, err)
 	}
-	f, err := decodeNotifyStore(data)
+	f, migrated, err := decodeNotifyStore(data)
 	if err != nil {
 		return nil, fmt.Errorf("notify store %s: %v", path, err)
+	}
+	if migrated {
+		if err := migrateNotifyStoreFile(path, data, f); err != nil {
+			return nil, fmt.Errorf("notify store %s: schema-1 migration: %v", path, err)
+		}
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -318,6 +406,26 @@ func loadNotifyStoreFile(path string) (*notifyStoreFile, error) {
 		log.Printf("Warning: notify store %s was mode %o (group/other bits set on a file holding raw FCM bearer tokens) — repaired to 0600", path, uint32(perm))
 	}
 	return f, nil
+}
+
+// migrateNotifyStoreFile performs the versioned, backup-first, atomic,
+// fail-closed schema-1 → schema-2 migration: raw (the exact pre-migration
+// file bytes, JSONC included) lands at path+notifyStoreBackupSuffix via
+// the same atomic 0600 discipline, THEN the migrated document replaces
+// the store. A failure at either step aborts with the store file still
+// holding the original schema-1 document (the persist is tmp+rename; the
+// backup write happens before it).
+func migrateNotifyStoreFile(path string, raw []byte, f *notifyStoreFile) error {
+	backup := path + notifyStoreBackupSuffix
+	if err := persistAtomic0600(backup, raw); err != nil {
+		return fmt.Errorf("write schema-1 backup %s: %v", backup, err)
+	}
+	if err := persistNotifyStore(path, f); err != nil {
+		return fmt.Errorf("replace with migrated schema-2 document: %v", err)
+	}
+	log.Printf("notify store %s: migrated schema 1 -> %d (policies defaulted to %s; %d token(s) preserved verbatim; original backed up at %s)",
+		path, notifyStoreSchema, alerts.PolicyWhenUnattended, len(f.Tokens), backup)
+	return nil
 }
 
 // notifyCreateExcl is the persist tmp exclusive-create seam — os.OpenFile
@@ -419,12 +527,14 @@ func cloneNotifyScope(s notifyScope) notifyScope {
 
 func cloneNotifyEntry(e *notifyStoreEntry) notifyStoreEntry {
 	out := notifyStoreEntry{
-		ID:        e.ID,
-		Token:     e.Token,
-		Label:     e.Label,
-		CreatedAt: e.CreatedAt,
-		LastError: e.LastError,
-		Scope:     cloneNotifyScope(e.Scope),
+		ID:         e.ID,
+		Token:      e.Token,
+		Label:      e.Label,
+		PushPolicy: e.PushPolicy,
+		CreatedAt:  e.CreatedAt,
+		LastError:  e.LastError,
+		Scope:      cloneNotifyScope(e.Scope),
+		RegGen:     e.RegGen,
 	}
 	if e.LastUsedAt != nil {
 		v := *e.LastUsedAt
@@ -454,6 +564,11 @@ type notifyStoreHolder struct {
 	path    string // persistence path; "" = registry disabled
 	entries []notifyStoreEntry
 	gen     uint64
+
+	// regGenSeq mints the per-registration generations (notifyStoreEntry
+	// .RegGen — see that field). Guarded by mu; deliberately NOT part of
+	// the persisted shape.
+	regGenSeq uint64
 
 	// results/recordOnce carry the ASYNCHRONOUS send-telemetry drain: a
 	// small buffered channel plus one drain goroutine, created lazily on
@@ -523,13 +638,26 @@ func (h *notifyStoreHolder) configured() bool {
 }
 
 // setLoaded installs the startup registry (--notify-store): persistence
-// path plus entries. Bumps gen.
+// path plus entries. Bumps gen. Each installed entry is minted a FRESH
+// registration generation (RegGen) — a load births new in-memory
+// incarnations (safe: StopNotifyDispatch joined every in-flight send
+// before this can run).
 func (h *notifyStoreHolder) setLoaded(path string, f *notifyStoreFile) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.path = path
 	h.entries = cloneNotifyEntries(f.Tokens)
+	for i := range h.entries {
+		h.entries[i].RegGen = h.nextRegGenLocked()
+	}
 	h.gen++
+}
+
+// nextRegGenLocked mints the next per-registration generation. Caller
+// holds h.mu.
+func (h *notifyStoreHolder) nextRegGenLocked() uint64 {
+	h.regGenSeq++
+	return h.regGenSeq
 }
 
 // persistLocked writes the CURRENT entries under the holder lock. Caller
@@ -541,13 +669,35 @@ func (h *notifyStoreHolder) persistLocked() error {
 	return persistNotifyStore(h.path, &notifyStoreFile{Schema: notifyStoreSchema, Tokens: cloneNotifyEntries(h.entries)})
 }
 
-// submit registers token (idempotently): an existing entry with the same
-// raw token is returned with created=false and is NOT mutated (label
-// changes belong to PATCH); a new entry gets a fresh ID, the given label,
-// created_at=now, and the default scope (enabled, conditions=[] = all
-// nine). Persist-before-swap: a persist failure returns the error and
-// leaves running state untouched. Bumps gen only on create.
-func (h *notifyStoreHolder) submit(token, label string) (entry notifyStoreEntry, created bool, err error) {
+// submit registers token (idempotently, v4 §3.1 FULL-STATE POST
+// semantics): the body {token,label,push_policy} is the token's COMPLETE
+// desired state. An existing entry with the same raw token gets its label
+// AND policy REFRESHED (a re-POST without push_policy RESETS an always
+// token to when_unattended) — but the ADMINISTRATIVE surfaces are never
+// touched: scope.enabled=false stays disabled and explicit scope
+// conditions stay restricted (a later Pulse POST does not override
+// administrative disable/scopes, v4 §3.2). A successful refresh is a NEW
+// REGISTRATION INCARNATION: the entry keeps its stable administrative ID,
+// scopes, and metadata, but its per-registration generation (RegGen) is
+// RE-MINTED (t1a-F1) — a dispatcher prune claimed against the
+// pre-refresh incarnation must not delete the refreshed registration. A
+// FAILED refresh (persist error) leaves RegGen untouched. A new entry
+// gets a fresh ID, the given label/policy, created_at=now, and the
+// default scope (enabled, conditions=[] = all nine); the registry cap
+// (notifyTokenCap) refuses a NEW token beyond it. Labels over the
+// ceiling are normalized to ≤64 code points ELLIPSIS INCLUDED on BOTH
+// branches (normalizeNotifyLabel), and the merged refresh entry passes
+// the SAME validateNotifyEntry gate a fresh create does BEFORE anything
+// persists (t1b-F1): a successful public refresh can never leave behind
+// a registry the strict reload would refuse. Persist-before-swap: a
+// persist failure returns the error and leaves running state untouched.
+// Bumps gen only on create (RegGen moves on every successful refresh).
+func (h *notifyStoreHolder) submit(token, label, policy string) (entry notifyStoreEntry, created bool, err error) {
+	if policy != "" && policy != alerts.PolicyWhenUnattended && policy != alerts.PolicyAlways {
+		return notifyStoreEntry{}, false, alerts.ErrNotifyTokenPolicy
+	}
+	policy = alerts.NormalizePushPolicy(policy)
+	label = normalizeNotifyLabel(label, maxNotifyLabelRunes)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.path == "" {
@@ -555,23 +705,51 @@ func (h *notifyStoreHolder) submit(token, label string) (entry notifyStoreEntry,
 	}
 	for i := range h.entries {
 		if h.entries[i].Token == token {
+			merged := cloneNotifyEntry(&h.entries[i])
+			merged.Label = label
+			merged.PushPolicy = policy
+			// t1b-F1: the merged refresh must pass the SAME strict
+			// validation the file load applies (the create branch below
+			// always has). Without this gate a successful public refresh
+			// could persist a registry the strict reload REFUSES at next
+			// startup — the byte-based truncator once produced a
+			// 64-bytes+ellipsis (65-rune) label exactly here.
+			// Post-normalization the label always passes; anything else
+			// that fails is rejected WITHOUT persisting.
+			if err := validateNotifyEntry(&merged); err != nil {
+				return notifyStoreEntry{}, false, err
+			}
+			if err := persistNotifyStore(h.path, &notifyStoreFile{Schema: notifyStoreSchema, Tokens: withReplaced(cloneNotifyEntries(h.entries), i, merged)}); err != nil {
+				return notifyStoreEntry{}, false, err
+			}
+			// The refresh landed: this is a NEW incarnation of the same
+			// registration (stable id/scopes/metadata, moved RegGen) —
+			// minted only AFTER the persist so a failed refresh cannot
+			// invalidate in-flight prunes (t1a-F1).
+			merged.RegGen = h.nextRegGenLocked()
+			h.entries[i] = merged
 			return cloneNotifyEntry(&h.entries[i]), false, nil
 		}
+	}
+	if len(h.entries) >= notifyTokenCap {
+		return notifyStoreEntry{}, false, alerts.ErrNotifyTokenCap
 	}
 	id, err := newNotifyID()
 	if err != nil {
 		return notifyStoreEntry{}, false, err
 	}
 	e := notifyStoreEntry{
-		ID:        id,
-		Token:     token,
-		Label:     label,
-		CreatedAt: time.Now().UTC(),
-		Scope:     notifyScope{Enabled: true, Conditions: []string{}},
+		ID:         id,
+		Token:      token,
+		Label:      label,
+		PushPolicy: policy,
+		CreatedAt:  time.Now().UTC(),
+		Scope:      notifyScope{Enabled: true, Conditions: []string{}},
+		RegGen:     h.nextRegGenLocked(),
 	}
 	// Defense-in-depth: the constructed entry must pass the same
 	// validation the file load applies (handler-side checks should have
-	// caught label/token problems already).
+	// caught label/token/policy problems already).
 	if err := validateNotifyEntry(&e); err != nil {
 		return notifyStoreEntry{}, false, err
 	}
@@ -614,6 +792,42 @@ func (h *notifyStoreHolder) delete(id string) (bool, error) {
 	}
 	if idx < 0 {
 		return false, nil
+	}
+	updated := append(h.entries[:idx:idx], h.entries[idx+1:]...)
+	if err := persistNotifyStore(h.path, &notifyStoreFile{Schema: notifyStoreSchema, Tokens: cloneNotifyEntries(updated)}); err != nil {
+		return true, err
+	}
+	h.entries = updated
+	h.gen++
+	return true, nil
+}
+
+// deleteIfRegistrationCurrent is the dispatcher's ATOMIC prune gate
+// (t1a-F1): the generation check AND the conditional deletion run under
+// ONE hold of the store mutex, so a registration refresh can never land
+// between the check and the delete. The entry with the given id is
+// removed only when its CURRENT token value and registration generation
+// still match the values captured at send-claim time; every mismatch is
+// the RETAIN verdict (deleted=false, err nil): unknown id (deleted
+// mid-send, or re-registered as a NEW entry with a fresh random id),
+// replaced token, or a REFRESHED registration whose generation moved past
+// the captured one (same id+token re-POST — the merge path re-mints
+// RegGen). Persist-before-swap like delete; bumps gen on success.
+func (h *notifyStoreHolder) deleteIfRegistrationCurrent(id, token string, regGen uint64) (deleted bool, err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.path == "" {
+		return false, errors.New("no persistence path configured")
+	}
+	idx := -1
+	for i := range h.entries {
+		if h.entries[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 || h.entries[idx].Token != token || h.entries[idx].RegGen != regGen {
+		return false, nil // stale incarnation: since re-registered/replaced/refreshed — retain
 	}
 	updated := append(h.entries[:idx:idx], h.entries[idx+1:]...)
 	if err := persistNotifyStore(h.path, &notifyStoreFile{Schema: notifyStoreSchema, Tokens: cloneNotifyEntries(updated)}); err != nil {
@@ -788,7 +1002,35 @@ func (h *notifyStoreHolder) flushSendResults() {
 	h.flushMu.Unlock()
 }
 
-// truncateRunes cuts s to at most max BYTES on a rune boundary.
+// normalizeNotifyLabel bounds label to at most max CODE POINTS, counting
+// any ellipsis it appends (the t1b-F1 label fix): a label over the
+// ceiling is cut to its first max-1 runes + "…" (U+2026), so the RESULT
+// — ellipsis included — is exactly max runes and always passes
+// validateNotifyLabel at load; a label at or under the ceiling
+// (including exactly max runes) is returned verbatim. The byte-based
+// truncateRunes is NOT suitable here: on a 65-ASCII-char label it
+// produced 64 bytes + the 1-rune ellipsis = 65 code points (a form the
+// strict reload refuses), and on multibyte labels it cut far under the
+// documented rune allowance (64 CJK runes = 192 bytes → ~21 runes).
+func normalizeNotifyLabel(label string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(label) <= max {
+		return label
+	}
+	rs := make([]rune, 0, max)
+	for _, r := range label {
+		if len(rs) == max-1 {
+			break
+		}
+		rs = append(rs, r)
+	}
+	return string(rs) + "…"
+}
+
+// truncateRunes cuts s to at most max BYTES on a rune boundary
+// (byte-bounded text — last_error; labels use normalizeNotifyLabel).
 func truncateRunes(s string, max int) string {
 	if len(s) <= max {
 		return s
@@ -811,6 +1053,7 @@ type notifyTokenWire struct {
 	ID           string      `json:"id"`
 	Label        string      `json:"label"`
 	TokenPreview string      `json:"token_preview"`
+	PushPolicy   string      `json:"push_policy"`
 	CreatedAt    time.Time   `json:"created_at"`
 	LastUsedAt   *time.Time  `json:"last_used_at"`
 	LastError    string      `json:"last_error"`
@@ -834,11 +1077,23 @@ func notifyEntryWire(e notifyStoreEntry) notifyTokenWire {
 		ID:           e.ID,
 		Label:        e.Label,
 		TokenPreview: maskNotifyToken(e.Token),
+		PushPolicy:   alerts.NormalizePushPolicy(e.PushPolicy),
 		CreatedAt:    e.CreatedAt,
 		LastUsedAt:   e.LastUsedAt,
 		LastError:    e.LastError,
 		Scope:        cloneNotifyScope(e.Scope),
 	}
+}
+
+// policyCounts reports the token counts by push policy — the v4 probe's
+// "policies" object (counts only, never values or labels; both keys always
+// present; the two counts sum to the entry count).
+func policyCounts(s *notifyStoreSnapshot) map[string]int {
+	out := map[string]int{alerts.PolicyWhenUnattended: 0, alerts.PolicyAlways: 0}
+	for i := range s.entries {
+		out[alerts.NormalizePushPolicy(s.entries[i].PushPolicy)]++
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -866,8 +1121,39 @@ func notifyEntryWire(e notifyStoreEntry) notifyTokenWire {
 // ledger alongside existing enrolled sources refuses startup (the global
 // id head must never silently restart at 1 — see the ledger's recovery
 // proof). Re-loading (controller-restart tests) re-arms from the committed
-// journal and resumes committed cursors.
+// journal and resumes committed cursors. Since S4 the re-load ALSO stops
+// and JOINS the central dispatcher (notify_dispatch.go) — the ledger swap
+// (armNotifyLedgerFor, under notifyLedgerMu) never lands under an in-flight
+// dispatch claim/send — and since t1b-F1 the stop-joins precede the
+// REGISTRY READ itself, extended by B-F1 to the THIRD writer: the
+// legacy fleet watcher (notify_watcher.go) is stop-joined too (see
+// the ordering invariant inside).
 func (d *Daemon) LoadNotifyStore(path string) error {
+	// ORDERING INVARIANT (t1b-F1, extended to all three writers by
+	// B-F1): quiesce + JOIN every notify-writer loop BEFORE the
+	// registry read — the ingest pull loop, the central dispatcher,
+	// AND the legacy fleet watcher (notify_watcher.go), whose fan-out
+	// sends carry the same generation-fenced UNREGISTERED prune
+	// (deleteIfRegistrationCurrent, which persists the retirement
+	// before swapping memory). All three stops are stop-JOINS — each
+	// returns only after every pull/dispatch/tick goroutine has
+	// drained, INCLUDING any in-flight FCM send AND its prune.
+	// Reading the file first would let the installed snapshot
+	// post-date a joined prune: an in-flight watcher (or dispatcher)
+	// send whose canonical UNREGISTERED answer lands while the reload
+	// is parked in the join durably retires the token, and setLoaded
+	// would then reinstall the stale entry from the pre-join snapshot
+	// — minting a fresh RegGen, resurrecting the confirmed-UNREGISTERED
+	// token in memory (and a later persist could restore it to disk).
+	// RegGen cannot fence this resurrection class: installing an older
+	// registry snapshot is NOT a registration refresh — the install
+	// post-dates a COMPLETED prune yet rewinds the registry past it.
+	// Stop-then-read guarantees no installed snapshot can predate ANY
+	// joined prune: a confirmed-UNREGISTERED token stays retired across
+	// reload, in memory AND on disk.
+	d.StopNotifyIngest()
+	d.StopNotifyDispatch()
+	d.StopNotifyWatcher()
 	f, err := loadNotifyStoreFile(path)
 	if err != nil {
 		return err
@@ -886,11 +1172,12 @@ func (d *Daemon) LoadNotifyStore(path string) error {
 		return err
 	}
 	// Central ledger journal (notify controller-hub S3): armed AFTER the
-	// sources anchor so the witness check sees the enrollment state. A
-	// running pull loop is stopped FIRST — and JOINED (b-F2: the stop
-	// returns only after every pull goroutine has drained) — so the
-	// re-load never swaps the ledger under an in-flight commit/ACK.
-	d.StopNotifyIngest()
+	// sources anchor so the witness check sees the enrollment state. The
+	// loops were already stopped — and JOINED (b-F2/B-F1: the stops above
+	// return only after every pull/dispatch/tick goroutine has drained) —
+	// at the TOP of this call, so the re-arm never swaps the ledger under
+	// an in-flight commit, ACK, claim, or send (and the registry read
+	// above never snapshots under one either).
 	if err := d.armNotifyLedgerFor(path); err != nil {
 		return err
 	}

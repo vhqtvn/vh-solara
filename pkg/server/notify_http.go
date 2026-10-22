@@ -1,14 +1,18 @@
 package server
 
-// notify_http.go — the /vh/notify/* HTTP family (slice S1; see
-// notify_transport.go for the program header). Controller userMux,
-// session-cookie auth family — the same chain as /vh/fleet/config:
+// notify_http.go — the /vh/notify/* HTTP family (slice S1; v4 registration
+// + probe since notify controller-hub S4; see notify_transport.go for the
+// program header). Controller userMux, session-cookie auth family — the
+// same chain as /vh/fleet/config:
 //
-//	POST   /vh/notify/tokens       app submits {token, label?} (CSRF)
-//	GET    /vh/notify/tokens       masked list for the management UI
-//	DELETE /vh/notify/tokens/{id}  revoke (CSRF; 404 unknown id)
-//	PATCH  /vh/notify/tokens/{id}  update label/scope (CSRF; strict decode)
-//	POST   /vh/notify/test         test-send {token?|id?} (CSRF)
+//	POST   /vh/notify/tokens          v4 PUBLIC registration (CSRF): the app
+//	                                 submits {token, label?, push_policy?}
+//	GET    /vh/notify/tokens          v4 PUBLIC channel probe (never errors)
+//	GET    /vh/admin/notify/tokens    masked list for the management UI
+//	DELETE /vh/notify/tokens/{id}     revoke (CSRF; 404 unknown id) [admin,
+//	                                 relocates to /vh/admin/notify/* in S5]
+//	PATCH  /vh/notify/tokens/{id}     update label/scope (CSRF; strict decode)
+//	POST   /vh/notify/test            test-send {token?|id?} (CSRF)
 //
 // Conventions carried over from the fleet-config family:
 //   - Mutations require X-VH-CSRF enforced IN the handler (403 without
@@ -16,17 +20,25 @@ package server
 //     under /api/, and these are /vh/ mutations outside its scope.
 //   - GET is CSRF-exempt (repo convention — GET carries no state change);
 //     unauthenticated requests under /vh/* get auth's clean API-class 401.
-//   - Disabled postures are HONEST refusals, never silent no-ops: no
-//     --notify-store path ⇒ 409 naming the flag on every family endpoint;
-//     no --notify-fcm-credentials ⇒ test-send 409s naming the flag (the
-//     registry itself still works — tokens can be enrolled before
-//     credentials exist).
+//   - Honest refusals, never silent no-ops: no --notify-store path ⇒ the
+//     v4 PUBLIC POST answers 503 "notify unavailable" BEFORE body
+//     validation (the worker-compatible channel-unavailable posture, v4
+//     §3.1 — 503 wins over 400); the ADMIN family (masked list,
+//     DELETE/PATCH/{id}, test-send) keeps its honest 409 posture naming
+//     the flag until S5 relocates it; no --notify-fcm-credentials ⇒
+//     test-send 409s naming the flag (the registry itself still works —
+//     tokens can be enrolled before credentials exist).
 //   - Bodies are strict JSON (DisallowUnknownFields, exactly one
 //     document) capped at 4 KiB (http.MaxBytesReader, like the config
 //     PUT's cap discipline). Unlike the config FILE reads, request bodies
 //     do not accept JSONC — they are app-generated, not hand-edited.
-//   - Responses are additive schema-1 JSON and NEVER echo a raw token:
-//     notifyEntryWire renders a masked preview only.
+//   - The v4 PUBLIC registration response is exactly {"ok":true} — no
+//     masked entry echo, never a token value (v4 §3.1). Every error the
+//     public registration route answers after the CSRF gate is the v4
+//     JSON envelope {"ok":false,"error":…} (t1a-F2/t1c-F2 — the response
+//     table in notify-fcm.md §3.1; the plain-text http.Error renderer
+//     stays on the ADMIN family only). The ADMIN masked list renders
+//     notifyTokenWire (preview only).
 //
 // hostInterceptor carves the whole /vh/notify/ prefix out of the
 // worker-subdomain proxy (daemon.go): the family is controller-owned and
@@ -42,6 +54,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/vhqtvn/vh-solara/pkg/alerts"
 )
 
 // maxNotifyBodyBytes caps every /vh/notify/* request body (a token
@@ -103,24 +117,23 @@ func notifyStoreDisabled(w http.ResponseWriter) {
 	http.Error(w, "notification registry is not configured: no --notify-store path is set on this controller", http.StatusConflict)
 }
 
-// decodeNotifyBody strictly decodes exactly one bounded JSON document
-// into dst. Error text is prefixed by what so each endpoint's 400s name
-// their surface.
-func decodeNotifyBody(w http.ResponseWriter, r *http.Request, what string, dst any) error {
+// decodeStrictNotifyBody is the strict-decode core shared by the
+// plain-text and v4-envelope wrappers: it decodes exactly one bounded
+// JSON document into dst and returns the 400 message on failure ("" on
+// success) WITHOUT writing the response — rendering is the wrapper's
+// concern. w feeds only http.MaxBytesReader's connection management.
+func decodeStrictNotifyBody(w http.ResponseWriter, r *http.Request, what string, dst any) (string, error) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxNotifyBodyBytes))
 	if err != nil {
-		http.Error(w, "invalid "+what+": request body exceeds the byte cap", http.StatusBadRequest)
-		return err
+		return "invalid " + what + ": request body exceeds the byte cap", err
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		if errors.Is(err, io.EOF) {
-			http.Error(w, "invalid "+what+": empty document", http.StatusBadRequest)
-			return err
+			return "invalid " + what + ": empty document", err
 		}
-		http.Error(w, "invalid "+what+": "+err.Error(), http.StatusBadRequest)
-		return err
+		return "invalid " + what + ": " + err.Error(), err
 	}
 	var trailing json.RawMessage
 	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
@@ -128,10 +141,34 @@ func decodeNotifyBody(w http.ResponseWriter, r *http.Request, what string, dst a
 		// the returned error must be non-nil either way, or the caller
 		// would proceed with the partially-decoded first document (the
 		// bug the lifecycle test caught: a 400 on the wire AND a create).
-		http.Error(w, "invalid "+what+": expected exactly one JSON document (trailing content)", http.StatusBadRequest)
-		return errors.New("trailing content")
+		return "invalid " + what + ": expected exactly one JSON document (trailing content)", errors.New("trailing content")
 	}
-	return nil
+	return "", nil
+}
+
+// decodeNotifyBody strictly decodes exactly one bounded JSON document
+// into dst, answering failures with the family's PLAIN-TEXT 400 (the
+// admin-surface renderer). Error text is prefixed by what so each
+// endpoint's 400s name their surface.
+func decodeNotifyBody(w http.ResponseWriter, r *http.Request, what string, dst any) error {
+	msg, err := decodeStrictNotifyBody(w, r, what, dst)
+	if err != nil {
+		http.Error(w, msg, http.StatusBadRequest)
+	}
+	return err
+}
+
+// decodeNotifyBodyV4 is decodeNotifyBody's v4-public variant: identical
+// strictness, but failures render through the JSON envelope (t1c-F2 —
+// the public registration route answers every error as
+// {"ok":false,"error":…} like the mirrored worker route; status codes
+// unchanged).
+func decodeNotifyBodyV4(w http.ResponseWriter, r *http.Request, what string, dst any) error {
+	msg, err := decodeStrictNotifyBody(w, r, what, dst)
+	if err != nil {
+		notifyV4Error(w, http.StatusBadRequest, msg)
+	}
+	return err
 }
 
 // writeNotifyJSON renders the family's response envelope.
@@ -163,64 +200,134 @@ func (d *Daemon) notifySender() Notifier {
 }
 
 // ---------------------------------------------------------------------------
-// POST /vh/notify/tokens — enroll (idempotent by raw token)
+// POST /vh/notify/tokens — v4 public registration (idempotent by raw token)
 // ---------------------------------------------------------------------------
 
-// handleNotifyTokenCreate serves POST /vh/notify/tokens.
+// notifyV4Error renders the v4 public error envelope {"ok":false,...}.
+func notifyV4Error(w http.ResponseWriter, status int, msg string) {
+	writeNotifyJSON(w, status, struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}{OK: false, Error: msg})
+}
+
+// handleNotifyTokenCreate serves POST /vh/notify/tokens — the v4 central
+// registration contract (notify-fcm.md §3.1; golden fixture
+// registration_request_v4.json). The body {token,label?,push_policy?} is
+// the token's COMPLETE desired state (full-state POST rule: a re-POST
+// without push_policy RESETS the policy to when_unattended — clients must
+// always send the field); it never touches the administrative scope.
 //
-// Check order: CSRF (403) → registry configured (409) → decode/validate
-// (400) → submit (500 on persist failure). 201 + masked entry on create;
-// 200 + masked entry (created:false) when the token is already registered
-// — the app's re-registration on every boot is the expected flow.
+// Check order: CSRF (403) → channel unconfigured 503 "notify unavailable"
+// BEFORE body validation (the interpreted-behavior gate: 503 wins over
+// 400, exactly like the worker route) → decode (400) → token required
+// (400) → policy vocabulary (400 "invalid push_policy") → submit (cap →
+// 400 "token limit reached"; persistence → 500). Success answers
+// 200 {"ok":true} — the registration NEVER echoes a masked entry or any
+// token material on the public surface. EVERY error this handler answers
+// after the CSRF gate is the v4 JSON envelope {"ok":false,"error":…}
+// (t1a-F2/t1c-F2) — never a plain-text http.Error.
 func (d *Daemon) handleNotifyTokenCreate(w http.ResponseWriter, r *http.Request) {
 	if !requireNotifyCSRF(w, r) {
 		return
 	}
 	if !d.notifyStore.configured() {
-		notifyStoreDisabled(w)
+		notifyV4Error(w, http.StatusServiceUnavailable, "notify unavailable")
 		return
 	}
 	var req struct {
-		Token string `json:"token"`
-		Label string `json:"label"`
+		Token      string `json:"token"`
+		Label      string `json:"label"`
+		PushPolicy string `json:"push_policy"` // "" | when_unattended | always ("" = when_unattended)
 	}
-	if err := decodeNotifyBody(w, r, "token submission", &req); err != nil {
+	if err := decodeNotifyBodyV4(w, r, "token submission", &req); err != nil {
+		return
+	}
+	if req.Token == "" {
+		notifyV4Error(w, http.StatusBadRequest, alerts.ErrNotifyTokenRequired.Error())
 		return
 	}
 	if err := validNotifyToken(req.Token); err != nil {
-		http.Error(w, "invalid token submission — token: "+err.Error(), http.StatusBadRequest)
+		notifyV4Error(w, http.StatusBadRequest, "invalid token submission — token: "+err.Error())
 		return
 	}
-	if err := validateNotifyLabel(req.Label); err != nil {
-		http.Error(w, "invalid token submission — "+err.Error(), http.StatusBadRequest)
+	if req.PushPolicy != "" && req.PushPolicy != alerts.PolicyWhenUnattended && req.PushPolicy != alerts.PolicyAlways {
+		notifyV4Error(w, http.StatusBadRequest, alerts.ErrNotifyTokenPolicy.Error())
 		return
 	}
-	entry, created, err := d.notifyStore.submit(req.Token, req.Label)
+	_, _, err := d.notifyStore.submit(req.Token, req.Label, req.PushPolicy)
 	if err != nil {
-		http.Error(w, "notification registry: "+err.Error(), http.StatusInternalServerError)
+		if errors.Is(err, alerts.ErrNotifyTokenCap) {
+			notifyV4Error(w, http.StatusBadRequest, alerts.ErrNotifyTokenCap.Error())
+			return
+		}
+		notifyV4Error(w, http.StatusInternalServerError, "notification registry: "+err.Error())
 		return
 	}
-	status := http.StatusOK
-	if created {
-		status = http.StatusCreated
-	}
-	writeNotifyJSON(w, status, struct {
-		Schema  int             `json:"schema"`
-		Created bool            `json:"created"`
-		Token   notifyTokenWire `json:"token"`
-	}{Schema: 1, Created: created, Token: notifyEntryWire(entry)})
+	writeNotifyJSON(w, http.StatusOK, struct {
+		OK bool `json:"ok"`
+	}{OK: true})
 }
 
 // ---------------------------------------------------------------------------
-// GET /vh/notify/tokens — masked list
+// GET /vh/notify/tokens — the v4 channel probe (never an error)
 // ---------------------------------------------------------------------------
 
-// handleNotifyTokenList serves GET /vh/notify/tokens: the masked registry
-// for the management UI (S3). Read-only and CSRF-exempt (repo
-// convention); unauthenticated requests get auth's clean 401 before the
-// handler runs. 409 (not an empty 200) when no store is configured — an
-// empty list would read as "zero devices registered", which is a lie.
-func (d *Daemon) handleNotifyTokenList(w http.ResponseWriter, r *http.Request) {
+// notifyProbeWire is the v4 probe response — the worker probe shape with
+// CENTRAL semantics (v4 §3.1; golden fixture probe_response_v4.json):
+// enabled reports the controller sender's configuration/readiness (the
+// central dispatcher is armed with a configured transport), NOT worker
+// coverage; policies carries token COUNTS by push_policy; the
+// last_attempt/last_error pair keeps the v3 LATEST-COMPLETED-ATTEMPT
+// semantics, describing the CENTRAL sender's attempts. Token values and
+// labels are never returned by any read route.
+type notifyProbeWire struct {
+	Enabled     bool           `json:"enabled"`
+	Count       int            `json:"count"`
+	Policies    map[string]int `json:"policies"`
+	LastAttempt string         `json:"last_attempt"`
+	LastError   string         `json:"last_error"`
+}
+
+// handleNotifyTokenProbe serves GET /vh/notify/tokens. Never an error (the
+// app verifies connectivity by this route's HTTP success alone — keep it
+// 200-always): an unconfigured store reports the honest disabled shape
+// rather than a 409, unlike the admin family.
+func (d *Daemon) handleNotifyTokenProbe(w http.ResponseWriter, r *http.Request) {
+	probe := notifyProbeWire{
+		Enabled:  false,
+		Policies: map[string]int{alerts.PolicyWhenUnattended: 0, alerts.PolicyAlways: 0},
+	}
+	if d.notifyStore.configured() {
+		snap := d.notifyStore.snapshot()
+		probe.Count = len(snap.entries)
+		probe.Policies = policyCounts(&snap)
+	}
+	if d.centralNotifyEnabled() {
+		if at, lastErr := d.centralNotifyHealth(); !at.IsZero() {
+			probe.Enabled = true
+			probe.LastAttempt = at.Format(time.RFC3339)
+			probe.LastError = lastErr
+		} else {
+			probe.Enabled = true
+		}
+	}
+	writeNotifyJSON(w, http.StatusOK, probe)
+}
+
+// ---------------------------------------------------------------------------
+// GET /vh/admin/notify/tokens — masked list (the admin surface)
+// ---------------------------------------------------------------------------
+
+// handleNotifyAdminTokenList serves the masked registry for the management
+// UI (the S1 GET /vh/notify/tokens list, kept working verbatim against the
+// migrated store). The v4 public GET is the probe (above); this admin home
+// is where S5 relocates PATCH/DELETE/test alongside it and points
+// NotifyDialog at it. Read-only and CSRF-exempt (repo convention);
+// unauthenticated requests get auth's clean 401 before the handler runs.
+// 409 (not an empty 200) when no store is configured — an empty list would
+// read as "zero devices registered", which is a lie.
+func (d *Daemon) handleNotifyAdminTokenList(w http.ResponseWriter, r *http.Request) {
 	if !d.notifyStore.configured() {
 		notifyStoreDisabled(w)
 		return

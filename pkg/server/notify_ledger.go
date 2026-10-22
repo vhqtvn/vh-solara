@@ -1227,6 +1227,38 @@ func (l *notifyLedger) EventsSince(sinceID int64, limit int) []NotifyEvent {
 	return append([]NotifyEvent(nil), l.events[start:]...)
 }
 
+// EventsAfter pages the OLDEST retained events with id > afterID,
+// ascending, up to limit — the DISPATCH drain order (notify_dispatch.go):
+// unlike EventsSince (the public v4 semantics, whose since==0 returns the
+// NEWEST page), afterID <= 0 starts from the OLDEST retained event so a
+// fresh dispatcher replays the retained window from its beginning.
+// Retention is prefix-only: the returned window is contiguous.
+func (l *notifyLedger) EventsAfter(afterID int64, limit int) []NotifyEvent {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if limit <= 0 {
+		limit = 50
+	}
+	// Binary search for the first retained id > afterID.
+	lo, hi := 0, len(l.events)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if l.events[mid].ID <= afterID {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo >= len(l.events) {
+		return nil
+	}
+	out := append([]NotifyEvent(nil), l.events[lo:]...)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
 // Coverage builds the coverage snapshot.
 func (l *notifyLedger) Coverage() NotifyCoverage {
 	l.mu.Lock()
@@ -1249,6 +1281,21 @@ func (l *notifyLedger) Coverage() NotifyCoverage {
 	}
 	sort.Slice(cov.Sources, func(i, j int) bool { return cov.Sources[i].SourceID < cov.Sources[j].SourceID })
 	return cov
+}
+
+// Health reports the ledger's fatal condition: nil when healthy;
+// ErrNotifyLedgerPoisoned (wrapped) when a failed rollback left journal
+// bytes of unknown extent and every further mutation is refused until a
+// successful reopen. The S4 dispatch loop checks this each pass and
+// classifies poison as FATAL (stop the caller, log loudly — GF2/c-F1);
+// the ingest pull path classifies its commit errors the same way.
+func (l *notifyLedger) Health() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.poisoned != nil {
+		return fmt.Errorf("notify ledger %s: %w: %v", l.path, ErrNotifyLedgerPoisoned, l.poisoned)
+	}
+	return nil
 }
 
 // Close releases the journal handle (tests / daemon teardown).

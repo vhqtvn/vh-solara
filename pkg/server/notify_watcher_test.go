@@ -14,7 +14,10 @@ package server
 //   - clear suppression under incomplete coverage (held state, nothing
 //     recorded) and the complete-coverage clear;
 //   - scope filtering (disabled token, conditions-subset token);
-//   - retirement on UNREGISTERED vs NO retirement on a bare 404;
+//   - retirement on UNREGISTERED vs NO retirement on a bare 404, plus
+//     the RegGen fence on the watcher's own prune: a mid-send refresh
+//     survives a stale in-flight UNREGISTERED (memory AND strict
+//     reload), while a same-generation response still prunes;
 //   - the no-start posture (store/transport gating);
 //   - THE NOBODY-POLLS OBSERVATION: a transition is detected and pushed
 //     with ZERO requests to GET /vh/fleet/status;
@@ -121,7 +124,7 @@ func tickExpire(d *Daemon, w *notifyWatcher) {
 // default recipient of these tests).
 func enrollNotifyToken(t *testing.T, d *Daemon, token string) {
 	t.Helper()
-	if _, _, err := d.notifyStore.submit(token, "phone"); err != nil {
+	if _, _, err := d.notifyStore.submit(token, "phone", ""); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -158,7 +161,7 @@ func TestNotifyWatcher_TransitionMatrix(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "alpha")
 	setWorkerPerm(fake, "alpha", "/repo", 0)
 
-	if _, _, err := d.notifyStore.submit("watcher-token-all-conditions", "phone"); err != nil {
+	if _, _, err := d.notifyStore.submit("watcher-token-all-conditions", "phone", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -452,25 +455,25 @@ func TestNotifyWatcher_ScopeFiltering(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "alpha")
 	setWorkerPerm(fake, "alpha", "/repo", 0)
 
-	allTok, _, err := d.notifyStore.submit("watcher-token-scope-all", "all")
+	allTok, _, err := d.notifyStore.submit("watcher-token-scope-all", "all", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	subTok, _, err := d.notifyStore.submit("watcher-token-scope-sub", "sub")
+	subTok, _, err := d.notifyStore.submit("watcher-token-scope-sub", "sub", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := d.notifyStore.patch(subTok.ID, notifyPatch{Scope: &notifyScope{Enabled: true, Conditions: []string{fleetCondPermissionPending, fleetCondWorkerDown}}}); err != nil {
 		t.Fatal(err)
 	}
-	offTok, _, err := d.notifyStore.submit("watcher-token-scope-off", "off")
+	offTok, _, err := d.notifyStore.submit("watcher-token-scope-off", "off", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := d.notifyStore.patch(offTok.ID, notifyPatch{Scope: &notifyScope{Enabled: false, Conditions: []string{}}}); err != nil {
 		t.Fatal(err)
 	}
-	otherTok, _, err := d.notifyStore.submit("watcher-token-scope-other", "other")
+	otherTok, _, err := d.notifyStore.submit("watcher-token-scope-other", "other", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -530,11 +533,11 @@ func TestNotifyWatcher_RetirementOnUnregisteredNotBare404(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "alpha")
 	setWorkerPerm(fake, "alpha", "/repo", 0)
 
-	deadTok, _, err := d.notifyStore.submit("watcher-token-dead-unreg", "dead")
+	deadTok, _, err := d.notifyStore.submit("watcher-token-dead-unreg", "dead", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	bareTok, _, err := d.notifyStore.submit("watcher-token-bare-4040", "bare")
+	bareTok, _, err := d.notifyStore.submit("watcher-token-bare-4040", "bare", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,6 +578,149 @@ func TestNotifyWatcher_RetirementOnUnregisteredNotBare404(t *testing.T) {
 	}
 	if dr := byID[bareTok.ID]; dr.OK || dr.Retired || !strings.Contains(dr.Error, "404") {
 		t.Errorf("bare-404 delivery row: %+v (want ok=false retired=false error naming 404)", dr)
+	}
+}
+
+// TestNotifyWatcher_UnregisteredPruneGenerationFenced pins the RegGen
+// fence on the LEGACY watcher's retirement path (t1b-F1): the watcher is
+// the DEFAULT active writer, so its UNREGISTERED prune must obey the
+// same generation fence as the dispatcher. A public refresh (same
+// id+token re-POST) landing while a watcher send is IN FLIGHT re-mints
+// the registration's generation; the send's later canonical UNREGISTERED
+// must NOT prune the refreshed registration — in memory OR after strict
+// reload. The positive control (identical blocked-send machinery, NO
+// mid-flight refresh) proves a same-generation stale response still
+// prunes.
+func TestNotifyWatcher_UnregisteredPruneGenerationFenced(t *testing.T) {
+	sn := &scriptedNotifier{}
+	d, fake := newWatcherDaemon(t, sn)
+	fleetAddOnline(t, d.Registry, "alpha")
+	setWorkerPerm(fake, "alpha", "/repo", 0)
+
+	const tok = "watcher-token-refresh-inflight"
+	enrolled, _, err := d.notifyStore.submit(tok, "phone", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unregErr := &NotifyUnregisteredError{Detail: `{"error":{"code":404,"status":"NOT_FOUND","details":[{"errorCode":"UNREGISTERED"}]}}`}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	sn.respond = func(token string, _ NotifyMessage) error {
+		if token == tok {
+			entered <- struct{}{}
+			<-release
+			return unregErr
+		}
+		return nil
+	}
+
+	w := newNotifyWatcher(d, time.Hour, 0)
+	tickExpire(d, w) // baseline over an empty condition set
+
+	// The transition tick runs in the background: its send to tok parks
+	// mid-flight (entered), the PUBLIC v4 refresh lands on the SAME
+	// token (the submit merge path: stable id, re-minted RegGen), and
+	// only then does the parked send answer UNREGISTERED.
+	setWorkerPerm(fake, "alpha", "/repo", 1)
+	tickDone := make(chan struct{})
+	go func() {
+		defer close(tickDone)
+		tickExpire(d, w)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher send never entered the transport")
+	}
+	refreshed, created, err := d.notifyStore.submit(tok, "refreshed-in-flight", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || refreshed.ID != enrolled.ID {
+		t.Fatalf("refresh must merge onto the same entry: created=%v id=%q want %q", created, refreshed.ID, enrolled.ID)
+	}
+	if refreshed.RegGen == enrolled.RegGen {
+		t.Fatalf("refresh must re-mint RegGen: both %d", refreshed.RegGen)
+	}
+	close(release)
+
+	select {
+	case <-tickDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher tick never finished after the send was released")
+	}
+
+	// SURVIVAL, memory: the refreshed incarnation is still registered.
+	got, ok := d.notifyStore.byID(enrolled.ID)
+	if !ok {
+		t.Fatal("stale in-flight UNREGISTERED pruned the REFRESHED registration (memory)")
+	}
+	if got.Label != "refreshed-in-flight" || got.RegGen != refreshed.RegGen {
+		t.Fatalf("surviving entry is not the refreshed incarnation: %+v", got)
+	}
+	// SURVIVAL, disk: the strict reload still sees the registration.
+	f, err := loadNotifyStoreFile(d.notifyStore.path)
+	if err != nil || len(f.Tokens) != 1 || f.Tokens[0].ID != enrolled.ID {
+		t.Fatalf("strict reload after the fenced prune: err=%v tokens=%+v", err, f.Tokens)
+	}
+	// The history row records the failed delivery WITHOUT the retired
+	// flag — the registration was deliberately kept.
+	entries := d.notifyHistory.queryAllForTest()
+	if len(entries) != 1 || len(entries[0].Deliveries) != 1 {
+		t.Fatalf("history: %+v", entries)
+	}
+	if dr := entries[0].Deliveries[0]; dr.OK || dr.Retired {
+		t.Errorf("fenced delivery row: %+v (want ok=false retired=false)", dr)
+	}
+
+	// Positive control — same blocked-send machinery, NO mid-flight
+	// refresh: the same-generation UNREGISTERED still prunes (memory
+	// and disk), proving the fence did not neuter retirement.
+	sn2 := &scriptedNotifier{}
+	d2, fake2 := newWatcherDaemon(t, sn2)
+	fleetAddOnline(t, d2.Registry, "alpha")
+	setWorkerPerm(fake2, "alpha", "/repo", 0)
+	const tok2 = "watcher-token-stale-same-gen"
+	dead, _, err := d2.notifyStore.submit(tok2, "phone", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered2 := make(chan struct{})
+	release2 := make(chan struct{})
+	sn2.respond = func(token string, _ NotifyMessage) error {
+		if token == tok2 {
+			entered2 <- struct{}{}
+			<-release2
+			return unregErr
+		}
+		return nil
+	}
+	w2 := newNotifyWatcher(d2, time.Hour, 0)
+	tickExpire(d2, w2) // baseline
+	setWorkerPerm(fake2, "alpha", "/repo", 1)
+	tickDone2 := make(chan struct{})
+	go func() {
+		defer close(tickDone2)
+		tickExpire(d2, w2)
+	}()
+	select {
+	case <-entered2:
+	case <-time.After(5 * time.Second):
+		t.Fatal("control: watcher send never entered the transport")
+	}
+	close(release2) // no refresh: the send's generation is still current
+	select {
+	case <-tickDone2:
+	case <-time.After(5 * time.Second):
+		t.Fatal("control: watcher tick never finished")
+	}
+	if _, still := d2.notifyStore.byID(dead.ID); still {
+		t.Error("control: same-generation UNREGISTERED must still prune")
+	}
+	f2, err := loadNotifyStoreFile(d2.notifyStore.path)
+	if err != nil || len(f2.Tokens) != 0 {
+		t.Fatalf("control: prune must persist: err=%v tokens=%+v", err, f2.Tokens)
 	}
 }
 
@@ -718,7 +864,7 @@ func TestNotifyWatcher_CruxFleetPushThroughFakeFCM(t *testing.T) {
 	fleetAddOnline(t, d.Registry, "alpha")
 	setWorkerPerm(fake, "alpha", "/repo", 0)
 	const rawTok = "fcm-crux-device-token-0001"
-	enrolled, _, err := d.notifyStore.submit(rawTok, "crux phone")
+	enrolled, _, err := d.notifyStore.submit(rawTok, "crux phone", "")
 	if err != nil {
 		t.Fatal(err)
 	}

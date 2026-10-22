@@ -1,17 +1,20 @@
 package alerts
 
 // notify.go — the FCM (Firebase Cloud Messaging) HTTP v1 sender channel for
-// /vh/notify/* (Slice 2). Where Web Push reaches a BROWSER through its push
-// service, this reaches a PHONE through FCM — data-only messages (no
-// `notification` block; the device renders from the vh_* data fields) so the
-// client app owns presentation.
+// the WORKER's standalone /vh/notify/* surface (Slice 2; unchanged v3
+// behavior). Where Web Push reaches a BROWSER through its push service, this
+// reaches a PHONE through FCM — data-only messages (no `notification`
+// block; the device renders from the vh_* data fields) so the client app
+// owns presentation.
 //
-// Auth is the Google OAuth2 service-account flow on the standard library
-// only: an RS256-signed JWT (iss=client_email, aud=token_uri,
-// scope=firebase.messaging) exchanged at the token endpoint for an access
-// token, cached and refreshed ~5 min before expiry. Everything runs
-// best-effort in per-token goroutines (the pusher fan-out pattern): a send
-// failure never blocks or breaks the rest of alerts.
+// Since notify controller-hub S4 the TRANSPORT core — OAuth2
+// service-account flow, send policy (401 refresh-once / one cheap 5xx
+// retry), UNREGISTERED evidence classification, and the attempt-lifecycle
+// observability surface — is shared with the controller's central
+// dispatcher via fcm_transport.go (FCMTransport, the narrowly-shared seam;
+// see that file). This file keeps the WORKER's delivery POLICY: the
+// profile type filter, PER-TOKEN attendance gating, and the per-(type,
+// token) cooldown from the SAME cooldown_sec knob as Web Push.
 //
 // Delivery policy is PER TOKEN (v3): a token registered with
 // push_policy=always bypasses the attendance gate entirely (it still gets
@@ -31,10 +34,7 @@ package alerts
 // canonical error names, and paths only.
 
 import (
-	"bytes"
 	"context"
-	"crypto"
-	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -43,17 +43,10 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
-	"net/http"
-	"net/url"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
-
-	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
 const (
@@ -101,40 +94,20 @@ type serviceAccount struct {
 // by attendance (always tokens proceed, still cooldown'd per (type, token)
 // via the SAME cooldown_sec knob as Web Push, from a separate map keyed by
 // type|tokenHash).
+//
+// The embedded fcmTransport (by value — fcm_transport.go) carries the
+// SHARED transport core: the OAuth flow, the send policy, UNREGISTERED
+// classification, and the health surface. Field promotion keeps the
+// historical in-package access shape (nt.fcmBase / nt.now / nt.logger /
+// nt.statMu …) compiling unchanged.
 type Notifier struct {
+	FCMTransport
 	cfg      *Store
 	presence *Presence
 	tokens   *TokenRegistry // shared with the /vh/notify routes (enumerate + Prune)
-	client   *http.Client
-	now      func() time.Time
-	logger   *slog.Logger // vhlog's shared logger by default; overridable in tests
-
-	projectID string
-	creds     serviceAccount
-	signer    *rsa.PrivateKey
-	ttl       int
-
-	fcmBase string // API root; default fcmDefaultBase, overridden in tests
 
 	mu   sync.Mutex
 	cool map[string]time.Time // "type|tokenHash" -> last send
-
-	tokMu  sync.Mutex
-	tokVal string
-	tokExp time.Time
-
-	// statMu guards the observability surface: window counters for the
-	// periodic health line plus the operator-checkable last_attempt /
-	// last_error pair. The pair is published TOGETHER, under one lock hold,
-	// only when an attempt COMPLETES — an in-flight attempt stays invisible
-	// to the probe. Failures still never block delivery.
-	statMu      sync.Mutex
-	attempted   int64     // delivery units started since the last health line
-	succeeded   int64     // delivered OK since the last health line
-	failed      int64     // failed (any class) since the last health line
-	pruned      int64     // pruned as UNREGISTERED since the last health line
-	lastAttempt time.Time // start time of the most recent COMPLETED attempt (zero before any completes)
-	lastErr     string    // sanitized outcome of that same completed attempt ("" when it succeeded)
 }
 
 // NewNotifier loads the service-account credentials named by the config's
@@ -166,18 +139,11 @@ func NewNotifier(cfg *Store, presence *Presence, tokens *TokenRegistry) (*Notifi
 		ttl = fcmDefaultTTL
 	}
 	return &Notifier{
-		cfg:       cfg,
-		presence:  presence,
-		tokens:    tokens,
-		client:    &http.Client{Timeout: 10 * time.Second},
-		now:       time.Now,
-		logger:    vhlog.Logger(), // the daemon's shared logger (single config, VH_DEBUG toggle)
-		projectID: project,
-		creds:     creds,
-		signer:    key,
-		ttl:       ttl,
-		fcmBase:   fcmDefaultBase,
-		cool:      map[string]time.Time{},
+		FCMTransport: *newFCMTransport(creds, key, project, ttl),
+		cfg:          cfg,
+		presence:     presence,
+		tokens:       tokens,
+		cool:         map[string]time.Time{},
 	}, nil
 }
 
@@ -216,91 +182,6 @@ func parseRSAPEM(pemBytes []byte) (*rsa.PrivateKey, error) {
 		return nil, errors.New("PKCS#8 key is not RSA")
 	}
 	return x509.ParsePKCS1PrivateKey(block.Bytes)
-}
-
-// --- OAuth2 service-account token (stdlib only) ---
-
-// assertion builds the signed RS256 JWT for the token exchange.
-func (n *Notifier) assertion(iat time.Time) (string, error) {
-	header := b64url([]byte(`{"alg":"RS256","typ":"JWT"}`))
-	claims, err := json.Marshal(struct {
-		Iss   string `json:"iss"`
-		Scope string `json:"scope"`
-		Aud   string `json:"aud"`
-		Iat   int64  `json:"iat"`
-		Exp   int64  `json:"exp"`
-	}{
-		Iss:   n.creds.ClientEmail,
-		Scope: fcmScope,
-		Aud:   n.creds.TokenURI,
-		Iat:   iat.Unix(),
-		Exp:   iat.Add(fcmJWTLifetime).Unix(),
-	})
-	if err != nil {
-		return "", err
-	}
-	input := header + "." + b64url(claims)
-	digest := sha256.Sum256([]byte(input))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, n.signer, crypto.SHA256, digest[:])
-	if err != nil {
-		return "", err
-	}
-	return input + "." + b64url(sig), nil
-}
-
-// accessToken returns a cached access token, exchanging a fresh JWT when the
-// cache is empty or within fcmTokenLeadTime of expiry. force discards the
-// cache first (the 401 recovery path: refresh once, then treat as failure).
-func (n *Notifier) accessToken(force bool) (string, error) {
-	n.tokMu.Lock()
-	defer n.tokMu.Unlock()
-	now := n.now()
-	if force {
-		n.tokVal, n.tokExp = "", time.Time{}
-	}
-	if n.tokVal != "" && now.Add(fcmTokenLeadTime).Before(n.tokExp) {
-		return n.tokVal, nil
-	}
-	assert, err := n.assertion(now)
-	if err != nil {
-		return "", err
-	}
-	form := url.Values{
-		"grant_type": {"urn:ietf:params:oauth:grant-type:jwt-bearer"},
-		"assertion":  {assert},
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.creds.TokenURI,
-		strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := n.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("notify: token exchange: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("notify: token exchange status %d", resp.StatusCode)
-	}
-	var out struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&out); err != nil {
-		return "", fmt.Errorf("notify: token exchange response: %w", err)
-	}
-	if out.AccessToken == "" {
-		return "", errors.New("notify: token exchange returned no access_token")
-	}
-	if out.ExpiresIn <= 0 {
-		out.ExpiresIn = 3600
-	}
-	n.tokVal = out.AccessToken
-	n.tokExp = now.Add(time.Duration(out.ExpiresIn) * time.Second)
-	return n.tokVal, nil
 }
 
 // --- message construction ---
@@ -436,182 +317,22 @@ func (n *Notifier) onCooldown(typ, token string, window time.Duration) bool {
 	return false
 }
 
-// tokenRef renders a token for log lines: the LABEL when present, else the
-// same sha256 hash prefix the cooldown map keys on (sum[:16] bytes, hex).
-// The token VALUE never enters a log line or error string.
-func tokenRef(tok NotifyToken) string {
-	if tok.Label != "" {
-		return tok.Label
-	}
-	sum := sha256.Sum256([]byte(tok.Token))
-	return hex.EncodeToString(sum[:16])
-}
-
-// sendFailure classifies one failed delivery for the log line, the window
-// counters, and the probe's sanitized last_error. reason is a short
-// classified phrase; status is the HTTP status when the failure came from a
-// response (0 otherwise); canonical is FCM's google error.status name when
-// the body carried one (e.g. NOT_FOUND, UNREGISTERED); err optionally
-// carries the underlying transport error (which never contains token or key
-// material — only URLs, timeouts, and status lines).
-type sendFailure struct {
-	reason    string
-	status    int
-	canonical string
-	err       error
-	pruned    bool // the UNREGISTERED prune path (counted separately, still logged)
-}
-
-// summary renders the sanitized operator-facing error string for the probe:
-// "404 NOT_FOUND" when a status and canonical name exist, "429 rate limited
-// (quota)" when only a status does, or the bare reason (no status), e.g.
-// "oauth exchange failed".
-func (f *sendFailure) summary() string {
-	switch {
-	case f.status > 0 && f.canonical != "":
-		return strconv.Itoa(f.status) + " " + f.canonical
-	case f.status > 0:
-		return strconv.Itoa(f.status) + " " + f.reason
-	default:
-		return f.reason
-	}
-}
-
 // deliver sends one message, best-effort — the pusher posture is unchanged:
-// a failure never blocks or breaks anything, but it is now OBSERVED (one log
-// line per failure, window counters, last_attempt/last_error). A 401 forces
-// ONE token refresh + retry; a 5xx gets ONE cheap retry; there is no queue
-// and no backoff loop.
+// a failure never blocks or breaks anything, but it is OBSERVED (one log
+// line per failure, window counters, last_attempt/last_error). Since S4 the
+// whole attempt lifecycle — including the 401-refresh/5xx-retry send policy
+// and the worker registry's prune on canonical UNREGISTERED evidence — runs
+// in the shared FCMTransport.Deliver (fcm_transport.go); this wrapper only
+// supplies the worker's prune action.
 func (n *Notifier) deliver(tok NotifyToken, msg fcmMessage) {
-	started := n.now() // this attempt's start time, published with its own outcome below
-
-	n.statMu.Lock()
-	n.attempted++
-	n.statMu.Unlock()
-
-	f := n.send(tok.Token, msg, 0, false)
-
-	// Publish last_attempt and last_error TOGETHER, only at attempt
-	// COMPLETION: the pair always describes ONE whole attempt — its start
-	// time plus its own outcome (a success clears the error). Until then
-	// the probe shows the untouched zero state, and overlapping attempts
-	// can never pair one attempt's timestamp with another's outcome.
-	n.statMu.Lock()
-	n.lastAttempt = started
-	switch {
-	case f == nil:
-		n.succeeded++
-		n.lastErr = "" // the completed attempt succeeded — current channel health is OK
-	case f.pruned:
-		n.pruned++
-		n.lastErr = f.summary()
-	default:
-		n.failed++
-		n.lastErr = f.summary()
+	android := &AndroidConfig{TTLSeconds: n.ttl}
+	if msg.Android != nil {
+		android.Priority = msg.Android.Priority
+		android.CollapseKey = msg.Android.CollapseKey
 	}
-	n.statMu.Unlock()
-
-	if f != nil {
-		n.logFailure(tok, f)
-	}
-}
-
-// logFailure emits the one-line-per-failure record. channel=notify, the
-// classified reason, the HTTP status where applicable, and the token as
-// label-or-hash — never the value, credentials material, or response bodies.
-func (n *Notifier) logFailure(tok NotifyToken, f *sendFailure) {
-	attrs := []any{"channel", "notify", "token", tokenRef(tok), "reason", f.reason}
-	if f.status > 0 {
-		attrs = append(attrs, "status", f.status)
-	}
-	if f.canonical != "" {
-		attrs = append(attrs, "code", f.canonical)
-	}
-	if f.err != nil {
-		attrs = append(attrs, "err", f.err.Error())
-	}
-	if f.pruned {
-		n.logger.Warn("notify: token unregistered, pruned", attrs...)
-		return
-	}
-	n.logger.Warn("notify: fcm send failed", attrs...)
-}
-
-// send posts the message, applying the retry/prune policy. attempt counts
-// posts so far (0 = first); refreshed marks that the OAuth token was already
-// force-refreshed for this message (a second 401 is a failure). It returns
-// nil on success or a classified *sendFailure.
-func (n *Notifier) send(token string, msg fcmMessage, attempt int, refreshed bool) *sendFailure {
-	access, err := n.accessToken(refreshed)
-	if err != nil {
-		return &sendFailure{reason: "oauth exchange failed", err: err}
-	}
-	body, err := json.Marshal(struct {
-		Message fcmMessage `json:"message"`
-	}{msg})
-	if err != nil {
-		return &sendFailure{reason: "marshal message failed", err: err}
-	}
-	endpoint := n.fcmBase + "/v1/projects/" + url.PathEscape(n.projectID) + "/messages:send"
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return &sendFailure{reason: "request build failed", err: err}
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+access)
-	req.Header.Set("User-Agent", "vh-solara-notify/1")
-	resp, err := n.client.Do(req)
-	if err != nil {
-		return &sendFailure{reason: "transport error", err: err}
-	}
-	defer resp.Body.Close()
-
-	// 401 → the cached OAuth token went stale: force-refresh once and retry.
-	if resp.StatusCode == http.StatusUnauthorized && !refreshed {
-		return n.send(token, msg, attempt+1, true)
-	}
-	// 5xx → one cheap retry, then give up.
-	if resp.StatusCode >= 500 && attempt < 1 {
-		return n.send(token, msg, attempt+1, refreshed)
-	}
-	// Terminal non-2xx: read (bounded) body once for the canonical error
-	// name and the UNREGISTERED inspection. Only parsed fields are used —
-	// the raw body is never surfaced.
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
-	canonical := fcmErrorStatus(raw)
-
-	// Token gone: 400 or 404 carrying error detail UNREGISTERED → prune.
-	// A generic 404 NOT_FOUND (FCM's answer to sender-side misconfiguration,
-	// e.g. a wrong/deleted project ID) carries no UNREGISTERED evidence and
-	// must leave registrations intact — pruning on it would mass-erase every
-	// valid token. Both statuses share the same body-inspection rule.
-	if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound {
-		if fcmIsUnregistered(raw) {
-			// The operator-facing canonical name for the prune decision is
-			// the UNREGISTERED evidence itself (the body's top-level status
-			// is a generic NOT_FOUND/INVALID_ARGUMENT).
-			if perr := n.tokens.Prune(token); perr != nil {
-				return &sendFailure{reason: "token unregistered but prune failed", status: resp.StatusCode, canonical: "UNREGISTERED", err: perr}
-			}
-			return &sendFailure{reason: "token unregistered (pruned)", status: resp.StatusCode, canonical: "UNREGISTERED", pruned: true}
-		}
-		return &sendFailure{reason: "fcm rejected message", status: resp.StatusCode, canonical: canonical}
-	}
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return &sendFailure{reason: "rate limited (quota)", status: resp.StatusCode, canonical: canonical}
-	}
-	if resp.StatusCode >= 300 {
-		if resp.StatusCode == http.StatusUnauthorized {
-			return &sendFailure{reason: "unauthenticated after refresh", status: resp.StatusCode, canonical: canonical}
-		}
-		if resp.StatusCode >= 500 {
-			return &sendFailure{reason: "fcm 5xx retry exhausted", status: resp.StatusCode, canonical: canonical}
-		}
-		return &sendFailure{reason: "fcm error", status: resp.StatusCode, canonical: canonical}
-	}
-	return nil
+	_ = n.FCMTransport.Deliver(tok.Token, tok.Label, msg.Data, android, func() error {
+		return n.tokens.Prune(tok.Token)
+	})
 }
 
 // fcmErrorBody is the subset of an FCM v1 error response the prune policy
@@ -660,72 +381,16 @@ func fcmErrorStatus(body []byte) string {
 	return e.Error.Status
 }
 
-// --- observability surface (v3) ---
+// --- observability surface (v3; the surface lives on the shared core) ---
 
-// notifyHealthInterval is the default period of the channel-health log line.
-const notifyHealthInterval = 10 * time.Minute
-
-// SetLogger swaps the failure/health log target. Production keeps the
-// daemon's shared vhlog logger; cross-package tests (pkg/web route tests)
-// use a discard or buffered handler so failure-path coverage never writes
-// real Warn lines into the test run's stderr. Call before the first Send —
-// the per-token delivery goroutines read the field without a lock.
-func (n *Notifier) SetLogger(l *slog.Logger) {
-	if l != nil {
-		n.logger = l
-	}
-}
-
-// Health returns the operator-checkable channel state: the start time of the
-// most recent COMPLETED FCM send attempt and that same attempt's sanitized
-// outcome (empty when it succeeded). Both stay zero values until some
-// attempt has completed — an in-flight attempt is invisible. Safe for
-// concurrent use; never carries token material.
-func (n *Notifier) Health() (time.Time, string) {
-	n.statMu.Lock()
-	defer n.statMu.Unlock()
-	return n.lastAttempt, n.lastErr
-}
-
-// StartHealthLoop launches the periodic channel-health line: enabled, token
-// counts by policy, and attempted/succeeded/failed/pruned counters since the
-// previous line (window counters reset on each line). interval <= 0 means
-// the daemon default (notifyHealthInterval). Returns immediately; the loop
-// exits when ctx is cancelled (daemon teardown).
+// StartHealthLoop is the worker's wrapper over the shared core's health
+// loop (fcm_transport.go), supplying the worker's own enabled state (the
+// alerts config's notify section) and policy counts (the worker token
+// registry). interval <= 0 means the daemon default (notifyHealthInterval).
+// Returns immediately; the loop exits when ctx is cancelled (daemon
+// teardown). SetLogger and Health are the promoted core methods, unchanged.
 func (n *Notifier) StartHealthLoop(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		interval = notifyHealthInterval
-	}
-	go func() {
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				n.logHealth()
-			}
-		}
-	}()
-}
-
-// logHealth snapshots-and-resets the window counters and emits the health
-// line. The counters are maintained under statMu by deliver(); this reader
-// takes the same lock, so no new races.
-func (n *Notifier) logHealth() {
-	n.statMu.Lock()
-	attempted, succeeded, failed, pruned := n.attempted, n.succeeded, n.failed, n.pruned
-	n.attempted, n.succeeded, n.failed, n.pruned = 0, 0, 0, 0
-	n.statMu.Unlock()
-	counts := n.tokens.PolicyCounts()
-	n.logger.Info("notify: channel health",
-		"channel", "notify",
-		"enabled", n.cfg.Get().NotifyConfigured(),
-		"tokens_when_unattended", counts[PolicyWhenUnattended],
-		"tokens_always", counts[PolicyAlways],
-		"attempted", attempted,
-		"succeeded", succeeded,
-		"failed", failed,
-		"pruned", pruned)
+	n.FCMTransport.StartHealthLoop(ctx, interval,
+		func() bool { return n.cfg.Get().NotifyConfigured() },
+		n.tokens.PolicyCounts)
 }

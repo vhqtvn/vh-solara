@@ -20,6 +20,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/vhqtvn/vh-solara/pkg/alerts"
 )
 
 // newStoreHolder builds a holder whose persistence path points inside a
@@ -40,27 +42,42 @@ func newStoreHolder(t *testing.T) (*notifyStoreHolder, string) {
 // ---------------------------------------------------------------------------
 
 // TestNotifyStore_DecodeValidationMatrix pins the file contract: strict
-// fields, schema-1 gate, validated entries, JSONC accepted on read.
+// fields, schema 1 (migrating) + 2 gates, validated entries, JSONC
+// accepted on read. Schema-1 documents decode to the MIGRATED shape
+// (policies defaulted to when_unattended).
 func TestNotifyStore_DecodeValidationMatrix(t *testing.T) {
+	wu := "when_unattended"
 	valid := []struct {
-		name string
-		in   string
-		want []notifyStoreEntry
+		name     string
+		in       string
+		migrated bool
+		want     []notifyStoreEntry
 	}{
-		{"empty registry", `{"schema":1,"tokens":[]}`, []notifyStoreEntry{}},
-		{"nil tokens normalized", `{"schema":1}`, []notifyStoreEntry{}},
+		{"empty registry", `{"schema":2,"tokens":[]}`, false, []notifyStoreEntry{}},
+		{"nil tokens normalized", `{"schema":2}`, false, []notifyStoreEntry{}},
+		{"schema-1 empty migrates", `{"schema":1,"tokens":[]}`, true, []notifyStoreEntry{}},
+		{"schema-2 explicit policies", `{"schema":2,"tokens":[{"id":"0011223344556677","token":"abcdefghijklmnop","push_policy":"always","created_at":"2026-09-28T00:00:00Z","scope":{"enabled":true,"conditions":[]}}]}`,
+			false, []notifyStoreEntry{{ID: "0011223344556677", Token: "abcdefghijklmnop", PushPolicy: "always", CreatedAt: time.Date(2026, 9, 28, 0, 0, 0, 0, time.UTC), Scope: notifyScope{Enabled: true, Conditions: []string{}}}}},
+		{"schema-1 entries default when_unattended", `{"schema":1,"tokens":[{"id":"0011223344556677","token":"abcdefghijklmnop","created_at":"2026-09-28T00:00:00Z","scope":{"enabled":true,"conditions":[]}}]}`,
+			true, []notifyStoreEntry{{ID: "0011223344556677", Token: "abcdefghijklmnop", PushPolicy: wu, CreatedAt: time.Date(2026, 9, 28, 0, 0, 0, 0, time.UTC), Scope: notifyScope{Enabled: true, Conditions: []string{}}}}},
 		{"JSONC comments accepted", "{\n  // registry\n  \"schema\": 1,\n  \"tokens\": [ { \"id\": \"0011223344556677\", \"token\": \"abcdefghijklmnop\", \"created_at\": \"2026-09-28T00:00:00Z\", \"scope\": {\"enabled\": true, \"conditions\": []}, }, ],\n}\n",
-			[]notifyStoreEntry{{ID: "0011223344556677", Token: "abcdefghijklmnop", CreatedAt: time.Date(2026, 9, 28, 0, 0, 0, 0, time.UTC), Scope: notifyScope{Enabled: true, Conditions: []string{}}}}},
+			true, []notifyStoreEntry{{ID: "0011223344556677", Token: "abcdefghijklmnop", PushPolicy: wu, CreatedAt: time.Date(2026, 9, 28, 0, 0, 0, 0, time.UTC), Scope: notifyScope{Enabled: true, Conditions: []string{}}}}},
 		{"nil conditions normalized to explicit all", `{"schema":1,"tokens":[{"id":"0011223344556677","token":"abcdefghijklmnop","created_at":"2026-09-28T00:00:00Z","scope":{"enabled":false}}]}`,
-			[]notifyStoreEntry{{ID: "0011223344556677", Token: "abcdefghijklmnop", CreatedAt: time.Date(2026, 9, 28, 0, 0, 0, 0, time.UTC), Scope: notifyScope{Enabled: false, Conditions: []string{}}}}},
+			true, []notifyStoreEntry{{ID: "0011223344556677", Token: "abcdefghijklmnop", PushPolicy: wu, CreatedAt: time.Date(2026, 9, 28, 0, 0, 0, 0, time.UTC), Scope: notifyScope{Enabled: false, Conditions: []string{}}}}},
 		{"subset conditions", `{"schema":1,"tokens":[{"id":"0011223344556677","token":"abcdefghijklmnop","created_at":"2026-09-28T00:00:00Z","scope":{"enabled":true,"conditions":["worker_down","session_error"]}}]}`,
-			[]notifyStoreEntry{{ID: "0011223344556677", Token: "abcdefghijklmnop", CreatedAt: time.Date(2026, 9, 28, 0, 0, 0, 0, time.UTC), Scope: notifyScope{Enabled: true, Conditions: []string{"worker_down", "session_error"}}}}},
+			true, []notifyStoreEntry{{ID: "0011223344556677", Token: "abcdefghijklmnop", PushPolicy: wu, CreatedAt: time.Date(2026, 9, 28, 0, 0, 0, 0, time.UTC), Scope: notifyScope{Enabled: true, Conditions: []string{"worker_down", "session_error"}}}}},
 	}
 	for _, tc := range valid {
-		f, err := decodeNotifyStore([]byte(tc.in))
+		f, migrated, err := decodeNotifyStore([]byte(tc.in))
 		if err != nil {
 			t.Errorf("%s: unexpected error: %v", tc.name, err)
 			continue
+		}
+		if migrated != tc.migrated {
+			t.Errorf("%s: migrated=%v, want %v", tc.name, migrated, tc.migrated)
+		}
+		if f.Schema != notifyStoreSchema {
+			t.Errorf("%s: decoded schema = %d, want %d (schema-1 migrates in memory)", tc.name, f.Schema, notifyStoreSchema)
 		}
 		if !reflect.DeepEqual(f.Tokens, tc.want) {
 			t.Errorf("%s: entries = %+v, want %+v", tc.name, f.Tokens, tc.want)
@@ -78,8 +95,9 @@ func TestNotifyStore_DecodeValidationMatrix(t *testing.T) {
 		{"unknown top-level key", `{"schema":1,"tokens":[],"nope":1}`, `unknown field "nope"`},
 		{"unknown entry key", `{"schema":1,"tokens":[{"id":"0011223344556677","token":"abcdefghijklmnop","created_at":"2026-09-28T00:00:00Z","scope":{"enabled":true,"conditions":[]},"bogus":1}]}`, `unknown field "bogus"`},
 		{"unknown scope key", `{"schema":1,"tokens":[{"id":"0011223344556677","token":"abcdefghijklmnop","created_at":"2026-09-28T00:00:00Z","scope":{"enabled":true,"conditions":[],"x":1}}]}`, `unknown field "x"`},
-		{"wrong schema", `{"schema":2,"tokens":[]}`, "schema version 2 not supported"},
+		{"future schema refused", `{"schema":3,"tokens":[]}`, "schema version 3 not supported"},
 		{"schema zero", `{"schema":0,"tokens":[]}`, "schema version 0 not supported"},
+		{"invalid push_policy", `{"schema":2,"tokens":[{"id":"0011223344556677","token":"abcdefghijklmnop","push_policy":"sometimes","created_at":"2026-09-28T00:00:00Z","scope":{"enabled":true,"conditions":[]}}]}`, `push_policy "sometimes"`},
 		{"id not hex", `{"schema":1,"tokens":[{"id":"zz","token":"abcdefghijklmnop","created_at":"2026-09-28T00:00:00Z","scope":{"enabled":true}}]}`, "must be exactly 16 lowercase hex"},
 		{"id uppercase", `{"schema":1,"tokens":[{"id":"AABBCCDD00112233","token":"abcdefghijklmnop","created_at":"2026-09-28T00:00:00Z","scope":{"enabled":true}}]}`, "must be exactly 16 lowercase hex"},
 		{"id wrong length", `{"schema":1,"tokens":[{"id":"00112233","token":"abcdefghijklmnop","created_at":"2026-09-28T00:00:00Z","scope":{"enabled":true}}]}`, "must be exactly 16 lowercase hex"},
@@ -95,7 +113,7 @@ func TestNotifyStore_DecodeValidationMatrix(t *testing.T) {
 		{"duplicate token", `{"schema":1,"tokens":[{"id":"0011223344556677","token":"aaaaaaaaaaaaaaaa","created_at":"2026-09-28T00:00:00Z","scope":{"enabled":true}},{"id":"8899aabbccddeeff","token":"aaaaaaaaaaaaaaaa","created_at":"2026-09-28T00:00:00Z","scope":{"enabled":true}}]}`, `duplicate token`},
 	}
 	for _, tc := range invalid {
-		_, err := decodeNotifyStore([]byte(tc.in))
+		_, _, err := decodeNotifyStore([]byte(tc.in))
 		if err == nil {
 			t.Errorf("%s: accepted invalid document", tc.name)
 			continue
@@ -189,7 +207,7 @@ func TestNotifyStore_MissingFileEmptyStart(t *testing.T) {
 	}
 
 	// First mutation (submit) creates the file: 0600, canonical, reloads.
-	e, created, err := d.notifyStore.submit("fcm-token-fresh-boot-01", "Operator phone")
+	e, created, err := d.notifyStore.submit("fcm-token-fresh-boot-01", "Operator phone", "")
 	if err != nil || !created {
 		t.Fatalf("first submit after empty start: created=%v err=%v", created, err)
 	}
@@ -220,7 +238,10 @@ func TestNotifyStore_MissingFileEmptyStart(t *testing.T) {
 // already-0600 file loads silently (no spurious repair).
 func TestNotifyStore_LoadRepairsLooseMode(t *testing.T) {
 	dir := t.TempDir()
-	doc := `{"schema":1,"tokens":[{"id":"0011223344556677","token":"abcdefghijklmnop","created_at":"2026-09-28T00:00:00Z","scope":{"enabled":true,"conditions":[]}}]}`
+	// Schema-2 document: the mode-repair path is orthogonal to the S4
+	// schema-1 migration (a migrating file is REPLACED at 0600 by the
+	// atomic persist, so it never reaches the chmod branch).
+	doc := `{"schema":2,"tokens":[{"id":"0011223344556677","token":"abcdefghijklmnop","push_policy":"when_unattended","created_at":"2026-09-28T00:00:00Z","scope":{"enabled":true,"conditions":[]}}]}`
 
 	// Capture the standard logger (package tests run serially — no
 	// t.Parallel anywhere in pkg/server).
@@ -290,7 +311,7 @@ func TestNotifyStore_LoadRepairsLooseMode(t *testing.T) {
 func TestNotifyStore_LoadChmodFailureFails(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "chmodfails.json")
-	if err := os.WriteFile(path, []byte(`{"schema":1,"tokens":[]}`), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(`{"schema":2,"tokens":[]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(path, 0o644); err != nil {
@@ -316,25 +337,31 @@ func TestNotifyStore_LoadChmodFailureFails(t *testing.T) {
 // Submit / persist / reload
 // ---------------------------------------------------------------------------
 
-// TestNotifyStore_IdempotentSubmit pins the uniqueness rule: the same raw
-// token submitted twice returns the EXISTING entry (created=false,
-// unchanged id/label), never a duplicate.
+// TestNotifyStore_IdempotentSubmit pins the v4 full-state POST semantics
+// at the holder level: the same raw token submitted twice never creates a
+// duplicate (created=false, same id) but DOES refresh the label and policy
+// — the body is the token's complete desired state (a re-POST without
+// push_policy RESETS an always token to when_unattended).
 func TestNotifyStore_IdempotentSubmit(t *testing.T) {
 	h, _ := newStoreHolder(t)
-	e1, created, err := h.submit("fcm-token-aaaaaaaaaaaaaa", "Operator phone")
+	e1, created, err := h.submit("fcm-token-aaaaaaaaaaaaaa", "Operator phone", alerts.PolicyAlways)
 	if err != nil || !created {
 		t.Fatalf("first submit: created=%v err=%v", created, err)
 	}
 	if !validNotifyID(e1.ID) {
 		t.Fatalf("generated id %q is not 16 lowercase hex chars", e1.ID)
 	}
+	if e1.PushPolicy != alerts.PolicyAlways {
+		t.Fatalf("explicit policy = %q, want always", e1.PushPolicy)
+	}
 	if e1.Scope.Enabled != true || len(e1.Scope.Conditions) != 0 {
 		t.Errorf("default scope = %+v, want enabled + empty (all-nine) conditions", e1.Scope)
 	}
 
-	// Re-submit the same token with a DIFFERENT label: same entry returns,
-	// label NOT mutated (label changes belong to PATCH).
-	e2, created, err := h.submit("fcm-token-aaaaaaaaaaaaaa", "Renamed")
+	// Re-submit the same token with a DIFFERENT label and NO policy: same
+	// entry (no duplicate), label refreshed, policy RESET to
+	// when_unattended (the full-state rule).
+	e2, created, err := h.submit("fcm-token-aaaaaaaaaaaaaa", "Renamed", "")
 	if err != nil {
 		t.Fatalf("re-submit: %v", err)
 	}
@@ -344,12 +371,174 @@ func TestNotifyStore_IdempotentSubmit(t *testing.T) {
 	if e2.ID != e1.ID {
 		t.Errorf("re-submit returned id %q, want the existing %q", e2.ID, e1.ID)
 	}
-	if e2.Label == "Renamed" {
-		t.Error("re-submit must not mutate the stored label")
+	if e2.Label != "Renamed" {
+		t.Errorf("re-submit must refresh the label (full-state POST), got %q", e2.Label)
+	}
+	if e2.PushPolicy != alerts.PolicyWhenUnattended {
+		t.Errorf("re-submit without push_policy must RESET to when_unattended, got %q", e2.PushPolicy)
 	}
 	snap := h.snapshot()
 	if len(snap.entries) != 1 {
 		t.Fatalf("registry holds %d entries after idempotent re-submit, want 1", len(snap.entries))
+	}
+}
+
+// assertNotifyLabelStrictReload reloads the store through the STRICT
+// startup reader and pins the persisted label of the named token — the
+// persist-always-reloads invariant every label case asserts.
+func assertNotifyLabelStrictReload(t *testing.T, path, token, want string) {
+	t.Helper()
+	f, err := loadNotifyStoreFile(path)
+	if err != nil {
+		t.Fatalf("strict reload REFUSED the persisted registry %s: %v (persist-always-reloads violated)", path, err)
+	}
+	for i := range f.Tokens {
+		if f.Tokens[i].Token == token {
+			if f.Tokens[i].Label != want {
+				t.Errorf("token %s: strictly reloaded label = %q, want %q", token, f.Tokens[i].Label, want)
+			}
+			return
+		}
+	}
+	t.Errorf("token %s missing from the reloaded store", token)
+}
+
+// TestNormalizeNotifyLabel pins the t1b-F1 normalizer semantics: the
+// output is ≤max CODE POINTS ELLIPSIS INCLUDED (exactly-max stays
+// verbatim; over-max becomes max-1 runes + "…"), so every persistable
+// form passes validateNotifyLabel.
+func TestNormalizeNotifyLabel(t *testing.T) {
+	const ell = "…"
+	cases := []struct{ name, in, want string }{
+		{"empty stays empty", "", ""},
+		{"under ceiling verbatim", "Operator phone", "Operator phone"},
+		{"exactly 64 ASCII stays verbatim", strings.Repeat("a", 64), strings.Repeat("a", 64)},
+		{"65 ASCII becomes 63+ellipsis", strings.Repeat("a", 65), strings.Repeat("a", 63) + ell},
+		{"exactly 64 CJK stays verbatim (192 bytes)", strings.Repeat("世", 64), strings.Repeat("世", 64)},
+		{"65 CJK becomes 63 CJK+ellipsis", strings.Repeat("界", 65), strings.Repeat("界", 63) + ell},
+	}
+	for _, tc := range cases {
+		got := normalizeNotifyLabel(tc.in, maxNotifyLabelRunes)
+		if got != tc.want {
+			t.Errorf("%s: normalizeNotifyLabel = %q, want %q", tc.name, got, tc.want)
+		}
+		if n := len([]rune(got)); n > maxNotifyLabelRunes {
+			t.Errorf("%s: %d code points exceeds the %d ceiling (the ellipsis must be included in the count)", tc.name, n, maxNotifyLabelRunes)
+		}
+		if err := validateNotifyLabel(got); err != nil {
+			t.Errorf("%s: normalized label must pass strict validation: %v", tc.name, err)
+		}
+	}
+	// Degenerate ceilings: never exceed max, whatever the input.
+	if got := normalizeNotifyLabel("abcdef", 1); got != ell {
+		t.Errorf("max=1 over-long input = %q, want the lone ellipsis", got)
+	}
+	if got := normalizeNotifyLabel("abc", 0); got != "" {
+		t.Errorf("max=0 input = %q, want empty", got)
+	}
+}
+
+// TestNotifyStore_LabelNormalizeCreateReloadSafe pins the CREATE half of
+// t1b-F1: a 65-ASCII label normalizes to 63+ellipsis (64 code points)
+// and validates-persists-reloads (normalize-and-validate is the
+// documented public posture, identical on both branches); a 64-rune
+// MULTIBYTE label (192 bytes) persists FULLY (no byte-based
+// under-truncation); an over-long multibyte label normalizes within the
+// ceiling. Every case reloads through the strict startup reader.
+func TestNotifyStore_LabelNormalizeCreateReloadSafe(t *testing.T) {
+	h, path := newStoreHolder(t)
+	const ell = "…"
+
+	// 65 ASCII chars on CREATE: normalized-and-validated, never persisted
+	// above the ceiling.
+	e, created, err := h.submit("fcm-token-label-ascii-1", strings.Repeat("a", 65), "")
+	if err != nil || !created {
+		t.Fatalf("create with a 65-ASCII label: created=%v err=%v (normalization must make it submittable)", created, err)
+	}
+	want := strings.Repeat("a", 63) + ell
+	if e.Label != want {
+		t.Fatalf("created label = %q (%d runes), want 63×'a'+ellipsis (64 runes)", e.Label, len([]rune(e.Label)))
+	}
+	assertNotifyLabelStrictReload(t, path, "fcm-token-label-ascii-1", want)
+
+	// 64-rune multibyte label (192 bytes): at the ceiling — persists
+	// FULLY. (The byte-based truncator cut this to ~21 runes + ellipsis.)
+	cjk64 := strings.Repeat("世", 64)
+	e2, _, err := h.submit("fcm-token-label-cjk-0001", cjk64, "")
+	if err != nil {
+		t.Fatalf("create with a 64-rune CJK label: %v", err)
+	}
+	if e2.Label != cjk64 {
+		t.Errorf("64-rune CJK label must persist fully, got %q (%d runes)", e2.Label, len([]rune(e2.Label)))
+	}
+	assertNotifyLabelStrictReload(t, path, "fcm-token-label-cjk-0001", cjk64)
+
+	// Over-long multibyte (80 CJK runes): normalized to 63+ellipsis,
+	// exactly at the ceiling, and strictly reloads.
+	e3, _, err := h.submit("fcm-token-label-cjk-0002", strings.Repeat("界", 80), "")
+	if err != nil {
+		t.Fatalf("create with an 80-rune CJK label: %v", err)
+	}
+	wantC := strings.Repeat("界", 63) + ell
+	if e3.Label != wantC || len([]rune(e3.Label)) != maxNotifyLabelRunes {
+		t.Errorf("80-rune CJK label = %q (%d runes), want 63×'界'+ellipsis (exactly 64)", e3.Label, len([]rune(e3.Label)))
+	}
+	assertNotifyLabelStrictReload(t, path, "fcm-token-label-cjk-0002", wantC)
+}
+
+// TestNotifyStore_LabelRefreshPersistAlwaysReloads pins the REFRESH half
+// of t1b-F1 — the exact poison path: the submit merge branch
+// historically persisted the merged entry WITHOUT validateNotifyEntry,
+// and the byte-based truncator turned a 65-ASCII refresh into a
+// 64-bytes+ellipsis (65-rune) label the strict reload REFUSES at next
+// startup (persist-always-reloads violated). Now the merged entry
+// validates BEFORE persist, and every refresh case below strictly
+// reloads.
+func TestNotifyStore_LabelRefreshPersistAlwaysReloads(t *testing.T) {
+	h, path := newStoreHolder(t)
+	const ell = "…"
+	const tok = "fcm-token-label-refresh-1"
+	if _, _, err := h.submit(tok, "phone", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// 65-ASCII REFRESH: succeeds (normalized), and the persisted form
+	// strictly reloads. (Pre-fix: the refresh returned success and
+	// poisoned the registry for the next startup.)
+	want := strings.Repeat("b", 63) + ell
+	e, created, err := h.submit(tok, strings.Repeat("b", 65), "")
+	if err != nil || created {
+		t.Fatalf("refresh with a 65-ASCII label: created=%v err=%v (must succeed via normalization)", created, err)
+	}
+	// Strict reload FIRST — the persist-always-reloads invariant is the
+	// crux (the pre-fix byte truncator persisted a 65-rune label here
+	// that this reload refuses); the exact normalized form follows.
+	assertNotifyLabelStrictReload(t, path, tok, want)
+	if e.Label != want {
+		t.Fatalf("refreshed label = %q (%d runes), want 63×'b'+ellipsis (64 runes)", e.Label, len([]rune(e.Label)))
+	}
+
+	// At-ceiling multibyte REFRESH (64 CJK runes = 192 bytes): persists
+	// fully — no under-truncation.
+	cjk64 := strings.Repeat("世", 64)
+	if _, _, err := h.submit(tok, cjk64, ""); err != nil {
+		t.Fatalf("refresh with a 64-rune CJK label: %v", err)
+	}
+	assertNotifyLabelStrictReload(t, path, tok, cjk64)
+
+	// Over-long multibyte REFRESH (65 CJK runes): ≤64 runes incl. the
+	// ellipsis, strictly reloads.
+	wantC := strings.Repeat("界", 63) + ell
+	if _, _, err := h.submit(tok, strings.Repeat("界", 65), ""); err != nil {
+		t.Fatalf("refresh with a 65-rune CJK label: %v", err)
+	}
+	assertNotifyLabelStrictReload(t, path, tok, wantC)
+
+	// The in-memory entry agrees with the persisted form (the reload is
+	// not passing because memory drifted from the file).
+	cur, _ := h.byID(e.ID)
+	if cur.Label != wantC {
+		t.Errorf("in-memory label = %q, want the persisted %q", cur.Label, wantC)
 	}
 }
 
@@ -358,10 +547,10 @@ func TestNotifyStore_IdempotentSubmit(t *testing.T) {
 // tmp leftovers, and a reload into a FRESH holder reproducing entries.
 func TestNotifyStore_PersistReload(t *testing.T) {
 	h, path := newStoreHolder(t)
-	if _, _, err := h.submit("fcm-token-bbbbbbbbbbbbbb", "Pixel 8"); err != nil {
+	if _, _, err := h.submit("fcm-token-bbbbbbbbbbbbbb", "Pixel 8", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := h.submit("fcm-token-cccccccccccccc", ""); err != nil {
+	if _, _, err := h.submit("fcm-token-cccccccccccccc", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(path); err != nil {
@@ -384,8 +573,8 @@ func TestNotifyStore_PersistReload(t *testing.T) {
 	if !strings.HasSuffix(string(data), "\n") {
 		t.Error("canonical persist must end with a newline")
 	}
-	if !strings.Contains(string(data), "\n  \"schema\": 1,") {
-		t.Errorf("canonical persist must be 2-space-indented JSON, got:\n%s", data)
+	if !strings.Contains(string(data), "\n  \"schema\": 2,") {
+		t.Errorf("canonical persist must be 2-space-indented schema-2 JSON, got:\n%s", data)
 	}
 
 	// Reload into a fresh holder (the startup path).
@@ -422,7 +611,7 @@ func TestNotifyStore_PersistFailureUntouched(t *testing.T) {
 	}
 	var h notifyStoreHolder
 	h.setLoaded(path, &notifyStoreFile{Schema: 1, Tokens: []notifyStoreEntry{}})
-	if _, _, err := h.submit("fcm-token-dddddddddddddd", "x"); err == nil {
+	if _, _, err := h.submit("fcm-token-dddddddddddddd", "x", ""); err == nil {
 		t.Fatal("submit must fail when persist fails")
 	}
 	snap := h.snapshot()
@@ -457,7 +646,7 @@ func TestNotifyStore_PersistOverStaleLooseTmp(t *testing.T) {
 	if err := os.Chmod(tmp, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := h.submit("fcm-token-stale-tmp-0001", "Phone"); err != nil {
+	if _, _, err := h.submit("fcm-token-stale-tmp-0001", "Phone", ""); err != nil {
 		t.Fatalf("submit over a stale tmp: %v", err)
 	}
 	// (a) The stale artifact was replaced, not reused: the published
@@ -518,7 +707,7 @@ func TestNotifyStore_PersistDoubleCollisionFails(t *testing.T) {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrExist}
 	}
 	defer func() { notifyCreateExcl = old }()
-	_, _, err := h.submit("fcm-token-collide-000001", "x")
+	_, _, err := h.submit("fcm-token-collide-000001", "x", "")
 	if err == nil {
 		t.Fatal("submit must fail when the exclusive tmp create collides twice")
 	}
@@ -552,7 +741,7 @@ func TestNotifyStore_PersistDoubleCollisionFails(t *testing.T) {
 // entry, and generation bumps.
 func TestNotifyStore_PatchDeleteSemantics(t *testing.T) {
 	h, _ := newStoreHolder(t)
-	e, _, err := h.submit("fcm-token-eeeeeeeeeeeeee", "Old")
+	e, _, err := h.submit("fcm-token-eeeeeeeeeeeeee", "Old", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -674,7 +863,7 @@ func TestMaskNotifyToken(t *testing.T) {
 // WRITES always reloads through the strict reader (no omitempty drift).
 func TestNotifyStore_CanonicalFileRoundTrip(t *testing.T) {
 	h, path := newStoreHolder(t)
-	e, _, err := h.submit("fcm-token-roundtripaaa", "lbl")
+	e, _, err := h.submit("fcm-token-roundtripaaa", "lbl", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,6 +880,148 @@ func TestNotifyStore_CanonicalFileRoundTrip(t *testing.T) {
 	}
 	if len(f.Tokens) != 1 || f.Tokens[0].LastError == "" {
 		t.Errorf("round-trip lost state: %+v", f.Tokens)
+	}
+}
+
+// TestNotifyStore_RegistrationGenerationSemantics pins t1a-F1's store
+// half: RegGen is a memory-only incarnation identity — minted at create,
+// RE-MINTED on every SUCCESSFUL registration refresh (the submit merge
+// path, stable id preserved), untouched by a FAILED refresh, and
+// preserved across administrative patches and send telemetry (neither is
+// a re-registration). Delete+re-create mints a fresh id AND generation.
+// It is never persisted.
+func TestNotifyStore_RegistrationGenerationSemantics(t *testing.T) {
+	h, path := newStoreHolder(t)
+	e1, _, err := h.submit("fcm-token-reggen-000001", "phone", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Successful refresh (merge): same administrative id, NEW generation.
+	e2, created, err := h.submit("fcm-token-reggen-000001", "phone refreshed", alerts.PolicyAlways)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || e2.ID != e1.ID {
+		t.Fatalf("refresh must MERGE in place (created=%v id=%q, want false/%q)", created, e2.ID, e1.ID)
+	}
+	if e2.RegGen == e1.RegGen {
+		t.Fatalf("a successful refresh must RE-MINT the registration generation: %d == %d", e2.RegGen, e1.RegGen)
+	}
+	if e2.Label != "phone refreshed" || e2.PushPolicy != alerts.PolicyAlways {
+		t.Fatalf("refreshed entry = %+v, want the refreshed label/policy", e2)
+	}
+
+	// FAILED refresh: the persist seam fails, the generation must NOT
+	// move (a failed refresh cannot invalidate in-flight prunes).
+	orig := notifyCreateExcl
+	notifyCreateExcl = func(name string) (*os.File, error) {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrPermission}
+	}
+	t.Cleanup(func() { notifyCreateExcl = orig })
+	if _, _, err := h.submit("fcm-token-reggen-000001", "doomed", ""); err == nil {
+		t.Fatal("refresh over a failing persist must error")
+	}
+	cur, _ := h.byID(e1.ID)
+	if cur.RegGen != e2.RegGen || cur.Label != "phone refreshed" {
+		t.Fatalf("a failed refresh must leave the incarnation untouched: %+v", cur)
+	}
+	notifyCreateExcl = orig
+
+	// Send telemetry is NOT a re-registration: generation preserved.
+	h.recordSendResult(e1.ID, nil)
+	cur, _ = h.byID(e1.ID)
+	if cur.RegGen != e2.RegGen {
+		t.Fatalf("recordSendResult must preserve the generation: %d != %d", cur.RegGen, e2.RegGen)
+	}
+
+	// Administrative patch is NOT a re-registration either.
+	patched, ok, err := h.patch(e1.ID, notifyPatch{Label: &[]string{"admin"}[0]})
+	if err != nil || !ok {
+		t.Fatalf("patch: ok=%v err=%v", ok, err)
+	}
+	if patched.RegGen != e2.RegGen {
+		t.Fatalf("patch must preserve the generation: %d != %d", patched.RegGen, e2.RegGen)
+	}
+
+	// Delete + re-create: fresh id AND fresh generation.
+	if ok, err := h.delete(e1.ID); err != nil || !ok {
+		t.Fatalf("delete: ok=%v err=%v", ok, err)
+	}
+	e3, _, err := h.submit("fcm-token-reggen-000001", "re-registered", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e3.ID == e1.ID {
+		t.Fatal("delete+re-create must mint a NEW id")
+	}
+	if e3.RegGen == e1.RegGen || e3.RegGen == e2.RegGen {
+		t.Fatalf("delete+re-create must mint a fresh generation, got %d (was %d/%d)", e3.RegGen, e1.RegGen, e2.RegGen)
+	}
+
+	// Never persisted: the canonical file carries no generation material
+	// and strictly reloads with the memory-only field zeroed.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "RegGen") || strings.Contains(string(data), "reg_gen") {
+		t.Fatalf("the per-registration generation must never be persisted:\n%s", data)
+	}
+	f, err := loadNotifyStoreFile(path)
+	if err != nil || len(f.Tokens) != 1 || f.Tokens[0].RegGen != 0 {
+		t.Fatalf("reloaded entries must have the memory-only generation zeroed: err=%v tokens=%+v", err, f.Tokens)
+	}
+}
+
+// TestNotifyStore_DeleteIfRegistrationCurrent pins the dispatcher's
+// ATOMIC prune gate (t1a-F1): the current incarnation deletes (and the
+// deletion persists + bumps the STRUCTURAL generation); a stale
+// generation, a replaced token, and an unknown id each RETAIN with no
+// error.
+func TestNotifyStore_DeleteIfRegistrationCurrent(t *testing.T) {
+	h, path := newStoreHolder(t)
+	e, _, err := h.submit("fcm-token-atomic-prune-1", "phone", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, _ := h.byID(e.ID)
+	staleGen := cur.RegGen + 999 // never minted by this holder
+
+	// Stale generation (the refreshed registration): retain.
+	deleted, err := h.deleteIfRegistrationCurrent(e.ID, e.Token, staleGen)
+	if deleted || err != nil {
+		t.Fatalf("stale generation must RETAIN: deleted=%v err=%v", deleted, err)
+	}
+	// Replaced token value: retain.
+	deleted, err = h.deleteIfRegistrationCurrent(e.ID, "fcm-some-other-token-x", cur.RegGen)
+	if deleted || err != nil {
+		t.Fatalf("replaced token must RETAIN: deleted=%v err=%v", deleted, err)
+	}
+	// Unknown id (deleted mid-send / re-registered as a new entry): retain.
+	deleted, err = h.deleteIfRegistrationCurrent("8899aabbccddeeff", e.Token, cur.RegGen)
+	if deleted || err != nil {
+		t.Fatalf("unknown id must RETAIN: deleted=%v err=%v", deleted, err)
+	}
+	if _, ok := h.byID(e.ID); !ok {
+		t.Fatal("no retain path may remove the entry")
+	}
+
+	// Current incarnation: deletes, persists, bumps the structural gen.
+	genBefore := h.generation()
+	deleted, err = h.deleteIfRegistrationCurrent(e.ID, e.Token, cur.RegGen)
+	if !deleted || err != nil {
+		t.Fatalf("current incarnation must DELETE: deleted=%v err=%v", deleted, err)
+	}
+	if h.generation() != genBefore+1 {
+		t.Errorf("prune delete must bump the structural generation: %d → %d", genBefore, h.generation())
+	}
+	if _, ok := h.byID(e.ID); ok {
+		t.Error("pruned entry must be gone")
+	}
+	f, err := loadNotifyStoreFile(path)
+	if err != nil || len(f.Tokens) != 0 {
+		t.Fatalf("prune must persist: err=%v tokens=%+v", err, f.Tokens)
 	}
 }
 
@@ -730,7 +1061,7 @@ func waitForNotify(deadline time.Duration, cond func() bool) bool {
 // persist, so a memory check would block on that mutex.)
 func TestNotifyStore_RecordSendResultAsyncOffCriticalPath(t *testing.T) {
 	h, path := newStoreHolder(t)
-	e, _, err := h.submit("fcm-token-asyncrecorder", "lbl")
+	e, _, err := h.submit("fcm-token-asyncrecorder", "lbl", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -780,7 +1111,7 @@ func TestNotifyStore_RecordSendResultAsyncOffCriticalPath(t *testing.T) {
 // change), while an unknown id (already deleted mid-send) is a no-op.
 func TestNotifyStore_RetireIsDelete(t *testing.T) {
 	h, path := newStoreHolder(t)
-	e, _, err := h.submit("fcm-token-retire-me-now", "lbl")
+	e, _, err := h.submit("fcm-token-retire-me-now", "lbl", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -820,7 +1151,7 @@ func TestNotifyStore_FlushSendResultsJoinsDrain(t *testing.T) {
 	idle.flushSendResults()
 
 	h, path := newStoreHolder(t)
-	e, _, err := h.submit("fcm-token-async-flush-aa", "lbl")
+	e, _, err := h.submit("fcm-token-async-flush-aa", "lbl", "")
 	if err != nil {
 		t.Fatal(err)
 	}

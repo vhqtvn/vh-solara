@@ -2,11 +2,18 @@
 //
 // Lane-5 coverage for the push-notification admin pane (slice S3,
 // NotifyDialog — reached from AdminMenu → "Push notifications"):
-//   • masked device list render (label/preview/date/scope badge/telemetry);
-//   • add-device: POST /vh/notify/tokens with the exact body + CSRF
-//     header, then re-GET; client token validation mirrors the server
-//     (byte bounds / printable ASCII) without a round-trip; the
-//     server's 400 lands verbatim;
+//   • masked device list render (label/preview/date/scope badge/telemetry)
+//     from the S4 admin home GET /vh/admin/notify/tokens — the legacy
+//     masked-list wire, unchanged (the public GET /vh/notify/tokens is
+//     the v4 probe since S4 and never carries a list);
+//   • add-device: POST /vh/notify/tokens with the exact body (token,
+//     label, push_policy — the v4 FULL-STATE rule: the policy field is
+//     always sent; the add form defaults to when_unattended and a Select
+//     flip sends always) + CSRF header, then re-GET; the v4 success
+//     envelope is {"ok":true}; a 503 {"ok":false,"error":"notify
+//     unavailable"} flips the read-only disabled posture (the old 409
+//     posture, relocated per v4 §3.1); client token validation mirrors
+//     the server (byte bounds / printable ASCII) without a round-trip;
 //   • enable/disable toggle: PATCH wholesale scope body (BOTH members);
 //   • scope editor: nine condition checkboxes + select-all; Save PATCHes
 //     the wholesale scope (canonical order, all-nine → []); an EMPTY
@@ -148,9 +155,10 @@ function stubNotify(cfg: {
       return Promise.resolve(answer(cfg.test, { schema: 1, sent: true, transport: "fcm" }));
     }
     if (url.includes("/vh/notify/tokens") && method === "POST") {
-      return Promise.resolve(
-        answer(cfg.create, { schema: 1, created: true, token: TOK1 }),
-      );
+      // The v4 public registration route answers exactly {"ok":true} on
+      // success (never a created flag or token echo) and the
+      // {"ok":false,"error":…} envelope on refusals.
+      return Promise.resolve(answer(cfg.create, { ok: true }));
     }
     if (url.includes("/vh/notify/tokens") && method === "PATCH") {
       return Promise.resolve(answer(cfg.patch, { schema: 1, token: TOK1 }));
@@ -158,7 +166,8 @@ function stubNotify(cfg: {
     if (url.includes("/vh/notify/tokens") && method === "DELETE") {
       return Promise.resolve(answer(cfg.del, { schema: 1 }));
     }
-    if (url.includes("/vh/notify/tokens") && method === "GET") {
+    if (url.includes("/vh/admin/notify/tokens") && method === "GET") {
+      // The masked list's admin home (S4) — same legacy wire shape.
       return Promise.resolve(answer(cfg.getTokens, { schema: 1, tokens: [] }));
     }
     if (url.includes("/vh/notify/history")) {
@@ -175,7 +184,7 @@ function stubNotify(cfg: {
     patches: () => of("PATCH", "/vh/notify/tokens"),
     deletes: () => of("DELETE", "/vh/notify/tokens"),
     tests: () => of("POST", "/vh/notify/test"),
-    tokenGets: () => of("GET", "/vh/notify/tokens"),
+    tokenGets: () => of("GET", "/vh/admin/notify/tokens"),
     histGets: () => of("GET", "/vh/notify/history"),
   };
 }
@@ -206,6 +215,21 @@ function inputByLabel(label: string): HTMLInputElement {
   expect(el, `expected input[aria-label="${label}"]`).toBeTruthy();
   return el!;
 }
+// Drive the app's custom Select (see Select.test.tsx for the pattern):
+// click the trigger (aria-label), then click the option whose trimmed
+// text equals `label` in the <body>-portaled popup.
+function selectOptionByLabel(ariaLabel: string, label: string): void {
+  const trigger = document.querySelector(
+    `.vh-select-btn[aria-label="${ariaLabel}"]`,
+  ) as HTMLButtonElement | null;
+  expect(trigger, `expected .vh-select-btn[aria-label="${ariaLabel}"]`).toBeTruthy();
+  trigger!.click();
+  const opt = Array.from(
+    document.querySelectorAll<HTMLButtonElement>(".vh-select-opt"),
+  ).find((b) => (b.textContent || "").trim() === label);
+  expect(opt, `expected an open Select option labeled ${label}`).toBeTruthy();
+  opt!.click();
+}
 
 describe("NotifyDialog — devices list (masked render)", () => {
   afterEach(() => {
@@ -214,10 +238,16 @@ describe("NotifyDialog — devices list (masked render)", () => {
   });
 
   it("renders masked rows: label/preview/date/scope badge + telemetry lines", async () => {
-    stubNotify({ getTokens: { status: 200, body: { schema: 1, tokens: [TOK1, TOK2] } } });
+    const { tokenGets } = stubNotify({
+      getTokens: { status: 200, body: { schema: 1, tokens: [TOK1, TOK2] } },
+    });
     render(() => <NotifyDialog onClose={() => {}} />);
 
     await waitFor(() => expect(document.body.textContent).toContain("Operator phone"));
+    // S4 migration pin: the list comes from the ADMIN home, never the
+    // public GET /vh/notify/tokens (that is the v4 probe now).
+    expect(tokenGets().length).toBeGreaterThanOrEqual(1);
+    expect(tokenGets()[0].url).toBe("/vh/admin/notify/tokens");
     // Masked previews (mono), never raw tokens — the wire only carries these.
     expect(document.body.textContent).toContain("fcm-to…1234");
     expect(document.body.textContent).toContain("fcm-tw…5678");
@@ -261,10 +291,55 @@ describe("NotifyDialog — add device (POST + CSRF + client mirror)", () => {
     expect(JSON.parse(post.init!.body as string)).toEqual({
       token: "fcm-newdevice-000001",
       label: "Tablet",
+      push_policy: "when_unattended", // v4 full-state: the field is ALWAYS sent
     });
     // Success note + the list is re-fetched.
     await waitFor(() => expect(document.body.textContent).toContain("✓ Device added"));
     await waitFor(() => expect(tokenGets().length).toBe(2));
+  });
+
+  it("defaults the policy Select to when_unattended; flipping to always sends push_policy always", async () => {
+    const { posts } = stubNotify({});
+    render(() => <NotifyDialog onClose={() => {}} />);
+
+    await waitFor(() => expect(btn("Add device")).toBeTruthy());
+    const trigger = document.querySelector(
+      '.vh-select-btn[aria-label="New device push policy"]',
+    ) as HTMLButtonElement;
+    expect(trigger, "expected the push-policy Select").toBeTruthy();
+    expect(trigger.textContent).toContain("when unattended (default)");
+
+    setInput(inputByLabel("New device token"), "fcm-always-0000000001");
+    selectOptionByLabel("New device push policy", "always");
+    // The trigger reflects the pick.
+    expect(trigger.textContent).toContain("always");
+
+    btn("Add device")!.click();
+    await waitFor(() => expect(posts().length).toBe(1));
+    expect(JSON.parse(posts()[0].init!.body as string)).toEqual({
+      token: "fcm-always-0000000001",
+      label: "",
+      push_policy: "always",
+    });
+  });
+
+  it("a 503 notify-unavailable POST flips the read-only disabled posture (the v4-relocated 409)", async () => {
+    const { posts } = stubNotify({
+      create: { status: 503, body: { ok: false, error: "notify unavailable" } },
+    });
+    render(() => <NotifyDialog onClose={() => {}} />);
+
+    await waitFor(() => expect(btn("Add device")).toBeTruthy());
+    setInput(inputByLabel("New device token"), "fcm-willfail-000000001");
+    btn("Add device")!.click();
+
+    await waitFor(() => {
+      expect(document.body.textContent).toContain("Push notifications are off");
+      expect(document.body.textContent).toContain("--notify-store");
+    });
+    // The refusal happened exactly once, and the add form is gone.
+    expect(posts().length).toBe(1);
+    expect(btn("Add device")).toBeUndefined();
   });
 
   it("client validation mirrors the server: too-short token blocks the POST; the server's 400 wins verbatim", async () => {
@@ -617,7 +692,8 @@ describe("AdminMenu — Push notifications entry wiring", () => {
             }),
           );
         }
-        if (url.includes("/vh/notify/tokens")) return Promise.resolve(respJson({ schema: 1, tokens: [] }));
+        if (url.includes("/vh/admin/notify/tokens"))
+          return Promise.resolve(respJson({ schema: 1, tokens: [] }));
         if (url.includes("/vh/notify/history"))
           return Promise.resolve(respJson({ schema: 1, events: [], first_id: 0, last_id: 0 }));
         return Promise.resolve(respJson({}));
