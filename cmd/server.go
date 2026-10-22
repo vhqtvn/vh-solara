@@ -27,8 +27,10 @@ var serverStatusConfig string
 // serverNotifyStore is the optional push-notification token registry file
 // path (--notify-store): the JSON file holding the companion-app device
 // tokens managed via /vh/notify/tokens (see pkg/server/notify_store.go).
-// Unset = the whole /vh/notify/ family answers 409 (notifications
-// disabled). A set-but-invalid file fails startup.
+// Unset = disabled per operation: public POST answers 503
+// notify-unavailable, the public GET probe answers 200 with
+// enabled:false, and the rest of the family answers 409 naming this
+// flag. A set-but-invalid file fails startup.
 var serverNotifyStore string
 
 // serverNotifyFCMCreds is the optional Google service-account JSON path
@@ -94,7 +96,8 @@ var serverCmd = &cobra.Command{
 		}
 		// Same discipline for the notification registry: set-but-bad fails
 		// startup (LoadNotifyStore names the path and reason); unset leaves
-		// the family in the honest 409 disabled posture. A missing file in
+		// the family disabled per operation (public POST 503, GET probe
+		// 200 enabled:false, rest 409 naming this flag). A missing file in
 		// an existing directory starts empty (created on first change).
 		if serverNotifyStore != "" {
 			// Central ledger retention (notify controller-hub S3): applied
@@ -179,7 +182,7 @@ func init() {
 	serverCmd.Flags().StringVar(&serverWorkerSecret, "worker-secret", "", "Shared secret required from workers on registration via X-VH-Worker-Secret (prefer the VH_WORKER_SECRET env var); empty = open registration")
 	serverCmd.Flags().StringVar(&serverAPIToken, "api-token", "", "Bearer token required on the cross-worker coordination API /api/workers/{id}/sessions|events (prefer the VH_API_TOKEN env var); empty = open")
 	serverCmd.Flags().StringVar(&serverStatusConfig, "status-config", "", "Path to the fleet-status config JSONC file: the expected workers/projects rosters for GET /vh/fleet/status, managed live via PUT /vh/fleet/config (the file is rewritten as canonical JSON on save; comments allowed on read; created on first save when missing). A set-but-invalid file fails startup. Unset = config management disabled (discovered scope).")
-	serverCmd.Flags().StringVar(&serverNotifyStore, "notify-store", "", "Path to the push-notification token registry JSON file for the companion app, managed via public POST/GET /vh/notify/tokens + admin PATCH/DELETE /vh/admin/notify/tokens/{id} (rewritten as canonical JSON on change; created on first change when missing). A set-but-invalid file fails startup. Unset = the /vh/notify/ endpoints answer 409 (notifications disabled).")
+	serverCmd.Flags().StringVar(&serverNotifyStore, "notify-store", "", "Path to the push-notification token registry JSON file for the companion app, managed via public POST/GET /vh/notify/tokens + admin PATCH/DELETE /vh/admin/notify/tokens/{id} (rewritten as canonical JSON on change; created on first change when missing). A set-but-invalid file fails startup. Unset = disabled per operation: public POST answers 503 notify-unavailable, the public GET probe answers 200 with enabled:false, and the rest of the family (admin list/PATCH/DELETE, test-send, history) answer 409 naming this flag.")
 	serverCmd.Flags().StringVar(&serverNotifyFCMCreds, "notify-fcm-credentials", "", "Path to the Google service-account JSON (client_email, private_key, project_id) used to send FCM push notifications via POST /vh/admin/notify/test. A set-but-invalid file fails startup. Unset = no transport configured (test-send answers 409; the token registry still works).")
 	serverCmd.Flags().DurationVar(&serverNotifyIngestPoll, "notify-ingest-poll", 3*time.Second, "Poll interval for the controller notify pull loop (per enrolled source; unmeasured default — tune per fleet). Requires --notify-store.")
 	serverCmd.Flags().IntVar(&serverNotifyIngestConcurrency, "notify-ingest-concurrency", 4, "Maximum simultaneous notify feed fetches across the fleet (bounded fleet concurrency for the pull loop).")

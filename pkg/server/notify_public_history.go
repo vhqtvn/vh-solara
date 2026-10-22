@@ -28,7 +28,10 @@ package server
 //	  ]}
 //	}
 //
-// Paging is identical to the v3 legacy semantics (notify_history.go):
+// Paging follows the v4 §3.1 convention (notify-fcm.md — the v3
+// worker-standalone public-history semantics of pkg/alerts/history.go
+// Query, NOT the legacy archive notify_history.go, which 400s limit=0
+// and serves oldest-first for since=0):
 // since > 0 ⇒ ascending from since+1; since 0/absent ⇒ the newest `limit`
 // events ascending; limit 0/absent ⇒ 50; limit > 200 ⇒ clamped to 200;
 // negative or non-numeric since/limit ⇒ 400 {"ok":false,"error":"bad since"
