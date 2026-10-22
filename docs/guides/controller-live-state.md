@@ -8,10 +8,11 @@ the server's own detection cadence, and the plain
 [`GET /vh/fleet/status`](#relationship-to-get-vhfleetstatus) stays available
 as the conditional (ETag) fallback.
 
-This guide also carries the **shared history read cursor** contract
-([below](#shared-history-read-cursor-slice-2)) — the operator-level
-read-through state the companion app's devices share through
-`/vh/notify/history`.
+This guide also carries the companion **notification and history state**
+contracts ([below](#notification-and-history-live-state-controller-hub-v4)) —
+covering both the central v4 public notification routes (`/vh/notify/*`),
+the legacy delivery history archive with its shared read cursor
+(`/vh/admin/notify/*`), and the controller's dispatch enablement posture.
 
 Everything in the stream section is the frozen Slice-1 contract (2026-09).
 Authentication, cookies, CSRF, and error conventions are exactly those of
@@ -72,14 +73,15 @@ This is a **current-state stream, not a transition log**:
   disconnected is reflected in the next full snapshot you receive.
 
 Observation cadence: while any stream client is connected, the controller
-refreshes the rollup on its own roughly every 15s (its generation TTL is
-5s, so plain GET traffic or the notification watcher's sampling refreshes
-it sooner). Expect on the order of one frame per ~15s in a quiet fleet —
-each carries a new `generated_at` — plus the 15s ping in gaps. Battery and
-radio behavior cannot be inferred from byte counts; the intended client
-pattern is ONE connection per foreground app instance, reconnect with
-backoff+jitter, and plain GET (or nothing) while backgrounded. Do not
-promise indefinite Android background SSE.
+refreshes the rollup on its own roughly every 15s via its subscriber-demand
+loop (its generation TTL is 5s, so plain GET traffic refreshes it sooner;
+the legacy fleet-condition watcher is retired). Expect on the order of
+one frame per ~15s in a quiet fleet — each carries a new `generated_at` —
+plus the 15s ping in gaps. Battery and radio behavior cannot be inferred
+from byte counts; the intended client pattern is ONE connection per
+foreground app instance, reconnect with backoff+jitter, and plain GET (or
+nothing) while backgrounded. Do not promise indefinite Android background
+SSE.
 
 ## Failure postures
 
@@ -130,39 +132,209 @@ controller (nginx or similar):
 WebSocket upgrade is NOT involved: the stream is plain HTTP/1.1 chunked
 responses (and works over HTTP/2); no special upgrade headers are needed.
 
-## Shared history read cursor (Slice 2)
+## Notification and history live state (controller-hub v4)
 
-The notification history carries ONE operator-level read-through
-cursor, shared by every device: "seen on the phone → dimmed on the
-watch". The server is single-operator, so there is exactly one cursor —
-no per-device or per-token dimension. It means "the operator has seen
-through event id N", not per-event read marks or push-delivery
-acknowledgements.
+<a id="shared-history-read-cursor-slice-2"></a>
 
-### Endpoints
+During the controller-hub notification cutover (S0–S5, commits
+`56c7ccbf..565f5bbf`), Firebase Cloud Messaging (FCM) delivery and
+notification history were centralized in the controller daemon. Workers
+remain the sole detection authority (spooling notices durably with monotonic
+`(epoch, seq)` coordinates), while the controller pulls private worker feeds,
+commits events into a central transactional JSONL ledger, and delivers
+FCM pushes.
 
-#### `POST /vh/notify/history/read`
+For full architectural depth and design rationale, see:
+- Canonical server contract: [`docs/architecture/notify-fcm.md`](../architecture/notify-fcm.md) (v4)
+- Program execution record: [`docs/checkpoints/2026-10-22-notify-controller-hub.md`](../checkpoints/2026-10-22-notify-controller-hub.md)
 
-Body (strict, exactly one field):
+### Route summary
+
+All notification routes are controller-owned. The `/vh/notify/` prefix and
+`/vh/admin/notify/` family prefix are carved out of the worker-subdomain reverse
+proxy (`pkg/server/daemon.go`), so they answer consistently on every host
+(controller root host and per-worker subdomains).
+
+| Route | Method | Auth & CSRF | Purpose |
+|---|---|---|---|
+| `/vh/notify/history` | `GET` | Session cookie (CSRF-exempt) | Central public history from the transactional ledger (v4 shape) |
+| `/vh/notify/tokens` | `POST` | Session cookie + `X-VH-CSRF: 1` | Register or refresh companion app FCM device token |
+| `/vh/notify/tokens` | `GET` | Session cookie (CSRF-exempt) | Public channel probe (controller readiness & policy counts) |
+| `/vh/admin/notify/tokens` | `GET` | Session cookie (CSRF-exempt) | Admin masked token list for management UI (`NotifyDialog`) |
+| `/vh/admin/notify/tokens/{id}` | `PATCH` | Session cookie + `X-VH-CSRF: 1` | Update token label, push policy, or scope |
+| `/vh/admin/notify/tokens/{id}` | `DELETE` | Session cookie + `X-VH-CSRF: 1` | Revoke a registered token (204 on success; 404 if already deleted) |
+| `/vh/admin/notify/test` | `POST` | Session cookie + `X-VH-CSRF: 1` | Test-send an FCM push (`token` or `id`); 10s rate limit |
+| `/vh/admin/notify/legacy-history` | `GET` | Session cookie (CSRF-exempt) | Read-only archive of pre-S5 watcher fleet-condition events |
+| `/vh/admin/notify/legacy-history/read` | `POST` | Session cookie + `X-VH-CSRF: 1` | Advance global read cursor over the legacy archive ID namespace |
+
+The worker→controller ingest feed (`GET /vh/internal/notify/feed` and `POST /vh/internal/notify/ack`) is **private**: guarded by per-process crypto-random bearer tokens negotiated over the yamux tunnel during registration, and denied on all public interfaces.
+
+### Central public history — `GET /vh/notify/history`
+
+`GET /vh/notify/history` serves committed notification events directly from
+the controller's central transactional ledger (`<notify-store>.ledger`) in the
+v4 public shape. It replaces the legacy watcher file previously served at this
+URL.
+
+Goldens: `pkg/server/testdata/notify_v4/history_response_v4.json` (complete
+coverage) and `history_response_gaps.json` (source gaps).
+
+```json
+{
+  "events": [
+    {
+      "id": 41,
+      "type": "waiting",
+      "sessionID": "ses_bason_1",
+      "root": "ses_bason_1",
+      "project": "/home/op/repo-alpha",
+      "title": "Review requested",
+      "detail": "Question pending",
+      "ts": "1792454330000",
+      "kind": "question_pending",
+      "count": 1,
+      "label": "bason — Review requested",
+      "worker": { "id": "bason", "name": "bason" },
+      "source": { "epoch": "bason-epoch-0007", "seq": 125 },
+      "ui_url": "https://bason.example/app?session=ses_bason_1&dir=%2Fhome%2Fop%2Frepo-alpha"
+    }
+  ],
+  "lastId": 41,
+  "coverage": { "complete": true, "gaps": [] }
+}
+```
+
+#### Event fields
+
+- **Base fields (always present, never omitted):**
+  - `id` (integer) — central ledger sequence ID (`1..head`), strictly contiguous in append order.
+  - `type` (string) — high-level event type (`waiting`, `finished`, `session_started`, `stalled`). Daemon-level notices (e.g. OpenCode process exits) carry `type: "stalled"`, `title: "OpenCode"`, and empty strings for `sessionID`, `root`, and `project`.
+  - `sessionID`, `root`, `project`, `title`, `detail` (strings).
+- **V4 additive fields:**
+  - `ts` (**decimal string of Unix epoch milliseconds**) — breaking type change from v3 (Position C) required by strict-typing in upstream client deserializers (e.g. `vh-agent-pulse` Kotlinx serialization).
+  - `kind` (string) — condition vocabulary (`question_pending`, `permission_pending`, `session_unread`, `session_started`, `worker_down`, etc.).
+  - `count` (integer) — collapsed notice count (`1` today).
+  - `label` (string) — pre-rendered display label (`"<worker name> — <title>"`).
+  - `worker` (`{"id": string, "name": string}`) — origin worker identity.
+  - `source` (`{"epoch": string, "seq": integer}`) — origin worker durable spool coordinates.
+  - `ui_url` (string) — deep link to origin worker's `/app` with `session` and `dir` query params. **The only field that may be absent**: omitted when no usable worker host pattern is configured on the controller.
+
+#### Top-level response fields & paging
+
+- `lastId` (integer) — committed global head pointer in the central ledger. Note that after prefix retention compaction, `lastId` can exceed the newest event returned in the page.
+- `coverage` (`{"complete": bool, "gaps": [...]}`) — reports worker spool continuity. When source gaps occur (e.g. spool overflow or unreadable files), gaps are rendered as `{"source_id": string, "epoch": string, "from_seq": int, "to_seq": int}`. Holes are never fabricated into central ledger IDs.
+- **Paging:**
+  - `since > 0`: events with `id > since`, ascending (oldest-first), at most `limit` entries.
+  - `since` omitted or `0`: the newest `limit` events, ascending.
+  - `limit`: default `50`; values above `200` are clamped to `200`. Non-numeric or negative values return `400 {"ok":false,"error":"bad since"|"bad limit"}`.
+- **Unread state is client-derived:** Unlike the legacy archive, the central v4 public history maintains **no server-side read cursor** (`read_id` and `unread_count` do not exist on this endpoint). The companion client stores the highest event ID it has rendered and compares it against `lastId` to compute local badge and unread counts.
+- **Disabled posture:** When `--notify-store` is unset, answers `409` naming the flag.
+
+### Public token registration & channel probe
+
+#### `POST /vh/notify/tokens` — register / refresh device token
+
+Enrolls or refreshes an FCM device token in the central registry (`<notify-store>`).
+
+```json
+{
+  "token": "fcm-registration-token-string",
+  "label": "Pixel 9 Pro",
+  "push_policy": "when_unattended"
+}
+```
+
+- `push_policy`: optional, either `"when_unattended"` (default) or `"always"`.
+- **Full-state POST rule:** The request body represents the token's desired state. Re-submitting a token without `push_policy` **resets** it to `"when_unattended"`. Clients must send `push_policy` on every refresh.
+- **Payload limit:** Request body strictly capped at 4 KiB (`DisallowUnknownFields`).
+- **Response:** On success, returns `200 {"ok":true}`. Never echoes the token.
+- **Refusals:**
+  - `--notify-store` unset: `503 {"ok":false,"error":"notify unavailable"}` evaluated **before** body validation (honest channel-unavailable posture).
+  - Empty token: `400 {"ok":false,"error":"token required"}`.
+  - Invalid policy: `400 {"ok":false,"error":"invalid push_policy"}`.
+  - Registry full (32 tokens): `400 {"ok":false,"error":"token limit reached"}`.
+  - Missing CSRF: `403` plain text.
+
+#### `GET /vh/notify/tokens` — channel probe
+
+Public channel health probe. Never returns an error status (always `200 OK`).
+
+Golden: `pkg/server/testdata/notify_v4/probe_response_v4.json`.
+
+```json
+{
+  "enabled": true,
+  "count": 1,
+  "policies": {
+    "when_unattended": 0,
+    "always": 1
+  },
+  "last_attempt": "2026-10-22T14:30:00Z",
+  "last_error": ""
+}
+```
+
+- `enabled`: `true` iff the controller's central FCM sender is configured and ready (`--notify-store`, `--notify-fcm-credentials`, and `--notify-dispatch` all active). If `--notify-dispatch` is omitted or credentials are missing, returns `enabled: false`.
+- `count`: total enrolled device tokens.
+- `policies`: breakdown of token counts by policy (`when_unattended` vs `always`).
+- `last_attempt` / `last_error`: timestamp and sanitized error from the central sender's latest completed dispatch attempt (success clears `last_error`).
+- Token values and labels are never returned by any read endpoint.
+- If `--notify-store` is unset, answers `200 OK` with `enabled: false, count: 0`.
+
+### Legacy delivery history archive & read cursor
+
+The pre-cutover push notification history (which recorded fleet-condition transitions emitted by the retired watcher) was relocated to the `/vh/admin/notify/*` namespace in S5. It remains preserved for operator inspection with its **own independent ID namespace**, completely separate from the central ledger.
+
+#### `GET /vh/admin/notify/legacy-history`
+
+Returns retained legacy events from `<notify-store>.history`. This file is **read-only** in production: no new entries are appended.
+
+```json
+{
+  "schema": 1,
+  "events": [
+    {
+      "id": 123,
+      "ts": "2026-09-28T12:00:00Z",
+      "kind": "permission_pending",
+      "action": "appeared",
+      "count": 2,
+      "title": "vh-solara",
+      "body": "2 permissions pending",
+      "deliveries": [{ "token_id": "0011223344556677", "ok": true }]
+    }
+  ],
+  "first_id": 118,
+  "last_id": 123,
+  "read_id": 100,
+  "unread_count": 7
+}
+```
+
+- `since` (default 0) and `limit` (default 50, max 200) query parameters supported.
+- `read_id`: the operator's global read cursor over the legacy ID namespace.
+- `unread_count`: retained events with `id > read_id` in the legacy 500-event window.
+- Returns `409` naming `--notify-store` if unconfigured.
+
+#### `POST /vh/admin/notify/legacy-history/read` — advance legacy read cursor
+
+Advances the global read cursor for the legacy history archive. This was previously located at `POST /vh/notify/history/read` (now retired).
+
+Body (strict JSON, exactly one field):
 
 ```json
 {"id": 123}
 ```
 
-Session-cookie auth + `X-VH-CSRF: 1` (a `/vh/` mutation — plain-text
-errors, family conventions). `id` is the greatest event id the client
-actually rendered as read — never auto-ack the newest id from an
-unrelated page.
-
-| Behavior | Result |
-|---|---|
-| `id` ≤ current cursor (incl. `0`) | `200` no-op, current state echoed, **no disk write** — stale/replaying devices never see conflicts |
-| `id` above the newest assigned event id | `400` naming the newest id (never clamped) |
-| Malformed body (missing/null/negative/fraction/exponent/overflow/string/bool/duplicate keys/unknown fields/trailing docs/>4 KiB) | `400` plain text |
-| `id` key spelled as a case variant (`"ID"`, `"Id"`, …) | `400` naming the key — encoding/json would match it case-insensitively, so variants are never silently decoded or last-won |
-| Notifications not configured (`--notify-store` unset) | `409` naming the flag (after the CSRF check) |
-| Persistence failure | `500`; the in-memory cursor does NOT advance — the cursor never outruns what a restart can honor |
-| Success | `{"schema":1,"read_id":123,"unread_count":7}` |
+- Requires session-cookie auth and `X-VH-CSRF: 1`.
+- `id` must be a non-negative integer representing the highest legacy history ID seen.
+- **Behaviors:**
+  - `id` ≤ current cursor: `200` no-op echoing current state without disk write.
+  - `id` > newest assigned legacy event ID: `400` naming the newest ID. Central ledger IDs cannot be used here.
+  - Malformed body, unknown fields, or duplicate keys: `400`.
+  - Case variants of `"id"` (e.g. `"ID"`, `"Id"`): `400` naming the key (strict decoded key match prevents `encoding/json` case-insensitive matching).
+  - Success: returns `{"schema":1,"read_id":123,"unread_count":7}` after atomic persistence to `<notify-store>.history`.
+  - Unconfigured: `409` naming `--notify-store`.
 
 Key matching is on the **decoded** key, not the raw wire bytes: an
 escape-encoded spelling that decodes to exactly `id` (e.g.
@@ -174,47 +346,45 @@ The advance is forward-only and monotonic. Trimmed historical ids stay
 valid watermarks — acknowledging an id that has already been trimmed
 out of the 500-event window is fine.
 
-### `GET /vh/notify/history` (extended, additive)
+### Admin token management & test send
 
-The existing response gains two fields; nothing else changes:
+All admin endpoints live under `/vh/admin/notify/*` and are protected by session-cookie auth. Mutations require `X-VH-CSRF: 1`.
 
-```json
-{"schema":1,"events":[…],"first_id":118,"last_id":123,"read_id":100,"unread_count":7}
+- `GET /vh/admin/notify/tokens`: Returns masked token list for the operator `NotifyDialog`. Tokens display an ID, label, preview (first/last characters masked), creation/last seen timestamps, push policy, and scope (`{"schema":1,"tokens":[...]}`). Returns `409` if `--notify-store` is unset.
+- `PATCH /vh/admin/notify/tokens/{id}`: Updates a token's label, push policy, or scope. Strict JSON decode. Returns `404` if the token ID is unknown, `409` if unconfigured.
+- `DELETE /vh/admin/notify/tokens/{id}`: Revokes and removes the token from the central store (204 No Content on success; 404 if already deleted, not idempotent). Returns `409` if unconfigured.
+- `POST /vh/admin/notify/test`: Dispatches a live test push through the controller's FCM transport. Accepts exactly one of `{"token":"..."}` or `{"id":"..."}`. Enforces a 10-second minimum interval between test sends daemon-wide (`429` if too frequent). Refusals: `409` naming `--notify-fcm-credentials` if credentials are not configured; when sending by id: `409` naming `--notify-store` if the registry is unconfigured, or `404` if the id is unknown.
+
+### Rollout, enablement, and operator flags
+
+Three controller daemon flags govern the notification subsystem:
+
+```bash
+# 1. Token registry and ledger base path (required for notify features)
+--notify-store=/var/lib/vh-solara/notify.json
+
+# 2. Google Firebase service account credentials (required for FCM dispatch)
+--notify-fcm-credentials=/etc/vh-solara/fcm-creds.json
+
+# 3. Central FCM dispatcher enablement (opt-in)
+--notify-dispatch
 ```
 
-- `read_id` — the global cursor (0 = nothing acknowledged yet).
-- `unread_count` — RETAINED events with id > `read_id`: the whole
-  500-event window, independent of `since`/`limit`. It is never an
-  archive total, and trimming can lower it without any acknowledgement
-  (events falling off the window stop counting as unread). If
-  `read_id` is below the trimmed `first_id`, the whole retained window
-  counts as unread; the cursor itself is preserved, never clamped.
-- Page and cursor metadata are captured together (one holder lock) and
-  the POST response echoes the same pair — clients may update their
-  badge from either response.
+#### Dispatcher is the sole delivery writer
 
-`GET /vh/notify/tokens` is unchanged (no cursor fields).
+With the retirement of the legacy fleet-condition watcher in S5, **the central dispatcher is the ONLY notification delivery writer**. A controller running without `--notify-dispatch`:
+- Records ingested worker events into the central ledger and serves them via `GET /vh/notify/history`.
+- Enrolls and manages companion app tokens via `POST /vh/notify/tokens` and `/vh/admin/notify/tokens`.
+- Serves `GET /vh/notify/tokens` with `enabled: false`.
+- **Delivers NO FCM push notifications**.
 
-### How devices stay in sync
+#### Safe rollout sequence
 
-Shared storage does not push read state: a second device learns the
-cursor on its next history GET (app foreground, watch face refresh) or
-its own acknowledgement. The fleet SSE stream carries no read-state
-event. Acknowledge after rendering, from the greatest id actually shown
-— acknowledging an assumed-newest id would erase unread state for
-events the user has not seen.
+To avoid delivering pushes to stale or un-migrated device tokens:
+1. **Deploy controller with `--notify-dispatch` OFF:** The controller starts ingesting notices and recording history. The token registry automatically performs backup-first migration to schema 2.
+2. **Companion app reconnect:** Companion app (`vh-agent-pulse`) users perform a one-time **Log out → Connect** cycle. This re-registers the FCM token directly with the controller and resets the client-side history cursor to the new central ledger namespace.
+3. **Enable `--notify-dispatch`:** Once tokens are enrolled, restart the controller with `--notify-dispatch` to begin active FCM push delivery.
 
-### Persistence + compatibility notes
+#### Worker local FCM fencing
 
-- The cursor lives IN the history file (`<notify-store>.history`):
-  every acknowledgement atomically re-persists the full retained event
-  window together with the new cursor (same crash-safe 0600
-  tmp+rename discipline as the rest of the family). A restart
-  therefore honors acknowledged cursors, and an ack also flushes any
-  events that were still memory-only after a failed append persist.
-- While the cursor is 0 the field is omitted — a never-acked history
-  stays byte-identical to the legacy format.
-- **Downgrade hazard:** a controller binary from before this feature
-  uses strict decoding and refuses to start on a history file that
-  carries `read_id`. Back the file up before downgrading; there is no
-  silent reset or migration.
+Workers running in controller mode (the default when `--controller` is non-empty) **automatically fence and disable worker-local FCM at boot**. Workers detect notices and write them to their local `SourceSpool`, waiting for the controller's pull loop. Standalone workers (started with `--controller ""`) retain worker-local FCM delivery.
