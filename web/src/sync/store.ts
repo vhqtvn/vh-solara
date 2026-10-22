@@ -296,9 +296,13 @@ export interface SyncState {
   // cannot signal "cached, refresh pending") and from connLatency.session.hydrate
   // (a per-CONNECTION one-shot diagnostic, not a live per-session flag). Set
   // true when openSessionStream (re)opens the stream, cleared when that
-  // connection's first snapshot lands (stream.ts) or the stream is
-  // closed/switched away. Drives the per-row .dot.refreshing warm silent-swap
-  // indicator. Ephemeral — NOT persisted, pruned on session.delete.
+  // connection's first snapshot lands or the stream is closed/switched away
+  // (both in session-stream.ts). Readership today: set/cleared only by those
+  // session-stream paths, reset wholesale on project switch (switchProject's
+  // produce block), and asserted by the reset-parity unit suites — NO current
+  // UI render reads it (the per-row .dot.refreshing indicator died with the
+  // old SessionTree rewrite). Ephemeral — NOT persisted, pruned on
+  // session.delete.
   refreshing: Record<string, boolean>;
   // Per-session activity (busy/idle/error) and pending permissions are kept for
   // ALL sessions so the sidebar/chat can surface status without opening them.

@@ -11,11 +11,17 @@
 // fresh tree=2 connect ships a frontier-scoped PARTIAL (pkg/web/stream_http.go,
 // Slice-A D7) which only MERGES gate/currentVerbs for in-scope ids
 // (projectScopedPartial in reconcile.ts) — a project-A id is never in project
-// B's scope; an epoch-change clear can't fire at a project switch (epochs are
-// per-daemon-store-lifetime, and switching projects does not restart the
-// daemon store); and the no-project branch ('') receives no frame at all
-// (connect early-returns on empty dir). Survival is therefore
-// connection-lifetime. All three maps are ephemeral (never persisted), so this
+// B's scope; an epoch-change clear CAN fire at a project switch (stores and
+// their crypto-random epochs are per-project-aggregator —
+// pkg/aggregator/aggregator.go:334–339 builds a fresh store per directory,
+// pkg/web/server_aggregators.go:264 creates one lazily per dir — so an A→B
+// switch carries two non-empty epochs), but only once B's first frame LANDS,
+// never at switch time; and the no-project branch ('') receives no frame at
+// all (connect early-returns on empty dir). Survival is therefore
+// connection-lifetime — which is why test 2 delivers its epoch against the
+// store's default EMPTY epoch (epochChanged needs both non-empty): that
+// guard is what keeps the suite from passing vacuously via the epoch-change
+// branch. All three maps are ephemeral (never persisted), so this
 // pin is the in-session twin of the removal-side parity: deleted/project-A
 // facts must not leak into project B or resurrect when B reuses an id.
 //
@@ -28,7 +34,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { reconcile } from "solid-js/store";
 import { connect } from "../../src/sync/tree-transport";
-import { closeSessionStream } from "../../src/sync/session-stream";
+import { closeSessionStream, openSessionStream } from "../../src/sync/session-stream";
 import { setProjectDirRaw, setState, state } from "../../src/sync/store";
 import { resetTreeStore } from "../../src/sync/treeState";
 import { switchProject } from "../../src/sync/actions";
@@ -212,5 +218,47 @@ describe("switchProject — B2b reset parity (every per-session surface clears)"
     for (const surface of A_SURFACES) {
       expect.soft(aEntry(surface), `${surface}.a1 must stay cleared after B's frontier partial`).toBeUndefined();
     }
+  });
+
+  it("switching A → '' (no project) clears every A entry on the shared produce path — with the closeSessionStream refreshing tombstone as the one pinned exception", () => {
+    // The no-project variant: the produce block (actions.ts) runs BEFORE the
+    // if (!dir) split, so '' exercises the SAME reset code as A→B — but the
+    // no-project branch additionally tears down Stream 2 (closeSessionStream),
+    // which has a known wrinkle pinned below. Open a session stream on A so
+    // that teardown path is live (sesId set) when the switch fires.
+    setProjectDirRaw("/proj-A");
+    connect(true);
+    seedProjectA();
+    openSessionStream("a1");
+    for (const surface of A_SURFACES) {
+      expect.soft(aEntry(surface), `${surface}.a1 must be seeded before the switch`).toBeDefined();
+    }
+
+    switchProject("");
+
+    // No frame can arrive: the mock EventSource never delivers, and the
+    // no-project branch early-returns connect() before constructing a new ES
+    // (tree-transport.ts) — so the instance count stays at exactly A's tree
+    // stream + A's session stream. A third construction here would mean the
+    // no-project branch opened a stream it must not open.
+    expect(instances.length).toBe(2);
+
+    // Every A entry is gone — with ONE deliberate exception. The no-project
+    // branch calls closeSessionStream() AFTER the produce wipe, and that
+    // teardown re-adds refreshing["a1"] = false from its module-local sesId
+    // (session-stream.ts, "Drop the warm silent-swap indicator"): a BENIGN
+    // tombstone, not a leak — false (never true), no UI reads it, and it
+    // exists so a switched-away session's indicator can't read stuck-true.
+    // Do NOT "fix" the assertion below to toBeUndefined(): the tombstone is
+    // intentional. Note it proves only the TEARDOWN ran (closeSessionStream
+    // writes false unconditionally for its retained sesId); the twelve
+    // assertions above carry the produce-wipe proof — under a skipped-wipe
+    // mutation this tombstone assertion still passes (verified) while they
+    // go red.
+    for (const surface of A_SURFACES) {
+      if (surface === "refreshing") continue;
+      expect.soft(aEntry(surface), `${surface}.a1 must be cleared by the switch itself`).toBeUndefined();
+    }
+    expect(state.refreshing.a1).toBe(false);
   });
 });
