@@ -1,20 +1,22 @@
 package e2e
 
-// notify_history_read_e2e_test.go — lane-3 proof for the global history
-// read cursor (Slice 2 of
-// tmp/agent-runs/android-push-20260928/stream-readstate-brief.md):
-// POST /vh/notify/history/read + the history GET echo, through the real
-// controller edge with REAL passphrase session auth.
+// notify_history_read_e2e_test.go — lane-3 proof for the LEGACY history
+// archive's global read cursor (Slice 2 origin; archive-relocated in S5):
+// POST /vh/admin/notify/legacy-history/read + the archive GET echo,
+// through the real controller edge with REAL passphrase session auth.
 //
 // The scenario is the cross-device story the slice exists for: a
 // phone-like client POSTs the read cursor, and a watch-like client (a
 // second, later GET with no CSRF — reads are exempt) learns the SHARED
-// cursor+unread state from the history envelope. Both requests are
-// issued with the WORKER-SUBDOMAIN Host header: the /vh/notify/ prefix
-// carve-out must keep them on the controller (a proxied request would
-// die on the worker, which has no /vh/notify/ routes). The 401/403
-// ladder runs over real HTTP (auth middleware + in-handler CSRF), and
-// the acknowledged cursor is verified in the PERSISTED history file.
+// cursor+unread state from the archive envelope. Both requests are
+// issued with the WORKER-SUBDOMAIN Host header: the /vh/admin/notify/
+// prefix carve-out must keep them on the controller (a proxied request
+// would die on the worker, which has no /vh/admin/notify/ routes). The
+// 401/403 ladder runs over real HTTP (auth middleware + in-handler
+// CSRF), and the acknowledged cursor is verified in the PERSISTED
+// history file. The archive's cursor namespace stays SEPARATE from the
+// central /vh/notify/history ids (notify_public_history.go) — nothing
+// here splices into the central ledger.
 //
 // No FCM/transport involvement (the ack path never touches the
 // transport); the lane-1 suite (pkg/server/notify_history_test.go)
@@ -126,25 +128,25 @@ func TestE2E_NotifyHistoryReadSharedCursor(t *testing.T) {
 	}
 
 	// Auth ladder over real HTTP (API-class /vh/* → clean 401).
-	resp, body := e2eNotifyReq(t, c, http.MethodGet, "/vh/notify/history", "", workerHost, nil, false)
+	resp, body := e2eNotifyReq(t, c, http.MethodGet, "/vh/admin/notify/legacy-history", "", workerHost, nil, false)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated history GET: want 401, got %d: %s", resp.StatusCode, body)
 	}
-	resp, body = e2eNotifyReq(t, c, http.MethodPost, "/vh/notify/history/read", `{"id":2}`, workerHost, nil, true)
+	resp, body = e2eNotifyReq(t, c, http.MethodPost, "/vh/admin/notify/legacy-history/read", `{"id":2}`, workerHost, nil, true)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated read POST: want 401, got %d: %s", resp.StatusCode, body)
 	}
 
 	// Login; then the CSRF gate fires BEFORE anything else in-handler.
 	session := e2eLogin(t, c, "e2e-secret")
-	resp, body = e2eNotifyReq(t, c, http.MethodPost, "/vh/notify/history/read", `{"id":2}`, workerHost, session, false)
+	resp, body = e2eNotifyReq(t, c, http.MethodPost, "/vh/admin/notify/legacy-history/read", `{"id":2}`, workerHost, session, false)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("read POST without CSRF: want 403, got %d: %s", resp.StatusCode, body)
 	}
 
 	// Phone acks read-through 2 — under the WORKER-SUBDOMAIN Host (the
 	// prefix carve-out keeps it on the controller).
-	resp, body = e2eNotifyReq(t, c, http.MethodPost, "/vh/notify/history/read", `{"id":2}`, workerHost, session, true)
+	resp, body = e2eNotifyReq(t, c, http.MethodPost, "/vh/admin/notify/legacy-history/read", `{"id":2}`, workerHost, session, true)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("phone ack: want 200, got %d: %s", resp.StatusCode, body)
 	}
@@ -158,7 +160,7 @@ func TestE2E_NotifyHistoryReadSharedCursor(t *testing.T) {
 
 	// Watch-like second device: plain history GET (no CSRF — reads are
 	// exempt) sees the SHARED cursor and count.
-	resp, body = e2eNotifyReq(t, c, http.MethodGet, "/vh/notify/history", "", workerHost, session, false)
+	resp, body = e2eNotifyReq(t, c, http.MethodGet, "/vh/admin/notify/legacy-history", "", workerHost, session, false)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("watch history GET: want 200, got %d: %s", resp.StatusCode, body)
 	}
@@ -179,7 +181,7 @@ func TestE2E_NotifyHistoryReadSharedCursor(t *testing.T) {
 	}
 
 	// Stale replay from the phone: 200 no-op, state unchanged.
-	resp, body = e2eNotifyReq(t, c, http.MethodPost, "/vh/notify/history/read", `{"id":1}`, workerHost, session, true)
+	resp, body = e2eNotifyReq(t, c, http.MethodPost, "/vh/admin/notify/legacy-history/read", `{"id":1}`, workerHost, session, true)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("stale replay: want 200, got %d: %s", resp.StatusCode, body)
 	}
@@ -188,7 +190,7 @@ func TestE2E_NotifyHistoryReadSharedCursor(t *testing.T) {
 	}
 
 	// Future id: 400 naming the newest retained id.
-	resp, body = e2eNotifyReq(t, c, http.MethodPost, "/vh/notify/history/read", `{"id":99}`, workerHost, session, true)
+	resp, body = e2eNotifyReq(t, c, http.MethodPost, "/vh/admin/notify/legacy-history/read", `{"id":99}`, workerHost, session, true)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("future id: want 400, got %d: %s", resp.StatusCode, body)
 	}

@@ -34,8 +34,8 @@ var serverNotifyStore string
 // serverNotifyFCMCreds is the optional Google service-account JSON path
 // (--notify-fcm-credentials) used to send FCM push notifications (see
 // pkg/server/notify_transport.go). Unset = no transport configured (the
-// registry still works; POST /vh/notify/test answers 409). A set-but-
-// invalid file fails startup.
+// registry still works; POST /vh/admin/notify/test answers 409). A
+// set-but-invalid file fails startup.
 var serverNotifyFCMCreds string
 
 // Notify controller-hub S3 knobs: the controller pull loop's cadence/
@@ -117,13 +117,13 @@ var serverCmd = &cobra.Command{
 			notifier = fcm
 		}
 		daemon.SetNotifyTransport(notifier)
-		// Fleet-condition watcher (notify_watcher.go): starts ONLY when
-		// both the registry and a real transport are configured — no
-		// store means nobody to send to; no creds means nothing to send
-		// through (history-only mode is a later slice, not half-built
-		// here). A no-start is silent BY DESIGN (the unset-flag postures
-		// already speak through their 409s).
-		daemon.StartNotifyWatcher()
+		// (S5) The legacy fleet-condition watcher's aggregate notification
+		// loop is RETIRED — no startup wiring remains. Fleet status
+		// itself (GET /vh/fleet/status, its SSE stream, and the
+		// lazy-refresh cache) never depended on the watcher's ticks; the
+		// watcher's only outputs were legacy delivery-history appends
+		// (the archive stays readable) and token fan-out sends (the S4
+		// central dispatcher owns delivery now, --notify-dispatch).
 		// Controller pull loop (notify controller-hub S3,
 		// pkg/server/notify_ingest.go): pulls private feed pages from
 		// enrolled workers into the central ledger (exactly-once ingest,
@@ -142,8 +142,9 @@ var serverCmd = &cobra.Command{
 		// pkg/server/notify_dispatch.go): per-event pushes from the central
 		// ledger through the CONTROLLER's own shared-sender instance (the
 		// worker sender machinery, controller credentials — v4 (a)).
-		// OPT-IN by design while the legacy watcher runs: the double-
-		// delivery risk during the S4 window is bounded by this flag. The
+		// Opt-in via --notify-dispatch; since the S5 retirement of the
+		// legacy watcher it is the ONLY notification delivery writer, so
+		// a controller running without it delivers no pushes at all. The
 		// enable order is documented on the flag itself.
 		if serverNotifyDispatch {
 			if serverNotifyStore == "" {
@@ -178,12 +179,12 @@ func init() {
 	serverCmd.Flags().StringVar(&serverWorkerSecret, "worker-secret", "", "Shared secret required from workers on registration via X-VH-Worker-Secret (prefer the VH_WORKER_SECRET env var); empty = open registration")
 	serverCmd.Flags().StringVar(&serverAPIToken, "api-token", "", "Bearer token required on the cross-worker coordination API /api/workers/{id}/sessions|events (prefer the VH_API_TOKEN env var); empty = open")
 	serverCmd.Flags().StringVar(&serverStatusConfig, "status-config", "", "Path to the fleet-status config JSONC file: the expected workers/projects rosters for GET /vh/fleet/status, managed live via PUT /vh/fleet/config (the file is rewritten as canonical JSON on save; comments allowed on read; created on first save when missing). A set-but-invalid file fails startup. Unset = config management disabled (discovered scope).")
-	serverCmd.Flags().StringVar(&serverNotifyStore, "notify-store", "", "Path to the push-notification token registry JSON file for the companion app, managed via POST/GET/PATCH/DELETE /vh/notify/tokens (rewritten as canonical JSON on change; created on first change when missing). A set-but-invalid file fails startup. Unset = the /vh/notify/ endpoints answer 409 (notifications disabled).")
-	serverCmd.Flags().StringVar(&serverNotifyFCMCreds, "notify-fcm-credentials", "", "Path to the Google service-account JSON (client_email, private_key, project_id) used to send FCM push notifications via POST /vh/notify/test. A set-but-invalid file fails startup. Unset = no transport configured (test-send answers 409; the token registry still works).")
+	serverCmd.Flags().StringVar(&serverNotifyStore, "notify-store", "", "Path to the push-notification token registry JSON file for the companion app, managed via public POST/GET /vh/notify/tokens + admin PATCH/DELETE /vh/admin/notify/tokens/{id} (rewritten as canonical JSON on change; created on first change when missing). A set-but-invalid file fails startup. Unset = the /vh/notify/ endpoints answer 409 (notifications disabled).")
+	serverCmd.Flags().StringVar(&serverNotifyFCMCreds, "notify-fcm-credentials", "", "Path to the Google service-account JSON (client_email, private_key, project_id) used to send FCM push notifications via POST /vh/admin/notify/test. A set-but-invalid file fails startup. Unset = no transport configured (test-send answers 409; the token registry still works).")
 	serverCmd.Flags().DurationVar(&serverNotifyIngestPoll, "notify-ingest-poll", 3*time.Second, "Poll interval for the controller notify pull loop (per enrolled source; unmeasured default — tune per fleet). Requires --notify-store.")
 	serverCmd.Flags().IntVar(&serverNotifyIngestConcurrency, "notify-ingest-concurrency", 4, "Maximum simultaneous notify feed fetches across the fleet (bounded fleet concurrency for the pull loop).")
 	serverCmd.Flags().IntVar(&serverNotifyLedgerRetention, "notify-ledger-retention", 50000, "Central notify ledger retention bound: the number of newest committed events retained before prefix compaction (prefix truncation only; dedupe knowledge survives truncation). 0 = default.")
-	serverCmd.Flags().BoolVar(&serverNotifyDispatch, "notify-dispatch", false, "Enable the central per-event FCM dispatcher (notify controller-hub S4): pushes committed ledger events through the controller's FCM credentials under the v4 gating ladder (detection-time attendance snapshot, freshness, persisted cooldown). Requires --notify-store and --notify-fcm-credentials. DISABLED by default while the legacy fleet watcher runs — documented enable order: (1) deploy with dispatch off, (2) verify the token migration and let Pulse re-register, (3) enable this flag accepting bounded overlap with the legacy watcher until the S5 cutover retires it.")
+	serverCmd.Flags().BoolVar(&serverNotifyDispatch, "notify-dispatch", false, "Enable the central per-event FCM dispatcher (notify controller-hub S4): pushes committed ledger events through the controller's FCM credentials under the v4 gating ladder (detection-time attendance snapshot, freshness, persisted cooldown). Requires --notify-store and --notify-fcm-credentials. Disabled by default: the rollout order is (1) deploy with dispatch off, (2) verify the token migration and let Pulse re-register, (3) enable this flag. Since the S5 cutover retired the legacy fleet watcher, the dispatcher is the ONLY notification delivery writer — a controller with this flag off delivers no pushes (history/registry/probe still work).")
 	serverCmd.Flags().DurationVar(&serverNotifyDispatchPoll, "notify-dispatch-poll", 3*time.Second, "Poll interval for the central FCM dispatcher (unmeasured default — tune per fleet).")
 	serverCmd.Flags().DurationVar(&serverNotifyStaleAfter, "notify-stale-after", 24*time.Hour, "Stale-push threshold: ledger events older than this are history-only (never pushed, however much TTL remains; v4 §9.8 default 24h, operator-tunable).")
 	serverCmd.Flags().DurationVar(&serverNotifyDispatchCool, "notify-dispatch-cooldown", 300*time.Second, "Central push cooldown per (source, notice type, token hash): a second push of the same key within this window is suppressed; decisions persist across controller restarts (the shared cooldown_sec knob; default 300s).")

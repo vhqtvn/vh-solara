@@ -126,11 +126,12 @@ export default function AdminMenu(props: { onClose: () => void }) {
         <Icon name="layers" size={14} /> Fleet status
       </button>
 
-      {/* Push notifications — the device-token registry + delivery
-          history manager (GET/POST/PATCH/DELETE /vh/notify/tokens, GET
-          /vh/notify/history). Opens a centered portaled dialog hosting
-          NotifyDialog; the menu stays mounted under it (the dismiss
-          guard above knows about it), same as Update/Restart/Fleet. */}
+      {/* Push notifications — the device-token registry + the v4 central
+          history manager (GET/POST /vh/notify/tokens, GET
+          /vh/admin/notify/tokens, GET /vh/notify/history). Opens a
+          centered portaled dialog hosting NotifyDialog; the menu stays
+          mounted under it (the dismiss guard above knows about it),
+          same as Update/Restart/Fleet. */}
       <button type="button" class="admin-btn" onClick={() => setNotifyOpen(true)}>
         <Icon name="bell" size={14} /> Push notifications
       </button>

@@ -308,8 +308,17 @@ func TestNotifyV4HistoryGapsFixture(t *testing.T) {
 		}
 		from := v4WantInt(t, ctx, g, "from_seq")
 		to := v4WantInt(t, ctx, g, "to_seq")
+		// The EMPTY-RANGE sentinel {from_seq:1, to_seq:0} is the one legal
+		// from>to shape: the worker standalone surface (pkg/web
+		// notify_feature.go) emits it for an epoch whose unknown-extent
+		// prefix is entirely gone (rotation with discontinuity before
+		// enrollment/overflow). Sanctioned additive in S5 (README note in
+		// testdata/notify_v4/); every other from>to remains malformed.
+		if from == 1 && to == 0 {
+			continue
+		}
 		if from < 0 || to < from {
-			t.Fatalf("%s: need 0 <= from_seq <= to_seq, got [%d..%d]", ctx, from, to)
+			t.Fatalf("%s: need 0 <= from_seq <= to_seq (or the {1,0} empty-range sentinel), got [%d..%d]", ctx, from, to)
 		}
 	}
 }

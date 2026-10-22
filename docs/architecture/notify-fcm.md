@@ -642,23 +642,42 @@ v4 notes:
   requires restore/recovery disposition — it never silently resets public
   ids (§9).
 - **The fleet-condition watcher no longer delivers aggregate
-  notifications** ((m)); fleet status itself is kept.
-- **S4 implementation posture (landed):** the central dispatcher
-  (`pkg/server/notify_dispatch.go`) is **opt-in** — it starts only with
-  `--notify-dispatch` (plus `--notify-store` and
-  `--notify-fcm-credentials`), because the legacy fleet watcher keeps
-  running until the S5 cutover retires it. **Documented enable order:**
-  (1) deploy the S4 controller with dispatch OFF; (2) verify the schema-1
-  → schema-2 token migration (admin masked list / probe counts) and let
-  Pulse re-register (full-state POSTs set policies without touching
-  administrative disable/scopes); (3) enable `--notify-dispatch`,
-  accepting the bounded overlap with the legacy watcher until S5.
+  notifications** ((m)); fleet status itself is kept. The watcher's
+  delivery loop is **fully removed** as of S5 (not flag-gated): its only
+  outputs were the legacy history file (now a read-only archive), token
+  telemetry (the dispatcher also feeds it), and a fleet-status TTL refresh
+  the status service never depended on (it refreshes lazily on demand).
+  Aggregate-condition notifications (e.g. "all workers offline"
+  controller-health alerts) are documented **lost** — restoring that
+  category requires a separately approved design; fleet status (§3.7) and
+  per-event dispatch are unaffected.
+- **S5 implementation posture (landed — final):** the notify
+  controller-hub program is **implementation-complete**. The dispatcher
+  (`pkg/server/notify_dispatch.go`) is the **only** notification delivery
+  writer; it remains **opt-in** behind `--notify-dispatch` (plus
+  `--notify-store` and `--notify-fcm-credentials` — with the legacy
+  watcher gone there is no overlap window; the flag keeps the enable
+  explicit and reversible). The public central history
+  (`GET /vh/notify/history`, §3.1 golden shape) serves from the central
+  ledger on every host; the pre-central controller history is a
+  **read-only archive** at `/vh/admin/notify/legacy-history` (+
+  `/legacy-history/read` for its cursor) with its **own cursor
+  namespace** — archived ids are never spliced into central ids, and the
+  central read-cursor advance (one-time Pulse "Log out → Connect") is the
+  only client-side reconciliation. The admin family
+  (`GET /vh/admin/notify/tokens`, `PATCH`/`DELETE
+  /vh/admin/notify/tokens/{id}`, `POST /vh/admin/notify/test`) is final.
+  **Rollout order (recap):** (1) deploy the S5 controller with dispatch
+  OFF; (2) verify the schema-1 → schema-2 token migration (admin masked
+  list / probe counts) and let Pulse re-register (full-state POSTs set
+  policies without touching administrative disable/scopes); (3) enable
+  `--notify-dispatch` — no double-delivery is possible (no second writer
+  exists); (4) clients perform the one-time "Log out → Connect" to reset
+  the local read cursor to the central namespace.
   Dispatch freshness (`--notify-stale-after`, default 24h per §9.8) and
   the central cooldown (`--notify-dispatch-cooldown`, default 300s) are
-   operator-tunable. The interim admin home for the masked list is
-   `GET /vh/admin/notify/tokens` (S4) — the management UI (NotifyDialog)
-   consumes it since the S4 route swap; PATCH/DELETE/test-send (the
-   remaining admin operations) relocate there in S5.
+  operator-tunable. The probe reports `enabled: false` with a fatal-stop
+  reason once the dispatcher has fatally stopped (poisoned ledger).
 
 ## 7. Network path & controller route ownership (settled 2026-10-14 — **superseded 2026-10-21**)
 

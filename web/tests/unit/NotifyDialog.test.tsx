@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 //
-// Lane-5 coverage for the push-notification admin pane (slice S3,
-// NotifyDialog — reached from AdminMenu → "Push notifications"):
-//   • masked device list render (label/preview/date/scope badge/telemetry)
-//     from the S4 admin home GET /vh/admin/notify/tokens — the legacy
-//     masked-list wire, unchanged (the public GET /vh/notify/tokens is
-//     the v4 probe since S4 and never carries a list);
+// Lane-5 coverage for the push-notification admin pane (NotifyDialog —
+// reached from AdminMenu → "Push notifications"; FINAL S5 shape):
+//   • masked device list render (label/preview/date/scope badge/
+//     push-policy badge/telemetry) from the admin home GET
+//     /vh/admin/notify/tokens — the masked-list wire now carries
+//     push_policy (the public GET /vh/notify/tokens is the v4 probe
+//     since S4 and never carries a list);
 //   • add-device: POST /vh/notify/tokens with the exact body (token,
 //     label, push_policy — the v4 FULL-STATE rule: the policy field is
 //     always sent; the add form defaults to when_unattended and a Select
@@ -14,26 +15,33 @@
 //     unavailable"} flips the read-only disabled posture (the old 409
 //     posture, relocated per v4 §3.1); client token validation mirrors
 //     the server (byte bounds / printable ASCII) without a round-trip;
-//   • enable/disable toggle: PATCH wholesale scope body (BOTH members);
-//   • scope editor: nine condition checkboxes + select-all; Save PATCHes
-//     the wholesale scope (canonical order, all-nine → []); an EMPTY
-//     selection requires the explicit confirm whose text states the
-//     wire truth ([] = ALL nine kinds);
+//   • enable/disable toggle + scope editor: PATCH wholesale scope body
+//     (BOTH members) to the S5 ADMIN route /vh/admin/notify/tokens/{id}
+//     (canonical order, all-nine → []); an EMPTY selection requires the
+//     explicit confirm whose text states the wire truth ([] = ALL nine
+//     kinds);
 //   • delete: confirm step naming unrecoverability/re-enrollment, then
-//     DELETE with CSRF;
-//   • test send: per-row {id} and raw-token {token} paths; {sent,
-//     transport} surfaced inline; error verbatim; 429 wait hint
-//     (body + Retry-After);
+//     DELETE /vh/admin/notify/tokens/{id} with CSRF;
+//   • test send: per-row {id} and raw-token {token} paths via POST
+//     /vh/admin/notify/test; {sent, transport} surfaced inline; error
+//     verbatim; 429 wait hint (body + Retry-After);
 //   • 409 (--notify-store off): whole dialog read-only + off-hint;
-//   • history: newest-first render with color-coded action chips,
-//     relative ts, expandable per-token deliveries; empty state
-//     ("no notifications yet") distinguished from the 409 posture;
+//   • history: the v4 CENTRAL shape (GET /vh/notify/history →
+//     {events, lastId, coverage}; ts a DECIMAL STRING of epoch ms):
+//     newest-first render with label ("<worker> — <title>"), kind chip,
+//     ×count, relative ts, and the ui_url worker anchor — plus the
+//     worker-STANDALONE posture (ui_url/source omitted) rendering
+//     without the anchor; empty state ("no notifications yet")
+//     distinguished from the 409 posture;
 //   • AdminMenu wiring: the "Push notifications" entry opens the dialog
 //     while the menu stays mounted.
 //
-// Wire mirrors pkg/server/notify_http.go + notify_history.go; the server
-// is the authority — the 400 test pins that its message wins verbatim.
+// Wire mirrors pkg/server/notify_http.go + notify_public_history.go;
+// the server is the authority — the 400 test pins that its message wins
+// verbatim.
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { cleanup, render, waitFor } from "@solidjs/testing-library";
 
 import NotifyDialog from "../../src/components/NotifyDialog";
@@ -44,6 +52,7 @@ const TOK1 = {
   id: "0011223344556677",
   label: "Operator phone",
   token_preview: "fcm-to…1234",
+  push_policy: "always",
   created_at: "2026-09-20T10:00:00Z",
   last_used_at: "2026-09-27T09:00:00Z",
   last_error: "",
@@ -53,52 +62,86 @@ const TOK2 = {
   id: "8899aabbccddeeff",
   label: "",
   token_preview: "fcm-tw…5678",
+  push_policy: "when_unattended",
   created_at: "2026-09-21T10:00:00Z",
   last_used_at: null,
   last_error: "send failed: HTTP 404",
   scope: { enabled: false, conditions: ["worker_down", "session_error", "session_unread"] },
 };
 
+// v4 CENTRAL history fixture — ts is a DECIMAL STRING of epoch ms
+// (goldens: pkg/server/testdata/notify_v4/history_response_v4.json).
+// Ids ascend with time (the committed ledger's guarantee); id4 is the
+// worker-STANDALalone posture (no ui_url / source) the same renderer
+// must handle.
 const NOW = Date.now();
 const HIST = {
-  schema: 1,
   events: [
     {
       id: 1,
-      ts: new Date(NOW - 3600_000).toISOString(),
-      kind: "worker_down",
-      action: "appeared",
+      type: "waiting",
+      sessionID: "ses-aaa",
+      root: "/w/iris",
+      project: "/w/iris",
+      title: "fix the login flow",
+      detail: "Permission request: bash*",
+      ts: String(NOW - 3 * 3600_000),
+      kind: "permission_pending",
       count: 2,
-      title: "vh-solara",
-      body: "2 workers down",
-      deliveries: [{ token_id: "0011223344556677", ok: true }],
+      label: "iris — fix the login flow",
+      worker: { id: "iris", name: "iris" },
+      source: { epoch: "iris-epoch-0002", seq: 3 },
+      ui_url: "https://iris.localhost/app?session=ses-aaa&dir=%2Fw%2Firis",
     },
     {
       id: 2,
-      ts: new Date(NOW - 60_000).toISOString(),
-      kind: "session_error",
-      action: "cleared",
-      count: 0,
-      title: "vh-solara",
-      body: "session errors (cleared)",
-      deliveries: [
-        { token_id: "0011223344556677", ok: false, error: "HTTP 500: backend error" },
-        { token_id: "8899aabbccddeeff", ok: false, retired: true },
-      ],
+      type: "waiting",
+      sessionID: "ses-bbb",
+      root: "/w/bason",
+      project: "/w/bason",
+      title: "refactor the sync layer",
+      detail: "Question: which shape?",
+      ts: String(NOW - 3600_000),
+      kind: "question_pending",
+      count: 5,
+      label: "bason — refactor the sync layer",
+      worker: { id: "bason", name: "bason" },
+      source: { epoch: "bason-epoch-0007", seq: 1 },
+      ui_url: "https://bason.localhost/app?session=ses-bbb&dir=%2Fw%2Fbason",
     },
     {
       id: 3,
-      ts: new Date(NOW - 1800_000).toISOString(),
-      kind: "question_pending",
-      action: "changed",
-      count: 5,
-      title: "vh-solara",
-      body: "5 questions pending",
-      deliveries: [{ token_id: "0011223344556677", ok: true }],
+      type: "stalled",
+      sessionID: "",
+      root: "",
+      project: "",
+      title: "OpenCode",
+      detail: "daemon-level: no heartbeat for 5m",
+      ts: String(NOW - 1800_000),
+      kind: "worker_down",
+      count: 1,
+      label: "iris — OpenCode",
+      worker: { id: "iris", name: "iris" },
+      source: { epoch: "iris-epoch-0002", seq: 4 },
+      ui_url: "https://iris.localhost/app",
+    },
+    {
+      id: 4,
+      type: "waiting",
+      sessionID: "ses-ccc",
+      root: "/local",
+      project: "/local",
+      title: "standalone notice",
+      detail: "served by the worker surface",
+      ts: String(NOW - 60_000),
+      kind: "session_unread",
+      count: 1,
+      label: "solo — standalone notice",
+      worker: { id: "solo", name: "solo" },
     },
   ],
-  first_id: 1,
-  last_id: 3,
+  lastId: 4,
+  coverage: { complete: true, gaps: [] },
 };
 
 function respJson(body: unknown, ok = true, status = 200): Response {
@@ -130,9 +173,12 @@ interface Call {
 
 type Endpoint = { status: number; body?: unknown; text?: string; headers?: Record<string, string> };
 
-// Router-style fetch stub for the /vh/notify/* family. Unspecified
-// endpoints answer their empty 200 default; every call is recorded for
-// method/header/body assertions.
+// Router-style fetch stub for the /vh/notify/* + /vh/admin/notify/*
+// family (S5 final route split). Unspecified endpoints answer their
+// empty 200 default; every call is recorded for method/header/body
+// assertions. NOTE ordering: the admin matcher must run BEFORE the
+// public one ("/vh/admin/notify/test" does not contain "/vh/notify/"
+// as a substring, but keep the explicitness anyway).
 function stubNotify(cfg: {
   getTokens?: Endpoint;
   create?: Endpoint;
@@ -151,27 +197,25 @@ function stubNotify(cfg: {
         : e.body !== undefined
           ? respJson(e.body, e.status >= 200 && e.status < 300, e.status)
           : respText(e.text ?? "", e.status, e.headers);
-    if (url.includes("/vh/notify/test") && method === "POST") {
+    if (url === "/vh/admin/notify/test" && method === "POST") {
       return Promise.resolve(answer(cfg.test, { schema: 1, sent: true, transport: "fcm" }));
     }
-    if (url.includes("/vh/notify/tokens") && method === "POST") {
+    if (url.startsWith("/vh/admin/notify/tokens/") && (method === "PATCH" || method === "DELETE")) {
+      // S5-relocated admin ops; 200 body is not consumed by the dialog.
+      return Promise.resolve(answer(cfg.patch ?? cfg.del, {}));
+    }
+    if (url === "/vh/admin/notify/tokens" && method === "GET") {
+      // The masked list's admin home — rows carry push_policy.
+      return Promise.resolve(answer(cfg.getTokens, { schema: 1, tokens: [] }));
+    }
+    if (url === "/vh/notify/tokens" && method === "POST") {
       // The v4 public registration route answers exactly {"ok":true} on
       // success (never a created flag or token echo) and the
       // {"ok":false,"error":…} envelope on refusals.
       return Promise.resolve(answer(cfg.create, { ok: true }));
     }
-    if (url.includes("/vh/notify/tokens") && method === "PATCH") {
-      return Promise.resolve(answer(cfg.patch, { schema: 1, token: TOK1 }));
-    }
-    if (url.includes("/vh/notify/tokens") && method === "DELETE") {
-      return Promise.resolve(answer(cfg.del, { schema: 1 }));
-    }
-    if (url.includes("/vh/admin/notify/tokens") && method === "GET") {
-      // The masked list's admin home (S4) — same legacy wire shape.
-      return Promise.resolve(answer(cfg.getTokens, { schema: 1, tokens: [] }));
-    }
-    if (url.includes("/vh/notify/history")) {
-      return Promise.resolve(answer(cfg.history, { schema: 1, events: [], first_id: 0, last_id: 0 }));
+    if (url.startsWith("/vh/notify/history")) {
+      return Promise.resolve(answer(cfg.history, { events: [], lastId: 0, coverage: { complete: true, gaps: [] } }));
     }
     return Promise.resolve(respJson({}));
   });
@@ -181,9 +225,9 @@ function stubNotify(cfg: {
   return {
     calls,
     posts: () => of("POST", "/vh/notify/tokens"),
-    patches: () => of("PATCH", "/vh/notify/tokens"),
-    deletes: () => of("DELETE", "/vh/notify/tokens"),
-    tests: () => of("POST", "/vh/notify/test"),
+    patches: () => of("PATCH", "/vh/admin/notify/tokens/"),
+    deletes: () => of("DELETE", "/vh/admin/notify/tokens/"),
+    tests: () => of("POST", "/vh/admin/notify/test"),
     tokenGets: () => of("GET", "/vh/admin/notify/tokens"),
     histGets: () => of("GET", "/vh/notify/history"),
   };
@@ -257,6 +301,18 @@ describe("NotifyDialog — devices list (masked render)", () => {
     // Scope badges: enabled + all-events vs disabled + subset summary.
     expect(document.body.textContent).toContain("on · all events");
     expect(document.body.textContent).toContain("off · 3 of 9 events");
+    // v4 push-policy badges (the masked list carries push_policy now):
+    // one .badge per row names the policy EXACTLY (the scope badges
+    // carry "·", the Select options carry "(default)").
+    const badges = Array.from(document.querySelectorAll(`.${styles.badge}`));
+    expect(
+      badges.some((b) => (b.textContent || "").trim() === "always"),
+      "expected an exact-'always' policy badge",
+    ).toBe(true);
+    expect(
+      badges.some((b) => (b.textContent || "").trim() === "when unattended"),
+      "expected an exact-'when unattended' policy badge",
+    ).toBe(true);
     // Telemetry: used date on TOK1, never-used + verbatim last_error on TOK2.
     expect(document.body.textContent).toContain("used 2026-09-27");
     expect(document.body.textContent).toContain("never used");
@@ -380,7 +436,7 @@ describe("NotifyDialog — enable/disable toggle (wholesale PATCH)", () => {
     await waitFor(() => expect(patches().length).toBe(1));
 
     const patch = patches()[0];
-    expect(patch.url).toBe(`/vh/notify/tokens/${TOK1.id}`);
+    expect(patch.url).toBe(`/vh/admin/notify/tokens/${TOK1.id}`);
     const headers = patch.init!.headers as Record<string, string>;
     expect(headers["X-VH-CSRF"]).toBe("1");
     expect(JSON.parse(patch.init!.body as string)).toEqual({
@@ -430,7 +486,7 @@ describe("NotifyDialog — scope editor (nine checkboxes, wholesale body, empty 
     await waitFor(() => expect(patches().length).toBe(1));
 
     const patch = patches()[0];
-    expect(patch.url).toBe(`/vh/notify/tokens/${TOK1.id}`);
+    expect(patch.url).toBe(`/vh/admin/notify/tokens/${TOK1.id}`);
     const headers = patch.init!.headers as Record<string, string>;
     expect(headers["X-VH-CSRF"]).toBe("1");
     // Wholesale: enabled + the eight remaining kinds in canonical order.
@@ -500,7 +556,7 @@ describe("NotifyDialog — delete confirm flow", () => {
     btn("Delete permanently")!.click();
     await waitFor(() => expect(deletes().length).toBe(1));
     const del = deletes()[0];
-    expect(del.url).toBe(`/vh/notify/tokens/${TOK1.id}`);
+    expect(del.url).toBe(`/vh/admin/notify/tokens/${TOK1.id}`);
     expect((del.init!.headers as Record<string, string>)["X-VH-CSRF"]).toBe("1");
     await waitFor(() => expect(tokenGets().length).toBe(2));
   });
@@ -523,7 +579,7 @@ describe("NotifyDialog — test send (row + raw token; result and 429)", () => {
     await waitFor(() => expect(tests().length).toBe(1));
 
     const test = tests()[0];
-    expect(test.url).toBe("/vh/notify/test");
+    expect(test.url).toBe("/vh/admin/notify/test");
     expect((test.init!.headers as Record<string, string>)["X-VH-CSRF"]).toBe("1");
     expect(JSON.parse(test.init!.body as string)).toEqual({ id: TOK1.id });
 
@@ -572,7 +628,7 @@ describe("NotifyDialog — test send (row + raw token; result and 429)", () => {
     btnByLabel("Test unregistered token").click();
 
     await waitFor(() => expect(tests().length).toBe(1));
-    expect(tests()[0].url).toBe("/vh/notify/test");
+    expect(tests()[0].url).toBe("/vh/admin/notify/test");
     expect(JSON.parse(tests()[0].init!.body as string)).toEqual({
       token: "fcm-raw-0000000000001",
     });
@@ -615,51 +671,79 @@ describe("NotifyDialog — history render", () => {
     vi.unstubAllGlobals();
   });
 
-  it("renders newest-first with color-coded action chips and expandable deliveries", async () => {
+  it("renders the v4 central shape newest-first: label, kind chip, ×count, ts, ui_url anchor", async () => {
     stubNotify({
       getTokens: { status: 200, body: { schema: 1, tokens: [TOK1] } },
       history: { status: 200, body: HIST },
     });
     render(() => <NotifyDialog onClose={() => {}} />);
 
-    await waitFor(() => expect(document.body.textContent).toContain("5 questions pending"));
-    // Newest-first: changed (1h→id3 is 30m ago…) — order by DOM position.
+    // Labels render verbatim (server-computed "<worker> — <title>").
+    await waitFor(() => expect(document.body.textContent).toContain("bason — refactor the sync layer"));
+
+    // Newest-first by DOM position: id4 (60s, standalone) → id3 (30m,
+    // worker_down) → id2 (1h, question) → id1 (3h, permission).
     const text = document.body.textContent || "";
-    const iChanged = text.indexOf("5 questions pending");
-    const iCleared = text.indexOf("session errors (cleared)");
-    const iAppeared = text.indexOf("2 workers down");
-    expect(iChanged).toBeGreaterThanOrEqual(0);
-    expect(iCleared).toBeGreaterThan(iChanged);
-    expect(iAppeared).toBeGreaterThan(iCleared);
+    const iSolo = text.indexOf("solo — standalone notice");
+    const iNew = text.indexOf("iris — OpenCode");
+    const iQ = text.indexOf("bason — refactor the sync layer");
+    const iOld = text.indexOf("iris — fix the login flow");
+    expect(iSolo).toBeGreaterThanOrEqual(0);
+    expect(iNew).toBeGreaterThan(iSolo);
+    expect(iQ).toBeGreaterThan(iNew);
+    expect(iOld).toBeGreaterThan(iQ);
 
-    // Action chips carry the color-coded classes.
-    const chip = (frag: string) => {
-      const el = Array.from(document.querySelectorAll(`.${styles.chip}`)).find((c) =>
-        (c.textContent || "").includes(frag),
-      );
-      expect(el, `chip ${frag}`).toBeTruthy();
-      return el!;
-    };
-    expect(chip("appeared").classList.contains(styles.chipAppeared)).toBe(true);
-    expect(chip("changed").classList.contains(styles.chipChanged)).toBe(true);
-    expect(chip("cleared").classList.contains(styles.chipCleared)).toBe(true);
+    // Kind chips: the neutral chip class carries the kind phrase (the
+    // v4 central shape has no appeared/changed/cleared action anymore).
+    const chips = Array.from(document.querySelectorAll(`.${styles.chip}`)).map(
+      (c) => (c.textContent || "").trim(),
+    );
+    expect(chips).toContain("worker down");
+    expect(chips).toContain("question pending");
+    expect(chips).toContain("permission pending");
+    expect(chips).toContain("unread"); // standalone event's kind
+    // The retired color variants are gone from the module. The css-module
+    // proxy fabricates a name for ANY key, so assert against the source
+    // instead of property access.
+    const cssSource = readFileSync(
+      resolve("src/components/NotifyDialog.module.css"),
+      "utf8",
+    );
+    for (const gone of [
+      "chipAppeared",
+      "chipChanged",
+      "chipCleared",
+      "deliv",
+      "okText",
+    ]) {
+      expect(cssSource).not.toContain(gone);
+    }
 
-    // Count + relative ts render (fixture id2 is 60s old → "1m ago",
-    // stable however slow the suite runs).
+    // Detail renders as the secondary line (clamped at 90 chars — the
+    // fixture's details are short, so verbatim).
+    expect(document.body.textContent).toContain("daemon-level: no heartbeat for 5m");
+
+    // Count only when > 1 (×5 on the question batch, ×2 on the permission
+    // batch; no ×1 noise).
     expect(document.body.textContent).toContain("×5");
-    expect(document.body.textContent).toContain("1m ago");
+    expect(document.body.textContent).toContain("×2");
+    expect(document.body.textContent).not.toContain("×1");
 
-    // Deliveries are collapsed until the toggle; then per-token outcomes.
-    expect(document.body.textContent).not.toContain("✓ delivered");
-    btnByLabel("Deliveries event 2").click();
-    await waitFor(() => {
-      expect(document.body.textContent).toContain("00112233…");
-      expect(document.body.textContent).toContain("HTTP 500: backend error");
-      expect(document.body.textContent).toContain("retired (unregistered)");
-    });
-    // The ok delivery on the OTHER event stays collapsed until asked.
-    btnByLabel("Deliveries event 3").click();
-    await waitFor(() => expect(document.body.textContent).toContain("✓ delivered"));
+    // ts is a DECIMAL STRING of epoch ms — id4 is 60s old → "1m ago"
+    // (stable however slow the suite runs); the raw digits never leak.
+    expect(document.body.textContent).toContain("1m ago");
+    expect(document.body.textContent).not.toContain(String(NOW - 60_000));
+
+    // ui_url: controller events carry an anchor with the worker href;
+    // the daemon-level event links the bare /app root.
+    const links = Array.from(document.querySelectorAll(`a.${styles.evLink}`)) as HTMLAnchorElement[];
+    const hrefs = links.map((a) => a.getAttribute("href"));
+    expect(hrefs).toContain("https://iris.localhost/app?session=ses-aaa&dir=%2Fw%2Firis");
+    expect(hrefs).toContain("https://bason.localhost/app?session=ses-bbb&dir=%2Fw%2Fbason");
+    expect(hrefs).toContain("https://iris.localhost/app");
+    // Exactly three anchors — the STANDALONE event (ui_url omitted, the
+    // worker-surface posture) renders NO link.
+    expect(links.length).toBe(3);
   });
 
   it("empty history (200, no events) shows the quiet empty state", async () => {
@@ -695,7 +779,9 @@ describe("AdminMenu — Push notifications entry wiring", () => {
         if (url.includes("/vh/admin/notify/tokens"))
           return Promise.resolve(respJson({ schema: 1, tokens: [] }));
         if (url.includes("/vh/notify/history"))
-          return Promise.resolve(respJson({ schema: 1, events: [], first_id: 0, last_id: 0 }));
+          return Promise.resolve(
+            respJson({ events: [], lastId: 0, coverage: { complete: true, gaps: [] } }),
+          );
         return Promise.resolve(respJson({}));
       }),
     );

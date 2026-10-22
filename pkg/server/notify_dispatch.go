@@ -82,22 +82,21 @@ package server
 // rides the store's existing ASYNC drain.
 //
 // ---------------------------------------------------------------------------
-// ROLLOUT POSTURE (S4): dispatch is DISABLED BY DEFAULT and starts only
-// when the operator passes --notify-dispatch (plus --notify-store and
-// --notify-fcm-credentials). The old fleet-condition watcher
-// (notify_watcher.go) keeps running until S5 retires it — the
-// double-delivery risk during the S4 window is bounded by exactly this
-// opt-in. DOCUMENTED ENABLE ORDER:
-//   1. deploy the S4 controller with dispatch OFF (the watcher keeps
-//      serving the legacy program; registration + probe + migration are
-//      live);
-//   2. verify the token migration (admin masked list / probe counts) and
-//      let Pulse re-register (its full-state POSTs set the desired
+// ROLLOUT POSTURE (S5, final): dispatch is DISABLED BY DEFAULT and
+// starts only when the operator passes --notify-dispatch (plus
+// --notify-store and --notify-fcm-credentials). The legacy
+// fleet-condition watcher is RETIRED (removed outright by the S5
+// cutover — no overlap window remains): this dispatcher is the ONLY
+// notification delivery writer, so a controller running without the
+// flag delivers no pushes at all (history, registry, and probe still
+// work). DOCUMENTED ENABLE ORDER:
+//   1. deploy the controller with dispatch OFF (registration + probe +
+//      the token migration are live);
+//   2. verify the token migration (admin masked list / probe counts)
+//      and let Pulse re-register (its full-state POSTs set the desired
 //      policies without touching administrative disable/scopes);
-//   3. only then enable --notify-dispatch — and accept that until S5
-//      retires the watcher, fleet-condition pushes (legacy) and per-event
-//      pushes (central) may both fire; the S5 cutover (route relocation +
-//      watcher retirement) closes the overlap.
+//   3. enable --notify-dispatch — no double-delivery is possible (no
+//      second writer exists).
 //
 // ---------------------------------------------------------------------------
 // SECRECY: the ledger's events, the store's tokens, and the transport's
@@ -622,21 +621,26 @@ func dispatchWorkerURL(hostPattern, workerID string) string {
 // dispatchUIURL builds the deep link to the origin worker's /app with the
 // session/dir query params (daemon-level notices — empty sessionID — link
 // the worker's /app root). "" (omit) when no usable worker host is
-// configured.
+// configured. Query order is golden-pinned (history_response_v4.json):
+// session FIRST, then dir — url.Values.Encode()'s alphabetical sort would
+// flip them; build the query manually.
 func dispatchUIURL(hostPattern, workerID, sessionID, project string) string {
 	base := dispatchWorkerURL(hostPattern, workerID)
 	if base == "" {
 		return ""
 	}
-	q := url.Values{}
+	var q strings.Builder
 	if sessionID != "" {
-		q.Set("session", sessionID)
+		q.WriteString("session=" + url.QueryEscape(sessionID))
 	}
 	if project != "" {
-		q.Set("dir", project)
+		if q.Len() > 0 {
+			q.WriteByte('&')
+		}
+		q.WriteString("dir=" + url.QueryEscape(project))
 	}
-	if enc := q.Encode(); enc != "" {
-		return base + "/app?" + enc
+	if q.Len() > 0 {
+		return base + "/app?" + q.String()
 	}
 	return base + "/app"
 }
@@ -760,6 +764,18 @@ func (d *Daemon) centralNotifyEnabled() bool {
 	return d.notifyDispatch != nil
 }
 
+// centralNotifyDegraded reports whether the armed central dispatcher has
+// FATALLY stopped (GF2/c-F1: a poisoned ledger stops it until restart).
+// The v4 probe pairs this with centralNotifyEnabled: enabled=true +
+// degraded=true renders enabled=false with a naming last_error, so a
+// parked-dead dispatcher never masquerades as a healthy channel
+// (t1d-F2).
+func (d *Daemon) centralNotifyDegraded() bool {
+	d.notifyDispatchMu.Lock()
+	defer d.notifyDispatchMu.Unlock()
+	return d.notifyDispatch != nil && d.notifyDispatch.isFatal()
+}
+
 // centralNotifyHealth exposes the armed central sender's
 // latest-completed-attempt pair for the v4 probe.
 func (d *Daemon) centralNotifyHealth() (time.Time, string) {
@@ -770,4 +786,23 @@ func (d *Daemon) centralNotifyHealth() (time.Time, string) {
 		return time.Time{}, ""
 	}
 	return m.transport.Health()
+}
+
+// notifyScopeMatches reports whether a device scope selects a condition
+// kind: enabled AND (conditions empty = all nine kinds OR an explicit
+// member). Unknown kinds match nothing but the empty list (defensive —
+// the registry validates against the nine-kind vocabulary anyway).
+func notifyScopeMatches(s notifyScope, kind string) bool {
+	if !s.Enabled {
+		return false
+	}
+	if len(s.Conditions) == 0 {
+		return true
+	}
+	for _, c := range s.Conditions {
+		if c == kind {
+			return true
+		}
+	}
+	return false
 }

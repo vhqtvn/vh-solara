@@ -96,7 +96,7 @@ type Notifier interface {
 	// token retirement, or operator surfacing.
 	Send(ctx context.Context, token string, msg NotifyMessage) error
 	// Name is the stable transport identifier echoed by
-	// POST /vh/notify/test ("fcm", "null", ...).
+	// POST /vh/admin/notify/test ("fcm", "null", ...).
 	Name() string
 }
 

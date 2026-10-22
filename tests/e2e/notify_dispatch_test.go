@@ -163,21 +163,26 @@ func startDispatchCluster(t *testing.T) (*Cluster, *e2eFCMMock) {
 	return c, fcm
 }
 
-// waitDispatchReceipt returns the next receipt whose token matches.
-func waitDispatchReceipt(t *testing.T, fcm *e2eFCMMock, token string) map[string]string {
+// collectDispatchReceipts collects exactly n receipts (15s deadline) and
+// then asserts 500ms of silence — the S4-gate C1 closure: the receipt
+// stream is EXACTLY the expected multiset, never a filtered view of it
+// (a receipt for an unexpected token or history id lands in the collected
+// set and fails the multiset assertion instead of being discarded).
+func collectDispatchReceipts(t *testing.T, fcm *e2eFCMMock, n int) []map[string]string {
 	t.Helper()
+	out := make([]map[string]string, 0, n)
 	deadline := time.Now().Add(15 * time.Second)
-	for {
+	for len(out) < n {
 		select {
 		case r := <-fcm.receipts:
-			if r["·token"] == token {
-				return r
-			}
+			out = append(out, r)
 		case <-time.After(time.Until(deadline)):
-			t.Fatalf("no FCM receipt for token %q within the deadline", token)
+			t.Fatalf("only %d/%d FCM receipts within the deadline: %+v", len(out), n, out)
 			return nil
 		}
 	}
+	assertNoDispatchReceipt(t, fcm, "", "exact receipt multiset")
+	return out
 }
 
 // assertNoDispatchReceipt asserts no further receipt for token arrives.
@@ -228,28 +233,29 @@ func TestNotifyDispatchEndToEndOverRealTunnel(t *testing.T) {
 	//   event 1 (attended)  → always ONLY;
 	//   event 2 (unattended, same source|type) → when_unattended ONLY
 	//   (always is centrally cooldown'd by its event-1 push).
-	r1 := waitDispatchReceipt(t, fcm, e2eTokAlways)
+	// collectDispatchReceipts pins the EXACT multiset (S4-gate C1): two
+	// receipts and only two, no stray delivery discarded on the floor.
+	rs := collectDispatchReceipts(t, fcm, 2)
+	r1, r2 := rs[0], rs[1]
+	if r1["·token"] != e2eTokAlways || r1["vh_history_id"] != "1" {
+		t.Fatalf("receipt 1 must be (always, central id 1), got token %q id %q", r1["·token"], r1["vh_history_id"])
+	}
+	if r2["·token"] != e2eTokWU || r2["vh_history_id"] != "2" {
+		t.Fatalf("receipt 2 must be (when_unattended, central id 2), got token %q id %q", r2["·token"], r2["vh_history_id"])
+	}
 	if r1["vh_event"] != "waiting" || r1["vh_condition"] != "permission_pending" {
 		t.Fatalf("receipt 1 data = %v", r1)
-	}
-	if r1["vh_history_id"] != "1" {
-		t.Fatalf("receipt 1 vh_history_id = %q, want the CENTRAL ledger id \"1\"", r1["vh_history_id"])
 	}
 	if r1["vh_worker_id"] != c.WorkerID || r1["vh_worker_name"] == "" {
 		t.Fatalf("receipt 1 worker attribution = %v / %v", r1["vh_worker_id"], r1["vh_worker_name"])
 	}
-	if want := fmt.Sprintf("https://%s.localhost/app?dir=%%2Fworkspace%%2Fe2e&session=ses-dispatch-1", c.WorkerID); r1["vh_ui_url"] != want {
+	// ui_url follows the golden query order: session FIRST, then dir.
+	if want := fmt.Sprintf("https://%s.localhost/app?session=ses-dispatch-1&dir=%%2Fworkspace%%2Fe2e", c.WorkerID); r1["vh_ui_url"] != want {
 		t.Fatalf("receipt 1 vh_ui_url = %q, want the controller-derived %q", r1["vh_ui_url"], want)
 	}
-
-	r2 := waitDispatchReceipt(t, fcm, e2eTokWU)
-	if r2["vh_history_id"] != "2" || r2["vh_session_id"] != "ses-dispatch-2" {
+	if r2["vh_session_id"] != "ses-dispatch-2" {
 		t.Fatalf("receipt 2 must be the UNATTENDED event for the when_unattended token, got %v", r2)
 	}
-
-	// Exactly two receipts: no duplicate for always (cooldown), no leak of
-	// the attended event to when_unattended.
-	assertNoDispatchReceipt(t, fcm, e2eTokAlways, "cooldown window")
 
 	// Secret hygiene: the dispatch state file carries token HASHES only.
 	raw, err := os.ReadFile(c.NotifyStorePath + ".dispatch")

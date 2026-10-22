@@ -6,25 +6,22 @@ import Icon from "./Icon";
 import Select from "./Select";
 import styles from "./NotifyDialog.module.css";
 
-// Push-notification admin (slice S3 of the Android-push program; server
-// side landed in S1/S2 — pkg/server/notify_http.go, notify_history.go,
-// notify_watcher.go). Reached from the hidden server-admin menu
-// (right-click / long-press Settings → VH Solara Server → "Push
-// notifications"), beside "Fleet status". Manages the device token
-// registry and shows the delivery history.
+// Push-notification admin (FINAL S5 shape of the notify controller-hub
+// program; server side — pkg/server/notify_http.go,
+// notify_public_history.go, notify_history.go [legacy archive]).
+// Reached from the hidden server-admin menu (right-click / long-press
+// Settings → VH Solara Server → "Push notifications"), beside "Fleet
+// status". Manages the device token registry and shows the CENTRAL
+// delivery history.
 //
-// Wire contract (mirror of pkg/server — FROZEN from S1/S2):
-//   GET    /vh/admin/notify/tokens      → {schema, tokens:[masked]} —
-//     the masked ADMIN list. Since the S4 route swap, GET
-//     /vh/notify/tokens is the v4 PUBLIC probe ({enabled, count,
-//     policies, last_attempt, last_error} — never a token list), so
-//     the dialog reads the admin home instead (S5 relocates the
-//     remaining admin ops there). 409 when no --notify-store: the
-//     WHOLE dialog then flips to the read-only posture + the off-hint
-//     (family convention: an empty list would read as "zero devices",
-//     which is a lie).
+// Wire contract (mirror of pkg/server — S5 final route split):
+//   GET    /vh/admin/notify/tokens → {schema, tokens:[masked]} — the
+//     masked ADMIN list (rows carry push_policy). 409 when no
+//     --notify-store: the WHOLE dialog then flips to the read-only
+//     posture + the off-hint (family convention: an empty list would
+//     read as "zero devices", which is a lie).
 //   POST   /vh/notify/tokens {token,label?,push_policy} (CSRF) → 200
-//     {"ok":true} (v4 public registration; idempotent by token). The
+//     {"ok":true} (v4 PUBLIC registration; idempotent by token). The
 //     body is the token's COMPLETE desired state (the full-state POST
 //     rule): push_policy must ALWAYS be sent — omitting it RESETS an
 //     existing always device to when_unattended. 503
@@ -33,20 +30,24 @@ import styles from "./NotifyDialog.module.css";
 //     dialog flips to the read-only disabled posture, same hint as the
 //     admin 409); 400s answer the same JSON envelope and their error
 //     text lands verbatim.
-//   PATCH  /vh/notify/tokens/{id} {label?, scope?} (CSRF) — scope is
-//     WHOLESALE: BOTH enabled and conditions required when present;
-//     conditions [] MEANS ALL NINE KINDS (there is no "none" on the
-//     wire — the scope editor's empty-selection confirm says exactly
-//     that, honestly).
-//   DELETE /vh/notify/tokens/{id} (CSRF) → 204. Unrecoverable: the
-//     device must re-enroll — the delete confirm says so.
-//   POST   /vh/notify/test {token}|{id} (CSRF) → 200 {schema, sent,
-//     transport, error?}; 429 + Retry-After when the 10s-per-controller
-//     rate limit trips (body names the wait); 409 names
-//     --notify-fcm-credentials when no transport is configured.
-//   GET    /vh/notify/history?since&limit → {schema, events:[…
-//     ascending…], first_id, last_id}. Rendered NEWEST-FIRST (reversed
-//     client-side); deliveries carry token IDs only (never raw tokens).
+//   PATCH  /vh/admin/notify/tokens/{id} {label?, scope?} (CSRF) —
+//     S5-relocated ADMIN op. Scope is WHOLESALE: BOTH enabled and
+//     conditions required when present; conditions [] MEANS ALL NINE
+//     KINDS (there is no "none" on the wire — the scope editor's
+//     empty-selection confirm says exactly that, honestly).
+//   DELETE /vh/admin/notify/tokens/{id} (CSRF) → 204. Unrecoverable:
+//     the device must re-enroll — the delete confirm says so.
+//   POST   /vh/admin/notify/test {token}|{id} (CSRF) → 200 {schema,
+//     sent, transport, error?}; 429 + Retry-After when the
+//     10s-per-controller rate limit trips (body names the wait); 409
+//     names --notify-fcm-credentials when no transport is configured.
+//   GET    /vh/notify/history?since&limit → the v4 CENTRAL ledger
+//     response {events:[…ascending…], lastId, coverage}. Each event
+//     carries ts as a DECIMAL STRING of epoch ms, kind, count, label
+//     ("<worker> — <title>"), worker{id,name}, source{epoch,seq}
+//     (optional), and ui_url (controller surface only — the ONE
+//     absent-able field; the worker-standalone surface serves the same
+//     shape without it). Rendered NEWEST-FIRST (reversed client-side).
 //
 // Client validation MIRRORS the server token rules (printable-ASCII
 // 0x21–0x7E, 16..2048 bytes; label ≤ 64 code points) for immediate
@@ -61,28 +62,29 @@ interface TokenWire {
   id: string;
   label: string;
   token_preview: string;
+  push_policy: string;
   created_at: string;
   last_used_at: string | null;
   last_error: string;
   scope: { enabled: boolean; conditions: string[] };
 }
 
-interface DeliveryWire {
-  token_id: string;
-  ok: boolean;
-  error?: string;
-  retired?: boolean;
-}
-
+// One v4 public history event (central controller ledger AND the
+// worker-standalone surface serve this shape). `ts` is a DECIMAL STRING
+// of epoch ms — Number() it before any Date math. source is omitted on
+// ring-only legacy events; ui_url only exists on the controller surface
+// (it needs a configured worker host) — render both postures.
 interface EventWire {
   id: number;
   ts: string;
   kind: string;
-  action: string; // appeared | changed | cleared
   count: number;
+  label: string;
   title: string;
-  body: string;
-  deliveries: DeliveryWire[];
+  detail: string;
+  worker: { id: string; name: string };
+  source?: { epoch: string; seq: number };
+  ui_url?: string;
 }
 
 interface TokensResponse {
@@ -91,8 +93,8 @@ interface TokensResponse {
 }
 
 interface HistoryResponse {
-  schema?: number;
   events?: EventWire[];
+  lastId?: number;
 }
 
 interface TestResponse {
@@ -127,7 +129,19 @@ const CONDITION_LABELS: Record<string, string> = {
   session_retry: "session retrying",
   session_unread: "unread",
   session_done: "finished",
+  // v4 central-history kinds outside the nine fleet conditions (the
+  // ledger's kind set — pkg/server notify_ledger.go v4Kinds).
+  degraded_thinking: "stalled thinking",
+  degraded_runaway: "runaway",
+  degraded_stalled: "session stalled",
+  session_started: "session started",
 };
+
+// Push-policy badge text (mirror of PUSH_POLICY_OPTIONS minus the
+// "(default)" suffix — a stored row just names its policy).
+function policyLabel(p: string): string {
+  return p === "always" ? "always" : "when unattended";
+}
 
 // The v4 push policies (notify-fcm.md §3.1: when_unattended | always,
 // default when_unattended), labeled with the contract vocabulary. The
@@ -202,9 +216,11 @@ function clampText(s: string, n = 120): string {
   return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
-function relTime(iso: string): string {
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return "";
+// The v4 history `ts` is a decimal string of epoch MS (not ISO —
+// Date.parse cannot read it raw; Number() first).
+function relTime(ms: string): string {
+  const t = Number(ms);
+  if (!Number.isFinite(t) || t <= 0) return "";
   const s = Math.max(0, (Date.now() - t) / 1000);
   if (s < 60) return "just now";
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
@@ -255,9 +271,6 @@ export default function NotifyDialog(props: { onClose: () => void }) {
   const [confirmEmptyScope, setConfirmEmptyScope] = createSignal(false);
   const [scopeError, setScopeError] = createSignal<string | null>(null);
 
-  // Expandable history deliveries (one event at a time).
-  const [openEvent, setOpenEvent] = createSignal<number | null>(null);
-
   function noteRow(id: string, ok: boolean, text: string): void {
     setRowNotes((prev) => ({ ...prev, [id]: { ok, text } }));
   }
@@ -283,6 +296,9 @@ export default function NotifyDialog(props: { onClose: () => void }) {
     setHistLoading(true);
     setHistError(null);
     try {
+      // The v4 CENTRAL history (public family route since S5): the
+      // controller ledger's view, same shape on the worker-standalone
+      // surface. 409 = registry off ⇒ same disabled posture.
       const r = await fetch("/vh/notify/history?limit=50");
       if (r.status === 409) {
         setDisabled(true); // registry off ⇒ history 409s too
@@ -415,7 +431,7 @@ export default function NotifyDialog(props: { onClose: () => void }) {
     }
     setAdding(true);
     try {
-      const r = await fetch("/vh/notify/test", {
+      const r = await fetch("/vh/admin/notify/test", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
         body: JSON.stringify({ token: tok }),
@@ -433,7 +449,7 @@ export default function NotifyDialog(props: { onClose: () => void }) {
   async function toggleEnabled(row: TokenWire): Promise<void> {
     setActing(row.id);
     try {
-      const r = await fetch(`/vh/notify/tokens/${row.id}`, {
+      const r = await fetch(`/vh/admin/notify/tokens/${row.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
         // Wholesale scope: BOTH members, conditions carried as stored.
@@ -509,7 +525,7 @@ export default function NotifyDialog(props: { onClose: () => void }) {
     const conditions = sel.length === CONDITIONS.length ? [] : sel;
     setActing(d.id);
     try {
-      const r = await fetch(`/vh/notify/tokens/${d.id}`, {
+      const r = await fetch(`/vh/admin/notify/tokens/${d.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
         body: JSON.stringify({ scope: { enabled: d.enabled, conditions } }),
@@ -534,7 +550,7 @@ export default function NotifyDialog(props: { onClose: () => void }) {
   async function deleteToken(row: TokenWire): Promise<void> {
     setActing(row.id);
     try {
-      const r = await fetch(`/vh/notify/tokens/${row.id}`, {
+      const r = await fetch(`/vh/admin/notify/tokens/${row.id}`, {
         method: "DELETE",
         headers: { "X-VH-CSRF": "1" },
       });
@@ -558,7 +574,7 @@ export default function NotifyDialog(props: { onClose: () => void }) {
   async function testRow(row: TokenWire): Promise<void> {
     setActing(row.id);
     try {
-      const r = await fetch("/vh/notify/test", {
+      const r = await fetch("/vh/admin/notify/test", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
         body: JSON.stringify({ id: row.id }),
@@ -665,6 +681,11 @@ export default function NotifyDialog(props: { onClose: () => void }) {
                             >
                               {row().scope.enabled ? "on" : "off"} ·{" "}
                               {scopeSummary(row().scope.conditions)}
+                            </span>
+                            {/* v4 push policy (the masked list carries it):
+                                advisory badge beside the scope state. */}
+                            <span class={styles.badge} title="push policy">
+                              {policyLabel(row().push_policy)}
                             </span>
                           </div>
                           <div class={styles.devSub}>
@@ -923,7 +944,7 @@ export default function NotifyDialog(props: { onClose: () => void }) {
                   </Show>
                   <Show when={!histError() && history().length === 0}>
                     <div class={styles.empty}>
-                      No notifications yet — fleet events pushed to enrolled devices appear here.
+                      No notifications yet — notices from your workers appear here.
                     </div>
                   </Show>
                   <Index each={newestFirst()}>
@@ -934,69 +955,34 @@ export default function NotifyDialog(props: { onClose: () => void }) {
                           <div class={styles.evMain}>
                             <span class={styles.evDot} aria-hidden="true" />
                             <span class={styles.evBody}>
-                              <span class={styles.evTitle}>
-                                {ev().title} — {ev().body}
-                              </span>
-                              <span class={styles.evKind}>
-                                {CONDITION_LABELS[ev().kind] ?? ev().kind}
-                              </span>
-                            </span>
-                            <span
-                              class={styles.chip}
-                              classList={{
-                                [styles.chipAppeared]: ev().action === "appeared",
-                                [styles.chipChanged]: ev().action === "changed",
-                                [styles.chipCleared]: ev().action === "cleared",
-                              }}
-                            >
-                              {ev().action}
-                            </span>
-                            <Show when={ev().count > 0}>
-                              <span class={styles.evCount}>×{ev().count}</span>
-                            </Show>
-                            <span class={styles.evTs}>{relTime(ev().ts)}</span>
-                            <button
-                              type="button"
-                              class={styles.delivBtn}
-                              aria-label={`Deliveries event ${ev().id}`}
-                              aria-expanded={openEvent() === ev().id}
-                              title="Deliveries"
-                              onClick={() =>
-                                setOpenEvent(openEvent() === ev().id ? null : ev().id)
-                              }
-                            >
-                              <Icon name="chevronDown" size={13} />
-                            </button>
-                          </div>
-                          <Show when={openEvent() === ev().id}>
-                            <div class={styles.deliv}>
-                              <Index each={ev().deliveries}>
-                                {(d) => (
-                                  <div class={styles.delivRow}>
-                                    <span class={styles.mono} title={d().token_id}>
-                                      {d().token_id.slice(0, 8)}…
-                                    </span>
-                                    <Show when={d().retired}>
-                                      <span class={styles.retired}>retired (unregistered)</span>
-                                    </Show>
-                                    <Show when={!d().retired && d().ok}>
-                                      <span class={styles.okText}>✓ delivered</span>
-                                    </Show>
-                                    <Show when={!d().ok && !d().retired}>
-                                      <span class={styles.errText}>
-                                        {clampText(d().error || "failed")}
-                                      </span>
-                                    </Show>
-                                  </div>
-                                )}
-                              </Index>
-                              <Show when={ev().deliveries.length === 0}>
-                                <span class={styles.dim}>
-                                  no devices were eligible (scope or disabled)
+                              {/* label = "<worker> — <title>" (server-computed) */}
+                              <span class={styles.evTitle}>{ev().label}</span>
+                              <Show when={ev().detail}>
+                                <span class={styles.evKind}>
+                                  {clampText(ev().detail, 90)}
                                 </span>
                               </Show>
-                            </div>
-                          </Show>
+                            </span>
+                            <span class={styles.chip}>
+                              {CONDITION_LABELS[ev().kind] ?? ev().kind}
+                            </span>
+                            <Show when={ev().count > 1}>
+                              <span class={styles.evCount}>×{ev().count}</span>
+                            </Show>
+                            <Show when={ev().ui_url}>
+                              <a
+                                class={styles.evLink}
+                                href={ev().ui_url}
+                                target="_blank"
+                                rel="noopener"
+                                aria-label={`Open event ${ev().id} on its worker`}
+                                title={ev().ui_url}
+                              >
+                                open ↗
+                              </a>
+                            </Show>
+                            <span class={styles.evTs}>{relTime(ev().ts)}</span>
+                          </div>
                         </div>
                       );
                     }}

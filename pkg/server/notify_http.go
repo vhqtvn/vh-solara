@@ -1,18 +1,18 @@
 package server
 
 // notify_http.go — the /vh/notify/* HTTP family (slice S1; v4 registration
-// + probe since notify controller-hub S4; see notify_transport.go for the
-// program header). Controller userMux, session-cookie auth family — the
-// same chain as /vh/fleet/config:
+// + probe since notify controller-hub S4; admin relocation completed in
+// S5; see notify_transport.go for the program header). Controller
+// userMux, session-cookie auth family — the same chain as
+// /vh/fleet/config:
 //
-//	POST   /vh/notify/tokens          v4 PUBLIC registration (CSRF): the app
-//	                                 submits {token, label?, push_policy?}
-//	GET    /vh/notify/tokens          v4 PUBLIC channel probe (never errors)
-//	GET    /vh/admin/notify/tokens    masked list for the management UI
-//	DELETE /vh/notify/tokens/{id}     revoke (CSRF; 404 unknown id) [admin,
-//	                                 relocates to /vh/admin/notify/* in S5]
-//	PATCH  /vh/notify/tokens/{id}     update label/scope (CSRF; strict decode)
-//	POST   /vh/notify/test            test-send {token?|id?} (CSRF)
+//	POST   /vh/notify/tokens             v4 PUBLIC registration (CSRF): the
+//	                                  app submits {token, label?, push_policy?}
+//	GET    /vh/notify/tokens             v4 PUBLIC channel probe (never errors)
+//	GET    /vh/admin/notify/tokens       masked list for the management UI
+//	DELETE /vh/admin/notify/tokens/{id}  revoke (CSRF; 404 unknown id)
+//	PATCH  /vh/admin/notify/tokens/{id}  update label/scope (CSRF; strict decode)
+//	POST   /vh/admin/notify/test         test-send {token?|id?} (CSRF)
 //
 // Conventions carried over from the fleet-config family:
 //   - Mutations require X-VH-CSRF enforced IN the handler (403 without
@@ -25,9 +25,9 @@ package server
 //     validation (the worker-compatible channel-unavailable posture, v4
 //     §3.1 — 503 wins over 400); the ADMIN family (masked list,
 //     DELETE/PATCH/{id}, test-send) keeps its honest 409 posture naming
-//     the flag until S5 relocates it; no --notify-fcm-credentials ⇒
-//     test-send 409s naming the flag (the registry itself still works —
-//     tokens can be enrolled before credentials exist).
+//     the flag; no --notify-fcm-credentials ⇒ test-send 409s naming the
+//     flag (the registry itself still works — tokens can be enrolled
+//     before credentials exist).
 //   - Bodies are strict JSON (DisallowUnknownFields, exactly one
 //     document) capped at 4 KiB (http.MaxBytesReader, like the config
 //     PUT's cap discipline). Unlike the config FILE reads, request bodies
@@ -40,9 +40,10 @@ package server
 //     stays on the ADMIN family only). The ADMIN masked list renders
 //     notifyTokenWire (preview only).
 //
-// hostInterceptor carves the whole /vh/notify/ prefix out of the
-// worker-subdomain proxy (daemon.go): the family is controller-owned and
-// must answer from every host the SPA/app can be served through.
+// hostInterceptor carves the /vh/notify/ and /vh/admin/notify/ prefixes
+// out of the worker-subdomain proxy (daemon.go): the family is
+// controller-owned and must answer from every host the SPA/app can be
+// served through.
 
 import (
 	"bytes"
@@ -179,7 +180,7 @@ func writeNotifyJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// testNotifyMessage is the fixed message POST /vh/notify/test sends —
+// testNotifyMessage is the fixed message POST /vh/admin/notify/test sends —
 // deterministic on purpose (S2 will define the real event vocabulary;
 // the operator comparing "did my phone buzz" needs no timestamp noise).
 func testNotifyMessage() NotifyMessage {
@@ -304,7 +305,20 @@ func (d *Daemon) handleNotifyTokenProbe(w http.ResponseWriter, r *http.Request) 
 		probe.Policies = policyCounts(&snap)
 	}
 	if d.centralNotifyEnabled() {
-		if at, lastErr := d.centralNotifyHealth(); !at.IsZero() {
+		// t1d-F2: once the dispatcher has FATALLY stopped (poisoned
+		// ledger), the probe must stop claiming enabled=true — report
+		// enabled:false with the fatal reason so Pulse surfaces the
+		// degradation instead of a silently dead channel. The health
+		// pair (last_attempt/last_error from the latest COMPLETED
+		// attempt) is kept when it exists, but the fatal reason wins
+		// as last_error: it describes the CURRENT channel state.
+		if d.centralNotifyDegraded() {
+			probe.Enabled = false
+			if at, _ := d.centralNotifyHealth(); !at.IsZero() {
+				probe.LastAttempt = at.Format(time.RFC3339)
+			}
+			probe.LastError = "central dispatcher fatally stopped (notify ledger poisoned — restart required)"
+		} else if at, lastErr := d.centralNotifyHealth(); !at.IsZero() {
 			probe.Enabled = true
 			probe.LastAttempt = at.Format(time.RFC3339)
 			probe.LastError = lastErr
@@ -344,10 +358,11 @@ func (d *Daemon) handleNotifyAdminTokenList(w http.ResponseWriter, r *http.Reque
 }
 
 // ---------------------------------------------------------------------------
-// DELETE /vh/notify/tokens/{id} — revoke
+// DELETE /vh/admin/notify/tokens/{id} — revoke
 // ---------------------------------------------------------------------------
 
-// handleNotifyTokenDelete serves DELETE /vh/notify/tokens/{id}: 204 on
+// handleNotifyTokenDelete serves DELETE /vh/admin/notify/tokens/{id}
+// (relocated from the public prefix in S5 per v4 §3.6): 204 on
 // success, 404 for an unknown id, 409 when the registry is disabled,
 // 500 on persist failure.
 func (d *Daemon) handleNotifyTokenDelete(w http.ResponseWriter, r *http.Request) {
@@ -376,7 +391,7 @@ func (d *Daemon) handleNotifyTokenDelete(w http.ResponseWriter, r *http.Request)
 }
 
 // ---------------------------------------------------------------------------
-// PATCH /vh/notify/tokens/{id} — update label/scope
+// PATCH /vh/admin/notify/tokens/{id} — update label/scope
 // ---------------------------------------------------------------------------
 
 // notifyScopePatchWire is the strict PATCH body's scope member: BOTH
@@ -388,7 +403,8 @@ type notifyScopePatchWire struct {
 	Conditions *[]string `json:"conditions"`
 }
 
-// handleNotifyTokenPatch serves PATCH /vh/notify/tokens/{id}: a partial
+// handleNotifyTokenPatch serves PATCH /vh/admin/notify/tokens/{id}
+// (relocated from the public prefix in S5 per v4 §3.6): a partial
 // update of label and/or scope (unknown fields rejected; at least one
 // field required — a fully-empty patch is a 400, not a no-op). 200 with
 // the masked entry on success; 404 unknown id; 409 disabled.
@@ -458,10 +474,11 @@ func (d *Daemon) handleNotifyTokenPatch(w http.ResponseWriter, r *http.Request) 
 }
 
 // ---------------------------------------------------------------------------
-// POST /vh/notify/test — test-send
+// POST /vh/admin/notify/test — test-send
 // ---------------------------------------------------------------------------
 
-// handleNotifyTest serves POST /vh/notify/test.
+// handleNotifyTest serves POST /vh/admin/notify/test (relocated from the
+// public prefix in S5 per v4 §3.6).
 //
 // Body {token?, id?} — EXACTLY ONE of the two: a bare token lets the
 // operator test BEFORE registering (e.g. pasting a token from the app);

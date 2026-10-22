@@ -67,18 +67,21 @@ type Daemon struct {
 	// generation-stamped. Zero value = registry disabled — every
 	// /vh/notify/* handler then answers the honest 409 posture naming
 	// the flag. Entries are created/managed via the notify HTTP family
-	// (notify_http.go); the S2 watcher consumes snapshots.
+	// (notify_http.go); the S4 central dispatcher consumes snapshots.
 	notifyStore notifyStoreHolder
 
-	// notifyHistory is the push-notification delivery history holder
+	// notifyHistory is the LEGACY notification delivery history archive
 	// (see notify_history.go): the bounded file-backed record of every
-	// fleet-condition transition the watcher (notify_watcher.go)
-	// emits, served by GET /vh/notify/history, PLUS the operator-level
-	// global read-through cursor advanced by POST
-	// /vh/notify/history/read (persisted in the same history file —
-	// one atomic events+cursor replacement). Its path derives from
-	// the registry path + ".history" (installed by LoadNotifyStore);
-	// zero value = unconfigured (the family's 409 posture).
+	// fleet-condition transition the retired watcher emitted — READ-ONLY
+	// since the S5 watcher retirement (no new appends; pre-retirement
+	// history stays inspectable for operators) — served at GET
+	// /vh/admin/notify/legacy-history, PLUS the operator-level global
+	// read-through cursor over that archive's OWN id namespace, advanced
+	// by POST /vh/admin/notify/legacy-history/read (persisted in the
+	// same history file — one atomic events+cursor replacement). Its
+	// path derives from the registry path + ".history" (installed by
+	// LoadNotifyStore); zero value = unconfigured (the family's 409
+	// posture). Never spliced into the central ledger's ids.
 	notifyHistory notifyHistoryHolder
 
 	// notifySources is the enrolled notify-source registry (see
@@ -123,7 +126,8 @@ type Daemon struct {
 	// FCM dispatcher (see notify_dispatch.go — S4): StartNotifyDispatch
 	// arms at most one loop per Daemon; StopNotifyDispatch cancels AND
 	// JOINS it (LoadNotifyStore re-arm safety). The dispatcher is opt-in
-	// (--notify-dispatch) while the legacy watcher runs.
+	// (--notify-dispatch); it is the ONLY notification delivery writer
+	// since the S5 retirement of the legacy fleet-condition watcher.
 	notifyDispatch       *notifyDispatchManager
 	notifyDispatchCancel context.CancelFunc
 	notifyDispatchMu     sync.Mutex
@@ -144,24 +148,6 @@ type Daemon struct {
 	// hammering, not a quota; a restart clearing it is fine.
 	notifyTestSendMu   sync.Mutex
 	notifyTestSendLast time.Time
-
-	// notifyWatchOnce/notifyWatcherRunning gate StartNotifyWatcher
-	// (notify_watcher.go): the fleet-condition watcher starts at most
-	// once per Daemon, only when the registry AND a real transport are
-	// configured. The sync.Once synchronizes the write; readers after
-	// Do observe the final value. (running stays true once started —
-	// the Once record; StopNotifyWatcher does not reset it, it cannot
-	// restart.) notifyWatcher/notifyWatcherCancel/notifyWatcherMu carry
-	// the STOP side (B-F1): StopNotifyWatcher cancels AND JOINS the run
-	// loop — the same discipline as the ingest/dispatch stops above —
-	// and is a safe no-op while both are nil (cmd/server.go loads the
-	// store, and thus stop-joins a never-started watcher, BEFORE
-	// StartNotifyWatcher runs).
-	notifyWatchOnce      sync.Once
-	notifyWatcherRunning bool
-	notifyWatcher        *notifyWatcher
-	notifyWatcherCancel  context.CancelFunc
-	notifyWatcherMu      sync.Mutex
 
 	// tunnelDeflate is the controller-side permessage-deflate write policy
 	// for the worker tunnel WebSocket (Q4c experiment). Parsed once from
@@ -364,51 +350,68 @@ func (d *Daemon) buildRootHandler() http.Handler {
 	userMux.HandleFunc("GET /vh/fleet/config/options", d.handleFleetOptionsGet)
 
 	// Push-notification family (/vh/notify/*; see notify_http.go +
-	// notify_store.go + notify_transport.go + notify_dispatch.go): since
-	// notify controller-hub S4 the PUBLIC prefix carries the v4 central
-	// contract — POST /vh/notify/tokens is the app registration (full-state
-	// {token,label,push_policy}, {"ok":true}, never a token echo) and GET
-	// /vh/notify/tokens is the channel probe (enabled/count/policies/
-	// last_attempt/last_error; 200-always). The ADMIN surface keeps working
-	// unchanged until S5 relocates it to /vh/admin/notify/*: the masked
-	// list is ALREADY served there (GET /vh/admin/notify/tokens), while
-	// DELETE/PATCH/{id} and test-send keep their S1 paths. Same
-	// session-cookie auth family as the fleet routes above (the whole
-	// userMux chain is auth-gated; API-class /vh/* means unauthenticated
-	// requests get a clean 401). Mutations (POST/DELETE/PATCH) carry the
-	// in-handler X-VH-CSRF check — the same /vh/-mutation convention as
-	// PUT /vh/fleet/config, since the controller csrfGuard only gates
-	// unsafe methods under /api/. GETs are read-only and CSRF-exempt. The
-	// whole /vh/notify/ prefix AND the /vh/admin/notify/ family prefix are
-	// carved out of the worker-subdomain proxy below (controller-owned
-	// family; NotifyDialog fetches the masked admin list from
-	// worker-subdomain hosts). Honest disabled postures: no
-	// --notify-store ⇒ the public POST answers 503 "notify unavailable"
-	// (before body validation) and the admin family 409s naming the flag;
-	// no --notify-fcm-credentials ⇒ test-send names the flag.
+	// notify_store.go + notify_transport.go + notify_dispatch.go +
+	// notify_public_history.go): since notify controller-hub S5 the
+	// family has its FINAL shape. The PUBLIC prefix carries the v4
+	// central contract — POST /vh/notify/tokens is the app registration
+	// (full-state {token,label,push_policy}, {"ok":true}, never a token
+	// echo), GET /vh/notify/tokens is the channel probe (enabled/count/
+	// policies/last_attempt/last_error; 200-always), and GET
+	// /vh/notify/history is the CENTRAL public history (golden v4 shape,
+	// see notify_public_history.go). The ADMIN surface is fully relocated
+	// under /vh/admin/notify/*: the masked token list, PATCH/DELETE
+	// /vh/admin/notify/tokens/{id}, test-send POST /vh/admin/notify/test,
+	// and the LEGACY history archive (+ its read cursor) at
+	// /vh/admin/notify/legacy-history — the old public PATCH/DELETE/test/
+	// history routes no longer occupy the public prefix (v4 §7.3; the UI
+	// ships in the same release). Same session-cookie auth family as the
+	// fleet routes above (the whole userMux chain is auth-gated; API-class
+	// /vh/* means unauthenticated requests get a clean 401). Mutations
+	// (POST/DELETE/PATCH) carry the in-handler X-VH-CSRF check — the same
+	// /vh/-mutation convention as PUT /vh/fleet/config, since the
+	// controller csrfGuard only gates unsafe methods under /api/. GETs
+	// are read-only and CSRF-exempt. The whole /vh/notify/ prefix AND the
+	// /vh/admin/notify/ family prefix are carved out of the
+	// worker-subdomain proxy below (controller-owned family; NotifyDialog
+	// fetches the masked admin list from worker-subdomain hosts). Honest
+	// disabled postures: no --notify-store ⇒ the public POST answers 503
+	// "notify unavailable" (before body validation), the admin family
+	// 409s naming the flag, and the public history 409s likewise; no
+	// --notify-fcm-credentials ⇒ test-send names the flag.
 	userMux.HandleFunc("POST /vh/notify/tokens", d.handleNotifyTokenCreate)
 	userMux.HandleFunc("GET /vh/notify/tokens", d.handleNotifyTokenProbe)
 	userMux.HandleFunc("GET /vh/admin/notify/tokens", d.handleNotifyAdminTokenList)
-	userMux.HandleFunc("DELETE /vh/notify/tokens/{id}", d.handleNotifyTokenDelete)
-	userMux.HandleFunc("PATCH /vh/notify/tokens/{id}", d.handleNotifyTokenPatch)
-	userMux.HandleFunc("POST /vh/notify/test", d.handleNotifyTest)
+	userMux.HandleFunc("DELETE /vh/admin/notify/tokens/{id}", d.handleNotifyTokenDelete)
+	userMux.HandleFunc("PATCH /vh/admin/notify/tokens/{id}", d.handleNotifyTokenPatch)
+	userMux.HandleFunc("POST /vh/admin/notify/test", d.handleNotifyTest)
 
-	// Notification delivery history (GET /vh/notify/history; see
-	// notify_history.go): the bounded file-backed record of watcher-
-	// emitted fleet-condition transitions with per-token outcomes.
-	// Read-only/CSRF-exempt like the token list; same 409-disabled
-	// posture; covered by the /vh/notify/ prefix carve-out below, so it
-	// answers from worker-subdomain hosts too.
-	userMux.HandleFunc("GET /vh/notify/history", d.handleNotifyHistory)
+	// Central public history (GET /vh/notify/history; see
+	// notify_public_history.go — notify controller-hub S5): the central
+	// ledger's committed event stream in the v4 public golden shape,
+	// replacing the legacy watcher file at this route. Read-only/
+	// CSRF-exempt like the token probe; same 409-disabled posture; the
+	// /vh/notify/ prefix carve-out below keeps it answering from
+	// worker-subdomain hosts (every-host public surface).
+	userMux.HandleFunc("GET /vh/notify/history", d.handleNotifyHistoryCentral)
 
-	// Global read-cursor advance (POST /vh/notify/history/read; see
-	// notify_history.go): the operator-level "read through id N"
-	// acknowledgement shared by every device. A /vh/ mutation: the
-	// in-handler X-VH-CSRF check (403) fires before the 409/400 ladder,
-	// per the family convention above; the method-agnostic prefix
-	// carve-out covers it on worker subdomains (methods enforced by
-	// this pattern — anything but POST gets the mux's 405).
-	userMux.HandleFunc("POST /vh/notify/history/read", d.handleNotifyHistoryRead)
+	// LEGACY history archive (see notify_history.go): the fleet-condition
+	// watcher's file-backed delivery record, kept readable for operators
+	// at its clearly-named admin path with its OWN cursor namespace —
+	// never spliced into the central ids. Read-only since the S5 watcher
+	// retirement: no new entries are appended (the file's events freeze;
+	// pre-retirement history stays inspectable).
+	userMux.HandleFunc("GET /vh/admin/notify/legacy-history", d.handleNotifyLegacyHistory)
+
+	// Legacy global read-cursor advance (POST /vh/admin/notify/
+	// legacy-history/read; see notify_history.go): the operator-level
+	// "read through id N" acknowledgement over the LEGACY archive's own
+	// id namespace (central history has no read cursor — its unread state
+	// is client-derived). A /vh/ mutation: the in-handler X-VH-CSRF check
+	// (403) fires before the 409/400 ladder, per the family convention
+	// above; the method-agnostic family-prefix carve-out covers it on
+	// worker subdomains (methods enforced by this pattern — anything but
+	// POST gets the mux's 405).
+	userMux.HandleFunc("POST /vh/admin/notify/legacy-history/read", d.handleNotifyLegacyHistoryRead)
 
 	// Latency diagnostics — AGGREGATED global view. The controller merges its
 	// own probes (diag.Default) with every connected worker's snapshot fetched
@@ -540,21 +543,22 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 		// catch-all route would answer /vh/fleet/config with the SPA shell
 		// (200 text/html), which the config pane cannot parse; ditto the
 		// /vh/fleet/config/options picker feed. The /vh/notify/ carve-out is
-		// a PREFIX (the family has /vh/notify/tokens/{id} subpaths): workers
+		// a PREFIX (the family keeps /vh/notify/tokens and the central
+		// /vh/notify/history): workers
 		// have no /vh/notify/ routes (new controller-owned family), so their
 		// catch-all would likewise serve the unparseable SPA shell — same
 		// carve-out list discipline as /vh/fleet/*, with the same
 		// method-agnostic fall-through (methods enforced by userMux
 		// patterns; mutations keep their in-handler CSRF checks). The
 		// /vh/admin/notify/ carve-out extends the same prefix discipline
-		// to the ADMIN family home: the masked list already lives there
-		// (S4) and S5 relocates PATCH/DELETE/{id} + test-send onto it.
-		// NotifyDialog fetches /vh/admin/notify/tokens from
-		// worker-subdomain hosts — without the carve-out the interceptor
-		// would proxy it down to the worker (SPA shell when online, 502
-		// when the worker is offline/not found) BEFORE userMux could
-		// serve the masked list, breaking the dialog in exactly the
-		// deployment it must work in.
+		// to the ADMIN family: the masked list, PATCH/DELETE/{id},
+		// test-send, and the legacy-history archive (+ read cursor) all
+		// live there since the S5 relocation. NotifyDialog fetches
+		// /vh/admin/notify/tokens from worker-subdomain hosts — without
+		// the carve-out the interceptor would proxy it down to the
+		// worker (SPA shell when online, 502 when the worker is
+		// offline/not found) BEFORE userMux could serve the masked list,
+		// breaking the dialog in exactly the deployment it must work in.
 		// Falling through to `next` (the userMux chain) serves the global
 		// controller-owned view regardless of host. Per-worker
 		// /vh/diag/latency remains reachable on the worker for the

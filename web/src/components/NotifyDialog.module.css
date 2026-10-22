@@ -1,6 +1,7 @@
 /* Push-notification admin dialog (AdminMenu → "Push notifications") —
- * device token registry (GET/POST/PATCH/DELETE /vh/notify/tokens) plus
- * the delivery history (GET /vh/notify/history).
+ * device token registry (GET /vh/admin/notify/tokens, POST
+ * /vh/notify/tokens) plus the v4 CENTRAL history (GET
+ * /vh/notify/history).
  *
  * Scoped; consumes foundation tokens only (web/src/styles/foundation/
  * tokens.css). The dialog chrome (.dialog / .dialog-head / .dialog-body /
@@ -121,9 +122,6 @@
 .errText {
   color: var(--warn);
   overflow-wrap: anywhere;
-}
-.okText {
-  color: var(--ok);
 }
 
 /* ── Devices ─────────────────────────────────────────────────────────
@@ -328,9 +326,9 @@
 }
 
 /* ── History ─────────────────────────────────────────────────────────
- * Newest-first list; each event is a plain block (dot + body + action
- * chip + count + relative ts + deliveries toggle), deliveries expand
- * inline. */
+ * Newest-first list of v4 central events; each event is a plain block
+ * (dot + label/detail body + kind chip + count + worker link +
+ * relative ts). */
 .ev {
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -366,7 +364,10 @@
 .evKind {
   font-size: 11px;
   color: var(--fg-dim);
+  overflow-wrap: anywhere;
 }
+/* Kind chip — the event's condition class at a glance (neutral: the
+ * v4 central shape carries no appeared/changed/cleared action anymore). */
 .chip {
   flex: 0 0 auto;
   font-size: 10.5px;
@@ -375,23 +376,6 @@
   padding: 3px 8px;
   border: 1px solid var(--border);
   color: var(--fg-dim);
-}
-/* appeared = needs attention (warn), changed = info (accent),
- * cleared = recovery (ok). */
-.chipAppeared {
-  color: var(--warn);
-  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
-  background: color-mix(in srgb, var(--warn) 10%, transparent);
-}
-.chipChanged {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-}
-.chipCleared {
-  color: var(--ok);
-  border-color: color-mix(in srgb, var(--ok) 45%, var(--border));
-  background: color-mix(in srgb, var(--ok) 10%, transparent);
 }
 .evCount {
   flex: 0 0 auto;
@@ -405,40 +389,21 @@
   color: var(--fg-dim);
   white-space: nowrap;
 }
-.delivBtn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+/* ui_url anchor — jumps to the event's session on its worker
+ * (controller surface only; the standalone surface omits the field). */
+.evLink {
   flex: 0 0 auto;
-  width: 24px;
-  height: 24px;
-  color: var(--fg-dim);
-  background: none;
+  font-size: 11px;
+  color: var(--accent);
+  text-decoration: none;
   border: 1px solid var(--border);
   border-radius: 7px;
-  cursor: pointer;
+  padding: 2px 7px;
+  white-space: nowrap;
 }
-.delivBtn:hover {
+.evLink:hover {
   border-color: var(--accent);
-}
-.deliv {
-  margin-top: 5px;
-  padding: 5px 0 0 15px;
-  border-top: 1px dashed var(--border);
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.delivRow {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 4px 10px;
-  font-size: 11.5px;
-}
-.retired {
-  color: var(--fg-dim);
-  font-style: italic;
+  text-decoration: underline;
 }
 
 /* ── Footer ────────────────────────────────────────────────────────── */

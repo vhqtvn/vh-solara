@@ -1,20 +1,26 @@
 package server
 
-// notify_history.go — the push-notification delivery history (slice S2;
-// see notify_transport.go for the program header): the bounded,
-// file-persisted record of every fleet-condition transition the watcher
-// EMITTED, with per-token delivery outcomes. Push is best-effort; this
-// history is the reliable record.
+// notify_history.go — the LEGACY push-notification delivery history
+// ARCHIVE (slice S2 origin; see notify_transport.go for the program
+// header): the bounded, file-persisted record of every fleet-condition
+// transition the retired watcher EMITTED, with per-token delivery
+// outcomes. Since the S5 watcher retirement this file is READ-ONLY in
+// production — no writer remains (the aggregate notification loop is
+// gone; the S4 central dispatcher delivers, and the central public
+// history GET /vh/notify/history serves from the ledger) — but the
+// pre-retirement record stays operator-inspectable at GET
+// /vh/admin/notify/legacy-history with its OWN cursor namespace,
+// never spliced into the central ledger's ids. The read-through cursor
+// advance (POST /vh/admin/notify/legacy-history/read) remains live.
 //
 // Storage: a SEPARATE file next to the token registry — path = the
-// --notify-store value + ".history" (no new flag). Isolation from
-// token-file writes is the point: history appends are far more frequent
-// than registry mutations, and sharing one file would couple the raw-
-// token registry's read/write cadence to the history's. The file is
-// NON-SECRET (no raw tokens — deliveries carry token IDs only), but the
-// SAME O_EXCL-0600 tmp+rename persist discipline is kept via the shared
-// persistAtomic0600 helper, for uniformity and defense-in-depth (one
-// crash-safe write path, one mode posture).
+// --notify-store value + ".history" (no new flag; the derivation is why
+// the archive shares the registry's 409-disabled posture). Isolation
+// from token-file writes was the point while appends flowed. The file
+// is NON-SECRET (no raw tokens — deliveries carry token IDs only), but
+// the SAME O_EXCL-0600 tmp+rename persist discipline is kept via the
+// shared persistAtomic0600 helper, for uniformity and defense-in-depth
+// (one crash-safe write path, one mode posture).
 //
 // File shape (canonical 2-space JSON + trailing newline):
 //
@@ -44,11 +50,11 @@ package server
 // downgrading; the controller does not silently reset or migrate it.
 //
 // Bound: at most notifyHistoryMaxEntries (500) entries in memory AND in
-// the file — the OLDEST are trimmed on append, so the file is a bounded
-// ring of the newest transitions (documented cap; 500 entries ≈ months
-// of a single-operator fleet at realistic transition rates). IDs keep
-// rising across trims and restarts (nextID resumes above the newest
-// persisted id), so `since` cursors never collide after a restart.
+// the file — the OLDEST were trimmed on append (the writer discipline
+// the retired watcher followed), so the file is a bounded ring of the
+// newest transitions. IDs keep rising across trims and restarts (nextID
+// resumes above the newest persisted id), so `since` cursors never
+// collide after a restart.
 //
 // Load discipline (mirrors the registry): strict decode
 // (DisallowUnknownFields, exactly one document, ascending ids), a MISSING
@@ -59,13 +65,9 @@ package server
 // on load. A persisted read_id below the oldest retained id is
 // PRESERVED as-is (a watermark into the trimmed past is still valid —
 // trimming never clamps the cursor); a negative read_id or one above
-// the newest retained id is corrupt (the writer always persists the
+// the newest retained id is corrupt (the writer always persisted the
 // cursor with the events that established that high-water) and fails
 // load with the same startup-failure posture.
-//
-// Appends are watcher-loop-serialized (single goroutine), which keeps
-// ids monotonic and the persist order deterministic; the holder mutex
-// still guards readers (the HTTP handler) against the append path.
 
 import (
 	"bytes"
@@ -88,8 +90,9 @@ const (
 	// notifyHistoryMaxEntries bounds the retained history (oldest
 	// trimmed on append).
 	notifyHistoryMaxEntries = 500
-	// notifyHistoryDefaultLimit / notifyHistoryMaxLimit bound GET
-	// /vh/notify/history's limit parameter.
+	// notifyHistoryDefaultLimit / notifyHistoryMaxLimit bound the
+	// history limit parameter — shared by this archive route and the
+	// central public history (notify_public_history.go).
 	notifyHistoryDefaultLimit = 50
 	notifyHistoryMaxLimit     = 200
 )
@@ -98,8 +101,8 @@ const (
 // Entry + file shape
 // ---------------------------------------------------------------------------
 
-// notifyHistoryAction values (the transition vocabulary the watcher
-// emits; also the FCM data vh_event values).
+// notifyHistoryAction values (the transition vocabulary the retired
+// watcher emitted; also the FCM data vh_event values).
 const (
 	notifyActionAppeared = "appeared"
 	notifyActionChanged  = "changed"
@@ -110,7 +113,8 @@ const (
 // fan-out. token_id ONLY — the raw token never reaches the history (the
 // ID resolves through the registry when the entry still exists).
 // retired marks the UNREGISTERED-class outcome that removed the entry
-// from the registry (see notify_watcher.go).
+// from the registry (the RegGen-fenced prune the retired watcher and
+// the S4 dispatcher share).
 type notifyDeliveryRecord struct {
 	TokenID string `json:"token_id"`
 	OK      bool   `json:"ok"`
@@ -277,41 +281,10 @@ func (h *notifyHistoryHolder) setPath(path string) error {
 	return nil
 }
 
-// append records one emitted transition and persists (the cursor rides
-// along — every history write carries the current read_id, so the
-// file's events and cursor can never drift apart). ids are assigned
-// monotonically from nextID. The persist is best-effort-by-log (the
-// in-memory window stays authoritative for this process; a failed
-// history persist must never unwind the watcher loop) — deliberately
-// LOUDER than recordSendResult's silent swallow because this file IS
-// the reliable record, but equally non-fatal. Callers: the watcher loop
-// only (serialized appends keep ids monotonic); readers go through
-// query/advanceRead.
-func (h *notifyHistoryHolder) append(e notifyHistoryEntry) notifyHistoryEntry {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.path == "" {
-		return e // unconfigured: no-op (the watcher never runs in this posture)
-	}
-	if e.ID == 0 {
-		e.ID = h.nextID
-		h.nextID++
-	}
-	if e.TS.IsZero() {
-		e.TS = time.Now().UTC()
-	}
-	if e.Deliveries == nil {
-		e.Deliveries = []notifyDeliveryRecord{}
-	}
-	h.entries = append(h.entries, e)
-	if over := len(h.entries) - notifyHistoryMaxEntries; over > 0 {
-		h.entries = h.entries[over:]
-	}
-	if err := h.persistLocked(); err != nil {
-		log.Printf("notify: history append persist failed (kept in memory): %v", err)
-	}
-	return e
-}
+// (The append path lived here until the S5 watcher retirement — no
+// production writer remains. The holder keeps its load/query/cursor
+// machinery for the read-only archive; the test tree carries the
+// retired append as a seeding helper in notify_history_test.go.)
 
 // persistLocked writes the canonical form (current entries + current
 // cursor); caller holds h.mu.
@@ -427,14 +400,19 @@ func (h *notifyHistoryHolder) query(since int64, limit int) (entries []notifyHis
 }
 
 // ---------------------------------------------------------------------------
-// HTTP: GET /vh/notify/history
+// HTTP: GET /vh/admin/notify/legacy-history (the archive)
 // ---------------------------------------------------------------------------
 
-// handleNotifyHistory serves GET /vh/notify/history — the reliable
-// delivery record for the companion app / management UI. Same
-// session-cookie auth family as the rest of /vh/notify/* (read-only,
-// CSRF-exempt by the repo GET convention); automatically carved out of
-// the worker-subdomain proxy by the existing /vh/notify/ prefix rule.
+// handleNotifyLegacyHistory serves GET /vh/admin/notify/legacy-history —
+// the LEGACY delivery-history archive for operators: the reliable record
+// of what the retired fleet-condition watcher emitted (frozen at the S5
+// cutover; no new entries). Same session-cookie auth family as the rest
+// of the notify surfaces (read-only, CSRF-exempt by the repo GET
+// convention); carved out of the worker-subdomain proxy by the
+// /vh/admin/notify/ family-prefix rule. The PUBLIC /vh/notify/history
+// route now serves the CENTRAL ledger history (notify_public_history.go)
+// — a DIFFERENT id namespace that is never spliced into these ids; the
+// one-time client reconciliation is documented in notify-fcm.md §5.
 //
 // Query: since=<id> (exclusive cursor; default 0 = from the oldest
 // retained), limit=<n> (default 50, clamped to 200; non-numeric values
@@ -443,19 +421,18 @@ func (h *notifyHistoryHolder) query(since int64, limit int) (entries []notifyHis
 //	{"schema":1,"events":[…entries…],"first_id":N,"last_id":M,
 //	 "read_id":R,"unread_count":U}
 //
-// read_id is the operator's GLOBAL read-through cursor (Slice 2) and
-// unread_count the RETAINED events strictly after it (whole window —
-// never an archive total; a cursor below the trimmed first_id counts
-// the entire retained window). Page and metadata are captured under
-// one holder lock. first_id/last_id stay page-local; existing fields
-// are unchanged (additive).
+// read_id is the operator's GLOBAL read-through cursor over THIS
+// archive (Slice 2) and unread_count the RETAINED events strictly after
+// it (whole window — never an archive total; a cursor below the trimmed
+// first_id counts the entire retained window). Page and metadata are
+// captured under one holder lock. first_id/last_id stay page-local.
 //
-// 409 when the registry is disabled (no --notify-store): the history
+// 409 when the registry is disabled (no --notify-store): the archive
 // derives from the registry path, so there is nothing honest to serve.
 // Entries survive restarts (file-backed); the bounded window means
 // since-cursors older than the trim line simply return from the oldest
 // retained entry.
-func (d *Daemon) handleNotifyHistory(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleNotifyLegacyHistory(w http.ResponseWriter, r *http.Request) {
 	if !d.notifyStore.configured() {
 		notifyStoreDisabled(w)
 		return
@@ -494,7 +471,7 @@ func (d *Daemon) handleNotifyHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP: POST /vh/notify/history/read
+// HTTP: POST /vh/admin/notify/legacy-history/read
 // ---------------------------------------------------------------------------
 
 // duplicateTopLevelKey scans the TOP LEVEL of a JSON object body and
@@ -579,22 +556,25 @@ func caseVariantIDKey(body []byte) string {
 	return ""
 }
 
-// handleNotifyHistoryRead serves POST /vh/notify/history/read — the
-// global read-cursor advance (Slice 2). Body: {"id":<n>} — exactly one
-// non-negative int64 (the greatest event id the operator has actually
-// SEEN; trimmed ids stay valid watermarks; never auto-ack the newest
-// from an unrelated page). Key semantics are DECODED-key semantics: the
-// pre-checks scan json.Decoder tokens (which resolve \uXXXX escapes),
-// so the contract is exactly one top-level member whose DECODED key is
-// precisely "id" — no case folding ("ID", "Id" are rejected pre-decode
-// with a 400: encoding/json matches struct fields case-insensitively
-// and would silently decode or last-win them) and no duplicates (any
-// two members decoding to "id" — including an escaped+exact mix like
-// {"\u0069d":1,"id":2} — are a 400 duplicate). A single escape-encoded
-// spelling that decodes to exactly "id" is unambiguous and accepted as
-// the same field. Check order follows the family: in-handler
-// CSRF (403) → store configured (409) → strict bounded decode (400) →
-// holder mutation.
+// handleNotifyLegacyHistoryRead serves POST /vh/admin/notify/
+// legacy-history/read — the legacy archive's global read-cursor advance
+// (Slice 2 semantics, relocated verbatim by S5). Body: {"id":<n>} —
+// exactly one non-negative int64 (the greatest LEGACY history id the
+// operator has actually SEEN; trimmed ids stay valid watermarks; never
+// auto-ack the newest from an unrelated page; ids from the CENTRAL
+// ledger's namespace are rejected by the future-id check — the
+// namespaces are never spliced). Key semantics are DECODED-key
+// semantics: the pre-checks scan json.Decoder tokens (which resolve
+// \uXXXX escapes), so the contract is exactly one top-level member
+// whose DECODED key is precisely "id" — no case folding ("ID", "Id"
+// are rejected pre-decode with a 400: encoding/json matches struct
+// fields case-insensitively and would silently decode or last-win them)
+// and no duplicates (any two members decoding to "id" — including an
+// escaped+exact mix like {"\u0069d":1,"id":2} — are a 400 duplicate).
+// A single escape-encoded spelling that decodes to exactly "id" is
+// unambiguous and accepted as the same field. Check order follows the
+// family: in-handler CSRF (403) → store configured (409) → strict
+// bounded decode (400) → holder mutation.
 //
 //   - id <= current cursor (0 included): 200 no-op — stale/replaying
 //     devices must not see conflicts; returns the CURRENT state, no
@@ -604,14 +584,15 @@ func caseVariantIDKey(body []byte) string {
 //     does NOT advance (the cursor never outruns what a restart can
 //     honor).
 //   - success: {"schema":1,"read_id":N,"unread_count":U} — the same
-//     coherent pair GET /vh/notify/history echoes, captured under the
-//     holder lock.
+//     coherent pair GET /vh/admin/notify/legacy-history echoes,
+//     captured under the holder lock.
 //
 // Wrong method → the mux's 405 (only POST is registered); same
-// session-cookie auth family and /vh/notify/ host carve-out as the
-// rest of the family. No token-registry or fleet-cache side effects:
-// an ack is invisible to the store generation and the status service.
-func (d *Daemon) handleNotifyHistoryRead(w http.ResponseWriter, r *http.Request) {
+// session-cookie auth family and /vh/admin/notify/ family-prefix host
+// carve-out as the rest of the admin family. No token-registry or
+// fleet-cache side effects: an ack is invisible to the store
+// generation and the status service.
+func (d *Daemon) handleNotifyLegacyHistoryRead(w http.ResponseWriter, r *http.Request) {
 	if !requireNotifyCSRF(w, r) {
 		return
 	}

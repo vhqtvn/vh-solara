@@ -1,17 +1,22 @@
 package server
 
-// notify_history_test.go — lane-1 co-located tests for the notification
-// delivery history (slice S2; see notify_history.go). Covers: the strict
-// decode matrix, append/trim(500)/persist/reload round-trips, id
-// monotonicity across trims and restarts, the query window semantics,
-// and GET /vh/notify/history through the REAL handler chain (auth
-// ladder, 409-disabled posture, since/limit validation, ascending
+// notify_history_test.go — lane-1 co-located tests for the LEGACY
+// notification history archive (see notify_history.go). Since the S5
+// cutover this file is a read-only operator archive served at
+// /vh/admin/notify/legacy-history (own cursor namespace, never spliced
+// into the central ledger ids; the central public history lives in
+// notify_public_history.go). Covers: the strict decode matrix,
+// append/trim(500)/persist/reload round-trips via the test-only writer,
+// id monotonicity across trims and restarts, the query window semantics,
+// and GET /vh/admin/notify/legacy-history through the REAL handler chain
+// (auth ladder, 409-disabled posture, since/limit validation, ascending
 // order, additive envelope).
 
 import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -40,6 +45,39 @@ func newHistoryHolder(t *testing.T) (*Daemon, *notifyHistoryHolder, string) {
 // histEntry builds a minimal valid entry for append-driven tests.
 func histEntry(kind, action string, count int) notifyHistoryEntry {
 	return notifyHistoryEntry{Kind: kind, Action: action, Count: count, Title: "vh-solara", Body: "b"}
+}
+
+// append records one entry and persists — the retired watcher's writer,
+// kept HERE (test-only) since the S5 retirement removed the production
+// caller from notify_history.go. The archive tests need a writer that
+// mirrors the retired loop's exact discipline (monotonic nextID, ring
+// trim at the 500 cap, best-effort persist) to pin the round-trip,
+// reload-continuity, and cursor-advance invariants of files the watcher
+// actually produced. Callers are tests only.
+func (h *notifyHistoryHolder) append(e notifyHistoryEntry) notifyHistoryEntry {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.path == "" {
+		return e // unconfigured: no-op
+	}
+	if e.ID == 0 {
+		e.ID = h.nextID
+		h.nextID++
+	}
+	if e.TS.IsZero() {
+		e.TS = time.Now().UTC()
+	}
+	if e.Deliveries == nil {
+		e.Deliveries = []notifyDeliveryRecord{}
+	}
+	h.entries = append(h.entries, e)
+	if over := len(h.entries) - notifyHistoryMaxEntries; over > 0 {
+		h.entries = h.entries[over:]
+	}
+	if err := h.persistLocked(); err != nil {
+		log.Printf("notify: history append persist failed (kept in memory): %v", err)
+	}
+	return e
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +255,7 @@ func TestNotifyHistory_QueryWindow(t *testing.T) {
 // HTTP surface
 // ---------------------------------------------------------------------------
 
-// TestNotifyHistory_HTTPSurface drives GET /vh/notify/history through
+// TestNotifyHistory_HTTPSurface drives GET /vh/admin/notify/legacy-history through
 // the REAL chain (auth + userMux): the auth ladder (401 unauthenticated,
 // 200 with a session, GET CSRF-exempt), the 409-disabled posture, query
 // validation (bad since/limit → 400; limit clamped), and the ascending
@@ -227,13 +265,13 @@ func TestNotifyHistory_HTTPSurface(t *testing.T) {
 
 	// Disabled posture first: no store configured (authenticated — the
 	// auth middleware must pass so the HANDLER's 409 is what answers).
-	rec := doNotify(t, h, http.MethodGet, "/vh/notify/history", "", withCookie(session))
+	rec := doNotify(t, h, http.MethodGet, "/vh/admin/notify/legacy-history", "", withCookie(session))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("disabled history: want 409, got %d (%s)", rec.Code, rec.Body.String())
 	}
 
 	// Unauthenticated → clean 401 (API-class /vh/*).
-	rec = doNotify(t, h, http.MethodGet, "/vh/notify/history", "")
+	rec = doNotify(t, h, http.MethodGet, "/vh/admin/notify/legacy-history", "")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated: want 401, got %d", rec.Code)
 	}
@@ -253,7 +291,7 @@ func TestNotifyHistory_HTTPSurface(t *testing.T) {
 	})
 	d.notifyHistory.append(histEntry(fleetCondWorkerDown, notifyActionCleared, 0))
 
-	rec = doNotify(t, h, http.MethodGet, "/vh/notify/history", "", withCookie(session))
+	rec = doNotify(t, h, http.MethodGet, "/vh/admin/notify/legacy-history", "", withCookie(session))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("authenticated GET: want 200, got %d (%s)", rec.Code, rec.Body.String())
 	}
@@ -293,7 +331,7 @@ func TestNotifyHistory_HTTPSurface(t *testing.T) {
 	}
 
 	// since-cursor.
-	rec = doNotify(t, h, http.MethodGet, "/vh/notify/history?since=1", "", withCookie(session))
+	rec = doNotify(t, h, http.MethodGet, "/vh/admin/notify/legacy-history?since=1", "", withCookie(session))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("since query: %d", rec.Code)
 	}
@@ -308,7 +346,7 @@ func TestNotifyHistory_HTTPSurface(t *testing.T) {
 
 	// Validation ladder.
 	for _, q := range []string{"since=-1", "since=abc", "limit=0", "limit=-3", "limit=xyz"} {
-		rec = doNotify(t, h, http.MethodGet, "/vh/notify/history?"+q, "", withCookie(session))
+		rec = doNotify(t, h, http.MethodGet, "/vh/admin/notify/legacy-history?"+q, "", withCookie(session))
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("query %q: want 400, got %d (%s)", q, rec.Code, rec.Body.String())
 		}
@@ -316,14 +354,14 @@ func TestNotifyHistory_HTTPSurface(t *testing.T) {
 
 	// limit clamp: asking for 10000 with 2 entries returns both (clamped
 	// to 200 — not an error).
-	rec = doNotify(t, h, http.MethodGet, "/vh/notify/history?limit=10000", "", withCookie(session))
+	rec = doNotify(t, h, http.MethodGet, "/vh/admin/notify/legacy-history?limit=10000", "", withCookie(session))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("clamp query: %d", rec.Code)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Global read cursor (Slice 2 — POST /vh/notify/history/read)
+// Global read cursor (Slice 2 — POST /vh/admin/notify/legacy-history/read)
 // ---------------------------------------------------------------------------
 
 // withReadCursor is decodeNotifyHistory's file fixture helper: a valid
@@ -781,14 +819,14 @@ func TestNotifyRead_NoStoreOrFleetSideEffects(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP: POST /vh/notify/history/read (real chain)
+// HTTP: POST /vh/admin/notify/legacy-history/read (real chain)
 // ---------------------------------------------------------------------------
 
-// doRead issues a POST /vh/notify/history/read through the real chain
+// doRead issues a POST /vh/admin/notify/legacy-history/read through the real chain
 // with the standard decorators.
 func doRead(t *testing.T, h http.Handler, body string, opts ...func(*http.Request)) *httptest.ResponseRecorder {
 	t.Helper()
-	return doNotify(t, h, http.MethodPost, "/vh/notify/history/read", body, opts...)
+	return doNotify(t, h, http.MethodPost, "/vh/admin/notify/legacy-history/read", body, opts...)
 }
 
 // TestNotifyRead_HTTPMatrix drives the read mutation through the REAL
@@ -813,7 +851,7 @@ func TestNotifyRead_HTTPMatrix(t *testing.T) {
 		t.Fatalf("read with no store: want 409, got %d (%s)", rec.Code, rec.Body.String())
 	}
 	// Wrong method: GET on the read path → the mux 405.
-	if rec := doNotify(t, h, http.MethodGet, "/vh/notify/history/read", "", withCookie(session), withCSRF()); rec.Code != http.StatusMethodNotAllowed {
+	if rec := doNotify(t, h, http.MethodGet, "/vh/admin/notify/legacy-history/read", "", withCookie(session), withCSRF()); rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("GET read path: want 405, got %d", rec.Code)
 	}
 
@@ -899,7 +937,7 @@ func TestNotifyRead_HTTPMatrix(t *testing.T) {
 
 	// History GET echoes the same pair alongside the unchanged fields.
 	d.notifyHistory.append(histEntry(fleetCondSessionDone, notifyActionAppeared, 1))
-	rec = doNotify(t, h, http.MethodGet, "/vh/notify/history", "", withCookie(session))
+	rec = doNotify(t, h, http.MethodGet, "/vh/admin/notify/legacy-history", "", withCookie(session))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("history GET after ack: %d", rec.Code)
 	}

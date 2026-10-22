@@ -1125,35 +1125,32 @@ func policyCounts(s *notifyStoreSnapshot) map[string]int {
 // and JOINS the central dispatcher (notify_dispatch.go) — the ledger swap
 // (armNotifyLedgerFor, under notifyLedgerMu) never lands under an in-flight
 // dispatch claim/send — and since t1b-F1 the stop-joins precede the
-// REGISTRY READ itself, extended by B-F1 to the THIRD writer: the
-// legacy fleet watcher (notify_watcher.go) is stop-joined too (see
-// the ordering invariant inside).
+// REGISTRY READ itself (see the ordering invariant inside). The S5
+// retirement removed the legacy fleet watcher (once a third writer); the
+// two-writer invariant below is the same discipline, one writer fewer.
 func (d *Daemon) LoadNotifyStore(path string) error {
-	// ORDERING INVARIANT (t1b-F1, extended to all three writers by
-	// B-F1): quiesce + JOIN every notify-writer loop BEFORE the
-	// registry read — the ingest pull loop, the central dispatcher,
-	// AND the legacy fleet watcher (notify_watcher.go), whose fan-out
-	// sends carry the same generation-fenced UNREGISTERED prune
+	// ORDERING INVARIANT (t1b-F1/B-F1, two writers since the S5 watcher
+	// retirement): quiesce + JOIN every notify-writer loop BEFORE the
+	// registry read — the ingest pull loop and the central dispatcher,
+	// whose sends carry the generation-fenced UNREGISTERED prune
 	// (deleteIfRegistrationCurrent, which persists the retirement
-	// before swapping memory). All three stops are stop-JOINS — each
-	// returns only after every pull/dispatch/tick goroutine has
-	// drained, INCLUDING any in-flight FCM send AND its prune.
-	// Reading the file first would let the installed snapshot
-	// post-date a joined prune: an in-flight watcher (or dispatcher)
-	// send whose canonical UNREGISTERED answer lands while the reload
-	// is parked in the join durably retires the token, and setLoaded
-	// would then reinstall the stale entry from the pre-join snapshot
-	// — minting a fresh RegGen, resurrecting the confirmed-UNREGISTERED
-	// token in memory (and a later persist could restore it to disk).
-	// RegGen cannot fence this resurrection class: installing an older
-	// registry snapshot is NOT a registration refresh — the install
-	// post-dates a COMPLETED prune yet rewinds the registry past it.
-	// Stop-then-read guarantees no installed snapshot can predate ANY
-	// joined prune: a confirmed-UNREGISTERED token stays retired across
-	// reload, in memory AND on disk.
+	// before swapping memory). Both stops are stop-JOINS — each returns
+	// only after every pull/dispatch goroutine has drained, INCLUDING
+	// any in-flight FCM send AND its prune. Reading the file first would
+	// let the installed snapshot post-date a joined prune: an in-flight
+	// dispatcher send whose canonical UNREGISTERED answer lands while
+	// the reload is parked in the join durably retires the token, and
+	// setLoaded would then reinstall the stale entry from the pre-join
+	// snapshot — minting a fresh RegGen, resurrecting the
+	// confirmed-UNREGISTERED token in memory (and a later persist could
+	// restore it to disk). RegGen cannot fence this resurrection class:
+	// installing an older registry snapshot is NOT a registration
+	// refresh — the install post-dates a COMPLETED prune yet rewinds the
+	// registry past it. Stop-then-read guarantees no installed snapshot
+	// can predate ANY joined prune: a confirmed-UNREGISTERED token stays
+	// retired across reload, in memory AND on disk.
 	d.StopNotifyIngest()
 	d.StopNotifyDispatch()
-	d.StopNotifyWatcher()
 	f, err := loadNotifyStoreFile(path)
 	if err != nil {
 		return err
@@ -1173,11 +1170,11 @@ func (d *Daemon) LoadNotifyStore(path string) error {
 	}
 	// Central ledger journal (notify controller-hub S3): armed AFTER the
 	// sources anchor so the witness check sees the enrollment state. The
-	// loops were already stopped — and JOINED (b-F2/B-F1: the stops above
-	// return only after every pull/dispatch/tick goroutine has drained) —
-	// at the TOP of this call, so the re-arm never swaps the ledger under
-	// an in-flight commit, ACK, claim, or send (and the registry read
-	// above never snapshots under one either).
+	// loops were already stopped — and JOINED (b-F2/t1b-F1: the stops
+	// above return only after every pull/dispatch goroutine has drained)
+	// — at the TOP of this call, so the re-arm never swaps the ledger
+	// under an in-flight commit, ACK, claim, or send (and the registry
+	// read above never snapshots under one either).
 	if err := d.armNotifyLedgerFor(path); err != nil {
 		return err
 	}

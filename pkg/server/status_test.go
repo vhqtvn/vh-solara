@@ -104,6 +104,22 @@ func (f *fleetFake) fetch(_ context.Context, workerID, path string, _ time.Durat
 	return []byte(body), nil
 }
 
+// expireFleetCache rewinds the current generation's publishedAt so the
+// NEXT serve() considers the cache past-TTL and refreshes (the TTL
+// cannot simply be zeroed: serve()'s bounded loop resolves by finding
+// the cache FRESH right after a refresh, so an always-elapsed TTL makes
+// every serve() spin out). Deterministic, no sleeps. Landed here from
+// the retired watcher test file (S5): the fleet-status cache machinery
+// is the real dependency, not the notification loop that used to force
+// refreshes.
+func expireFleetCache(d *Daemon) {
+	d.fleetStatus.mu.Lock()
+	if d.fleetStatus.cur != nil {
+		d.fleetStatus.cur.publishedAt = time.Now().Add(-time.Hour)
+	}
+	d.fleetStatus.mu.Unlock()
+}
+
 // fleetAddOnline registers a worker whose transport is a REAL yamux session
 // pair over an in-memory pipe — Summaries inspects Transport.IsClosed(), so a
 // nil-Session MuxTransport would panic. No streams are ever opened on it (the

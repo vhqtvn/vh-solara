@@ -13,7 +13,7 @@ JSON number there fails the test).
 | Fixture | Surface |
 |---|---|
 | `history_response_v4.json` | `GET /vh/notify/history` — complete coverage; includes waiting+question, session_started, finished, and a daemon-level worker_down event; all v4 additive fields present |
-| `history_response_gaps.json` | `GET /vh/notify/history` — `coverage.gaps` with source/epoch/seq-range (source gaps, never fabricated central-id holes) |
+| `history_response_gaps.json` | `GET /vh/notify/history` — `coverage.gaps` with source/epoch/seq-range (source gaps, never fabricated central-id holes); the third entry is the `{from_seq:1, to_seq:0}` **empty-range sentinel** (S5-sanctioned additive): the worker standalone surface (`pkg/web/notify_feature.go`) emits it for an epoch whose unknown-extent prefix is entirely gone (spool rotation with discontinuity). It is the ONE legal `from_seq > to_seq` shape — the validator accepts exactly `{1,0}`, nothing else |
 | `registration_request_v4.json` | `POST /vh/notify/tokens` request body (v3 shape, served centrally) |
 | `probe_response_v4.json` | `GET /vh/notify/tokens` probe response (v3 field shape, central-`enabled` semantics) |
 | `fcm_message_v4.json` | FCM HTTP v1 data-only message (existing five `vh_*` keys + five additive v4 keys; waiting/HIGH) |

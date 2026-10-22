@@ -781,19 +781,15 @@ func TestFleetStream_CapAdmissionAndRelease(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestFleetStream_DemandLoopLifecycleNoPoller pins THE reason the demand
-// loop exists: with notifications entirely unconfigured (the notify watcher
-// refuses to start) and ZERO HTTP requests to GET /vh/fleet/status (a
-// counting middleware proves it), an open stream keeps the rollup
-// refreshing on its own and keeps delivering full snapshots; when the last
-// subscriber leaves, the loop stops and refreshes freeze.
+// loop exists: with no notification writers configured at all (the S5
+// watcher retirement left zero background notify loops) and ZERO HTTP
+// requests to GET /vh/fleet/status (a counting middleware proves it), an
+// open stream keeps the rollup refreshing on its own and keeps delivering
+// full snapshots; when the last subscriber leaves, the loop stops and
+// refreshes freeze.
 func TestFleetStream_DemandLoopLifecycleNoPoller(t *testing.T) {
 	d, fake := newFleetTestDaemon(t, "")
 	seedQuietFleet(t, d, fake)
-	// The notify watcher must refuse to start in this posture (no store, no
-	// transport) — the premise behind the stream's own demand driver.
-	if d.StartNotifyWatcher() {
-		t.Fatal("watcher started without store+transport — premise broken")
-	}
 	svc := d.fleetStatusService()
 	svc.mu.Lock()
 	svc.budgets.TTL = 5 * time.Millisecond

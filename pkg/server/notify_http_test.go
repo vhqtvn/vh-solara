@@ -10,7 +10,7 @@ package server
 //   - the full token lifecycle (create → masked list → patch → delete),
 //     pinning that the RAW TOKEN NEVER appears in any response body;
 //   - strict decode refusals and the disabled-store 409 posture;
-//   - THE CRUX: POST /vh/notify/test through the real chain driving the
+//   - THE CRUX: POST /vh/admin/notify/test through the real chain driving the
 //     fake-OAuth + fake-FCM pair (both bare-token and by-id paths) — the
 //     fake FCM must receive the correct message envelope; error
 //     surfacing and registry telemetry included.
@@ -184,15 +184,15 @@ func TestNotifyHTTP_CSRFLadder(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), csrfHeader) {
 		t.Fatalf("403 body must name the missing header: %q", rec.Body.String())
 	}
-	rec = doNotify(t, h, http.MethodDelete, "/vh/notify/tokens/0011223344556677", "", withCookie(session))
+	rec = doNotify(t, h, http.MethodDelete, "/vh/admin/notify/tokens/0011223344556677", "", withCookie(session))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("DELETE without CSRF: want 403, got %d", rec.Code)
 	}
-	rec = doNotify(t, h, http.MethodPatch, "/vh/notify/tokens/0011223344556677", `{}`, withCookie(session))
+	rec = doNotify(t, h, http.MethodPatch, "/vh/admin/notify/tokens/0011223344556677", `{}`, withCookie(session))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("PATCH without CSRF: want 403, got %d", rec.Code)
 	}
-	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"x"}`, withCookie(session))
+	rec = doNotify(t, h, http.MethodPost, "/vh/admin/notify/test", `{"token":"x"}`, withCookie(session))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("test POST without CSRF: want 403, got %d", rec.Code)
 	}
@@ -201,7 +201,7 @@ func TestNotifyHTTP_CSRFLadder(t *testing.T) {
 	for _, tc := range []struct{ method, path, body string }{
 		{http.MethodPost, "/vh/notify/tokens", `{"token":"fcm-token-ladder-aaaaaa"}`},
 		{http.MethodGet, "/vh/notify/tokens", ""},
-		{http.MethodPost, "/vh/notify/test", `{"token":"fcm-token-ladder-aaaaaa"}`},
+		{http.MethodPost, "/vh/admin/notify/test", `{"token":"fcm-token-ladder-aaaaaa"}`},
 	} {
 		rec := doNotify(t, h, tc.method, tc.path, tc.body, withCSRF())
 		if rec.Code != http.StatusUnauthorized {
@@ -288,7 +288,7 @@ func TestNotifyHTTP_TokenLifecycle(t *testing.T) {
 
 	// PATCH label + scope (wholesale) — the administrative surface keeps
 	// working against the migrated store.
-	rec = doNotify(t, h, http.MethodPatch, "/vh/notify/tokens/"+id,
+	rec = doNotify(t, h, http.MethodPatch, "/vh/admin/notify/tokens/"+id,
 		`{"label":"Tablet","scope":{"enabled":false,"conditions":["worker_down"]}}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusOK {
 		t.Fatalf("patch: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
@@ -333,7 +333,7 @@ func TestNotifyHTTP_TokenLifecycle(t *testing.T) {
 		{"unknown id", `{"label":"x"}`, "unknown token id", 404, "8899aabbccddeeff"},
 		{"bad id shape", `{"label":"x"}`, "invalid token id", 400, "not-hex!"},
 	} {
-		rec := doNotify(t, h, http.MethodPatch, "/vh/notify/tokens/"+tc.id, tc.body, withCookie(session), withCSRF())
+		rec := doNotify(t, h, http.MethodPatch, "/vh/admin/notify/tokens/"+tc.id, tc.body, withCookie(session), withCSRF())
 		if rec.Code != tc.code {
 			t.Errorf("%s: want %d, got %d (body=%q)", tc.name, tc.code, rec.Code, rec.Body.String())
 			continue
@@ -367,11 +367,11 @@ func TestNotifyHTTP_TokenLifecycle(t *testing.T) {
 	}
 
 	// DELETE: 204, then the entry is gone (admin list empty, id now 404).
-	rec = doNotify(t, h, http.MethodDelete, "/vh/notify/tokens/"+id, "", withCookie(session), withCSRF())
+	rec = doNotify(t, h, http.MethodDelete, "/vh/admin/notify/tokens/"+id, "", withCookie(session), withCSRF())
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete: want 204, got %d (body=%q)", rec.Code, rec.Body.String())
 	}
-	rec = doNotify(t, h, http.MethodDelete, "/vh/notify/tokens/"+id, "", withCookie(session), withCSRF())
+	rec = doNotify(t, h, http.MethodDelete, "/vh/admin/notify/tokens/"+id, "", withCookie(session), withCSRF())
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("re-delete: want 404, got %d", rec.Code)
 	}
@@ -423,8 +423,8 @@ func TestNotifyHTTP_DisabledStorePosture(t *testing.T) {
 	// Admin family: honest 409s naming the flag.
 	for _, tc := range []struct{ method, path, body string }{
 		{http.MethodGet, "/vh/admin/notify/tokens", ""},
-		{http.MethodDelete, "/vh/notify/tokens/0011223344556677", ""},
-		{http.MethodPatch, "/vh/notify/tokens/0011223344556677", `{"label":"x"}`},
+		{http.MethodDelete, "/vh/admin/notify/tokens/0011223344556677", ""},
+		{http.MethodPatch, "/vh/admin/notify/tokens/0011223344556677", `{"label":"x"}`},
 	} {
 		rec := doNotify(t, h, tc.method, tc.path, tc.body, withCookie(session), withCSRF())
 		if rec.Code != http.StatusConflict {
@@ -450,7 +450,7 @@ func TestNotifyHTTP_DisabledTransportPosture(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("enroll without transport: want 200 (registry is independent), got %d", rec.Code)
 	}
-	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"fcm-credless-aaaaaaaa"}`, withCookie(session), withCSRF())
+	rec = doNotify(t, h, http.MethodPost, "/vh/admin/notify/test", `{"token":"fcm-credless-aaaaaaaa"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("test-send without transport: want 409, got %d (body=%q)", rec.Code, rec.Body.String())
 	}
@@ -459,7 +459,7 @@ func TestNotifyHTTP_DisabledTransportPosture(t *testing.T) {
 	}
 	// Explicit null transport (the cmd/server.go unset-flag wiring) — same posture.
 	d.SetNotifyTransport(NewNullNotifier())
-	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"fcm-credless-aaaaaaaa"}`, withCookie(session), withCSRF())
+	rec = doNotify(t, h, http.MethodPost, "/vh/admin/notify/test", `{"token":"fcm-credless-aaaaaaaa"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "--notify-fcm-credentials") {
 		t.Fatalf("explicit null transport: want 409 naming the flag, got %d %q", rec.Code, rec.Body.String())
 	}
@@ -470,7 +470,7 @@ func TestNotifyHTTP_DisabledTransportPosture(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestNotifyHTTP_TestSendThroughRealChain is the slice's behavioral
-// crux: POST /vh/notify/test through the FULL handler chain (session
+// crux: POST /vh/admin/notify/test through the FULL handler chain (session
 // auth + csrfGuard + userMux → handler → FCMNotifier with injected
 // endpoints) drives the fake OAuth exchange + fake FCM send, and the
 // fake FCM receives the CORRECT message envelope for BOTH the bare-token
@@ -491,7 +491,7 @@ func TestNotifyHTTP_TestSendThroughRealChain(t *testing.T) {
 	advance := fakeNotifyClock(t)
 
 	// Bare-token path: test BEFORE registering.
-	rec := doNotify(t, h, http.MethodPost, "/vh/notify/test",
+	rec := doNotify(t, h, http.MethodPost, "/vh/admin/notify/test",
 		`{"token":"fcm-bare-00000000000001"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusOK {
 		t.Fatalf("bare-token test-send: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
@@ -519,7 +519,7 @@ func TestNotifyHTTP_TestSendThroughRealChain(t *testing.T) {
 	id := enrolledList.Tokens[0].ID
 
 	advance(notifyTestSendInterval) // rate limit: the bare send just consumed the slot
-	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test",
+	rec = doNotify(t, h, http.MethodPost, "/vh/admin/notify/test",
 		`{"id":"`+id+`"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusOK {
 		t.Fatalf("by-id test-send: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
@@ -586,7 +586,7 @@ func TestNotifyHTTP_TestSendThroughRealChain(t *testing.T) {
 		return http.StatusNotFound, `{"error":{"code":404,"message":"Requested entity was not found","status":"NOT_FOUND"}}`, nil
 	}
 	advance(notifyTestSendInterval)
-	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test",
+	rec = doNotify(t, h, http.MethodPost, "/vh/admin/notify/test",
 		`{"id":"`+id+`"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusOK {
 		t.Fatalf("failed test-send must still be 200 (sent:false), got %d", rec.Code)
@@ -614,7 +614,7 @@ func TestNotifyHTTP_TestSendThroughRealChain(t *testing.T) {
 		{"bad bare token", `{"token":"short"}`, "outside the", 400},
 		{"unknown id", `{"id":"8899aabbccddeeff"}`, "unknown token id", 404},
 	} {
-		rec := doNotify(t, h, http.MethodPost, "/vh/notify/test", tc.body, withCookie(session), withCSRF())
+		rec := doNotify(t, h, http.MethodPost, "/vh/admin/notify/test", tc.body, withCookie(session), withCSRF())
 		if rec.Code != tc.code {
 			t.Errorf("test-send %s: want %d, got %d (body=%q)", tc.name, tc.code, rec.Code, rec.Body.String())
 			continue
@@ -686,7 +686,7 @@ func TestNotifyHTTP_HostInterceptorPrecedence(t *testing.T) {
 	// The subpath shape ({id}) is covered by the PREFIX carve-out too.
 	// (8899… is NOT the seeded id — this stays the unknown-id 404 pin,
 	// not a real delete of the seeded device below.)
-	rec = doNotify(t, h, http.MethodDelete, "/vh/notify/tokens/8899aabbccddeeff", "", withHost("alpha.example.test"), withCookie(session), withCSRF())
+	rec = doNotify(t, h, http.MethodDelete, "/vh/admin/notify/tokens/8899aabbccddeeff", "", withHost("alpha.example.test"), withCookie(session), withCSRF())
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("worker-subdomain DELETE unknown id: want controller 404, got %d", rec.Code)
 	}
@@ -844,7 +844,7 @@ func TestNotifyHTTP_TestSendRateLimit(t *testing.T) {
 	id := enrolledList.Tokens[0].ID
 
 	// First send: allowed, reaches the stub transport.
-	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"fcm-ratelimit-000001"}`, withCookie(session), withCSRF())
+	rec = doNotify(t, h, http.MethodPost, "/vh/admin/notify/test", `{"token":"fcm-ratelimit-000001"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusOK {
 		t.Fatalf("first send: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
 	}
@@ -854,7 +854,7 @@ func TestNotifyHTTP_TestSendRateLimit(t *testing.T) {
 
 	// Rapid second send (bare-token path): 429 + Retry-After naming the
 	// full wait; the provider is untouched.
-	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"fcm-ratelimit-000001"}`, withCookie(session), withCSRF())
+	rec = doNotify(t, h, http.MethodPost, "/vh/admin/notify/test", `{"token":"fcm-ratelimit-000001"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("rapid second send: want 429, got %d (body=%q)", rec.Code, rec.Body.String())
 	}
@@ -870,11 +870,11 @@ func TestNotifyHTTP_TestSendRateLimit(t *testing.T) {
 
 	// The limit is per-Daemon, not per-token or per-path: a DIFFERENT
 	// token, and the by-id path, are equally refused inside the window.
-	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"fcm-ratelimit-000002"}`, withCookie(session), withCSRF())
+	rec = doNotify(t, h, http.MethodPost, "/vh/admin/notify/test", `{"token":"fcm-ratelimit-000002"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusTooManyRequests {
 		t.Errorf("different bare token inside the window: want 429, got %d", rec.Code)
 	}
-	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"id":"`+id+`"}`, withCookie(session), withCSRF())
+	rec = doNotify(t, h, http.MethodPost, "/vh/admin/notify/test", `{"id":"`+id+`"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusTooManyRequests {
 		t.Errorf("by-id inside the window: want 429, got %d", rec.Code)
 	}
@@ -882,7 +882,7 @@ func TestNotifyHTTP_TestSendRateLimit(t *testing.T) {
 	// Partial wait: 4s in, the remaining 6s is named; the 429s above did
 	// NOT extend the window (they never record).
 	advance(4 * time.Second)
-	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"fcm-ratelimit-000001"}`, withCookie(session), withCSRF())
+	rec = doNotify(t, h, http.MethodPost, "/vh/admin/notify/test", `{"token":"fcm-ratelimit-000001"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("4s into the window: want 429, got %d", rec.Code)
 	}
@@ -892,11 +892,11 @@ func TestNotifyHTTP_TestSendRateLimit(t *testing.T) {
 
 	// Validation refusals keep their precise codes WITHOUT consuming or
 	// extending a slot (the gate sits after decode/resolve).
-	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{}`, withCookie(session), withCSRF())
+	rec = doNotify(t, h, http.MethodPost, "/vh/admin/notify/test", `{}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("empty test body: want 400, got %d", rec.Code)
 	}
-	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"id":"8899aabbccddeeff"}`, withCookie(session), withCSRF())
+	rec = doNotify(t, h, http.MethodPost, "/vh/admin/notify/test", `{"id":"8899aabbccddeeff"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("unknown id: want 404, got %d", rec.Code)
 	}
@@ -908,7 +908,7 @@ func TestNotifyHTTP_TestSendRateLimit(t *testing.T) {
 	// returns (racing RemoveAll); the by-id rate-limit behavior is
 	// already pinned by the in-window 429 above.
 	advance(6 * time.Second)
-	rec = doNotify(t, h, http.MethodPost, "/vh/notify/test", `{"token":"fcm-ratelimit-000001"}`, withCookie(session), withCSRF())
+	rec = doNotify(t, h, http.MethodPost, "/vh/admin/notify/test", `{"token":"fcm-ratelimit-000001"}`, withCookie(session), withCSRF())
 	if rec.Code != http.StatusOK {
 		t.Fatalf("send after full interval: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
 	}
