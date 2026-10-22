@@ -47,6 +47,12 @@ type Cluster struct {
 	// tests, which call Proxy.FetchWorkerJSONBounded against the real
 	// tunnel). Always set before StartCluster returns.
 	Daemon *server.Daemon
+	// DaemonAddr is the controller's agent-facing tunnel listener address
+	// (the daemon edge; reserved in 1b). Tests that rebuild a WORKER stack
+	// mid-test (the S3 worker-restart catch-up scenario) need it to dial
+	// the tunnel and to mirror the AlertsOptions the enrollment posture
+	// expects.
+	DaemonAddr string
 
 	// AlertsEngine is the worker-side alerts engine, set ONLY when the
 	// cluster was started WithNotifyEnrollment (notify controller-hub S2):
@@ -59,6 +65,18 @@ type Cluster struct {
 	// registry holds after enrollment. Tests use it to drive authenticated
 	// fetches and to assert denial when it is withheld.
 	NotifyToken string
+	// NotifyStorePath is the controller's file-backed notify store path
+	// (set ONLY with WithNotifyStore): the token registry file whose
+	// derived anchors (.history/.sources/.ledger) carry the S2/S3 state.
+	// Tests use it to simulate a controller restart (re-LoadNotifyStore).
+	NotifyStorePath string
+
+	// agent is the worker-side tunnel agent (kept for tests that need to
+	// tear the WORKER down mid-test — the S3 worker-restart catch-up
+	// scenario; the agent has no public stop, so the sanctioned kill is
+	// HealthCheck=false + closing the worker web server, which makes the
+	// agent self-cancel on its next raw-proxy dial).
+	agent *agent.Daemon
 
 	fakeSrv   *httptest.Server
 	workerSrv *httptest.Server
@@ -77,6 +95,8 @@ type clusterOptions struct {
 	passphrase   string
 	notifyEnroll bool
 	regSecret    string
+	notifyStore  string
+	notifyIngest time.Duration
 }
 
 // WithHostPattern sets the controller daemon's host-based provisioning
@@ -119,6 +139,25 @@ func WithNotifyEnrollment() ClusterOption {
 // and the worker is marked notify-ineligible).
 func WithRegSecret(secret string) ClusterOption {
 	return func(o *clusterOptions) { o.regSecret = secret }
+}
+
+// WithNotifyStore arms the controller's file-backed notify stores at path
+// (notify controller-hub S3): the token registry plus its derived anchors —
+// .history (delivery history), .sources (enrolled-source registry), and
+// .ledger (the central transactional ledger). Without it the controller
+// runs the in-memory S2 posture (no durable ledger; the ingest loop cannot
+// start). The parent directory must exist or be creatable.
+func WithNotifyStore(path string) ClusterOption {
+	return func(o *clusterOptions) { o.notifyStore = path }
+}
+
+// WithNotifyIngest starts the controller's notify pull loop
+// (notify controller-hub S3) with the given poll interval (test cadence —
+// production's default is 3s). Requires WithNotifyStore (the loop refuses a
+// memory-only ledger); pair with WithNotifyEnrollment + WithRegSecret for a
+// source to actually be pulled.
+func WithNotifyIngest(poll time.Duration) ClusterOption {
+	return func(o *clusterOptions) { o.notifyIngest = poll }
 }
 
 // StartCluster brings the whole stack up and waits until the worker is online.
@@ -209,7 +248,18 @@ func StartClusterWithOptions(opts ...ClusterOption) (*Cluster, error) {
 		}
 		d.Auth = a
 	}
+	// File-backed notify stores (notify controller-hub S3) — the production
+	// order (cmd/server.go loads BEFORE the daemon starts serving): the
+	// token registry, delivery history, enrolled sources, and the central
+	// ledger journal all arm here. Set-but-bad fails the cluster.
+	if cfg.notifyStore != "" {
+		if err := d.LoadNotifyStore(cfg.notifyStore); err != nil {
+			return nil, fmt.Errorf("harness LoadNotifyStore(%s): %w", cfg.notifyStore, err)
+		}
+		c.NotifyStorePath = cfg.notifyStore
+	}
 	c.Daemon = d
+	c.DaemonAddr = daemonAddr
 	go func() { _ = d.Start() }()
 	c.ControllerURL = "http://" + userAddr
 	if err := waitHTTP(c.ControllerURL+"/api/coord/workers", c.APIToken, 200, 10*time.Second); err != nil {
@@ -230,10 +280,19 @@ func StartClusterWithOptions(opts ...ClusterOption) (*Cluster, error) {
 		ag.SetNotifyEnroll(wsrv.NotifyEnrollment)
 	}
 	go ag.Start()
+	c.agent = ag
 
 	// 5. Wait until the worker registers and shows online.
 	if err := waitWorkerOnline(c, 15*time.Second); err != nil {
 		return nil, err
+	}
+	// 6. Controller pull loop (notify controller-hub S3) — after the worker
+	// is online so the first tick (immediate) already finds an enrolled,
+	// reachable source.
+	if cfg.notifyIngest > 0 {
+		if err := d.StartNotifyIngest(server.NotifyIngestConfig{PollInterval: cfg.notifyIngest}); err != nil {
+			return nil, fmt.Errorf("harness StartNotifyIngest: %w", err)
+		}
 	}
 	return c, nil
 }

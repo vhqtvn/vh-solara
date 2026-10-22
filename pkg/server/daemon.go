@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -88,6 +89,26 @@ type Daemon struct {
 	// groundwork store for S3's pull loop. HandleWorkerWS records/removes
 	// entries as registrations arrive.
 	notifySources *notifySourceRegistry
+
+	// notifyLedger is the central transactional notify ledger (see
+	// notify_ledger.go — notify controller-hub S3): the journal-backed
+	// merged event stream with exactly-once ingestion, per-source cursors,
+	// dedupe, and coverage gaps. Memory-only (tests, pre-load zero value)
+	// until LoadNotifyStore arms the `<notify-store>.ledger` journal —
+	// StartNotifyIngest refuses a memory-only ledger.
+	notifyLedger *notifyLedger
+
+	// notifyLedgerRetain is the ledger retention bound applied when the
+	// journal is armed (SetNotifyLedgerRetention overrides; 0 = default).
+	notifyLedgerRetain int
+
+	// notifyIngest/notifyIngestCancel/notifyIngestMu gate the controller
+	// pull loop (see notify_ingest.go — S3): StartNotifyIngest arms at most
+	// one loop per Daemon; StopNotifyIngest cancels it (controller-restart
+	// posture — the committed ledger survives).
+	notifyIngest       *notifyIngestManager
+	notifyIngestCancel context.CancelFunc
+	notifyIngestMu     sync.Mutex
 
 	// notifyTransport is the configured push transport (see
 	// notify_transport.go): an *FCMNotifier built from
@@ -201,6 +222,10 @@ func NewDaemon(addr, daemonAddr, hostPattern string) *Daemon {
 	// until LoadNotifyStore arms the `<notify-store>.sources` anchor.
 	// Created eagerly so handleWorkerWS never races a lazy path.
 	d.notifySources = newNotifySourceRegistry()
+	// Central ledger (notify controller-hub S3): memory-only until
+	// LoadNotifyStore arms the `<notify-store>.ledger` journal (tests use
+	// the memory posture directly; production ingestion requires the file).
+	d.notifyLedger = newMemoryNotifyLedger()
 	return d
 }
 

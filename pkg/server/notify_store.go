@@ -859,6 +859,14 @@ func notifyEntryWire(e notifyStoreEntry) notifyTokenWire {
 // (notify_history.go): a missing history file starts empty; a present-
 // but-bad one fails here with the same set-but-bad discipline (the
 // operator's reliable record is not silently discarded).
+//
+// It also arms the CENTRAL NOTIFY LEDGER journal at path+".ledger"
+// (notify_ledger.go — notify controller-hub S3), with the just-armed
+// path+".sources" file as its fail-closed deletion witness: a missing
+// ledger alongside existing enrolled sources refuses startup (the global
+// id head must never silently restart at 1 — see the ledger's recovery
+// proof). Re-loading (controller-restart tests) re-arms from the committed
+// journal and resumes committed cursors.
 func (d *Daemon) LoadNotifyStore(path string) error {
 	f, err := loadNotifyStoreFile(path)
 	if err != nil {
@@ -875,6 +883,15 @@ func (d *Daemon) LoadNotifyStore(path string) error {
 		d.notifySources = newNotifySourceRegistry()
 	}
 	if err := d.notifySources.armNotifySources(path + ".sources"); err != nil {
+		return err
+	}
+	// Central ledger journal (notify controller-hub S3): armed AFTER the
+	// sources anchor so the witness check sees the enrollment state. A
+	// running pull loop is stopped FIRST — and JOINED (b-F2: the stop
+	// returns only after every pull goroutine has drained) — so the
+	// re-load never swaps the ledger under an in-flight commit/ACK.
+	d.StopNotifyIngest()
+	if err := d.armNotifyLedgerFor(path); err != nil {
 		return err
 	}
 	d.notifyStore.setLoaded(path, f)
