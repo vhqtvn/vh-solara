@@ -30,6 +30,19 @@
 //
 // RED-FIRST: assertions (a)/(b) below fail pre-fix — (a) because the latch
 // fired, (b) because the epoch-clear wiped the buried re-seeded entries.
+//
+// FOLLOW-UP PINS (post-23ef65b review, both TEST-ONLY — no production change):
+//   Pin 1 (tier1_b-F1): the reset's LATCH-CLEARING half, independently. The
+//     first test below latches state.epoch (eA) but never latches
+//     epochChanged=true BEFORE the switch, so nothing pins that an A-lifetime
+//     restart latch is dropped at the switch. A genuine double-snapshot latch
+//     (eA1 → eA2 on A) now covers it.
+//   Pin 2 (A-F2): the HTTP-provenance expand-page detail bundle interleaved
+//     after a switch — audited benign at 23ef65b, never pinned. The guard's
+//     boot branch (cascade.ts:505) fires BEFORE the provenance split, so an
+//     http bundle against an EMPTY state epoch boot-applies (never discards);
+//     against B's adopted epoch it takes the same-epoch seq-compare path.
+//     Both orders (stream-first and HTTP-racing-first) are pinned.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { reconcile } from "solid-js/store";
 import { connect } from "../../src/sync/tree-transport";
@@ -84,6 +97,10 @@ beforeEach(() => {
   for (const surface of SURFACES) setState(surface, reconcile({}));
   setState("epoch", "");
   setState("epochChanged", false);
+  // Cursor, unlike the slices above, is a scalar the frames re-baseline on
+  // their first boot-path apply — but reset it anyway so a prior test's cursor
+  // can never leak into a test that asserts monotonic-advance values.
+  setState("cursor", 0);
 });
 
 afterEach(() => {
@@ -122,6 +139,55 @@ function frontierPartial(seq: number, epoch: string, scope: string[]) {
         questions: "global",
         permissions: "global",
         unread: "global",
+      },
+    },
+  } as any;
+}
+
+// The expand-children HTTP detail bundle — the frame shape the server stamps
+// in ExpandChildrenWithDetail (pkg/state/tree_emitter.go:1152–1161): the
+// page's node IDs as scope, mode "expand-page", the same authority tags as
+// the frontier frame. The expand fetch path installs it via
+// applyScopedSnapshot(…, "http") (tree-transport.ts:1829–1837). Unlike
+// frontierPartial (one frontier id), this fills EVERY page id so a multi-id
+// expand page exercises the merge across scope.
+function pageDetailBundle(seq: number, epoch: string, scope: string[]) {
+  const activity: Record<string, string> = {};
+  const gate: Record<string, { hasMessages: boolean }> = {};
+  const lastAgents: Record<string, string> = {};
+  const currentVerbs: Record<string, unknown> = {};
+  for (const id of scope) {
+    activity[id] = "busy";
+    gate[id] = { hasMessages: true };
+    lastAgents[id] = "plan";
+    currentVerbs[id] = { tool: "edit", state: { status: "running" } };
+  }
+  return {
+    seq,
+    epoch,
+    sessions: scope.map((id) => ({ id })),
+    activity,
+    gate,
+    lastAgents,
+    currentVerbs,
+    questions: {},
+    permissions: {},
+    unread: [],
+    partial: {
+      mode: "expand-page",
+      scope,
+      authority: {
+        sessions: "frontier",
+        activity: "frontier",
+        gate: "frontier",
+        lastAgents: "frontier",
+        currentVerbs: "frontier",
+        questions: "global",
+        permissions: "global",
+        unread: "global",
+        todos: "omitted",
+        statuses: "omitted",
+        messages: "omitted",
       },
     },
   } as any;
@@ -176,6 +242,123 @@ describe("switchProject — epoch adoption (a switch boots B, never diffs agains
     expect(state.lastAgents.b1).toBe("plan");
     // (d) B's epoch is adopted (the boot-path apply sets it).
     expect(state.epoch).toBe("eB");
+  });
+
+  it("Pin 1 — an epochChanged latched during A's lifetime is cleared at the switch: B's boot inherits no A restart latch", () => {
+    // GENUINE latch construction (no direct setState): two A frames with
+    // DIFFERENT store epochs, the way a real A-restart looks at this seam.
+    setProjectDirRaw("/proj-A");
+    connect(true);
+    // A boots: the first frame adopts eA1 via the empty-prev-epoch boot path
+    // (changed === false — a first adoption is not a transition).
+    expect(applyScopedSnapshot(frontierPartial(10, "eA1", ["a1"]))).toBe(true);
+    expect(state.epoch).toBe("eA1");
+    expect(state.epochChanged).toBe(false);
+    // A's aggregator restarts: the next A frame carries a fresh crypto-random
+    // epoch (eA2 ≠ eA1). Cross-epoch STREAM provenance ⇒ apply + rebaseline;
+    // projectScopedPartial's epoch-change clear fires and the transition
+    // latches epochChanged (reconcile.ts "if (changed) s.epochChanged = true").
+    expect(applyScopedSnapshot(frontierPartial(11, "eA2", ["a1"]))).toBe(true);
+    expect(state.epoch).toBe("eA2");
+    // The premise itself is pinned: if this fails, the latch construction was
+    // wrong — not the switch under test.
+    expect(state.epochChanged).toBe(true);
+
+    switchProject("/proj-B");
+
+    // (a) THE PIN (pre-frame, before any B data arrives): the switch's
+    // produce block dropped A's unconsumed latch. Without this half of the
+    // reset, the ConnectionToast would surface A's restart notice while
+    // connected to B, and projectSnapshot's resync window (reducers.ts
+    // mergeLastAgents) would treat B's first full snapshot as mid-restart
+    // aggregation — both boot-inconsistent for B.
+    expect(state.epoch).toBe("");
+    expect(state.epochChanged).toBe(false);
+
+    // (b) B's first partial applies via the boot path and does NOT re-latch:
+    // prev epoch is "" so changed === false — the guard never diffs eB
+    // against A's eA2.
+    expect(applyScopedSnapshot(frontierPartial(21, "eB", ["b1"]))).toBe(true);
+    expect(state.epochChanged).toBe(false);
+    // (c) B's data merges and B's epoch is adopted (the full boot contract).
+    expect(state.sessions.b1?.id).toBe("b1");
+    expect(state.activity.b1).toBe("busy");
+    expect(state.epoch).toBe("eB");
+  });
+
+  it("Pin 2a — an HTTP expand-page detail bundle for B, after B's stream frame: B detail lands, no A resurrection, no latch", () => {
+    // A delivered a frame pre-switch (a1 latched into sessions/activity, eA
+    // adopted) — the entries whose NON-resurrection the pin asserts.
+    setProjectDirRaw("/proj-A");
+    connect(true);
+    expect(applyScopedSnapshot(frontierPartial(10, "eA", ["a1"]))).toBe(true);
+    expect(state.sessions.a1?.id).toBe("a1");
+
+    switchProject("/proj-B");
+
+    // B's stream frame lands first: boot path applies, adopts eB, cursor 21.
+    expect(applyScopedSnapshot(frontierPartial(21, "eB", ["b1"]))).toBe(true);
+    expect(state.epoch).toBe("eB");
+
+    // The expand-children HTTP detail bundle for B (page scope b1+b2 — b2 is
+    // a child the frontier frame never carried) resolves next. Guard verdict:
+    // same epoch (eB) + seq above the cursor ⇒ the same-epoch seq-compare
+    // apply (monotonic advance) — HTTP provenance only mistrusts a CROSS-
+    // epoch identity (both non-empty, differing).
+    const applied = applyScopedSnapshot(pageDetailBundle(22, "eB", ["b1", "b2"]), "http");
+    expect(applied).toBe(true);
+    // Correct application: B detail data lands — b2 came ONLY from the bundle.
+    expect(state.sessions.b2?.id).toBe("b2");
+    expect(state.activity.b2).toBe("busy");
+    expect(state.lastAgents.b2).toBe("plan");
+    expect(state.gate.b2?.hasMessages).toBe(true);
+    expect(state.currentVerbs.b2).toBeDefined();
+    // NO resurrection of A entries (the switch cleared them; neither the
+    // stream frame nor the HTTP bundle re-derives them).
+    expect(state.sessions.a1).toBeUndefined();
+    expect(state.activity.a1).toBeUndefined();
+    // NO epoch transition latched; the cursor advanced monotonically to the
+    // bundle's seq (no rebaseline — same store lifetime).
+    expect(state.epochChanged).toBe(false);
+    expect(state.epoch).toBe("eB");
+    expect(state.cursor).toBe(22);
+  });
+
+  it("Pin 2b — the HTTP bundle RACING B's first stream frame (bundle first): empty state epoch ⇒ HTTP boot-applies, never discards", () => {
+    setProjectDirRaw("/proj-A");
+    connect(true);
+    expect(applyScopedSnapshot(frontierPartial(10, "eA", ["a1"]))).toBe(true);
+
+    switchProject("/proj-B");
+
+    // The audited interleaving: the expand HTTP response resolves BEFORE B's
+    // first stream frame reaches the reconcile seam. stateEpoch is "" —
+    // guardSnapshotApply's boot branch (cascade.ts:505) returns apply +
+    // rebaseline BEFORE the provenance split is ever consulted, so the http
+    // bundle applies and ADOPTS eB. (An http discard would strand expand
+    // detail until the next frame and request a spurious epoch-reset re-sync.)
+    const applied = applyScopedSnapshot(pageDetailBundle(21, "eB", ["b1", "b2"]), "http");
+    expect(applied).toBe(true);
+    expect(state.epoch).toBe("eB");
+    expect(state.epochChanged).toBe(false);
+    expect(state.sessions.b2?.id).toBe("b2");
+
+    // B's stream frame lands AFTER the bundle: same epoch (eB), seq above the
+    // bundle's — the seq-compare path applies it. The frontier merge must not
+    // treat the bundle's out-of-scope detail (b2) as stale: it survives as
+    // buried detail (the scoped installer's preserve-buried contract).
+    expect(applyScopedSnapshot(frontierPartial(22, "eB", ["b1"]))).toBe(true);
+    expect(state.sessions.b1?.id).toBe("b1");
+    expect(state.activity.b1).toBe("busy");
+    expect(state.sessions.b2?.id).toBe("b2");
+    expect(state.activity.b2).toBe("busy");
+    // No A resurrection, no latch, epoch adopted — the full benign verdict.
+    expect(state.sessions.a1).toBeUndefined();
+    expect(state.epochChanged).toBe(false);
+    expect(state.epoch).toBe("eB");
+    // The stream frame's seq-compare leg advanced the cursor monotonically
+    // (mirrors Pin 2a's explicit cursor assertion).
+    expect(state.cursor).toBe(22);
   });
 
   it("switching A → '' (no project) leaves the epoch cleared harmlessly — no frame ever arrives to adopt one", () => {
