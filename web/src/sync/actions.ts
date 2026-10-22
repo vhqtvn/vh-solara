@@ -110,12 +110,13 @@ export function switchProject(dir: string, fromUrl = false) {
       // gate/currentVerbs/refreshing are per-session facets that must NOT
       // carry over from the outgoing project. The wire does not heal them —
       // the fresh tree=2 connect ships a frontier-scoped partial that only
-      // MERGES in-scope ids, an epoch-change clear can't fire at a project
-      // switch (epochs live for the daemon store's lifetime), and the
-      // no-project branch receives no frame at all — so a project-A fact
-      // could otherwise leak into B or resurrect on id-reuse. All three maps
-      // are ephemeral (never persisted) and every reader tolerates absence,
-      // mirroring the removal side.
+      // MERGES in-scope ids, an epoch-change clear never fires at switch
+      // time (the epoch adoption reset below boots B's first frame; a
+      // clear fires only on a later genuine epoch change while connected
+      // to B), and the no-project branch receives no frame at all —
+      // so a project-A fact could otherwise leak into B or resurrect on
+      // id-reuse. All three maps are ephemeral (never persisted) and every
+      // reader tolerates absence, mirroring the removal side.
       s.gate = {};
       s.currentVerbs = {};
       s.refreshing = {};
@@ -129,6 +130,33 @@ export function switchProject(dir: string, fromUrl = false) {
       s.permissions = {};
       s.questions = {};
       s.unread = {};
+      // EPOCH ADOPTION (same parity audit; corrects this block's earlier
+      // rationale, whose epoch leg — "epochs live for the daemon store's
+      // lifetime" (5bcb7ea reviewer DEFER, upgraded-to-fix on this touch) —
+      // was wrong): stores, and their crypto-random epochs, are
+      // PER-PROJECT-AGGREGATOR (pkg/aggregator/aggregator.go:334–339 builds
+      // a fresh store per directory via state.New; pkg/web/
+      // server_aggregators.go:264 creates one lazily per project dir), and
+      // the tree stream explicitly targets the per-project store (dir= on
+      // the tree-transport URL). An in-session A→B switch therefore carries
+      // two non-empty epochs: without this reset, B's first frame diffs eB
+      // against A's latched eA and the epoch-changed guard fires — the
+      // epoch-clear in projectScopedPartial (reconcile.ts) wipes the fresh
+      // activity/lastAgents re-seeds above (buried, non-frontier B sessions
+      // lose their chips until a full-snapshot path, while a fresh page
+      // load of B preserves them) and latches epochChanged (a spurious
+      // "vh-solara restarted — re-syncing…" toast). Clearing the epoch makes
+      // the guard take the empty-prev-epoch BOOT path
+      // (cascade.ts guardSnapshotApply: apply + rebaseline — exactly what a
+      // genuine first load of B takes): a switch ADOPTS B's epoch as a
+      // fresh boot would, never diffs it against A's. The latch reset also
+      // drops any unconsumed transition from A's lifetime — both remaining
+      // readers are boot-inconsistent if it survived the switch: the toast
+      // would surface A's restart notice after the switch, and
+      // projectSnapshot's resync window (reducers.ts mergeLastAgents) would
+      // treat B's first full snapshot as mid-restart aggregation.
+      s.epoch = "";
+      s.epochChanged = false;
       // Phase 3 snapshot trim: clear the hoisted project constants so a stale
       // fallback from the outgoing project doesn't linger before the new
       // project's first projected snapshot repopulates it.
