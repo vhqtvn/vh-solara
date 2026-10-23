@@ -182,8 +182,12 @@ let sessionContentSeen = 0;
 // Stream2's CONTENT listeners (snapshot, message.*, onopen) and the open()
 // construction seed. The ping listener calls markSessionTransportSeen instead
 // (transport only) so a content-stall ages out sessionContentSeen even while
-// pings keep sessionLastSeen fresh. No reactive mirror — Stream2 health
-// surfaces through `refreshing[id]` and the watchdog, not the global status dot.
+// pings keep sessionLastSeen fresh. No reactive mirror — Stream2 health never
+// surfaces in the global status dot (isStale reads the TREE clock only); it is
+// healed by the Stream2 watchdog branch. The `refreshing[id]` flag the
+// open/snapshot/close paths arm and clear is state-only — NO UI render reads
+// it (the per-row .dot.refreshing indicator died with the old SessionTree
+// rewrite; see store.ts's `refreshing` readership note).
 function markSessionSeen() {
   const now = Date.now();
   sessionLastSeen = now;
@@ -448,10 +452,12 @@ export function closeSessionStream() {
   sesGen++;
   ses?.close();
   ses = null;
-  // Drop the warm silent-swap indicator for the session being closed: if we
+  // Drop the warm silent-swap flag for the session being closed: if we
   // switch away before its first snapshot lands, its `refreshing` flag would
-  // otherwise never be cleared (that connection's snapshot listener is gone),
-  // leaking a permanent dot on the row.
+  // otherwise never be cleared (that connection's snapshot listener is gone)
+  // and would stay armed in the record forever. No UI renders it (the per-row
+  // .dot.refreshing indicator died with the old SessionTree rewrite) — this
+  // clear is state hygiene; see store.ts's `refreshing` readership note.
   if (sesId) setState("refreshing", sesId, false);
   sesId = "";
   // Reset Stream2's local resume cursor: a session switch (or close) must start
@@ -660,9 +666,11 @@ function openSessionES(id: string): void {
     sesSnapshotDecoding = false;
     // Warm silent-swap: this (re)open is showing cached/stale message state
     // until this connection's first authoritative snapshot lands. Arm the
-    // per-session refresh indicator; the snapshot listener clears it (and
-    // closeSessionStream clears it on switch-away). Set per (re)open so a
-    // reconnect retry re-arms it.
+    // per-session refresh flag — state-only, NO UI render reads it (the
+    // per-row .dot.refreshing indicator died with the old SessionTree
+    // rewrite; see store.ts's `refreshing` readership note). The snapshot
+    // listener clears it (and closeSessionStream clears it on switch-away).
+    // Set per (re)open so a reconnect retry re-arms it.
     setState("refreshing", id, true);
     // Cursor-based resume: on a retry (same session, sesCursor > 0), pass the
     // last-received seq as cursor= so the server replays missed deltas from the
@@ -716,7 +724,7 @@ function openSessionES(id: string): void {
       } catch (err) {
         // Stream-2 never advances the shared resume cursor (trackCursor:false),
         // so a malformed session snapshot is a clean log + drop. The connection
-        // stays open; the per-session refresh indicator and reconcile overlay
+        // stays open; the per-session refresh flag and reconcile overlay
         // (expectSessionSnap) self-heal via the next well-formed snapshot or the
         // 15s reconcile safety timeout — resolving them here would be dispatch/
         // state-machine surgery, out of scope for parse hardening.
@@ -749,7 +757,7 @@ function openSessionES(id: string): void {
       const wasExpected = getExpectSessionSnap();
       if (wasExpected) setExpectSessionSnap(false);
       // Apply the decoded snapshot: hydrate stamping (needs snap.gate) + clear
-      // the per-session refresh indicator + reconcile. The server gzip64-wraps
+      // the per-session refresh flag + reconcile. The server gzip64-wraps
       // the snapshot when z=1 AND it exceeds the size threshold (a warm open of
       // a loaded session — the megabyte transcript). Small/cold/messageless
       // snapshots ship raw (no `encoding`) and skip the async decode.
@@ -807,7 +815,7 @@ function openSessionES(id: string): void {
             // the connection may have been replaced (sesGen bumped in
             // closeSessionStream/open) while we were decoding. The entry guard
             // cannot catch this — it ran before the await. A superseded decode
-            // must NOT apply its snapshot, clear the refresh indicator, or run
+            // must NOT apply its snapshot, clear the refresh flag, or run
             // latency effects: the replacement connection owns the session
             // state now. Supplements (does not replace) the epoch guard below,
             // which separately handles a busy-gate activation mid-await.

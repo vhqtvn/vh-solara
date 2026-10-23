@@ -94,8 +94,9 @@ export function isStale(): boolean {
   healthNow(); // subscribe to the coarse tick
   // Reads the TREE clock only: the status dot represents GLOBAL connection
   // health. A dead-but-OPEN Stream2 (selected-session messages) does NOT flip
-  // the global status to stale/disconnected — it surfaces via the per-session
-  // `refreshing[id]` dot and is healed by the Stream2 watchdog branch below.
+  // the global status to stale/disconnected — no UI surface reads its
+  // `refreshing[id]` flag (the per-row dot died with the old SessionTree
+  // rewrite); it is healed by the Stream2 watchdog branch below.
   return state.status === "live" && getTreeLastSeen() > 0 && Date.now() - getTreeLastSeen() > STALE_MS;
 }
 
