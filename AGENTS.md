@@ -712,6 +712,7 @@ is **no pytest** anywhere in this repo.
    remaining 16 are pure-logic tests that stay in node).
    Runner: `npm --prefix web run test:unit`.
    Typecheck: `npm --prefix web run typecheck`.
+   *Stability note:* Vitest `--repeats` is not a supported repo-wide stability tool (module singletons trip repeat re-runs by design; see [`docs/ai/web-unit-repeats.md`](../docs/ai/web-unit-repeats.md)).
 
 6. **Web e2e** — `web/tests/e2e/*.spec.ts` (Playwright). Runs **serially** by
    design (`web/playwright.config.ts`: `fullyParallel: false` at line 30,
