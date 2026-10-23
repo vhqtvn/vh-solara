@@ -1753,8 +1753,12 @@ test("epsilon threshold: small scroll-ups drop following (data for the DEFER car
   // changes.) 2px is deliberately excluded — it is the non-deterministic
   // sub-pixel transition zone (empirically both absorbed and dropped across run
   // contexts), so a fixed assertion there would itself be the flake.
+  // The message carries the failing dpx + the full scan so a future mid-suite
+  // recurrence (one absorbed ≥3px delta observed once in two full-lane runs,
+  // never reproduced across 15 isolated repeats + 1 file run + 1 full lane;
+  // hunt log 2026-10-23) is legible directly from the failure output.
   for (const dpx of [4, 6, 8, 10, 12, 14, 16, 20, 24]) {
-    expect(dropped[dpx]).toBe(true);
+    expect(dropped[dpx], `EPSILON_SCAN dpx=${dpx} absorbed: ${JSON.stringify(dropped)}`).toBe(true);
   }
 });
 

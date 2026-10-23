@@ -42,6 +42,28 @@ import { projectUrl, resetPins } from "./util";
 // POST /oc/session — archive/delete are destructive and permanent (the fixture
 // has no un-archive-for-test path), so the seeded demo/other/slow/sub sessions
 // are never archived or deleted.
+//
+// CROSS-CLIENT CONVERGENCE BUDGET: the polls that wait for a pin mutation made
+// in client A to converge in client B (and the L1/L2 lifecycle broadcasts that
+// reach BOTH clients) allow 20s, not the historical 8/10s. Grounding (not a
+// blind bump): a pins mutation reaches the other client ONLY as a transient
+// pins.updated SSE frame (never replayed, never re-GET'd by the client). The
+// transport's by-design slow-consumer path (pkg/state subscriptions.go
+// EmitTransient: subscriber channel full → close + drop) means a busy
+// full-suite moment can cut a client's stream at the exact frame under test;
+// recovery is reconnect-based — the server's jittered SSE retry hint is
+// 2–3s (pkg/web stream_http.go sseRetryHintMs) and, if the first attempts
+// also fail under load, the SPA's tree stream takes over after a 3-failure
+// CONNECTING streak onto its bounded manual backoff ladder 1s→2s→4s→8s→15s
+// (web/src/sync/tree-transport.ts). pins.snapshot on the reconnect (emitted on
+// EVERY /vh/stream connect) then restores the doc — a legitimate end-to-end
+// recovery sequence that can exceed 8s. Observed once in two full-lane runs
+// (2026-10-22/23: run-2 failure — B frozen at ["demo"] for the whole 8s poll,
+// consistent with a reconnect recovery still in flight; the exact frame is
+// unobservable post-hoc); 90/90 green across isolated 5-repeat runs, so the
+// budget change waits LONGER for the SAME convergence — every assertion
+// (which sessions are pinned, in which order) is unchanged.
+const CONVERGE_MS = 20_000;
 
 // Wait for the tree to populate. Unlike tree2-parity's waitForTreeSettled this
 // does NOT gate on `.tree-twisty.running` count 0: in a full serial-suite run a
@@ -140,7 +162,7 @@ test("(a) pinning a session in client A appears in client B", async ({ browser }
     // .tree-pinned group too.
     await expect(
       b.page.locator(`.tree-pinned .tree-node[data-session-id="other"]`)
-    ).toBeVisible({ timeout: 8000 });
+    ).toBeVisible({ timeout: CONVERGE_MS });
   } finally {
     await a.close();
     await b.close();
@@ -156,14 +178,14 @@ test("(b) unpinning a session in client A removes it in client B", async ({ brow
     await pinViaMenu(a.page, "other");
     await expect(
       b.page.locator(`.tree-pinned .tree-node[data-session-id="other"]`)
-    ).toBeVisible({ timeout: 8000 });
+    ).toBeVisible({ timeout: CONVERGE_MS });
 
     // A unpins; B must follow.
     await unpinViaMenu(a.page, "other");
 
     await expect(
       b.page.locator(`.tree-pinned .tree-node[data-session-id="other"]`)
-    ).toHaveCount(0, { timeout: 8000 });
+    ).toHaveCount(0, { timeout: CONVERGE_MS });
   } finally {
     await a.close();
     await b.close();
@@ -182,7 +204,7 @@ test("(c) reordering pinned sessions in A syncs the new order to B", async ({ br
 
     // Both clients converge to [demo, other].
     await expect.poll(async () => await pinnedOrder(a.page), { timeout: 8000 }).toEqual(["demo", "other"]);
-    await expect.poll(async () => await pinnedOrder(b.page), { timeout: 8000 }).toEqual(["demo", "other"]);
+    await expect.poll(async () => await pinnedOrder(b.page), { timeout: CONVERGE_MS }).toEqual(["demo", "other"]);
 
     // Reorder in A: right-click `other` (currently last) → "Move up". This fires
     // movePinnedByOffset(other, -1) → server reorders to [other, demo].
@@ -194,7 +216,7 @@ test("(c) reordering pinned sessions in A syncs the new order to B", async ({ br
     // A adopts its own successful reorder...
     await expect.poll(async () => await pinnedOrder(a.page), { timeout: 8000 }).toEqual(["other", "demo"]);
     // ...and B converges to the SAME server order via pins.updated.
-    await expect.poll(async () => await pinnedOrder(b.page), { timeout: 8000 }).toEqual(["other", "demo"]);
+    await expect.poll(async () => await pinnedOrder(b.page), { timeout: CONVERGE_MS }).toEqual(["other", "demo"]);
   } finally {
     await a.close();
     await b.close();
@@ -215,7 +237,7 @@ test("(e) archiving a pinned disposable session removes it in both clients", asy
     await pinViaMenu(a.page, id);
     await expect(
       b.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
-    ).toBeVisible({ timeout: 8000 });
+    ).toBeVisible({ timeout: CONVERGE_MS });
 
     // Archive via the real /vh/archive path (the L1 cleanup hook runs on its
     // success). The response returns before the async cascade completes, so we
@@ -233,10 +255,10 @@ test("(e) archiving a pinned disposable session removes it in both clients", asy
     // broadcast slice.)
     await expect(
       a.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
-    ).toHaveCount(0, { timeout: 10000 });
+    ).toHaveCount(0, { timeout: CONVERGE_MS });
     await expect(
       b.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
-    ).toHaveCount(0, { timeout: 10000 });
+    ).toHaveCount(0, { timeout: CONVERGE_MS });
   } finally {
     await a.close();
     await b.close();
@@ -255,7 +277,7 @@ test("(f) deleting a pinned disposable session removes it in both clients", asyn
     await pinViaMenu(a.page, id);
     await expect(
       b.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
-    ).toBeVisible({ timeout: 8000 });
+    ).toBeVisible({ timeout: CONVERGE_MS });
 
     // Delete via the fake OpenCode's /fixture/delete, reached through the web
     // server's /oc/ passthrough (NOT the bare /fixture/delete form, which hits
@@ -269,10 +291,10 @@ test("(f) deleting a pinned disposable session removes it in both clients", asyn
     // L2 cleanup broadcasts to BOTH clients.
     await expect(
       a.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
-    ).toHaveCount(0, { timeout: 10000 });
+    ).toHaveCount(0, { timeout: CONVERGE_MS });
     await expect(
       b.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
-    ).toHaveCount(0, { timeout: 10000 });
+    ).toHaveCount(0, { timeout: CONVERGE_MS });
   } finally {
     await a.close();
     await b.close();
@@ -296,7 +318,7 @@ test("(g) a reconnecting client receives surviving pins via the bootstrap snapsh
     // B (still connected) sees the live update.
     await expect(
       b.page.locator(`.tree-pinned .tree-node[data-session-id="other"]`)
-    ).toBeVisible({ timeout: 8000 });
+    ).toBeVisible({ timeout: CONVERGE_MS });
 
     // Reconnect B: reload tears down its SSE stream + Solid state; on reconnect
     // the server emits pins.snapshot as the bootstrap frame, which restores the

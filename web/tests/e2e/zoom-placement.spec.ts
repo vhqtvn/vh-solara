@@ -1,7 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { projectUrl, settledTopLineNumber, topLineNumber } from "./util";
+import { projectUrl, settledTopLineNumber } from "./util";
 
 // Live-browser receipt (M1) for the UI-zoom fixed-placement conversion commits
 // fc2ef59d / f9a8bbd4 / a191148d. prefs.ts applies UI zoom as CSS `zoom` +
@@ -672,6 +672,38 @@ test.describe("terminal wheel parity across UI zoom", () => {
   // ./util.ts together with settledTopLineNumber (shared with the
   // escaped-selection-drag describe below).
 
+  // Ladder-COMPLETION gate: line 250 (the last `seq` row) is rendered and
+  // VISIBLE in .xterm-rows. Directly, that proves the ladder is fully
+  // emitted; "and the viewport sits at the buffer bottom" is the inference
+  // (xterm renders only the visible screenful in .xterm-rows and, while the
+  // shell is mid-burst, autoscrolls the bottom-follow view — so the LAST
+  // ladder row being on-screen means emission caught up to 250; the follow-up
+  // settledTopLineNumber call then pins the actual marker). This is
+  // deliberately stronger than the old
+  // `topLineNumber <= 250` poll, which was near-vacuous: it held for ANY
+  // first-visible value 0..250, including pre-ladder and mid-ladder states.
+  // That vacuity is exactly how the mid-stream measurement race slipped
+  // through (flake-hunt capture, firefox-zoom, 2/10 isolated runs:
+  // settledBefore=250/settledAfter=250 with moved=0 — the two-sample settle
+  // passed on a transiently-stable mid-burst value and the wheel gesture
+  // fired while the ladder tail was still streaming, the view never leaving
+  // the bottom; and settledBefore=0 — measured before the ladder rendered at
+  // all). With the tail visible AND the shell kept busy (`; sleep 30`, same
+  // rationale as the escaped-drag describe below: no returning prompt bytes
+  // inside the measurement window), settledTopLineNumber settles on the true
+  // end state and the gesture runs in a quiet window.
+  async function waitLadderComplete(page: Page): Promise<void> {
+    await expect
+      .poll(
+        () =>
+          page.locator(".xterm-rows").evaluate((el) =>
+            (el as HTMLElement).innerText.split("\n").some((l) => l.trim() === "250") ? 1 : 0,
+          ),
+        { timeout: 15000 },
+      )
+      .toBe(1);
+  }
+
   async function measureWheelAdvance(page: Page): Promise<number> {
     const before = await settledTopLineNumber(page);
     const box = await page.locator(".xterm-screen").boundingBox();
@@ -697,11 +729,14 @@ test.describe("terminal wheel parity across UI zoom", () => {
     await expect(page.locator(".term-host")).toBeVisible({ timeout: 10000 });
     await expect(page.locator(".term-status.open")).toBeVisible({ timeout: 10000 });
     await page.locator(".term-host").click(); // focus the terminal
-    await page.keyboard.type("seq 1 250");
+    // `; sleep 30` keeps the shell BUSY after the ladder: no returning prompt
+    // (= no post-ladder bytes, ever, inside this test's window) — the same
+    // mid-measurement autoscroll race fix the escaped-drag describe below
+    // documents. Without it the wheel gesture can fire while the ladder tail
+    // is still streaming (captured: moved=0, view pinned at the bottom).
+    await page.keyboard.type("seq 1 250; sleep 30");
     await page.keyboard.press("Enter");
-    await expect
-      .poll(() => topLineNumber(page), { timeout: 15000 })
-      .toBeLessThanOrEqual(250); // output complete (marker visible)
+    await waitLadderComplete(page); // ladder fully emitted + viewport at the buffer bottom
 
     // Live premise, phase 1: the engine is really at zoom 1 (same probe as
     // openSessionAtZoom — guards a leaked/changed default pref). applyScale
@@ -729,9 +764,7 @@ test.describe("terminal wheel parity across UI zoom", () => {
     await page.getByRole("button", { name: "Terminal", exact: true }).click();
     await expect(page.locator(".term-host")).toBeVisible({ timeout: 10000 });
     await expect(page.locator(".term-status.open")).toBeVisible({ timeout: 10000 });
-    await expect
-      .poll(() => topLineNumber(page), { timeout: 15000 })
-      .toBeLessThanOrEqual(250); // replay complete
+    await waitLadderComplete(page); // replay complete + viewport at the buffer bottom
 
     // The file-standard live zoom premise (see openSessionAtZoom): prove the
     // engine really applied 1.25 before trusting the parity assertion.
