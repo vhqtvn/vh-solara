@@ -155,8 +155,14 @@ describe("TreeRow rendering (self-contained node, §3)", () => {
     const { container } = render(() => (
       <TreeRow node={baseNode({ activity: "retry" })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
-    // retry is now part of `working()` → the ring is the signal, and the retry
-    // dot is suppressed (working suppresses redundant priority dots).
+    // retry is part of `working()` → the ring is the signal, and no retry dot
+    // renders. The .dot.retry SPAN was removed as dead markup (its
+    // !isWorking() && isRetry() gate was unsatisfiable — working() includes
+    // retry). What the null assertion below pins is the OUTCOME — no retry
+    // dot ever RENDERS again: a future satisfiable retry-dot path would fail
+    // it. (An exact re-add of the dead span itself stays invisible to DOM
+    // assertions — that source-level absence is a code-review concern, not a
+    // DOM concern.) The ring assertion is the load-bearing half of the pin.
     expect(twisty(container as unknown as HTMLElement).classList.contains("running")).toBe(true);
     expect(nodeButton(container as unknown as HTMLElement).querySelector(".dot.retry")).toBeNull();
   });

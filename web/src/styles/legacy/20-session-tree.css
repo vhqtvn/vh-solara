@@ -162,11 +162,10 @@
 }
 .dot.idle { background: var(--border); }
 .dot.error { background: var(--danger); }
-.dot.busy, .dot.retry {
+.dot.busy {
   background: var(--accent);
   animation: pulse 1.1s ease-in-out infinite;
 }
-.dot.retry { background: var(--warn); }
 
 /* Per-agent badge on a session row (agentStyles). Compact; color is a sanitized
    theme token (var(--agent-color), set inline) in one of three variants. */
@@ -227,11 +226,13 @@
   animation: pulse 1.1s ease-in-out infinite;
 }
 .tree-title.needs-input { color: var(--warn, #e8a838) !important; font-weight: 600; }
-/* Shared by LIVE rules only — .dot.busy/.dot.retry and .dot.needs-input here,
-   plus term-status (TerminalDock.css), TerminalPane.css, and Part.module.css
+/* Shared by LIVE rules only — .dot.busy and .dot.needs-input here, plus
+   term-status (TerminalDock.css), TerminalPane.css, and Part.module.css
    (which references it by bare name). The dead .dot.hydrating/.dot.refreshing
-   consumers were removed with the old SessionTree rewrite; do NOT delete the
-   keyframes on their account. */
+   consumers were removed with the old SessionTree rewrite, and the dead
+   .dot.retry rule with the TreeRow dead-markup cleanup (the span's render gate
+   was unsatisfiable — retry renders the running ring, not a dot); do NOT
+   delete the keyframes on their account. */
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 
 .icon-btn {

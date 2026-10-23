@@ -101,7 +101,6 @@ export function TreeRow(props: TreeRowProps) {
   // suppression so "working" semantics never diverge within one row.
   const isWorking = () => working(node());
   const isError = () => node().activity === "error";
-  const isRetry = () => node().activity === "retry";
   const needsInput = () => node().flags.pendingInput || node().flags.subtreeNeedsInput;
   // A structural leaf has no direct children, ever (childCount is structural,
   // not resident-count). A collapsed node (loaded:false) with childCount>0 is
@@ -225,12 +224,13 @@ export function TreeRow(props: TreeRowProps) {
               on the twisty button is the sole working signal, so no shimmering
               block or redundant dot renders beside the title). needsInput is the
               one exception: it stays visible even on a working subtree-needs-input
-              ancestor so the operator still sees "reply needed". */}
+              ancestor so the operator still sees "reply needed". NOTE: retry has
+              NO dot, by design — working() includes activity==="retry"
+              (treeSelectors.ts), so a retry row renders the running ring only;
+              a .dot.retry span that used to sit here was dead markup (its
+              !isWorking() && isRetry() gate was unsatisfiable) and was removed. */}
           <Show when={!isWorking() && isError()}>
             <span class="dot error" data-tip="error" />
-          </Show>
-          <Show when={!isWorking() && isRetry()}>
-            <span class="dot retry" data-tip="retrying" />
           </Show>
           <Show when={needsInput()}>
             <span class="dot needs-input" data-tip="needs your input — reply to continue" />

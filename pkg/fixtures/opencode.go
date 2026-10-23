@@ -1561,6 +1561,7 @@ func (f *FakeOpenCode) Handler() http.Handler {
 	mux.HandleFunc("/fixture/busy", f.handleFixtureBusy)
 	mux.HandleFunc("/fixture/slow-tail", f.handleFixtureSlowTail)
 	mux.HandleFunc("/fixture/idle", f.handleFixtureIdle)
+	mux.HandleFunc("/fixture/error", f.handleFixtureError)
 	mux.HandleFunc("/fixture/compaction-burst", f.handleFixtureCompactionBurst)
 	mux.HandleFunc("/fixture/orphan", f.handleFixtureOrphan)
 	mux.HandleFunc("/fixture/delete", f.handleFixtureDelete)
@@ -3337,6 +3338,32 @@ func (f *FakeOpenCode) handleFixtureIdle(w http.ResponseWriter, r *http.Request)
 	}
 	f.EmitSessionTerminal(session, "session.idle")
 	writeJSON(w, map[string]any{"idle": session})
+}
+
+// handleFixtureError emits a turn-terminal session.error for a session through
+// the real /event stream WITHOUT touching the transcript or any other
+// bookkeeping — the deterministic error-activity driver for the TreeRow
+// .dot.error e2e (web/tests/e2e/tree-row-dots.spec.ts). Sibling of
+// /fixture/idle above (same zero-side-effect contract; the two differ only in
+// the terminal event name). WIRE-SHAPE NOTE: a session.status emit must NOT be
+// used here — the store normalizes a status type:"error" observation to idle
+// (pkg/state normalizeActivity; pinned by the ActivityError carve-out in
+// gates_lean_test.go), so the dedicated session.error TERMINAL event is the
+// only HTTP-drivable ActivityError source (fleet_selection_test.go: "session.error
+// is the ONLY ActivityError source"). Like busy, the error state is cleared by
+// /fixture/reset — not via fixture-side state (emit already removed the session
+// from the busy map; session.error mirrors nothing), but via the reset's own
+// session.idle fan-out (handleFixtureReset), which the aggregator applies as
+// an activity error→idle transition. Test-only infrastructure — never
+// exercised by the shipped binary.
+func (f *FakeOpenCode) handleFixtureError(w http.ResponseWriter, r *http.Request) {
+	session := r.URL.Query().Get("session")
+	if session == "" {
+		http.Error(w, "missing session", http.StatusBadRequest)
+		return
+	}
+	f.EmitSessionTerminal(session, "session.error")
+	writeJSON(w, map[string]any{"error": session})
 }
 
 // handleFixtureCompactionBurst scripts the incident-shaped end-of-turn
