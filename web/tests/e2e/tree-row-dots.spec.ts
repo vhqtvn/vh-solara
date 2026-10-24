@@ -40,9 +40,12 @@ import { projectUrl } from "./util";
 //     PendingInput flag (pkg/state/tree_node.go) → the dot renders.
 //     The disappearance pin uses /fixture/reset's question.replied fan-out
 //     (handleFixtureReset — clears the store blocker AND forwards the delete
-//     to a connected SPA). Caveat: reset ALSO recreates the session row, so
-//     that pin is absence coverage, not an isolated question-resolution proof
-//     (see the NOTE at the assertion).
+//     to a connected SPA). Reset ALSO recreates the session row
+//     (session.deleted + session.created, resetSessionQueueState), so the
+//     post-reset absence check ANCHORS on the recreated row
+//     (resetSessionAwaitingRecreation) — still reset-clears-the-dot
+//     coverage, not an isolated question-resolution proof (see the NOTE at
+//     the assertion).
 //
 //   error — DRIVABLE since this slice via /fixture/error (handleFixtureError,
 //     the /fixture/idle sibling): it emits the turn-terminal session.error
@@ -90,6 +93,55 @@ async function resetSession(page: Page, id: string) {
     headers: { "X-VH-CSRF": "1" },
   });
   if (!res.ok()) throw new Error(`resetSession(${id}) -> ${res.status()} ${res.statusText()}`);
+}
+
+// Reset a session AND deterministically await its row's RECREATION before
+// returning — the anchor for the post-reset dot-absence checks (review
+// e06b984 F1: the old bare toHaveCount(0) could pass vacuously).
+//
+// Why recreation is awaitable by ELEMENT IDENTITY (DOM evidence): reset ends
+// with resetSessionQueueState emitting session.deleted THEN session.created
+// back-to-back (pkg/fixtures/opencode.go:3069-3071). The SPA receives both
+// structurally — tree.op node.remove + node.upsert (tree-transport.ts:
+// session.delete/created "emitted on BOTH wires") — and the tree renders
+// rows through KEYED <For> (SessionTree sections / TreeBranch children), so
+// the remove DISPOSES the old row element and the re-add mounts a FRESH one.
+//
+// Why identity and not detach→re-attach: the two emits can be co-delivered
+// and applied within one Playwright poll interval, making the transient
+// no-row state UNOBSERVABLE — an expect(row).not.toBeAttached() step could
+// time out on correct behavior, and a bare locator re-resolve +
+// toBeVisible() can bind the still-attached OLD element (proving nothing).
+// Comparing the attached row against a page-realm reference to the pre-reset
+// element needs only the END state: recreation happened ⟺ identity differs.
+// If reset ever stopped recreating the row this times out — the anchor
+// self-verifies the recreation premise.
+//
+// The capture lives on `window` (page realm), not an ElementHandle arg, so
+// the comparison is a true in-page reference compare; each test's
+// page.goto() starts a fresh document realm, so it cannot leak across
+// tests. Folding capture+reset+wait into ONE helper makes capture-after-
+// reset (which could grab the fresh element and pass vacuously) structurally
+// impossible.
+async function resetSessionAwaitingRecreation(page: Page, id: string, timeout = 10000) {
+  const sel = `.tree-node[data-session-id="${id}"]`;
+  // Capture pre-reset (the caller has just asserted the row — and its dot —
+  // visible, so a null here is a fixture-shape surprise, fail fast).
+  await page.evaluate((s) => {
+    const el = document.querySelector(s);
+    if (!el) throw new Error(`resetSessionAwaitingRecreation: row not attached at capture (${s})`);
+    (window as { __vhPreResetRow?: Element | null }).__vhPreResetRow = el;
+  }, sel);
+  await resetSession(page, id);
+  await page.waitForFunction(
+    (s) => {
+      const pre = (window as { __vhPreResetRow?: Element | null }).__vhPreResetRow;
+      const cur = document.querySelector(s);
+      return cur !== null && cur !== pre;
+    },
+    sel,
+    { timeout },
+  );
 }
 
 async function waitForTree(page: Page) {
@@ -143,14 +195,17 @@ test("needs-input dot appears on a pending question and clears when it resolves"
   // Resolve via the reset's question.replied fan-out. The aggregator store
   // clears the blocker and forwards the delete to the connected SPA — the
   // row must drop the dot (absence when the driving state is not present).
-  // NOTE (review B1): this pin is reset-clears-the-dot coverage, NOT an
-  // isolated question-resolution proof — /fixture/reset also recreates the
-  // session row (session.deleted + session.created), so toHaveCount(0) alone
-  // would not distinguish "blocker resolved" from "row replaced". Isolating
-  // the live question.replied → dot-clear propagation (reply route, session
-  // row never replaced) is a possible follow-up; this slice pins the
-  // absence half only.
-  await resetSession(page, "other");
+  // NOTE (review e06b984 F1, strengthened): reset ends with a
+  // session.deleted + session.created pair, so the SPA disposes and
+  // RECREATES the row — the absence check below is ANCHORED on the
+  // recreated row (resetSessionAwaitingRecreation proves the attached row
+  // is a fresh element before the count runs; a bare toHaveCount(0) could
+  // have polled the old-row-gone / new-row-not-yet-attached gap and passed
+  // vacuously). Still reset-clears-the-dot coverage, NOT an isolated
+  // question-resolution proof — reset both resolves the blocker AND
+  // recreates the row; the isolated question.replied → flag-clear
+  // transition stays pinned aggregator-side (pkg/state).
+  await resetSessionAwaitingRecreation(page, "other");
   await expect(dot(page, "other", "needs-input")).toHaveCount(0, { timeout: 10000 });
 });
 
@@ -177,12 +232,16 @@ test("error dot appears via /fixture/error and clears on reset", async ({ page }
   if (!res.ok()) throw new Error(`fixture/error -> ${res.status()} ${res.statusText()}`);
   await expect(dot(page, "other", "error")).toBeVisible({ timeout: 15000 });
 
-  // Clear via reset. NOTE (same caveat as the needs-input pin): reset also
-  // recreates the session row (session.deleted + session.created), so the
-  // post-reset toHaveCount(0) is reset-clears-the-dot coverage, not an
-  // isolated error→idle transition proof — the isolated transition is
-  // aggregator-side territory (pkg/state pins own it).
-  await resetSession(page, "other");
+  // Clear via reset. NOTE (same confound as the needs-input pin, anchored
+  // the same way — review e06b984 F1): reset's session.deleted +
+  // session.created pair recreates the row, so the absence check below runs
+  // only AFTER the recreated (fresh-element) row is attached
+  // (resetSessionAwaitingRecreation — non-vacuous). It remains
+  // reset-clears-the-dot coverage, not an isolated error→idle transition
+  // proof — reset both fires its session.idle fan-out AND recreates the
+  // row; the isolated transition is aggregator-side territory (pkg/state
+  // pins own it).
+  await resetSessionAwaitingRecreation(page, "other");
   await expect(dot(page, "other", "error")).toHaveCount(0, { timeout: 10000 });
 });
 
