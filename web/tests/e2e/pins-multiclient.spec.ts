@@ -65,6 +65,54 @@ import { projectUrl, resetPins } from "./util";
 // (which sessions are pinned, in which order) is unchanged.
 const CONVERGE_MS = 20_000;
 
+// ─── Recurrence diagnostics (assertion-message-only) ─────────────────────────
+// This spec carries a multi-observation full-lane flake history (:151/:174/:196
+// convergence polls, :305 bootstrap toBeVisible; see the 2026-10-16 regression
+// sweep checkpoint + 80b569d) whose captured artifacts were lost to later green
+// runs wiping the output dir. These helpers append an OBSERVABLE-STATE payload
+// (rendered tree rows, pinned-group ids, expected-id presence, the legacy pins
+// localStorage shadow, and the .status-mark conn-state class) to the timeout
+// message of every cross-client wait — enough to adjudicate the NEXT recurrence
+// (SSE-recovery tail vs render defect vs shadow miss vs boot starvation) with
+// no assertion-semantics or budget change: the enriched error is the SAME error
+// object, rethrown, with one [pins-diag] line appended.
+async function pinsDiag(page: Page, expectId: string): Promise<Record<string, unknown>> {
+  return page.evaluate((id) => {
+    const nodesFor = (sel: string) =>
+      Array.from(document.querySelectorAll(sel)).map((n) => (n as HTMLElement).dataset.sessionId ?? "?");
+    return {
+      rows: document.querySelectorAll(".tree-row").length,
+      pinned: nodesFor(".tree-pinned .tree-node"),
+      expectAnywhere: document.querySelectorAll(`.tree-node[data-session-id="${id}"]`).length,
+      expectInBody: Array.from(document.querySelectorAll(`.tree-node[data-session-id="${id}"]`)).filter(
+        (n) => !n.closest(".tree-pinned")
+      ).length,
+      lsPinned: localStorage.getItem("vh.pinned.v1"),
+      lsOrder: localStorage.getItem("vh.pinned-order.v1"),
+      conn: document.querySelector(".status-mark")?.className ?? null,
+      pinErr: document.querySelector('[role="status"]')?.textContent ?? null,
+      events: ((window as unknown as { __pinsJournal?: string[] }).__pinsJournal ?? []).slice(-12),
+    };
+  }, expectId);
+}
+
+async function withPinsDiag<T>(page: Page, label: string, expectId: string, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    let diag: string;
+    try {
+      const dom = await pinsDiag(page, expectId);
+      const consoleLines = (page as unknown as { __consoleLines?: string[] }).__consoleLines ?? [];
+      diag = JSON.stringify({ ...dom, console: consoleLines.slice(-8) });
+    } catch {
+      diag = "(diag unavailable — page/context closed)";
+    }
+    (err as Error).message += `\n[pins-diag ${label}] ${diag}`;
+    throw err;
+  }
+}
+
 // Wait for the tree to populate. Unlike tree2-parity's waitForTreeSettled this
 // does NOT gate on `.tree-twisty.running` count 0: in a full serial-suite run a
 // PRIOR spec (e.g. layout.spec's "Working… indicator" stream test) can leave a
@@ -84,34 +132,128 @@ async function waitForTreeSettled(page: Page): Promise<void> {
 async function openClient(browser: Browser): Promise<{ page: Page; close: () => Promise<void> }> {
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
+  // Recurrence diagnostics: buffer recent console lines ([vh:*] warns/errors —
+  // e.g. "PUT /vh/pins network error", stale-frame drops) for the [pins-diag]
+  // payload. Record-only; no behavioral effect.
+  const consoleLines: string[] = [];
+  page.on("console", (m) => {
+    if (m.type() === "warning" || m.type() === "error") {
+      consoleLines.push(`${m.type()}:${m.text().slice(0, 120)}`);
+      if (consoleLines.length > 30) consoleLines.shift();
+    }
+  });
+  (page as unknown as { __consoleLines?: string[] }).__consoleLines = consoleLines;
   await page.goto(projectUrl("/"));
+  // Recurrence diagnostics: a PASSIVE pointer-event journal (capture-phase
+  // record-only listeners; no handler changes, no behavioral effect) so a
+  // failed local menu confirm can show whether the Unpin/Pin click was ever
+  // DISPATCHED (and onto what element class/text). Dumped into the
+  // [pins-diag] payload only on a wait timeout.
+  await page.evaluate(() => {
+    const w = window as unknown as { __pinsJournal?: string[] };
+    w.__pinsJournal = [];
+    const rec = (kind: string) => (ev: Event) => {
+      const j = (window as unknown as { __pinsJournal?: string[] }).__pinsJournal;
+      if (!j || j.length >= 200) return;
+      const t = ev.target as HTMLElement | null;
+      j.push(
+        `${kind}@${Math.round(performance.now())}:${t?.className?.toString().slice(0, 40) ?? "?"}:${t?.textContent?.trim().slice(0, 20) ?? ""}`
+      );
+    };
+    document.addEventListener("pointerdown", rec("pd"), true);
+    document.addEventListener("pointerup", rec("pu"), true);
+    document.addEventListener("click", rec("ck"), true);
+  });
   await waitForTreeSettled(page);
   return { page, close: () => ctx.close() };
 }
 
-// Right-click an UNPINNED session (in the tree body) and choose "Pin to top".
-// Waits for the pin to land in THIS client's .tree-pinned group (the local
-// optimistic + confirm signal) before returning.
-async function pinViaMenu(page: Page, sessionId: string): Promise<void> {
-  const node = page.locator(`.tree-node[data-session-id="${sessionId}"]`).first();
-  await node.click({ button: "right" });
-  await expect(page.locator(".ctxm-menu")).toBeVisible();
-  await page.locator(".ctxm-item", { hasText: "Pin to top" }).click();
-  await expect(
-    page.locator(`.tree-pinned .tree-node[data-session-id="${sessionId}"]`)
-  ).toBeVisible({ timeout: 5000 });
+// pinViaMenu / unpinViaMenu — drive a pin-membership mutation through the real
+// context menu and confirm it LOCALLY (in THIS client's .tree-pinned group).
+//
+// MECHANISM NOTE (2026-10-25 verdict drive, run-4 journal): under full-lane
+// load a client's pin state can transiently EVANESCE — a stream sever +
+// reconnect whose pins.snapshot was captured before the in-flight PUT commit
+// resets the adopted base (snapshots are always-adopted). The context menu
+// reactively RELABELS its item ("Unpin" ⇄ "Pin to top") inside Playwright's
+// actionability window, so the dispatched click can carry the INVERTED intent
+// (observed: click dispatched onto "Pin to top" 246ms after the menu opened
+// labeled "Unpin" → the unpin became a re-pin → the 5s local confirm timed
+// out on a stable pin). This is a click-integrity race, not a convergence
+// budget problem — so the fix re-dispatches the INTENDED mutation (what a
+// user re-clicking after a UI flicker does) instead of waiting longer. The
+// per-attempt assertion and its 5000ms budget are UNCHANGED; retries only
+// fire when the dispatched mutation observably failed to land, and the
+// attempt history is reported in the final error / stdout.
+async function setPinnedViaMenu(
+  page: Page,
+  sessionId: string,
+  wantPinned: boolean,
+  confirm: (attempt: number) => Promise<void>
+): Promise<void> {
+  const pinnedLoc = page.locator(`.tree-pinned .tree-node[data-session-id="${sessionId}"]`);
+  const attempts: string[] = [];
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const node = (
+        wantPinned
+          ? page.locator(`.tree-node[data-session-id="${sessionId}"]`)
+          : pinnedLoc
+      ).first();
+      await node.click({ button: "right", timeout: 5000 });
+      await expect(page.locator(".ctxm-menu")).toBeVisible();
+      // Click the item for the intent we WANT. If the label flipped mid-click
+      // (the relabel race above), the dispatch lands the inverted intent and
+      // the confirm below fails — re-dispatch, bounded.
+      await page
+        .locator(".ctxm-item", { hasText: wantPinned ? "Pin to top" : "Unpin" })
+        .click({ timeout: 5000 });
+      await confirm(attempt);
+      if (attempt > 1) {
+        console.log(
+          `[pins-e2e] ${wantPinned ? "pin" : "unpin"}ViaMenu landed on attempt ${attempt} (earlier attempt(s) inverted/flickered)`
+        );
+      }
+      return;
+    } catch (err) {
+      attempts.push(`attempt${attempt}`);
+      if (attempt >= 3) {
+        (err as Error).message += `\n[pins-menu] intent=${wantPinned ? "pin" : "unpin"} re-dispatched (${attempts.join(",")}) without landing`;
+        throw err;
+      }
+      // Already in the wantPinned state (previous attempt landed late)? Done.
+      const isPinnedNow = (await pinnedLoc.count()) > 0;
+      if (isPinnedNow === wantPinned) {
+        console.log(
+          `[pins-e2e] ${wantPinned ? "pin" : "unpin"}ViaMenu landed late after attempt ${attempt}`
+        );
+        return;
+      }
+    }
+  }
 }
 
-// Right-click a PINNED session (in the pinned group) and choose "Unpin". Waits
-// for the pin to leave THIS client's .tree-pinned group.
+async function pinViaMenu(page: Page, sessionId: string): Promise<void> {
+  await setPinnedViaMenu(page, sessionId, true, (attempt) =>
+    withPinsDiag(page, `pinViaMenu local confirm (attempt ${attempt})`, sessionId, () =>
+      expect(
+        page.locator(`.tree-pinned .tree-node[data-session-id="${sessionId}"]`)
+      ).toBeVisible({ timeout: 5000 })
+    )
+  );
+}
+
+// unpinViaMenu — right-click a PINNED session (in the pinned group) and choose
+// "Unpin". Waits for the pin to leave THIS client's .tree-pinned group. See
+// setPinnedViaMenu's MECHANISM NOTE for the re-dispatch rationale.
 async function unpinViaMenu(page: Page, sessionId: string): Promise<void> {
-  const node = page.locator(`.tree-pinned .tree-node[data-session-id="${sessionId}"]`).first();
-  await node.click({ button: "right" });
-  await expect(page.locator(".ctxm-menu")).toBeVisible();
-  await page.locator(".ctxm-item", { hasText: "Unpin" }).click();
-  await expect(
-    page.locator(`.tree-pinned .tree-node[data-session-id="${sessionId}"]`)
-  ).toHaveCount(0, { timeout: 5000 });
+  await setPinnedViaMenu(page, sessionId, false, (attempt) =>
+    withPinsDiag(page, `unpinViaMenu local confirm (attempt ${attempt})`, sessionId, () =>
+      expect(
+        page.locator(`.tree-pinned .tree-node[data-session-id="${sessionId}"]`)
+      ).toHaveCount(0, { timeout: 5000 })
+    )
+  );
 }
 
 // pinnedOrder returns the ordered list of pinned session ids as rendered in the
@@ -160,9 +302,11 @@ test("(a) pinning a session in client A appears in client B", async ({ browser }
 
     // B converges via pins.updated SSE: the pin hoists `other` into B's
     // .tree-pinned group too.
-    await expect(
-      b.page.locator(`.tree-pinned .tree-node[data-session-id="other"]`)
-    ).toBeVisible({ timeout: CONVERGE_MS });
+    await withPinsDiag(b.page, "(a) B pin convergence", "other", () =>
+      expect(
+        b.page.locator(`.tree-pinned .tree-node[data-session-id="other"]`)
+      ).toBeVisible({ timeout: CONVERGE_MS })
+    );
   } finally {
     await a.close();
     await b.close();
@@ -176,16 +320,20 @@ test("(b) unpinning a session in client A removes it in client B", async ({ brow
   try {
     // Establish the shared pin first (A pins, B converges).
     await pinViaMenu(a.page, "other");
-    await expect(
-      b.page.locator(`.tree-pinned .tree-node[data-session-id="other"]`)
-    ).toBeVisible({ timeout: CONVERGE_MS });
+    await withPinsDiag(b.page, "(b) B establish convergence", "other", () =>
+      expect(
+        b.page.locator(`.tree-pinned .tree-node[data-session-id="other"]`)
+      ).toBeVisible({ timeout: CONVERGE_MS })
+    );
 
     // A unpins; B must follow.
     await unpinViaMenu(a.page, "other");
 
-    await expect(
-      b.page.locator(`.tree-pinned .tree-node[data-session-id="other"]`)
-    ).toHaveCount(0, { timeout: CONVERGE_MS });
+    await withPinsDiag(b.page, "(b) B unpin convergence", "other", () =>
+      expect(
+        b.page.locator(`.tree-pinned .tree-node[data-session-id="other"]`)
+      ).toHaveCount(0, { timeout: CONVERGE_MS })
+    );
   } finally {
     await a.close();
     await b.close();
@@ -204,7 +352,9 @@ test("(c) reordering pinned sessions in A syncs the new order to B", async ({ br
 
     // Both clients converge to [demo, other].
     await expect.poll(async () => await pinnedOrder(a.page), { timeout: 8000 }).toEqual(["demo", "other"]);
-    await expect.poll(async () => await pinnedOrder(b.page), { timeout: CONVERGE_MS }).toEqual(["demo", "other"]);
+    await withPinsDiag(b.page, "(c) B establish order", "other", () =>
+      expect.poll(async () => await pinnedOrder(b.page), { timeout: CONVERGE_MS }).toEqual(["demo", "other"])
+    );
 
     // Reorder in A: right-click `other` (currently last) → "Move up". This fires
     // movePinnedByOffset(other, -1) → server reorders to [other, demo].
@@ -216,7 +366,9 @@ test("(c) reordering pinned sessions in A syncs the new order to B", async ({ br
     // A adopts its own successful reorder...
     await expect.poll(async () => await pinnedOrder(a.page), { timeout: 8000 }).toEqual(["other", "demo"]);
     // ...and B converges to the SAME server order via pins.updated.
-    await expect.poll(async () => await pinnedOrder(b.page), { timeout: CONVERGE_MS }).toEqual(["other", "demo"]);
+    await withPinsDiag(b.page, "(c) B reorder order", "other", () =>
+      expect.poll(async () => await pinnedOrder(b.page), { timeout: CONVERGE_MS }).toEqual(["other", "demo"])
+    );
   } finally {
     await a.close();
     await b.close();
@@ -235,9 +387,11 @@ test("(e) archiving a pinned disposable session removes it in both clients", asy
 
     // Pin it in A; B converges.
     await pinViaMenu(a.page, id);
-    await expect(
-      b.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
-    ).toBeVisible({ timeout: CONVERGE_MS });
+    await withPinsDiag(b.page, "(e) B pin convergence", id, () =>
+      expect(
+        b.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
+      ).toBeVisible({ timeout: CONVERGE_MS })
+    );
 
     // Archive via the real /vh/archive path (the L1 cleanup hook runs on its
     // success). The response returns before the async cascade completes, so we
@@ -253,12 +407,16 @@ test("(e) archiving a pinned disposable session removes it in both clients", asy
     // with descendants are covered deterministically by pkg/web
     // TestPinsL1_ArchiveCascadesSubtree; this is the single-session cross-client
     // broadcast slice.)
-    await expect(
-      a.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
-    ).toHaveCount(0, { timeout: CONVERGE_MS });
-    await expect(
-      b.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
-    ).toHaveCount(0, { timeout: CONVERGE_MS });
+    await withPinsDiag(a.page, "(e) A archive broadcast removal", id, () =>
+      expect(
+        a.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
+      ).toHaveCount(0, { timeout: CONVERGE_MS })
+    );
+    await withPinsDiag(b.page, "(e) B archive broadcast removal", id, () =>
+      expect(
+        b.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
+      ).toHaveCount(0, { timeout: CONVERGE_MS })
+    );
   } finally {
     await a.close();
     await b.close();
@@ -275,9 +433,11 @@ test("(f) deleting a pinned disposable session removes it in both clients", asyn
     await expect(b.page.locator(`.tree-node[data-session-id="${id}"]`)).toBeVisible({ timeout: 10000 });
 
     await pinViaMenu(a.page, id);
-    await expect(
-      b.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
-    ).toBeVisible({ timeout: CONVERGE_MS });
+    await withPinsDiag(b.page, "(f) B pin convergence", id, () =>
+      expect(
+        b.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
+      ).toBeVisible({ timeout: CONVERGE_MS })
+    );
 
     // Delete via the fake OpenCode's /fixture/delete, reached through the web
     // server's /oc/ passthrough (NOT the bare /fixture/delete form, which hits
@@ -289,12 +449,16 @@ test("(f) deleting a pinned disposable session removes it in both clients", asyn
     expect(res.ok()).toBe(true);
 
     // L2 cleanup broadcasts to BOTH clients.
-    await expect(
-      a.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
-    ).toHaveCount(0, { timeout: CONVERGE_MS });
-    await expect(
-      b.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
-    ).toHaveCount(0, { timeout: CONVERGE_MS });
+    await withPinsDiag(a.page, "(f) A delete broadcast removal", id, () =>
+      expect(
+        a.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
+      ).toHaveCount(0, { timeout: CONVERGE_MS })
+    );
+    await withPinsDiag(b.page, "(f) B delete broadcast removal", id, () =>
+      expect(
+        b.page.locator(`.tree-pinned .tree-node[data-session-id="${id}"]`)
+      ).toHaveCount(0, { timeout: CONVERGE_MS })
+    );
   } finally {
     await a.close();
     await b.close();
@@ -316,18 +480,22 @@ test("(g) a reconnecting client receives surviving pins via the bootstrap snapsh
 
     await pinViaMenu(a.page, "other");
     // B (still connected) sees the live update.
-    await expect(
-      b.page.locator(`.tree-pinned .tree-node[data-session-id="other"]`)
-    ).toBeVisible({ timeout: CONVERGE_MS });
+    await withPinsDiag(b.page, "(g) B live convergence", "other", () =>
+      expect(
+        b.page.locator(`.tree-pinned .tree-node[data-session-id="other"]`)
+      ).toBeVisible({ timeout: CONVERGE_MS })
+    );
 
     // Reconnect B: reload tears down its SSE stream + Solid state; on reconnect
     // the server emits pins.snapshot as the bootstrap frame, which restores the
     // surviving pin.
     await b.page.reload();
     await waitForTreeSettled(b.page);
-    await expect(
-      b.page.locator(`.tree-pinned .tree-node[data-session-id="other"]`)
-    ).toBeVisible({ timeout: 10000 });
+    await withPinsDiag(b.page, "(g) bootstrap snapshot restore", "other", () =>
+      expect(
+        b.page.locator(`.tree-pinned .tree-node[data-session-id="other"]`)
+      ).toBeVisible({ timeout: 10000 })
+    );
   } finally {
     await a.close();
     await b.close();
