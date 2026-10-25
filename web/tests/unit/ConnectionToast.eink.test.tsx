@@ -6,8 +6,9 @@ import { cleanup, fireEvent, render } from "@solidjs/testing-library";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ConnectionToast from "../../src/components/ConnectionToast";
 import { einkProfile, setEinkProfile } from "../../src/prefs";
-import { state } from "../../src/sync";
+import { connGrade, installTunnelSampler, state } from "../../src/sync";
 import { setState } from "../../src/sync/store";
+import { _resetWeakLinkForTest, recordFetchFailure } from "../../src/sync/weaklink";
 
 // E-ink display profile (UX Slice 4 — quiet UI): the ConnectionToast's
 // profile-scoped persistence contract, at the component seam with FAKE TIMERS.
@@ -56,6 +57,16 @@ afterEach(() => {
 });
 
 describe("ConnectionToast — e-ink profile OFF (baseline unchanged)", () => {
+  // The degraded-dip test below racks weaklink fetch-failure counters (module
+  // singletons) and consumes the tunnel sampler's install latch. Reset both so
+  // the spike cannot leak into later tests in this file (silently re-grading
+  // their stores to "degraded") and a future sampler-dependent test cannot
+  // silently no-op — the connstatus.test.ts delete-latch pattern.
+  afterEach(() => {
+    _resetWeakLinkForTest();
+    delete (globalThis as { __vhTunnelSampled?: boolean }).__vhTunnelSampled;
+  });
+
   it("auto-expires the restart warn at 4s and renders no dismiss button", async () => {
     const { container } = await mount();
     expect(einkProfile()).toBe(false);
@@ -94,6 +105,56 @@ describe("ConnectionToast — e-ink profile OFF (baseline unchanged)", () => {
     expect(ok!.querySelector('button[aria-label="Dismiss notice"]')).toBeNull();
     // …and auto-expires 2.5s later (the pre-profile transient).
     await vi.advanceTimersByTimeAsync(2499);
+    expect(toastEl(container)).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(toastEl(container)).toBeNull();
+  });
+
+  // Field flake 2026-10-25 (pins-verdict run 3, web e2e preferences.spec.ts:387
+  // "E Ink OFF: notices stay transient"): under load the recovery ok got
+  // ORPHANED on screen — a live → degraded dip (FE fetch-failure spike) inside
+  // the ok's 2.5s expiry window cleared the pending auto-hide timer while
+  // matching no toast branch, so "Reconnected" stayed up past every assertion
+  // window (the e2e toHaveCount(0) failed 14× with the status icon showing
+  // "degraded — recent network errors"). The ok is a TRANSIENT under OFF: its
+  // expiry must survive a silent degraded dip.
+  it("OFF: the recovery ok still auto-expires when the grade dips to degraded mid-window", async () => {
+    const { container } = await mount();
+
+    setState("status", "reconnecting");
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(toastEl(container)?.textContent).toContain("Connection lost");
+
+    setState("status", "live");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(toastEl(container)?.textContent).toContain("Reconnected");
+
+    // 500ms into the ok's 2.5s window: ≥2 FE-vantage fetch failures land
+    // (route-aborted /vh/ fetches classify as "network" — the deliberate-
+    // abort exclusion covers real AbortError only)…
+    await vi.advanceTimersByTimeAsync(500);
+    recordFetchFailure("network");
+    recordFetchFailure("network");
+    // …and the next connMemo evaluation re-grades live → degraded. In the
+    // real app that re-run rides the ~5s health tick or any store write; the
+    // tunnel sampler's documented reactive carrier (X-VH-Tunnel-State read
+    // off a /vh/ fetch) drives it here deterministically.
+    const origFetch = globalThis.fetch;
+    (globalThis as { fetch: typeof fetch }).fetch = (() =>
+      Promise.resolve({
+        status: 200,
+        headers: { get: (n: string) => (n.toLowerCase() === "x-vh-tunnel-state" ? "connected" : null) },
+      } as unknown as Response)) as typeof fetch;
+    installTunnelSampler();
+    await globalThis.fetch("/vh/unit-tunnel-probe");
+    (globalThis as { fetch: typeof fetch }).fetch = origFetch;
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("degraded"); // the dip is real, not vacuous
+    // The dip neither replaced nor cleared the ok…
+    expect(toastEl(container)?.textContent).toContain("Reconnected");
+    // …and it still EXPIRES on schedule (2.5s from fire; 2s remain).
+    await vi.advanceTimersByTimeAsync(1999);
     expect(toastEl(container)).not.toBeNull();
     await vi.advanceTimersByTimeAsync(1);
     expect(toastEl(container)).toBeNull();

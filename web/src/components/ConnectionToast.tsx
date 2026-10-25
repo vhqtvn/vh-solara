@@ -47,6 +47,11 @@ import styles from "./ConnectionToast.module.css";
 // re-run into a no-op; the notice now displays as documented (4s under OFF,
 // until-dismissed under ON). Verified against a verbatim HEAD copy of the
 // component (scratch probe) before fixing.
+//
+// (2026-10-25 flake fix, disclosed): a SILENT "degraded" transition no longer
+// cancels a pending auto-expiry — live → degraded inside the ok's 2.5s OFF
+// window used to orphan the "Reconnected" toast on screen (the expiry was
+// cleared, no branch fired). See the guard in the effect below.
 export default function ConnectionToast() {
   const [toast, setToast] = createSignal<{ kind: "warn" | "ok"; text: string } | null>(null);
   let showTimer: number | undefined;
@@ -83,7 +88,15 @@ export default function ConnectionToast() {
       return;
     }
     clearTimeout(showTimer);
-    clearTimeout(hideTimer);
+    // A silent "degraded" transition must NOT cancel a pending auto-expiry:
+    // live → degraded (fetch-failure spike / tree-stale) inside the ok's 2.5s
+    // OFF window used to orphan the "Reconnected" toast on screen — no branch
+    // matches degraded, and an unconditional clear had already killed its
+    // expiry (field flake 2026-10-25, e2e preferences.spec.ts:387). Every
+    // other transition either replaces/clears the toast immediately (epoch,
+    // live) or will replace it after the 1200ms debounce (offline,
+    // reconnecting) — cancelling the pending expiry there stays correct.
+    if (ec || grade !== "degraded") clearTimeout(hideTimer);
     if (ec) {
       // Consume the latch here (only the toast surfaces it). warned=false so
       // the subsequent live transition does NOT also fire a "Reconnected".
