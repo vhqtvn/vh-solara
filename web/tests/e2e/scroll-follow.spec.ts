@@ -116,9 +116,9 @@ async function openDemo(page: import("@playwright/test").Page) {
   // chat-controls-gating.spec test 1. (The scroll-subsystem quirk itself is out
   // of scope for this regression fix.)
   await waitForReady(page); // ensure startup restore (maybeRestore) is done so onScrolled won't drop our scroll
-  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
-    el.scrollTop = el.scrollHeight;
-  });
+  // Two-step deterministic glue (see glueToTail): a bare bottom write no-ops
+  // when the load already left the viewport at the bottom.
+  await glueToTail(page);
   // Geometry-first (see expectFollowingTail): the idle demo has working()=false,
   // so the .chat-live pill is hidden by the `&& working()` gate even though
   // following=true. Assert the glued geometry + no "↓ Latest" button instead.
@@ -129,6 +129,34 @@ async function setScrollTop(page: import("@playwright/test").Page, value: number
   await page.locator(".chat-scroll").evaluate((el: HTMLElement, v) => {
     el.scrollTop = v;
   }, value);
+}
+
+// Deterministic glue-to-tail: guarantees onScrolled actually RUNS for the
+// glue, whatever state the load left behind. A bare `el.scrollTop =
+// el.scrollHeight` is IDEMPOTENT when the viewport already sits at the
+// bottom — no scrollTop change → NO scroll event → onScrolled never runs →
+// whatever `following` was, it stays. That is exactly how the 2026-10-25
+// captured red (test 6, full-lane run 3) failed: the load window left
+// following=false while geometry was already glued at the bottom (the known
+// load-window misclassification this file's helpers work around), the glue
+// write no-op'd, and expectFollowingTail's geometry poll passed instantly
+// while button.jump stayed mounted for its whole 5s budget (video + ARIA
+// snapshot retained: viewport at the tail, "Latest" mounted, per-second
+// timers ticking — page live, state stuck). Fix: force a REAL scroll delta
+// first (−3px, > epsilon so it classifies as user-scroll-up and provably
+// disengages any stale following), then scroll to the bottom (+3px →
+// reached-bottom → following=true). Two SEPARATE evaluates = two separate
+// tasks = two separate scroll events (a single evaluate would coalesce both
+// writes into one event with net residual 0 — classified "none"). Works
+// from every entry state: at-bottom+following-false, at-bottom+following-
+// true, or off-bottom.
+async function glueToTail(page: import("@playwright/test").Page) {
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - 3);
+  });
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
 }
 
 // Wait for the app's startup scroll-restore to complete before issuing any
@@ -352,10 +380,14 @@ test("scrolling back to the bottom flips Latest → Live", async ({ page }) => {
   // arming pinnedGeom.scrollTop to this bottom clamp; capture it so the scroll-back below
   // lands on the exact value pin() wrote.
   await waitForReady(page); // ensure startup restore is done so onScrolled won't drop our scroll
-  const bottomClamp = await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
-    el.scrollTop = el.scrollHeight;
-    return el.scrollTop;
-  });
+  // Two-step deterministic glue (see glueToTail): the 2026-10-25 captured red
+  // proved a bare bottom write can no-op at load with following=false stuck
+  // (geometry at tail, "Latest" mounted) — and this test's whole premise
+  // (capture the clamp the last pin wrote) needs the pin to have provably run.
+  await glueToTail(page);
+  const bottomClamp = await page.locator(".chat-scroll").evaluate(
+    (el: HTMLElement) => el.scrollTop,
+  );
   // following=true → glued to the tail (geometry), Latest button absent. The
   // .chat-live pill hides on the idle demo (working()=false), so assert geometry.
   await expectFollowingTail(page);
@@ -1706,6 +1738,37 @@ test("epsilon threshold: small scroll-ups drop following (data for the DEFER car
   // nearBottom's 24px tolerance.
   const deltas = [1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 20, 24];
   const dropped: Record<number, boolean> = {};
+  // Watch-state diagnostics (2026-10-25 verdict drive on the unreproduced
+  // mid-suite absorbed-delta flake; 80b569d hunt + this slice). Diagnostic-only
+  // — NO assertion reads these maps:
+  //   probeMs[dpx] — wall-ms the 1.2s visibility probe took (≈1200 ⇒ timed out
+  //     waiting; small ⇒ resolved fast). Always recorded; zero behavior cost.
+  //   late[dpx] — recorded ONLY for an absorbed delta in the ASSERTED-DROP range
+  //     (dpx ≥ 3, the anomaly class): after the failed 1.2s window it re-probes
+  //     button.jump for 3.8s more and records how long after the window the
+  //     button took to appear, or null if it never did. Absent key = expected
+  //     absorb (dpx ≤ 2, not probed). This one field adjudicates the surviving
+  //     hypothesis classes on the next natural recurrence: late=<ms> ⇒ the drop
+  //     was merely DELAYED past the window; late=null ⇒ a TRUE absorb
+  //     (classification genuinely saw the scroll-up as non-user — H2/new).
+  //     Calibrated by deliberate-stall probes (temp spec, removed; 2026-10-25):
+  //     a main-thread stall AROUND the scroll write is structurally absorbed
+  //     (the await on the write synchronizes the clock; refuted), while an
+  //     OBSERVER-side stall — checks delayed past the deadline while the app
+  //     pipeline completed on time — reproduces the signature exactly, with a
+  //     SMALL late (~0.4s). So: small late ⇒ observer-side stall; large late ⇒
+  //     app-side pipeline delay; null ⇒ true absorb.
+  const probeMs: Record<number, number> = {};
+  const late: Record<number, number | null> = {};
+
+  // Deterministic loop entry (see glueToTail): guards the load state captured
+  // 2026-10-25 in test 6 — following=false while geometry is already at the
+  // bottom would make iteration 1's in-loop bare bottom write a no-op (no
+  // scroll event), expectFollowingTail would pass its geometry poll and hang
+  // on button-count-0, and the scan would record from a state it believes it
+  // excluded. After this call following=true at the exact bottom, and every
+  // in-loop glue is a real delta (each iteration provably ends at bottom−dpx).
+  await glueToTail(page);
 
   for (const dpx of deltas) {
     // Glue to the tail deterministically (scroll-to-bottom; same proven pattern
@@ -1731,17 +1794,33 @@ test("epsilon threshold: small scroll-ups drop following (data for the DEFER car
     // update are near-immediate; 1.2s is generous. If following did NOT drop the
     // locator stays hidden and we record false.
     let didDrop = true;
+    const probeStart = Date.now();
     try {
       await expect(page.locator("button.jump")).toBeVisible({ timeout: 1200 });
     } catch {
       didDrop = false;
     }
+    probeMs[dpx] = Date.now() - probeStart;
+    if (!didDrop && dpx >= 3) {
+      // Late re-probe (diagnostic-only; see the maps' leading comment): does
+      // the drop land AFTER the failed window, and how long after?
+      const lateStart = Date.now();
+      try {
+        await expect(page.locator("button.jump")).toBeVisible({ timeout: 3800 });
+        late[dpx] = Date.now() - lateStart;
+      } catch {
+        late[dpx] = null;
+      }
+    }
     dropped[dpx] = didDrop;
   }
 
   // Boundary log: re-derive the PINNED values from this line if the threshold
-  // ever moves. (2px is intentionally not asserted — see leading comment.)
-  console.log("EPSILON_SCAN " + JSON.stringify(dropped));
+  // ever moves. (2px is intentionally not asserted — see leading comment.) The
+  // payload also carries the watch-state maps (dropped + probeMs + late).
+  console.log(
+    "EPSILON_SCAN " + JSON.stringify({ dropped, probeMs, late }),
+  );
 
   // PINNED boundary (chromium): reliably absorbs ≤ 1px, reliably drops at ≥ 3px.
   // Largest reliably-absorbed delta keeps following; smallest reliably-dropping
@@ -1756,7 +1835,10 @@ test("epsilon threshold: small scroll-ups drop following (data for the DEFER car
   // The message carries the failing dpx + the full scan so a future mid-suite
   // recurrence (one absorbed ≥3px delta observed once in two full-lane runs,
   // never reproduced across 15 isolated repeats + 1 file run + 1 full lane;
-  // hunt log 2026-10-23) is legible directly from the failure output.
+  // hunt log 2026-10-23) is legible directly from the failure output — and the
+  // run log's EPSILON_SCAN line now also carries probeMs + late, whose dpx≥3
+  // late value (finite ⇒ window-stall H1, null ⇒ true absorb) adjudicates the
+  // surviving hypothesis classes without another reproduction campaign.
   for (const dpx of [4, 6, 8, 10, 12, 14, 16, 20, 24]) {
     expect(dropped[dpx], `EPSILON_SCAN dpx=${dpx} absorbed: ${JSON.stringify(dropped)}`).toBe(true);
   }
