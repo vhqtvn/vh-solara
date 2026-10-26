@@ -1772,6 +1772,18 @@ test("epsilon threshold: small scroll-ups drop following (data for the DEFER car
   //     change, or the scrollTop clamp to a shrunk maxBottom classifying as
   //     reached-bottom). Those fire once per geometry churn; a fresh write
   //     after re-glue drops normally — hence the bounded retry below.
+  //     2026-10-27: retry path demonstrated via temp probe (temp spec created/
+  //     run/deleted per the 2026-10-25 precedent; closes DEFERs A1/B1/D1 of the
+  //     0248798 commit review). A synchronous viewport churn (inline max-height
+  //     −40px applied in the SAME task as the −24 write) deterministically
+  //     absorbs attempt 1 via the churn guard (probeMs=1202/late=null — the
+  //     run-40333545109 signature) and the verbatim retry recovers:
+  //     retried[24]=true in a PASSING run. Churning the retry write too →
+  //     retried=false → dropped=false → toBe(true) fails loudly (regression
+  //     contract holds). Holding the write's scroll event ~2s then delivering
+  //     it late → late=875ms finite → counted as dropped without retry. (A
+  //     busy main-thread stall does NOT induce the delayed-drop branch — it
+  //     hangs the in-flight poll into a late first-probe success.)
   const probeMs: Record<number, number> = {};
   const late: Record<number, number | null> = {};
   const retried: Record<number, boolean> = {};
