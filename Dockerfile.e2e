@@ -44,7 +44,7 @@ COPY --from=webbuild /app/web/dist-build ./web/dist-build
 RUN cd host-web && VITE_HOST_FOLDED=1 npm run build
 
 # 3) Build the Go binaries (e2e server + fake LLM).
-FROM golang:1.26-alpine AS gobuild
+FROM golang:1.26.10-alpine AS gobuild
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -62,12 +62,14 @@ RUN rm -rf ./pkg/web/host-dist/assets ./pkg/web/host-dist/index.html \
 COPY --from=hostbuild /app/host-web/dist ./pkg/web/host-dist
 # GOTOOLCHAIN=local is deliberate (hermetic, reproducible builds) and means there is
 # NO auto-download fallback inside this image. Invariant: the base image's Go (FROM
-# golang:1.26-alpine above) MUST be >= the `go` directive in go.mod, or this stage
+# golang:1.26.10-alpine above) MUST be >= the `go` directive in go.mod, or this stage
 # hard-fails. Local dev and CI stay green via GOTOOLCHAIN=auto / go-version-file, so a
 # go.mod directive bump that outruns the Docker official image is a SILENT TRAP here.
-# Before bumping go.mod's `go` line, confirm the tag already carries that patch:
-#   docker run --rm golang:1.26-alpine go version
-# (As of go.mod 1.26.9 the margin is zero: the image supplies exactly go1.26.9.)
+# Pinned to the exact patch tag: at the 1.26.10 bump (GO-2026-6809) a warm-cached
+# rolling golang:1.26-alpine still supplied go1.26.9, so the rolling tag's content
+# varies per host cache state. Before bumping go.mod's `go` line, confirm the exact
+# patch tag you will pin to already exists and carries that patch:
+#   docker run --rm golang:1.26.10-alpine go version
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 # /out/vh-solara is the REAL production binary (Flow 8 in tests/e2e-docker/
 # run.sh boots it as `vh-solara local-server --opencode-detached` so the
