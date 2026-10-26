@@ -767,7 +767,7 @@ func (s *Store) deleteSessionLocked(id string) {
 	// KindActivity(idle) emits above). clearUnreadLocked self-guards:
 	// unflagged ids emit nothing.
 	s.clearUnreadLocked(id)
-	delete(s.unread, id) // belt-and-suspenders: clearUnreadLocked already removed a flagged entry
+	delete(s.unread, id)           // belt-and-suspenders: clearUnreadLocked already removed a flagged entry
 	delete(s.subtreeBusyCount, id) // per-root busy aggregate is derived from this index (single source of truth)
 	// Phase 1 (Gate C extension): drop id's own entries from each new index.
 	delete(s.children, id) // direct-child list (already emptied by orphaning)
