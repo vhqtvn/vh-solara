@@ -5,12 +5,20 @@ is the record — the dispatcher, central history, registry, and routes ship
 behind `--notify-dispatch` etc.). **v4.1 (2026-10-27) is a settled ADDITIVE
 extension** — the `fleet_changed` status poke (§3.3.1) plus the
 `session_started` per-session detection fix (§3.7) — negotiated with the
-client (their six answers recorded in the changelog below). **Client
-prerequisite: handler 0.4.2 ships BEFORE the v4.1 server deploy** — pokes
-delivered to a pre-0.4.2 handler render as generic informational
-notifications (the reserved `vh_kind:"status"` slot is unknown to it); the
-order is a deploy gate, not a compatibility break. Design authority:
-`docs/architecture/notify-controller-hub-brief.md` — a researcher → debate → planner chain —
+client (their six answers recorded in the changelog below). **Deploy order:
+either order is safe** (client handler 0.4.2 is recommended for diagnostics,
+not a correctness gate). Line-level verification against vh-agent-pulse 0.4.1
+(tree `dd28b12`) confirms the exact v4.1 poke shape (`{vh_kind:"status",
+vh_event:"fleet_changed", vh_count:"1", vh_ts}`) is already fully silent with
+the full reconcile chain on 0.4.1+: lacking `vh_condition`, parsed kind is
+`UNKNOWN` with effective count 0, which NotificationPolicy's count-0 filter
+drops before any notification post or dedupe accrual
+(`NotificationPolicy.kt:149`), while refresh → history-reconcile →
+truth-notify → watch-publish runs unconditionally. Generic informational
+notification behavior applies only to `vh_condition`-carrying unknown payloads
+(`session_started`-style), not this shape. Handler 0.4.2 adds explicit
+classification plus the `fcm-received(fleet_changed)` dev-log token. Design
+authority: `docs/architecture/notify-controller-hub-brief.md` — a researcher → debate → planner chain —
 with the open timestamp gate subsequently executed and settled as Position C,
 §7.2). Server-side, v1–v3 are implemented at commits `70607590` (slice 1:
 history ring + token registry + routes), `26cd6add` (slice 2: FCM HTTP v1
@@ -86,7 +94,7 @@ Three additive changes, client-approved; no v2 field changed shape.
    type — profiles with an explicit `types` list do **not** receive it until
    the operator adds it.
 
-### v4 → v4.1 (2026-10-27 — settled additive; client handler 0.4.2 is a deploy prerequisite)
+### v4 → v4.1 (2026-10-27 — settled additive; either deploy order safe, handler 0.4.2 recommended for diagnostics)
 
 Two changes, both additive; no v4 field changed shape.
 
@@ -125,6 +133,30 @@ Two changes, both additive; no v4 field changed shape.
    same-sweep replacement now fires for the starter; running→idle
    transitions fire nothing (finished/unread semantics unchanged —
    controller-side figure freshness is the poke's job).
+
+**Client verification (2026-10-27):** Line-level answer from vh-agent-pulse
+(tree `dd28b12`, client 0.4.1):
+- **Deploy order:** Either deploy order is safe (handler 0.4.2 recommended for
+  diagnostics). The exact v4.1 poke shape (`{vh_kind:"status",
+  vh_event:"fleet_changed", vh_count:"1", vh_ts}`) is already fully silent with
+  the full reconcile chain on 0.4.1+ (no `vh_condition` ⇒ parsed kind `UNKNOWN`
+  with effective count 0 ⇒ NotificationPolicy's count-0 filter drops it before
+  any notification post or dedupe accrual at `NotificationPolicy.kt:149`),
+  while refresh → history-reconcile → truth-notify → watch-publish runs
+  unconditionally. Generic informational notification behavior applies only to
+  `vh_condition`-carrying unknown payloads (`session_started`-style), not this
+  shape. 0.4.2 adds explicit classification + `fcm-received(fleet_changed)`
+  dev-log token.
+- **Client acks:**
+  - `vh_count` diagnostics-only (contract-pinned since v2);
+  - client cadence-agnostic on debounce (no client test assumes server cadence
+    — `collapse_key` + server refractory bound it);
+  - history/central-id exclusion confirmed (`lastId`/gap logic unchanged, ids
+    contiguous);
+  - `session_started` per-session fix acknowledged no-impact;
+  - worker error-detail exclusion agreed;
+  - both-policies fan-out (`always`-token pokes while attended) confirmed as
+    exactly the intended scenario, no divergence.
 
 ### v3 → v4 (2026-10-21 — implemented; the S5 landing record is §6)
 
