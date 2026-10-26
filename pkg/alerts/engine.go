@@ -489,17 +489,25 @@ func (w *watcher) sweep() {
 	}
 	var fires []pending
 
-	// session_started (v3): compare the set of RUNNING root sessions (a root
-	// whose OWN activity is busy/retry — a busy child is its root's turn, not
-	// a new session) against the previous sweep. The FIRST sweep establishes
-	// the baseline WITHOUT firing; after that, an INCREASE fires exactly ONE
-	// notice carrying a representative newly-running root (deterministic: the
-	// lexicographically first new root — multiple new sessions in one sweep
-	// collapse to one notice; the per-(type,token)/(type,session) cooldowns
-	// bound repeats anyway). Decrease or unchanged count never fires; a root
-	// that stops and later runs again IS a new increase (fires again). The
-	// detector is sweep-based by contract: detection latency is up to ~one
-	// sweep interval (20s) plus propagation.
+	// session_started (v3; masking fixed v4.1): compare the set of RUNNING
+	// root sessions (a root whose OWN activity is busy/retry — a busy child
+	// is its root's turn, not a new session) against the previous sweep,
+	// PER SESSION. The FIRST sweep establishes the baseline WITHOUT firing;
+	// after that, ANY idle→running transition of an individual root fires
+	// exactly ONE notice carrying a representative newly-running root
+	// (deterministic: the lexicographically first new root — multiple new
+	// sessions in one sweep collapse to one notice; the
+	// per-(type,token)/(type,session) cooldowns bound repeats anyway). The
+	// v4.1 fix: detection is transition-based, NOT net-count-based — the
+	// v3 "increase in count" rule let opposite transitions inside ONE sweep
+	// mask each other (A started while B stopped: net zero, no notice; A's
+	// start was invisible). Per-session diffing means a same-sweep
+	// replacement (one stops, another starts) now fires for the starter.
+	// running→idle transitions fire nothing (finished/unread semantics
+	// unchanged; controller-side figure freshness is the v4.1 fleet_changed
+	// poke's job). A root that stops and later runs again is a new
+	// transition (fires again). Detection latency is up to ~one sweep
+	// interval (20s) plus propagation — the accepted sweep design cost.
 	{
 		cur := map[string]bool{}
 		for sid, t := range w.sessions {
@@ -510,13 +518,13 @@ func (w *watcher) sweep() {
 		if !w.runBased {
 			w.runBase, w.runBased = cur, true
 		} else {
-			if len(cur) > len(w.runBase) {
-				newRoots := make([]string, 0, len(cur))
-				for sid := range cur {
-					if !w.runBase[sid] {
-						newRoots = append(newRoots, sid)
-					}
+			newRoots := make([]string, 0, len(cur))
+			for sid := range cur {
+				if !w.runBase[sid] {
+					newRoots = append(newRoots, sid)
 				}
+			}
+			if len(newRoots) > 0 {
 				sort.Strings(newRoots)
 				fires = append(fires, pending{newRoots[0], TypeSessionStarted, "Session started"})
 			}

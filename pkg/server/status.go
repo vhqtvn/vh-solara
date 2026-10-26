@@ -414,6 +414,12 @@ type fleetJSONFetcher func(ctx context.Context, workerID, path string, timeout t
 // the newer config: its stamp can never match the live generation again).
 // options is the GET /vh/fleet/config/options picker feed marshaled from the
 // SAME refresh — a second view of one generation, not a second acquisition.
+// fingerprint is the v4.1 fleet_changed poke fingerprint (see
+// fleetRollupFingerprint in notify_fleetpoke.go's domain, computed by
+// buildRollup from the same acquisition results): a content hash of the
+// per-worker/per-selected-session state that MUST be identical across two
+// refreshes of an unchanged fleet. A fallback generation carries the stable
+// fleetFallbackFingerprint instead.
 type fleetGeneration struct {
 	body        []byte
 	etag        string
@@ -421,6 +427,7 @@ type fleetGeneration struct {
 	publishedAt time.Time
 	regGen      uint64
 	cfgGen      uint64
+	fingerprint string
 }
 
 // fleetStatusService is the daemon-owned rollup cache. Where the cache lives:
@@ -550,7 +557,7 @@ func (s *fleetStatusService) refresh(done chan struct{}, regGen uint64) {
 	// captured together, so the published generation is stamped with exactly
 	// the config it was built from (no read-then-stamp race).
 	snap := s.d.statusCfg.snapshot()
-	resp, opts := s.buildRollup(time.Now().UTC(), snap)
+	resp, opts, fp := s.buildRollup(time.Now().UTC(), snap)
 	body, err := json.Marshal(resp)
 	if err != nil {
 		// Cannot happen (plain structs), but fail honest rather than serve nil.
@@ -570,6 +577,7 @@ func (s *fleetStatusService) refresh(done chan struct{}, regGen uint64) {
 		publishedAt: time.Now().UTC(),
 		regGen:      regGen,
 		cfgGen:      snap.gen,
+		fingerprint: fp,
 	}
 	s.mu.Unlock()
 	// SSE: every publication wakes stream subscribers (status_stream.go).
@@ -617,6 +625,12 @@ func (s *fleetStatusService) publishFallback(regGen, cfgGen uint64) {
 		publishedAt: time.Now().UTC(),
 		regGen:      regGen,
 		cfgGen:      cfgGen,
+		// A fallback generation has no observations: the stable
+		// !fleet-unavailable marker (never a real fold's sha256 hex). A
+		// persistently failing refresh never pokes on its own noise; a
+		// fallback ↔ observed transition DOES diff — honestly, coverage
+		// changed.
+		fingerprint: fleetFallbackFingerprint,
 	}
 	s.mu.Unlock()
 	// SSE: fallback publications wake stream subscribers too — a fallback
@@ -662,7 +676,10 @@ type fleetContributor struct {
 // buildRollup snapshots the registry, acquires every in-scope online worker
 // within the budgets, and folds the observations into the wire response —
 // plus, from the SAME results, the /vh/fleet/config/options picker feed
-// (see buildFleetOptions). (The registry-generation stamp is applied by the
+// (see buildFleetOptions) and the v4.1 fleet_changed poke fingerprint (see
+// fleetRollupFingerprint: one content hash over the same acquisition
+// results, so a generation and its fingerprint can never disagree about
+// what was observed). (The registry-generation stamp is applied by the
 // caller in refresh().) The expected rosters come from the ONE config
 // snapshot the caller captured — snap — so a concurrent PUT /vh/fleet/config
 // can never half-apply (worker roster from one config, project roster from
@@ -672,7 +689,7 @@ type fleetContributor struct {
 // refresh goroutine, and per-worker acquisition is sequential (discovery,
 // then each project snapshot one at a time), so at most ONE fetch is in
 // flight per worker at any moment — by construction, not by semaphore.
-func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapshot) (fleetStatusResponse, fleetOptionsResponse) {
+func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapshot) (fleetStatusResponse, fleetOptionsResponse, string) {
 	b := s.effectiveBudgets(snap)
 	fetch := s.fetcher()
 
@@ -1133,7 +1150,79 @@ func (s *fleetStatusService) buildRollup(now time.Time, snap statusConfigSnapsho
 		ProjectsOmit:   projectsOmitted,
 		GeneratedAt:    now.Format(time.RFC3339),
 		MaxStalenessMS: b.MaxStalenessMS,
-	}, buildFleetOptions(now, results, summaries)
+	}, buildFleetOptions(now, results, summaries), fleetRollupFingerprint(results)
+}
+
+// fleetFallbackFingerprint is the distinct, stable fingerprint of a FALLBACK
+// generation (a refresh that failed so hard there are no observations at
+// all): "!fleet-unavailable" cannot collide with any sha256 hex the real
+// fold produces, and it is STABLE so a persistently failing refresh never
+// pokes on its own noise — only a real observation change (a fallback ↔
+// observed transition included, honestly: coverage changed) diffs.
+const fleetFallbackFingerprint = "!fleet-unavailable"
+
+// fleetRollupFingerprint derives the v4.1 `fleet_changed` status-poke
+// fingerprint from ONE refresh's acquisition results (notify-fcm.md §3.3,
+// v4.1): a content hash over
+//
+//   - one line per in-scope worker carrying its acquisition status — the
+//     composition axis. A worker going offline/missing/error changes the
+//     fingerprint even when it hosted no selected sessions (worker UP/DOWN
+//     is naturally in the rollup diff; the existing worker_down NOTICE
+//     still fires independently as a visible notice — complementary, no
+//     special-casing here), and an offline worker's sessions vanishing from
+//     the fold changes it trivially.
+//   - one line per SELECTED root session (the fold population: the
+//     fleet_selected tri-state, exactly as the /vh/fleet/status fold filters
+//     it) carrying the state facts the rollup exposes for it — the
+//     running/idle/waiting axes: activity, subtree busy, per-kind subtree
+//     pending counts, subtree error/retry SESSION counts (the closest thing
+//     this rollup shape has to queue counts — there is no other queue
+//     concept in /vh/fleet/status), the root-scoped unread flag, and the
+//     informational done predicate.
+//
+// VOLATILE fields are deliberately absent (observed_at, condition `since`
+// continuity times, generated_at, gauge floats): two refreshes of an
+// UNCHANGED fleet must produce the IDENTICAL fingerprint — the poke debounce
+// keys on it. Lines are sorted before hashing, so the value is independent
+// of map/acquisition order.
+func fleetRollupFingerprint(results []fleetWorkerResult) string {
+	lines := make([]string, 0, 16)
+	for _, r := range results {
+		lines = append(lines, "w|"+r.id+"|"+r.status)
+		for _, p := range r.projects {
+			for sid, gf := range p.gate {
+				if gf.FleetSelected == nil || !*gf.FleetSelected {
+					continue // child/archived: not in the fold population
+				}
+				errN, retryN := 0, 0
+				if gf.SubtreeError != nil {
+					errN = *gf.SubtreeError
+				}
+				if gf.SubtreeRetry != nil {
+					retryN = *gf.SubtreeRetry
+				}
+				unread := gf.Unread != nil && *gf.Unread
+				lines = append(lines, fmt.Sprintf("s|%s|%s|%s|%s|%d|%d|%d|%d|%d|%d|%d|%d",
+					r.id, p.dir, sid, gf.Activity,
+					fleetBoolBit(gf.SubtreeBusy),
+					gf.SubtreePendingPermission, gf.SubtreePendingQuestion, gf.SubtreePendingInput,
+					errN, retryN,
+					fleetBoolBit(unread), fleetBoolBit(fleetSessionDone(gf))))
+			}
+		}
+	}
+	sort.Strings(lines)
+	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+	return hex.EncodeToString(sum[:])
+}
+
+// fleetBoolBit renders a bool as the deterministic fingerprint digit.
+func fleetBoolBit(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // fleetProjFold is the per-dir fold accumulator behind one projects[] row:

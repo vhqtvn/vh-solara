@@ -87,9 +87,11 @@ package server
 // --notify-store and --notify-fcm-credentials). The legacy
 // fleet-condition watcher is RETIRED (removed outright by the S5
 // cutover — no overlap window remains): this dispatcher is the ONLY
-// notification delivery writer, so a controller running without the
-// flag delivers no pushes at all (history, registry, and probe still
-// work). DOCUMENTED ENABLE ORDER:
+// NOTICE delivery writer, so a controller running without the flag
+// delivers no pushes at all (history, registry, and probe still work);
+// since v4.1 the flag also arms the fleet_changed STATUS-poke watcher
+// (notify_fleetpoke.go — a silent non-notice kind that never touches the
+// ledger or history). DOCUMENTED ENABLE ORDER:
 //   1. deploy the controller with dispatch OFF (registration + probe +
 //      the token migration are live);
 //   2. verify the token migration (admin masked list / probe counts)
@@ -168,6 +170,13 @@ type NotifyDispatchConfig struct {
 	// TTLSec is the configured FCM TTL bound by each event's remaining
 	// freshness (default 86400).
 	TTLSec int
+	// FleetPokeInterval tunes the v4.1 fleet_changed status-poke watcher's
+	// diff tick over the fleet-status service (default 20s; tests and the
+	// e2e harness tighten it). Zero = default.
+	FleetPokeInterval time.Duration
+	// FleetPokeDebounce is the v4.1 status-poke refractory (leading fire +
+	// trailing catch-up; default 30s). Zero = default.
+	FleetPokeDebounce time.Duration
 }
 
 func (c NotifyDispatchConfig) normalized() NotifyDispatchConfig {
@@ -575,17 +584,25 @@ func (m *notifyDispatchManager) snapshotStateLocked() notifyDispatchFile {
 }
 
 // pruneClosure builds the UNREGISTERED prune action for one in-flight
-// send, GENERATION-BOUND (v4 §3.5/§9.5, t1a-F1): the closure captures the
-// entry's (id, token, registration generation) at send-claim time, and
-// the prune runs check-and-delete ATOMICALLY under the store lock
-// (deleteIfRegistrationCurrent). A registration REFRESHED after the claim
-// (same id+token re-POST — the submit merge path re-mints the
-// generation) SURVIVES; a re-registration after a delete (a NEW entry
-// with a fresh random id) and an admin-replaced or already-deleted entry
-// are likewise left alone; a same-generation response still prunes.
+// send, GENERATION-BOUND (v4 §3.5/§9.5, t1a-F1). See notifyPruneClosure
+// (the shared implementation, also used by the v4.1 fleet-poke watcher).
 func (m *notifyDispatchManager) pruneClosure(entry notifyStoreEntry) func() error {
+	return notifyPruneClosure(m.store, entry)
+}
+
+// notifyPruneClosure is the shared generation-bound prune action for one
+// in-flight FCM send (notice dispatch AND the v4.1 fleet_changed status
+// poke): the closure captures the entry's (id, token, per-registration
+// generation) at send-claim time, and the prune runs check-and-delete
+// ATOMICALLY under the store lock (deleteIfRegistrationCurrent). A
+// registration REFRESHED after the claim (same id+token re-POST — the
+// submit merge path re-mints the generation) SURVIVES; a re-registration
+// after a delete (a NEW entry with a fresh random id) and an admin-replaced
+// or already-deleted entry are likewise left alone; a same-generation
+// response still prunes.
+func notifyPruneClosure(store *notifyStoreHolder, entry notifyStoreEntry) func() error {
 	return func() error {
-		deleted, err := m.store.deleteIfRegistrationCurrent(entry.ID, entry.Token, entry.RegGen)
+		deleted, err := store.deleteIfRegistrationCurrent(entry.ID, entry.Token, entry.RegGen)
 		if err != nil {
 			return err
 		}
@@ -727,13 +744,25 @@ func (d *Daemon) StartNotifyDispatch(cfg NotifyDispatchConfig, transport *alerts
 	d.notifyDispatch = m
 	d.notifyDispatchCancel = cancel
 	go m.Run(ctx)
+	// v4.1: the fleet_changed status-poke watcher rides the SAME flag,
+	// ctx, and stop-join lifecycle as the notice dispatcher (a LoadNotifyStore
+	// re-arm joins it too — an in-flight poke carries the same
+	// generation-bound prune as a notice send). It is not a notice writer:
+	// its sends never touch the ledger, history, or the notice message
+	// builder.
+	poke := newFleetPokeWatcher(&d.notifyStore, transport, d.fleetPokeFingerprintSource(), fleetPokeConfig{
+		Interval: cfg.FleetPokeInterval,
+		Debounce: cfg.FleetPokeDebounce,
+	})
+	d.notifyFleetPoke = poke
+	go poke.Run(ctx)
 	// The shared transport's periodic channel-health line, with the
 	// controller's own enabled state + policy counts.
 	transport.StartHealthLoop(ctx, 0, func() bool { return true }, func() map[string]int {
 		snap := d.notifyStore.snapshot()
 		return policyCounts(&snap)
 	})
-	log.Printf("notify dispatch: central dispatcher started (poll %s, stale-after %s, cooldown %s, ttl %ds)", m.cfg.PollInterval, m.cfg.StaleAfter, m.cfg.Cooldown, m.cfg.TTLSec)
+	log.Printf("notify dispatch: central dispatcher started (poll %s, stale-after %s, cooldown %s, ttl %ds) + fleet_changed status-poke watcher (tick %s, debounce %s)", m.cfg.PollInterval, m.cfg.StaleAfter, m.cfg.Cooldown, m.cfg.TTLSec, poke.cfg.Interval, poke.cfg.Debounce)
 	return nil
 }
 
@@ -741,7 +770,9 @@ func (d *Daemon) StartNotifyDispatch(cfg NotifyDispatchConfig, transport *alerts
 // discipline as StopNotifyIngest): Run returns only after dispatchPass
 // drains, so when this returns no dispatch goroutine exists anywhere —
 // LoadNotifyStore's ledger re-arm can never swap the journal under an
-// in-flight send/claim. Idempotent.
+// in-flight send/claim. The v4.1 fleet-poke watcher stops and joins under
+// the same hold (its in-flight sends carry the same generation-fenced
+// prune). Idempotent.
 func (d *Daemon) StopNotifyDispatch() {
 	d.notifyDispatchMu.Lock()
 	defer d.notifyDispatchMu.Unlock()
@@ -752,6 +783,10 @@ func (d *Daemon) StopNotifyDispatch() {
 	if m := d.notifyDispatch; m != nil {
 		<-m.done
 		d.notifyDispatch = nil
+	}
+	if w := d.notifyFleetPoke; w != nil {
+		<-w.done
+		d.notifyFleetPoke = nil
 	}
 }
 

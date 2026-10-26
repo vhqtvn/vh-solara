@@ -132,6 +132,13 @@ type Daemon struct {
 	notifyDispatchCancel context.CancelFunc
 	notifyDispatchMu     sync.Mutex
 
+	// notifyFleetPoke is the v4.1 fleet_changed status-poke watcher (see
+	// notify_fleetpoke.go), armed and stopped TOGETHER with the dispatcher
+	// (same mutex, same ctx; StopNotifyDispatch joins it). It is not a
+	// notice writer: its sends carry vh_kind:"status" and never touch the
+	// ledger or history.
+	notifyFleetPoke *fleetPokeWatcher
+
 	// notifyTransport is the configured push transport (see
 	// notify_transport.go): an *FCMNotifier built from
 	// --notify-fcm-credentials, a nullNotifier when the flag is unset, or

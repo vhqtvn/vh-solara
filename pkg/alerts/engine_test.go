@@ -393,10 +393,13 @@ func TestEngineSessionStartedMultipleNewOneNotice(t *testing.T) {
 	}
 }
 
-// TestEngineSessionStartedNotOnDecreaseOrReplacement: a decrease never fires,
-// and a REPLACEMENT (one stops, another starts — count unchanged between
-// sweeps) never fires either; the detector is count-increase-only.
-func TestEngineSessionStartedNotOnDecreaseOrReplacement(t *testing.T) {
+// TestEngineSessionStartedDecreaseQuietReplacementFires (v4.1 masking fix):
+// a pure DECREASE never fires, but a REPLACEMENT (one stops, another starts
+// — count unchanged between sweeps) now DOES fire for the starter: the v3
+// net-count rule let opposite transitions inside one sweep mask each other
+// (A's start invisible because B stopped in the same sweep); v4.1 diffs the
+// running-root SET per session.
+func TestEngineSessionStartedDecreaseQuietReplacementFires(t *testing.T) {
 	w, _, fired, _ := newTestWatcher(t)
 	w.onEvent(session(1, "a", ""))
 	w.onEvent(activity(2, "a", state.ActivityBusy))
@@ -404,20 +407,70 @@ func TestEngineSessionStartedNotOnDecreaseOrReplacement(t *testing.T) {
 	w.onEvent(activity(4, "b", state.ActivityBusy))
 	w.sweep() // baseline {a, b}
 
-	// Decrease: a stops → {b}, no fire.
+	// Pure decrease: a stops → {b}, no fire (running→idle fires nothing).
 	w.onEvent(activity(5, "a", state.ActivityIdle))
 	w.sweep()
 	if has(*fired, TypeSessionStarted, "") {
-		t.Fatalf("decrease must not fire: %+v", *fired)
+		t.Fatalf("pure decrease must not fire: %+v", *fired)
 	}
 
-	// Replacement: c starts and b stops → {c} vs {b}, count equal → no fire.
+	// Replacement: c starts and b stops → {c} vs {b}, count equal — the
+	// v4.1 fix: c's idle→running transition still fires, carrying c.
 	w.onEvent(session(6, "c", ""))
 	w.onEvent(activity(7, "c", state.ActivityBusy))
 	w.onEvent(activity(8, "b", state.ActivityIdle))
 	w.sweep()
-	if has(*fired, TypeSessionStarted, "") {
-		t.Fatalf("count-preserving replacement must not fire: %+v", *fired)
+	if c := count(*fired, TypeSessionStarted, ""); c != 1 {
+		t.Fatalf("same-sweep replacement must fire for the starter, got %d: %+v", c, *fired)
+	}
+	if n := lastOfType(*fired, TypeSessionStarted); n.SessionID != "c" {
+		t.Errorf("replacement notice must carry the NEWLY started root c, got %+v", n)
+	}
+}
+
+// TestEngineSessionStartedMaskingOppositeTransitionsSameSweep pins the v4.1
+// masking fix head-on: root A starts while root B stops inside ONE sweep —
+// the net running count is unchanged (or even lower), yet A's start must
+// still fire. The v3 count-increase rule suppressed exactly this case.
+func TestEngineSessionStartedMaskingOppositeTransitionsSameSweep(t *testing.T) {
+	w, _, fired, _ := newTestWatcher(t)
+	// Baseline: two running roots.
+	w.onEvent(session(1, "b1", ""))
+	w.onEvent(activity(2, "b1", state.ActivityBusy))
+	w.onEvent(session(3, "b2", ""))
+	w.onEvent(activity(4, "b2", state.ActivityBusy))
+	w.sweep() // baseline {b1, b2}
+
+	// One sweep with an opposite pair: b1+b2 stop, a1+a2 start → set goes
+	// {b1,b2} → {a1,a2} (net count EQUAL). Both starts are real
+	// transitions; one notice fires (collapsed), carrying a representative
+	// starter (a1).
+	w.onEvent(activity(5, "b1", state.ActivityIdle))
+	w.onEvent(activity(6, "b2", state.ActivityIdle))
+	w.onEvent(session(7, "a1", ""))
+	w.onEvent(activity(8, "a1", state.ActivityBusy))
+	w.onEvent(session(9, "a2", ""))
+	w.onEvent(activity(10, "a2", state.ActivityBusy))
+	w.sweep()
+	if c := count(*fired, TypeSessionStarted, ""); c != 1 {
+		t.Fatalf("opposite transitions in one sweep must not mask the starts, got %d fires: %+v", c, *fired)
+	}
+	if n := lastOfType(*fired, TypeSessionStarted); n.SessionID != "a1" {
+		t.Errorf("notice must carry a newly started root (a1), got %+v", n)
+	}
+
+	// Net-DECREASE transition set: one start, two stops → {a2} — the start
+	// still fires (a2 is a new transition even though the count fell).
+	w.onEvent(activity(11, "a1", state.ActivityIdle))
+	w.onEvent(session(12, "late", ""))
+	w.onEvent(activity(13, "late", state.ActivityBusy))
+	w.onEvent(activity(14, "a2", state.ActivityIdle))
+	w.sweep()
+	if c := count(*fired, TypeSessionStarted, ""); c != 2 {
+		t.Fatalf("a start inside a net-decrease sweep must still fire, got %d total: %+v", c, *fired)
+	}
+	if n := lastOfType(*fired, TypeSessionStarted); n.SessionID != "late" {
+		t.Errorf("second notice must carry the late starter, got %+v", n)
 	}
 }
 

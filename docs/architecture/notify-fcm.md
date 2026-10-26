@@ -1,15 +1,21 @@
-# vh-solara × vh-agent-pulse: /vh/notify/* FCM channel contract — v4 (2026-10-21)
+# vh-solara × vh-agent-pulse: /vh/notify/* FCM channel contract — v4.1 (2026-10-27)
 
-**Status.** v4 is **approved design / pre-implementation** (operator-approved
-2026-10-20/21; design authority: the consolidated controller-hub brief at
+**Status.** v4 is **implemented** (S1–S5 landed; the §6 S5 posture paragraph
+is the record — the dispatcher, central history, registry, and routes ship
+behind `--notify-dispatch` etc.). **v4.1 (2026-10-27) is a settled ADDITIVE
+extension** — the `fleet_changed` status poke (§3.3.1) plus the
+`session_started` per-session detection fix (§3.7) — negotiated with the
+client (their six answers recorded in the changelog below). **Client
+prerequisite: handler 0.4.2 ships BEFORE the v4.1 server deploy** — pokes
+delivered to a pre-0.4.2 handler render as generic informational
+notifications (the reserved `vh_kind:"status"` slot is unknown to it); the
+order is a deploy gate, not a compatibility break. Design authority:
 `docs/architecture/notify-controller-hub-brief.md` — a researcher → debate → planner chain —
 with the open timestamp gate subsequently executed and settled as Position C,
 §7.2). Server-side, v1–v3 are implemented at commits `70607590` (slice 1:
 history ring + token registry + routes), `26cd6add` (slice 2: FCM HTTP v1
 sender), the v2 closeout slice (`c2bf5c26`), and `16ff64a`/`a1e82ade` (v3
-slices A/B). **v4 is not yet implemented: until slices S1–S5 land, shipped
-behavior remains v3.** This document states the v4 contract and freezes the
-acceptance bars later slices must meet (§9). Golden wire fixtures for the v4
+slices A/B). Golden wire fixtures for the v4
 public shapes are pinned at `pkg/server/testdata/notify_v4/` and
 machine-checked since S0 by `pkg/server/notify_v4_fixture_test.go`.
 
@@ -80,7 +86,47 @@ Three additive changes, client-approved; no v2 field changed shape.
    type — profiles with an explicit `types` list do **not** receive it until
    the operator adds it.
 
-### v3 → v4 (2026-10-21 — approved design / pre-implementation)
+### v4 → v4.1 (2026-10-27 — settled additive; client handler 0.4.2 is a deploy prerequisite)
+
+Two changes, both additive; no v4 field changed shape.
+
+1. **The `fleet_changed` STATUS POKE (§3.3.1).** A second FCM message kind:
+   `vh_kind:"status"` (the reserved future-kinds slot), `vh_event:
+   "fleet_changed"` — a SILENT reconciler poke sent by the CONTROLLER when
+   its fleet-status rollup observes the per-session state map changed. The
+   client fetches `/vh/fleet/status` on receipt; figures never come from
+   the payload. The client's six negotiated answers (2026-10-27, FINAL):
+   **(1) poke, not a rendered notice** (silent reconciler wake);
+   **(2) NORMAL priority** (not HIGH — a figure refresh is not
+   interrupt-worthy); **(3) ~30s debounce** — leading-edge fire +
+   trailing catch-up: the first transition wakes immediately, transitions
+   during the refractory absorb, and if any occurred one catch-up poke
+   fires ~30s after the last fire (window-measured: sustained churn pokes
+   at most once per window); no cooldown beyond that; **(4) fan to ALL
+   registered tokens** (both push policies — the attendance rung is
+   SKIPPED for this kind; web-tab-open is exactly when watch figures still
+   matter); **(5) one reducer** — the client reconciles from
+   `/vh/fleet/status`, never from payload figures; **(6) no
+   last-active/attribution fields** — the payload stays minimal
+   (`vh_kind`/`vh_event`/`vh_ts`, plus `vh_count:"1"` for shape
+   consistency with every other `vh_*` message). Status pokes are **not
+   notices**: no history ring entry, no central ledger event, no central
+   id (id contiguity preserved), never in `/vh/notify/history`. The
+   type-filter rung, freshness rung, and central cooldown do not apply;
+   the channel-enabled rung does (the poke watcher arms with
+   `--notify-dispatch`).
+2. **`session_started` per-session detection (§3.7 fix).** The v3 detector
+   keyed on a NET running-count increase, so opposite transitions inside
+   ONE sweep masked each other (A started while B stopped: net zero — A's
+   start was invisible). v4.1 diffs the running-root SET per session: any
+   idle→running transition of an individual root fires (once per
+   transition; stopped-then-restarted still fires; first-sweep baseline
+   still silent; the 300s per-(type,token) cooldown is unchanged). A
+   same-sweep replacement now fires for the starter; running→idle
+   transitions fire nothing (finished/unread semantics unchanged —
+   controller-side figure freshness is the poke's job).
+
+### v3 → v4 (2026-10-21 — implemented; the S5 landing record is §6)
 
 Centralization per the operator's controller-hub requirement, plus one
 negotiated breaking type change. Design authority:
@@ -399,7 +445,7 @@ values are strings (an FCM data-message requirement):
 
 | Key | Value |
 |---|---|
-| `vh_kind` | `"notice"` (fixed in v2) |
+| `vh_kind` | `"notice"` (fixed in v2; v4.1 adds the second kind `"status"` for `fleet_changed` pokes — §3.3.1) |
 | `vh_event` | `waiting \| finished \| stuck-thinking \| runaway \| stalled \| session_started` |
 | `vh_condition` | see table below |
 | `vh_count` | `"1"` (fixed — v1 §3) |
@@ -436,6 +482,65 @@ by type, so wakes from different workers may collapse together — history
 remains authoritative; one phone banner per notice is NOT promised);
 `ttl` = `"{configured ttl_sec}s"` **bounded by the event's remaining
 freshness** — an old replay never gets a fresh full TTL (§3.4 rung 5).
+
+#### 3.3.1 The `status` kind — `fleet_changed` (v4.1 additive)
+
+A **second FCM message kind** occupies the reserved future-kinds slot. It is
+NOT a notice and never enters the notice pipeline (no worker detection, no
+durable source, no ingest, no ledger, no history ring, no central id —
+central id contiguity is preserved; it never appears in
+`/vh/notify/history`).
+
+| Key | Value |
+|---|---|
+| `vh_kind` | `"status"` (additive v4.1 — the reserved slot) |
+| `vh_event` | `"fleet_changed"` |
+| `vh_count` | `"1"` (fixed — shape consistency with every other `vh_*` message; counts are derived, never aggregated into payloads) |
+| `vh_ts` | observation (poke) time, unix milliseconds, string |
+
+The payload is deliberately MINIMAL: **no `vh_condition`** (the §9.1
+condition vocabulary is notice-specific), and none of the v4 attribution
+keys (`vh_worker_id`/`vh_worker_name`/`vh_session_id`/`vh_history_id`/
+`vh_ui_url`) — a poke is fleet-scoped and carries no figures. The client's
+ONLY obligation on receipt is to fetch `/vh/fleet/status` (one reducer;
+stale pokes are harmless — the fetch reconciles current state).
+
+Semantics — a **silent reconciler poke**, produced by the CONTROLLER's
+fleet-status rollup diff (a dedicated ~20s watcher tick over the ordinary
+single-flight rollup service; the fingerprint covers per-worker acquisition
+status plus the per-selected-root state facts — activity, subtree busy,
+per-kind pending counts, subtree error/retry session counts, unread, done —
+with volatile fields excluded, so an unchanged fleet never diffs). Worker
+UP/DOWN transitions are naturally in the diff (composition changes); the
+existing `worker_down` NOTICE still fires independently (complementary — a
+visible notice also wakes the client). Controller restart re-pokes on the
+first real diff (in-memory baseline; best-effort and self-healing).
+
+Android config: `priority: "NORMAL"` (a figure refresh is not
+interrupt-worthy), `collapse_key: "fleet_changed"` (a catch-up supersedes
+an undelivered leading poke), `ttl: "300s"` (bounded short — a stale queued
+poke must not buzz a device late; the client reconciles on its next wake
+regardless).
+
+**Debounce (~30s refractory, in-memory only):** leading-edge fire + trailing
+catch-up — the first transition of a quiet period pokes immediately;
+transitions observed during the refractory absorb; if any occurred, exactly
+one catch-up poke fires at the first watcher tick past the window measured
+from the LAST FIRE (window-measured, so sustained churn pokes at most once
+per window — a bounded rate for the 20–50-session multi-worker target).
+**No cooldown beyond the debounce.**
+
+**Gating — the v4 ladder (§3.4), collapsed for this kind:** rung 1
+(channel enabled) applies — the watcher arms with `--notify-dispatch` under
+the dispatcher's lifecycle. The attendance rung is **SKIPPED** (per token:
+fan to ALL registered tokens of BOTH policies — web-tab-open is exactly
+when watch figures still matter). The type-filter rung is **SKIPPED** (a
+poke is not a notice; there is no §9.1 condition and no profile types
+entry). Freshness is **N/A** (no event timestamp to be stale). The central
+cooldown is **NOT applied**. Per token, only the administrative
+`scope.enabled` gate remains (a disabled token is not a delivery target;
+explicit legacy condition scopes do not filter pokes — that vocabulary is
+about notice kinds).
 
 ### 3.4 Gating ladder (v4, central dispatch)
 
@@ -503,7 +608,7 @@ A notice reaches a given token only if ALL rungs pass, in order:
   anything else in alerts; the settings UI does not edit this section and
   a UI save preserves it verbatim.
 
-### 3.7 `session_started` detection semantics (v3 — unchanged by v4)
+### 3.7 `session_started` detection semantics (v3; detection rule amended by v4.1)
 
 The sixth notice type, sweep-detected by design (the client accepts sweep
 latency); detection remains worker-side under v4:
@@ -511,14 +616,18 @@ latency); detection remains worker-side under v4:
 - **What is a running root.** A session whose OWN activity is `busy`/`retry`
   and which is a root (no tracked parent). A busy child under an idle root is
   the root's ongoing turn (delegation), not a new session start.
-- **Detection.** Each engine sweep (20 s tick) compares the current set of
-  running roots against the previous sweep's. On an **increase in count**,
-  exactly **one** `session_started` notice fires, carrying a representative
-  newly-running root (`sessionID`/`root`/`title` from that root,
-  human-readable detail). Multiple new roots within one sweep collapse to one
-  notice — per-session fires would be collapsed by the 300 s
-  per-(type, token)/(type, session) cooldowns anyway, and `vh_count` is fixed
-  `"1"` per contract.
+- **Detection (v4.1: PER-SESSION transition diff).** Each engine sweep (20 s
+  tick) compares the current **set** of running roots against the previous
+  sweep's, per session: ANY root observed idle→running that was not running
+  at the previous sweep fires — the v3 "net increase in count" rule was
+  masked by opposite transitions inside one sweep (A started while B
+  stopped: net zero, no notice) and is deliberately reversed. Exactly one
+  notice fires per sweep carrying a representative newly-running root
+  (`sessionID`/`root`/`title` from that root, human-readable detail).
+  Multiple new roots within one sweep still collapse to one notice —
+  per-session fires would be collapsed by the 300 s
+  per-(type, token)/(type, session) cooldowns anyway, and `vh_count` is
+  fixed `"1"` per contract.
 - **Latency.** Up to ~one sweep interval (20 s) plus propagation — this is
   the accepted cost of the sweep design (no event-stream hook on session
   start).
@@ -526,10 +635,14 @@ latency); detection remains worker-side under v4:
   the initial running-root set WITHOUT firing — sessions already running at
   startup never produce `session_started` (the only-events-after-startup
   rule, same as every other detector).
-- **Once per increase.** A decrease or unchanged count never fires. A root
-  that stops running and later runs again is a new increase and fires again
-  (subject to the cooldown rungs). A same-sweep replacement (one stops,
-  another starts; count unchanged) does not fire.
+- **Once per transition.** A root with no NEW idle→running transition never
+  fires: a decrease or unchanged set never fires, and running→idle
+  transitions fire NO visible notice at all (finished/unread semantics
+  unchanged — controller-side figure freshness is the v4.1 `fleet_changed`
+  poke's job). A root that stops running and later runs again IS a new
+  transition and fires again (subject to the cooldown rungs). A same-sweep
+  replacement (one stops, another starts; count unchanged) DOES fire for
+  the starter (the v4.1 masking fix).
 - **All-channel visibility.** The notice rides the standard fire path: SSE
   notice events, webhooks, Web Push, and FCM all see it, subject to each
   channel's gating — including the **profile `types` filter** (§3.4 rung 2):
@@ -767,6 +880,17 @@ v4 additions:
   golden fixtures (field names/types; key order insensitive) and meet the
   §9 acceptance bars. Before any delivery-success claim, retain the §9.6
   receipts.
+- **v4.1 additions:** lane-1 `pkg/server/notify_fleetpoke_test.go` (the
+  fingerprint diff semantics, the debounce state machine on a mutable
+  clock, the message-shape pin, the collapsed gating ladder over the real
+  transport + fake FCM, the no-history/no-ledger rule, and the
+  buildRollup → generation.fingerprint wiring over the faked acquisition
+  seam) plus the `pkg/alerts/engine_test.go` masking-fix cases; lane-3
+  `tests/e2e/notify_fleetpoke_test.go` proves the full spine over the real
+  tunnel (worker session transition → rollup diff → debounced silent poke
+  at the fake FCM → bounded waves under rapid transitions → the
+  `session_started` notice through the real sweep + dispatch spine →
+  pokes absent from the real `/vh/notify/history`).
 
 ## 9. v4 acceptance criteria (frozen bars — S1–S5 must meet these)
 
@@ -784,7 +908,9 @@ v4 additions:
 | `session_started` | `session_started` | NORMAL |
 
 No emitted notice type maps to `unknown`; any future notice type gets a
-mapping **before** release (never reconstructed from free text).
+mapping **before** release (never reconstructed from free text). The v4.1
+`status` kind (§3.3.1) is **outside this enumeration by design**: it is not
+a notice, carries no `vh_condition`, and never enters the notice pipeline.
 
 ### 9.2 Durable-source identity
 
