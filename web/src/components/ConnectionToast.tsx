@@ -52,11 +52,23 @@ import styles from "./ConnectionToast.module.css";
 // cancels a pending auto-expiry — live → degraded inside the ok's 2.5s OFF
 // window used to orphan the "Reconnected" toast on screen (the expiry was
 // cleared, no branch fired). See the guard in the effect below.
+//
+// (2026-10-26 A-F4, follow-up to that fix — clear-on-cancelled-debounce): a
+// degraded landing INSIDE the 1200ms warn debounce is the mirror-image orphan:
+// the run cancels the pending replacement warn and fires no branch, so the
+// stale ok/restart-warn it was about to replace lingered with ZERO timers.
+// The degraded fall-through now clears the toast, FENCED to fire only when a
+// debounce was actually cancelled (see the cancelledDebounce capture below).
 export default function ConnectionToast() {
   const [toast, setToast] = createSignal<{ kind: "warn" | "ok"; text: string } | null>(null);
   let showTimer: number | undefined;
   let hideTimer: number | undefined;
   let warned = false;
+  // True while the 1200ms warn debounce is armed and has NOT yet fired — lets
+  // a later effect run distinguish "this run cancelled a pending replacement"
+  // (the toast on screen is stale, its replacement is not coming) from "no
+  // debounce was pending" (any on-screen toast keeps its own lifecycle).
+  let showArmed = false;
   // True only between "the epoch branch armed the restart notice" and the
   // effect re-run that arming ITSELF schedules: consumeEpochChanged() writes
   // state.epochChanged inside the effect that just read it, so Solid re-runs
@@ -87,6 +99,10 @@ export default function ConnectionToast() {
       epochSelfReentry = false;
       return;
     }
+    // A-F4: capture whether THIS run cancels a live warn debounce — before
+    // the unconditional clear below eats the evidence.
+    const cancelledDebounce = showArmed;
+    showArmed = false;
     clearTimeout(showTimer);
     // A silent "degraded" transition must NOT cancel a pending auto-expiry:
     // live → degraded (fetch-failure spike / tree-stale) inside the ok's 2.5s
@@ -113,13 +129,17 @@ export default function ConnectionToast() {
     }
     if (grade === "offline") {
       // Only surface if it persists — avoids flashing on a quick recovery.
+      showArmed = true;
       showTimer = window.setTimeout(() => {
+        showArmed = false;
         warned = true;
         setToast({ kind: "warn", text: "You're offline — waiting for network…" });
       }, 1200);
     } else if (grade === "reconnecting") {
       // Only surface if it persists — avoids flashing on a quick recovery.
+      showArmed = true;
       showTimer = window.setTimeout(() => {
+        showArmed = false;
         warned = true;
         setToast({ kind: "warn", text: "Connection lost — reconnecting…" });
       }, 1200);
@@ -133,8 +153,22 @@ export default function ConnectionToast() {
       } else {
         setToast(null);
       }
+    } else if (grade === "degraded" && cancelledDebounce) {
+      // A-F4 (2026-10-26): this run CANCELLED a pending warn debounce (the
+      // replacement is not coming) and landed on the silent grade — the toast
+      // on screen was content that replacement was about to retire (e.g. the
+      // stale "Reconnected" ok after a hard drop whose sub-second recovery
+      // landed degraded). Nothing true remains to show: clear it, or it sits
+      // orphaned with zero timers until the next grade transition. FENCE:
+      // fires ONLY when a debounce was actually cancelled — degraded with NO
+      // pending debounce stays the 2026-10-25-protected silent dip (a pending
+      // auto-expiry survives untouched), and degraded with toast=null is a
+      // no-op. The epoch branch is above this and unaffected (it replaces the
+      // toast itself).
+      setToast(null);
     }
-    // "degraded" is a silent observational grade — no toast.
+    // "degraded" without a cancelled debounce is a silent observational
+    // grade — no toast, no timer changes.
   });
 
   // ON-only explicit dismissal: clears the current notice and any pending
@@ -145,6 +179,7 @@ export default function ConnectionToast() {
   const dismiss = () => {
     clearTimeout(showTimer);
     clearTimeout(hideTimer);
+    showArmed = false; // a dismissed debounce is cancelled by intent, not orphaned
     setToast(null);
   };
 
