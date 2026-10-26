@@ -1758,8 +1758,23 @@ test("epsilon threshold: small scroll-ups drop following (data for the DEFER car
   //     pipeline completed on time — reproduces the signature exactly, with a
   //     SMALL late (~0.4s). So: small late ⇒ observer-side stall; large late ⇒
   //     app-side pipeline delay; null ⇒ true absorb.
+  //   retried[dpx] — recorded ONLY when an asserted-drop delta (≥ 3) absorbed
+  //     on the first attempt (late=null) and was re-glued + retried once.
+  //     true ⇒ the retry dropped (transient race, not a threshold shift);
+  //     false ⇒ both attempts absorbed (real regression signal). Added after
+  //     the 2026-10-26 flake-probe recurrence (run 40333545109, repeat 4/10):
+  //     dpx=24 absorbed with probeMs=1201/late=null — a TRUE absorb. Artifact
+  //     pixel-diff (video frames f_008→f_010) showed a persistent whole-
+  //     transcript geometry shift concurrent with the write, dock unchanged,
+  //     ending at-bottom with no pill: the programmatic write raced one of the
+  //     product's INTENTIONAL absorb paths (viewport-churn guard absorbing
+  //     |residual| ≤ |viewportDelta|+1, scrollEl-RO re-pin on clientHeight
+  //     change, or the scrollTop clamp to a shrunk maxBottom classifying as
+  //     reached-bottom). Those fire once per geometry churn; a fresh write
+  //     after re-glue drops normally — hence the bounded retry below.
   const probeMs: Record<number, number> = {};
   const late: Record<number, number | null> = {};
+  const retried: Record<number, boolean> = {};
 
   // Deterministic loop entry (see glueToTail): guards the load state captured
   // 2026-10-25 in test 6 — following=false while geometry is already at the
@@ -1811,15 +1826,41 @@ test("epsilon threshold: small scroll-ups drop following (data for the DEFER car
       } catch {
         late[dpx] = null;
       }
+      if (late[dpx] != null) {
+        // Delayed, not absorbed (window-stall class): classification DID fire,
+        // just past the 1.2s window — the delta honestly counts as dropped.
+        didDrop = true;
+      } else {
+        // TRUE absorb (late=null). One bounded re-glue + retry distinguishes
+        // the transient race above from a real threshold regression: a fresh
+        // write after re-glue drops unless the product genuinely stopped
+        // dropping ≥3px scroll-ups (both attempts absorb → retried=false →
+        // the assertion below still fails loudly).
+        await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+          el.scrollTop = el.scrollHeight;
+        });
+        await expectFollowingTail(page);
+        await page.locator(".chat-scroll").evaluate((el: HTMLElement, d) => {
+          el.scrollTop = Math.max(0, el.scrollTop - d);
+        }, dpx);
+        try {
+          await expect(page.locator("button.jump")).toBeVisible({ timeout: 1200 });
+          retried[dpx] = true;
+          didDrop = true;
+        } catch {
+          retried[dpx] = false;
+        }
+      }
     }
     dropped[dpx] = didDrop;
   }
 
   // Boundary log: re-derive the PINNED values from this line if the threshold
   // ever moves. (2px is intentionally not asserted — see leading comment.) The
-  // payload also carries the watch-state maps (dropped + probeMs + late).
+  // payload also carries the watch-state maps (dropped + probeMs + late +
+  // retried).
   console.log(
-    "EPSILON_SCAN " + JSON.stringify({ dropped, probeMs, late }),
+    "EPSILON_SCAN " + JSON.stringify({ dropped, probeMs, late, retried }),
   );
 
   // PINNED boundary (chromium): reliably absorbs ≤ 1px, reliably drops at ≥ 3px.
@@ -1833,12 +1874,16 @@ test("epsilon threshold: small scroll-ups drop following (data for the DEFER car
   // sub-pixel transition zone (empirically both absorbed and dropped across run
   // contexts), so a fixed assertion there would itself be the flake.
   // The message carries the failing dpx + the full scan so a future mid-suite
-  // recurrence (one absorbed ≥3px delta observed once in two full-lane runs,
-  // never reproduced across 15 isolated repeats + 1 file run + 1 full lane;
-  // hunt log 2026-10-23) is legible directly from the failure output — and the
-  // run log's EPSILON_SCAN line now also carries probeMs + late, whose dpx≥3
-  // late value (finite ⇒ window-stall H1, null ⇒ true absorb) adjudicates the
-  // surviving hypothesis classes without another reproduction campaign.
+  // recurrence is legible directly from the failure output — and the run log's
+  // EPSILON_SCAN line carries probeMs + late + retried, whose dpx≥3 values
+  // adjudicate the hypothesis classes without another reproduction campaign:
+  // finite late ⇒ window-stall (counted as dropped), late=null + retried=true
+  // ⇒ transient race with an intentional absorb path (counted as dropped),
+  // late=null + retried=false ⇒ true threshold regression (FAILS). History:
+  // one absorbed ≥3px delta in two full-lane runs (2026-10-23 hunt), then the
+  // 2026-10-26 flake-probe recurrence (run 40333545109 repeat 4/10, dpx=24,
+  // late=null ⇒ true absorb, pixel-diff-proven concurrent content-geometry
+  // shift — see the maps' leading comment) which motivated the bounded retry.
   for (const dpx of [4, 6, 8, 10, 12, 14, 16, 20, 24]) {
     expect(dropped[dpx], `EPSILON_SCAN dpx=${dpx} absorbed: ${JSON.stringify(dropped)}`).toBe(true);
   }
