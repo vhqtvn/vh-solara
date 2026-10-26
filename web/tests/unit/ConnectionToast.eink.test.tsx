@@ -49,7 +49,19 @@ import { _resetWeakLinkForTest, recordFetchFailure } from "../../src/sync/weakli
 //   18   an epoch event during a pending disconnect debounce suppresses the
 //        disconnect warn (the epoch branch clears the debounce and replaces
 //        the toast with the restart warn) — the restart notice is the more
-//        important signal; adjudicated acceptable.
+//        important signal; adjudicated acceptable. PINNED by the T1A-F1 test
+//        below (2026-10-26 obligations pass), which also proves the epoch
+//        run's cancellation leaves NO stale showArmed: a later degraded dip
+//        does not spuriously clear the restart warn (e6f9a7e path holds).
+//   A-F4′ (2026-10-26 obligations pass) the A-F4 clear's WARN-side variant:
+//        a standing warn (its debounce already fired) whose replacement
+//        debounce a degraded landing cancels is CLEARED. Adjudicated HONEST,
+//        pinned both profiles below: degraded requires store status "live"
+//        (connstatus.ts rule 4 — the socket is OPEN), so "Connection lost"
+//        is counterfactual at the landing, and `warned` surviving guarantees
+//        the documented live→ok resolution still fires. The ON contract's
+//        letter (persist until RESOLVED≡live or DISMISSED) is in tension
+//        with this; re-open ONLY as a product decision, not a defect fix.
 
 function toastEl(container: HTMLElement): HTMLElement | null {
   return container.querySelector('[role="status"]');
@@ -68,10 +80,16 @@ async function mount() {
 // carry X-VH-Tunnel-State: connected — the documented reactive carrier (the
 // same drive shape as the degraded-dip test above). Probe as many times as
 // needed; the wrapper must STAY installed between probes (restoring fetch
-// would discard it while the latch still claims installed). Restore via the
-// returned closure when done; the describes' afterEach deletes the latch and
-// resets the weaklink counters between tests.
-function tunnelCarrier(): { probe: () => Promise<void>; restore: () => void } {
+// would discard it while the latch still claims installed). RESTORE OWNERSHIP
+// LIVES IN afterEach (2026-10-26 obligations pass, dropped advisory): every
+// install pushes its restore closure onto fetchRestores, drained by the
+// top-level afterEach even when a test fails mid-flight — an assertion
+// failure between install and restore can no longer leak the stub (and the
+// spent install latch) into later tests. Tests therefore never call restore
+// themselves; the describes' afterEach deletes the latch and resets the
+// weaklink counters between tests.
+const fetchRestores: Array<() => void> = [];
+function tunnelCarrier(): { probe: () => Promise<void> } {
   const g = globalThis as { fetch: typeof fetch; __vhTunnelSampled?: boolean };
   if (!g.__vhTunnelSampled) {
     const orig = g.fetch;
@@ -81,19 +99,16 @@ function tunnelCarrier(): { probe: () => Promise<void>; restore: () => void } {
         headers: { get: (n: string) => (n.toLowerCase() === "x-vh-tunnel-state" ? "connected" : null) },
       } as unknown as Response)) as typeof fetch;
     installTunnelSampler();
-    return {
-      probe: () => g.fetch("/vh/unit-tunnel-probe").then(() => undefined),
-      restore: () => {
-        g.fetch = orig;
-      },
-    };
+    fetchRestores.push(() => {
+      g.fetch = orig;
+    });
   }
-  // Latch leak (a prior test skipped its restore): probe with whatever fetch
-  // is present — if it doesn't carry the header this fails loudly here, it
-  // never silently passes.
+  // Latch leak (a prior test skipped its restore — belt-and-braces: with
+  // afterEach-owned restores this branch should be unreachable). Probe with
+  // whatever fetch is present — if it doesn't carry the header this fails
+  // loudly here, it never silently passes.
   return {
     probe: () => g.fetch("/vh/unit-tunnel-probe").then(() => undefined),
-    restore: () => {},
   };
 }
 
@@ -111,6 +126,12 @@ afterEach(() => {
   cleanup();
   setEinkProfile(false);
   localStorage.clear();
+  // Drain any fetch stubs tunnelCarrier() installed — restore ownership
+  // lives HERE (not on a test's green path), so an assertion failure between
+  // install and restore cannot leak the stub across tests. Runs AFTER the
+  // describes' latch-deleting afterEach hooks (innermost-first), which is
+  // fine: nothing probes fetch between the hooks.
+  for (const restore of fetchRestores.splice(0)) restore();
   vi.useRealTimers();
 });
 
@@ -293,7 +314,6 @@ describe("ConnectionToast — e-ink profile OFF (baseline unchanged)", () => {
     const carrier = tunnelCarrier();
     _resetWeakLinkForTest();
     await carrier.probe();
-    carrier.restore();
     await vi.advanceTimersByTimeAsync(0);
     expect(connGrade()).toBe("live");
     expect(toastEl(container)?.textContent).toContain("Reconnected");
@@ -328,11 +348,161 @@ describe("ConnectionToast — e-ink profile OFF (baseline unchanged)", () => {
     // path → the ok is cleared BY THE TRANSITION, earlier than the expiry.
     _resetWeakLinkForTest();
     await carrier.probe();
-    carrier.restore();
     await vi.advanceTimersByTimeAsync(0);
     expect(connGrade()).toBe("live");
     expect(toastEl(container)).toBeNull();
     expect(vi.getTimerCount()).toBe(0); // the expiry was cleared, not left to fire
+  });
+
+  // ── 2026-10-26 obligations pass (T1A-F1 / T1C-F1) ────────────────────────
+
+  // T1A-F1: epoch-while-showArmed. Potential defect to rule out: if any run
+  // cleared showTimer WITHOUT the callback firing and left showArmed set, a
+  // LATER degraded landing — which legitimately keeps whatever is on screen
+  // (the e6f9a7e silent-dip path) — would see a stale cancelledDebounce=true
+  // and wrongly clear the toast. Adjudicated by tracing every
+  // clearTimeout(showTimer) site in ConnectionToast.tsx: the effect's
+  // top-of-run capture (`cancelledDebounce = showArmed; showArmed = false`)
+  // sits BEFORE the unconditional clear, so NO effect run can leave the flag
+  // set (the epoch branch included); dismiss resets it explicitly; onCleanup
+  // is unreachable-irrelevant (the component is dead). NO DEFECT — this test
+  // PINS that adjudication: an epoch firing while a debounce is pending
+  // cancels it (the restart warn replaces the pending warn — open-cell 18's
+  // suppression, now pinned) and a subsequent degraded landing clears
+  // NOTHING: under OFF the restart warn's 4s expiry survives the dip
+  // (e6f9a7e), under ON the persistent restart warn stays.
+  it("epoch while a debounce is armed: no stale clear on a later degraded dip (both profiles)", async () => {
+    const { container } = await mount();
+
+    // OFF phase — a drop arms the 1200ms debounce (no toast yet)…
+    setState("status", "reconnecting");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(toastEl(container)).toBeNull();
+    // …then the daemon restarts mid-debounce: the epoch run captures AND
+    // RESETS showArmed, cancels the debounce, and shows the restart warn.
+    setState("epochChanged", true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(toastEl(container)?.textContent).toContain("vh-solara restarted");
+    expect(state.epochChanged).toBe(false); // the latch was consumed
+
+    // The debounce is truly cancelled: past its would-fire point the restart
+    // warn is still alone on screen, and the 4s expiry is the ONLY timer
+    // (a surviving debounce would make this 2).
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(toastEl(container)?.textContent).toContain("vh-solara restarted");
+    expect(vi.getTimerCount()).toBe(1);
+
+    // The degraded landing: cancelledDebounce must be FALSE here (the epoch
+    // run consumed it) — the A-F4 branch must NOT fire…
+    recordFetchFailure("network");
+    recordFetchFailure("network");
+    setState("status", "live");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("degraded"); // the dip is real, not vacuous
+    expect(toastEl(container)?.textContent).toContain("vh-solara restarted");
+    // …and the 4s expiry survives the silent dip (e6f9a7e): 1200ms already
+    // burned above; 2799ms more keeps it on screen, +1ms hides it.
+    await vi.advanceTimersByTimeAsync(2799);
+    expect(toastEl(container)).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(toastEl(container)).toBeNull();
+
+    // ON phase — same interleaving, persistent posture: the restart warn
+    // arms NO expiry under ON, and the degraded landing must clear NOTHING
+    // (the stale-flag scenario would have cleared it here too).
+    setEinkProfile(true);
+    setState("status", "reconnecting");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(toastEl(container)).toBeNull();
+    setState("epochChanged", true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(toastEl(container)?.textContent).toContain("vh-solara restarted");
+    expect(vi.getTimerCount()).toBe(0); // no expiry under ON; the debounce was cancelled
+    recordFetchFailure("network");
+    recordFetchFailure("network");
+    setState("status", "live");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("degraded");
+    expect(toastEl(container)?.textContent).toContain("vh-solara restarted");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(toastEl(container)?.textContent).toContain("vh-solara restarted");
+  });
+
+  // T1C-F1: the A-F4 clear's WARN-side variant, adjudicated HONEST and pinned
+  // as-is (ledger A-F4′ above). Interleaving: a warn is up (its debounce
+  // already fired — warned=true) → a further drop re-arms the 1200ms
+  // REPLACEMENT debounce (the warn stays while the replacement pends) →
+  // degraded lands inside the debounce → the A-F4 branch clears the warn.
+  //
+  // ADJUDICATION (why clearing is honest): degraded REQUIRES store status
+  // "live" (connstatus.ts reduceConnStatus rule 4 — the hard socket is OPEN,
+  // tunnel not down, navigator online); it is a QUALITY grade of a connected
+  // transport, never a disconnected one. At the landing the warn's claim —
+  // "Connection lost — reconnecting…" — is counterfactual: the reconnect
+  // completed with weak evidence. The warn was also already scheduled for
+  // retirement by the component's own logic (the replacement would have
+  // superseded it at debounce-fire) — exactly the A-F4 structure. Keeping it
+  // would show a falsehood for an UNBOUNDED duration (no timer retires a
+  // warn under either profile). The loss is only interim: `warned` stays
+  // true across the clear, so the documented resolution — live → the
+  // "Reconnected" ok — still fires (pinned at the tail of this test).
+  //
+  // The ON-contract tension, named: ConnectionToast.tsx:31–39 says IMPORTANT
+  // notices under ON persist "until RESOLVED … or DISMISSED", defining
+  // RESOLVED as the grade returning to live. A degraded landing is not that
+  // documented signal — but the notice's SUBJECT (the disconnect) did end
+  // (the socket reopened), and the sidebar StatusMark carries the degraded
+  // state onward ("degraded — recent network errors"); the toast is not the
+  // only surface. Re-open ONLY as a product decision, not a defect fix.
+  it("OFF: a degraded landing inside a replacement debounce clears the standing warn (A-F4 warn-side)", async () => {
+    const { container } = await mount();
+
+    // The warn fires (debounce elapsed → warned=true).
+    setState("status", "reconnecting");
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(toastEl(container)?.textContent).toContain("Connection lost");
+
+    // A silent degraded dip first (the Part B warned=true cell): the
+    // debounce already fired — nothing to cancel — so the warn survives it.
+    // This is ALSO the bridge that lets the grade re-arm: connGrade is
+    // string-deduped, so a fresh "reconnecting" run requires leaving the
+    // grade first.
+    recordFetchFailure("network");
+    recordFetchFailure("network");
+    setState("status", "live");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("degraded");
+    expect(toastEl(container)?.textContent).toContain("Connection lost");
+
+    // A fresh drop re-arms the 1200ms REPLACEMENT debounce; the warn stays.
+    setState("status", "reconnecting");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(toastEl(container)?.textContent).toContain("Connection lost");
+    expect(vi.getTimerCount()).toBe(1); // the replacement debounce, alone
+
+    // Degraded lands inside the debounce: the socket reopened weakly — this
+    // run CANCELS the replacement (A-F4 captures it) and clears the now-
+    // false warn.
+    recordFetchFailure("network");
+    recordFetchFailure("network");
+    setState("status", "live");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("degraded"); // the landing is real, not vacuous
+    expect(toastEl(container)).toBeNull(); // the warn-side A-F4 clear
+    expect(vi.getTimerCount()).toBe(0);
+
+    // The resolution ack was NOT lost: `warned` survived the clear, so live
+    // fires the recovery ok — which auto-expires at 2.5s under OFF.
+    const carrier = tunnelCarrier();
+    _resetWeakLinkForTest();
+    await carrier.probe();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("live");
+    expect(toastEl(container)?.textContent).toContain("Reconnected");
+    await vi.advanceTimersByTimeAsync(2499);
+    expect(toastEl(container)).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(toastEl(container)).toBeNull();
   });
 });
 
@@ -502,7 +672,6 @@ describe("ConnectionToast — e-ink profile ON (quiet UI: persistent notices)", 
     const carrier = tunnelCarrier();
     _resetWeakLinkForTest();
     await carrier.probe();
-    carrier.restore();
     await vi.advanceTimersByTimeAsync(0);
     expect(connGrade()).toBe("live");
     expect(toastEl(container)?.textContent).toContain("Reconnected");
@@ -542,10 +711,108 @@ describe("ConnectionToast — e-ink profile ON (quiet UI: persistent notices)", 
     // Recovery: the live run's warned=false path clears it — the deviation.
     _resetWeakLinkForTest();
     await carrier.probe();
-    carrier.restore();
     await vi.advanceTimersByTimeAsync(0);
     expect(connGrade()).toBe("live");
     expect(toastEl(container)).toBeNull(); // PINNED CURRENT BEHAVIOR (cell 2b)
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  // ── 2026-10-26 obligations pass, ON pair (A-F4 symmetry + warn-side) ─────
+
+  // Advisory pin: ON-profile symmetry of the A-F4 branch — the c0c36f2
+  // regression drove the OFF flavor only. The branch is profile-independent
+  // BY CODE (no quiet read inside it); this test VERIFIES rather than
+  // assumes: under ON the ok arms NO 2.5s expiry (quiet skips the arming),
+  // so when the degraded landing cancels the replacement debounce the A-F4
+  // branch is the ONLY clearer — if it somehow failed to fire under ON, the
+  // stale ok would persist and the null assertion below would go red (a
+  // finding to report, not to force green).
+  it("ON: a degraded landing inside the debounce clears the stale ok (A-F4, profile symmetry)", async () => {
+    const { container } = await mount();
+
+    // warned=true → live: the ok fires and, under ON, coalesces into a
+    // stable status — no expiry is armed.
+    setState("status", "reconnecting");
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(toastEl(container)?.textContent).toContain("Connection lost");
+    setState("status", "live");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(toastEl(container)?.textContent).toContain("Reconnected"); // ok fired; warned consumed → false
+    expect(vi.getTimerCount()).toBe(0); // ON: no 2.5s expiry armed
+
+    // Hard drop: arms the 1200ms replacement; the stale ok stays up.
+    setState("status", "reconnecting");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(toastEl(container)?.textContent).toContain("Reconnected");
+    expect(vi.getTimerCount()).toBe(1); // the debounce, alone
+
+    // Sub-second recovery lands DEGRADED (failures racked during the drop
+    // grade the socket-open write down): the run cancels the replacement and
+    // the A-F4 branch clears the orphaned ok — the same clear as OFF,
+    // verified under ON.
+    recordFetchFailure("network");
+    recordFetchFailure("network");
+    setState("status", "live");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("degraded"); // the landing is real, not vacuous
+    expect(toastEl(container)).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(toastEl(container)).toBeNull(); // nothing is armed to change it later
+  });
+
+  // T1C-F1, ON flavor — the A-F4 warn-side clear under the quiet profile
+  // (adjudication + ledger entry A-F4′ above; the OFF flavor's comment block
+  // carries the full reasoning). Under ON the standing warn is an "important
+  // notice" that by contract persists until RESOLVED (≡ live) or DISMISSED —
+  // the adjudication rules this clear honest anyway: degraded means the
+  // socket is OPEN (store "live", weak evidence), so "Connection lost" is
+  // counterfactual, and `warned` surviving guarantees the resolution ok
+  // still fires on live (pinned at the tail). PINNED AS-IS — re-open only as
+  // a product decision.
+  it("ON: a degraded landing inside a replacement debounce clears the standing warn (A-F4 warn-side)", async () => {
+    const { container } = await mount();
+
+    // The warn fires and persists under ON (warns carry no expiry in either
+    // profile; under ON nothing else retires it either).
+    setState("status", "reconnecting");
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(toastEl(container)?.textContent).toContain("Connection lost");
+
+    // The silent dip bridge (Part B warned=true cell) — the warn survives,
+    // and the grade leaves "reconnecting" so the drop below can re-arm.
+    recordFetchFailure("network");
+    recordFetchFailure("network");
+    setState("status", "live");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("degraded");
+    expect(toastEl(container)?.textContent).toContain("Connection lost");
+
+    // A fresh drop re-arms the 1200ms REPLACEMENT debounce; the warn stays.
+    setState("status", "reconnecting");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(toastEl(container)?.textContent).toContain("Connection lost");
+    expect(vi.getTimerCount()).toBe(1); // the replacement debounce, alone
+
+    // Degraded lands inside the debounce → the A-F4 branch clears the warn
+    // under ON too (the branch reads no profile signal — verified here).
+    recordFetchFailure("network");
+    recordFetchFailure("network");
+    setState("status", "live");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("degraded"); // the landing is real, not vacuous
+    expect(toastEl(container)).toBeNull(); // the warn-side A-F4 clear, ON
+    expect(vi.getTimerCount()).toBe(0);
+
+    // Resolution-ack intact: live fires the ok, which coalesces into a
+    // stable status under ON (no 2.5s flash).
+    const carrier = tunnelCarrier();
+    _resetWeakLinkForTest();
+    await carrier.probe();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("live");
+    expect(toastEl(container)?.textContent).toContain("Reconnected");
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(toastEl(container)?.textContent).toContain("Reconnected"); // stable, readable on a slow panel
   });
 });
