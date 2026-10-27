@@ -26,6 +26,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@solidjs/testing-library";
 import { QueueChip } from "../../src/components/QueueChip";
 import type { QueuedMessage } from "../../src/queue";
+import {
+  __resetQueueDispatchModeForTests,
+  noteQueueCustodyRefusal,
+  refreshDispatchMode,
+} from "../../src/lib/queueDispatchMode";
 
 // Matches the current backend staleDispatchRecoveryDetail wording for realism;
 // this test verifies the component renders q.detail verbatim — it is NOT a
@@ -35,6 +40,10 @@ const RECOVERY_DETAIL =
 
 afterEach(() => {
   cleanup();
+  // G2 render-guard cells flip the dispatch-mode module state (custody latch
+  // / capability signal) — reset it so every describe starts legacy.
+  __resetQueueDispatchModeForTests();
+  vi.unstubAllGlobals();
 });
 
 function item(opts: Partial<QueuedMessage>): QueuedMessage {
@@ -446,5 +455,81 @@ describe("QueueChip — mark-sent action (Bug 2: manual mark-sent for unknown)",
     container.querySelector<HTMLElement>(".queue-mark-sent")!.click();
     expect(onMarkSent).toHaveBeenCalledTimes(1);
     expect(onMarkSent).toHaveBeenCalledWith(q);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// G2 render guard (2026-10-27, annex-2 §2) — daemon custody suppresses the
+// direct-POST retry affordance at the leaf. The Retry button is the ONE
+// browser affordance that direct-POSTs prompt_async with no arbitrated step
+// in front of it (the server's custody 409 fires only AFTER a POST — on
+// claim/resolve), so in daemon-dispatch mode (projectionActive: capability
+// advertised, or a custody refusal latched) it must not render. The chip
+// keeps its sanctioned recovery affordances (mark-sent / edit-again /
+// dismiss); the controller-side execution guard (createSend.retryQueuedItem)
+// backstops a click that races the mode flip.
+// ---------------------------------------------------------------------------
+describe("QueueChip — G2 render guard (daemon custody suppresses the retry affordance)", () => {
+  const retryable = (): Partial<QueuedMessage> => ({
+    state: "unknown",
+    opencodeMsgID: "msg_g2_1",
+    detail: RECOVERY_DETAIL,
+  });
+
+  it("custody-owned (latched refusal): NO retry button renders; mark-sent/retract/dismiss remain — ONLY the retry is suppressed", () => {
+    noteQueueCustodyRefusal(); // a live custody owner was observed → projection active
+    const onRetry = vi.fn();
+    const r = render(() => (
+      <QueueChip
+        q={item({ ...retryable() })}
+        onRemove={vi.fn()}
+        onRetry={onRetry}
+        onRetract={vi.fn()}
+        onMarkSent={vi.fn()}
+      />
+    ));
+    expect(r.container.querySelector(".queue-retry")).toBeNull();
+    // The sanctioned recovery affordances are untouched (3 of the 4 actions).
+    expect(r.container.querySelector(".queue-mark-sent")).toBeTruthy();
+    expect(r.container.querySelector(".queue-retract")).toBeTruthy();
+    expect(r.container.querySelector(".queue-dismiss")).toBeTruthy();
+    expect(r.container.querySelectorAll(".queue-chip button").length).toBe(3);
+    r.unmount();
+  });
+
+  it("legacy (daemon-off): the retry button still renders + clicks through — the guard is mode-scoped, not a removal", () => {
+    // Projection inactive (module default after reset) → the pre-fix
+    // affordance contract is intact.
+    const onRetry = vi.fn();
+    const q = item({ ...retryable() });
+    const { container } = render(() => <QueueChip q={q} onRemove={vi.fn()} onRetry={onRetry} />);
+    const btn = container.querySelector<HTMLElement>(".queue-retry")!;
+    expect(btn).toBeTruthy();
+    btn.click();
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(onRetry).toHaveBeenCalledWith(q);
+  });
+
+  it("reactive: a late daemonDispatchCapable:true flip REMOVES an already-rendered retry button (boot-race closure)", async () => {
+    // Boot-race shape: the chip rendered while the /vh/version probe was
+    // still in flight (legacy posture), then the capability lands. The Show
+    // condition reads the reactive capable() signal, so the affordance must
+    // disappear without a re-mount.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({ daemonDispatchCapable: true }) })),
+    );
+    try {
+      const r = render(() => (
+        <QueueChip q={item({ ...retryable() })} onRemove={vi.fn()} onRetry={vi.fn()} />
+      ));
+      expect(r.container.querySelector(".queue-retry")).toBeTruthy(); // pre-flip
+      await refreshDispatchMode();
+      await new Promise((res) => setTimeout(res, 0)); // flush the reactive effect
+      expect(r.container.querySelector(".queue-retry")).toBeNull();
+      r.unmount();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

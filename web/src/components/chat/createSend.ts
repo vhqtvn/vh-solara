@@ -24,6 +24,7 @@
 
 import type { Accessor, Setter } from "solid-js";
 import { log } from "../../lib/log";
+import type { DispatchMode } from "../../lib/queueDispatchMode";
 import {
   effectiveInline,
   inlineAttachForced,
@@ -177,6 +178,30 @@ export type SendDependencies = {
     state: "sent" | "failed" | "unknown",
     detail: string,
   ) => Promise<unknown>;
+  // G2 custody-bypass fix (2026-10-27, annex-2 §2 + b-F1): the
+  // dispatch-ownership TRI-STATE read (lib/queueDispatchMode's dispatchMode —
+  // the same two switches as the drainer's observeOnly gate, read as
+  // "modern" | "legacy-confirmed" | "unknown"). "modern" = a live daemon
+  // custody owner holds this project's queue → the browser must NEVER
+  // direct-POST prompt_async around it. "legacy-confirmed" = the last
+  // completed /vh/version probe returned a parseable body and no switch says
+  // modern (including the capability-ABSENT shape — a genuine legacy daemon)
+  // → the retry proceeds. "unknown" = the mode could not be established
+  // (every probe failed, or none completed yet) → NOT permission to POST
+  // (b-F1: false capability is absence of evidence, not legacy evidence).
+  // OPTIONAL: absent keeps the retry path byte-identical to the pre-fix
+  // behavior (minimal harnesses; legacy daemon-off servers).
+  dispatchMode?: () => DispatchMode;
+  // Paired LIVE refresh of the ownership signal (lib/queueDispatchMode's
+  // refreshDispatchMode — same signature as createQueueSync's dep). Awaited
+  // INSIDE the retry window before any dispatch: the capability probe can
+  // still be in flight at click time (boot race), so the click-time snapshot
+  // alone could read a stale value — the refresh + tri-state re-check closes
+  // that window AND refuses when the refresh itself cannot establish the
+  // mode (a failed probe downgrades dispatchMode() to "unknown"). OPTIONAL
+  // (absent = no refresh; the tri-state read is then only as fresh as the
+  // last completed probe).
+  refreshDispatchMode?: () => Promise<void>;
   // Send-net-resilience slice 3: the IndexedDB outbox seam (see
   // SendOutboxDeps). Optional — absent keeps the pre-slice admission path
   // byte-intact (minimal unit harnesses); production ChatView always wires
@@ -610,10 +635,18 @@ export function createSend(deps: SendDependencies): SendController {
   // previously in ChatView's drainer dispatch closure; moving it in aligns
   // this method's signature with queueDrain.ts's `dispatch` dep
   // `(id, item, signal) => Promise<DrainOutcome>`.
+  // The internal 4th parameter (prePostGuard) is the G2 custody-bypass seam:
+  // evaluated AFTER every await in this function (the agent-evidence gate is
+  // the only one) and IMMEDIATELY before the prompt_async POST. It exists so
+  // retryQueuedItem can abort a retry whose dispatch ownership flipped to the
+  // daemon mid-await — the drainer never passes it (absent = byte-identical
+  // legacy dispatch; the exported SendController type keeps the 3-arg
+  // signature, so this stays a createSend-internal seam).
   async function dispatchQueuedItem(
     id: string,
     item: QueuedMessage,
     signal: AbortSignal,
+    prePostGuard?: () => boolean,
   ): Promise<DrainOutcome> {
     // The item's captured sendConfig is honored only when COMPLETE (provider +
     // model + agent). A LEGACY item persisted without an agent (or a capture
@@ -646,6 +679,17 @@ export function createSend(deps: SendDependencies): SendController {
         return { state: "failed", detail: msg };
       }
       config = captureConfig(id, ag.agent);
+    }
+    // G2 custody guard, LAST check: runs after every await above (the agent
+    // gate is the only one) and immediately before the POST. A capability
+    // flip that landed during that await must not produce a POST from the
+    // caller's stale legacy snapshot. guardRefused marks the outcome as
+    // "nothing was sent, do not resolve" — the retry caller refuses loudly
+    // instead of recording a dispatch that never happened.
+    if (prePostGuard && !prePostGuard()) {
+      const msg = "pre-POST custody guard: queue dispatch is daemon-owned — nothing was sent";
+      log.error("send", "queued dispatch aborted: custody flipped to the daemon pre-POST", { id, itemId: item.id });
+      return { state: "failed", detail: msg, guardRefused: true };
     }
     const body: any = { parts: buildParts(item.text, item.attachments) };
     // Unconditional: every dispatched prompt carries an explicit agent string
@@ -1525,8 +1569,46 @@ export function createSend(deps: SendDependencies): SendController {
   // matrix's monotonic rules (identical state+detail is a no-op; a
   // conflicting rewrite is surfaced by the queue layer, never silently
   // applied), and the item never double-pends.
+  //
+  // G2 custody-bypass guard (2026-10-27, annex-2 §2): this retry is the ONE
+  // browser path that direct-POSTs prompt_async with NO arbitrated step in
+  // front of it (claim/resolve custody refusals fire only AFTER a POST), so
+  // in daemon-dispatch mode it must NEVER reach the upstream. Three checks:
+  // (1) click-time ownership snapshot, (2) re-check after the capability
+  // refresh await (the /vh/version probe can still be in flight at click —
+  // a stale legacy snapshot must not produce a POST), (3) the pre-POST guard
+  // inside dispatchQueuedItem (a flip during its agent-gate await). A
+  // refused retry sends nothing, resolves nothing, enqueues nothing — an
+  // existing server-held unknown item recovers ONLY through daemon
+  // reconciliation/certified recovery, never through a browser redispatch
+  // or an automatic duplicate admission (the operator's explicit recovery
+  // affordances stay mark-sent / edit-again / dismiss on the chip). Legacy
+  // (daemon-off) retry behavior is unchanged.
   const RETRY_DISPATCH_TIMEOUT_MS = 12_000; // mirrors the drainer's DEFAULT_DISPATCH_TIMEOUT_MS
   const retryInFlight = new Set<string>();
+  // G2: the loud refusal for a custody-owned retry — one surface (the
+  // attention-cue notification pattern; no retained row owns this event).
+  const refuseRetryUnderCustody = (sessionId: string, itemId: string): void => {
+    log.error("send", "guarded queue retry refused: dispatch is daemon-owned", { id: sessionId, itemId });
+    deps.pushNotification({
+      kind: "error", sessionID: sessionId, title: "Retry unavailable — dispatch is daemon-owned",
+      detail:
+        "Nothing was sent. The daemon owns dispatching this queue; this message recovers through daemon reconciliation. Use edit again or mark sent instead.",
+    });
+  };
+  // G2 (b-F1): the loud refusal for an UNESTABLISHED dispatch mode — the
+  // click-time /vh/version probe could not confirm the server's posture
+  // (offline / non-OK / malformed). Same shape as the custody refusal: no
+  // POST, no resolve — an unconfirmable mode is not permission to dispatch,
+  // and the operator must learn why nothing happened.
+  const refuseRetryModeUnverified = (sessionId: string, itemId: string): void => {
+    log.error("send", "guarded queue retry refused: dispatch mode unverified (probe failed)", { id: sessionId, itemId });
+    deps.pushNotification({
+      kind: "error", sessionID: sessionId, title: "Retry unavailable — dispatch mode unverified",
+      detail:
+        "Nothing was sent. The queue dispatch mode could not be confirmed (the server status probe failed); nothing was sent or resolved. Try again in a moment, or use edit again / mark sent.",
+    });
+  };
   async function retryQueuedItem(sessionId: string, item: QueuedMessage): Promise<void> {
     if (item.state !== "unknown" || !item.opencodeMsgID) {
       // UNKNOWN-ONLY (review t1b-F1/t1d-F1): the queue resolve matrix
@@ -1555,15 +1637,80 @@ export function createSend(deps: SendDependencies): SendController {
       });
       return;
     }
+    // G2 custody guard, check 1 of 3 — the click-time ownership snapshot.
+    // "modern" (capability advertised, or a custody refusal already latched)
+    // means a live daemon-dispatch owner holds this queue and this browser
+    // must never dispatch: the resolve matrix's 409 fires only AFTER a POST,
+    // so there is no arbitrated step to catch us downstream — refuse before
+    // anything is sent. "unknown" does NOT refuse here (b-F1): the boot
+    // probe may still be in flight on a perfectly healthy legacy server, and
+    // check 2's click-time refresh is the step that establishes the mode —
+    // refusing pre-refresh would break the legacy boot-race retry.
+    if (deps.dispatchMode?.() === "modern") {
+      refuseRetryUnderCustody(sessionId, item.id);
+      return;
+    }
     if (retryInFlight.has(item.id)) return; // swallow re-clicks on an in-flight retry
     retryInFlight.add(item.id);
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), RETRY_DISPATCH_TIMEOUT_MS);
     try {
+      // G2 custody guard, check 2 of 3 (b-F1): refresh the ownership signal
+      // and re-read the TRI-STATE after the await. "modern" — the capability
+      // landed during the refresh (the boot-race snapshot was stale) →
+      // refuse. "unknown" — the refresh itself could not establish the mode
+      // (fetch error / non-OK / malformed JSON; every probe failed) → refuse
+      // LOUDLY with no POST and no resolve: an unestablishable mode is not
+      // legacy evidence, and this is the exact window where a daemon-
+      // dispatch server with failing probes would otherwise be raced (the
+      // 409 fires only AFTER a POST). Only "legacy-confirmed" — a
+      // successfully observed legacy capability response, including the
+      // capability-ABSENT 200 — proceeds toward the dispatch.
+      if (deps.refreshDispatchMode) {
+        await deps.refreshDispatchMode();
+        const mode = deps.dispatchMode?.();
+        if (mode === "modern") {
+          refuseRetryUnderCustody(sessionId, item.id);
+          return;
+        }
+        if (mode === "unknown") {
+          refuseRetryModeUnverified(sessionId, item.id);
+          return;
+        }
+      }
       // Identical resend: dispatchQueuedItem builds the body from the item's
       // captured config/text/attachments and threads item.opencodeMsgID into
-      // body.messageID — the EXACT id the original dispatch carried.
-      const outcome = await dispatchQueuedItem(sessionId, item, ctrl.signal);
+      // body.messageID — the EXACT id the original dispatch carried. The
+      // prePostGuard (G2 check 3 of 3) re-reads the ownership tri-state
+      // inside dispatchQueuedItem after its agent-gate await, immediately
+      // before the POST — and REQUIRES "legacy-confirmed", the only mode
+      // that is permission to POST (b-F1 round 2). "modern" (a custody flip
+      // that landed during that await) refuses; "unknown" ALSO refuses: the
+      // observation is last-completion-wins (queueDispatchMode's
+      // refreshDispatchMode), so an OLDER probe (boot / session-open) still
+      // pending at click can complete with a failure DURING the gate await —
+      // after check 2 already confirmed legacy — downgrading the mode to
+      // "unknown" at exactly this read. An unestablished mode is never
+      // permission to POST. Wired only when the ownership read exists, so
+      // legacy (daemon-off / unwired) dispatch is byte-identical.
+      const custodyGuard = deps.dispatchMode
+        ? () => deps.dispatchMode!() === "legacy-confirmed"
+        : undefined;
+      const outcome = await dispatchQueuedItem(sessionId, item, ctrl.signal, custodyGuard);
+      if (outcome.guardRefused) {
+        // Nothing was sent and nothing may be resolved. Route the loud
+        // refusal by what the tri-state reads now: "modern" — the daemon
+        // owns the item's outcome; leave the chip's state to daemon
+        // reconciliation. Otherwise ("unknown" — downgraded mid-await by a
+        // failed concurrent probe) — the unverified-mode refusal: equally
+        // loud, equally resolve-free.
+        if (deps.dispatchMode?.() === "modern") {
+          refuseRetryUnderCustody(sessionId, item.id);
+        } else {
+          refuseRetryModeUnverified(sessionId, item.id);
+        }
+        return;
+      }
       await deps.resolveQueued(sessionId, item.id, outcome.state, outcome.detail);
       // Refresh the cache so the chip reflects the resolved state (a
       // successful retry's `sent` clears it). Guarded (review t1d-F2): a

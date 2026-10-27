@@ -35,7 +35,7 @@
 // brief, tmp/agent-runs/queue-delivery-verification-brief/brief.md §5).
 
 import { expect, test, type APIRequestContext, type Route } from "@playwright/test";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { demoDir, projectUrl } from "./util";
 
@@ -366,5 +366,171 @@ test("real Send under daemon custody clears the Sending chip via the live delive
     { type: "qd-cleared-at", description: String(clearedAt) },
     { type: "qd-elapsed-ms", description: String(elapsedFromDispatch) },
     { type: "qd-item-id", description: frozen!.itemId },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// G2 custody-bypass fix (2026-10-27, annex-2 §2) — the modern Retry affordance
+// must never direct-POST prompt_async around daemon custody. The G2 chain's
+// producer is stale-dispatch recovery (pkg/web/queue.go
+// recoverStaleDispatchingLocked): it leaves an UNMARKED terminal `unknown`
+// item (retained claim correlation id, NO ambiguousDelivery marker), which
+// the Composer renders as the GENERIC QueueChip — whose Retry button was the
+// one browser affordance that direct-POSTs the upstream prompt endpoint with
+// no arbitrated step in front of it (the queue custody 409 fires only AFTER a
+// POST, on claim/resolve). The fix guards BOTH the render (the leaf suppresses
+// the Retry button while projectionActive) and the execution
+// (createSend.retryQueuedItem refuses before the POST, re-checking ownership
+// after every await).
+//
+// This cell plants the custody-recovery shape in the raw durable queue file
+// (the lane-9 planted-operator-blob precedent: production-safe, no dev
+// bridges), serves it to the REAL SPA in the REAL daemon-dispatch posture,
+// and proves the OUTCOME in the real environment:
+//   - the unknown chip renders with its sanctioned recovery affordances
+//     (mark-sent / edit-again / dismiss) but NO Retry button — through real
+//     navigation, real mounts, and real focus-driven queue refreshes;
+//   - zero direct upstream prompt POSTs arrive at the fake OpenCode for the
+//     seeded correlation id (the fixture's unconditional arrival witness —
+//     evidence independent of the browser route layer);
+//   - zero prohibited browser writes (claim/resolve/remove//vh/send/direct
+//     upstream) are attempted.
+// The execution guard's click-path refusal (including the capability-flip
+// mid-await windows) is unit-pinned in createSendAttempts.test.ts (G2
+// describe); in modern mode no real gesture can even reach it — the render
+// guard removed the affordance — which is exactly the fix.
+// ---------------------------------------------------------------------------
+test("G2: unmarked unknown chip under daemon custody renders NO Retry and produces zero direct upstream prompt POSTs", async ({
+  page,
+  context,
+  request,
+}) => {
+  const marker = `${MARKER_PREFIX}-G2-${Date.now()}`;
+  // Unique per run: the arrival witness is session-cumulative across the
+  // serial lane (the cell above dispatched once), so the zero-POST proof
+  // filters by THIS run's seeded correlation id.
+  const seedMsgID = `msg_g2_e2e_${Date.now()}`;
+  const seedItem = {
+    id: "q-g2-seed",
+    order: 1,
+    state: "unknown",
+    text: marker,
+    attachments: [],
+    sendConfig: { providerID: "p", modelID: "m", agent: "build" },
+    opencodeMsgID: seedMsgID,
+    createdAt: Date.now() - 60_000,
+    dispatchStartedAt: Date.now() - 55_000,
+    resolvedAt: Date.now() - 50_000,
+    detail: "Send outcome unknown after a dispatch interruption",
+    claimGeneration: 1,
+  };
+  const seededBody = JSON.stringify({ version: 1, order: 1, items: [seedItem] });
+  mkdirSync(path.dirname(queueJsonPath), { recursive: true });
+  writeFileSync(queueJsonPath, seededBody);
+
+  // --- Prohibited-write + direct-POST detection (browser context only) ----
+  const violations: string[] = [];
+  let queueGetCount = 0;
+  await context.route(`**/vh/session/${SID}/queue**`, async (route: Route) => {
+    const url = new URL(route.request().url());
+    const method = route.request().method();
+    const isExactQueuePath = url.pathname === `/vh/session/${SID}/queue`;
+    if (isExactQueuePath && method === "GET") {
+      queueGetCount++;
+      // Frozen at the seed: the browser's view of the custody-recovery shape
+      // is deterministic regardless of daemon-side reconciliation.
+      await route.fulfill({ status: 200, contentType: "application/json", body: seededBody });
+      return;
+    }
+    if (isExactQueuePath && method === "POST") {
+      await route.continue(); // admission passes unchanged
+      return;
+    }
+    // claim / resolve / remove — prohibited browser-side writes under custody.
+    violations.push(`${method} ${url.pathname}`);
+    await route.abort("blockedbyclient");
+  });
+  await context.route("**/vh/send", async (route) => {
+    if (route.request().method() === "POST") {
+      violations.push("POST /vh/send");
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.continue();
+  });
+  await context.route(`**/oc/session/**`, async (route) => {
+    if (route.request().method() === "POST") {
+      const u = new URL(route.request().url());
+      violations.push(`direct upstream POST ${u.pathname}`);
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.continue();
+  });
+
+  // --- Navigate; the browser must be in the daemon-dispatch posture --------
+  await page.goto(projectUrl(`/?session=${SID}`));
+  const capable = await page.evaluate(async () => {
+    const r = await fetch("/vh/version", { cache: "no-store" });
+    const j = (await r.json()) as { daemonDispatchCapable?: boolean };
+    return j.daemonDispatchCapable === true;
+  });
+  expect(capable, "browser observes daemonDispatchCapable:true on /vh/version").toBeTruthy();
+
+  // --- The custody-recovery chip renders through the real mount ------------
+  const chip = page.locator(`.queue-chip[data-state="unknown"]`, { hasText: marker });
+  const nudgeDeadline = Date.now() + 15_000;
+  while ((await chip.count()) === 0) {
+    if (Date.now() > nudgeDeadline) throw new Error("seeded unknown chip never became visible");
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.waitForTimeout(300);
+  }
+  await expect(chip).toBeVisible();
+
+  // --- THE RENDER-GUARD CRUX: no Retry affordance on the custody-owned chip -
+  // The unknown chip keeps its sanctioned recovery affordances — only the
+  // direct-POSTing Retry is suppressed (a wiring-level consumer of QueueChip
+  // cannot resurrect it; the leaf owns the guard).
+  await expect(chip.locator(".queue-retry")).toHaveCount(0);
+  await expect(chip.locator(".queue-mark-sent")).toHaveCount(1);
+  await expect(chip.locator(".queue-retract")).toHaveCount(1);
+  await expect(chip.locator(".queue-dismiss")).toHaveCount(1);
+  // The visible duplicate-risk guidance (the honest recovery contract).
+  await expect(page.locator(".queue-detail-note", { hasText: seedItem.detail })).toBeVisible();
+
+  // --- Real-event re-observation window: focus-driven queue refreshes re-
+  // render the chip (real browser events through the real event model); the
+  // affordance must STILL be absent, and the chip must persist (nothing was
+  // resolved, dispatched, or dismissed by the page).
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(500);
+  await expect(chip).toBeVisible();
+  await expect(chip.locator(".queue-retry")).toHaveCount(0);
+
+  // --- OUTCOME witness at the upstream: zero arrivals under the seeded
+  // correlation id (the fixture records every prompt_async POST
+  // unconditionally — evidence independent of the route layer).
+  const witness = (await (
+    await request.get(`/oc/fixture/prompt-hold/state?session=${SID}`)
+  ).json()) as { arrivals: string[]; persistedUserIDs: string[] };
+  expect(
+    witness.arrivals.filter((id) => id === seedMsgID),
+    "zero direct upstream prompt POSTs for the seeded correlation id",
+  ).toHaveLength(0);
+  expect(
+    witness.persistedUserIDs.filter((id) => id === seedMsgID),
+    "no persisted user message for the seeded correlation id",
+  ).toHaveLength(0);
+
+  // --- Confound exclusions -------------------------------------------------
+  expect(violations, "no browser claim/resolve/direct-send/direct-upstream POST was attempted").toEqual([]);
+  expect(
+    queueGetCount,
+    "the browser performed its queue reads (served from the frozen seed)",
+  ).toBeGreaterThan(0);
+
+  test.info().annotations.push(
+    { type: "qd-g2-seed-msg-id", description: seedMsgID },
+    { type: "qd-g2-queue-gets", description: String(queueGetCount) },
   );
 });

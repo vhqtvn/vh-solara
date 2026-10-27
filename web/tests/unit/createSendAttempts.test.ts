@@ -26,6 +26,7 @@ import { createSignal } from "solid-js";
 import { createSend, type SendDependencies } from "../../src/components/chat/createSend";
 import type { Attachment } from "../../src/components/chat/createAttachments";
 import { EnqueueError, fetchQueue as realFetchQueue, type QueuedMessage } from "../../src/queue";
+import type { DispatchMode } from "../../src/lib/queueDispatchMode";
 import { __resetSendSingleFlightForTests, isSendInFlight } from "../../src/lib/sendSingleFlight";
 import {
   __resetSendActionStatusForTests,
@@ -108,6 +109,14 @@ function harness(overrides: {
   /** Slice 3 (intent recovery): overrides the queue resolve seam the retry
    *  records outcomes through (default: an in-memory recorder, no network). */
   resolveQueued?: SendDependencies["resolveQueued"];
+  /** G2 custody-bypass fix (b-F1): the dispatch-ownership tri-state read
+   *  for the retry execution-guard cells ("modern" = daemon owns dispatch →
+   *  never direct-POST; "legacy-confirmed" = a successful legacy observation
+   *  → proceed; "unknown" = mode unestablished → refuse, no POST). */
+  dispatchMode?: SendDependencies["dispatchMode"];
+  /** G2: overrides the capability-refresh await inside the retry window
+   *  (cells flip the ownership tri-state mid-await to prove the re-check). */
+  refreshDispatchMode?: SendDependencies["refreshDispatchMode"];
 } = {}): Harness {
   const [input, setInput] = createSignal("");
   const [atts, setAtts] = createSignal<Attachment[]>([]);
@@ -190,6 +199,8 @@ function harness(overrides: {
   // detail) shape).
   const resolveCalls: Harness["resolveCalls"] = [];
   deps.opencodeDown = overrides.opencodeDown;
+  deps.dispatchMode = overrides.dispatchMode;
+  deps.refreshDispatchMode = overrides.refreshDispatchMode;
   deps.resolveQueued =
     overrides.resolveQueued ??
     (async (sid, itemId, state, detail) => {
@@ -1481,5 +1492,209 @@ describe("createSend slice 3 — retryQueuedItem (guarded same-messageID queue-i
     await h.retryQueuedItem("ses-1", terminalItem());
     expect(h.resolveCalls).toEqual([["ses-1", "q-retry-1", "sent", ""]]);
     expect(h.notes).toHaveLength(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // G2 custody-bypass fix (2026-10-27, annex-2 §2 + b-F1) — the retry
+  // execution guard. In daemon-dispatch mode (dispatchMode "modern" — the
+  // same two switches as the projectionActive predicate that gates the
+  // drainer, read as the tri-state) retryQueuedItem must NEVER direct-POST
+  // prompt_async: the queue custody 409 fires only AFTER a POST (on
+  // claim/resolve), so there is no arbitrated step downstream to catch the
+  // browser — the refusal must happen BEFORE the POST, at all three windows:
+  // (1) the click-time snapshot ("modern" only — "unknown" falls through to
+  // the establishing refresh), (2) after the capability-refresh await (the
+  // tri-state re-check: a stale boot-race snapshot must not produce a POST,
+  // and per b-F1 a refresh that CANNOT ESTABLISH the mode — every probe
+  // failed — refuses identically: an unestablishable mode is not legacy
+  // evidence), and (3) inside dispatchQueuedItem after its agent-gate await
+  // (a "modern" flip that lands mid-await). A refused retry sends nothing,
+  // resolves nothing (an existing server-held unknown item recovers ONLY
+  // through daemon reconciliation), and surfaces ONE loud notification. The
+  // final cell pins the legacy contract WITH the new seams wired — the guard
+  // is mode-scoped, never a behavior change for daemon-off.
+  // -------------------------------------------------------------------------
+  describe("createSend G2 — retryQueuedItem execution guard (daemon custody refuses the direct POST)", () => {
+    const respondText = (status: number, body: string) =>
+      vi.fn(() => Promise.resolve({ ok: status >= 200 && status < 300, status, text: async () => body }));
+    const terminalItem = (opts: Partial<QueuedMessage> = {}): QueuedMessage => ({
+      id: "q-retry-g2",
+      order: 1,
+      state: "unknown",
+      text: "the custody-held prompt",
+      attachments: [],
+      sendConfig: { providerID: "p", modelID: "m", agent: "build" },
+      opencodeMsgID: "msg_g2_retry_1",
+      createdAt: 1,
+      resolvedAt: 1,
+      detail: "",
+      ...opts,
+    });
+    const postedBodies = (): Array<Record<string, unknown>> =>
+      ((globalThis as any).fetch as any).mock.calls.map((c: any[]) => JSON.parse(c[1].body));
+    const fetchCallCount = (): number => ((globalThis as any).fetch as any).mock.calls.length;
+    const expectCustodyRefusal = (h: ReturnType<typeof harness>): void => {
+      // The loud refusal: ONE error notification naming daemon ownership and
+      // pointing at the sanctioned recoveries — never a silent no-op.
+      expect(h.notes).toHaveLength(1);
+      expect(h.notes[0].kind).toBe("error");
+      expect(h.notes[0].title).toBe("Retry unavailable — dispatch is daemon-owned");
+      expect(h.notes[0].detail).toContain("Nothing was sent");
+      expect(h.notes[0].detail).toContain("daemon reconciliation");
+    };
+
+    it("check 1 — custody active at click time (\"modern\"): NO POST, NO resolve, ONE custody-refusal notification (the chip keeps its server-held state)", async () => {
+      vi.stubGlobal("fetch", respondText(204, ""));
+      const h = harness({ dispatchMode: () => "modern" });
+      await h.retryQueuedItem("ses-1", terminalItem());
+      expect(fetchCallCount()).toBe(0); // THE CRUX: nothing reached the upstream
+      expect(h.resolveCalls).toHaveLength(0); // the daemon owns the item's outcome
+      expectCustodyRefusal(h);
+    });
+
+    it("check 2 — capability flips to daemon DURING the refresh await (boot-race: stale click snapshot): NO POST, NO resolve, refusal", async () => {
+      // The click snapshot reads "unknown" (the /vh/version probe was still
+      // in flight at click — no observation has completed), the refresh
+      // await lands the daemon capability — the tri-state re-check after the
+      // await must convert the retry into a refusal BEFORE any dispatch.
+      // This is the stale-capability-snapshot window the fix exists for:
+      // without the re-check this cell POSTs.
+      let mode: DispatchMode = "unknown";
+      vi.stubGlobal("fetch", respondText(204, ""));
+      const h = harness({
+        dispatchMode: () => mode,
+        refreshDispatchMode: async () => {
+          mode = "modern"; // the probe lands mid-retry-window
+        },
+      });
+      await h.retryQueuedItem("ses-1", terminalItem());
+      expect(fetchCallCount()).toBe(0); // THE CRUX: the stale snapshot produced no POST
+      expect(h.resolveCalls).toHaveLength(0);
+      expectCustodyRefusal(h);
+    });
+
+    it("check 3 — capability flips to daemon during dispatchQueuedItem's agent-gate await (pre-POST guard): NO POST, NO resolve, refusal", async () => {
+      // The item's captured config lacks an agent, so dispatchQueuedItem
+      // re-resolves through the evidence gate — a REAL await between the
+      // retry-window checks and the POST. The capability flips inside that
+      // await; the pre-POST guard must abort with guardRefused, and the retry
+      // caller must refuse WITHOUT resolving (a `failed` resolve would rewrite
+      // the server-held unknown item from a dispatch that never happened).
+      let mode: DispatchMode = "legacy-confirmed"; // check 2 passed on a live legacy observation
+      vi.stubGlobal("fetch", respondText(204, ""));
+      const h = harness({
+        dispatchMode: () => mode,
+        awaitAgent: async () => {
+          mode = "modern"; // the flip lands inside the agent-gate await
+          return { ok: true, agent: "build" };
+        },
+      });
+      await h.retryQueuedItem(
+        "ses-1",
+        terminalItem({ sendConfig: { providerID: "p", modelID: "m" } }), // incomplete → the gate runs
+      );
+      expect(fetchCallCount()).toBe(0); // THE CRUX: the mid-await flip produced no POST
+      expect(h.resolveCalls).toHaveLength(0); // guardRefused ≠ a dispatch outcome — nothing recorded
+      expectCustodyRefusal(h);
+    });
+
+    it("b-F1 round 2 — check 2 CONFIRMS legacy, then an older in-flight probe FAILS during the agent-gate await (mode downgrades to \"unknown\"): NO POST, NO resolve, ONE unverified-mode refusal", async () => {
+      // The tier1_b:F1 defect cell (commit-review round 2, 2026-10-27,
+      // contract_drift; ran RED against the round-1 guard — the retry POSTed
+      // once): queueDispatchMode's observation is last-completion-wins, so a
+      // boot/session-open probe still pending when the retry started can
+      // complete with a FAILURE during dispatchQueuedItem's agent-gate await
+      // — AFTER check 2's click-time refresh already confirmed
+      // "legacy-confirmed" — downgrading the mode to "unknown" exactly when
+      // the pre-POST guard reads it. The round-1 guard (`!== "modern"`)
+      // treated that unestablished mode as permission to POST. The fakes
+      // mimic production exactly: the click-time refresh establishes
+      // legacy-confirmed (check 2 passes), the older probe's failure lands
+      // inside the gate await, and the prompt endpoint is REACHABLE (a 204 —
+      // a lax guard POSTs and lands it). Check 3 must require
+      // legacy-confirmed — the only mode that is permission to POST — and
+      // refuse loudly without resolving.
+      let mode: DispatchMode = "unknown"; // the boot probe is still in flight at click
+      vi.stubGlobal("fetch", respondText(204, ""));
+      const h = harness({
+        dispatchMode: () => mode,
+        refreshDispatchMode: async () => {
+          mode = "legacy-confirmed"; // check 2's click-time probe SUCCEEDS
+        },
+        awaitAgent: async () => {
+          mode = "unknown"; // the OLDER probe fails inside the gate await — last completion wins
+          return { ok: true, agent: "build" };
+        },
+      });
+      await h.retryQueuedItem(
+        "ses-1",
+        terminalItem({ sendConfig: { providerID: "p", modelID: "m" } }), // incomplete → the gate runs (the downgrade window)
+      );
+      expect(fetchCallCount()).toBe(0); // THE CRUX: a downgraded-to-unknown mode is NOT permission to POST
+      expect(h.resolveCalls).toHaveLength(0); // nothing was sent — nothing may be recorded
+      // The loud refusal: ONE error notification naming the unverified mode
+      // — never a silent no-op, never a resolve.
+      expect(h.notes).toHaveLength(1);
+      expect(h.notes[0].kind).toBe("error");
+      expect(h.notes[0].title).toBe("Retry unavailable — dispatch mode unverified");
+      expect(h.notes[0].detail).toContain("Nothing was sent");
+    });
+
+    it("b-F1 — daemon server, click-time probe CANNOT establish the mode (every probe failed): NO POST, NO resolve, ONE unverified-mode refusal", async () => {
+      // The b-F1 defect cell (commit-review 2026-10-27, contract_drift; ran
+      // RED against the pre-fix guard — the retry POSTed once): on a
+      // daemon-dispatch server where the boot/session probes AND the
+      // click-time /vh/version probe all fail, production's
+      // refreshDispatchMode swallows the failure and returns normally while
+      // the mode stays "unknown" — the OLD boolean guard read that as
+      // "not modern = permission" and direct-POSTed prompt_async around
+      // custody (the 409 fires only AFTER the POST). The fakes mimic
+      // production EXACTLY: the tri-state reads "unknown" (no observation
+      // ever completed), the refresh resolves normally having established
+      // NOTHING, and the prompt endpoint is REACHABLE (a 204 — a lax guard
+      // POSTs and lands it). The tri-state guard must refuse loudly.
+      vi.stubGlobal("fetch", respondText(204, ""));
+      const h = harness({
+        dispatchMode: () => "unknown", // mode never established (all probes failed)
+        refreshDispatchMode: async () => {}, // production swallow: resolves, establishes NOTHING
+      });
+      await h.retryQueuedItem("ses-1", terminalItem());
+      expect(fetchCallCount()).toBe(0); // THE CRUX: an unestablished mode is NOT permission to POST
+      expect(h.resolveCalls).toHaveLength(0); // nothing was sent — nothing may be recorded
+      // The loud refusal: ONE error notification naming the unverified mode
+      // — never a silent no-op.
+      expect(h.notes).toHaveLength(1);
+      expect(h.notes[0].kind).toBe("error");
+      expect(h.notes[0].title).toBe("Retry unavailable — dispatch mode unverified");
+      expect(h.notes[0].detail).toContain("Nothing was sent");
+    });
+
+    it("legacy pin — seams WIRED but daemon-off (\"legacy-confirmed\"): the retry proceeds byte-identically (POST + resolve sent)", async () => {
+      // The guard is mode-scoped: with the tri-state read present but
+      // legacy-CONFIRMED (a successful /vh/version observation on a
+      // daemon-off server — including the capability-absent shape, pinned in
+      // queueDispatchMode.test.ts), the retry contract is exactly the
+      // pre-fix behavior — one identical-payload POST under the same
+      // messageID, one unknown→sent resolve. Pins that wiring the new deps
+      // alone changes nothing for legacy deployments.
+      let refreshCalls = 0;
+      vi.stubGlobal("fetch", respondText(204, ""));
+      const h = harness({
+        dispatchMode: () => "legacy-confirmed",
+        refreshDispatchMode: async () => {
+          refreshCalls++;
+        },
+      });
+      await h.retryQueuedItem("ses-1", terminalItem());
+      expect(refreshCalls).toBe(1); // the refresh ran inside the retry window
+      expect(fetchCallCount()).toBe(1);
+      const body = postedBodies()[0];
+      expect(body.messageID).toBe("msg_g2_retry_1");
+      expect(body.parts).toEqual([{ type: "text", text: "the custody-held prompt" }]);
+      expect(body.agent).toBe("build");
+      expect(body.model).toEqual({ providerID: "p", modelID: "m" });
+      expect(h.resolveCalls).toEqual([["ses-1", "q-retry-g2", "sent", ""]]);
+      expect(h.notes).toHaveLength(0);
+    });
   });
 });

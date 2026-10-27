@@ -26,6 +26,8 @@ import {
   mintSendAttempt,
   updateSendAction,
 } from "../../src/lib/sendActionStatus";
+import { clearQueueCache, fetchQueue, type QueuedMessage } from "../../src/queue";
+import { __resetQueueDispatchModeForTests, noteQueueCustodyRefusal } from "../../src/lib/queueDispatchMode";
 
 // Seed one retained uncertain retry-same record under the live session id —
 // a row whose Retry affordance is under test. Returns the attemptId the row
@@ -108,7 +110,11 @@ function baseProps(over: Partial<ComposerProps> = {}): ComposerProps {
 afterEach(() => {
   cleanup();
   __resetSendActionStatusForTests();
+  // G2 wiring cells seed the real queue cache + flip the dispatch-mode state.
+  clearQueueCache(["s1"]);
+  __resetQueueDispatchModeForTests();
   vi.clearAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("Composer → SendStatus guarded-retry wiring (row click routes retrySame(attemptId), never raw send)", () => {
@@ -171,6 +177,79 @@ describe("Composer → SendStatus guarded-retry wiring (row click routes retrySa
     // The fallback ignores the argument (its signature is `() => Promise<void>`)
     // — but the row still passes it; the wiring is unchanged.
     expect(send).toHaveBeenCalledWith(id);
+    r.unmount();
+  });
+});
+
+// Seed the REAL queue module cache with one custody-recovery-shaped unknown
+// item — the exact render shape daemon stale-dispatch recovery produces
+// (pkg/web/queue.go recoverStaleDispatchingLocked): terminal `unknown`, the
+// retained claim-minted correlation id, and NO ambiguousDelivery marker (the
+// marker lands later, at reconcile-budget terminalization). Composer's queue
+// row then mounts a real QueueChip against it through the same queueFor read
+// production uses.
+async function seedUnknownQueueItem(text: string, opencodeMsgID = "msg_w_1"): Promise<QueuedMessage> {
+  const q: QueuedMessage = {
+    id: "q-w-1",
+    order: 1,
+    state: "unknown",
+    text,
+    attachments: [],
+    sendConfig: { providerID: "p", modelID: "m", agent: "build" },
+    opencodeMsgID,
+    createdAt: 1,
+    resolvedAt: 1,
+    detail: "",
+  };
+  vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ items: [q] }) })));
+  await fetchQueue("s1");
+  vi.unstubAllGlobals();
+  return q;
+}
+
+// -------------------------------------------------------------------------
+// G2 custody-bypass fix (2026-10-27, annex-2 §2) — the Composer wiring-level
+// render guard. In daemon-dispatch mode the generic unknown QueueChip must
+// offer NO Retry affordance (the button direct-POSTs prompt_async around
+// daemon custody — the server's 409 fires only AFTER a POST). The leaf guard
+// lives in QueueChip (pinned there); these cells prove the suppression holds
+// through the REAL Composer mount with the handler still wired, and that the
+// legacy wiring (button present → routes to the wired handler) is unchanged.
+// -------------------------------------------------------------------------
+describe("Composer → QueueChip G2 render-guard wiring (daemon custody owns the retry affordance)", () => {
+  it("custody-owned unknown chip: onRetry IS wired but the chip renders NO retry button; mark-sent/retract remain", async () => {
+    await seedUnknownQueueItem("g2 wiring probe");
+    noteQueueCustodyRefusal(); // projection active — a live custody owner was observed
+    const retryQueuedItem = vi.fn();
+    const r = render(() => (
+      <Composer {...baseProps({ retryQueuedItem: (q) => retryQueuedItem(q) })} />
+    ));
+    const chip = r.container.querySelector('.queue-chip[data-state="unknown"]');
+    expect(chip).toBeTruthy();
+    // THE RENDER-GUARD CRUX: no Retry affordance on the custody-owned chip
+    // even though the handler prop IS threaded (the leaf guard owns the
+    // suppression; a wiring-level pass-through cannot resurrect it).
+    expect(chip!.querySelector(".queue-retry")).toBeNull();
+    // The sanctioned recovery affordances stay reachable through this mount.
+    expect(chip!.querySelector(".queue-mark-sent")).toBeTruthy();
+    expect(chip!.querySelector(".queue-retract")).toBeTruthy();
+    expect(retryQueuedItem).not.toHaveBeenCalled();
+    r.unmount();
+  });
+
+  it("legacy (daemon-off): the retry button renders AND routes to the wired retryQueuedItem (wiring pin, unchanged by the guard)", async () => {
+    const seeded = await seedUnknownQueueItem("g2 legacy probe");
+    const retryQueuedItem = vi.fn();
+    const r = render(() => (
+      <Composer {...baseProps({ retryQueuedItem: (q) => retryQueuedItem(q) })} />
+    ));
+    const btn = r.container.querySelector<HTMLElement>(
+      '.queue-chip[data-state="unknown"] .queue-retry',
+    )!;
+    expect(btn).toBeTruthy();
+    btn.click();
+    expect(retryQueuedItem).toHaveBeenCalledTimes(1);
+    expect(retryQueuedItem).toHaveBeenCalledWith(seeded);
     r.unmount();
   });
 });

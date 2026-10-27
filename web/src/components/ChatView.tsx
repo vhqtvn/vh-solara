@@ -151,7 +151,7 @@ import {
   type OutboxPayload,
   type OutboxSaveResult,
 } from "../lib/outbox";
-import { projectionActive, refreshDispatchMode } from "../lib/queueDispatchMode";
+import { dispatchMode, projectionActive, refreshDispatchMode } from "../lib/queueDispatchMode";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
 
@@ -2325,6 +2325,18 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // optional in the factory (minimal harnesses omit it and the retry
     // refuses loudly instead of firing a blind POST).
     resolveQueued: (sid, itemId, state, detail) => resolveQueued(sid, itemId, state, detail),
+    // G2 custody-bypass fix (2026-10-27, annex-2 §2 + b-F1): the
+    // dispatch-ownership TRI-STATE read + its live refresh, threaded into
+    // createSend's queue-item retry execution guard — the retry refuses
+    // (never direct-POSTs prompt_async) while the daemon owns dispatch
+    // ("modern") AND when the click-time probe cannot establish the mode
+    // ("unknown" — every /vh/version probe failed; an unestablishable mode
+    // is not legacy evidence). Only "legacy-confirmed" (a successfully
+    // observed legacy response, including the capability-absent 200)
+    // proceeds, re-checked after every await in the retry window. Same two
+    // switches as the drainer's observeOnly gate above, read as the tri-state.
+    dispatchMode,
+    refreshDispatchMode,
     uploading: att.uploading,
     isSending,
     setSending,

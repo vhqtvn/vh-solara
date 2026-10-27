@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   __resetQueueDispatchModeForTests,
   daemonDispatchCapable,
+  dispatchMode,
   noteQueueCustodyRefusal,
   projectionActive,
   queueCustodyRefused,
@@ -63,5 +64,95 @@ describe("dispatch mode (projection feature-detect)", () => {
     expect(queueCustodyRefused()).toBe(true);
     expect(projectionActive()).toBe(true); // the refusal IS ownership information
     expect(daemonDispatchCapable()).toBe(false); // the advertisement itself stays honest
+  });
+
+  // -----------------------------------------------------------------------
+  // The dispatch-ownership tri-state (b-F1, commit-review 2026-10-27):
+  // `capable() === false` is NOT legacy evidence — a daemon-dispatch server
+  // whose every /vh/version probe fails also reads false. dispatchMode()
+  // must distinguish a SUCCESSFULLY OBSERVED legacy response
+  // ("legacy-confirmed" — including the capability-ABSENT 200, a genuine
+  // legacy daemon) from an unavailable/invalid observation ("unknown").
+  // The retry guard consumes this: "unknown" is not permission to POST.
+  // -----------------------------------------------------------------------
+  describe("dispatchMode() tri-state (b-F1: unestablished ≠ legacy)", () => {
+    it("reads \"unknown\" before any probe completes (boot race) — not legacy evidence", () => {
+      expect(dispatchMode()).toBe("unknown");
+    });
+
+    it("a 200 WITHOUT daemonDispatchCapable is a genuine legacy observation → \"legacy-confirmed\"", async () => {
+      stubVersion({ version: "0.0.1" }); // capability-absent shape
+      await refreshDispatchMode();
+      expect(dispatchMode()).toBe("legacy-confirmed");
+      expect(daemonDispatchCapable()).toBe(false);
+      expect(projectionActive()).toBe(false);
+    });
+
+    it("a 200 advertising daemonDispatchCapable:false → \"legacy-confirmed\"", async () => {
+      stubVersion({ daemonDispatchCapable: false });
+      await refreshDispatchMode();
+      expect(dispatchMode()).toBe("legacy-confirmed");
+    });
+
+    it("a 200 advertising daemonDispatchCapable:true → \"modern\"", async () => {
+      stubVersion({ daemonDispatchCapable: true });
+      await refreshDispatchMode();
+      expect(dispatchMode()).toBe("modern");
+      expect(projectionActive()).toBe(true);
+    });
+
+    it("a non-OK /vh/version downgrades the observation → \"unknown\" (even after an earlier success)", async () => {
+      stubVersion({ daemonDispatchCapable: false });
+      await refreshDispatchMode();
+      expect(dispatchMode()).toBe("legacy-confirmed");
+      stubVersion(null, false); // 503 — the click-time probe cannot establish the mode
+      await refreshDispatchMode();
+      expect(dispatchMode()).toBe("unknown"); // stale legacy evidence must not survive a failed probe
+    });
+
+    it("a malformed JSON body → \"unknown\" (invalid observation)", async () => {
+      (globalThis as any).fetch = vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => {
+          throw new SyntaxError("Unexpected token < in JSON");
+        },
+      }));
+      await refreshDispatchMode();
+      expect(dispatchMode()).toBe("unknown");
+    });
+
+    it("a failed probe RETAINS a previously advertised capability → stays \"modern\" (fail-safe projection)", async () => {
+      stubVersion({ daemonDispatchCapable: true });
+      await refreshDispatchMode();
+      stubVersion(null, false);
+      await refreshDispatchMode();
+      expect(daemonDispatchCapable()).toBe(true); // capability keeps its value
+      expect(dispatchMode()).toBe("modern"); // "modern" dominates the per-attempt flag
+    });
+
+    it("a network error (fetch rejects) → \"unknown\"", async () => {
+      (globalThis as any).fetch = vi.fn(async () => {
+        throw new TypeError("Failed to fetch");
+      });
+      await refreshDispatchMode();
+      expect(dispatchMode()).toBe("unknown");
+    });
+
+    it("a latched custody refusal → \"modern\" regardless of the advertisement", async () => {
+      stubVersion({ daemonDispatchCapable: false });
+      await refreshDispatchMode(); // legacy-confirmed…
+      noteQueueCustodyRefusal(); // …but a live custody owner was observed
+      expect(dispatchMode()).toBe("modern"); // the refusal IS ownership information
+    });
+
+    it("recovery: a successful probe after a failed one re-establishes → back to \"legacy-confirmed\"", async () => {
+      stubVersion(null, false);
+      await refreshDispatchMode();
+      expect(dispatchMode()).toBe("unknown");
+      stubVersion({ daemonDispatchCapable: false });
+      await refreshDispatchMode();
+      expect(dispatchMode()).toBe("legacy-confirmed");
+    });
   });
 });

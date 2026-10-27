@@ -27,6 +27,13 @@ import type { QueuedMessage } from "./queue";
 export interface DrainOutcome {
   state: "sent" | "failed" | "unknown";
   detail: string;
+  // G2 custody-bypass fix (2026-10-27): true when NO POST was made because the
+  // dispatch's pre-POST custody guard refused — a live daemon-dispatch owner
+  // took over the queue between the caller's last check and the POST. This is
+  // NOT a dispatch outcome: nothing was sent, so the caller must not resolve
+  // the item with it — it refuses the action instead (createSend.
+  // retryQueuedItem). The drainer never sets it (it passes no guard).
+  guardRefused?: boolean;
 }
 
 // Injectable side effects + guards. ChatView passes its closures; tests pass

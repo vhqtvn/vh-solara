@@ -1,5 +1,6 @@
 import { Show } from "solid-js";
 import { type QueuedMessage } from "../queue";
+import { projectionActive } from "../lib/queueDispatchMode";
 import Icon from "./Icon";
 
 // QueueChip renders a single queued-message pill in the composer's queue row,
@@ -105,22 +106,36 @@ export function QueueChip(props: {
         </Show>
         <span class="queue-text">{props.q.text || "(attachment)"}</span>
         {/* Retry (slice 3, intent recovery — 2026-10-03 incident): explicit,
-            user-driven re-send of an OUTCOME-UNKNOWN item that retained its
-            claim-minted opencodeMsgID. UNKNOWN-ONLY by design (review
-            t1b-F1/t1d-F1): `unknown` is the one state where a resend is both
-            honest (delivery was never disproven) and recordable (the queue
-            resolve matrix allows exactly unknown→sent; failed→sent is
-            REJECTED, so a `failed` item whose retry re-POST SUCCEEDED could
-            never record it and the chip would re-render failed with a stale
-            detail for a message that just landed). A `failed` item's honest
-            recovery stays retract-to-compose (its copy already says nothing
-            was delivered). The handler (createSend.retryQueuedItem) re-POSTs
-            the IDENTICAL payload under the SAME messageID — idempotent on
-            opencode ≥ 1.17.18 — and records the outcome. The data-tip
-            carries the honest version boundary (one line, per the slice
-            contract: no dialog). Not rendered without an opencodeMsgID
-            (legacy items) or when the handler is unwired. */}
-        <Show when={props.q.state === "unknown" && props.q.opencodeMsgID && props.onRetry}>
+             user-driven re-send of an OUTCOME-UNKNOWN item that retained its
+             claim-minted opencodeMsgID. UNKNOWN-ONLY by design (review
+             t1b-F1/t1d-F1): `unknown` is the one state where a resend is both
+             honest (delivery was never disproven) and recordable (the queue
+             resolve matrix allows exactly unknown→sent; failed→sent is
+             REJECTED, so a `failed` item whose retry re-POST SUCCEEDED could
+             never record it and the chip would re-render failed with a stale
+             detail for a message that just landed). A `failed` item's honest
+             recovery stays retract-to-compose (its copy already says nothing
+             was delivered). The handler (createSend.retryQueuedItem) re-POSTs
+             the IDENTICAL payload under the SAME messageID — idempotent on
+             opencode ≥ 1.17.18 — and records the outcome. The data-tip
+             carries the honest version boundary (one line, per the slice
+             contract: no dialog). Not rendered without an opencodeMsgID
+             (legacy items) or when the handler is unwired.
+             G2 render guard (2026-10-27, annex-2 §2): in daemon-dispatch
+             mode (projectionActive — capability advertised on /vh/version,
+             or a custody refusal latched) the retry is SUPPRESSED at the
+             leaf: this button is the only browser affordance that direct-
+             POSTs prompt_async with no arbitrated step in front of it
+             (claim/resolve custody refusals fire only AFTER a POST), so a
+             custody-owning daemon must never be raced by it. The chip keeps
+             its sanctioned recovery affordances (mark-sent / edit-again /
+             dismiss); an existing server-held unknown item recovers through
+             daemon reconciliation. Reading the reactive capability signal
+             here keeps the button tracking the LIVE mode (it disappears when
+             the boot probe lands a daemonDispatchCapable:true); the
+             controller-side execution guard (createSend.retryQueuedItem)
+             backstops any click that raced the flip. */}
+        <Show when={props.q.state === "unknown" && props.q.opencodeMsgID && props.onRetry && !projectionActive()}>
           <button
             type="button"
             class="queue-action queue-retry"
