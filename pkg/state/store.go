@@ -1376,6 +1376,39 @@ func (s *Store) rootOfLocked(id string) string {
 	return cur
 }
 
+// TreeBusyForDispatch is the NARROW canonical eligibility read for the
+// daemon queue drain loop's idle gate (2026-10-26 incident fix; release-rule
+// memo Path A / corner-rule Candidate A; annex-1 E4 pre-authorizes "expose a
+// narrow canonical accessor if justified" over the GateFacts map, which
+// carries no parent links). It reports whether the session's WHOLE TREE is
+// observably busy: the effective root (rootOfLocked) resolved first, then
+// the SINGLE canonical index GateFacts().SubtreeBusy derives from
+// (subtreeBusyCount[root] > 0 — snapshots.go gateFactsFromScalars), so a
+// busy SIBLING holds the lane too (root-resolved semantics, not
+// own-subtree-only) and the root's own busy counts (self-inclusive).
+//
+// Contract:
+//   - busy=true  ⇒ ≥1 busy/retry session in the tree, root inclusive.
+//     ActivityError is EXCLUDED by the standing carve-out (error ≠ running;
+//     tree_finish_cascade_test.go pins it) — an errored descendant does NOT
+//     hold dispatch.
+//   - exists=false ⇒ sid has no entry in the store at all: NO busy
+//     evidence. The dispatch-side disposition (absent=allow, waiver W1)
+//     belongs to the CALLER — this accessor reports the observation, not
+//     the policy.
+//
+// Fresh per call: no caching, no debounce, no remembered state — the caller
+// re-reads at every dispatch decision (Candidate A's per-tick recheck).
+// Read-only, one RLock span; safe at drain-loop tick cadence.
+func (s *Store) TreeBusyForDispatch(sid string) (busy, exists bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.sessions[sid]; !ok {
+		return false, false
+	}
+	return s.subtreeBusyCount[s.rootOfLocked(sid)] > 0, true
+}
+
 // --- incremental subtreeBusyCount maintenance (Gate C de-risk prototype) ---
 //
 // These helpers maintain s.subtreeBusyCount incrementally. The reference is

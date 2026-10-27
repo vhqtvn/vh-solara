@@ -24,6 +24,13 @@ package web
 //	   of the design's custody protocol), applying the AGENT EVIDENCE GATE
 //	   before any POST.
 //
+//	Both 2 and 3 pass THE IDLE GATE first (slice S2, the 2026-10-26 incident
+//	fix): the selected item's session tree must be observably idle in the
+//	canonical store (Store.TreeBusyForDispatch — the subtreeBusyCount index
+//	GateFacts.SubtreeBusy derives from, resolved at the effective root)
+//	before ANY marker consumption or claim. Daemon-dispatch mode only; the
+//	legacy (daemon-off) browser drainer owns waiting there.
+//
 // RECEIPT POLICY (inline, after each attempt): server_error → terminal
 // failed (class 5, "no loop"); every other receipt (accepted_2xx /
 // written_unknown / connect_failed) takes NO inline action — the item stays
@@ -367,6 +374,29 @@ func (l *queueDrainLoop) tick(ctx context.Context, lastFsScan *time.Time) error 
 		st := s.queues.store(l.root, sid)
 		itemID, mode, ok := l.oldestDispatchable(st)
 		if !ok {
+			continue
+		}
+		// THE IDLE GATE (2026-10-26 incident fix; release-rule memo Path A,
+		// corner-rule Candidate A "visible-idle-only recheck, absent=allow"):
+		// a queued item must NOT be POSTed upstream while the session's
+		// subtree is observably busy — the guarantee the legacy browser
+		// drainer had, restored in daemon dispatch mode. Mode-keyed by
+		// construction: this loop only runs under DaemonDispatchEnabled; the
+		// legacy (daemon-off) browser path never reaches this code.
+		//
+		// Placement (binding): AFTER selection (corner 6 — FIFO and
+		// resume-precedence untouched; the lane holds its oldest item) and
+		// BEFORE both the resume-marker consumption (corner 7 — a blocked
+		// evaluation must not burn the certified marker) and the claim.
+		// FRESH canonical read per tick per lane — no debounce, no
+		// cross-tick memory (corner 1); absent-from-store = allow (corner 3,
+		// W1: the routine post-restart posture for FS-discovered lanes —
+		// deliberate, S3 tightens to unknown≠idle). The certified recovery
+		// pass above is NEVER gated (classification ≠ dispatch).
+		if busy, _ := a.Store().TreeBusyForDispatch(sid); busy {
+			// Skip the LANE this tick: the selected item stays pending (or
+			// its resume marker stays unconsumed); re-evaluated next tick.
+			vhlog.Debug("queue drain: idle gate holds lane (subtree observably busy)", "dir", l.dir, "sessionID", sid, "item", itemID)
 			continue
 		}
 		if mode == dispatchModeResume {
