@@ -56,7 +56,9 @@ const stateDir =
 
 export default defineConfig({
   testDir: path.join(hostRoot, "tests/folded-e2e"),
-  testMatch: /(folded-restore|layouts-sync|folded-sw-narrow|folded-theme)\.spec\.ts/,
+  // folded-manifest: the WebAPK identity anchor on the folded start_url
+  // document (host links the SPA manifest root-absolutely; see the spec).
+  testMatch: /(folded-restore|layouts-sync|folded-sw-narrow|folded-theme|folded-manifest)\.spec\.ts/,
   // Serial: one real server, shared origin state (localStorage/SW) across a
   // context would leak between workers. Each TEST uses its own fresh context.
   fullyParallel: false,

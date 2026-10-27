@@ -18,6 +18,19 @@
          route in pkg/web/server.go handleStatic. -->
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
+    <!-- WebAPK identity anchor. The folded production start_url document is
+         THIS page (the host shell served at `/`), so the PWA manifest link
+         must live HERE: Chrome Android's WebAPK update fetcher only observes
+         MAIN-FRAME in-scope loads linking a valid manifest — the /app pane
+         iframes are invisible to it. Without this link the installed app is
+         a manifest-less DIY WebAPK (minimal-ui → title bar). The href is
+         root-absolute and MUST stay that way: unlike the icons above (public
+         files, which Vite rewrites under the folded base /host/), this is
+         NOT a host-public file, so Vite leaves it untouched and the binary
+         serves it from the single-server SPA dist at the origin root. Do NOT
+         let the build namespace it under /host/ — pinned by
+         host-web/tests/folded-e2e/folded-manifest.spec.ts. -->
+    <link rel="manifest" href="/manifest.webmanifest" />
     <!-- Pre-paint HOST theme (no first-paint flash): set .theme-<id> on
          <html> before anything renders, from the host's OWN storage key
          (vh-host:theme:v1 — the embedded SPAs keep their independent
