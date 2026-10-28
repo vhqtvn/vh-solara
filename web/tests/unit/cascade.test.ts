@@ -3,9 +3,8 @@
 // generation-keyed, coalescing, supersession-aware recovery supervisor in
 // src/sync/cascade.ts. BINDING CONTRACT:
 // researches/decisions/2026-10-10-send-convergence-cascade-and-connstatus.md.
-// These are the RED-first invariants the research packet
-// (tmp/agent-runs/send-design/research-packet-cascade.md §Q7 slice-A; gitignored
-// history) binds:
+// These are the RED-first invariants the decision record
+// binds:
 //   (3) N overlapping triggers within one window ⇒ exactly ONE cascade executes
 //   (4) superseded cascade's late outputs do not commit after a newer generation
 //   (5) flapping tunnel (repeated drop/restore) converges without unbounded

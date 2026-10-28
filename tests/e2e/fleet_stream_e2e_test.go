@@ -1,7 +1,7 @@
 package e2e
 
 // fleet_stream_e2e_test.go — lane-3 proof for GET /vh/fleet/stream (Slice 1
-// of tmp/agent-runs/android-push-20260928/stream-readstate-brief.md).
+// of researches/decisions/2026-09-29-controller-stream-and-history-readstate.md).
 //
 // This drives the SSE surface through the SHARED pattern's REAL stack end to
 // end: held HTTP connection → controller user edge (userMux + hostInterceptor

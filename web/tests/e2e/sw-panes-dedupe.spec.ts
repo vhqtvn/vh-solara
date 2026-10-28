@@ -4,7 +4,7 @@
 // The coalescing COUNT (identical in-flight GETs sharing one network fetch)
 // is NOT observable from the page/CDP (the SW's own network fetches emit no
 // page-session records) — that number is pinned by the perf harness
-// (tmp/agent-runs/page-load-perf, worker-edge request stats). What IS
+// (see docs/checkpoints/2026-10-09-page-load-perf-closeout.md, worker-edge request stats). What IS
 // observable per page, and pinned here:
 //   - the pane DOCUMENT (navigation entry) has transferSize 0 — the shell
 //     TTL served it from the SW cache with zero wire bytes (warm pane-boot

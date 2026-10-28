@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Offline, docker-free verification of the lane-4 flow-1 stream assertions.
 
-Promoted from the B8 scratch stub
-(tmp/agent-runs/page-load-perf-residuals/b8/test_decode_stub.py) and extended
+Promoted from the B8 scratch stub and extended
 to close the B8 c-F1 DEFER: the batch-absent (legacy-only) capture case is
 SYNTHESIZED here, per the defer's own escape hatch ("synthesize in the offline
 stub"), because a live batch-absent cold-boot capture could not be obtained

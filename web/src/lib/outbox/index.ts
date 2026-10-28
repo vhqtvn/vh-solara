@@ -10,8 +10,7 @@
 //     state and the compose text retained in memory — never a silent loss.
 //     `storageFailure()` carries the retained payload for that surface.
 //
-// CAPTURE SEMANTICS (debate-4 finding 7, as amended 2026-10-09 — see
-// tmp/agent-runs/send-design/design.md):
+// CAPTURE SEMANTICS (debate-4 finding 7, as amended 2026-10-09):
 //   - At successful local save the gesture captures the immutable target
 //     session + the current context-head (transcript tail). The captured head
 //     is compared at RESUME (reconcile re-admission — a changed head surfaces

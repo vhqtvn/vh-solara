@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 // /vh/highlight.css. Eight per-pane same-URL fetches of that link serialized
 // inside the browser network stack (~one RTT per pane at 110ms RTT), gating
 // each pane's JS boot and TTI (P0 diagnosis,
-// tmp/agent-runs/page-load-perf-waterfall/p0-diagnosis.md). The highlight CSS
+// docs/checkpoints/2026-10-11-page-load-perf-waterfall-closeout.md). The highlight CSS
 // now ships inside the hashed app stylesheet via the generated artifact
 // imported FIRST by src/index.tsx; its byte parity with the daemon's
 // /vh/highlight.css handler is enforced by pkg/web/highlight_parity_test.go.

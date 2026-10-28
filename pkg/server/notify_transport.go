@@ -2,8 +2,8 @@ package server
 
 // notify_transport.go — the replaceable push-notification transport layer
 // (slice S1 of the controller-side companion-app notification program;
-// solution brief tmp/agent-runs/android-push-20260928/brief.md, operator
-// decision: FCM first, but transports must be replaceable/addable).
+// solution brief researches/decisions/2026-09-28-android-companion-notifications.md,
+// operator decision: FCM first, but transports must be replaceable/addable).
 //
 // Pieces:
 //   - NotifyMessage + the Notifier interface: the transport-neutral send

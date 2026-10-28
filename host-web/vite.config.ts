@@ -21,7 +21,7 @@ const foldedBase = process.env.VITE_HOST_FOLDED ? "/host/" : undefined;
 
 // Folded-posture SPA entry preload (page-load-perf Waterfall P2).
 //
-// PROBLEM (measured; tmp/agent-runs/page-load-perf/raw/bbundle-after-cold-8):
+// PROBLEM (measured; see docs/checkpoints/2026-10-11-page-load-perf-waterfall-closeout.md):
 // in the folded topology the host shell at `/` boots the SPA panes at `/app`,
 // and the SPA's hashed entry assets (/assets/index-*.js|css) are only
 // discovered when the first pane document arrives — strictly AFTER the host

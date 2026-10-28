@@ -1,7 +1,7 @@
 package e2e
 
 // TestMultiProjectContentionBaseline is the Phase-A1 MEASUREMENT slice
-// (tmp/agent-runs/multiproject-contention-20260918/brief.md §6): it gives the
+// (see docs/checkpoints/2026-09-18-multi-project-tunnel-contention.md): it gives the
 // repo a ruler for multi-project contention — N populated projects on ONE
 // worker, browser-shaped demand client-side through the REAL yamux tunnel vs
 // direct — so a later decision can pick between recovery-fix / browser-fix /

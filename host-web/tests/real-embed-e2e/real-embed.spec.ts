@@ -929,8 +929,8 @@ test.describe("lane 8: real SPA cross-origin iframe embed", () => {
 });
 
 // =============================================================================
-// HIDDEN-PANE STATUS LIVENESS (2026-10-04 operator report; solution brief
-// tmp/agent-runs/hidden-pane-status-20261004/brief.md, Phase 0 RED + Phase 1
+// HIDDEN-PANE STATUS LIVENESS (2026-10-04 operator report; see
+// docs/ai/hidden-pane-status.md, Phase 0 RED + Phase 1
 // GREEN). The operator report: while a workspace is HIDDEN (not the active
 // one), its tab badge numbers (running/unread) stop updating — they show
 // stale counts until the workspace is revealed again.

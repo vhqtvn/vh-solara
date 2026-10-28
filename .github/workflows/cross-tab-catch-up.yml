@@ -1,5 +1,5 @@
 # Cross-tab catch-up headed experiment — Q1-A from the crosstab-find solution
-# brief (tmp/agent-runs/crosstab-find-solution-brief/brief.md, option O2).
+# brief (option O2).
 #
 # PURPOSE (what this lane exists to do): the hidden→visible catch-up
 # assertions in web/tests/e2e/theme-cross-tab.spec.ts and

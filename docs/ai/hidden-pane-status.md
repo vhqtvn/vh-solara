@@ -111,6 +111,6 @@ Headline numbers (chromium headless, baseline-vs-A at 2 and 4 panes, identical w
   noisy against keep-alive pools; ESTAB counts are polluted by heartbeat keep-alives.
 - 12-pane and headed (WebRender) cells were not run (time-boxed; 2→4 panes showed no movement).
 
-Raw per-cell JSON (`measure-{A,baseline}-{2,4}p.json`) and the full table live in the measurement
-session's run dir (`tmp/agent-runs/hidden-pane-status-20261004/`, gitignored — not part of the
-tree); the driver spec was ephemeral and deleted after the session.
+Raw per-cell JSON (`measure-{A,baseline}-{2,4}p.json`) and the full table were captured in the
+measurement session's run dir (gitignored — not part of the tree); the driver spec was
+ephemeral and deleted after the session.

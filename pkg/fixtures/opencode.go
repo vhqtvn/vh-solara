@@ -721,8 +721,8 @@ func textPart(msgID, sessionID, partID, text string, t float64) map[string]any {
 // opencode DB. Each row carries the fields a real session row serializes
 // (id/projectID/title/directory/model/time) so the per-row byte cost is
 // realistic. It does NOT seed messages (the detail snapshot bottleneck is the
-// session+gate volume, not message parts — see tmp/agent-runs/delivery-proof/
-// subtree-open-hang.md). New sessions are picked up by the aggregator's
+// session+gate volume, not message parts — per the delivery-proof
+// subtree-open-hang study). New sessions are picked up by the aggregator's
 // tree-reconcile poll and/or the live /event session.created fan-out below.
 func (f *FakeOpenCode) SeedFlatSessions(n int) {
 	if n <= 0 {
@@ -795,7 +795,7 @@ func (f *FakeOpenCode) SeedDeepTreeSessions(nChildren, nGrandchildren int) {
 
 // MultiProjectSpec are the workload volume knobs for SeedMultiProject — the
 // Phase-A1 multi-project contention fixture (measurement infrastructure only;
-// see tmp/agent-runs/multiproject-contention-20260918/brief.md §6). Every knob
+// see docs/checkpoints/2026-09-18-multi-project-tunnel-contention.md). Every knob
 // is a size/count control on STATIC seeded transcripts: deterministic ids,
 // deterministic content, deterministic timestamps (fixed epoch base), so two
 // seedings with the same spec produce byte-identical data. A live event-rate

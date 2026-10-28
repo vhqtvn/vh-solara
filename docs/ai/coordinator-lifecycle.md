@@ -3,8 +3,8 @@
 Status: **advisory operational guidance** (OWN-LOCAL pilot per the 2026-08-16
 ownership brief; upstream-candidate). Nothing here changes review authority,
 git authority, exec-family verbs, or permission edges. Sources:
-`tmp/agent-runs/sb-harness-waste_2026-08-15/brief.md` (Slice S1),
-`tmp/agent-runs/sb-overlay-vs-upstream_2026-08-16/brief.md` (Phase 1 Slice 1A),
+`researches/decisions/harness-adoption-waste-cuts.md` (Slice S1),
+`researches/decisions/harness-own-vs-upstream-boundary.md` (Phase 1 Slice 1A),
 `docs/checkpoints/2026-08-16-phase0-harness-verification.md` (0B evidence).
 
 ## Why

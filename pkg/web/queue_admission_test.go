@@ -3,7 +3,7 @@ package web
 // Send-reliability slice 1 — idempotent queue admission + replay-safe resolve.
 //
 // These cases pin the two backend guarantees the accepted plan (derived from
-// tmp/agent-runs/send-reliability-brief/brief.md §4.1/§4.2) requires:
+// researches/decisions/2026-09-25-send-state-ux-design-and-defers.md) requires:
 //
 //   - Admission is durably idempotent per (session, client attempt id,
 //     canonical payload): concurrent identical requests create exactly ONE

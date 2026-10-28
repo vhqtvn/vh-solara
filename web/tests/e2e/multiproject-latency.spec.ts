@@ -4,7 +4,7 @@ import path from "node:path";
 
 // Phase A2 — browser-side apply/render attribution under SUSTAINED
 // seven-project demand (Q2 of the multi-project contention brief,
-// tmp/agent-runs/multiproject-contention-20260918/open-questions-brief.md).
+// docs/checkpoints/2026-09-18-multi-project-tunnel-contention.md).
 //
 // Shape: SEVEN pages in ONE browser context (shared cookies/storage — the
 // same-profile-tabs model the operator reported), each pointed at its own

@@ -31,8 +31,8 @@
 //     detail, and the fixture witness must record exactly one correlated
 //     arrival and one persisted user-message occurrence.
 //
-// The receipt wording this spec earns lives in the slice closeout (see the
-// brief, tmp/agent-runs/queue-delivery-verification-brief/brief.md §5).
+// The receipt wording this spec earns lives in the slice closeout (see
+// docs/checkpoints/2026-10-13-queue-delivery-caveat-closure.md).
 
 import { expect, test, type APIRequestContext, type Route } from "@playwright/test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";

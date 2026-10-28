@@ -1,8 +1,8 @@
 # Docker test routes — lane 7 (host-web e2e)
 
 Phase 1 of the docker dev-env plan (solution brief:
-`tmp/agent-runs/researcher/docker-dev-env-brief.md`; Phase-0 probes:
-`tmp/agent-runs/devenv-phase0-probes/report.md`). This is the first
+docker-dev-env-brief; Phase-0 probes:
+devenv-phase0-probes). This is the first
 Docker-backed local route for one test lane; later phases extend the pattern to
 the other lanes. It exists so the full three-engine host-web e2e matrix is
 locally runnable with **zero host toolchain dependence**.

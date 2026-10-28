@@ -5,7 +5,7 @@
 // TERM_STALE_MS) — typed input must not vanish. Text routes into a visible,
 // editable compose buffer shown as NOT SENT; it reaches the PTY only through
 // an explicit user send (Send button / Enter-on-buffer), NEVER automatically.
-// Binding decision (tmp/agent-runs/send-design/debate-2.md Q4): queue-and-
+// Binding decision (debate-2 Q4): queue-and-
 // replay of raw PTY input means later blind execution of stale keystrokes —
 // worse than loss. An explicit, reviewed, one-tap send is the only flush path.
 //

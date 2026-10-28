@@ -2,7 +2,7 @@ package fixtures
 
 // Unit coverage for the Phase-A1 multi-project contention fixture
 // (SeedMultiProject / MultiProjectSpec — measurement infrastructure; see
-// tmp/agent-runs/multiproject-contention-20260918/brief.md §6). Pins the
+// docs/checkpoints/2026-09-18-multi-project-tunnel-contention.md). Pins the
 // contracts the e2e measurement (tests/e2e/multiproject_latency_test.go)
 // derives its session ids and expectations from:
 //

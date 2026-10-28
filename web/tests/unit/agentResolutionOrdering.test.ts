@@ -1,5 +1,4 @@
-// Resolver-ORDERING pins (DEFER-disposition Bundle 1 — brief at
-// tmp/agent-runs/defer-disposition-brief/brief.md): the two ordering
+// Resolver-ORDERING pins (DEFER-disposition Bundle 1): the two ordering
 // contracts from ad6c138 ("validate provably-empty agent default and settle
 // pre-aborted send gate immediately") that agentSilentFlip.test.ts does not
 // discriminate:

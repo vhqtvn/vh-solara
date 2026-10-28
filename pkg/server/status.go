@@ -3,8 +3,8 @@ package server
 // status.go — GET /vh/fleet/status: the compact fleet-status rollup API.
 //
 // STANDING CAVEAT (task card task-2026-09-25-…-compact-readonly-fleet-status-
-// rollup-api-controller; contract in tmp/agent-runs/watch-status-20260922/
-// api-brief.md): every observation in this rollup is RECENTLY-OBSERVED
+// rollup-api-controller; contract in
+// researches/decisions/2026-09-26-fleet-status-rollup-api.md): every observation in this rollup is RECENTLY-OBSERVED
 // WORKER-STORE STATE, not guaranteed live OpenCode freshness. The worker's
 // aggregator store lags upstream OpenCode by its reconciliation interval, and
 // a successful HTTP acquisition of a snapshot does not establish live upstream

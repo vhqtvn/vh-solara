@@ -218,8 +218,8 @@
 .status-mark.connecting .status-core { animation: core-search 1.05s ease-in-out infinite; }
 /* SLICE 1 (webperf paint): `live` and `stale` are the states an IDLE pane sits
    in for hours (live = connected+quiet, stale = watchdog-quiet), so they must
-   carry ZERO running animations — profile evidence (tmp/agent-runs/
-   webperf-paint/mechanism.md): every pane with ANY running animation restyles
+   carry ZERO running animations — profile evidence (webperf-paint
+   mechanism study): every pane with ANY running animation restyles
    every refresh tick, and even compositor-only transforms keep the driver
    ticking; 6 idle stale panes each styled exactly their 2 animated elements on
    every one of 281 ticks. Same treatment as the slice-6 `reconnecting` fix:

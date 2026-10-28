@@ -283,8 +283,8 @@ describe("sendActionStatus — A1 createLinkCandidates (timing-window correlatio
 // ---------------------------------------------------------------------------
 describe("sendActionStatus — transferOwnerSendAttempts stage-agnostic owner sweep (A2)", () => {
   it("re-keys EVERY draft-owned record regardless of stage: ids preserved, stages untouched, updatedAt bumped, count returned", () => {
-    // UNREACHABILITY NOTE (send-defers study §A2, mint-site trace —
-    // tmp/agent-runs/send-defers-study/report.md): draft-owned conflict/unsaved
+    // UNREACHABILITY NOTE (send-defers study §A2, mint-site trace — see
+    // researches/decisions/2026-09-25-send-state-ux-design-and-defers.md §2.2): draft-owned conflict/unsaved
     // records CANNOT occur via any current call path. Every mint/patch site
     // that sets those stages runs under a LIVE session id: queue.ts's resolve
     // paths (queue items exist only for live sessions), SendStatus's

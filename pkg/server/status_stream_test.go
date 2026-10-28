@@ -1,7 +1,7 @@
 package server
 
 // status_stream_test.go — lane-1 co-located tests for GET /vh/fleet/stream
-// (Slice 1 of tmp/agent-runs/android-push-20260928/stream-readstate-brief.md).
+// (Slice 1 of researches/decisions/2026-09-29-controller-stream-and-history-readstate.md).
 //
 // The SSE surface is exercised through the REAL handler chain
 // (buildRootHandler → auth → csrfGuard → hostInterceptor → userMux →

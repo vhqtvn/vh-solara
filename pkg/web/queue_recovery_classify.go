@@ -16,8 +16,9 @@ package web
 //                    journaled OCGeneration is older than the current one —
 //                    AND the exact-ID GET 404s post-restart AND
 //                    custodyBarrierCertified(externalOC); class 3. The
-//                    projector pin (tmp/agent-runs/send-design/projector-
-//                    pin.md) proves event-append and projection commit in
+//                    projector pin (see
+//                    researches/sources/2026-10-09-opencode-v1.17.18-projector-pin.md)
+//                    proves event-append and projection commit in
 //                    ONE SQLite transaction inside commitDurableEvent, so a
 //                    post-restart 404 for the exact id proves the
 //                    MessageUpdated transaction never committed — the

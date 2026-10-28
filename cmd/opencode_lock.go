@@ -17,7 +17,7 @@ import (
 // ocState.
 //
 // The mechanism (operator-accepted; crash-matrix-verified in
-// tmp/agent-runs/oc-spawn-lock-experiment) is a two-role flock(2) protocol on
+// researches/decisions/2026-08-28-oc-spawn-lock-experiment.md) is a two-role flock(2) protocol on
 // two lock files that live beside the per-project ocState file:
 //
 //   - STARTER lock (<key>.spawn.lock): parent-held, CLOEXEC, held across the

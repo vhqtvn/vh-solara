@@ -95,3 +95,5 @@ Evidence base (inherited from annexes; annex 2 supersedes annex 1 on conflicts):
 
 - [annex-1 solution brief (2026-10-27)](./2026-10-27-queue-dispatch-annex-1-solution-brief.md) — promoted from `tmp/agent-runs/send-now-queue-solution-20261027/brief.md`
 - [annex-2 gap resolution (2026-10-27)](./2026-10-27-queue-dispatch-annex-2-gap-resolution.md) — promoted from `tmp/agent-runs/send-now-queue-gap-resolution-20261027/brief.md`; supersedes annex-1 on conflicts, incl. the dispatching-item-exclusion correction.
+- [annex-3 upstream witness verdict (2026-10-27)](./2026-10-27-queue-dispatch-annex-3-upstream-witness.md) — promoted from `tmp/agent-runs/queue-upstream-witness-20261027/packet.md`; upstream witness verdict committed `11107d6`
+- [annex-4 interim corner rule (2026-10-27)](./2026-10-27-queue-dispatch-annex-4-interim-corner-rule.md) — promoted from `tmp/agent-runs/queue-interim-corner-rule-20261027/report.md`; interim corner rule committed `d5d8153`

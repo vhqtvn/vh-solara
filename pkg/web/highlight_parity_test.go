@@ -16,8 +16,8 @@ import (
 // bundled app stylesheet contains the highlight rules (unlayered, before all
 // app rules) and pane documents no longer fetch /vh/highlight.css per pane —
 // eight same-URL fetches that serialized inside the browser network stack
-// (~one RTT per pane; see the 2026-10-10 P0 diagnosis under
-// tmp/agent-runs/page-load-perf-waterfall/). The handler itself is unchanged
+// (~one RTT per pane; see the 2026-10-10 P0 diagnosis in
+// docs/checkpoints/2026-10-11-page-load-perf-waterfall-closeout.md). The handler itself is unchanged
 // and keeps serving standalone consumers.
 //
 // This test is the drift gate: if the chroma pin (go.mod) or the renderer's

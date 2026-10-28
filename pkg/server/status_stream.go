@@ -2,7 +2,7 @@ package server
 
 // status_stream.go — GET /vh/fleet/stream: the SSE live fleet-status stream
 // (Slice 1 of the controller stream/read-state brief,
-// tmp/agent-runs/android-push-20260928/stream-readstate-brief.md).
+// researches/decisions/2026-09-29-controller-stream-and-history-readstate.md).
 //
 // One held connection per client pushes the FULL current rollup JSON body per
 // published generation as SSE event `fleet.status` — a current-state stream,

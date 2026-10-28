@@ -2,7 +2,7 @@ package server
 
 // status_config.go — the fleet-status configuration core (slice C1 of the
 // fleet-status config redesign; operator-confirmed recommendation in
-// tmp/agent-runs/watch-status-20260922/config-brief.md). The expected
+// researches/decisions/2026-09-26-fleet-status-configuration.md). The expected
 // worker/project rosters for GET /vh/fleet/status live in ONE JSONC file
 // selected by --status-config, replacing the unpushed --status-worker /
 // --status-project repeatable flags.

@@ -203,8 +203,8 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
    :root.pane-hidden gate (tokens.css) pauses all animation while the pane is
    hidden. Standing rule: stroke-dashoffset, content, and filter must NEVER
    loop — none are compositor-animatable, and looping them is a per-frame
-   MAIN-THREAD restyle (profile evidence in
-   tmp/agent-runs/webperf-paint/mechanism.md). */
+    MAIN-THREAD restyle (profile evidence in webperf-paint
+    mechanism study). */
 .working {
   display: inline-flex; align-items: center; gap: 8px; min-width: 0;
   /* Cap width so a long tool subject truncates instead of pushing the Tasks

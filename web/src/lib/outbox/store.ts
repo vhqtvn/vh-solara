@@ -15,7 +15,7 @@
 // implementations live here because they share the record contract.
 
 /** Context head captured at gesture-save time (debate-4 finding 7, as
- *  amended 2026-10-09 — see tmp/agent-runs/send-design/design.md): the
+ *  amended 2026-10-09): the
  *  immutable target session's transcript tail at the moment the gesture became
  *  locally durable. Compared at RESUME (the reconcile re-admission gate) and
  *  at REPLACEMENT (the chip's inline confirm + TOCTOU re-verify) — NOT inside
