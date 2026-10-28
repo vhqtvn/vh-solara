@@ -14,6 +14,12 @@
 //     per connection generation, so a NATIVE retry (onerror CONNECTING, no
 //     new stream-open) is distinguishable from a JS-owned open.
 //  4. The diag ring stays bounded under an open burst (existing caps).
+//  5. (B-F3, deferred from the diagnostics-slice review — closed by the
+//     cursor-loss-fix card) the REAL scheduled retry callbacks execute under
+//     fake timers: the tree CLOSED backoff (tree-transport) and the session
+//     retry ladder (session-stream) re-open through their own timers,
+//     carrying the preserved cursor and emitting their stream-open reason —
+//     no substituted direct openSessionStream/connect calls.
 //
 // Harness mirrors coherentBarrierReloadRace.test.ts (MockEventSource +
 // resetModules + raw store setters). Real timers.
@@ -286,6 +292,136 @@ describe("stream-open diag — EventSource lifecycle observability (A3 discrimin
     if (rec.kind !== "stream-open") return;
     expect(rec.reason).toBe("retry-ladder");
     expect(openEntries().length).toBe(opensBefore + 1);
+  });
+
+  // B-F3 (deferred from the diagnostics-slice review): the two tests above
+  // SUBSTITUTE a direct openSessionStream call for the scheduled retry. These
+  // execute the REAL scheduled retry callbacks under fake timers and assert
+  // the re-open's wire shape (URL cursor) + the emitted stream-open record.
+  describe("the REAL scheduled retry callbacks (B-F3)", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    });
+
+    it("session retry ladder: the scheduled closed-retry reopens with the preserved cursor", async () => {
+      diaglog.setDiagLogOn(true);
+      stream.openSessionStream("s1", false, "first-open", "boot");
+      const ses = sessionESes()[0];
+      // A raw snapshot applies synchronously → sesCursor = 7.
+      ses.fire("snapshot", { seq: 7, sessions: [] }, "7.1");
+      const firstRec = openEntries()[openEntries().length - 1];
+      const opensBefore = openEntries().length;
+
+      ses.fireError(CLOSED); // onerror CLOSED → sesRetry scheduled at sesBackoff=1500
+      // Just before the ladder fires: no new construction, no new record.
+      vi.advanceTimersByTime(1499);
+      expect(sessionESes()).toHaveLength(1);
+      expect(openEntries()).toHaveLength(opensBefore);
+      // Cross the boundary: the REAL openSessionES("retry-ladder",
+      // "closed-retry") runs from the timer.
+      vi.advanceTimersByTime(1);
+      expect(sessionESes()).toHaveLength(2);
+      expect(sessionESes()[1].url).toContain("cursor=7"); // preserved cursor
+
+      const rec = openEntries()[openEntries().length - 1];
+      expect(rec.kind).toBe("stream-open");
+      if (rec.kind !== "stream-open") return;
+      expect(rec.stream).toBe("session");
+      expect(rec.reason).toBe("retry-ladder");
+      expect(rec.detail).toBe("closed-retry");
+      expect(rec.cursor).toBe(7);
+      expect(rec.hadCursor).toBe(true);
+      expect(rec.generation).toBeGreaterThan(
+        firstRec.kind === "stream-open" ? firstRec.generation : 0,
+      );
+    });
+
+    // F10 (round-2 review, deferred → closed): composition proof that the B13
+    // retry ladder restores the cursor from the per-session MEMORY (the
+    // cursor-loss fix) when the live cursor was zeroed — snapshot applied
+    // (memory=100) → cursorless recovery with NO delivery (live=0) → CLOSED
+    // on that connection → advance past sesBackoff → the scheduled retry ES
+    // carries cursor=100. Pre-fix this open sent cursor=0 (the parked defect
+    // shape the fix exists to kill).
+    it("B13 retry ladder restores the cursor from MEMORY when the live cursor was zeroed (cursor-loss fix)", async () => {
+      diaglog.setDiagLogOn(true);
+      // Raw session snapshot carrying m1 — applies synchronously, advancing
+      // the per-session cursor memory to 100.
+      const rawSessionSnap = (seq: number, id: string, msgID: string): any => ({
+        seq,
+        gate: { [id]: { messagesLoaded: true } },
+        messages: {
+          [id]: [{ info: { id: msgID, sessionID: id, role: "assistant", time: { created: 1 } }, parts: [] }],
+        },
+      });
+      stream.openSessionStream("s1", false, "first-open", "boot");
+      sessionESes()[0].fire("snapshot", rawSessionSnap(100, "s1", "m1"), "100.1");
+
+      // Forced cursorless recovery, NO delivery → the live sesCursor parks at
+      // 0 (closeSessionStream zeroed it; nothing arrived to re-advance it).
+      stream.openSessionStream("s1", true, "recovery-fresh", "f10-zeroing");
+      const es1 = sessionESes()[1];
+      expect(es1).toBeDefined();
+      expect(es1).not.toBe(sessionESes()[0]);
+
+      // Fatal CLOSED on the recovery connection → the manual retry ladder is
+      // scheduled at sesBackoff (1500, reset by the recovery's close).
+      es1.fireError(CLOSED);
+      vi.advanceTimersByTime(1499);
+      expect(sessionESes()).toHaveLength(2); // nothing yet — the ladder owns the reopen
+      vi.advanceTimersByTime(1); // cross sesBackoff
+      expect(sessionESes()).toHaveLength(3);
+      const es2 = sessionESes()[2];
+      expect(es2).not.toBe(es1);
+      // The LIVE cursor is 0 — this cursor can come ONLY from the memory.
+      expect(es2.url).toContain("cursor=100");
+
+      const rec = openEntries()[openEntries().length - 1];
+      expect(rec.kind).toBe("stream-open");
+      if (rec.kind !== "stream-open") return;
+      expect(rec.stream).toBe("session");
+      expect(rec.reason).toBe("retry-ladder");
+      expect(rec.detail).toBe("closed-retry");
+      expect(rec.cursor).toBe(100);
+      expect(rec.hadCursor).toBe(true);
+    });
+
+    it("tree CLOSED backoff: the scheduled closed-backoff reconnect re-carries the store cursor", async () => {
+      diaglog.setDiagLogOn(true);
+      stream.connect(false, "first-open", "boot");
+      const allTree = () => instances.filter((e) => !/sessions=[^&]/.test(e.url));
+      const es = allTree()[0];
+      es.simulateOpen();
+      // Advance the SHARED store cursor via a live tree event (session.upsert
+      // seq 42 → state.cursor=42, trackCursor=true — Stream1 owns it).
+      es.fire("session.upsert", { id: "s1" }, "42.1");
+      await vi.advanceTimersByTimeAsync(0);
+      const opensBefore = openEntries().length;
+
+      es.fireError(CLOSED); // onerror CLOSED → reconnectTimer at backoff=1000
+      vi.advanceTimersByTime(999);
+      expect(allTree()).toHaveLength(1);
+      expect(openEntries()).toHaveLength(opensBefore);
+      vi.advanceTimersByTime(1);
+      // The REAL connect(false, "onerror-backoff", "closed-backoff") ran.
+      expect(allTree()).toHaveLength(2);
+      const es2 = allTree()[1];
+      expect(es2).not.toBe(es);
+      expect(es2.url).toContain("cursor=42"); // cursor-PRESERVING reconnect
+
+      const rec = openEntries()[openEntries().length - 1];
+      expect(rec.kind).toBe("stream-open");
+      if (rec.kind !== "stream-open") return;
+      expect(rec.stream).toBe("tree");
+      expect(rec.reason).toBe("onerror-backoff");
+      expect(rec.detail).toBe("closed-backoff");
+      expect(rec.cursor).toBe(42);
+      expect(rec.hadCursor).toBe(true);
+    });
   });
 });
 

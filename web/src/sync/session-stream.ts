@@ -1,6 +1,8 @@
 // The Stream 2 (active-session messages) lifecycle, extracted from ./stream per
 // the invariant audit §6c. Owns the session EventSource, its listeners, the
-// sesGen connection-generation token, sesCursor resume cursor, the in-flight
+// sesGen connection-generation token, sesCursor resume cursor, the per-session
+// last-applied cursor memory (lastKnownSesCursor — the cursor-loss-fix
+// send-side state; see its block comment below), the in-flight
 // snapshot/batch decode gates (sesSnapshotDecode / sesSnapshotDecoding /
 // pendingBatch), Stream2's liveness clocks (sessionLastSeen /
 // sessionContentSeen and their mark* helpers), the session-only L1 latency
@@ -126,6 +128,10 @@ export function isPartDeltaEnabled(): boolean {
 interface PendingAppend {
   gen: number;
   sid: string;
+  // The frame's globalSeq (cursor space) — captured at receipt so the flush
+  // can advance the per-session last-known cursor for frames whose suffix
+  // actually APPLIED (cursor-loss fix; see lastKnownSesCursor).
+  seq: number;
   payload: PartAppendPayload;
 }
 let pendingAppends: PendingAppend[] = [];
@@ -267,6 +273,12 @@ let sesHydrating = false;
 // The batch listener stashes its decode promise here; the messages.loaded /
 // messages.error listener awaits any pending entry for the session before
 // flipping the gate. Cleared as each batch lands (try/finally in the listener).
+// F9 round-2b caveat: a Map keeps only the LATEST registration per session —
+// a second same-session batch frame OVERWRITES the entry while the first
+// decode is still in flight (the wait above then serializes against the
+// wrong batch). Cursor-advance correctness under that concurrency lives in
+// pendingBatchSeqs/claimSessionCursorApplied below (seq-set truth, not this
+// map); this map keeps its original purpose — the reveal-gate serialization.
 const pendingBatch = new Map<string, Promise<void>>();
 // In-flight gzip64 snapshot decode for the CURRENT session connection. A warm
 // open ships the transcript compressed (server maybeCompressSnapshot); the
@@ -322,6 +334,189 @@ const SES_CONNECTING_GIVEUP = 3;
 // state.cursor. Reset to 0 in closeSessionStream (session switch / close) so a
 // new session always starts fresh; preserved across retries (same session).
 let sesCursor = 0;
+// lastKnownSesCursor — per-session LAST-APPLIED cursor memory (card
+// task-2026-10-28t17-34-52-pwa-session-cursor-loss-fix, capture-1 §Q3: the
+// "second recovery" cursor-loss defect). closeSessionStream zeroes the LIVE
+// sesCursor at the START of every fresh open; if that open's authoritative
+// snapshot never APPLIES (suspend raced it mid-decode — the sesGen guard at
+// the gzip64 continuation discards the in-flight decode — or delivery never
+// landed), the zero persists in the suspended/parked state and EVERY later
+// open of the session (B3 reveal-resume, B13 retry-ladder, B5/B7 preserving
+// reopens) pays the cursorless full-snapshot price again. This map is the
+// send-side repair:
+//   - It advances ONLY where content was successfully APPLIED (post
+//     generation-guard, post busy-gate/epoch-guard — never from receipt of a
+//     deferred frame or an in-flight/discarded decode), so resuming from it is
+//     loss-free: everything ≤ the stored seq is already in the store. A
+//     part.append offset-mismatch latches the session against incremental
+//     claims (ALL capped sites — round-4b uniform gating) until a session
+//     snapshot re-applies (mismatchLatchedSids, round-4 F1 — see its block
+//     comment below for the resume-subsume corner that made the flush-local
+//     gate insufficient, and claimSessionCursorApplied for the uniform gate).
+//   - F8 strict-reading boundary (round-5b): no INCREMENTAL claim covers
+//     un-applied content; the snapshot floor-raise inherits the store merge
+//     policy as the definition of applied (see applySnap's round-5b recorded
+//     boundary below).
+//   - It is NEVER zeroed by closeSessionStream / the B12 silence fallback /
+//     the B10 offset-mismatch recovery (they zero the LIVE cursor only).
+//   - openSessionES sends it in place of a live sesCursor of 0, within the
+//     same page life (module state — a reload correctly starts fresh).
+// Safety rests on the server fallback contract (health.ts ~221–223 /
+// reopenSessionStreamPreservingCursor's no-loss note): correctness never
+// depends on the cursor being recent — a stale stored cursor degrades to ring
+// replay (duplicates merged away by prependMessagesIfAbsent) or the server's
+// own fresh fallback (hasCursor && !replayOK). Deliberately-fresh opens
+// (openSessionStream force=true recoveries, B9/B10/B11/B15; the B12
+// silence-fallback confirmation) stay CURSORLESS: their repair semantically
+// requires the server's fresh-snapshot branch (a replayed range would repeat
+// the same mismatch / the same interest-filtered silence and defeat the
+// recovery), so openSessionES takes an explicit `fresh` flag for them.
+// Project-switch hygiene: switchProject wipes s.messages while session ids
+// stay addressable, so a cursor memory from the outgoing project must never
+// feed a replay against the wiped store. The REQUIRED invalidation is at the
+// TRUE boundary — switchProject calls resetLastKnownSesCursors() on every dir
+// change (both its with-project and no-project branches; see actions.ts). The
+// openSessionES dir-observation clear below is retained ONLY as
+// defense-in-depth: it cannot be the primary mechanism, because a ZERO-OPEN
+// excursion (A→""→A with the session stream closed, A→B with no session
+// selected, a session-less popstate) never runs openSessionES under the
+// changed dir — the change is never observed, and the stale cursor would be
+// sent on return against the wiped store, stranding the pre-cursor transcript.
+const lastKnownSesCursor = new Map<string, number>();
+let lastKnownCursorDir: string | null = null;
+// noteSessionCursorApplied — the single advance point for the per-session
+// cursor memory. Monotonic per session id; ignores non-positive seqs (legacy
+// ids / parse fallbacks) and empty ids.
+function noteSessionCursorApplied(id: string, seq: number): void {
+  if (!id || !(seq > 0)) return;
+  const prev = lastKnownSesCursor.get(id) ?? 0;
+  if (seq > prev) lastKnownSesCursor.set(id, seq);
+}
+// resetLastKnownSesCursors — the project-boundary invalidation for the cursor
+// memory (review F1/F2/F3): called by switchProject on EVERY dir change, in
+// BOTH the with-project and the no-project branch. switchProject wipes
+// s.messages on every dir change while session ids stay addressable, so any
+// remembered cursor from the outgoing project must die AT the boundary — a
+// later re-select must take the fresh-snapshot branch, never a replay against
+// a wiped store. The openSessionES dir-observation clear stays as
+// defense-in-depth (it would catch a dir change that somehow bypassed
+// switchProject).
+export function resetLastKnownSesCursors(): void {
+  lastKnownSesCursor.clear();
+}
+// pendingBatchSeqs — F9 round-2b (data_integrity): per-session frame seqs of
+// UNRESOLVED messages.batch decodes. pendingBatch keeps only the LATEST
+// registration per session (a second same-session batch frame OVERWRITES the
+// entry — two batches can be concurrently unresolved: the ring records
+// messages.batch events, a session can be cold-published more than once, and
+// EventSource fires the next frame as soon as the listener suspends at its
+// decode await), so the promise map alone cannot tell a cursor claim "another
+// batch below you is still unresolved". This set is the seq-side truth. An
+// entry lives from the batch listener's synchronous registration to the
+// listener's finally (the decode settled — applied OR discarded), and is
+// removed even when the continuation drops at a guard: after the settle, the
+// pre-existing safety net owns the dropped range (same-connection frames die
+// at the gen guard / defer at the gate; a replacement connection's own
+// bootstrap re-covers it).
+const pendingBatchSeqs = new Map<string, Set<number>>();
+function notePendingBatchSeq(id: string, seq: number): void {
+  if (!id || !(seq > 0)) return;
+  let s = pendingBatchSeqs.get(id);
+  if (!s) {
+    s = new Set();
+    pendingBatchSeqs.set(id, s);
+  }
+  s.add(seq);
+}
+function forgetPendingBatchSeq(id: string, seq: number): void {
+  const s = pendingBatchSeqs.get(id);
+  if (!s) return;
+  s.delete(seq);
+  if (s.size === 0) pendingBatchSeqs.delete(id);
+}
+// claimSessionCursorApplied — the CAPPED advance point for the per-session
+// cursor memory (F9 round-2b). The memory may never cover un-applied content:
+// while any same-session batch decode is unresolved, the claim advances only
+// to min(unresolved seqs) − 1 — never into an unresolved batch's frame seq,
+// whose content a mid-decode gen/epoch drop can still discard. Under-advance
+// is always safe: the server replays the range and the merge dedups it.
+// ignorePendingSeq lets a batch's own apply claim its full seq (its own entry
+// is still registered at that moment — the listener's finally has not run).
+//
+// Round-4b (E2 subsume corner): the mismatch latch is consulted HERE, inside
+// the claim, so EVERY capped claim site — the batch apply site, the non-batch
+// message-listener tail, and the part.append flush — is gated UNIFORMLY.
+// Rounds 1–4 gated only the flush site; the E2 subsume window refuted that
+// locality: a drain-time mismatch whose recovery is SUBSUMED by a pending
+// resume-mode cascade step bumps no sesGen, so the post-drain gen re-check
+// passes and the triggering non-append frame APPLIES and CLAIMS at the
+// message-listener tail — advancing the memory past the un-applied mismatched
+// seq through a site the flush-local gate never saw. Latch semantics here are
+// FULL-SKIP (not cap-below-mismatch), matching the flush site's established
+// behavior: the memory freezes at the pre-mismatch value until applySnap —
+// the UNGATED authoritative floor-raise (noteSessionCursorApplied, called
+// directly there) and the latch-clear point — repairs it. The latch gate and
+// the pendingBatchSeqs cap COMPOSE: both only ever reduce or void a claim,
+// so under-advance safety holds under any evaluation order.
+function claimSessionCursorApplied(id: string, seq: number, ignorePendingSeq = 0): void {
+  if (!id || !(seq > 0)) return;
+  if (mismatchLatchedSids.has(id)) return;
+  const pend = pendingBatchSeqs.get(id);
+  if (pend && pend.size > 0) {
+    let min = Infinity;
+    for (const s of pend) if (s < min && s !== ignorePendingSeq) min = s;
+    if (min !== Infinity && seq >= min) seq = min - 1;
+  }
+  noteSessionCursorApplied(id, seq);
+}
+// mismatchLatchedSids — round-4 F1 (data_integrity, enumeration E11): the
+// per-session CROSS-FLUSH mismatch latch for the cursor-memory incremental
+// claims. Rounds 1–3 made that claim's mismatch gate flush-local (t1b-F1: a
+// flush that records a mismatch for a session never claims for it), resting on the
+// premise that the mismatch's cursorless recovery always runs — bumping
+// sesGen and moving every later frame onto a snapshot-first recovery
+// connection. The round-4 counterexample refuted that premise: a
+// sentinel-timeout cascade pass (health.ts's watchdog) holds a PENDING
+// {session:'resume'} step whose reopen connection sends cursor= with NO
+// tree=2 (openSessionES's URL), so the server's replay branch ships NO
+// trailing session snapshot (stream_http.go gates it on treeEmitter != nil)
+// — that step can never converge (only applySnap converges it) and pends up
+// to the 15s cascade timeout. A part.append mismatch in that window hits the
+// COALESCE branch: the pending session step SUBSUMES the direct (skipped —
+// no sesGen bump, no cursorless re-snapshot) and S2 cannot supersede (its
+// implied session step is pending). A LATER clean flush then passed every
+// flush-local gate and claimed past the un-applied mismatched seq; the next
+// close + unforced reopen sent that cursor and stranded the mismatched range
+// (pre-fix that reopen sent cursor=0 → healed). This latch carries the
+// mismatch across flushes:
+//   - SET at flush-mismatch time (every sid in flushAppends's mismatchSessions).
+//   - CLEARED only by applySnap — a session snapshot that APPLIES is the
+//     authoritative repair point: a session snapshot at a higher seq contains
+//     the mismatched range's content by construction (panel-verified
+//     content-inclusion), so cursor-memory claims above it are legitimate.
+//   - GATES EVERY capped claim (round-4b uniform gating, enforced INSIDE
+//     claimSessionCursorApplied): a latched session's incremental claims —
+//     the batch apply site, the non-batch message-listener tail, and the
+//     part.append flush — are voided until repaired, not just the flush's.
+//     (Rounds 1–4 gated the flush site only; the E2 subsume window — a
+//     drain-time mismatch subsumed by a pending resume step, gen unchanged,
+//     triggering non-append frame applies and CLAIMS at the listener tail —
+//     refuted the flush-local gate. The snapshot-apply site is deliberately
+//     UNGATED: applySnap calls the RAW noteSessionCursorApplied and then
+//     clears the latch, so the repair both raises the floor and reopens the
+//     capped claims.)
+// Safety: if no snapshot ever applies, the latch freezes the memory at the
+// pre-mismatch value — pure under-advance, always safe (a preserving replay
+// re-delivers the range; prependMessagesIfAbsent dedups it). Any eventual
+// repair (re-triggered mismatch / watchdog / B12 once no pass is in flight
+// — the coalesced direct itself is dropped, not re-run: the COALESCE branch
+// skips a subsumed direct permanently, cascade.ts:289-321,365-394, and
+// nothing re-runs it after the pass completes) opens CURSORLESS → its
+// snapshot applies → clears the latch and re-raises the memory
+// legitimately. Cascade semantics are deliberately UNCHANGED (panel
+// option 1; option 2's directness changes were rejected as
+// wider-behavior risk).
+const mismatchLatchedSids = new Set<string>();
 // sesLastDeliveryOrdinal — O3: per-stream DELIVERY ORDINAL for Inv1 gap
 // detection. The server stamps each Stream2-relevant wire event (snapshot +
 // message events) with a compound SSE id ("globalSeq.ordinal"); the ordinal is
@@ -640,7 +835,13 @@ export function openSessionStream(id: string, force = false, reason: StreamOpenR
   // the no-project state and a stray selection cleared before a project lands.
   if (!id || !projectDir()) return;
   sesId = id;
-  openSessionES(id, reason, detail);
+  // `force` doubles as the cursorless-send flag: a forced recovery demands the
+  // server's fresh-snapshot branch (see openSessionES's cursor selection), so
+  // it must NOT be answered with a restored last-known cursor. Unforced opens
+  // (selection-follow / reveal-moved-selection) DO restore — a re-selected
+  // previously-streamed session replays its missed deltas instead of paying
+  // the full-snapshot price (same page life only).
+  openSessionES(id, reason, detail, force);
 }
 
 // === open() extraction (Slice 2 webperf — visibility lifecycle) ==============
@@ -653,7 +854,11 @@ export function openSessionStream(id: string, force = false, reason: StreamOpenR
 // would force a cursorless full re-snapshot on every pane reveal. The retry
 // seam (open directly, cursor preserved) is the load-bearing property; `id`
 // became a parameter (the closure's only non-module capture).
-function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: string): void {
+// `fresh` (cursor-loss fix, see lastKnownSesCursor) pins the open CURSORLESS
+// for the deliberately-fresh recovery classes — it overrides a restored
+// last-known cursor, never a live one (callers that reach here with
+// sesCursor>0 keep today's wire shape exactly).
+function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: string, fresh = false): void {
     if (sesId !== id) return;
     // Bump the connection generation so listeners captured by any prior open()
     // of THIS selection (a retry) or a superseded selection are ignored. The
@@ -698,7 +903,27 @@ function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: 
     // sent → the server takes the fresh-snapshot branch. This mirrors Stream1's
     // cursorParam construction. The cursor is sesCursor (Stream2-local), NOT
     // state.cursor (the shared cursor Stream1 owns).
-    const cursorParam = sesCursor > 0 ? `cursor=${sesCursor}&` : "";
+    //
+    // Cursor-loss fix (lastKnownSesCursor): a live sesCursor of 0 no longer
+    // downgrades the open — when this session had APPLIED content earlier in
+    // the page life, the stored last-known cursor is sent in its place (the
+    // zeroed-live-cursor state is exactly the parked defect shape: a fresh
+    // open whose snapshot never applied). Deliberately-fresh recoveries
+    // (`fresh`, e.g. B10 offset-mismatch / B12 silence-fallback) stay
+    // cursorless. Project-switch hygiene: the memory belongs to the project
+    // dir it was recorded under — switchProject resets it AT THE BOUNDARY
+    // (resetLastKnownSesCursors, the required mechanism; the store's messages
+    // were wiped there). This dir-observation clear is DEFENSE-IN-DEPTH only:
+    // a zero-open excursion never observes the change, which is exactly why
+    // the boundary reset exists.
+    const dirNow = projectDir();
+    if (dirNow !== lastKnownCursorDir) {
+      lastKnownSesCursor.clear();
+      lastKnownCursorDir = dirNow;
+    }
+    const rememberedCursor = fresh ? 0 : lastKnownSesCursor.get(id) ?? 0;
+    const sendCursor = sesCursor > 0 ? sesCursor : rememberedCursor;
+    const cursorParam = sendCursor > 0 ? `cursor=${sendCursor}&` : "";
     // Slice 3: part_delta=1 opts into the KindPartAppend suffix wire format
     // (spec §3), mirroring the z=1 (gzip64) capability flag. Gated behind
     // partDeltaEnabled (isPartDeltaEnabled) so flipping the single flag reverts
@@ -710,14 +935,16 @@ function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: 
     // Diagnostics (logging-only): one stream-open record per construction —
     // reason taxonomy + the cursor this open sent. Progress stamps complete
     // later on the SAME record (listeners below). Inert unless the diaglog
-    // capture flag is on.
+    // capture flag is on. The cursor/hadCursor fields read the SENT cursor
+    // (sendCursor) — a restored last-known open records the restored value
+    // naturally, no special-casing.
     noteSessionStreamOpen({
       generation: gen,
       reason,
       detail,
       sessionId: id,
-      cursor: sesCursor > 0 ? sesCursor : 0,
-      hadCursor: sesCursor > 0,
+      cursor: sendCursor > 0 ? sendCursor : 0,
+      hadCursor: sendCursor > 0,
     });
     // Seed Stream2's liveness deadline from construction (mirrors Stream1's
     // markTreeSeen() right after `new EventSource`): a connection that NEVER
@@ -822,6 +1049,45 @@ function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: 
         // unit suites — see store.ts's `refreshing` note.
         setState("refreshing", id, false);
         applySessionSnapshot(id, snap);
+        // Cursor memory (cursor-loss fix): the snapshot APPLIED — advance the
+        // per-session last-known cursor. applySnap is reached only PAST the
+        // generation guard and the busy-gate/epoch guards (raw path: entry
+        // guard + not-busy-gated; gzip64 path: post-decode gen + epoch
+        // re-checks), so a deferred or discarded decode never advances it.
+        // Strictly AFTER applySessionSnapshot (review F8): all four advance
+        // sites share strict post-apply ordering — the memory claims content
+        // only once the reducer has actually run for it.
+        // Round-5b RECORDED BOUNDARY (coordinator adjudication, round-5
+        // F1/F2): for the SNAPSHOT path, the remembered-cursor charter's
+        // "applied" means "applySnap ran the snapshot through the store's
+        // established merge policy" — prependMessagesIfAbsent, live-wins for
+        // keyed non-completed residents — NOT "every byte the snapshot
+        // carried is now resident". The floor-raise below therefore fires at
+        // receipt even when the merge SKIPS content: the known pre-existing
+        // gap (a keyed incomplete resident missing a part whose snapshot
+        // repair the merge skips — reduce.ts:200-228) stays un-repaired in
+        // the store while the memory floor-raises past it. That gap is
+        // OUT-OF-SLICE (routed to the separate store-policy card);
+        // freeze-until-merged was adjudicated AGAINST (it would livelock the
+        // mismatch-recovery loop into re-snapshot storms; the pre-slice
+        // parity this preserves is the receipt-time LIVE-cursor advance).
+        // Incremental claims (every other advance site) remain STRICTLY
+        // applied-only — no incremental claim covers un-applied content.
+        // Pinned by the round-5b boundary-pin test in
+        // session-cursor-persistence.test.ts.
+        // Round-4b ARCHITECTURAL INVARIANT: this is deliberately the RAW
+        // noteSessionCursorApplied (authoritative floor-raise + repair), NOT
+        // claimSessionCursorApplied — the snapshot-apply site must stay
+        // UNGATED by the mismatch latch, because the very next line is the
+        // latch's CLEAR point (a snapshot that APPLIED is the repair itself).
+        noteSessionCursorApplied(id, seq);
+        // Round-4 F1: an authoritative session snapshot APPLIED — the
+        // content-inclusion repair point for the mismatch latch (a snapshot
+        // at a higher seq contains the mismatched range's content by
+        // construction; see mismatchLatchedSids). Clear it so the session's
+        // capped claims (all sites, round-4b uniform gating) may resume from
+        // this repair point.
+        mismatchLatchedSids.delete(id);
         // Slice A (send-net-resilience): a session baseline landed on the
         // current session connection — satisfy the convergence cascade's
         // session step.
@@ -920,7 +1186,7 @@ function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: 
       sesBackoff = 1500; // Phase 3-F: healthy open resets the CLOSED-reopen backoff
       sesConnectingFails = 0; // F3: healthy — native retry loop works again
     };
-    registerSessionMessageListeners(ses, gen);
+    registerSessionMessageListeners(ses, gen, id);
     ses.onerror = () => {
       // Gen guard: a superseded connection's error must not arm a retry on
       // behalf of the new (current) connection — the current connection owns
@@ -1127,9 +1393,14 @@ function armResumeSilenceFallback(): void {
     });
     // Cursorless reopen: the server takes the fresh-snapshot branch; the
     // snapshot confirms the repair. sesCursor=0 makes openSessionES omit the
-    // cursor param (its cursorParam derives from sesCursor).
+    // cursor param — and the `fresh` flag keeps the cursor-loss fix's restored
+    // last-known cursor OUT of this open: the silence this fallback answers was
+    // measured against (at least) that cursor, so re-sending it would take the
+    // replay branch again and repeat the interest-filtered silence — the exact
+    // wedge slice 5b exists to close. The fallback's snapshot re-advances the
+    // cursor memory when it applies.
     sesCursor = 0;
-    openSessionES(sesId, "recovery-fresh", "silence-fallback");
+    openSessionES(sesId, "recovery-fresh", "silence-fallback", true);
   }, SES_RESUME_SILENT_FALLBACK_MS);
 }
 
@@ -1305,9 +1576,12 @@ export const SESSION_MESSAGE_KINDS = [
 // Synchronous by contract (registration only, no async, no Promise return).
 // `gen` is THIS connection's captured generation token, passed by value; the
 // callback reads `gen` for the stale-entry / post-await recheck guards and the
-// live module-scope `sesGen` exactly as the inline registration did. No
-// open()-local state other than `es`/`gen` is captured, so there is no ctx.
-function registerSessionMessageListeners(es: EventSource, gen: number): void {
+// live module-scope `sesGen` exactly as the inline registration did. `id` is
+// the session this connection is scoped to (added by the cursor-loss fix for
+// the per-session last-known cursor advance at the two apply sites below —
+// the extracted function otherwise captured no open()-local state, so there
+// is no ctx).
+function registerSessionMessageListeners(es: EventSource, gen: number, id: string): void {
   for (const kind of SESSION_MESSAGE_KINDS) {
     es.addEventListener(kind, async (e) => {
       // Gen guard: ignore frames from a superseded connection BEFORE touching
@@ -1328,18 +1602,19 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
       // snapshot listener). Done BEFORE the gate check so even a deferred
       // (busy-gated) frame advances sesCursor — the event WAS received, so a
       // retry after the gate releases must not replay it.
-      {
-        // O3: parse compound SSE id — globalSeq for sesCursor, ordinal for gap.
-        const { globalSeq: seq, ordinal } = parseSSEID((e as MessageEvent).lastEventId);
-        // Invariant 1: delivery-ordinal gap detection. Checked BEFORE advancing
-        // sesCursor/sesLastDeliveryOrdinal so the gap is measured from the prior baseline.
-        checkSesOrdinalGap(ordinal, kind);
-        // checkSesOrdinalGap MAY have triggered openSessionStream(id, true) →
-        // sesGen++ → this connection is superseded. Drop cleanly.
-        if (gen !== sesGen) return;
-        if (seq > sesCursor) sesCursor = seq;
-        if (ordinal > sesLastDeliveryOrdinal) sesLastDeliveryOrdinal = ordinal;
-      }
+      // O3: parse compound SSE id — globalSeq for sesCursor, ordinal for gap.
+      // (Hoisted to listener scope from its former bare block: the part.append
+      // branch below buffers the frame's seq with it — cursor bookkeeping for
+      // the flush-time last-known advance, see PendingAppend.)
+      const { globalSeq: seq, ordinal } = parseSSEID((e as MessageEvent).lastEventId);
+      // Invariant 1: delivery-ordinal gap detection. Checked BEFORE advancing
+      // sesCursor/sesLastDeliveryOrdinal so the gap is measured from the prior baseline.
+      checkSesOrdinalGap(ordinal, kind);
+      // checkSesOrdinalGap MAY have triggered openSessionStream(id, true) →
+      // sesGen++ → this connection is superseded. Drop cleanly.
+      if (gen !== sesGen) return;
+      if (seq > sesCursor) sesCursor = seq;
+      if (ordinal > sesLastDeliveryOrdinal) sesLastDeliveryOrdinal = ordinal;
       if (isGateActive()) {
         // Deferred Stream-2 frame — neither mutate the store nor advance the
         // shared cursor. Latch dirty so the coalesced refresh catches up.
@@ -1404,7 +1679,7 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
       // the current task). See flushAppends / scheduleAppendFlush below.
       if (kind === "part.append") {
         if (sid) {
-          pendingAppends.push({ gen, sid, payload: data as PartAppendPayload });
+          pendingAppends.push({ gen, sid, seq, payload: data as PartAppendPayload });
           scheduleAppendFlush();
         }
         return;
@@ -1480,15 +1755,30 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
           // Epoch guard: the gate may have activated during the batch decode.
           if (ep === currentGateEpoch()) {
             applyMessageEvent("messages.batch", parseSSEID(ev.lastEventId).globalSeq, decoded, false);
+            // Cursor memory: the batch STAGED past the gen + epoch guards —
+            // applied content, advance (same rule as the final apply below).
+            // F9 round-2b: CLAIM (capped), not a raw note — a concurrent
+            // same-session batch with a lower seq may still be decoding; this
+            // batch's own pending entry must not cap its own claim.
+            // Round-4b: the claim is latch-gated inside the helper — a
+            // latched session's batch apply under-advances (safe) until
+            // applySnap repairs the latch.
+            claimSessionCursorApplied(sid || id, seq, seq);
           } else if (isGateActive()) {
             markBusyDirty();
           }
         })();
-        if (sid) pendingBatch.set(sid, p);
+        if (sid) {
+          pendingBatch.set(sid, p);
+          notePendingBatchSeq(sid, seq);
+        }
         try {
           await p;
         } finally {
-          if (sid) pendingBatch.delete(sid);
+          if (sid) {
+            pendingBatch.delete(sid);
+            forgetPendingBatchSeq(sid, seq);
+          }
         }
         return;
       }
@@ -1534,6 +1824,22 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
         );
       }
       applyMessageEvent(kind, parseSSEID(ev.lastEventId).globalSeq, data, false);
+      // Cursor memory: this frame reached the reducer PAST every guard
+      // (gen entry/post-await re-checks, epoch, drain-triggered-resync
+      // re-check) — successfully applied content, so the per-session
+      // last-known cursor may advance to its seq. part.append never reaches
+      // here (it buffers and returns); its advance happens in flushAppends.
+      // F9 round-2b: CLAIM (capped) — the pendingBatch wait above serializes
+      // only against the LATEST same-session registration; an earlier-seq
+      // batch can still be decoding (its map entry was overwritten).
+      // Round-4b (E2 subsume corner): the post-drain gen re-check above
+      // passes whenever a drain-time mismatch's recovery was SUBSUMED by a
+      // pending resume-mode cascade step (no sesGen bump) — this tail site
+      // then applies + claims past the un-applied mismatched range unless
+      // the latch gate INSIDE the claim voids it. That uniform gate is the
+      // round-4b fix; the E2/E3 pin's drop-at-recheck disposition covers the
+      // no-pass case only.
+      claimSessionCursorApplied(sid || id, seq);
     });
   }
 }
@@ -1598,6 +1904,15 @@ function flushAppends(): void {
     try { console.debug("[vh:sync] flushCardinality collector threw; contained (frames still apply)"); } catch { /* log must never abort the flush either */ }
   }
   const mismatchSessions = new Set<string>();
+  // Cursor memory (cursor-loss fix): the highest suffix seq in THIS flush that
+  // actually landed ("applied" — byte offset matched, text appended; "skipped"
+  // — the resident completed copy is authoritative and already covers it).
+  // Mismatched frames never advance it (their content did not apply; the
+  // cursorless re-snapshot they trigger re-establishes the cursor on apply).
+  // Tracked inside the produce body, advanced AFTER setState — module state is
+  // never mutated inside the producer.
+  let flushAppliedSeq = 0;
+  let flushAppliedSid = "";
   bumpUpdating();
   setState(
     produce((s) => {
@@ -1622,11 +1937,106 @@ function flushAppends(): void {
             field: f.payload.field,
             start: f.payload.start,
           });
+        } else if (f.seq > flushAppliedSeq) {
+          flushAppliedSeq = f.seq;
+          flushAppliedSid = f.sid;
         }
         // "applied" / "skipped": no action beyond the in-place mutation.
       }
     }),
   );
+  // Round-4 F1 (E11): carry THIS flush's mismatches across flushes — latch
+  // each mismatched sid (module state mutated OUTSIDE the producer, per the
+  // discipline above). The claim gate below refuses a latched session even
+  // when THIS flush is clean, because the earlier mismatch's content is still
+  // un-applied and — in the resume-subsume corner — no recovery is coming to
+  // repair it. Only applySnap clears the latch (snapshot-apply repair point).
+  for (const sid of mismatchSessions) mismatchLatchedSids.add(sid);
+  // F9 (round-2 review, data_integrity): the flush-time cursor advance must
+  // NEVER pass an unresolved pendingBatch. Wire order guarantees an append
+  // arriving after a messages.batch frame has a HIGHER seq, so advancing here
+  // while that batch's decode is still in flight would let the remembered
+  // cursor COVER the batch's content — content a mid-decode suspension (sesGen
+  // bump) then discards at the batch continuation's gen guard, stranding it on
+  // the next preserving replay (cursor past the batch → replay omits it).
+  // Under-advance instead: while a batch decode for the session is
+  // unresolved, the advance is skipped entirely (equivalent to "advance only
+  // up to pendingBatch.seq − 1" — the memory cannot pass the batch's seq).
+  // The suffix itself still APPLIES above (its content is live and
+  // offset-validated); only the cursor claim waits. No stranding risk:
+  //   - the batch APPLIES → its own advance-on-apply (the batch branch's
+  //     noteSessionCursorApplied) catches the memory up to the batch seq, and
+  //     any append flushed afterwards (map entry deleted in the batch
+  //     listener's finally) advances normally;
+  //   - the batch DISCARDS (gen/epoch) → the memory stays below the batch —
+  //     the resume replays the batch (safe: under-advance always converges
+  //     via ring replay + prependMessagesIfAbsent/dedup).
+  // Appends buffered BEFORE a batch frame (lower seq) are unaffected: the
+  // non-append path drains them synchronously BEFORE the batch branch
+  // registers its pendingBatch entry, so their flush-time advance never sees
+  // this gate.
+  // F9 round-2b: the `has()` gate alone has an overwrite hole — pendingBatch
+  // keeps only the LATEST same-session registration, so after a later-seq
+  // batch's finally deletes the (shared) entry, this flush could advance past
+  // a still-decoding EARLIER-seq batch. The claim below is capped by
+  // pendingBatchSeqs (min unresolved batch seq − 1), which tracks every
+  // concurrent registration, not just the latest. The `has()` gate is kept:
+  // full-skip when the latest batch is unresolved preserves the round-2
+  // semantics (and its pinned tests) exactly; the cap handles the residual
+  // concurrent-registration window.
+  // t1b-F1 (round-3 review, data_integrity): a mismatch recorded in THIS
+  // flush for the claiming session voids the claim entirely. The per-flush
+  // applied-max tracking cannot prove the applied suffix sits ABOVE every
+  // mismatched seq in the same buffer — the defect shape is a mismatched
+  // suffix at 200 (target part absent → content NOT applied) followed by an
+  // applicable suffix at 201 in the SAME flush: the claim committed 201 to
+  // the memory BEFORE the mismatch's cursorless recovery ran, so a later
+  // memory-restoring open replayed from 201 and skipped the un-applied 200.
+  // Conservative skip (not a below-mismatch cap): under-advance is always
+  // safe, and the mismatch recovery's authoritative snapshot re-advances the
+  // memory when it applies. Per-session keyed — a mismatch for session A
+  // does not void session B's claim (per-session memory, per-session
+  // recovery).
+  // Cross-FLUSH safety is carried by mismatchLatchedSids (round-4 F1, E11).
+  // The round-3 "needs no state" premise — that the mismatch's direct action
+  // always runs synchronously here (bumping sesGen so every later frame lands
+  // on a snapshot-first recovery connection), with the subsume-skip corner
+  // excluded because a fresh recovery connection receives its snapshot before
+  // any suffix could buffer — was REFUTED by the resume-mode subsume corner:
+  // a sentinel-timeout pass holds a PENDING {session:'resume'} step whose
+  // reopen URL carries a cursor but no tree=2, so the server's replay branch
+  // ships NO trailing session snapshot (stream_http.go gates it on
+  // treeEmitter != nil) — the step can never converge (only applySnap
+  // converges it) and pends up to the 15s cascade timeout, while the suffixes
+  // live on the RESUME connection where no snapshot ever lands. A mismatch in
+  // that window takes the COALESCE branch (pending session step → direct
+  // skipped; S2 cannot supersede a pending step), so NOTHING repairs it — and
+  // a later clean flush would pass every flush-local gate. The latch set at
+  // that mismatch therefore persists into later flushes and voids their
+  // claims too, until a snapshot APPLIES (applySnap's clear — the
+  // content-inclusion repair point). Safety: a latch that never clears
+  // freezes the memory at the pre-mismatch value — under-advance, always
+  // safe; any eventual repair (re-triggered mismatch / watchdog / B12 once
+  // no pass is in flight — the coalesced direct itself is dropped, not
+  // re-run) opens cursorless → its snapshot applies → clears the latch and
+  // re-raises the memory legitimately. Pinned by the
+  // t1b-F1 red-first test, the round-4 resume-subsume red-first test, the
+  // latch-clear pin, and the E2/E3 drain-ordering pin; the round-4b uniform
+  // gate additionally pins the E2 subsume corner (the tail-site claim) red-
+  // first.
+  // Round-4b: the !mismatchLatchedSids.has() clause below is now REDUNDANT
+  // with the latch gate inside claimSessionCursorApplied (the uniform gate
+  // voids the claim anyway) — kept because removing it changes nothing
+  // observable and the smallest diff wins; it also preserves the pinned
+  // full-skip semantics visibly at the flush call site.
+  if (
+    flushAppliedSid &&
+    !pendingBatch.has(flushAppliedSid) &&
+    !mismatchSessions.has(flushAppliedSid) &&
+    !mismatchLatchedSids.has(flushAppliedSid)
+  ) {
+    claimSessionCursorApplied(flushAppliedSid, flushAppliedSeq);
+  }
   // Trigger cursorless re-snapshot for each mismatched session (defense in depth
   // + the genuine reconnect/loss case). Only the SELECTED session has an open
   // Stream2 to repair; a non-selected session re-snapshots on next open.

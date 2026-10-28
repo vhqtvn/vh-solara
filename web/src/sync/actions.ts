@@ -27,7 +27,7 @@ import {
 } from "./store";
 import { syncUrl } from "./url";
 import { connect } from "./tree-transport";
-import { closeSessionStream } from "./session-stream";
+import { closeSessionStream, resetLastKnownSesCursors } from "./session-stream";
 import { resetPageInFlight } from "./history";
 import { resetTreeStore, clearUserToggled, applyTreeOpStore } from "./treeState";
 import { resetLabelsScope } from "../labels";
@@ -83,6 +83,19 @@ export function setSelectedId(id: string | null) {
 // per-project state instead of bridging cwd.
 export function switchProject(dir: string, fromUrl = false) {
   if (dir === projectDir()) return;
+  // Cursor-loss fix (review F1/F2/F3): drop the outgoing project's per-session
+  // last-known cursor memory AT THE BOUNDARY, before anything else. This runs
+  // on EVERY dir change — both the with-project reconnect and the no-project
+  // teardown below — because the produce block wipes s.messages on every
+  // switch while session ids stay addressable: a remembered cursor surviving
+  // the boundary would be sent on a later re-select and replay only deltas > M
+  // against the wiped store, stranding the pre-M transcript. The reset must
+  // live HERE (not lazily at the next openSessionES dir observation): a
+  // ZERO-OPEN excursion (A→""→A with the session stream closed, A→B with no
+  // session selected, a session-less popstate) never observes the dir change,
+  // so only the boundary reset covers every excursion shape. The openSessionES
+  // observation clear remains as defense-in-depth.
+  resetLastKnownSesCursors();
   saveVersioned(LS_PROJECT, 1, dir);
   setProjectDirRaw(dir);
   setSelectedIdRaw(null);
