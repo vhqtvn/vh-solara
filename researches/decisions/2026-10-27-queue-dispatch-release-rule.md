@@ -91,6 +91,85 @@ Evidence base (inherited from annexes; annex 2 supersedes annex 1 on conflicts):
 4. **FE schema/U5/composer** (gated on 3).
 5. **Tests + closeout** (regressions: queue item pending while root-idle-but-subtree-busy; G2 retry no longer direct-POSTs; witness-gated tests per annex 2).
 
+## Amendment (2026-10-29): Option B taken — policy feature on the interim gate
+
+> NOTE: Dated amendment; every historical section above is preserved unchanged.  
+> Date: 2026-10-29  
+> Status: RATIFIED (operator)  
+> Provenance: Operator decisions in-session 2026-10-29 (three explicit sub-decisions: Enter-while-busy=Queue with chip escalation; Stop only when text empty; attachments in queue path).  
+> References: `researches/decisions/2026-10-27-queue-dispatch-annex-3-upstream-witness.md` §6; `researches/sources/2026-10-28-opencode-v2-migration-feasibility.md` §Verdicts & §Dispositions.
+
+### 1. Decision statement
+
+The operator formally takes **Option B** (as defined in annex-3 §6 and recorded in the 2026-10-28 v2 migration feasibility disposition): ship the Send-now / Queue policy feature on the behavior-grade interim gate (EX) WITHOUT witness/obligation machinery, while the repository remains deployed on OpenCode v1.
+
+- **U5 superseded**: The original U5 composer design (always-visible `Queue` + `Send now` buttons with `Stop` relocated) is **SUPERSEDED** by the state-sensitive button table specified in §2 below.
+- **Witness gate decoupled**: The strict witness gate (O3 / S3) remains in force for any future proof-grade or obligation-based scheduler; it no longer gates **this** feature shape.
+- **v2 migration posture**: OpenCode v2 migration remains deferred per the 2026-10-28 feasibility study disposition (`researches/sources/2026-10-28-opencode-v2-migration-feasibility.md`).
+
+### 2. Composer button table (operator-ratified 2026-10-29)
+
+The composer UI adapts its controls and primary action based on whole-tree activity and input text presence:
+
+| State | Controls rendered | Primary action (Enter key) | Behavior |
+|---|---|---|---|
+| **Idle** | `Send` button | **Send** | Dispatches immediately to the session. |
+| **Busy + text empty** | `Stop` button only | — | Aborts / cancels the active turn. |
+| **Busy + text present** | `Queue` + `Send now` buttons (NO `Stop`) | **Queue** (safe default) | `Queue`: Admits item with policy `"queue"`.<br>`Send now`: Admits item with policy `"now"`. |
+
+**Pending queue chip escalation:**
+- Each pending queue chip gains a **Send now** escalation action.
+- Triggering escalation performs deliberate immediate dispatch (folding into the running turn if one is currently active).
+- Consent semantics are identical to the composer's busy `Send now` button: it is an explicit operator gesture of override consent, never evidence of turn completion (per the debate verdict's override-is-consent rule, annex-1/annex-2).
+
+### 3. Policy semantics
+
+- **Per-item policy**: Every admitted queue item carries `dispatchPolicy: "now" | "queue"`. Absence of the property defaults to `"queue"`.
+- **Immutability**: `dispatchPolicy` is immutable per admitted item, with exactly one exception: the explicit pending-chip **Send now** escalation action.
+- **Escalation modeling**: Implementations may model chip escalation either as a cancel-and-re-admit with policy `"now"`, or as an append-only policy escalation event in the attempt journal. In both cases, daemon custody fencing and attempt-journal invariants must hold without relaxation.
+- **Dispatch gating by policy**:
+  - `now` items (admitted via busy `Send now` or chip escalation) deliberately bypass the S2 subtree-idle gate at dispatch. Daemon custody, process fencing, and attempt-journaling remain fully active and unchanged.
+  - `queue` items strictly respect the interim gate exactly as shipped (Candidate A corner rule from annex-4: visible-idle-only recheck with `absent=allow`).
+- **Cross-category selection ordering**: In accordance with annex-2 §1 and §3, item selection uses oldest-eligible ordering across categories: an eligible `now` item may bypass earlier `queue` items that are currently blocked by subtree activity.
+
+### 4. Schema contract (G3)
+
+The G3 compatibility contract from annex-2 §3 applies verbatim:
+- **Schema 2**: Policy-bearing outbox/queue files use schema version 2.
+- **Atomic upgrade**: A policy-capable daemon opening a schema-1 file upgrades it atomically to schema 2 before persisting any policy-bearing item or reservation semantics; explicit `now` cannot be persisted in schema 1.
+- **Schema 2 + daemon-off refusal**: If a schema-2 file is encountered with daemon dispatch disabled, the system MUST refuse operation before List-side recovery, compaction, admission, claim, or mutation. File bytes must be preserved with a visible configuration/mode-required conflict. No legacy draining of policy-bearing files.
+- **Now under legacy drainer**: Items with `dispatchPolicy: "now"` under a legacy drainer must be refused, never silently degraded to `"queue"` or legacy direct-POST.
+- **No auto-downgrade**: Downgrades from schema 2 to schema 1 are prohibited without an authorized, lossless conversion process accounting for receipts, attempts, policies, and reservations.
+- **Fingerprint & canonical byte compatibility**: Normalized-queue receipts omit the `dispatchPolicy` member to preserve identical canonical identity bytes for legacy queue items; items with policy `"now"` include the member. Compatibility must be verified by tests.
+- **Capability advertisement**: `queueDispatchPolicyVersion: 1` is advertised in server capabilities only when the policy scheduler is supported and actively enabled.
+
+### 5. Attachments
+
+- Attachment support must be fully implemented in the queue path.
+- The existing prepared-payload / outbox pipeline already carries attachments; the queue admission and dispatch pipeline must preserve and forward these attachments to upstream dispatch.
+- A warning or fallback mode is acceptable **only** if a concrete, irreconcilable incompatibility surfaces during implementation. In that event, the incompatibility must be surfaced explicitly to the operator; silent warning fallbacks are forbidden.
+
+### 6. Residuals explicitly accepted by the operator
+
+This amendment deliberately extends the interim-gate waiver posture (W1 and W4 from §Waiver register) to cover the Send-now / Queue policy feature:
+1. **W4 (inter-actor race)**: Another actor starting work between the idle check and prompt admission can race a `"queue"` item into active work.
+2. **W1 (restart / unknown readiness)**: After a daemon restart or during an unobserved readiness interval, a `"queue"` item may dispatch into surviving-but-unobserved work (Candidate A `absent=allow` stands).
+3. **Missed-Busy-after-Now race**: When a `Send now` item dispatches and its busy state is never observed by the drain loop (e.g. fast completion or sampling gap), a subsequent `"queue"` item may fold into the still-running turn.
+
+The operator explicitly accepts these residuals for the policy feature under the behavior-grade interim gate, maintaining consistency with the established EX gate trade-offs.
+
+### 7. Known UX tradeoff recorded
+
+- **Stop unavailable when composer has text**: Because `Stop` is omitted whenever text is present in the composer while busy, aborting a running turn requires the operator to clear or cut their draft text first.
+- **Future escape hatch**: If this creates operational friction, a dedicated `Stop` control beside the global working / activity indicator is reserved as the future escape hatch.
+
+### 8. Provenance
+
+This amendment formalizes and records operator decisions ratified in-session on 2026-10-29. It incorporates three explicit operator-directed resolutions:
+1. Primary keypress while busy defaults safely to Queue (`Enter` = Queue), paired with an explicit chip-level `Send now` escalation action.
+2. The composer renders `Stop` exclusively when text is empty while busy, avoiding button sprawl and ambiguity.
+3. Queue dispatch must include first-class attachment support via the prepared-payload pipeline.
+
 ## Annexes
 
 - [annex-1 solution brief (2026-10-27)](./2026-10-27-queue-dispatch-annex-1-solution-brief.md) — promoted from `tmp/agent-runs/send-now-queue-solution-20261027/brief.md`
