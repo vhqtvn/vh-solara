@@ -2174,8 +2174,20 @@ func TestQueueFileVersionDecodeTable(t *testing.T) {
 			wantItems: 1,
 		},
 		{
-			name:         "newer version",
+			// B1: version 2 is the policy-bearing CURRENT schema (was the
+			// "newer" case pre-B1, when queueSchemaVersion was 1). Under an
+			// inactive policy scheduler it refuses with the mode-required
+			// conflict (bytes preserved) — pinned here daemon-off; the
+			// daemon-on clean load is pinned in
+			// TestQueueSchema2DaemonOnLoads (queue_dispatch_policy_test.go).
+			name:         "policy-bearing version, scheduler off",
 			body:         `{"version":2,"order":1,"items":[` + itemJSON + `]}`,
+			wantErr:      errQueueSchemaModeRequired,
+			wantPreserve: true,
+		},
+		{
+			name:         "newer version",
+			body:         `{"version":3,"order":1,"items":[` + itemJSON + `]}`,
 			wantErr:      errQueueSchemaNewer,
 			wantPreserve: true,
 		},
@@ -2310,8 +2322,10 @@ func TestQueueFileVersionedRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	// The receipt fingerprint must be the REAL canonical fingerprint of the
 	// payload — a placeholder would make the replay below (correctly)
-	// conflict. queuePayloadFingerprint is the same-package authority.
-	fp := queuePayloadFingerprint("seeded", nil, QueueSendConfig{})
+	// conflict. queuePayloadFingerprint is the same-package authority. (B1
+	// note: the "" policy argument is the normalized-queue representation —
+	// byte-identical to the pre-policy fingerprint.)
+	fp := queuePayloadFingerprint("seeded", nil, QueueSendConfig{}, "")
 	p := seedQueueFileBody(t, root, "s1", fmt.Sprintf(`{"version":1,"order":1,"fenceGeneration":7,"items":[`+
 		`{"id":"q-vt","order":1,"state":"pending","text":"seeded","attachments":[],"createdAt":1700000000000,`+
 		`"intentId":"11111111-2222-3333-4444-555555555555",`+
@@ -2474,7 +2488,7 @@ func TestQueueIntentIDAdmissionDedupe(t *testing.T) {
 	}
 
 	// Both aliases with DIFFERENT values is an ambiguous identity.
-	if _, _, err := s.enqueueAdmission("id-one", "id-two", "z", nil, QueueSendConfig{}, ""); !errors.Is(err, errQueueConflictingAdmissionIDs) {
+	if _, _, err := s.enqueueAdmission("id-one", "id-two", "z", nil, QueueSendConfig{}, "", ""); !errors.Is(err, errQueueConflictingAdmissionIDs) {
 		t.Fatalf("conflicting admission ids: err=%v, want errQueueConflictingAdmissionIDs", err)
 	}
 }

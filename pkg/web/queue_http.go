@@ -29,10 +29,49 @@ package web
 // durable gesture and list is read-only. See queueCustodyArbitrationRefused.
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 )
+
+// parseDispatchPolicyJSON validates the inbound `dispatchPolicy` body member
+// of an admission request (queue-policy slice B1; 2026-10-29 amendment §3).
+// The member is decoded as RawMessage so the ILLEGAL shapes are
+// distinguishable from absence:
+//
+//	absent                  → "" (queue — the default; absence ≡ queue)
+//	"queue"                 → "" (normalized: elided on the wire/disk — the
+//	                           receipt byte-compatibility representation)
+//	"now"                   → "now" (requires the policy scheduler; the
+//	                           caller checks that separately)
+//	null / "" / other string
+//	/ number / bool / object → errQueueInvalidDispatchPolicy (explicit
+//	                           null/empty/unsupported/wrong-type — never
+//	                           guessed, never degraded to the default)
+func parseDispatchPolicyJSON(raw json.RawMessage) (QueueDispatchPolicy, error) {
+	if len(raw) == 0 {
+		return "", nil // absent member
+	}
+	if string(raw) == "null" {
+		return "", fmt.Errorf("%w: explicit null (omit the member or send \"now\"/\"queue\")", errQueueInvalidDispatchPolicy)
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", fmt.Errorf("%w: dispatchPolicy must be the JSON string \"now\" or \"queue\" (got %s)", errQueueInvalidDispatchPolicy, raw)
+	}
+	switch {
+	case s == "":
+		return "", fmt.Errorf("%w: explicit empty string (omit the member or send \"now\"/\"queue\")", errQueueInvalidDispatchPolicy)
+	case QueueDispatchPolicy(s) == QueueDispatchPolicyQueue:
+		return "", nil // "queue" normalizes to the elided representation
+	case QueueDispatchPolicy(s) == QueueDispatchPolicyNow:
+		return QueueDispatchPolicyNow, nil
+	default:
+		return "", fmt.Errorf("%w: %q", errQueueInvalidDispatchPolicy, s)
+	}
+}
 
 // resolveQueueCtx extracts + validates the session id and project root from a
 // queue request. Writes the error response and returns ok=false on failure.
@@ -77,6 +116,43 @@ func writeQueueStoreErr(w http.ResponseWriter, err error) {
 		// Ambiguous client identity: both wire aliases present with different
 		// values. Machine-readable code mirrors the admission sentinels.
 		writeJSON(w, http.StatusBadRequest, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_admission_id_conflict"}))
+	case errors.Is(err, errQueueInvalidDispatchPolicy):
+		// B1 policy validation (amendment §3): explicit null/empty/
+		// unsupported/wrong-typed dispatchPolicy — refused before ANY store
+		// effect (bytes preserved), never guessed into a default.
+		writeJSON(w, http.StatusBadRequest, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_invalid_dispatch_policy"}))
+	case errors.Is(err, errQueuePolicyUnsupported):
+		// B1 G3 "now under legacy drainer": a `now` admission/escalation
+		// while the policy scheduler is off. 409 mode-conflict shape with
+		// the recovery path named — never a silent degradation to queue.
+		writeJSON(w, http.StatusConflict, jsonBytes(map[string]any{
+			"ok":      false,
+			"error":   err.Error(),
+			"code":    "queue_dispatch_policy_unsupported",
+			"require": "daemon dispatch (--daemon-dispatch)",
+		}))
+	case errors.Is(err, errQueueSchemaModeRequired):
+		// B1 G3 "schema 2 + daemon off": a policy-bearing file under an
+		// inactive policy scheduler. Refused before ANY mutation with the
+		// bytes preserved — a VISIBLE mode-required conflict, never an
+		// authoritative empty queue and never legacy draining of a
+		// policy-bearing file. The payload carries the same binding
+		// contract as queue_custody_active: the queue remains server-held.
+		writeJSON(w, http.StatusConflict, jsonBytes(map[string]any{
+			"ok":        false,
+			"error":     err.Error(),
+			"code":      "queue_schema_mode_required",
+			"queueHeld": true,
+			"require":   "daemon dispatch (--daemon-dispatch)",
+		}))
+	case errors.Is(err, errQueueNotEscalatable):
+		writeJSON(w, http.StatusConflict, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_not_escalatable"}))
+	case errors.Is(err, errQueueFenced):
+		// The escalation surface is today's only HTTP path that can surface
+		// a fence rejection: the custody epoch changed under the escalation
+		// request (a newer owner exists / the token was released between
+		// snapshot and fence). Retry against the new epoch.
+		writeJSON(w, http.StatusConflict, jsonBytes(map[string]any{"ok": false, "error": err.Error(), "code": "queue_escalation_fenced"}))
 	case errors.Is(err, errQueueSchemaNewer):
 		// AMEND-A4 valid-newer: this binary cannot serve a queue.json written
 		// by a newer binary. The file was NOT touched (no reinterpretation, no
@@ -218,8 +294,24 @@ func (s *Server) handleQueueEnqueue(w http.ResponseWriter, r *http.Request) {
 		OriginClientID string            `json:"originClientId"`
 		AttemptID      string            `json:"attemptId"`
 		IntentID       string            `json:"intentId"`
+		// DispatchPolicy stays RawMessage so parseDispatchPolicyJSON can
+		// distinguish absence (→ queue default) from the illegal explicit
+		// shapes (null / empty / unsupported / wrong type → 400).
+		DispatchPolicy json.RawMessage `json:"dispatchPolicy"`
 	}
 	if !decodeBody(w, r, &body) {
+		return
+	}
+	policy, perr := parseDispatchPolicyJSON(body.DispatchPolicy)
+	if perr != nil {
+		writeQueueStoreErr(w, perr)
+		return
+	}
+	if policy == QueueDispatchPolicyNow && !queuePolicySchedulerActive() {
+		// G3 "now under legacy drainer": refuse, never degrade. With daemon
+		// dispatch off, the legacy browser drainer owns waiting and a now
+		// item would silently behave as queue.
+		writeQueueStoreErr(w, errQueuePolicyUnsupported)
 		return
 	}
 	// Alias resolution: intentId (canonical) / attemptId (legacy) are the same
@@ -232,14 +324,7 @@ func (s *Server) handleQueueEnqueue(w http.ResponseWriter, r *http.Request) {
 		writeQueueStoreErr(w, errQueueConflictingAdmissionIDs)
 		return
 	}
-	var item QueueItem
-	var replayed bool
-	var err error
-	if body.IntentID != "" {
-		item, replayed, err = s.queues.store(root, sid).EnqueueWithIntentID(body.IntentID, body.Text, body.Attachments, body.SendConfig, body.OriginClientID)
-	} else {
-		item, replayed, err = s.queues.store(root, sid).EnqueueWithAttemptID(body.AttemptID, body.Text, body.Attachments, body.SendConfig, body.OriginClientID)
-	}
+	item, replayed, err := s.queues.store(root, sid).EnqueueAdmission(body.IntentID, body.AttemptID, policy, body.Text, body.Attachments, body.SendConfig, body.OriginClientID)
 	if err != nil {
 		writeQueueStoreErr(w, err)
 		return
@@ -362,6 +447,70 @@ func (s *Server) handleQueueResolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	item, err := s.queues.store(root, sid).Resolve(itemID, target, body.Detail)
+	if err != nil {
+		writeQueueStoreErr(w, err)
+		return
+	}
+	writeJSONResp(w, map[string]any{"item": item})
+}
+
+// queueCustodyTokenForDir snapshots the drain loop's custody token for a
+// project dir (nil when no loop is registered or it holds no epoch — e.g.
+// mid re-acquire backoff). The token may be stale by the time the caller
+// fences with it; that is the ordinary client-side-fencing posture — the
+// fence gate rejects it (errQueueFenced), which the escalation surfaces as
+// a retryable 409.
+func (s *Server) queueCustodyTokenForDir(dir string) *QueueCustody {
+	s.drainLoopsMu.Lock()
+	defer s.drainLoopsMu.Unlock()
+	if l, ok := s.drainLoops[dir]; ok {
+		return l.token()
+	}
+	return nil
+}
+
+// POST /vh/session/{sessionId}/queue/{itemId}/escalate — the pending-chip
+// Send-now escalation (queue-policy slice B1; 2026-10-29 amendment §2/§3).
+// Transitions a PENDING queue item to immediate-dispatch semantics via
+// cancel + re-admit with policy "now" under a fresh admission identity —
+// behind the custody fence (a stale/concurrent token is rejected by
+// generation), in one atomic save, with the original admission's receipt
+// bytes left intact. The browser CALLS this route (it is an admission-grade
+// gesture like enqueue, not a claim); the resulting item is dispatched by
+// the daemon loop exactly once.
+//
+// Refusal shapes: scheduler off or no live custody owner → 409
+// queue_escalation_requires_custody; non-pending item → 409
+// queue_not_escalatable; stale epoch → 409 queue_escalation_fenced.
+func (s *Server) handleQueueEscalate(w http.ResponseWriter, r *http.Request) {
+	sid, root, ok := s.resolveQueueCtx(w, r)
+	if !ok {
+		return
+	}
+	if !queuePolicySchedulerActive() {
+		writeJSON(w, http.StatusConflict, jsonBytes(map[string]any{
+			"ok":      false,
+			"error":   "send-now escalation requires daemon dispatch (the policy scheduler is disabled)",
+			"code":    "queue_escalation_requires_custody",
+			"require": "daemon dispatch (--daemon-dispatch)",
+		}))
+		return
+	}
+	tok := s.queueCustodyTokenForDir(reqDir(r))
+	if tok == nil {
+		writeJSON(w, http.StatusConflict, jsonBytes(map[string]any{
+			"ok":    false,
+			"error": "send-now escalation requires a live queue-custody owner (no drain loop holds this project's custody right now; retry shortly)",
+			"code":  "queue_escalation_requires_custody",
+		}))
+		return
+	}
+	itemID := r.PathValue("itemId")
+	if itemID == "" {
+		http.Error(w, "itemId required", http.StatusBadRequest)
+		return
+	}
+	item, err := s.queues.store(root, sid).EscalatePendingToNow(tok, itemID)
 	if err != nil {
 		writeQueueStoreErr(w, err)
 		return

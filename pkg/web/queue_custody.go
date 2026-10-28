@@ -488,6 +488,37 @@ func (s *sessionQueueStore) ClaimForCustody(tok *QueueCustody) (QueueItem, bool,
 	return s.claimOldestPendingLocked(tok.gen)
 }
 
+// ClaimPendingForCustody is the EXACT-ID custody claim for the policy-keyed
+// selection path (queue-policy slice B1; annex-2 §1 "atomic exact-ID claim"):
+// it claims THE item the drain loop selected — selection has already applied
+// the policy-keyed busy-eligibility (an eligible `now` item may pass older
+// `queue` items a busy tree blocks), so the claim must not re-derive
+// "oldest pending" and diverge from the selection. A missing item, or one no
+// longer pending at claim time (resolved/removed/concurrently claimed in the
+// selection→claim window), returns won=false — the loop re-selects next
+// tick. Same fence gate and same atomic claim body (claimItemLocked) as
+// ClaimForCustody.
+func (s *sessionQueueStore) ClaimPendingForCustody(tok *QueueCustody, itemID string) (QueueItem, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.archived {
+		return QueueItem{}, false, errQueueArchived
+	}
+	if err := s.fenceGateLocked(tok); err != nil {
+		return QueueItem{}, false, err
+	}
+	for i := range s.items {
+		if s.items[i].ID != itemID {
+			continue
+		}
+		if s.items[i].State != QueuePending {
+			return QueueItem{}, false, nil
+		}
+		return s.claimItemLocked(i, tok.gen)
+	}
+	return QueueItem{}, false, nil
+}
+
 // BeginDispatchAttempt durably journals the write-ahead transition
 // `prepared → sending` for one item: it appends a QueueAttempt record
 // (generation, StartedAt; TransportClass empty = in flight) to the item's

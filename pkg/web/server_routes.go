@@ -37,18 +37,29 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/skill/emit", s.handleSkillEmit)
 	mux.HandleFunc("/vh/version", func(w http.ResponseWriter, r *http.Request) {
 		// Capability advert (send-net-resilience slice 1; slice 2b phase 2
-		// made daemonDispatchCapable RUNTIME-reflective): queueSchemaVersion
-		// is the on-disk queue.json schema this binary writes/understands;
+		// made daemonDispatchCapable RUNTIME-reflective; queue-policy slice
+		// B1 added queueDispatchPolicyVersion): queueSchemaVersion is the
+		// MAX on-disk queue.json schema this binary writes/understands;
 		// daemonDispatchCapable advertises daemon-owned dispatch custody —
 		// the LIVE value of the --daemon-dispatch opt-in (default OFF) — so
 		// clients feature-detect the daemon-dispatch era on the EXISTING
-		// version endpoint rather than a parallel mechanism. Additive keys:
+		// version endpoint rather than a parallel mechanism.
+		// queueDispatchPolicyVersion is advertised ONLY while the policy
+		// scheduler is ACTIVE (2026-10-29 amendment §4 / G3: "advertised in
+		// server capabilities only when the policy scheduler is supported
+		// and actively enabled" — the same enablement that runs the daemon
+		// drain loop); the key is ABSENT otherwise so a missing/unsupported
+		// capability never activates modern gestures. Additive keys:
 		// existing consumers read "version" only.
-		writeJSONResp(w, map[string]any{
+		advert := map[string]any{
 			"version":               s.version(),
 			"queueSchemaVersion":    queueSchemaVersion,
 			"daemonDispatchCapable": DaemonDispatchEnabled(),
-		})
+		}
+		if queuePolicySchedulerActive() {
+			advert["queueDispatchPolicyVersion"] = queueDispatchPolicyVersion
+		}
+		writeJSONResp(w, advert)
 	})
 	mux.HandleFunc("/vh/snapshot", s.handleSnapshot)
 	mux.HandleFunc("/vh/projects", s.handleProjects)
@@ -115,6 +126,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /vh/session/{sessionId}/queue/{itemId}", s.handleQueueRemove)
 	mux.HandleFunc("POST /vh/session/{sessionId}/queue/claim", s.handleQueueClaim)
 	mux.HandleFunc("POST /vh/session/{sessionId}/queue/{itemId}/resolve", s.handleQueueResolve)
+	// Pending-chip Send-now escalation (queue-policy slice B1; 2026-10-29
+	// amendment §2): cancel + re-admit with dispatchPolicy "now" behind the
+	// custody fence. An admission-grade gesture (browser-callable like
+	// enqueue, unlike claim/resolve); CSRF enforced by csrfGuard.
+	mux.HandleFunc("POST /vh/session/{sessionId}/queue/{itemId}/escalate", s.handleQueueEscalate)
 	// Transcript-windowing historical-page endpoint (Phase 2). GET-only: serves
 	// one bounded page of OLDER messages (?before=<id>) for prepend/merge-by-id
 	// on the client. Distinct from the cold-load messages.batch SSE path: this

@@ -89,15 +89,27 @@ type QueueSendConfig struct {
 	Agent      string `json:"agent,omitempty"`
 }
 
-// queueSchemaVersion is the on-disk queue.json schema version this binary
-// writes and understands (send-net-resilience slice 1; the AMEND-A4 version
-// decoder foundation). It is an INT on purpose: the version exists to answer
-// exactly one question — "was this file written by a NEWER binary?" — and an
-// integer answers that with a single unambiguous numeric compare. A string
-// version would drag in format/semver parsing ambiguity for zero additional
-// information (schema bumps are monotonic whole-format changes, not
-// independent major/minor evolutions), and int makes the "absent" legacy
-// sentinel fall out for free (0 via json default when the key is missing).
+// queueSchemaVersion is the MAXIMUM on-disk queue.json schema version this
+// binary writes and understands (queue-policy-send-now slice B1 raised it
+// 1 → 2: schema 2 is the policy-bearing format). It is an INT on purpose:
+// the version exists to answer exactly one question — "was this file written
+// by a NEWER binary?" — and an integer answers that with a single
+// unambiguous numeric compare. A string version would drag in format/semver
+// parsing ambiguity for zero additional information (schema bumps are
+// monotonic whole-format changes, not independent major/minor evolutions),
+// and int makes the "absent" legacy sentinel fall out for free (0 via json
+// default when the key is missing).
+//
+// PER-FILE VERSION DISCIPLINE (G3, 2026-10-29 amendment §4 — applied
+// verbatim from annex-2 §3): save() does NOT stamp this const blindly. The
+// per-store on-disk version (s.version, loaded from the file) RATCHETS
+// monotonically and reaches 2 only when the save persists policy-bearing
+// semantics (an item with dispatchPolicy "now") — the atomic 1→2 upgrade
+// happens in the SAME atomic write as the first `now` persistence, so an
+// explicit `now` is never persisted in a schema-1 file. Legacy-only files
+// are never upgraded gratuitously; schema 2 never auto-downgrades (the
+// loaded-or-written version is a floor — save() advances s.version to what
+// it persisted; see the B-F1 note in save()).
 //
 // Decode contract (AMEND-A4, enforced in load()):
 //   - no version key (0) or any version <= queueSchemaVersion → valid-old or
@@ -107,11 +119,16 @@ type QueueSendConfig struct {
 //     guessing at a newer format is how corrupt-looking queues get rewritten
 //     and evidence destroyed. The file is left byte-intact for a newer binary
 //     or the read-only diagnostic/export path.
+//   - version 2 (policy-bearing) with the policy scheduler OFF
+//     (!queuePolicySchedulerActive): errQueueSchemaModeRequired — refuse
+//     BEFORE any state is assigned, recovery, compaction, admission, claim,
+//     or resolve. File bytes preserved; a visible mode-required conflict is
+//     surfaced (never interpreted as an authoritative empty queue).
 //   - malformed/truncated JSON, or a syntactically valid but structurally
 //     non-object top-level document (`null`, an array, a number, a string)
 //     → errQueueFileCorrupt (distinct typed error); corrupt bytes are
 //     PRESERVED (load failure never triggers a rewrite).
-const queueSchemaVersion = 1
+const queueSchemaVersion = 2
 
 // daemonDispatchEnabled is the RUNTIME daemon-dispatch capability (slice 2b
 // phase 2): when true, this daemon takes exclusive custody of queue dispatch
@@ -137,6 +154,65 @@ func SetDaemonDispatchEnabled(v bool) { daemonDispatchEnabled.Store(v) }
 // /vh/version advertises as "daemonDispatchCapable" and what gates custody
 // acquisition (via queueCustodyAllowed) and drain-loop startup.
 func DaemonDispatchEnabled() bool { return daemonDispatchEnabled.Load() }
+
+// QueueDispatchPolicy is the per-item dispatch scheduling policy
+// (queue-policy-send-now slice B1; 2026-10-29 amendment §3). The wire/on-disk
+// member is `dispatchPolicy`; the two legal values:
+//
+//   - "queue" (DEFAULT; absence ≡ "queue") — the item strictly respects the
+//     S2 interim idle gate (annex-4 Candidate A: visible-idle-only recheck,
+//     absent=allow). This is the exact behavior of every pre-policy item.
+//   - "now" — the item deliberately bypasses ONLY the busy-eligibility check
+//     at dispatch (an explicit operator override consent — the busy composer
+//     "Send now" button or a pending-chip escalation). Daemon custody,
+//     process fencing, attempt-journaling, and every other invariant remain
+//     fully active.
+//
+// REPRESENTATION DISCIPLINE (receipt byte-compatibility, G3): the field is
+// stored NORMALIZED — absence and explicit "queue" both persist as "" so the
+// omitempty tag ELIDES the member and a normalized-queue item's canonical
+// bytes are byte-identical to the schema-1 era. Only "now" materializes the
+// member. All admission paths normalize via normalizeQueueDispatchPolicy;
+// nothing else ever writes this field (claim/requeue/resolve preserve it
+// verbatim — the policy is immutable post-admission with exactly one
+// exception, the escalation surface, see queue_escalate.go).
+type QueueDispatchPolicy string
+
+const (
+	QueueDispatchPolicyQueue QueueDispatchPolicy = "queue"
+	QueueDispatchPolicyNow   QueueDispatchPolicy = "now"
+)
+
+// queueDispatchPolicyVersion is the capability advert value (G3): 1 = the
+// per-item dispatchPolicy scheduler is supported. Advertised by /vh/version
+// as "queueDispatchPolicyVersion" ONLY while the policy scheduler is active
+// (queuePolicySchedulerActive — the same enablement that runs the daemon
+// drain loop); absent otherwise, per the "advertised ONLY when enabled" rule.
+const queueDispatchPolicyVersion = 1
+
+// queuePolicySchedulerActive reports whether the dispatch-policy scheduler is
+// live: the same enablement that starts the daemon drain loop
+// (maybeStartQueueDrainLoop's DaemonDispatchEnabled check). Everything
+// policy-keyed keys off this ONE switch: the `now`-admission gate (a now item
+// must never sit under the legacy browser drainer), the schema-2 mode
+// requirement (a policy-bearing file refuses to operate under daemon-off),
+// the escalation surface, and the /vh/version advert.
+func queuePolicySchedulerActive() bool { return daemonDispatchEnabled.Load() }
+
+// normalizeQueueDispatchPolicy validates and normalizes an inbound policy:
+// "" (absent) and "queue" both normalize to "" (the elided, byte-compatible
+// representation); "now" passes through; anything else is
+// errQueueInvalidDispatchPolicy — never guessed, never degraded.
+func normalizeQueueDispatchPolicy(p QueueDispatchPolicy) (QueueDispatchPolicy, error) {
+	switch p {
+	case "", QueueDispatchPolicyQueue:
+		return "", nil
+	case QueueDispatchPolicyNow:
+		return QueueDispatchPolicyNow, nil
+	default:
+		return "", fmt.Errorf("%w: %q (want \"now\" or \"queue\")", errQueueInvalidDispatchPolicy, p)
+	}
+}
 
 // QueueAttemptTransportClass classifies a dispatch attempt's transport outcome
 // (send-net-resilience design "Dispatch Ownership"). It is the certification
@@ -365,6 +441,19 @@ type QueueItem struct {
 	// exact-match → sent heal. omitempty for backward compatibility.
 	AmbiguousDelivery bool `json:"ambiguousDelivery,omitempty"`
 
+	// DispatchPolicy is the item's immutable dispatch scheduling policy
+	// (queue-policy-send-now slice B1; 2026-10-29 amendment §3). Stored
+	// NORMALIZED: "" ≡ "queue" (the member is ELIDED on the wire/disk so a
+	// normalized-queue item's canonical bytes are byte-identical to the
+	// schema-1 era); only "now" materializes `"dispatchPolicy":"now"` — and
+	// persisting a `now` item is what ratchets the file to schema 2. The
+	// policy is immutable post-admission with exactly ONE exception: the
+	// explicit pending-chip Send-now escalation (queue_escalate.go), which
+	// models the exception as cancel + re-admit under a fresh admission
+	// identity rather than mutating this field. omitempty IS the
+	// byte-compatibility mechanism — do not remove it.
+	DispatchPolicy QueueDispatchPolicy `json:"dispatchPolicy,omitempty"`
+
 	// SessionError / SessionErrorAt record the LATEST session.error event
 	// observed on this item's session while the item sat in a
 	// delivery-uncertain state (slice 2b phase 2, the projector-pin
@@ -470,6 +559,33 @@ var (
 	// from a newer-schema file instead of treating both as a generic read
 	// failure.
 	errQueueFileCorrupt = errors.New("queue file corrupt (malformed or truncated JSON; bytes preserved)")
+	// errQueueInvalidDispatchPolicy (B1): an inbound dispatchPolicy value
+	// that is not "now" or "queue" — including explicit null/empty and
+	// wrong-typed members (the HTTP layer distinguishes those shapes before
+	// the store sees them; this sentinel is the shared typed verdict).
+	// Refused before ANY effect; never degraded to a default.
+	errQueueInvalidDispatchPolicy = errors.New("invalid queue dispatchPolicy")
+	// errQueuePolicyUnsupported (B1, G3 "now under legacy drainer"): an
+	// explicit `now` admission (or escalation) while the policy scheduler is
+	// inactive (daemon dispatch off — the legacy browser drainer owns
+	// waiting). Refused, NEVER silently degraded to "queue" or a legacy
+	// direct-POST: a now item sitting under the legacy drainer would
+	// silently behave as queue, which is exactly the degradation the
+	// amendment forbids.
+	errQueuePolicyUnsupported = errors.New("dispatchPolicy \"now\" requires daemon dispatch (the policy scheduler is disabled; refusing rather than degrading to queue)")
+	// errQueueSchemaModeRequired (B1, G3 "schema 2 + daemon off"): the
+	// on-disk queue.json is policy-bearing (schema 2) but the policy
+	// scheduler is inactive. Refused BEFORE any mutation — List-side
+	// recovery, compaction, admission, claim, resolve — with the file bytes
+	// preserved and a visible mode-required conflict (never an authoritative
+	// empty queue, never legacy draining of a policy-bearing file).
+	errQueueSchemaModeRequired = errors.New("queue file schema 2 is policy-bearing and requires daemon dispatch enabled (mode-required conflict; bytes preserved)")
+	// errQueueNotEscalatable (B1): the escalation surface only transitions
+	// a PENDING queue item to immediate-dispatch semantics; dispatching,
+	// terminal, or missing items are refused (an in-flight dispatch is
+	// owned by the custody state machine, a terminal item by the resolve
+	// matrix's monotonicity).
+	errQueueNotEscalatable = errors.New("only a pending queue item can be escalated to send-now")
 )
 
 // sessionQueueStore owns ONE session's queue: a mutex, a lazy-loaded in-memory
@@ -499,6 +615,17 @@ type sessionQueueStore struct {
 	// fenceGateLocked (queue_custody.go) and rejects a loaded value higher
 	// than the token's (a newer owner wrote this queue).
 	fenceGeneration uint64
+
+	// version mirrors queueFile.Version (B1, G3): the on-disk schema version
+	// this store last loaded OR SUCCESSFULLY WROTE (save() advances it to
+	// the version it persisted — review B-F1; assigned only by load()
+	// pre-fix, which let a now-item removal downgrade the next save). It is
+	// the FLOOR for every subsequent save (no auto-downgrade);
+	// effectiveSchemaVersionLocked ratchets it to 2 in the same atomic save
+	// that first persists a `now` item. 0 = never loaded a versioned file
+	// (legacy/pre-versioning file or no file) — normalized to 1 on write,
+	// preserving the pre-B1 write behavior.
+	version int
 
 	// receipts is the durable admission-receipt log (send-reliability slice 1),
 	// keyed by client attempt id. Lazily loaded from queueFile.Receipts by
@@ -536,6 +663,7 @@ func (s *sessionQueueStore) load() error {
 			s.items = nil
 			s.order = 0
 			s.fenceGeneration = 0
+			s.version = 0
 			s.loaded = true
 			return nil
 		}
@@ -577,14 +705,39 @@ func (s *sessionQueueStore) load() error {
 		// bytes stay on disk for an upgraded binary / the diagnostic path.
 		return fmt.Errorf("%w: file version %d, this binary supports %d (%s)", errQueueSchemaNewer, doc.Version, queueSchemaVersion, s.path)
 	}
+	if doc.Version >= 2 && !queuePolicySchedulerActive() {
+		// G3 "schema 2 + daemon off" (2026-10-29 amendment §4, applied
+		// verbatim from annex-2 §3): a POLICY-BEARING file under an inactive
+		// policy scheduler is refused BEFORE any state is assigned — so
+		// List-side recovery/compaction, admission, claim, and resolve (all
+		// of which route through load()) never mutate it. File bytes are
+		// preserved; the caller surfaces the visible mode-required conflict.
+		// Never drained by the legacy path, never presented as an empty
+		// queue.
+		return fmt.Errorf("%w: %s (file version %d, daemon dispatch disabled)", errQueueSchemaModeRequired, s.path, doc.Version)
+	}
+	if doc.Version >= 2 {
+		// G3 "schema 2, fully capable enabled daemon": validate
+		// policy-bearing items BEFORE accepting loaded state. An item
+		// carrying an unsupported policy member is semantic corruption —
+		// corrupt-bytes posture (refuse, preserve, never rewrite).
+		for i := range doc.Items {
+			if p := doc.Items[i].DispatchPolicy; p != "" && p != QueueDispatchPolicyQueue && p != QueueDispatchPolicyNow {
+				return fmt.Errorf("%w: %s: item %s carries unsupported dispatchPolicy %q", errQueueFileCorrupt, s.path, doc.Items[i].ID, p)
+			}
+		}
+	}
 	// No version key (0) or version <= queueSchemaVersion: valid-old/current —
 	// load exactly as before. Unknown fields within a known version are
 	// ignored by encoding/json (forward tolerance inside the version), and
-	// save() re-stamps the file with THIS binary's version.
+	// save() re-stamps the file with THIS binary's effective version (the
+	// loaded version as a floor — never a gratuitous upgrade, never a
+	// downgrade).
 	s.items = doc.Items
 	s.order = doc.Order
 	s.receipts = doc.Receipts
 	s.fenceGeneration = doc.FenceGeneration
+	s.version = doc.Version
 	// Normalize legacy on-disk items: a queue.json persisted BEFORE the
 	// attachments-always-array contract had no `attachments` key (the field used
 	// omitempty), so json.Unmarshal leaves QueueItem.Attachments nil. With the
@@ -614,6 +767,27 @@ func (s *sessionQueueStore) load() error {
 	return nil
 }
 
+// effectiveSchemaVersionLocked computes the schema version THIS save stamps:
+// the store's tracked version (loaded, or advanced by a prior successful
+// save — see save()'s B-F1 floor-advance) as a floor (no auto-downgrade, no
+// gratuitous upgrade of legacy-only files), ratcheted to queueSchemaVersion
+// (2) when the
+// save persists an explicit `now` item — the G3 atomic 1→2 upgrade fires in
+// the SAME atomic write as the first policy persistence, so `now` is never
+// on disk in a schema-1 file. Caller holds s.mu.
+func (s *sessionQueueStore) effectiveSchemaVersionLocked() int {
+	v := s.version
+	if v < 1 {
+		v = 1 // legacy/no-version file: this binary writes at least schema 1
+	}
+	for i := range s.items {
+		if s.items[i].DispatchPolicy == QueueDispatchPolicyNow {
+			return queueSchemaVersion
+		}
+	}
+	return v
+}
+
 // save writes the queue atomically (temp file + fsync + rename) so a crash at
 // any point never leaves queue.json truncated or partially written.
 //
@@ -626,7 +800,8 @@ func (s *sessionQueueStore) save() error {
 	if s.archived {
 		return errQueueArchived
 	}
-	doc := queueFile{Version: queueSchemaVersion, Order: s.order, Items: s.items, Receipts: s.receipts, FenceGeneration: s.fenceGeneration}
+	v := s.effectiveSchemaVersionLocked()
+	doc := queueFile{Version: v, Order: s.order, Items: s.items, Receipts: s.receipts, FenceGeneration: s.fenceGeneration}
 	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return fmt.Errorf("queue: encode: %w", err)
@@ -640,7 +815,24 @@ func (s *sessionQueueStore) save() error {
 	if err := projectcfg.EnsureRuntimeGitignore(vhSolaraDir(s.path)); err != nil {
 		vhlog.Warn("queue: ensure .vh-solara/.gitignore failed", "err", err)
 	}
-	return writeQueueAtomic(s.path, data, 0o644)
+	if err := writeQueueAtomic(s.path, data, 0o644); err != nil {
+		return err
+	}
+	// Advance the in-memory schema floor to the version just persisted
+	// (review B-F1, G3 no-downgrade — amendment §4). The stamp is derived
+	// from the LIVE items plus this floor: once the now item that ratcheted
+	// a save to 2 is removed, a later save would re-derive 1 from the stale
+	// floor and rewrite a still-policy-bearing file (a retained admission
+	// receipt carries the now item) as schema 1 — smuggling policy bytes
+	// past the daemon-off load() refusal. Recording the written version
+	// here keeps the in-memory ratchet monotonic exactly as the on-disk
+	// ratchet is. Unchanged on write failure (nothing was persisted), and
+	// never lowered (effectiveSchemaVersionLocked already floors at
+	// s.version, so the guard is monotonic by construction).
+	if v > s.version {
+		s.version = v
+	}
+	return nil
 }
 
 // staleDispatchThreshold is the maximum time a queue item may remain in the
@@ -1060,9 +1252,10 @@ func (s *sessionQueueStore) List() ([]QueueItem, error) {
 // Enqueue appends a new pending item (LEGACY, non-idempotent). The backend
 // issues the ID and the monotonic order. Requests without a client attempt id
 // keep exactly this behavior — no receipt, no dedupe — so pre-slice clients
-// and tests are unaffected. See EnqueueWithAttemptID for the idempotent path.
+// and tests are unaffected. Policy is the default ("" ≡ queue). See
+// EnqueueAdmission for the policy-carrying path.
 func (s *sessionQueueStore) Enqueue(text string, attachments []QueueAttachment, cfg QueueSendConfig, originClientID string) (QueueItem, error) {
-	it, _, err := s.enqueueAdmission("", "", text, attachments, cfg, originClientID)
+	it, _, err := s.enqueueAdmission("", "", text, attachments, cfg, originClientID, "")
 	return it, err
 }
 
@@ -1108,22 +1301,34 @@ const attemptIDMaxLength = 128
 
 // queuePayloadFingerprint computes the canonical fingerprint of the COMPLETE
 // prepared payload: text + attachments (ordered — order is part of the message
-// parts) + sendConfig. originClientID is deliberately EXCLUDED: it is
-// diagnostics-only (never affects ordering/visibility/dispatch), and including
-// it would spuriously conflict a legitimate retry observed from a different
-// browser (device handoff). nil attachments normalize to [] so a retry that
-// omits the key and one that sends [] fingerprint identically. Struct field
-// order in the canonical shape is fixed by the Go type, making the marshal
-// deterministic; sha256 makes collisions infeasible.
-func queuePayloadFingerprint(text string, attachments []QueueAttachment, cfg QueueSendConfig) string {
+// parts) + sendConfig + dispatchPolicy. originClientID is deliberately
+// EXCLUDED: it is diagnostics-only (never affects ordering/visibility/
+// dispatch), and including it would spuriously conflict a legitimate retry
+// observed from a different browser (device handoff). nil attachments
+// normalize to [] so a retry that omits the key and one that sends []
+// fingerprint identically. Struct field order in the canonical shape is fixed
+// by the Go type, making the marshal deterministic; sha256 makes collisions
+// infeasible.
+//
+// POLICY JOINS ADMISSION IDENTITY (B1, amendment §3 + mission bullet 3): the
+// normalized policy is the LAST canonical member, omitempty — so a
+// normalized-queue admission (policy "") fingerprints BYTE-IDENTICALLY to the
+// pre-policy era (existing receipts stay valid across the upgrade), while an
+// explicit `now` yields a DISTINCT fingerprint: the same attempt id replayed
+// with a different policy CONFLICTS (errQueueAdmissionConflict) instead of
+// collapsing into the original admission — the escalation re-admit path
+// mints its own fresh admission identity (queue_escalate.go) precisely so
+// this rule holds without swallowing escalations as replays.
+func queuePayloadFingerprint(text string, attachments []QueueAttachment, cfg QueueSendConfig, policy QueueDispatchPolicy) string {
 	if attachments == nil {
 		attachments = []QueueAttachment{}
 	}
 	canonical := struct {
-		Text        string            `json:"text"`
-		Attachments []QueueAttachment `json:"attachments"`
-		SendConfig  QueueSendConfig   `json:"sendConfig"`
-	}{Text: text, Attachments: attachments, SendConfig: cfg}
+		Text           string              `json:"text"`
+		Attachments    []QueueAttachment   `json:"attachments"`
+		SendConfig     QueueSendConfig     `json:"sendConfig"`
+		DispatchPolicy QueueDispatchPolicy `json:"dispatchPolicy,omitempty"`
+	}{Text: text, Attachments: attachments, SendConfig: cfg, DispatchPolicy: policy}
 	sum := sha256.Sum256(jsonBytes(canonical))
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
@@ -1150,7 +1355,7 @@ func queuePayloadFingerprint(text string, attachments []QueueAttachment, cfg Que
 //   - Receipt lifetime = store lifetime. deleteStore (archive/cleanup) ends
 //     the replay guarantee: a post-cleanup replay is a fresh admission.
 func (s *sessionQueueStore) EnqueueWithAttemptID(attemptID, text string, attachments []QueueAttachment, cfg QueueSendConfig, originClientID string) (QueueItem, bool, error) {
-	return s.enqueueAdmission("", attemptID, text, attachments, cfg, originClientID)
+	return s.enqueueAdmission("", attemptID, text, attachments, cfg, originClientID, "")
 }
 
 // EnqueueWithIntentID is the design-canonical alias of EnqueueWithAttemptID
@@ -1161,7 +1366,18 @@ func (s *sessionQueueStore) EnqueueWithAttemptID(attemptID, text string, attachm
 // capacity, atomicity, and lifetime contracts are byte-for-byte those of
 // EnqueueWithAttemptID. intentID=="" is the legacy non-idempotent path.
 func (s *sessionQueueStore) EnqueueWithIntentID(intentID, text string, attachments []QueueAttachment, cfg QueueSendConfig, originClientID string) (QueueItem, bool, error) {
-	return s.enqueueAdmission(intentID, "", text, attachments, cfg, originClientID)
+	return s.enqueueAdmission(intentID, "", text, attachments, cfg, originClientID, "")
+}
+
+// EnqueueAdmission is the FULL policy-carrying admission entry (queue-policy
+// slice B1): the alias-resolution core of EnqueueWithIntentID plus the typed
+// dispatchPolicy. policy follows the same normalization contract as the HTTP
+// layer — "" / "queue" normalize to the elided queue representation, "now"
+// requires the policy scheduler to be active (errQueuePolicyUnsupported
+// otherwise), and any other value is errQueueInvalidDispatchPolicy (the
+// defensive store-boundary check; the HTTP layer is the primary validator).
+func (s *sessionQueueStore) EnqueueAdmission(intentID, attemptID string, policy QueueDispatchPolicy, text string, attachments []QueueAttachment, cfg QueueSendConfig, originClientID string) (QueueItem, bool, error) {
+	return s.enqueueAdmission(intentID, attemptID, text, attachments, cfg, originClientID, policy)
 }
 
 // enqueueAdmission is the shared admission core behind the attemptId (legacy)
@@ -1172,7 +1388,12 @@ func (s *sessionQueueStore) EnqueueWithIntentID(intentID, text string, attachmen
 // admission id — whichever alias carried it — indexes the single durable
 // receipt log, so a replay dedupes by VALUE even if it arrives under the other
 // alias (the replayed receipt echoes the field the FIRST admission stamped).
-func (s *sessionQueueStore) enqueueAdmission(intentID, attemptID, text string, attachments []QueueAttachment, cfg QueueSendConfig, originClientID string) (QueueItem, bool, error) {
+//
+// policy is NORMALIZED + VALIDATED up front ("" ≡ queue; "now" requires the
+// policy scheduler; anything else is refused) — before any capacity check,
+// item construction, or receipt write, so an invalid or unsupported policy
+// admission has NO effect on the store.
+func (s *sessionQueueStore) enqueueAdmission(intentID, attemptID, text string, attachments []QueueAttachment, cfg QueueSendConfig, originClientID string, policy QueueDispatchPolicy) (QueueItem, bool, error) {
 	if intentID != "" && attemptID != "" {
 		if intentID != attemptID {
 			return QueueItem{}, false, errQueueConflictingAdmissionIDs
@@ -1182,6 +1403,16 @@ func (s *sessionQueueStore) enqueueAdmission(intentID, attemptID, text string, a
 	admissionID := intentID
 	if admissionID == "" {
 		admissionID = attemptID
+	}
+	policy, perr := normalizeQueueDispatchPolicy(policy)
+	if perr != nil {
+		return QueueItem{}, false, perr
+	}
+	if policy == QueueDispatchPolicyNow && !queuePolicySchedulerActive() {
+		// G3 "now under legacy drainer": refuse, never degrade. A now item
+		// admitted while the daemon drain loop is off would sit under the
+		// legacy browser drainer and silently behave as queue.
+		return QueueItem{}, false, errQueuePolicyUnsupported
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1205,7 +1436,7 @@ func (s *sessionQueueStore) enqueueAdmission(intentID, attemptID, text string, a
 		if len(admissionID) > attemptIDMaxLength {
 			return QueueItem{}, false, fmt.Errorf("%w: length %d exceeds %d", errQueueBadAttemptID, len(admissionID), attemptIDMaxLength)
 		}
-		fp := queuePayloadFingerprint(text, attachments, cfg)
+		fp := queuePayloadFingerprint(text, attachments, cfg, policy)
 		if rec, ok := s.receipts[admissionID]; ok {
 			if rec.Fingerprint != fp {
 				return QueueItem{}, false, fmt.Errorf("%w (fingerprint mismatch)", errQueueAdmissionConflict)
@@ -1230,6 +1461,12 @@ func (s *sessionQueueStore) enqueueAdmission(intentID, attemptID, text string, a
 		OriginClientID: originClientID,
 		AttemptID:      attemptID,
 		IntentID:       intentID,
+		// DispatchPolicy is stored NORMALIZED ("" ≡ queue, member elided on
+		// the wire/disk — receipt byte-compatibility); "now" materializes
+		// the member and ratchets the file to schema 2 in this same atomic
+		// save. Immutable post-admission (the one exception is the
+		// escalation surface, queue_escalate.go).
+		DispatchPolicy: policy,
 		// OpencodeMsgID is intentionally NOT minted here: a `pending` item is
 		// not yet dispatched, and minting the OpenCode correlation id at enqueue
 		// time would let it encode a wall-clock earlier than messages that land
@@ -1246,7 +1483,7 @@ func (s *sessionQueueStore) enqueueAdmission(intentID, attemptID, text string, a
 			s.receipts = map[string]queueAdmissionReceipt{}
 		}
 		s.receipts[admissionID] = queueAdmissionReceipt{
-			Fingerprint: queuePayloadFingerprint(text, attachments, cfg),
+			Fingerprint: queuePayloadFingerprint(text, attachments, cfg, policy),
 			Item:        item,
 		}
 		receiptRecorded = true
@@ -1342,39 +1579,51 @@ func (s *sessionQueueStore) Claim() (QueueItem, bool, error) {
 func (s *sessionQueueStore) claimOldestPendingLocked(claimGen uint64) (QueueItem, bool, error) {
 	for i := range s.items {
 		if s.items[i].State == QueuePending {
-			// Record the dispatch-start timestamp AND mint the OpenCode
-			// correlation id in the SAME in-memory mutation + atomic save as
-			// the pending→dispatching transition. Minting here (not at Enqueue)
-			// makes the ascending id track the actual dispatch wall-clock as
-			// closely as possible, so it does not sort into the transcript's
-			// past when OpenCode orders messages by string id. A crash after
-			// Claim returns but before dispatch leaves BOTH a recoverable
-			// timestamp and a reconciler correlation id on disk
-			// (recoverStaleDispatchingLocked uses the timestamp;
-			// queue_msg_reconcile.go uses the id).
-			s.items[i].State = QueueDispatching
-			s.items[i].DispatchStartedAt = queueNow().UnixMilli()
-			s.items[i].OpencodeMsgID = opencode.MintMessageID()
-			s.items[i].ClaimGeneration = claimGen
-			if err := s.save(); err != nil {
-				// Roll back the state, timestamp, AND correlation id so the
-				// store stays consistent with disk (none were durably
-				// committed). This rollback fires STRICTLY BEFORE Claim returns,
-				// hence strictly before any dispatch POST reaches the network,
-				// so re-minting on a later Claim is safe (no duplicate-message
-				// hazard: OpenCode never persisted anything under the cleared
-				// id). Clearing — not freezing — is correct here.
-				s.items[i].State = QueuePending
-				s.items[i].DispatchStartedAt = 0
-				s.items[i].OpencodeMsgID = ""
-				s.items[i].ClaimGeneration = 0
-				return QueueItem{}, false, err
-			}
-			item := s.items[i]
-			return item, true, nil
+			return s.claimItemLocked(i, claimGen)
 		}
 	}
 	return QueueItem{}, false, nil
+}
+
+// claimItemLocked performs the atomic oldest-shape pending→dispatching
+// transition on the item at index i: state flip + DispatchStartedAt +
+// OpencodeMsgID mint + ClaimGeneration stamp, all in ONE atomic save (the
+// inline body of the pre-policy claimOldestPendingLocked, extracted so the
+// exact-ID custody claim — ClaimPendingForCustody, the policy-keyed
+// selection path — shares it byte-for-byte). claimGen: 0 = legacy claim,
+// else the custody token's generation. Caller holds s.mu with the queue
+// loaded and s.items[i].State == QueuePending verified.
+func (s *sessionQueueStore) claimItemLocked(i int, claimGen uint64) (QueueItem, bool, error) {
+	// Record the dispatch-start timestamp AND mint the OpenCode
+	// correlation id in the SAME in-memory mutation + atomic save as
+	// the pending→dispatching transition. Minting here (not at Enqueue)
+	// makes the ascending id track the actual dispatch wall-clock as
+	// closely as possible, so it does not sort into the transcript's
+	// past when OpenCode orders messages by string id. A crash after
+	// Claim returns but before dispatch leaves BOTH a recoverable
+	// timestamp and a reconciler correlation id on disk
+	// (recoverStaleDispatchingLocked uses the timestamp;
+	// queue_msg_reconcile.go uses the id).
+	s.items[i].State = QueueDispatching
+	s.items[i].DispatchStartedAt = queueNow().UnixMilli()
+	s.items[i].OpencodeMsgID = opencode.MintMessageID()
+	s.items[i].ClaimGeneration = claimGen
+	if err := s.save(); err != nil {
+		// Roll back the state, timestamp, AND correlation id so the
+		// store stays consistent with disk (none were durably
+		// committed). This rollback fires STRICTLY BEFORE Claim returns,
+		// hence strictly before any dispatch POST reaches the network,
+		// so re-minting on a later Claim is safe (no duplicate-message
+		// hazard: OpenCode never persisted anything under the cleared
+		// id). Clearing — not freezing — is correct here.
+		s.items[i].State = QueuePending
+		s.items[i].DispatchStartedAt = 0
+		s.items[i].OpencodeMsgID = ""
+		s.items[i].ClaimGeneration = 0
+		return QueueItem{}, false, err
+	}
+	item := s.items[i]
+	return item, true, nil
 }
 
 // Resolve records a terminal outcome (sent/failed/unknown) on an item. It can
@@ -1531,6 +1780,52 @@ func (qr *queueRegistry) store(root, sessionID string) *sessionQueueStore {
 	return st
 }
 
+// queueSniffPolicyBearing reports whether the queue.json at path is
+// POLICY-BEARING (on-disk schema version >= 2 — the same predicate load()'s
+// mode-required gate applies). It is a minimal version sniff, deliberately
+// NOT a load(): load() refuses exactly the files this must protect
+// (errQueueSchemaModeRequired under daemon-off), and the cleanup decision
+// needs only the version member. Corruption-tolerant by design: any read or
+// decode failure (missing, unreadable, truncated, non-object) answers false
+// — "cannot prove policy-bearing" keeps the pre-existing best-effort
+// removal behavior, so a corrupt file can never wedge cleanup on (review
+// B-F2).
+func queueSniffPolicyBearing(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var sniff struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(data, &sniff); err != nil {
+		return false
+	}
+	return sniff.Version >= 2
+}
+
+// removeQueueFileForCleanup is the single queue.json unlink used by the
+// cleanup/archive path (deleteStore). It enforces the G3 daemon-off
+// preservation rule (review B-F2): while the policy scheduler is inactive,
+// a policy-bearing (schema >= 2) queue file is NOT unlinked — the load()-
+// side refusal (errQueueSchemaModeRequired) protects load-based operations
+// only, and without this guard CleanupSession / automatic
+// reconcileOrphanQueues would delete the very bytes that refusal preserves.
+// The conflict is surfaced as a WARN carrying the typed sentinel (cleanup
+// has no HTTP response to carry it), consistent with the existing refusal
+// surfacing; the registry/tombstone work in deleteStore still completes, so
+// session archival itself is not blocked. A daemon-ON pass removes such
+// files normally (schema 2 is legally operable when the scheduler is
+// active). Bounded leak, accepted by the chosen resolution: files persist
+// only while the daemon stays off, one log line per cleanup attempt.
+func removeQueueFileForCleanup(path string) {
+	if !queuePolicySchedulerActive() && queueSniffPolicyBearing(path) {
+		vhlog.Warn("queue cleanup: preserved policy-bearing queue file (mode-required conflict; daemon dispatch disabled, bytes preserved)", "path", path, "err", errQueueSchemaModeRequired)
+		return
+	}
+	_ = os.Remove(path)
+}
+
 // deleteStore is the idempotent web-owned cleanup primitive for one session's
 // queue. It drops the in-memory store for (root, sessionID), tombstones it
 // (BLK-1), removes its queue.json, AND attempts empty-only rmdir of the parent
@@ -1556,6 +1851,13 @@ func (qr *queueRegistry) store(root, sessionID string) *sessionQueueStore {
 //   - Filesystem cleanup runs even when no store is registered (mirrors the
 //     original best-effort file-removal contract) so a hand-seeded queue.json
 //     from a pre-startup persistence state still gets removed.
+//   - Policy-bearing preservation (review B-F2, G3): with daemon dispatch
+//     DISABLED, a schema-2 queue.json is NOT removed (see
+//     removeQueueFileForCleanup) — the deletion-path twin of load()'s
+//     errQueueSchemaModeRequired refusal. The store is still tombstoned and
+//     the registry entry still dropped, so archival completes; a daemon-ON
+//     pass cleans such files normally, and schema-1/legacy files keep the
+//     existing behavior in both modes.
 //
 // The REGISTRY lock is held across BOTH the map-removal AND the os.Remove so a
 // concurrent store()/Enqueue (which needs the registry lock to create a new
@@ -1588,8 +1890,10 @@ func (qr *queueRegistry) deleteStore(root, sessionID string) {
 	st := qr.stores[key]
 	if st == nil {
 		// No in-memory store to tombstone; just ensure the file is gone and
-		// attempt empty-only rmdir of the parent session directory.
-		_ = os.Remove(path)
+		// attempt empty-only rmdir of the parent session directory. The
+		// unlink goes through removeQueueFileForCleanup so a policy-bearing
+		// file is preserved under daemon-off (B-F2).
+		removeQueueFileForCleanup(path)
 		_ = os.Remove(dir)
 		return
 	}
@@ -1601,7 +1905,12 @@ func (qr *queueRegistry) deleteStore(root, sessionID string) {
 	st.mu.Lock()
 	st.archived = true
 	delete(qr.stores, key)
-	_ = os.Remove(path)
+	// The unlink honors the B-F2 daemon-off preservation rule: a
+	// policy-bearing queue.json survives this call (logged as a
+	// mode-required conflict) while the tombstone + registry removal above
+	// still complete — archival is not blocked, only the file bytes are
+	// kept for a daemon-ON pass.
+	removeQueueFileForCleanup(path)
 	// Empty-only rmdir of the parent session directory. If attachments/,
 	// an atomic-write temp file from writeQueueAtomic, or anything else is
 	// present, os.Remove fails and the directory survives — that is the
@@ -1681,6 +1990,10 @@ func (qr *queueRegistry) CleanupCallCount() int64 {
 //     observes archived==true and refuses to re-save, so the orphan cannot be
 //     resurrected. A file that vanishes between stat and CleanupSession is
 //     not an error (deleteStore's os.Remove is best-effort).
+//   - Policy-bearing files under daemon-off are PRESERVED by this pass (the
+//     CleanupSession → deleteStore preservation rule, review B-F2): each is
+//     logged as a mode-required conflict and left on disk for a daemon-ON
+//     pass to clean.
 //
 // GC-3 stale-inventory race — CLOSED by the T2 recheck (FIX-QUEUE-GC-3-RACE).
 //   - T1: the caller captures the active-session set (SessionIDs()) at one

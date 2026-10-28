@@ -81,6 +81,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -149,9 +150,42 @@ type queueDrainLoop struct {
 	srv    *Server
 	dir    string
 	root   string
-	tok    *QueueCustody
 	cancel context.CancelFunc // per-loop cancellation (nil for ad-hoc test loops)
 	done   chan struct{}      // closed when the loop goroutine has fully exited
+
+	// tokMu guards tok: the loop goroutine writes it at acquisition and
+	// clears it at release, while the escalation HTTP handler (a different
+	// goroutine) snapshots it via token() to fence the cancel+re-admit
+	// transition. QueueCustody itself is thread-safe; the mutex exists only
+	// to make the field's read/write race-free under -race.
+	tokMu sync.Mutex
+	tok   *QueueCustody
+}
+
+// token snapshots the loop's current custody token (nil between epochs —
+// e.g. mid re-acquire backoff). A returned token may STILL be stale or
+// released by the time the caller fences with it — that is the ordinary
+// client-side-fencing posture: FenceCheck/fenceGateLocked reject it.
+func (l *queueDrainLoop) token() *QueueCustody {
+	l.tokMu.Lock()
+	defer l.tokMu.Unlock()
+	return l.tok
+}
+
+func (l *queueDrainLoop) setTok(tok *QueueCustody) {
+	l.tokMu.Lock()
+	l.tok = tok
+	l.tokMu.Unlock()
+}
+
+// releaseTok clears the token and revokes its fence validity (Release is
+// idempotent and itself atomic w.r.t. FenceCheck).
+func (l *queueDrainLoop) releaseTok() {
+	t := l.token()
+	l.setTok(nil)
+	if t != nil {
+		t.Release()
+	}
 }
 
 // maybeStartQueueDrainLoop starts this dir's drain loop iff daemon dispatch
@@ -253,7 +287,7 @@ func (l *queueDrainLoop) run(ctx context.Context) {
 			return
 		}
 		exit := l.dispatchLoop(ctx)
-		l.tok.Release()
+		l.releaseTok()
 		if exit {
 			return
 		}
@@ -282,7 +316,7 @@ func (l *queueDrainLoop) acquire(ctx context.Context) bool {
 		}
 		tok, err := AcquireQueueCustody(l.root)
 		if err == nil {
-			l.tok = tok
+			l.setTok(tok)
 			l.srv.queues.invalidateStoresUnderRoot(l.root)
 			vhlog.Info("queue drain: custody acquired", "dir", l.dir, "root", l.root, "generation", tok.Generation())
 			return true
@@ -356,65 +390,69 @@ func (l *queueDrainLoop) tick(ctx context.Context, lastFsScan *time.Time) error 
 		_, err := a.Client().Prompt(ctx, sessionID, body)
 		return err
 	}
+	tok := l.token()
 	for _, sid := range l.discoverSessions(lastFsScan) {
 		if ctx.Err() != nil {
 			return nil
 		}
 		// 1. Certified recovery classification (a fence error propagates to
-		// dispatchLoop's exit condition).
+		// dispatchLoop's exit condition). NEVER gated — classification ≠
+		// dispatch (annex-4 corner 5); the requeue markers it sets are then
+		// consumed by the policy-keyed selection below, which respects each
+		// item's own policy (a recovered `now` item redispatches without
+		// waiting; a `queue` recovery waits).
 		resolve := func(ctx context.Context, sessionID, messageID string) ([]byte, error) {
 			return a.Client().Message(ctx, sessionID, messageID)
 		}
-		if err := s.certifiedRecoveryPass(l.root, sid, l.tok, resolve); err != nil {
+		if err := s.certifiedRecoveryPass(l.root, sid, tok, resolve); err != nil {
 			return err
 		}
 		// 2+3. One work item this tick: a pending requeue first, else a
 		// pending claim. (FIFO across both sets is preserved by Order via
 		// oldestDispatchable.)
 		st := s.queues.store(l.root, sid)
-		itemID, mode, ok := l.oldestDispatchable(st)
-		if !ok {
-			continue
-		}
-		// THE IDLE GATE (2026-10-26 incident fix; release-rule memo Path A —
-		// researches/decisions/2026-10-27-queue-dispatch-release-rule.md;
-		// corner-rule Candidate A "visible-idle-only recheck, absent=allow" —
-		// researches/decisions/2026-10-27-queue-dispatch-annex-4-interim-corner-rule.md):
+		// THE IDLE GATE, POLICY-KEYED (H2 — 2026-10-29 amendment §3; the
+		// S2 gate from the 2026-10-26 incident fix, release-rule memo Path A
+		// + annex-4 Candidate A "visible-idle-only recheck, absent=allow"):
 		// a queued item must NOT be POSTed upstream while the session's
-		// subtree is observably busy — the guarantee the legacy browser
-		// drainer had, restored in daemon dispatch mode. Mode-keyed by
+		// subtree is observably busy. The busy read is a FRESH canonical
+		// read per tick per lane (no debounce, no cross-tick memory —
+		// corner 1; absent-from-store = allow — corner 3, W1) passed INTO
+		// selection as the eligibility key: the selected item's STORED
+		// dispatchPolicy is the ONLY bypass key — `now` skips ONLY this
+		// busy-eligibility check; `queue` items take the existing S2 path
+		// unchanged, so an eligible `now` item may pass `queue` items the
+		// busy tree blocks (cross-category oldest-eligible ordering,
+		// amendment §3). Placement (binding): eligibility is decided BEFORE
+		// both the resume-marker consumption (corner 7 — a blocked
+		// evaluation must not burn the certified marker) and the claim;
+		// claim/fence/journal ordering is untouched. Mode-keyed by
 		// construction: this loop only runs under DaemonDispatchEnabled; the
 		// legacy (daemon-off) browser path never reaches this code.
-		//
-		// Placement (binding): AFTER selection (corner 6 — FIFO and
-		// resume-precedence untouched; the lane holds its oldest item) and
-		// BEFORE both the resume-marker consumption (corner 7 — a blocked
-		// evaluation must not burn the certified marker) and the claim.
-		// FRESH canonical read per tick per lane — no debounce, no
-		// cross-tick memory (corner 1); absent-from-store = allow (corner 3,
-		// W1: the routine post-restart posture for FS-discovered lanes —
-		// deliberate; a future witness-backed scheduler tightens this to
-		// unknown≠idle — that scheduler is deferred with the OpenCode v2
-		// migration, see
-		// researches/sources/2026-10-28-opencode-v2-migration-feasibility.md).
-		// The certified recovery pass above is NEVER gated
-		// (classification ≠ dispatch).
-		if busy, _ := a.Store().TreeBusyForDispatch(sid); busy {
-			// Skip the LANE this tick: the selected item stays pending (or
-			// its resume marker stays unconsumed); re-evaluated next tick.
-			vhlog.Debug("queue drain: idle gate holds lane (subtree observably busy)", "dir", l.dir, "sessionID", sid, "item", itemID)
+		busy, _ := a.Store().TreeBusyForDispatch(sid)
+		itemID, mode, ok := l.oldestDispatchable(st, busy)
+		if !ok {
+			if busy {
+				vhlog.Debug("queue drain: idle gate holds lane (subtree observably busy)", "dir", l.dir, "sessionID", sid)
+			}
 			continue
 		}
+		if busy {
+			vhlog.Debug("queue drain: now-policy item bypasses busy eligibility (queue-policy items held)", "dir", l.dir, "sessionID", sid, "item", itemID)
+		}
 		if mode == dispatchModeResume {
-			outcome, err := ResumeQueuedDispatchAttempt(ctx, st, sid, l.tok, itemID, ocGen, poster)
+			outcome, err := ResumeQueuedDispatchAttempt(ctx, st, sid, tok, itemID, ocGen, poster)
 			if err != nil && errors.Is(err, errQueueFenced) {
 				return err
 			}
 			l.resolveServerErrorInline(st, sid, outcome)
 			continue
 		}
-		// dispatchModePending: claim + agent evidence gate + dispatch.
-		claimed, won, cerr := st.ClaimForCustody(l.tok)
+		// dispatchModePending: EXACT-ID claim (the selection already applied
+		// policy-keyed eligibility — claiming "oldest pending" here could
+		// diverge from the selection and claim a busy-blocked queue item) +
+		// agent evidence gate + dispatch.
+		claimed, won, cerr := st.ClaimPendingForCustody(tok, itemID)
 		if cerr != nil {
 			if errors.Is(cerr, errQueueFenced) {
 				return cerr
@@ -431,7 +469,7 @@ func (l *queueDrainLoop) tick(ctx context.Context, lastFsScan *time.Time) error 
 			vhlog.Warn("queue drain: refused dispatch — no agent captured (evidence gate)", "sessionID", sid, "item", claimed.ID)
 			continue
 		}
-		outcome, err := resumeDispatchAttempt(ctx, st, sid, l.tok, claimed, ocGen, poster)
+		outcome, err := resumeDispatchAttempt(ctx, st, sid, tok, claimed, ocGen, poster)
 		if err != nil && errors.Is(err, errQueueFenced) {
 			return err
 		}
@@ -477,14 +515,26 @@ const (
 	dispatchModeResume
 )
 
-// oldestDispatchable returns the oldest work item for the session and which
-// executor entry applies. A requeue-awaiting-resume (dispatching AND
-// RequeuePending — a shape ONLY RequeueForCertifiedRedelivery produces and
-// ONLY itemForResume consumes) takes precedence over pending items; pending
-// items follow FIFO by slice order (claimOldestPendingLocked's own scan).
-// `ok=false` when nothing is dispatchable. In-flight attempts (dispatching
-// WITHOUT the marker) are never returned.
-func (l *queueDrainLoop) oldestDispatchable(st *sessionQueueStore) (itemID string, mode dispatchMode, ok bool) {
+// oldestDispatchable returns the oldest ELIGIBLE work item for the session
+// and which executor entry applies. A requeue-awaiting-resume (dispatching
+// AND RequeuePending — a shape ONLY RequeueForCertifiedRedelivery produces
+// and ONLY itemForResume consumes) takes precedence over pending items;
+// pending items follow FIFO by slice order (claimOldestPendingLocked's own
+// scan). In-flight attempts (dispatching WITHOUT the marker) are never
+// returned. `ok=false` when nothing is dispatchable.
+//
+// ELIGIBILITY IS POLICY-KEYED (H2, 2026-10-29 amendment §3): busy is the
+// lane's FRESH canonical whole-tree busy read for THIS tick; the item's
+// STORED dispatchPolicy is the ONLY bypass key — a `now` item is eligible
+// regardless of busy (it bypasses ONLY this busy-eligibility check), a
+// `queue` item (or a legacy no-policy item, ≡ queue) is eligible only when
+// the tree is not observably busy — the existing S2 Candidate-A path
+// unchanged. Scanning skips ineligible items in place, which yields
+// cross-category oldest-eligible ordering: an eligible `now` item may pass
+// blocked `queue` items. Resume-precedence and marker-consumption ordering
+// are otherwise untouched; when the tree is idle this returns exactly what
+// the pre-policy selection returned.
+func (l *queueDrainLoop) oldestDispatchable(st *sessionQueueStore, busy bool) (itemID string, mode dispatchMode, ok bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.archived {
@@ -493,13 +543,16 @@ func (l *queueDrainLoop) oldestDispatchable(st *sessionQueueStore) (itemID strin
 	if err := st.load(); err != nil {
 		return "", 0, false
 	}
+	eligible := func(it *QueueItem) bool {
+		return it.DispatchPolicy == QueueDispatchPolicyNow || !busy
+	}
 	for i := range st.items {
-		if st.items[i].State == QueueDispatching && st.items[i].RequeuePending {
+		if st.items[i].State == QueueDispatching && st.items[i].RequeuePending && eligible(&st.items[i]) {
 			return st.items[i].ID, dispatchModeResume, true
 		}
 	}
 	for i := range st.items {
-		if st.items[i].State == QueuePending {
+		if st.items[i].State == QueuePending && eligible(&st.items[i]) {
 			return st.items[i].ID, dispatchModePending, true
 		}
 	}
