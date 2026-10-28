@@ -125,7 +125,104 @@ export interface StallEntry {
     session: number;
   };
 }
-export type DiagEntry = ColdOpenEntry | StallEntry;
+// --- Stream-open diagnostics (PWA warm-resume capture, 2026-10-28) -----------
+//
+// STREAM_OPEN_REASONS is the CLOSED enum of open-cause values for the
+// stream-open diag kind. Every tree/session EventSource construction records
+// exactly one of these (an untagged caller lands on the explicit "other") so a
+// real-resume capture can attribute each open to its S0 taxonomy path. The
+// taxonomy-level granularity (e.g. WHICH recovery forced a fresh open) rides
+// the free-form `detail` field; the enum itself must stay closed + stable —
+// extend only, never rename (operator evidence packs grep these).
+export const STREAM_OPEN_REASONS = [
+  "first-open",
+  "reveal-resume",
+  "visibility-resume",
+  "watchdog",
+  "onerror-backoff",
+  "retry-ladder",
+  "recovery-fresh",
+  "selection-change",
+  "other",
+] as const;
+export type StreamOpenReason = (typeof STREAM_OPEN_REASONS)[number];
+
+/**
+ * StreamOpenEntry — recorded at every tree/session EventSource CONSTRUCTION.
+ * The content-progress stamps (openTs/firstFrameTs/firstSnapshotTs/
+ * snapshotAppliedTs/replayDoneTs) are completed LATER on the SAME record
+ * object (the ring holds the reference; stream-open-diag mutates in place and
+ * re-touches persistence), so one line carries construction → catch-up.
+ *
+ * Stamp semantics (wall-clock ms epoch, joinable against the worker journal
+ * ±100 ms):
+ *  - openTs            — EventSource onopen (also emitted as an es-life entry).
+ *  - firstFrameTs      — first CONTENT frame of any kind on this connection
+ *                        (replayed delta, snapshot, tree.snapshot, message.*).
+ *  - firstSnapshotTs   — first snapshot-family frame (`snapshot` detail /
+ *                        `tree.snapshot` / session `snapshot`).
+ *  - snapshotAppliedTs — first snapshot actually APPLIED (tree: coherent
+ *                        install or independent apply; session: applySnap).
+ *  - replayDoneTs      — tree only: the re-seed `snapshot.complete` boundary
+ *                        (the truthful end of a resume catch-up — replay tail
+ *                        + re-seed, or the fallback snapshot). The SESSION
+ *                        stream has NO replay-complete milestone (S0 gate (b)
+ *                        — protocol fact); it stays undefined there, by
+ *                        design, not by omission.
+ */
+export interface StreamOpenEntry {
+  kind: "stream-open";
+  /** Wall-clock construction time (ms epoch). */
+  ts: number;
+  stream: "tree" | "session";
+  reason: StreamOpenReason;
+  /** S0 taxonomy path id for attribution granularity (e.g. "watchdog-closed"). */
+  detail?: string;
+  /** "hosted" (host-shell iframe) | "standalone" (own window / installed PWA). */
+  pane: string;
+  /** Project dir at open time (pane/project identity; no pane-id wire surface exists). */
+  project: string;
+  /** Session id (session stream only). */
+  sessionId?: string;
+  /** Connection generation AFTER the open's bump (treeGen / sesGen). */
+  generation: number;
+  /** Resume cursor SENT on the open URL (0 = none). */
+  cursor: number;
+  /** Whether the URL carried a meaningful (>0) cursor. */
+  hadCursor: boolean;
+  /** Whether THIS open armed the 8 s silence fallback (stamped at arm time). */
+  fallbackArmed: boolean;
+  // --- completed later, same record ---
+  openTs?: number;
+  firstFrameTs?: number;
+  firstSnapshotTs?: number;
+  snapshotAppliedTs?: number;
+  replayDoneTs?: number;
+}
+
+/**
+ * StreamLifeEntry — NATIVE EventSource lifecycle observability. onopen and
+ * onerror (with readyState) are logged BOUNDED (first per connection
+ * generation always; further errors at most once per 30 s per generation) so
+ * a NATIVE auto-reconnect attempt (onerror readyState=CONNECTING with NO new
+ * stream-open record) is distinguishable from a JS-owned open in captured
+ * data — the A3-vs-A4/A5/A6 discriminator.
+ */
+export interface StreamLifeEntry {
+  kind: "es-life";
+  /** Wall-clock time (ms epoch). */
+  ts: number;
+  stream: "tree" | "session";
+  /** Connection generation the EventSource instance belongs to. */
+  generation: number;
+  phase: "onopen" | "onerror";
+  /** EventSource readyState at the event (0=CONNECTING,1=OPEN,2=CLOSED). */
+  readyState: number;
+  /** Per-generation onerror ordinal (1-based; absent on onopen). */
+  attempt?: number;
+}
+
+export type DiagEntry = ColdOpenEntry | StallEntry | StreamOpenEntry | StreamLifeEntry;
 
 // --- entryLine rendering ----------------------------------------------------
 // One entry -> a single copy-friendly line. The label `conn` (not the persisted
@@ -202,6 +299,26 @@ export function entryLine(e: DiagEntry): string {
       }
       return parts.join(" ");
     }
+    case "stream-open": {
+      const parts: string[] = [
+        iso(e.ts),
+        "stream-open",
+        `stream=${e.stream}`,
+        `reason=${e.reason}`,
+      ];
+      if (e.detail) parts.push(`detail=${e.detail}`);
+      parts.push(`gen=${e.generation}`, `cursor=${e.cursor}`, `had_cursor=${e.hadCursor}`);
+      if (e.sessionId) parts.push(`sess=${e.sessionId}`);
+      parts.push(`fb=${e.fallbackArmed ? 1 : 0}`, `pane=${e.pane}`, `proj=${e.project}`);
+      if (e.openTs !== undefined) parts.push(`open@=${e.openTs}`);
+      if (e.firstFrameTs !== undefined) parts.push(`frame@=${e.firstFrameTs}`);
+      if (e.firstSnapshotTs !== undefined) parts.push(`snap@=${e.firstSnapshotTs}`);
+      if (e.snapshotAppliedTs !== undefined) parts.push(`applied@=${e.snapshotAppliedTs}`);
+      if (e.replayDoneTs !== undefined) parts.push(`replayDone@=${e.replayDoneTs}`);
+      return parts.join(" ");
+    }
+    case "es-life":
+      return `${iso(e.ts)} es-life stream=${e.stream} gen=${e.generation} ${e.phase} readyState=${e.readyState}${e.attempt !== undefined ? ` attempt=${e.attempt}` : ""}`;
   }
 }
 
@@ -243,13 +360,33 @@ function loadDiagEntries(dir: string): DiagEntry[] {
 }
 // Runtime validator for migrated / foreign persisted payloads. StallEntry's
 // sessionId is OPTIONAL, so a valid entry must have (ts:number + kind:string)
-// and EITHER a string sessionId (cold-open) OR kind==="stall".
+// and EITHER a string sessionId (cold-open) OR kind==="stall" OR one of the
+// stream diag kinds (stream-open requires stream+reason; es-life requires
+// stream+generation+phase).
 function isDiagEntry(o: unknown): o is DiagEntry {
   if (!o || typeof o !== "object") return false;
-  const obj = o as { ts?: unknown; kind?: unknown; sessionId?: unknown };
+  const obj = o as {
+    ts?: unknown;
+    kind?: unknown;
+    sessionId?: unknown;
+    stream?: unknown;
+    reason?: unknown;
+    generation?: unknown;
+    phase?: unknown;
+  };
   if (typeof obj.ts !== "number") return false;
   if (typeof obj.kind !== "string") return false;
   if (obj.kind === "stall") return true; // sessionId optional on stall entries
+  if (obj.kind === "stream-open") {
+    return obj.stream === "tree" || obj.stream === "session";
+  }
+  if (obj.kind === "es-life") {
+    return (
+      (obj.stream === "tree" || obj.stream === "session") &&
+      typeof obj.generation === "number" &&
+      (obj.phase === "onopen" || obj.phase === "onerror")
+    );
+  }
   return typeof obj.sessionId === "string"; // cold-open requires it
 }
 
@@ -282,6 +419,17 @@ export function enforceCaps(list: DiagEntry[], now: number): DiagEntry[] {
 export function captureDiagEntry(entry: DiagEntry): void {
   if (!enabled()) return; // default-off: no allocation, no writes
   setEntriesRaw(enforceCaps([...entries(), entry], entry.ts));
+  schedulePersist();
+}
+
+/**
+ * Re-schedule the debounced persist after mutating an ALREADY-captured entry
+ * in place (the stream-open progress stamps complete seconds after their
+ * construction record landed). No-op when capture is off. Cheap: one signal
+ * read + a timer reschedule; safe to call from listener paths.
+ */
+export function touchDiagPersist(): void {
+  if (!enabled()) return;
   schedulePersist();
 }
 

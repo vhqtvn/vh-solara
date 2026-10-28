@@ -209,10 +209,10 @@ export function switchProject(dir: string, fromUrl = false) {
     // status as "connecting"; the no-project view hides the session tree, so the
     // status dot is not in a misleading state for the user's current focus.
     closeSessionStream();
-    connect(true); // early-returns on empty dir but closes the tree stream
+    connect(true, "selection-change", "project-switch"); // early-returns on empty dir but closes the tree stream
     return;
   }
-  connect(true); // project switch: snapshot to fully reconcile the new project's state
+  connect(true, "selection-change", "project-switch"); // project switch: snapshot to fully reconcile the new project's state. A13
 }
 
 // Reserve a session's message slot so the chat renders immediately; the actual

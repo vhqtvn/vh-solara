@@ -256,6 +256,25 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	var ordinal uint64
 
 	events, head, replayOK := store.Replay(cursor)
+	// PWA warm-resume fallback attribution (2026-10-28 diagnostics card): the
+	// fresh branch has THREE distinct causes that the journal line previously
+	// conflated (and that partial.ringGap on the wire STILL conflates — its
+	// semantics are deliberately unchanged here). replayOKAtEntry + the scan
+	// below disambiguate them for the JOURNAL only:
+	//   cursorless             — the client had no cursor (first open / fresh request).
+	//   ring_eviction          — store.Replay itself said !ok (cursor older than
+	//                            the retained ring window): events were missed.
+	//   compatibility_fallback — Replay was ok but the §4.3 scan below flipped
+	//                            replayOK (a part.append suffix sits in the
+	//                            replay range of a non-opted-in connection): a
+	//                            fresh snapshot is served despite NO events
+	//                            being missed — the S0 gate-(d) discriminator.
+	//   none                   — the replay branch served the cursor normally.
+	replayOKAtEntry := replayOK
+	// partAppendInRange: does the replay range contain a KindPartAppend? Now
+	// scanned for opted-in connections too (logging-only; the flip below still
+	// applies ONLY to non-opted-in, byte-for-byte the previous control flow).
+	partAppendInRange := false
 	// Slice 2 (part-append-streaming — spec §4.3): a LEGACY (non-opted-in)
 	// connection whose replay range contains a KindPartAppend must NOT interpret
 	// those suffix frames — it would lose the full-text reference a legacy
@@ -274,13 +293,26 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// here too double-counted a single §4.3 fallback (once here, once at the
 	// unified site). This is a METRIC-only change: replayOK still flips, so the
 	// connection still takes the snapshot path exactly as before.
-	if hasCursor && replayOK && !wantsPartDelta(r) {
+	if hasCursor && replayOK {
 		for _, ev := range events {
 			if ev.Kind == state.KindPartAppend {
-				replayOK = false
+				partAppendInRange = true
+				if !wantsPartDelta(r) {
+					replayOK = false
+				}
 				break
 			}
 		}
+	}
+	fallbackReason := "none"
+	if hasCursor && !replayOK {
+		if replayOKAtEntry {
+			fallbackReason = "compatibility_fallback"
+		} else {
+			fallbackReason = "ring_eviction"
+		}
+	} else if !hasCursor {
+		fallbackReason = "cursorless"
 	}
 	if hasCursor && replayOK {
 		for _, ev := range events {
@@ -378,20 +410,21 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 		baseline = head
 		sw.RecordReplayPath() // PROBE 3: cursor-replay baseline branch
-		// Slice 1 (webperf build1): VH_DEBUG line distinguishing the cursor-
-		// replay baseline branch from the fresh-snapshot branch so worker logs
-		// alone can count reconnect amplification (journalctl:
-		// path="replay" vs path="fresh"). Mirrors the P1-WEB-038 /vh/snapshot
-		// dur_ms pattern: vhlog.Debug is level-gated by VH_DEBUG, so the
-		// default path pays only the call.
-		if vhlog.Enabled() {
-			vhlog.Debug("stream baseline",
-				"path", "replay",
-				"class", streamClassLabel(streamClass),
-				"cursor", cursor,
-				"replayed", len(events),
-				"head", head)
-		}
+		// Slice 1 (webperf build1) + PWA warm-resume attribution (2026-10-28):
+		// the stream-baseline journal line distinguishing the cursor-replay
+		// baseline branch from the fresh-snapshot branch. Now ALWAYS-ON (one
+		// Info line per stream open — negligible) and carrying
+		// fallback_reason/part_append_in_range so worker logs alone can
+		// attribute every fresh fallback without VH_DEBUG and correlate
+		// against the client stream-open diag records (ts join ±100 ms).
+		vhlog.Info("stream baseline",
+			"path", "replay",
+			"class", streamClassLabel(streamClass),
+			"fallback_reason", fallbackReason,
+			"part_append_in_range", partAppendInRange,
+			"cursor", cursor,
+			"replayed", len(events),
+			"head", head)
 		// Phase 3 Step B (C-F1): tree=2 resume/reconnect must ALSO bootstrap
 		// the full session-detail snapshot and re-seed the tree frontier,
 		// mirroring the fresh-connect path (GAP 3, committed 3903b131). The
@@ -472,18 +505,23 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		if hasCursor && !replayOK {
 			diag.IncStream2ReplayFallback()
 		}
-		// Slice 1 (webperf build1): the fresh-snapshot twin of the replay
-		// branch's "stream baseline" debug line — counts full-snapshot sends
-		// (including the ring-gap fallback above) vs cursor replays from
-		// worker logs. VH_DEBUG-gated.
-		if vhlog.Enabled() {
-			vhlog.Debug("stream baseline",
-				"path", "fresh",
-				"class", streamClassLabel(streamClass),
-				"had_cursor", hasCursor,
-				"cursor", cursor,
-				"head", head)
-		}
+		// Slice 1 (webperf build1) + PWA warm-resume attribution (2026-10-28):
+		// the fresh-snapshot twin of the replay branch's "stream baseline"
+		// journal line — always-on (one Info line per stream open) and now
+		// carrying fallback_reason, the discriminator the S0 gate-(d) analysis
+		// identified as missing: ring_eviction (real gap) vs
+		// compatibility_fallback (§4.3 part.append in a legacy replay range, NO
+		// events missed) vs cursorless (no resume cursor at all). The wire
+		// partial.ringGap stamp is deliberately UNCHANGED (it still conflates
+		// both fallback causes; fixing its semantics is a separate card).
+		vhlog.Info("stream baseline",
+			"path", "fresh",
+			"class", streamClassLabel(streamClass),
+			"fallback_reason", fallbackReason,
+			"part_append_in_range", partAppendInRange,
+			"had_cursor", hasCursor,
+			"cursor", cursor,
+			"head", head)
 		// NON-BLOCKING hydration: kick the upstream fetch off in the background
 		// (EnsureMessagesAsync) so the snapshot sends immediately, then forward
 		// message.*/part.* deltas + messages.loaded over this same connection as

@@ -131,7 +131,7 @@ export function watchdogTick() {
   setHealthNow((n) => n + 1);
   // --- Stream 1 (tree) liveness: drives the GLOBAL connection status. ---
   if (isTreeClosed()) {
-    connect();
+    connect(false, "watchdog", "watchdog-closed"); // A5
   } else {
     // Two independent stall signals, EITHER trips a forced reconnect (connect()
     // tears down the old EventSource — treeGen++, es.close() — and rebuilds,
@@ -206,7 +206,7 @@ export function watchdogTick() {
         // action runs synchronously when no pass is in flight — unchanged
         // recovery latency). connect() is cursor-PRESERVING (the server falls
         // back to a fresh snapshot itself on ring-gap).
-        requestRecovery(reason ?? "tree-transport-stale", () => connect(), { tree: "resume" });
+        requestRecovery(reason ?? "tree-transport-stale", () => connect(false, "watchdog", "tree-stale-force"), { tree: "resume" });
       };
       // Slice 5 (webperf/F7): the liveness SENTINEL replaces both content-
       // stale heuristics (idle-skip AND active-force) whenever the worker
@@ -246,7 +246,7 @@ export function watchdogTick() {
             });
             setState("status", "reconnecting");
             // Slice A: feeds the convergence cascade; cursor-preserving.
-            requestRecovery("sentinel-timeout", () => connect(), { tree: "resume" });
+            requestRecovery("sentinel-timeout", () => connect(false, "watchdog", "sentinel-timeout"), { tree: "resume" });
           },
           onLegacy: () => {
             if (!anySessionActive()) legacyIdleSkip();
@@ -290,7 +290,7 @@ export function watchdogTick() {
       // directly: sesCursor survives → the server takes the ring-replay
       // branch (and itself falls back to a fresh snapshot on ring-gap, so
       // correctness never depends on the cursor being recent).
-      reopenSessionStreamPreservingCursor();
+      reopenSessionStreamPreservingCursor("watchdog", "watchdog-closed"); // B5
     } else {
       // Two independent stall signals, EITHER trips the forced fresh-snapshot
       // reconnect (openSessionStream(id, true) → cursorless → authoritative
@@ -361,7 +361,7 @@ export function watchdogTick() {
           // Slice A: feeds the convergence cascade; a forced fresh-snapshot
           // reopen (the direct action runs synchronously when no pass is in
           // flight).
-          requestRecovery(reason ?? "session-transport-stale", () => openSessionStream(sesId, true), {
+          requestRecovery(reason ?? "session-transport-stale", () => openSessionStream(sesId, true, "watchdog", "session-stale-force"), {
             session: "fresh",
           });
         };
@@ -397,7 +397,7 @@ export function watchdogTick() {
               // Slice A: feeds the convergence cascade; cursor-preserving
               // (NEVER openSessionStream here — its closeSessionStream resets
               // sesCursor).
-              requestRecovery("sentinel-timeout", () => reopenSessionStreamPreservingCursor(), {
+              requestRecovery("sentinel-timeout", () => reopenSessionStreamPreservingCursor("watchdog", "sentinel-timeout"), {
                 session: "resume",
               });
             },
@@ -437,7 +437,7 @@ export function maybeReconnect() {
   // (watchdogTick internally stands its session branch down while host-hidden).
   // A doc-hidden pane (both streams closed) still recovers nothing.
   if (!isPaneVisible() && !isDocVisible()) return;
-  if (isTreeClosed()) connect();
+  if (isTreeClosed()) connect(false, "visibility-resume", "maybe-reconnect"); // A6
   else watchdogTick();
 }
 
@@ -510,7 +510,7 @@ export function resyncTree() {
   // with any overlapping recovery into ONE pass (the direct action runs
   // synchronously when no pass is in flight).
   countRecovery("tree-drift-resync");
-  requestRecovery("tree-drift-resync", () => connect(true), { tree: "fresh" });
+  requestRecovery("tree-drift-resync", () => connect(true, "recovery-fresh", "tree-drift-resync"), { tree: "fresh" });
 }
 
 // Test-only accessor — resets the resync throttle gate so a test can exercise

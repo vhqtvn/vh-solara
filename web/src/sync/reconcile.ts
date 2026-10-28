@@ -47,7 +47,7 @@ import { connect } from "./tree-transport";
 // identity cannot order the two lifetimes, so the conservative re-sync runs).
 function recoverFromEpochDiscard(): void {
   countRecovery("epoch-reset");
-  requestRecovery("epoch-reset", () => connect(true), { tree: "fresh" });
+  requestRecovery("epoch-reset", () => connect(true, "recovery-fresh", "epoch-reset"), { tree: "fresh" }); // A11
 }
 
 // interpretEffects — map factual effects to side-effect policy. sync-state-dirty
@@ -159,7 +159,7 @@ function interpretEffects(effects: ReconcileEffect[]): void {
           // independent reconnect (AMEND-A5).
           requestRecovery(
             "tail-incomplete",
-            () => openSessionStream(e.sessionID, true),
+            () => openSessionStream(e.sessionID, true, "recovery-fresh", "tail-incomplete"), // B11
             { session: "fresh" },
           );
         }

@@ -65,7 +65,11 @@ describe("diaglog — enable/disable toggle persists", () => {
     setDiagLogOn(true);
     captureDiagEntry(e(1000));
     captureDiagEntry(e(2000, "s2"));
-    expect(diagEntries().map((x) => [x.ts, x.sessionId])).toEqual([
+    // (The DiagEntry union also carries stream diag kinds without sessionId;
+    // narrow to cold-open for the field read.)
+    expect(
+      diagEntries().map((x) => [x.ts, x.kind === "cold-open" ? x.sessionId : undefined]),
+    ).toEqual([
       [1000, "s1"],
       [2000, "s2"],
     ]);
@@ -93,7 +97,7 @@ describe("diaglog — max-time eviction", () => {
     // A new capture far in the future ages the prior two out.
     const futureTs = 2000 + MAX_DIAG_AGE_MS + 1;
     captureDiagEntry(e(futureTs, "s3"));
-    expect(diagEntries().map((x) => x.sessionId)).toEqual(["s3"]);
+    expect(diagEntries().map((x) => (x.kind === "cold-open" ? x.sessionId : undefined))).toEqual(["s3"]);
   });
 });
 
@@ -113,7 +117,8 @@ describe("diaglog — max-size eviction", () => {
     for (let i = 0; i < MAX_DIAG_ENTRIES + 5; i++) captureDiagEntry(e(3000 + i, `s${i}`));
     expect(diagEntries().length).toBe(MAX_DIAG_ENTRIES);
     // Newest survived; oldest evicted.
-    expect(diagEntries()[diagEntries().length - 1].sessionId).toBe(`s${MAX_DIAG_ENTRIES + 4}`);
+    const newest = diagEntries()[diagEntries().length - 1];
+    expect(newest.kind === "cold-open" && newest.sessionId).toBe(`s${MAX_DIAG_ENTRIES + 4}`);
   });
 });
 
@@ -133,7 +138,8 @@ describe("diaglog — foreign / migrated persisted payload recovery", () => {
     );
     _resetDiagForTest();
     expect(diagEntries().length).toBe(1);
-    expect(diagEntries()[0].sessionId).toBe("x");
+    const kept = diagEntries()[0];
+    expect(kept.kind === "cold-open" && kept.sessionId).toBe("x");
   });
 
   it("an unversioned/foreign entries blob falls back to empty", () => {

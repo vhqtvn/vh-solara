@@ -91,6 +91,13 @@ import {
   maybeResolveReconcile,
 } from "./stream";
 import { captureDiagEntry } from "./diaglog";
+import {
+  noteTreeLife,
+  noteTreeSnapshotAppliedIfCurrent,
+  noteTreeStamp,
+  noteTreeStreamOpen,
+  type StreamOpenReason,
+} from "./stream-open-diag";
 import { countRecovery, countSnapshotBytes } from "./recovery-reasons";
 import { recordStreamDrop } from "./weaklink";
 import { noteLivenessFrame } from "./liveness";
@@ -654,6 +661,7 @@ function applyDetailIndependent(snap: Snapshot): void {
   let applied = false;
   if (snap.partial) applied = applyScopedSnapshot(snap);
   else applied = applySnapshot(snap);
+  noteTreeSnapshotAppliedIfCurrent(treeGen); // diagnostics stamp (logging-only)
   if (!treeSnapDone) {
     treeSnapDone = true;
     if (treeT1) recordLatency("tree", "snap", performance.now() - treeT1);
@@ -681,6 +689,7 @@ function applyTreeIndependent(snap: TreeSnapshot, seq: number, gen: number): voi
     maybeResolveReconcile();
   }
   seedTreeStore(snap.nodes);
+  noteTreeSnapshotAppliedIfCurrent(treeGen); // diagnostics stamp (logging-only)
   const backfill = expandedButUnloadedIds();
   if (backfill.length > 0) {
     for (const id of backfill) void expandTreeNode(id);
@@ -761,6 +770,9 @@ function tryInstall(owner: PendingCaptureOwner): void {
     advanceCursor(id.seq);
     // Truthful readiness ONLY after both projections installed.
     setState("authoritativeReady", true);
+    // Diagnostics stamp (logging-only): the coherent install IS the tree's
+    // snapshot-applied boundary for this connection's open record.
+    noteTreeSnapshotAppliedIfCurrent(treeGen);
   });
   // DETACH before SETTLE: a newly-delivered event joining the barrier finds no
   // owner and (gen still current) takes its fast path instead of awaiting a
@@ -871,10 +883,24 @@ function checkTreeOrdinalGap(ordinal: number, kind: string): void {
   // coalesced with any overlapping recovery into ONE pass (AMEND-A5); the
   // direct action runs synchronously when no pass is in flight (unchanged
   // recovery latency).
-  requestRecovery("tree-seq-gap", () => connect(true), { tree: "fresh" });
+  requestRecovery("tree-seq-gap", () => connect(true, "recovery-fresh", "tree-seq-gap"), { tree: "fresh" });
 }
 
-export function connect(fresh = false) {
+// `reason`/`detail` are LOGGING-ONLY parameters (the stream-open diagnostics
+// record): they never branch control flow. Untagged callers land on the
+// explicit "other" so no construction goes unrecorded. The S0 gate-(a)
+// taxonomy → reason mapping:
+//   A1 boot / first-ever reveal ......... first-open
+//   A2 reveal resume (everOpened) ....... reveal-resume
+//   A4 CLOSED manual backoff ............ onerror-backoff
+//   A5 watchdog (closed/stale/sentinel) . watchdog
+//   A6 maybeReconnect (fg/online) ....... visibility-resume
+//   A7/A8 resyncTree drift heal ......... recovery-fresh
+//   A9 seq-gap, A10 overlap, A11 epoch-reset, A12 busy reconcile → recovery-fresh
+//   A13 project switch .................. selection-change
+//   A3 native auto-reconnect is NOT a JS construction — it surfaces via the
+//   bounded es-life records (onerror readyState=CONNECTING, no new open).
+export function connect(fresh = false, reason: StreamOpenReason = "other", detail?: string) {
   clearTimeout(reconnectTimer);
   connectingFails = 0;
   // Invalidate any in-flight async gzip64 snapshot decode captured by a PRIOR
@@ -946,6 +972,17 @@ export function connect(fresh = false) {
     `/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1&tree=2`,
   );
   markTreeSeen();
+  // Diagnostics (logging-only): one stream-open record per construction,
+  // carrying the reason taxonomy + the cursor this open actually sent. The
+  // progress stamps complete later on the SAME record (see the listeners
+  // below + noteTreeStamp). Inert unless the diaglog capture flag is on.
+  noteTreeStreamOpen({
+    generation: gen,
+    reason,
+    detail,
+    cursor: fresh ? 0 : state.cursor,
+    hadCursor: !fresh && state.cursor > 0,
+  });
   log.debug("sync", "tree stream connect", { cursor: fresh ? "fresh" : state.cursor, dir: projectDir() });
   es.addEventListener("snapshot", (e) => {
     // Generation guard: ignore frames from a superseded connection BEFORE
@@ -957,6 +994,11 @@ export function connect(fresh = false) {
     // Slice 1 (webperf): cumulative snapshot bytes received (Stream 1, detail
     // projection) — SSE data length ≈ wire bytes.
     countSnapshotBytes("tree", ((e as MessageEvent).data ?? "").length);
+    // Diagnostics stamps (logging-only, first-write-wins): the detail
+    // `snapshot` is both the first content frame candidate and the first
+    // snapshot-family frame on this connection.
+    noteTreeStamp(gen, "firstFrameTs");
+    noteTreeStamp(gen, "firstSnapshotTs");
     // Parse the outer envelope ONCE. The server emits either the raw snapshot
     // JSON (small/legacy) OR {encoding:"gzip64", data:base64(gzip(snapshot))}
     // when z=1 AND the payload exceeds the threshold. The decode helper is a
@@ -1080,6 +1122,10 @@ export function connect(fresh = false) {
   es.addEventListener("tree.snapshot", (e) => {
     if (gen !== treeGen) return;
     markTreeSeen();
+    // Diagnostics stamps: tree.snapshot is a snapshot-family frame (and a
+    // first-content candidate on a fresh/fallback connect).
+    noteTreeStamp(gen, "firstFrameTs");
+    noteTreeStamp(gen, "firstSnapshotTs");
     // Slice 1 (webperf): cumulative snapshot bytes received (Stream 1, tree
     // projection — gzip64/base64 when warm, so data length ≈ exact wire bytes).
     countSnapshotBytes("tree", ((e as MessageEvent).data ?? "").length);
@@ -1118,7 +1164,7 @@ export function connect(fresh = false) {
       // capture; a coalesced skip would strand it) — the cascade only
       // OBSERVES the reason so a running pass's generation key stays truthful.
       noteExternalRecovery("tree-overlap-capture");
-      connect(true);
+      connect(true, "recovery-fresh", "tree-overlap-capture");
       return;
     }
     // CREATE the owner BEFORE the first async decode yield. Identity-unbound
@@ -1264,6 +1310,10 @@ export function connect(fresh = false) {
   es.addEventListener("snapshot.complete", (e) => {
     if (gen !== treeGen) return;
     markTreeSeen();
+    // Diagnostics stamp: snapshot.complete is the tree's truthful resume
+    // catch-up boundary (replay tail + re-seed, or the fallback snapshot) —
+    // the replayDoneTs of the open record.
+    noteTreeStamp(gen, "replayDoneTs");
     let p: { epoch?: string; revision?: number; projections?: string[] };
     try {
       p = JSON.parse((e as MessageEvent).data);
@@ -1328,6 +1378,10 @@ export function connect(fresh = false) {
   });
   registerAuxiliaryListeners(es, gen);
   es.onopen = () => {
+    // Diagnostics (logging-only, bounded ≥1 per generation): the native/JS
+    // lifecycle discriminator — see stream-open-diag.
+    noteTreeLife(gen, "onopen", EventSource.OPEN);
+    noteTreeStamp(gen, "openTs");
     markTreeSeen();
     // O3 Finding 2: re-baseline the tree delivery ordinal on every successful
     // (re)open. connect() already resets treeLastDeliveryOrdinal for the
@@ -1350,6 +1404,11 @@ export function connect(fresh = false) {
     everOpened = true;
   };
   es.onerror = () => {
+    // Diagnostics (logging-only, bounded): an onerror with readyState
+    // CONNECTING and NO subsequent stream-open record = a NATIVE retry (A3)
+    // — the discriminator the captured data needs. Placed at entry so the
+    // CONNECTING-streak early return below still observes every attempt.
+    noteTreeLife(gen, "onerror", es ? es.readyState : -1);
     // EventSource auto-retries while CONNECTING; we only step in once it gives
     // up (CLOSED), with backoff, so a flaky network / daemon restart self-heals.
     setState("status", "reconnecting");
@@ -1397,7 +1456,7 @@ export function connect(fresh = false) {
       recordStreamDrop("tree");
       log.warn("sync", "tree stream closed → reconnecting", { backoff });
       clearTimeout(reconnectTimer);
-      reconnectTimer = window.setTimeout(connect, backoff);
+      reconnectTimer = window.setTimeout(() => connect(false, "onerror-backoff", "closed-backoff"), backoff);
       backoff = Math.min(backoff * 2, 15_000);
     }
   };
@@ -1450,7 +1509,7 @@ export function resumeTreeFromVisibility(): void {
   // established before the cursor. Later resumes are transient reconnects:
   // cursor-based ring replay (server re-seeds the tree=2 projections on the
   // reconnect block; bounded, once per reveal).
-  connect(!everOpened);
+  connect(!everOpened, everOpened ? "reveal-resume" : "first-open", "visibility-reveal");
 }
 
 
@@ -1596,6 +1655,7 @@ function registerAuxiliaryListeners(es: EventSource, gen: number): void {
       // downstream gen re-check.
       if (gen !== treeGen) return;
       markTreeSeen();
+      noteTreeStamp(gen, "firstFrameTs"); // diagnostics (logging-only): replay/live delta arrival
       const ev = e as MessageEvent;
       // O3: parse compound SSE id — globalSeq for cursor, ordinal for gap.
       const { globalSeq: seq, ordinal } = parseSSEID(ev.lastEventId);
@@ -1674,6 +1734,7 @@ function registerAuxiliaryListeners(es: EventSource, gen: number): void {
 function registerTreeStreamListeners(es: EventSource, gen: number): void {
   es.addEventListener("tree.op", async (e) => {
     markTreeSeen();
+    noteTreeStamp(gen, "firstFrameTs"); // diagnostics (logging-only): replay/live delta arrival
     const ev = e as MessageEvent;
     // F4 + O3: parse compound SSE id — globalSeq for cursor, ordinal for gap.
     const { globalSeq: seq, ordinal } = parseSSEID(ev.lastEventId);
@@ -1721,6 +1782,7 @@ function registerTreeStreamListeners(es: EventSource, gen: number): void {
         return;
       }
       markTreeSeen();
+      noteTreeStamp(gen, "firstFrameTs"); // diagnostics (logging-only): replay/live delta arrival
       const ev = e as MessageEvent;
       // O3: parse compound SSE id — globalSeq for cursor, ordinal for gap.
       const { globalSeq: seq, ordinal } = parseSSEID(ev.lastEventId);

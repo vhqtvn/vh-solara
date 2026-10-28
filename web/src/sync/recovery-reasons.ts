@@ -237,9 +237,41 @@ export function countSnapshotBytes(stream: "tree" | "session", bytes: number): v
   if (bytes > 0) snapBytes[stream] += bytes;
 }
 
+// Stream-open counters (PWA warm-resume diagnostics, 2026-10-28): counted by
+// stream-open-diag at every tree/session EventSource construction, keyed by
+// (stream, reason-string). ALWAYS on (near-free Map increments, no ring, no
+// toggle) so `__vhSyncDiag()` answers "how many opens, for which reasons,
+// per stream" from the console alone — the burst census the bounded diaglog
+// ring can miss when it was never enabled.
+const openStats = new Map<"tree" | "session", Map<string, ReasonStat>>();
+
+/** Count one stream open by (stream, reason). Reason is the closed stream-open enum value. */
+export function countStreamOpen(stream: "tree" | "session", reason: string): void {
+  let byReason = openStats.get(stream);
+  if (!byReason) {
+    byReason = new Map();
+    openStats.set(stream, byReason);
+  }
+  const s = byReason.get(reason);
+  if (s) {
+    s.count++;
+    s.lastTs = Date.now();
+  } else {
+    byReason.set(reason, { count: 1, lastTs: Date.now() });
+  }
+}
+
 export interface SyncDiagSnapshot {
   /** Per-reason recovery counters (only reasons that fired at least once). */
   recovery: Partial<Record<RecoveryReason, { count: number; lastTs: number }>>;
+  /**
+   * Stream-open counters (PWA warm-resume diagnostics, 2026-10-28): every
+   * tree/session EventSource construction counted by (stream, reason) —
+   * always-on, near-free (same Map pattern as `recovery`), regardless of the
+   * diaglog capture flag. Gives a console-readable burst census even when the
+   * bounded ring was never enabled.
+   */
+  streamOpens: Partial<Record<"tree" | "session", Partial<Record<string, { count: number; lastTs: number }>>>>;
   /** Cumulative snapshot payload bytes received, per stream, since load. */
   snapshotBytes: { tree: number; session: number };
   /** Weak-link FE-vantage counters (slice 4c): fetch failures by class +
@@ -257,8 +289,15 @@ export interface SyncDiagSnapshot {
 export function readSyncDiag(): SyncDiagSnapshot {
   const recovery: SyncDiagSnapshot["recovery"] = {};
   for (const [k, v] of stats) recovery[k] = { count: v.count, lastTs: v.lastTs };
+  const streamOpens: SyncDiagSnapshot["streamOpens"] = {};
+  for (const [stream, byReason] of openStats) {
+    const section: NonNullable<SyncDiagSnapshot["streamOpens"]["tree"]> = {};
+    for (const [reason, v] of byReason) section[reason] = { count: v.count, lastTs: v.lastTs };
+    streamOpens[stream] = section;
+  }
   return {
     recovery,
+    streamOpens,
     snapshotBytes: { tree: snapBytes.tree, session: snapBytes.session },
     weakLink: readWeakLink(),
     generatedAt: Date.now(),
@@ -282,4 +321,5 @@ export function _resetRecoveryCountersForTest(): void {
   stats.clear();
   snapBytes.tree = 0;
   snapBytes.session = 0;
+  openStats.clear();
 }

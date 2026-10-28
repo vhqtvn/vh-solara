@@ -70,6 +70,13 @@ import {
   maybeResolveReconcile,
 } from "./stream";
 import { captureDiagEntry } from "./diaglog";
+import {
+  noteSessionFallbackArmed,
+  noteSessionLife,
+  noteSessionStamp,
+  noteSessionStreamOpen,
+  type StreamOpenReason,
+} from "./stream-open-diag";
 import { countRecovery, countSnapshotBytes } from "./recovery-reasons";
 import { recordStreamDrop } from "./weaklink";
 import { noteLivenessFrame } from "./liveness";
@@ -408,7 +415,7 @@ function checkSesOrdinalGap(ordinal: number, kind: string): void {
   // coalesced with any overlapping recovery into ONE pass (AMEND-A5); the
   // direct action runs synchronously when no pass is in flight (unchanged
   // recovery latency).
-  if (sid) requestRecovery("seq-gap", () => openSessionStream(sid, true), { session: "fresh" });
+  if (sid) requestRecovery("seq-gap", () => openSessionStream(sid, true, "recovery-fresh", "seq-gap"), { session: "fresh" });
 }
 
 // Health accessors for ./health's watchdogTick — that module evaluates each
@@ -605,7 +612,7 @@ export function applySessionSnapshot(id: string, snap: Snapshot) {
   }
 }
 
-export function openSessionStream(id: string, force = false) {
+export function openSessionStream(id: string, force = false, reason: StreamOpenReason = "other", detail?: string) {
   // `force` bypasses the "already open" early-return so a caller can demand a
   // FRESH authoritative snapshot even when the selected session's Stream-2
   // EventSource is healthy. Used by reconcileBusy() on the outermost busy
@@ -614,14 +621,26 @@ export function openSessionStream(id: string, force = false) {
   // expectSessionSnap stays true and the overlay only clears via the 15s safety
   // timeout — the exact UX this feature exists to fix. force=true → skip the
   // early-return → closeSessionStream() tears down the existing connection →
-  // open() recreates the EventSource fresh.
+  // open() recreates the EventSource fresh. `reason`/`detail` are LOGGING-ONLY
+  // (the stream-open diagnostics record); they never branch control flow.
+  // S0 gate-(a) session taxonomy → reason mapping:
+  //   B1 boot / B4 reveal-fresh ......................... first-open / selection-change
+  //   B2 selection-follow, B16 popstate ................. selection-change
+  //   B3 visibility reveal .............................. reveal-resume
+  //   B5 watchdog-closed, B6 stale-force, B7 sentinel ... watchdog
+  //   B8 busy-edge rearm ............................... other (+detail)
+  //   B9 seq-gap, B10 offset-mismatch, B11 tail-incomplete, B15 busy reconcile
+  //      → recovery-fresh;  B12 silence fallback ....... recovery-fresh
+  //   B13 CLOSED retry ladder ........................... retry-ladder
+  //   B14 native CONNECTING retries are NOT JS constructions — they surface
+  //   via the bounded es-life records only.
   if (!force && id === sesId && ses && ses.readyState !== EventSource.CLOSED) return;
   closeSessionStream();
   // No project selected → nothing to stream (and no cwd bridge). Guards both
   // the no-project state and a stray selection cleared before a project lands.
   if (!id || !projectDir()) return;
   sesId = id;
-  openSessionES(id);
+  openSessionES(id, reason, detail);
 }
 
 // === open() extraction (Slice 2 webperf — visibility lifecycle) ==============
@@ -634,7 +653,7 @@ export function openSessionStream(id: string, force = false) {
 // would force a cursorless full re-snapshot on every pane reveal. The retry
 // seam (open directly, cursor preserved) is the load-bearing property; `id`
 // became a parameter (the closure's only non-module capture).
-function openSessionES(id: string): void {
+function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: string): void {
     if (sesId !== id) return;
     // Bump the connection generation so listeners captured by any prior open()
     // of THIS selection (a retry) or a superseded selection are ignored. The
@@ -688,6 +707,18 @@ function openSessionES(id: string): void {
     const partDeltaParam = isPartDeltaEnabled() ? `&part_delta=1` : "";
     sesConnectingFails = 0; // F3: a fresh ES starts a fresh streak count
     ses = new EventSource(`/vh/stream?${cursorParam}sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}&z=1${partDeltaParam}`);
+    // Diagnostics (logging-only): one stream-open record per construction —
+    // reason taxonomy + the cursor this open sent. Progress stamps complete
+    // later on the SAME record (listeners below). Inert unless the diaglog
+    // capture flag is on.
+    noteSessionStreamOpen({
+      generation: gen,
+      reason,
+      detail,
+      sessionId: id,
+      cursor: sesCursor > 0 ? sesCursor : 0,
+      hadCursor: sesCursor > 0,
+    });
     // Seed Stream2's liveness deadline from construction (mirrors Stream1's
     // markTreeSeen() right after `new EventSource`): a connection that NEVER
     // fires any event (silent from the start) must still be aged out after
@@ -701,6 +732,10 @@ function openSessionES(id: string): void {
       // the clock or the store.
       if (gen !== sesGen) return;
       markSessionSeen();
+      // Diagnostics stamps (logging-only, first-write-wins): the session
+      // `snapshot` is the first content + first snapshot frame candidate.
+      noteSessionStamp(gen, "firstFrameTs");
+      noteSessionStamp(gen, "firstSnapshotTs");
       // Slice 1 (webperf): cumulative snapshot bytes received (Stream 2) —
       // the idle-churn cost signal. SSE data length ≈ wire bytes (exact for
       // the gzip64/base64 payloads that dominate).
@@ -762,6 +797,9 @@ function openSessionES(id: string): void {
       // a loaded session — the megabyte transcript). Small/cold/messageless
       // snapshots ship raw (no `encoding`) and skip the async decode.
       const applySnap = (snap: Snapshot) => {
+        // Diagnostics stamp (logging-only): first snapshot APPLIED on this
+        // connection — the fresh-path catch-up boundary.
+        noteSessionStamp(gen, "snapshotAppliedTs");
         if (first) {
           // L1 hydrate: warm-vs-cold read from the snapshot's gate. A warm
           // session (gate.messagesLoaded!==false) already has the full history,
@@ -863,6 +901,10 @@ function openSessionES(id: string): void {
     // with Stream 1's connect/backoff semantics).
     ses.onopen = () => {
       if (gen !== sesGen) return;
+      // Diagnostics (logging-only, bounded ≥1 per generation): the native/JS
+      // lifecycle discriminator — see stream-open-diag.
+      noteSessionLife(gen, "onopen", EventSource.OPEN);
+      noteSessionStamp(gen, "openTs");
       // O3 Finding 2: re-baseline the delivery ordinal on every successful
       // (re)open. This covers NATIVE EventSource auto-reconnect: the browser
       // reuses this EventSource object but opens a NEW HTTP connection, so the
@@ -884,6 +926,11 @@ function openSessionES(id: string): void {
       // behalf of the new (current) connection — the current connection owns
       // its own retry scheduling via its own onerror.
       if (gen !== sesGen) return;
+      // Diagnostics (logging-only, bounded): onerror readyState=CONNECTING
+      // with NO new stream-open record = a NATIVE retry (B14) — the
+      // discriminator the captured data needs. At entry so the CONNECTING
+      // early return below still observes every attempt.
+      noteSessionLife(gen, "onerror", ses ? ses.readyState : -1);
       // F3 CONNECTING-streak takeover (twin of tree-transport's): a sustained
       // CONNECTING failure loop never reaches CLOSED on its own — after
       // SES_CONNECTING_GIVEUP consecutive failures, close the ES and use the
@@ -910,7 +957,7 @@ function openSessionES(id: string): void {
         // — one browser-vantage stream drop. Counted only; never authority.
         recordStreamDrop("session");
         clearTimeout(sesRetry);
-        sesRetry = window.setTimeout(() => openSessionES(id), sesBackoff);
+        sesRetry = window.setTimeout(() => openSessionES(id, "retry-ladder", "closed-retry"), sesBackoff);
         sesBackoff = Math.min(sesBackoff * 2, 15_000);
       }
     };
@@ -974,7 +1021,7 @@ export function resumeSessionStreamForVisibility(): void {
   // snapshot). openSessionES preserves the cursor → ring replay. Arms the
   // existing `refreshing[id]` flag (cleared on first snapshot) — no UI
   // render reads it; see store.ts's `refreshing` readership note.
-  openSessionES(sesId);
+  openSessionES(sesId, "reveal-resume", "visibility-reveal");
 }
 
 // === Slice 5 (webperf/F7): sentinel proof refresher + closed-stream reopen ===
@@ -1048,6 +1095,9 @@ function armResumeSilenceFallback(): void {
   clearResumeSilenceFallback();
   const gen = sesGen; // the connection openSessionES just constructed
   const cursorAtOpen = sesCursor; // the preserved cursor the resume asked with
+  // Diagnostics (logging-only): stamp the open record — THIS open armed the
+  // fallback (the fallbackArmed field of the stream-open entry).
+  noteSessionFallbackArmed(gen);
   sesResumeFallback = window.setTimeout(() => {
     sesResumeFallback = undefined;
     // Superseded (switch/force/close/suspend/newer reopen) → stand down; the
@@ -1079,17 +1129,17 @@ function armResumeSilenceFallback(): void {
     // snapshot confirms the repair. sesCursor=0 makes openSessionES omit the
     // cursor param (its cursorParam derives from sesCursor).
     sesCursor = 0;
-    openSessionES(sesId);
+    openSessionES(sesId, "recovery-fresh", "silence-fallback");
   }, SES_RESUME_SILENT_FALLBACK_MS);
 }
 
-export function reopenSessionStreamPreservingCursor(): void {
+export function reopenSessionStreamPreservingCursor(reason: StreamOpenReason = "watchdog", detail?: string): void {
   if (!sesId || !projectDir()) return;
   // Cancel any pending CLOSED-retry backoff timer: this reopen supersedes it
   // (otherwise the timer would fire openSessionES AGAIN on top of the fresh
   // connection). Mirrors ensureSessionStreamLiveForActivity.
   clearTimeout(sesRetry);
-  openSessionES(sesId);
+  openSessionES(sesId, reason, detail);
   // Slice 5b fix: confirm the resume actually delivered — see the block
   // comment above.
   armResumeSilenceFallback();
@@ -1141,7 +1191,10 @@ export function ensureSessionStreamLiveForActivity(): void {
   // it (otherwise the timer would fire openSessionES AGAIN on top of the fresh
   // connection — a needless teardown/replace).
   clearTimeout(sesRetry);
-  openSessionES(sesId);
+  // "other" + detail: a cursor-PRESERVING liveness re-attach — neither a
+  // fresh-snapshot recovery nor a transport retry (the closed enum has no
+  // preserving-repair bucket; the detail carries the exact taxonomy path B8).
+  openSessionES(sesId, "other", "busy-edge-rearm");
 }
 
 // startBusyEdgeRearm — arm the reactive idle→busy edge watcher. Wired once
@@ -1270,6 +1323,7 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
         return;
       }
       markSessionSeen();
+      noteSessionStamp(gen, "firstFrameTs"); // diagnostics (logging-only): replay/live frame arrival
       // Track Stream2's local cursor from the SSE id field (mirrors the
       // snapshot listener). Done BEFORE the gate check so even a deferred
       // (busy-gated) frame advances sesCursor — the event WAS received, so a
@@ -1591,7 +1645,7 @@ function flushAppends(): void {
       // Slice A (send-net-resilience): the force feeds the convergence
       // cascade (ONE coalesced pass; the direct action runs synchronously
       // when no pass is in flight).
-      requestRecovery("offset-mismatch", () => openSessionStream(sid, true), { session: "fresh" });
+      requestRecovery("offset-mismatch", () => openSessionStream(sid, true, "recovery-fresh", "offset-mismatch"), { session: "fresh" });
     }
   }
 }

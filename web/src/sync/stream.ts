@@ -183,11 +183,11 @@ function reconcileBusy(): Promise<void> {
     // Slice 1 (webperf): count the busy-release forced reconcile by stable
     // reason code (window.__vhSyncDiag).
     countRecovery("busy-reconcile");
-    connect(true);
+    connect(true, "recovery-fresh", "busy-reconcile"); // A12
     // force=true so the selected session's Stream-2 EventSource is recreated
     // even when it's already healthy/open — the fresh snapshot this produces is
     // what clears expectSessionSnap and resolves reconciliation promptly.
-    if (sel) openSessionStream(sel, true);
+    if (sel) openSessionStream(sel, true, "recovery-fresh", "busy-reconcile"); // B15
     // Safety: if the fresh snapshots don't arrive in 15s (e.g. the server is
     // unresponsive), clear the flags and resolve so the overlay doesn't wedge.
     clearTimeout(reconcileTimer);

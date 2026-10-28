@@ -59,11 +59,14 @@ export default function DiagLogDialog(props: { onClose: () => void }) {
               checked={diagLogEnabled()}
               onChange={(e) => setDiagLogOn(e.currentTarget.checked)}
             />
-            <span>Capture cold-open timing</span>
+            <span>Capture sync diagnostics</span>
           </label>
           <p class={styles.help}>
-            Off by default. When off, nothing is recorded. When on, each cold session open appends one
-            entry (session id + timestamp + total/conn/snap/hydrate/fetchMs/reconcileMs).
+            Off by default. When off, nothing is recorded. When on, capture appends bounded entries:
+            cold-open timing (session id + total/conn/snap/hydrate), stall detections, and — for
+            warm-resume attribution — one line per stream open (stream, reason, generation, cursor)
+            with lifecycle (onopen/onerror) records, so native retries are distinguishable from
+            JS-owned opens.
             <code>total</code> = user-perceived cold-open time (conn + snap + hydrate);
             <code>conn</code> = pure transport (EventSource construction → onopen) — NOT total time.
             Older entries age out automatically.

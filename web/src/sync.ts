@@ -125,7 +125,7 @@ function resumeSyncForVisibility(): void {
   } else {
     // Stale suspension (selection moved) OR boot-hidden (nothing ever
     // opened): open the CURRENT selection through the normal fresh path.
-    openSessionStream(sel);
+    openSessionStream(sel, false, "selection-change", "reveal-moved-selection"); // B4
     void openSession(sel);
   }
 }
@@ -171,9 +171,9 @@ export function startSync() {
     // visibility-pause too) and the session-suspension markers arm the reveal
     // resume path.
     suspendSyncForVisibility();
-    if (isDocVisible() && projectDir()) connect(true);
+    if (isDocVisible() && projectDir()) connect(true, "first-open", "boot-hidden"); // A1
   } else if (projectDir()) {
-    connect(true);
+    connect(true, "first-open", "boot"); // A1
   } else {
     closeSessionStream(); // ensure no stray session stream from a prior tab state
   }
@@ -184,7 +184,7 @@ export function startSync() {
   createRoot(() =>
     createEffect(
       on(selectedId, (id) => {
-        if (isPaneVisible()) openSessionStream(id ?? "");
+        if (isPaneVisible()) openSessionStream(id ?? "", false, "selection-change", "selection-follow"); // B2
       }, { defer: true }),
     ),
   );
@@ -251,7 +251,7 @@ export function startSync() {
     // reveal (resumeSyncForVisibility's fallback opens it fresh). Selection +
     // LS bookkeeping still run — only the streaming/network opens wait.
     if (isPaneVisible()) {
-      openSessionStream(initial);
+      openSessionStream(initial, false, "first-open", "boot"); // B1
       void openSession(initial);
     }
     persistSelection(projectDir(), initial);
@@ -271,7 +271,7 @@ export function startSync() {
     try {
       if (dir !== projectDir()) switchProject(dir, true);
       setSelectedIdRaw(id);
-      openSessionStream(id ?? "");
+      openSessionStream(id ?? "", false, "selection-change", "popstate"); // B16
       if (id) {
         setDraft(false);
         void openSession(id);
