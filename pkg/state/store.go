@@ -1378,11 +1378,13 @@ func (s *Store) rootOfLocked(id string) string {
 
 // TreeBusyForDispatch is the NARROW canonical eligibility read for the
 // daemon queue drain loop's idle gate (2026-10-26 incident fix; release-rule
-// memo Path A / corner-rule Candidate A; annex-1 E4 pre-authorizes "expose a
-// narrow canonical accessor if justified" over the GateFacts map, which
-// carries no parent links). It reports whether the session's WHOLE TREE is
-// observably busy: the effective root (rootOfLocked) resolved first, then
-// the SINGLE canonical index GateFacts().SubtreeBusy derives from
+// memo Path A / corner-rule Candidate A, adjudicated in
+// researches/decisions/2026-10-27-queue-dispatch-annex-4-interim-corner-rule.md;
+// annex-1 E4 pre-authorizes "expose a narrow canonical accessor if
+// justified" over the GateFacts map, which carries no parent links). It
+// reports whether the session's WHOLE TREE is observably busy: the
+// effective root (rootOfLocked) resolved first, then the SINGLE canonical
+// index GateFacts().SubtreeBusy derives from
 // (subtreeBusyCount[root] > 0 — snapshots.go gateFactsFromScalars), so a
 // busy SIBLING holds the lane too (root-resolved semantics, not
 // own-subtree-only) and the root's own busy counts (self-inclusive).

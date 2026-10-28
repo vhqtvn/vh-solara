@@ -8,7 +8,9 @@ package web
 // guarantee the legacy browser drainer had.
 //
 // Corner rule (binding, Candidate A "visible-idle-only recheck with
-// absent=allow"): corners 2/6/7 BLOCK (the gate runs BEFORE resume-marker
+// absent=allow" — adjudicated and promoted as
+// researches/decisions/2026-10-27-queue-dispatch-annex-4-interim-corner-rule.md):
+// corners 2/6/7 BLOCK (the gate runs BEFORE resume-marker
 // consumption); corners 1/3/4 ALLOW on a fresh per-tick canonical read (no
 // debounce, no memory); corner 5 takes NO gate action (the certified
 // recovery ladder owns in-flight items).
@@ -184,8 +186,10 @@ func TestQueueIdleGateErrorAllows(t *testing.T) {
 // aggregator adopts it — is not observably busy, so dispatch proceeds.
 //
 // DELIBERATE W1 PIN (waiver-covered judgment call; do not "fix"): this is
-// the exact disposition slice S3 INVERTS (unknown≠idle tightening) — when
-// S3 lands, this test flips to asserting the hold.
+// the exact disposition a future witness-backed scheduler INVERTS (the
+// unknown≠idle tightening — deferred with the OpenCode v2 migration per
+// researches/sources/2026-10-28-opencode-v2-migration-feasibility.md);
+// when that scheduler lands, this test flips to asserting the hold.
 func TestQueueIdleGateAbsentSessionDispatches(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("flock semantics — Linux only")
@@ -284,8 +288,8 @@ func TestQueueIdleGateFlickerNoDebounce(t *testing.T) {
 // message) while the tree STILL shows idle — busy for item 1's turn was
 // never observed. Item 2 then dispatches on its OWN tick's fresh read: no
 // cross-item memory exists (deliberate W1 allow — the fold-into-running-turn
-// gap in this window is the waived evidence-loss class; S3's obligations are
-// the flip target).
+// gap in this window is the waived evidence-loss class; the future
+// witness-backed scheduler's obligations are the flip target).
 func TestQueueIdleGateSecondItemAfterPersistenceBeforeBusy(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("flock semantics — Linux only")

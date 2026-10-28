@@ -376,8 +376,10 @@ func (l *queueDrainLoop) tick(ctx context.Context, lastFsScan *time.Time) error 
 		if !ok {
 			continue
 		}
-		// THE IDLE GATE (2026-10-26 incident fix; release-rule memo Path A,
-		// corner-rule Candidate A "visible-idle-only recheck, absent=allow"):
+		// THE IDLE GATE (2026-10-26 incident fix; release-rule memo Path A —
+		// researches/decisions/2026-10-27-queue-dispatch-release-rule.md;
+		// corner-rule Candidate A "visible-idle-only recheck, absent=allow" —
+		// researches/decisions/2026-10-27-queue-dispatch-annex-4-interim-corner-rule.md):
 		// a queued item must NOT be POSTed upstream while the session's
 		// subtree is observably busy — the guarantee the legacy browser
 		// drainer had, restored in daemon dispatch mode. Mode-keyed by
@@ -391,8 +393,12 @@ func (l *queueDrainLoop) tick(ctx context.Context, lastFsScan *time.Time) error 
 		// FRESH canonical read per tick per lane — no debounce, no
 		// cross-tick memory (corner 1); absent-from-store = allow (corner 3,
 		// W1: the routine post-restart posture for FS-discovered lanes —
-		// deliberate, S3 tightens to unknown≠idle). The certified recovery
-		// pass above is NEVER gated (classification ≠ dispatch).
+		// deliberate; a future witness-backed scheduler tightens this to
+		// unknown≠idle — that scheduler is deferred with the OpenCode v2
+		// migration, see
+		// researches/sources/2026-10-28-opencode-v2-migration-feasibility.md).
+		// The certified recovery pass above is NEVER gated
+		// (classification ≠ dispatch).
 		if busy, _ := a.Store().TreeBusyForDispatch(sid); busy {
 			// Skip the LANE this tick: the selected item stays pending (or
 			// its resume marker stays unconsumed); re-evaluated next tick.
