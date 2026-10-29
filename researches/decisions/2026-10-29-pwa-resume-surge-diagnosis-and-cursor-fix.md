@@ -181,3 +181,20 @@ To maintain strict epistemic honesty, evidence is classified into verified measu
 - **Cursor Fix Landing:** Commit `e2f0f36efa2141e2366971aa8c095614f099e06b` (Card `task-2026-10-28t17-34-52-pwa-session-cursor-loss-fix`)
 - **Coordinator Review & Adjudication:** `.local/coordinator/reports/task-2026-10-28t17-34-52-pwa-session-cursor-loss-fix/2026-10-28T21-39-49-review.md`
 - **Store Merge-Policy Gap Draft:** Card `task-2026-10-28t18-40-00-store-merge-policy-gap-draft`
+
+---
+
+## Addendum 2026-10-29 (evening): parked-design closure and standing
+
+1. **Position A (host-coordinated warm-resume admission + Known-Edge amendment): CLOSED — not built, evidence-justified.**
+   Its motivating theory (surge contention starving the visible pane) was overturned by four instrumented captures: every observed resume converged sub-second to ~2.5s (worst case: 34-min backlog, of which 2.3s was phone radio wake), including occasions the operator reported as slow. The hidden-pane badge contract (`docs/ai/hidden-pane-status.md`) stays untouched — the Known Edge is now runtime-observed and remains documented there.
+   - **Reopen trigger (only):** a future instrumented capture showing visible-pane time-to-live materially degraded by cross-pane load — concretely, `applied@` stamps >2s on the visible pane's streams attributable to concurrent decode (not radio wake, not backlog size), with the conn-grade/cascade stamps from `6dd6e8e` showing grade still reconnecting meanwhile.
+2. **Position C (defer JS-owned watchdog reconnects for host-hidden panes): CLOSED on the same evidence.**
+   The storm is watchdog-synchronized (proven by reason tags) but demonstrably cheap; deferring it buys nothing measurable. Same reopen trigger as Position A.
+3. **Tree stream `part_delta` opt-in: landed (commit `ad19da32`).**
+   Tree streams now negotiate delta replay, closing the compatibility-fallback mis-flip observed twice in the 00:03+07 journal. Honest scope: classification-closure, not snapshot elimination; shared `isPartDeltaEnabled()` kill-switch reverts both streams.
+4. **Standing open (operator-side):**
+   Capture-3 on a build ≥`6dd6e8e` (toast/cascade stamps adjudicate any lingering banner); the banner-vs-content question; the 05:20Z tree-flap (likely release-deploy churn).
+   - **Next theme:** Formal verification of the sync layer — entry point is the store merge-policy gap draft card (`task-2026-10-28t18-40-00-store-merge-policy-gap-draft`, `prependMessagesIfAbsent` keyed-non-completed-resident skip, `web/src/lib/reduce.ts:200–228` region), pinned by the round-5b bidirectional boundary test.
+5. **Ledger status at addendum time:**
+   Six unpushed local commits: `b2d3d62` (diagnostics), `e2f0f36` (cursor fix), `f0b6ff1` (this memo), `6dd6e8e` (toast/stamps), `4d5cfd8` (ledger cleanup), `ad19da3` (part_delta).
