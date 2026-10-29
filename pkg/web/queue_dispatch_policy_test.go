@@ -412,6 +412,60 @@ func TestQueueSchema2DaemonOffRefusesBeforeAnyMutation(t *testing.T) {
 	assertQueueFileUnchanged(t, p2, before)
 }
 
+// TestQueueSchema2DaemonOffListResolveCannotReachCompactionRemove (G1,
+// R2-F1 unreachability pin): persistAfterCompaction's empty-queue os.Remove
+// branch (queue.go ~L1185) is adjudicated UNREACHABLE for schema-2
+// (policy-bearing) files under daemon-off, because BOTH call sites that could
+// drive it with a compaction-empty store — List() (~L1239) and Resolve()
+// (~L1707) — call load() first, which refuses with errQueueSchemaModeRequired
+// BEFORE any state is assigned.
+//
+// This pin has teeth: the seeded file is shaped so that IF the load()
+// refusal ever stopped firing, List()'s recovery+compaction pass WOULD empty
+// the store (a single long-expired sent item, zero receipts) and the remove
+// branch would DELETE queue.json. The assertion is therefore not just the
+// typed refusal from each call but that the file still exists afterwards with
+// byte-identical content — a regression in either the refusal or its
+// before-any-state-assignment placement fails visibly.
+//
+// Test-only by design: the remove branch is NOT rerouted (the adjudication
+// holds; see also TestQueueSchema2DaemonOffRefusesBeforeAnyMutation for the
+// wider store+HTTP refusal matrix).
+func TestQueueSchema2DaemonOffListResolveCannotReachCompactionRemove(t *testing.T) {
+	root := t.TempDir()
+	// One sent item with a far-past resolvedAt (2023 epoch ms — years beyond
+	// the 1h sent TTL) and no receipts: the maximal compaction-empty shape —
+	// a loaded store would purge the item (TTL pass) and hit
+	// persistAfterCompaction's remove branch.
+	const body = `{"version":2,"order":1,"items":[` +
+		`{"id":"q-old","order":1,"state":"sent","text":"expired terminal","attachments":[],"createdAt":1700000000000,` +
+		`"resolvedAt":1700000000000,"detail":"delivered long ago","dispatchPolicy":"now"}]}`
+	p := seedQueueFileBody(t, root, "s1", body)
+	before := mustReadFile(t, p)
+
+	// Daemon OFF (the policy scheduler is inactive, so a v2 file is
+	// mode-required refused). Explicit set: this test must not inherit
+	// whatever a prior test left on the process-global flag.
+	SetDaemonDispatchEnabled(false)
+	t.Cleanup(func() { SetDaemonDispatchEnabled(false) })
+
+	// List(): must refuse with the typed mode-required error — never reach
+	// recovery, compaction, or the remove branch.
+	fresh := &sessionQueueStore{path: p}
+	if _, err := fresh.List(); !errors.Is(err, errQueueSchemaModeRequired) {
+		t.Fatalf("List under schema2+daemon-off: err=%v, want errQueueSchemaModeRequired", err)
+	}
+	assertQueueFileUnchanged(t, p, before)
+
+	// Resolve() on the same file: same load()-first refusal, no transition,
+	// no compaction persistence, no removal.
+	fresh2 := &sessionQueueStore{path: p}
+	if _, err := fresh2.Resolve("q-old", QueueSent, "different detail"); !errors.Is(err, errQueueSchemaModeRequired) {
+		t.Fatalf("Resolve under schema2+daemon-off: err=%v, want errQueueSchemaModeRequired", err)
+	}
+	assertQueueFileUnchanged(t, p, before)
+}
+
 // Schema 2 under an ACTIVE scheduler loads cleanly (validating the policy
 // members); an item carrying an unsupported policy value in a v2 file is
 // semantic corruption — refused, bytes preserved.
@@ -542,6 +596,168 @@ func TestQueueReceiptByteCompatFixture(t *testing.T) {
 	}
 	if _, _, err := s2.EnqueueAdmission("", "att-era1", QueueDispatchPolicyNow, "hello", nil, QueueSendConfig{}, ""); !errors.Is(err, errQueueAdmissionConflict) {
 		t.Fatalf("era-1 attempt id replayed as now: err=%v, want errQueueAdmissionConflict (distinct admission)", err)
+	}
+}
+
+// --- frozen pre-B1 byte oracle (G2, R2-F2) -----------------------------------
+//
+// TestQueueReceiptByteCompatFixture above proves REWRITE stability (the same
+// NEW implementation produces the same bytes across an upgrade). This oracle
+// is the independent PRE-POLICY identity pin: the frozen literals below were
+// produced by the PRE-B1 implementation recovered read-only from git history,
+// so a policy-era change to the policy-less serialization shape (field order,
+// tag, elision) fails here even if it is perfectly self-consistent.
+//
+// PROVENANCE (frozen literals):
+//   - Producing revision: 1296ecd (= 4dfc9ca^ — the 2026-10-27 release-rule
+//     amendment; pkg/web/queue.go's last pre-B1 state before the policy
+//     commit 4dfc9ca).
+//   - Extraction method: `git show 1296ecd:pkg/web/queue.go` — the pre-B1
+//     queuePayloadFingerprint (3-arg form, NO policy member), the pre-B1
+//     QueueAttachment/QueueSendConfig/QueueItem/queueFile/queueAdmissionReceipt
+//     field order + json tags (verbatim; the pre-B1 QueueItem is
+//     field-for-field the current one minus DispatchPolicy), the jsonBytes
+//     helper (pkg/web/feature.go — unchanged 1296ecd..HEAD: plain
+//     json.Marshal), and save()'s on-disk encode form
+//     (json.MarshalIndent(doc, "", "  ")). These were extracted into a
+//     standalone scratch program under tmp/ (gitignored, never committed),
+//     run once, and its outputs frozen verbatim below.
+//   - sha256 of the canonical fingerprint input:
+//     55a4a852b832d0b8f31e5605bd620e5b7d7ef52232e3deb9f16e4afd5aab74c7
+//     (base64 RawURL: the frozen fingerprint below).
+//
+// The FIXED sample is a queue-policy-equivalent (policy-less) payload: text +
+// one attachment + a populated sendConfig, admitted under attempt id
+// "att-oracle-fixed" on session "s-oracle". Every runtime-variable member is
+// pinned to a literal (id, order, createdAt) so both eras serialize the SAME
+// values; all omitempty members stay zero so they elide — exactly the shape a
+// fresh admission produces.
+
+// The fixed sample shared by the oracle assertions (values only — no policy
+// member, DispatchPolicy stays "" so the wire member elides).
+func frozenOracleSample() (text string, atts []QueueAttachment, cfg QueueSendConfig, item QueueItem) {
+	text = "frozen oracle sample: policy-less queued message"
+	atts = []QueueAttachment{{
+		URL:      "file:///.vh-solara/sessions/s-oracle/attachments/oracle.png",
+		Filename: "oracle.png",
+		Mime:     "image/png",
+		Path:     ".vh-solara/sessions/s-oracle/attachments/oracle.png",
+	}}
+	cfg = QueueSendConfig{ProviderID: "anthropic", ModelID: "claude-sonnet-4-5", Agent: "build"}
+	item = QueueItem{
+		ID:             "q-oracle-0001",
+		Order:          1,
+		State:          QueuePending,
+		Text:           text,
+		Attachments:    atts,
+		SendConfig:     cfg,
+		OriginClientID: "client-oracle",
+		AttemptID:      "att-oracle-fixed",
+		CreatedAt:      1700000000000,
+	}
+	return
+}
+
+// The pre-B1 fingerprint literal (base64 RawURL of the sha256 above).
+const frozenOraclePreB1Fingerprint = "VaSoUrgy0LjzHlYFvWIOW31-9SIy49658W5K_VqrdMc"
+
+// The pre-B1 receipt canonical bytes (jsonBytes path — compact json.Marshal
+// of queueAdmissionReceipt{Fingerprint, Item}).
+const frozenOraclePreB1ReceiptCompact = `{"fingerprint":"VaSoUrgy0LjzHlYFvWIOW31-9SIy49658W5K_VqrdMc","item":{"id":"q-oracle-0001","order":1,"state":"pending","text":"frozen oracle sample: policy-less queued message","attachments":[{"url":"file:///.vh-solara/sessions/s-oracle/attachments/oracle.png","filename":"oracle.png","mime":"image/png","path":".vh-solara/sessions/s-oracle/attachments/oracle.png"}],"sendConfig":{"providerID":"anthropic","modelID":"claude-sonnet-4-5","agent":"build"},"originClientId":"client-oracle","attemptId":"att-oracle-fixed","createdAt":1700000000000}}`
+
+// The pre-B1 on-disk queueFile form (save()'s json.MarshalIndent(doc, "", "  ")
+// for the fixed sample: one item, one receipt, schema 1, no fence generation).
+// This is the exact subtree rawReceiptBytes extracts from queue.json — pinned
+// whole-file so the on-disk embedding (map-key indentation included) is part
+// of the oracle. No trailing newline: MarshalIndent emits none and save()
+// writes the bytes as-is.
+const frozenOraclePreB1QueueFileOnDisk = `{
+  "version": 1,
+  "order": 1,
+  "items": [
+    {
+      "id": "q-oracle-0001",
+      "order": 1,
+      "state": "pending",
+      "text": "frozen oracle sample: policy-less queued message",
+      "attachments": [
+        {
+          "url": "file:///.vh-solara/sessions/s-oracle/attachments/oracle.png",
+          "filename": "oracle.png",
+          "mime": "image/png",
+          "path": ".vh-solara/sessions/s-oracle/attachments/oracle.png"
+        }
+      ],
+      "sendConfig": {
+        "providerID": "anthropic",
+        "modelID": "claude-sonnet-4-5",
+        "agent": "build"
+      },
+      "originClientId": "client-oracle",
+      "attemptId": "att-oracle-fixed",
+      "createdAt": 1700000000000
+    }
+  ],
+  "admissionReceipts": {
+    "att-oracle-fixed": {
+      "fingerprint": "VaSoUrgy0LjzHlYFvWIOW31-9SIy49658W5K_VqrdMc",
+      "item": {
+        "id": "q-oracle-0001",
+        "order": 1,
+        "state": "pending",
+        "text": "frozen oracle sample: policy-less queued message",
+        "attachments": [
+          {
+            "url": "file:///.vh-solara/sessions/s-oracle/attachments/oracle.png",
+            "filename": "oracle.png",
+            "mime": "image/png",
+            "path": ".vh-solara/sessions/s-oracle/attachments/oracle.png"
+          }
+        ],
+        "sendConfig": {
+          "providerID": "anthropic",
+          "modelID": "claude-sonnet-4-5",
+          "agent": "build"
+        },
+        "originClientId": "client-oracle",
+        "attemptId": "att-oracle-fixed",
+        "createdAt": 1700000000000
+      }
+    }
+  }
+}`
+
+// TestQueueReceiptPreB1ByteOracle asserts the CURRENT implementation
+// reproduces the pre-B1 (1296ecd) bytes BYTE-FOR-BYTE for the policy-less
+// (normalized queue) payload: the fingerprint, the compact receipt canonical
+// bytes, and the on-disk indented queueFile form. A mismatch here is a REAL
+// compat defect (existing on-disk receipts/fingerprints invalidated by the
+// policy era), not a test to fix.
+func TestQueueReceiptPreB1ByteOracle(t *testing.T) {
+	text, atts, cfg, item := frozenOracleSample()
+
+	// 1. Fingerprint: the normalized-queue ("" policy) admission fingerprints
+	// byte-identically to the pre-B1 3-arg form — omitempty elision is the
+	// compat mechanism.
+	if got := queuePayloadFingerprint(text, atts, cfg, ""); got != frozenOraclePreB1Fingerprint {
+		t.Fatalf("policy-less fingerprint drifted from pre-B1:\n got: %s\nwant: %s", got, frozenOraclePreB1Fingerprint)
+	}
+
+	// 2. Compact receipt canonical bytes (the replay/compare representation).
+	rec := queueAdmissionReceipt{Fingerprint: frozenOraclePreB1Fingerprint, Item: item}
+	if got := string(jsonBytes(rec)); got != frozenOraclePreB1ReceiptCompact {
+		t.Fatalf("policy-less receipt canonical bytes drifted from pre-B1:\n got: %s\nwant: %s", got, frozenOraclePreB1ReceiptCompact)
+	}
+
+	// 3. On-disk form: save()'s exact encode of the whole doc (item + receipt
+	// map embedding + indentation) for the same fixed state.
+	doc := queueFile{Version: 1, Order: 1, Items: []QueueItem{item}, Receipts: map[string]queueAdmissionReceipt{"att-oracle-fixed": rec}}
+	got, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != frozenOraclePreB1QueueFileOnDisk {
+		t.Fatalf("policy-less on-disk queueFile bytes drifted from pre-B1:\n got: %s\nwant: %s", got, frozenOraclePreB1QueueFileOnDisk)
 	}
 }
 

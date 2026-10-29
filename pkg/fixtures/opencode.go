@@ -2910,7 +2910,19 @@ func (f *FakeOpenCode) simulatePrompt(sessionID, text, messageID string) {
 		f.emit("session.idle", map[string]any{"sessionID": sessionID})
 	}()
 
-	userInfo := map[string]any{"id": userID, "sessionID": sessionID, "role": "user", "time": map[string]any{"created": now(), "completed": now()}}
+	// Agent stamps (G4, queue-policy follow-up): real OpenCode sender-stamps
+	// the agent on the user message (the agent the send carried — the FE
+	// resolver's live scan relies on this: "user messages are sender-stamped
+	// with `agent`, so the live scan is fresh after every send", web/src/
+	// agents.ts) and the responding agent on the assistant message (the
+	// aggregator's lastAssistantAgent scans exactly that member). The fake
+	// stamped NEITHER, so after a delivered turn on a fresh session the send
+	// gate's agent resolution pended forever — the B2 e2e policy cell had to
+	// run on the seeded `demo` session as a workaround (queue-delivery-
+	// custody.spec.ts). "build" is the fixture's default primary agent (the
+	// /agent list's first primary; the same hard-stamp the seeded transcripts
+	// use).
+	userInfo := map[string]any{"id": userID, "sessionID": sessionID, "role": "user", "agent": "build", "time": map[string]any{"created": now(), "completed": now()}}
 	userPart := textPart(userID, sessionID, upID, text, now())
 	f.appendMessage(sessionID, messageWithParts{Info: userInfo, Parts: []map[string]any{userPart}})
 	f.emit("message.updated", map[string]any{"info": userInfo})
@@ -2974,7 +2986,12 @@ func (f *FakeOpenCode) simulatePrompt(sessionID, text, messageID string) {
 // the continuation that follows a question reply.
 func (f *FakeOpenCode) streamAssistant(sessionID, asstID, apID string, chunks []string) {
 	now := func() float64 { return float64(time.Now().UnixMilli()) }
-	asstInfo := map[string]any{"id": asstID, "sessionID": sessionID, "role": "assistant", "time": map[string]any{"created": now()}}
+	// The assistant message carries the responding agent ("build" — the
+	// fixture's default primary), matching the seeded transcripts' shape
+	// (e.g. demo's m2/m6) and real OpenCode: without the stamp the aggregator
+	// seeds no lastAgent and the FE send gate pends on fresh sessions after a
+	// delivered turn (see the G4 note in simulatePrompt above).
+	asstInfo := map[string]any{"id": asstID, "sessionID": sessionID, "role": "assistant", "agent": "build", "time": map[string]any{"created": now()}}
 	f.emit("message.updated", map[string]any{"info": asstInfo})
 
 	// Create the (empty) text part, then stream tokens via message.part.delta —
