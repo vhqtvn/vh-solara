@@ -195,6 +195,57 @@ describe("A — tree stream URL opts into gzip64", () => {
     expect(url).toMatch(/sessions=&/);
     expect(url).toMatch(/(?:^|[?&])z=1(?:&|$)/);
   });
+
+  // -------------------------------------------------------------------------
+  // part_delta=1 — the tree stream's opt-in pin (task
+  // task-2026-10-29t17-37-06-tree-stream-part-delta-opt-in). Mirrors the
+  // session stream's exact parameter form (session-stream.ts open():
+  // `&part_delta=1` gated by isPartDeltaEnabled). With the param present the
+  // server's §4.3 replay scan does NOT flip a cursor-replay whose range
+  // contains a part.append into a fresh snapshot — the compatibility_fallback
+  // the 2026-10-29 journal caught twice on tree streams. Pinned on BOTH the
+  // fresh and resume URL shapes so a future template-literal edit can't drop
+  // it from either branch.
+  // -------------------------------------------------------------------------
+  it("includes `part_delta=1` in the Stream-1 URL (fresh + resume shapes)", async () => {
+    stream.connect();
+    expect(treeESes()).toHaveLength(1);
+    expect(treeESes()[0].url).toMatch(/sessions=&/);
+    expect(treeESes()[0].url).toMatch(/(?:^|[?&])part_delta=1(?:&|$)/);
+
+    // Resume shape: seed a cursor, reconnect — the opt-in must survive the
+    // cursor param branch too. (connect() closed the first ES; the resume ES
+    // is the newest instance — instances accumulates across both connects.)
+    window.localStorage.clear();
+    saveVersioned(LS_PROJECT, 1, "/test");
+    saveVersioned(lsCursor("/test"), 1, 99);
+    await setupFresh();
+    stream.connect();
+    const resumeES = treeESes()[treeESes().length - 1];
+    expect(resumeES.readyState).not.toBe(CLOSED);
+    expect(resumeES.url).toMatch(/cursor=99&/);
+    expect(resumeES.url).toMatch(/tree=2&part_delta=1$/);
+  });
+
+  it("omits `part_delta=1` when the shared kill-switch is off (rollback = param drop)", async () => {
+    // The kill-switch (isPartDeltaEnabled, session-stream.ts) is shared by
+    // both streams: flipping it removes the param → the server keeps the
+    // legacy full part.upsert encoding for this connection (one-reconnect
+    // rollback, no server change). Pin that the tree URL actually honors it.
+    const sessionStream = await import("../../src/sync/session-stream");
+    sessionStream._setPartDeltaEnabledForTest(false);
+
+    stream.connect();
+    expect(treeESes()).toHaveLength(1);
+    expect(treeESes()[0].url).not.toMatch(/part_delta=/);
+  });
+
+  // Restore the kill-switch default between tests — the disabled-path test
+  // above flips the real module flag and must not leak it into siblings.
+  // Mirrors partAppendStreaming.test.ts:406-409.
+  afterEach(async () => {
+    (await import("../../src/sync/session-stream"))._setPartDeltaEnabledForTest(true);
+  });
 });
 
 // ===========================================================================

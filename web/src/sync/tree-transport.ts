@@ -101,6 +101,7 @@ import {
 import { countRecovery, countSnapshotBytes } from "./recovery-reasons";
 import { recordStreamDrop } from "./weaklink";
 import { noteLivenessFrame } from "./liveness";
+import { isPartDeltaEnabled } from "./session-stream";
 import {
   requestRecovery,
   noteExternalRecovery,
@@ -968,8 +969,36 @@ export function connect(fresh = false, reason: StreamOpenReason = "other", detai
   // frames (snapshot/session.*/permission.*/etc → the detail layer). The
   // shared resume cursor (state.cursor, store-seq space, see F4 below) is
   // identical for both projections, so cursorParam above applies unchanged.
+  //
+  // `&part_delta=1` (spec §3) — the SAME opt-in + kill-switch form the session
+  // stream (Stream 2) sends (session-stream.ts open()). It negotiates the
+  // KindPartAppend suffix wire format for this connection so the server's §4.3
+  // replay scan no longer flips a cursor-replay whose RANGE happens to contain
+  // a part.append into a full fresh snapshot ("compatibility_fallback" — the
+  // 2026-10-29 journal showed two tree streams taking path=fresh over gaps
+  // 712/1122, both under ring capacity, purely because session activity had
+  // landed part.append events in the shared per-project ring).
+  //
+  // LIVE-PARITY (why this is safe for a stream that never CONSUMES part
+  // frames): this URL sends `sessions=` (empty), so the server's egress gate
+  // drops part.*/message.*/messages.* events for the tree stream on BOTH
+  // paths — live (Interest filter upstream + sendable() at egress) and replay
+  // (the same sendable() gates every replayed event before any frame is
+  // written). The opt-in changes only the negotiated ENCODING and thus the
+  // §4.3 scan verdict; the tree client still receives zero part.* frames.
+  // Tolerance is structural even if a future server variant delivered one:
+  // this transport registers no part.* listener (TREE_STREAM_KINDS is
+  // structural/notification only; EventSource drops unlistened named events
+  // at zero cost), the skipped seq is absorbed by the NEXT delivered frame's
+  // monotonic advanceCursor (the shared per-project seq space already
+  // includes session events this stream never sees live), and the delivery
+  // ORDINAL — the only gap-detection input (checkTreeOrdinalGap) — advances
+  // solely for tree-counted kinds, which part.* never is. Gated behind the
+  // same isPartDeltaEnabled() kill-switch as Stream 2, so one flag reverts
+  // both connections to the legacy encoding.
+  const partDeltaParam = isPartDeltaEnabled() ? `&part_delta=1` : "";
   es = new EventSource(
-    `/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1&tree=2`,
+    `/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1&tree=2${partDeltaParam}`,
   );
   markTreeSeen();
   // Diagnostics (logging-only): one stream-open record per construction,

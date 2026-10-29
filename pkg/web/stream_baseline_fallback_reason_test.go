@@ -170,6 +170,111 @@ func TestStreamBaseline_FallbackReason_Matrix(t *testing.T) {
 	}
 }
 
+// TestStreamBaseline_FallbackReason_TreeStreamPartDeltaReplay — the
+// tree-stream (Stream 1) case the 2026-10-29 parked item actioned
+// (task-2026-10-29t17-37-06-tree-stream-part-delta-opt-in): a tree stream
+// that opts into part_delta=1 and reconnects over a replay range containing
+// part.append MUST take the replay branch (fallback_reason=none) — the
+// opt-in removes the COMPATIBILITY_FALLBACK branch classification (no fresh
+// re-seed flip when part.append sits in the cursor range; the 00:03+07
+// worker journal caught the mis-flip twice, gaps 712/1122, both under ring
+// capacity). The replay branch still unconditionally emits its reconnect
+// snapshot pair (stream_http.go:447-496 SnapshotWithTreePartial): a
+// semantics/consistency fix + fallback_reason=none in the journal — not
+// snapshot elimination.
+//
+// Tree-specific pins beyond the matrix test (which covers sessions=s1):
+//   - The tree URL shape is `sessions=` EMPTY + `tree=2`, so the replayed
+//     part.append events are dropped at the egress sendable() gate — the tree
+//     client receives NO part.append frames (live parity: the same gate drops
+//     them on the live tail, and the Interest filter keeps message-class
+//     events out of the tree channel entirely). Replay tolerance merely
+//     matches live tolerance.
+//   - replayed counts the RAW ring slice (2 part.append events), even though
+//     zero of them cross the wire for this stream.
+//
+// Red-first note: written against the OPT-IN path — with `&part_delta=1`
+// removed from the URL this exact connect flips to path=fresh
+// fallback_reason=compatibility_fallback (the matrix test's step 2 branch).
+func TestStreamBaseline_FallbackReason_TreeStreamPartDeltaReplay(t *testing.T) {
+	srv, agg := treeReplayServer(t)
+	store := agg.Store()
+	store.Apply(ev("session.created", `{"info":{"id":"s1"}}`))
+	store.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"s1","role":"assistant"}}`))
+	store.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"s1","messageID":"m1","type":"text","text":""}}`))
+	// A SECOND message+part: deltaLastEmit is per-messageEntry (reducers.go
+	// appendPartDeltaLocked), so two deltas on the SAME message inside the
+	// flush-interval window coalesce into ONE ring event (the throttle —
+	// first-of-burst flushes, the rest buffer). Seeding a second message makes
+	// the replayed count below deterministic: each message's first delta
+	// flushes → exactly TWO KindPartAppend ring events above the cursor.
+	store.Apply(ev("message.updated", `{"info":{"id":"m2","sessionID":"s1","role":"assistant"}}`))
+	store.Apply(ev("message.part.updated", `{"part":{"id":"p2","sessionID":"s1","messageID":"m2","type":"text","text":""}}`))
+
+	web := httptest.NewServer(srv.Handler())
+	defer web.Close()
+
+	// 1. Cursorless tree connect (the real tree URL shape): fresh frontier
+	//    bootstrap. The detail snapshot's SSE id (store head, compound form)
+	//    is the resume cursor for step 3.
+	var cursor string
+	lines := captureBaselines(t, func() {
+		resp, err := http.Get(web.URL + "/vh/stream?sessions=&tree=2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		evs := drainIdle(startSSEReader(t, resp.Body), 500*time.Millisecond)
+		resp.Body.Close()
+		cursor = lastEventIDOf(evs, "snapshot")
+		if cursor == "" {
+			t.Fatalf("tree fresh connect: no detail snapshot id; events=%v", eventNames(evs))
+		}
+	})
+	cursorlessLine := lastBaselineLine(t, lines, 1)
+	if !strings.Contains(cursorlessLine, "path=fresh") || !strings.Contains(cursorlessLine, "fallback_reason=cursorless") {
+		t.Errorf("tree cursorless: line = %q", cursorlessLine)
+	}
+
+	// Land KindPartAppend events into the ring at seq > cursor: one delta per
+	// MESSAGE (m1, m2) so both flush (per-message throttle — see the seeding
+	// comment above). Same flush shape as the matrix test: the flush emits the
+	// ring event regardless of live subscribers — none are attached to this
+	// store between connects.
+	store.Apply(ev("message.part.delta", `{"sessionID":"s1","messageID":"m1","partID":"p1","field":"text","delta":"a"}`))
+	store.Apply(ev("message.part.delta", `{"sessionID":"s1","messageID":"m2","partID":"p2","field":"text","delta":"c"}`))
+
+	// 2. Opted-in TREE reconnect over the part.append-bearing range → the
+	//    §4.3 scan must NOT flip: replay branch, fallback_reason=none, and
+	//    (tree-specific) NO part frames delivered — the empty sessions filter
+	//    drops them at sendable(), exactly as the live tail would.
+	lines = captureBaselines(t, func() {
+		req, _ := http.NewRequest("GET", web.URL+"/vh/stream?sessions=&tree=2&part_delta=1", nil)
+		req.Header.Set("Last-Event-ID", cursor)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		treeResumed := drainIdle(startSSEReader(t, resp.Body), 700*time.Millisecond)
+		resp.Body.Close()
+		if hasEvent(treeResumed, "part.append") {
+			t.Errorf("tree replay must NOT deliver part.append frames (empty sessions filter drops them at sendable): %v", eventNames(treeResumed))
+		}
+		if hasEvent(treeResumed, "part.upsert") {
+			t.Errorf("tree replay must NOT deliver part.upsert frames either: %v", eventNames(treeResumed))
+		}
+	})
+	line := lastBaselineLine(t, lines, 1)
+	if !strings.Contains(line, "path=replay") || !strings.Contains(line, "fallback_reason=none") {
+		t.Errorf("tree opt-in replay: line = %q", line)
+	}
+	if !strings.Contains(line, "part_append_in_range=true") {
+		t.Errorf("tree opt-in replay: part_append_in_range must be true (the range contains them): %q", line)
+	}
+	if !strings.Contains(line, "replayed=2") {
+		t.Errorf("tree opt-in replay: replayed must count the RAW ring slice (2 part.append events): %q", line)
+	}
+}
+
 // TestStreamBaseline_FallbackReason_RingEviction — a cursor older than the
 // retained ring window (capacity 1000 in treeReplayServer) makes store.Replay
 // report !ok at ENTRY: the journal must say ring_eviction (a true gap), not

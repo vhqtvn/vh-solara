@@ -307,6 +307,56 @@ describe("Stream1 connect() listener manifest", () => {
   });
 
   // -------------------------------------------------------------------------
+  // part.* replay tolerance (task task-2026-10-29t17-37-06-tree-stream-part-
+  // delta-opt-in). The tree URL now sends part_delta=1 so the server's §4.3
+  // replay scan keeps the cursor-replay branch when the replay RANGE contains
+  // part.append (compatibility_fallback elimination). The tree stream itself
+  // never consumes part frames: the empty `sessions=` filter drops them at
+  // the server's egress gate on BOTH live and replay paths, and — the pin
+  // here — even a DEFENSIVELY delivered part.append frame is inert on this
+  // transport: no listener is registered for part.*/message.*/messages.*
+  // kinds (EventSource drops unlistened named events), the skipped seq is
+  // absorbed by the next delivered frame's monotonic advanceCursor, and the
+  // delivery ORDINAL (the only gap-detection input, checkTreeOrdinalGap)
+  // stays contiguous because the server never assigns ordinals to
+  // non-tree-counted frames. Replay tolerance == live tolerance.
+  // -------------------------------------------------------------------------
+  it("ignores part.* frames (no listener, no cursor move, no seq-gap) while later frames keep applying", () => {
+    stream.connect();
+    const es = treeESes()[0];
+    es.simulateOpen();
+
+    // The manifest carries no session-content kinds — pinned by the exact-set
+    // assertion above; restated here because THIS test's contract depends on it.
+    for (const kind of ["part.append", "part.upsert", "message.updated", "messages.loaded"]) {
+      expect(es.listenerTypes()).not.toContain(kind);
+    }
+
+    // Baseline: one counted frame with a COMPOUND id (seq 100, ordinal 1).
+    es.fire("session.upsert", { id: "sA", title: "a" }, "100.1");
+    expect(store.state.sessions.sA).toEqual({ id: "sA", title: "a" });
+    expect(store.state.cursor).toBe(100);
+
+    // Worst-case defensive shape: a part.append frame that somehow CARRIES an
+    // id (seq 101). No listener → nothing runs: no cursor move, no state.
+    es.fire("part.append", { sessionID: "sA", messageID: "m1", partID: "p1", field: "text", start: 0, text: "x" }, "101");
+    expect(store.state.cursor).toBe(100);
+
+    // The next counted frame jumps the seq (102 — the shared per-project seq
+    // space includes the ignored session event) while the ORDINAL stays
+    // contiguous (2 = 1+1): applied cleanly, cursor jumps over the ignored
+    // seq exactly as the live path does for session events, and NO
+    // tree-seq-gap recovery fires (no reconnect: same ES stays OPEN, no new
+    // instance, status stays live).
+    es.fire("session.upsert", { id: "sB", title: "b" }, "102.2");
+    expect(store.state.sessions.sB).toEqual({ id: "sB", title: "b" });
+    expect(store.state.cursor).toBe(102);
+    expect(es.readyState).toBe(1); // OPEN — no forced fresh-snapshot reconnect
+    expect(instances.filter((e) => e.readyState !== 2)).toHaveLength(1);
+    expect(store.state.status).toBe("live");
+  });
+
+  // -------------------------------------------------------------------------
   // Fast-path listeners — notice / pins.snapshot / pins.updated / labels.* /
   // ping. These are disjoint from tree/detail coherent state and never await
   // the owner.
