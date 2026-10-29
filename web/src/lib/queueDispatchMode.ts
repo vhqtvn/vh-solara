@@ -33,6 +33,16 @@ import { createSignal } from "solid-js";
 export type DispatchMode = "modern" | "legacy-confirmed" | "unknown";
 
 const [capable, setCapable] = createSignal(false);
+// Queue-policy slice B2 (2026-10-29 amendment §4): the server advertises
+// `queueDispatchPolicyVersion` (a number, 1 = the per-item dispatchPolicy
+// scheduler) ONLY while the policy scheduler is ACTIVE — the same enablement
+// as daemon dispatch. True gates the policy composer button table + the
+// pending-chip Send-now escalation; false/absent keeps every pre-policy
+// surface byte-for-byte. Same fail-safe posture as `capable`: a failed probe
+// keeps the previous value (the buttons stay as rendered; a server that truly
+// lost the capability answers the now-admission with 409
+// queue_dispatch_policy_unsupported, which surfaces on the rejected row).
+const [policyCapable, setPolicyCapable] = createSignal(false);
 let custodyRefused = false;
 // Whether the LAST COMPLETED /vh/version probe established the mode (a
 // parseable response body arrived). Per-attempt by design: a probe that
@@ -47,6 +57,13 @@ let modeEstablished = false;
 /** Live daemon-dispatch capability as advertised by /vh/version. */
 export function daemonDispatchCapable(): boolean {
   return capable();
+}
+
+/** Queue-policy capability (queueDispatchPolicyVersion on /vh/version).
+ *  True ONLY while the server's policy scheduler is active — gates the
+ *  Send-now/Queue composer button table and the pending-chip escalation. */
+export function queuePolicyCapable(): boolean {
+  return policyCapable();
 }
 
 /** The observe-only projection predicate: true when the daemon owns dispatch
@@ -93,6 +110,12 @@ export async function refreshDispatchMode(): Promise<void> {
     if (typeof (j as any).daemonDispatchCapable === "boolean") {
       setCapable((j as any).daemonDispatchCapable);
     }
+    // Queue-policy B2: a numeric queueDispatchPolicyVersion >= 1 advertises
+    // the ACTIVE policy scheduler (the server omits the key otherwise — a
+    // missing/unsupported capability never activates modern gestures). Any
+    // other shape (absent, wrong type, 0/negative) reads NOT capable.
+    const pv = (j as any).queueDispatchPolicyVersion;
+    setPolicyCapable(typeof pv === "number" && Number.isFinite(pv) && pv >= 1);
     // Any parseable 200 body establishes the mode: capability advertised or
     // false → resolved by the switches + this flag; field ABSENT → genuine
     // legacy (an old daemon that predates the advertisement) — the retry
@@ -111,6 +134,7 @@ export function noteQueueCustodyRefusal(): void {
 /** Test-only: reset both switches. */
 export function __resetQueueDispatchModeForTests(): void {
   setCapable(false);
+  setPolicyCapable(false);
   custodyRefused = false;
   modeEstablished = false;
 }

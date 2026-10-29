@@ -13,6 +13,7 @@ import {
   noteQueueCustodyRefusal,
   projectionActive,
   queueCustodyRefused,
+  queuePolicyCapable,
   refreshDispatchMode,
 } from "../../src/lib/queueDispatchMode";
 
@@ -153,6 +154,58 @@ describe("dispatch mode (projection feature-detect)", () => {
       stubVersion({ daemonDispatchCapable: false });
       await refreshDispatchMode();
       expect(dispatchMode()).toBe("legacy-confirmed");
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Queue-policy B2 (2026-10-29 amendment §4): queuePolicyCapable() reads
+  // /vh/version's queueDispatchPolicyVersion — advertised ONLY while the
+  // policy scheduler is ACTIVE (the same enablement as daemon dispatch).
+  // Gates the Send-now/Queue composer button table + the pending-chip
+  // escalation. Absent/malformed → NOT capable; a failed probe keeps the
+  // previous value (fail-safe, mirroring daemonDispatchCapable).
+  // -----------------------------------------------------------------------
+  describe("queuePolicyCapable (queueDispatchPolicyVersion feature-detect)", () => {
+    it("parses a numeric queueDispatchPolicyVersion >= 1 as capable", async () => {
+      stubVersion({ version: "1.2.3", daemonDispatchCapable: true, queueDispatchPolicyVersion: 1 });
+      await refreshDispatchMode();
+      expect(queuePolicyCapable()).toBe(true);
+    });
+
+    it("absent / zero / negative / wrong-typed key reads NOT capable", async () => {
+      stubVersion({ version: "1.2.3", daemonDispatchCapable: true });
+      await refreshDispatchMode();
+      expect(queuePolicyCapable()).toBe(false);
+      stubVersion({ daemonDispatchCapable: true, queueDispatchPolicyVersion: 0 });
+      await refreshDispatchMode();
+      expect(queuePolicyCapable()).toBe(false);
+      stubVersion({ daemonDispatchCapable: true, queueDispatchPolicyVersion: "1" });
+      await refreshDispatchMode();
+      expect(queuePolicyCapable()).toBe(false);
+    });
+
+    it("a failed probe keeps the previous value (fail-safe: the buttons stay as rendered)", async () => {
+      stubVersion({ daemonDispatchCapable: true, queueDispatchPolicyVersion: 1 });
+      await refreshDispatchMode();
+      expect(queuePolicyCapable()).toBe(true);
+      stubVersion(null, false);
+      await refreshDispatchMode();
+      expect(queuePolicyCapable()).toBe(true); // unchanged — same posture as capable
+      // …and a later parseable body without the key reads NOT capable again.
+      stubVersion({ daemonDispatchCapable: true });
+      await refreshDispatchMode();
+      expect(queuePolicyCapable()).toBe(false);
+    });
+
+    it("does NOT touch the S1 tri-state (dispatchMode stays intact)", async () => {
+      stubVersion({ daemonDispatchCapable: true, queueDispatchPolicyVersion: 1 });
+      await refreshDispatchMode();
+      expect(queuePolicyCapable()).toBe(true);
+      expect(dispatchMode()).toBe("modern"); // policy implies daemon dispatch, but the switches stay independent
+      stubVersion({ daemonDispatchCapable: true });
+      await refreshDispatchMode();
+      expect(queuePolicyCapable()).toBe(false);
+      expect(dispatchMode()).toBe("modern"); // capability alone still modern
     });
   });
 });

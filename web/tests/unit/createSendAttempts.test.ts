@@ -33,6 +33,7 @@ import {
   finishSendAttempt,
   getSendAction,
   markOwnerSessionCreateUnknown,
+  mintSendAttempt,
   sendActionsFor,
   updateSendAction,
 } from "../../src/lib/sendActionStatus";
@@ -58,6 +59,11 @@ Object.defineProperty(globalThis, "localStorage", {
 
 interface Harness {
   send: ReturnType<typeof createSend>["send"];
+  // Queue-policy B2: the explicit-gesture policy entry (the busy composer's
+  // Queue / Send now buttons). Absent from the controller until B2 lands.
+  sendPolicy: ReturnType<typeof createSend>["sendPolicy"];
+  // Queue-policy B2: the pending-chip Send-now escalation entry.
+  escalateQueuedItem: ReturnType<typeof createSend>["escalateQueuedItem"];
   // Guarded SendStatus row-retry entry (sending-UX O2 fix) — the
   // edited-composer retry-same cells exercise this seam.
   retrySameMessage: ReturnType<typeof createSend>["retrySameMessage"];
@@ -117,6 +123,19 @@ function harness(overrides: {
   /** G2: overrides the capability-refresh await inside the retry window
    *  (cells flip the ownership tri-state mid-await to prove the re-check). */
   refreshDispatchMode?: SendDependencies["refreshDispatchMode"];
+  /** Queue-policy B2: whole-tree working state at tap (busy-gesture cells). */
+  working?: () => boolean;
+  /** Queue-policy B2: the queueMode preference read (legacy-gate cells). */
+  queueModeOverride?: () => boolean;
+  /** Queue-policy B2: the policy-capability read (server advertises
+   *  queueDispatchPolicyVersion — the button table's gate). */
+  queuePolicyCapable?: () => boolean;
+  /** Queue-policy B2: the pending-chip Send-now escalation seam (queue.ts
+   *  escalateQueued injected, mirroring the enqueue/fetchQueue discipline). */
+  escalate?: SendDependencies["escalate"];
+  /** Queue-policy B2: the BLK-A3 outbox seam — the policy cells assert the
+   *  dispatchPolicy member survives the durable gesture save. */
+  outbox?: SendDependencies["outbox"];
 } = {}): Harness {
   const [input, setInput] = createSignal("");
   const [atts, setAtts] = createSignal<Attachment[]>([]);
@@ -143,8 +162,8 @@ function harness(overrides: {
     input,
     setInput,
     readyToSend: () => true,
-    working: () => false,
-    queueMode: () => true,
+    working: overrides.working ?? (() => false),
+    queueMode: overrides.queueModeOverride ?? (() => true),
     selectionFor: () => ({ providerID: "p", modelID: "m" }),
     awaitAgent: overrides.awaitAgent ?? (async () => ({ ok: true, agent: "build" })),
     resolveAgent: overrides.resolveAgent ?? (() => ({ state: "agent", agent: "build" })),
@@ -201,14 +220,19 @@ function harness(overrides: {
   deps.opencodeDown = overrides.opencodeDown;
   deps.dispatchMode = overrides.dispatchMode;
   deps.refreshDispatchMode = overrides.refreshDispatchMode;
+  deps.queuePolicyCapable = overrides.queuePolicyCapable;
+  deps.escalate = overrides.escalate;
+  deps.outbox = overrides.outbox;
   deps.resolveQueued =
     overrides.resolveQueued ??
     (async (sid, itemId, state, detail) => {
       resolveCalls.push([sid, itemId, state, detail]);
     });
-  const { send, retrySameMessage, retryQueuedItem, dispatchQueuedItem } = createSend(deps);
+  const { send, sendPolicy, escalateQueuedItem, retrySameMessage, retryQueuedItem, dispatchQueuedItem } = createSend(deps);
   return {
     send,
+    sendPolicy,
+    escalateQueuedItem,
     retrySameMessage,
     retryQueuedItem,
     dispatchQueuedItem,
@@ -1696,5 +1720,364 @@ describe("createSend slice 3 — retryQueuedItem (guarded same-messageID queue-i
       expect(h.resolveCalls).toEqual([["ses-1", "q-retry-g2", "sent", ""]]);
       expect(h.notes).toHaveLength(0);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Queue-policy slice B2 (2026-10-29 amendment) — gesture policy capture +
+// thread-through. H1: the FE is delegated transport; the daemon owns
+// semantics. The policy is captured ONCE from the explicit gesture BEFORE any
+// async preparation (the agent-resolution snapshot-once discipline) and
+// threaded through the prepared payload, the BLK-A3 outbox gesture save, and
+// the admission request. Idle gestures are NEVER stamped `now` (an idle send
+// admits with absent policy and dispatches via the idle gate; a busy-race
+// makes it WAIT — the accepted safe default). Without the capability the wire
+// carries NO policy member (legacy bytes byte-for-byte).
+// ---------------------------------------------------------------------------
+describe("createSend queue-policy B2 — policy capture + admission thread-through", () => {
+  function outboxRecorder(saves: any[]): SendDependencies["outbox"] {
+    return {
+      save: async (input) => {
+        saves.push(JSON.parse(JSON.stringify(input)));
+        return { ok: true } as const;
+      },
+      markAdmitted: async () => {},
+      captureHead: () => null,
+    };
+  }
+
+  it("CORE: a busy Send-now gesture admits with dispatchPolicy \"now\" through the durable pipeline — no FE direct-POST anywhere", async () => {
+    const saves: any[] = [];
+    const h = harness({
+      working: () => true,
+      queuePolicyCapable: () => true,
+      outbox: outboxRecorder(saves),
+    });
+    // G2 stays closed for policy paths: any prompt_async / upstream POST from
+    // the browser is a custody bypass — the gesture must admit through the
+    // queue ONLY (the daemon's now-bypass owns dispatch).
+    const directPosts: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: any) => {
+        directPosts.push(String(url));
+        throw new Error(`FE direct-POST reached: ${String(url)}`);
+      }),
+    );
+    h.setInput("send me now");
+    await h.sendPolicy("now");
+    expect(h.enqueueInputs).toHaveLength(1);
+    expect(h.enqueueInputs[0].input.dispatchPolicy).toBe("now");
+    // The BLK-A3 gesture save carries the SAME policy (IDB replay + failed-
+    // save recovery must re-admit with the captured policy, never a degraded
+    // one — a changed fingerprint would 409 the idempotent replay).
+    expect(saves).toHaveLength(1);
+    expect(saves[0].payload.dispatchPolicy).toBe("now");
+    expect(saves[0].payload.text).toBe("send me now");
+    expect(directPosts).toEqual([]);
+  });
+
+  it("Enter while busy (policy capable) defaults to Queue: admission carries dispatchPolicy \"queue\"", async () => {
+    const h = harness({ working: () => true, queuePolicyCapable: () => true });
+    h.setInput("enter queues me");
+    await h.send();
+    expect(h.enqueueInputs).toHaveLength(1);
+    expect(h.enqueueInputs[0].input.dispatchPolicy).toBe("queue");
+  });
+
+  it("an IDLE gesture is never stamped now: no dispatchPolicy member on the wire (absent ≡ queue + immediate idle-gate dispatch)", async () => {
+    const h = harness({ working: () => false, queuePolicyCapable: () => true });
+    h.setInput("idle send");
+    await h.send();
+    expect(h.enqueueInputs).toHaveLength(1);
+    expect(h.enqueueInputs[0].input.dispatchPolicy).toBeUndefined();
+  });
+
+  it("capability ABSENT (legacy): busy gestures carry NO policy member and the queueMode gate still applies (legacy bytes byte-for-byte)", async () => {
+    // queueMode ON (default): the busy send enqueues as today, with NO
+    // dispatchPolicy member anywhere on the wire.
+    const h = harness({ working: () => true });
+    h.setInput("legacy busy");
+    await h.send();
+    expect(h.enqueueInputs).toHaveLength(1);
+    expect(h.enqueueInputs[0].input.dispatchPolicy).toBeUndefined();
+    // queueMode OFF: the legacy busy rejection still fires.
+    const h2 = harness({ working: () => true, queueModeOverride: () => false });
+    h2.setInput("legacy blocked");
+    await h2.send();
+    expect(h2.enqueueInputs).toHaveLength(0);
+    expect(h2.notes.some((n) => n.title === "Busy — turn in progress")).toBe(true);
+  });
+
+  it("capability PRESENT: the queueMode setting no longer gates busy sends (explicit buttons replace it — amendment §2)", async () => {
+    const h = harness({ working: () => true, queueModeOverride: () => false, queuePolicyCapable: () => true });
+    h.setInput("policy busy send");
+    await h.sendPolicy("queue");
+    expect(h.enqueueInputs).toHaveLength(1);
+    expect(h.notes.some((n) => n.title === "Busy — turn in progress")).toBe(false);
+  });
+
+  it("sendPolicy without the capability refuses loudly (never a silent now→queue degradation — G3 posture)", async () => {
+    const h = harness({});
+    h.setInput("must refuse");
+    await h.sendPolicy("now");
+    expect(h.enqueueInputs).toHaveLength(0);
+    expect(h.notes.some((n) => n.title.includes("queue policy unavailable"))).toBe(true);
+    expect(h.input()).toBe("must refuse"); // text preserved
+  });
+
+  it("retry-same preserves the captured policy: an uncertain NOW-gesture replays with dispatchPolicy \"now\"; a no-policy record replays without the member", async () => {
+    const a = mintSendAttempt("ses-1");
+    updateSendAction(a.attemptId, {
+      stage: "uncertain", certainty: "unknown", recovery: "retry-same",
+      detail: "enqueue timed out",
+      payload: { tapText: "now gesture", text: "now gesture", attachments: [], sendConfig: {}, dispatchPolicy: "now" },
+    });
+    const h = harness({});
+    await h.retrySameMessage(a.attemptId);
+    expect(h.enqueueInputs).toHaveLength(1);
+    expect(h.enqueueInputs[0].input.attemptId).toBe(a.attemptId);
+    expect(h.enqueueInputs[0].input.dispatchPolicy).toBe("now");
+    // The successful replay finished the record (custody → the queue item);
+    // nothing retained remains to re-admit.
+    expect(getSendAction(a.attemptId)).toBeUndefined();
+
+    const b = mintSendAttempt("ses-1");
+    updateSendAction(b.attemptId, {
+      stage: "uncertain", certainty: "unknown", recovery: "retry-same",
+      detail: "enqueue timed out",
+      payload: { tapText: "plain gesture", text: "plain gesture", attachments: [], sendConfig: {} },
+    });
+    const h2 = harness({});
+    await h2.retrySameMessage(b.attemptId);
+    expect(h2.enqueueInputs[0].input.dispatchPolicy).toBeUndefined();
+  });
+
+  it("a fresh (non-reuse) attempt records dispatchPolicy on the PreparedSendPayload snapshot", async () => {
+    // An uncertain admission RETAINS the record + payload; the policy must be
+    // on that snapshot (the retry-same basis above reads it).
+    const h = harness({
+      working: () => true,
+      queuePolicyCapable: () => true,
+      enqueue: async () => {
+        throw new EnqueueError("enqueue timed out", "timeout");
+      },
+      fetchQueue: async () => null, // reconcile miss → uncertain retained
+    });
+    h.setInput("snapshot me");
+    await h.sendPolicy("now");
+    const rec = sendActionsFor("ses-1").find((r) => r.stage === "uncertain");
+    expect(rec?.payload?.dispatchPolicy).toBe("now");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Queue-policy slice B2 — the pending-chip Send-now escalation
+// (POST /vh/queue/{itemId}/escalate; cancel + re-admit with policy "now" and
+// a FRESH backend id — the amendment's one policy-immutability exception).
+// The browser CALLS the route (admission-grade, CSRF-bearing); the daemon's
+// custody loop owns the resulting dispatch. On 404 the item was already
+// escalated/removed/consumed (fresh-ID consequence) → refresh + gentle
+// notice, NEVER a blind re-escalate (D-F4). 409 fenced → retry-later notice.
+// ---------------------------------------------------------------------------
+describe("createSend queue-policy B2 — pending-chip Send-now escalation", () => {
+  const pendingItem = (id: string): QueuedMessage => ({
+    id, order: 1, state: "pending", text: "held message", attachments: [], createdAt: 1,
+  });
+
+  it("a pending item escalates through the seam; success converges the queue (no notification — the chip is the surface)", async () => {
+    const escalateCalls: [string, string][] = [];
+    const h = harness({
+      queuePolicyCapable: () => true,
+      escalate: async (sid, itemId) => {
+        escalateCalls.push([sid, itemId]);
+        return {
+          ok: true,
+          item: { ...pendingItem("q-new"), dispatchPolicy: "now" as const },
+        };
+      },
+    });
+    await h.escalateQueuedItem("ses-1", pendingItem("q-old"));
+    expect(escalateCalls).toEqual([["ses-1", "q-old"]]);
+    expect(h.fetchQueueCalls).toBeGreaterThanOrEqual(1); // convergence refresh
+    expect(h.notes).toHaveLength(0);
+  });
+
+  it("404 (already escalated / removed / consumed — the fresh-ID consequence): queue refresh + gentle notice, NEVER a re-escalate", async () => {
+    const escalateCalls: [string, string][] = [];
+    const h = harness({
+      queuePolicyCapable: () => true,
+      escalate: async (sid, itemId) => {
+        escalateCalls.push([sid, itemId]);
+        return { ok: false, code: "not-found" as const, status: 404 };
+      },
+    });
+    await h.escalateQueuedItem("ses-1", pendingItem("q-gone"));
+    expect(escalateCalls).toHaveLength(1); // exactly one call — no blind retry
+    expect(h.fetchQueueCalls).toBeGreaterThanOrEqual(1);
+    expect(h.notes.some((n) => n.kind === "info")).toBe(true);
+  });
+
+  it("409 queue_escalation_fenced maps to an unobtrusive retry-later notice (no auto-retry, no refresh storm)", async () => {
+    const h = harness({
+      queuePolicyCapable: () => true,
+      escalate: async () => ({ ok: false, code: "fenced" as const, status: 409 }),
+    });
+    await h.escalateQueuedItem("ses-1", pendingItem("q-fenced"));
+    expect(h.notes.some((n) => n.kind === "info" && /moment/i.test(n.title + n.detail))).toBe(true);
+  });
+
+  it("a non-pending item refuses loudly (status changed) — the escalate seam is never called", async () => {
+    const escalateCalls: [string, string][] = [];
+    const h = harness({
+      queuePolicyCapable: () => true,
+      escalate: async (sid, itemId) => {
+        escalateCalls.push([sid, itemId]);
+        return { ok: true, item: pendingItem("q-x") };
+      },
+    });
+    await h.escalateQueuedItem("ses-1", { ...pendingItem("q-disp"), state: "dispatching" });
+    expect(escalateCalls).toHaveLength(0);
+    expect(h.notes.some((n) => n.title.includes("status changed"))).toBe(true);
+  });
+
+  it("an escalation whose response is lost (timeout/network) refreshes the queue and says the outcome is unconfirmed — never re-fires", async () => {
+    const escalateCalls: [string, string][] = [];
+    const h = harness({
+      queuePolicyCapable: () => true,
+      escalate: async (sid, itemId) => {
+        escalateCalls.push([sid, itemId]);
+        return { ok: false, code: "timeout" as const };
+      },
+    });
+    await h.escalateQueuedItem("ses-1", pendingItem("q-t"));
+    expect(escalateCalls).toHaveLength(1);
+    expect(h.fetchQueueCalls).toBeGreaterThanOrEqual(1);
+    expect(h.notes.some((n) => n.kind === "info")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Queue-policy B2 FIX (tier1_b-F1/F2, operator option A) — shell "!" input
+// must never ride a policy gesture. The three policy gestures (busy-table
+// Queue button, busy-table Send now button, Enter-while-busy defaulting to
+// Queue) all carry a captured policy; under the policy controls a busy
+// session cannot execute shell input, and shell input is not queueable ("!"
+// only makes sense against a live shell). The contract at every entry: ONE
+// error notice, ZERO network POSTs (the GLOBAL-fetch tripwire — the
+// blocker's required coverage; the B2 tripwire only covered plain-text
+// paths), the draft fully preserved, no attempt/outbox/queue state. Pins:
+// idle "!" under the capability keeps the historic immediate shell, and the
+// capability-absent legacy path keeps busy "!" + Enter → immediate shell.
+// ---------------------------------------------------------------------------
+describe("createSend queue-policy B2 fix — shell \"!\" input refuses under the busy policy controls (option A)", () => {
+  const REFUSED = "Not sent — shell commands aren't available while the session is busy";
+
+  // The blocker's tripwire: ANY global fetch — shell POST, admission POST,
+  // session create, anything — is an escape from the refusal.
+  const armTripwire = (): { fn: ReturnType<typeof vi.fn>; posts: string[] } => {
+    const posts: string[] = [];
+    const fn = vi.fn((url: unknown) => {
+      posts.push(String(url));
+      throw new Error(`network escape under the busy-shell refusal: ${String(url)}`);
+    });
+    vi.stubGlobal("fetch", fn);
+    return { fn, posts };
+  };
+
+  const outboxSnoop = (saves: any[]): SendDependencies["outbox"] => ({
+    save: async (input) => {
+      saves.push(JSON.parse(JSON.stringify(input)));
+      return { ok: true } as const;
+    },
+    markAdmitted: async () => {},
+    captureHead: () => null,
+  });
+
+  it("busy + `!` + QUEUE button → ONE refusal notice, ZERO POSTs, draft (text + attachments) preserved, no attempt/outbox/queue state", async () => {
+    const saves: any[] = [];
+    const h = harness({
+      working: () => true,
+      queuePolicyCapable: () => true,
+      outbox: outboxSnoop(saves),
+    });
+    const trip = armTripwire();
+    h.setInput("!echo busy");
+    h.setAtts([{ url: "file:///a.png", filename: "a.png", mime: "image/png" }]);
+    await h.sendPolicy("queue");
+    expect(trip.fn).toHaveBeenCalledTimes(0); // the blocker's crux: no POST of any kind
+    expect(h.enqueueInputs).toHaveLength(0);
+    expect(h.fetchQueueCalls).toBe(0);
+    expect(sendActionsFor("ses-1")).toHaveLength(0);
+    expect(saves).toHaveLength(0);
+    expect(h.notes).toHaveLength(1); // exactly one clear refusal notice
+    expect(h.notes[0].kind).toBe("error");
+    expect(h.notes[0].title).toBe(REFUSED);
+    expect(h.input()).toBe("!echo busy"); // draft fully preserved…
+    expect(h.atts()).toHaveLength(1); // …text AND attachments untouched
+  });
+
+  it("busy + `!` + SEND-NOW button → same refusal: no POST, no state, draft preserved", async () => {
+    const h = harness({ working: () => true, queuePolicyCapable: () => true });
+    const trip = armTripwire();
+    h.setInput("!echo now");
+    await h.sendPolicy("now");
+    expect(trip.fn).toHaveBeenCalledTimes(0);
+    expect(h.enqueueInputs).toHaveLength(0);
+    expect(h.fetchQueueCalls).toBe(0);
+    expect(sendActionsFor("ses-1")).toHaveLength(0);
+    expect(h.notes).toHaveLength(1);
+    expect(h.notes[0].title).toBe(REFUSED);
+    expect(h.input()).toBe("!echo now");
+  });
+
+  it("busy + `!` + ENTER (send() default queue path) → same refusal", async () => {
+    const h = harness({ working: () => true, queuePolicyCapable: () => true });
+    const trip = armTripwire();
+    h.setInput("!echo enter");
+    await h.send();
+    expect(trip.fn).toHaveBeenCalledTimes(0);
+    expect(h.enqueueInputs).toHaveLength(0);
+    expect(h.fetchQueueCalls).toBe(0);
+    expect(sendActionsFor("ses-1")).toHaveLength(0);
+    expect(h.notes).toHaveLength(1);
+    expect(h.notes[0].title).toBe(REFUSED);
+    expect(h.input()).toBe("!echo enter");
+  });
+
+  it("PIN: idle + `!` + Send/Enter under the capability → shell executes immediately (historic semantics unchanged)", async () => {
+    const shell = vi.fn((_url: unknown, _init?: any) =>
+      Promise.resolve({ ok: true, status: 204, text: async () => "" }),
+    );
+    vi.stubGlobal("fetch", shell);
+    const h = harness({ working: () => false, queuePolicyCapable: () => true });
+    h.setInput("!echo idle");
+    await h.send();
+    expect(shell).toHaveBeenCalledTimes(1);
+    const call = shell.mock.calls[0]!;
+    expect(String(call[0])).toBe("/oc/session/ses-1/shell");
+    const body = JSON.parse(call[1].body);
+    expect(body.command).toBe("echo idle");
+    expect(body.agent).toBe("build");
+    expect(h.enqueueInputs).toHaveLength(0); // shell never enqueues
+    expect(h.input()).toBe(""); // cleared on success
+    expect(h.notes).toHaveLength(0);
+  });
+
+  it("PIN: busy + `!` + Enter WITHOUT the capability (legacy) → immediate shell, byte-for-byte", async () => {
+    const shell = vi.fn((_url: unknown, _init?: any) =>
+      Promise.resolve({ ok: true, status: 204, text: async () => "" }),
+    );
+    vi.stubGlobal("fetch", shell);
+    const h = harness({ working: () => true }); // queuePolicyCapable unwired → legacy
+    h.setInput("!echo legacy");
+    await h.send();
+    expect(shell).toHaveBeenCalledTimes(1);
+    const call = shell.mock.calls[0]!;
+    expect(String(call[0])).toBe("/oc/session/ses-1/shell");
+    expect(JSON.parse(call[1].body).command).toBe("echo legacy");
+    expect(h.enqueueInputs).toHaveLength(0);
+    expect(h.input()).toBe("");
+    expect(h.notes).toHaveLength(0);
   });
 });

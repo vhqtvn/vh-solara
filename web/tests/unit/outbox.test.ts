@@ -360,6 +360,27 @@ describe("reconcile (boot / session-open / focus)", () => {
     expect((await memoryStore.get("i-1"))?.status).toBe("admitted");
   });
 
+  it("queue-policy B2: a NOW-gesture's re-admission carries its captured dispatchPolicy verbatim (fingerprint-stable replay)", async () => {
+    // A busy Send-now gesture whose admission response was lost (the crash
+    // window the outbox exists for): the durable record carries
+    // dispatchPolicy "now", and reconcile's re-admission MUST thread it —
+    // the daemon's admission fingerprint includes the member, so a replay
+    // without it would 409 the idempotent replay instead of deduping it.
+    await saveGesture({
+      intentId: "i-now",
+      sessionId: "s1",
+      payload: { text: "send now gesture", attachments: [], sendConfig: { agent: "build" }, dispatchPolicy: "now" },
+      capturedHead: head("s1", "m-0", 1),
+    });
+    const rec = (await memoryStore.get("i-now"))!;
+    await memoryStore.put({ ...rec, createdAt: Date.now() - READMIT_MIN_AGE_MS - 1000 });
+    const enq = vi.fn(async (_sid: string, input: any) => qItem("q-now", { intentId: input.intentId }));
+    await reconcileOutboxSession("s1", deps({ current: head("s1", "m-0", 1), enqueueImpl: enq as any }));
+    expect(enq).toHaveBeenCalledTimes(1);
+    expect(enq.mock.calls[0][1].dispatchPolicy).toBe("now");
+    expect((await memoryStore.get("i-now"))?.status).toBe("admitted");
+  });
+
   it("saved + absent + STALE head → NEVER auto-sends; a visible stale-context row is surfaced", async () => {
     await saveGesture(gesture("i-1"));
     const rec = (await memoryStore.get("i-1"))!;

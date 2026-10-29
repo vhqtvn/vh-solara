@@ -37,6 +37,13 @@ export interface QueuedAttachment {
   path?: string;
 }
 export type QueueItemState = "pending" | "dispatching" | "sent" | "failed" | "unknown";
+// Queue-policy slice B2 (2026-10-29 amendment §3): the per-item dispatch
+// scheduling policy. FE-side the wire/disk only ever carries `"now"` — the
+// daemon serializes `dispatchPolicy` omitempty after normalizing `"queue"`
+// to the elided representation (absence ≡ queue; pkg/web/queue.go), so a
+// listed item shows `dispatchPolicy: "now"` for deliberate immediate-dispatch
+// semantics and no member otherwise.
+export type QueueDispatchPolicy = "now" | "queue";
 export interface QueuedMessage {
   // Daemon-minted durable queue primary key ("q-"+hex). This IS the send-net-
   // resilience design's `queueID` — the cross-client correlation id — under
@@ -102,6 +109,12 @@ export interface QueuedMessage {
   // give-up already carries its own "manual review advised" detail. (An
   // earlier consumer, the composer custody line, was removed in 61ca3a9.)
   reconcileTerminal?: boolean;
+  // Queue-policy B2: present (as "now") when the item carries
+  // immediate-dispatch semantics — admitted via the busy composer's
+  // Send now button or the pending-chip escalation. Absent ≡ "queue"
+  // (strictly respects the whole-tree idle gate). Server-serialized only
+  // for "now" (see the QueueDispatchPolicy note above).
+  dispatchPolicy?: "now";
   // Send-net-resilience slice 2b (FE mirror): the durable live-uncertain
   // marker. The item carries custody-journal attempt records, the exact-ID
   // GET stayed negative, and NO certified redelivery class applies — the
@@ -146,11 +159,18 @@ export interface QueueAttempt {
 // enqueue() for the legacy-server feature-detect. intentId (send-net-
 // resilience slice 1) is the design-canonical alias for the same admission
 // identity — types only in this slice; no FE caller sets it yet.
+// dispatchPolicy (queue-policy B2, amendment §3) is threaded verbatim when
+// defined: "now" requires the policy scheduler (the server 409s
+// queue_dispatch_policy_unsupported otherwise — never degraded); "queue" is
+// the explicit Queue gesture (the server normalizes it into the elided
+// fingerprint representation). Absent = the default queue semantics —
+// legacy-mode admissions carry no member at all (wire bytes unchanged).
 export type QueueInput = Pick<QueuedMessage, "text" | "attachments"> & {
   sendConfig?: QueuedMessage["sendConfig"];
   originClientId?: string;
   attemptId?: string;
   intentId?: string;
+  dispatchPolicy?: QueueDispatchPolicy;
 };
 
 // Typed enqueue failure (send-reliability slice 2). `code` is machine-readable:
@@ -561,6 +581,123 @@ export async function removeQueued(sessionId: string, id: string): Promise<Remov
     return { removed: false, nonRemovable: true, reason: "409" };
   }
   return { removed: false, reason: String(res.status) };
+}
+
+// Bounded timeout for the pending-chip Send-now ESCALATION POST
+// (queue-policy B2). The escalate handler is one atomic file op server-side
+// (cancel + re-admit behind the custody fence in a single save), so 10s
+// mirrors the REMOVE bound. On abort/network failure the outcome is UNKNOWN
+// (the transition may have committed server-side — the fresh-ID consequence
+// makes a blind re-escalate against the OLD id a 404 by construction); the
+// caller refreshes the queue and surfaces an honest notice instead.
+const ESCALATE_TIMEOUT_MS = 10000;
+
+// Typed outcome of escalateQueued (see the function).
+export type EscalateQueuedOutcome =
+  | { ok: true; item: QueuedMessage }
+  | {
+      ok: false;
+      // not-found       — 404: the item was already escalated/removed/
+      //                    consumed (the fresh-ID consequence) — refresh +
+      //                    gentle notice, never a blind re-escalate (D-F4).
+      // fenced          — 409 queue_escalation_fenced: the custody epoch
+      //                    changed under the request — retry-later notice.
+      // not-escalatable — 409 queue_not_escalatable: non-pending item.
+      // requires-custody— 409 queue_escalation_requires_custody: the policy
+      //                    scheduler is off / no live custody owner.
+      // timeout/network — NO response: the outcome is UNKNOWN.
+      // unknown         — any other non-2xx WITH a response.
+      code:
+        | "not-found"
+        | "fenced"
+        | "not-escalatable"
+        | "requires-custody"
+        | "timeout"
+        | "network"
+        | "unknown";
+      status?: number;
+      detail?: string;
+    };
+
+// escalateQueued performs the pending-chip Send-now escalation (queue-policy
+// B2, amendment §2/§3): POST /vh/session/{id}/queue/{itemId}/escalate. The
+// daemon executes it as cancel + re-admit with policy "now" under a FRESH
+// backend id (pkg/web/queue_escalate.go) — an admission-grade gesture like
+// enqueue (CSRF-bearing; the browser CALLS the route, the daemon's custody
+// loop owns the resulting dispatch — never a FE direct-POST).
+//
+// Cache semantics on success: the OLD id is gone and the escalated item (born
+// "now") takes its place — remove the old id, upsert the fresh item, then
+// converge to backend truth (the daemon typically claims it within one 250ms
+// drain tick, so the chip flips to dispatching/sent almost immediately).
+export async function escalateQueued(
+  sessionId: string,
+  itemId: string,
+): Promise<EscalateQueuedOutcome> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ESCALATE_TIMEOUT_MS);
+  try {
+    let res: Response;
+    try {
+      res = await fetch(queueUrl(sessionId, `/${encodeURIComponent(itemId)}/escalate`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
+        body: "{}",
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      const aborted = ctrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError");
+      return {
+        ok: false,
+        code: aborted ? "timeout" : "network",
+        detail: String(e),
+      };
+    }
+    if (res.ok) {
+      // Body read INSIDE the armed window (the D-F2 hang class, same as
+      // enqueue/claim): a stalled body is torn down by the aborting signal;
+      // readJSON swallows the rejection to {} which the item check below
+      // maps to the honest "unknown" shape.
+      const j = await readJSON(res);
+      const item = j.item as QueuedMessage | undefined;
+      if (!item) {
+        return { ok: false, code: "unknown", detail: "escalate: no item in response" };
+      }
+      setQueues(produce((q) => {
+        const arr = (q[sessionId] ||= []);
+        const i = arr.findIndex((m) => m.id === item.id);
+        if (i >= 0) arr[i] = item;
+        else arr.push(item);
+        // Cancel+re-admit removed the original id — drop it AFTER the upsert
+        // (the fresh id is always distinct; both operations are exact-id).
+        q[sessionId] = arr.filter((m) => m.id !== itemId);
+      }));
+      // Converge to daemon truth (read-only; the ~5s poll is the backstop).
+      void fetchQueue(sessionId);
+      return { ok: true, item };
+    }
+    // Error mapping (B1's writeQueueStoreErr): the 404 carries the plain
+    // errResp shape (no machine code — keyed by STATUS); the 409s carry
+    // typed codes. Body read inside the armed window.
+    const j = await readJSON(res);
+    if (res.status === 404) {
+      return { ok: false, code: "not-found", status: 404, detail: String(j.error || "") };
+    }
+    if (res.status === 409) {
+      if (j.code === "queue_escalation_fenced") {
+        return { ok: false, code: "fenced", status: 409, detail: String(j.error || "") };
+      }
+      if (j.code === "queue_not_escalatable") {
+        return { ok: false, code: "not-escalatable", status: 409, detail: String(j.error || "") };
+      }
+      if (j.code === "queue_escalation_requires_custody") {
+        return { ok: false, code: "requires-custody", status: 409, detail: String(j.error || "") };
+      }
+    }
+    return { ok: false, code: "unknown", status: res.status, detail: String(j.error || "") };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // Bounded timeout for the claim POST (same class as ENQUEUE_TIMEOUT_MS above —

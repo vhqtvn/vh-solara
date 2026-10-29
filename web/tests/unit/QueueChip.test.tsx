@@ -533,3 +533,87 @@ describe("QueueChip — G2 render guard (daemon custody suppresses the retry aff
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Queue-policy slice B2 (2026-10-29 amendment §2) — the PENDING chip's
+// Send-now ESCALATION affordance. Render guard: pending + policy capability
+// (queueDispatchPolicyVersion advertised) + handler wired; hidden for
+// non-pending states, already-now items, legacy (no capability), and unwired
+// handlers. Click routes the WHOLE item to onEscalate (the controller
+// revalidates state and POSTs the daemon's admission-grade /escalate route).
+// ---------------------------------------------------------------------------
+describe("QueueChip — Send-now escalation (queue-policy B2)", () => {
+  async function enablePolicyCapability() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ version: "t", daemonDispatchCapable: true, queueDispatchPolicyVersion: 1 }),
+      })),
+    );
+    await refreshDispatchMode();
+  }
+
+  it("pending + capability + handler: renders the escalation action; click routes the WHOLE item", async () => {
+    await enablePolicyCapability();
+    const onEscalate = vi.fn();
+    const q = item({ state: "pending", resolvedAt: undefined });
+    const r = render(() => <QueueChip q={q} onRemove={vi.fn()} onEscalate={onEscalate} />);
+    const btn = r.container.querySelector<HTMLElement>(".queue-escalate");
+    expect(btn).toBeTruthy();
+    expect(btn!.getAttribute("aria-label")).toContain("Send now");
+    btn!.click();
+    expect(onEscalate).toHaveBeenCalledTimes(1);
+    expect(onEscalate).toHaveBeenCalledWith(q);
+    r.unmount();
+  });
+
+  it("NEVER for non-pending states (dispatching / sent / failed / unknown) — escalation is pending-only", async () => {
+    await enablePolicyCapability();
+    for (const state of ["dispatching", "failed", "unknown"] as const) {
+      const r = render(() => (
+        <QueueChip q={item({ state })} onRemove={vi.fn()} onEscalate={vi.fn()} />
+      ));
+      expect(r.container.querySelector(".queue-escalate")).toBeNull();
+      r.unmount();
+    }
+  });
+
+  it("hidden WITHOUT the capability (legacy daemon: the escalate route would 409 — no lying affordance)", () => {
+    // Module default after reset: capability off.
+    const r = render(() => (
+      <QueueChip q={item({ state: "pending", resolvedAt: undefined })} onRemove={vi.fn()} onEscalate={vi.fn()} />
+    ));
+    expect(r.container.querySelector(".queue-escalate")).toBeNull();
+    r.unmount();
+  });
+
+  it("hidden for an already-now pending item (its immediate dispatch is imminent) and when the handler is unwired", async () => {
+    await enablePolicyCapability();
+    const r1 = render(() => (
+      <QueueChip
+        q={item({ state: "pending", resolvedAt: undefined, dispatchPolicy: "now" })}
+        onRemove={vi.fn()}
+        onEscalate={vi.fn()}
+      />
+    ));
+    expect(r1.container.querySelector(".queue-escalate")).toBeNull();
+    r1.unmount();
+    const r2 = render(() => (
+      <QueueChip q={item({ state: "pending", resolvedAt: undefined })} onRemove={vi.fn()} />
+    ));
+    expect(r2.container.querySelector(".queue-escalate")).toBeNull();
+    r2.unmount();
+  });
+
+  it("the pending chip keeps its dismiss action beside the escalation (cancel stays available)", async () => {
+    await enablePolicyCapability();
+    const r = render(() => (
+      <QueueChip q={item({ state: "pending", resolvedAt: undefined })} onRemove={vi.fn()} onEscalate={vi.fn()} />
+    ));
+    expect(r.container.querySelector(".queue-escalate")).toBeTruthy();
+    expect(r.container.querySelector(".queue-dismiss")).toBeTruthy();
+    r.unmount();
+  });
+});

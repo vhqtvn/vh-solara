@@ -16,7 +16,7 @@ import { layoutPx } from "../lib/zoom";
 import { findModel, loadModels, migrateModelPick, models, selectionFor } from "../models";
 import { loadVersioned, saveVersioned } from "../lib/store";
 import { adoptDraftAgent, agents, awaitSendAgent, resolveAgentForSession, selectAgentForSession, selectedAgent } from "../agents";
-import { claimQueued, enqueue, fetchQueue, hasQueueState, migrateLegacyQueue, queueFor, queueMode, removeQueued, resolveQueued } from "../queue";
+import { claimQueued, enqueue, escalateQueued, fetchQueue, hasQueueState, migrateLegacyQueue, queueFor, queueMode, removeQueued, resolveQueued } from "../queue";
 import { createQueueDrainer } from "../queueDrain";
 import { pushHistory } from "../history";
 import {
@@ -151,7 +151,7 @@ import {
   type OutboxPayload,
   type OutboxSaveResult,
 } from "../lib/outbox";
-import { dispatchMode, projectionActive, refreshDispatchMode } from "../lib/queueDispatchMode";
+import { dispatchMode, projectionActive, queuePolicyCapable, refreshDispatchMode } from "../lib/queueDispatchMode";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
 
@@ -2276,7 +2276,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     markAdmitted,
     captureHead,
   };
-  const { send, retrySameMessage, retryQueuedItem, resendText, dispatchQueuedItem } = createSend({
+  const { send, sendPolicy, escalateQueuedItem, retrySameMessage, retryQueuedItem, resendText, dispatchQueuedItem } = createSend({
     sessionId: () => props.sessionId,
     draft: () => !!props.draft,
     ensureSession,
@@ -2337,6 +2337,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // switches as the drainer's observeOnly gate above, read as the tri-state.
     dispatchMode,
     refreshDispatchMode,
+    // Queue-policy B2: the policy-capability read (queueDispatchMode's
+    // queuePolicyCapable — /vh/version advertises queueDispatchPolicyVersion
+    // only while the policy scheduler is active) + the pending-chip Send-now
+    // escalation seam (queue.ts escalateQueued — admission-grade POST; the
+    // controller owns the gesture guard + error mapping).
+    queuePolicyCapable,
+    escalate: (sid, itemId) => escalateQueued(sid, itemId),
     uploading: att.uploading,
     isSending,
     setSending,
@@ -2687,6 +2694,8 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         hist={hist}
         recovery={recovery}
         send={send}
+        sendPolicy={sendPolicy}
+        escalateQueuedItem={(q) => void escalateQueuedItem(props.sessionId, q)}
         retrySame={retrySameMessage}
         // Slice 3 (intent recovery): QueueChip's Retry button → guarded
         // same-messageID re-send of an outcome-unknown queue item (explicit

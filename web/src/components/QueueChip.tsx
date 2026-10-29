@@ -1,6 +1,6 @@
 import { Show } from "solid-js";
 import { type QueuedMessage } from "../queue";
-import { projectionActive } from "../lib/queueDispatchMode";
+import { projectionActive, queuePolicyCapable } from "../lib/queueDispatchMode";
 import Icon from "./Icon";
 
 // QueueChip renders a single queued-message pill in the composer's queue row,
@@ -60,6 +60,13 @@ export function QueueChip(props: {
   q: QueuedMessage;
   // Dismiss: clear the chip from view (pending cancel or terminal dismissal).
   onRemove: (id: string) => void;
+  // Queue-policy B2 (amendment §2): Send-now ESCALATION — the pending chip's
+  // deliberate immediate-dispatch gesture. PENDING-ONLY (dispatching is owned
+  // by the custody state machine; terminal states are outside the escalation
+  // contract). The handler (createSend.escalateQueuedItem) POSTs the
+  // daemon's admission-grade /escalate route (cancel + re-admit with policy
+  // "now" under a FRESH id) — the FE never direct-POSTs for this path.
+  onEscalate?: (q: QueuedMessage) => void;
   // Retry (slice 3, intent recovery): re-send this exact message under its
   // original messageID (idempotent on opencode ≥ 1.17.18). UNKNOWN-state
   // items only (the resolve matrix allows exactly unknown→sent); the handler
@@ -105,6 +112,35 @@ export function QueueChip(props: {
           <span class="queue-state">{label()}</span>
         </Show>
         <span class="queue-text">{props.q.text || "(attachment)"}</span>
+        {/* Send-now ESCALATION (queue-policy B2, 2026-10-29 amendment §2):
+             PENDING chips only, and only while the server advertises
+             queueDispatchPolicyVersion (the policy scheduler is ACTIVE —
+             without it the escalate route 409s and the affordance would be a
+             lie). Deliberate immediate dispatch: the daemon cancel+re-admits
+             the item with policy "now" under a FRESH id (the amendment's one
+             policy-immutability exception) — consent semantics identical to
+             the busy composer's Send now button (override consent, never
+             completion evidence). An item already carrying dispatchPolicy
+             "now" HIDES the action (its immediate dispatch is imminent —
+             re-escalating is a server no-op churn). */}
+        <Show
+          when={
+            props.q.state === "pending" &&
+            props.q.dispatchPolicy !== "now" &&
+            props.onEscalate &&
+            queuePolicyCapable()
+          }
+        >
+          <button
+            type="button"
+            class="queue-action queue-escalate"
+            aria-label="Send now — dispatches this queued message immediately"
+            data-tip="Send now — dispatches this message immediately (folds into the running turn)"
+            onClick={() => props.onEscalate!(props.q)}
+          >
+            <Icon name="send" size={11} />
+          </button>
+        </Show>
         {/* Retry (slice 3, intent recovery — 2026-10-03 incident): explicit,
              user-driven re-send of an OUTCOME-UNKNOWN item that retained its
              claim-minted opencodeMsgID. UNKNOWN-ONLY by design (review

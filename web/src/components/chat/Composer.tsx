@@ -25,6 +25,7 @@ import { agents, resolveAgentForSession, selectAgentForSession } from "../../age
 import { agentDisplay } from "../../projectSettings";
 import { chooseVariant, models } from "../../models";
 import { queueFor, queueMode, removeQueued, type QueuedMessage } from "../../queue";
+import { queuePolicyCapable } from "../../lib/queueDispatchMode";
 import { highlightInput } from "../../lib/composerHighlight";
 import { isInlineChipOrphan } from "../../lib/inlineAttach";
 import { layoutPx } from "../../lib/zoom";
@@ -76,6 +77,16 @@ export interface ComposerProps {
   recovery: QueueRecovery;
   // send / abort
   send: () => Promise<void>;
+  // Queue-policy B2 (2026-10-29 amendment §2): the busy composer's explicit
+  // policy entries — Queue admits with policy "queue", Send now with policy
+  // "now" (both through the durable admission pipeline; the daemon owns the
+  // semantics). OPTIONAL — the policy button table renders only when the
+  // capability is advertised AND this entry is wired (minimal harnesses).
+  sendPolicy?: (policy: "now" | "queue") => Promise<void>;
+  // Queue-policy B2: QueueChip's pending Send-now escalation entry
+  // (createSend.escalateQueuedItem — admission-grade, never a FE direct
+  // POST). OPTIONAL — absent renders no escalation affordance.
+  escalateQueuedItem?: (q: QueuedMessage) => void;
   // Guarded SendStatus row-retry entry (sending-UX O2 fix, RECORD-ADDRESSED
   // per the slice-1 review A-F1): createSend's retrySameMessage — takes the
   // DISPLAYED row's attemptId, revalidates that record at click time, and
@@ -273,6 +284,7 @@ export function Composer(props: ComposerProps) {
                             ? props.removeQueuedItem(id)
                             : void removeQueued(props.sessionId(), id)
                         }
+                        onEscalate={props.escalateQueuedItem}
                         onRetry={props.retryQueuedItem}
                         onRetract={props.recovery.retract}
                         onMarkSent={props.recovery.markSent}
@@ -521,24 +533,82 @@ export function Composer(props: ComposerProps) {
                 </button>
               }
             >
-              {/* Busy: Stop aborts the running turn; a Queue button appears once
-                  you've typed something (Enter queues too). */}
-              <Show when={queueMode() && props.input().trim().length > 0}>
-                <button
-                  type="button"
-                  class="send-btn queue"
-                  classList={{ sending: props.sendInFlight() }}
-                  aria-label={props.sendInFlight() ? "Queueing…" : "Queue"}
-                  data-tip="Queue — sends when the current turn finishes"
-                  disabled={props.sendInFlight() || !props.readyToSend()}
-                  onClick={props.send}
+              {/* Busy composer. Queue-policy B2 (2026-10-29 amendment §2) —
+                  under the policy capability the operator-ratified button
+                  table replaces the legacy controls:
+                    busy + text/attachments → Queue + Send now (NO Stop — the
+                    §7 tradeoff: aborting requires clearing the draft first);
+                    busy + empty            → Stop only.
+                  The explicit buttons supersede the queueMode setting (it
+                  stays functional for legacy daemon-off deployments). Enter
+                  while busy defaults to Queue (handled inside send()).
+                  WITHOUT the capability (or unwired policy entry): the legacy
+                  table byte-for-byte — Queue (queueMode on + text) + Stop. */}
+              <Show
+                when={queuePolicyCapable() && props.sendPolicy}
+                fallback={
+                  <>
+                    {/* Busy: Stop aborts the running turn; a Queue button appears once
+                        you've typed something (Enter queues too). */}
+                    <Show when={queueMode() && props.input().trim().length > 0}>
+                      <button
+                        type="button"
+                        class="send-btn queue"
+                        classList={{ sending: props.sendInFlight() }}
+                        aria-label={props.sendInFlight() ? "Queueing…" : "Queue"}
+                        data-tip="Queue — sends when the current turn finishes"
+                        disabled={props.sendInFlight() || !props.readyToSend()}
+                        onClick={props.send}
+                      >
+                        <Icon name="plus" />
+                      </button>
+                    </Show>
+                    <button type="button" class="send-btn stop" aria-label="Stop" onClick={props.abort}>
+                      <Icon name="stop" />
+                    </button>
+                  </>
+                }
+              >
+                {/* Text OR attachments counts as sendable (§5: attachments in
+                    the queue path — no text-only gating); readyToSend governs
+                    the disabled state of both busy actions. */}
+                <Show
+                  when={
+                    props.input().trim().length > 0 || props.att.attachments().length > 0
+                  }
+                  fallback={
+                    <button type="button" class="send-btn stop" aria-label="Stop" onClick={props.abort}>
+                      <Icon name="stop" />
+                    </button>
+                  }
                 >
-                  <Icon name="plus" />
-                </button>
+                  <button
+                    type="button"
+                    class="send-btn queue"
+                    classList={{ sending: props.sendInFlight() }}
+                    aria-label={props.sendInFlight() ? "Queueing…" : "Queue"}
+                    data-tip="Queue — sends when the whole tree is idle"
+                    disabled={props.sendInFlight() || !props.readyToSend()}
+                    onClick={() => void props.sendPolicy!("queue")}
+                  >
+                    <Icon name="plus" />
+                  </button>
+                  <button
+                    type="button"
+                    class="send-btn send-now"
+                    classList={{ sending: props.sendInFlight() }}
+                    aria-label={props.sendInFlight() ? "Sending…" : "Send now"}
+                    data-tip="Send now — dispatches immediately, folding into the running turn"
+                    disabled={props.sendInFlight() || !props.readyToSend()}
+                    onClick={() => void props.sendPolicy!("now")}
+                  >
+                    <Icon name="send" />
+                  </button>
+                  {/* NO Stop while text is present — amendment §7's recorded
+                      UX tradeoff (a dedicated global Stop control is the
+                      reserved future escape hatch). */}
+                </Show>
               </Show>
-              <button type="button" class="send-btn stop" aria-label="Stop" onClick={props.abort}>
-                <Icon name="stop" />
-              </button>
             </Show>
           </div>
           <Show when={props.modelDialog()}>

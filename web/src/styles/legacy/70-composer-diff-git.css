@@ -293,6 +293,11 @@
 .queue-chip button.queue-retract { color: var(--accent); }
 .queue-chip button.queue-retract:hover { color: var(--accent); background: color-mix(in srgb, var(--accent) 18%, var(--bg)); }
 .queue-chip button.queue-dismiss { color: var(--fg-dim); }
+/* Queue-policy B2 (2026-10-29 amendment §2): the PENDING chip's Send-now
+   escalation — accent-tinted (the deliberate immediate-dispatch gesture),
+   matching the composer's Send now button family. */
+.queue-chip button.queue-escalate { color: var(--accent); }
+.queue-chip button.queue-escalate:hover { color: var(--accent); background: color-mix(in srgb, var(--accent) 18%, var(--bg)); }
 /* Recovery detail note for recovered `unknown` items (FIX-QUEUE-STUCK-2): a
    backend-set explanation + duplicate-risk warning. Surfaced VISIBLELY (not in
    the data-tip tooltip) so the operator sees it at a glance. Full-width under

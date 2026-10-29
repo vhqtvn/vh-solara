@@ -24,6 +24,7 @@ import {
   claimQueued,
   enqueue,
   EnqueueError,
+  escalateQueued,
   fetchQueue,
   hasQueueState,
   migrateLegacyQueue,
@@ -1247,5 +1248,129 @@ describe("resolveQueued — custody-refused (409 queue_custody_active)", () => {
     } finally {
       __resetQueueDispatchModeForTests();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Queue-policy slice B2 (2026-10-29 amendment) — the dispatchPolicy admission
+// member + the pending-chip Send-now escalation client
+// (POST /vh/session/{id}/queue/{itemId}/escalate; server-side cancel +
+// re-admit with policy "now" under a FRESH id — pkg/web/queue_escalate.go).
+// ---------------------------------------------------------------------------
+describe("queue-policy B2 — enqueue dispatchPolicy member (wire contract)", () => {
+  it("threads dispatchPolicy \"now\"/\"queue\" verbatim on the admission body; absent input carries NO member (legacy bytes)", async () => {
+    const sid = "s-pol-enq";
+    touched.push(sid);
+    const bodies: any[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: any) => {
+        if (url.endsWith(`/vh/session/${sid}/queue`) && init?.method === "POST") {
+          bodies.push(JSON.parse(init.body));
+          const n = bodies.length;
+          return Promise.resolve(res(200, { item: item(`q-${n}`, { order: n, text: bodies[n - 1].text }), replayed: false }));
+        }
+        return Promise.resolve(res(200, { items: [] }));
+      }),
+    );
+    await enqueue(sid, { text: "now msg", attachments: [], dispatchPolicy: "now" });
+    await enqueue(sid, { text: "queue msg", attachments: [], dispatchPolicy: "queue" });
+    await enqueue(sid, { text: "plain msg", attachments: [] });
+    expect(bodies[0].dispatchPolicy).toBe("now");
+    expect(bodies[1].dispatchPolicy).toBe("queue");
+    expect("dispatchPolicy" in bodies[2]).toBe(false); // absent → no member (JSON-dropped)
+  });
+});
+
+describe("queue-policy B2 — escalateQueued (pending-chip Send-now escalation client)", () => {
+  const escalatedItem = (id: string): any => ({
+    ...item(id, { order: 2, text: "held message" }),
+    dispatchPolicy: "now",
+  });
+
+  it("POSTs the escalate route with CSRF; on success the OLD id leaves the cache, the fresh now-item lands, and a convergence GET follows", async () => {
+    const sid = "s-esc-1";
+    touched.push(sid);
+    const calls: Array<{ url: string; method: string; headers: any }> = [];
+    const orig = { ...item("q-old", { order: 1, text: "held message" }) };
+    // Stage 1: the cache holds the pending original (the chip the operator
+    // sees) via an authoritative list GET. Stage 2: the escalate POST answers
+    // the fresh now-item; subsequent GETs return backend truth.
+    let escalated = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: any) => {
+        calls.push({ url: String(url), method: init?.method ?? "GET", headers: init?.headers ?? {} });
+        const u = String(url);
+        if (u.endsWith(`/vh/session/${sid}/queue/q-old/escalate`)) {
+          escalated = true;
+          return Promise.resolve(res(200, { item: escalatedItem("q-fresh") }));
+        }
+        return Promise.resolve(
+          res(200, { items: escalated ? [escalatedItem("q-fresh")] : [orig] }),
+        );
+      }),
+    );
+    await fetchQueue(sid);
+    expect(queueFor(sid).some((m) => m.id === "q-old")).toBe(true);
+
+    const r = await escalateQueued(sid, "q-old");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.item.id).toBe("q-fresh");
+    // The escalate POST: exact route, POST, CSRF header.
+    const esc = calls.find((c) => c.url.endsWith("/queue/q-old/escalate"));
+    expect(esc).toBeTruthy();
+    expect(esc!.method).toBe("POST");
+    expect(esc!.headers["X-VH-CSRF"]).toBe("1");
+    // Wait for the fire-and-forget convergence GET, then the cache holds the
+    // fresh now-item and NOT the consumed original id.
+    await new Promise((r2) => setTimeout(r2, 10));
+    const ids = queueFor(sid).map((m) => m.id);
+    expect(ids).not.toContain("q-old");
+    expect(ids).toContain("q-fresh");
+    expect(queueFor(sid).find((m) => m.id === "q-fresh")?.dispatchPolicy).toBe("now");
+  });
+
+  it("404 (already escalated / removed / consumed) maps to not-found — the cache is left for the caller's refresh, nothing auto-fires", async () => {
+    const sid = "s-esc-2";
+    touched.push(sid);
+    const posts: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: any) => {
+        if (init?.method === "POST") posts.push(String(url));
+        return Promise.resolve(res(404, { error: "queue item not found" }));
+      }),
+    );
+    const r = await escalateQueued(sid, "q-gone");
+    expect(r).toMatchObject({ ok: false, code: "not-found", status: 404 });
+    expect(posts).toHaveLength(1); // one call — no blind re-escalate
+  });
+
+  it("maps the typed 409 refusal codes (fenced / not-escalatable / requires-custody) and the plain shapes", async () => {
+    const sid = "s-esc-3";
+    touched.push(sid);
+    const stub = (status: number, body: unknown) =>
+      vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(status, body))));
+    stub(409, { ok: false, error: "fenced", code: "queue_escalation_fenced" });
+    expect(await escalateQueued(sid, "a")).toMatchObject({ ok: false, code: "fenced" });
+    stub(409, { ok: false, error: "not pending", code: "queue_not_escalatable" });
+    expect(await escalateQueued(sid, "b")).toMatchObject({ ok: false, code: "not-escalatable" });
+    stub(409, { ok: false, error: "no custody owner", code: "queue_escalation_requires_custody" });
+    expect(await escalateQueued(sid, "c")).toMatchObject({ ok: false, code: "requires-custody" });
+    stub(500, { error: "boom" });
+    expect(await escalateQueued(sid, "d")).toMatchObject({ ok: false, code: "unknown", status: 500 });
+  });
+
+  it("a response-less failure classifies timeout/network (outcome UNKNOWN — the transition may have committed)", async () => {
+    const sid = "s-esc-4";
+    touched.push(sid);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.reject(new DOMException("aborted", "AbortError"))),
+    );
+    expect(await escalateQueued(sid, "q-t")).toMatchObject({ ok: false, code: "timeout" });
+    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("net down"))));
+    expect(await escalateQueued(sid, "q-t2")).toMatchObject({ ok: false, code: "network" });
   });
 });

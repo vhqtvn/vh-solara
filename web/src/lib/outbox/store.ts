@@ -34,11 +34,16 @@ export interface OutboxContextHead {
 
 /** Serializable enqueue payload retained verbatim (the exact text/attachments/
  *  config the gesture will admit — mirrors PreparedSendPayload's serializable
- *  subset). */
+ *  subset). dispatchPolicy (queue-policy B2) is the tap-captured dispatch
+ *  policy: re-admission (IDB replay / reconcile / failed-save recovery)
+ *  re-admits under the SAME policy — the daemon's admission fingerprint
+ *  includes it, so a replay without it would 409 the idempotent replay of a
+ *  "now" gesture. Absent = no explicit policy (idle/legacy gestures). */
 export interface OutboxPayload {
   text: string;
   attachments: { url: string; filename: string; mime: string; path?: string }[];
   sendConfig?: { providerID?: string; modelID?: string; variant?: string; agent?: string };
+  dispatchPolicy?: "now" | "queue";
 }
 
 /** One send gesture's durable local record. `intentId` is the gesture identity

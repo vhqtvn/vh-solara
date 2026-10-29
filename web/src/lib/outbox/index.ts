@@ -902,11 +902,15 @@ export async function reconcileOutboxSession(sessionId: string, deps: ReconcileD
     try {
       // Same-gesture re-admission: identical payload under the SAME intentId.
       // The daemon dedupes by value — a tab that raced us gets the same
-      // receipt, never a second item.
+      // receipt, never a second item. The tap-captured dispatchPolicy
+      // (queue-policy B2) rides the payload verbatim so a "now" gesture
+      // re-admits as "now" (the fingerprint includes the member; dropping it
+      // would 409 the replay instead of deduping it).
       const admitted = await deps.enqueue(sessionId, {
         text: rec.payload.text,
         attachments: rec.payload.attachments,
         sendConfig: rec.payload.sendConfig,
+        dispatchPolicy: rec.payload.dispatchPolicy,
         intentId: rec.intentId,
       });
       await markAdmitted(rec.intentId, admitted.id);

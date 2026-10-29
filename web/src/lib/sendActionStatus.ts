@@ -134,6 +134,12 @@ export interface PreparedSendPayload {
   // Retained file references (filenames of files involved in this attempt) —
   // diagnostics for Slice 3's recovery affordances.
   files?: string[];
+  // Queue-policy B2 (amendment §3): the dispatch policy captured at TAP from
+  // the explicit gesture. Present on retry so retry-same re-admits under the
+  // SAME policy — the daemon's admission fingerprint includes it, so a
+  // replay with a changed/missing member is a 409 conflict, never a silent
+  // degradation. Absent = no explicit policy (idle/legacy gestures).
+  dispatchPolicy?: "now" | "queue";
 }
 
 export interface SendAction {

@@ -49,7 +49,7 @@ import {
 import { modernCreateTransferTarget } from "../../lib/sessionCreateStatus";
 import { projectDir } from "../../sync/store";
 import type { Attachment } from "./createAttachments";
-import { EnqueueError, type QueuedMessage } from "../../queue";
+import { EnqueueError, type EscalateQueuedOutcome, type QueuedMessage } from "../../queue";
 import type { DrainOutcome } from "../../queueDrain";
 import type { Notification } from "../../notify";
 import type { OutboxContextHead, OutboxPayload, OutboxSaveResult } from "../../lib/outbox";
@@ -152,6 +152,9 @@ export type SendDependencies = {
       sendConfig: QueueConfig;
       attemptId?: string;
       intentId?: string;
+      // Queue-policy B2: the gesture's tap-captured dispatch policy,
+      // threaded onto the admission request (absent = no explicit policy).
+      dispatchPolicy?: SendDispatchPolicy;
     },
   ) => Promise<{ id?: string } | unknown>;
   // Authoritative queue list (queue.ts fetchQueue) — injected for the
@@ -202,6 +205,23 @@ export type SendDependencies = {
   // (absent = no refresh; the tri-state read is then only as fresh as the
   // last completed probe).
   refreshDispatchMode?: () => Promise<void>;
+  // Queue-policy slice B2 (2026-10-29 amendment): true while the server
+  // advertises queueDispatchPolicyVersion (the policy scheduler is ACTIVE —
+  // the same enablement as daemon dispatch). Gates the gesture policy
+  // capture: under the capability a BUSY gesture carries an explicit
+  // dispatchPolicy ("now" from the Send now button / chip escalation,
+  // "queue" from the Queue button or the Enter safe default) and the busy
+  // composer's queueMode gate is superseded by the explicit button table
+  // (amendment §2). Absent (or false) keeps every legacy behavior
+  // byte-for-byte — no policy member is ever stamped without the capability.
+  // OPTIONAL: minimal harnesses omit it (reads as not-capable).
+  queuePolicyCapable?: () => boolean;
+  // Queue-policy B2: the pending-chip Send-now escalation seam (queue.ts
+  // escalateQueued — POST /vh/queue/{itemId}/escalate). The controller owns
+  // the gesture guard + error mapping; this dep keeps the factory free of
+  // network state (the enqueue/fetchQueue discipline). OPTIONAL: absent
+  // refuses the escalation loudly (nothing to call).
+  escalate?: (sessionId: string, itemId: string) => Promise<EscalateQueuedOutcome>;
   // Send-net-resilience slice 3: the IndexedDB outbox seam (see
   // SendOutboxDeps). Optional — absent keeps the pre-slice admission path
   // byte-intact (minimal unit harnesses); production ChatView always wires
@@ -234,8 +254,26 @@ export type SendDependencies = {
   draftKey: (sid: string) => string;
 };
 
+// Queue-policy B2 (amendment §3): the per-item dispatch policy captured from
+// an explicit gesture. "now" = deliberate immediate dispatch (bypasses the
+// S2 subtree-idle gate at the DAEMON; custody/fencing/journaling unchanged);
+// "queue" = strictly respects the interim gate. Absence (undefined) = the
+// pre-policy default — idle gestures and every legacy-mode gesture.
+export type SendDispatchPolicy = "now" | "queue";
+
 export type SendController = {
   send(): Promise<void>;
+  // Queue-policy B2: the busy composer's explicit-gesture entry (Queue /
+  // Send now buttons). The policy is captured BEFORE any async preparation
+  // (snapshot-once, like the agent resolution) and threaded through the
+  // prepared payload, the outbox gesture save, and the admission request.
+  // Refuses loudly when the capability is absent (never a silent now→queue
+  // degradation — the G3 posture applied to the FE gesture).
+  sendPolicy(policy: SendDispatchPolicy): Promise<void>;
+  // Queue-policy B2: the pending-chip Send-now escalation (the amendment's
+  // one policy-immutability exception; the server cancel+re-admits under a
+  // FRESH id). Explicit user action only.
+  escalateQueuedItem(sessionId: string, item: QueuedMessage): Promise<void>;
   // Guarded SendStatus row-retry entry (sending-UX O2 defect fix, RECORD-
   // ADDRESSED per the O2 slice-1 review A-F1): takes the DISPLAYED row's
   // attemptId, revalidates that exact record at click time, and replays ITS
@@ -347,10 +385,14 @@ export function createSend(deps: SendDependencies): SendController {
   // One logical send attempt's thread-through: stable identity + (on retry)
   // the retained payload to reuse verbatim. `tapText` is the raw tap-time
   // composer text (the retry-matching key recorded in the payload snapshot).
+  // `policy` (queue-policy B2) is the tap-captured dispatch policy threaded
+  // into the payload snapshot, the outbox gesture save, and the admission
+  // request — retries reuse it via the retained payload (fingerprint-stable).
   type SendAttemptRef = {
     attemptId: string;
     tapText: string;
     reuse?: PreparedSendPayload;
+    policy?: SendDispatchPolicy;
   };
 
   // Typed admission-failure classification (send-reliability slice 2). The OLD
@@ -530,6 +572,9 @@ export function createSend(deps: SendDependencies): SendController {
             attachments: input.attachments,
             sendConfig: input.sendConfig,
             files: input.attachments.map((a) => a.filename).filter(Boolean),
+            // Queue-policy B2: the tap-captured policy joins the immutable
+            // prepared attempt (retry-same replays it — fingerprint-stable).
+            dispatchPolicy: attempt.policy,
           },
         });
       }
@@ -572,6 +617,10 @@ export function createSend(deps: SendDependencies): SendController {
             path: a.path,
           })),
           sendConfig: input.sendConfig,
+          // Queue-policy B2: the durable gesture carries the tap-captured
+          // policy so IDB replay / reconcile / failed-save recovery re-admits
+          // under the SAME policy (the admission fingerprint includes it).
+          dispatchPolicy: attempt.policy,
         },
         capturedHead: tapHead,
       });
@@ -593,7 +642,15 @@ export function createSend(deps: SendDependencies): SendController {
       admittedItem = await deps.enqueue(
         id,
         attempt
-          ? { ...input, attemptId: attempt.attemptId, intentId: attempt.attemptId }
+          ? {
+              ...input,
+              attemptId: attempt.attemptId,
+              intentId: attempt.attemptId,
+              // Queue-policy B2: the gesture's dispatch policy on the
+              // admission request (JSON drops undefined — legacy/Idle
+              // gestures carry no member, wire bytes unchanged).
+              dispatchPolicy: attempt.policy,
+            }
           : input,
       );
     } catch (e) {
@@ -880,7 +937,42 @@ export function createSend(deps: SendDependencies): SendController {
     return dispatchSend(key, id, `/oc/session/${encodeURIComponent(id)}/shell`, body, "Shell command failed");
   }
 
-  async function send() {
+  // Queue-policy B2: the implicit-entry send (Send button / Enter key). Enter
+  // while busy under the policy capability defaults safely to QUEUE (the
+  // amendment §2 button table's primary action); idle gestures are NEVER
+  // stamped — the item admits with absent policy (≡ queue) and dispatches
+  // immediately through the idle gate (a busy-race makes it WAIT: the
+  // accepted safe default, never a retroactive "now").
+  async function send(): Promise<void> {
+    // POLICY CAPTURE (snapshot-once, amendment §3): decided from the tree
+    // state AT TAP, before any async preparation — later busy/idle
+    // transitions never reinterpret it. Without the capability the gesture
+    // carries NO policy at all (legacy bytes byte-for-byte).
+    const policy =
+      deps.queuePolicyCapable?.() && deps.working() ? ("queue" as const) : undefined;
+    return runGesture(policy);
+  }
+
+  // Queue-policy B2: the explicit-gesture entry (the busy composer's Queue /
+  // Send now buttons). The captured policy is exactly the tapped gesture —
+  // even if the tree went idle between render and tap (an explicit "now"
+  // stays now; "queue" strictly respects the gate and dispatches on idle).
+  async function sendPolicy(policy: SendDispatchPolicy): Promise<void> {
+    if (!deps.queuePolicyCapable?.()) {
+      // Render-gated in production (the buttons only exist under the
+      // capability); reaching here means a wiring bug or a capability flip
+      // mid-frame. Refuse loudly — never a silent now→queue degradation.
+      log.error("send", "sendPolicy refused: queue policy capability absent", {});
+      deps.pushNotification({
+        kind: "error", sessionID: deps.sessionId(), title: "Not sent — queue policy unavailable",
+        detail: "This server does not support Send-now/Queue policies right now; nothing was sent. Retry in a moment.",
+      });
+      return;
+    }
+    return runGesture(policy);
+  }
+
+  async function runGesture(explicitPolicy?: SendDispatchPolicy): Promise<void> {
     // F1: composer OWNERSHIP snapshot at TAP time — before ANY agent/session
     // wait. A send can spend up to AGENT_RESOLVE_TIMEOUT_MS (10s) in the
     // evidence gate; edits the operator makes during that wait must SURVIVE:
@@ -903,6 +995,28 @@ export function createSend(deps: SendDependencies): SendController {
     const ownedAtts = deps.attachments();
     const owned = new Set<Attachment>(ownedAtts);
     const text = ownedText.trim();
+    // Queue-policy B2 fix (tier1_b-F1/F2, operator option A): shell input
+    // ("!") must NEVER ride a policy gesture. A captured policy marks the
+    // gesture as one of the three policy entries — the busy-table Queue /
+    // Send now buttons (sendPolicy) or Enter-while-busy (send() stamps
+    // "queue" exactly when capability + busy held at tap) — and shell input
+    // can neither queue ("!" only makes sense against a live shell) nor run
+    // while the session is busy. Refuse LOUDLY before ANY state change: one
+    // error notice, zero network POSTs, the draft (text + attachments) fully
+    // preserved, no attempt/outbox/queue record. Idle Send/Enter carries no
+    // captured policy and keeps the historic immediate-shell semantics; with
+    // the capability absent every gesture stays policy-free and the legacy
+    // path (busy "!" + Enter → immediate shell) is byte-for-byte unchanged.
+    if (explicitPolicy && text.startsWith("!")) {
+      log.error("send", "policy gesture refused: shell input under the busy policy controls", {});
+      deps.pushNotification({
+        kind: "error", sessionID: deps.sessionId(),
+        title: "Not sent — shell commands aren't available while the session is busy",
+        detail:
+          "Nothing was sent. \"!\" shell commands run only from the idle composer; wait for the current turn to finish, then send it again.",
+      });
+      return;
+    }
     // O2 C-F1/D-F1 (attachments-only replay): an attachment-only RETRY of a
     // retained uncertain admission is NOT an empty send — the stored payload
     // carries the attachments, and the row's Retry affordance was tapped with
@@ -943,7 +1057,13 @@ export function createSend(deps: SendDependencies): SendController {
     // when queueMode() is on, so this gate primarily catches the Enter-key
     // path that bypasses the button's visibility. With the setting On, a
     // busy send enqueues (the Queue button's purpose) and falls through.
-    if (deps.working() && !deps.queueMode()) {
+    //
+    // Queue-policy B2 (amendment §2): under the policy capability this gate
+    // NO LONGER applies to busy sends — the busy composer renders the
+    // explicit Queue / Send now button table and Enter defaults to Queue, so
+    // the legacy setting no longer gates the busy composer (it stays fully
+    // functional for legacy daemon-off deployments).
+    if (deps.working() && !deps.queueMode() && !deps.queuePolicyCapable?.()) {
       deps.pushNotification({ kind: "info", sessionID: deps.sessionId(), title: "Busy — turn in progress" });
       return;
     }
@@ -971,9 +1091,17 @@ export function createSend(deps: SendDependencies): SendController {
           // the retained payload on read, so an inline identity includes is
           // always false for attachment-bearing payloads — see the helper.
           if (reusable?.payload && attachmentsSubsetOfPayload(ownedAtts, reusable.payload)) {
-            return { attemptId: reusable.attemptId, tapText: text, reuse: reusable.payload };
+            // Retry of a retained uncertain admission: the ORIGINAL payload's
+            // dispatchPolicy rides along (a replay under a changed/missing
+            // member would 409 the idempotent admission, never dedupe).
+            return {
+              attemptId: reusable.attemptId,
+              tapText: text,
+              reuse: reusable.payload,
+              policy: reusable.payload.dispatchPolicy,
+            };
           }
-          return { attemptId: mintSendAttempt(ownerKey).attemptId, tapText: text };
+          return { attemptId: mintSendAttempt(ownerKey).attemptId, tapText: text, policy: explicitPolicy };
         })();
     // Send-reliability slice 3: a reused attempt IS a retry of a retained
     // uncertain admission — flagged INSIDE admission (moved from send()'s
@@ -1283,7 +1411,14 @@ export function createSend(deps: SendDependencies): SendController {
         id,
         sendAgent,
         owned,
-        attempt ? { attemptId: attempt.attemptId, tapText: attempt.tapText, reuse: attempt.reuse } : undefined,
+        attempt
+          ? {
+              attemptId: attempt.attemptId,
+              tapText: attempt.tapText,
+              reuse: attempt.reuse,
+              policy: attempt.policy,
+            }
+          : undefined,
       );
       if (!ok) {
         // Preserve the composed text for retry — but never OVER an edit made
@@ -1504,7 +1639,15 @@ export function createSend(deps: SendDependencies): SendController {
       return;
     }
     const payload = rec.payload;
-    const attempt: SendAttemptRef = { attemptId, tapText: payload.tapText, reuse: payload };
+    const attempt: SendAttemptRef = {
+      attemptId,
+      tapText: payload.tapText,
+      reuse: payload,
+      // Queue-policy B2: retry-same preserves the ORIGINAL gesture's policy
+      // (the admission fingerprint includes it — a changed member is a 409,
+      // never a silent degradation).
+      policy: payload.dispatchPolicy,
+    };
     await runSendSingleFlight(ownerKey, async () => {
       // A reused attempt IS a retry — flag it so the status surface renders
       // "Retrying queue confirmation…" (same as send()'s reuse branch).
@@ -1724,6 +1867,109 @@ export function createSend(deps: SendDependencies): SendController {
     }
   }
 
+  // Queue-policy B2 (amendment §2 "Pending queue chip escalation"): the
+  // guarded pending-chip Send-now action. The ONLY trigger is QueueChip's
+  // explicit button (wired through ChatView/Composer) — no timer, no loop.
+  // The server executes cancel + re-admit with policy "now" under a FRESH
+  // backend id behind the custody fence (pkg/web/queue_escalate.go); the
+  // daemon's drain loop owns the resulting dispatch (now-bypasses the
+  // subtree-idle gate) — the FE NEVER direct-POSTs for this path (G2 stays
+  // closed). Error mapping per the mission contract: 404 = the item was
+  // already escalated/removed/consumed (the fresh-ID consequence — refresh +
+  // gentle notice, NEVER a blind re-escalate, D-F4); 409 fenced = the custody
+  // epoch changed under the request (retry-later notice); a lost response =
+  // outcome-unknown (refresh + honest notice — the transition may have
+  // committed server-side).
+  const escalateInFlight = new Set<string>();
+  const notifyEscalate = (sessionId: string, kind: "info" | "error", title: string, detail: string): void => {
+    deps.pushNotification({ kind, sessionID: sessionId, title, detail });
+  };
+  async function escalateQueuedItem(sessionId: string, item: QueuedMessage): Promise<void> {
+    if (item.state !== "pending") {
+      // PENDING-ONLY: dispatching is owned by the custody state machine;
+      // terminal states are outside the escalation contract. Loud refusal,
+      // nothing fired.
+      log.error("send", "chip escalation refused: item not pending", { sessionId, itemId: item.id, state: item.state });
+      notifyEscalate(
+        sessionId, "error", "Send now unavailable — status changed",
+        "Nothing was sent. This queued message is no longer waiting; the queue was not changed.",
+      );
+      return;
+    }
+    if (!deps.queuePolicyCapable?.() || !deps.escalate) {
+      // Render-gated in production (the chip action only exists under the
+      // capability); reaching here is a wiring bug or a capability flip.
+      log.error("send", "chip escalation refused: policy capability or escalate seam absent", { sessionId, itemId: item.id });
+      notifyEscalate(
+        sessionId, "error", "Send now unavailable",
+        "Nothing was sent. The queue policy capability is not active on this server right now.",
+      );
+      return;
+    }
+    if (escalateInFlight.has(item.id)) return; // swallow re-clicks while pending
+    escalateInFlight.add(item.id);
+    try {
+      const r = await deps.escalate!(sessionId, item.id);
+      if (r.ok) {
+        // The cache already holds the replacement (queue.ts escalateQueued
+        // removed the old id + upserted the fresh now-item). Converge to
+        // daemon truth — the now item typically claims+dispatches within one
+        // 250ms drain tick. NO notification: the chip IS the surface.
+        await deps.fetchQueue(sessionId).catch(() => {});
+        return;
+      }
+      switch (r.code) {
+        case "not-found": {
+          // The fresh-ID consequence: already escalated (another tab), removed,
+          // or consumed by the drain loop. Refresh so the UI reflects what
+          // actually happened; gentle notice; NEVER a blind re-escalate.
+          await deps.fetchQueue(sessionId).catch(() => {});
+          notifyEscalate(
+            sessionId, "info", "Queue updated",
+            "This message was already sent, escalated, or removed — the queue view was refreshed.",
+          );
+          return;
+        }
+        case "fenced": {
+          // Custody epoch changed under the request (a newer owner exists).
+          // Unobtrusive retry-later notice; the queue state is untouched.
+          notifyEscalate(
+            sessionId, "info", "Send now not applied — try again in a moment",
+            "Queue ownership changed while sending; the message is still queued. Tap Send now again if you still want it immediately.",
+          );
+          return;
+        }
+        case "not-escalatable": {
+          await deps.fetchQueue(sessionId).catch(() => {});
+          notifyEscalate(
+            sessionId, "error", "Send now unavailable — status changed",
+            "Nothing was sent. This queued message is no longer waiting; the queue view was refreshed.",
+          );
+          return;
+        }
+        case "requires-custody": {
+          notifyEscalate(
+            sessionId, "error", "Send now unavailable",
+            "Nothing was sent. Immediate dispatch requires the daemon's queue policy scheduler.",
+          );
+          return;
+        }
+        default: {
+          // timeout / network / unknown — the escalation's outcome is
+          // UNKNOWN (the transition may have committed server-side; the old
+          // id may already be gone). Refresh + honest notice; no auto-retry.
+          await deps.fetchQueue(sessionId).catch(() => {});
+          notifyEscalate(
+            sessionId, "info", "Send now unconfirmed",
+            "The escalation result could not be confirmed; the queue view was refreshed to show the current state.",
+          );
+        }
+      }
+    } finally {
+      escalateInFlight.delete(item.id);
+    }
+  }
+
   // retry() reuses sendText() to resend an OLD message; named resendText on the
   // public surface so ChatView's retry closure can call it without reaching
   // into the private sendText. Same evidence gate as send(): the session
@@ -1752,5 +1998,5 @@ export function createSend(deps: SendDependencies): SendController {
     return sendText(text, id, ag.agent, new Set(), { attemptId, tapText: text });
   }
 
-  return { send, retrySameMessage, retryQueuedItem, resendText, dispatchQueuedItem };
+  return { send, sendPolicy, escalateQueuedItem, retrySameMessage, retryQueuedItem, resendText, dispatchQueuedItem };
 }

@@ -194,6 +194,11 @@ export function createAmbiguousReplacement(deps: AmbiguousReplacementDeps): Ambi
       text: q.text,
       attachments: q.attachments.map((a) => ({ url: a.url, filename: a.filename, mime: a.mime, path: a.path })),
       sendConfig: q.sendConfig,
+      // Queue-policy B2 audit: preserve the original item's immediate-dispatch
+      // semantics on the replacement gesture (an ambiguous NOW delivery's
+      // replacement should not silently demote to queue-waiting). Absent on
+      // queue/default items — the wire member only ever exists for "now".
+      dispatchPolicy: q.dispatchPolicy,
     };
     // BLK-A3 outbox gate (same contract as a composer send): capture at tap,
     // commit before admission, block visibly on storage failure.

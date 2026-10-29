@@ -50,6 +50,16 @@ const jsonCsrf = { "Content-Type": "application/json", "X-VH-CSRF": "1" };
 // the List endpoint, which can reconcile).
 const queueJsonPath = path.join(demoDir, ".vh-solara", "sessions", SID, "queue.json");
 
+// Queue-policy B2 cell: that cell runs on "demo", NOT "other" — "other" is
+// provably-empty only until the first delivered turn; the fake's turn
+// messages (simulatePrompt/streamAssistant) carry NO agent field, so after
+// the first test's delivered turn "other" has messages but ZERO
+// agent-stamped evidence and the send gate's agent resolution pends forever.
+// "demo"'s SEEDED transcript carries agent-stamped assistant messages, so
+// the evidence scan resolves deterministically regardless of turn history.
+const POLICY_SID = "demo";
+const policyQueueJsonPath = path.join(demoDir, ".vh-solara", "sessions", POLICY_SID, "queue.json");
+
 interface RawItem {
   id: string;
   state: string;
@@ -59,6 +69,7 @@ interface RawItem {
   dispatchStartedAt?: number;
   detail?: string;
   intentId?: string;
+  dispatchPolicy?: string;
 }
 
 function readRawItems(): RawItem[] {
@@ -533,4 +544,221 @@ test("G2: unmarked unknown chip under daemon custody renders NO Retry and produc
     { type: "qd-g2-seed-msg-id", description: seedMsgID },
     { type: "qd-g2-queue-gets", description: String(queueGetCount) },
   );
+});
+
+// ---------------------------------------------------------------------------
+// Queue-policy slice B2 (2026-10-29 amendment) — the FE policy feature on the
+// REAL daemon-dispatch stack: capability-driven composer button table under a
+// REAL busy subtree, the busy Queue gesture held by the interim gate, the
+// busy Send-now gesture + the pending-chip Send-now escalation both admitted
+// with dispatchPolicy "now" through the DURABLE pipeline and dispatched by the
+// daemon's now-bypass DESPITE the busy tree. Raw queue.json is the passive
+// witness (the List endpoint is never frozen here); the browser stays
+// observe-only (claim/resolve/direct-upstream POSTs are detected and failed).
+// ---------------------------------------------------------------------------
+test("busy-state policy gestures: Queue waits, Send now + chip escalation dispatch under busy", async ({
+  page,
+  context,
+  request,
+}) => {
+  const markerA = `QP-A-${Date.now()}`; // the queued (policy-absent) message
+  const markerC = `QP-C-${Date.now()}`; // the composer Send-now message
+  const readRaw = (): RawItem[] => {
+    try {
+      const j = JSON.parse(readFileSync(policyQueueJsonPath, "utf8")) as { items?: RawItem[] };
+      return Array.isArray(j.items) ? j.items : [];
+    } catch {
+      return []; // no queue file yet — an honest empty list
+    }
+  };
+
+  // --- Guards: the browser must stay observe-only (G2 closed) -----------
+  const violations: string[] = [];
+  await context.route(`**/vh/session/${POLICY_SID}/queue**`, async (route: Route) => {
+    const url = new URL(route.request().url());
+    const method = route.request().method();
+    const path = url.pathname;
+    if (method === "GET") {
+      await route.continue(); // live truth — no freezing in this cell
+      return;
+    }
+    if (method === "POST" && (path.endsWith(`/queue`) || path.endsWith(`/escalate`))) {
+      await route.continue(); // admission + escalation: sanctioned browser writes
+      return;
+    }
+    violations.push(`${method} ${path}`);
+    await route.abort("blockedbyclient");
+  });
+  await context.route("**/vh/send", async (route) => {
+    if (route.request().method() === "POST") {
+      violations.push("POST /vh/send");
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.continue();
+  });
+  await context.route("**/oc/session/**", async (route) => {
+    if (route.request().method() === "POST") {
+      violations.push(`direct upstream POST ${new URL(route.request().url()).pathname}`);
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.continue();
+  });
+
+  try {
+    // --- Busy subtree + held upstream -------------------------------------
+    const arm = await request.post(`/oc/fixture/prompt-hold/arm?session=${POLICY_SID}`, {
+      headers: jsonCsrf,
+      data: { deadlineMs: 120_000 },
+    });
+    expect(arm.ok(), "arm prompt hold").toBeTruthy();
+    const busy = await request.post(`/oc/fixture/busy?session=${POLICY_SID}`, {
+      headers: jsonCsrf,
+      data: {},
+    });
+    expect(busy.ok(), "mark the session busy (live session.status)").toBeTruthy();
+
+    // --- Navigate; the policy capability must be advertised ---------------
+    await page.goto(projectUrl(`/?session=${POLICY_SID}`));
+    const capable = await page.evaluate(async () => {
+      const r = await fetch("/vh/version", { cache: "no-store" });
+      return (await r.json()) as { queueDispatchPolicyVersion?: number };
+    });
+    expect(
+      capable.queueDispatchPolicyVersion,
+      "queueDispatchPolicyVersion advertised (the policy scheduler is active)",
+    ).toBeGreaterThanOrEqual(1);
+
+    const ta = page.getByPlaceholder(/Message/);
+    await expect(ta).toBeVisible();
+    // Busy flip first (the amendment's empty-text row: Stop only — there is
+    // no Send button to poll in the busy state).
+    await expect
+      .poll(
+        async () => page.locator('button[aria-label="Stop"]').count(),
+        { timeout: 15_000, message: "busy reached the composer (Stop renders)" },
+      )
+      .toBeGreaterThan(0);
+
+    // --- Busy + text: the policy button table (Queue + Send now, NO Stop) --
+    await ta.fill(markerA);
+    await expect(page.locator('button[aria-label="Queue"]')).toBeVisible();
+    await expect(page.locator('button[aria-label="Send now"]')).toBeVisible();
+    await expect(page.locator('button[aria-label="Stop"]')).toHaveCount(0);
+    // Readiness (agents/models load asynchronously): both busy actions
+    // enable once readyToSend clears.
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(() => {
+            const q = document.querySelector('button[aria-label="Queue"]') as HTMLButtonElement | null;
+            const n = document.querySelector('button[aria-label="Send now"]') as HTMLButtonElement | null;
+            return !!q && !!n && !q.disabled && !n.disabled;
+          }),
+        { timeout: 15_000, message: "policy buttons ready (agents/models loaded)" },
+      )
+      .toBeTruthy();
+
+    // --- Phase 1: the Queue gesture is HELD by the interim gate -----------
+    await page.locator('button[aria-label="Queue"]').click();
+    await expect(ta).toHaveValue("", { timeout: 10_000 }); // admission confirmed
+    let held: RawItem | undefined;
+    const heldDeadline = Date.now() + 10_000;
+    for (;;) {
+      held = readRaw().find((it) => it.text === markerA);
+      if (held) break;
+      if (Date.now() > heldDeadline) throw new Error("queued item never appeared in raw queue.json");
+      await page.waitForTimeout(200);
+    }
+    expect(held.state).toBe("pending");
+    expect(held.dispatchPolicy ?? "").toBe(""); // queue elided — absent member
+    expect((held.claimGeneration ?? 0)).toBe(0); // NOT claimed
+    // The interim gate holds under busy: ~12 drain ticks (250ms) with no claim.
+    await page.waitForTimeout(3_000);
+    const stillHeld = readRaw().find((it) => it.text === markerA);
+    expect(stillHeld?.state, "queue-policy item stays pending while the tree is busy").toBe("pending");
+    expect((stillHeld?.claimGeneration ?? 0)).toBe(0);
+
+    // --- Phase 2: the pending chip's Send-now ESCALATION ------------------
+    const chip = page.locator(`.queue-chip[data-state="pending"]`, { hasText: markerA });
+    const chipDeadline = Date.now() + 10_000;
+    while ((await chip.count()) === 0) {
+      if (Date.now() > chipDeadline) throw new Error("pending chip never became visible");
+      await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+      await page.waitForTimeout(300);
+    }
+    await chip.locator(".queue-escalate").click();
+    // The server cancel+re-admitted under a FRESH id born "now"; the daemon's
+    // now-bypass claims it DESPITE the busy tree.
+    let escalated: RawItem | undefined;
+    const escDeadline = Date.now() + 15_000;
+    for (;;) {
+      const items = readRaw().filter((it) => it.text === markerA);
+      escalated = items.find((it) => it.dispatchPolicy === "now");
+      if (
+        escalated &&
+        escalated.state === "dispatching" &&
+        (escalated.claimGeneration ?? 0) > 0 &&
+        escalated.opencodeMsgID
+      ) {
+        break;
+      }
+      if (Date.now() > escDeadline) {
+        throw new Error(
+          `escalated item never reached dispatching (got ${JSON.stringify(items)})`,
+        );
+      }
+      await page.waitForTimeout(200);
+    }
+    expect(readRaw().some((it) => it.id === held!.id), "the original id was consumed").toBe(false);
+
+    // --- Phase 3: the busy composer's Send-now gesture --------------------
+    await ta.fill(markerC);
+    await page.locator('button[aria-label="Send now"]').click();
+    await expect(ta).toHaveValue("", { timeout: 10_000 });
+    let nowItem: RawItem | undefined;
+    const nowDeadline = Date.now() + 15_000;
+    for (;;) {
+      nowItem = readRaw().find((it) => it.text === markerC);
+      if (
+        nowItem &&
+        nowItem.dispatchPolicy === "now" &&
+        (nowItem.claimGeneration ?? 0) > 0 &&
+        nowItem.opencodeMsgID
+      ) {
+        break;
+      }
+      if (Date.now() > nowDeadline) {
+        throw new Error(`Send-now item never dispatched (got ${JSON.stringify(nowItem)})`);
+      }
+      await page.waitForTimeout(200);
+    }
+
+    // --- Release; both now items converge to sent via the watcher ---------
+    const rel = await request.post("/oc/fixture/prompt-hold/release", {
+      headers: jsonCsrf,
+      data: {},
+    });
+    expect(rel.ok()).toBeTruthy();
+    const sentDeadline = Date.now() + 15_000;
+    for (;;) {
+      const items = readRaw().filter((it) => it.text === markerA || it.text === markerC);
+      const allSent =
+        items.length === 2 && items.every((it) => it.state === "sent" && (it.claimGeneration ?? 0) > 0);
+      if (allSent) break;
+      if (Date.now() > sentDeadline) {
+        throw new Error(`items never reached sent (got ${JSON.stringify(items)})`);
+      }
+      await page.waitForTimeout(300);
+    }
+
+    // --- Confound exclusion: the browser never bypassed custody -----------
+    expect(violations, "no browser claim/resolve/direct-send/direct-upstream POST was attempted").toEqual([]);
+  } finally {
+    // Hygiene: join/reset the hold and restore the session to idle so later
+    // cells start from a clean busy state.
+    await request.post("/oc/fixture/prompt-hold/reset", { headers: jsonCsrf, data: {} });
+    await request.post(`/oc/fixture/idle?session=${POLICY_SID}`, { headers: jsonCsrf, data: {} });
+  }
 });
