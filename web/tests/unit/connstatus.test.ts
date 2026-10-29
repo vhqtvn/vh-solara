@@ -23,6 +23,10 @@
 // Harness: stream1Registration.test.ts / treeConvergedGate.test.ts shape
 // (vi.resetModules + dynamic imports per test → fresh signal + store state).
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+// Type-only: the runtime diaglog handle is per-test (resetModules in
+// setupFresh); this import is erased at runtime and only names the entry
+// type for the stamps describe below.
+import type { ConnGradeEntry } from "../../src/sync/diaglog";
 import type { ConnStatusInput } from "../../src/sync/connstatus";
 
 let conn: typeof import("../../src/sync/connstatus") = null as unknown as typeof import("../../src/sync/connstatus");
@@ -30,6 +34,7 @@ let store: typeof import("../../src/sync/store") = null as unknown as typeof imp
 let cascade: typeof import("../../src/sync/cascade") = null as unknown as typeof import("../../src/sync/cascade");
 let weaklink: typeof import("../../src/sync/weaklink") = null as unknown as typeof import("../../src/sync/weaklink");
 let health: typeof import("../../src/sync/health") = null as unknown as typeof import("../../src/sync/health");
+let diaglog: typeof import("../../src/sync/diaglog") = null as unknown as typeof import("../../src/sync/diaglog");
 
 async function setupFresh(): Promise<void> {
   vi.resetModules();
@@ -38,6 +43,7 @@ async function setupFresh(): Promise<void> {
   cascade = await import("../../src/sync/cascade");
   weaklink = await import("../../src/sync/weaklink");
   health = await import("../../src/sync/health");
+  diaglog = await import("../../src/sync/diaglog");
   store.setProjectDirRaw("/test");
 }
 
@@ -329,6 +335,88 @@ describe("FE fetch-failure spike → degraded (reactive, weaklink counters)", ()
     expect(conn.connModel().grade).toBe("live");
     for (let i = 0; i < 5; i++) weaklink.recordFetchFailure("abort");
     health.tickHealth();
+    expect(conn.connModel().grade).toBe("live");
+  });
+});
+
+// ── Grade-transition diag stamps (capture-2, card ───────────────────────────
+// task-2026-10-29t06-06-05): the observer wired in initConnStatus records
+// every genuine grade transition into the SAME ring as the stream-open
+// stamps, with from/to + the landing grade's reasons — so a future capture
+// reads exactly when/why the ConnectionToast cleared relative to the
+// tree/session applied@ stamps. Default-off ring posture asserted too.
+describe("grade-transition diag stamps (capture-2)", () => {
+  // Solid effects (the observer lives in its own app-lifetime root) flush on
+  // microtasks; with fake timers, two 0-advances flush the whole chain
+  // (signal → memo → effect → helper).
+  const flushEffects = async (): Promise<void> => {
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+  };
+  const gradeEntries = (): ConnGradeEntry[] =>
+    diaglog.diagEntries().filter((e): e is ConnGradeEntry => e.kind === "conn-grade");
+
+  it("capture OFF (default): transitions stamp nothing into the ring", async () => {
+    conn.initConnStatus();
+    await flushEffects(); // the baseline evaluation records no entry
+    store.setState("status", "reconnecting");
+    await flushEffects();
+    store.setState("status", "live");
+    await flushEffects();
+    expect(gradeEntries()).toEqual([]);
+  });
+
+  it("capture ON: every transition lands with from/to + the landing reasons, in order; the baseline stamps nothing", async () => {
+    diaglog.setDiagLogOn(true);
+    conn.initConnStatus();
+    await flushEffects();
+    expect(gradeEntries()).toEqual([]); // baseline (live) — not a transition
+
+    store.setState("status", "reconnecting");
+    await flushEffects();
+    store.setState("status", "live");
+    await flushEffects();
+    // The convergence-pending transition: status live + an armed pass.
+    cascade.requestRecovery("tree-seq-gap", undefined, { tree: "await" });
+    await flushEffects();
+    expect(conn.connModel().grade).toBe("reconnecting");
+    cascade.noteTreeConverged();
+    await flushEffects();
+
+    expect(gradeEntries().map((e) => [e.from, e.to, e.reasons])).toEqual([
+      ["live", "reconnecting", ["socket-reconnecting"]],
+      ["reconnecting", "live", []],
+      ["live", "reconnecting", ["convergence-pending"]],
+      ["reconnecting", "live", []],
+    ]);
+    // The rendered line is capture-readable (the "Copy all" surface).
+    const first = gradeEntries()[0];
+    expect(diaglog.entryLine(first)).toContain("conn-grade live→reconnecting reason=socket-reconnecting");
+  });
+
+  // LIVE-GATE PIN (hard constraint of the 2026-10-29 card): grade=live on
+  // healthy paths still requires the FULL post-reconnect convergence
+  // cascade — this slice's stale-side toast lifecycle changes must not let
+  // anything reach live EARLIER than today. The reduction is untouched by
+  // the slice; this pins the reactive composition at the resume shape.
+  it("LIVE-GATE PIN: live requires the full post-reconnect convergence cascade (unchanged by the toast lifecycle slice)", async () => {
+    conn.initConnStatus();
+    await flushEffects();
+    expect(conn.connModel().grade).toBe("live");
+
+    // Hard down, then recovery: the socket REOPENS (status live) while the
+    // cascade pass still awaits its baseline → the grade MUST stay down…
+    store.setState("status", "reconnecting");
+    await flushEffects();
+    cascade.requestRecovery("tree-seq-gap", undefined, { tree: "fresh" });
+    store.setState("status", "live"); // socket open, snapshot NOT yet applied
+    await flushEffects();
+    const blocked = conn.connModel();
+    expect(blocked.grade).toBe("reconnecting");
+    expect(blocked.reasons).toEqual(["convergence-pending"]);
+    // …and ONLY the truthful convergence note (an APPLIED baseline) restores live.
+    cascade.noteTreeConverged();
+    await flushEffects();
     expect(conn.connModel().grade).toBe("live");
   });
 });

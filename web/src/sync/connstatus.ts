@@ -27,13 +27,14 @@
 // Every threshold below ships ASSUMPTION-labeled. The 4c FE-vantage baseline
 // (window.__vhSyncDiag, recovery-reasons.ts + weaklink.ts) is the ONLY
 // legitimate tuning consumer — never daemon-only proxy metrics.
-import { createMemo, createSignal } from "solid-js";
+import { createEffect, createMemo, createRoot, createSignal } from "solid-js";
 import { state } from "./store";
 import { isStale } from "./health";
 import { isUpdating } from "./reconcile";
 import { STALE_MS } from "./stream";
 import { readWeakLink } from "./weaklink";
 import { cascadeRecoveryPending, subscribeCascadeState } from "./cascade";
+import { noteConnGradeTransition } from "./diaglog";
 
 // The graded connection status. "offline" = the BROWSER has no network
 // (navigator.offline); "reconnecting" = any hard-down observation (tunnel
@@ -220,6 +221,13 @@ export function installTunnelSampler(): void {
 
 // ── Initialization (idempotent; wired from startSync) ───────────────────────
 let connStatusInited = false;
+
+// Grade-transition diag stamps (capture-2, 2026-10-29): the prior grade for
+// the transition observer below. Tracked CONTINUOUSLY (even while diag
+// capture is off) so enabling capture mid-flight still stamps the next
+// genuine transition with a truthful from-grade.
+let gradeDiagPrev: ConnGrade | null = null;
+
 export function initConnStatus(): void {
   if (connStatusInited) return;
   connStatusInited = true;
@@ -230,6 +238,27 @@ export function initConnStatus(): void {
   }
   setCascadePending(cascadeRecoveryPending());
   subscribeCascadeState(setCascadePending);
+  // The transition observer: record every genuine connstatus grade
+  // transition into the diag ring with the landing grade's reasons, so a
+  // capture can read exactly when/why the ConnectionToast cleared RELATIVE
+  // to the stream-open applied@ stamps (already in the same ring). App-
+  // lifetime root (never disposed — the same posture as startSync's own
+  // createRoot effects). Cost: one string compare per model re-evaluation
+  // (connMemo re-runs on the ~5s health tick + input writes — it returns a
+  // fresh object each time, so this effect re-runs with it); the ring write
+  // itself is default-off gated inside noteConnGradeTransition. The first
+  // evaluation records the BASELINE only (not a transition — nothing is
+  // stamped). OBSERVATIONAL ONLY (the module's binding policy: this owns
+  // zero side effects beyond its own signals + this diag write).
+  createRoot(() => {
+    createEffect(() => {
+      const m = connMemo();
+      const prev = gradeDiagPrev;
+      gradeDiagPrev = m.grade;
+      if (prev === null || prev === m.grade) return;
+      noteConnGradeTransition(prev, m.grade, m.reasons);
+    });
+  });
 }
 
 // ── Consumer mappings (one table per surface vocabulary) ────────────────────

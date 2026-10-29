@@ -10,6 +10,8 @@ import {
   diagLogOn,
   enforceCaps,
   entryLine,
+  noteCascadeBoundary,
+  noteConnGradeTransition,
   setDiagLogOn,
   type ColdOpenEntry,
 } from "../../src/sync/diaglog";
@@ -228,5 +230,83 @@ describe("diaglog — entryLine rendering", () => {
     expect(line).toContain("recon=5"); // finite reconcile still renders
     expect(line).not.toMatch(/\bNaN\b/);
     expect(line).not.toMatch(/\bInfinity\b/);
+  });
+});
+
+// ── capture-2 stamp kinds (card task-2026-10-29t06-06-05) ───────────────────
+// conn-grade (connstatus grade transitions) + cascade (pass-lifecycle
+// boundaries) ride the same default-off ring, caps, and validation as the
+// b2d3d62 kinds. These tests pin the three ring contracts for them: the
+// rendered line, the bounded-emitter gating, and persisted-payload
+// validation.
+describe("diaglog — conn-grade + cascade kinds (capture-2 stamps)", () => {
+  it("entryLine renders grade transitions (init baseline, reasons)", () => {
+    // from=null renders as `init` (the observer's baseline evaluation — the
+    // helper is safe to call with it even though the observer never stamps it).
+    const line = entryLine({ kind: "conn-grade", ts: 1, from: null, to: "live", reasons: [] });
+    expect(line).toContain("conn-grade init→live");
+    expect(line).not.toContain("reason=");
+    const withReason = entryLine({
+      kind: "conn-grade",
+      ts: 1,
+      from: "live",
+      to: "reconnecting",
+      reasons: ["convergence-pending"],
+    });
+    expect(withReason).toContain("conn-grade live→reconnecting reason=convergence-pending");
+    const multi = entryLine({ kind: "conn-grade", ts: 1, from: "reconnecting", to: "degraded", reasons: ["tree-stale", "fetch-failure-spike"] });
+    expect(multi).toContain("reason=tree-stale+fetch-failure-spike");
+  });
+
+  it("entryLine renders cascade boundaries (stream/reasons/pending/elapsed)", () => {
+    const timeout = entryLine({
+      kind: "cascade",
+      ts: 1,
+      event: "pass-timeout",
+      reasons: ["tree-seq-gap"],
+      pending: ["tree"],
+      elapsedMs: 15000,
+    });
+    expect(timeout).toContain("cascade event=pass-timeout");
+    expect(timeout).toContain("reasons=tree-seq-gap");
+    expect(timeout).toContain("pending=tree");
+    expect(timeout).toContain("elapsed=15000");
+    const step = entryLine({ kind: "cascade", ts: 1, event: "step-converged", stream: "session" });
+    expect(step).toContain("cascade event=step-converged stream=session");
+    // elapsed renders human-compact like the other diag lines (fmtMs).
+    const human = entryLine({ kind: "cascade", ts: 1, event: "pass-converged", reasons: ["x"], elapsedMs: 2400 });
+    expect(human).toMatch(/elapsed=/);
+  });
+
+  it("the bounded emitters capture when on, no-op when off, and skip vacuous transitions", () => {
+    setDiagLogOn(true);
+    noteConnGradeTransition("live", "reconnecting", ["socket-reconnecting"]);
+    noteConnGradeTransition("reconnecting", "reconnecting", []); // vacuous — skipped
+    noteCascadeBoundary("pass-start", { reasons: ["tree-seq-gap"], pending: ["tree"] });
+    expect(diagEntries()).toHaveLength(2);
+    expect(diagEntries().map((x) => x.kind)).toEqual(["conn-grade", "cascade"]);
+
+    setDiagLogOn(false);
+    noteConnGradeTransition("reconnecting", "live", []);
+    noteCascadeBoundary("pass-converged", {});
+    expect(diagEntries()).toHaveLength(2); // no writes while off
+  });
+
+  it("persisted-payload validation accepts the new kinds and drops malformed ones", () => {
+    // loadVersioned only runs the isDiagEntry filter on a LEGACY raw array
+    // (same-version envelopes are trusted verbatim) — plant one.
+    localStorage.setItem(
+      "vh.diaglog.entries:",
+      JSON.stringify([
+        { kind: "conn-grade", ts: 5, from: "live", to: "degraded", reasons: ["tree-stale"] },
+        { kind: "cascade", ts: 6, event: "pass-timeout", reasons: ["x"], pending: ["tree"], elapsedMs: 15 },
+        { kind: "conn-grade", ts: 7 }, // malformed: no `to`
+        { kind: "cascade", ts: 8 }, // malformed: no `event`
+      ]),
+    );
+    _resetDiagForTest();
+    expect(diagEntries()).toHaveLength(2);
+    expect(diagEntries()[0].kind).toBe("conn-grade");
+    expect(diagEntries()[1].kind).toBe("cascade");
   });
 });

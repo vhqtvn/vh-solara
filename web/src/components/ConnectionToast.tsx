@@ -31,12 +31,16 @@ import styles from "./ConnectionToast.module.css";
 // E-ink display profile (UX Slice 4 — quiet UI): while the profile is ON the
 // auto-expiry timers (4s restart warn / 2.5s "Reconnected" ok) are NOT armed —
 // on a slow-refresh panel those windows are unreadable. IMPORTANT notices
-// (disconnect/offline/restart warns) persist until RESOLVED (the grade
-// returning to live replaces the warn with the recovery ok) or DISMISSED (an
-// ON-only × button); the benign recovery ok coalesces into a stable status —
-// it stays until dismissed or superseded by the next warn, never piling up
-// (the component holds one toast at a time by construction). Profile OFF is
-// unchanged: same timers, same wording, no dismiss affordance.
+// (disconnect/offline warns) persist until RESOLVED or DISMISSED (an ON-only
+// × button); RESOLVED = the hard-down condition ended — the grade reaching
+// live (recovery ok) OR landing degraded (A-F5: the warn clears; the ok
+// still fires when the grade later reaches live, `warned` surviving). The
+// restart warn is resolution-by-timer only (4s under OFF, dismiss-only under
+// ON — a degraded landing never clears it); the benign recovery ok
+// coalesces into a stable status — it stays until dismissed or superseded
+// by the next warn, never piling up (the component holds one toast at a
+// time by construction). Profile OFF is unchanged: same timers, same
+// wording, no dismiss affordance.
 //
 // Latent-defect fix riding this slice (disclosed): the epoch/restart branch
 // previously consumed the latch (a store write) inside the effect that had
@@ -59,6 +63,22 @@ import styles from "./ConnectionToast.module.css";
 // stale ok/restart-warn it was about to replace lingered with ZERO timers.
 // The degraded fall-through now clears the toast, FENCED to fire only when a
 // debounce was actually cancelled (see the cancelledDebounce capture below).
+//
+// (2026-10-29 A-F5, the orphaned-warn lifecycle fix — card
+// task-2026-10-29t06-06-05-pwa-toast-grading-amplifiers-and-grade-stamps):
+// the clear was extended from "cancelled a pending debounce" to "a standing
+// FIRED warn too" (warned=true). Capture-1 §Q4's "degraded-orphaned warn"
+// amplifier: a warn that fired under "reconnecting" was not cleared by a
+// landing on "degraded" — it sat with zero timers until the grade actually
+// reached "live", i.e. up to the 30s fetch-failure spike window / a >45s
+// tree-stale dip AFTER the streams fully reconverged. degraded is only
+// reachable from store status "live" with cascadePending FALSE (the
+// reduction's rule 4), so the hard-down condition the warn announced has
+// genuinely ended at the landing; the warn text is counterfactual there.
+// `warned` survives the clear, so the documented live→"Reconnected" ack
+// still fires. The A-F4′ lattice cell adjudicated this "re-open ONLY as a
+// product decision" — that card is the decision. The RESTART warn is
+// unaffected (the epoch branch sets warned=false; they never coexist).
 export default function ConnectionToast() {
   const [toast, setToast] = createSignal<{ kind: "warn" | "ok"; text: string } | null>(null);
   let showTimer: number | undefined;
@@ -153,18 +173,27 @@ export default function ConnectionToast() {
       } else {
         setToast(null);
       }
-    } else if (grade === "degraded" && cancelledDebounce) {
-      // A-F4 (2026-10-26): this run CANCELLED a pending warn debounce (the
-      // replacement is not coming) and landed on the silent grade — the toast
-      // on screen was content that replacement was about to retire (e.g. the
-      // stale "Reconnected" ok after a hard drop whose sub-second recovery
-      // landed degraded). Nothing true remains to show: clear it, or it sits
-      // orphaned with zero timers until the next grade transition. FENCE:
-      // fires ONLY when a debounce was actually cancelled — degraded with NO
-      // pending debounce stays the 2026-10-25-protected silent dip (a pending
-      // auto-expiry survives untouched), and degraded with toast=null is a
-      // no-op. The epoch branch is above this and unaffected (it replaces the
-      // toast itself).
+    } else if (grade === "degraded" && (cancelledDebounce || warned)) {
+      // A-F4 (2026-10-26) + A-F5 (2026-10-29): a landing on the SILENT grade
+      // must not keep stale hard-down content pinned. A-F4: this run
+      // CANCELLED a pending warn debounce (the replacement is not coming) —
+      // the toast on screen was content that replacement was about to retire
+      // (e.g. the stale "Reconnected" ok after a hard drop whose sub-second
+      // recovery landed degraded). A-F5: a warn that already FIRED
+      // (warned=true, no debounce pending) is equally stale at this landing —
+      // degraded REQUIRES store status "live" AND no pending convergence
+      // pass, i.e. the hard-down condition the warn announced has genuinely
+      // ended (only weak evidence remains); pre-A-F5 it sat on screen with
+      // zero timers until live (up to the 30s fetch-spike window / a >45s
+      // tree-stale dip after full reconvergence — the capture-1 §Q4
+      // orphan). `warned` stays true across the clear, so the documented
+      // resolution — live → the "Reconnected" ok — still fires. FENCES: a
+      // degraded landing with NO cancelled debounce and warned=false is the
+      // 2026-10-25-protected silent dip (a pending auto-expiry survives
+      // untouched), and degraded with toast=null is a no-op (incl. a
+      // dismissed warn). The epoch branch is above this, and the restart
+      // warn never coexists with warned=true (the epoch branch sets
+      // warned=false), so restart notices are never cleared here.
       setToast(null);
     }
     // "degraded" without a cancelled debounce is a silent observational

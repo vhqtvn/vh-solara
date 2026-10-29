@@ -84,10 +84,14 @@
 // trigger (convergence unproven; the queue's own 5s poll / focus covers).
 //
 // No top-level side effects (only let/const/function). Imports are leaves
-// (store, recovery-reasons) — no transport imports, no cycles.
+// (store, recovery-reasons, diaglog) — no transport imports, no cycles. The
+// diaglog import is INSTRUMENTATION ONLY (bounded, default-off-gated
+// pass-boundary stamps — see noteCascadeBoundary call sites); it never
+// influences pass control flow.
 import { log } from "../lib/log";
 import { state } from "./store";
 import { countRecovery, type RecoveryReason } from "./recovery-reasons";
+import { noteCascadeBoundary } from "./diaglog";
 
 // Cascade reasons: the EXISTING closed vocabulary (recovery-reasons.ts,
 // extend-only) plus the stream-live trigger context (counted at the OUTCOME —
@@ -133,6 +137,8 @@ interface CascadePass {
     session?: { state: "pending" | "converged"; mode: "fresh" | "resume" };
   };
   timeout: number;
+  /** Wall-clock pass start (ms epoch) — the diag boundary stamps' elapsed base. */
+  startedAt: number;
 }
 
 let cascadeGen = 0;
@@ -230,6 +236,15 @@ function stepConvergedForS2(pass: CascadePass, stream: "tree" | "session"): bool
   return !s || s.state === "converged";
 }
 
+// pendingStreams — the pass's still-unconverged steps, for the bounded diag
+// boundary stamps (pass-start / pass-timeout / pass-superseded). Pure read.
+function pendingStreams(pass: CascadePass): ("tree" | "session")[] {
+  const out: ("tree" | "session")[] = [];
+  if (pass.steps.tree?.state === "pending") out.push("tree");
+  if (pass.steps.session?.state === "pending") out.push("session");
+  return out;
+}
+
 // startPass — open a new in-flight pass, run its action, await convergence.
 // `inherit` carries a same-epoch superseded pass's pending steps.
 function startPass(
@@ -248,6 +263,7 @@ function startPass(
     },
     steps: {},
     timeout: 0,
+    startedAt: Date.now(),
   };
   if (steps?.tree !== undefined) {
     // "await" is satisfied immediately when the tree baseline is already
@@ -273,6 +289,13 @@ function startPass(
   inFlight = pass;
   stats.started++;
   syncLastGenKey(pass);
+  // Bounded diag stamp (capture-2): the pass START boundary, stamped before
+  // the direct action runs so a synchronous convergence note inside it still
+  // lands after this entry in the ring. Default-off gated inside the helper.
+  noteCascadeBoundary("pass-start", {
+    reasons: canon(pass.genKey.reasons),
+    pending: pendingStreams(pass),
+  });
   // The recovery action runs IMMEDIATELY, synchronously — the cascade adds NO
   // recovery latency. (An unwired/no-op direct is fine: convergence-awaiting
   // passes like server-ring-gap pass none.)
@@ -295,6 +318,15 @@ function startPass(
     log.warn("sync", "cascade pass timed out without convergence", {
       reasons: canon(pass.genKey.reasons),
     });
+    // Bounded diag stamp (capture-2): the 15s timeout boundary — the one
+    // edge where pendingness clears WITHOUT convergence. Must be observable
+    // in a capture (a grade stuck on convergence-pending that suddenly
+    // resolves with no applied@ stamp is THIS entry).
+    noteCascadeBoundary("pass-timeout", {
+      reasons: canon(pass.genKey.reasons),
+      pending: pendingStreams(pass),
+      elapsedMs: Date.now() - pass.startedAt,
+    });
   }, cascadeTimeoutMs);
   maybeComplete(pass);
   notifyCascadeState();
@@ -312,6 +344,12 @@ function maybeComplete(pass: CascadePass): void {
   notifyCascadeState();
   window.clearTimeout(pass.timeout);
   syncLastGenKey(pass);
+  // Bounded diag stamp (capture-2): the convergence boundary — every awaited
+  // baseline landed. pending is empty by definition here (omitted).
+  noteCascadeBoundary("pass-converged", {
+    reasons: canon(pass.genKey.reasons),
+    elapsedMs: Date.now() - pass.startedAt,
+  });
   stats.queueTriggers++;
   queueMicrotask(() => {
     if (pass.gen !== cascadeGen) return; // superseded before the microtask ran
@@ -345,6 +383,14 @@ export function requestRecovery(
     stats.superseded++;
     inFlight = null;
     window.clearTimeout(cur.timeout);
+    // Bounded diag stamp (capture-2): the dying pass's boundary (stamped
+    // before the successor's pass-start so ring order reads A-start,
+    // A-superseded, B-start).
+    noteCascadeBoundary("pass-superseded", {
+      reasons: canon(cur.genKey.reasons),
+      pending: pendingStreams(cur),
+      elapsedMs: Date.now() - cur.startedAt,
+    });
     startPass(reason, direct, steps, null);
     return;
   }
@@ -359,6 +405,11 @@ export function requestRecovery(
     stats.superseded++;
     inFlight = null;
     window.clearTimeout(cur.timeout);
+    noteCascadeBoundary("pass-superseded", {
+      reasons: canon(cur.genKey.reasons),
+      pending: pendingStreams(cur),
+      elapsedMs: Date.now() - cur.startedAt,
+    });
     startPass(reason, direct, steps, cur);
     return;
   }
@@ -420,6 +471,10 @@ export function noteTreeConverged(): void {
   const t = inFlight.steps.tree;
   if (!t || t.state === "converged") return;
   t.state = "converged";
+  // Bounded diag stamp (capture-2): this step's baseline landed (≤1 per
+  // stream per pass). Stamped before maybeComplete so step precedes
+  // pass-converged in the ring.
+  noteCascadeBoundary("step-converged", { stream: "tree" });
   maybeComplete(inFlight);
 }
 
@@ -432,6 +487,7 @@ export function noteSessionConverged(): void {
   const s = inFlight.steps.session;
   if (!s || s.state === "converged") return;
   s.state = "converged";
+  noteCascadeBoundary("step-converged", { stream: "session" });
   maybeComplete(inFlight);
 }
 

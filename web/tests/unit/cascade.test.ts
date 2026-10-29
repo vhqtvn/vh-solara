@@ -12,7 +12,7 @@
 // plus AMEND-A5 flapping (reason storm → one pass; supersession mid-pass),
 // epoch-reset, server-ring-gap (SSE cause:"reconnect" consumption), and the
 // unified queue-reconcile trigger.
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { reconcile } from "solid-js/store";
 import {
   requestRecovery,
@@ -30,6 +30,7 @@ import {
 } from "../../src/sync/cascade";
 import { state, setState } from "../../src/sync/store";
 import { readSyncDiag, _resetRecoveryCountersForTest } from "../../src/sync/recovery-reasons";
+import * as diaglog from "../../src/sync/diaglog";
 
 // Flush the pass-completion microtask (the queue trigger fires on a microtask
 // so it never runs inside a Solid batch / listener frame).
@@ -334,6 +335,114 @@ describe("cascade — generation key", () => {
     expect(st.lastGenKey?.acceptedCursor).toBe(4242);
     // Canonical = sorted, deduped.
     expect(st.lastGenKey?.reasons).toEqual(["tree-seq-gap", "tree-transport-stale"]);
+  });
+});
+
+// ── Pass-boundary diag stamps (capture-2, card ──────────────────────────────
+// task-2026-10-29t06-06-05): the cascade stamps its pass LIFECYCLE edges
+// (start / step convergence / completion / the 15s timeout / supersession)
+// into the default-OFF diaglog ring — bounded by construction (edges only,
+// never per-tick), so a future capture shows the convergence cascade's
+// timeline next to the conn-grade + stream-open stamps in the same ring.
+describe("cascade — pass-boundary diag stamps (capture-2, 2026-10-29)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    diaglog._resetDiagForTest();
+    diaglog.setDiagLogOn(true);
+  });
+  afterEach(() => {
+    diaglog.setDiagLogOn(false);
+    localStorage.clear();
+    diaglog._resetDiagForTest();
+  });
+
+  const cascadeEntries = (): diaglog.CascadeDiagEntry[] =>
+    diaglog.diagEntries().filter((e): e is diaglog.CascadeDiagEntry => e.kind === "cascade");
+
+  it("a converging pass stamps pass-start → step-converged → pass-converged, in ring order", async () => {
+    setState("epoch", "e1");
+    setQueueReconcileTrigger(() => {});
+    requestRecovery("tree-seq-gap", vi.fn(), { tree: "fresh" });
+    expect(cascadeEntries().map((e) => e.event)).toEqual(["pass-start"]);
+    const start = cascadeEntries()[0];
+    expect(start.reasons).toEqual(["tree-seq-gap"]);
+    expect(start.pending).toEqual(["tree"]);
+
+    noteTreeConverged();
+    await flushMicro();
+    const evs = cascadeEntries();
+    expect(evs.map((e) => e.event)).toEqual(["pass-start", "step-converged", "pass-converged"]);
+    expect(evs[1].stream).toBe("tree");
+    expect(evs[2].elapsedMs).toBeGreaterThanOrEqual(0);
+    expect(evs[2].pending).toBeUndefined(); // converged = nothing pending
+    // The rendered line is capture-readable (the "Copy all" surface).
+    expect(diaglog.entryLine(evs[2])).toContain("cascade event=pass-converged");
+    expect(diaglog.entryLine(evs[2])).toContain("reasons=tree-seq-gap");
+    expect(diaglog.entryLine(evs[2])).toContain("elapsed=");
+  });
+
+  it("a multi-step pass stamps each step's convergence (tree then session)", async () => {
+    setState("epoch", "e1");
+    setQueueReconcileTrigger(() => {});
+    requestRecovery("tree-seq-gap", vi.fn(), { tree: "fresh" });
+    requestRecovery("idle-content-stale", vi.fn(), { session: "fresh" });
+    noteTreeConverged();
+    await flushMicro();
+    noteSessionConverged();
+    await flushMicro();
+    expect(cascadeEntries().map((e) => [e.event, e.stream ?? null])).toEqual([
+      ["pass-start", null],
+      ["step-converged", "tree"],
+      ["step-converged", "session"],
+      ["pass-converged", null],
+    ]);
+  });
+
+  it("the pass timeout stamps pass-timeout with the still-pending steps + elapsed (the 15s ceiling, observable)", async () => {
+    _setCascadeTimeoutForTest(10);
+    setQueueReconcileTrigger(() => {});
+    requestRecovery("tree-seq-gap", vi.fn(), { tree: "fresh" });
+    await new Promise((r) => setTimeout(r, 40));
+    const evs = cascadeEntries();
+    expect(evs.map((e) => e.event)).toEqual(["pass-start", "pass-timeout"]);
+    const t = evs[1];
+    expect(t.pending).toEqual(["tree"]);
+    // NOT >= the 10ms timer setting: setTimeout can fire marginally EARLY vs
+    // a Date.now() delta (observed 9ms on a 10ms timer under multi-worker
+    // load — timer clamping vs wall-clock coarseness). The stamp's content
+    // is the event + pending set; elapsed only needs to be present + sane.
+    expect(t.elapsedMs).toBeGreaterThanOrEqual(0);
+    expect(diaglog.entryLine(t)).toContain("cascade event=pass-timeout");
+    expect(diaglog.entryLine(t)).toContain("pending=tree");
+  });
+
+  it("supersession stamps the dying pass's boundary before the successor's start (S1 epoch change)", async () => {
+    setState("epoch", "e1");
+    setQueueReconcileTrigger(() => {});
+    requestRecovery("tree-transport-stale", vi.fn(), { tree: "resume" }); // pass A
+    setState("epoch", "e2"); // daemon restart mid-pass
+    requestRecovery("tree-seq-gap", vi.fn(), { tree: "fresh" }); // supersedes A
+    noteTreeConverged(); // pass B converges
+    await flushMicro();
+    expect(cascadeEntries().map((e) => e.event)).toEqual([
+      "pass-start", // A
+      "pass-superseded", // A died (S1) — before B's start
+      "pass-start", // B
+      "step-converged",
+      "pass-converged",
+    ]);
+    const sup = cascadeEntries()[1];
+    expect(sup.reasons).toEqual(["tree-transport-stale"]);
+    expect(sup.pending).toEqual(["tree"]); // A's unconverged step at death
+  });
+
+  it("no cascade stamps while capture is off (the default)", async () => {
+    diaglog.setDiagLogOn(false); // the describe's beforeEach enabled it — flip back
+    setQueueReconcileTrigger(() => {});
+    requestRecovery("tree-seq-gap", vi.fn(), { tree: "fresh" });
+    noteTreeConverged();
+    await flushMicro();
+    expect(cascadeEntries()).toEqual([]);
   });
 });
 

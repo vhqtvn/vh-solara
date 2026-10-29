@@ -222,7 +222,46 @@ export interface StreamLifeEntry {
   attempt?: number;
 }
 
-export type DiagEntry = ColdOpenEntry | StallEntry | StreamOpenEntry | StreamLifeEntry;
+// --- Grade/cascade diag stamps (PWA resume capture-2, 2026-10-29 card) -------
+//
+// The capture-1 interpretation (tmp/agent-runs/pwa-resume-surge/
+// capture-1-interpretation.md §Q4/§Q5) ranked the toast/connstatus grading
+// path as the remaining resume suspect after every instrumented stream
+// converged <0.5s: the discriminating evidence for the next capture is
+// WHEN/WHY the connstatus grade moved relative to the stream-open applied@
+// stamps already in this ring. These kinds ride the SAME ring + caps +
+// enable flag (default OFF). Emitters: connstatus.ts's transition observer
+// (conn-grade) and cascade.ts's pass-boundary stamps (cascade). Bounded by
+// construction — genuine grade transitions and pass-lifecycle edges only,
+// never per-tick.
+export interface ConnGradeEntry {
+  kind: "conn-grade";
+  /** Wall-clock capture time (ms epoch). */
+  ts: number;
+  /** The prior grade; null on the observer's baseline evaluation. */
+  from: string | null;
+  to: string;
+  /** The landing grade's reduction reasons (e.g. ["convergence-pending"]; [] for live). */
+  reasons: string[];
+}
+
+export interface CascadeDiagEntry {
+  kind: "cascade";
+  /** Wall-clock capture time (ms epoch). */
+  ts: number;
+  /** Which pass-lifecycle boundary fired. */
+  event: "pass-start" | "step-converged" | "pass-converged" | "pass-timeout" | "pass-superseded";
+  /** The stream whose baseline converged (step-converged only). */
+  stream?: "tree" | "session";
+  /** Canonical reason-set at the boundary (absent on step-converged). */
+  reasons?: string[];
+  /** Steps still PENDING at the boundary (absent/empty = none). */
+  pending?: ("tree" | "session")[];
+  /** Pass in-flight duration at the boundary (absent on pass-start). */
+  elapsedMs?: number;
+}
+
+export type DiagEntry = ColdOpenEntry | StallEntry | StreamOpenEntry | StreamLifeEntry | ConnGradeEntry | CascadeDiagEntry;
 
 // --- entryLine rendering ----------------------------------------------------
 // One entry -> a single copy-friendly line. The label `conn` (not the persisted
@@ -319,6 +358,16 @@ export function entryLine(e: DiagEntry): string {
     }
     case "es-life":
       return `${iso(e.ts)} es-life stream=${e.stream} gen=${e.generation} ${e.phase} readyState=${e.readyState}${e.attempt !== undefined ? ` attempt=${e.attempt}` : ""}`;
+    case "conn-grade":
+      return `${iso(e.ts)} conn-grade ${e.from ?? "init"}→${e.to}${e.reasons.length ? ` reason=${e.reasons.join("+")}` : ""}`;
+    case "cascade": {
+      const parts: string[] = [iso(e.ts), "cascade", `event=${e.event}`];
+      if (e.stream) parts.push(`stream=${e.stream}`);
+      if (e.reasons?.length) parts.push(`reasons=${e.reasons.join("+")}`);
+      if (e.pending?.length) parts.push(`pending=${e.pending.join("+")}`);
+      if (e.elapsedMs !== undefined) parts.push(`elapsed=${fmtMs(e.elapsedMs)}`);
+      return parts.join(" ");
+    }
   }
 }
 
@@ -373,10 +422,14 @@ function isDiagEntry(o: unknown): o is DiagEntry {
     reason?: unknown;
     generation?: unknown;
     phase?: unknown;
+    to?: unknown;
+    event?: unknown;
   };
   if (typeof obj.ts !== "number") return false;
   if (typeof obj.kind !== "string") return false;
   if (obj.kind === "stall") return true; // sessionId optional on stall entries
+  if (obj.kind === "conn-grade") return typeof obj.to === "string";
+  if (obj.kind === "cascade") return typeof obj.event === "string";
   if (obj.kind === "stream-open") {
     return obj.stream === "tree" || obj.stream === "session";
   }
@@ -431,6 +484,37 @@ export function captureDiagEntry(entry: DiagEntry): void {
 export function touchDiagPersist(): void {
   if (!enabled()) return;
   schedulePersist();
+}
+
+// --- Bounded emitters for the capture-2 stamp kinds ---------------------------
+// Thin, default-off-gated wrappers so the emitters in connstatus.ts /
+// cascade.ts stay one-call sites. Each checks the enable flag BEFORE any
+// object allocation (the "must not log too much" promise), and the entries
+// then ride the same capped ring as every other kind.
+
+/**
+ * Capture one connstatus GRADE transition (connstatus.ts's transition
+ * observer is the sole caller). Skips a vacuous from===to call defensively
+ * (the caller already diffs, but the helper must be safe on its own).
+ */
+export function noteConnGradeTransition(from: string | null, to: string, reasons: string[]): void {
+  if (from === to) return;
+  if (!enabled()) return;
+  captureDiagEntry({ kind: "conn-grade", ts: Date.now(), from, to, reasons });
+}
+
+/**
+ * Capture one cascade pass-lifecycle boundary (cascade.ts is the sole
+ * caller): pass started / a step's baseline converged / pass converged /
+ * the pass timeout fired / pass superseded. Bounded: pass-lifecycle edges
+ * only, never per-tick.
+ */
+export function noteCascadeBoundary(
+  event: CascadeDiagEntry["event"],
+  info: Omit<CascadeDiagEntry, "kind" | "ts" | "event"> = {},
+): void {
+  if (!enabled()) return;
+  captureDiagEntry({ kind: "cascade", ts: Date.now(), event, ...info });
 }
 
 // Internal: re-point both mirrors at a (possibly new) project dir.
