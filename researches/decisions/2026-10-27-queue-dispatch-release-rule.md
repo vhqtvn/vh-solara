@@ -122,6 +122,9 @@ The composer UI adapts its controls and primary action based on whole-tree activ
 - Triggering escalation performs deliberate immediate dispatch (folding into the running turn if one is currently active).
 - Consent semantics are identical to the composer's busy `Send now` button: it is an explicit operator gesture of override consent, never evidence of turn completion (per the debate verdict's override-is-consent rule, annex-1/annex-2).
 
+**Shell input under busy policy controls:**
+- Shell `!`-prefixed input under the busy policy controls (`Queue` button, `Send now` button, Enter-while-busy) is refused loudly — nothing sent, no admission, draft preserved (implemented in B2, commit `a1fb793`) — while idle `!` shell and capability-absent legacy busy `!` Enter behavior are unchanged (shell still executes; operator sub-decision recorded 2026-10-29 during B2 review, review finding d-F1 disposition).
+
 ### 3. Policy semantics
 
 - **Per-item policy**: Every admitted queue item carries `dispatchPolicy: "now" | "queue"`. Absence of the property defaults to `"queue"`.
