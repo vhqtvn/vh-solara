@@ -34,7 +34,7 @@
 // The receipt wording this spec earns lives in the slice closeout (see
 // docs/checkpoints/2026-10-13-queue-delivery-caveat-closure.md).
 
-import { expect, test, type APIRequestContext, type Route } from "@playwright/test";
+import { expect, test, type APIRequestContext, type BrowserContext, type Route } from "@playwright/test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { demoDir, projectUrl } from "./util";
@@ -50,13 +50,18 @@ const jsonCsrf = { "Content-Type": "application/json", "X-VH-CSRF": "1" };
 // the List endpoint, which can reconcile).
 const queueJsonPath = path.join(demoDir, ".vh-solara", "sessions", SID, "queue.json");
 
-// Queue-policy B2 cell: that cell runs on "demo", NOT "other" — "other" is
-// provably-empty only until the first delivered turn; the fake's turn
-// messages (simulatePrompt/streamAssistant) carry NO agent field, so after
-// the first test's delivered turn "other" has messages but ZERO
-// agent-stamped evidence and the send gate's agent resolution pends forever.
-// "demo"'s SEEDED transcript carries agent-stamped assistant messages, so
-// the evidence scan resolves deterministically regardless of turn history.
+// Queue-policy B2 cell: that cell runs on "demo" for DETERMINISM — its seeded
+// transcript carries agent-stamped assistant messages, so the send gate's
+// evidence scan resolves identically regardless of turn history.
+// (Historical note: this used to be a WORKAROUND, not a determinism choice —
+// the fake's turn messages carried NO agent field, so after any delivered
+// turn a session had messages but ZERO agent-stamped evidence and the send
+// gate's agent resolution pended forever; "demo" was the only host for the
+// policy cell. The fixture now stamps agent "build" on fake turn messages —
+// user messages sender-stamped, assistant messages matching the resolver's
+// lastAssistantAgent scan (commit 8f78bcc) — so FRESH sessions send fine
+// after a delivered turn. The fresh-session cells at the bottom of this spec
+// prove that repair end-to-end through the real FE resolver.)
 const POLICY_SID = "demo";
 const policyQueueJsonPath = path.join(demoDir, ".vh-solara", "sessions", POLICY_SID, "queue.json");
 
@@ -70,6 +75,7 @@ interface RawItem {
   detail?: string;
   intentId?: string;
   dispatchPolicy?: string;
+  attachments?: { url?: string; filename?: string; mime?: string; path?: string }[];
 }
 
 function readRawItems(): RawItem[] {
@@ -761,4 +767,431 @@ test("busy-state policy gestures: Queue waits, Send now + chip escalation dispat
     await request.post("/oc/fixture/prompt-hold/reset", { headers: jsonCsrf, data: {} });
     await request.post(`/oc/fixture/idle?session=${POLICY_SID}`, { headers: jsonCsrf, data: {} });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Queue-policy riding follow-ups (web slice, 2026-10-29) — fresh-session
+// breadth cells (d-F2/b-F3) + the b-F1/b-F3 fixture agent-stamp repair proof.
+// Each cell creates its OWN fresh session through the real POST /session
+// create route (the same call the SPA's draft materialization takes), so no
+// seeded transcript is involved and no cross-cell state is shared. Raw
+// queue.json is the passive witness; the browser stays observe-only.
+// ---------------------------------------------------------------------------
+
+// Shared shape for the fresh-session cells: create the session + the raw
+// queue reader + the observe-only guard stack (with admission-body snooping —
+// the queue.json policy member is server-NORMALIZED ("queue" elided to
+// absent), so the pre-normalization admission body is the only wire-level
+// witness of WHICH stamp the gesture carried).
+async function freshSessionHarness(
+  request: APIRequestContext,
+  context: BrowserContext,
+  sid: string,
+): Promise<{ admissionBodies: any[]; violations: string[] }> {
+  const admissionBodies: any[] = [];
+  const violations: string[] = [];
+  await context.route(`**/vh/session/${sid}/queue**`, async (route: Route) => {
+    const url = new URL(route.request().url());
+    const method = route.request().method();
+    const path = url.pathname;
+    if (method === "GET") {
+      await route.continue(); // live truth — no freezing in these cells
+      return;
+    }
+    if (method === "POST" && (path.endsWith(`/queue`) || path.endsWith(`/escalate`))) {
+      // Snoop the admission/escalation body (the gesture's policy stamp +
+      // attachment refs BEFORE server normalization), then pass through.
+      try {
+        admissionBodies.push(route.request().postDataJSON());
+      } catch {
+        /* unreadable body — the durable queue.json witness still applies */
+      }
+      await route.continue(); // admission + escalation: sanctioned browser writes
+      return;
+    }
+    violations.push(`${method} ${path}`);
+    await route.abort("blockedbyclient");
+  });
+  await context.route("**/vh/send", async (route) => {
+    if (route.request().method() === "POST") {
+      violations.push("POST /vh/send");
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.continue();
+  });
+  await context.route("**/oc/session/**", async (route) => {
+    if (route.request().method() === "POST") {
+      violations.push(`direct upstream POST ${new URL(route.request().url()).pathname}`);
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.continue();
+  });
+  return { admissionBodies, violations };
+}
+
+// Create a fresh session through the REAL create route (zero seeded
+// messages) and return its id. Must run BEFORE the /oc/session/** POST guard
+// is installed (the guard would block the create itself).
+async function createFreshSession(request: APIRequestContext): Promise<string> {
+  const created = await request.post("/oc/session", { headers: jsonCsrf, data: {} });
+  expect(created.ok(), "create fresh session via the real POST /session").toBeTruthy();
+  const sid = ((await created.json()) as { id: string }).id;
+  expect(sid).toBeTruthy();
+  return sid;
+}
+
+function rawQueueReader(sid: string): () => RawItem[] {
+  const qPath = path.join(demoDir, ".vh-solara", "sessions", sid, "queue.json");
+  return () => {
+    try {
+      const j = JSON.parse(readFileSync(qPath, "utf8")) as { items?: RawItem[] };
+      return Array.isArray(j.items) ? j.items : [];
+    } catch {
+      return []; // no queue file yet — an honest empty list
+    }
+  };
+}
+
+// (a) Busy-Enter cell: typing + Enter on a FRESH session (stamped by the
+// Enter-default rule) admits a queue-policy item that is HELD pending — no
+// claim, no dispatch — while the tree is busy. Contrast with the attachment
+// cell below: the same busy driver + a "now" stamp DOES claim.
+test("busy-Enter on a FRESH session: Enter-default Queue stamp admits an item HELD (no claim) while busy", async ({
+  page,
+  context,
+  request,
+}) => {
+  const sid = await createFreshSession(request);
+  const readRaw = rawQueueReader(sid);
+  const marker = `QP-ENTER-${Date.now()}`;
+  const { admissionBodies, violations } = await freshSessionHarness(request, context, sid);
+
+  try {
+    // Busy the fresh session's tree (the lane's busy driver — live
+    // session.status busy through the /oc proxy).
+    const busy = await request.post(`/oc/fixture/busy?session=${sid}`, {
+      headers: jsonCsrf,
+      data: {},
+    });
+    expect(busy.ok(), "mark the fresh session busy").toBeTruthy();
+
+    await page.goto(projectUrl(`/?session=${sid}`));
+    const capable = await page.evaluate(async () => {
+      const r = await fetch("/vh/version", { cache: "no-store" });
+      return (await r.json()) as { queueDispatchPolicyVersion?: number };
+    });
+    expect(
+      capable.queueDispatchPolicyVersion,
+      "queueDispatchPolicyVersion advertised (the policy scheduler is active)",
+    ).toBeGreaterThanOrEqual(1);
+
+    const ta = page.getByPlaceholder(/Message/);
+    await expect(ta).toBeVisible();
+    // Busy + empty text → Stop only (amendment §2 row 2).
+    await expect
+      .poll(
+        async () => page.locator('button[aria-label="Stop"]').count(),
+        { timeout: 15_000, message: "busy reached the composer (Stop renders)" },
+      )
+      .toBeGreaterThan(0);
+
+    // Busy + text → the policy button table (Queue + Send now, NO Stop).
+    await ta.fill(marker);
+    await expect(page.locator('button[aria-label="Queue"]')).toBeVisible();
+    await expect(page.locator('button[aria-label="Send now"]')).toBeVisible();
+    await expect(page.locator('button[aria-label="Stop"]')).toHaveCount(0);
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(() => {
+            const q = document.querySelector('button[aria-label="Queue"]') as HTMLButtonElement | null;
+            const n = document.querySelector('button[aria-label="Send now"]') as HTMLButtonElement | null;
+            return !!q && !!n && !q.disabled && !n.disabled;
+          }),
+        { timeout: 15_000, message: "policy buttons ready (agents/models loaded)" },
+      )
+      .toBeTruthy();
+
+    // THE GESTURE: Enter (the safe-default key) — the controller stamps
+    // "queue" exactly when capability + busy held at tap (amendment §2).
+    await ta.press("Enter");
+    await expect(ta).toHaveValue("", { timeout: 10_000 }); // admitted (fresh-session agent gate resolved via provably-empty)
+
+    // WIRE WITNESS: the admission body carried the explicit Enter-default
+    // "queue" stamp. The durable queue.json CANNOT distinguish this from a
+    // legacy admission (the server normalizes "queue" to the elided absent
+    // member) — the snooped body is the only pre-normalization witness.
+    const body = admissionBodies.find((b: any) => b?.text === marker);
+    expect(body, "the Enter admission POST was observed").toBeTruthy();
+    expect((body as any).dispatchPolicy).toBe("queue");
+
+    // DURABLE WITNESS: pending, elided policy member, NOT claimed.
+    let held: RawItem | undefined;
+    const heldDeadline = Date.now() + 10_000;
+    for (;;) {
+      held = readRaw().find((it) => it.text === marker);
+      if (held) break;
+      if (Date.now() > heldDeadline) throw new Error("Enter-admitted item never appeared in raw queue.json");
+      await page.waitForTimeout(200);
+    }
+    expect(held.state).toBe("pending");
+    expect(held.dispatchPolicy ?? "").toBe(""); // queue elided — absent member
+    expect(held.claimGeneration ?? 0).toBe(0); // NOT claimed
+    // The interim gate holds under busy: ~12 drain ticks (250ms) with no claim.
+    await page.waitForTimeout(3_000);
+    const stillHeld = readRaw().find((it) => it.text === marker);
+    expect(stillHeld?.state, "Enter-default item stays pending while the tree is busy").toBe("pending");
+    expect(stillHeld?.claimGeneration ?? 0).toBe(0);
+
+    expect(violations, "no browser claim/resolve/direct-send/direct-upstream POST was attempted").toEqual([]);
+  } finally {
+    // Release the busy marker: the interim gate opens and the daemon owns the
+    // held item from here (dispatch + turn complete server-side; this cell's
+    // assertions are already done).
+    await request.post(`/oc/fixture/idle?session=${sid}`, { headers: jsonCsrf, data: {} });
+  }
+});
+
+// (b) Attachment-bearing gesture cell: a REAL file attach (real file input →
+// real /vh/attach upload) + Send now under busy — the admitted item carries
+// the attachment refs AND dispatchPolicy "now", and the daemon's now-bypass
+// claims it DESPITE the busy tree (the same busy driver that HOLDS the
+// Enter-default cell above — the contrast is the despite-busy proof).
+//
+// FIXTURE LIMITATION (reported honestly; cell kept at the admission
+// boundary): the fake's prompt_async persists only the first TEXT part
+// (promptText, pkg/fixtures/opencode.go) — it cannot express file parts, so
+// upstream attachment-part delivery is NOT witnessable in this lane. Proven
+// here: the admission wire body, the durable queue.json attachment refs, and
+// the now-dispatch under busy.
+test("busy Send now with an attachment: the admitted item carries the refs and dispatches as now DESPITE busy", async ({
+  page,
+  context,
+  request,
+}) => {
+  const sid = await createFreshSession(request);
+  const readRaw = rawQueueReader(sid);
+  const marker = `QP-ATT-${Date.now()}`;
+  const { admissionBodies, violations } = await freshSessionHarness(request, context, sid);
+
+  try {
+    // Park the upstream turn deterministically (the lane's prompt-hold latch)
+    // so the now-dispatch is observably held at dispatching while assertions
+    // run — same shape as the B2 policy cell above.
+    const arm = await request.post(`/oc/fixture/prompt-hold/arm?session=${sid}`, {
+      headers: jsonCsrf,
+      data: { deadlineMs: 90_000 },
+    });
+    expect(arm.ok(), "arm prompt hold").toBeTruthy();
+    const busy = await request.post(`/oc/fixture/busy?session=${sid}`, {
+      headers: jsonCsrf,
+      data: {},
+    });
+    expect(busy.ok(), "mark the fresh session busy").toBeTruthy();
+
+    await page.goto(projectUrl(`/?session=${sid}`));
+    const capable = await page.evaluate(async () => {
+      const r = await fetch("/vh/version", { cache: "no-store" });
+      return (await r.json()) as { queueDispatchPolicyVersion?: number };
+    });
+    expect(capable.queueDispatchPolicyVersion).toBeGreaterThanOrEqual(1);
+
+    const ta = page.getByPlaceholder(/Message/);
+    await expect(ta).toBeVisible();
+    await expect
+      .poll(
+        async () => page.locator('button[aria-label="Stop"]').count(),
+        { timeout: 15_000, message: "busy reached the composer (Stop renders)" },
+      )
+      .toBeGreaterThan(0);
+
+    // Attach a small file through the REAL hidden file input (the production
+    // upload path: POST /vh/attach writes under
+    // <demoDir>/.vh-solara/sessions/<sid>/attachments — a real writable dir).
+    await page.locator(".composer input[type=file]").setInputFiles({
+      name: "note.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("hello attachment"),
+    });
+    await expect(
+      page.locator(".attach-chip .attach-name", { hasText: "note.txt" }),
+      "the attachment chip uploaded through the real /vh/attach path",
+    ).toBeVisible({ timeout: 8_000 });
+
+    await ta.fill(marker);
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(() => {
+            const n = document.querySelector('button[aria-label="Send now"]') as HTMLButtonElement | null;
+            return !!n && !n.disabled;
+          }),
+        { timeout: 15_000, message: "Send now ready (agents/models loaded)" },
+      )
+      .toBeTruthy();
+    await page.locator('button[aria-label="Send now"]').click();
+    await expect(ta).toHaveValue("", { timeout: 10_000 }); // admitted
+    await expect(page.locator(".attach-chip")).toHaveCount(0, { timeout: 8_000 }); // chips cleared with the admission
+
+    // WIRE WITNESS: the admission body carried the attachment refs AND "now".
+    const body = admissionBodies.find((b: any) => b?.text === marker);
+    expect(body, "the Send-now admission POST was observed").toBeTruthy();
+    const wireAtt = (body as any).attachments as any[] | undefined;
+    expect(wireAtt, "the admission body carries the attachment array").toHaveLength(1);
+    expect(wireAtt![0]).toMatchObject({ filename: "note.txt", mime: "text/plain" });
+    expect((body as any).dispatchPolicy).toBe("now");
+
+    // DURABLE WITNESS: the raw item carries the refs + "now" and the daemon's
+    // now-bypass claimed it DESPITE the busy tree (claim > 0 + correlation id
+    // + dispatching while the SAME busy marker still holds the Enter-default
+    // cell's queue-stamped shape).
+    let nowItem: RawItem | undefined;
+    const nowDeadline = Date.now() + 15_000;
+    for (;;) {
+      nowItem = readRaw().find((it) => it.text === marker);
+      if (
+        nowItem &&
+        nowItem.dispatchPolicy === "now" &&
+        nowItem.state === "dispatching" &&
+        (nowItem.claimGeneration ?? 0) > 0 &&
+        nowItem.opencodeMsgID
+      ) {
+        break;
+      }
+      if (Date.now() > nowDeadline) {
+        throw new Error(`attachment-bearing now item never dispatched under busy (got ${JSON.stringify(nowItem)})`);
+      }
+      await page.waitForTimeout(200);
+    }
+    expect(nowItem.attachments, "the durable item carries the attachment refs").toHaveLength(1);
+    expect(nowItem.attachments![0]).toMatchObject({ filename: "note.txt", mime: "text/plain" });
+
+    // Release; the parked turn delivers and the watcher resolves to sent.
+    const rel = await request.post("/oc/fixture/prompt-hold/release", {
+      headers: jsonCsrf,
+      data: {},
+    });
+    expect(rel.ok()).toBeTruthy();
+    const sentDeadline = Date.now() + 15_000;
+    for (;;) {
+      nowItem = readRaw().find((it) => it.text === marker);
+      if (nowItem?.state === "sent" && (nowItem.claimGeneration ?? 0) > 0) break;
+      if (Date.now() > sentDeadline) {
+        throw new Error(`attachment-bearing now item never reached sent (got ${JSON.stringify(nowItem)})`);
+      }
+      await page.waitForTimeout(300);
+    }
+
+    expect(violations, "no browser claim/resolve/direct-send/direct-upstream POST was attempted").toEqual([]);
+  } finally {
+    await request.post("/oc/fixture/prompt-hold/reset", { headers: jsonCsrf, data: {} });
+    await request.post(`/oc/fixture/idle?session=${sid}`, { headers: jsonCsrf, data: {} });
+  }
+});
+
+// (c) Fresh-session send-readiness outcome cell (b-F1/b-F3, the Go review):
+// on a fresh session (NOT demo) send once while idle, wait for the delivered
+// turn, then send AGAIN — the second send must dispatch. This proves the
+// fixture agent-stamp repair (8f78bcc: fake turn messages carry agent
+// "build") end-to-end through the REAL FE resolver: pre-repair, the first
+// delivered turn left messages with ZERO agent evidence, the second send's
+// agent resolution pended forever, and the admission never happened (the
+// B2 policy cell had to run on seeded "demo" — see the POLICY_SID note).
+test("FRESH-session send readiness: the first delivered turn leaves agent evidence — a SECOND send dispatches", async ({
+  page,
+  context,
+  request,
+}) => {
+  const sid = await createFreshSession(request);
+  const readRaw = rawQueueReader(sid);
+  const marker1 = `QP-F1-${Date.now()}`;
+  const marker2 = `QP-F2-${Date.now()}`;
+  const { violations } = await freshSessionHarness(request, context, sid);
+
+  // No latch: idle turns complete in ~1s; nothing needs parking.
+
+  // FIRST send while idle: the provably-empty resolution (zero messages +
+  // hydration delivered) legitimately resolves via the draft-default policy.
+  await page.goto(projectUrl(`/?session=${sid}`));
+  const capable = await page.evaluate(async () => {
+    const r = await fetch("/vh/version", { cache: "no-store" });
+    return (await r.json()) as { queueDispatchPolicyVersion?: number; daemonDispatchCapable?: boolean };
+  });
+  expect(capable.daemonDispatchCapable).toBe(true);
+
+  const ta = page.getByPlaceholder(/Message/);
+  await expect(ta).toBeVisible();
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(() => {
+          const btn = document.querySelector('button[aria-label="Send"]') as HTMLButtonElement | null;
+          return btn ? !btn.disabled : false;
+        }),
+      { timeout: 15_000, message: "Send button becomes ready (agents/models loaded)" },
+    )
+    .toBeTruthy();
+  await ta.fill(marker1);
+  await page.locator('button[aria-label="Send"]').click();
+  await expect(ta).toHaveValue("", { timeout: 15_000 }); // first admission (fresh-session gate resolved)
+
+  // The delivered turn renders over live SSE — its messages now carry agent
+  // evidence (the fixture repair): user sender-stamped "build", assistant
+  // stamped for the lastAssistantAgent scan.
+  await expect(
+    page.locator(".msg.user", { hasText: marker1 }),
+    "the first delivered user message rendered",
+  ).toBeVisible({ timeout: 15_000 });
+
+  // Wait out the turn + watcher: the first item reaches sent and the composer
+  // flips back to the idle Send button (the tree is idle again).
+  const sent1Deadline = Date.now() + 15_000;
+  for (;;) {
+    const it = readRaw().find((x) => x.text === marker1);
+    if (it?.state === "sent") break;
+    if (Date.now() > sent1Deadline) throw new Error(`first item never reached sent (got ${JSON.stringify(it)})`);
+    await page.waitForTimeout(300);
+  }
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(() => {
+          const btn = document.querySelector('button[aria-label="Send"]') as HTMLButtonElement | null;
+          return btn ? !btn.disabled : false;
+        }),
+      {
+        timeout: 15_000,
+        message: "composer back to idle Send after the first turn",
+      },
+    )
+    .toBeTruthy();
+
+  // SECOND send — THE CRUX. Pre-repair this pended at the agent gate (messages
+  // present but unstamped → resolution pended → "Not sent — agent unresolved"
+  // after the 10s bound, composer retained, NOTHING dispatched). Post-repair
+  // the first turn's stamped messages ARE the evidence: resolution is
+  // immediate and the second send ADMISSION clears the composer well inside
+  // the gate bound.
+  await ta.fill(marker2);
+  await page.locator('button[aria-label="Send"]').click();
+  await expect(ta, "second send admitted (agent evidence resolved — no gate pend)").toHaveValue("", {
+    timeout: 8_000,
+  });
+
+  // And it DISPATCHED: the second item reaches sent through the daemon.
+  const sent2Deadline = Date.now() + 15_000;
+  for (;;) {
+    const it = readRaw().find((x) => x.text === marker2);
+    if (it?.state === "sent" && (it.claimGeneration ?? 0) > 0) break;
+    if (Date.now() > sent2Deadline) throw new Error(`second item never reached sent (got ${JSON.stringify(it)})`);
+    await page.waitForTimeout(300);
+  }
+  await expect(
+    page.locator(".msg.user", { hasText: marker2 }),
+    "the second delivered user message rendered",
+  ).toBeVisible({ timeout: 15_000 });
+
+  expect(violations, "no browser claim/resolve/direct-send/direct-upstream POST was attempted").toEqual([]);
 });

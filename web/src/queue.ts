@@ -627,9 +627,10 @@ export type EscalateQueuedOutcome =
 // loop owns the resulting dispatch — never a FE direct-POST).
 //
 // Cache semantics on success: the OLD id is gone and the escalated item (born
-// "now") takes its place — remove the old id, upsert the fresh item, then
-// converge to backend truth (the daemon typically claims it within one 250ms
-// drain tick, so the chip flips to dispatching/sent almost immediately).
+// "now") takes its place — remove the old id, upsert the fresh item; the
+// CALLER (createSend's escalateQueuedItem) owns the convergence fetch to
+// daemon truth (the daemon typically claims it within one 250ms drain tick,
+// so the chip flips to dispatching/sent almost immediately).
 export async function escalateQueued(
   sessionId: string,
   itemId: string,
@@ -669,11 +670,17 @@ export async function escalateQueued(
         if (i >= 0) arr[i] = item;
         else arr.push(item);
         // Cancel+re-admit removed the original id — drop it AFTER the upsert
-        // (the fresh id is always distinct; both operations are exact-id).
-        q[sessionId] = arr.filter((m) => m.id !== itemId);
+        // (both operations are exact-id). The fresh id is distinct in the
+        // cancel+re-admit shape, BUT the same-id no-op edge (the server
+        // returning an already-now item UNCHANGED under the same id) must not
+        // drop the very item the upsert just wrote — keep it when the ids
+        // coincide.
+        q[sessionId] = arr.filter((m) => m.id !== itemId || m.id === item.id);
       }));
-      // Converge to daemon truth (read-only; the ~5s poll is the backstop).
-      void fetchQueue(sessionId);
+      // Convergence refresh is the CONTROLLER's job (createSend's
+      // escalateQueuedItem awaits deps.fetchQueue on success — the one awaited
+      // caller owns the refresh; the ~5s poll is the backstop). This function
+      // deliberately does NOT double-fetch.
       return { ok: true, item };
     }
     // Error mapping (B1's writeQueueStoreErr): the 404 carries the plain

@@ -1872,6 +1872,104 @@ describe("createSend queue-policy B2 — policy capture + admission thread-throu
 });
 
 // ---------------------------------------------------------------------------
+// Queue-policy riding defer (W2, amendment §5 obligation) — attachment-bearing
+// policy ADMISSION (the happy path). Refusal-preservation (shell "!" under the
+// busy policy controls keeps its attachment draft) is pinned above; what no
+// cell demonstrated is an attachment-bearing Queue / Send-now gesture landing
+// THROUGH the pipeline with its refs AND policy intact at every stage:
+// prepared payload (the PreparedSendPayload snapshot on the action store) →
+// BLK-A3 outbox save → the admission request. §5: attachments must be fully
+// implemented in the queue path — no silent strip anywhere.
+// ---------------------------------------------------------------------------
+describe("createSend queue-policy B2 — attachment-bearing policy admission (§5)", () => {
+  function outboxRecorder(saves: any[]): SendDependencies["outbox"] {
+    return {
+      save: async (input) => {
+        saves.push(JSON.parse(JSON.stringify(input)));
+        return { ok: true } as const;
+      },
+      markAdmitted: async () => {},
+      captureHead: () => null,
+    };
+  }
+
+  it("text+attachment QUEUE gesture: the attachment refs and policy \"queue\" survive prepared payload → outbox save → admission", async () => {
+    const saves: any[] = [];
+    // Capture the action-store snapshot AT ADMISSION TIME (inside the enqueue
+    // override): sendText writes the PreparedSendPayload + flips the record to
+    // "admitting" BEFORE the enqueue fires, and a SUCCESSFUL admission then
+    // finishes (deletes) the record — so the snapshot is only observable from
+    // within the admission window.
+    const preparedAtAdmit: any[] = [];
+    const h = harness({
+      working: () => true,
+      queuePolicyCapable: () => true,
+      outbox: outboxRecorder(saves),
+      enqueue: async () => {
+        preparedAtAdmit.push(JSON.parse(JSON.stringify(sendActionsFor("ses-1"))));
+        return { id: "q1" };
+      },
+    });
+    const att: Attachment = {
+      url: "file:///notes.txt",
+      filename: "notes.txt",
+      mime: "text/plain",
+      path: ".vh-solara/sessions/ses-1/attachments/notes.txt",
+    };
+    h.setAtts([att]);
+    h.setInput("see attached");
+    await h.sendPolicy("queue");
+
+    // Admission request: the attachment refs AND the explicit queue policy.
+    expect(h.enqueueInputs).toHaveLength(1);
+    expect(h.enqueueInputs[0].input.dispatchPolicy).toBe("queue");
+    expect(h.enqueueInputs[0].input.attachments).toHaveLength(1);
+    expect(h.enqueueInputs[0].input.attachments[0]).toMatchObject({
+      url: "file:///notes.txt",
+      filename: "notes.txt",
+      mime: "text/plain",
+      path: ".vh-solara/sessions/ses-1/attachments/notes.txt",
+    });
+    // BLK-A3 durable gesture save: same refs, same policy (re-admission from
+    // IDB replay / reconcile must be fingerprint-stable under BOTH).
+    expect(saves).toHaveLength(1);
+    expect(saves[0].payload.dispatchPolicy).toBe("queue");
+    expect(saves[0].payload.attachments).toEqual([
+      { url: "file:///notes.txt", filename: "notes.txt", mime: "text/plain", path: ".vh-solara/sessions/ses-1/attachments/notes.txt" },
+    ]);
+    // Prepared payload snapshot (captured mid-admission): the refs + policy
+    // were on the immutable attempt BEFORE any of the writes above.
+    const admitting = preparedAtAdmit[0].find((a: any) => a.stage === "admitting");
+    expect(admitting).toBeDefined();
+    expect(admitting.payload.dispatchPolicy).toBe("queue");
+    expect(admitting.payload.attachments).toHaveLength(1);
+    expect(admitting.payload.attachments[0]).toMatchObject({ filename: "notes.txt" });
+    expect(admitting.payload.files).toEqual(["notes.txt"]);
+  });
+
+  it("attachment-ONLY Send-now gesture: an empty-text busy gesture admits with policy \"now\" and its refs intact (§5: no text-only gating)", async () => {
+    const saves: any[] = [];
+    const h = harness({
+      working: () => true,
+      queuePolicyCapable: () => true,
+      outbox: outboxRecorder(saves),
+    });
+    h.setAtts([{ url: "file:///shot.png", filename: "shot.png", mime: "image/png" }]);
+    h.setInput(""); // attachment-only — the empty-send guard passes on the refs
+    await h.sendPolicy("now");
+
+    expect(h.enqueueInputs).toHaveLength(1);
+    expect(h.enqueueInputs[0].input.dispatchPolicy).toBe("now");
+    expect(h.enqueueInputs[0].input.text).toBe("");
+    expect(h.enqueueInputs[0].input.attachments).toHaveLength(1);
+    expect(h.enqueueInputs[0].input.attachments[0]).toMatchObject({ filename: "shot.png", mime: "image/png" });
+    expect(saves).toHaveLength(1);
+    expect(saves[0].payload.dispatchPolicy).toBe("now");
+    expect(saves[0].payload.attachments).toEqual([{ url: "file:///shot.png", filename: "shot.png", mime: "image/png", path: undefined }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Queue-policy slice B2 — the pending-chip Send-now escalation
 // (POST /vh/queue/{itemId}/escalate; cancel + re-admit with policy "now" and
 // a FRESH backend id — the amendment's one policy-immutability exception).

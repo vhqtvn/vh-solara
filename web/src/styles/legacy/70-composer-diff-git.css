@@ -235,6 +235,15 @@
 /* Queue button (sits next to Stop while busy): accent outline, not filled, to
    read as secondary to the primary Stop. */
 .send-btn.queue { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+/* Queue-policy B2 (amendment §2): the busy composer's Send now — the DELIBERATE
+   immediate-dispatch gesture. Accent-tinted (the same accent the pending chip's
+   .queue-escalate action carries, incl. its 18% hover tint at rest), sitting
+   between the solid idle Send and the outline Queue so the three actions read
+   distinctly at a glance. */
+.send-btn.send-now {
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg));
+  color: var(--accent);
+}
 /* Sending state (single-flight enqueue feedback): while an enqueue POST is
    in-flight for this session (up to 12s on a slow/hung network), the Send /
    Queue button is :disabled (re-taps are dropped) and carries the `sending`

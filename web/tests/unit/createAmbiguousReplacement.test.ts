@@ -267,3 +267,71 @@ describe("createAmbiguousReplacement — two-tap stale-confirm (compare-at-REPLA
     expect((notify.mock.calls[0] as any[])[0].title).toBe("Conversation moved on");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Queue-policy B2 riding defer (W1) — dispatchPolicy preservation through the
+// ambiguous-replacement path. The B2 audit preserved the original item's
+// immediate-dispatch semantics on the replacement gesture
+// (createAmbiguousReplacement.ts: `dispatchPolicy: q.dispatchPolicy`) but
+// added no test. Amendment §3 semantics vs the FE wire form: every admitted
+// item semantically carries "now"|"queue" with absence ≡ "queue", while the
+// FE-listed form only ever materializes "now" (the daemon serializes the
+// member omitempty after normalizing "queue" to the elided representation —
+// web/src/queue.ts QueuedMessage.dispatchPolicy). Preservation therefore
+// pins as: a NOW item's replacement carries "now" verbatim (never silently
+// demoted to queue-waiting), and a queue/default item's replacement carries
+// NO member (undefined — JSON-dropped, so the admission body is byte-clean
+// legacy queue semantics).
+// ---------------------------------------------------------------------------
+describe("createAmbiguousReplacement — dispatchPolicy preservation (queue-policy B2)", () => {
+  async function armFreshContextGesture(intentId: string): Promise<void> {
+    await saveGesture({
+      intentId,
+      sessionId: "s1",
+      payload: { text: "did this arrive?", attachments: [], sendConfig: { agent: "build" } },
+      capturedHead: head("s1", "m-0", 1),
+    });
+  }
+
+  it("an ambiguous NOW delivery's replacement preserves dispatchPolicy \"now\" — the new gesture re-admits as deliberate immediate dispatch", async () => {
+    await armFreshContextGesture("i-orig");
+    const enqueue = vi.fn(async (_sid: string, input: any) => qItem("q-new", { intentId: input.intentId }));
+    const ctl = createAmbiguousReplacement({
+      sessionId: () => "s1",
+      enqueue: enqueue as any,
+      captureHead: () => head("s1", "m-0", 1), // fresh context — single-tap path
+      notify: vi.fn() as any,
+    });
+
+    await expect(ctl.replace(ambiguousItem({ dispatchPolicy: "now" }))).resolves.toBe(true);
+    expect(enqueue).toHaveBeenCalledTimes(1);
+    const input = (enqueue.mock.calls[0] as any[])[1];
+    expect(input.dispatchPolicy).toBe("now"); // preserved verbatim — never demoted
+    // The SAME policy is on the durable gesture (the saveGesture payload is
+    // this controller's one payload const — assert the stored record directly).
+    const rec = await memoryStore.get(input.intentId as string);
+    expect(rec?.payload.dispatchPolicy).toBe("now");
+  });
+
+  it("an ambiguous QUEUE delivery's replacement carries NO dispatchPolicy member (absent ≡ queue — the elided wire form, byte-clean admission)", async () => {
+    await armFreshContextGesture("i-orig");
+    const enqueue = vi.fn(async (_sid: string, input: any) => qItem("q-new", { intentId: input.intentId }));
+    const ctl = createAmbiguousReplacement({
+      sessionId: () => "s1",
+      enqueue: enqueue as any,
+      captureHead: () => head("s1", "m-0", 1),
+      notify: vi.fn() as any,
+    });
+
+    // A listed queue item has no dispatchPolicy member at all (only "now" is
+    // ever serialized — see the describe note). The replacement must keep the
+    // elided form: undefined, JSON-dropped from the admission body.
+    await expect(ctl.replace(ambiguousItem())).resolves.toBe(true);
+    expect(enqueue).toHaveBeenCalledTimes(1);
+    const input = (enqueue.mock.calls[0] as any[])[1];
+    expect(input.dispatchPolicy).toBeUndefined();
+    expect(JSON.parse(JSON.stringify(input)).dispatchPolicy).toBeUndefined(); // wire-dropped
+    const rec = await memoryStore.get(input.intentId as string);
+    expect(rec?.payload.dispatchPolicy).toBeUndefined();
+  });
+});

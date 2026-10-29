@@ -1288,7 +1288,7 @@ describe("queue-policy B2 — escalateQueued (pending-chip Send-now escalation c
     dispatchPolicy: "now",
   });
 
-  it("POSTs the escalate route with CSRF; on success the OLD id leaves the cache, the fresh now-item lands, and a convergence GET follows", async () => {
+  it("POSTs the escalate route with CSRF; on success the OLD id leaves the cache and the fresh now-item lands (NO convergence fetch — the controller owns the refresh)", async () => {
     const sid = "s-esc-1";
     touched.push(sid);
     const calls: Array<{ url: string; method: string; headers: any }> = [];
@@ -1322,13 +1322,50 @@ describe("queue-policy B2 — escalateQueued (pending-chip Send-now escalation c
     expect(esc).toBeTruthy();
     expect(esc!.method).toBe("POST");
     expect(esc!.headers["X-VH-CSRF"]).toBe("1");
-    // Wait for the fire-and-forget convergence GET, then the cache holds the
-    // fresh now-item and NOT the consumed original id.
+    // W5 (double-fetch consolidation): escalateQueued must NOT fire its own
+    // convergence GET — the CONTROLLER (createSend.escalateQueuedItem) awaits
+    // deps.fetchQueue on success (pinned in createSendAttempts.test.ts). Wait
+    // a tick so a regressed fire-and-forget fetch would have hit the stub,
+    // then assert the POST was the LAST call and the cache already holds the
+    // upsert truth (fresh now-item in, consumed original out).
     await new Promise((r2) => setTimeout(r2, 10));
+    expect(calls[calls.length - 1].method).toBe("POST");
     const ids = queueFor(sid).map((m) => m.id);
     expect(ids).not.toContain("q-old");
     expect(ids).toContain("q-fresh");
     expect(queueFor(sid).find((m) => m.id === "q-fresh")?.dispatchPolicy).toBe("now");
+  });
+
+  it("W6 same-id no-op edge: an escalate echo under the ORIGINAL id never drops the item (the cache-filter guard)", async () => {
+    // Cancel+re-admit normally answers a FRESH id, but the server may return
+    // an already-now item UNCHANGED under the SAME id (the no-op edge). The
+    // old cache filter (`m.id !== itemId`, assuming the fresh id is always
+    // distinct) dropped the very item the upsert had just written — a phantom
+    // vanish with the item still live server-side. The guard keeps the item
+    // when the echoed id equals the escalated id.
+    const sid = "s-esc-5";
+    touched.push(sid);
+    const orig = { ...item("q-same", { order: 1, text: "already now?" }) };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: any) => {
+        const u = String(url);
+        if (u.endsWith(`/vh/session/${sid}/queue/q-same/escalate`)) {
+          return Promise.resolve(res(200, { item: escalatedItem("q-same") }));
+        }
+        return Promise.resolve(res(200, { items: [orig] }));
+      }),
+    );
+    await fetchQueue(sid);
+    expect(queueFor(sid).some((m) => m.id === "q-same")).toBe(true);
+
+    const r = await escalateQueued(sid, "q-same");
+    expect(r.ok).toBe(true);
+    // THE CRUX: exactly ONE item under the same id survives — the fresh
+    // now-stamped echo, not dropped by the old-id filter.
+    const kept = queueFor(sid).filter((m) => m.id === "q-same");
+    expect(kept).toHaveLength(1);
+    expect(kept[0].dispatchPolicy).toBe("now");
   });
 
   it("404 (already escalated / removed / consumed) maps to not-found — the cache is left for the caller's refresh, nothing auto-fires", async () => {
