@@ -411,7 +411,10 @@ function loadDiagEntries(dir: string): DiagEntry[] {
 // sessionId is OPTIONAL, so a valid entry must have (ts:number + kind:string)
 // and EITHER a string sessionId (cold-open) OR kind==="stall" OR one of the
 // stream diag kinds (stream-open requires stream+reason; es-life requires
-// stream+generation+phase).
+// stream+generation+phase). conn-grade requires to:string + an ARRAY reasons
+// (required field; entryLine dereferences reasons.length unguarded); cascade
+// requires event:string + reasons/pending absent-or-array (optional fields,
+// but entryLine's ?.length is truthy on a non-empty string → .join throws).
 function isDiagEntry(o: unknown): o is DiagEntry {
   if (!o || typeof o !== "object") return false;
   const obj = o as {
@@ -424,12 +427,22 @@ function isDiagEntry(o: unknown): o is DiagEntry {
     phase?: unknown;
     to?: unknown;
     event?: unknown;
+    reasons?: unknown;
+    pending?: unknown;
   };
   if (typeof obj.ts !== "number") return false;
   if (typeof obj.kind !== "string") return false;
   if (obj.kind === "stall") return true; // sessionId optional on stall entries
-  if (obj.kind === "conn-grade") return typeof obj.to === "string";
-  if (obj.kind === "cascade") return typeof obj.event === "string";
+  // (2026-10-29 hardening, triple-corroborated review advisory: the conn-grade
+  // branch previously validated only `to` — a reasons-missing payload passed
+  // validation and threw at the entryLine render.)
+  if (obj.kind === "conn-grade") return typeof obj.to === "string" && Array.isArray(obj.reasons);
+  if (obj.kind === "cascade")
+    return (
+      typeof obj.event === "string" &&
+      (obj.reasons === undefined || Array.isArray(obj.reasons)) &&
+      (obj.pending === undefined || Array.isArray(obj.pending))
+    );
   if (obj.kind === "stream-open") {
     return obj.stream === "tree" || obj.stream === "session";
   }

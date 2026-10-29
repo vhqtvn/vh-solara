@@ -302,6 +302,15 @@ describe("diaglog — conn-grade + cascade kinds (capture-2 stamps)", () => {
         { kind: "cascade", ts: 6, event: "pass-timeout", reasons: ["x"], pending: ["tree"], elapsedMs: 15 },
         { kind: "conn-grade", ts: 7 }, // malformed: no `to`
         { kind: "cascade", ts: 8 }, // malformed: no `event`
+        // Validation hardening (2026-10-29 micro-slice, triple-corroborated
+        // review advisory): the conn-grade branch validated only `to` while
+        // entryLine dereferences reasons.length UNGUARDED — a reasons-missing
+        // payload passed validation and threw at render. Same class for the
+        // cascade branch's optional reasons/pending: entryLine's ?.length is
+        // truthy on a non-empty STRING, so .join throws there too.
+        { kind: "conn-grade", ts: 9, to: "degraded" }, // malformed: reasons missing
+        { kind: "cascade", ts: 10, event: "pass-start", reasons: "oops" }, // malformed: non-array reasons
+        { kind: "cascade", ts: 11, event: "pass-start", pending: "tree" }, // malformed: non-array pending
       ]),
     );
     _resetDiagForTest();

@@ -766,6 +766,50 @@ describe("ConnectionToast — e-ink profile ON (quiet UI: persistent notices)", 
     expect(toastEl(container)?.textContent).toContain("Reconnected"); // stable, readable on a slow panel
   });
 
+  // Dismiss × degraded interaction pin (card-2 run-1 F1 DEFER, closed here):
+  // a warn the OPERATOR dismissed (not one the A-F5 branch cleared) meets a
+  // degraded landing next. The A-F5 branch fires its setToast(null) as a
+  // NO-OP at that landing (the fence: "degraded with toast=null is a no-op
+  // (incl. a dismissed warn)") — and `warned` is untouched by BOTH dismiss()
+  // and the branch, so the resolution ack must still fire when the grade
+  // later reaches live. Coverage-closure PIN (green-on-landing expected).
+  it("ON: a dismissed warn meets a degraded landing (no-op clear); warned survives so live still acks", async () => {
+    const { container } = await mount();
+
+    // The warn fires (debounce elapsed → warned=true)…
+    setState("status", "reconnecting");
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(toastEl(container)?.textContent).toContain("Connection lost");
+
+    // …and the operator dismisses it: banner gone, `warned` stays true
+    // (dismiss clears toast + timers, never the warned latch).
+    fireEvent.click(toastEl(container)!.querySelector('button[aria-label="Dismiss notice"]')!);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(toastEl(container)).toBeNull();
+
+    // The degraded landing (socket reopened + converged, ≥2 racked failures):
+    // the A-F5 branch runs but its setToast(null) is a no-op — toast stays
+    // null, nothing is armed, and `warned` survives the pass-through.
+    recordFetchFailure("network");
+    recordFetchFailure("network");
+    setState("status", "live");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("degraded"); // the landing is real, not vacuous
+    expect(toastEl(container)).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+
+    // The resolution ack was NOT lost by the dismissal: live fires the
+    // "Reconnected" ok — a stable status under ON (no 2.5s flash).
+    const carrier = tunnelCarrier();
+    _resetWeakLinkForTest();
+    await carrier.probe();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("live");
+    expect(toastEl(container)?.textContent).toContain("Reconnected");
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(toastEl(container)?.textContent).toContain("Reconnected");
+  });
+
   // Lattice cell 2b — KNOWN DEVIATION, pinned AS-IS (see the open-cell
   // ledger in the file header): the documented ON contract says the recovery
   // ok "stays until dismissed or superseded" (ConnectionToast.tsx:36–38),

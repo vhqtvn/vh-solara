@@ -436,6 +436,39 @@ describe("cascade — pass-boundary diag stamps (capture-2, 2026-10-29)", () => 
     expect(sup.pending).toEqual(["tree"]); // A's unconverged step at death
   });
 
+  // D-F2 (card-2 gate review): the S2 (proven-loss) pass-superseded stamp
+  // site — cascade.ts's SECOND supersede branch — was the only stamp site
+  // never covered with capture ON. Coverage-closure PIN (green-on-landing
+  // expected): the S2 branch's supersede/inherit BEHAVIOR is pinned in the
+  // supersession describe above; this test pins the STAMP (kind, ring order,
+  // content) with capture enabled.
+  it("supersession stamps the dying pass's boundary before the successor's start (S2 proven loss)", async () => {
+    setState("epoch", "e1"); // SAME epoch throughout — S2, not the S1 epoch path
+    setQueueReconcileTrigger(() => {});
+    // Pass A: a soft session-only pass (tree undeclared ⇒ converged-for-S2).
+    requestRecovery("idle-content-stale", vi.fn(), { session: "fresh" });
+    // A PROVEN tree loss arrives: tree is converged-for-S2 in A (undeclared)
+    // ⇒ A cannot absorb it ⇒ S2 supersede WITH inheritance (same epoch).
+    requestRecovery("tree-seq-gap", vi.fn(), { tree: "fresh" }); // supersedes A
+    noteTreeConverged(); // B's own tree step
+    await flushMicro();
+    noteSessionConverged(); // the step B INHERITED from A — B cannot converge before it
+    await flushMicro();
+    expect(cascadeEntries().map((e) => e.event)).toEqual([
+      "pass-start", // A
+      "pass-superseded", // A died (S2) — before B's start
+      "pass-start", // B
+      "step-converged", // tree (B's own step)
+      "step-converged", // session (A's, inherited by B)
+      "pass-converged",
+    ]);
+    const sup = cascadeEntries()[1];
+    expect(sup.kind).toBe("cascade");
+    expect(sup.event).toBe("pass-superseded");
+    expect(sup.reasons).toEqual(["idle-content-stale"]); // A's reason set at death
+    expect(sup.pending).toEqual(["session"]); // A's unconverged step at death
+  });
+
   it("no cascade stamps while capture is off (the default)", async () => {
     diaglog.setDiagLogOn(false); // the describe's beforeEach enabled it — flip back
     setQueueReconcileTrigger(() => {});
