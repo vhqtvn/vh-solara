@@ -6,6 +6,7 @@ features:
     resolve-first-pilot: true
 overlays:
     - auto-classifier-pilot
+    - push-safety
     - release
     - session-progress-pilot
 capabilities:

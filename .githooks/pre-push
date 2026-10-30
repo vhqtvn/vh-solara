@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# .githooks/pre-push — human-side companion hook (push-safety Phase 3, O3).
+#
+# OPTIONAL, per-clone, operator-installed via scripts/install-prepush-hook.sh,
+# and BYPASSABLE BY DESIGN (`git push --no-verify`): this hook is a convenience
+# net for human terminal pushes, NEVER the enforcement layer of record — the
+# enforcement layers are scripts/push-checked.sh (checked transport) and the
+# CI changes-gate. It contains NO checking logic of its own: every branch
+# update is delegated to the shared changeset-aware gate
+# scripts/prepush-check.sh (fast tier), exactly as the wrapper does.
+#
+# stdin (git pre-push contract): one line per outgoing ref —
+#   <local-ref> <local-sha> <remote-ref> <remote-sha>
+# (all-zero sha = ref does not exist on that side).
+#
+# Policy, per line (fail-closed; mirrors the wrapper's initial surface):
+#   branch update (refs/heads/*, both shas nonzero)
+#       -> run scripts/prepush-check.sh <remote-sha>..<local-sha>
+#          (real range mode: requires the clean working tree to BE <local-sha>;
+#          a dirty tracked tree is therefore a refusal, same as the wrapper)
+#   new branch on the remote (remote sha zero)  -> REFUSE (outside the checked
+#       surface; scripts/push-checked.sh refuses these too)
+#   deletion (local sha zero)                   -> REFUSE (ditto)
+#   non-branch refs (refs/tags/* etc.)          -> ALLOW with a stderr note
+#       (tag transport belongs to the sanctioned release flow and is
+#        deliberately not fast-tier-checkable)
+#
+# Exit: 0 = all checked refs green; 1 = refused / check red / timeout.
+# Env: PREPUSH_CHECK_TIMEOUT_S soft timeout for the gate (default 3600s).
+#      PREPUSH_GIT set in the environment is a REFUSAL — a real push gate
+#      never runs shimmed discovery (same guard as scripts/push-checked.sh).
+
+set -uo pipefail
+
+fail() {
+    echo "pre-push: $*" >&2
+    exit 1
+}
+
+note() { echo "pre-push: $*" >&2; }
+
+# A test seam in the ambient environment means this is not a real push gate.
+[ -n "${PREPUSH_GIT:-}" ] && fail "PREPUSH_GIT is set in the environment — refusing (a real push gate never runs shimmed discovery; unset it and retry)."
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || fail "not a git repository"
+GATE="$REPO_ROOT/scripts/prepush-check.sh"
+[ -f "$GATE" ] || fail "scripts/prepush-check.sh not found under $REPO_ROOT — refusing (the hook must delegate, never self-contain, the checks)"
+TIMEOUT_S="${PREPUSH_CHECK_TIMEOUT_S:-3600}"
+
+checked=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -n "${local_ref:-}" ] || continue
+
+    if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
+        fail "deletion push ($remote_ref) is outside the checked surface — review it manually and use --no-verify consciously if intended."
+    fi
+
+    case "$remote_ref" in
+        refs/heads/*) ;;
+        *)
+            note "$remote_ref is not a branch ref — not fast-tier-checkable (release tag flow); allowing through."
+            continue
+            ;;
+    esac
+
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+        fail "new branch on the remote ($remote_ref) is outside the checked surface — push it via a reviewed path or use --no-verify consciously."
+    fi
+
+    note "checking $local_ref -> $remote_ref ($remote_sha..$local_sha) with the fast-tier gate…"
+    timeout "$TIMEOUT_S" bash "$GATE" "$remote_sha..$local_sha" 1>&2
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        fail "prepush gate not green (exit $rc) for $local_ref — push blocked. Fix the cause, then re-push (see the receipt above). Bypass consciously with --no-verify at your own risk."
+    fi
+    checked=$((checked + 1))
+done
+
+note "$checked branch ref(s) checked green — allowing push."
+exit 0
