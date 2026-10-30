@@ -542,9 +542,23 @@ async function installCaptureWithLatency(page: Page, session: string) {
     (window as any).__vhStaleSnap = null; // captured pre-prompt baseline
     (window as any).__vhInjections = 0;
     const OrigES = (window as any).EventSource;
+    let sidOpens = 0;
     function LoggingES(url: string, opts?: any) {
-      const es = opts !== undefined ? new OrigES(url, opts) : new OrigES(url);
-      if (typeof url === "string" && url.indexOf("sessions=" + sid) !== -1) {
+      const isSid = typeof url === "string" && url.indexOf("sessions=" + sid) !== -1;
+      // RECONNECT VEHICLE (post-e2f0f36): the cursor-preservation fix
+      // (lastKnownSesCursor) sends the remembered cursor when this session's
+      // stream REOPENS after a switch-away-and-back — the server then takes
+      // the cursor-replay branch (deltas only, NO new `snapshot` frame) and
+      // the injection below never fires. Strip the cursor on every reopen of
+      // THIS session's stream so the server takes the fresh-snapshot branch
+      // (the same path a production cursorless reconnect — page reload, ring
+      // eviction — takes) and actually ships a 2nd `snapshot` frame.
+      let connectUrl = url;
+      if (isSid && ++sidOpens > 1) {
+        connectUrl = url.replace(/([?&])cursor=\d+&/, "$1");
+      }
+      const es = opts !== undefined ? new OrigES(connectUrl, opts) : new OrigES(connectUrl);
+      if (isSid) {
         const origAdd = es.addEventListener.bind(es);
         es.addEventListener = function (type: string, listener: any, options?: any) {
           return origAdd(
@@ -820,7 +834,10 @@ test("regression: stale reconnect snapshot must not clobber the settled tail (me
 
   // Phase 2: FORCE A RECONNECT by switching to `other` then back to `demo`. The
   // selectedId effect (sync.ts:66) calls openSessionStream → demo's stream closes
-  // + reopens → a new `snapshot` frame arrives → the SSE wrapper INJECTS the
+  // + reopens → a new `snapshot` frame arrives (the wrapper strips the remembered
+  // cursor on reopen — see installCaptureWithLatency; since e2f0f36 the client
+  // would otherwise resume-from-cursor and the server would replay deltas
+  // instead of re-shipping a snapshot frame) → the SSE wrapper INJECTS the
   // captured stale baseline (no tail); applySessionSnapshot must MERGE
   // (prependMessagesIfAbsent), leaving the settled tail intact.
   await page.evaluate(() => {
