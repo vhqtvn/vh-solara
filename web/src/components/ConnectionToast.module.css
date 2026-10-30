@@ -1,13 +1,17 @@
-/* Connection-health toast (sync drop / recovery). `.warn`/`.ok` are shared
-   generic modifiers (also used by status-dot, icon-btn, quota-*, setting-note),
-   so they stay :global; the dynamic `classList={{ [kind]: true }}` in the TSX
-   applies the plain class name, which the :global selectors match. */
+/* Connection-health display (ConnectionToast): ONE fixed, non-blocking
+   surface at a time — quiet pill / escalation banner / "Back online" ack /
+   restart warn. Static by contract (e-ink safe): no animations, no
+   transitions; fixed-position so tier changes never shift layout; the state
+   is carried by the TEXT, not color alone. `.warn`/`.ok` are shared generic
+   modifiers (also used by status-dot, icon-btn, quota-*, setting-note), so
+   they stay :global; `.quiet` follows the same pattern (the dynamic
+   `classList` in the TSX applies the plain class name). */
 .conn-toast {
   position: fixed;
   left: 50%;
   top: calc(14px + env(safe-area-inset-top));
   transform: translateX(-50%);
-  z-index: 90;
+  z-index: var(--z-toast);
   display: flex;
   align-items: center;
   gap: 8px;
@@ -16,7 +20,9 @@
   box-shadow: var(--shadow-md);
   padding: 7px 14px;
   max-width: calc(100vw - 24px);
-  animation: dialog-in 0.16s var(--ease, ease);
 }
 .conn-toast:global(.warn) { background: color-mix(in srgb, var(--warn) 22%, var(--bg-2)); border: 1px solid var(--warn); color: var(--fg); }
 .conn-toast:global(.ok) { background: color-mix(in srgb, var(--ok) 20%, var(--bg-2)); border: 1px solid var(--ok); color: var(--fg); }
+/* Quiet tier — deliberately muted: a quiet, honest "still working on it"
+   that sits below the warn vocabulary until escalation or resolution. */
+.conn-toast:global(.quiet) { background: var(--bg-2); border: 1px solid var(--border); color: var(--fg-dim); }

@@ -254,18 +254,39 @@ test("E Ink mode hint: accurate settled-part wording and truthful feature descri
 });
 
 // ----------------------------------------------------------------------------
-// E-ink profile (UX Slice 4 — quiet UI): connection-notice persistence on the
-// REAL event path. The drop is injected exactly as connstatus-thread.spec.ts
-// does (an init-script EventSource wrapper closes the tree stream and fires
-// its onerror — the tunnel-drop shape); the reconnect requests are held
-// (aborted) by a route until the test releases them, so the reconnecting
-// grade — and with it the warn — deterministically outlives every OFF expiry
-// window. Physical e-ink panel readability is an operator observation, not a
-// browser property; this proves the BROWSER contract:
-//   ON: the warn stays visible >5s while unresolved; recovery coalesces into
-//       a stable ok that also stays >5s; the ON-only dismiss clears it.
-//   OFF: the same drop recovers into the transient ok, which auto-expires
-//       (≤2.5s + slack) and no dismiss affordance ever renders.
+// E-ink profile (UX Slice 4 — quiet UI) × the content-first connection
+// display (card task-2026-10-30t09-11-45-resume-ux-connection-display):
+// connection-notice lifecycle on the REAL event path. The drop is injected
+// exactly as connstatus-thread.spec.ts does (an init-script EventSource
+// wrapper closes the tree stream and fires its onerror — the tunnel-drop
+// shape); the reconnect requests are held (aborted) by a route until the
+// test releases them, so the reconnecting grade — and with it the episode —
+// deterministically outlives any tier boundary the test names. The display
+// tiers are profile-INDEPENDENT now (only the restart warn's expiry/dismiss
+// is profile-gated, and no restart happens here); what these tests pin is
+// the tier lifecycle under both profile settings:
+//   ON (banner tier): past the 1.5s grace the quiet "Reconnecting…" pill
+//       appears and persists while unresolved; at the 30s boundary the
+//       dismissible banner takes over and nothing auto-expires it; the
+//       dismiss DEMOTES to the quiet pill (no same-episode re-prompt); the
+//       release resolves the episode at the landing.
+//   OFF (quiet tier): the pill has NO dismiss affordance (either profile),
+//       and a quiet-tier recovery fires NO ack at all (the routine
+//       "Reconnected" is retired) — the surface resolves with the episode.
+// The "Back online" ack (banner visible ≥5s → clean-live landing) is NOT
+// reachable on this real path: a banner-tier hold (≥35s of hard-down)
+// reliably accumulates enough fetch failures (DEGRADED_FETCH_FAILURES=2 in
+// 30s) that the landing grade is "degraded", and the A-F5 fence closes the
+// episode there WITHOUT acking — a legitimate recovery-end by design. The
+// ack gate is pinned in the unit suite (ConnectionToast.eink.test.tsx)
+// under direct grade control.
+
+// ConnectionToast tier thresholds — Node-side mirrors of the constants
+// exported from src/components/ConnectionToast.tsx (the e2e runner cannot
+// import the component module itself: it pulls solid-js + a CSS module).
+// Retune here if the component retunes there.
+const TOAST_BANNER_MS = 30_000; // DISCONNECT_BANNER_MS — banner boundary
+const TOAST_ACK_MIN_VISIBLE_MS = 5_000; // ACK_MIN_VISIBLE_MS — visibility probe floor
 
 // The tree stream URL carries sessions= EMPTY ("sessions=&"); only the TREE
 // stream is dropped (the session stream stays live throughout).
@@ -302,8 +323,10 @@ async function installDropInjection(page: import("@playwright/test").Page) {
 }
 
 // Passive toast-history recorder (connstatus-thread's idiom): the toast is
-// <Show>-conditional and (under OFF) the ok lives only 2.5s — too transient
-// for a polling expect to catch deterministically. Pure observation.
+// <Show>-conditional and its texts can be transient (a fast-recovery quiet
+// pill; an ack that depends on banner visibility) — the recorder makes every
+// text the surface EVER rendered durable and order-checkable. Pure
+// observation.
 async function installToastHistory(page: import("@playwright/test").Page) {
   await page.addInitScript(() => {
     (window as unknown as { __vhToastHistory: string[] }).__vhToastHistory = [];
@@ -339,7 +362,7 @@ function holdTreeReconnects(page: import("@playwright/test").Page, release: { at
 }
 
 test("E Ink ON: connection notices persist until resolved or dismissed (>5s visibility on the real event path)", async ({ page }) => {
-  test.setTimeout(90_000);
+  test.setTimeout(120_000);
   await page.addInitScript(() => {
     localStorage.setItem("vh.prefs.einkProfile.v1", JSON.stringify({ v: 1, data: true }));
   });
@@ -351,40 +374,55 @@ test("E Ink ON: connection notices persist until resolved or dismissed (>5s visi
   await page.goto(projectUrl("/?session=demo"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 15_000 });
 
-  // Hold every reconnect for 9s — the warn (armed at +1.2s) must outlive the
-  // largest OFF expiry window (4s) by >5s of visibility.
-  release.at = Date.now() + 9_000;
+  // Hold every reconnect well past the 30s banner boundary: the episode
+  // must escalade to the dismissible banner with seconds to spare before
+  // the dismiss/release sequence below.
+  release.at = Date.now() + TOAST_BANNER_MS + 7_000;
   expect(await page.evaluate(() => (window as unknown as { __vhDropTree: () => boolean }).__vhDropTree())).toBe(true);
 
   const toast = page.getByRole("status");
-  const warn = toast.filter({ hasText: "Connection lost" });
-  await expect(warn).toBeVisible({ timeout: 15_000 });
-  const warnSeenAt = Date.now();
+  // Past the 1.5s grace (GRACE_MS) the quiet pill appears and persists…
+  const pill = toast.filter({ hasText: "Reconnecting…" });
+  await expect(pill).toBeVisible({ timeout: 15_000 });
+  // …until the 30s boundary escalates to the DISMISSIBLE banner (the demo
+  // transcript is warm → the saved-content wording).
+  const banner = toast.filter({ hasText: "Still disconnected" });
+  await expect(banner).toBeVisible({ timeout: TOAST_BANNER_MS + 15_000 });
+  const bannerSeenAt = Date.now();
   await expect(page.getByRole("button", { name: "Dismiss notice" })).toBeVisible();
 
-  // >5s later, still unresolved → still visible (nothing auto-expired it).
-  await page.waitForTimeout(Math.max(0, warnSeenAt + 5_500 - Date.now()));
-  await expect(warn).toBeVisible();
+  // >5s later, still unresolved → still visible (nothing auto-expires it).
+  await page.waitForTimeout(Math.max(0, bannerSeenAt + TOAST_ACK_MIN_VISIBLE_MS + 500 - Date.now()));
+  await expect(banner).toBeVisible();
 
-  // Release: the real stream resumes; the warn resolves into the recovery ok…
-  release.at = 0;
-  const ok = toast.filter({ hasText: "Reconnected" });
-  await expect(ok).toBeVisible({ timeout: 30_000 });
-  const okSeenAt = Date.now();
-  // …which coalesces into a STABLE status under ON (>5s — OFF's 2.5s flash
-  // is exactly what this rules out).
-  await page.waitForTimeout(Math.max(0, okSeenAt + 5_500 - Date.now()));
-  await expect(ok).toBeVisible();
-
-  // DISMISS clears it (the ON-only exit).
+  // DISMISS demotes to the quiet tier (no same-episode re-prompt): the
+  // banner is gone, the pill carries the episode…
   await page.getByRole("button", { name: "Dismiss notice" }).click();
-  await expect(toast).toHaveCount(0);
-  // And it STAYS gone (no re-arm without a new grade transition).
+  await expect(banner).toHaveCount(0);
+  await expect(pill).toBeVisible();
+  // …and the banner never re-prompts while still unresolved.
+  await page.waitForTimeout(1_500);
+  await expect(banner).toHaveCount(0);
+  await expect(pill).toBeVisible();
+
+  // Release: the real stream resumes and the episode resolves AT the
+  // landing — on this real path a DEGRADED landing (the hold's accumulated
+  // fetch failures trip the fetch-failure spike at the live flip), an A-F5
+  // recovery-end: the surfaces clear and NO ack fires (see the section
+  // header — the "Back online" gate is pinned in the unit suite).
+  release.at = 0;
+  await expect(pill).toHaveCount(0, { timeout: 30_000 });
+  // The whole toast surface is gone, it STAYS gone…
   await page.waitForTimeout(1_500);
   await expect(toast).toHaveCount(0);
+  // …and no ack text ever rendered on this path.
+  const history = await page.evaluate(
+    () => (window as unknown as { __vhToastHistory: string[] }).__vhToastHistory,
+  );
+  expect(history.some((t) => t.includes("Back online"))).toBe(false);
 });
 
-test("E Ink OFF: notices stay transient — recovery ok auto-expires, no dismiss affordance", async ({ page }) => {
+test("E Ink OFF: quiet-tier recovery clears the surface — no ack fires, no dismiss affordance", async ({ page }) => {
   test.setTimeout(90_000);
   await installDropInjection(page);
   await installToastHistory(page);
@@ -398,23 +436,29 @@ test("E Ink OFF: notices stay transient — recovery ok auto-expires, no dismiss
   expect(await page.evaluate(() => (window as unknown as { __vhDropTree: () => boolean }).__vhDropTree())).toBe(true);
 
   const toast = page.getByRole("status");
-  const warn = toast.filter({ hasText: "Connection lost" });
-  await expect(warn).toBeVisible({ timeout: 15_000 });
-  // The OFF baseline has NO dismiss affordance — even while the warn holds.
+  const pill = toast.filter({ hasText: "Reconnecting…" });
+  await expect(pill).toBeVisible({ timeout: 15_000 });
+  // The quiet tier has NO dismiss affordance — in either profile (the pill
+  // is quiet and resolves with the episode).
   await expect(page.getByRole("button", { name: "Dismiss notice" })).toHaveCount(0);
 
   release.at = 0;
-  // Recovery lands (durable via the history recorder — the ok is a 2.5s
-  // transient under OFF, exactly the baseline under test)…
-  await page.waitForFunction(
-    () => (window as unknown as { __vhToastHistory: string[] }).__vhToastHistory.some((t) => t.includes("Reconnected")),
-    undefined,
-    { timeout: 30_000, polling: 250 },
-  );
-  // …and the ok AUTO-EXPIRES: by 4s after it fired (2.5s + slack) the toast
-  // surface is gone.
+  // Recovery lands and the quiet pill resolves WITH the episode (the pill
+  // was just proven visible, so its locator going to zero is the episode
+  // closing at the live grade). The routine "Reconnected" ok is RETIRED:
+  // no ack can fire here — the banner tier and its ≥5s visibility gate were
+  // never reached — so the pill clearing IS the user-visible recovery.
+  await expect(pill).toHaveCount(0, { timeout: 30_000 });
+  // …by 4s after recovery the whole toast surface is gone (the old
+  // auto-expiring ok is retired with it — nothing lingers past the
+  // episode)…
   await page.waitForTimeout(4_000);
   await expect(toast).toHaveCount(0);
-  // Still no dismiss anywhere in the OFF lifecycle.
+  // …the history recorder confirms NO ack text ever rendered…
+  const history = await page.evaluate(
+    () => (window as unknown as { __vhToastHistory: string[] }).__vhToastHistory,
+  );
+  expect(history.some((t) => t.includes("Back online"))).toBe(false);
+  // …and still no dismiss anywhere in the quiet-tier lifecycle.
   await expect(page.getByRole("button", { name: "Dismiss notice" })).toHaveCount(0);
 });

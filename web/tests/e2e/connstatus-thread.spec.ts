@@ -8,14 +8,18 @@ import { projectUrl } from "./util";
 //
 // THE USER-VISIBLE THREAD: a tunnel-shape drop of the tree SSE stream must
 // (a) DEGRADE the visible status (the ConnectionToast — now driven by the
-// SHARED connstatus reduction — shows "Connection lost — reconnecting…"),
+// SHARED connstatus reduction — shows its quiet "Reconnecting…" pill once
+// the 1.5s foreground-visible grace has elapsed),
 // (b) consume the PRECISE ring-gap signal (partial.ringGap — Slice B's
-// discrimination switch) into the cascade, (c) count the benign
+// discrimination switch) into the cascade,
+// (c) count the benign
 // cause:"reconnect" replay-resume telemetry separately (the new
 // server-reconnect-resume code), (d) RECOVER to the "live" grade only at
-// CONVERGENCE (the "Reconnected" ok toast fires when the live grade lands —
-// which requires the post-reconnect cascade pass to have completed; this is
-// the F3-folded composition the unit suite pins at the transport seam), and
+// CONVERGENCE — the quiet pill clears exactly at the live landing, which
+// requires the post-reconnect cascade pass to have completed (the
+// F3-folded composition the unit suite pins at the transport seam; the
+// routine "Reconnected" ack is RETIRED and never fires in this
+// fast-recovery episode), and
 // (e) prove real convergence with a post-drop prompt turn — all WITHOUT a
 // page reload.
 //
@@ -50,11 +54,11 @@ test("tunnel-drop degrades the visible status, converges via the precise ring-ga
   });
 
   // Passive toast-history recorder: the ConnectionToast is <Show>-conditional
-  // and its "Reconnected" ok only lives 2.5s — too transient for a polling
-  // expect to catch deterministically. A MutationObserver records every text
-  // the role="status" surface EVER rendered, in order, so the assertions are
-  // durable AND order-checkable (lost BEFORE reconnected). Pure observation —
-  // no behavior change to the app.
+  // and a fast-recovery quiet pill is too transient for a polling expect to
+  // catch deterministically. A MutationObserver records every text the
+  // role="status" surface EVER rendered, in order, so the assertions are
+  // durable AND order-checkable. Pure observation — no behavior change to
+  // the app.
   await page.addInitScript(() => {
     (window as unknown as { __vhToastHistory: string[] }).__vhToastHistory = [];
     let last = "";
@@ -228,10 +232,11 @@ test("tunnel-drop degrades the visible status, converges via the precise ring-ga
   expect(await page.evaluate(() => (window as unknown as { __vhDropTree: () => boolean }).__vhDropTree())).toBe(true);
 
   // (a) THE VISIBLE DEGRADATION — the shared reduction drives the toast (the
-  // 1.2s debounce must elapse while reconnecting; the abort+retry path keeps
-  // the grade down for several seconds, so the polling expect catches it).
+  // 1.5s foreground-visible grace — GRACE_MS in ConnectionToast.tsx — must
+  // elapse while reconnecting; the abort+retry path keeps the grade down for
+  // several seconds, so the polling expect catches the pill well past it).
   const toast = page.getByRole("status");
-  await expect(toast.filter({ hasText: "Connection lost" })).toBeVisible({ timeout: 15_000 });
+  await expect(toast.filter({ hasText: "Reconnecting…" })).toBeVisible({ timeout: 15_000 });
 
   // (b) The PRECISE ring-gap signal fired the cascade (frame consumed).
   await page.waitForFunction(
@@ -254,22 +259,22 @@ test("tunnel-drop degrades the visible status, converges via the precise ring-ga
     { timeout: 15_000, polling: 500 },
   );
 
-  // (d) RECOVERY AT CONVERGENCE — the "Reconnected" ok toast fires only when
-  // the live grade lands, which requires the cascade pass (armed by the
-  // ring-gap signal) to have completed via a truthfully-applied baseline (the
-  // F3-folded composition). Asserted on the DURABLE toast history (the ok
-  // toast lives only 2.5s — too transient for a polling locator) and with
-  // the ORDER pinned: the degradation toast preceded the recovery toast.
-  await page.waitForFunction(
-    () => {
-      const h = (window as unknown as { __vhToastHistory: string[] }).__vhToastHistory;
-      const lost = h.findIndex((t) => t.includes("Connection lost"));
-      const ok = h.findIndex((t) => t.includes("Reconnected"));
-      return lost !== -1 && ok !== -1 && lost < ok;
-    },
-    undefined,
-    { timeout: 30_000, polling: 250 },
+  // (d) RECOVERY AT CONVERGENCE — the quiet pill clears only when the live
+  // grade lands, which requires the cascade pass (armed by the ring-gap
+  // signal) to have completed via a truthfully-applied baseline (the
+  // F3-folded composition). The routine "Reconnected" ok is RETIRED
+  // (content-first display): no ack can fire in this episode — the banner
+  // tier and its ≥5s visibility gate were never reached — so the clear
+  // ITSELF is the user-visible recovery signal. The pill was proven visible
+  // at (a), so its locator going to zero is the episode closing; the DURABLE
+  // toast history pins the thread's text sequence: the degradation pill
+  // rendered, and no "Back online" ever did.
+  await expect(toast.filter({ hasText: "Reconnecting…" })).toHaveCount(0, { timeout: 30_000 });
+  const toastHistory = await page.evaluate(
+    () => (window as unknown as { __vhToastHistory: string[] }).__vhToastHistory,
   );
+  expect(toastHistory.some((t) => t.includes("Reconnecting"))).toBe(true);
+  expect(toastHistory.some((t) => t.includes("Back online"))).toBe(false);
 
   // The unified queue-reconcile trigger fired FROM the converged cascade.
   await page.waitForFunction(
