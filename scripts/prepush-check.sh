@@ -77,6 +77,16 @@
 #
 # PATH hygiene: /usr/local/go/bin is added to PATH if go is not found.
 #
+# Test seam (failure injection): PREPUSH_GIT, when set, names the git binary
+# used ONLY for changeset discovery (git status in worktree mode; git diff in
+# range mode). Ref resolution (rev-parse) ALWAYS uses the real git. This
+# exists so the fail-closed discovery guards can be failure-tested — there is
+# no env-only way to make `git diff` fail while `rev-parse` succeeds against
+# the same real repository. A discovery command that fails is a refusal
+# (exit 2), never an empty changeset. scripts/push-checked.sh UNSETS
+# PREPUSH_GIT before invoking this script, so a real push gate can never run
+# shimmed discovery. See scripts/prepush-selftest.sh for the injection tests.
+#
 # Known limitations (deliberate, kept simple): paths containing tabs, a
 # " -> " substring, or non-ASCII (porcelain C-quoted) names would confuse
 # the line parser; this repo's tree is ASCII-tame. `date +%s%N` is GNU-only
@@ -133,6 +143,12 @@ real range runs — working tree does not match <head>).
 
 stdout: exactly one JSON receipt line (schema prepush-check/1).
 stderr: human-readable progress and per-check results.
+
+Env:
+  PREPUSH_GIT  test seam (failure injection): path to a git binary used ONLY
+               for changeset discovery (git status / git diff). Ref resolution
+               always uses the real git. Must be executable; anything else is
+               a refusal (exit 2). Real push gates must never set this.
 USAGE
 }
 
@@ -213,6 +229,18 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# --- discovery-git test seam (failure injection) ----------------------------------
+# PREPUSH_GIT (see header + usage) overrides the git binary ONLY for changeset
+# discovery below. Validated here so a broken value is a clean refusal, not a
+# mid-flight crash. Unset by scripts/push-checked.sh before invocation.
+DISCOVERY_GIT="git"
+if [ -n "${PREPUSH_GIT:-}" ]; then
+    if ! command -v "$PREPUSH_GIT" >/dev/null 2>&1; then
+        refuse "PREPUSH_GIT is set but not executable: $PREPUSH_GIT (test seam; unset it for real runs)"
+    fi
+    DISCOVERY_GIT="$PREPUSH_GIT"
+fi
+
 # --- environment -------------------------------------------------------------------
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
     # Outside a repository: refuse through the receipt-emitting path so the
@@ -228,7 +256,7 @@ TESTED_HEAD=$(git rev-parse HEAD 2>/dev/null) || refuse "could not resolve HEAD"
 # Fail-closed discovery: a failed `git status` (e.g. corrupt/locked index) is
 # a REFUSAL, never an empty "clean" changeset.
 STATUS_RC=0
-STATUS_OUT=$(git status --porcelain=v1 --untracked-files=all 2>/dev/null) || STATUS_RC=$?
+STATUS_OUT=$("$DISCOVERY_GIT" status --porcelain=v1 --untracked-files=all 2>/dev/null) || STATUS_RC=$?
 if [ "$STATUS_RC" -ne 0 ]; then
     refuse "git status failed (exit $STATUS_RC) — cannot observe the working-tree changeset; refusing rather than guessing"
 fi
@@ -278,7 +306,7 @@ if [ "$MODE" = "range" ]; then
     # Fail-closed discovery: a failed `git diff` is a REFUSAL, never an
     # empty changeset.
     DIFF_RC=0
-    DIFF_OUT=$(git diff --name-status --find-renames "$BASE_SHA" "$HEAD_RANGE_SHA" 2>/dev/null) || DIFF_RC=$?
+    DIFF_OUT=$("$DISCOVERY_GIT" diff --name-status --find-renames "$BASE_SHA" "$HEAD_RANGE_SHA" 2>/dev/null) || DIFF_RC=$?
     if [ "$DIFF_RC" -ne 0 ]; then
         refuse "git diff failed (exit $DIFF_RC) for range $BASE_SHA..$HEAD_RANGE_SHA — cannot observe the changeset; refusing rather than guessing"
     fi

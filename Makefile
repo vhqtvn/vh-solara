@@ -5,7 +5,7 @@
 # (copy) BOTH staged bundles into pkg/web/dist + pkg/web/host-dist right before
 # `go build`, so one binary carries both SPAs (`/` → host, `/app` → single-server).
 
-.PHONY: web web-materialize host-web host-web-materialize embed-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-docker test-host-web-preview test-host-web-real-embed test-host-web-folded test-host-web-deploy-transition test-queue-delivery-headed-docker verify fmt fmt-check vet typecheck typecheck-host-web prepush-check e2e e2e-keep docker fixtures bench clean-web-embed clean-host-web-embed
+.PHONY: web web-materialize host-web host-web-materialize embed-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-docker test-host-web-preview test-host-web-real-embed test-host-web-folded test-host-web-deploy-transition test-queue-delivery-headed-docker verify fmt fmt-check vet typecheck typecheck-host-web prepush-check push-checked prepush-selftest e2e e2e-keep docker fixtures bench clean-web-embed clean-host-web-embed
 
 # Version stamping: local builds set cmd.Version to "<latest v-tag>+dev" (e.g.
 # v1.60.0+dev) so the self-update check never treats them as an already-released
@@ -168,6 +168,12 @@ verify: fmt-check vet test typecheck ## Local end-of-impl/release verification g
 
 prepush-check: ## Run the changeset-aware fast pre-push gate (scripts/prepush-check.sh): selects the right fast checks for the current changeset and fails mechanically on red. ARGS passes through, e.g. ARGS='--dry-run' or ARGS='v1.2.3^..v1.2.4'. No pushes — the script is read-only verification only.
 	bash scripts/prepush-check.sh $(ARGS)
+
+push-checked: ## Mechanical checked push (scripts/push-checked.sh, push-safety Phase 2): runs the prepush gate over the EXACT outgoing range, verifies the receipt (green + exact tree binding), re-checks inputs, then pushes only the approved sha to the named remote. Refuses (exit 2) force/tags/deletions/new-branch/multi-ref/non-FF/dirty-tree; exit 1 = a selected check failed. ARGS passes through, e.g. ARGS='--remote origin'.
+	bash scripts/push-checked.sh $(ARGS)
+
+prepush-selftest: ## Durable self-test for scripts/prepush-check.sh (guard matrix incl. PREPUSH_GIT failure injection), run from a scratch clone; real worktree untouched.
+	bash scripts/prepush-selftest.sh
 
 fixtures: embed-materialize ## Run the fixture-backed web stack locally on :8099 (no opencode needed)
 	go run ./tools/fixtureserver -addr 127.0.0.1:8099
