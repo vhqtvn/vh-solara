@@ -17,7 +17,138 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Changeset gate (push-safety Phase 4). Only `push` events can skip code
+  # lanes; pull_request / schedule / workflow_dispatch always run everything.
+  #
+  # Why a hand-rolled detection job instead of `on.push.paths`: workflow path
+  # filters are glob-only and cannot express the precedence-aware docs class
+  # shared with scripts/prepush-check.sh (there, web/README.md is a WEB
+  # change, not docs — yet it matches a `**/*.md` glob), and a path-filtered
+  # *workflow* is the one shape GitHub documents as leaving required checks
+  # stuck "Pending" (docs.github.com — "Troubleshooting required status
+  # checks": skipped workflow → checks Pending → merge blocked). A job skipped
+  # by a conditional instead reports "Success", and this gate never skips
+  # lanes on non-push events at all. No third-party action: pinned checkout
+  # only, same SHA as every other job in this file.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      reason: ${{ steps.filter.outputs.reason }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        if: ${{ github.event_name == 'push' }}
+        with:
+          # The diff base is github.event.before — for a batched push it can
+          # sit any number of commits back, so fetch full history to
+          # guarantee it exists locally (worst case below: run all lanes).
+          fetch-depth: 0
+      - name: classify the push changeset
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          # Note on -e: GitHub runs bash steps with -e by default. Every
+          # failure-capable command below (git cat-file, git diff, is_docs)
+          # sits inside a condition position, so each foreseen path reaches
+          # an explicit exit 0 with outputs written. If the gate ever dies
+          # anyway, its outputs stay unset and the consumers' != 'false'
+          # check reads that as run-everything on every event -- a broken
+          # gate degrades to today's behavior, never a silent skip. Default
+          # verdict is RUN (code=true); only a fully observed, provably
+          # docs-only push flips it to false.
+          code=true
+          reason="unclassified (default: run)"
+
+          # docs-class mirror of scripts/prepush-check.sh classify() -- same
+          # first-match-wins order, collapsed to "docs or not":
+          #   lockfile basenames / *.go / web/ / host-web/ / tooling dirs /
+          #     tooling basenames -> NOT docs
+          #   docs/ , researches/ , docs name suffixes (*.md *.txt *.rst
+          #     *.adoc LICENSE* COPYING* NOTICE* CHANGELOG*) -> docs
+          #   anything else -> NOT docs (unknown => run, conservative)
+          # Keep the order in sync with prepush-check.sh classify().
+          is_docs() {
+            b="${1##*/}"
+            case "$b" in
+              go.mod|go.sum|package.json|package-lock.json|npm-shrinkwrap.json|yarn.lock|pnpm-lock.yaml) return 1 ;;
+            esac
+            case "$1" in
+              *.go|web/*|host-web/*|scripts/*|.github/*|.githooks/*|.opencode/*|.vh-agent-harness/*|tests/*|tools/*|docker/*) return 1 ;;
+              docs/*|researches/*) return 0 ;;
+            esac
+            case "$b" in
+              Makefile|makefile|*.mk|Dockerfile*|.dockerignore|opencode.jsonc|.gitignore|.gitattributes|.editorconfig|*.sh|*.py|*.yml|*.yaml|*.toml|*.jsonc) return 1 ;;
+              *.md|*.txt|*.rst|*.adoc|LICENSE*|COPYING*|NOTICE*|CHANGELOG*) return 0 ;;
+            esac
+            return 1
+          }
+
+          if [ "$EVENT_NAME" != "push" ]; then
+            reason="non-push event ($EVENT_NAME): code lanes always run"
+          else
+            ZERO=0000000000000000000000000000000000000000
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = "$ZERO" ]; then
+              reason="push without before SHA (new branch): run all lanes"
+            elif ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+              reason="before $BEFORE missing from clone: run all lanes"
+            elif ! DIFF="$(git diff --name-status --find-renames "$BEFORE" "$AFTER" 2>/dev/null)"; then
+              reason="git diff failed: run all lanes"
+            else
+              total=0
+              docs=0
+              first_code=""
+              TAB="$(printf '\t')"
+              while IFS="$TAB" read -r st pa pb; do
+                [ -n "${st:-}" ] || continue
+                total=$((total+1))
+                ok=0
+                case "$st" in
+                  R*|C*)
+                    # Mirrors prepush-check.sh: a rename/copy counts as docs
+                    # only when BOTH sides are docs-class.
+                    if is_docs "$pa" && is_docs "$pb"; then ok=1; fi
+                    ;;
+                  *)
+                    if is_docs "$pa"; then ok=1; fi
+                    ;;
+                esac
+                if [ "$ok" -eq 1 ]; then
+                  docs=$((docs+1))
+                elif [ -z "$first_code" ]; then
+                  first_code="$st $pa${pb:+ -> $pb}"
+                fi
+              done < <(printf '%s\n' "$DIFF")
+              echo "changeset: $total entries, $docs docs-class; first non-docs: ${first_code:-none}"
+              if [ "$total" -gt 0 ] && [ "$docs" -eq "$total" ]; then
+                code=false
+                reason="docs-only push ($total entries): skip code lanes"
+              else
+                reason="push with code changes ($((total-docs)) non-docs of $total): run all lanes"
+              fi
+            fi
+          fi
+
+          echo "changes-gate: code=$code -- $reason"
+          {
+            echo "code=$code"
+            echo "reason=$reason"
+          } >>"$GITHUB_OUTPUT"
+          exit 0
+
   go:
+    needs: [changes]
+    # Push-safety Phase 4: only push events can skip this lane, and only when
+    # the changes gate SUCCEEDED and explicitly wrote code=false (proven
+    # docs-only). Unset/missing/garbage gate output runs the lane, so a
+    # failed or broken gate degrades to today's run-everything behavior,
+    # never a silent skip. !cancelled() both neutralizes the implicit
+    # success() status check (a failed `changes` job can never skip
+    # PR/schedule/dispatch lanes) and avoids always()-style post-cancel
+    # zombie runs.
+    if: ${{ !cancelled() && (github.event_name != 'push' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
@@ -49,6 +180,9 @@ jobs:
         run: go test ./...
 
   web:
+    needs: [changes]
+    # Push-safety Phase 4 (see the `go` job comment): push-only skip.
+    if: ${{ !cancelled() && (github.event_name != 'push' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -83,6 +217,9 @@ jobs:
   # Fixture-backed Playwright e2e. Needs Go too — the Playwright webServer builds
   # the SPA and runs ./tools/fixtureserver (real aggregator + fake OpenCode).
   e2e:
+    needs: [changes]
+    # Push-safety Phase 4 (see the `go` job comment): push-only skip.
+    if: ${{ !cancelled() && (github.event_name != 'push' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
@@ -130,6 +267,9 @@ jobs:
   #                         (asserts window.__host is absent in a real bundle).
   # No Go, no fixtureserver — disjoint from the Go/web jobs above.
   host-web-e2e:
+    needs: [changes]
+    # Push-safety Phase 4 (see the `go` job comment): push-only skip.
+    if: ${{ !cancelled() && (github.event_name != 'push' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -232,3 +372,40 @@ jobs:
           path: tmp/agent-runs/host-web-real-embed
           retention-days: 14
           if-no-files-found: warn
+
+  # Stable aggregate (push-safety Phase 4): runs for every event; red iff any
+  # lane that executed went red. Lane skips are legitimate — they only happen
+  # on push events (changes-gate) and on the real-embed event guard, neither
+  # of which carries merge-gate semantics. If branch protection wants a single
+  # required check instead of per-lane ones, require "CI / ci-summary".
+  # !cancelled() (GitHub's recommended alternative to always()) both lets this
+  # job run when a needed job was skipped or failed and avoids post-cancel
+  # zombie runs.
+  ci-summary:
+    needs: [changes, go, web, e2e, host-web-e2e, host-web-real-embed]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: fail if any executed lane failed
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          GO: ${{ needs.go.result }}
+          WEB: ${{ needs.web.result }}
+          E2E: ${{ needs.e2e.result }}
+          HOST_WEB_E2E: ${{ needs['host-web-e2e'].result }}
+          REAL_EMBED: ${{ needs['host-web-real-embed'].result }}
+        run: |
+          status=0
+          check() {
+            case "$2" in
+              success|skipped) echo "  $1: $2" ;;
+              *) echo "::error::$1 result: $2"; status=1 ;;
+            esac
+          }
+          check changes "$CHANGES"
+          check go "$GO"
+          check web "$WEB"
+          check e2e "$E2E"
+          check host-web-e2e "$HOST_WEB_E2E"
+          check host-web-real-embed "$REAL_EMBED"
+          exit "$status"
