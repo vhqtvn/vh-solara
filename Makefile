@@ -5,7 +5,7 @@
 # (copy) BOTH staged bundles into pkg/web/dist + pkg/web/host-dist right before
 # `go build`, so one binary carries both SPAs (`/` → host, `/app` → single-server).
 
-.PHONY: web web-materialize host-web host-web-materialize embed-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-docker test-host-web-preview test-host-web-real-embed test-host-web-folded test-host-web-deploy-transition test-queue-delivery-headed-docker verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed clean-host-web-embed
+.PHONY: web web-materialize host-web host-web-materialize embed-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-docker test-host-web-preview test-host-web-real-embed test-host-web-folded test-host-web-deploy-transition test-queue-delivery-headed-docker verify fmt fmt-check vet typecheck typecheck-host-web prepush-check e2e e2e-keep docker fixtures bench clean-web-embed clean-host-web-embed
 
 # Version stamping: local builds set cmd.Version to "<latest v-tag>+dev" (e.g.
 # v1.60.0+dev) so the self-update check never treats them as an already-released
@@ -158,10 +158,16 @@ fmt-check: ## Fail if any Go file is not gofmt-clean (mirrors CI's gofmt gate)
 vet: ## Run go vet on all packages (mirrors CI's `go vet ./...`)
 	go vet ./...
 
-typecheck: ## Typecheck the web SPA (mirrors CI's `npm run typecheck`)
+typecheck: ## Typecheck the web SPA (mirrors CI's `npm --prefix web run typecheck`)
 	cd web && npm run typecheck
 
+typecheck-host-web: ## Typecheck the host-web shell (mirrors `npm --prefix host-web run typecheck`)
+	cd host-web && npm run typecheck
+
 verify: fmt-check vet test typecheck ## Local end-of-impl/release verification gate (mirrors CI: gofmt -> vet -> test -> typecheck). Run before any release or declaring implementation done.
+
+prepush-check: ## Run the changeset-aware fast pre-push gate (scripts/prepush-check.sh): selects the right fast checks for the current changeset and fails mechanically on red. ARGS passes through, e.g. ARGS='--dry-run' or ARGS='v1.2.3^..v1.2.4'. No pushes — the script is read-only verification only.
+	bash scripts/prepush-check.sh $(ARGS)
 
 fixtures: embed-materialize ## Run the fixture-backed web stack locally on :8099 (no opencode needed)
 	go run ./tools/fixtureserver -addr 127.0.0.1:8099
