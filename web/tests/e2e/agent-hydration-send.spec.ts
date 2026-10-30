@@ -104,7 +104,10 @@ test("send while agent evidence is pending dispatches exactly once with the evid
   await expect(sendBtn.locator(".icon")).toHaveCSS("animation-name", "none");
   // 4c. O2 slice 2 — compact merged happy-path line: the parked preparing
   //     record renders as ONE calm progress row (not a per-record ledger).
-  await expect(page.locator('.sendStatusLine[data-kind="progress"]')).toHaveText("Sending…");
+  //     Card B (2026-10-30): preparing WITHOUT uploads is pre-custody device-
+  //     local work (agent gate here) — the receipt-bound headline, not the old
+  //     delivery-claiming "Sending…".
+  await expect(page.locator('.sendStatusLine[data-kind="progress"]')).toHaveText("Pending — on this device…");
 
   // 4d. O2 slice-2 review C-F4 — production-bundle CSS-content guard. The
   //     webServer serves the PRODUCTION-built SPA (fixture-web.sh runs

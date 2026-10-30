@@ -1,6 +1,7 @@
 import { Show } from "solid-js";
 import { type QueuedMessage } from "../queue";
 import { projectionActive, queuePolicyCapable } from "../lib/queueDispatchMode";
+import { connGrade, type ConnGrade } from "../sync/connstatus";
 import Icon from "./Icon";
 
 // QueueChip renders a single queued-message pill in the composer's queue row,
@@ -56,8 +57,30 @@ import Icon from "./Icon";
 // message (retract) or acknowledges an already-sent one (mark-sent). Items
 // WITHOUT an opencodeMsgID (legacy, pre-correlation-id) get NO retry —
 // their honest recovery remains retract with its duplicate-risk warning.
+//
+// Card B (2026-10-30, content-first UX theme) — receipt-bound vocabulary:
+//   - `pending` renders NO state text here (the queue-row "Queued" label —
+//     server CUSTODY, never delivery — owns that wording);
+//   - `dispatching` keeps "Sending…" — that is the queue state machine's
+//     own dispatch-claim receipt (queue.ts:39 lifecycle), never inferred
+//     from the connection grade; its resolution timing is mode-dependent
+//     (browser drainer vs daemon custody — `--daemon-dispatch` is default
+//     OFF at HEAD) and arrives via pull/watcher on reconnect;
+//   - `failed`/`unknown` keep "Failed" / "Outcome unknown" while connected;
+//     while the connection grade is reconnecting/offline they compose to
+//     "Not sent — reconnecting" (see NOT_SENT_RECONNECTING below);
+//   - confirmation is NEVER a chip label: `sent` items are filtered
+//     upstream and clear via the queue-delivery-observed effect when the
+//     message enters the transcript (reducers.ts) — never connGrade.
 export function QueueChip(props: {
   q: QueuedMessage;
+  // Card B: the connection-grade accessor for the "Not sent — reconnecting"
+  // composition. READ-ONLY consumption of connstatus (the grade is
+  // observational context, NEVER delivery authority). Optional injection
+  // seam for unit tests only — connstatus has no test setter BY DESIGN
+  // (read-only for this slice); production mounts (Composer) omit it and
+  // read the live connGrade().
+  grade?: () => ConnGrade;
   // Dismiss: clear the chip from view (pending cancel or terminal dismissal).
   onRemove: (id: string) => void;
   // Queue-policy B2 (amendment §2): Send-now ESCALATION — the pending chip's
@@ -82,6 +105,24 @@ export function QueueChip(props: {
   // enqueues or dispatches.
   onMarkSent?: (q: QueuedMessage) => void;
 }) {
+  // Card B (2026-10-30): the display-layer "Not sent — reconnecting"
+  // composition — the ONLY place the connection grade may modulate send
+  // wording. It applies to terminal `failed`/`unknown` WHILE the grade is
+  // reconnecting or offline, and states "no send receipt exists + the
+  // connection is down". It never asserts delivery and never promises a
+  // resend (nothing auto-retries — queue.ts has no auto-retry anywhere):
+  //   - for `failed` the non-delivery receipt is definitive;
+  //   - for `unknown` "Not sent" means NO SEND RECEIPT — delivery was never
+  //     disproven, so the standing may-have-been-delivered caveat stays
+  //     visible (tip + the queue-detail-note below render it).
+  // Recovery (grade → live/degraded) reverts the label to the honest
+  // connected form — the composition NEVER converts into a delivered claim;
+  // confirmation remains sent + transcript entry only.
+  const NOT_SENT_RECONNECTING = "Not sent — reconnecting";
+  const connDown = (): boolean => {
+    const g = (props.grade ?? connGrade)();
+    return g === "reconnecting" || g === "offline";
+  };
   const tip = (): string => {
     const q = props.q;
     if (q.state === "failed" || q.state === "unknown") {
@@ -100,9 +141,13 @@ export function QueueChip(props: {
   };
   const label = (): string => {
     const q = props.q;
+    if (q.state === "failed" || q.state === "unknown") {
+      // Card B: while disconnected, terminal non-delivery/ambiguity composes
+      // with the connection context; while connected (live OR degraded —
+      // degraded is a connected posture), the honest per-state labels stand.
+      return connDown() ? NOT_SENT_RECONNECTING : q.state === "failed" ? "Failed" : "Outcome unknown";
+    }
     if (q.state === "dispatching") return "Sending…";
-    if (q.state === "failed") return "Failed";
-    if (q.state === "unknown") return "Outcome unknown";
     return "";
   };
   return (

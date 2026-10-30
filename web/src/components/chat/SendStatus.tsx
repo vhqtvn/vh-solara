@@ -73,6 +73,20 @@
 //                                    Retry STATUS SAVE (a record, never a
 //                                    resend — "Does not resend the message.")
 //
+// Card B amendment (2026-10-30, content-first UX theme — receipt-bound send
+// vocabulary): every PRE-CUSTODY state (preparing without uploads, admitting,
+// uncertain — i.e. outbox-saved+unadmitted, admission in flight, or outcome
+// unknown) now renders the ONE headline "Pending — on this device": local
+// retention is real (the outbox IDB gesture and/or the retained verbatim
+// record), and NO acceptance receipt exists — the wording never implies the
+// server accepted or delivered anything. The granular stage facts above
+// ("retrying queue confirmation", "Queue confirmation unknown.", the
+// session-create copy, "Outcome unknown — check before sending again.")
+// SURVIVE as secondary copy on the same row, and the upload ordinals keep
+// their specific copy. "confirmed" is never rendered here: confirmation
+// remains `sent` + transcript entry (the queue chip clears), never inferred
+// from the connection grade.
+//
 // Create-certainty Slice 2 additions (the modern /vh/session/create client):
 //   create-unknown + recovery running → "Checking session creation." (the
 //                                    budget's lookups are reads; the
@@ -181,6 +195,15 @@ const SECONDARY_CAP = 2;
 // possible sessions" (brief §3.5: "Show two newest candidates initially").
 const CANDIDATE_CAP = 2;
 
+// Card B (2026-10-30): the receipt-bound pre-custody vocabulary label. It
+// states exactly what the signals prove — the gesture is retained LOCALLY
+// (the outbox IndexedDB save and/or this store's retained verbatim record;
+// createSend.ts saves the gesture before admission, outbox/index.ts:4-11) and
+// no acceptance receipt exists. Never implies acceptance; never implies
+// delivery. Granular stage facts stay as secondary copy (uncertainSecondary
+// below + the retry-same guidance span).
+const PENDING_LOCAL = "Pending — on this device";
+
 // Severity ladder for row ordering (brief §3.4): conflict first; create/
 // admission/other unknown next; status-save unconfirmed next; then blocked/
 // rejected. Actions-required before informational; transient summary is not
@@ -275,10 +298,10 @@ export function SendStatus(props: SendStatusProps) {
     return `${ts.length} send actions in progress…`;
   });
 
-  // Per-stage primary copy (decision-doc §1.3 matrix — normative). Returned
-  // null means "nothing to render for this record" (admitted never appears —
-  // the record is finished on confirmation). Shared by the recovery rows and
-  // the single-record merged line.
+  // Per-stage primary copy (decision-doc §1.3 matrix as amended by card B —
+  // normative). Returned null means "nothing to render for this record"
+  // (admitted never appears — the record is finished on confirmation). Shared
+  // by the recovery rows and the single-record merged line.
   function lineFor(rec: SendAction): string | null {
     switch (rec.stage) {
       case "preparing": {
@@ -287,27 +310,23 @@ export function SendStatus(props: SendStatusProps) {
         // index counts the file IN PROGRESS (done + 1), capped at total so
         // the last file never reads "N+1 of N".
         if (p && p.total > 0) return `Uploading ${Math.min(p.done + 1, p.total)} of ${p.total}…`;
-        return "Sending…";
+        // Card B: no-upload preparing is device-local pre-admission work
+        // (agent gate / session create) — "Sending…" claimed delivery was
+        // under way; the honest headline is pending + on this device.
+        return `${PENDING_LOCAL}…`;
       }
       case "admitting":
-        return rec.retry ? "Retrying queue confirmation…" : "Sending…";
+        // Card B: admitting spans the outbox IDB save + the enqueue POST —
+        // local retention is real, acceptance is NOT yet receipted.
+        return rec.retry ? `${PENDING_LOCAL}: retrying queue confirmation…` : `${PENDING_LOCAL}…`;
       case "uncertain":
-        // Admission-response loss (recovery "retry-same") gets the dedicated
-        // copy + affordance; the create-unknown shape (typed reason, set by
-        // markOwnerSessionCreateUnknown) carries the duplicate-session
-        // warning the suppressed notification used to own; every other
-        // uncertainty is check-before-sending — never a blanket Retry.
-        if (rec.recovery === "retry-same") return "Queue confirmation unknown.";
-        if (rec.reason === "session-create-unknown") {
-          // Create-certainty Slice 2: while the modern receipt-recovery
-          // budget is RUNNING, the primary line names what is happening
-          // (brief §3.3 "Checking session creation.") — the unconfirmed copy
-          // + its affordances return when the budget exhausts.
-          const op = getCreateOp(rec.createOpId);
-          if (op && op.recoveryActive) return "Checking session creation.";
-          return "Session creation unconfirmed. Check possible sessions before sending again; another send may create another session.";
-        }
-        return "Outcome unknown — check before sending again.";
+        // Card B: ALL uncertain records share the Pending headline (the
+        // granular ambiguity — enqueue loss, create unknown, other — is the
+        // row's SECONDARY copy via uncertainSecondary/the retry-same span,
+        // never lost, never the headline). A dismissable "Pending" row is
+        // honest: the record survives until resolved or dismissed, and the
+        // secondary names what is unknown.
+        return `${PENDING_LOCAL}.`;
       case "conflict":
         // O2 §3.6: both conflict flavors converge on the actionable guidance
         // — check the queue. (conflictSource stays recorded on the action for
@@ -367,6 +386,26 @@ export function SendStatus(props: SendStatusProps) {
       default:
         return null;
     }
+  }
+
+  // Card B — the uncertain row's SECONDARY copy: the granular ambiguity that
+  // used to BE the primary line (slice-3 / create-certainty copy matrix,
+  // preserved verbatim so no fact is lost or re-taught). The retry-same
+  // guidance span in the JSX owns its row's secondary, so it returns null
+  // here. Rendered as a sendStatusPayload span directly under the Pending
+  // headline.
+  function uncertainSecondary(rec: SendAction): string | null {
+    if (rec.recovery === "retry-same") return null;
+    if (rec.reason === "session-create-unknown") {
+      // Create-certainty Slice 2: while the modern receipt-recovery budget
+      // is RUNNING, the secondary names what is happening (brief §3.3
+      // "Checking session creation."); the unconfirmed copy + its
+      // affordances return when the budget exhausts.
+      const op = getCreateOp(rec.createOpId);
+      if (op && op.recoveryActive) return "Checking session creation.";
+      return "Session creation unconfirmed. Check possible sessions before sending again; another send may create another session.";
+    }
+    return "Outcome unknown — check before sending again.";
   }
 
   // ONE polite announcer (slice 2): mirrors the visible PRIMARY texts only —
@@ -505,6 +544,13 @@ export function SendStatus(props: SendStatusProps) {
               <Show when={line()}>
                 <div class="sendStatusLine" data-kind={rec.stage} data-tip={rec.detail || undefined}>
                   <span class="sendStatusText">{line()}</span>
+                  {/* Card B — the uncertain row's granular secondary copy
+                      (the former primary line, preserved verbatim): the
+                      Pending headline answers "where is my message"; this
+                      span names WHAT is unknown. */}
+                  <Show when={rec.stage === "uncertain" && uncertainSecondary(rec)}>
+                    <span class="sendStatusPayload">{uncertainSecondary(rec)}</span>
+                  </Show>
                   {/* Retry-same affordance — ONLY for an uncertain ENQUEUE
                       outcome whose replay is deduped server-side (recovery
                       "retry-same"). O2 §3.6 copy: the guidance sentence names
@@ -523,7 +569,11 @@ export function SendStatus(props: SendStatusProps) {
                       verbatim stored text + all retained filenames inline. */}
                   <Show when={rec.stage === "uncertain" && rec.recovery === "retry-same"}>
                     <span class="sendStatusPayload">
-                      Check the queue, or retry this same message.
+                      {/* Card B: the admission-response-loss CAUSE stays
+                          readable on the row (formerly the primary line) —
+                          pending on this device, and the queue confirmation
+                          specifically is what is unknown. */}
+                      Queue confirmation unknown. Check the queue, or retry this same message.
                     </span>
                     <span class="sendStatusPayload">
                       Same message:{" "}

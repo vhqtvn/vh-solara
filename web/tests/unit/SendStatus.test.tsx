@@ -117,11 +117,14 @@ describe("SendStatus — per-stage readable copy (brief §4.4)", () => {
     r.unmount();
   });
 
-  it("admitting renders 'Sending…'; a RETRY of an uncertain admission renders 'Retrying queue confirmation…'", () => {
+  it("admitting renders 'Pending — on this device…' (card B); a RETRY of an uncertain admission renders 'Pending — on this device: retrying queue confirmation…'", () => {
     const a = mintSendAttempt("s1");
     updateSendAction(a.attemptId, { stage: "admitting" });
     const r1 = render(() => <SendStatus {...baseProps()} />);
-    expect(r1.container.textContent).toContain("Sending…");
+    // Card B receipt-bound vocabulary: pre-custody stages never say "Sending"
+    // (that implied delivery); the honest claim is pending + local retention.
+    expect(r1.container.textContent).toContain("Pending — on this device…");
+    expect(r1.container.textContent).not.toContain("Sending…");
     r1.unmount();
 
     // O2 slice 2: transient records MERGE into one line, so the retry copy is
@@ -131,7 +134,7 @@ describe("SendStatus — per-stage readable copy (brief §4.4)", () => {
     const b = mintSendAttempt("s1");
     updateSendAction(b.attemptId, { stage: "admitting", retry: true });
     const r2 = render(() => <SendStatus {...baseProps()} />);
-    expect(r2.container.textContent).toContain("Retrying queue confirmation…");
+    expect(r2.container.textContent).toContain("Pending — on this device: retrying queue confirmation…");
     r2.unmount();
   });
 
@@ -440,7 +443,9 @@ describe("SendStatus — a11y + dismissal", () => {
     expect(r.container.querySelector(".sendStatus")!.getAttribute("aria-live")).toBeNull();
     const announcer = r.container.querySelector(".sendStatusAnnouncer")!;
     expect(announcer.getAttribute("aria-live")).toBe("polite");
-    expect(announcer.textContent).toBe("Sending…");
+    // Card B: the announcer mirrors the PRIMARY text — the receipt-bound
+    // pre-custody vocabulary, never "Sending…".
+    expect(announcer.textContent).toBe("Pending — on this device…");
     r.unmount();
   });
 
@@ -630,7 +635,9 @@ describe("SendStatus — O2 slice 2: compact merged happy-path line", () => {
       el.getAttribute("data-kind"),
     );
     expect(kinds).toEqual(["uncertain", "progress"]);
-    expect(r.container.querySelector('.sendStatusLine[data-kind="progress"]')!.textContent).toBe("Sending…");
+    // Card B: the lone admitting record's progress line is the pre-custody
+    // vocabulary — exactly, no residual "Sending…" claim.
+    expect(r.container.querySelector('.sendStatusLine[data-kind="progress"]')!.textContent).toBe("Pending — on this device…");
     r.unmount();
   });
 });
@@ -709,11 +716,13 @@ describe("SendStatus — O2 slice 2: ONE polite announcer, batched by mirroring 
     });
     const r = render(() => <SendStatus {...baseProps()} />);
     const ann = () => r.container.querySelector(".sendStatusAnnouncer")!.textContent;
-    // Primary line ONLY — no payload preview, no control text.
-    expect(ann()).toBe("Queue confirmation unknown.");
+    // Primary line ONLY — no payload preview, no control text. Card B: the
+    // uncertain primary is the vocabulary headline; the granular
+    // "Queue confirmation unknown." fact lives in the row's secondary copy.
+    expect(ann()).toBe("Pending — on this device.");
     r.container.querySelector<HTMLElement>(".sendStatusMore")!.click(); // expand full text
     expect(r.container.querySelector(".sendStatusFull")!.textContent).toBe(long);
-    expect(ann()).toBe("Queue confirmation unknown."); // unchanged → no announcement
+    expect(ann()).toBe("Pending — on this device."); // unchanged → no announcement
     r.unmount();
   });
 
@@ -953,6 +962,106 @@ describe("SendStatus — create-certainty Slice 2 modern states", () => {
     // No timing-candidates row alongside the exact receipt (hidden by
     // construction — its records left the draft owner).
     expect(r.container.querySelector('.sendStatusLine[data-kind="create-link"]')).toBeNull();
+    r.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Card B (2026-10-30, content-first UX theme) — receipt-bound send
+// vocabulary. Every pre-custody state (outbox-saved+unadmitted, admitting,
+// uncertain) renders the ONE headline "Pending — on this device": local
+// retention is real, NO acceptance receipt exists. The granular ambiguity
+// stays as secondary copy. Confirmation is never inferred: the only
+// "Message sent" claim stays the dispatch-resolved unsaved row (a real
+// terminal receipt), and no pending-state primary ever says
+// sent/delivered/queued/accepted.
+// ---------------------------------------------------------------------------
+describe("SendStatus — receipt-bound vocabulary (card B): 'Pending — on this device'", () => {
+  it("every uncertain row's PRIMARY is exactly 'Pending — on this device.' — the granular fact survives as secondary copy on the same row", () => {
+    // retry-same (admission-response loss)
+    const a = mintSendAttempt("s1");
+    updateSendAction(a.attemptId, {
+      stage: "uncertain",
+      certainty: "unknown",
+      recovery: "retry-same",
+      detail: "enqueue timed out",
+      payload: { tapText: "m", text: "m", attachments: [], files: [] },
+    });
+    let r = render(() => <SendStatus {...baseProps()} />);
+    let row = r.container.querySelector('.sendStatusLine[data-kind="uncertain"]')!;
+    expect(row.querySelector(".sendStatusText")!.textContent).toBe("Pending — on this device.");
+    expect(row.textContent).toContain("Queue confirmation unknown.");
+    expect(row.textContent).toContain("Check the queue, or retry this same message.");
+    r.unmount();
+    finishSendAttempt(a.attemptId);
+
+    // other uncertainty (check recovery)
+    const b = mintSendAttempt("s1");
+    updateSendAction(b.attemptId, { stage: "uncertain", certainty: "unknown", recovery: "check", detail: "x" });
+    r = render(() => <SendStatus {...baseProps()} />);
+    row = r.container.querySelector('.sendStatusLine[data-kind="uncertain"]')!;
+    expect(row.querySelector(".sendStatusText")!.textContent).toBe("Pending — on this device.");
+    expect(row.textContent).toContain("Outcome unknown — check before sending again.");
+    r.unmount();
+    finishSendAttempt(b.attemptId);
+  });
+
+  it("the session-create-unknown row keeps its create-specific fact as secondary copy under the Pending primary", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    mintSendAttempt("draft");
+    vi.setSystemTime(2_000);
+    markOwnerSessionCreateUnknown("draft", "session create timed out", 1_000);
+    vi.useRealTimers();
+    const r = render(() => <SendStatus {...baseProps({ draft: () => true, sessionId: () => "" })} />);
+    const row = r.container.querySelector('.sendStatusLine[data-kind="uncertain"]')!;
+    expect(row.querySelector(".sendStatusText")!.textContent).toBe("Pending — on this device.");
+    expect(row.textContent).toContain("Session creation unconfirmed.");
+    r.unmount();
+  });
+
+  it("preparing WITHOUT uploads renders the Pending vocabulary; the upload ordinal copy is retained when uploads are in flight", () => {
+    mintSendAttempt("s1"); // preparing, no uploadProgress accessor value
+    let r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.querySelector('.sendStatusLine[data-kind="progress"]')!.textContent).toBe("Pending — on this device…");
+    r.unmount();
+
+    r = render(() => (
+      <SendStatus {...baseProps({ uploadProgress: () => ({ done: 1, total: 3 }) })} />
+    ));
+    expect(r.container.querySelector('.sendStatusLine[data-kind="progress"]')!.textContent).toBe("Uploading 2 of 3…");
+    r.unmount();
+  });
+
+  it("Pending NEVER implies acceptance: no pending-state primary text says sent/delivered/queued/accepted/sending", () => {
+    const a = mintSendAttempt("s1");
+    updateSendAction(a.attemptId, { stage: "admitting" });
+    const b = mintSendAttempt("s1");
+    updateSendAction(b.attemptId, { stage: "uncertain", certainty: "unknown", recovery: "check", detail: "x" });
+    const r = render(() => <SendStatus {...baseProps()} />);
+    const primaries = Array.from(r.container.querySelectorAll(".sendStatusText")).map((el) => el.textContent!);
+    expect(primaries.length).toBeGreaterThanOrEqual(2);
+    for (const p of primaries) {
+      expect(p).not.toMatch(/sent|delivered|queued|accepted|sending/i);
+    }
+    expect(primaries).toContain("Pending — on this device.");
+    expect(primaries).toContain("Pending — on this device…");
+    r.unmount();
+  });
+
+  it("confirmed stays receipt-bound: 'Message sent' appears ONLY on the dispatch-resolved unsaved row (a real terminal receipt), never on a pending-state row", () => {
+    const a = mintSendAttempt("s1");
+    updateSendAction(a.attemptId, { stage: "uncertain", certainty: "unknown", recovery: "retry-same", payload: { tapText: "m", text: "m", attachments: [], files: [] } });
+    let r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.textContent).not.toContain("Message sent");
+    r.unmount();
+    finishSendAttempt(a.attemptId);
+
+    // The dispatch-resolved unsaved row KEEPS its precise receipt-backed claim
+    // (the dispatch's own terminal `sent` outcome; only the SAVE is unknown).
+    markSendAttemptStatusUnsaved("att-cc-sent", "s1", { itemId: "q-cc", state: "sent", detail: "ok" });
+    r = render(() => <SendStatus {...baseProps()} />);
+    expect(r.container.textContent).toContain("Message sent — status save unconfirmed.");
     r.unmount();
   });
 });

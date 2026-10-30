@@ -266,10 +266,17 @@ export function Composer(props: ComposerProps) {
               opencodeMsgID, slice 3 intent recovery; retract-to-compose for
               failed/unknown, mark-sent for unknown — Bug 1 / Bug 2). `sent` is
               filtered from the visible queue upstream (queueFor), so it needs no
-              surface. See QueueChip.tsx for the per-state action wiring. */}
+              surface. See QueueChip.tsx for the per-state action wiring.
+              Card B (2026-10-30, receipt-bound send vocabulary): the row
+              label "Queued" states CUSTODY (server queue holds the message),
+              never delivery — the tip below spells out the transcript as the
+              only delivery receipt, matching the QueueChip vocabulary. */}
           <Show when={!props.draft() && queueFor(props.sessionId()).length > 0}>
             <div class="queue-row">
-              <span class="queue-label" data-tip="Sent automatically when the current turn finishes">
+              <span
+                class="queue-label"
+                data-tip="Held in the server queue — dispatches when the current turn finishes; delivered only once it appears in the transcript"
+              >
                 Queued
               </span>
               <For each={queueFor(props.sessionId())}>

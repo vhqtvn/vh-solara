@@ -22,15 +22,41 @@
 // retract-with-warning + dismiss.
 //
 // The data-layer contract (cache, resolve, claim) is pinned in queue.test.ts.
+//
+// Card B (2026-10-30, content-first UX theme) — receipt-bound send
+// vocabulary: "Not sent — reconnecting" is a DISPLAY-LAYER composition over
+// terminal failed/unknown WHILE the connection grade is reconnecting/offline
+// (the ONLY place the grade may modulate send wording; it is never delivery
+// authority). Connected labels ("Failed" / "Outcome unknown") are retained;
+// pending renders no state text of its own (the queue-row "Queued" label —
+// server custody, never delivery — owns that wording). The QueueChip has no
+// connstatus test setter BY DESIGN (connstatus.ts is read-only for this
+// slice), so the grade reaches the chip through the optional `grade`
+// injection prop; production mounts omit it and read the live connGrade().
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createSignal } from "solid-js";
 import { cleanup, render } from "@solidjs/testing-library";
 import { QueueChip } from "../../src/components/QueueChip";
+import { Composer, type ComposerProps } from "../../src/components/chat/Composer";
 import type { QueuedMessage } from "../../src/queue";
+import type { ConnGrade } from "../../src/sync/connstatus";
 import {
   __resetQueueDispatchModeForTests,
   noteQueueCustodyRefusal,
   refreshDispatchMode,
 } from "../../src/lib/queueDispatchMode";
+
+// The Composer queue-row mount (the "Queued" custody label surface) needs
+// queueFor/queueMode/removeQueued from src/queue — QueueChip itself imports
+// only TYPES from it, so a file-wide vi.mock is safe for every chip cell.
+// SendStatus (pulled in by Composer) also imports resolveQueued; stubbed.
+const Q = vi.hoisted(() => ({ items: [] as QueuedMessage[] }));
+vi.mock("../../src/queue", () => ({
+  queueFor: () => Q.items,
+  queueMode: () => true,
+  removeQueued: () => {},
+  resolveQueued: async () => ({ kind: "recorded" as const }),
+}));
 
 // Matches the current backend staleDispatchRecoveryDetail wording for realism;
 // this test verifies the component renders q.detail verbatim — it is NOT a
@@ -44,6 +70,8 @@ afterEach(() => {
   // / capability signal) — reset it so every describe starts legacy.
   __resetQueueDispatchModeForTests();
   vi.unstubAllGlobals();
+  // Composer queue-row mount state (card B) — never leak into sibling specs.
+  Q.items = [];
 });
 
 function item(opts: Partial<QueuedMessage>): QueuedMessage {
@@ -79,7 +107,11 @@ describe("QueueChip — recovered `unknown` detail surfacing", () => {
 
   it("renders gracefully when an `unknown` item has NO detail (edge case: pre-STUCK-1 or recovery without detail)", () => {
     const { container } = render(() => (
-      <QueueChip q={item({ state: "unknown", detail: "" })} onRemove={vi.fn()} />
+      // grade injected (card B): a bare jsdom store defaults to status
+      // "connecting" → connGrade "reconnecting", under which the label
+      // composes to "Not sent — reconnecting". This cell pins the CONNECTED
+      // label, so it reads the live/connected posture explicitly.
+      <QueueChip q={item({ state: "unknown", detail: "" })} onRemove={vi.fn()} grade={() => "live"} />
     ));
     // No detail note rendered; no crash; the chip still shows the state label.
     expect(container.querySelector(".queue-detail-note")).toBeNull();
@@ -614,6 +646,194 @@ describe("QueueChip — Send-now escalation (queue-policy B2)", () => {
     ));
     expect(r.container.querySelector(".queue-escalate")).toBeTruthy();
     expect(r.container.querySelector(".queue-dismiss")).toBeTruthy();
+    r.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Card B (2026-10-30, content-first UX theme) — receipt-bound send
+// vocabulary. The connection grade is NEVER delivery authority; it may
+// modulate wording in EXACTLY one place: terminal failed/unknown WHILE the
+// grade is reconnecting/offline compose to "Not sent — reconnecting".
+// Confirmation remains `sent` + transcript entry only (the chip clears via
+// the queue-delivery-observed effect) — never inferred from connGrade.
+// ---------------------------------------------------------------------------
+describe("QueueChip — receipt-bound vocabulary (card B): 'Not sent — reconnecting' composition", () => {
+  it("connected labels retained: failed → 'Failed', unknown → 'Outcome unknown' at grade live AND degraded", () => {
+    // "degraded" is a CONNECTED posture (fetch failures, transport alive) —
+    // the composition must NOT fire there.
+    for (const g of ["live", "degraded"] as ConnGrade[]) {
+      const failed = render(() => (
+        <QueueChip q={item({ state: "failed", detail: "500 upstream" })} onRemove={vi.fn()} grade={() => g} />
+      ));
+      expect(failed.container.querySelector(".queue-state")!.textContent).toBe("Failed");
+      failed.unmount();
+
+      const unknown = render(() => (
+        <QueueChip q={item({ state: "unknown", detail: RECOVERY_DETAIL })} onRemove={vi.fn()} grade={() => g} />
+      ));
+      expect(unknown.container.querySelector(".queue-state")!.textContent).toBe("Outcome unknown");
+      unknown.unmount();
+    }
+  });
+
+  it("failed/unknown render 'Not sent — reconnecting' while grade is reconnecting or offline", () => {
+    for (const g of ["reconnecting", "offline"] as ConnGrade[]) {
+      const failed = render(() => (
+        <QueueChip q={item({ state: "failed", detail: "500 upstream" })} onRemove={vi.fn()} grade={() => g} />
+      ));
+      expect(failed.container.querySelector(".queue-state")!.textContent).toBe("Not sent — reconnecting");
+      failed.unmount();
+
+      const unknown = render(() => (
+        <QueueChip q={item({ state: "unknown", detail: RECOVERY_DETAIL })} onRemove={vi.fn()} grade={() => g} />
+      ));
+      expect(unknown.container.querySelector(".queue-state")!.textContent).toBe("Not sent — reconnecting");
+      unknown.unmount();
+    }
+  });
+
+  it("NEVER for pending or dispatching at any grade — pending has no state label; dispatching's 'Sending…' is the queue state machine's own dispatch claim, never a grade composition", () => {
+    for (const g of ["live", "degraded", "reconnecting", "offline"] as ConnGrade[]) {
+      const pending = render(() => (
+        <QueueChip q={item({ state: "pending", resolvedAt: undefined })} onRemove={vi.fn()} grade={() => g} />
+      ));
+      expect(pending.container.querySelector(".queue-state")).toBeNull(); // labelless by design
+      pending.unmount();
+
+      const dispatching = render(() => (
+        <QueueChip q={item({ state: "dispatching" })} onRemove={vi.fn()} grade={() => g} />
+      ));
+      expect(dispatching.container.querySelector(".queue-state")!.textContent).toBe("Sending…");
+      dispatching.unmount();
+    }
+  });
+
+  it("recovery: grade reconnecting → live reverts the label honestly — 'Outcome unknown' returns and the state label NEVER becomes a delivered/confirmed claim", () => {
+    const [grade, setGrade] = createSignal<ConnGrade>("reconnecting");
+    const r = render(() => (
+      <QueueChip q={item({ state: "unknown", detail: RECOVERY_DETAIL })} onRemove={vi.fn()} grade={grade} />
+    ));
+    const stateLabel = () => r.container.querySelector(".queue-state")!.textContent!;
+    expect(stateLabel()).toBe("Not sent — reconnecting");
+    setGrade("live");
+    expect(stateLabel()).toBe("Outcome unknown");
+    // Honest on recovery: no "Sent"/"Delivered"/"Confirmed" state label ever
+    // renders — confirmation is the chip CLEARING on sent + transcript entry,
+    // never a grade-driven label.
+    expect(stateLabel()).not.toMatch(/^(Sent|Delivered|Confirmed)/);
+    r.unmount();
+  });
+
+  it("the standing may-have-been-delivered caveat SURVIVES the composition (unknown + detail keeps its check-transcript note while disconnected)", () => {
+    const r = render(() => (
+      <QueueChip
+        q={item({ state: "unknown", detail: "proxy 502 (outcome unknown): upstream unreachable" })}
+        onRemove={vi.fn()}
+        grade={() => "offline"}
+      />
+    ));
+    expect(r.container.querySelector(".queue-state")!.textContent).toBe("Not sent — reconnecting");
+    const note = r.container.querySelector(".queue-detail-note")!;
+    expect(note.textContent).toContain("it may have been delivered; check the transcript before sending it again");
+    r.unmount();
+  });
+
+  it("the pending chip renders no acceptance/delivery-implying state text at any grade (custody wording belongs to the queue-row label)", () => {
+    for (const g of ["live", "reconnecting", "offline"] as ConnGrade[]) {
+      const r = render(() => (
+        <QueueChip q={item({ state: "pending", resolvedAt: undefined, text: "queued text" })} onRemove={vi.fn()} grade={() => g} />
+      ));
+      const state = r.container.querySelector(".queue-state");
+      expect(state).toBeNull();
+      expect(r.container.textContent!.toLowerCase()).not.toContain("sending");
+      expect(r.container.textContent!.toLowerCase()).not.toContain("sent");
+      r.unmount();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Card B — the Composer queue-row surface: "Queued" states SERVER CUSTODY
+// (a real receipt: the daemon accepted the item) and must never imply
+// delivery. The old tip ("Sent automatically when the current turn
+// finishes") promised sending; the receipt-bound tip names dispatch as an
+// attempt and binds delivery to the transcript.
+// ---------------------------------------------------------------------------
+describe("Queue-row vocabulary (Composer surface) — 'Queued' never implies delivery", () => {
+  function composerProps(over: Partial<ComposerProps> = {}): ComposerProps {
+    return {
+      draft: () => false,
+      sessionId: () => "s1",
+      isChild: () => false,
+      parentId: () => undefined,
+      onOpenParent: () => {},
+      input: () => "",
+      setInput: () => {},
+      focusMode: () => false,
+      setFocusMode: () => {},
+      working: () => false,
+      sending: () => false,
+      send: async () => {},
+      abort: () => {},
+      sendInFlight: () => false,
+      readyToSend: () => true,
+      curModel: () => undefined,
+      curVariant: () => "",
+      modelDialog: () => false,
+      setModelDialog: () => {},
+      ac: {
+        acItems: () => [],
+        acIndex: () => 0,
+        acVisible: () => false,
+        setAcIndex: () => {},
+        applyAc: () => {},
+        onAcKeyDown: () => false,
+        syncCaret: () => {},
+        dismissAc: () => {},
+      },
+      att: {
+        attachments: () => [],
+        setAttachments: () => [],
+        uploading: () => false,
+        uploadProgress: () => null,
+        presentInlineIds: () => new Set<string>(),
+        removeAttachment: () => {},
+        reinsertInlineChip: () => {},
+        addFiles: () => {},
+        flushPendingAttachments: async (_id: string) => ({ failed: [] }),
+        uploadFile: async (_file: File, _id: string) => null,
+        inlineFiles: new Map<string, File>(),
+      },
+      paste: {
+        onPaste: () => {},
+        pasteFromClipboard: async () => {},
+        onPasteButtonDown: () => {},
+        onPasteButtonUp: () => {},
+        onPasteButtonClick: () => {},
+        onPasteButtonBlur: () => {},
+      },
+      hist: { onHistoryKey: () => false, resetHistory: () => {} },
+      recovery: { retract: async () => {}, markSent: async () => {} },
+      refTa: () => {},
+      refMirror: () => {},
+      refFileInput: () => {},
+      onPickFile: () => {},
+      ...over,
+    };
+  }
+
+  it("the queue-row label reads 'Queued' (custody receipt) and its tip never promises sending — delivery is named transcript-bound", () => {
+    Q.items = [item({ id: "q-row-1", state: "pending", resolvedAt: undefined, text: "queued hello" })];
+    const r = render(() => <Composer {...composerProps()} />);
+    const label = r.container.querySelector(".queue-label")!;
+    expect(label).toBeTruthy();
+    expect(label.textContent).toContain("Queued");
+    const tip = label.getAttribute("data-tip")!;
+    // The retired promise-of-sending wording is gone…
+    expect(tip).not.toContain("Sent automatically");
+    // …delivery is bound to its only receipt: the transcript entry.
+    expect(tip).toContain("transcript");
     r.unmount();
   });
 });
