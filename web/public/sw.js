@@ -75,6 +75,17 @@ function narrowScope() {
 // channel deterministically.
 let hostFocusPort = null;
 
+// S4 cold-open notify activation: notificationclick's openWindow rung (the
+// Android sweep case — a backgrounded PWA has ZERO window clients) sets this
+// BEFORE opening; the freshly-booted host document cannot have a message
+// listener yet (messages to a listener-less page are dropped), so it ASKS
+// (VH_NOTIFY_FOCUS_QUERY) the moment its listener is live and the worker
+// answers "vh-notify-focus" exactly once. Module state lives with the worker
+// instance: a worker restart between the open and the query merely degrades
+// to the NO-AUTO-NEXT default (the operator taps NEXT). Mirrored in
+// web/src/lib/swPolicy.ts (NOTIFY_FOCUS_MSG / NOTIFY_FOCUS_QUERY_MSG).
+let pendingNotifyFocus = false;
+
 // --- Policy tables (mirror of web/src/lib/swPolicy.ts) ----------------------
 const STAMP_HEADER = "x-vh-sw-at"; // store-time stamp on cached entries (ms epoch)
 const SHELL_KEY = "/index.html"; // cache key for the single-server shell
@@ -198,6 +209,19 @@ self.addEventListener("message", (e) => {
       /* source went away — ignore */
     }
   }
+  if (e.data && e.data.type === "VH_NOTIFY_FOCUS_QUERY") {
+    // S4 cold-open reply: a freshly-booted host asks whether a
+    // notificationclick just opened it. One-shot — the flag was armed in the
+    // openWindow rung below and is consumed here (never re-answers).
+    if (pendingNotifyFocus) {
+      pendingNotifyFocus = false;
+      try {
+        e.source && e.source.postMessage({ type: "vh-notify-focus" });
+      } catch {
+        /* source went away — ignore */
+      }
+    }
+  }
 });
 
 // Web Push: the daemon pushes a notice when the app is closed and you're away.
@@ -230,6 +254,14 @@ self.addEventListener("push", (e) => {
 // notification payload; the app re-derives fresh state on arrival.
 // S3b scope-aware order (S3a X4 receipts — the NARROW registration's matchAll
 // can never see the host window; Firefox returns no iframe clients either):
+//   0. S4: prefer the HOST shell window (client URL pathname "/") — the ROOT
+//      registration controls the host document (scope "/" covers it; activate
+//      claims it), so ITS matchAll sees the host and a tap must land THERE,
+//      not on a stray pane window. Under the narrow scope the find() is
+//      naturally empty (X4) — no scope branch needed. After focusing it, send
+//      the notify-focus signal: the host — never the payload — owns the
+//      tab-selection decision and re-derives FRESH attention state
+//      (host-web attentionNotify/attentionNext).
 //   1. focus an existing controlled window client (the click's user
 //      activation makes client.focus() the reliable bring-to-front);
 //   2. else ask a connected host shell to focus itself over the focus
@@ -237,11 +269,29 @@ self.addEventListener("push", (e) => {
 //   3. else open the app INSIDE this worker's scope — openWindow enforces
 //      scope, and openWindow("/") from the narrow worker is rejected on every
 //      engine (X4). For the root registration the target is "/" — unchanged.
+//      The cold-open arm is set FIRST so the booted host's
+//      VH_NOTIFY_FOCUS_QUERY (see the message handler) learns the boot was
+//      notification-derived.
 self.addEventListener("notificationclick", (e) => {
   e.notification.close();
   e.waitUntil(
     (async () => {
       const all = await self.clients.matchAll({ type: "window", includeUncontrolled: false });
+      const host = all.find((c) => new URL(c.url).pathname === "/");
+      if (host) {
+        try {
+          await host.focus();
+        } catch {
+          /* engine refused focus — the window EXISTS (matchAll saw it), so
+             never openWindow a second one; still deliver the signal. */
+        }
+        try {
+          host.postMessage({ type: "vh-notify-focus" });
+        } catch {
+          /* host client went away mid-focus — nothing else to do */
+        }
+        return;
+      }
       for (const c of all) {
         if ("focus" in c) return c.focus();
       }
@@ -253,6 +303,7 @@ self.addEventListener("notificationclick", (e) => {
           /* stale port (worker/client teardown race) — fall through */
         }
       }
+      pendingNotifyFocus = true;
       if (self.clients.openWindow) return self.clients.openWindow(scopePath());
     })(),
   );

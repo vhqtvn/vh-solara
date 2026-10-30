@@ -82,6 +82,10 @@ async function initFakes(page: Page): Promise<void> {
       return n;
     }
     const reg = {
+      // `ready`/register() only ever resolve registrations with an ACTIVE
+      // worker (spec guarantee) — the S4 notifyRegistration prefers root and
+      // checks reg.active, so the fake models an active worker stub.
+      active: {},
       // Platform fact #6 model: a same-tag show REPLACES the open entry.
       showNotification(title: string, opts: { tag?: string; body?: string }) {
         const tag = opts?.tag ?? "";
@@ -107,6 +111,38 @@ async function initFakes(page: Page): Promise<void> {
       register: (url: string) => {
         log.push({ op: "sw-register", tag: url });
         return Promise.resolve(reg);
+      },
+      // S4 notify-focus plumbing — model exactly what attentionNotify touches
+      // on the REAL navigator.serviceWorker: the "message" EventTarget + the
+      // controller's postMessage. The WORKER side (sw.js) is simulated: the
+      // pending cold-open flag (notificationclick's openWindow rung arms it;
+      // a VH_NOTIFY_FOCUS_QUERY consumes it ONCE and replies "vh-notify-focus"
+      // as a message event — mirroring web/public/sw.js).
+      addEventListener: (t: string, fn: (ev: { data: unknown }) => void) => {
+        if (t === "message") messageListeners.push(fn);
+      },
+      removeEventListener: (t: string, fn: (ev: { data: unknown }) => void) => {
+        if (t !== "message") return;
+        const i = messageListeners.indexOf(fn);
+        if (i >= 0) messageListeners.splice(i, 1);
+      },
+      get controller() {
+        return controllerStub;
+      },
+    };
+    const messageListeners: Array<(ev: { data: unknown }) => void> = [];
+    let workerPendingNotify = false;
+    let notifyQueryCount = 0;
+    const controllerStub = {
+      postMessage(m: { type?: string }) {
+        if (m && m.type === "VH_NOTIFY_FOCUS_QUERY") {
+          notifyQueryCount++;
+          if (!workerPendingNotify) return; // ordinary boot — nothing pending
+          workerPendingNotify = false; // one-shot consume (mirrors sw.js)
+          setTimeout(() => {
+            for (const fn of messageListeners) fn({ data: { type: "vh-notify-focus" } });
+          }, 0);
+        }
       },
     };
     try {
@@ -165,6 +201,17 @@ async function initFakes(page: Page): Promise<void> {
         for (const [t, arr] of openByTag) out[t] = arr.length;
         return out;
       },
+      // S4 notify-focus worker-side controls.
+      armPendingNotify: () => {
+        workerPendingNotify = true;
+      },
+      pendingNotifyArmed: (): boolean => workerPendingNotify,
+      notifyQueryCount: (): number => notifyQueryCount,
+      /** Deliver the worker→page warm-path signal through the REAL installed
+       *  listener (models host.postMessage from notificationclick). */
+      deliverNotifyFocus: () => {
+        for (const fn of messageListeners) fn({ data: { type: "vh-notify-focus" } });
+      },
     };
   });
 }
@@ -208,6 +255,42 @@ async function setHidden(page: Page, hidden: boolean | null): Promise<void> {
     const b = (window as unknown as { __hostAttention?: { setHidden(v: boolean | null): void } }).__hostAttention;
     b?.setHidden(h);
   }, hidden);
+}
+
+/** Notify-focus one-shot state (armed / fired count). DEV bridge. */
+async function notifyFocusState(page: Page): Promise<{ armed: boolean; fired: number }> {
+  return page.evaluate(() => {
+    const b = (window as unknown as { __hostAttention?: { notifyFocusState(): { armed: boolean; fired: number } } })
+      .__hostAttention;
+    return b ? b.notifyFocusState() : { armed: false, fired: -1 };
+  });
+}
+
+/** Override the notify-focus arm deadline (null = production 30s). */
+async function setNotifyFocusArmMs(page: Page, ms: number | null): Promise<void> {
+  await page.evaluate((v) => {
+    const b = (window as unknown as { __hostAttention?: { setNotifyFocusArmMs(x: number | null): void } })
+      .__hostAttention;
+    b?.setNotifyFocusArmMs(v);
+  }, ms);
+}
+
+/** Simulate the notification-derived activation through the SAME handler the
+ *  swNarrow focus-channel listener routes through (swFocusHostListener). */
+async function simulateNotifyFocus(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const b = (window as unknown as { __hostAttention?: { simulateNotifyFocus(): void } }).__hostAttention;
+    b?.simulateNotifyFocus();
+  });
+}
+
+/** Re-fire the production boot query (install-time in prod; App mount cannot
+ *  be re-entered headlessly). */
+async function requeryPendingNotifyFocus(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const b = (window as unknown as { __hostAttention?: { requeryPendingNotifyFocus(): void } }).__hostAttention;
+    b?.requeryPendingNotifyFocus();
+  });
 }
 
 /** Enable/disable through the PRODUCTION setter (toggle + side effects). */
@@ -638,5 +721,128 @@ test.describe("needs-you Settings toggle (permission flows)", () => {
       .poll(() => page.evaluate((k) => localStorage.getItem(k), KEY))
       .toBe("off");
     await expect(item).toHaveAttribute("aria-checked", "false");
+  });
+});
+
+// ---- notification-derived tap selection (S4 notify-focus) ----------------------
+//
+// The Android shade TAP itself (the real gesture on a swept PWA) is not
+// headlessly reproducible — this block proves the MECHANISM the tap drives on
+// the HOST side: the "vh-notify-focus" signal → one-shot arm → the PRODUCTION
+// attentionNext.next() selection over FRESH live state (probeStatus-driven,
+// never the notification payload), the cold-boot deferral (state arrives
+// seconds after the shell), the deadline expiry (no stale hijack), and the
+// boot-query one-shot (cold open). The sw.js side of the contract is pinned
+// statically by web/tests/unit/sw-notificationclick.test.ts.
+
+test.describe("notify-focus: notification-derived tab selection (S4)", () => {
+  test.beforeEach(async ({ page }) => {
+    await initFakes(page);
+    await H.loadHost(page);
+  });
+
+  test("warm signal with live needy state selects the needy tab through production next(); no need → stays armed", async ({ page }) => {
+    const ids = await H.panes(page);
+    expect(ids.length).toBeGreaterThanOrEqual(2);
+    // Focus the OTHER pane so the selection is observable.
+    await H.focusPane(page, ids[1]);
+    await expect.poll(async () => H.focused(page)).toBe(ids[1]);
+    // A need lands on pane 0 (fresh, router-driven — not payload-driven).
+    await probeAttention(page, ids[0], "needs_permission");
+
+    // The worker's warm-path signal arrives as an SW message event — deliver
+    // it through the REAL installed listener.
+    await page.evaluate(() => {
+      const f = (window as unknown as { __fakeSw?: { deliverNotifyFocus(): void } }).__fakeSw;
+      f?.deliverNotifyFocus();
+    });
+    // FRESH state selected the needy pane via the production next() path.
+    await expect.poll(async () => H.focused(page), { timeout: 5000 }).toBe(ids[0]);
+    const st = await notifyFocusState(page);
+    expect(st.armed).toBe(false); // fired immediately — no pending arm left
+    expect(st.fired).toBe(1);
+
+    // With NO needy pane, the same signal arms and WAITS (cold-boot posture)
+    // instead of selecting anything.
+    await probeAttention(page, ids[0], "none");
+    await expect.poll(async () => H.needsYou(page)).toBe(0);
+    await H.focusPane(page, ids[1]);
+    await page.evaluate(() => {
+      const f = (window as unknown as { __fakeSw?: { deliverNotifyFocus(): void } }).__fakeSw;
+      f?.deliverNotifyFocus();
+    });
+    const armed = await notifyFocusState(page);
+    expect(armed.armed).toBe(true);
+    await page.waitForTimeout(250);
+    expect(await H.focused(page)).toBe(ids[1]); // nothing was selected
+  });
+
+  test("cold-open deferral: signal with NO needy state stays armed and selects on the FIRST fresh arrival", async ({ page }) => {
+    const ids = await H.panes(page);
+    await setNotifyFocusArmMs(page, 4000); // generous arm window for this proof
+    // Cold posture: activation arrives BEFORE any pane has reported a need.
+    await simulateNotifyFocus(page);
+    expect((await notifyFocusState(page)).armed).toBe(true);
+    expect((await notifyFocusState(page)).fired).toBe(0);
+
+    // Fresh state arrives seconds "later" (panes boot, probes land)…
+    await probeAttention(page, ids[0], "needs_reply");
+    // …and the armed one-shot selects it — exactly once.
+    await expect.poll(async () => H.focused(page), { timeout: 5000 }).toBe(ids[0]);
+    const st = await notifyFocusState(page);
+    expect(st.armed).toBe(false);
+    expect(st.fired).toBe(1);
+  });
+
+  test("deadline expiry: an expired arm never hijacks a later arrival; ordinary needs never select", async ({ page }) => {
+    const ids = await H.panes(page);
+    await H.focusPane(page, ids[1]);
+    await expect.poll(async () => H.focused(page)).toBe(ids[1]);
+    await setNotifyFocusArmMs(page, 150);
+    await simulateNotifyFocus(page);
+    expect((await notifyFocusState(page)).armed).toBe(true);
+    await page.waitForTimeout(400); // arm expires untouched
+    expect((await notifyFocusState(page)).armed).toBe(false);
+
+    // A need arriving AFTER expiry is a plain in-app need — no selection
+    // (the operator taps NEXT). Only notification-derived activation selects.
+    await probeAttention(page, ids[0], "needs_permission");
+    await expect.poll(async () => H.needsYou(page)).toBe(1);
+    await page.waitForTimeout(250);
+    expect(await H.focused(page)).toBe(ids[1]);
+    expect((await notifyFocusState(page)).fired).toBe(0);
+  });
+
+  test("boot query: install asked the worker; a pending cold-open activation replies ONCE, a re-query does not", async ({ page }) => {
+    // Ordinary boot (beforeEach's loadHost): install fired the query, the
+    // worker had nothing pending → no arm.
+    const queries = () =>
+      page.evaluate(() => (window as unknown as { __fakeSw?: { notifyQueryCount(): number } }).__fakeSw?.notifyQueryCount() ?? -1);
+    expect(await queries()).toBeGreaterThanOrEqual(1);
+    expect((await notifyFocusState(page)).armed).toBe(false);
+
+    // notificationclick's openWindow rung armed the worker-side flag; the
+    // (replayed) boot query consumes it exactly once and the reply runs the
+    // same one-shot as the warm path.
+    const ids = await H.panes(page);
+    await H.focusPane(page, ids[1]);
+    await probeAttention(page, ids[0], "needs_permission");
+    await page.evaluate(() => {
+      const f = (window as unknown as { __fakeSw?: { armPendingNotify(): void } }).__fakeSw;
+      f?.armPendingNotify();
+    });
+    await requeryPendingNotifyFocus(page);
+    await expect.poll(async () => H.focused(page), { timeout: 5000 }).toBe(ids[0]);
+    expect((await notifyFocusState(page)).armed).toBe(false);
+    expect(
+      await page.evaluate(() => (window as unknown as { __fakeSw?: { pendingNotifyArmed(): boolean } }).__fakeSw?.pendingNotifyArmed()),
+      "the worker consumed the pending flag (one-shot)",
+    ).toBe(false);
+
+    // A SECOND query gets nothing — the flag was consumed, no re-arm.
+    await requeryPendingNotifyFocus(page);
+    await page.waitForTimeout(120);
+    expect((await notifyFocusState(page)).armed).toBe(false);
+    expect((await notifyFocusState(page)).fired).toBe(1);
   });
 });

@@ -13,6 +13,8 @@ import { describe, expect, it } from "vitest";
 import {
   ASSET_PUT_PREFIXES,
   BOOT_TTL_MS,
+  NOTIFY_FOCUS_MSG,
+  NOTIFY_FOCUS_QUERY_MSG,
   SHELL_KEY,
   SHELL_TTL_MS,
   SHELL_URL,
@@ -176,6 +178,20 @@ describe("sw.js handlers that must survive unchanged", () => {
     expect(sw).toContain("self.clients.openWindow(scopePath())");
     // And it must NOT route to a pane/session from the payload.
     expect(sw).toContain("re-derives fresh state on arrival");
+  });
+
+  it("S4 notification activation: host-shell preference + notify-focus vocabulary mirrors swPolicy", () => {
+    // The click ladder prefers the HOST shell client (pathname "/" — the ROOT
+    // registration controls the host window after claim(); narrow matchAll
+    // can never see it, so the preference is scope-safe), signals the host
+    // with NOTIFY_FOCUS_MSG after focusing it, arms the cold-open activation
+    // before openWindow, and answers the booted host's
+    // NOTIFY_FOCUS_QUERY_MSG once. Literals pinned against swPolicy.
+    expect(sw).toContain('all.find((c) => new URL(c.url).pathname === "/")');
+    expect(sw).toContain(`host.postMessage({ type: "${NOTIFY_FOCUS_MSG}" })`);
+    expect(sw).toContain("pendingNotifyFocus = true");
+    expect(sw).toContain(`"${NOTIFY_FOCUS_QUERY_MSG}"`);
+    expect(sw).toContain(`e.source.postMessage({ type: "${NOTIFY_FOCUS_MSG}" })`);
   });
 
   it("keeps the SKIP_WAITING message + skipWaiting install posture", () => {

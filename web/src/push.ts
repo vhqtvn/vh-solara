@@ -30,13 +30,26 @@ function urlBase64ToUint8Array(b64: string): Uint8Array {
   return out;
 }
 
-async function getReg(): Promise<ServiceWorkerRegistration | null> {
+// The subscription is PINNED to the ROOT registration (scope "/"): a push
+// notification shown by the root worker can focus the HOST window (its
+// matchAll sees it after claim()) and cold-open "/" (openWindow enforces
+// scope — a narrow worker can never openWindow("/")). `serviceWorker.ready`
+// would resolve the longest-scope registration covering THIS document, which
+// under the S3b both-state is engine-defined for a /app document — pinning
+// makes it deterministic. register() is idempotent (same script URL + default
+// scope returns the existing root registration pwa.ts already created).
+async function rootRegistration(): Promise<ServiceWorkerRegistration | null> {
   if (!pushSupported) return null;
   try {
-    return await navigator.serviceWorker.ready;
+    return await navigator.serviceWorker.register("/sw.js");
   } catch {
     return null;
   }
+}
+
+// getReg kept as the single resolution point for enable/disable/sync.
+async function getReg(): Promise<ServiceWorkerRegistration | null> {
+  return rootRegistration();
 }
 
 async function postSub(sub: PushSubscription): Promise<boolean> {
@@ -85,6 +98,17 @@ export async function enablePush(): Promise<{ ok: boolean; error?: string }> {
   }
   const ok = await postSub(sub);
   if (ok) {
+    // Heal a pre-S4 subscription that landed on the NARROW registration
+    // (scope /app): its push notifications could never focus/open the host.
+    // Best-effort — a failure just leaves the old subscription to die on its
+    // next unreachable push.
+    try {
+      const narrow = await navigator.serviceWorker.getRegistration("/app");
+      const stale = narrow ? await narrow.pushManager.getSubscription() : null;
+      if (stale && stale.endpoint !== sub.endpoint) await stale.unsubscribe();
+    } catch {
+      /* best effort */
+    }
     setPushEnabledSig(true);
     saveVersioned(ENABLED_KEY, 1, true);
   }

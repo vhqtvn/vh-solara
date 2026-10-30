@@ -221,6 +221,36 @@ export function openWindowTarget(scopePath: string): string {
   return scopePath;
 }
 
+// --- S4 notification-activation vocabulary (notification tap → HOST shell) -----
+
+/**
+ * Message type the SW posts to the HOST window client after a notification
+ * tap (focused-existing or cold-opened). The host consumes it to run
+ * attention-next over FRESH live state — NEVER the notification payload
+ * (stale-state hazard; pinned by web/tests/unit/sw-notificationclick.test.ts).
+ */
+export const NOTIFY_FOCUS_MSG = "vh-notify-focus";
+
+/**
+ * Message a freshly-booted HOST document sends to its CONTROLLING worker to
+ * ask "did a notificationclick just open me?" (the cold-open path: the worker
+ * cannot postMessage a client whose listener does not exist yet, so the host
+ * asks the moment its listener is live). The worker replies with
+ * NOTIFY_FOCUS_MSG exactly once per pending activation.
+ */
+export const NOTIFY_FOCUS_QUERY_MSG = "VH_NOTIFY_FOCUS_QUERY";
+
+/**
+ * The HOST shell's client URL pathname. notificationclick PREFERS a focused
+ * controlled window client at this path: the ROOT registration controls the
+ * host window (scope "/" covers it; activate's claim() takes it), while the
+ * NARROW registration can never see it in matchAll (S3a X4 — so the
+ * preference is scope-safe: the find() is simply empty under narrow).
+ */
+export function isHostShellClient(pathname: string): boolean {
+  return pathname === "/";
+}
+
 /**
  * entryAge returns the age in ms of a cached entry from its stamp header
  * value. A missing, malformed, or non-numeric stamp yields Infinity: an

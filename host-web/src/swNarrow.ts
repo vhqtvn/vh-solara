@@ -52,10 +52,13 @@
 // no iframe clients either). Once the narrow worker is active we transfer
 // one MessageChannel port to it; a notificationclick that finds no
 // focusable window client asks the host to focus itself over the port
-// (window.focus() — no routing decision, the NO-AUTO-NEXT default; see
-// attentionNotify.ts). Honest limit: a gesture-less window.focus() from a
-// port message may be ignored by the engine — the reliable bring-to-front
-// stays client.focus() inside the worker's notificationclick handler.
+// (window.focus()). S4: the same notification-derived message also notifies
+// the focus-host listener (setFocusHostListener — attentionNotify registers)
+// so the host selects the needy tab from FRESH state (attentionNext); an
+// ordinary manual focus never travels this channel. Honest limit: a
+// gesture-less window.focus() from a port message may be ignored by the
+// engine — the reliable bring-to-front stays client.focus() inside the
+// worker's notificationclick handler.
 
 /** The narrow registration scope (pane documents live at `/app` exactly). */
 export const NARROW_SCOPE = "/app";
@@ -91,6 +94,16 @@ function establishFocusChannel(worker: ServiceWorker): void {
         } catch {
           /* ignored — engines may refuse gesture-less focus */
         }
+        // S4: this port message originates ONLY from notificationclick (the
+        // worker sends it when its matchAll found no focusable client), so it
+        // IS a notification-derived activation — notify the listener so the
+        // host runs attention-next over FRESH state (attentionNotify owns the
+        // one-shot; hook registration avoids an import cycle here).
+        try {
+          focusHostListener?.();
+        } catch {
+          /* listener threw — focus already happened, ignore */
+        }
       }
     };
     channel.port1.onmessageerror = () => {
@@ -103,6 +116,17 @@ function establishFocusChannel(worker: ServiceWorker): void {
     // notificationclick falls back to its matchAll/openWindow legs.
     focusPort = null;
   }
+}
+
+// Notification-derived host-focus listener (S4). attentionNotify registers
+// here — the import direction attentionNotify → swNarrow already exists, so a
+// reverse import would cycle; the hook keeps swNarrow dependency-free.
+let focusHostListener: (() => void) | null = null;
+
+/** Register (or clear) the listener invoked when notificationclick asks the
+ *  host to focus itself over the focus channel. */
+export function setFocusHostListener(fn: (() => void) | null): void {
+  focusHostListener = fn;
 }
 
 /** Wire the focus channel to every future activation of this registration. */

@@ -20,8 +20,11 @@ import {
   classifyRequest,
   createCoalescer,
   entryAge,
+  isHostShellClient,
   isNarrowScope,
   navDispatch,
+  NOTIFY_FOCUS_MSG,
+  NOTIFY_FOCUS_QUERY_MSG,
   openWindowTarget,
   shellDecision,
 } from "../../src/lib/swPolicy";
@@ -293,6 +296,30 @@ describe("S3b narrow-scope vocabulary (navDispatch / openWindowTarget / isNarrow
     expect(openWindowTarget("/app")).toBe("/app");
     expect(isNarrowScope("/")).toBe(false);
     expect(isNarrowScope("/app")).toBe(true);
+  });
+});
+
+describe("S4 notification-activation vocabulary (NOTIFY_FOCUS_MSG / isHostShellClient)", () => {
+  it("isHostShellClient: exactly the host root pathname, nothing else", () => {
+    expect(isHostShellClient("/")).toBe(true);
+    // The pane SPA entry, host assets, scope strays and hashed assets are NOT
+    // the host shell client the click ladder prefers.
+    expect(isHostShellClient("/app")).toBe(false);
+    expect(isHostShellClient("/app/x")).toBe(false);
+    expect(isHostShellClient("/host/")).toBe(false);
+    expect(isHostShellClient("/apple")).toBe(false);
+    expect(isHostShellClient("/assets/x.js")).toBe(false);
+    expect(isHostShellClient("")).toBe(false);
+  });
+
+  it("the notify-focus vocabulary is stable, namespaced, and distinct", () => {
+    // The SW is plain JS and cannot import this module — the literals are
+    // pinned against the SW text by sw-coalesce-mirror.test.ts. Keep the
+    // values vh-namespaced and keep query ≠ signal (a reply must never be
+    // confusable with the query).
+    expect(NOTIFY_FOCUS_MSG).toBe("vh-notify-focus");
+    expect(NOTIFY_FOCUS_QUERY_MSG).toBe("VH_NOTIFY_FOCUS_QUERY");
+    expect(NOTIFY_FOCUS_MSG).not.toBe(NOTIFY_FOCUS_QUERY_MSG);
   });
 });
 

@@ -7,7 +7,8 @@ import {
   workspaces,
   workspaceApiFor,
 } from "./dockview/store";
-import { ACTIVATION_BUDGET_MS, ensureNarrowRegistration } from "./swNarrow";
+import { next } from "./attentionNext";
+import { ACTIVATION_BUDGET_MS, ensureNarrowRegistration, setFocusHostListener } from "./swNarrow";
 
 // =============================================================================
 // PWA NEEDS-YOU ATTENTION NOTIFICATIONS (v1).
@@ -30,19 +31,29 @@ import { ACTIVATION_BUDGET_MS, ensureNarrowRegistration } from "./swNarrow";
 //   4. The ROOT SW (/sw.js, scope /) is registration-persistent and
 //      origin-wide; its fetch handler route-excludes / and /host/* (host
 //      passthrough — zero interference). S3b: the host ALSO registers the
-//      same script at scope /app (swNarrow.ts) so panes are born controlled;
-//      notifications display through THAT held registration (see
-//      notifyRegistration — the host doc's `ready` hangs under narrow-only,
-//      S3a X4). Both registrations share this file's notificationclick
-//      handler, which is scope-aware (matchAll → host focus channel →
-//      in-scope openWindow) — the host window itself is invisible to the
-//      narrow worker's matchAll on every engine, and Firefox returns no
-//      iframe clients at all (X4), so click-to-focus is host-mediated.
-//   5. SW notifications attribute to the installed app; clicks focus an
-//      existing window when one is visible to the worker (see 4 for the
-//      scope-aware fallback ladder).
+//      same script at scope /app (swNarrow.ts) so panes are born controlled.
+//      S4 (Android tap fix): NOTIFICATIONS GO THROUGH THE ROOT REGISTRATION
+//      (see notifyRegistration): a worker may only openWindow INSIDE its
+//      scope (S3a X4 — openWindow("/") from the narrow worker is rejected on
+//      every engine), and only the root worker's matchAll can see the HOST
+//      window (scope "/" covers it; activate's claim() takes it) — so the
+//      root worker can BOTH focus the live host and cold-open "/" after an
+//      Android sweep. The narrow registration is the degraded fallback (dev
+//      hosts without /sw.js, or a root activation still in flight).
+//   5. SW notifications attribute to the installed app; clicks focus the
+//      HOST shell (the root worker prefers the host window client; the
+//      narrow worker falls back to its focus channel / in-scope openWindow —
+//      the scope-aware ladder in sw.js notificationclick).
 //   6. Same-tag showNotification REPLACES; distinct tags are separate shade
 //      entries; getNotifications({tag}) + close() cleans up.
+//   7. S4 TAP SELECTION (fresh state, never the payload): when the host is
+//      focused/opened BY a notification tap, the worker sends the
+//      "vh-notify-focus" signal (warm: postMessage to the focused host
+//      client; cold: a pending flag the booted host queries via
+//      VH_NOTIFY_FOCUS_QUERY). The host then runs attentionNext.next() over
+//      LIVE state — one-shot, deadline-bounded (a cold PWA boot needs
+//      seconds before panes re-report their needs), and ONLY on the
+//      notification-derived signal: an ordinary manual focus never selects.
 //
 // REVERSIBLE DEFAULTS (all flagged, all cheap to flip):
 //   - OPT-IN default OFF (absent key = off; notifications deserve consent).
@@ -51,10 +62,11 @@ import { ACTIVATION_BUDGET_MS, ensureNarrowRegistration } from "./swNarrow";
 //     host — the tab badges + NEXT already show the need); pending fires
 //     flush on the next visibilitychange→hidden. The SUMMARY notification is
 //     maintained regardless of visibility (it IS the shade indicator).
-//   - NO AUTO-NEXT on notification click: the SW click just focuses the app;
-//     the operator taps NEXT (which re-derives fresh ranking). Routing to a
-//     specific pane from a (possibly stale) notification payload was
-//     considered and deferred — always fresh state.
+//   - NO AUTO-NEXT on ORDINARY focus: the SW click focuses the host and (S4)
+//     signals notify-focus — ONLY that notification-derived signal runs the
+//     attention-next selection over fresh state. Routing to a specific pane
+//     from a (possibly stale) notification payload was considered and
+//     deferred — always fresh state, never the payload.
 //   - SW REGISTRATION ON ENABLE, not unconditionally: the host registers
 //     /sw.js (idempotent, scope /) when the persisted toggle is ON at boot
 //     and on first enable. A device that never opted in never grows a host-SW
@@ -239,7 +251,15 @@ export async function requestEnableAttentionNotify(): Promise<boolean> {
 
 /** One manager decision, for the DEV-bridge fired-log (DEV builds only). */
 export interface NotifyLogEntry {
-  op: "show" | "close" | "suppressed" | "badge" | "badge-clear" | "register" | "error";
+  op:
+    | "show"
+    | "close"
+    | "suppressed"
+    | "badge"
+    | "badge-clear"
+    | "register"
+    | "notify-next"
+    | "error";
   tag?: string;
   title?: string;
   body?: string;
@@ -333,24 +353,52 @@ function enumerateNeedy(): NeedyPane[] {
 // ---- service-worker plumbing --------------------------------------------------
 
 /**
- * Resolve the registration notifications go through (S3b surgery, S3a X4):
- * prefer the HELD narrow registration (registered at host boot — always
- * available when the folded host could register at all), because the host
- * document's `serviceWorker.ready` HANGS FOREVER under narrow-only (no
- * registration covers the host doc at "/") and reselects the ROOT
- * registration under both-state. Fallback: a BOUNDED ready race (root
- * registration — the both-state steady path for hosts where the narrow
- * registration failed, e.g. dev servers without /sw.js). Never hangs; null
- * → degrade quietly (same posture as before, but now with a bound).
+ * How long a show/close waits for the ROOT registration to become ready
+ * before degrading to the narrow fallback (the bounded-race pattern from
+ * swNarrow's ACTIVATION_BUDGET_MS, deliberately longer: notification calls
+ * are fire-and-forget — nothing user-visible blocks on them — while a first
+ * enable may still be mid-install, whose activate precache can be slow over
+ * a tunnel).
+ */
+const NOTIFY_ROOT_BUDGET_MS = 5000;
+
+/**
+ * Bounded narrow fallback (commit-review b-F1, the paneSrcGate b-F1 pattern):
+ * `ensureNarrowRegistration()` awaits `register()` with NO internal timer, so
+ * a stalled /sw.js script fetch would leave a notification show/close pending
+ * forever. Race the registration promise itself against the budget — the
+ * SAME bound the pane-src gate uses — and fall through to null on expiry
+ * (degrade quietly; a late registration still memoizes for later calls).
+ */
+async function boundedNarrowRegistration(): Promise<ServiceWorkerRegistration | null> {
+  return Promise.race([
+    ensureNarrowRegistration(),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), ACTIVATION_BUDGET_MS)),
+  ]);
+}
+
+/**
+ * Resolve the registration notifications go through (S4 Android tap fix):
+ * PREFER THE ROOT REGISTRATION (scope "/"). Only the root worker can focus
+ * the HOST window (its matchAll sees it after claim()) and cold-open "/" on
+ * an Android sweep (openWindow enforces scope — S3a X4 — so the narrow
+ * worker can NEVER openWindow("/")); the needs-you tap therefore only opens
+ * the HOST shell when the notification was shown by the ROOT worker. The
+ * host document's `serviceWorker.ready` resolves exactly that root
+ * registration (the narrow scope /app does not cover the host at "/"), so a
+ * BOUNDED ready race is the resolution; under narrow-only (no root yet) it
+ * hangs and the bound fires. Degraded fallback: the HELD narrow registration
+ * (registered at host boot), itself bounded (a stalled register() resolves
+ * null — never hangs; total worst case 5s + 2s, fire-and-forget calls) —
+ * pre-S4 behavior, tap lands on the focus channel or /app. null → degrade
+ * quietly.
  */
 async function notifyRegistration(): Promise<ServiceWorkerRegistration | null> {
-  const narrow = await ensureNarrowRegistration();
-  if (narrow && narrow.active) return narrow;
   if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) {
     return null;
   }
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(null), ACTIVATION_BUDGET_MS);
+  const root = await new Promise<ServiceWorkerRegistration | null>((resolve) => {
+    const timer = setTimeout(() => resolve(null), NOTIFY_ROOT_BUDGET_MS);
     navigator.serviceWorker.ready.then(
       (reg) => {
         clearTimeout(timer);
@@ -362,6 +410,10 @@ async function notifyRegistration(): Promise<ServiceWorkerRegistration | null> {
       },
     );
   });
+  if (root && root.active) return root;
+  const narrow = await boundedNarrowRegistration();
+  if (narrow && narrow.active) return narrow;
+  return null;
 }
 
 /**
@@ -441,6 +493,82 @@ function updateBadge(count: number): void {
 
 function showPaneNotification(pane: NeedyPane): void {
   void showNotification(paneTag(pane.paneId), `${pane.label} needs you`, needyBody(pane.attention));
+}
+
+// ---- notification-derived activation (S4 notify-focus) -------------------------
+
+/**
+ * How long a notify-focus activation stays armed waiting for fresh needy
+ * state (one-shot deadline). The WARM host already has live state and fires
+ * immediately; the COLD path (Android swept the PWA; the tap openWindowed
+ * "/") must wait for the shell to boot, panes to load, and status probes to
+ * re-report the need — seconds on a phone over a tunnel. Generous by design;
+ * a stale arm simply expires (the NO-AUTO-NEXT default returns).
+ */
+const NOTIFY_FOCUS_ARM_MS = 30_000;
+
+/** DEV-only override of the arm deadline (e2e timing proofs; prod untouched). */
+let notifyFocusArmMs = NOTIFY_FOCUS_ARM_MS;
+/** Whether a notify-focus activation is currently armed (awaiting needy state). */
+let notifyFocusArmed = false;
+/** Deadline-clearing timer for the current arm (null when unarmed). */
+let notifyFocusDisarmTimer: ReturnType<typeof setTimeout> | null = null;
+/** How many times a notify-focus activation actually ran next() (DEV probe). */
+let notifyFocusFired = 0;
+
+function disarmNotifyFocus(): void {
+  notifyFocusArmed = false;
+  if (notifyFocusDisarmTimer !== null) {
+    clearTimeout(notifyFocusDisarmTimer);
+    notifyFocusDisarmTimer = null;
+  }
+}
+
+/**
+ * The notify-focus signal handler — the ONLY entry point that can trigger the
+ * notification-derived tab selection. Sources (all notification-derived, none
+ * reachable by an ordinary manual focus): the SW "message" event
+ * ("vh-notify-focus" — the root worker's notificationclick sends it to the
+ * focused host client, or replies with it to the boot query after a cold
+ * open), and the swNarrow focus-channel listener ("vh-focus-host" — the
+ * narrow fallback's notificationclick asking the host to focus itself).
+ * Arms a one-shot: if fresh state already has a needy pane, select it NOW;
+ * otherwise the reactive evaluation fires on the first needy arrival (cold
+ * boot) until the deadline expires.
+ */
+function onNotifyFocusSignal(): void {
+  notifyFocusArmed = true;
+  if (notifyFocusDisarmTimer !== null) clearTimeout(notifyFocusDisarmTimer);
+  notifyFocusDisarmTimer = setTimeout(disarmNotifyFocus, notifyFocusArmMs);
+  maybeRunNotifyFocus();
+}
+
+/**
+ * Run the armed selection if fresh state justifies it: EXACTLY the existing
+ * NEXT mechanism (attentionNext.next — rank, cross-workspace switch,
+ * restore-from-tray, keyboard composition) over LIVE state, never the
+ * notification payload. No-op when unarmed or no pane currently needs the
+ * operator (next() itself is also a no-op then; the guard keeps the one-shot
+ * ARMED so a later arrival still fires within the deadline).
+ */
+function maybeRunNotifyFocus(): void {
+  if (!notifyFocusArmed) return;
+  if (enumerateNeedy().length === 0) return;
+  disarmNotifyFocus();
+  notifyFocusFired++;
+  note({ op: "notify-next" });
+  try {
+    next();
+  } catch {
+    // A selection failure must never break the evaluation effect that calls
+    // this — the operator still has the tab badges + NEXT button.
+  }
+}
+
+/** SW "message" event handler (messages from the controlling worker). */
+function onServiceWorkerMessage(ev: MessageEvent): void {
+  const d = ev.data as { type?: string } | null;
+  if (d && d.type === "vh-notify-focus") onNotifyFocusSignal();
 }
 
 // ---- evaluation ----------------------------------------------------------------
@@ -581,6 +709,20 @@ interface AttentionDevBridge {
   /** Override the visibility read (null = real document.visibilityState).
    *  Mechanism-proof for headless e2e; prod never sets this. */
   setHidden(hidden: boolean | null): void;
+  /** Simulate a notification-derived activation: runs the SAME handler the
+   *  SW "vh-notify-focus" message routes through (the real gesture — an
+   *  Android shade tap — is not headlessly reproducible; the e2e proves the
+   *  mechanism). */
+  simulateNotifyFocus(): void;
+  /** Notify-focus one-shot state (armed / how many times next() fired). */
+  notifyFocusState(): { armed: boolean; fired: number };
+  /** Override the arm deadline (null = production 30s). E2e timing proofs. */
+  setNotifyFocusArmMs(ms: number | null): void;
+  /** Re-fire the production boot query (queryPendingNotifyFocus). In prod it
+   *  runs once at install (App mount); headless e2e cannot re-enter mount, so
+   *  the bridge exposes the same production function for the cold-open
+   *  one-shot proof. */
+  requeryPendingNotifyFocus(): void;
   /** Unit-level probes of the PURE core (host-web has no unit runner — these
    *  are the pure functions, callable with synthetic inputs). */
   pure: {
@@ -612,6 +754,12 @@ function installDevBridge(): void {
     setHidden: (h) => {
       visibilityOverride = h;
     },
+    simulateNotifyFocus: () => onNotifyFocusSignal(),
+    notifyFocusState: () => ({ armed: notifyFocusArmed, fired: notifyFocusFired }),
+    setNotifyFocusArmMs: (ms) => {
+      notifyFocusArmMs = ms ?? NOTIFY_FOCUS_ARM_MS;
+    },
+    requeryPendingNotifyFocus: () => queryPendingNotifyFocus(),
     pure: {
       episodeDiff: (prev, next) => episodeDiff(new Map(prev), new Map(next)),
       summary: (list) => summaryNotification(list),
@@ -630,18 +778,52 @@ function removeDevBridge(): void {
 
 // ---- install / uninstall (mirrors viewportShape.ts) ---------------------------
 
+/** Held SW message listener (uninstall detaches it; null while uninstalled). */
+let swMessageListener: ((ev: MessageEvent) => void) | null = null;
+
+/**
+ * Ask the controlling worker whether THIS boot was notification-opened (the
+ * S4 cold path: notificationclick's openWindow rung set a pending flag in the
+ * root worker BEFORE opening — a freshly-booted page cannot have a listener
+ * yet, so the host asks the moment its listener is live; the worker replies
+ * "vh-notify-focus" exactly once). A worker restart between the open and
+ * this query loses the flag — degrades to the NO-AUTO-NEXT default.
+ */
+function queryPendingNotifyFocus(): void {
+  if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
+  const sw = navigator.serviceWorker;
+  if (!sw.controller) return; // uncontrolled boot (no active root worker) — nothing pending
+  try {
+    sw.controller.postMessage({ type: "VH_NOTIFY_FOCUS_QUERY" });
+  } catch {
+    // controller vanished mid-query — ignore (no arm happens).
+  }
+}
+
 /**
  * Install the needs-you notification manager. Creates the reactive evaluation
  * (a dedicated root so uninstall can dispose it cleanly), the visibilitychange
- * listener, and the DEV bridge. If the persisted toggle is ON at boot, ensures
- * the /sw.js registration (see the registration choice in the header). No-op
- * in non-browser environments. Idempotent.
+ * listener, the notify-focus consumers (SW message listener + boot query +
+ * the swNarrow focus-channel hook), and the DEV bridge. If the persisted
+ * toggle is ON at boot, ensures the /sw.js registration (see the registration
+ * choice in the header). No-op in non-browser environments. Idempotent.
  */
 export function installAttentionNotify(): void {
   if (installed) return;
   if (typeof window === "undefined") return;
   installed = true;
   if (attentionNotifyEnabled()) ensureServiceWorker();
+  // Notify-focus consumers (S4). The listener attaches BEFORE the boot query
+  // posts (same synchronous block — the reply lands in a later task).
+  if (typeof navigator !== "undefined" && "serviceWorker" in navigator) {
+    const sw = navigator.serviceWorker;
+    if (typeof sw.addEventListener === "function") {
+      swMessageListener = onServiceWorkerMessage;
+      sw.addEventListener("message", swMessageListener);
+    }
+  }
+  queryPendingNotifyFocus();
+  setFocusHostListener(onNotifyFocusSignal);
   rootDispose = createRoot((dispose) => {
     createEffect(() => {
       // Track the store's per-workspace needs-you signal — it is recomputed on
@@ -649,6 +831,9 @@ export function installAttentionNotify(): void {
       // so this effect re-runs exactly when the needy set could have changed.
       void needsYouByWs();
       evaluate();
+      // S4: a notification-derived activation selects the needy tab from THIS
+      // fresh evaluation (warm: immediately; cold: on the first arrival).
+      maybeRunNotifyFocus();
     });
     return dispose;
   });
@@ -668,5 +853,16 @@ export function uninstallAttentionNotify(): void {
     document.removeEventListener("visibilitychange", visibilityListener);
     visibilityListener = null;
   }
+  if (
+    swMessageListener &&
+    typeof navigator !== "undefined" &&
+    "serviceWorker" in navigator &&
+    typeof navigator.serviceWorker.removeEventListener === "function"
+  ) {
+    navigator.serviceWorker.removeEventListener("message", swMessageListener);
+  }
+  swMessageListener = null;
+  setFocusHostListener(null);
+  disarmNotifyFocus();
   removeDevBridge();
 }
