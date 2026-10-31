@@ -17,7 +17,17 @@ import (
 // is the harness for the reload-project integration tests.
 func newReloadServer(t *testing.T) (*Server, *fakeOpenCode, *httptest.Server, *httptest.Server) {
 	t.Helper()
-	fake := newFake()
+	return newReloadServerWithFake(t, newFake())
+}
+
+// newReloadServerWithFake is newReloadServer for a caller-supplied fake — the
+// subscriber-lifecycle harness (queue_subscriber_lifecycle_test.go) installs a
+// sessionListGate on its own fake BEFORE the default aggregator starts, so the
+// first hydrate is ordered after the test seeds the authoritative session list
+// (CI 41192532920: a pre-seed hydrate froze an empty set and the post-hydrate
+// orphan-queue reconcile reaped the just-seeded queue.json).
+func newReloadServerWithFake(t *testing.T, fake *fakeOpenCode) (*Server, *fakeOpenCode, *httptest.Server, *httptest.Server) {
+	t.Helper()
 	ocSrv := httptest.NewServer(fake.handler())
 
 	agg := aggregator.New(ocSrv.URL, 100)

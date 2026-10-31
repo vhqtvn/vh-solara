@@ -43,9 +43,23 @@ import (
 // write .vh-solara into the package directory. newReloadServer creates the
 // Server first and projectRoot("") is evaluated per call, so chdiring after
 // construction (but before any aggFor("")) is sufficient.
+//
+// sessionListGate (CI 41192532920): the fake's session list endpoint is GATED
+// closed before the default aggregator starts, and seedFakeSessions opens it.
+// Without the gate, the default aggregator's first hydrate races the test's
+// seedFakeSessions — a hydrate that wins freezes an authoritative EMPTY
+// session set, and the post-hydrate orphan-queue reconcile
+// (reconcileQueuesForAgg, spawned by aggFor's immediate-run arm) then reaps
+// every seeded queue.json whose session the store never sourced. The gate
+// orders every hydrate AFTER the seed, so every reconcile pass that can see
+// the seeded queue.json necessarily carries the seeded sessions in its store.
 func newSubscriberServer(t *testing.T) (*Server, *fakeOpenCode, *httptest.Server, *httptest.Server) {
 	t.Helper()
-	srv, fake, ocSrv, web := newReloadServer(t)
+	fake := newFake()
+	fake.mu.Lock()
+	fake.sessionListGate = make(chan struct{})
+	fake.mu.Unlock()
+	srv, fake, ocSrv, web := newReloadServerWithFake(t, fake)
 	t.Chdir(t.TempDir())
 	return srv, fake, ocSrv, web
 }
@@ -105,7 +119,11 @@ func deliverWireEvent(a *aggregator.Aggregator, msgID, sessionID string) {
 // seedFakeSessions installs the authoritative backend session list under the
 // fake's mutex (the /session handler reads it under the same lock; the
 // default aggregator is already tailing when tests run, so an unsynchronized
-// assignment could race a reconnect hydrate).
+// assignment could race a reconnect hydrate). It ALSO opens the harness's
+// sessionListGate (under the same mutex, nil-ing it so only one closer
+// exists): newSubscriberServer holds every /session list GET closed until
+// this point, so the default aggregator's first hydrate is ORDERED after the
+// seed and can never freeze an authoritative empty set (CI 41192532920).
 func seedFakeSessions(fake *fakeOpenCode, ids ...string) {
 	raw := make([]string, 0, len(ids))
 	for _, id := range ids {
@@ -113,7 +131,12 @@ func seedFakeSessions(fake *fakeOpenCode, ids ...string) {
 	}
 	fake.mu.Lock()
 	fake.sessions = raw
+	gate := fake.sessionListGate
+	fake.sessionListGate = nil
 	fake.mu.Unlock()
+	if gate != nil {
+		close(gate) // AFTER the list is visible: blocked hydrates see the seed.
+	}
 }
 
 // TestQueueSubscriberLifecycle_AggForInstallsSiblings — REAL aggFor callers:

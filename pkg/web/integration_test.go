@@ -25,10 +25,24 @@ import (
 type fakeOpenCode struct {
 	mu       sync.Mutex
 	sessions []string // raw JSON session objects
-	messages map[string]string
-	events   chan string    // raw JSON event payloads ({id,type,properties})
-	prompts  []string       // bodies POSTed to /session/:id/message (prompt passthrough)
-	msgGets  map[string]int // GET /session/:id/message hit counts (lazy-hydration test)
+	// sessionListGate, when non-nil, BLOCKS every GET /session (the session
+	// list the aggregator hydrates from) until the channel is closed — a
+	// test-owned rendezvous that orders the FIRST hydrate AFTER the test has
+	// seeded `sessions`. Without it, the default aggregator started by
+	// newReloadServer races the test's seedFakeSessions: a hydrate that wins
+	// freezes an authoritative EMPTY session set, and the post-hydrate
+	// orphan-queue reconcile (reconcileQueuesForAgg) then reaps every
+	// on-disk queue.json for a session the store never sourced — the CI run
+	// 41192532920 flake (TestQueueSubscriberLifecycle_AggForInstallsSiblings).
+	// Blocking happens OUTSIDE f.mu; the seeder sets `sessions` under f.mu
+	// and then closes the gate (nil-ing it under f.mu so only one closer
+	// exists). nil (default) = no gating, so every other fake user is
+	// unaffected.
+	sessionListGate chan struct{}
+	messages        map[string]string
+	events          chan string    // raw JSON event payloads ({id,type,properties})
+	prompts         []string       // bodies POSTed to /session/:id/message (prompt passthrough)
+	msgGets         map[string]int // GET /session/:id/message hit counts (lazy-hydration test)
 	// msgFullGets counts ONLY cold-load GETs (?limit=<WindowMaxCount>) — the
 	// single-flight invariant (Part-B: cold-load is MessagesTail(WindowMaxCount),
 	// not a no-?limit Messages()). Cold-seed tail GETs (?limit=<coldTailLimit>)
@@ -85,6 +99,26 @@ func newFake() *fakeOpenCode {
 func (f *fakeOpenCode) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/session", func(w http.ResponseWriter, r *http.Request) {
+		// Test rendezvous (see sessionListGate): hold the session list until
+		// the owning test has seeded it, so a hydrate can never freeze an
+		// empty authoritative set that post-hydrate reconcile treats as
+		// "delete every on-disk queue". Block OUTSIDE f.mu — the seeder
+		// (seedFakeSessions) needs f.mu to publish the list before closing.
+		f.mu.Lock()
+		gate := f.sessionListGate
+		f.mu.Unlock()
+		if gate != nil {
+			// Context-aware: a test that never seeds (and never opens the
+			// gate) still tears the fake down — CloseClientConnections /
+			// Server.Close cancel the request, and a bare <-gate would hang
+			// Close() on this outstanding request forever (observed:
+			// TestQueueSubscriberLifecycle_ShutdownRetiresAndPreservesDefault).
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return
+			}
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		fmt.Fprintf(w, "[%s]", strings.Join(f.sessions, ","))
