@@ -117,6 +117,18 @@ var discReasonName = [numDiscReasons]string{
 	"write_failure",
 }
 
+// DiscReasonName returns the stable token for a DisconnectReason value
+// ("request_ctx_closed", …) so journal lines can carry the reason as text
+// instead of a bare int (the P4 incident self-capture "stream close" line is
+// the first consumer). Out-of-range values return "unknown" — a journal line
+// must never stringify to empty or panic on a future reason value.
+func DiscReasonName(reason int) string {
+	if reason < 0 || reason >= numDiscReasons {
+		return "unknown"
+	}
+	return discReasonName[reason]
+}
+
 // CopyTerm enumerates how a controller io.Copy direction ended (Probe 6).
 const (
 	CopyTermNormal = iota // 0 — io.Copy returned nil (clean EOF)

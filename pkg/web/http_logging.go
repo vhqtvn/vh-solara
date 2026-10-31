@@ -28,9 +28,13 @@ import (
 // GET /vh/snapshot is also logged: it is the one-shot snapshot path whose
 // server time is the daemon-side signal for warm-session hydrate latency (the
 // frontend's conn·server·hydrate diagnostic line is the only other signal).
-// GET /vh/stream is intentionally NOT logged — it is a long-lived EventSource,
-// so its dur_ms would be the whole stream lifetime (minutes/hours), useless for
-// measuring first-snapshot latency.
+// GET /vh/stream is intentionally NOT logged here — it is a long-lived
+// EventSource, so its dur_ms would be the whole stream lifetime (minutes/
+// hours), useless for measuring first-snapshot latency. Its OBSERVABILITY is
+// lifecycle-scoped instead: handleStream emits exactly one "stream open" and
+// one "stream close" journal line per connection (client attribution — UA,
+// query shape, cursor, remote — plus disconnect reason and lifetime; see
+// stream_http.go), always-on at Info level.
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path

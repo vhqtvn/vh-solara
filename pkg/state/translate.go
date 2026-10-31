@@ -14,8 +14,13 @@
 // switches on NormalizedEvent.Kind and consumes typed routing fields; it never
 // re-parses wire JSON for routing.
 //
-// BEHAVIOR-PRESERVING modulo TWO intentional changes (F4 + the callId
-// defensive-parsing invariant). TranslatorV1 replicates EXACTLY the per-arm
+// BEHAVIOR-PRESERVING modulo TWO intentional changes to the NormalizedEvent
+// stream (F4 + the callId defensive-parsing invariant) and ONE
+// observability-only side channel (P4 incident self-capture, 2026-10-31): the
+// default arm now emits a single always-on journal line for
+// server.instance.disposed — it changes NO NormalizedEvent output, adds no
+// kind, and leaves view behavior untouched (see the default arm).
+// TranslatorV1 replicates EXACTLY the per-arm
 // parsing + validity guards that used to live inline in Apply, so the rewire
 // (slice #3) was a pure refactor modulo F4 (session.error arms
 // liveIdleObserved — see Apply's NormSessionTerminalError arm). The opaque Raw
@@ -47,6 +52,7 @@ import (
 	"encoding/json"
 
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
+	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
 // NormalizedKind enumerates the normalized event kinds the state layer consumes.
@@ -59,6 +65,9 @@ type NormalizedKind int
 const (
 	// NormIgnored: server.connected / heartbeat / instance.disposed / file.* —
 	// or a wire payload that failed its validity guard. Apply no-ops.
+	// server.instance.disposed additionally emits ONE always-on journal line
+	// at the drop decision (see the default arm) — instance churn is
+	// evidence, not view state.
 	NormIgnored NormalizedKind = iota
 	// NormSessionUpsert: session.created/updated/compacted. Raw = the WHOLE raw
 	// opencode properties (upsertSessionLocked parses {info} itself).
@@ -297,7 +306,35 @@ func (TranslatorV1) Translate(raw opencode.Event) (NormalizedEvent, error) {
 		}
 		return NormalizedEvent{Kind: NormQuestionClear, SessionID: p.SessionID, ID: p.RequestID}, nil
 	default:
-		// server.connected / heartbeat / instance.disposed / file.* — ignored for the view.
+		// server.connected / heartbeat / file.* — ignored for the view.
+		//
+		// server.instance.disposed: ignored for the view TOO, but
+		// journal-first (P4 incident self-capture, 2026-10-31 post-mortem).
+		// During the instant-abort incident, opencode instance churn was
+		// invisible to vh-solara — exactly the evidence the abort
+		// investigation needed and the journal did not have. OpenCode emits
+		// this event on its GlobalBus and its /event SSE stream forwards it
+		// (as the TERMINAL event for the disposed instance's directory — the
+		// SSE stream ends right after, so vh-solara's aggregator reconnect
+		// loop fires next); vh-solara's SubscribeEvents applies NO type
+		// filter, so the event reaches this arm on every dispose — including
+		// disposes vh-solara itself triggers via POST /instance/dispose
+		// (reload-project). Emit ONE always-on Info line naming the
+		// directory so instance churn lands in durable evidence. This is an
+		// observability side-channel at the drop decision — deliberately NOT
+		// a NormalizedKind (no UI state, no snapshot, no behavior change;
+		// the return value stays NormIgnored). Ultra-low volume by nature
+		// (one line per instance dispose).
+		if raw.Type == "server.instance.disposed" {
+			var p struct {
+				Directory string `json:"directory"`
+			}
+			dir := ""
+			if json.Unmarshal(raw.Properties, &p) == nil {
+				dir = p.Directory
+			}
+			vhlog.Info("oc instance disposed", "type", raw.Type, "directory", dir)
+		}
 		return NormalizedEvent{Kind: NormIgnored}, nil
 	}
 }

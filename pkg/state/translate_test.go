@@ -13,10 +13,14 @@ package state
 // slice.
 
 import (
+	"bytes"
 	"encoding/json"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
+	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
 // partUpdatedEvent builds a raw "message.part.updated" event whose properties
@@ -236,4 +240,104 @@ func TestResolveToolCallIdentity_FallThrough(t *testing.T) {
 			})
 		}
 	})
+}
+
+// journalBuf is a concurrency-safe vhlog capture (the same lockedWriter
+// pattern as pkg/web's stream journal tests). vhlog.SetOutput is
+// PROCESS-WIDE: tests using it must never call t.Parallel() without first
+// converting to a test-scoped logger.
+type journalBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *journalBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *journalBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *journalBuf) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
+}
+
+// TestTranslatorV1_InstanceDisposedJournaledAndIgnored — P4 incident
+// self-capture (2026-10-31 post-mortem, Gap 2). server.instance.disposed is
+// ignored for the VIEW (NormIgnored — no UI state, no snapshot, deliberately
+// unchanged), but the drop decision now emits ONE always-on "oc instance
+// disposed" journal line naming the directory, so opencode instance churn —
+// invisible during the incident — lands in durable evidence. Verified
+// upstream (sst/opencode /event route): the SSE stream forwards the event for
+// the disposed instance's directory as its TERMINAL event (the stream ends
+// right after), and vh-solara's SubscribeEvents applies no type filter, so
+// the event reaches Translate on every dispose. Also pins that OTHER event
+// types keep their exact existing translate behavior: no journal line, same
+// NormalizedKind.
+func TestTranslatorV1_InstanceDisposedJournaledAndIgnored(t *testing.T) {
+	var jb journalBuf
+	prev := vhlog.SetOutput(&jb)
+	defer vhlog.SetOutput(prev)
+
+	tr := TranslatorV1{}
+
+	// (1) The disposed event, well-formed: still NormIgnored for the view,
+	//     but the journal line names the directory from the properties.
+	ne, err := tr.Translate(opencode.Event{
+		Type:       "server.instance.disposed",
+		Properties: json.RawMessage(`{"directory":"/home/op/repo"}`),
+	})
+	if err != nil {
+		t.Fatalf("Translate returned error: %v", err)
+	}
+	if ne.Kind != NormIgnored {
+		t.Fatalf("server.instance.disposed must stay NormIgnored (view behavior unchanged), got %v", ne.Kind)
+	}
+	if line := jb.String(); !strings.Contains(line, "oc instance disposed") ||
+		!strings.Contains(line, "type=server.instance.disposed") ||
+		!strings.Contains(line, "directory=/home/op/repo") {
+		t.Errorf("disposed event must journal one line naming the directory, got: %q", line)
+	}
+	// Volume pin: EXACTLY one line per disposed event (a duplicate emission
+	// must fail, not pass silently through substring containment).
+	if n := strings.Count(jb.String(), `msg="oc instance disposed"`); n != 1 {
+		t.Errorf("disposed event must emit exactly one journal line, got %d: %q", n, jb.String())
+	}
+
+	// (2) Unparseable/absent properties: the ARRIVAL is the evidence — the
+	//     line still emits (with an empty directory), never panics.
+	jb.Reset()
+	ne, err = tr.Translate(opencode.Event{Type: "server.instance.disposed", Properties: json.RawMessage(`{not-json`)})
+	if err != nil || ne.Kind != NormIgnored {
+		t.Fatalf("malformed disposed: err=%v kind=%v, want nil/NormIgnored", err, ne.Kind)
+	}
+	if line := jb.String(); !strings.Contains(line, "oc instance disposed") {
+		t.Errorf("disposed arrival with malformed properties must still journal: %q", line)
+	}
+
+	// (3) Existing behavior unchanged for other event types — no journal line
+	//     for the rest of the ignored set, and a real translated kind still
+	//     translates.
+	jb.Reset()
+	ne, err = tr.Translate(opencode.Event{Type: "server.heartbeat", Properties: json.RawMessage(`{}`)})
+	if err != nil || ne.Kind != NormIgnored {
+		t.Fatalf("server.heartbeat: err=%v kind=%v, want nil/NormIgnored", err, ne.Kind)
+	}
+	ne, err = tr.Translate(opencode.Event{
+		Type:       "session.created",
+		Properties: json.RawMessage(`{"info":{"id":"s1"}}`),
+	})
+	if err != nil || ne.Kind != NormSessionUpsert {
+		t.Fatalf("session.created: err=%v kind=%v, want nil/NormSessionUpsert", err, ne.Kind)
+	}
+	if line := jb.String(); strings.Contains(line, "oc instance disposed") {
+		t.Errorf("non-disposed events must NOT emit the disposed journal line: %q", line)
+	}
 }

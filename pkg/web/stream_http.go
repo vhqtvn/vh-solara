@@ -16,6 +16,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -36,6 +37,33 @@ func streamClassLabel(class int) string {
 	default:
 		return "firehose"
 	}
+}
+
+// streamSessionsLabel renders the sessions= request shape for the "stream
+// open" journal line: "all" (?sessions=all / firehose), "none" (absent or
+// empty — the tree-only Stream 1 shape), or the comma-joined session ids (the
+// selected-session Stream 2 shape; sorted so the line is deterministic and
+// testable despite map iteration order). Capped at 8 ids (+ "+N" marker) so a
+// degenerate client cannot bloat the journal — the real SPA sends zero or one.
+// Mirrors messageFilter's three-way parse exactly (it takes the FILTER, not
+// the request, so the label and the class derivation stay in lockstep).
+func streamSessionsLabel(filter map[string]bool) string {
+	if filter == nil {
+		return "all"
+	}
+	if len(filter) == 0 {
+		return "none"
+	}
+	ids := make([]string, 0, len(filter))
+	for id := range filter {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	const capIDs = 8
+	if len(ids) > capIDs {
+		return strings.Join(ids[:capIDs], ",") + fmt.Sprintf(",+%d", len(ids)-capIDs)
+	}
+	return strings.Join(ids, ",")
 }
 
 // partWindowKey extracts the (sessionID, messageID) parent key from a
@@ -99,13 +127,65 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	flusher = sw // route Flush through the probe (sw implements http.Flusher)
 	sw.RecordOpen()
 	var discReason int = diag.DiscRequestCtxClosed // default: browser closed
-	defer func() { sw.RecordDisconnect(discReason) }()
+	// P4 incident self-capture (2026-10-31 post-mortem): ONE Info line per
+	// stream open and ONE per close/teardown — the request-level attribution
+	// the "stream baseline" vocabulary lacked. During the incident the journal
+	// could not answer "which client reconnected?" (phone PWA vs desktop) or
+	// even confirm a /vh/stream request arrived, because the request itself
+	// was logged nowhere (logRequests deliberately skips GET /vh/stream — its
+	// dur_ms semantics are wrong for a long-lived EventSource; these lines are
+	// lifecycle-scoped instead). The open line carries exactly the
+	// discriminators the post-mortem wanted: User-Agent (PWA vs desktop — THE
+	// missing discriminator), remote address (tunnel-local on the controller
+	// topology: the proxy does not forward X-Forwarded-For, so remote=
+	// distinguishes local daemon vs tunnel but not the physical browser), the
+	// query shape (tree2/sessions/cursor raw resume string + the part_delta/z
+	// capability flags), and the project dir. The close line carries the
+	// disconnect reason token (mirroring diag's DiscReason), the stream
+	// lifetime, and the UA so it carries best-effort attribution on its own
+	// (concurrent same-UA connections are disambiguated by open/close
+	// timestamps and class, not a unique correlation id). STRICT volume
+	// discipline: exactly these two lines per connection — NEVER per-event on
+	// the hot path (per-event trace stays behind VH_DEBUG).
+	streamOpenedAt := time.Now()
+	defer func() {
+		sw.RecordDisconnect(discReason)
+		vhlog.Info("stream close",
+			"class", streamClassLabel(streamClass),
+			"reason", diag.DiscReasonName(discReason),
+			"dur_ms", time.Since(streamOpenedAt).Milliseconds(),
+			"ua", r.UserAgent())
+	}()
 
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache, no-transform")
 	h.Set("X-Accel-Buffering", "no")
 	h.Set("Connection", "keep-alive")
+
+	// Prefer the Last-Event-ID header (sent automatically by EventSource on
+	// reconnect) over the cursor query param. Both may be compound
+	// ("globalSeq.ordinal") or legacy numeric — parseResumeCursor extracts the
+	// global seq for store.Replay, discarding the connection-local ordinal.
+	// (Hoisted above the journal line so the open line can carry the RAW
+	// resume string — the compound form itself is client-shape evidence; the
+	// parsed cursor for store.Replay is taken right after.)
+	cursorStr := r.Header.Get("Last-Event-ID")
+	if cursorStr == "" {
+		cursorStr = r.URL.Query().Get("cursor")
+	}
+	cursor, hasCursor := parseResumeCursor(cursorStr)
+
+	vhlog.Info("stream open",
+		"class", streamClassLabel(streamClass),
+		"tree2", wantsTree2(r),
+		"sessions", streamSessionsLabel(messageFilter(r)),
+		"cursor", cursorStr,
+		"part_delta", wantsPartDelta(r),
+		"z", wantsCompress(r),
+		"ua", r.UserAgent(),
+		"remote", r.RemoteAddr,
+		"dir", reqDir(r))
 
 	// Honest conn: flush a no-op SSE comment IMMEDIATELY so the client's onopen
 	// fires at handler entry (Go sends response headers on the first Write/Flush;
@@ -140,16 +220,6 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// mutable state without damping the measured storm.
 	fmt.Fprintf(w, ": hello\nretry: %d\n\n", sseRetryHintMs())
 	flusher.Flush()
-
-	// Prefer the Last-Event-ID header (sent automatically by EventSource on
-	// reconnect) over the cursor query param. Both may be compound
-	// ("globalSeq.ordinal") or legacy numeric — parseResumeCursor extracts the
-	// global seq for store.Replay, discarding the connection-local ordinal.
-	cursorStr := r.Header.Get("Last-Event-ID")
-	if cursorStr == "" {
-		cursorStr = r.URL.Query().Get("cursor")
-	}
-	cursor, hasCursor := parseResumeCursor(cursorStr)
 
 	agg := s.aggFor(reqDir(r))
 	store := agg.Store()
