@@ -446,6 +446,23 @@ jobs:
     # Push-safety Phase 4 (see the `go` job comment): push-only skip.
     if: ${{ !cancelled() && (github.event_name != 'push' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
+    # Engine-sharding pilot (test-speed plan slice 2, option 6a): the three
+    # engines run as SEPARATE matrix jobs on separate runners — inter-JOB
+    # parallelism only. Within each leg everything stays exactly as the
+    # unsharded lane ran it: workers:1, fullyParallel:false (host-web/
+    # playwright.config.ts — shared live Dockview state demands serial), and
+    # fresh self-bootstrapped servers per leg (CI=true ⇒ reuseExistingServer:
+    # false for the DEV servers; the preview host never reuses a dev server).
+    # Sharding is Playwright PROJECT SELECTION only (--project=<engine>) —
+    # no test-file reorganization, no coverage change; the discovery-set
+    # union across legs is asserted equal to the unsharded set locally.
+    # fail-fast:false so one engine's failure cannot cancel the others'
+    # evidence; ci-summary still gates on the aggregated job result, so any
+    # failed/cancelled leg fails the PR check.
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [chromium, firefox, webkit]
     defaults:
       run:
         working-directory: host-web
@@ -457,12 +474,12 @@ jobs:
           cache: npm
           cache-dependency-path: host-web/package-lock.json
       - run: npm ci
-      - name: install Playwright browsers
+      - name: install Playwright browser (${{ matrix.engine }})
         run: |
           t=$SECONDS
-          npx playwright install --with-deps chromium firefox webkit
+          npx playwright install --with-deps ${{ matrix.engine }}
           echo "HW_INSTALL_SECS=$((SECONDS - t))" >> "$GITHUB_ENV"
-      - name: host-web e2e (iframe survival + shell, DEV servers)
+      - name: host-web e2e (iframe survival + shell, DEV servers, ${{ matrix.engine }})
         # Timing visibility (docs/ai/test-runtime-budget.md); see the go job
         # note on shell: bash + `|| status=$?`.
         shell: bash
@@ -470,47 +487,59 @@ jobs:
           mkdir -p ../tmp/timing-summaries
           t=$SECONDS
           status=0
-          npm run test:e2e 2>&1 | tee ../tmp/timing-summaries/host-web-e2e.log || status=$?
+          npm run test:e2e -- --project=${{ matrix.engine }} 2>&1 | tee ../tmp/timing-summaries/host-web-e2e.log || status=$?
           echo "HW_E2E_SECS=$((SECONDS - t))" >> "$GITHUB_ENV"
           exit "$status"
-      - name: host-web e2e (production-build shell proof, vite preview)
+      - name: host-web e2e (production-build shell proof, vite preview, ${{ matrix.engine }})
+        # playwright.preview.config.ts defines chromium+firefox projects only
+        # — the webkit leg has no preview suite to run.
+        if: ${{ matrix.engine != 'webkit' }}
         shell: bash
         run: |
           mkdir -p ../tmp/timing-summaries
           t=$SECONDS
           status=0
-          npm run test:e2e:preview 2>&1 | tee ../tmp/timing-summaries/host-web-preview.log || status=$?
+          npm run test:e2e:preview -- --project=${{ matrix.engine }} 2>&1 | tee ../tmp/timing-summaries/host-web-preview.log || status=$?
           echo "HW_PREVIEW_SECS=$((SECONDS - t))" >> "$GITHUB_ENV"
           exit "$status"
       - name: timing summary
         # Advisory visibility only — never a pass/fail gate on wall-clock.
+        # Per-engine record: the matrix migration starts a NEW comparable
+        # series per docs/ai/test-runtime-budget.md §3 — never compare
+        # sharded-leg durations against pre-matrix monolith baselines.
         if: ${{ !cancelled() }}
         working-directory: .
         run: |
           hw_pass=$(grep -oE '[0-9]+ passed' tmp/timing-summaries/host-web-e2e.log | tail -1 | grep -oE '^[0-9]+' || echo unknown)
           hw_fail=$(grep -oE '[0-9]+ failed' tmp/timing-summaries/host-web-e2e.log | tail -1 | grep -oE '^[0-9]+' || echo 0)
-          pv_pass=$(grep -oE '[0-9]+ passed' tmp/timing-summaries/host-web-preview.log | tail -1 | grep -oE '^[0-9]+' || echo unknown)
+          if [ -f tmp/timing-summaries/host-web-preview.log ]; then
+            pv_pass=$(grep -oE '[0-9]+ passed' tmp/timing-summaries/host-web-preview.log | tail -1 | grep -oE '^[0-9]+' || echo unknown)
+            pv_secs=${HW_PREVIEW_SECS:-unknown}
+          else
+            pv_pass=skipped
+            pv_secs=skipped
+          fi
           cat >>"$GITHUB_STEP_SUMMARY" <<EOF
-          ## Timing — host-web-e2e
+          ## Timing — host-web-e2e (${{ matrix.engine }})
           - browser install: ${HW_INSTALL_SECS:-unknown}s
-          - DEV e2e: ${HW_E2E_SECS:-unknown}s (chromium+firefox+webkit, workers:1, self-bootstrapped servers)
-          - preview e2e: ${HW_PREVIEW_SECS:-unknown}s (chromium+firefox)
-          - outcome: DEV ${hw_pass} passed / ${hw_fail} failed; preview ${pv_pass} passed (parsed from list reporter; raw logs in artifact)
+          - DEV e2e: ${HW_E2E_SECS:-unknown}s (${{ matrix.engine }}, workers:1, self-bootstrapped servers)
+          - preview e2e: ${pv_secs}s (preview config covers chromium+firefox only)
+          - outcome: DEV ${hw_pass} passed / ${hw_fail} failed; preview ${pv_pass} (parsed from list reporter; raw logs in artifact)
           EOF
           recorded=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           cat > tmp/timing-summaries/host-web-e2e.json <<EOF
           {
             "job": "host-web-e2e",
             "lane": "host-web Playwright e2e (lane 7 + 7b preview)",
-            "engine": "chromium+firefox+webkit",
+            "engine": "${{ matrix.engine }}",
             "steps": {
               "browser_install_secs": "${HW_INSTALL_SECS:-unknown}",
               "dev_e2e_secs": "${HW_E2E_SECS:-unknown}",
-              "preview_e2e_secs": "${HW_PREVIEW_SECS:-unknown}"
+              "preview_e2e_secs": "${pv_secs}"
             },
             "counts": { "dev_passed": "${hw_pass}", "dev_failed": "${hw_fail}", "preview_passed": "${pv_pass}" },
             "runner_class": "github-hosted-ubuntu-latest",
-            "command": "npm run test:e2e && npm run test:e2e:preview",
+            "command": "npm run test:e2e -- --project=${{ matrix.engine }} (+ preview, non-webkit)",
             "build_mode": "fresh (self-bootstrapped vite dev/preview servers)",
             "event": "${GITHUB_EVENT_NAME}",
             "commit": "${GITHUB_SHA}",
@@ -521,8 +550,9 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          # Per-job suffix — upload-artifact v4+ forbids duplicate names per run.
-          name: timing-summaries-host-web-e2e
+          # Per-engine suffix (matrix legs share one runner-local tmp dir
+          # name but must not share artifact names; v4+ forbids duplicates).
+          name: timing-summaries-host-web-e2e-${{ matrix.engine }}
           path: tmp/timing-summaries
           retention-days: 14
           if-no-files-found: warn
@@ -530,7 +560,9 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: playwright-host-web-e2e
+          # Per-engine suffix — matrix legs run isolated and upload from
+          # their own runners; a shared name would collide/fail under v4+.
+          name: playwright-host-web-e2e-${{ matrix.engine }}
           # Covers both artifact roots, set in host-web/playwright.config.ts
           # (tmp/agent-runs/host-web-playwright) and playwright.preview.config.ts
           # (tmp/agent-runs/host-web-playwright-preview); overridable via
