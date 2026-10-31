@@ -27,7 +27,7 @@ import { MessageParts } from "./MessageParts";
 import { Deferred } from "../Deferred";
 import Icon from "../Icon";
 import RelTime from "../RelTime";
-import { agentLabel, costLabel, messageError, modelLabel, roleLabel } from "./messageMeta";
+import { agentLabel, costLabel, messageError, modelLabel, neverStartedNotice, roleLabel } from "./messageMeta";
 import { classifyHold, shouldSkipAfterContextmenu } from "../../lib/copyHold";
 import { fmtTurnStats, turnStats } from "../../usage";
 
@@ -233,8 +233,19 @@ export function MessageRow(props: MessageRowProps) {
           failed={props.messageFailed}
         />
       </Deferred>
-      <Show when={messageError(props.message.info)}>
-        <div class="msg-error">⚠ {messageError(props.message.info)}</div>
+      {/* Either/or: the never-started notice (quiet, distinct vocabulary) wins
+          over the generic error box — never both boxes on one row. */}
+      <Show
+        when={neverStartedNotice(props.message.info)}
+        fallback={
+          <Show when={messageError(props.message.info)}>
+            <div class="msg-error">⚠ {messageError(props.message.info)}</div>
+          </Show>
+        }
+      >
+        <div class="msg-never" title="OpenCode aborted this turn before it started — not your stop.">
+          {neverStartedNotice(props.message.info)}
+        </div>
       </Show>
       <Show when={props.inspected()}>
         <pre class="msg-inspect">{props.inspectText()}</pre>

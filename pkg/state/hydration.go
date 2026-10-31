@@ -364,6 +364,28 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts, exh
 				fetchedInfo = merged
 			}
 		}
+		// P1 never-started refinement (never_started.go): an instant
+		// zero-parts zero-tokens MessageAbortedError row is re-classified as
+		// NeverStartedErrorName BEFORE adoption, so the bytes.Equal diff
+		// below compares against the refined bytes — a warm re-fetch of the
+		// same raw upstream row re-merges byte-identically (no churn, no
+		// emit). partCount vouches for fetched ∪ resident parts (Option A
+		// preservation: a fetch that omits a LIVE part cannot fake "zero
+		// parts" while the resident copy exists). Mutually exclusive with
+		// preserveMarker (that arm requires an empty upstream error name).
+		neverStart := false
+		if !preserveMarker {
+			residentParts := 0
+			if me != nil {
+				residentParts = len(me.parts)
+			}
+			neverStart = s.classifyNeverStartedLocked(sid, &env, len(mwp.Parts)+residentParts)
+			if neverStart {
+				if merged := mergeNeverStartedInfo(fetchedInfo); len(merged) > 0 {
+					fetchedInfo = merged
+				}
+			}
+		}
 		if me == nil {
 			me = &messageEntry{
 				id: env.ID, info: fetchedInfo, parts: map[string]json.RawMessage{},
@@ -416,7 +438,18 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts, exh
 				me.finish = env.Finish
 				me.tokens = env.Tokens
 				me.agent = env.Agent
-				me.terminalError = env.errorName()
+				// P1 never-started refinement: the cached classification follows
+				// the refined info bytes adopted above (both surfaces must
+				// agree). The raw pre-refinement fetched body is retained so a
+				// later first LIVE part can revoke the refinement
+				// (upsertPartLocked; C-F1).
+				if neverStart {
+					me.terminalError = NeverStartedErrorName
+					me.neverStartedRaw = mwp.Info
+				} else {
+					me.terminalError = env.errorName()
+					me.neverStartedRaw = nil
+				}
 				me.synthesizedTerminal = false
 			}
 			// Cache/refresh the chronological key. On an info-less placeholder
@@ -456,6 +489,17 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts, exh
 			// is a no-op for parts under the cap.
 			part = capPartJSON(part, s.partTextCap)
 			if old, ok := me.parts[pe.ID]; !ok {
+				// P1 never-started revocation (never_started.go; commit-review
+				// R3 B-F1/C-F1): a fetched part can be the FIRST resident part of
+				// an entry still carrying the never-started refinement — when
+				// coldLoad && liveTouchedBody skipped body adoption above, the
+				// classification clearing never ran either. Revoke BEFORE the
+				// insert. emitRestored=false on coldLoad: the wholesale cold
+				// batch carries the restored body (no per-message upsert on the
+				// cold path, mirroring the emits below).
+				if len(me.parts) == 0 {
+					s.revokeNeverStartedOnFirstPartLocked(me, !coldLoad)
+				}
 				me.parts[pe.ID] = part
 				me.partOrder = append(me.partOrder, pe.ID)
 				if !coldLoad {

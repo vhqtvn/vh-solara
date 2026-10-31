@@ -590,8 +590,11 @@ type messageEntry struct {
 	// reconcileMessagesLocked). Empty for normal turns. Set from
 	// messageInfoEnvelope.errorName() in BOTH reconcileMessagesLocked (history
 	// fetch) and upsertMessageLocked (live message.updated), alongside
-	// finish/tokens/agent; cleared implicitly when the entry is dropped
-	// (message/part removal or session delete drop the whole messageEntry).
+	// finish/tokens/agent — or NeverStartedErrorName at those same two sites
+	// when the never-started classifier (never_started.go) refines an instant
+	// zero-parts zero-tokens MessageAbortedError; cleared implicitly when the
+	// entry is dropped (message/part removal or session delete drop the whole
+	// messageEntry).
 	terminalError string
 	// deltaBuf is the native streaming-text accumulator (Option C / P1-AGG-004):
 	// per (partID, field) it holds the authoritative accumulated field text in a
@@ -665,10 +668,20 @@ type messageEntry struct {
 	// entry; never set on a message OpenCode itself terminalized.
 	synthesizedTerminal bool
 	// synthTerminalMs is the unix-ms completion time the sweep stamped into
-	// the merged info JSON. Kept beside the flag so later merges re-stamp
-	// the SAME bytes (byte-stable info ⇒ no spurious diff emits), instead of
+	// the merged info JSON. Kept beside the flag so later merges re-stamp the
+	// SAME bytes (byte-stable info ⇒ no spurious diff emits), instead of
 	// re-deriving a fresh "now" per reconcile.
 	synthTerminalMs float64
+	// neverStartedRaw retains the RAW upstream info bytes a never-started
+	// refinement (never_started.go) replaced, while this entry carries
+	// terminalError == NeverStartedErrorName. The zero-parts conjunct of the
+	// signature is enforced ACROSS time: if a first part arrives later (live
+	// message.part.updated for a turn that DID start — reducers.go
+	// upsertPartLocked), the refinement is revoked by restoring these bytes
+	// (and re-emitting the body), so a parts-bearing turn can never keep
+	// displaying "turn never ran". Cleared on any non-refining body adoption
+	// and implicitly with the entry.
+	neverStartedRaw []byte
 }
 
 type sessionMessages struct {

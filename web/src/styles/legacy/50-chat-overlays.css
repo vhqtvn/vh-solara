@@ -91,6 +91,30 @@
   font-size: 13px;
 }
 
+/* P1 never-started (instant self-abort) notice — the quiet counterpart to
+   .msg-error for turns opencode aborted BEFORE they ran (≤100 ms, zero parts,
+   zero tokens; classified VHSolaraNeverStartedError by pkg/state/
+   never_started.go). Deliberately NOT red: a red box reads as "your abort /
+   a failure you caused", which is exactly the confusion the incident
+   surfaced. Quiet amber, dashed border = informational, no ⚠ glyph, and the
+   vocabulary carries the "not your stop / re-sending repeats it" message.
+   Stays a global .msg-* class in this legacy shard per
+   docs/ai/web-css-architecture.md §8 (chat GPU hot path). Same cheap-CSS
+   constraints as .msg-partless below: no backdrop-filter / mask-image /
+   contain. */
+.msg-never {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px dashed color-mix(in srgb, var(--warn) 45%, transparent);
+  background: color-mix(in srgb, var(--warn) 10%, var(--bg));
+  /* No --warn-fg token exists (only --warn); mix at the use site so the text
+     stays legible in every theme, including the grayscale eink themes where
+     --warn is a mid gray. */
+  color: color-mix(in srgb, var(--warn) 70%, var(--fg));
+  border-radius: 6px;
+  font-size: 13px;
+}
+
 /* F-SHAPE-B safety net: placeholder shown where a COMPLETED assistant message's
    parts would render, while zero parts are resident — the residual hydration
    window (parts not yet served) or a fetch failure. Without it the message head

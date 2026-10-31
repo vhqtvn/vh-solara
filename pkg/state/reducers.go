@@ -925,7 +925,26 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 				me.info = info
 			}
 		} else {
-			me.info = info
+			// P1 never-started refinement (never_started.go): an instant
+			// zero-parts zero-tokens MessageAbortedError is re-classified as
+			// NeverStartedErrorName (info.error block rewritten, upstream name
+			// kept as data.cause) BEFORE adoption, so me.info and the emit
+			// below carry the refined bytes and a warm re-fetch of the same
+			// raw row re-merges byte-identically (no churn). Mutually
+			// exclusive with keepMarker above (this arm requires a non-empty
+			// upstream error name).
+			effInfo, effTermErr := info, env.errorName()
+			me.neverStartedRaw = nil
+			if s.classifyNeverStartedLocked(env.SessionID, &env, len(me.parts)) {
+				if merged := mergeNeverStartedInfo(info); len(merged) > 0 {
+					effInfo = merged
+				}
+				effTermErr = NeverStartedErrorName
+				// Retain the raw upstream body so a later first part can
+				// revoke the refinement (upsertPartLocked; C-F1).
+				me.neverStartedRaw = info
+			}
+			me.info = effInfo
 			me.role = env.Role
 			// Terminal stickiness: a REAL terminal error arriving on an entry
 			// this view already closed refines WHICH terminal it is but must
@@ -934,7 +953,7 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 			me.finish = env.Finish
 			me.tokens = env.Tokens
 			me.agent = env.Agent
-			me.terminalError = env.errorName()
+			me.terminalError = effTermErr
 			me.synthesizedTerminal = false
 		}
 		// Keyless→keyed transition (placeholder promotion): reposition the id
@@ -951,11 +970,27 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 			me.liveTouchedBody = true
 		}
 	} else {
+		// P1 never-started refinement (never_started.go), fresh-entry arm: a
+		// live-created entry has no resident parts yet, so partCount is 0 —
+		// correct for the instant-abort signature (its rows never carry
+		// parts). If a first part arrives later anyway, upsertPartLocked
+		// revokes the refinement from the retained raw body (C-F1); a later
+		// body adoption also re-derives the raw upstream shape.
+		effInfo, effTermErr := info, env.errorName()
+		var rawRetain []byte
+		if s.classifyNeverStartedLocked(env.SessionID, &env, 0) {
+			if merged := mergeNeverStartedInfo(info); len(merged) > 0 {
+				effInfo = merged
+			}
+			effTermErr = NeverStartedErrorName
+			rawRetain = info
+		}
 		sm.byID[env.ID] = &messageEntry{
-			id: env.ID, info: info, parts: map[string]json.RawMessage{},
+			id: env.ID, info: effInfo, parts: map[string]json.RawMessage{},
 			role: env.Role, completed: env.Time.Completed != nil,
 			finish: env.Finish, tokens: env.Tokens, agent: env.Agent,
-			terminalError: env.errorName(), createdMs: createdMs, createdOK: createdOK,
+			terminalError: effTermErr, createdMs: createdMs, createdOK: createdOK,
+			neverStartedRaw: rawRetain,
 		}
 		sm.insertMessageIDOrdered(env.ID, createdMs, createdOK)
 		// A live-created message is also live-touched (its body is at least as
@@ -1358,7 +1393,18 @@ func (s *Store) upsertPartLocked(part json.RawMessage) {
 	// uint64 for its bounded distinct table).
 	resident := me.parts[env.ID]
 	diag.Default.PartUpsertBurst.Observe(part, env.Type, env.SessionID, env.MessageID, env.ID, resident)
+	firstResidentPart := len(me.parts) == 0
 	me.parts[env.ID] = part
+	// P1 never-started revocation (never_started.go; commit-review C-F1): if
+	// THIS part is the first resident part of an entry carrying the
+	// never-started refinement, the run demonstrably started — restore the
+	// retained raw upstream body and re-emit it. Without this, a part arriving
+	// after the terminal message.updated (the SSE ordering upsertPartLocked
+	// has always supported) would leave a parts-bearing turn displaying
+	// never-started vocabulary indefinitely.
+	if firstResidentPart {
+		s.revokeNeverStartedOnFirstPartLocked(me, true)
+	}
 	// Mark live-touched so a concurrent cold-load reconcile does NOT clobber
 	// this newer live part body with the stale fetched one (C-F2). Only tagged
 	// while a cold GET is in flight (coldFetchActive); events outside that
@@ -1424,6 +1470,15 @@ func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta
 	// the part is ordered + the accumulator has a base to seed from. A later
 	// message.part.updated overwrites it authoritatively.
 	if _, had := me.parts[partID]; !had {
+		// P1 never-started revocation (never_started.go; commit-review
+		// R2-F1): the delta path creates the first resident part DIRECTLY —
+		// a refined entry receiving any streaming delta demonstrably started
+		// its run, so revoke here too (shared helper with upsertPartLocked;
+		// a later part.updated would otherwise see firstResidentPart=false
+		// and never revoke).
+		if len(me.parts) == 0 {
+			s.revokeNeverStartedOnFirstPartLocked(me, true)
+		}
 		me.parts[partID] = partPlaceholderJSON(partID, sessionID, messageID)
 		me.partOrder = append(me.partOrder, partID)
 	}

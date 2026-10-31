@@ -16,7 +16,14 @@ vi.mock("../../src/models", () => ({
     modelsSeed.find((m) => m.providerID === providerID && m.modelID === modelID),
 }));
 
-import { agentLabel, costLabel, messageError, modelLabel, roleLabel } from "../../src/components/chat/messageMeta";
+import {
+  agentLabel,
+  costLabel,
+  messageError,
+  modelLabel,
+  neverStartedNotice,
+  roleLabel,
+} from "../../src/components/chat/messageMeta";
 
 beforeEach(() => {
   modelsSeed.length = 0;
@@ -100,6 +107,51 @@ describe("messageError", () => {
   it("treats an empty data.message as absent and falls through to name", () => {
     // "" is falsy under || chaining.
     expect(messageError({ error: { data: { message: "" }, name: "Named" } })).toBe("Named");
+  });
+});
+
+describe("neverStartedNotice", () => {
+  // The refined row shape pkg/state/never_started.go produces: the state
+  // layer rewrites ONLY the error block to name=VHSolaraNeverStartedError
+  // with data.message = Go's neverStartedUserMessage (single source of the
+  // vocabulary) and data.cause = the upstream name.
+  const refined = {
+    error: {
+      name: "VHSolaraNeverStartedError",
+      data: {
+        message:
+          "Turn never ran: OpenCode aborted this turn before it started — this was not your stop. Re-sending will likely repeat this.",
+        cause: "MessageAbortedError",
+      },
+    },
+  };
+
+  it("returns the passed-through data.message for the refined name", () => {
+    expect(neverStartedNotice(refined)).toBe(refined.error.data.message);
+  });
+
+  it("falls back to the local literal when only the name is set (hand-built fixtures)", () => {
+    expect(neverStartedNotice({ error: { name: "VHSolaraNeverStartedError" } })).toMatch(
+      /^Turn never ran: OpenCode aborted this turn before it started/,
+    );
+  });
+
+  it("returns null for a plain upstream abort (real operator/limit abort)", () => {
+    expect(neverStartedNotice({ error: { name: "MessageAbortedError", data: { message: "Aborted" } } })).toBeNull();
+  });
+
+  it("returns null when there is no error at all", () => {
+    expect(neverStartedNotice({})).toBeNull();
+    expect(neverStartedNotice(undefined)).toBeNull();
+  });
+
+  it("both selectors are non-null for a refined row; either/or is enforced by the render layer", () => {
+    // MessageRow renders .msg-never INSTEAD of .msg-error: messageError stays
+    // truthy for refined rows (MessageParts' partless suppression relies on
+    // it), so the either/or Show in MessageRow.tsx is the single render
+    // decision point.
+    expect(neverStartedNotice(refined)).not.toBeNull();
+    expect(messageError(refined)).toBe(refined.error.data.message);
   });
 });
 

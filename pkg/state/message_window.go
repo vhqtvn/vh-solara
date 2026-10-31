@@ -787,6 +787,16 @@ func (s *Store) MergeOlderMessages(sid string, items []MessageWithParts, history
 		sm.historyExhausted = true
 	}
 	prepend := make([]string, 0, len(items))
+	// P1 never-started note (never_started.go): older-history merges
+	// (MergeOlderMessages) are NOT run through the never-started classifier.
+	// Accepted limitation, not an impossibility: the never-started signature is
+	// the NEWEST turn's shape when written (finalizeInterruptedAssistant stamps
+	// it at creation), so it does not reach this older-page path in practice —
+	// but a row can of course BECOME older history later. The consequence of a
+	// hypothetical matching older page is only the pre-P1 presentation (plain
+	// red abort box), never a wrong positive classification; the next full
+	// reconcile re-derives from the fetched shape. If stricter treatment is
+	// ever wanted, classify here as well (commit-review defer A-F1/R4 B-F1).
 	for _, mw := range items {
 		id := messageIDFromInfo(mw.Info)
 		if id == "" || sm.byID[id] != nil {

@@ -1612,12 +1612,25 @@ func (s *Store) IsMessagesLoaded(sid string) bool {
 //     info.error.name="MessageAbortedError", tokens all zero, parts:[], no
 //     finish. This set may grow as further terminal shapes are confirmed.
 //
+//   - NeverStartedErrorName ("VHSolaraNeverStartedError") — the P1
+//     instant-abort refinement (never_started.go): vh-solara's re-labeling of
+//     an upstream MessageAbortedError row matching the validated
+//     never-started signature (≤100 ms, zero parts, zero tokens). It is a
+//     member UNLIKE VHSolaraInterruptedError (deliberately excluded): the
+//     interrupted marker fabricates a terminal opencode never wrote (pure
+//     inference), while this name only refines a terminal opencode itself
+//     positively wrote (completed + error) — the row's outputless emptiness
+//     remains upstream truth, so the first-reconcile fast path must keep
+//     admitting it exactly as it did under the upstream name.
+//
 // Empty (no error) and unrecognized names return false — those turns fall
 // through to the O5 two-empty confirmation backstop for non-aborted zero-parts
 // cases.
 func isTerminalError(name string) bool {
 	switch name {
 	case "MessageAbortedError": // confirmed: aborted turn (operator/limit abort)
+		return true
+	case NeverStartedErrorName: // refinement of an upstream-positive terminal (never_started.go)
 		return true
 	}
 	return false

@@ -32,6 +32,27 @@ export function messageError(info: any): string | null {
   return e.data?.message || e.name || "error";
 }
 
+// P1 never-started (instant self-abort) vocabulary. vh-solara's state layer
+// refines an upstream MessageAbortedError row matching the never-started
+// signature (≤100 ms, zero parts, zero tokens — opencode finalized the row
+// before the run started; pkg/state/never_started.go) into
+// error.name="VHSolaraNeverStartedError" with error.data.message carrying the
+// user-facing text (single source of truth: Go's neverStartedUserMessage).
+// MessageRow renders it through the distinct quiet .msg-never affordance —
+// NOT the red .msg-error box — so the operator can tell "opencode aborted
+// this turn itself; not my stop; re-sending will likely repeat it" apart from
+// a real operator abort. The local literal is only a fallback for rows that
+// carry the name without data.message (e.g. hand-built fixtures).
+export const NEVER_STARTED_ERROR_NAME = "VHSolaraNeverStartedError";
+const neverStartedFallback =
+  "Turn never ran: OpenCode aborted this turn before it started — this was not your stop. Re-sending will likely repeat this.";
+
+export function neverStartedNotice(info: any): string | null {
+  const e = info?.error;
+  if (!e || e.name !== NEVER_STARTED_ERROR_NAME) return null;
+  return e.data?.message || neverStartedFallback;
+}
+
 // The model that produced an assistant message, resolved to its display name
 // (falling back to the raw id). Empty for non-assistant messages or when the
 // message carries no model. message.model uses `modelID`; older/flat envelopes
