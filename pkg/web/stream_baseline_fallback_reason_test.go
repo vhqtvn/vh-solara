@@ -3,14 +3,19 @@ package web
 // stream_baseline_fallback_reason_test.go — PWA warm-resume fallback
 // attribution (card task-2026-10-28t15-08-16). The always-on "stream
 // baseline" journal line must carry fallback_reason ∈ {cursorless,
-// ring_eviction, compatibility_fallback, none} + part_append_in_range so a
-// real-resume capture can tell WHY each fresh snapshot was served WITHOUT
-// VH_DEBUG and without touching the (deliberately unchanged) partial.ringGap
-// wire semantics. Branch coverage:
+// ring_eviction, stale_cursor_exceeds_head, compatibility_fallback, none} +
+// part_append_in_range so a real-resume capture can tell WHY each fresh
+// snapshot was served WITHOUT VH_DEBUG and without touching the (deliberately
+// unchanged) partial.ringGap wire semantics. Branch coverage:
 //
 //   cursorless             — fresh connect, no resume cursor.
 //   ring_eviction          — cursor older than the retained ring window
 //                            (store.Replay itself reports !ok).
+//   stale_cursor_exceeds_head — cursor > head: the cursor predates a daemon
+//                            restart (fresh store seq restarts low); same
+//                            fresh-snapshot fallback, distinct cause (P2;
+//                            see TestSessionStream_FreshSnapshotOnStaleEpochCursor
+//                            and TestTreeResume_StaleEpochCursorFreshFallback).
 //   compatibility_fallback — replay range contains part.append on a
 //                            non-opted-in connection (the §4.3 scan flips
 //                            replayOK; NO events were actually missed).

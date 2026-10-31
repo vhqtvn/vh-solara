@@ -257,13 +257,19 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	events, head, replayOK := store.Replay(cursor)
 	// PWA warm-resume fallback attribution (2026-10-28 diagnostics card): the
-	// fresh branch has THREE distinct causes that the journal line previously
+	// fresh branch has several distinct causes that the journal line previously
 	// conflated (and that partial.ringGap on the wire STILL conflates — its
 	// semantics are deliberately unchanged here). replayOKAtEntry + the scan
 	// below disambiguate them for the JOURNAL only:
 	//   cursorless             — the client had no cursor (first open / fresh request).
 	//   ring_eviction          — store.Replay itself said !ok (cursor older than
 	//                            the retained ring window): events were missed.
+	//   stale_cursor_exceeds_head — cursor > head: the cursor predates a daemon
+	//                            restart (a fresh store's seq restarts low), so
+	//                            the cursor is meaningless against this store
+	//                            (ring.since returns !ok). Same fresh-snapshot
+	//                            fallback as ring_eviction, distinct cause: a
+	//                            restart-storm reconnect vs an overflowed ring.
 	//   compatibility_fallback — Replay was ok but the §4.3 scan below flipped
 	//                            replayOK (a part.append suffix sits in the
 	//                            replay range of a non-opted-in connection): a
@@ -288,11 +294,13 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// Slice 7 metric hygiene: do NOT increment Stream2ReplayFallback here.
 	// Flipping replayOK=false routes this connection into the snapshot branch
 	// below, where the single PROBE 8 increment (the `hasCursor && !replayOK`
-	// site) records the fallback ONCE for BOTH fallback reasons (ring-gap
-	// cursor-too-old AND this §4.3 suffix-in-legacy-replay case). Incrementing
-	// here too double-counted a single §4.3 fallback (once here, once at the
-	// unified site). This is a METRIC-only change: replayOK still flips, so the
-	// connection still takes the snapshot path exactly as before.
+	// site) records the fallback ONCE for EVERY fresh-fallback cause
+	// (ring_eviction cursor-too-old, stale_cursor_exceeds_head daemon-restart,
+	// AND this §4.3 suffix-in-legacy-replay case — see fallback_reason above
+	// for the attribution split). Incrementing here too double-counted a
+	// single §4.3 fallback (once here, once at the unified site). This is a
+	// METRIC-only change: replayOK still flips, so the connection still takes
+	// the snapshot path exactly as before.
 	if hasCursor && replayOK {
 		for _, ev := range events {
 			if ev.Kind == state.KindPartAppend {
@@ -308,6 +316,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	if hasCursor && !replayOK {
 		if replayOKAtEntry {
 			fallbackReason = "compatibility_fallback"
+		} else if cursor > head {
+			fallbackReason = "stale_cursor_exceeds_head"
 		} else {
 			fallbackReason = "ring_eviction"
 		}
@@ -496,12 +506,14 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			baseline = treeSnap.Seq
 		}
 	} else {
-		// Fresh client or cursor too old: send a full snapshot, then live-tail.
-		// PROBE 8: when the client HAD a cursor but the shared replay ring
-		// evicted it (hasCursor && !replayOK), this is a silent fallback to a
-		// fresh snapshot — the exact signal that reveals whether the single
-		// 4096-event shared ring is evicting Stream2 cursors under multi-
-		// session load (the deferred per-session-ring finding).
+		// Fresh client, stale-epoch cursor, or cursor too old: send a full
+		// snapshot, then live-tail. PROBE 8: when the client HAD a cursor but
+		// replay said !ok (hasCursor && !replayOK — ring eviction, OR the
+		// P2 stale cursor that exceeds head after a daemon restart), this is
+		// a silent fallback to a fresh snapshot — the exact signal that
+		// reveals whether the single 4096-event shared ring is evicting
+		// Stream2 cursors under multi-session load (the deferred
+		// per-session-ring finding) or a restart storm invalidated them.
 		if hasCursor && !replayOK {
 			diag.IncStream2ReplayFallback()
 		}
@@ -510,10 +522,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		// journal line — always-on (one Info line per stream open) and now
 		// carrying fallback_reason, the discriminator the S0 gate-(d) analysis
 		// identified as missing: ring_eviction (real gap) vs
+		// stale_cursor_exceeds_head (P2 daemon-restart cursor) vs
 		// compatibility_fallback (§4.3 part.append in a legacy replay range, NO
 		// events missed) vs cursorless (no resume cursor at all). The wire
 		// partial.ringGap stamp is deliberately UNCHANGED (it still conflates
-		// both fallback causes; fixing its semantics is a separate card).
+		// every had-cursor fallback cause; fixing its semantics is a separate
+		// card).
 		vhlog.Info("stream baseline",
 			"path", "fresh",
 			"class", streamClassLabel(streamClass),
@@ -532,10 +546,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// Phase 2 tree=2: emit a frontier snapshot (roots + active-path +
 			// direct-children-of-loaded placeholders) instead of the legacy
 			// wholesale/projected snapshot. treeEmitter was created above.
-			// When the client HAD a cursor but the ring evicted it
-			// (hasCursor && !replayOK), this is a ring-gap reconnect → cause
-			// "reconnect" so the client knows to wholesale-replace its tree
-			// (§5.5). A fresh client (no cursor) gets cause "initial".
+			// When the client HAD a cursor but replay said !ok
+			// (hasCursor && !replayOK — a ring-gap reconnect OR the P2
+			// stale-epoch cursor after a daemon restart), this is a
+			// re-seed reconnect → cause "reconnect" so the client knows to
+			// wholesale-replace its tree (§5.5). A fresh client (no cursor)
+			// gets cause "initial".
 			cause := "initial"
 			if hasCursor && !replayOK {
 				cause = "reconnect"
@@ -553,10 +569,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			var treeSnap *state.TreeSnapshot
 			if filter != nil && len(filter) == 0 {
 				detailSnap, treeSnap = store.SnapshotWithTreePartial(treeEmitter, cause)
-				// D1: stamp the ring-gap signal ONLY when the cursor existed but the
-				// shared ring evicted it (hasCursor && !replayOK) — the missed deltas
-				// were lost, so the client mechanically invalidates buried detail not
-				// in scope. A fresh (no-cursor) connect leaves it false.
+				// D1: stamp the ring-gap signal ONLY when the cursor existed but
+				// replay said !ok (hasCursor && !replayOK — ring eviction OR the
+				// P2 stale-epoch cursor) — the missed deltas were lost or the
+				// cursor is meaningless, so the client mechanically invalidates
+				// buried detail not in scope. A fresh (no-cursor) connect leaves
+				// it false.
 				if detailSnap.Partial != nil && hasCursor && !replayOK {
 					detailSnap.Partial.RingGap = true
 				}

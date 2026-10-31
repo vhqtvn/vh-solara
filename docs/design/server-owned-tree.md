@@ -724,13 +724,25 @@ taken for both `P ∈ E_c` and `P ∉ E_c`.
    filtered view of the existing one); the semantics are identical: returns the
    ops strictly after `cursor` in insertion order, plus the current `head`, plus
    an `ok` flag.
-3. **Ring-gap fallback.** If `cursor` is too old (older than the oldest retained
-   op — `ring.since` returns `ok=false`, `ring.go:63-65`), the server falls back
-   to a FRESH §5 snapshot (cause `"reconnect"`) and the client re-seeds its flat
-   map + `E_c` from scratch. This mirrors today's `hasCursor && !replayOK`
-   silent-snapshot fallback (`pkg/web/server.go:1513-1518`). A reconnect MUST
-   NOT re-ship the whole tree by default — only on a ring-gap, which is rare
-   (ring is sized for the blip/sleep window).
+ 3. **Ring-gap fallback.** If `cursor` is too old (older than the oldest retained
+   op — `ringBuffer.since` returns `ok=false` on its gap branch), the server
+   falls back to a FRESH §5 snapshot (cause `"reconnect"`) and the client
+   re-seeds its flat map + `E_c` from scratch. This mirrors today's
+   `hasCursor && !replayOK` silent-snapshot fallback
+   (`pkg/web/server.go:1513-1518`). A reconnect MUST
+   NOT re-ship the whole tree by default — only when authoritative replay is
+   unavailable (a ring-gap, or the stale-epoch cursor below), both of which
+   are rare (ring is sized for the blip/sleep window; seq restarts only on a
+   daemon restart).
+   **Stale-epoch cursor (cursor > head).** The same fresh fallback fires when
+   the cursor EXCEEDS the current head: a daemon restart resets `seq` low, so
+   a retained cursor from the previous store lifetime is meaningless against
+   this store. `ring.since` treats `cursor > head` as NOT ok (only
+   `cursor == head` is "current"), so the reconnect storm right after a
+   restart converges via snapshot re-seed + the message-load kick instead of
+   a silent "you are current". The stream journal attributes this branch as
+   `fallback_reason=stale_cursor_exceeds_head` (distinct from
+   `ring_eviction`).
 4. **Subscribe-before-baseline.** The server subscribes the new connection to
    the live tail BEFORE resolving the replay baseline, so no op slips through
    the gap between replay and live (mirrors `pkg/web/server.go:1448-1449`).

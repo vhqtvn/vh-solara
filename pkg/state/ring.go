@@ -50,11 +50,21 @@ func (r *ringBuffer) oldestIndex() int {
 }
 
 // since returns events with seq > cursor. ok is false when the cursor is older
-// than the oldest retained event (a gap exists, so a snapshot is required).
+// than the oldest retained event (a gap exists, so a snapshot is required), OR
+// when the cursor EXCEEDS head (cursor > head): the cursor predates a store
+// restart (a fresh store's seq restarts low, so a retained cursor from the
+// previous daemon lifetime can sit above the current head). Treating that
+// client as "current" would stream it nothing while claiming it missed no
+// events — the cursor is meaningless against this store, so the caller must
+// fall back to the authoritative fresh path (snapshot re-seed). cursor == head
+// remains the genuine current case (ok=true, empty replay).
 // The returned slice is in insertion order (oldest -> newest).
 func (r *ringBuffer) since(cursor, head uint64) (events []ClientEvent, _ uint64, ok bool) {
-	if cursor >= head {
+	if cursor == head {
 		return nil, head, true // client is current
+	}
+	if cursor > head {
+		return nil, head, false // stale-epoch cursor (predates a store restart)
 	}
 	if r.count == 0 {
 		return nil, head, false

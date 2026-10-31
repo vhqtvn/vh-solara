@@ -31,6 +31,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -181,6 +182,109 @@ func TestSessionStream_FreshSnapshotOnStaleCursor(t *testing.T) {
 	first := firstFrameEvent(t, reader)
 	if first != "snapshot" {
 		t.Fatalf("stale cursor: want first frame 'snapshot' (ring overflow → fresh snapshot), got %q", first)
+	}
+}
+
+// TestSessionStream_FreshSnapshotOnStaleEpochCursor proves the daemon-restart
+// cursor invalidation fix (P2): a session stream whose cursor EXCEEDS the
+// current store head (cursor > head — the cursor predates a daemon restart;
+// a fresh store's seq restarts low) MUST fall back to the authoritative fresh
+// path — snapshot first, then the message-load kick — instead of the old
+// `cursor >= head → "client is current"` silent nothing (the incident: frozen
+// transcript + stuck queue chip after a daemon restart, with the FE's 35s
+// health watchdog looping reconnects forever). ring.since now returns ok=false
+// for cursor > head, so handleStream routes to the fresh else-branch:
+// triggerMessageLoad fires (asserted via the messages.loaded completion the
+// async fetch emits on THIS connection) and the wholesale snapshot is frame 1.
+// The journal must attribute the fallback as stale_cursor_exceeds_head
+// (distinct from ring_eviction: restart-storm vs overflowed ring).
+func TestSessionStream_FreshSnapshotOnStaleEpochCursor(t *testing.T) {
+	srv, fake, _, web := newReloadServer(t)
+
+	// Seed the session and give the fake a message body with a real part so
+	// the async fetch's completion gate (IsMessagesLoaded) holds and the
+	// messages.loaded event actually fires (mirrors TestStreamAsyncHydration's
+	// seeding — a user message with a resident text part).
+	seedSession(t, srv, fake, "s1")
+	fake.setMessage("s1", `[{"info":{"id":"m1","sessionID":"s1","role":"user"},"parts":[{"id":"p1","sessionID":"s1","messageID":"m1","type":"text","text":"hi"}]}]`)
+
+	// A cursor from the PREVIOUS daemon lifetime: the client's last seen seq
+	// sits far above the current (restarted-low) store head.
+	head := srv.agg.Store().Head()
+	staleCursor := head + 500
+	if staleCursor <= head {
+		t.Fatalf("test setup: staleCursor %d must exceed head %d", staleCursor, head)
+	}
+
+	var sawLoaded bool
+	lines := captureBaselines(t, func() {
+		reader, _ := openSessionStreamReq(t, web.URL, "s1", staleCursor, true, 3*time.Second)
+
+		// Frame 1 MUST be the wholesale snapshot: the fresh branch ran, not
+		// the (now unreachable for stale cursors) replay branch's silence.
+		if first := firstFrameEvent(t, reader); first != "snapshot" {
+			t.Fatalf("stale-epoch cursor: want first frame 'snapshot' (fresh re-seed), got %q", first)
+		}
+
+		// triggerMessageLoad fired: the async fetch reconciles the cold-load
+		// (messages.batch) and its messages.loaded completion flows on THIS
+		// connection — the message-load kick the incident's frozen
+		// transcripts were missing. readSSEFrameSilent keeps reading until
+		// the deadline ctx closes the body.
+		for {
+			ev, _ := readSSEFrameSilent(reader)
+			if ev == "" {
+				break // body closed (deadline) — stop scanning
+			}
+			if ev == "messages.loaded" {
+				sawLoaded = true
+				break
+			}
+		}
+		if !sawLoaded {
+			t.Fatal("stale-epoch cursor: messages.loaded never arrived — triggerMessageLoad did not fire on the fresh fallback")
+		}
+	})
+
+	// The message-load kick is double-proven by the upstream GET itself.
+	waitFor(t, func() bool { return fake.msgGetsCount("s1") > 0 },
+		"stale-epoch cursor: message GET reached the fake (triggerMessageLoad)")
+
+	// Journal attribution: fresh path + the stale-cursor discriminator.
+	line := lastBaselineLine(t, lines, 1)
+	if !strings.Contains(line, "path=fresh") {
+		t.Errorf("stale-epoch cursor: journal must say path=fresh: %q", line)
+	}
+	if !strings.Contains(line, "fallback_reason=stale_cursor_exceeds_head") {
+		t.Errorf("stale-epoch cursor: journal must attribute fallback_reason=stale_cursor_exceeds_head: %q", line)
+	}
+	if !strings.Contains(line, "had_cursor=true") {
+		t.Errorf("stale-epoch cursor: had_cursor must be true: %q", line)
+	}
+}
+
+// TestSessionStream_StaleEpochCursorConcurrentStreams pins that the
+// stale-cursor fresh fallback composes with a SECOND concurrent stream from
+// the same client (one stale-cursor reconnect + one cursorless open): both
+// connections independently take the fresh path and each receives its own
+// snapshot as frame 1 — the fallback reads no shared per-client state.
+func TestSessionStream_StaleEpochCursorConcurrentStreams(t *testing.T) {
+	srv, fake, _, web := newReloadServer(t)
+
+	seedSession(t, srv, fake, "s1")
+
+	head := srv.agg.Store().Head()
+	staleCursor := head + 100
+
+	// Open BOTH streams concurrently; read each one's first frame.
+	r1, _ := openSessionStreamReq(t, web.URL, "s1", staleCursor, true, 2*time.Second)
+	r2, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, 2*time.Second)
+
+	if first := firstFrameEvent(t, r1); first != "snapshot" {
+		t.Fatalf("concurrent/stale: want first frame 'snapshot', got %q", first)
+	}
+	if first := firstFrameEvent(t, r2); first != "snapshot" {
+		t.Fatalf("concurrent/cursorless: want first frame 'snapshot', got %q", first)
 	}
 }
 

@@ -82,7 +82,7 @@ func seqsOf(evs []ClientEvent) []uint64 {
 func TestRingSinceEmpty(t *testing.T) {
 	r := newRingBuffer(4)
 
-	// cursor >= head on a fresh (head==0) ring: client is "current", ok, empty.
+	// cursor == head on a fresh (head==0) ring: client is "current", ok, empty.
 	if evs, head, ok := r.since(0, 0); !ok || len(evs) != 0 || head != 0 {
 		t.Fatalf("since(0,0) on empty: want ok,0,head=0 got ok=%v,n=%d,head=%d", ok, len(evs), head)
 	}
@@ -169,6 +169,82 @@ func TestRingSinceOverflow(t *testing.T) {
 		t.Fatalf("since(3,7): want ok")
 	} else if !contiguousIncreasing(seqsOf(evs)) {
 		t.Fatalf("since(3,7) replay not contiguous+increasing: %v", seqsOf(evs))
+	}
+}
+
+// TestRingSinceStaleCursorExceedsHead pins the daemon-restart cursor
+// invalidation contract (P2): a cursor ABOVE head is from a previous store
+// lifetime (a fresh store's seq restarts low), so it is meaningless against
+// this ring — since must return ok=false (caller serves a fresh snapshot),
+// NOT the old "cursor >= head → current" silent-nothing answer. The adjacent
+// cursor == head case stays ok=true (genuinely current, byte-identical
+// behavior). Covers the empty ring (the literal post-restart head=0 store),
+// a partially filled ring, and a saturated (overflowed) ring.
+func TestRingSinceStaleCursorExceedsHead(t *testing.T) {
+	// Empty ring, head=0: the immediate post-restart store before any event.
+	// A retained cursor (e.g. 37) sits above head → not ok.
+	r := newRingBuffer(4)
+	if _, head, ok := r.since(37, 0); ok || head != 0 {
+		t.Fatalf("since(37,0) on empty post-restart ring: want ok=false,head=0 got ok=%v,head=%d", ok, head)
+	}
+	// cursor == head == 0 on the empty ring stays the current case.
+	if evs, _, ok := r.since(0, 0); !ok || len(evs) != 0 {
+		t.Fatalf("since(0,0) on empty ring: want ok,empty got ok=%v,n=%d", ok, len(evs))
+	}
+
+	// Partially filled: seqs 1..3, head=3.
+	r2 := newRingBuffer(4)
+	pushSeqRange(r2, 1, 3)
+	if _, _, ok := r2.since(4, 3); ok {
+		t.Fatal("since(4,3) partially-filled: cursor exceeds head (prior store lifetime), want not ok")
+	}
+	if _, _, ok := r2.since(100, 3); ok {
+		t.Fatal("since(100,3) partially-filled: far-future cursor, want not ok")
+	}
+	// cursor == head stays current.
+	if evs, _, ok := r2.since(3, 3); !ok || len(evs) != 0 {
+		t.Fatalf("since(3,3): want ok,empty got ok=%v,n=%d", ok, len(evs))
+	}
+
+	// Saturated/overflowed: cap=4, seqs 1..7 pushed, retained 4..7, head=7.
+	r3 := newRingBuffer(4)
+	pushSeqRange(r3, 1, 7)
+	if _, _, ok := r3.since(8, 7); ok {
+		t.Fatal("since(8,7) saturated: cursor exceeds head, want not ok")
+	}
+	if evs, _, ok := r3.since(7, 7); !ok || len(evs) != 0 {
+		t.Fatalf("since(7,7) saturated: want ok,empty got ok=%v,n=%d", ok, len(evs))
+	}
+	// The valid tail window inside the ring is unaffected (no regression of
+	// same-epoch replay semantics).
+	if evs, _, ok := r3.since(5, 7); !ok || !eqSeqs(evs, []uint64{6, 7}) {
+		t.Fatalf("since(5,7) saturated: want ok [6 7] got ok=%v %v", ok, seqsOf(evs))
+	}
+}
+
+// TestRingReplayStaleCursorViaStore pins the STORE-level path (Replay passes
+// s.seq as head): a cursor above the store's head — the reconnect storm right
+// after a daemon restart — reports !ok so handleStream takes the fresh-snapshot
+// branch instead of silently streaming nothing.
+func TestRingReplayStaleCursorViaStore(t *testing.T) {
+	s := New(3)
+	for i := 0; i < 5; i++ {
+		s.Apply(ev("session.created", `{"info":{"id":"s`+string(rune('0'+i))+`"}}`))
+	}
+	head := s.Head()
+	// Same-epoch semantics unchanged: at head → current; in-window → tail.
+	if _, _, ok := s.Replay(head); !ok {
+		t.Fatal("Replay(head): want ok (current)")
+	}
+	if evs, _, ok := s.Replay(head - 1); !ok || len(evs) != 1 {
+		t.Fatalf("Replay(head-1): want ok,1 got ok=%v,n=%d", ok, len(evs))
+	}
+	// Stale-epoch cursor ABOVE head: prior daemon lifetime → !ok.
+	if _, _, ok := s.Replay(head + 1); ok {
+		t.Fatal("Replay(head+1): cursor exceeds head (prior store lifetime), want not ok")
+	}
+	if _, _, ok := s.Replay(head + 1000); ok {
+		t.Fatal("Replay(head+1000): far-above cursor, want not ok")
 	}
 }
 
