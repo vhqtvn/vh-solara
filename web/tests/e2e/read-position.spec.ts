@@ -311,6 +311,10 @@ test("reload lands on the stored read-anchor [data-mid] row", async ({ page }) =
   // atBottom branch → clearReadAnchor (clears any stale anchor; defensive,
   // matches the unread-dot convention) + following=true. This is the known
   // bottom-pinned start state before the deliberate mid-history scroll-up.
+  // (Repeat-run nuance: the boot restored to the previous run's anchor, and
+  // the O4 restore contract blocks that debounced clear — so the stale
+  // anchor survives the glue until the flush below OVERWRITES it. The poll
+  // below therefore asserts the overwrite's value, never the clear.)
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
@@ -334,14 +338,40 @@ test("reload lands on the stored read-anchor [data-mid] row", async ({ page }) =
   // queued (leading-edge capture + 400ms debounce). The "↓ Latest" button
   // appears (following=false) — proves the scroll-up was processed.
   await scrollRowToTop(page, anchorTarget);
+  const anchorArmedAt = Date.now(); // debounce armed by the scroll event above
   await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
 
-  // Wait out the 400ms debounce so flushReadCursor persists the anchor before
-  // reload. bottommostReadFromDom returns the bottommost row whose top <= 0 —
-  // after scrollRowToTop that is anchorTarget itself (rows above have top < 0,
-  // rows below have top > 0; sub-pixel may make it the row immediately above,
-  // still mid-history — either way the persisted id is what we assert below).
-  await page.waitForTimeout(600);
+  // Bounded signal poll (test-runtime-budget §2, positive-settling): wait for
+  // the 400ms-debounced flushReadCursor to persist the anchor — no blind
+  // sleep. Expected value derived from THIS test's geometry under the
+  // bottommost-monotonic semantics (ChatView flushReadCursor persists
+  // bottommostReadFromDom, the bottommost row whose top <= 0): scrollRowToTop
+  // put anchorTarget's top AT the container top, so the flush yields
+  // anchorTarget itself, or — sub-pixel rounding leaves its top a hair above
+  // 0 — the row immediately above it. Those two ids are the exact
+  // product-guaranteed set (asserting equality with anchorTarget alone is
+  // the a5/u6 mistake that reverted the first attempt).
+  //
+  // The 600ms floor is the debounce's settling window — the same budget the
+  // retired sleep(600) granted. It is load-bearing, not cosmetic: on repeat
+  // runs the stale previous-run anchor (O4-surviving, see the glue note
+  // above) can ALREADY be msgIds[midIdx-1] here, and an un-floored poll
+  // would pass pre-flush on it, after which the pre-reload readAnchor below
+  // could diverge from what the reload restores (the fresh flush lands
+  // anchorTarget between the read and the reload). Post-floor the stored
+  // value is final: either flush outcome leaves localStorage holding one of
+  // the two ids above. Bounded 4s → red if persistence breaks or a wrong
+  // row is stored.
+  await expect
+    .poll(
+      async () => {
+        if (Date.now() - anchorArmedAt < 600) return 0;
+        const a = await readAnchor(page, "other");
+        return a !== undefined && (a === anchorTarget || a === msgIds[midIdx - 1]) ? 1 : 0;
+      },
+      { timeout: 4000 },
+    )
+    .toBe(1);
 
   // DIRECT verification: the anchor was persisted to localStorage via the real
   // debounced flush path (NOT synthetic seeding). This is the synchronous
@@ -451,12 +481,31 @@ async function establishRestoredAnchor(
     .locator(".msg[data-mid]")
     .evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.mid ?? ""));
   expect(msgIds.length).toBeGreaterThanOrEqual(4);
-  const anchorTarget = msgIds[Math.floor(msgIds.length / 2)];
+  const midIdx = Math.floor(msgIds.length / 2);
+  const anchorTarget = msgIds[midIdx];
   expect(anchorTarget).toBeTruthy();
 
   await scrollRowToTop(page, anchorTarget);
+  const anchorArmedAt = Date.now(); // debounce armed by the scroll event above
   await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
-  await page.waitForTimeout(600); // 400ms debounce → anchor persisted
+  // Bounded signal poll for the debounced flushReadCursor write — same
+  // construction as test (b) (full derivation there): the persisted value is
+  // anchorTarget or, sub-pixel, the row immediately above it. The 600ms floor
+  // covers the 400ms debounce AND forbids an early pass on the O4-surviving
+  // stale anchor of a previous repeat (which can be exactly
+  // msgIds[midIdx-1]); post-floor the stored value is final, so the
+  // pre-reload readAnchor below cannot diverge from the reload's restore
+  // target. §2 positive-settling; bounded 4s → red on no/wrong persistence.
+  await expect
+    .poll(
+      async () => {
+        if (Date.now() - anchorArmedAt < 600) return 0;
+        const a = await readAnchor(page, "other");
+        return a !== undefined && (a === anchorTarget || a === msgIds[midIdx - 1]) ? 1 : 0;
+      },
+      { timeout: 4000 },
+    )
+    .toBe(1);
 
   const anchor = await readAnchor(page, "other");
   expect(anchor).toBeDefined();
@@ -502,6 +551,12 @@ test("wheel down after restore advances the viewport instead of reverting", asyn
   expect(box).not.toBeNull();
   await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
   await page.mouse.wheel(0, 200);
+  // §2 NEGATIVE-OBSERVATION window (fixed duration by policy): the advance
+  // itself lands with the wheel event, but this test's assertion is that the
+  // restore servo did NOT revert it — and the defect-mode revert fires within
+  // the same/next frame. A poll could sample the transient pre-revert
+  // position and false-green the defect guard, so the sample must post-date
+  // any possible correction (500ms > the 300ms input-freshness window).
   await page.waitForTimeout(500);
 
   // The viewport STAYS scrolled down (advanced by roughly the wheel delta;
@@ -512,6 +567,8 @@ test("wheel down after restore advances the viewport instead of reverting", asyn
 
   // ...and it REMAINS advanced after the input-freshness window (300ms) has
   // fully elapsed — no deferred servo creep-back.
+  // §2 negative-observation window: fixed duration — the proof IS that real
+  // time passes with no creep-back; shortening it would change the contract.
   await page.waitForTimeout(600);
   expect(await scrollTopNow()).toBeGreaterThan(before + 100);
 });
@@ -559,6 +616,8 @@ test("navigator dot jump after restore lands on the target turn", async ({ page 
 
   // ...and it STAYS landed well past the click's 300ms input-freshness window
   // (no servo creep-back toward the abandoned restore anchor).
+  // §2 negative-observation window: fixed duration — the proof IS the elapsed
+  // creep-back window with the jump still landed.
   await page.waitForTimeout(700);
   const g = await rowGeometry(page, target);
   expect(g.rowTopRel).not.toBeNull();
@@ -609,6 +668,12 @@ test("keyboard PageDown after restore advances the viewport instead of reverting
   // One REAL PageDown: the browser's default action scrolls the focused
   // element's scroll container down ~a page.
   await page.keyboard.press("PageDown");
+  // §2 NEGATIVE-OBSERVATION window (fixed duration by policy): the page
+  // scroll lands with the keydown; the assertion is that the servo did NOT
+  // revert it. The defect-mode correction is same-tick/next-frame — a poll's
+  // first sample could catch the transient pre-revert position and
+  // false-green the defect guard, so the sample must post-date any possible
+  // correction (500ms > the 300ms input-freshness window).
   await page.waitForTimeout(500);
 
   // The viewport ADVANCED (roughly one client-height; >100 leaves headroom
@@ -619,6 +684,8 @@ test("keyboard PageDown after restore advances the viewport instead of reverting
 
   // ...and it REMAINS advanced once the input-freshness window (300ms) has
   // fully elapsed — no deferred servo creep-back to the restore anchor.
+  // §2 negative-observation window: fixed duration — elapsed real time with
+  // no creep-back IS the contract being proven.
   await page.waitForTimeout(600);
   expect(await scrollTopNow()).toBeGreaterThan(before + 100);
 });
@@ -664,6 +731,11 @@ test("touch drag after restore follows the gesture instead of reverting", async 
     touchPoints: [{ x: start.x, y: start.y }],
   });
   for (let i = 1; i <= 12; i++) {
+    // §2 input-synthesis CADENCE, not a settling sleep: the 80ms inter-move
+    // gaps ARE the gesture — 12 moves spanning ~960ms is what makes the pan's
+    // scroll events outlast the pointerdown's 300ms input-freshness window
+    // (the exact condition under test). Replacing this with a signal wait
+    // would rewrite the stimulus, not settle an effect.
     await page.waitForTimeout(80);
     await cdp.send("Input.dispatchTouchEvent", {
       type: "touchMove",
@@ -681,6 +753,11 @@ test("touch drag after restore follows the gesture instead of reverting", async 
     }
   }
   await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  // §2 positive-physics settle, intentionally fixed: compositor fling/momentum
+  // after touchEnd has no app-level observable with an exact expected value
+  // (a scroll-stability poll would assert a mechanism, not a value) — the
+  // stop-rule keeps this a short fixed window before the loose-threshold
+  // reads below.
   await page.waitForTimeout(150); // let the (slow-drag) momentum settle
 
   // The gesture's net effect survives: the pan advances the viewport by
@@ -691,6 +768,8 @@ test("touch drag after restore follows the gesture instead of reverting", async 
 
   // ...and it STAYS put once the freshness window has fully elapsed after
   // the release — no deferred servo creep-back to the restore anchor.
+  // §2 negative-observation window: fixed duration — elapsed real time with
+  // no creep-back IS the contract being proven.
   await page.waitForTimeout(600);
   expect(await scrollTopNow(), "no servo creep-back after the drag ends").toBeGreaterThan(before + 60);
 });
