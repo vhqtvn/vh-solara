@@ -37,16 +37,21 @@ func TestQueueSubscriberLifecycleSeededQueueSurvivesOrphanReconcile(t *testing.T
 	def := srv.aggFor("") // the production default-project install site
 
 	// Deterministic post-gate: wait until the store has actually sourced the
-	// seeded session (hydrate completes once the gate opens; in-process
-	// httptest server, so bounded and fast).
+	// seeded session AND the hydrate that sourced it has fully completed
+	// (hydrate completes once the gate opens; in-process httptest server, so
+	// bounded and fast). Both conditions are REQUIRED: store.Hydrate publishes
+	// the session (aggregator/hydration.go) BEFORE the aggregator records
+	// AnyHydrateCompleted, and reconcileQueuesForAgg FAILS CLOSED (returns
+	// without scanning) while that flag is false — so polling HasSession alone
+	// would let the synchronous call below pass via the no-op path.
 	rootDefault, err := projectRoot("")
 	if err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(10 * time.Second)
-	for !def.Store().HasSession("ses1") {
+	for !def.Store().HasSession("ses1") || !def.AnyHydrateCompleted() {
 		if time.Now().After(deadline) {
-			t.Fatal("default aggregator never sourced the seeded session (gate ordering broken?)")
+			t.Fatal("default aggregator never completed a hydrate that sourced the seeded session (gate ordering broken?)")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -62,6 +67,12 @@ func TestQueueSubscriberLifecycleSeededQueueSurvivesOrphanReconcile(t *testing.T
 
 	// Run the EXACT function the post-hydrate arm spawns — synchronously, so
 	// the pass's disk scan is guaranteed to observe the seeded queue.json.
+	// Barrier assert: reconcileQueuesForAgg fails closed (no-op) until
+	// AnyHydrateCompleted is set, so a regression in the poll above must fail
+	// LOUDLY here instead of greenly skipping the scan.
+	if !def.AnyHydrateCompleted() {
+		t.Fatal("hydration barrier broken: reconcile would no-op without scanning")
+	}
 	srv.reconcileQueuesForAgg("", def)
 
 	// A queue.json for a backend-sourced session must survive the pass.
