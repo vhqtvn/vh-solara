@@ -10,7 +10,10 @@ web_dir="$(cd "$(dirname "$0")/.." && pwd)"
 repo_root="$(cd "$web_dir/.." && pwd)"
 
 echo "[fixture-web] building SPA…"
-(cd "$web_dir" && npm run build >/dev/null)
+# Build output is NOT silenced: the vite build is a real slice of lane-6 boot
+# cost that was previously invisible (redirected to /dev/null), so timing the
+# e2e lane was impossible to attribute (see docs/ai/test-runtime-budget.md).
+(cd "$web_dir" && npm run build)
 
 echo "[fixture-web] materializing staged SPA into pkg/web/dist…"
 bash "$web_dir/scripts/materialize.sh"

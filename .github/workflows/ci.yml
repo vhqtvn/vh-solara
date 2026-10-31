@@ -177,7 +177,63 @@ jobs:
           # customer token. Resolves empty when no secret is configured →
           # the test skips harmlessly.
           VH_SKILL_BANNED_TOKENS: ${{ secrets.VH_SKILL_BANNED_TOKENS }}
-        run: go test ./...
+        # Timing visibility (docs/ai/test-runtime-budget.md): shell: bash
+        # gives -eo pipefail so `| tee` cannot swallow a failure; the
+        # `|| status=$?` wrapper records the duration even on red runs
+        # before re-raising the exit code.
+        shell: bash
+        run: |
+          mkdir -p tmp/timing-summaries
+          t=$SECONDS
+          status=0
+          go test ./... 2>&1 | tee tmp/timing-summaries/go-test.log || status=$?
+          echo "GO_TEST_SECS=$((SECONDS - t))" >> "$GITHUB_ENV"
+          exit "$status"
+      - name: timing summary
+        # Advisory visibility only — never a pass/fail gate on wall-clock.
+        if: ${{ !cancelled() }}
+        run: |
+          pkgs=$(grep -c '^ok ' tmp/timing-summaries/go-test.log || true)
+          secs=${GO_TEST_SECS:-unknown}
+          cat >>"$GITHUB_STEP_SUMMARY" <<EOF
+          ## Timing — go
+          - go test ./... body: ${secs}s
+          - packages ok: ${pkgs}
+          EOF
+          recorded=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > tmp/timing-summaries/go.json <<EOF
+          {
+            "job": "go",
+            "lane": "go test ./... (Go lanes 1-3)",
+            "engine": "n/a",
+            "steps": { "go_test_secs": "${secs}" },
+            "counts": { "packages_ok": "${pkgs}" },
+            "runner_class": "github-hosted-ubuntu-latest",
+            "command": "go test ./...",
+            "build_mode": "fresh",
+            "event": "${GITHUB_EVENT_NAME}",
+            "commit": "${GITHUB_SHA}",
+            "recorded_at": "${recorded}"
+          }
+          EOF
+      - name: upload timing summary
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # Per-job suffix: upload-artifact v4+ rejects duplicate artifact
+          # names within a run, so a shared bare "timing-summaries" name
+          # would fail on the second job's upload.
+          name: timing-summaries-go
+          # DELIBERATELY go.json ONLY, never go-test.log: the banned-token
+          # deny-list test (VH_SKILL_BANNED_TOKENS, wired above) prints the
+          # matched secret-derived token on failure, and GitHub's automatic
+          # secret masking covers the LIVE log, not uploaded artifact files
+          # — a raw-log upload would exfiltrate the token exactly on the red
+          # run that reports it (commit-review tier1_c-F1). The parsed count
+          # lives in go.json; the live (masked) log remains in the run view.
+          path: tmp/timing-summaries/go.json
+          retention-days: 14
+          if-no-files-found: warn
 
   web:
     needs: [changes]
@@ -196,11 +252,34 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
       - name: typecheck
-        run: npm run typecheck
+        # Timing visibility (docs/ai/test-runtime-budget.md); see the go job
+        # note on shell: bash + `|| status=$?`.
+        shell: bash
+        run: |
+          mkdir -p ../tmp/timing-summaries
+          t=$SECONDS
+          status=0
+          npm run typecheck 2>&1 | tee ../tmp/timing-summaries/web-typecheck.log || status=$?
+          echo "WEB_TYPECHECK_SECS=$((SECONDS - t))" >> "$GITHUB_ENV"
+          exit "$status"
       - name: unit tests
-        run: npm run test:unit
+        shell: bash
+        run: |
+          mkdir -p ../tmp/timing-summaries
+          t=$SECONDS
+          status=0
+          npm run test:unit 2>&1 | tee ../tmp/timing-summaries/web-unit.log || status=$?
+          echo "WEB_UNIT_SECS=$((SECONDS - t))" >> "$GITHUB_ENV"
+          exit "$status"
       - name: build
-        run: npm run build
+        shell: bash
+        run: |
+          mkdir -p ../tmp/timing-summaries
+          t=$SECONDS
+          status=0
+          npm run build 2>&1 | tee ../tmp/timing-summaries/web-build.log || status=$?
+          echo "WEB_BUILD_SECS=$((SECONDS - t))" >> "$GITHUB_ENV"
+          exit "$status"
       - name: guard — make web leaves no tracked dist changes
         # `npm run build` must stage into the gitignored web/dist-build/ and NEVER
         # dirty the tracked fallback placeholder pkg/web/dist/placeholder.html. If
@@ -213,6 +292,48 @@ jobs:
             git --no-pager diff -- pkg/web/dist/placeholder.html
             exit 1
           fi
+      - name: timing summary
+        # Advisory visibility only — never a pass/fail gate on wall-clock.
+        if: ${{ !cancelled() }}
+        working-directory: .
+        run: |
+          unit_tests=$(grep -oE 'Tests[[:space:]]+[0-9]+' tmp/timing-summaries/web-unit.log | tail -1 | grep -oE '[0-9]+' || echo unknown)
+          unit_files=$(grep -oE 'Test Files[[:space:]]+[0-9]+' tmp/timing-summaries/web-unit.log | tail -1 | grep -oE '[0-9]+' || echo unknown)
+          cat >>"$GITHUB_STEP_SUMMARY" <<EOF
+          ## Timing — web
+          - typecheck: ${WEB_TYPECHECK_SECS:-unknown}s
+          - unit tests: ${WEB_UNIT_SECS:-unknown}s (tests: ${unit_tests}, files: ${unit_files})
+          - build: ${WEB_BUILD_SECS:-unknown}s
+          EOF
+          recorded=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > tmp/timing-summaries/web.json <<EOF
+          {
+            "job": "web",
+            "lane": "web typecheck/unit/build (lane 5)",
+            "engine": "n/a",
+            "steps": {
+              "typecheck_secs": "${WEB_TYPECHECK_SECS:-unknown}",
+              "unit_secs": "${WEB_UNIT_SECS:-unknown}",
+              "build_secs": "${WEB_BUILD_SECS:-unknown}"
+            },
+            "counts": { "unit_tests": "${unit_tests}", "unit_files": "${unit_files}" },
+            "runner_class": "github-hosted-ubuntu-latest",
+            "command": "npm run typecheck && npm run test:unit && npm run build",
+            "build_mode": "fresh",
+            "event": "${GITHUB_EVENT_NAME}",
+            "commit": "${GITHUB_SHA}",
+            "recorded_at": "${recorded}"
+          }
+          EOF
+      - name: upload timing summary
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # Per-job suffix — upload-artifact v4+ forbids duplicate names per run.
+          name: timing-summaries-web
+          path: tmp/timing-summaries
+          retention-days: 14
+          if-no-files-found: warn
 
   # Fixture-backed Playwright e2e. Needs Go too — the Playwright webServer builds
   # the SPA and runs ./tools/fixtureserver (real aggregator + fake OpenCode).
@@ -238,10 +359,64 @@ jobs:
         run: npm ci
       - name: install Playwright browser
         working-directory: web
-        run: npx playwright install --with-deps chromium firefox
+        run: |
+          t=$SECONDS
+          npx playwright install --with-deps chromium firefox
+          echo "WEB_E2E_INSTALL_SECS=$((SECONDS - t))" >> "$GITHUB_ENV"
       - name: e2e
+        # Timing visibility (docs/ai/test-runtime-budget.md); see the go job
+        # note on shell: bash + `|| status=$?`.
         working-directory: web
-        run: npm run test:e2e
+        shell: bash
+        run: |
+          mkdir -p ../tmp/timing-summaries
+          t=$SECONDS
+          status=0
+          npm run test:e2e 2>&1 | tee ../tmp/timing-summaries/e2e.log || status=$?
+          echo "WEB_E2E_SECS=$((SECONDS - t))" >> "$GITHUB_ENV"
+          exit "$status"
+      - name: timing summary
+        # Advisory visibility only — never a pass/fail gate on wall-clock.
+        if: ${{ !cancelled() }}
+        run: |
+          passed=$(grep -oE '[0-9]+ passed' tmp/timing-summaries/e2e.log | tail -1 | grep -oE '^[0-9]+' || echo unknown)
+          failed=$(grep -oE '[0-9]+ failed' tmp/timing-summaries/e2e.log | tail -1 | grep -oE '^[0-9]+' || echo 0)
+          flaky=$(grep -oE '[0-9]+ flaky' tmp/timing-summaries/e2e.log | tail -1 | grep -oE '^[0-9]+' || echo 0)
+          skipped=$(grep -oE '[0-9]+ skipped' tmp/timing-summaries/e2e.log | tail -1 | grep -oE '^[0-9]+' || echo 0)
+          cat >>"$GITHUB_STEP_SUMMARY" <<EOF
+          ## Timing — e2e (web Playwright)
+          - browser install: ${WEB_E2E_INSTALL_SECS:-unknown}s
+          - e2e run: ${WEB_E2E_SECS:-unknown}s (chromium+firefox, workers:1, fresh fixture boot)
+          - outcome: ${passed} passed / ${failed} failed / ${flaky} flaky / ${skipped} skipped (parsed from list reporter; raw log in artifact)
+          EOF
+          recorded=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > tmp/timing-summaries/e2e.json <<EOF
+          {
+            "job": "e2e",
+            "lane": "web Playwright e2e (lane 6)",
+            "engine": "chromium+firefox",
+            "steps": {
+              "browser_install_secs": "${WEB_E2E_INSTALL_SECS:-unknown}",
+              "e2e_secs": "${WEB_E2E_SECS:-unknown}"
+            },
+            "counts": { "passed": "${passed}", "failed": "${failed}", "flaky": "${flaky}", "skipped": "${skipped}" },
+            "runner_class": "github-hosted-ubuntu-latest",
+            "command": "npm run test:e2e",
+            "build_mode": "fresh (SPA build + fixtureserver compile in webServer boot)",
+            "event": "${GITHUB_EVENT_NAME}",
+            "commit": "${GITHUB_SHA}",
+            "recorded_at": "${recorded}"
+          }
+          EOF
+      - name: upload timing summary
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # Per-job suffix — upload-artifact v4+ forbids duplicate names per run.
+          name: timing-summaries-e2e
+          path: tmp/timing-summaries
+          retention-days: 14
+          if-no-files-found: warn
       - name: upload Playwright artifacts
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -283,11 +458,74 @@ jobs:
           cache-dependency-path: host-web/package-lock.json
       - run: npm ci
       - name: install Playwright browsers
-        run: npx playwright install --with-deps chromium firefox webkit
+        run: |
+          t=$SECONDS
+          npx playwright install --with-deps chromium firefox webkit
+          echo "HW_INSTALL_SECS=$((SECONDS - t))" >> "$GITHUB_ENV"
       - name: host-web e2e (iframe survival + shell, DEV servers)
-        run: npm run test:e2e
+        # Timing visibility (docs/ai/test-runtime-budget.md); see the go job
+        # note on shell: bash + `|| status=$?`.
+        shell: bash
+        run: |
+          mkdir -p ../tmp/timing-summaries
+          t=$SECONDS
+          status=0
+          npm run test:e2e 2>&1 | tee ../tmp/timing-summaries/host-web-e2e.log || status=$?
+          echo "HW_E2E_SECS=$((SECONDS - t))" >> "$GITHUB_ENV"
+          exit "$status"
       - name: host-web e2e (production-build shell proof, vite preview)
-        run: npm run test:e2e:preview
+        shell: bash
+        run: |
+          mkdir -p ../tmp/timing-summaries
+          t=$SECONDS
+          status=0
+          npm run test:e2e:preview 2>&1 | tee ../tmp/timing-summaries/host-web-preview.log || status=$?
+          echo "HW_PREVIEW_SECS=$((SECONDS - t))" >> "$GITHUB_ENV"
+          exit "$status"
+      - name: timing summary
+        # Advisory visibility only — never a pass/fail gate on wall-clock.
+        if: ${{ !cancelled() }}
+        working-directory: .
+        run: |
+          hw_pass=$(grep -oE '[0-9]+ passed' tmp/timing-summaries/host-web-e2e.log | tail -1 | grep -oE '^[0-9]+' || echo unknown)
+          hw_fail=$(grep -oE '[0-9]+ failed' tmp/timing-summaries/host-web-e2e.log | tail -1 | grep -oE '^[0-9]+' || echo 0)
+          pv_pass=$(grep -oE '[0-9]+ passed' tmp/timing-summaries/host-web-preview.log | tail -1 | grep -oE '^[0-9]+' || echo unknown)
+          cat >>"$GITHUB_STEP_SUMMARY" <<EOF
+          ## Timing — host-web-e2e
+          - browser install: ${HW_INSTALL_SECS:-unknown}s
+          - DEV e2e: ${HW_E2E_SECS:-unknown}s (chromium+firefox+webkit, workers:1, self-bootstrapped servers)
+          - preview e2e: ${HW_PREVIEW_SECS:-unknown}s (chromium+firefox)
+          - outcome: DEV ${hw_pass} passed / ${hw_fail} failed; preview ${pv_pass} passed (parsed from list reporter; raw logs in artifact)
+          EOF
+          recorded=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > tmp/timing-summaries/host-web-e2e.json <<EOF
+          {
+            "job": "host-web-e2e",
+            "lane": "host-web Playwright e2e (lane 7 + 7b preview)",
+            "engine": "chromium+firefox+webkit",
+            "steps": {
+              "browser_install_secs": "${HW_INSTALL_SECS:-unknown}",
+              "dev_e2e_secs": "${HW_E2E_SECS:-unknown}",
+              "preview_e2e_secs": "${HW_PREVIEW_SECS:-unknown}"
+            },
+            "counts": { "dev_passed": "${hw_pass}", "dev_failed": "${hw_fail}", "preview_passed": "${pv_pass}" },
+            "runner_class": "github-hosted-ubuntu-latest",
+            "command": "npm run test:e2e && npm run test:e2e:preview",
+            "build_mode": "fresh (self-bootstrapped vite dev/preview servers)",
+            "event": "${GITHUB_EVENT_NAME}",
+            "commit": "${GITHUB_SHA}",
+            "recorded_at": "${recorded}"
+          }
+          EOF
+      - name: upload timing summary
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # Per-job suffix — upload-artifact v4+ forbids duplicate names per run.
+          name: timing-summaries-host-web-e2e
+          path: tmp/timing-summaries
+          retention-days: 14
+          if-no-files-found: warn
       - name: upload Playwright artifacts
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
