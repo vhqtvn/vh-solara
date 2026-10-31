@@ -11,6 +11,17 @@ import (
 	"time"
 )
 
+// watchEventWait is the budget for a poller-driven SSE "changed" event.
+// The settings poller ticks every 1200ms (see time.NewTicker in
+// handleProjectSettingsWatch), so a fixed 5s budget leaves only ~4 ticks of
+// headroom: under `go test ./...` parallel load on shared CI vCPUs the ticker
+// stalling past the window is the suspected mechanism (CI run 41155975937,
+// 2026-10-31: TestProjectSettingsWatchEmitsOnPreferencesChange timed out at
+// exactly 5.00s on a tree that had passed CI twice the day before — not
+// conclusive from one sample). 30s gives ~25 ticks of scheduling headroom;
+// do not tighten it back down.
+const watchEventWait = 30 * time.Second
+
 // The watch SSE must emit "changed" when the project's project.jsonc appears or
 // is modified, so the UI reflects an external edit without a manual reload.
 func TestProjectSettingsWatchEmitsOnChange(t *testing.T) {
@@ -51,7 +62,7 @@ func TestProjectSettingsWatchEmitsOnChange(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cfgDir, "project.jsonc"), []byte(`{"agentStyles":{"x":{"label":"X"}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	waitForLine(t, lines, "data: changed", 5*time.Second)
+	waitForLine(t, lines, "data: changed", watchEventWait)
 }
 
 // The watch must ALSO fire when the gitignored preferences.local.jsonc overlay
@@ -97,7 +108,7 @@ func TestProjectSettingsWatchEmitsOnPreferencesChange(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cfgDir, "preferences.local.jsonc"), []byte(`{"agentStyles":{"y":{"label":"Y"}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	waitForLine(t, lines, "data: changed", 5*time.Second)
+	waitForLine(t, lines, "data: changed", watchEventWait)
 }
 
 func waitForLine(t *testing.T, lines <-chan string, want string, d time.Duration) {
