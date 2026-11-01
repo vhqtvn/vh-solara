@@ -143,6 +143,12 @@ export const STREAM_OPEN_REASONS = [
   "retry-ladder",
   "recovery-fresh",
   "selection-change",
+  // F1 epoch handshake (round 2): a snapshot apply established/changed the
+  // store epoch and the live EventSource URL under-declares it (constructed
+  // before the first snapshot, or frozen on the previous lifetime) — the
+  // transport reconstructs the URL so every later native auto-reconnect
+  // carries the declaration. An upgrade, not a failure recovery.
+  "epoch-upgrade",
   "other",
 ] as const;
 export type StreamOpenReason = (typeof STREAM_OPEN_REASONS)[number];

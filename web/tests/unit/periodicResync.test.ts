@@ -348,7 +348,9 @@ describe("periodic resync timer — firing + reset-after-recovery", () => {
     );
 
     // Advance past where the ORIGINAL schedule would have fired — no periodic
-    // connect fires (the boundary reset pushed the next tick out).
+    // connect fires (the boundary reset pushed the next tick out). (F1 epoch
+    // handshake: a first-establishment does NOT reconnect — the epoch is
+    // persisted for the next boot instead — so no extra construction here.)
     const countAfterBoundary = treeESes().length;
     _markTreeSeenForTest();
     vi.advanceTimersByTime(10_000);

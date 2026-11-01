@@ -743,6 +743,62 @@ taken for both `P ∈ E_c` and `P ∉ E_c`.
    a silent "you are current". The stream journal attributes this branch as
    `fallback_reason=stale_cursor_exceeds_head` (distinct from
    `ring_eviction`).
+   **Epoch handshake (epoch mismatch).** The cursor comparison cannot see the
+   remaining restart window: a cursor from a previous store lifetime that
+   sits numerically BELOW head looks replayable, so the server would serve a
+   plausible-but-wrong delta replay over the dead store's history. The
+   client therefore declares its store lifetime on stream opens
+   (`&epoch=<Snapshot.epoch>`, appended by both openers; omitted when
+   unknown — a first-ever visit before any snapshot), and the server treats
+   a declared epoch ≠ the store's epoch as not-replayable — the same fresh
+   fallback + message-load kick as above, attributed as
+   `fallback_reason=epoch_mismatch` (which outranks the numeric causes when
+   both apply). Strictly additive: an absent param is byte-identical to the
+   previous behavior, and no snapshot schema or wire format changes.
+   Because an EventSource URL is frozen at construction and native
+   auto-reconnect re-requests it verbatim, the declaration alone is not
+    enough: the last-applied epoch is persisted per project dir so every
+    returning boot declares it in its FIRST URL — on BOTH streams, covering
+    the persisted resume cursor and the remembered session cursors (equally
+    previous-lifetime candidates; a declared epoch without a cursor is a
+    server-side no-op when it matches). A live URL that is declared-stale
+    (the store restarted while the page was closed), or a mid-life epoch
+    transition, gets a deferred URL-swap reconnect (a reconnect is a
+    significant app event, so a plain first-establishment never churns one
+    — it just persists). The session stream's live EventSource is likewise
+    rebuilt whenever a known lifetime change leaves its frozen URL wrong —
+    declared-stale at establishment (never resuming the receipt-time
+    cursor: the live cursor advances before an async compressed decode
+    applies, and the rebuild discards that decode, so only the apply-proven
+    cursor memory may be restored) or any URL (epoch-less included) at a
+    transition, since the open-time pairing guards cannot see a native
+    auto-reconnect of an epoch-less URL. The client's session-cursor memory
+    is lifetime-scoped by PRODUCER stamping: a snapshot's apply-proven claim
+    is stamped with the PRODUCING store's own epoch (`Snapshot.epoch`, which
+    every current daemon stamps into session detail snapshots), never with
+    what the client currently believes — so a cursor from a previous
+    lifetime keeps its foreign stamp even when it applied before the client
+    knew any epoch at all (the boot race), and the open-time guard (a resume
+    cursor is sent only when its stamp equals the declared epoch, which the
+    open declares as the established epoch, else the claim's own producer
+    stamp, else the persisted boot epoch — always server-validated) can
+    never relabel it into a matching handshake. Unknown-provenance claims
+    (""-stamped: message-class claims from before any snapshot, or an
+    ancient daemon that emits no epoch) are invalidated — cleared at the
+    first proven claim or at establishment — rather than adopted. Message
+    frames carry no epoch of their own, so their producer is inferred, never
+    taken from what the client currently believes: the connection's last
+    APPLIED snapshot, else the URL-declared epoch when the connection was
+    opened as a resume (the server validated that cursor+epoch pairing
+    before choosing replay, so its frames are that epoch's content), else
+    "" — a buffered previous-lifetime message arriving on a cursorless
+    epoch-less connection while the tree has already established the new
+    epoch therefore stamps unknown and cannot pair, even when its snapshot
+    is still mid-decode and the reopen discards that decode.
+    Residual: a first-ever visit's initial URLs stay epoch-less until the
+    first reconstruction (every error-ladder/watchdog/visibility
+    reconstruction declares); their native reconnects before that point
+    remain protected only by the cursor>head check of item 2.
 4. **Subscribe-before-baseline.** The server subscribes the new connection to
    the live tail BEFORE resolving the replay baseline, so no op slips through
    the gap between replay and live (mirrors `pkg/web/server.go:1448-1449`).

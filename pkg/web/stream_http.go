@@ -175,12 +175,22 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		cursorStr = r.URL.Query().Get("cursor")
 	}
 	cursor, hasCursor := parseResumeCursor(cursorStr)
+	// F1 epoch handshake (P2 follow-up): the client may DECLARE the store
+	// lifetime its cursor belongs to via &epoch=<Snapshot.epoch>. Parsed here
+	// (beside the cursor hoist) so the comparison below applies REGARDLESS of
+	// which source supplied the cursor — Last-Event-ID header (native
+	// EventSource auto-reconnect re-requests the SAME URL, param included) or
+	// the cursor= query param (manual retry). Absent/empty (old clients,
+	// first-ever connects with no epoch yet) is byte-identical old behavior:
+	// the check below only fires on a DECLARED mismatch.
+	reqEpoch := r.URL.Query().Get("epoch")
 
 	vhlog.Info("stream open",
 		"class", streamClassLabel(streamClass),
 		"tree2", wantsTree2(r),
 		"sessions", streamSessionsLabel(messageFilter(r)),
 		"cursor", cursorStr,
+		"epoch", reqEpoch,
 		"part_delta", wantsPartDelta(r),
 		"z", wantsCompress(r),
 		"ua", r.UserAgent(),
@@ -223,6 +233,19 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	agg := s.aggFor(reqDir(r))
 	store := agg.Store()
+
+	// F1 epoch handshake (P2 follow-up — the deferred window): P2's
+	// cursor > head comparison catches a cross-lifetime cursor that sits
+	// ABOVE the restarted-low head, but a cursor BELOW head from a previous
+	// store lifetime looks numerically replayable — store.Replay would serve
+	// a plausible-but-wrong delta replay over the dead store's history while
+	// the client silently misses the new store's re-hydration and appears
+	// converged. A DECLARED epoch that differs from this store's lifetime id
+	// (state.Store.Epoch — the same source Snapshot.Epoch stamps) marks the
+	// cursor as belonging to another lifetime regardless of its numeric
+	// side: not-replayable, existing fresh fallback. An absent param never
+	// mismatches (strictly additive).
+	epochMismatch := reqEpoch != "" && reqEpoch != store.Epoch()
 
 	// Priority separation: high-volume message/part events are streamed ONLY for
 	// the subscribed sessions (the active session via ?sessions=); structural
@@ -340,6 +363,14 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	//                            (ring.since returns !ok). Same fresh-snapshot
 	//                            fallback as ring_eviction, distinct cause: a
 	//                            restart-storm reconnect vs an overflowed ring.
+	//   epoch_mismatch         — the client DECLARED an epoch (the &epoch=
+	//                            handshake param) from a DIFFERENT store
+	//                            lifetime: the cursor may be numerically below
+	//                            head yet reference the dead store's history
+	//                            (the window the cursor>head comparison cannot
+	//                            see). Same fresh-snapshot fallback, the most
+	//                            fundamental cause of the three: it wins the
+	//                            discriminator even when cursor > head too.
 	//   compatibility_fallback — Replay was ok but the §4.3 scan below flipped
 	//                            replayOK (a part.append suffix sits in the
 	//                            replay range of a non-opted-in connection): a
@@ -347,6 +378,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	//                            being missed — the S0 gate-(d) discriminator.
 	//   none                   — the replay branch served the cursor normally.
 	replayOKAtEntry := replayOK
+	// F1 epoch handshake: force the not-replayable outcome — same routing the
+	// P2 cursor > head comparison established, applied BEFORE the §4.3 scan
+	// below (a mismatched cursor never reaches the replay-range analysis).
+	// Set AFTER replayOKAtEntry so the entry value keeps documenting
+	// store.Replay's own answer; the epoch arm in the discriminator chain
+	// below outranks both secondary causes.
+	if epochMismatch {
+		replayOK = false
+	}
 	// partAppendInRange: does the replay range contain a KindPartAppend? Now
 	// scanned for opted-in connections too (logging-only; the flip below still
 	// applies ONLY to non-opted-in, byte-for-byte the previous control flow).
@@ -384,7 +424,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	fallbackReason := "none"
 	if hasCursor && !replayOK {
-		if replayOKAtEntry {
+		if epochMismatch {
+			fallbackReason = "epoch_mismatch"
+		} else if replayOKAtEntry {
 			fallbackReason = "compatibility_fallback"
 		} else if cursor > head {
 			fallbackReason = "stale_cursor_exceeds_head"
@@ -578,12 +620,13 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// Fresh client, stale-epoch cursor, or cursor too old: send a full
 		// snapshot, then live-tail. PROBE 8: when the client HAD a cursor but
-		// replay said !ok (hasCursor && !replayOK — ring eviction, OR the
-		// P2 stale cursor that exceeds head after a daemon restart), this is
-		// a silent fallback to a fresh snapshot — the exact signal that
-		// reveals whether the single 4096-event shared ring is evicting
-		// Stream2 cursors under multi-session load (the deferred
-		// per-session-ring finding) or a restart storm invalidated them.
+		// replay said !ok (hasCursor && !replayOK — ring eviction, the P2
+		// stale cursor that exceeds head after a daemon restart, OR the F1
+		// declared-epoch mismatch), this is a silent fallback to a fresh
+		// snapshot — the exact signal that reveals whether the single
+		// 4096-event shared ring is evicting Stream2 cursors under
+		// multi-session load (the deferred per-session-ring finding) or a
+		// restart storm invalidated them.
 		if hasCursor && !replayOK {
 			diag.IncStream2ReplayFallback()
 		}
@@ -593,10 +636,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		// carrying fallback_reason, the discriminator the S0 gate-(d) analysis
 		// identified as missing: ring_eviction (real gap) vs
 		// stale_cursor_exceeds_head (P2 daemon-restart cursor) vs
-		// compatibility_fallback (§4.3 part.append in a legacy replay range, NO
-		// events missed) vs cursorless (no resume cursor at all). The wire
-		// partial.ringGap stamp is deliberately UNCHANGED (it still conflates
-		// every had-cursor fallback cause; fixing its semantics is a separate
+		// epoch_mismatch (F1 handshake: declared epoch from a previous store
+		// lifetime, cursor possibly below head) vs compatibility_fallback
+		// (§4.3 part.append in a legacy replay range, NO events missed) vs
+		// cursorless (no resume cursor at all). The wire partial.ringGap
+		// stamp is deliberately UNCHANGED (it still conflates every
+		// had-cursor fallback cause; fixing its semantics is a separate
 		// card).
 		vhlog.Info("stream baseline",
 			"path", "fresh",
@@ -617,11 +662,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// direct-children-of-loaded placeholders) instead of the legacy
 			// wholesale/projected snapshot. treeEmitter was created above.
 			// When the client HAD a cursor but replay said !ok
-			// (hasCursor && !replayOK — a ring-gap reconnect OR the P2
-			// stale-epoch cursor after a daemon restart), this is a
-			// re-seed reconnect → cause "reconnect" so the client knows to
-			// wholesale-replace its tree (§5.5). A fresh client (no cursor)
-			// gets cause "initial".
+			// (hasCursor && !replayOK — a ring-gap reconnect, the P2
+			// stale-epoch cursor after a daemon restart, OR the F1
+			// declared-epoch mismatch), this is a re-seed reconnect →
+			// cause "reconnect" so the client knows to wholesale-replace
+			// its tree (§5.5). A fresh client (no cursor) gets cause
+			// "initial".
 			cause := "initial"
 			if hasCursor && !replayOK {
 				cause = "reconnect"
@@ -640,11 +686,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if filter != nil && len(filter) == 0 {
 				detailSnap, treeSnap = store.SnapshotWithTreePartial(treeEmitter, cause)
 				// D1: stamp the ring-gap signal ONLY when the cursor existed but
-				// replay said !ok (hasCursor && !replayOK — ring eviction OR the
-				// P2 stale-epoch cursor) — the missed deltas were lost or the
-				// cursor is meaningless, so the client mechanically invalidates
-				// buried detail not in scope. A fresh (no-cursor) connect leaves
-				// it false.
+				// replay said !ok (hasCursor && !replayOK — ring eviction, the
+				// P2 stale-epoch cursor, OR the F1 declared-epoch mismatch) —
+				// the missed deltas were lost or the cursor is meaningless, so
+				// the client mechanically invalidates buried detail not in
+				// scope. A fresh (no-cursor) connect leaves it false.
 				if detailSnap.Partial != nil && hasCursor && !replayOK {
 					detailSnap.Partial.RingGap = true
 				}

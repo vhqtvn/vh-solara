@@ -91,6 +91,13 @@ import {
   maybeResolveReconcile,
 } from "./stream";
 import { captureDiagEntry } from "./diaglog";
+// F1 epoch handshake (round 2): the session-stream transition hook. The tree
+// transport's snapshot applies are the ONLY writers of state.epoch, so this
+// module is the only place a store-lifetime change is observable — the
+// session stream (whose own snapshots never write state.epoch) is notified
+// through this call. Acyclic: session-stream does not import tree-transport.
+import { noteStoreEpochChanged } from "./session-stream";
+import { readBootEpoch, writeBootEpoch } from "./bootEpoch";
 import {
   noteTreeLife,
   noteTreeSnapshotAppliedIfCurrent,
@@ -166,6 +173,27 @@ let treeContentSeen = 0;
 // dual-clock design comment above still documents WHY the tree clock is
 // independent; the session clock's lifecycle is now in its home module.
 let reconnectTimer: number | undefined;
+// F1 epoch handshake (round 2, review C-F1): the epoch the LIVE tree ES URL
+// declares (frozen at connect() construction; native auto-reconnect re-
+// requests that exact URL). noteEpochAdvanced compares it against the store
+// epoch an applied snapshot just established/changed and arms a deferred URL
+// upgrade when it under-declares — otherwise a boot-era epoch-less URL would
+// survive forever and its post-restart native reconnects would bypass the
+// handshake.
+let esUrlEpoch = "";
+// The pending deferred epoch-upgrade reconnect (see armEpochUpgrade). A
+// module-level handle so connect()/suspend can cancel it.
+let epochUpgradeTimer: number | undefined;
+// How quiet the tree stream must be before the epoch-upgrade reconnect may
+// swap the URL. The swap is a same-lifetime cursor resume — any frames
+// queued behind the current dispatch would be gen-dropped and re-fetched by
+// the server's replay — but doing it at the snapshot boundary (the busiest
+// in-flight moment of the stream) churns a reconnect per boot for nothing.
+// Waiting for a quiet window makes the swap unobservable: no in-flight
+// burst exists to drop. The window is bounded (seconds), so the upgraded
+// URL — the one native auto-reconnect will reuse — is in place long before
+// any realistic sleep/restart cycle.
+const EPOCH_UPGRADE_QUIET_MS = 2000;
 let backoff = 1000; // grows on repeated failures, reset on a healthy open
 // F3 (remote-latency brief 2026-10-12): consecutive CONNECTING-state onerror
 // count for the CURRENT tree EventSource. Native EventSource auto-retry loops
@@ -636,6 +664,82 @@ function coveredAwait(generation: number): Promise<void> | null {
   return null;
 }
 
+// --- F1 epoch handshake (round 2, review C-F1/C-F2): store-lifetime changes --
+//
+// The boot problem, and why the fix is PERSISTENCE rather than a reconnect:
+// the first tree connect of a page life necessarily precedes the snapshot
+// that would tell it the epoch — its URL is epoch-less by construction. An
+// EventSource URL is frozen, and native auto-reconnect reuses it verbatim,
+// so the naive fix (reconnect once the snapshot lands) injects a reconnect
+// into EVERY page load — and a reconnect here is a significant app event
+// (status resets, convergence boundaries, expand/refetch contracts), not a
+// URL swap. Instead the last-applied epoch is PERSISTED per project dir
+// (readBootEpoch/writeBootEpoch below): every boot AFTER the first declares
+// the previous lifetime in the URL from the very first connect — which also
+// covers the persisted state.cursor (store.ts), whose resume value is
+// equally a previous-lifetime candidate. The server-side handshake then
+// protects even the first reconnect of a returning visitor (declared≠store
+// ⇒ fresh fallback). Residual, documented: a FIRST-EVER visit's boot URL is
+// epoch-less until the first manual reconstruction (error ladder / watchdog
+// / visibility cycle — all rebuild through connect(), which declares).
+//
+// noteEpochAdvanced — called after every snapshot apply that could have
+// written state.epoch (applyDetailIndependent + tryInstall below; the http
+// detail path never can — the guard DISCARDS cross-epoch http bundles and
+// same-epoch ones don't transition). `prevEpoch` is the pre-apply value the
+// CALLER captured. Fires only on a real establishment ("" → E1; first
+// snapshot of a page life) or transition (E1 → E2; a restart while
+// connected). On either:
+//   1. persist the new lifetime for the next boot;
+//   2. notify the session stream (its cursor memory belongs to the outgoing
+//      lifetime — see noteStoreEpochChanged there);
+//   3. arm the deferred URL upgrade ONLY when the live URL is actually
+//      WRONG about the current lifetime — a DECLARED-but-stale epoch (the
+//      store restarted while this page was closed; every native retry of
+//      that URL takes a fresh-fallback snapshot until it is swapped) or a
+//      mid-life transition (prevEpoch non-empty — a restart while
+//      connected). A plain epoch-LESS boot URL on first establishment does
+//      NOT arm the swap (that is every page load; see above).
+function noteEpochAdvanced(prevEpoch: string): void {
+  const cur = state.epoch;
+  if (!cur || cur === prevEpoch) return; // no establishment/transition
+  writeBootEpoch(cur);
+  // Prompt (synchronous): the session stream's cursor memory belongs to the
+  // OUTGOING lifetime — invalidate now (a different EventSource object; no
+  // dispatch reentrancy). Its own ES reconstruction (wrong-on-transition and
+  // declared-stale URLs) is handled inside noteStoreEpochChanged.
+  noteStoreEpochChanged(cur, prevEpoch);
+  const midLifeTransition = prevEpoch !== "";
+  const declaredStale = esUrlEpoch !== "" && esUrlEpoch !== cur;
+  if (es && (midLifeTransition || declaredStale)) armEpochUpgrade();
+}
+// The persisted store lifetime for THIS project dir lives in ./bootEpoch.ts
+// (readBootEpoch/writeBootEpoch) — extracted so BOTH stream openers can
+// declare it at construction without an import cycle (session-stream must
+// not import tree-transport).
+// armEpochUpgrade — (re)start the quiet-window countdown for the URL swap.
+// Re-armable: a LATER transition replaces the pending swap with the newest
+// epoch. connect() and suspendTreeForVisibility() cancel it (their own open
+// rebuilds the URL / tears the stream down).
+function armEpochUpgrade(): void {
+  clearTimeout(epochUpgradeTimer);
+  epochUpgradeTimer = window.setTimeout(fireEpochUpgrade, EPOCH_UPGRADE_QUIET_MS);
+}
+// fireEpochUpgrade — the quiet window elapsed. Re-check everything at fire
+// time: the ES may be gone/suspended, the URL may already declare the epoch
+// (an intervening manual reconnect), and a coherent capture or gzip64 decode
+// still in flight means the stream is NOT quiet — re-arm and wait again.
+function fireEpochUpgrade(): void {
+  epochUpgradeTimer = undefined;
+  if (!es || !projectDir()) return;
+  if (esUrlEpoch === state.epoch) return; // already current
+  if (isTreeSnapshotDecoding()) {
+    armEpochUpgrade();
+    return;
+  }
+  connect(false, "epoch-upgrade", "epoch-handshake");
+}
+
 // applyDetailIndependent — the existing detail `snapshot` apply path, extracted
 // so the coherent install and the legacy/independent path run identical logic.
 // Gate deferral, expectTreeSnap handshake, applySnapshot (wholesale-replace +
@@ -660,6 +764,7 @@ function applyDetailIndependent(snap: Snapshot): void {
   // must NOT falsely satisfy a pending cascade tree step. The convergence
   // signal waits for a baseline that actually landed.
   let applied = false;
+  const prevEpoch = state.epoch; // F1: capture for noteEpochAdvanced below
   if (snap.partial) applied = applyScopedSnapshot(snap);
   else applied = applySnapshot(snap);
   noteTreeSnapshotAppliedIfCurrent(treeGen); // diagnostics stamp (logging-only)
@@ -672,6 +777,10 @@ function applyDetailIndependent(snap: Snapshot): void {
   // Slice A/B: an authoritative detail baseline APPLIED on the current tree
   // connection — satisfy the convergence cascade's tree step.
   if (applied) noteTreeConverged();
+  // F1 epoch handshake: this apply may have established/changed the store
+  // epoch (applySnapshot/applyScopedSnapshot are its only writers) — run the
+  // transition duties (session notification + URL upgrade) after the apply.
+  noteEpochAdvanced(prevEpoch);
 }
 
 // applyTreeIndependent — the existing tree.snapshot apply path, extracted so the
@@ -733,6 +842,7 @@ function tryInstall(owner: PendingCaptureOwner): void {
   owner.installed = true;
   let backfillIds: string[] = [];
   let detailApplied = false;
+  const prevEpoch = state.epoch; // F1: capture for noteEpochAdvanced below
   batch(() => {
     // Detail projection. A frontier-scoped partial (snap.partial present)
     // installs via the scoped merge/replace path (D3) — same branch as the
@@ -794,6 +904,11 @@ function tryInstall(owner: PendingCaptureOwner): void {
   // guard let the DETAIL projection apply; a stale same-epoch discard leaves
   // the pass in flight for the next valid baseline (or its timeout).
   if (detailApplied) noteTreeConverged();
+  // F1 epoch handshake: the detail projection's apply may have established/
+  // changed the store epoch — run the transition duties AFTER the batch (the
+  // reconnect it schedules fires on a later macrotask, so the atomic install
+  // completes first).
+  noteEpochAdvanced(prevEpoch);
 }
 
 // TREE_STREAM_KINDS — the named SSE events Stream 1 (the tree stream)
@@ -903,6 +1018,8 @@ function checkTreeOrdinalGap(ordinal: number, kind: string): void {
 //   bounded es-life records (onerror readyState=CONNECTING, no new open).
 export function connect(fresh = false, reason: StreamOpenReason = "other", detail?: string) {
   clearTimeout(reconnectTimer);
+  clearTimeout(epochUpgradeTimer); // F1: this open rebuilds the URL — the pending upgrade is moot
+  epochUpgradeTimer = undefined;
   connectingFails = 0;
   // Invalidate any in-flight async gzip64 snapshot decode captured by a PRIOR
   // connection BEFORE we close it. Bumping the generation first means a stale
@@ -939,7 +1056,14 @@ export function connect(fresh = false, reason: StreamOpenReason = "other", detai
   // Q5 C2: a new connection's projections haven't landed yet — reset the
   // convergence boundary so consumers see "not yet authoritative" until the
   // server's snapshot.complete fires for the new connection's first capture.
-  setState("authoritativeReady", false);
+  // F1 exception (epoch-upgrade): that open is a same-lifetime URL SWAP, not
+  // a recovery — it fires only after an applied snapshot of the CURRENT
+  // epoch re-sent the (re-baselined) cursor, so the already-installed
+  // projections remain authoritative and the server replays only the
+  // post-snapshot gap (no new capture will arrive on the swapped
+  // connection; resetting here would wedge authoritativeReady false until
+  // the next full capture).
+  if (reason !== "epoch-upgrade") setState("authoritativeReady", false);
   // Capture the generation for THIS connection's listeners. The bump above
   // already invalidated any prior decode; this `gen` is checked at listener
   // entry and after every await in the snapshot listener.
@@ -997,8 +1121,35 @@ export function connect(fresh = false, reason: StreamOpenReason = "other", detai
   // same isPartDeltaEnabled() kill-switch as Stream 2, so one flag reverts
   // both connections to the legacy encoding.
   const partDeltaParam = isPartDeltaEnabled() ? `&part_delta=1` : "";
+  // F1 epoch handshake (P2 follow-up): declare the store lifetime this
+  // client's cursor belongs to on every open. state.epoch is set only by an
+  // APPLIED snapshot (reducers/reconcile) and cleared on project switch; P2's
+  // guardSnapshotApply re-baselines state.cursor on every epoch change, so
+  // the cursor the URL below carries is same-lifetime by construction. The
+  // server treats a declared epoch that differs from its store epoch as
+  // not-replayable (fresh re-seed + message-load kick), closing the
+  // cross-lifetime window the cursor comparison cannot see — a cursor
+  // numerically BELOW head from a PREVIOUS daemon lifetime would otherwise
+  // replay plausible-but-wrong deltas over dead-store state while appearing
+  // converged. Native EventSource auto-reconnect re-requests this same URL
+  // (param included) plus Last-Event-ID, so the handshake covers both cursor
+  // sources. Strictly additive: a server without the check ignores the param.
+  //
+  // ROUND 2 (review C-F1/C-F2 — the frozen-URL problem): an EventSource URL
+  // is immutable and the first connect of a page life NECESSARILY precedes
+  // the snapshot that would establish the epoch, so until then declare the
+  // PERSISTED previous lifetime for this dir (readBootEpoch — see
+  // noteEpochAdvanced's block comment for why persistence beats a
+  // post-snapshot reconnect). A returning boot's persisted state.cursor is a
+  // previous-lifetime resume candidate and gets the handshake from the very
+  // first connect. Omitted only when genuinely unknown (first-ever visit,
+  // no persisted epoch yet — residual until the first manual
+  // reconstruction, which always re-runs this code with the epoch known).
+  const declaredEpoch = state.epoch || readBootEpoch();
+  const epochParam = declaredEpoch ? `&epoch=${encodeURIComponent(declaredEpoch)}` : "";
+  esUrlEpoch = declaredEpoch; // F1: remember what THIS frozen URL declares
   es = new EventSource(
-    `/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1&tree=2${partDeltaParam}`,
+    `/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1&tree=2${partDeltaParam}${epochParam}`,
   );
   markTreeSeen();
   // Diagnostics (logging-only): one stream-open record per construction,
@@ -1507,6 +1658,8 @@ export function suspendTreeForVisibility(): void {
   if (treeSuspended) return;
   treeSuspended = true;
   clearTimeout(reconnectTimer);
+  clearTimeout(epochUpgradeTimer); // F1: no URL swap while suspended
+  epochUpgradeTimer = undefined;
   // Mirrors connect()'s teardown prefix (audit §3a order): bump the generation
   // BEFORE close so in-flight decodes/listeners from the suspended connection
   // are invalidated; cancel any pending coherent owner; reset the decode gate
