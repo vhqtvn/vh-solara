@@ -188,9 +188,13 @@ func (a *Aggregator) refreshArchivedSnapshot(ctx context.Context) error {
 // hydrate's still-in-flight snapshot fetch (observed under full-suite CPU
 // contention; the cold-start contract is exactly ONE archived fetch).
 // anyHydrateCompleted is stored only after hydrate's fan-out wg.Wait, so
-// gate-open implies the hydrate-side fetch already completed (successfully
-// or not) — "never refreshed" then means exactly "it failed", never "it is
-// still running".
+// for the FIRST hydrate gate-open implies that hydrate's archived fetch
+// already completed (successfully or not) — "never refreshed" then means
+// exactly "it failed", never "it is still running". The flag is sticky
+// (stored once, never reset), so reconnect hydrates are NOT covered by
+// this implication: the gate is already open while their fetch is still
+// in flight, and a tick whose interval has elapsed may overlap it —
+// benign, because refreshArchivedSnapshot is store-locked and idempotent.
 func (a *Aggregator) archivedSnapshotDue() bool {
 	if !a.anyHydrateCompleted.Load() {
 		return false

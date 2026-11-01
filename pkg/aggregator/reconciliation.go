@@ -155,8 +155,13 @@ func (a *Aggregator) runTreeReconcile(ctx context.Context) {
 		// hydrate. Best-effort: a fetch error does not advance
 		// lastArchivedRefresh, so the next tick retries. archivedSnapshotDue
 		// also requires a completed hydrate, so this tick never races the
-		// cold-start (or reconnect) hydrate's own in-flight snapshot fetch
-		// with a duplicate (see its doc in hydration.go).
+		// cold-start (first) hydrate's own in-flight snapshot fetch with a
+		// duplicate (see its doc in hydration.go). On reconnect hydrates the
+		// gate is already open (anyHydrateCompleted is sticky), so a tick whose
+		// last refresh is older than the interval may overlap that hydrate's
+		// in-flight fetch — benign, since refreshArchivedSnapshot is
+		// store-locked and idempotent; ticks whose last refresh is fresher
+		// than the interval stay off it entirely.
 		if a.archivedSnapshotDue() {
 			if err := a.refreshArchivedSnapshot(ctx); err != nil {
 				if ctx.Err() != nil {
