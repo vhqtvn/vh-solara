@@ -69,6 +69,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -434,5 +435,110 @@ func TestShutdownJoinsParkedLabelsReconcile(t *testing.T) {
 	}
 	if g.Revision < 2 {
 		t.Fatalf("labels doc revision = %d, want ≥ 2 (seed Replace left rev 1; the pass's RemoveRootIDs must have bumped it again before Shutdown returned)", g.Revision)
+	}
+}
+
+// TestShutdownRefusesPostDrainPostHydrateSpawn pins the ADMISSION half of the
+// post-hydrate spawn contract — the complement of the join tests above — for
+// the 2026-11-01 scheduled-CI panic:
+//
+//	panic: sync: WaitGroup is reused before previous Wait has returned
+//	pkg/web.(*Server).Shutdown.func1()  pkg/web/server_aggregators.go:129
+//
+// Root cause (Go 1.26 sync.WaitGroup semantics): a PARKED bgWG waiter is woken
+// by the final Done's state reset + Semrelease and then re-loads wg.state; if
+// a positive Add lands in between, the load sees a non-zero counter and Wait
+// panics. spawnPostHydrateReconciles was admitted with NO teardown gate —
+// both of its trigger arms fire from the DEFAULT aggregator's hydrate tail,
+// and the default aggregator is daemon-owned and keeps hydrating past
+// Shutdown (in CI: "event stream ended ... reconnecting in 1s" — the fake
+// upstream's SSE drop, then a successful rehydrate whose onHydrate tail
+// lands in the waiter's wake window).
+//
+// Interleaving construction (deterministic under GOMAXPROCS=1):
+//   - the boot reconcile passes are drained first, so a test-controlled
+//     bgWG member is the ONLY remaining count;
+//   - srv.pins.mu is held, so any ADMITTED pins pass parks at its Snapshot
+//     acquisition and holds its bgWG count past the waiter's load;
+//   - the member goroutine runs bgWG.Done() (the final drain event: state
+//     reset + waiter released) and then IMMEDIATELY fires the production
+//     spawn site — program order puts the Add(3) inside the waiter's wake
+//     window, and single-P run-queue order (spawned passes are runnext/queue
+//     front, the released waiter is queue tail) runs the passes before the
+//     waiter loads: the parked pins pass leaves state non-zero → the exact
+//     CI panic. Post-fix the spawn is refused (shutdownStarted gate) and the
+//     waiter loads a clean zero.
+//
+// The pins-park is load-bearing for the RED shape: without a held count, all
+// three passes could conceivably complete before the waiter loads, hiding the
+// reuse. Outcome assertions post-fix: Shutdown returns nil, and NO pass was
+// admitted (pinsReconcileEntries unchanged — the spawn refusal is observable,
+// not just panic-free).
+func TestShutdownRefusesPostDrainPostHydrateSpawn(t *testing.T) {
+	srv, _, ocCtx := newPostHydrateFixture(t)
+	fireImmediateRunReconciles(t, srv, ocCtx) // installs both arms; boot passes enter
+
+	// Settle the boot passes: one-shot fs scans; the brief pause lets their
+	// deferred bgWG.Done land so the controlled member below is the ONLY
+	// remaining bg count (making its Done the FINAL drain event).
+	time.Sleep(200 * time.Millisecond)
+
+	// Force single-P scheduling so the post-Done run order is forced (the
+	// spawned passes run before the released waiter — see the comment above).
+	oldP := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldP)
+
+	// Park surface: hold the worker-wide PinStore mutex — an admitted pins
+	// pass parks at its Snapshot acquisition (pre-removal), deterministically
+	// holding its bgWG count. sync.Once pairs the explicit release path with
+	// the Goexit safety net, matching the file's rendezvous discipline.
+	srv.pins.mu.Lock()
+	var releaseOnce sync.Once
+	releasePins := func() {
+		releaseOnce.Do(func() { srv.pins.mu.Unlock() })
+	}
+	defer releasePins()
+
+	entriesBefore := srv.pinsReconcileEntryCount()
+
+	// Controlled FINAL bg member: its Done is the last drain event, and the
+	// production spawn site fires from the SAME goroutine immediately after —
+	// the CI interleaving (final Done → rehydrate-tail Add) with the 1s
+	// reconnect delay collapsed to program order.
+	unblock := make(chan struct{})
+	srv.bgWG.Add(1)
+	go func() {
+		<-unblock
+		srv.bgWG.Done() // final drain event: state reset + waiter released (queued)
+		srv.spawnPostHydrateReconciles("", srv.agg)
+	}()
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		shutdownDone <- srv.Shutdown(ctx)
+	}()
+	// Park-settle: hand the single P to the Shutdown chain so it has issued
+	// its signals and PARKED its bgWG waiter on the controlled member before
+	// the final Done fires (one-sided settle, same discipline as the 300ms
+	// negative windows above).
+	time.Sleep(150 * time.Millisecond)
+
+	close(unblock)
+
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("Shutdown returned err=%v; the post-drain spawn must be refused, not break the drain", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown did not return after the final bg member drained — an admitted post-drain pass is parked on the held pins.mu and the waiter cannot drain it")
+	}
+
+	// Outcome assert: the post-drain spawn attempt admitted NO pass (the
+	// refusal is observable via the entry counter, not merely panic-free).
+	if got := srv.pinsReconcileEntryCount(); got != entriesBefore {
+		t.Fatalf("post-drain post-hydrate spawn was admitted: pinsReconcileEntries %d → %d — Shutdown must refuse bgWG.Add after teardown started", entriesBefore, got)
 	}
 }

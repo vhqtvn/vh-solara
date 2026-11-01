@@ -240,6 +240,24 @@ type Server struct {
 	watcherOn     map[string]bool
 	watcherCancel map[string]context.CancelFunc
 
+	// shutdownStarted is the bg-admission gate set at the TOP of Shutdown
+	// (before bgCancel fires) and consulted by spawnPostHydrateReconciles
+	// before its bgWG.Add(3) — the 2026-11-01 scheduled-CI panic fix
+	// ("sync: WaitGroup is reused before previous Wait has returned" at
+	// Shutdown's bgWG.Wait). The post-hydrate spawn arms fire from the
+	// DEFAULT aggregator's hydrate tail, which is daemon-owned and keeps
+	// hydrating past Shutdown; without the gate, a rehydrate completing in
+	// the waiter's wake window Add's a drained WaitGroup and panics (or, at
+	// best, leaks an untracked pass racing the caller's teardown). Guarded by
+	// watcherMu — NOT aggMu — because the immediate-run arm reaches the spawn
+	// from inside aggFor's aggMu critical section (non-default dirs), and
+	// watcherMu is already legally nested under aggMu there (the
+	// ensurePermissionWatcher precedent); the onHydrate arm takes it
+	// standalone, as does Shutdown's set. The check+Add pair is atomic under
+	// the same hold Shutdown's set takes, so an Add either lands before the
+	// flag (tracked, awaited) or is refused — never post-drain.
+	shutdownStarted bool
+
 	// queueGCMu + queueGCOn guard the one-time, per-dir installation of the
 	// queue-GC session.delete subscriber (FIX-QUEUE-GC-2). The subscriber is
 	// installed from aggFor for the default project AND every lazily-created

@@ -79,9 +79,11 @@ func (s *Server) RetargetOpenCode(baseURL string) {
 
 // Shutdown retires the Server's owned lifetimes and awaits them, bounded by ctx.
 // It is idempotent and safe to call repeatedly (every cancellation it issues is
-// idempotent; the WaitGroups are only ever waited, never re-Add'd after exit).
-// It establishes an EXPLICIT per-directory ownership boundary — not a blanket
-// context swap — by issuing each retirement signal AND awaiting the goroutines:
+// idempotent; the WaitGroups are waited only — and the bg admission gate below
+// makes the hydrate-triggered spawnPostHydrateReconciles refuse to re-Add them
+// once teardown has started). It establishes an EXPLICIT per-directory ownership
+// boundary — not a blanket context swap — by issuing each retirement signal AND
+// awaiting the goroutines:
 //
 //  1. bgCancel() — cancels the background-task ctx (the post-archive re-assert
 //     goroutine, and every non-default aggregator's RunManaged Run loop).
@@ -104,15 +106,31 @@ func (s *Server) RetargetOpenCode(baseURL string) {
 // watchers and subscriber-backed workers cannot remain live after Shutdown.
 //
 // Terminal-Shutdown contract: this is a terminal, single-caller teardown. In
-// production both callers (cmd/client-daemon-vh, cmd/local-server) drain the HTTP
-// server (vhHTTP.Shutdown) BEFORE srv.Shutdown, so no concurrent aggFor can
-// install fresh lifecycle work during teardown; tests call Shutdown in cleanup.
-// There is intentionally no admission barrier: the default aggFor path does
-// not consult the aggregator map and takes no persistent lock (aggMu is
-// acquired briefly for the managed-project and aggHook read+invoke only), and
-// the only race that could install post-signal work cannot occur at the
-// actual call sites.
+// production both callers (cmd/client-daemon-vh, cmd/local-server) drain the
+// HTTP server (vhHTTP.Shutdown) BEFORE srv.Shutdown, so no concurrent aggFor
+// can install fresh lifecycle work during teardown; tests call Shutdown in
+// cleanup. ADMISSION GATE (2026-11-01 scheduled-CI panic fix): the
+// hydrate-driven arm is NOT covered by that HTTP drain — the default
+// aggregator is daemon-owned, keeps its Run loop past srv.Shutdown (until
+// vhCancel at process exit), and every successful rehydrate fires its
+// onHydrate tail at spawnPostHydrateReconciles, whose bgWG.Add(3) landed in
+// the woken waiter's state-reload window in scheduled CI and panicked
+// bgWG.Wait ("sync: WaitGroup is reused before previous Wait has returned").
+// Shutdown therefore sets shutdownStarted (watcherMu-guarded) as its FIRST
+// act — before bgCancel — so that spawn site refuses post-teardown Adds:
+// an Add either lands before the flag (tracked; awaited below) or never
+// happens. The HTTP-driven bg arms (handleArchive's cascade, queue_http's
+// dispatch goroutine) remain covered by the documented caller-drains-HTTP
+// ordering and test cleanup order.
 func (s *Server) Shutdown(ctx context.Context) error {
+	// Admission gate — FIRST act, before any signal or drain (see the
+	// terminal-Shutdown contract above): paired with the watcherMu-held
+	// check+Add in spawnPostHydrateReconciles, this makes a hydrate-tail
+	// spawn either pre-flag (tracked, joined below) or refused — never a
+	// post-drain bgWG reuse.
+	s.watcherMu.Lock()
+	s.shutdownStarted = true
+	s.watcherMu.Unlock()
 	s.bgCancel() // idempotent; never reassigned after NewServer
 	s.stopAllPermissionWatchers()
 	// Stop the per-dir drain loops (slice 2b phase 2) BEFORE the aggregator

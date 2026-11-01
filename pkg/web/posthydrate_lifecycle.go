@@ -53,16 +53,31 @@ import (
 // bgCancel does not shorten them; Shutdown's ctx bounds only the WAIT, not
 // the passes (same as the archive-cascade and b5d209b joins).
 //
-// Admission caveat (accepted — see Server.Shutdown's terminal-teardown
-// contract): there is intentionally NO admission barrier. A hydrate that
-// completes after Shutdown's bgWG.Wait has already observed zero could still
-// spawn an untracked pass — the default aggregator is daemon-owned and keeps
-// hydrating past Shutdown. That window is the same accepted race class as the
-// b5d209b HTTP-driven spawn: production callers drain the HTTP server before
-// srv.Shutdown. What this join closes is the in-flight window — a pass
-// launched before the Wait is awaited before Shutdown returns.
+// Admission gate (2026-11-01 scheduled-CI panic fix): Shutdown sets
+// shutdownStarted (watcherMu-guarded) as its FIRST act, and this spawn site
+// checks it under the SAME lock before bgWG.Add(3) — so an Add either lands
+// before the flag (tracked; Shutdown's later Wait counts and joins it) or is
+// refused outright. This closes the post-drain reuse window the old
+// "accepted race" caveat described: both trigger arms fire from the DEFAULT
+// aggregator's hydrate tail (onHydrate on every successful rehydrate; the
+// immediate-run arm at aggFor time), and the default aggregator is
+// daemon-owned and keeps hydrating past Shutdown — in scheduled CI a fake
+// upstream's SSE drop ("event stream ended ... reconnecting in 1s") followed
+// by a successful rehydrate landed Add(3) inside Shutdown's waiter wake
+// window, panicking bgWG.Wait with "sync: WaitGroup is reused before
+// previous Wait has returned". Refusing the spawn is strictly better than
+// the old untracked leak too: a post-Shutdown pass raced the caller's
+// teardown (the 2026-10-11 TempDir RemoveAll ENOTEMPTY class) with no one
+// awaiting it. What this gate does NOT change: the join contract above — a
+// pass launched before the Wait is still awaited before Shutdown returns.
 func (s *Server) spawnPostHydrateReconciles(dir string, a *aggregator.Aggregator) {
+	s.watcherMu.Lock()
+	if s.shutdownStarted {
+		s.watcherMu.Unlock()
+		return
+	}
 	s.bgWG.Add(3)
+	s.watcherMu.Unlock()
 	go func() {
 		defer s.bgWG.Done()
 		s.reconcileQueuesForAgg(dir, a)
