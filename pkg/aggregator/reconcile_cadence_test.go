@@ -97,6 +97,66 @@ func TestTreeReconcile_ArchivedRefreshNotPerTick(t *testing.T) {
 	}
 }
 
+// Regression (cold-start duplicate): the reconcile ticker spawns before the
+// first hydrate runs, so a tick can observe lastArchivedRefresh==0 ("never
+// refreshed yet") while the hydrate's own archived-snapshot fetch is still in
+// flight — and fire a duplicate /session?archived=true concurrent with it.
+// Under real load (full ./pkg/... suite, CPU contention) hydrate's fan-out
+// stretches past the first 5ms tick and the duplicate lands intermittently;
+// the delayed handler below widens that window deterministically so the shape
+// is red on the ungated code (2 fetches) every run. archivedSnapshotDue must
+// hold the tick off until a hydrate has completed (gate added there).
+func TestTreeReconcile_NoArchivedDupWhileColdStartSnapshotInFlight(t *testing.T) {
+	fx := fixtures.New()
+	cnt := &listCounter{inner: fx.Handler()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/session", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("archived") == "true" {
+			// Slow archived response: guarantees several 5ms reconcile
+			// ticks fire while the hydrate's snapshot fetch is in flight
+			// and lastArchivedRefresh is still 0.
+			time.Sleep(50 * time.Millisecond)
+		}
+		cnt.ServeHTTP(w, r)
+	})
+	mux.Handle("/", fx.Handler())
+	oc := httptest.NewServer(mux)
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+	agg.treeReconcileInterval = 5 * time.Millisecond
+	agg.treeReconcileIdleInterval = 0
+	agg.archivedSnapshotInterval = time.Hour
+	agg.statusReconcileInterval = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		agg.RunManaged(ctx)
+		close(runDone)
+	}()
+	if !waitForAnyHydrateCompleted(agg, 5*time.Second) {
+		cancel()
+		t.Fatal("aggregator never hydrated")
+	}
+	stop := func() {
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(5 * time.Second):
+			t.Error("Run did not return after cancel")
+		}
+		agg.Stop()
+		agg.waitColdSeed()
+	}
+	defer stop()
+
+	waitLiveTicks(t, cnt, 12)
+	if got := cnt.archived.Load(); got != 1 {
+		t.Errorf("archived list fetched %d times across %d live-list fetches; want exactly 1 (hydrate's in-flight fetch, no tick duplicate)", got, cnt.live.Load())
+	}
+}
+
 // Control: with a short archived interval the reconcile does refresh it
 // periodically (the gate is spacing, not disabling).
 func TestTreeReconcile_ArchivedRefreshStillPeriodic(t *testing.T) {

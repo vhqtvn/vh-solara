@@ -153,7 +153,10 @@ func (a *Aggregator) runTreeReconcile(ctx context.Context) {
 		// pinned). Between refreshes the snapshot stays current through
 		// session.updated archive events (store.noteArchivedLocked) and every
 		// hydrate. Best-effort: a fetch error does not advance
-		// lastArchivedRefresh, so the next tick retries.
+		// lastArchivedRefresh, so the next tick retries. archivedSnapshotDue
+		// also requires a completed hydrate, so this tick never races the
+		// cold-start (or reconnect) hydrate's own in-flight snapshot fetch
+		// with a duplicate (see its doc in hydration.go).
 		if a.archivedSnapshotDue() {
 			if err := a.refreshArchivedSnapshot(ctx); err != nil {
 				if ctx.Err() != nil {

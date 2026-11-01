@@ -177,10 +177,24 @@ func (a *Aggregator) refreshArchivedSnapshot(ctx context.Context) error {
 	return nil
 }
 
-// archivedSnapshotDue reports whether the periodic archived refresh should run:
-// never refreshed yet, or the last success is at least archivedSnapshotInterval
-// old.
+// archivedSnapshotDue reports whether the periodic archived refresh should
+// run: a hydrate has completed at least once, AND either the snapshot has
+// never been refreshed (that hydrate's own best-effort fetch failed — the
+// tick is the documented retry path) or the last success is at least
+// archivedSnapshotInterval old. The completed-hydrate gate is load-bearing:
+// runTreeReconcile is spawned before the first hydrate runs, so without it
+// an early tick reading lastArchivedRefresh==0 ("never refreshed yet")
+// fires a duplicate /session?archived=true concurrent with the initial
+// hydrate's still-in-flight snapshot fetch (observed under full-suite CPU
+// contention; the cold-start contract is exactly ONE archived fetch).
+// anyHydrateCompleted is stored only after hydrate's fan-out wg.Wait, so
+// gate-open implies the hydrate-side fetch already completed (successfully
+// or not) — "never refreshed" then means exactly "it failed", never "it is
+// still running".
 func (a *Aggregator) archivedSnapshotDue() bool {
+	if !a.anyHydrateCompleted.Load() {
+		return false
+	}
 	last := a.lastArchivedRefresh.Load()
 	return last == 0 || time.Since(time.Unix(0, last)) >= a.archivedSnapshotInterval
 }
