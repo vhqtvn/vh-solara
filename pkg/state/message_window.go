@@ -788,15 +788,17 @@ func (s *Store) MergeOlderMessages(sid string, items []MessageWithParts, history
 	}
 	prepend := make([]string, 0, len(items))
 	// P1 never-started note (never_started.go): older-history merges
-	// (MergeOlderMessages) are NOT run through the never-started classifier.
-	// Accepted limitation, not an impossibility: the never-started signature is
-	// the NEWEST turn's shape when written (finalizeInterruptedAssistant stamps
-	// it at creation), so it does not reach this older-page path in practice —
-	// but a row can of course BECOME older history later. The consequence of a
-	// hypothetical matching older page is only the pre-P1 presentation (plain
-	// red abort box), never a wrong positive classification; the next full
-	// reconcile re-derives from the fetched shape. If stricter treatment is
-	// ever wanted, classify here as well (commit-review defer A-F1/R4 B-F1).
+	// (MergeOlderMessages) run the never-started classifier EXACTLY as the two
+	// primary adoption surfaces do (D9, defer-triage slice A — formerly the
+	// accepted gap "commit-review defer A-F1/R4 B-F1"): an incident-shaped
+	// older row (instant zero-parts zero-tokens MessageAbortedError) is
+	// refined to NeverStartedErrorName, and error rows cache their terminal
+	// name, so a later full reconcile re-deriving the same shape finds the
+	// classification already in place. Belt-and-braces by nature — the
+	// signature is the NEWEST turn's shape when written, so a row reaches this
+	// path only after becoming older history — and the pre-D9 consequence was
+	// bounded (pre-P1 presentation only, never a wrong positive). Pin:
+	// TestNeverStarted_OlderPageClassifies (never_started_test.go).
 	for _, mw := range items {
 		id := messageIDFromInfo(mw.Info)
 		if id == "" || sm.byID[id] != nil {
@@ -828,6 +830,21 @@ func (s *Store) MergeOlderMessages(sid string, items []MessageWithParts, history
 			me.completed = env.Time.Completed != nil
 			if env.Time.Created != nil {
 				me.createdMs, me.createdOK = *env.Time.Created, true
+			}
+			// D9: classify as the primary adoption surfaces do. partCount
+			// vouches for the parts adopted above (the entry is always FRESH
+			// here — the dedup guard above skips already-resident ids — so
+			// adopted == fetched, with no separate resident count to union).
+			// neverStartedRaw retains the raw fetched body so a later first
+			// part can revoke (upsertPartLocked), exactly as reconcile does.
+			if s.classifyNeverStartedLocked(sid, &env, len(me.parts)) {
+				if merged := mergeNeverStartedInfo(me.info); len(merged) > 0 {
+					me.info = merged
+				}
+				me.terminalError = NeverStartedErrorName
+				me.neverStartedRaw = mw.Info
+			} else {
+				me.terminalError = env.errorName()
 			}
 		}
 		sm.byID[id] = me

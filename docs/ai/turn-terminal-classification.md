@@ -12,12 +12,13 @@ study).
 |---|---|---|---|---|
 | Normal completion | `finish: "stop"` etc., no error | adoption sites | n/a | — |
 | Operator/limit abort | `error.name == "MessageAbortedError"` NOT matching the never-started signature | adoption sites | **yes** (upstream positive terminal) | red `.msg-error` box ("⚠ Aborted") |
-| Never started (instant self-abort) | `MessageAbortedError` AND `completed − created ≤ 100 ms` AND zero parts AND zero tokens | refined at BOTH adoption sites into `VHSolaraNeverStartedError` | **yes** (refines an upstream-positive terminal) | quiet amber `.msg-never` notice |
+| Never started (instant self-abort) | `MessageAbortedError` AND `completed − created ≤ 100 ms` AND zero parts AND zero tokens | refined at all three adoption surfaces into `VHSolaraNeverStartedError` | **yes** (refines an upstream-positive terminal) | quiet amber `.msg-never` notice |
 | Interrupted (sweep inference) | uncompleted newest + two consecutive authoritative not-busy observations | `interrupted_sweep.go` marker | **no** (fabricates a terminal opencode never wrote — pure inference) | `.msg-error` box with sweep vocabulary |
 
-Adoption sites (both must agree): `upsertMessageLocked`
+Adoption surfaces (all must agree): the two primary — `upsertMessageLocked`
 (`reducers.go`, live `message.updated`) and `reconcileMessagesLocked`
-(`hydration.go`, history fetch).
+(`hydration.go`, history fetch) — plus the older-page surface
+`MergeOlderMessages` (`message_window.go`, boundary-demand paging; D9).
 
 ## Never-started (P1, `pkg/state/never_started.go`)
 
@@ -42,7 +43,7 @@ The refinement rewrites ONLY the `info.error` block:
 Byte-stable merge (no warm-reconcile churn), with non-error fields passed
 through verbatim (`json.RawMessage` decode — no numeric re-encoding).
 
-### The abort-marker question (resolved: no durable marker; TurnStopping guard on both surfaces)
+### The abort-marker question (resolved: no durable marker; TurnStopping guard on every adoption surface)
 
 The ideal classifier would also know "vh-solara sent no `/vh/abort` for this
 session". No cheap, reliable, durable marker exists:
@@ -56,7 +57,7 @@ session". No cheap, reliable, durable marker exists:
 - The restart fence (`pkg/web/restart_fence.go`) stamps QUEUE dispatch items —
   a different entity, only at restart time.
 
-What is wired: BOTH adoption surfaces suppress the refinement while the
+What is wired: EVERY adoption surface suppresses the refinement while the
 session is `TurnStopping` (`classifyNeverStartedLocked` — the one window
 where "we just aborted this session" is observable under the lock we already
 hold; a history fetch racing that window gets the same conservative
@@ -79,12 +80,12 @@ THREE part-ingestion surfaces: the authoritative `part.upsert`
 history-fetch merge loop (`reconcileMessagesLocked` — where a cold load can
 skip body adoption on a live-touched entry). A parts-bearing turn can never
 keep the "turn never ran" presentation. A later body adoption that breaks the
-signature also restores the raw shape. (One accepted gap, not an
-impossibility: `MergeOlderMessages` builds older-history entries without the
-classifier — the signature is the newest turn's shape when written, so it does
-not reach the older-page path in practice; the consequence of a hypothetical
-matching older page is only the pre-P1 presentation, and the next full
-reconcile re-derives.)
+signature also restores the raw shape. (The formerly accepted gap —
+`MergeOlderMessages` building older-history entries without the classifier —
+was closed in D9 (defer-triage slice A): the older-page adoption loop now
+classifies exactly as the primary surfaces do, pinned by
+`TestNeverStarted_OlderPageClassifies`. Belt-and-braces by nature, since the
+signature is the newest turn's shape when written.)
 
 ## Why `VHSolaraNeverStartedError` is an `isTerminalError` member but `VHSolaraInterruptedError` is not
 

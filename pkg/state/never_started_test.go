@@ -4,7 +4,9 @@ package state
 // (never_started.go): an opencode row written by finalizeInterruptedAssistant
 // (assistant + MessageAbortedError + ≤100 ms + zero parts + zero tokens — the
 // validated incident signature, observed at 27 ms and 7 ms) is refined into
-// NeverStartedErrorName at BOTH adoption surfaces, while every real
+// NeverStartedErrorName at ALL THREE adoption surfaces (live
+// upsertMessageLocked; history reconcileMessagesLocked; older-page
+// MergeOlderMessages — D9), while every real
 // operator/limit abort — the 145 s control from the same incident session,
 // duration outliers, and any abort that produced parts — keeps today's
 // positive-terminal MessageAbortedError meaning. Cases are built from the
@@ -556,5 +558,93 @@ func TestNeverStarted_IsTerminalErrorMember(t *testing.T) {
 	}
 	if isTerminalError(InterruptedTurnErrorName) {
 		t.Fatalf("isTerminalError(%q) = true, want false (sweep inference must stay excluded)", InterruptedTurnErrorName)
+	}
+}
+
+// TestNeverStarted_OlderPageClassifies (D9): MergeOlderMessages — the
+// older-history adoption surface — runs the never-started classifier exactly
+// as the two primary surfaces (upsertMessageLocked live;
+// reconcileMessagesLocked history fetch). An incident-shaped older row (27 ms,
+// zero parts, zero tokens) is refined (cached terminalError, refined info
+// bytes, raw body retained for first-part revocation), while a substantive
+// older abort (the 145 s control shape) keeps the operator-abort
+// classification and its bytes verbatim. Before D9 this surface skipped the
+// classifier entirely (accepted gap: pre-P1 presentation only, never a wrong
+// positive — see the former message_window.go note).
+func TestNeverStarted_OlderPageClassifies(t *testing.T) {
+	olderIncident := `{"id":"msg_old_incident","sessionID":"sess_ns","role":"assistant",` +
+		`"time":{"created":1790000000000,"completed":1790000000027},` +
+		`"error":{"name":"MessageAbortedError","data":{"message":"Aborted"}},` +
+		`"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}`
+	olderControl := `{"id":"msg_old_ctrl","sessionID":"sess_ns","role":"assistant",` +
+		`"time":{"created":1790000000000,"completed":1790000145000},` +
+		`"error":{"name":"MessageAbortedError","data":{"message":"Aborted"}},` +
+		`"tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}`
+	// Plain completed older assistant WITH a part and NO error: pins the
+	// else-arm's no-error case — terminalError must stay empty (review F5;
+	// the resident user row below exercises the dedup-skip path, not this).
+	olderPlain := `{"id":"msg_old_plain","sessionID":"sess_ns","role":"assistant",` +
+		`"time":{"created":1790000001000,"completed":1790000050000},` +
+		`"tokens":{"input":2,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}`
+	olderPlainPart := `{"id":"msg_old_plain_p1","type":"text","text":"older plain turn output"}`
+	resident := `{"id":"msg_resident","sessionID":"sess_ns","role":"user",` +
+		`"time":{"created":1790000200000}}`
+
+	s := New(1024)
+	s.Apply(ev("session.created", `{"info":{"id":"sess_ns","title":"S"}}`))
+	s.SetSessionMessages("sess_ns", []MessageWithParts{{Info: []byte(resident)}})
+	s.MergeOlderMessages("sess_ns", []MessageWithParts{
+		{Info: []byte(olderIncident)}, // oldest-first, as the cursor returns
+		{Info: []byte(olderControl)},
+		{Info: []byte(olderPlain), Parts: []json.RawMessage{json.RawMessage(olderPlainPart)}},
+	}, false)
+
+	// Incident-shaped older row: refined.
+	completed, te, info, parts := nsState(t, s, "sess_ns", "msg_old_incident")
+	if !completed {
+		t.Fatalf("older incident row: completed=false, want true (upstream completed survives refinement)")
+	}
+	if parts != 0 {
+		t.Fatalf("older incident row: parts=%d, want 0", parts)
+	}
+	if te != NeverStartedErrorName {
+		t.Fatalf("older incident row: terminalError=%q, want %q (older-page adoption must classify)", te, NeverStartedErrorName)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(info, &m); err != nil {
+		t.Fatalf("refined older info not valid JSON: %v", err)
+	}
+	errObj, _ := m["error"].(map[string]any)
+	if errObj == nil || errObj["name"] != NeverStartedErrorName {
+		t.Fatalf("older incident info.error.name = %v, want %q", errObj["name"], NeverStartedErrorName)
+	}
+	data, _ := errObj["data"].(map[string]any)
+	if data == nil || data["message"] != neverStartedUserMessage || data["cause"] != "MessageAbortedError" {
+		t.Fatalf("older incident info.error.data = %v, want message vocabulary + upstream cause", data)
+	}
+	s.mu.RLock()
+	rawLeft := s.messages["sess_ns"].byID["msg_old_incident"].neverStartedRaw
+	s.mu.RUnlock()
+	if len(rawLeft) == 0 || !bytes.Contains(rawLeft, []byte("MessageAbortedError")) {
+		t.Fatalf("older incident row: neverStartedRaw retention missing (first-part revocation would be blind)")
+	}
+
+	// Substantive older abort (145 s, tokens>0): stays operator-abort, bytes verbatim.
+	_, te, info, _ = nsState(t, s, "sess_ns", "msg_old_ctrl")
+	if te != "MessageAbortedError" {
+		t.Fatalf("older 145s control: terminalError=%q, want MessageAbortedError (real operator abort)", te)
+	}
+	if !bytes.Equal(info, []byte(olderControl)) {
+		t.Fatalf("older 145s control: info bytes were rewritten:\n got %s\nwant %s", info, olderControl)
+	}
+
+	// Plain non-error older row: terminalError stays empty, part adopted.
+	if _, te, _, parts = nsState(t, s, "sess_ns", "msg_old_plain"); te != "" || parts != 1 {
+		t.Fatalf("older plain row: terminalError=%q parts=%d, want empty/1 (no-error else-arm must not stamp a terminal)", te, parts)
+	}
+
+	// Resident tail untouched.
+	if _, te, _, _ = nsState(t, s, "sess_ns", "msg_resident"); te != "" {
+		t.Fatalf("resident user row: terminalError=%q, want empty (untouched by older-page adoption)", te)
 	}
 }
