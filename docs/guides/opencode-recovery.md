@@ -79,3 +79,29 @@ Force the cap by killing every replacement within a few seconds (preventing it f
 - `systemctl --user restart vh-opencode.service` is the **manual fallback only**.
 - Watcher NEVER restarts the daemon itself. Deliberate stops or ctx cancellation exit silently.
 - Deliberate user stops log `… — deliberate stop — not restarting`.
+
+## Instant-abort recurrence capture
+
+If an OpenCode turn self-aborts instantly again ("turn never ran" / instant
+`MessageAbortedError`), capture evidence BEFORE touching anything else.
+
+**Already automatic** (no action needed):
+- The daemon journal self-captures stream open/close with UA attribution and
+  `oc instance disposed` lines (commit `952d7ed`) — `journalctl --user -u
+  vh-opencode.service` retains them.
+- The UI visibly classifies never-started turns (commit `d329561`) — the quiet
+  amber "turn never ran" notice is itself a recurrence signal.
+
+**Still manual — do FIRST, before any restart:**
+1. Freeze (copy aside) the opencode log AND the opencode events DB covering the
+   incident window — do NOT restart the daemon or opencode instance until both
+   are copied (`systemctl --user restart` and every UI restart path are
+   evidence-destroying at this point). Restarts destroyed the discriminating
+   evidence **twice** on 2026-10-31 — do not repeat that.
+
+**Full protocol and open questions** live in the draft cards
+`.local/coordinator/tasks/defer-instant-abort-cause-recurrence.json` (R1 direct
+cancel vs R2 silent dispose; the events table does NOT persist bus events — the
+journal line is the only automatic R2 signal) and
+`.local/coordinator/tasks/defer-oc-dispose-sse-forwarding-proof.json`
+(proving real opencode forwards `server.instance.disposed` across SSE).
