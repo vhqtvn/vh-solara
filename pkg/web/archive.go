@@ -111,6 +111,24 @@ type archiveFailureKey struct {
 // POST /vh/archive {sessionID} — archive a session and all its subsessions.
 // POST /vh/unarchive {sessionID} — restore them.
 func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
+	// Shutdown admission gate (covers both routes this handler serves). The
+	// 200 {ok:true, affected} at the tail is a JOB-ACCEPTANCE contract: the
+	// cascade is async, so acceptance means the Server owns the job from
+	// here on — a promise it cannot keep once Shutdown has started (the
+	// cascade's bgWG.Add would land in Shutdown's drain window: either the
+	// WaitGroup-reuse panic or an untracked job racing the caller's
+	// teardown). Refuse with 503 instead of accepting-then-dropping. This
+	// window is ~unreachable in production (both daemon callers drain the
+	// HTTP server BEFORE srv.Shutdown — see the terminal-Shutdown contract
+	// on Shutdown), but it must be correct where it IS reachable: the drain
+	// race and test teardown.
+	s.watcherMu.Lock()
+	shuttingDown := s.shutdownStarted
+	s.watcherMu.Unlock()
+	if shuttingDown {
+		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -271,10 +289,27 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 			base:   s.archiveRetryBase,
 			max:    s.archiveRetryMax,
 		}
-		s.bgWG.Add(1)
+		// Defense-in-depth: route the admission through tryBgAdd (the
+		// shutdownStarted gate) even though the handler-top check already
+		// refused shutdown-time requests. Reaching a refusal HERE requires a
+		// Shutdown to start between that top check and this launch — a
+		// window production's caller-drains-HTTP ordering closes — but if it
+		// ever happens, log + refuse (nothing has been written to the
+		// ResponseWriter yet, so the 503 keeps the job-acceptance contract
+		// honest) instead of an un-gated bgWG.Add panicking Shutdown's
+		// waiter. bgMu is released before responding; the registry entry and
+		// archiveJobsActive increment below are skipped together with the
+		// job (no job exists → nothing to register).
+		if !s.tryBgAdd() {
+			s.bgMu.Unlock()
+			log.Printf("[archive] cascade admission refused at launch: shutdown started after the handler-top gate (dir=%q root=%q affected=%d)", dir, body.SessionID, len(affected))
+			http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+			return
+		}
 		atomic.AddInt64(&s.archiveJobsActive, 1) // hoisted before launch: awaitArchiveJobs must see >=1
 		// Slice-2 active-jobs registry (under the SAME bgMu critical section
-		// the bgWG.Add above already holds): record (dir, root) so the OOB-
+		// the tryBgAdd admission above already holds): record (dir, root) so
+		// the OOB-
 		// reconcile backstop (reconcileArchiveFailures) can SKIP this root
 		// while the cascade is in flight. Keyed by the SAME composite as the
 		// failure registry (archiveFailureKey) so the backstop's lookup is a

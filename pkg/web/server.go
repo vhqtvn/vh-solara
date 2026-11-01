@@ -241,8 +241,11 @@ type Server struct {
 	watcherCancel map[string]context.CancelFunc
 
 	// shutdownStarted is the bg-admission gate set at the TOP of Shutdown
-	// (before bgCancel fires) and consulted by spawnPostHydrateReconciles
-	// before its bgWG.Add(3) — the 2026-11-01 scheduled-CI panic fix
+	// (before bgCancel fires). Consulted by spawnPostHydrateReconciles
+	// before its bgWG.Add(3), by tryBgAdd (the reusable check+Add gate
+	// behind the two HTTP-driven bg arms — handleQueueList's dispatch
+	// goroutine and handleArchive's cascade launch), and by handleArchive's
+	// handler-top 503 refusal — the 2026-11-01 scheduled-CI panic fix
 	// ("sync: WaitGroup is reused before previous Wait has returned" at
 	// Shutdown's bgWG.Wait). The post-hydrate spawn arms fire from the
 	// DEFAULT aggregator's hydrate tail, which is daemon-owned and keeps
@@ -641,6 +644,39 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 	srv.bgWG.Add(1)
 	go srv.runArchiveBackstop()
 	return srv, nil
+}
+
+// tryBgAdd is the reusable bg-admission gate for server-owned background
+// arms: it performs the shutdownStarted check + bgWG.Add(1) ATOMICALLY under
+// watcherMu — the SAME lock hold Shutdown's first act (the flag set,
+// server_aggregators.go) takes — so an Add either lands before the flag
+// (tracked; Shutdown's later bgWG.Wait counts and joins it) or is refused
+// outright, never landing in the woken waiter's state-reload window (the
+// "sync: WaitGroup is reused before previous Wait has returned" panic class
+// — see the admission-gate contracts on Shutdown and
+// spawnPostHydrateReconciles, which inlines this same pattern for its
+// Add(3)).
+//
+// Caller contract: true ⇒ the caller MUST launch the goroutine whose
+// deferred bgWG.Done() releases the admitted count (never leak it); false ⇒
+// shutdown already started — skip the spawn (the work is either retried by
+// the caller's next poll against a new server or refused at the HTTP edge,
+// per the arm's documented refusal posture).
+//
+// Lock ordering: the helper takes watcherMu STANDALONE (it acquires nothing
+// else while holding it), matching every existing watcherMu site. It is safe
+// to call with aggMu held (aggMu → watcherMu is the established
+// ensurePermissionWatcher order) or with bgMu held (bgMu → watcherMu at
+// archive.go's cascade launch; no inverse edge exists — no watcherMu holder
+// acquires bgMu or aggMu).
+func (s *Server) tryBgAdd() bool {
+	s.watcherMu.Lock()
+	defer s.watcherMu.Unlock()
+	if s.shutdownStarted {
+		return false
+	}
+	s.bgWG.Add(1)
+	return true
 }
 
 // reqDir extracts the requested project directory from ?dir= (snapshot/stream)

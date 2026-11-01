@@ -248,11 +248,22 @@ func (s *Server) handleQueueList(w http.ResponseWriter, r *http.Request) {
 		// r's URL/header, whose lifetime is only guaranteed for the handler
 		// call itself. Eager evaluation — zero behavior change today.
 		dir := reqDir(r)
-		s.bgWG.Add(1)
-		go func() {
-			defer s.bgWG.Done()
-			s.reconcileSessionQueue(dir, sid, root)
-		}()
+		// Admission gate (2026-11-01 WaitGroup-reuse panic class — same
+		// contract as spawnPostHydrateReconciles): if Shutdown has started,
+		// tryBgAdd refuses and the spawn is SKIPPED. Refusal posture: this
+		// pass is best-effort cleanup, not a request obligation — the
+		// response below already carries the items, and the skipped pass is
+		// simply re-attempted by the FE's next poll (against a new server;
+		// `unknown` items are terminal and never resent, so nothing is
+		// lost). An un-gated Add here would either panic Shutdown's waiter
+		// (WaitGroup reuse in the drain race window) or leak an untracked
+		// pass racing the caller's teardown.
+		if s.tryBgAdd() {
+			go func() {
+				defer s.bgWG.Done()
+				s.reconcileSessionQueue(dir, sid, root)
+			}()
+		}
 	}
 	writeJSONResp(w, map[string]any{"items": items})
 }

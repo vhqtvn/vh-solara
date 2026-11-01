@@ -119,9 +119,24 @@ func (s *Server) RetargetOpenCode(baseURL string) {
 // Shutdown therefore sets shutdownStarted (watcherMu-guarded) as its FIRST
 // act — before bgCancel — so that spawn site refuses post-teardown Adds:
 // an Add either lands before the flag (tracked; awaited below) or never
-// happens. The HTTP-driven bg arms (handleArchive's cascade, queue_http's
-// dispatch goroutine) remain covered by the documented caller-drains-HTTP
-// ordering and test cleanup order.
+// happens. BOTH HTTP-driven bg arms are gated by the same flag:
+// handleArchive refuses 503 at the handler top (with a tryBgAdd
+// defense-in-depth refusal at the cascade launch), and handleQueueList's
+// dispatch goroutine routes through tryBgAdd (refusal skips the spawn — the
+// response still carries the items; the skipped pass is best-effort cleanup
+// retried on the FE's next poll). Remaining WaitGroup census (2026-11-01
+// audit): the seven aggFor-driven lifecycleWG.Add sites —
+// permission_watch.go:97 (ensurePermissionWatcher), queue_lifecycle.go:141
+// (installQueueGCCleanup), queue_recovery_classify.go:455,
+// pins_lifecycle.go:253, labels_lifecycle.go:229, queue_delivery_watch.go:108,
+// and queue_drain_loop.go:245 — all share the lifecycleWG.Wait below and
+// remain covered by the documented caller-drains-HTTP ordering (aggFor is
+// reachable only through HTTP handlers, which the production callers close
+// before srv.Shutdown; the permission watchers are ADDITIONALLY retired by
+// stopAllPermissionWatchers above, which cancels every watcher including the
+// default dir's). NewServer's archive-backstop bgWG.Add (server.go) is
+// construction-safe: it runs before the Server is returned, pre-serving, so
+// no Shutdown can exist concurrently with it.
 func (s *Server) Shutdown(ctx context.Context) error {
 	// Admission gate — FIRST act, before any signal or drain (see the
 	// terminal-Shutdown contract above): paired with the watcherMu-held
