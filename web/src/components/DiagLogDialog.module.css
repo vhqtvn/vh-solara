@@ -110,3 +110,35 @@
   color: var(--fg-dim);
   padding: 10px 2px;
 }
+
+/* __vhSyncDiag snapshot — collapsed by default (native <details>, no JS),
+   same selectable-pre treatment as the entries list with a smaller
+   viewport cap. No GPU-expensive effects. */
+.syncDiag {
+  margin-top: 10px;
+}
+.syncDiag summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  user-select: none;
+}
+.snapshot {
+  margin: 6px 0 0;
+  padding: 9px 11px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+  overflow-wrap: anywhere;
+  max-height: 30vh;
+  overflow-y: auto;
+}

@@ -19,6 +19,25 @@ import styles from "./DiagLogDialog.module.css";
 
 const mins = (msVal: number) => `${Math.round(msVal / 60000)} min`;
 
+// The __vhSyncDiag snapshot (recovery counters, stream-open counts,
+// weaklink, connstatus ring inputs — recovery-reasons.ts) is a plain window
+// getter installed once by startSync. Read it defensively ONCE at dialog
+// open: an absent getter (early boot, test envs) or a throwing read yields
+// null → the dialog shows an absence note instead of breaking.
+type SyncDiagFn = () => unknown;
+function readSyncDiagJson(): string | null {
+  try {
+    const fn = (window as { __vhSyncDiag?: SyncDiagFn }).__vhSyncDiag;
+    if (typeof fn !== "function") return null;
+    // stringify yields undefined only for non-serializable top-level values
+    // (undefined/function/symbol) — coerce to null so the annotation is
+    // runtime-honest and every `!= null` gate absorbs it.
+    return JSON.stringify(fn(), null, 2) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export default function DiagLogDialog(props: { onClose: () => void }) {
   const onKey = (e: KeyboardEvent) => {
     if (e.key === "Escape") props.onClose();
@@ -26,9 +45,21 @@ export default function DiagLogDialog(props: { onClose: () => void }) {
   onMount(() => document.addEventListener("keydown", onKey));
   onCleanup(() => document.removeEventListener("keydown", onKey));
 
+  const syncDiag = readSyncDiagJson();
+
   // Newest first for scanning (the buffer stores newest last).
   const list = createMemo(() => [...diagEntries()].reverse());
-  const allText = () => list().map(entryLine).join("\n");
+  const entriesText = () => list().map(entryLine).join("\n");
+  // Copy-all bundles the visible entries plus the __vhSyncDiag snapshot
+  // (when present) under a separator, so one tap captures the full FE sync
+  // picture — mirroring what `__vhSyncDiag()` prints to the console.
+  const allText = () => {
+    const entries = entriesText();
+    if (syncDiag == null) return entries;
+    return entries
+      ? `${entries}\n\n--- __vhSyncDiag ---\n${syncDiag}`
+      : `--- __vhSyncDiag ---\n${syncDiag}`;
+  };
 
   async function copyAll() {
     try {
@@ -84,7 +115,7 @@ export default function DiagLogDialog(props: { onClose: () => void }) {
 
           <div class={styles.listHead}>
             <span class={styles.listCount}>{list().length} entry{list().length === 1 ? "" : "ies"}</span>
-            <Show when={list().length > 0}>
+            <Show when={list().length > 0 || syncDiag != null}>
               <button type="button" class={styles.copyAll} onClick={copyAll}>
                 <Icon name="copy" size={13} /> Copy all
               </button>
@@ -96,9 +127,21 @@ export default function DiagLogDialog(props: { onClose: () => void }) {
             fallback={<div class={styles.empty}>No entries yet. Open a cold session with capture on.</div>}
           >
             <pre class={styles.list} aria-label="Diagnostic entries">
-              {allText()}
+              {entriesText()}
             </pre>
           </Show>
+
+          <details class={styles.syncDiag}>
+            <summary>Sync snapshot (__vhSyncDiag)</summary>
+            <Show
+              when={syncDiag != null}
+              fallback={<div class={styles.empty}>Not installed in this session — startSync has not run.</div>}
+            >
+              <pre class={styles.snapshot} aria-label="Sync snapshot">
+                {syncDiag}
+              </pre>
+            </Show>
+          </details>
         </div>
       </div>
     </div>
