@@ -12,7 +12,19 @@ package web
 // after the Wait returned leaks an untracked goroutine racing the caller's
 // teardown.
 //
-// Both tests set the flag the way Shutdown's first act does (white-box,
+// Three tests across the two arms:
+//   - TestShutdownWindowArchiveHandlerRefusesWith503 — archive arm,
+//     handler-TOP gate: flag set before dispatch ⇒ the POST is refused 503.
+//   - TestShutdownWindowQueueListSkipsReconcileSpawnButStillLists — queue
+//     arm: flag set before dispatch ⇒ the reconcile spawn is refused while
+//     the list read still answers 200 with the items.
+//   - TestShutdownWindowArchiveLaunchSiteRefusesWhenFlagLandsMidHandler —
+//     archive arm, LAUNCH-SITE gate: the flag lands BETWEEN the two archive
+//     gates while the request is already inside the handler ⇒ tryBgAdd must
+//     refuse (its own doc comment carries the rendezvous and the
+//     wrong-gate log discriminator).
+//
+// The first two set the flag the way Shutdown's first act does (white-box,
 // watcherMu-guarded — the "controlled Shutdown" option) rather than racing a
 // real Shutdown against a request, keeping them deterministic: no interleaving
 // construction is needed because the asserted behavior is a REFUSAL, not a
@@ -23,9 +35,11 @@ package web
 //     candidate seed does trigger a spawn pre-flag, so "no lookup fires" in
 //     this test means the gate refused it, not that nothing was eligible.
 //   - The archive 200 path is covered by the archive_job_test.go family; here
-//     the 503 status + "server shutting down" body are unique to the gate (no
-//     other path in handleArchive produces either), so the observed response
-//     proves the refusal came from the gate.
+//     the 503 status + "server shutting down" body identify a shutdown
+//     REFUSAL in general (no other path in handleArchive produces either)
+//     but CANNOT distinguish WHICH gate refused — the handler-top and
+//     launch-site gates return the identical response. Launch-site
+//     attribution rests on the third test's stdlib log discriminator alone.
 
 import (
 	"bytes"
@@ -184,6 +198,12 @@ func TestShutdownWindowQueueListSkipsReconcileSpawnButStillLists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Test-owned default-aggregator teardown (same as the launch-site test
+	// below — full rationale there): aggFor("") installs the default
+	// project's subscriber goroutines, which Server.Shutdown deliberately
+	// never stops. Registered BEFORE the Shutdown cleanup so LIFO runs it
+	// AFTER: server down first, then Stop. Idempotent, non-blocking.
+	t.Cleanup(func() { agg.Stop() })
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -312,6 +332,19 @@ func TestShutdownWindowArchiveLaunchSiteRefusesWhenFlagLandsMidHandler(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Test-owned default-aggregator teardown (review F3): this test's request
+	// reaches aggFor("") (the watcherOn rendezvous below), installing the
+	// default project's queue-GC/session-error/delivery/pins/labels
+	// subscriber goroutines — and Server.Shutdown deliberately NEVER stops
+	// the default aggregator (daemon-owned in production: its Run loop is
+	// process-lifetime, and stopServerOwnedAggregators skips dir ""), so
+	// those goroutines would otherwise survive to process exit. Registered
+	// BEFORE the Shutdown cleanup so LIFO runs it AFTER: server down first,
+	// then agg.Stop. Deadlock-free by construction: this aggregator's Run was
+	// never started (a.cancel nil ⇒ cancel is a no-op) and Store.Close is an
+	// idempotent, non-blocking close of the subscriber channels under the
+	// store lock — Stop joins nothing.
+	t.Cleanup(func() { agg.Stop() })
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -361,6 +394,21 @@ func TestShutdownWindowArchiveLaunchSiteRefusesWhenFlagLandsMidHandler(t *testin
 		resp, err := http.DefaultClient.Do(req)
 		respCh <- respErr{resp, err}
 	}()
+	// Hygiene (review F5): if the test Fatals anywhere past this point before
+	// the select below drains respCh (the watcherOn poll timeout, the
+	// response timeout, or a later assertion), a delivered *http.Response
+	// body would be abandoned undrained. Non-blockingly receive and close it
+	// at cleanup; respCh is buffered (cap 1), so the dispatcher goroutine
+	// never blocks either way.
+	t.Cleanup(func() {
+		select {
+		case r := <-respCh:
+			if r.resp != nil {
+				r.resp.Body.Close()
+			}
+		default:
+		}
+	})
 
 	// Step 3: observe the handler is PAST the top gate before setting the
 	// flag. aggFor("") arms the default permission watcher — watcherOn[""]
