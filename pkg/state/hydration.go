@@ -439,9 +439,13 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts, exh
 				me.tokens = env.Tokens
 				me.agent = env.Agent
 				// P1 never-started refinement: the cached classification follows
-				// the refined info bytes adopted above (both surfaces must
-				// agree). The raw pre-refinement fetched body is retained so a
-				// later first LIVE part can revoke the refinement
+				// the same neverStart verdict that drove the body adoption above,
+				// so the cached name and the adopted body agree on THIS surface
+				// (refined bytes ⇒ NeverStartedErrorName; raw bytes ⇒ the
+				// upstream error name — even an unparseable base whose bytes
+				// stayed raw carries the classification in the cache, see
+				// mergeNeverStartedInfo). The raw pre-refinement fetched body is
+				// retained so a later first LIVE part can revoke the refinement
 				// (upsertPartLocked; C-F1).
 				if neverStart {
 					me.terminalError = NeverStartedErrorName

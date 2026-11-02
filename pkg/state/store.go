@@ -588,13 +588,15 @@ type messageEntry struct {
 	// WITHOUT the two-empty confirmation re-fetch the non-aborted zero-parts
 	// case needs (see isTerminalError / latestAssistantResidentLocked /
 	// reconcileMessagesLocked). Empty for normal turns. Set from
-	// messageInfoEnvelope.errorName() in BOTH reconcileMessagesLocked (history
-	// fetch) and upsertMessageLocked (live message.updated), alongside
-	// finish/tokens/agent — or NeverStartedErrorName at those same two sites
-	// when the never-started classifier (never_started.go) refines an instant
-	// zero-parts zero-tokens MessageAbortedError; cleared implicitly when the
-	// entry is dropped (message/part removal or session delete drop the whole
-	// messageEntry).
+	// messageInfoEnvelope.errorName() at ALL THREE body-adoption surfaces:
+	// upsertMessageLocked (live message.updated) and reconcileMessagesLocked
+	// (history fetch), both caching it alongside finish/tokens/agent, and
+	// MergeOlderMessages (older-page merge, which caches role/completed but
+	// not finish/tokens/agent) — or NeverStartedErrorName at those same three
+	// surfaces when the never-started classifier (never_started.go) refines an
+	// instant zero-parts zero-tokens MessageAbortedError; cleared implicitly
+	// when the entry is dropped (message/part removal or session delete drop
+	// the whole messageEntry).
 	terminalError string
 	// deltaBuf is the native streaming-text accumulator (Option C / P1-AGG-004):
 	// per (partID, field) it holds the authoritative accumulated field text in a
@@ -680,7 +682,14 @@ type messageEntry struct {
 	// upsertPartLocked), the refinement is revoked by restoring these bytes
 	// (and re-emitting the body), so a parts-bearing turn can never keep
 	// displaying "turn never ran". Cleared on any non-refining body adoption
-	// and implicitly with the entry.
+	// and implicitly with the entry. Aliasing convention: retain sites store
+	// the incoming body slice itself, with NO defensive copy, so this field
+	// can share a backing array with me.info (when an unparseable base kept
+	// the adopted bytes raw) or with the caller's fetched slice; safety rests
+	// on the replace-only convention for me.info (every write is a
+	// whole-slice replacement, never an in-place mutation) — any future
+	// in-place write to me.info while the alias exists would silently corrupt
+	// this revocation body.
 	neverStartedRaw []byte
 }
 
@@ -772,9 +781,11 @@ type messageErrorEnvelope struct {
 
 // errorName returns the opencode `info.error.name` for this envelope, or "" when
 // the turn carries no terminal error (env.Error == nil). Used to populate
-// messageEntry.terminalError from BOTH the history-fetch reconcile
-// (reconcileMessagesLocked) and the live message.updated path
-// (upsertMessageLocked), alongside finish/tokens/agent.
+// messageEntry.terminalError at ALL THREE body-adoption surfaces: the live
+// message.updated path (upsertMessageLocked) and the history-fetch reconcile
+// (reconcileMessagesLocked), both alongside finish/tokens/agent, plus the
+// older-page merge (MergeOlderMessages, message_window.go) — and on refinement
+// revocation (revokeNeverStartedOnFirstPartLocked, never_started.go).
 func (e *messageInfoEnvelope) errorName() string {
 	if e.Error != nil {
 		return e.Error.Name

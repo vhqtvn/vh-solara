@@ -27,11 +27,11 @@
 // error.name=MessageAbortedError whose time.completed − time.created ≤
 // neverStartedMaxDurationMs, with zero parts and zero tokens, is REFINED into
 // a distinct terminal outcome — NeverStartedErrorName ("turn never ran"). The
-// refinement is applied at the SAME two body-adoption sites that cache
+// refinement is applied at the SAME THREE body-adoption surfaces that cache
 // terminalError (upsertMessageLocked live events; reconcileMessagesLocked
-// history fetch), by rewriting ONLY the info.error block (upstream times,
-// tokens and provenance survive; the upstream name is preserved as
-// error.data.cause). Everything NOT matching the full signature — including
+// history fetch; MergeOlderMessages older-page merges), by rewriting ONLY the
+// info.error block (upstream times, tokens and provenance survive; the
+// upstream name is preserved as error.data.cause). Everything NOT matching the full signature — including
 // every real operator/limit abort — keeps today's positive-terminal
 // MessageAbortedError meaning. REVERSIBLE by construction, on two axes: the
 // classification is re-derived from upstream truth at every adoption (a later
@@ -63,10 +63,10 @@
 //   - the restart fence (pkg/web/restart_fence.go) stamps QUEUE dispatch
 //     items (queue.json), a different entity, only at restart time.
 //
-// What IS wired: BOTH adoption surfaces suppress the refinement while the
-// session is TurnStopping (classifyNeverStartedLocked) — the one window where
-// "we just aborted this session" is observable in-memory under the lock we
-// already hold. Suppress-only: a hit falls back to today's plain-abort
+// What IS wired: ALL THREE adoption surfaces suppress the refinement while
+// the session is TurnStopping (classifyNeverStartedLocked) — the one window
+// where "we just aborted this session" is observable in-memory under the
+// lock we already hold. Suppress-only: a hit falls back to today's plain-abort
 // presentation, never a wrong "not your abort" claim. Best-effort by
 // ordering (the terminal SSE event can beat the Abort HTTP response that
 // precedes Store.Stop, so the guard can miss our own abort): the residual
@@ -163,17 +163,17 @@ func tokensMapAllZero(m map[string]any) bool {
 	return true
 }
 
-// classifyNeverStartedLocked is the under-lock gate BOTH adoption surfaces
-// call before refining: the pure signature PLUS the abort-suppression guard.
-// While the session is TurnStopping, a /vh/abort (or the pre-restart abort
-// sweep) is actively settling for THIS session, so an instant
+// classifyNeverStartedLocked is the under-lock gate ALL THREE adoption
+// surfaces call before refining: the pure signature PLUS the abort-suppression
+// guard. While the session is TurnStopping, a /vh/abort (or the pre-restart
+// abort sweep) is actively settling for THIS session, so an instant
 // MessageAbortedError terminal may be OUR abort landing — suppress the
 // refinement and keep the honest upstream operator-abort classification
 // (suppress-only: the fallback is today's behavior, never a wrong claim).
-// Applied on the live path (upsertMessageLocked) AND on history reconcile
-// (reconcileMessagesLocked): a fetch racing the TurnStopping window gets the
-// same conservative treatment, and the guard is moot outside that window.
-// Caller holds s.mu.
+// Applied on the live path (upsertMessageLocked), on history reconcile
+// (reconcileMessagesLocked), AND on older-page merges (MergeOlderMessages): a
+// fetch racing the TurnStopping window gets the same conservative treatment,
+// and the guard is moot outside that window. Caller holds s.mu.
 func (s *Store) classifyNeverStartedLocked(sid string, env *messageInfoEnvelope, partCount int) bool {
 	if s.turnState[sid] == TurnStopping {
 		return false
