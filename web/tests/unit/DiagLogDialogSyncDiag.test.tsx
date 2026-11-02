@@ -16,6 +16,13 @@
 import { cleanup, fireEvent, render, screen } from "@solidjs/testing-library";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import DiagLogDialog from "../../src/components/DiagLogDialog";
+import {
+  _resetDiagForTest,
+  captureDiagEntry,
+  entryLine,
+  setDiagLogOn,
+  type ColdOpenEntry,
+} from "../../src/sync/diaglog";
 
 const SNAPSHOT = {
   recovery: { "re-snapshot": 2 },
@@ -27,6 +34,21 @@ const SNAPSHOT = {
 
 type SyncDiagWindow = { __vhSyncDiag?: () => unknown };
 
+// A cold-open entry shape as the real capture path records it (same field
+// posture as diaglog.test.ts's `e()` helper). Fixed small ts values keep
+// entryLine's rendering deterministic; the age cap never fires because caps
+// are evaluated against the entry's OWN ts at capture.
+const coldOpen = (ts: number, sessionId: string): ColdOpenEntry => ({
+  kind: "cold-open",
+  ts,
+  sessionId,
+  open: 10,
+  snap: 20,
+  hydrate: 30,
+  fetchMs: 40,
+  reconcileMs: 50,
+});
+
 beforeEach(() => {
   // jsdom 30 made window.navigator getter-only — clone-and-override via
   // defineProperty instead of plain assignment (same as AmbiguousChip).
@@ -37,6 +59,12 @@ beforeEach(() => {
   Object.assign(navigator, {
     clipboard: { writeText: vi.fn(async () => {}) },
   });
+  // Seeded-entries tests (Copy-all with entries) use the REAL capture path,
+  // which persists to localStorage — start every test from the default-off,
+  // empty-buffer state (same posture as diaglog.test.ts) so a seeded test
+  // cannot leak entries/toggle into the zero-entry postures.
+  localStorage.clear();
+  _resetDiagForTest();
 });
 
 afterEach(() => {
@@ -63,6 +91,31 @@ describe("DiagLogDialog __vhSyncDiag fold-in", () => {
     const payload = writeText.mock.calls[0][0] as string;
     expect(payload).toContain("--- __vhSyncDiag ---");
     expect(payload).toContain('"streamOpens"');
+  });
+
+  it("Copy-all with entries present concat is exactly entries (newest first) + blank line + separator + snapshot JSON", () => {
+    // Seed through the REAL capture path: enable the toggle, then capture
+    // two cold-open entries oldest-first (the ring stores newest last; the
+    // dialog's list reverses to newest-first for display AND Copy-all).
+    setDiagLogOn(true);
+    const older = coldOpen(1000, "s1");
+    const newer = coldOpen(2000, "s2");
+    captureDiagEntry(older);
+    captureDiagEntry(newer);
+
+    // The snapshot is read ONCE at dialog open — install the getter BEFORE
+    // render (same ordering as the zero-entries test above).
+    (window as SyncDiagWindow).__vhSyncDiag = () => SNAPSHOT;
+    render(() => <DiagLogDialog onClose={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: /copy all/i }));
+    const writeText = vi.mocked(navigator.clipboard.writeText);
+    expect(writeText).toHaveBeenCalledTimes(1);
+    // The exact combined arm of DiagLogDialog's allText() when BOTH entries
+    // and a snapshot exist: entry lines (newest first, "\n"-joined), then a
+    // blank line, the separator, and the pretty-printed snapshot JSON.
+    expect(writeText.mock.calls[0][0] as string).toBe(
+      `${entryLine(newer)}\n${entryLine(older)}\n\n--- __vhSyncDiag ---\n${JSON.stringify(SNAPSHOT, null, 2)}`,
+    );
   });
 
   it("renders an absence note and no Copy-all when the getter is not installed", () => {
