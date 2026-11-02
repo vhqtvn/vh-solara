@@ -371,13 +371,12 @@ test("live epoch flip via reload-project converges on native EventSource auto-re
   // the string — both must be absent).
   await expect(page.getByText("Reconnecting…")).toHaveCount(0, { timeout: 10_000 });
 
-  // Honest no-navigation assertions — run AFTER the final convergence wait
-  // so the sentinel covers the ENTIRE scenario: neither the in-page reload
-  // wrapper nor the Node-side main-frame tracker may see any navigation
-  // after scenario setup (convergence happened on this living document).
-  expect(
-    await page.evaluate(() => (window as unknown as { __reloadCount: number }).__reloadCount),
-  ).toBe(0);
+  // Honest no-navigation check at the convergence boundary: the Node-side
+  // main-frame tracker has seen no navigation since scenario setup
+  // (convergence happened on this living document). Interim by design — the
+  // final E2-redeclaration phase below could still navigate or fire a reload
+  // call, so the authoritative re-check (plus the reload-wrapper belt) runs
+  // after it.
   expect(mainFrameNavigations, "no main-frame navigation after scenario setup").toBe(0);
 
   // The client fully re-synchronized on the NEW lifetime: the epoch-upgrade
@@ -390,6 +389,13 @@ test("live epoch flip via reload-project converges on native EventSource auto-re
     30_000,
     `tree stream URL declaring the new epoch ${e2} (post-flip epoch-upgrade)`,
   );
-  // The sentinel's final reading, after the last convergence phase too.
+  // The sentinels' final readings, after the last convergence phase too:
+  // the authoritative main-frame tracker, and the in-page reload wrapper
+  // read at the same final point (the belt's unique catch is a reload call
+  // whose navigation is blocked — invisible to the tracker).
   expect(mainFrameNavigations, "no main-frame navigation through final convergence").toBe(0);
+  expect(
+    await page.evaluate(() => (window as unknown as { __reloadCount: number }).__reloadCount),
+    "no location.reload call through final convergence",
+  ).toBe(0);
 });
