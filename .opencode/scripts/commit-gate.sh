@@ -31,7 +31,7 @@
 #   validateGitCPath in .opencode/plugins/shell-guard.js.
 #
 # Environment:
-#   SKIP_COMMIT_GATE=1         — bypass all gating, run git directly (operator-only, host terminal)
+#   SKIP_COMMIT_GATE=1         — bypass all gating, run git directly (operator-only, host terminal; never stages implicitly)
 #   COMMIT_GATE_TTL_SECONDS=N  — lock TTL in seconds (default 600)
 #
 # Lock dir: <git-dir>/commit-gate.lock/ (mkdir-based atomic lock, held only during acquire)
@@ -43,9 +43,12 @@
 # Agent msg scratch: tmp/commit-gate-message/msg-${UUID} (committer-authored via the
 #   Write tool; reclaimed by this gate on success/release/no_changes + aged-orphan GC)
 #
-# NOTE: SKIP_COMMIT_GATE acquire path still uses `git add -A`.
-#       The gated cmd_acquire path stages via private index (GIT_INDEX_FILE).
-#       Verification commands should scope to cmd_acquire only.
+# NOTE: the SKIP_COMMIT_GATE path stages NOTHING implicitly — no `git add -A`,
+#       no `.`. It commits the index exactly as the operator left it and
+#       REFUSES an empty index at SKIP-commit time (fail closed: stage explicit
+#       paths, then retry). The gated cmd_acquire path stages via private
+#       index (GIT_INDEX_FILE). Verification commands should scope to
+#       cmd_acquire only.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -2155,7 +2158,11 @@ main() {
         if [[ -n "$message_file" && -r "$message_file" ]]; then
           message=$(cat "$message_file")
         fi
-        git add -A 2>/dev/null || true
+        # Stage NOTHING implicitly. The SKIP path commits the index exactly as
+        # the operator left it; staging explicit paths (git add <paths>) is the
+        # operator's job. An empty index at SKIP-commit time is refused below
+        # (the implicit-wholesale-staging hazard this closes: `git add -A`
+        # here swept every dirty/untracked file into the escape-hatch commit).
         json_out "{\"status\":\"acquired\",\"skip_gate\":true}"
         return 0
         ;;
@@ -2171,6 +2178,14 @@ main() {
         done
         if [[ -n "$message_file" && -r "$message_file" ]]; then
           message=$(cat "$message_file")
+        fi
+        # Fail closed: refuse to commit an empty index. The SKIP path never
+        # stages implicitly, so an empty index means no deliberate slice was
+        # staged — guide the operator to stage explicit paths, then retry.
+        # Never fall back to wholesale staging (`git add -A` / `git add .`).
+        if git diff --cached --quiet 2>/dev/null; then
+          json_out "{\"status\":\"error\",\"reason\":\"skip_gate_empty_index\",\"message\":\"SKIP_COMMIT_GATE commit refused: the index is empty. Stage explicit paths first (git add <paths>), then retry. The gate never stages implicitly.\"}"
+          return 1
         fi
         if git commit -m "${message:-skip-gate commit}" 2>/dev/null; then
           local ch

@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "url";
 import {
     validateF3DesignReadiness,
@@ -862,6 +862,13 @@ function defaultCoordinationTaskPayload(taskID = "") {
         review_paths: [],
         latest_report: null,
         f3_design_readiness: null,
+        // Retention-preservation gate (owner-approved 2026-10-25; v3
+        // item-enumerated 2026-10-27): the decision_record declared at
+        // closeout — the BASELINE item inventory the retirement gate
+        // verifies. null until the first closeout (legacy cards predating
+        // the gate stay null and retire under the legacy compatibility
+        // rule, not the new gate).
+        decision_record: null,
         next_action: "",
         predicted_impact: null,
         measured_outcome: null,
@@ -1685,6 +1692,12 @@ function normalizeCoordinationTaskRecord(payload, taskID = "", accumulators = {}
                     !Array.isArray(source.f3_design_readiness)
                   ? source.f3_design_readiness
                   : null,
+        // Retention-preservation gate: lenient read-path normalization. A
+        // stored decision_record must be an object carrying an entries array;
+        // anything else (legacy cards have NO field at all → undefined →
+        // null) coerces to null so the retirement path treats it as the
+        // legacy compatibility case rather than crashing on a degraded shape.
+        decision_record: normalizeStoredDecisionRecord(source.decision_record),
         next_action: String(source.next_action || "").trim(),
         predicted_impact: normalizeOptionalText(source.predicted_impact),
         measured_outcome: normalizeOptionalText(source.measured_outcome),
@@ -4288,7 +4301,9 @@ function resolveRecurrenceDedup(incomingCard) {
 }
 
 // normalizeRecurrenceBlockForWrite validates an incoming recurrence block
-// against the task-card schema contract (task-card.schema.json:304-395)
+// against the task-card schema contract (task-card.schema.json, the
+// top-level `recurrence` property — cited by NAME, not line range; the
+// decision_record subschema above it shifts lines as the schema evolves)
 // BEFORE it reaches the persisted record. The schema requires:
 //   - string recurrence_id (minLength 1) — NO type coercion
 //   - string symptom_class_id (^recurrence.v1/.+$)
@@ -4524,7 +4539,8 @@ function saveCoordinationTask(sessionID, taskPayload, options = {}) {
     // --- Write-boundary recurrence validation ---
     // Validate the recurrence block BEFORE any dedup processing so no durable
     // card carries an invalid acknowledgement pair (schema contract:
-    // task-card.schema.json:304-395). This is producer convenience, NOT
+    // task-card.schema.json, the top-level `recurrence` property). This is
+    // producer convenience, NOT
     // gate-wired schema enforcement (defer-018, Slice 5). A recurrence block
     // that is undefined or null passes through unchanged (legacy / remove).
     let validatedRecurrence = input.recurrence;
@@ -5186,6 +5202,1546 @@ function verifyLandingProof(taskID, repoOverride) {
     };
 }
 
+// =============================================================================
+// Retention-preservation gate (decision records) — v3, item-enumerated
+// =============================================================================
+// Owner-approved 2026-10-25 (gate), 2026-10-26 (v2 coverage + review
+// classification), 2026-10-27 (v3 item-enumerated replacement). The
+// landing-proof contract above proves the work LANDED; it says nothing
+// about whether decision-class knowledge (owner authorizations,
+// materially-rejected alternatives, review verdicts, measured outcomes)
+// SURVIVES retirement. Retiring a completed card deletes the card AND its
+// report directory — the last local copy of that knowledge.
+//
+// V3 CONTRACT (replaces v2's excerpt-coverage; owner-approved bounded
+// replacement): the decision_record declares ONE SLOT PER DECISION ITEM —
+// every owner note, every non-empty open question, the measured outcome,
+// and every NON-PROCESS review signal (C2 classification survives) is its
+// own item with a stable identity, a disposition, a carrier, and a
+// per-item representation handle:
+//
+//   - identity: CONTENT-BOUND (the B-F1 fix, 2026-10-27 fix round):
+//     owner_notes[fnv1a:<hash>] | open_questions[fnv1a:<hash>] |
+//     measured_outcome[fnv1a:<hash>] | last_review[fnv1a:<hash>] |
+//     task_reviewed[fnv1a:<hash>] — duplicate identical items within one
+//     field carry a per-content occurrence suffix (.2, .3, ...).
+//     <hash> is a dependency-free FNV-1a content digest (two 32-bit
+//     passes, 16 hex chars) over the item's own text; the suffix
+//     disambiguates duplicates by per-content occurrence (NOT array
+//     position). Identity follows CONTENT, never position: rewriting an
+//     item's text in place (e.g. /task-update replacing an owner note)
+//     mints a NEW id, so the retirement baseline sees the old item as
+//     removed (kept-slot, its carrier still verified) and the new content
+//     as undeclared (mismatch -> refusal) — a sanctioned rewrite can no
+//     longer recycle a stored slot onto different content. Reordering
+//     items loses nothing (the id SET is order-independent) and is not a
+//     mismatch.
+//   - disposition: verbatim | curated | sanitized.
+//   - carrier: {kind:"commit",revision?} | {kind:"artifact",path,revision?}
+//     — there is deliberately NO inline carrier; content only in the local
+//     closeout report is not durable.
+//   - handle: for verbatim slots, a verbatim single line drawn from THAT
+//     item's own content (the excerpt containment core is the one piece of
+//     v2 machinery retained); for curated/sanitized slots, EXACTLY the
+//     canonical label `decision-item: <task-id>#<item-id> (<disposition>)`
+//     — the label-scoped representation. The label embeds the card id and
+//     the item id, so it is unique per item and can never satisfy two
+//     slots; the disposition inside the label keeps the recovered record
+//     honest about what it is carrying.
+//   - provenance: REQUIRED for owner-note items and sanitized items — who,
+//     when, where recorded. For curated/sanitized it must be a CITED
+//     reference, never an invented or AI-paraphrased owner statement.
+//
+// A carrier satisfies an item ONLY if the committed, branch-reachable
+// carrier contains BOTH the card-id ANCHOR (findability from the card id)
+// AND that item's handle. A commit whose body contains only the card id
+// satisfies NOTHING (owner condition 1).
+//
+// INVENTORY BASELINE (owner condition 2): the stored record IS the baseline
+// item inventory. At closeout, every decision item currently on the card
+// must be declared (no missing slots, no surplus slots) and verbatim
+// handles must bind to their own item's text. A RE-closeout is the
+// sanctioned ADD-ONLY amendment: previously stored slots must be carried
+// forward verbatim (dropping or rewriting a stored slot is refused); only
+// new items get fresh slots. At retirement, every declared slot's carrier
+// must resolve, and any decision item present on the card but NOT in the
+// record is a new-item mismatch (refusal). Items REMOVED from card fields
+// do not remove their slots — the baseline cannot be laundered by deletion.
+// Routine tasks (no decision items, clean review) declare an empty items
+// array and retire with zero ceremony.
+//
+// Honest limits (documented, NOT enforced — no semantic engine):
+//   - item enumeration is MECHANICAL over the recognized card state
+//     (owner_notes, measured_outcome, open_questions, last_review,
+//     history.task_reviewed); decision content left in an unlisted home is
+//     invisible to the classifier, and no gate defends against a hostile
+//     editor of the gitignored card JSON — the goal is sanctioned-path
+//     honesty;
+//   - for verbatim slots the gate proves a length-floored line drawn from
+//     the item's own text survived in an anchored committed carrier;
+//     whether that line carries the SUBSTANCE of the item is author +
+//     reviewer judgment;
+//   - for curated/sanitized slots the gate proves ONLY that the labeled
+//     item handle is present in an anchored committed carrier — that the
+//     content next to the label is a USEFUL, faithful curation (what was
+//     decided/rejected, why it mattered, key constraints, where authority
+//     came from, what was deliberately omitted) is author + reviewer
+//     judgment. A mechanically valid representation is NEVER proof the
+//     meaning was preserved;
+//   - verification proves LOCAL-repository reachability only. Cross-machine
+//     availability comes from the normal push/release flow; the gate
+//     performs no network operations and claims nothing about remotes.
+
+const DECISION_RECORD_FENCE = "decision-record";
+const DECISION_RECORD_VERSION = 3;
+const DECISION_DISPOSITIONS = Object.freeze([
+    "verbatim",
+    "curated",
+    "sanitized",
+]);
+// Per-slot allowed keys, mirroring the decision_record item variants in
+// docs/coordination/schemas/task-card.schema.json EXACTLY (every variant
+// carries additionalProperties:false). The closeout gate and the schema are
+// ONE contract: a key set the schema would reject is refused here too — the
+// schema is never relaxed to match a lax gate, and the gate is never looser
+// than the schema.
+const DECISION_SLOT_KEYS = Object.freeze([
+    "id",
+    "disposition",
+    "carrier",
+    "handle",
+    "provenance",
+    "note",
+]);
+// The immutable core of a retained slot: a re-closeout (the sanctioned
+// add-only amendment) may not drop or rewrite any of these on a slot that
+// is already stored. `note` stays free so an amendment can explain itself.
+const DECISION_SLOT_IMMUTABLE_KEYS = Object.freeze([
+    "id",
+    "disposition",
+    "carrier",
+    "handle",
+    "provenance",
+]);
+const DECISION_CARRIER_KINDS = Object.freeze(["commit", "artifact"]);
+const DECISION_CARRIER_KEYS_BY_KIND = Object.freeze({
+    commit: Object.freeze(["kind", "revision"]),
+    artifact: Object.freeze(["kind", "path", "revision"]),
+});
+const DECISION_RECORD_KEYS = Object.freeze(["version", "items", "note"]);
+// Verbatim-handle guards: the handle must be a single line, at least this
+// many characters (trimmed), and must not equal the card id — a trivially
+// short or id-shaped "handle" could satisfy the carrier check by accident
+// without carrying any real decision content.
+const DECISION_HANDLE_MIN_LENGTH = 24;
+// Canonical label-scoped representation for curated/sanitized slots. The
+// label is DERIVED (task id + item id + disposition), never free-typed, so
+// it is unique per (task, item, disposition) and cannot be shared across
+// slots. The disposition inside the label keeps recovery honest: what a
+// fresh session recovers is labeled curated/sanitized, never silently
+// presented as verbatim.
+const DECISION_ITEM_LABEL_PREFIX = "decision-item: ";
+// Review classification (owner-approved 2026-10-26, concern C2): a review
+// that resolved the card to one of these statuses is a PROCESS record, not
+// decision-class — an ordinary clean approve is not engineering knowledge,
+// and routine tasks must retire after a normal review without promotion
+// burden. Any other recorded verdict (blocked / ready / reported /
+// cancelled / unknown) changed the card's trajectory and IS decision-class.
+// Owner decisions recorded at review time belong in owner_notes (always
+// decision-class) — the verdict shape is the smallest honest mechanical
+// distinction the actual last_review/task_reviewed field shapes support
+// (their `status` is the TASK LIFECYCLE status the review resolved to).
+const DECISION_RECORD_PROCESS_REVIEW_STATUSES = Object.freeze(["completed"]);
+// Search-mode walk cap: `git log --branches -- <path>` on a long-lived repo
+// can return thousands of revisions; the carrier is expected near the top of
+// the history of the declared durable path. The cap bounds retirement latency
+// without weakening the declared-revision path (which checks exactly one
+// revision).
+const DECISION_RECORD_SEARCH_CAP = 200;
+
+function decisionItemLabel(taskID, itemId, disposition) {
+    return `${DECISION_ITEM_LABEL_PREFIX}${taskID}#${itemId} (${disposition})`;
+}
+
+// --- content-bound item identity (the B-F1 fix) ----------------------------
+//
+// Item ids used to be POSITIONAL (owner_notes[i]); position is a recyclable
+// handle, and a sanctioned laundering chain exploited exactly that: closeout
+// declared a slot for the note at index 0, /task-update later REPLACED that
+// note's content, /task-review resolved the card to completed without
+// re-closeout, and retirement matched the replacement to the stored slot by
+// POSITION alone while the carrier check validated the ORIGINAL note's
+// committed handle — the replacement decision (never preserved) was
+// destroyed with the card. Identity now derives from the item's CONTENT:
+//
+//   <source>[fnv1a:<16-hex-content-digest>.<occurrence>]
+//
+// - fnv1a digest: two dependency-free 32-bit FNV-1a passes with different
+//   offset bases over the item's trimmed text (UTF-16 code units — stable
+//   across runs and Node versions; ids never leave this corpus), concatenated
+//   as 16 hex chars. The 32-bit birthday bound across any realistic item
+//   count is negligible, and a same-source collision of DIFFERENT contents
+//   fails CLOSED (the duplicate-id structural refusal), never open.
+// - occurrence: a per-content counter for duplicate identical items within
+//   one field (the second identical copy = `.2`, the third = `.3`, ...; the
+//   FIRST copy carries no discriminator) so duplicates each keep a distinct
+//   stable id WITHOUT reintroducing array position. Reordering a field
+//   permutes which physical slot carries which copy but never changes the
+//   id SET — nothing is lost by reordering, so it passes. Replacing one of
+//   two identical copies with different text mints a new id (mismatch,
+//   refused) while the removed copy's slot is kept and still verified.
+const DECISION_ITEM_HASH_TAG = "fnv1a:";
+
+function fnv1a32Hex(text, offsetBasis) {
+    let h = offsetBasis >>> 0;
+    const s = String(text === undefined || text === null ? "" : text);
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(16).padStart(8, "0");
+}
+
+function decisionItemContentHash(content) {
+    // Two independent FNV-1a passes (standard offset basis 0x811c9dc5, plus
+    // a rotated basis 0x9dc5811c) — a 64-bit-strength content digest with
+    // no BigInt and no dependencies.
+    return fnv1a32Hex(content, 0x811c9dc5) + fnv1a32Hex(content, 0x9dc5811c);
+}
+
+// The canonical item-id factory. Array-backed sources pass an occurrence
+// discriminator (the FIRST copy of a content carries NO discriminator —
+// `owner_notes[fnv1a:<hash>]`; the second identical copy carries `.2`, the
+// third `.3`, ...); singleton sources (measured_outcome, last_review) and
+// an omitted occurrence emit no discriminator. Exported so tests and
+// tooling derive EXACTLY the ids the gate enumerates — the fixtures cannot
+// drift from the grammar.
+function decisionItemId(source, content, occurrence) {
+    const hash = decisionItemContentHash(content);
+    const n =
+        Number.isInteger(occurrence) && occurrence > 1 ? `.${occurrence}` : "";
+    return `${source}[${DECISION_ITEM_HASH_TAG}${hash}${n}]`;
+}
+
+// Extract every fenced ```decision-record JSON block from closeout markdown.
+// Returns [{ record, error }] like extractAllRewriteParityBlocks.
+function extractAllDecisionRecordBlocks(markdown) {
+    const text = String(markdown || "");
+    const results = [];
+    const re = new RegExp(
+        "```" + DECISION_RECORD_FENCE + "[ \\t]*\\n([\\s\\S]*?)\\n```",
+        "g",
+    );
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        try {
+            results.push({ record: JSON.parse(m[1]), error: null });
+        } catch (e) {
+            results.push({
+                record: null,
+                error:
+                    "decision-record fence found but its JSON is malformed: " +
+                    e.message,
+            });
+        }
+    }
+    return results;
+}
+
+// Lenient stored-shape normalization for the read path (see
+// normalizeCoordinationTaskRecord). Structural authority for NEW records is
+// the closeout gate (collectDecisionRecordStructuralErrors); this only keeps
+// a plausible object shape and coerces anything else to null. Both the v3
+// shape ({version:3, items}) and the legacy v1/v2 shape ({version:1,
+// entries}) pass through so in-flight legacy cards remain readable; the
+// retirement gate branches on the RAW version anyway.
+function normalizeStoredDecisionRecord(source) {
+    if (
+        source &&
+        typeof source === "object" &&
+        !Array.isArray(source) &&
+        Array.isArray(source.items)
+    ) {
+        return {
+            version: source.version,
+            items: source.items.map((slot) =>
+                slot && typeof slot === "object" && !Array.isArray(slot)
+                    ? { ...slot }
+                    : slot,
+            ),
+            ...(typeof source.note === "string" ? { note: source.note } : {}),
+        };
+    }
+    if (
+        source &&
+        typeof source === "object" &&
+        !Array.isArray(source) &&
+        Array.isArray(source.entries)
+    ) {
+        return {
+            version: source.version,
+            entries: source.entries.map((entry) =>
+                entry && typeof entry === "object" && !Array.isArray(entry)
+                    ? { ...entry }
+                    : entry,
+            ),
+        };
+    }
+    return null;
+}
+
+// Structural validation of a v3 decision_record as declared at closeout (and
+// re-checked on the stored shape at retirement). Returns collected error
+// strings (empty = structurally valid). Mirrors the decision_record
+// subschema of docs/coordination/schemas/task-card.schema.json EXACTLY —
+// per-slot allowed keys with undeclared keys refused, like the schema's
+// additionalProperties:false in every variant. There is deliberately no
+// "inline" carrier kind — content only in the local closeout report is not
+// durable. `revision`/`handle`/`id` must not start with "-": the verifier
+// hands these strings to git (rev-parse positional, git grep -e, log
+// --grep=), and closing the option-injection class structurally (not just
+// at the git call sites) means no user string that git could parse as an
+// option ever reaches a positional slot.
+function collectDecisionRecordStructuralErrors(record, taskID) {
+    const errors = [];
+    const where = `decision_record for ${taskID}`;
+    if (!record || typeof record !== "object" || Array.isArray(record)) {
+        return [
+            `${where} must be a JSON object with version and items (the item-enumerated contract; see CLOSEOUT_TEMPLATE.md).`,
+        ];
+    }
+    Object.keys(record).forEach((key) => {
+        if (!DECISION_RECORD_KEYS.includes(key)) {
+            errors.push(
+                `${where}: unknown key "${key}" — a decision_record object carries exactly version, items${key === "entries" ? " (the v2 entries shape was replaced by items; migrate by closing out again)" : ""} (task-card.schema.json).`,
+            );
+        }
+    });
+    if (record.version !== DECISION_RECORD_VERSION) {
+        errors.push(
+            `${where}: version must be ${DECISION_RECORD_VERSION} — the item-enumerated contract. A stored version-1 (v1/v2) record is legacy-honored at retirement but can no longer be DECLARED at closeout; re-declare under v3.`,
+        );
+    }
+    if (!Array.isArray(record.items)) {
+        errors.push(
+            `${where}: items must be an array of slots (possibly EMPTY — an empty inventory is the routine attestation, valid exactly when the card carries no decision items).`,
+        );
+        return errors;
+    }
+    const seenIds = new Set();
+    record.items.forEach((slot, idx) => {
+        const at = `${where} item #${idx + 1}`;
+        if (!slot || typeof slot !== "object" || Array.isArray(slot)) {
+            errors.push(`${at} must be an object (one slot per decision item).`);
+            return;
+        }
+        const unknownKeys = Object.keys(slot).filter(
+            (key) => !DECISION_SLOT_KEYS.includes(key),
+        );
+        if (unknownKeys.length > 0) {
+            errors.push(
+                `${at}: unknown key(s) ${unknownKeys.map((k) => `"${k}"`).join(", ")} — a slot carries exactly ${DECISION_SLOT_KEYS.join(" | ")} (provenance/note optional; task-card.schema.json).`,
+            );
+        }
+        // Item identity.
+        const id = typeof slot.id === "string" ? slot.id.trim() : "";
+        if (id === "") {
+            errors.push(
+                `${at}: id is required — the stable CONTENT-BOUND item identity within the task (owner_notes[fnv1a:<hash>] | open_questions[fnv1a:<hash>] | measured_outcome[fnv1a:<hash>] | last_review[fnv1a:<hash>] | task_reviewed[fnv1a:<hash>]; duplicates of identical content carry .2/.3/… — derived from the item's own text, never its array position).`,
+            );
+        } else if (id.includes("\n")) {
+            errors.push(`${at}: id must be a single line.`);
+        } else if (id.startsWith("-")) {
+            errors.push(
+                `${at}: id must not start with "-" — the id is embedded in the carrier label the verifier searches for, and no user string that git could parse as an option may reach a search position (option injection).`,
+            );
+        } else if (id.includes("#")) {
+            errors.push(
+                `${at}: id must not contain "#" — the carrier label format is ${DECISION_ITEM_LABEL_PREFIX}<task-id>#<item-id> (<disposition>); a "#" inside the id would blur the split.`,
+            );
+        } else if (seenIds.has(id)) {
+            errors.push(
+                `${at}: duplicate id "${id}" — ONE slot per item; two slots for one item is an ambiguous inventory.`,
+            );
+        } else {
+            seenIds.add(id);
+        }
+        // Disposition.
+        const dispositionOk = DECISION_DISPOSITIONS.includes(slot.disposition);
+        if (!dispositionOk) {
+            errors.push(
+                `${at}: disposition must be one of ${DECISION_DISPOSITIONS.join(" | ")} (got ${JSON.stringify(slot.disposition)}).`,
+            );
+        }
+        // Carrier.
+        const carrier = slot.carrier;
+        if (!carrier || typeof carrier !== "object" || Array.isArray(carrier)) {
+            errors.push(
+                `${at}: carrier is required — {kind:"commit",revision?} or {kind:"artifact",path,revision?}. There is deliberately no "inline" carrier: content only in the local closeout report is not durable.`,
+            );
+        } else if (!DECISION_CARRIER_KINDS.includes(carrier.kind)) {
+            errors.push(
+                `${at}: carrier.kind must be one of ${DECISION_CARRIER_KINDS.join(" | ")} (got ${JSON.stringify(carrier.kind)}).`,
+            );
+        } else {
+            const allowedKeys = DECISION_CARRIER_KEYS_BY_KIND[carrier.kind];
+            const carrierUnknown = Object.keys(carrier).filter(
+                (key) => !allowedKeys.includes(key),
+            );
+            if (carrierUnknown.length > 0) {
+                const hints = [];
+                if (carrierUnknown.includes("marker")) {
+                    hints.push(
+                        "v3 has no marker — the anchor is always the card id, and the per-item representation is the handle",
+                    );
+                }
+                if (carrier.kind === "commit" && carrierUnknown.includes("path")) {
+                    hints.push(
+                        "commit carriers take no path — declare an artifact carrier for file-located content",
+                    );
+                }
+                errors.push(
+                    `${at}: carrier unknown key(s) ${carrierUnknown.map((k) => `"${k}"`).join(", ")} — ${carrier.kind} carriers allow exactly ${allowedKeys.join(" | ")}${hints.length > 0 ? `; ${hints.join("; ")}` : ""}.`,
+                );
+            }
+            if (carrier.kind === "artifact") {
+                const p =
+                    typeof carrier.path === "string" ? carrier.path.trim() : "";
+                if (p === "") {
+                    errors.push(
+                        `${at}: artifact carriers require path — the durable file (docs/checkpoints/, researches/decisions/, researches/sources/, docs/planning/) that will carry the card-id anchor and this item's representation.`,
+                    );
+                } else if (path.isAbsolute(p) || p.includes("..")) {
+                    errors.push(
+                        `${at}: carrier path must be repo-relative and physically contained (no absolute paths, no "..").`,
+                    );
+                }
+            }
+            if (carrier.revision !== undefined) {
+                const rev =
+                    typeof carrier.revision === "string"
+                        ? carrier.revision.trim()
+                        : "";
+                if (rev === "") {
+                    errors.push(
+                        `${at}: carrier revision, when present, must be a non-empty string (a commit sha or resolvable revision).`,
+                    );
+                } else if (/\s/.test(rev)) {
+                    errors.push(
+                        `${at}: carrier revision must be a single revision token.`,
+                    );
+                } else if (rev.startsWith("-")) {
+                    errors.push(
+                        `${at}: carrier revision must not start with "-" — the verifier passes the revision to git as a positional, and a leading dash is how a user string could be parsed as a git OPTION (option injection). No resolvable revision (sha, ref, @{...}) ever starts with a dash.`,
+                    );
+                }
+            }
+        }
+        // Handle: the per-item representation.
+        const handle = slot.handle;
+        if (typeof handle !== "string" || handle.trim() === "") {
+            errors.push(
+                `${at}: handle is required — the per-item representation: for verbatim slots a verbatim single line drawn from the item's own content; for curated/sanitized slots EXACTLY the canonical label.`,
+            );
+        } else if (handle.includes("\n")) {
+            errors.push(
+                `${at}: handle must be a single line — the verifier matches it as one line in the committed carrier.`,
+            );
+        } else if (dispositionOk && slot.disposition === "verbatim") {
+            const trimmed = handle.trim();
+            if (trimmed.startsWith("-")) {
+                errors.push(
+                    `${at}: handle must not start with "-" — the same option-injection class refused for ids/revisions is refused for every user string in a carrier-checking position.`,
+                );
+            } else if (trimmed.length < DECISION_HANDLE_MIN_LENGTH) {
+                errors.push(
+                    `${at}: a verbatim handle must be at least ${DECISION_HANDLE_MIN_LENGTH} characters (trimmed) — a trivially short or generic string could verify against unrelated content by accident and is not evidence the item's content survived (got ${trimmed.length}: "${trimmed.slice(0, 40)}").`,
+                );
+            } else if (trimmed === taskID) {
+                errors.push(
+                    `${at}: handle must not equal the card id — the card id is the landing trailer's anchor, exactly the presence-only string that must NOT satisfy an item's representation.`,
+                );
+            }
+        } else if (dispositionOk) {
+            const canonical = decisionItemLabel(
+                taskID,
+                id,
+                slot.disposition,
+            );
+            if (handle.trim() !== canonical) {
+                errors.push(
+                    `${at}: a ${slot.disposition} slot's handle must be EXACTLY the canonical item label "${canonical}" — the label-scoped representation is derived from the task id, item id, and disposition (never free-typed), so it is unique per item and the recovered record stays honestly labeled.`,
+                );
+            }
+        }
+        // Provenance: required for owner-decision items and sanitized items.
+        const ownerOrigin = id.startsWith("owner_notes[");
+        const sanitized = dispositionOk && slot.disposition === "sanitized";
+        if (slot.provenance !== undefined && typeof slot.provenance !== "string") {
+            errors.push(`${at}: provenance, when present, must be a string.`);
+        } else if (
+            (ownerOrigin || sanitized) &&
+            (slot.provenance === undefined ||
+                String(slot.provenance).trim() === "")
+        ) {
+            errors.push(
+                `${at}: provenance is required${ownerOrigin ? " for owner-decision items (who decided, when, where recorded)" : ""}${sanitized && !ownerOrigin ? " for sanitized items (what was withheld and where the authority for withholding is recorded)" : ""} — for curated/sanitized representations it must be a CITED reference, never an invented or AI-paraphrased owner statement.`,
+            );
+        }
+        if (slot.note !== undefined && typeof slot.note !== "string") {
+            errors.push(`${at}: note, when present, must be a string.`);
+        }
+    });
+    return errors;
+}
+
+// Mechanical decision-ITEM enumeration (v3, owner-approved 2026-10-27; the
+// C2 review classification survives from 2026-10-26; content-bound identity
+// from the 2026-10-27 B-F1 fix round). A decision item is EACH owner note,
+// EACH non-empty open question, the measured outcome, and EACH non-process
+// review signal — enumerated with a CONTENT-BOUND stable identity (see the
+// decisionItemId factory above):
+//   owner_notes[fnv1a:<hash>]          — one per non-empty note; duplicate
+//                                        identical notes carry a per-content
+//                                        occurrence suffix (.2, .3, ...),
+//                                        NOT array position
+//   open_questions[fnv1a:<hash>]       — same shape, per question
+//   measured_outcome[fnv1a:<hash>]     — singleton (no discriminator)
+//   last_review[fnv1a:<hash>]          — only when its status did NOT
+//                                        resolve the card to a process
+//                                        status ("completed" = ordinary
+//                                        clean approve = process record)
+//   task_reviewed[fnv1a:<hash>]        — per non-process history event
+//                                        (identical duplicate events carry
+//                                        .2, .3, ...), scanned PER EVENT: a later clean
+//                                        approve does not launder an earlier
+//                                        non-completed review
+// Identity is CONTENT, so a hand-REORDER of items (including history
+// events) does not shift any id — reordering loses nothing and passes; a
+// content REPLACEMENT in place mints a new id, surfaces at retirement as an
+// undeclared item, and refuses (fail-closed, honest). Returns
+// [{ id, source, detail, content }] — content is the item's own text, the
+// binding source for verbatim handles. SEMANTIC honesty (which content is
+// actually important) is deliberately NOT evaluated.
+function collectDecisionItems(task, incoming = {}) {
+    const items = [];
+    const pushItem = (source, text, occurrence) => {
+        items.push({
+            id: decisionItemId(source, text, occurrence),
+            source,
+            detail: `"${text.slice(0, 80)}"`,
+            content: text,
+        });
+    };
+    const enumerateField = (values, source) => {
+        const seen = new Map();
+        (Array.isArray(values) ? values : []).forEach((value) => {
+            const text = String(value || "").trim();
+            if (text !== "") {
+                const occurrence = (seen.get(text) || 0) + 1;
+                seen.set(text, occurrence);
+                pushItem(source, text, occurrence);
+            }
+        });
+    };
+    enumerateField(task && task.owner_notes, "owner_notes");
+    const measuredOutcome =
+        incoming.measuredOutcome !== undefined
+            ? String(incoming.measuredOutcome || "").trim()
+            : String((task && task.measured_outcome) || "").trim();
+    if (measuredOutcome !== "") {
+        pushItem("measured_outcome", measuredOutcome);
+    }
+    enumerateField(task && task.open_questions, "open_questions");
+    if (
+        task &&
+        task.last_review &&
+        typeof task.last_review === "object"
+    ) {
+        const reviewStatus = String(task.last_review.status || "").trim();
+        if (!DECISION_RECORD_PROCESS_REVIEW_STATUSES.includes(reviewStatus)) {
+            const content = [
+                task.last_review.title,
+                task.last_review.status,
+                task.last_review.summary,
+                task.last_review.next_action,
+            ]
+                .filter((part) => String(part || "").trim() !== "")
+                .join("\n");
+            items.push({
+                id: decisionItemId("last_review", content),
+                source: "last_review",
+                detail: `review verdict recorded (status: ${reviewStatus || "unknown"}) — a review that did not resolve the card to ${DECISION_RECORD_PROCESS_REVIEW_STATUSES.join("/")} changed its trajectory`,
+                content,
+            });
+        }
+    }
+    const history = Array.isArray(task && task.history) ? task.history : [];
+    const seenReviewed = new Map();
+    history.forEach((entry) => {
+        if (
+            entry &&
+            typeof entry === "object" &&
+            entry.event === "task_reviewed" &&
+            !DECISION_RECORD_PROCESS_REVIEW_STATUSES.includes(
+                String(entry.status || "").trim(),
+            )
+        ) {
+            const content = [
+                entry.note,
+                entry.status ? `status: ${entry.status}` : "",
+            ]
+                .filter((part) => String(part || "").trim() !== "")
+                .join("\n");
+            const occurrence = (seenReviewed.get(content) || 0) + 1;
+            seenReviewed.set(content, occurrence);
+            items.push({
+                id: decisionItemId("task_reviewed", content, occurrence),
+                source: "history.task_reviewed",
+                detail: `non-approve review event (status: ${String(entry.status || "unknown")}; content-bound identity)`,
+                content,
+            });
+        }
+    });
+    return items;
+}
+
+// Whitespace normalization for verbatim-handle binding: runs of whitespace
+// (including line wraps) collapse to single spaces on BOTH the item content
+// and the handle, so a handle may span a wrap in the item's stored text
+// while remaining a verbatim word-sequence. The carrier side applies the
+// same normalization to text it reads in full (commit messages, committed
+// blobs); tree-wide git grep -F checks are line-based by nature and require
+// the handle on one line.
+function normalizeExcerptText(value) {
+    return String(value === undefined || value === null ? "" : value)
+        .trim()
+        .replace(/\s+/g, " ");
+}
+
+function normalizedTextContains(content, excerpt) {
+    const haystack = normalizeExcerptText(content);
+    const needle = normalizeExcerptText(excerpt);
+    return needle !== "" && haystack.includes(needle);
+}
+
+// Inventory completeness + binding + add-only amendment (v3, owner
+// conditions 1 and 2). Checked at closeout against the card as it stands
+// (plus the incoming measured_outcome option) and — the missing-direction
+// only — at retirement. Returns [{ code, id, detail }] with codes:
+//   missing_item     — a decision item on the card has NO slot (owner
+//                      condition 1: enumeration alone is insufficient; one
+//                      slot per item, and a carrier containing only the
+//                      card id satisfies nothing)
+//   unknown_item     — a declared slot matches no current item AND no
+//                      previously stored slot (a fabricated/stale inventory
+//                      is refused at declaration; at retirement the
+//                      baseline direction is EXPECTED for vanished items and
+//                      is not re-checked there)
+//   unbound_handle   — a verbatim handle not drawn from ITS OWN item's
+//                      content (per-item binding — the concern-1 fix)
+//   amendment_drop   — a re-closeout DROPPED a previously stored slot; the
+//                      stored record is the baseline and may only grow
+//   amendment_rewrite— a re-closeout REWROTE an immutable field of a
+//                      retained slot; baseline slots are carried forward
+//                      verbatim
+function collectDecisionInventoryProblems(
+    task,
+    record,
+    incoming = {},
+    storedRecord = null,
+) {
+    const problems = [];
+    const items = collectDecisionItems(task, incoming);
+    const itemById = new Map(items.map((item) => [item.id, item]));
+    const slots =
+        record && Array.isArray(record.items)
+            ? record.items.filter(
+                  (slot) =>
+                      slot &&
+                      typeof slot === "object" &&
+                      typeof slot.id === "string",
+              )
+            : [];
+    const slotById = new Map(slots.map((slot) => [slot.id.trim(), slot]));
+    items.forEach((item) => {
+        if (!slotById.has(item.id)) {
+            problems.push({
+                code: "missing_item",
+                id: item.id,
+                detail: `item ${item.id} (${item.source}): ${item.detail} — present on the card with NO slot. One slot per decision item; a carrier containing only the card id satisfies nothing.`,
+            });
+        }
+    });
+    const storedIds =
+        storedRecord &&
+        typeof storedRecord === "object" &&
+        Array.isArray(storedRecord.items)
+            ? new Set(
+                  storedRecord.items
+                      .filter(
+                          (slot) =>
+                              slot &&
+                              typeof slot === "object" &&
+                              typeof slot.id === "string",
+                      )
+                      .map((slot) => slot.id.trim()),
+              )
+            : new Set();
+    slotById.forEach((slot, id) => {
+        const item = itemById.get(id);
+        if (!item) {
+            if (!storedIds.has(id)) {
+                problems.push({
+                    code: "unknown_item",
+                    id,
+                    detail: `slot "${id}" matches no decision item on the card and no previously stored slot — the inventory must enumerate real items (content-bound identities: owner_notes[fnv1a:<hash>] | open_questions[fnv1a:<hash>] | measured_outcome[fnv1a:<hash>] | last_review[fnv1a:<hash>] | task_reviewed[fnv1a:<hash>]; duplicates of identical content carry .2/.3/…).`,
+                });
+            }
+            return;
+        }
+        if (
+            slot.disposition === "verbatim" &&
+            typeof slot.handle === "string"
+        ) {
+            if (!normalizedTextContains(item.content, slot.handle)) {
+                problems.push({
+                    code: "unbound_handle",
+                    id,
+                    detail: `slot ${id} declares a verbatim handle that is NOT drawn from that item's own content — the per-item representation must be the item's text ("${String(slot.handle).slice(0, 60)}…")`,
+                });
+            }
+        }
+    });
+    // Sanctioned amendment: add-only vs the stored v3 baseline. A re-closeout
+    // may ADD slots for new items (e.g. a post-closeout blocked review) but
+    // may never drop or rewrite a stored slot — removal from the card fields
+    // does not remove a slot, and a rewritten slot could quietly trade a real
+    // representation for a trivial one.
+    if (
+        storedRecord &&
+        typeof storedRecord === "object" &&
+        storedRecord.version === DECISION_RECORD_VERSION &&
+        Array.isArray(storedRecord.items)
+    ) {
+        storedRecord.items.forEach((storedSlot) => {
+            if (
+                !storedSlot ||
+                typeof storedSlot !== "object" ||
+                typeof storedSlot.id !== "string"
+            ) {
+                return;
+            }
+            const id = storedSlot.id.trim();
+            const next = slotById.get(id);
+            if (!next) {
+                problems.push({
+                    code: "amendment_drop",
+                    id,
+                    detail: `previously stored slot "${id}" was DROPPED — the stored record is the baseline inventory; a re-closeout is the sanctioned ADD-ONLY amendment (removing an item from the card never removes its slot).`,
+                });
+                return;
+            }
+            DECISION_SLOT_IMMUTABLE_KEYS.forEach((key) => {
+                const before =
+                    storedSlot[key] === undefined ? null : storedSlot[key];
+                const after = next[key] === undefined ? null : next[key];
+                if (JSON.stringify(before) !== JSON.stringify(after)) {
+                    problems.push({
+                        code: "amendment_rewrite",
+                        id,
+                        detail: `retained slot "${id}" was REWRITTEN ("${key}" changed) — a baseline slot is carried forward verbatim; only NEW items get fresh declarations.`,
+                    });
+                }
+            });
+        });
+    }
+    return problems;
+}
+
+// --- git verification helpers (spawnSync so expected non-zero exits like a
+// miss from `git grep` are distinguishable from spawn failures) ------------
+
+function gitSpawn(repo, args) {
+    try {
+        const res = spawnSync("git", args, {
+            cwd: repo,
+            encoding: "utf8",
+            timeout: 10000,
+        });
+        if (res.error) {
+            return { status: null, stdout: "", stderr: String(res.error.message || "") };
+        }
+        return {
+            status: res.status,
+            stdout: String(res.stdout || ""),
+            stderr: String(res.stderr || ""),
+        };
+    } catch (error) {
+        return {
+            status: null,
+            stdout: "",
+            stderr: String((error && error.message) || error),
+        };
+    }
+}
+
+// Resolve a declared revision to a full commit sha (null when unresolvable).
+function resolveCommitRevision(repo, revision) {
+    const res = gitSpawn(repo, [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        `${revision}^{commit}`,
+    ]);
+    if (res.status !== 0) {
+        return null;
+    }
+    const sha = res.stdout.trim();
+    return sha === "" ? null : sha;
+}
+
+// Branch-generic reachability (mirrors verifyLandingProof's --branches
+// semantic): true iff some local branch tip has the commit as an ancestor.
+function isCommitReachableFromBranches(repo, sha) {
+    const res = gitSpawn(repo, [
+        "branch",
+        "--contains",
+        sha,
+        "--format=%(refname)",
+    ]);
+    if (res.status !== 0) {
+        return false;
+    }
+    return res.stdout.trim() !== "";
+}
+
+// Tri-state commit-message read: { available, contains, stderr }. A failed
+// read (spawn failure, non-zero exit) is UNAVAILABLE — never a clean
+// "does not contain" — so the call site maps it to verifier_unavailable
+// instead of silently falling through to the tree search on a false
+// negative. (Pre-tri-state this returned a bare false on ANY git failure.)
+function commitMessageContains(repo, sha, marker) {
+    const res = gitSpawn(repo, ["log", "-1", "--format=%B", sha]);
+    if (res.status !== 0) {
+        return {
+            available: false,
+            contains: false,
+            stderr: res.stderr || `git log exited ${res.status}`,
+        };
+    }
+    return {
+        available: true,
+        contains: res.stdout.includes(marker),
+        stderr: "",
+    };
+}
+
+// Fixed-string search of the whole tree AT a committed revision. git grep
+// exits 0 on match and 1 on no-match (both expected); ANY other exit
+// (including a spawn failure) is UNAVAILABLE — a failed read is never
+// reported as marker-not-found (fail-closed either way; the diagnosis must
+// be honest). Working-tree content is never consulted. The marker is bound
+// with an EXPLICIT `-e`: as a bare positional, a marker with a leading dash
+// (e.g. "-v" = --invert-match) was consumed by git as an OPTION — the sha
+// became the pattern, no revision was searched, git scanned the WORKING
+// TREE inverted and exited 0, and the gate read contains:true (option
+// injection → fail-open deletion). `-e` consumes the next argument as the
+// pattern whatever it starts with; the structural gate additionally
+// refuses dash-prefixed markers at declaration AND retirement.
+function treeAtRevisionContains(repo, sha, marker) {
+    const res = gitSpawn(repo, [
+        "grep",
+        "-F",
+        "--quiet",
+        "-e",
+        marker,
+        sha,
+        "--",
+    ]);
+    if (res.status === 0) {
+        return { available: true, contains: true, stderr: "" };
+    }
+    if (res.status === 1) {
+        return { available: true, contains: false, stderr: "" };
+    }
+    return {
+        available: false,
+        contains: false,
+        stderr: res.stderr || `git grep exited ${res.status}`,
+    };
+}
+
+// Reachable commits whose tree touched the path, newest first (capped).
+function reachableCommitsTouchingPath(repo, targetPath) {
+    const res = gitSpawn(repo, [
+        "log",
+        "--branches",
+        "--format=%H",
+        "--",
+        targetPath,
+    ]);
+    if (res.status !== 0) {
+        return null;
+    }
+    return res.stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line !== "")
+        .slice(0, DECISION_RECORD_SEARCH_CAP);
+}
+
+// Tri-state committed-blob read: { available, tracked, blob, stderr,
+// missReason }. Reads the COMMITTED blob — never the worktree.
+// `available:false` means the READ failed (spawn failure, corrupt/missing
+// object) and is mapped by the caller to verifier_unavailable — never
+// overstated as path-not-tracked; `available:true, tracked:false` is a
+// DETERMINATE miss (no file blob at that path in that tree), carrying
+// `missReason` when the path resolves to a directory so the caller can
+// NAME that problem instead of a generic not-tracked diagnosis.
+//
+// Classification ALWAYS runs an explicit `git ls-tree <rev> -- <path>`
+// object-type probe BEFORE any content read (the `--` keeps the
+// user-supplied path on the pathspec side — it can never parse as an
+// option), on the success path too, because `git show`'s exits cannot
+// separate the shapes:
+//   - `git show <rev>:<dir>` exits 0 and prints the directory LISTING, so
+//     a success-path content read alone cannot tell a file blob from a
+//     directory — and a listing whose FILENAMES happen to contain the
+//     marker would falsely verify (round-3 blocker b-F1: the default
+//     marker is the card-id, and an id-named FILENAME inside the listed
+//     directory made retirement destroy the card unread);
+//   - `git show`'s non-zero exits do not distinguish "path absent from
+//     the tree" from genuine read failures.
+// The probe entry's path must also equal the declared path EXACTLY: a
+// directory-shaped pathspec (e.g. a trailing slash) makes ls-tree answer
+// with CHILD entries — a directory declaration in disguise.
+function committedBlobAt(repo, sha, targetPath) {
+    const probe = gitSpawn(repo, ["ls-tree", sha, "--", targetPath]);
+    if (probe.status !== 0) {
+        return {
+            available: false,
+            tracked: null,
+            blob: null,
+            stderr: probe.stderr || `git ls-tree exited ${probe.status}`,
+        };
+    }
+    const firstLine = (probe.stdout.split(/\r?\n/)[0] || "").trim();
+    if (firstLine === "") {
+        // Determinate miss: nothing at that path in that tree.
+        return { available: true, tracked: false, blob: null, stderr: "" };
+    }
+    const entry = /^([0-7]+) (\w+) ([0-9a-f]+)\t(.*)$/.exec(firstLine);
+    if (!entry) {
+        // Cannot classify the probe output — report a failed read, never
+        // a guess.
+        return {
+            available: false,
+            tracked: null,
+            blob: null,
+            stderr: `unparseable git ls-tree output: ${firstLine.slice(0, 120)}`,
+        };
+    }
+    const entryType = entry[2];
+    const entryPath = entry[4];
+    if (entryType === "tree" || entryType === "commit") {
+        // Determinate miss, honestly named: the path is a directory
+        // (submodules are the `commit` shape — `git show` exits 0 on both
+        // and prints a listing). A listing is not blob content, and
+        // filenames inside it must never verify a marker.
+        return {
+            available: true,
+            tracked: false,
+            blob: null,
+            stderr: "",
+            missReason: `"${targetPath}" at commit ${sha} is a directory, not a file blob — declare the durable file, not its containing directory (a directory listing is not content; filenames in it never verify a marker)`,
+        };
+    }
+    if (entryPath !== targetPath.replace(/^(?:\.\/)+/, "")) {
+        // Determinate miss, honestly named: the pathspec matched OTHER
+        // paths (a directory-shaped declaration, e.g. a trailing slash,
+        // makes ls-tree answer with child entries) — no file blob exists
+        // at exactly the declared path.
+        return {
+            available: true,
+            tracked: false,
+            blob: null,
+            stderr: "",
+            missReason: `"${targetPath}" at commit ${sha} matched directory contents, not a file blob — declare the durable file itself (a directory listing is not content; filenames in it never verify a marker)`,
+        };
+    }
+    const blob = gitSpawn(repo, ["show", `${sha}:${targetPath}`]);
+    if (blob.status !== 0) {
+        // The path IS a tracked blob yet `git show` failed — a genuine
+        // read failure (e.g. corrupt or missing object), never a
+        // determinate miss.
+        return {
+            available: false,
+            tracked: true,
+            blob: null,
+            stderr: blob.stderr || `git show exited ${blob.status}`,
+        };
+    }
+    return { available: true, tracked: true, blob: blob.stdout, stderr: "" };
+}
+
+// Verify every declared slot of a v3 decision_record against committed,
+// branch-reachable state in `repo` (owner condition 1 — the core binding).
+// Per slot, a carrier satisfies the item ONLY if the SAME committed carrier
+// contains BOTH:
+//   (a) the card-id ANCHOR — so a fresh session knowing only the card id can
+//       find the carrier after the card is destroyed; and
+//   (b) that item's HANDLE — for verbatim slots a whitespace-normalized
+//       verbatim line of the item's own content (the retained containment
+//       core); for curated/sanitized slots the canonical item label, whose
+//       presence means labeled content sits in the carrier (the label-scoped
+//       check — semantic fidelity of that content is author + reviewer,
+//       never this verifier).
+// A commit whose body contains only the card id satisfies NOTHING. Each
+// slot names its own carrier; multiple slots may share one carrier and are
+// each verified independently. Returns
+// { ok, problems: [{ index, id, kind, locator, code, detail }], verified }.
+// Never throws — the caller maps problems to a structured refusal naming
+// each missing/uncommitted/unreachable item.
+function verifyDecisionRecordForRetirement(taskID, record, repoOverride) {
+    const repo = repoOverride || repoRoot();
+    const problems = [];
+    const verified = [];
+    // A degraded record (missing, non-object, or carrying no items array) is
+    // NOT verified: iterating zero items proves nothing and must never read
+    // as "every carrier resolved". Refuse with an honest diagnosis instead
+    // of trusting an empty inventory (the retirement call site additionally
+    // runs the full structural check, so a wrong-version or junk-key shape
+    // is refused there with the specific structural problems; this guard
+    // keeps the verifier itself fail-closed for any caller).
+    if (
+        !record ||
+        typeof record !== "object" ||
+        Array.isArray(record) ||
+        !Array.isArray(record.items)
+    ) {
+        problems.push({
+            index: 0,
+            kind: "record",
+            id: "",
+            locator: "",
+            code: "record_degraded",
+            detail:
+                "the stored decision_record is degraded (missing, non-object, or carrying no items array) — it is not a verifiable inventory",
+        });
+        return { ok: false, problems, verified };
+    }
+    record.items.forEach((slot, idx) => {
+        const index = idx + 1;
+        if (!slot || typeof slot !== "object" || Array.isArray(slot)) {
+            problems.push({
+                index,
+                kind: "item",
+                id: "",
+                locator: "",
+                code: "slot_malformed",
+                detail: "slot is not an object",
+            });
+            return;
+        }
+        const id =
+            typeof slot.id === "string" && slot.id.trim() !== ""
+                ? slot.id.trim()
+                : `<slot #${index}>`;
+        const handle = typeof slot.handle === "string" ? slot.handle : "";
+        const carrier =
+            slot.carrier && typeof slot.carrier === "object"
+                ? slot.carrier
+                : null;
+        if (!carrier) {
+            problems.push({
+                index,
+                kind: "item",
+                id,
+                locator: "",
+                code: "slot_malformed",
+                detail: `item "${id}" declares no carrier`,
+            });
+            return;
+        }
+        const disposition =
+            typeof slot.disposition === "string" ? slot.disposition : "?";
+        const handleKind =
+            disposition === "verbatim"
+                ? "verbatim handle"
+                : `${disposition} item label`;
+        if (carrier.kind === "commit") {
+            const declaredRev = String(carrier.revision || "").trim();
+            if (declaredRev !== "") {
+                // Pinned-revision commit carrier: resolve, reachability, then
+                // anchor + handle in the MESSAGE (whitespace-normalized) or
+                // any blob at that committed revision (git grep -F -e —
+                // line-based, and handles are single lines by structure).
+                const sha = resolveCommitRevision(repo, declaredRev);
+                if (sha === null) {
+                    problems.push({
+                        index,
+                        kind: "item",
+                        id,
+                        locator: declaredRev,
+                        code: "revision_not_resolvable",
+                        detail: `item "${id}": carrier revision "${declaredRev}" does not resolve to a commit`,
+                    });
+                    return;
+                }
+                if (!isCommitReachableFromBranches(repo, sha)) {
+                    problems.push({
+                        index,
+                        kind: "item",
+                        id,
+                        locator: declaredRev,
+                        code: "revision_not_reachable",
+                        detail: `item "${id}": carrier commit ${sha} exists but is not reachable from any local branch (reflog-only/orphaned commits do not count)`,
+                    });
+                    return;
+                }
+                const msg = gitSpawn(repo, ["log", "-1", "--format=%B", sha]);
+                if (msg.status !== 0) {
+                    problems.push({
+                        index,
+                        kind: "item",
+                        id,
+                        locator: declaredRev,
+                        code: "verifier_unavailable",
+                        detail: `item "${id}": git could not read the commit message at ${sha}: ${msg.stderr || `git log exited ${msg.status}`}`,
+                    });
+                    return;
+                }
+                const treeHit = (needle) =>
+                    treeAtRevisionContains(repo, sha, needle);
+                let anchorOk = msg.stdout.includes(taskID);
+                if (!anchorOk) {
+                    const anchorTree = treeHit(taskID);
+                    if (!anchorTree.available) {
+                        problems.push({
+                            index,
+                            kind: "item",
+                            id,
+                            locator: declaredRev,
+                            code: "verifier_unavailable",
+                            detail: `item "${id}": git could not search the tree at commit ${sha}: ${anchorTree.stderr}`,
+                        });
+                        return;
+                    }
+                    anchorOk = anchorTree.contains;
+                }
+                let handleOk = normalizedTextContains(msg.stdout, handle);
+                if (!handleOk) {
+                    const handleTree = treeHit(handle);
+                    if (!handleTree.available) {
+                        problems.push({
+                            index,
+                            kind: "item",
+                            id,
+                            locator: declaredRev,
+                            code: "verifier_unavailable",
+                            detail: `item "${id}": git could not search the tree at commit ${sha}: ${handleTree.stderr}`,
+                        });
+                        return;
+                    }
+                    handleOk = handleTree.contains;
+                }
+                if (anchorOk && handleOk) {
+                    verified.push({
+                        index,
+                        kind: "item",
+                        id,
+                        locator: sha,
+                        how: `card-id anchor + ${handleKind} for "${id}" present at the declared revision`,
+                    });
+                    return;
+                }
+                if (!anchorOk) {
+                    problems.push({
+                        index,
+                        kind: "item",
+                        id,
+                        locator: declaredRev,
+                        code: "anchor_missing",
+                        detail: `item "${id}": carrier commit ${sha} carries the card-id anchor "${taskID}" neither in its message nor in any blob at that committed revision — every carrier must be discoverable from the card id after retirement`,
+                    });
+                }
+                if (!handleOk) {
+                    problems.push({
+                        index,
+                        kind: "item",
+                        id,
+                        locator: declaredRev,
+                        code: "handle_not_in_carrier",
+                        detail: `item "${id}": carrier commit ${sha} does not contain the ${handleKind} ("${String(handle).slice(0, 60)}…") in its message or any blob at that committed revision — the declared carrier does not contain THIS item's representation`,
+                    });
+                }
+                return;
+            }
+            // Search mode: the landing-commit body pattern — the carrier
+            // commit cannot be sha-pinned at closeout time. One reachable
+            // commit MESSAGE must carry the card-id anchor AND the handle
+            // together; an anchored message without the handle satisfies
+            // nothing, and a handle in an un-anchored message satisfies
+            // nothing.
+            const res = gitSpawn(repo, [
+                "log",
+                "--branches",
+                "--fixed-strings",
+                `--grep=${taskID}`,
+                "--format=%H%x1f%B%x1e",
+            ]);
+            if (res.status !== 0) {
+                // `git log` exits 0 even on NO match, so ANY non-zero exit
+                // (spawn failure included) is a failed read, not a miss.
+                problems.push({
+                    index,
+                    kind: "item",
+                    id,
+                    locator: "<reachable history>",
+                    code: "verifier_unavailable",
+                    detail: `item "${id}": git could not read history: ${res.stderr || `exit ${res.status}`}`,
+                });
+                return;
+            }
+            let anchorSeen = false;
+            let hit = null;
+            for (const record_ of res.stdout.split("\x1e")) {
+                const rec = record_.trim();
+                if (!rec) continue;
+                const sep = rec.indexOf("\x1f");
+                const sha = (sep >= 0 ? rec.slice(0, sep) : rec).trim();
+                const body = sep >= 0 ? rec.slice(sep + 1) : "";
+                if (!sha || !body.includes(taskID)) {
+                    continue;
+                }
+                anchorSeen = true;
+                if (normalizedTextContains(body, handle)) {
+                    hit = sha;
+                    break;
+                }
+            }
+            if (hit) {
+                verified.push({
+                    index,
+                    kind: "item",
+                    id,
+                    locator: hit,
+                    how: `card-id anchor + ${handleKind} for "${id}" present in the same reachable commit message`,
+                });
+                return;
+            }
+            if (!anchorSeen) {
+                problems.push({
+                    index,
+                    kind: "item",
+                    id,
+                    locator: "<reachable history>",
+                    code: "anchor_missing",
+                    detail: `item "${id}": no reachable commit message carries the card-id anchor "${taskID}" — every carrier must be discoverable from the card id after retirement (the landing trailer makes the landing commit body the natural carrier)`,
+                });
+                return;
+            }
+            problems.push({
+                index,
+                kind: "item",
+                id,
+                locator: "<reachable history>",
+                code: "handle_not_in_carrier",
+                detail: `item "${id}": no card-id-anchored reachable commit message carries the ${handleKind} ("${String(handle).slice(0, 60)}…") — the declared carrier does not contain THIS item's representation`,
+            });
+            return;
+        }
+        if (carrier.kind === "artifact") {
+            const targetPath = String(carrier.path || "").trim();
+            const declaredRev = String(carrier.revision || "").trim();
+            // One committed blob must carry the card-id anchor AND the
+            // handle together (whitespace-normalized, so wrapped doc lines
+            // still verify).
+            const checkBlob = (sha, how) => {
+                const read = committedBlobAt(repo, sha, targetPath);
+                if (!read.available) {
+                    // A failed read is NEVER overstated as
+                    // path-not-tracked / handle-not-in-blob.
+                    return {
+                        code: "verifier_unavailable",
+                        detail: `item "${id}": git could not read "${targetPath}" at commit ${sha}: ${read.stderr}`,
+                    };
+                }
+                if (read.blob === null) {
+                    if (read.missReason) {
+                        return {
+                            code: "path_is_directory_not_file_blob",
+                            detail: `item "${id}": ${read.missReason}`,
+                        };
+                    }
+                    return {
+                        code: "path_not_tracked_at_revision",
+                        detail: `item "${id}": "${targetPath}" is not tracked as a file blob at commit ${sha}`,
+                    };
+                }
+                const anchorOk = read.blob.includes(taskID);
+                const handleOk = normalizedTextContains(read.blob, handle);
+                if (anchorOk && handleOk) {
+                    verified.push({
+                        index,
+                        kind: "item",
+                        id,
+                        locator: `${sha}:${targetPath}`,
+                        how,
+                    });
+                    return null;
+                }
+                return {
+                    code: "carrier_blob_incomplete",
+                    anchorOk,
+                    handleOk,
+                    sha,
+                };
+            };
+            const incompleteProblems = (miss, locator) => {
+                const list = [];
+                if (!miss.anchorOk) {
+                    list.push({
+                        code: "anchor_missing",
+                        detail: `item "${id}": the committed blob of "${targetPath}" at commit ${miss.sha} does not contain the card-id anchor "${taskID}" — every carrier must be discoverable from the card id after retirement (the documented back-reference convention)`,
+                    });
+                }
+                if (!miss.handleOk) {
+                    list.push({
+                        code: "handle_not_in_carrier",
+                        detail: `item "${id}": the committed blob of "${targetPath}" at commit ${miss.sha} does not contain the ${handleKind} ("${String(handle).slice(0, 60)}…") — the declared carrier does not contain THIS item's representation`,
+                    });
+                }
+                return list.map((problem) => ({
+                    index,
+                    kind: "item",
+                    id,
+                    locator,
+                    ...problem,
+                }));
+            };
+            if (declaredRev !== "") {
+                const sha = resolveCommitRevision(repo, declaredRev);
+                if (sha === null) {
+                    problems.push({
+                        index,
+                        kind: "item",
+                        id,
+                        locator: `${declaredRev}:${targetPath}`,
+                        code: "revision_not_resolvable",
+                        detail: `item "${id}": carrier revision "${declaredRev}" does not resolve to a commit`,
+                    });
+                    return;
+                }
+                if (!isCommitReachableFromBranches(repo, sha)) {
+                    problems.push({
+                        index,
+                        kind: "item",
+                        id,
+                        locator: `${declaredRev}:${targetPath}`,
+                        code: "revision_not_reachable",
+                        detail: `item "${id}": carrier commit ${sha} exists but is not reachable from any local branch`,
+                    });
+                    return;
+                }
+                const miss = checkBlob(
+                    sha,
+                    `card-id anchor + ${handleKind} for "${id}" present in the committed blob at the declared revision`,
+                );
+                if (miss === null) {
+                    return;
+                }
+                if (miss.code !== "carrier_blob_incomplete") {
+                    problems.push({
+                        index,
+                        kind: "item",
+                        id,
+                        locator: `${declaredRev}:${targetPath}`,
+                        ...miss,
+                    });
+                    return;
+                }
+                problems.push(
+                    ...incompleteProblems(miss, `${declaredRev}:${targetPath}`),
+                );
+                return;
+            }
+            // Search mode: walk reachable commits that touched the path,
+            // newest first — the home of post-landing material (review
+            // verdicts, curated summaries, measured outcomes) promoted to a
+            // durable file after closeout declared it. Unavailable reads
+            // keep b-F2 semantics (an incomplete negative search is never a
+            // confident miss); directory paths keep b-F1 naming; anchor in
+            // one revision + handle in another is a TERMINAL scatter
+            // diagnosis (review F1, 2026-10-27) — split evidence is never
+            // a silent pass, because no single committed blob would carry
+            // the item's representation next to its discoverability anchor.
+            const revs = reachableCommitsTouchingPath(repo, targetPath);
+            if (revs === null) {
+                problems.push({
+                    index,
+                    kind: "item",
+                    id,
+                    locator: targetPath,
+                    code: "verifier_unavailable",
+                    detail: `item "${id}": git could not read history for the path`,
+                });
+                return;
+            }
+            if (revs.length === 0) {
+                problems.push({
+                    index,
+                    kind: "item",
+                    id,
+                    locator: targetPath,
+                    code: "path_never_committed",
+                    detail: `item "${id}": no reachable commit carries "${targetPath}" — the durable file was never committed (local-only files never count)`,
+                });
+                return;
+            }
+            let unavailableDetail = null;
+            let directoryDetail = null;
+            let anchorEver = false;
+            let handleEver = false;
+            // First (newest) revision bearing each half, so the scatter
+            // diagnosis can NAME where each side actually lives.
+            let anchorRev = null;
+            let handleRev = null;
+            for (const sha of revs) {
+                const read = committedBlobAt(repo, sha, targetPath);
+                if (!read.available) {
+                    if (unavailableDetail === null) {
+                        unavailableDetail = `item "${id}": git could not read "${targetPath}" at commit ${sha}: ${read.stderr}`;
+                    }
+                    continue;
+                }
+                if (read.blob === null) {
+                    if (read.missReason && directoryDetail === null) {
+                        directoryDetail = `item "${id}": ${read.missReason}`;
+                    }
+                    continue;
+                }
+                const anchorOk = read.blob.includes(taskID);
+                const handleOk = normalizedTextContains(read.blob, handle);
+                if (anchorOk && handleOk) {
+                    verified.push({
+                        index,
+                        kind: "item",
+                        id,
+                        locator: `${sha}:${targetPath}`,
+                        how: `card-id anchor + ${handleKind} for "${id}" present in the committed blob at reachable revision ${sha}`,
+                    });
+                    return;
+                }
+                if (anchorOk) {
+                    anchorEver = true;
+                    if (anchorRev === null) {
+                        anchorRev = sha;
+                    }
+                }
+                if (handleOk) {
+                    handleEver = true;
+                    if (handleRev === null) {
+                        handleRev = sha;
+                    }
+                }
+            }
+            if (unavailableDetail !== null) {
+                problems.push({
+                    index,
+                    kind: "item",
+                    id,
+                    locator: targetPath,
+                    code: "verifier_unavailable",
+                    detail: `no reachable revision verified "${targetPath}" for item "${id}" and at least one committed-blob read was unavailable — content absence is NOT established: ${unavailableDetail}`,
+                });
+                return;
+            }
+            if (directoryDetail !== null) {
+                problems.push({
+                    index,
+                    kind: "item",
+                    id,
+                    locator: targetPath,
+                    code: "path_is_directory_not_file_blob",
+                    detail: directoryDetail,
+                });
+                return;
+            }
+            // An unsuccessful walk is ALWAYS terminal. anchorEver and
+            // handleEver are per-revision accumulators, so "each half seen
+            // somewhere" is NOT "both seen together": anchor-alone in
+            // revision X + handle-alone in revision Y used to fall through
+            // with zero problems and read as ok:true (review F1 — the
+            // fail-open the deleted v2 scatter pin was guarding). Fail
+            // closed with a diagnosis naming both revisions.
+            if (!anchorEver) {
+                problems.push({
+                    index,
+                    kind: "item",
+                    id,
+                    locator: targetPath,
+                    code: "anchor_missing",
+                    detail: `item "${id}": no reachable revision of "${targetPath}" carries the card-id anchor "${taskID}" in its committed blob — every carrier must be discoverable from the card id after retirement (the documented back-reference convention)`,
+                });
+            }
+            if (!handleEver) {
+                problems.push({
+                    index,
+                    kind: "item",
+                    id,
+                    locator: targetPath,
+                    code: "handle_not_in_carrier",
+                    detail: `item "${id}": no reachable revision of "${targetPath}" carries the ${handleKind} ("${String(handle).slice(0, 60)}…") in its committed blob — the declared carrier does not contain THIS item's representation`,
+                });
+            }
+            if (anchorEver && handleEver) {
+                problems.push({
+                    index,
+                    kind: "item",
+                    id,
+                    locator: targetPath,
+                    code: "anchor_handle_scattered",
+                    detail: `item "${id}": no single reachable revision of "${targetPath}" carries the card-id anchor "${taskID}" AND the ${handleKind} together — the anchor was found at commit ${anchorRev} and the ${handleKind} at commit ${handleRev}, but never in the same committed blob. Split evidence across revisions is not a same-carrier representation: a fresh session recovering from the anchor-bearing revision finds no item representation there. Reunite both in one committed, branch-reachable carrier (or pin the revision that carries both).`,
+                });
+            }
+            return;
+        }
+        problems.push({
+            index,
+            kind: "item",
+            id,
+            locator: "",
+            code: "slot_malformed",
+            detail: `item "${id}": carrier.kind must be one of ${DECISION_CARRIER_KINDS.join(" | ")}`,
+        });
+    });
+    return { ok: problems.length === 0, problems, verified };
+}
+
+// Destructive-warning inventory for the FORCE path (and pre-removal audit):
+// what decision-class content is about to be destroyed. Items are the
+// CURRENT decision items enumerated from the card; slots are the declared
+// (baseline) inventory — verified or not. Best-effort — a force never blocks
+// on this.
+function decisionRecordDestructionInventory(task) {
+    const items = collectDecisionItems(task || {});
+    const record = task && task.decision_record;
+    const slots =
+        record &&
+        typeof record === "object" &&
+        Array.isArray(record.items)
+            ? record.items.map((slot, i) => ({
+                  index: i + 1,
+                  id: slot && slot.id,
+                  disposition: slot && slot.disposition,
+                  carrier: slot && slot.carrier,
+              }))
+            : [];
+    return { items, slots };
+}
+
 function deleteCoordinationTask(sessionID, taskIDRaw, options = {}) {
     const actor = coordinationActorContext(sessionID, options);
     const forced = options.force === true;
@@ -5480,7 +7036,243 @@ function deleteCoordinationTask(sessionID, taskIDRaw, options = {}) {
                 },
             };
         }
-        // Landing proven: fall through to the removal sequence below.
+        // 4c-2. Retention-preservation gate (owner-approved 2026-10-25; v3
+        //     item-enumerated replacement owner-approved 2026-10-27).
+        //     Landing proven ≠ knowledge preserved: retirement deletes the
+        //     card AND its report dir — the last local copy of decision-class
+        //     content. Before removal, the v3 gate checks, in order:
+        //       (1) the stored record is structurally sound (RAW shape);
+        //       (2) INVENTORY BASELINE: every decision item currently on the
+        //           card has a declared slot (a post-closeout addition —
+        //           e.g. a blocked review — is a new-item mismatch and
+        //           refuses; removals do NOT remove their slots — the stored
+        //           record is the baseline and cannot be laundered by
+        //           deletion);
+        //       (3) every declared slot's carrier resolves against COMMITTED,
+        //           branch-reachable state and carries the card-id anchor AND
+        //           that item's handle.
+        //     Legacy treatment: a card with NO decision_record follows the
+        //     compatibility rule (refused only when decision items are
+        //     non-empty); a stored version-1 (v1/v2) record is honored as
+        //     legacy under exactly the same rule — the routine case retires,
+        //     a decision-bearing legacy record must re-closeout under v3 (or
+        //     force). Never weakens the guards above: this runs AFTER landing
+        //     proof, completed-only, and force bypasses it as an explicit
+        //     emergency.
+        // Structural authority is the RAW stored record. The read-path
+        // normalizeStoredDecisionRecord rebuilds {version, items}, so
+        // checking AFTER normalization would silently strip record-level
+        // junk from a hand-edited stored record and never name it (F2);
+        // slot-level keys were never at risk (items are copied verbatim).
+        // The raw pre-check refuses and names the exact structural problems;
+        // only a record that is ABSENT (null or undefined — the legacy path
+        // below) skips it — any other value that fails the shape check
+        // (string, number, array, empty object) is degraded garbage and is
+        // refused, not treated as "no record".
+        const rawRecord = parsedCard ? parsedCard.decision_record : null;
+        const record =
+            rawRecord === null || rawRecord === undefined
+                ? null
+                : normalizeStoredDecisionRecord(rawRecord);
+        const currentItems = collectDecisionItems(parsedCard);
+        const isLegacyVersionOneRecord =
+            rawRecord !== null &&
+            rawRecord !== undefined &&
+            typeof rawRecord === "object" &&
+            !Array.isArray(rawRecord) &&
+            rawRecord.version === 1;
+        if (rawRecord !== null && rawRecord !== undefined && !isLegacyVersionOneRecord) {
+            // 4c-2a. A stored v3 record must be STRUCTURALLY sound before its
+            //     inventory is trusted. A degraded record (wrong version,
+            //     missing items array, undeclared keys — checked on the RAW
+            //     shape, pre-normalization) is NOT verified: a broken
+            //     inventory proves nothing. Fail closed with
+            //     decision_record_unresolved naming the structural problem,
+            //     and name the current decision items so treatment is at
+            //     least as strong as the legacy null-record path.
+            const structuralProblems = collectDecisionRecordStructuralErrors(
+                rawRecord,
+                taskID,
+            );
+            if (structuralProblems.length > 0) {
+                const namedStructural = structuralProblems
+                    .map((detail) => `  - ${detail}`)
+                    .join("\n");
+                const namedItems = currentItems
+                    .map((c) => `  - ${c.id} (${c.source}): ${c.detail}`)
+                    .join("\n");
+                return {
+                    ...actor,
+                    ok: false,
+                    operation: "delete_coordination_task",
+                    refusal: {
+                        code: "decision_record_unresolved",
+                        task_id: taskID,
+                        status: "completed",
+                        problems: structuralProblems.map((detail) => ({
+                            index: 0,
+                            kind: "record",
+                            id: "",
+                            locator: "",
+                            code: "record_degraded",
+                            detail,
+                        })),
+                        items: currentItems.map((c) => c.id),
+                        force_required: true,
+                        message:
+                            `Task ${taskID} is 'completed' and landed, but its stored decision_record is invalid/degraded and is NOT treated as verified:\n${namedStructural}\n` +
+                            (currentItems.length > 0
+                                ? `Decision items currently on the card (the same check as a legacy card with no decision_record):\n${namedItems}\n`
+                                : "") +
+                            `Repair or re-declare the decision_record (close out again under the current v3 gate), or re-run with explicit force ONLY for genuine emergency cleanup — force destroys the card, the report directory, AND the unpreserved decision-class content.`,
+                    },
+                };
+            }
+        }
+        if (record !== null && !isLegacyVersionOneRecord) {
+            // INVENTORY BASELINE — new-item mismatch (owner condition 2):
+            // every decision item on the card AS IT NOW STANDS must have a
+            // declared slot. Items may appear after closeout through
+            // sanctioned ops (a non-approve review via /task-review adds
+            // last_review + a task_reviewed history event); such an item has
+            // no slot and retirement refuses naming it. The sanctioned
+            // remedy is the ADD-ONLY amendment: re-closeout declaring the
+            // stored slots verbatim plus a fresh slot for the new item.
+            // Removals need no check here — the baseline slots are verified
+            // below regardless of what the card's fields now contain.
+            {
+                const declaredIds = new Set(
+                    Array.isArray(record.items)
+                        ? record.items
+                              .filter(
+                                  (slot) =>
+                                      slot &&
+                                      typeof slot === "object" &&
+                                      typeof slot.id === "string",
+                              )
+                              .map((slot) => slot.id.trim())
+                        : [],
+                );
+                const mismatched = currentItems.filter(
+                    (item) => !declaredIds.has(item.id),
+                );
+                if (mismatched.length > 0) {
+                    const named = mismatched
+                        .map((m) => `  - ${m.id} (${m.source}): ${m.detail}`)
+                        .join("\n");
+                    const isRoutineInventory =
+                        Array.isArray(record.items) && record.items.length === 0;
+                    return {
+                        ...actor,
+                        ok: false,
+                        operation: "delete_coordination_task",
+                        refusal: {
+                            code: "decision_content_unpromoted",
+                            task_id: taskID,
+                            status: "completed",
+                            items: mismatched.map((m) => m.id),
+                            force_required: true,
+                            message:
+                                (isRoutineInventory
+                                    ? `Task ${taskID} carries a routine decision_record (empty inventory — nothing decision-class to preserve) but decision items are present on the card:\n${named}\n`
+                                    : `Task ${taskID} declares a decision_record that does not enumerate every decision item currently on the card:\n${named}\n`) +
+                                `These items have no preserved representation — a carrier containing only the card id satisfies nothing. The sanctioned amendment is a re-closeout declaring the stored slots VERBATIM plus a fresh slot for each new item (add-only; dropped or rewritten stored slots are refused at closeout), or re-run with explicit force ONLY for genuine emergency cleanup — force destroys it.`,
+                        },
+                    };
+                }
+            }
+            // Per-slot carrier verification (owner condition 1): every
+            // declared slot's carrier must be committed, branch-reachable,
+            // card-id-anchored, and carrying THAT item's handle.
+            const decision = verifyDecisionRecordForRetirement(
+                taskID,
+                record,
+                options.landingProofRepo,
+            );
+            if (!decision.ok) {
+                const named = decision.problems
+                    .map(
+                        (p) =>
+                            `  - slot #${p.index}${p.id ? ` (${p.id})` : ""} (${p.kind}${p.locator ? ` ${p.locator}` : ""}): ${p.code} — ${p.detail}`,
+                    )
+                    .join("\n");
+                return {
+                    ...actor,
+                    ok: false,
+                    operation: "delete_coordination_task",
+                    refusal: {
+                        code: "decision_record_unresolved",
+                        task_id: taskID,
+                        status: "completed",
+                        problems: decision.problems,
+                        force_required: true,
+                        message:
+                            `Task ${taskID} is 'completed' and landed, but its decision_record does not resolve against committed, branch-reachable git state. ` +
+                            `Retirement is refused so the last local copy of decision-class content is not destroyed:\n${named}\n` +
+                            `Promote the content to a reachable commit or a committed durable file carrying the card-id anchor and the item's representation, or re-run with explicit force ONLY for genuine emergency cleanup — force destroys the card, the report directory, AND the unpreserved decision-class content.`,
+                    },
+                };
+            }
+            // Landing proven + baseline complete + every carrier resolved:
+            // retire.
+        } else if (isLegacyVersionOneRecord) {
+            // Legacy v1/v2 record (stored under the 2026-10-25/26 gates):
+            // honored as LEGACY under the same rule as a card with no
+            // decision_record — retire routinely when the card carries no
+            // decision items (the routine case, including a v2 routine
+            // attestation); refuse when decision items are present, with
+            // re-closeout under v3 as the remedy. This never weakens
+            // preservation (it refuses more than v2 did, never less); the
+            // v2 excerpt machinery itself is retired (owner-approved
+            // simplification) and is NOT run for legacy records.
+            if (currentItems.length > 0) {
+                const named = currentItems
+                    .map((c) => `  - ${c.id} (${c.source}): ${c.detail}`)
+                    .join("\n");
+                return {
+                    ...actor,
+                    ok: false,
+                    operation: "delete_coordination_task",
+                    refusal: {
+                        code: "decision_content_unpromoted",
+                        task_id: taskID,
+                        status: "completed",
+                        items: currentItems.map((c) => c.id),
+                        force_required: true,
+                        message:
+                            `Task ${taskID} carries a legacy version-1 decision_record (declared under the retired v1/v2 gate) and decision items are present on the card:\n${named}\n` +
+                            `Legacy records are honored only in the routine case. Re-declare under the current v3 gate — close out again declaring one slot per item — or re-run with explicit force ONLY for genuine emergency cleanup.`,
+                    },
+                };
+            }
+        } else {
+            // Legacy compatibility (owner condition 5): no decision_record.
+            // Refuse ONLY when decision items are present (nothing durable
+            // was declared for them — retiring would destroy the last
+            // copy); otherwise retire routinely.
+            if (currentItems.length > 0) {
+                const named = currentItems
+                    .map((c) => `  - ${c.id} (${c.source}): ${c.detail}`)
+                    .join("\n");
+                return {
+                    ...actor,
+                    ok: false,
+                    operation: "delete_coordination_task",
+                    refusal: {
+                        code: "decision_content_unpromoted",
+                        task_id: taskID,
+                        status: "completed",
+                        items: currentItems.map((c) => c.id),
+                        force_required: true,
+                        message:
+                            `Task ${taskID} is a legacy completed card with no decision_record, and decision items are present on the card:\n${named}\n` +
+                            `Ordinary retirement would destroy the last local copy. Promote the content to a reachable commit or a committed durable file (close out again with a decision_record under the current gate), or re-run with explicit force ONLY for genuine emergency cleanup.`,
+                    },
+                };
+            }
+        }
+        // Landing proven (+ decision record resolved where declared): fall
+        // through to the removal sequence below.
     }
 
     // 5. Pre-removal summary. Built BEFORE any fs mutation; emitted to the
@@ -5496,6 +7288,41 @@ function deleteCoordinationTask(sessionID, taskIDRaw, options = {}) {
         report_dir: relativeToRepo(reportDir),
         forced,
     };
+    // 5b. Destructive warning for a FORCED completed retirement (owner
+    //     condition: the force path survives with UNCHANGED semantics, but
+    //     the warning must NAME the decision-class content about to be
+    //     destroyed — current items and declared slots — not boilerplate).
+    //     The force itself is not blocked by this inventory (best-effort).
+    let decisionContentDestroyed = null;
+    if (forced && summaryStatus === "completed") {
+        decisionContentDestroyed =
+            decisionRecordDestructionInventory(parsedCard);
+        const hasItems = decisionContentDestroyed.items.length > 0;
+        const hasSlots = decisionContentDestroyed.slots.length > 0;
+        if (hasItems || hasSlots) {
+            const itemLines = decisionContentDestroyed.items
+                .map((f) => `  - card item ${f.id} (${f.source}): ${f.detail}`)
+                .join("\n");
+            const slotLines = decisionContentDestroyed.slots
+                .map((s) => {
+                    const carrier = s.carrier || {};
+                    const locator =
+                        carrier.kind === "artifact"
+                            ? carrier.path
+                            : carrier.kind === "commit"
+                              ? carrier.revision || "<reachable history>"
+                              : "";
+                    return `  - decision_record slot #${s.index} (${s.id}${s.disposition ? `, ${s.disposition}` : ""}${locator ? `; carrier: ${locator}` : ""})`;
+                })
+                .join("\n");
+            summary.destructive_warning =
+                `force is destroying the LAST LOCAL COPY of decision-class content for ${taskID}:\n` +
+                (hasItems ? `${itemLines}\n` : "") +
+                (hasSlots ? `${slotLines}\n` : "") +
+                `This content will NOT be recoverable from the card, the report directory, or (unless independently promoted) git history.`;
+            summary.decision_content_destroyed = decisionContentDestroyed;
+        }
+    }
     if (typeof options.beforeRemove === "function") {
         options.beforeRemove(summary);
     }
@@ -5526,6 +7353,12 @@ function deleteCoordinationTask(sessionID, taskIDRaw, options = {}) {
             forced,
             card_removed: cardRemoved,
             report_dir_removed: reportDirRemoved,
+            ...(decisionContentDestroyed
+                ? {
+                      decision_content_destroyed: decisionContentDestroyed,
+                      destructive_warning: summary.destructive_warning,
+                  }
+                : {}),
         },
     };
 }
@@ -7170,6 +9003,89 @@ function saveCoordinationTaskCloseout(sessionID, taskIDRaw, options = {}) {
             }
         });
     }
+    // Decision-record gate (retention preservation, owner-approved
+    // 2026-10-25; v3 item-enumerated contract owner-approved 2026-10-27).
+    // EVERY closeout saved under the current gate must declare how
+    // decision-class knowledge (owner authorizations, materially-rejected
+    // alternatives, review verdicts, measured outcomes) survives retirement —
+    // retiring a completed card deletes the card AND its report dir, the last
+    // local copy. The v3 record declares ONE SLOT PER DECISION ITEM
+    // (identity, disposition verbatim|curated|sanitized, carrier, per-item
+    // handle, provenance for owner decisions); an EMPTY items array is the
+    // routine attestation, valid exactly when the card carries no decision
+    // items (zero ceremony for routine work). There is deliberately NO
+    // "inline" carrier — content only in this local closeout report is NOT
+    // durable and never satisfies the gate (owner condition 1). Verification
+    // is deferred to retirement (the landing/durable commits usually do not
+    // exist yet at closeout time); here we enforce structure, inventory
+    // completeness, per-item binding, and the add-only amendment rule.
+    let decisionRecord = null;
+    const drBlocks = extractAllDecisionRecordBlocks(options.body || "");
+    if (drBlocks.length === 0) {
+        errors.push(
+            `Task ${loaded.payload.task_id} closeout requires a decision_record block: a fenced ` +
+                "```decision-record JSON block with one slot per decision item (items may be empty — the routine attestation) " +
+                "(see docs/coordination/CLOSEOUT_TEMPLATE.md).",
+        );
+    } else if (drBlocks.length > 1) {
+        errors.push(
+            `Task ${loaded.payload.task_id} closeout declares ${drBlocks.length} decision-record blocks; declare exactly ONE (merge the items).`,
+        );
+    } else if (drBlocks[0].error) {
+        errors.push(
+            `Task ${loaded.payload.task_id} decision-record block could not be parsed: ${drBlocks[0].error}`,
+        );
+    } else {
+        decisionRecord = drBlocks[0].record;
+        errors.push(
+            ...collectDecisionRecordStructuralErrors(
+                decisionRecord,
+                loaded.payload.task_id,
+            ),
+        );
+        // Guard: a JSON body of `null` (or a primitive/array — JSON allows
+        // all of them at top level) parses WITHOUT a parse error, and the
+        // structural collector already refuses it above. The inventory probe
+        // below must not dereference it — that raised a raw TypeError
+        // instead of the collected StateError. Only probe a plausible object
+        // shape.
+        const plausibleRecord =
+            decisionRecord !== null &&
+            typeof decisionRecord === "object" &&
+            !Array.isArray(decisionRecord) &&
+            Array.isArray(decisionRecord.items);
+        if (plausibleRecord) {
+            // INVENTORY COMPLETENESS + PER-ITEM BINDING + ADD-ONLY
+            // AMENDMENT (owner conditions 1 and 2): every decision item on
+            // the card (plus the incoming measured_outcome) must have a
+            // declared slot; no surplus slots; verbatim handles must be
+            // drawn from their OWN item's content; and a re-closeout must
+            // carry every previously stored slot forward verbatim (the
+            // sanctioned amendment is ADD-ONLY — the stored record is the
+            // baseline inventory, so removing an item from the card never
+            // removes its slot).
+            const inventory = collectDecisionInventoryProblems(
+                loaded.payload,
+                decisionRecord,
+                { measuredOutcome: options.measuredOutcome },
+                loaded.payload.decision_record,
+            );
+            if (inventory.length > 0) {
+                const named = inventory
+                    .map((p) => `  - [${p.code}] ${p.detail}`)
+                    .join("\n");
+                const isRoutineInventory = decisionRecord.items.length === 0;
+                errors.push(
+                    (isRoutineInventory
+                        ? `Task ${loaded.payload.task_id} declares a routine decision_record (empty inventory — nothing decision-class to preserve) but decision items are present on the card:\n${named}\n`
+                        : `Task ${loaded.payload.task_id} declares a decision_record whose slots do not enumerate the card's decision items exactly:\n${named}\n`) +
+                    "Declare one slot per decision item: { \"id\": \"owner_notes[fnv1a:<content-hash>]\" (content-bound — ids derive from each item's own text via the exported collectDecisionItems classifier, never its array position), \"disposition\": \"verbatim|curated|sanitized\", \"carrier\": {…}, \"handle\": \"…\", \"provenance\": \"…\" }. " +
+                    "A verbatim handle is a single line from that item's own content; a curated/sanitized handle is EXACTLY the canonical label \"decision-item: <task-id>#<item-id> (<disposition>)\" labeling the curated content in the carrier. " +
+                    "Sensitive content that genuinely cannot be represented must not be faked — leave the item undeclared (retirement will refuse and surface it) and use the documented operator force path, never a hollow declaration.",
+                );
+            }
+        }
+    }
     throwCollectedErrors(errors);
     const createdAt = isoZ();
     const reportTitle =
@@ -7213,6 +9129,22 @@ function saveCoordinationTaskCloseout(sessionID, taskIDRaw, options = {}) {
         ...current,
         status: taskStatus,
         report_envelope: reportEnvelope,
+        // Retention-preservation gate: persist the declared decision_record so
+        // the retirement path can resolve every slot against committed git
+        // state before deleting the card + report dir. decisionRecord is
+        // non-null here (a missing/invalid block refused the closeout above)
+        // and structurally valid v3 (wrong versions refused at declaration),
+        // so the stored baseline is exactly the declared item inventory.
+        decision_record:
+            decisionRecord !== null
+                ? {
+                      version: DECISION_RECORD_VERSION,
+                      items: decisionRecord.items,
+                      ...(typeof decisionRecord.note === "string"
+                          ? { note: decisionRecord.note }
+                          : {}),
+                  }
+                : current.decision_record,
         session_aliases: actor.session_name
             ? uniqueStrings([...(current.session_aliases || []), actor.session_name])
             : current.session_aliases,
@@ -8097,6 +10029,26 @@ export {
     saveCoordinationTaskCloseout,
     reviewCoordinationTask,
     deleteCoordinationTask,
+    // Read-only decision-record verifier (retention-preservation gate).
+    // Exported as a TEST SEAM so tests can exercise git-failure mapping
+    // (verifier_unavailable) directly, without fabricating a repo where
+    // landing proof succeeds but later git reads fail.
+    verifyDecisionRecordForRetirement,
+    // Mechanical decision-item enumeration (the authoring aid behind the v3
+    // inventory): tooling and tests enumerate a card's decision items to
+    // build/verify a decision_record without re-implementing the classifier.
+    collectDecisionItems,
+    // Content-bound item-id factory (the B-F1 fix): tests and tooling derive
+    // EXACTLY the ids collectDecisionItems mints, so fixtures cannot drift
+    // from the gate's identity grammar.
+    decisionItemId,
+    // Tri-state git read helpers behind that verifier, exported as TEST
+    // SEAMS for the same reason: repo corruption cannot selectively fail
+    // `git log -1` / `git show` while letting the earlier rev-parse /
+    // reachability reads succeed, so their unavailable branches are
+    // injected directly (non-git directory).
+    commitMessageContains,
+    committedBlobAt,
     saveSkillProposal,
     readSkillProposal,
     listSkillProposals,
@@ -8168,6 +10120,26 @@ export default {
     saveCoordinationTaskCloseout,
     reviewCoordinationTask,
     deleteCoordinationTask,
+    // Read-only decision-record verifier (retention-preservation gate).
+    // Exported as a TEST SEAM so tests can exercise git-failure mapping
+    // (verifier_unavailable) directly, without fabricating a repo where
+    // landing proof succeeds but later git reads fail.
+    verifyDecisionRecordForRetirement,
+    // Mechanical decision-item enumeration (the authoring aid behind the v3
+    // inventory): tooling and tests enumerate a card's decision items to
+    // build/verify a decision_record without re-implementing the classifier.
+    collectDecisionItems,
+    // Content-bound item-id factory (the B-F1 fix): tests and tooling derive
+    // EXACTLY the ids collectDecisionItems mints, so fixtures cannot drift
+    // from the gate's identity grammar.
+    decisionItemId,
+    // Tri-state git read helpers behind that verifier, exported as TEST
+    // SEAMS for the same reason: repo corruption cannot selectively fail
+    // `git log -1` / `git show` while letting the earlier rev-parse /
+    // reachability reads succeed, so their unavailable branches are
+    // injected directly (non-git directory).
+    commitMessageContains,
+    committedBlobAt,
     saveSkillProposal,
     readSkillProposal,
     listSkillProposals,

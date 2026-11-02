@@ -209,12 +209,16 @@ If the gated-commit mechanism locks up, the operator recovers from a **host term
 
 ```bash
 rm -rf .git/commit-gate.lock/ && git reset --mixed
+git add <paths>   # stage the deliberate slice — the gate never stages implicitly
 SKIP_COMMIT_GATE=1 git commit ...
 ```
 
 This is the operator-only host-terminal path. **No agent may use SKIP_COMMIT_GATE.**
 The `SKIP_COMMIT_GATE=1` environment variable has no effect inside OpenCode —
 shell-guard does not suppress forbidden patterns for SKIP_COMMIT_GATE from any agent.
+The SKIP path commits the index exactly as the operator left it: an empty index is
+refused with guidance (stage explicit paths, then retry) — never implicit wholesale
+staging.
 
 **Sanctioned in-session alternative**: `.opencode/scripts/commit-gate.sh revert <paths>` restores working-tree paths to HEAD with no lock/CAS/private index — the in-session way to unblock edits that collided with a concurrent committer, instead of the operator escape hatch.
 

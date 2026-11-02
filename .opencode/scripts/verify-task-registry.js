@@ -5,6 +5,7 @@ import {
     StateError,
     activateCoordinationTask,
     bindSessionName,
+    collectDecisionItems,
     computeTaskDesignDigest,
     deleteCoordinationTask,
     listCoordinationTasks,
@@ -821,6 +822,18 @@ function main() {
                     "1. Verified that local task cards persist under `.local/coordinator/tasks/`.",
                     "2. Verified that subagent sessions can reopen the task and attach their session alias.",
                     "3. Verified that closeout reports land under the task-specific local report directory.",
+                    "",
+                    "```decision-record",
+                    JSON.stringify(
+                        {
+                            version: 3,
+                            items: [],
+                            note: "verification fixture; nothing decision-class to preserve",
+                        },
+                        null,
+                        2,
+                    ),
+                    "```",
                 ].join("\n"),
                 taskStatus: "reported",
                 reportEnvelope: "standard",
@@ -956,6 +969,38 @@ function main() {
                     "1. Reopened task resumed cleanly from ready into a fresh working claim.",
                     "2. Final pass completed without violating the active-owner guard.",
                     "3. Local report history remains durable across multiple closeout cycles.",
+                    "",
+                    "```decision-record",
+                    JSON.stringify(
+                        {
+                            version: 3,
+                            // v3: one slot per decision item — the earlier
+                            // coordinator review verdict (a non-completed
+                            // rework review — decision-class) plus its
+                            // task_reviewed history event are enumerated
+                            // from the card itself, so the fixture declares
+                            // the exact inventory whatever history indices
+                            // the preceding lifecycle steps produced. The
+                            // curated labels are declared, never resolved —
+                            // this verification fixture never retires.
+                            items: collectDecisionItems(
+                                readCoordinationTask(
+                                    secondSubagentSessionID,
+                                    primary.task.task_id,
+                                    { cwd: "/verification" },
+                                ).task,
+                            ).map((item) => ({
+                                id: item.id,
+                                disposition: "curated",
+                                carrier: { kind: "commit" },
+                                handle: `decision-item: ${primary.task.task_id}#${item.id} (curated)`,
+                                note: "label-scoped review-verdict curation; this verification fixture never retires, so the carrier is structurally declared, never resolved",
+                            })),
+                        },
+                        null,
+                        2,
+                    ),
+                    "```",
                 ].join("\n"),
                 taskStatus: "reported",
                 reportEnvelope: "standard",

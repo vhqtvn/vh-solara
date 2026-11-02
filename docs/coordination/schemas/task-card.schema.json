@@ -223,6 +223,181 @@
     "measured_outcome": {
       "type": ["string", "null"]
     },
+    "decision_record": {
+      "type": ["object", "null"],
+      "description": "Retention-preservation declaration (owner-approved 2026-10-25; v3 item-enumerated contract owner-approved 2026-10-27). Set by the closeout gate; at retirement every declared slot's carrier is verified — card-id anchor + per-item handle together in the SAME committed, branch-reachable carrier — before a completed card is deleted. null on legacy cards that predate the gate. The version-1 (v1/v2 entries) shape is LEGACY: still storable/readable for in-flight cards and honored at retirement only in the routine case (no decision items); NEW closeouts declare version 3 only (one slot per decision item; empty items = the routine attestation).",
+      "anyOf": [
+        {
+          "type": "null",
+          "description": "No decision_record: cards that have not closed out under the retention gate carry decision_record: null (the payload default), and legacy cards that predate the gate keep null — the retirement gate treats null as the legacy compatibility case (refused iff decision items are present). Validated explicitly here because anyOf is ANDed with the property's type union: without a null branch, both object alternatives would reject the default value."
+        },
+        {
+          "type": "object",
+          "description": "Legacy v1/v2 shape (entries of kind commit | artifact | routine, optional carries excerpts). Retired: the excerpt-coverage machinery no longer runs; a decision-bearing legacy record must re-closeout under version 3.",
+          "required": ["version", "entries"],
+          "properties": {
+            "version": { "const": 1 },
+            "entries": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {
+                      "kind": { "const": "commit" },
+                      "revision": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Commit sha or resolvable revision carrying the decision content. Omitted = search reachable commit messages for the marker. Must not start with \"-\" (option-injection guard: the retirement verifier passes it to git as a positional)."
+                      },
+                      "marker": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Content marker verified in the commit message or a blob at that committed revision. Defaults to the card id. Proves presence only — it covers NO decision-class field. Must not start with \"-\" (option-injection guard: the retirement verifier hands it to git as a search pattern)."
+                      },
+                      "carries": {
+                        "type": "object",
+                        "description": "Legacy v2 coverage declaration: map of decision-class field name to a verbatim single-line excerpt from that field's content. Retired with the v2 gate; kept so stored v2 records remain schema-valid.",
+                        "additionalProperties": {
+                          "type": "string",
+                          "minLength": 24
+                        }
+                      },
+                      "note": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "required": ["kind", "path"],
+                    "properties": {
+                      "kind": { "const": "artifact" },
+                      "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Repo-relative durable file (docs/checkpoints/, researches/decisions/, researches/sources/, docs/planning/) carrying the card-id back-reference."
+                      },
+                      "revision": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Commit sha or resolvable revision whose committed blob must contain the marker. Omitted = search reachable revisions of the path. Must not start with \"-\" (option-injection guard)."
+                      },
+                      "marker": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Back-reference string verified in the committed blob. Defaults to the card id. Proves presence only — it covers NO decision-class field. Must not start with \"-\" (option-injection guard)."
+                      },
+                      "carries": {
+                        "type": "object",
+                        "description": "Legacy v2 coverage declaration (retired; kept for stored-record schema validity).",
+                        "additionalProperties": {
+                          "type": "string",
+                          "minLength": 24
+                        }
+                      },
+                      "note": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {
+                      "kind": { "const": "routine" },
+                      "note": {
+                        "type": "string",
+                        "description": "Attestation that nothing decision-class needs preserving; must be the only entry and must not contradict explicit decision-class card fields."
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "v3 item-enumerated contract: ONE SLOT PER DECISION ITEM. Items are enumerated mechanically from the card (every owner note, every non-empty open question, the measured outcome, and every NON-PROCESS review signal — a review that resolved the card to completed is a process record). Empty items is the routine attestation, valid exactly when the card carries no decision items. The closeout gate additionally enforces what draft-07 cannot express: per-item handle binding (verbatim handles drawn from that item's own content), the canonical curated/sanitized label (decision-item: <task-id>#<item-id> (<disposition>)), required provenance on owner-decision and sanitized slots, duplicate-id refusal, and the add-only amendment rule for re-closeouts.",
+          "required": ["version", "items"],
+          "properties": {
+            "version": { "const": 3 },
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id", "disposition", "carrier", "handle"],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Stable CONTENT-BOUND item identity within the task: owner_notes[fnv1a:<hash>] | open_questions[fnv1a:<hash>] | measured_outcome[fnv1a:<hash>] | last_review[fnv1a:<hash>] | task_reviewed[fnv1a:<hash>] — <hash> is an FNV-1a digest of the item's own text; duplicate identical items carry a per-content occurrence suffix (.2, .3, ...; the first copy has none — never array position; reordering items changes no id, while an in-place content replacement mints a new id and refuses at retirement until declared). Must not start with \"-\", contain \"#\", or span lines (gate-enforced — the id is embedded in the carrier label the verifier searches for)."
+                  },
+                  "disposition": {
+                    "enum": ["verbatim", "curated", "sanitized"],
+                    "description": "verbatim = the carrier carries the item's own text (handle = a verbatim single line of it, mechanically containment-checked). curated = the carrier carries a labeled useful summary (handle = the canonical item label; semantic fidelity is author + reviewer). sanitized = like curated but with sensitive material deliberately withheld (provenance must name what was omitted and the authority for it)."
+                  },
+                  "carrier": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "required": ["kind"],
+                        "properties": {
+                          "kind": { "const": "commit" },
+                          "revision": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Commit sha or resolvable revision whose message or blob at that committed revision must carry the anchor + handle. Omitted = search reachable commit messages (the landing-commit body pattern). Must not start with \"-\" (option-injection guard)."
+                          }
+                        },
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "required": ["kind", "path"],
+                        "properties": {
+                          "kind": { "const": "artifact" },
+                          "path": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Repo-relative durable file (docs/checkpoints/, researches/decisions/, researches/sources/, docs/planning/) whose committed blob must carry the card-id anchor + this item's handle."
+                          },
+                          "revision": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Commit sha or resolvable revision whose committed blob is checked. Omitted = search reachable revisions of the path. Must not start with \"-\" (option-injection guard)."
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "handle": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "The per-item representation. verbatim: a verbatim single line drawn from that item's own content, >= 24 chars trimmed, not the card id, no leading dash (gate-enforced). curated/sanitized: EXACTLY the canonical label 'decision-item: <task-id>#<item-id> (<disposition>)' (gate-enforced) — its presence in an anchored committed carrier means labeled content sits there; whether that content is a USEFUL, faithful representation is author + reviewer judgment, never the gate."
+                  },
+                  "provenance": {
+                    "type": "string",
+                    "description": "Who, when, where recorded. REQUIRED (gate-enforced) for owner-decision items (owner_notes[…]) and for sanitized items. For curated/sanitized representations it must be a CITED reference, never an invented or AI-paraphrased owner statement."
+                  },
+                  "note": { "type": "string" }
+                },
+                "additionalProperties": false
+              }
+            },
+            "note": {
+              "type": "string",
+              "description": "Free-form record-level note (e.g. why an amendment was declared)."
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "last_review": {
       "type": ["object", "null"],
       "required": [

@@ -1,6 +1,6 @@
 {
   "manifest_version": "1",
-  "successful_render_id": "493c1a7403679bac",
+  "successful_render_id": "2a1cba5191f23436",
   "entries": [
     {
       "destination_path": ".opencode/skills/contract-invariant-audit/SKILL.md",
@@ -49,14 +49,14 @@
       "producer_kind": "overlay_skill",
       "overlay_pack": "resolve-first-pilot",
       "source_relative_path": "skills/resolve-first/SKILL.md",
-      "rendered_digest": "sha256:d75a1f6df7f93fd5abb6c1663f081576f80e3bada90542b102b18e7e9e9bcaaf"
+      "rendered_digest": "sha256:9596ab8ff49628e37c431a40f36ea1a420521558cdb145706615b30571c8520a"
     },
     {
       "destination_path": ".opencode/skills/resolve-first/references/runbook.md",
       "producer_kind": "overlay_skill",
       "overlay_pack": "resolve-first-pilot",
       "source_relative_path": "skills/resolve-first/references/runbook.md",
-      "rendered_digest": "sha256:7eb5b91026d4e3d48846324d46f209144b3b91b510b30dfd6305bd66a36370fe"
+      "rendered_digest": "sha256:3bcc3b3af390ecd7b707b991f7ddc22f940f3feee5382b0f1d4d93f52fef5512"
     },
     {
       "destination_path": ".opencode/skills/review-blocker-fix/SKILL.md",

@@ -132,7 +132,12 @@ unavailable or broken, the operator can bypass the gate from a **host terminal**
 (outside OpenCode):
 
 1. Clear any stuck lock: `rm -rf .git/commit-gate.lock/ && git reset --mixed`
-2. Run: `SKIP_COMMIT_GATE=1 git commit ...`
+2. Stage the deliberate slice: `git add <paths>` — the gate never stages implicitly (no `git add -A`)
+3. Run: `SKIP_COMMIT_GATE=1 git commit ...`
+
+The SKIP path commits the index exactly as the operator left it. An empty index at
+SKIP-commit time is refused with guidance (stage explicit paths, then retry) — it never
+falls back to wholesale staging.
 
 `SKIP_COMMIT_GATE=1` is operator-only. It has no effect inside OpenCode:
 - **shell-guard**: does not suppress forbidden patterns for agents with SKIP_COMMIT_GATE=1

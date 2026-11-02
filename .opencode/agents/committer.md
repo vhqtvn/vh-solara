@@ -176,12 +176,15 @@ If the gated-commit mechanism locks up, the operator recovers from a **host term
 
 ```bash
 rm -rf .git/commit-gate.lock/ && git reset --mixed
+git add <paths>   # stage the deliberate slice — the gate never stages implicitly
 SKIP_COMMIT_GATE=1 git commit ...
 ```
 
 This is the operator-only host-terminal path. **No agent may use SKIP_COMMIT_GATE.**
 The `SKIP_COMMIT_GATE=1` environment variable has no effect inside OpenCode — it is
-only honored by `commit-gate.sh` when run from a host terminal.
+only honored by `commit-gate.sh` when run from a host terminal. The SKIP path commits
+the index exactly as the operator left it: an empty index is refused with guidance
+(stage explicit paths, then retry) — never implicit wholesale staging.
 
 C will NEVER attempt to bypass the review gate. If the gate mechanism is stuck,
 escalate to the operator.

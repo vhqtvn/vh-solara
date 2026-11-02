@@ -106,6 +106,138 @@ result: proven               # proven | skipped | not-demonstrable (the crux out
     accepts the honest declaration, and the closeout routes to defer rather
     than `completed`.
 
+## Decision record (retention preservation — REQUIRED on every closeout)
+
+Every closeout must declare exactly ONE fenced ```decision-record block (v3,
+item-enumerated) saying how decision-class knowledge (owner authorizations,
+materially-rejected alternatives, non-approve review verdicts, measured
+outcomes) survives retirement. Retiring a completed card deletes the card and
+its report directory — the last local copy — so each declared slot's carrier
+is verified against committed, branch-reachable git state before ordinary
+retirement (see RECORD_LIFECYCLE.md → "Retention preservation").
+
+**One slot per decision item; a carrier containing only the card id
+satisfies nothing.** The gate mechanically enumerates the card's decision
+items — every non-empty owner note, every non-empty open question,
+`measured_outcome`, and every NON-PROCESS review signal (`last_review` /
+`task_reviewed` whose status is not `completed`) — and the record must
+declare exactly that inventory. Items may be represented `verbatim` (the
+carrier carries the item's own text), `curated` (the carrier carries a
+labeled useful summary), or `sanitized` (like curated, with sensitive
+material deliberately withheld and the withholding's authority cited).
+
+**Item identity is CONTENT-BOUND, never positional.** Each item's id embeds
+an FNV-1a content digest of that item's own text
+(`owner_notes[fnv1a:<hash>]`, `open_questions[fnv1a:<hash>]`,
+`measured_outcome[fnv1a:<hash>]`, `last_review[fnv1a:<hash>]`,
+`task_reviewed[fnv1a:<hash>]`); duplicate identical items within one field
+carry a per-content occurrence suffix (`.2`, `.3`, … — the first copy has
+none), NOT an array position. Consequences: reordering a field's items (or
+history events) changes no id and loses nothing — it passes; REPLACING an
+item's text in place mints a NEW id, which surfaces at retirement as an
+undeclared item and refuses (a sanctioned `/task-update` rewrite can no
+longer recycle a stored slot onto different content — the positional
+laundering chain is closed). Derive exact ids with the exported
+`collectDecisionItems` classifier rather than hand-hashing.
+
+````text
+```decision-record
+{
+  "version": 3,
+  "items": [
+    { "id": "owner_notes[fnv1a:9f2c41d7a03b8e15]",
+      "disposition": "verbatim",
+      "carrier": { "kind": "commit" },
+      "handle": "OWNER 2026-10-27 (chat m0066): approved the v3 item-enumerated retention contract",
+      "provenance": "owner chat m0066, 2026-10-27 — verbatim note on the card" },
+    { "id": "owner_notes[fnv1a:4b81c6d29e57a20f]",
+      "disposition": "sanitized",
+      "carrier": { "kind": "artifact", "path": "docs/checkpoints/2026-10-27-<slug>.md" },
+      "handle": "decision-item: <task-id>#owner_notes[fnv1a:4b81c6d29e57a20f] (sanitized)",
+      "provenance": "censored rationale: specifics withheld as private (owner chat m0066 authorized withholding); decision + scope cited in the artifact" },
+    { "id": "measured_outcome[fnv1a:c1d0e3f4a5b69782]",
+      "disposition": "verbatim",
+      "carrier": { "kind": "artifact", "path": "docs/checkpoints/2026-10-27-<slug>.md" },
+      "handle": "suite 231/231 green; recovery receipts tree-bound" }
+  ]
+}
+```
+````
+
+The example shows all three dispositions (hashes are ILLUSTRATIVE — derive
+real ids from the items' own text via `collectDecisionItems`); declare only
+the slots you need — one per item, ids matching the card's items exactly.
+The routine shape for work with NO decision items is an empty inventory
+(this is the whole burden of an ordinary closeout):
+
+````text
+```decision-record
+{ "version": 3, "items": [], "note": "routine — nothing decision-class to preserve" }
+```
+````
+
+Rules:
+
+- `items` enumerates the card's decision items EXACTLY: a missing slot is
+  refused at closeout (the primary concern-1 fix — two owner notes cannot be
+  covered by one excerpt), and a slot for a nonexistent item is refused too.
+- `id` — the CONTENT-BOUND item identity:
+  `owner_notes[fnv1a:<hash>]` | `open_questions[fnv1a:<hash>]` |
+  `measured_outcome[fnv1a:<hash>]` | `last_review[fnv1a:<hash>]` |
+  `task_reviewed[fnv1a:<hash>]`. `<hash>` is an FNV-1a digest of the
+  item's own text; duplicate identical items carry a per-content
+  occurrence suffix (`.2`, `.3`, …; the first copy has none — never array
+  position). Single line, no leading dash, no `#`. Reordering items loses
+  nothing (identity is content); replacing an item's text in place mints a
+  new id and refuses at retirement until the replacement is declared.
+- `disposition` — `verbatim` | `curated` | `sanitized`.
+- `carrier` — `{kind:"commit",revision?}` (content in a reachable commit's
+  message or a blob at that committed revision; revision omitted = the
+  landing-commit body pattern, searched at retirement) or
+  `{kind:"artifact",path,revision?}` (a durable file — `docs/checkpoints/`,
+  `researches/decisions/`, `researches/sources/`, `docs/planning/` — whose
+  COMMITTED blob carries the anchor + handle). There is deliberately NO
+  inline carrier; working-tree content never counts.
+- `handle` — the per-item representation the verifier checks in the carrier
+  TOGETHER with the card-id anchor:
+  - `verbatim`: a single line copied from that item's own content (≥ 24
+    chars trimmed, not the card id, no leading dash). Put the full decision
+    text in the landing commit body so the verified carrier and the
+    declaration match.
+  - `curated`/`sanitized`: EXACTLY the canonical label
+    `decision-item: <task-id>#<item-id> (<disposition>)` — write that label
+    line into the carrier, followed by the curation. The label is derived,
+    never free-typed, so it is unique per item and the recovered record
+    honestly distinguishes curated from verbatim content.
+- `provenance` — REQUIRED for owner-decision (`owner_notes[…]`) slots and for every
+  `sanitized` slot: who, when, where recorded. For curated/sanitized
+  representations it must be a CITED reference (e.g. "owner chat m0066,
+  2026-10-27"), never an invented or AI-paraphrased owner statement.
+- **Curated/sanitized content must be USEFUL, not ceremonial** —
+  proportional to the decision's importance, it should let a fresh agent
+  recover: what was decided/rejected, why it mattered, key constraints,
+  where the authority came from, and what was deliberately omitted (when
+  relevant). This is author + reviewer judgment; no semantic validator
+  checks it, and a mechanically valid label never proves the meaning was
+  preserved.
+- **Add-only amendment**: if the card already carries a stored record (a
+  re-closeout), previously stored slots must be re-declared VERBATIM; only
+  new items get fresh slots. Dropping or rewriting a stored slot is refused
+  — the stored record is the baseline, so removing an item from the card
+  never removes its slot.
+- A clean-approve review (`last_review.status` = `completed`) is a PROCESS
+  record — it creates no item and does not block routine retirement. Any
+  other verdict is decision-class (per history event — a later clean approve
+  does not launder an earlier blocked review).
+- Verified content means COMMITTED, branch-reachable state. Verification
+  proves local-repository reachability only; cross-machine availability
+  comes from the normal push/release flow.
+- **Private content:** never commit sensitive owner notes merely to satisfy
+  the gate. Prefer a `sanitized` slot with cited provenance; if no safe,
+  meaningful representation exists at all, leave the item undeclared —
+  retirement refuses and surfaces it — and use the documented operator
+  force path, never a hollow declaration.
+
 ## Rewrite-parity contract (only for explicitly-declared deletion/rewrite slices)
 
 When the task was an explicitly-declared deletion or rewrite slice — the task
