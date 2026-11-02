@@ -9,6 +9,7 @@ package aggregator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -357,6 +358,27 @@ func TestTreeReconcile_RetriesArchivedSnapshotAfterHydrateFetchFailed(t *testing
 // agg.Rehydrate (the same hydrate seam the reconnect loop at lifecycle.go
 // and POST /vh/reload drive) runs its own archived fetch while the tick's
 // is still in flight — and asserts the documented outcome on release.
+//
+// f3 hardening (review 81a0a8df F1/F2/F3): the original final assertions
+// could be satisfied by PRE-overlap state — the initial hydrate already set
+// lastArchivedRefresh, the archived snapshot, and sub's orphan flag, so a
+// skip-apply-under-overlap mutant was unobservable. Now a synthetic LIVE
+// child of the archived demo ("sub2") is injected into /session responses
+// only AFTER the initial hydrate completed: sub2 is state that hydrate
+// NEVER saw, so every sub2-derived assertion below can only be satisfied by
+// an apply that consumed post-arming responses. The fixture itself has no
+// second parent→child edge to archive (POST /session creates parentless
+// roots, which the e88f19e gate never flags), so the discrimination is
+// injected at this test's own /session wrapper — the fixture's real
+// archived list keeps flowing untouched. Attribution is exact, not
+// timing-based: ReconcileSessions never ADDS unknown ids (ghost-evict
+// only), so sub2 enters the store precisely at the rehydrate's
+// store.Hydrate, and is orphan-flagged precisely by an archived-snapshot
+// sweep — i.e. by one of the two overlap applies. The tick's own apply
+// (unawaited by RunManaged's Stop, which does not join runTreeReconcile)
+// gets a dedicated witness: the archived spacing is stretched to 1h BEFORE
+// the tick is released, so after release the only possible
+// lastArchivedRefresh writer is the parked tick's completing apply.
 func TestRehydrateArchivedRefreshOverlapIsBenign(t *testing.T) {
 	fx := fixtures.New()
 	fxHandler := fx.Handler()
@@ -367,6 +389,11 @@ func TestRehydrateArchivedRefreshOverlapIsBenign(t *testing.T) {
 	var mu sync.Mutex
 	armed := false
 	arrivals := 0 // archived arrivals while armed (the overlap-window count)
+	// shapeLive arms the f3 discriminator: while set, every LIVE /session
+	// response gets the synthetic sub2 row appended (see the live branch
+	// below). Armed only after the initial hydrate completed, so sub2 is
+	// post-arming state by construction.
+	shapeLive := false
 	holds := []chan struct{}{}
 	closeHolds := func(indices ...int) { // idempotent per slot
 		mu.Lock()
@@ -392,7 +419,50 @@ func TestRehydrateArchivedRefreshOverlapIsBenign(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/session", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("archived") != "true" {
-			fxHandler.ServeHTTP(w, r)
+			// f3-F1/F3 discriminator injection. The fixture has no second
+			// parent→child edge (POST /session mints parentless roots, and a
+			// root is never orphan-flagged — the e88f19e gate), so a second
+			// natively-archived session would change the archived list with
+			// NO observable store effect. Instead: while shapeLive is armed,
+			// append sub2 — a LIVE child of the (pre-start) archived demo —
+			// to the fixture's real live list. The initial hydrate never sees
+			// sub2 (shaping is armed only after waitForAnyHydrateCompleted),
+			// and the tick's own live path cannot introduce it
+			// (ReconcileSessions evicts ghosts, it never adds unknown ids),
+			// so sub2 enters the store exactly at the rehydrate's
+			// store.Hydrate — and is orphan-flagged exactly by an
+			// archived-snapshot sweep. That makes IsOrphanFlagged("sub2") a
+			// fully-attributed witness of an overlap APPLY, impossible to
+			// satisfy from pre-overlap state.
+			mu.Lock()
+			shape := shapeLive
+			mu.Unlock()
+			if !shape {
+				fxHandler.ServeHTTP(w, r)
+				return
+			}
+			rec := httptest.NewRecorder()
+			fxHandler.ServeHTTP(rec, r)
+			var rows []map[string]any
+			if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &rows) != nil {
+				http.Error(w, "fixture live list undecodable under shaping", http.StatusInternalServerError)
+				return
+			}
+			now := float64(time.Now().UnixMilli())
+			sub2 := map[string]any{
+				"id": "sub2", "projectID": "proj", "parentID": "demo",
+				"title": "Subagent: overlap discriminator",
+				"time":  map[string]any{"created": now - 100, "updated": now - 50},
+			}
+			if len(rows) > 0 {
+				sub2["directory"] = rows[0]["directory"]
+			}
+			rows = append(rows, sub2)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if err := json.NewEncoder(w).Encode(rows); err != nil {
+				return // client went away; nothing else to do
+			}
 			return
 		}
 		mu.Lock()
@@ -424,7 +494,7 @@ func TestRehydrateArchivedRefreshOverlapIsBenign(t *testing.T) {
 	agg := New(oc.URL, 100)
 	agg.treeReconcileInterval = 5 * time.Millisecond
 	agg.treeReconcileIdleInterval = 0
-	agg.archivedSnapshotInterval = time.Millisecond // every tick due → the tick refresh arrives promptly once armed
+	agg.archivedSnapshotInterval = time.Millisecond // every tick due → the tick refresh arrives promptly once armed (stretched to 1h later, before the tick's release, to isolate its apply as the only remaining refresher)
 	agg.statusReconcileInterval = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -449,6 +519,14 @@ func TestRehydrateArchivedRefreshOverlapIsBenign(t *testing.T) {
 	}
 	defer stop()
 
+	// f3 discriminator FIRST (between the initial hydrate and the hold-gate
+	// arming): from here on, live /session responses carry sub2 — state the
+	// initial hydrate never saw. Everything the overlap applies from this
+	// point is distinguishable from pre-overlap state.
+	mu.Lock()
+	shapeLive = true
+	mu.Unlock()
+
 	// Arm the hold, then wait for the next tick's refresh to park
 	// (interval=1ms ⇒ every tick is due; the single reconcile goroutine
 	// then blocks in the held fetch, so at most this one parks).
@@ -471,6 +549,15 @@ func TestRehydrateArchivedRefreshOverlapIsBenign(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+
+	// f3-F2 attribution baseline. The reconcile goroutine — the only
+	// periodic archived refresher — is parked inside the held tick fetch,
+	// and no other hydrate is running, so between now and the rehydrate's
+	// return the ONLY possible lastArchivedRefresh writer is the
+	// rehydrate's own apply. (A pre-arming tick fetch cannot still be in
+	// flight: the reconcile goroutine is serial — one archived fetch at a
+	// time — and it is the one now parked.)
+	tPre := agg.lastArchivedRefresh.Load()
 
 	// With the tick's refresh parked mid-flight, run a full hydrate
 	// (Rehydrate = the reconnect loop's hydrate seam): its own archived
@@ -499,8 +586,7 @@ func TestRehydrateArchivedRefreshOverlapIsBenign(t *testing.T) {
 	// its apply (store.RefreshArchivedSnapshot + lastArchivedRefresh) must
 	// complete while the tick's fetch is still parked mid-flight — then
 	// the tick's. The armed window closes here: later arrivals (the next
-	// tick's refresh after the tick's release, legitimately due at a 1ms
-	// interval) pass through uncounted.
+	// tick's refresh after the tick's release) pass through uncounted.
 	disarm()
 	closeHolds(1) // the rehydrate's fetch (arrival #2)
 	select {
@@ -518,7 +604,67 @@ func TestRehydrateArchivedRefreshOverlapIsBenign(t *testing.T) {
 		cancel()
 		t.Fatal("Rehydrate deadlocked against the parked tick refresh")
 	}
-	closeHolds(0)
+
+	// f3-F1/F2: Rehydrate returned nil — but nil only proves DISPATCH. A
+	// mutant that discards the apply when a refresh is concurrently in
+	// flight (the exact overlap condition here: the tick's fetch is still
+	// parked) would also return nil, and the OLD assertions could not tell.
+	// The attribution baseline tPre makes this discriminating: the parked
+	// reconcile goroutine cannot write, so a value strictly greater than
+	// tPre can ONLY be the rehydrate's own apply — and since
+	// lastArchivedRefresh is stored AFTER store.RefreshArchivedSnapshot,
+	// advancement proves the store apply ran, not just the fetch.
+	if got := agg.lastArchivedRefresh.Load(); got <= tPre {
+		closeHolds(0)
+		cancel()
+		t.Fatalf("Rehydrate returned nil but its archived-snapshot apply never landed (lastArchivedRefresh %d, not > pre-spawn %d) — an apply-discard under the overlap would look exactly like this", got, tPre)
+	}
+	// f3-F1/F3: the applied snapshot carried POST-arming state. sub2 was
+	// added to the store by this rehydrate's store.Hydrate (its live list
+	// was shaped), and its archived apply then swept the snapshot — so the
+	// sweep MUST have orphan-flagged sub2 (parent demo is in the archived
+	// set). No pre-overlap write can satisfy this: the initial hydrate
+	// never saw sub2, and the tick's live path cannot add it. This is the
+	// discriminating replacement for the old pre-overlap-satisfiable
+	// snapshot assertions.
+	if !agg.Store().IsOrphanFlagged("sub2") {
+		closeHolds(0)
+		cancel()
+		t.Fatalf("rehydrate nil'd and advanced lastArchivedRefresh, but sub2 is not orphan-flagged: the apply did not consume the post-arming responses (pre-overlap state would look exactly like this)")
+	}
+
+	// f3-F2: completion witness for the PARKED TICK's apply. tRh is the
+	// value the rehydrate's apply just wrote; the tick's fetch is STILL
+	// parked, so the witness starts definitionally false — it cannot pass
+	// vacuously. Stretch the archived spacing BEFORE the release: with a
+	// 1h interval no later tick can refresh the snapshot, so after the
+	// release the ONLY possible writer is the parked tick's own completing
+	// apply. (RunManaged's Stop does not join runTreeReconcile, which is
+	// why this apply needs its own witness at all.) The interval write is
+	// race-free: the reconcile goroutine is parked on the hold channel,
+	// and this write happens-before close(holds[0]) happens-before its
+	// receive happens-before its next archivedSnapshotDue read.
+	tRh := agg.lastArchivedRefresh.Load()
+	agg.archivedSnapshotInterval = time.Hour
+	closeHolds(0) // the tick's fetch (arrival #1) — its apply lands asynchronously
+	tickApplyEnd := time.Now().Add(5 * time.Second)
+	for agg.lastArchivedRefresh.Load() <= tRh {
+		if time.Now().After(tickApplyEnd) {
+			t.Errorf("the parked tick's archived apply never landed after release: lastArchivedRefresh %d never advanced past the rehydrate's %d — a tick-side apply discard would look exactly like this", agg.lastArchivedRefresh.Load(), tRh)
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// The tick's apply re-ran the sweep over the same post-arming state:
+	// sub2 stays flagged and its chain still terminates at the archived
+	// demo. (lastArchivedRefresh advanced ⟹ RefreshArchivedSnapshot ran
+	// first, so these are direct asserts — no poll needed.)
+	if !agg.Store().IsOrphanFlagged("sub2") {
+		t.Errorf("sub2 not orphan-flagged after the tick's apply: the tick-side snapshot rebuild dropped the post-arming state")
+	}
+	if !agg.Store().ChainTerminatesAtArchived("sub2") {
+		t.Errorf("sub2's parent chain should terminate at archived demo after the overlap applies")
+	}
 
 	// Exactly the documented pair: the parked tick refresh + the
 	// rehydrate's own fetch. No third archived arrival can squeeze into
@@ -530,9 +676,10 @@ func TestRehydrateArchivedRefreshOverlapIsBenign(t *testing.T) {
 	if gotArrivals != 2 {
 		t.Errorf("armed window saw %d archived arrivals, want exactly 2 (the tick's refresh + the rehydrate's fetch)", gotArrivals)
 	}
-	// The overlap applied: lastArchivedRefresh nonzero (the initial
-	// hydrate set it; the overlap's applies kept it set — zero here would
-	// mean the overlap CLEARED it, a corruption, not a benign overlap).
+	// The overlap applied: lastArchivedRefresh nonzero. Kept as the cheap
+	// corruption sentinel (zero would mean an overlap apply CLEARED it);
+	// the discriminating advancement proofs are the tPre/tRh witnesses
+	// above, which this is strictly weaker than.
 	if agg.lastArchivedRefresh.Load() == 0 {
 		t.Errorf("lastArchivedRefresh == 0 after the overlap: no successful archived refresh was applied")
 	}
