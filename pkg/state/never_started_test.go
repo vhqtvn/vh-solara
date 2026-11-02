@@ -192,6 +192,63 @@ func TestNeverStarted_TurnStoppingGuardSuppressesRefinement(t *testing.T) {
 	}
 }
 
+// TestNeverStarted_TurnStoppingGuardSuppressesOlderPageRefinement: the
+// TurnStopping suppression must also hold on the older-history adoption
+// surface (MergeOlderMessages — D9). An incident-shaped older row landing
+// while the session is TurnStopping may be our own abort's history settling,
+// so the refinement is suppressed there too: plain MessageAbortedError
+// terminal, info bytes verbatim, nothing retained for first-part revocation.
+// Follows the immediate-assert pattern above: no waiting out the settle
+// window — the guard is the transient turnState, not the timer.
+func TestNeverStarted_TurnStoppingGuardSuppressesOlderPageRefinement(t *testing.T) {
+	olderIncident := `{"id":"msg_old_incident","sessionID":"sess_ns","role":"assistant",` +
+		`"time":{"created":1790000000000,"completed":1790000000027},` +
+		`"error":{"name":"MessageAbortedError","data":{"message":"Aborted"}},` +
+		`"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}`
+	resident := `{"id":"msg_resident","sessionID":"sess_ns","role":"user",` +
+		`"time":{"created":1790000200000}}`
+
+	s := New(1024)
+	s.Apply(ev("session.created", `{"info":{"id":"sess_ns","title":"S"}}`))
+	s.SetSessionMessages("sess_ns", []MessageWithParts{{Info: []byte(resident)}})
+	s.Stop("sess_ns", "msg_resident") // → TurnStopping (settle timer armed)
+	s.MergeOlderMessages("sess_ns", []MessageWithParts{
+		{Info: []byte(olderIncident)}, // oldest-first, as the cursor returns
+	}, false)
+
+	_, te, info, _ := nsState(t, s, "sess_ns", "msg_old_incident")
+	if te != "MessageAbortedError" {
+		t.Fatalf("older page during TurnStopping: terminalError=%q, want MessageAbortedError (guard must suppress refinement)", te)
+	}
+	if !bytes.Equal(info, []byte(olderIncident)) {
+		t.Fatalf("older page during TurnStopping: info bytes rewritten despite guard:\n got %s", info)
+	}
+	s.mu.RLock()
+	rawLeft := s.messages["sess_ns"].byID["msg_old_incident"].neverStartedRaw
+	s.mu.RUnlock()
+	if len(rawLeft) != 0 {
+		t.Fatalf("older page during TurnStopping: neverStartedRaw retained (%s) — suppression must arm nothing", rawLeft)
+	}
+}
+
+// TestNeverStarted_TurnStoppingGuardSuppressesReconcileRefinement:
+// belt-only twin of the hydration surface — the guard is ONE shared check
+// (classifyNeverStartedLocked's TurnStopping branch), so this pins the
+// reconcileMessagesLocked caller's wiring, not a separate behavior.
+func TestNeverStarted_TurnStoppingGuardSuppressesReconcileRefinement(t *testing.T) {
+	s := New(100)
+	s.Stop("sess_ns", "msg_incident") // → TurnStopping (settle timer armed)
+	s.SetSessionMessages("sess_ns", []MessageWithParts{{Info: json.RawMessage(incidentInfo)}})
+
+	_, te, info, _ := nsState(t, s, "sess_ns", "msg_incident")
+	if te != "MessageAbortedError" {
+		t.Fatalf("reconcile during TurnStopping: terminalError=%q, want MessageAbortedError (guard must suppress refinement)", te)
+	}
+	if !bytes.Equal(info, []byte(incidentInfo)) {
+		t.Fatalf("reconcile during TurnStopping: info bytes rewritten despite guard:\n got %s", info)
+	}
+}
+
 // TestNeverStarted_PartOnlyRevocation (commit-review C-F1 regression): a part
 // arriving AFTER the terminal message.updated — with NO further body adoption
 // — must itself revoke the refinement. The raw pre-refinement body is
@@ -407,7 +464,7 @@ func TestNeverStarted_HydrationRefines(t *testing.T) {
 
 	_, te, info, _ := nsState(t, s, "sess_ns", "msg_incident")
 	if te != NeverStartedErrorName {
-		t.Fatalf("hydration: terminalError=%q, want %q (both surfaces must agree)", te, NeverStartedErrorName)
+		t.Fatalf("hydration: terminalError=%q, want %q (reconcile refines the same incident shape as the live surface)", te, NeverStartedErrorName)
 	}
 	if !bytes.Contains(info, []byte(`"`+NeverStartedErrorName+`"`)) {
 		t.Fatalf("hydration: refined info bytes missing %q:\n%s", NeverStartedErrorName, info)
