@@ -43,7 +43,7 @@ package web
 // red-first by neutering neverStartedMaxDurationMs (see slice closeout).
 //
 // Determinism (commit-review b-F1/c-F1): both tests HOLD the fake's
-// /session/s1/message GET (nsWireHoldMessages) across the snapshot read, so
+// /session/s1/message GET (holdColdGet) across the snapshot read, so
 // the two adoption surfaces are exercised in isolation — the snapshot test's
 // rows provably come from the LIVE surface (the hydration fetch cannot have
 // reconciled yet), and the batch test provably delivers the hydration
@@ -56,7 +56,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
-	"sync"
 	"testing"
 	"time"
 
@@ -107,24 +106,6 @@ func nsWireApplyLive(t *testing.T, apply func(typ, props string)) {
 	t.Helper()
 	for _, info := range []string{nsWireU1Info, nsWireCtrlInfo, nsWireU2Info, nsWireNSInfo} {
 		apply("message.updated", `{"info":`+info+`}`)
-	}
-}
-
-// nsWireHoldMessages holds the fake's /session/s1/message GET (race-safe
-// post-start registration under holdMu — the handler reads the map under the
-// same mutex) and returns an idempotent release func. Holding the GET makes
-// the cold-delivery posture deterministic: no async fetch can reconcile the
-// store's message rows while the hold is up, so whichever adoption surface the
-// test drives is exercised in isolation.
-func nsWireHoldMessages(t *testing.T, fake *fakeOpenCode) (release func()) {
-	t.Helper()
-	hold := make(chan struct{})
-	fake.holdMu.Lock()
-	fake.msgHold["s1"] = hold
-	fake.holdMu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() { close(hold) })
 	}
 }
 
@@ -249,8 +230,7 @@ func TestStreamNeverStarted_ColdSnapshotCarriesRefinedError(t *testing.T) {
 	// trailing async cold-load re-serves identical shapes instead of an empty
 	// list — keeps the post-snapshot tail quiescent.
 	fake.setMessage("s1", nsWireFakeBody)
-	release := nsWireHoldMessages(t, fake)
-	t.Cleanup(release)
+	release := holdColdGet(t, fake, "s1")
 
 	reader, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, 3*time.Second)
 	data := nsWireReadUntil(t, reader, "snapshot")
@@ -287,8 +267,7 @@ func TestStreamNeverStarted_ColdBatchCarriesRefinedError(t *testing.T) {
 
 	seedSession(t, srv, fake, "s1")
 	fake.setMessage("s1", nsWireFakeBody) // no live store seeding — cold fetch only
-	release := nsWireHoldMessages(t, fake)
-	t.Cleanup(release)
+	release := holdColdGet(t, fake, "s1")
 
 	reader, _ := openSessionStreamReq(t, web.URL, "s1", 0, false, 3*time.Second)
 
