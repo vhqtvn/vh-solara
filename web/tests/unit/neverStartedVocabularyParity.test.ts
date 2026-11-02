@@ -51,13 +51,44 @@ const USER_MESSAGE =
 // Declared FE-only literal (see header): the MessageRow tooltip phrasing.
 const FE_ONLY_TITLE = "OpenCode aborted this turn before it started — not your stop.";
 
-/** Sub-window of `src` starting at `marker` — scopes fixture assertions to
- *  the mirror under guard so a second quoted-name occurrence elsewhere in
- *  the file cannot mask a fixture-name drift. */
-function scoped(src: string, marker: string, len = 600): string {
-  const i = src.indexOf(marker);
-  if (i < 0) throw new Error(`parity guard: marker not found: ${marker}`);
-  return src.slice(i, i + len);
+/** Sub-window of `src` from `marker` through the STRUCTURALLY matching close
+ *  brace of the first block opened at/after the marker — scopes fixture
+ *  assertions to the mirror under guard so a second quoted-name occurrence
+ *  elsewhere in the file cannot mask a fixture-name drift. Bounds are
+ *  structural, not a fixed byte length: formatting changes inside the fixture
+ *  (extra line wraps, spacing, reordering) cannot false-break the window, and
+ *  a missing/unbalanced block throws (fail-closed) instead of passing
+ *  vacuously. The brace scanner skips string/template literals (honoring
+ *  escapes) and line comments so quoted or commented braces never move the
+ *  depth. Not parsed — and absent from the two scanned windows (the source
+ *  FILES are not so guaranteed; messageMeta.test.ts carries a regex literal
+ *  outside its window): regex literals, block comments, and ${…} template
+ *  interpolation. */
+function scoped(src: string, marker: string): string {
+  const start = src.indexOf(marker);
+  if (start < 0) throw new Error(`parity guard: marker not found: ${marker}`);
+  const open = src.indexOf("{", start);
+  if (open < 0) throw new Error(`parity guard: no block opens after marker: ${marker}`);
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    const c = src[i];
+    if (c === '"' || c === "'" || c === "`") {
+      for (i++; i < src.length && src[i] !== c; i++) {
+        if (src[i] === "\\") i++; // skip the escaped char
+      }
+      continue;
+    }
+    if (c === "/" && src[i + 1] === "/") {
+      while (i < src.length && src[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return src.slice(start, i + 1);
+    }
+  }
+  throw new Error(`parity guard: unbalanced block after marker: ${marker}`);
 }
 
 describe("never-started vocabulary parity (Go canonical ↔ FE fallback ↔ test mirrors)", () => {
@@ -73,19 +104,21 @@ describe("never-started vocabulary parity (Go canonical ↔ FE fallback ↔ test
   });
 
   it("messageMeta.test.ts fixtures mirror the canonical pair", () => {
-    // Scoped to the `refined` initializer (the mirror under guard); the file
-    // also quotes the bare name in its fallback-path case, which is NOT a
-    // mirror and must not mask a fixture drift.
+    // Scoped to the `refined` initializer — marker through its matching
+    // close brace (the mirror under guard); the file also quotes the bare
+    // name in its fallback-path case, which is NOT a mirror and must not
+    // mask a fixture drift.
     const fixture = scoped(testMessageMeta, "const refined = {");
     expect(fixture).toContain(`name: "${ERROR_NAME}"`);
     expect(fixture).toContain(`"${USER_MESSAGE}"`);
   });
 
   it("ChatViewNeverStarted.test.tsx fixtures mirror the canonical pair", () => {
-    // Name scoped to the mkNeverStarted factory (the file's other quoted
-    // name is not a mirror); the message is pinned at the
-    // GO_NEVER_STARTED_MESSAGE constant definition — the only place the
-    // literal appears — which the factory feeds into data.message.
+    // Name scoped to the mkNeverStarted factory — marker through its
+    // matching close brace (the file's other quoted name is not a mirror);
+    // the message is pinned at the GO_NEVER_STARTED_MESSAGE constant
+    // definition — the only place the literal appears — which the factory
+    // feeds into data.message.
     const factory = scoped(testChatView, "const mkNeverStarted");
     expect(factory).toContain(`name: "${ERROR_NAME}"`);
     expect(testChatView).toContain(`"${USER_MESSAGE}"`);
