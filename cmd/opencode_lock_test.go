@@ -344,6 +344,12 @@ func (sc *ocLockScenario) waitReport(name string, d time.Duration) ocStarterRepo
 // made the post-kill orphan assertions race pid-1 reap latency — the
 // 2026-09-27 CI racehammer flake ("cleanup left 1 children" + the sweep's
 // "failed cmdline identity revalidation" for the same pid).
+//
+// DELIBERATELY state-only (no cmdline identity check): this is the sweep's
+// CANDIDATE POOL, and TestOCSweepNeverSignalsRejectedPids proves
+// discrimination at signal time — a live innocent recorded under the
+// suffix must COUNT here and be spared by the sweep's own revalidation.
+// Assertions that mean "still OUR process" use aliveMatchingPids.
 func (sc *ocLockScenario) alivePids(suffix string) []int {
 	ents, _ := os.ReadDir(sc.pidsDir)
 	var pids []int
@@ -352,6 +358,39 @@ func (sc *ocLockScenario) alivePids(suffix string) []int {
 			continue
 		}
 		if pid, err := strconv.Atoi(strings.TrimSuffix(e.Name(), suffix)); err == nil && ocProcessRunning(pid) {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+// aliveMatchingPids filters alivePids' candidate pool down to pids that
+// still carry the suffix's process identity (/proc cmdline). Two shapes
+// leave a recorded pid that is no longer the recorded process, both
+// state-only "running":
+//
+//   - MID-EXIT window (the 2026-11-02 CI racehammer flake, "cleanup left 1
+//     children" + the sweep's revalidation failure for the same pid): a
+//     SIGKILLed fake releases its flock the moment exit_files() runs — so
+//     waitOwnerFree returns — but the task's /proc state only becomes 'Z'
+//     at the END of do_exit, and its cmdline reads back EMPTY from
+//     exit_mm() on. Between the two, state is still R/S: state-only
+//     counting sees a "running" child that is provably exiting. The
+//     2026-09-27 fix closed the post-exit Z shape; the empty-cmdline
+//     fingerprint closes this pre-Z shape too.
+//   - PID RECYCLING: a reaped pid reissued to an unrelated process counts
+//     as a live leftover child under state-only counting.
+//
+// A genuine live fake/gchild always matches (the pid file is written by
+// the fake itself, after exec, with the signature cmdline in place).
+func (sc *ocLockScenario) aliveMatchingPids(suffix string) []int {
+	stillOurs := ocSweepIsFakeOC
+	if suffix == ".gchild" {
+		stillOurs = ocSweepIsGrandchild
+	}
+	var pids []int
+	for _, pid := range sc.alivePids(suffix) {
+		if stillOurs(pid) {
 			pids = append(pids, pid)
 		}
 	}
@@ -715,20 +754,46 @@ func TestOCSpawnRacehammer(t *testing.T) {
 	sc := newOCLockScenario(t)
 	const reps = 10
 	for i := 0; i < reps; i++ {
-		a := sc.startStarter(fmt.Sprintf("A%d", i), map[string]string{"VH_FAKE_OC_NOLISTEN": "1"}, false)
-		fakes := sc.waitAliveCount(".fake", 1, 10*time.Second)
+		name := fmt.Sprintf("A%d", i)
+		a := sc.startStarter(name, map[string]string{"VH_FAKE_OC_NOLISTEN": "1"}, false)
+		// A green rep NEVER produces the starter's report (the starter
+		// blocks in readiness until we crash it); its existence — or the
+		// starter dying — while no fake is up is failure evidence worth
+		// surfacing immediately instead of burning the 10s budget blind.
+		// Accounting is identity-matched (aliveMatchingPids): a stale pid
+		// from a previous rep — mid-exit (cmdline gone, state not yet Z)
+		// or recycled into a foreign process — must never satisfy this
+		// wait, count as a child, or survive the cleanup check.
+		var fakes []int
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			fakes = sc.aliveMatchingPids(".fake")
+			if len(fakes) == 1 {
+				break
+			}
+			if b, err := os.ReadFile(sc.resultPath(name)); err == nil {
+				t.Fatalf("rep %d: starter ended without a live fake; report: %s", i, b)
+			}
+			if !ocProcessRunning(a.Process.Pid) {
+				t.Fatalf("rep %d: starter died before spawning a fake (no report)", i)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("rep %d: wanted 1 alive %q processes, got %d (%v)", i, ".fake", len(fakes), fakes)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
 		_ = a.Process.Kill() // crash mid-window
 		_ = a.Wait()
 		b := EnsureDetachedOpenCode(sc.bin, sc.dir)
 		if b.Verdict != DetachedStartOrphanedOwner {
 			t.Fatalf("rep %d: B verdict=%v (%s), want orphaned-owner", i, b.Verdict, b.Reason)
 		}
-		if got := len(sc.alivePids(".fake")); got != 1 {
+		if got := len(sc.aliveMatchingPids(".fake")); got != 1 {
 			t.Fatalf("rep %d: DOUBLE-SPAWN — %d children alive after B", i, got)
 		}
 		killPid9(fakes[0])
 		sc.waitOwnerFree(5 * time.Second)
-		if got := len(sc.alivePids(".fake")); got != 0 {
+		if got := len(sc.aliveMatchingPids(".fake")); got != 0 {
 			t.Fatalf("rep %d: cleanup left %d children", i, got)
 		}
 	}
