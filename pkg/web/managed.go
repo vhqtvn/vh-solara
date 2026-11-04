@@ -725,14 +725,6 @@ func (s *Server) handleProjectSettingsWatch(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	h.Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, ": ok\n\n")
-	flusher.Flush()
-
 	// fileSnap captures the existence/mtime/size of ONE file. A missing file is
 	// a stable zero-state (a never-created preferences.local.jsonc must not fire),
 	// so the watch tolerates the overlay's absence without error.
@@ -754,7 +746,23 @@ func (s *Server) handleProjectSettingsWatch(w http.ResponseWriter, r *http.Reque
 	read := func() [2]fileSnap {
 		return [2]fileSnap{statOne(cfgPath), statOne(prefPath)}
 	}
+	// Sample the baseline BEFORE the ": ok" readiness signal is flushed. Clients
+	// (and the watch tests) treat ": ok" as "baseline established — changes made
+	// after this point will be reported". If the baseline were sampled after the
+	// flush, an edit landing in the flush→snapshot gap — a real risk when the
+	// handler goroutine is descheduled under parallel-load test runs — would be
+	// swallowed by the baseline itself and "changed" would NEVER fire, no matter
+	// how long the client waits. Sampling first makes ": ok" a true fence: any
+	// change after it differs from `last` by construction.
 	last := read()
+
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, ": ok\n\n")
+	flusher.Flush()
 
 	poll := time.NewTicker(1200 * time.Millisecond)
 	defer poll.Stop()
