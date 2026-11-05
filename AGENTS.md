@@ -684,8 +684,9 @@ is **no pytest** anywhere in this repo.
 
 ### The ten lanes
 
-1. **Go co-located unit** — `pkg/*/*_test.go` beside the source under test.
-   Runner: `go test ./pkg/<pkg>/` (whole tree: `go test ./pkg/...`).
+1. **Go co-located unit** — `pkg/*/*_test.go` beside the source under test;
+   `cmd/` carries co-located client-daemon/local-server tests.
+   Runner: `go test ./pkg/<pkg>/` (whole tree: `go test ./pkg/... ./cmd/`).
 
 2. **Go integration** — `tests/integration/` (e.g. `opencode_lifecycle_test.go`).
    Runner: `go test ./tests/integration/`.
@@ -804,7 +805,7 @@ Execution examples:
 
 ```bash
 # Go co-located unit (whole tree):
-vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go test ./pkg/...'
+vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go test ./pkg/... ./cmd/'
 # Go integration:
 vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go test ./tests/integration/'
 # Go in-process e2e:

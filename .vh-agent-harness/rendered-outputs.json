@@ -42,7 +42,7 @@
       "producer_kind": "overlay_skill",
       "overlay_pack": "push-safety",
       "source_relative_path": "skills/push-safety/SKILL.md",
-      "rendered_digest": "sha256:04085584964d998eafaf48876d4d44471ba3a45eef074de0bf1b4348cd0fbe20"
+      "rendered_digest": "sha256:53c18df34d4faf4d3ea04984a9078e87a962885521dea532881b9390df8acb57"
     },
     {
       "destination_path": ".opencode/skills/resolve-first/SKILL.md",
