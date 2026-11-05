@@ -129,15 +129,19 @@ six. Checks run sequentially, fail-fast:
 1. `make fmt-check` (go-fmt — bare `gofmt -l` always exits 0; fmt-check
    fails on non-empty OUTPUT),
 2. `make vet`,
-3. `make test-unit` (`go test ./pkg/...`),
+3. `make test-unit` (`go test ./pkg/... ./cmd/`),
 4. `make typecheck` (web),
 5. `npm --prefix web run test:unit`,
 6. `make typecheck-host-web`.
 
 **Deliberate omissions** (CI remains authoritative): no web build, no
-placeholder-guard, no e2e/browser lanes, no host-web tests. Fast tier is a
-strict subset of CI; a green fast tier means "no known local red", not "CI
-will be green".
+placeholder-guard, no e2e/browser lanes, no host-web tests. The go tier's
+`make test-unit` covers `go test ./pkg/... ./cmd/`; `tests/integration` and
+`tests/e2e` stay CI-only — the flakiest lanes don't belong in a hard
+push-blocker. Fast tier is a strict subset of CI; a green fast tier means
+"no known local red", not "CI will be green" — a CI-contention flake that
+passes locally is invisible to any local gate (2026-11-02:
+`TestOCSpawnRacehammer` passed locally 3×, red in CI 2×).
 
 ## Receipts and hygiene
 

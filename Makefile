@@ -73,8 +73,8 @@ install-local: build ## Build vh-solara and atomically install it over the exist
 test: ## Run all Go tests (mirrors CI's `go test ./...`)
 	go test ./...
 
-test-unit: ## Run Go co-located unit tests (fast lane: ./pkg/...)
-	go test ./pkg/...
+test-unit: ## Run Go co-located unit tests (fast lane: ./pkg/... + ./cmd/)
+	go test ./pkg/... ./cmd/
 
 test-web: ## Run web unit tests + fixture-backed Playwright e2e (needs Node >= 24)
 	cd web && npm run test:unit && npm run test:e2e

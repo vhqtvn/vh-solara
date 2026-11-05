@@ -6,11 +6,13 @@ compatibility: opencode
 
 # Push safety — the one push verb
 
-Three mechanical layers keep CI green: the local changeset-aware gate
-(`scripts/prepush-check.sh`), the checked-push wrapper
-(`scripts/push-checked.sh`, Phase 2), and the CI changes-gate
-(path-filtered lanes + `ci-summary`, Phase 4). This skill is only about
-routing pushes onto that stack — it changes no enforcement logic.
+Three mechanical layers catch local reds in the diff's lane at push time:
+the local changeset-aware gate (`scripts/prepush-check.sh`), the
+checked-push wrapper (`scripts/push-checked.sh`, Phase 2), and the CI
+changes-gate (path-filtered lanes + `ci-summary`, Phase 4). They do not by
+themselves keep CI green — CI remains the only full-universe,
+contention-load gate. This skill is only about routing pushes onto that
+stack — it changes no enforcement logic.
 
 ## The one verb
 
