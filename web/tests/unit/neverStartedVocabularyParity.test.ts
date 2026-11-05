@@ -135,3 +135,69 @@ describe("never-started vocabulary parity (Go canonical ↔ FE fallback ↔ test
     expect(feMessageRow).toContain(`"${FE_ONLY_TITLE}"`);
   });
 });
+
+describe("scoped() window extraction (self-test)", () => {
+  // Committed stand-in for the run-once mutation evidence recorded in a4a2ff9:
+  // these synthetic-string cases (no file reads, no mutation) pin the
+  // scanner's contract so a future edit that loosens any property fails HERE
+  // instead of silently widening/narrowing the parity windows above.
+  // Deliberately NOT pinned: regex literals, block comments, and ${…}
+  // interpolation — the scanner's doc above declares them absent; pinning
+  // them would pin non-behavior.
+
+  it("(a) padding-resistance: window spans whitespace/comment padding to the structural close", () => {
+    const src = [
+      "const before = 0;",
+      "const target = {", // marker + first block open
+      "  name: 1,",
+      "", // whitespace padding
+      "  // comment padding",
+      "  mid: 2,", // literal far from the marker, deep in the block
+      "",
+      "  tail: 3,",
+      "};",
+      "const after = 9;",
+    ].join("\n");
+    const win = scoped(src, "const target = {");
+    expect(win.startsWith("const target = {")).toBe(true); // starts at the marker
+    expect(win).toContain("tail: 3"); // reaches the far literal…
+    expect(win.endsWith("}")).toBe(true); // …through the structural close (inclusive brace, exclusive what follows)
+    expect(win).not.toContain("const after"); // and stops there
+  });
+
+  it("(b) anti-masking: a bare target literal AFTER the block's close is not in the window", () => {
+    const src = [
+      "const fixture = {",
+      '  name: "INSIDE",',
+      "};",
+      'const elsewhere = { name: "MASKER" };', // same-shaped literal OUTSIDE — must not mask
+    ].join("\n");
+    const win = scoped(src, "const fixture = {");
+    expect(win).toContain("INSIDE");
+    expect(win).not.toContain("MASKER"); // window ends at the block close: later content can't satisfy assertions
+  });
+
+  it("(c) throws on all three fail-closed paths", () => {
+    // Missing marker.
+    expect(() => scoped("const a = { ok: 1 };\n", "no such marker")).toThrow("marker not found");
+    // Marker present, but no block opens after it.
+    expect(() => scoped("const target = 1;", "const target")).toThrow("no block opens after marker");
+    // Block opens but never closes.
+    expect(() => scoped("const target = { a: 1,", "const target")).toThrow("unbalanced block");
+  });
+
+  it("(d) lexical skipping: a '}' inside a string and a '// {' comment do not move depth", () => {
+    const src = [
+      "const target = {", // marker + real open (depth 1)
+      '  s1: "escaped \\"q\\" then } stays inside",', // '}' in a string (escape honored) — not a close
+      "  // comment with an open { that is not a brace", // '{' in a line comment — not an open
+      "  afterBoth: 2,", // survives both fake braces: depth still 1
+      "};", // the REAL depth-0 close
+      'const after = "SENTINEL_AFTER_CLOSE";',
+    ].join("\n");
+    const win = scoped(src, "const target = {");
+    expect(win).toContain("afterBoth: 2"); // the string '}' did not close the block early
+    expect(win.endsWith("}")).toBe(true); // the comment '{' did not add depth — closes at the real depth-0 brace
+    expect(win).not.toContain("SENTINEL_AFTER_CLOSE"); // closed at the real depth-0 brace
+  });
+});
