@@ -189,7 +189,12 @@ describe("scoped() window extraction (self-test)", () => {
   it("(d) lexical skipping: a '}' inside a string and a '// {' comment do not move depth", () => {
     const src = [
       "const target = {", // marker + real open (depth 1)
-      '  s1: "escaped \\"q\\" then } stays inside",', // '}' in a string (escape honored) — not a close
+      // ONE escaped quote before the fake '}': with escape-skip removed the
+      // scanner exits the string at the \", the '}' counts as a close, and
+      // the window truncates before afterBoth (mutation-sensitive — two
+      // escaped quotes would hide the '}' in a phantom second string either
+      // way, commit-review F1 on 70c08df).
+      '  s1: "escaped \\" then } stays inside",', // '}' in a string (escape honored) — not a close
       "  // comment with an open { that is not a brace", // '{' in a line comment — not an open
       "  afterBoth: 2,", // survives both fake braces: depth still 1
       "};", // the REAL depth-0 close
