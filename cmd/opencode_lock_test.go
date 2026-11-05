@@ -753,34 +753,67 @@ func TestOCSpawnGrandchildRetainsOwner(t *testing.T) {
 func TestOCSpawnRacehammer(t *testing.T) {
 	sc := newOCLockScenario(t)
 	const reps = 10
+	// Rep-boundary retries (2026-11-05 gate-run red on tree 1037e38): a
+	// fresh starter transiently observed the owner lock HELD — verdict
+	// orphaned-owner, its /proc fd scan finding NO holders — after the
+	// previous rep's teardown had passed EVERY test-side probe
+	// (waitOwnerFree + identity-matched zero count). The holder is
+	// invisible to the test process (kernel-deferred file release of the
+	// dying fake's fd 3, or an equally transient flocker), so no
+	// test-side wait can close the window — the 2026-09-27/2026-11-02
+	// fixes closed the state/cmdline shapes, not this flock-visibility
+	// shape. The starter's refusal is CORRECT conservative product
+	// behavior (never spawn beside maybe-live work) and must be
+	// accommodated by the test, not the product: retry the rep, bounded,
+	// when a fresh starter reports orphaned-owner with no fake spawned.
+	// Any other verdict (or persistence past the bound) still fails with
+	// the report retained — the evidence path survives. contended from a
+	// deferred SPAWN-lock release is the mechanically analogous sibling
+	// shape; it is unobserved to date and stays a hard fail.
+	const repAttempts = 3
 	for i := 0; i < reps; i++ {
-		name := fmt.Sprintf("A%d", i)
-		a := sc.startStarter(name, map[string]string{"VH_FAKE_OC_NOLISTEN": "1"}, false)
-		// A green rep NEVER produces the starter's report (the starter
-		// blocks in readiness until we crash it); its existence — or the
-		// starter dying — while no fake is up is failure evidence worth
-		// surfacing immediately instead of burning the 10s budget blind.
-		// Accounting is identity-matched (aliveMatchingPids): a stale pid
-		// from a previous rep — mid-exit (cmdline gone, state not yet Z)
-		// or recycled into a foreign process — must never satisfy this
-		// wait, count as a child, or survive the cleanup check.
-		var fakes []int
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			fakes = sc.aliveMatchingPids(".fake")
+		var (
+			a     *exec.Cmd
+			fakes []int
+		)
+		for try := 1; ; try++ {
+			name := fmt.Sprintf("A%d.%d", i, try)
+			a = sc.startStarter(name, map[string]string{"VH_FAKE_OC_NOLISTEN": "1"}, false)
+			// A green attempt NEVER produces the starter's report (the
+			// starter blocks in readiness until we crash it); its
+			// existence — or the starter dying — while no fake is up is
+			// failure evidence worth surfacing immediately instead of
+			// burning the 10s budget blind. Accounting is
+			// identity-matched (aliveMatchingPids): a stale pid from a
+			// previous rep — mid-exit (cmdline gone, state not yet Z) or
+			// recycled into a foreign process — must never satisfy this
+			// wait, count as a child, or survive the cleanup check.
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				fakes = sc.aliveMatchingPids(".fake")
+				if len(fakes) == 1 {
+					break
+				}
+				if b, err := os.ReadFile(sc.resultPath(name)); err == nil {
+					var rep ocStarterReport
+					if json.Unmarshal(b, &rep) == nil && rep.Verdict == "orphaned-owner" && try < repAttempts {
+						t.Logf("rep %d try %d: transient orphaned-owner at the rep boundary (previous rep's dying fake still holds lock visibility); retrying — report: %s", i, try, b)
+						time.Sleep(100 * time.Millisecond)
+						break // next try
+					}
+					t.Fatalf("rep %d try %d: starter ended without a live fake; report: %s", i, try, b)
+				}
+				if !ocProcessRunning(a.Process.Pid) {
+					t.Fatalf("rep %d try %d: starter died before spawning a fake (no report)", i, try)
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("rep %d try %d: wanted 1 alive %q processes, got %d (%v)", i, try, ".fake", len(fakes), fakes)
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
 			if len(fakes) == 1 {
-				break
+				break // attempt succeeded: fake is up
 			}
-			if b, err := os.ReadFile(sc.resultPath(name)); err == nil {
-				t.Fatalf("rep %d: starter ended without a live fake; report: %s", i, b)
-			}
-			if !ocProcessRunning(a.Process.Pid) {
-				t.Fatalf("rep %d: starter died before spawning a fake (no report)", i)
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("rep %d: wanted 1 alive %q processes, got %d (%v)", i, ".fake", len(fakes), fakes)
-			}
-			time.Sleep(20 * time.Millisecond)
 		}
 		_ = a.Process.Kill() // crash mid-window
 		_ = a.Wait()
