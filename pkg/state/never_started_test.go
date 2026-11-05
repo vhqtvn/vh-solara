@@ -247,6 +247,18 @@ func TestNeverStarted_TurnStoppingGuardSuppressesReconcileRefinement(t *testing.
 	if !bytes.Equal(info, []byte(incidentInfo)) {
 		t.Fatalf("reconcile during TurnStopping: info bytes rewritten despite guard:\n got %s", info)
 	}
+	// Belt line mirroring the older-page primary's rawLeft check above: the
+	// suppressed reconcile must leave nothing retained for revocation. This
+	// pins the terminal↔retain else-arm coupling (hydration.go: neverStart
+	// false ⇒ terminalError = the upstream name AND neverStartedRaw = nil in
+	// the same else arm), not new behavior — inert-by-construction today
+	// (nothing arms the retain on this path), refactor insurance.
+	s.mu.RLock()
+	rawLeft := s.messages["sess_ns"].byID["msg_incident"].neverStartedRaw
+	s.mu.RUnlock()
+	if len(rawLeft) != 0 {
+		t.Fatalf("reconcile during TurnStopping: neverStartedRaw retained (%s) — suppression must arm nothing", rawLeft)
+	}
 }
 
 // TestNeverStarted_PartOnlyRevocation (commit-review C-F1 regression): a part
