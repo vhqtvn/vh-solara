@@ -34,9 +34,18 @@ import (
 //     place) and the filter-in-place idiom append(me.info[:0], …) — the
 //     first-argument reference check is deliberately "anywhere in the first
 //     argument", not "exactly the field", so both are caught.
-//   - index writes me.info[i] = … / me.neverStartedRaw[i] = …
+//   - index writes me.info[i] = … / me.neverStartedRaw[i] = … — the assign
+//     TOKEN is deliberately not filtered, so compound index assigns
+//     (me.info[i] += …, ^=, <<=, &^=, …) are caught by the same branch.
+//   - me.info[i]++ / me.neverStartedRaw[i]-- (IncDecStmt on an index
+//     expression of a guarded field) — mutates one element in place.
 //   - copy(me.info, …) / copy(me.neverStartedRaw, …) — copy writes its
 //     FIRST argument in place.
+//   - clear(me.info) / clear(me.neverStartedRaw) / clear of any index or
+//     slice expression over either field — the builtin zeroes the backing
+//     array in place. Matched by identifier name like append/copy, so a
+//     hypothetical package-local function spelled `clear` would also be
+//     flagged; acceptable for a convention guard (none exists here).
 //
 // Accepted shapes (asserted on synthetic sources by the companion
 // TestMessageInfoReplaceOnlyConventionSynthetic, so the guard is provably
@@ -115,6 +124,9 @@ func forbiddenShapes(me *messageEntry, b, src []byte, i int) {
 	me.info = append(me.info[:0], src...)  // filter-in-place idiom (first arg references the field)
 	me.info[i] = b[0]                      // index write
 	copy(me.info, src)                     // copy destination write
+	clear(me.info)                         // builtin clear zeroes the backing array in place
+	me.info[i]++                           // in-place increment (IncDecStmt)
+	me.neverStartedRaw[i]--                // in-place decrement (IncDecStmt, other guarded field)
 	_ = i
 }
 `
@@ -133,16 +145,19 @@ func forbiddenShapes(me *messageEntry, b, src []byte, i int) {
 		t.Fatalf("parse synthetic forbidden source: %v", err)
 	}
 	vs := entryReplaceOnlyViolations(fset, forbidden)
-	if len(vs) != 5 {
-		t.Fatalf("forbidden shapes must produce exactly 5 violations (one per shape), got %d:\n%s", len(vs), strings.Join(vs, "\n"))
+	if len(vs) != 8 {
+		t.Fatalf("forbidden shapes must produce exactly 8 violations (one per shape), got %d:\n%s", len(vs), strings.Join(vs, "\n"))
 	}
 	joined := strings.Join(vs, "\n")
 	for _, want := range []string{
-		"append(me.info",            // self-assign append
-		"append(me.neverStartedRaw", // bare append
-		"append(me.info",            // filter-in-place (first-arg reference)
-		"index write to me.info",    // index write
-		"copy(me.info",              // copy destination
+		"append(me.info",                 // self-assign append
+		"append(me.neverStartedRaw",      // bare append
+		"append(me.info",                 // filter-in-place (first-arg reference)
+		"index write to me.info",         // index write
+		"copy(me.info",                   // copy destination
+		"clear(me.info",                  // builtin clear
+		"++ write to me.info",            // in-place increment
+		"-- write to me.neverStartedRaw", // in-place decrement (both fields pinned)
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("violation output missing expected shape %q:\n%s", want, joined)
@@ -163,7 +178,10 @@ func entryReplaceOnlyViolations(fset *token.FileSet, f *ast.File) []string {
 		}
 		fnName := fn.Name.Name
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			// Index writes: me.info[i] = … / me.neverStartedRaw[i] = …
+			// Index writes: me.info[i] = … / me.neverStartedRaw[i] = ….
+			// The assign TOKEN is deliberately not filtered, so compound
+			// index assigns (me.info[i] += …, ^=, <<=, &^=, …) are caught
+			// by the same branch as plain =.
 			if as, ok := n.(*ast.AssignStmt); ok {
 				for _, lhs := range as.Lhs {
 					if _, isIndex := lhs.(*ast.IndexExpr); !isIndex {
@@ -175,18 +193,34 @@ func entryReplaceOnlyViolations(fset *token.FileSet, f *ast.File) []string {
 					}
 				}
 			}
-			// append(me.<field>, …) with the field as the first argument —
-			// the self-assign AND bare-call AND filter-in-place forms all
-			// write the existing backing array; copy(me.<field>, …) writes
-			// its destination in place.
+			// me.info[i]++ / me.neverStartedRaw[i]-- — IncDecStmt on an
+			// index expression of a guarded field mutates one element in
+			// place; the token (INC/DEC) is not filtered either.
+			if ids, ok := n.(*ast.IncDecStmt); ok {
+				if _, isIndex := ids.X.(*ast.IndexExpr); isIndex {
+					if field, found := refsEntryByteSlice(ids.X); found {
+						pos := fset.Position(ids.Pos())
+						out = append(out, fmt.Sprintf("%s: %s write to me.%s in %q — in-place inc/dec on a guarded field; replace-only convention (store.go, neverStartedRaw aliasing) requires whole-slice assignment", pos, ids.Tok, field, fnName))
+					}
+				}
+			}
+			// append(me.<field>, …) / copy(me.<field>, …) /
+			// clear(me.<field>) — all three write the existing backing
+			// array in place (append extends it, copy overwrites its
+			// destination, the clear builtin zeroes it). The first
+			// argument is checked with the same deep contains-scan, so
+			// ANY first-argument form referencing the field — bare
+			// me.info, me.info[:0], me.info[i:j], … — is caught, which is
+			// what flags the self-assign append, the bare call, and the
+			// filter-in-place idiom alike.
 			if ce, ok := n.(*ast.CallExpr); ok {
 				id, ok := ce.Fun.(*ast.Ident)
-				if !ok || (id.Name != "append" && id.Name != "copy") || len(ce.Args) == 0 {
+				if !ok || (id.Name != "append" && id.Name != "copy" && id.Name != "clear") || len(ce.Args) == 0 {
 					return true
 				}
 				if field, found := refsEntryByteSlice(ce.Args[0]); found {
 					pos := fset.Position(ce.Pos())
-					out = append(out, fmt.Sprintf("%s: %s(me.%s, …) in %q — writes the backing array in place; replace-only convention (store.go, neverStartedRaw aliasing) requires whole-slice assignment", pos, id.Name, field, fnName))
+					out = append(out, fmt.Sprintf("%s: %s(me.%s…) in %q — writes the backing array in place; replace-only convention (store.go, neverStartedRaw aliasing) requires whole-slice assignment", pos, id.Name, field, fnName))
 				}
 			}
 			return true
