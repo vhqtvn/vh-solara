@@ -15,8 +15,11 @@ package web
 // the code): a cold/cursorless PWA client viewing a session opens the
 // SESSION-FILTERED stream (?sessions=<sid> — Stream 2; the tree-only Stream 1
 // carries no messages by design), which takes the fresh branch of handleStream
-// (stream_http.go) and delivers message rows over TWO frames, each backed by
-// one of the two body-adoption surfaces that carry the refinement:
+// (stream_http.go) and delivers message rows over TWO frames — the two
+// DELIVERY frames this file pins (snapshot leg + messages.batch leg below),
+// NOT the adoption-surface roster: the roster of surfaces carrying the
+// refinement is three since 0f1a36d (upsert, hydration reconcile,
+// MergeOlderMessages), and the older-page surface serves no cold frame here:
 //
 //  1. the `snapshot` frame (store.Snapshot(filter) → snap.Messages[sid]),
 //     whose rows are the store-resident bodies adopted by the LIVE surface
@@ -44,7 +47,7 @@ package web
 //
 // Determinism (commit-review b-F1/c-F1): both tests HOLD the fake's
 // /session/s1/message GET (holdColdGet) across the snapshot read, so
-// the two adoption surfaces are exercised in isolation — the snapshot test's
+// the two delivery frames are exercised in isolation — the snapshot test's
 // rows provably come from the LIVE surface (the hydration fetch cannot have
 // reconciled yet), and the batch test provably delivers the hydration
 // surface's wholesale batch AFTER the empty daemon-restart snapshot.

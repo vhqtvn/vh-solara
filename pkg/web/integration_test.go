@@ -286,10 +286,8 @@ func waitRendezvous(t *testing.T, notify <-chan struct{}, release func(), what s
 }
 
 // holdColdGet registers a per-session hold channel on the fake (msgHold) and
-// returns an idempotent release closure. The five rendezvous tests (the two
-// async stream precedence tests, the sync snapshot precedence test, the
-// cross-path single-flight test, and the TOCTOU recheck test) use it to park
-// the cold-load GET deterministically:
+// returns an idempotent release closure. Rendezvous tests use it to park the
+// cold-load GET deterministically:
 //   - the test calls release() on its success path (replacing bare
 //     close(hold));
 //   - waitRendezvous calls release() on its timeout path (see above) so a
