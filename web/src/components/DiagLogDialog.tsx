@@ -1,4 +1,4 @@
-import { createMemo, For, onCleanup, onMount, Show } from "solid-js";
+import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import {
   diagEntries,
   diagLogEnabled,
@@ -61,11 +61,36 @@ export default function DiagLogDialog(props: { onClose: () => void }) {
       : `--- __vhSyncDiag ---\n${syncDiag}`;
   };
 
+  // Copy-all status (debate-settled shape): scoped plain inline text — no
+  // toast, no timer, no legacy fallback chain. A silent catch made a failed
+  // export look identical to a successful one exactly when evidence capture
+  // matters, so the write now reports per-attempt success/failure. Success
+  // means the API resolved for THAT attempted snapshot (later log entries
+  // are not implied copied); failure = the write rejected OR the clipboard
+  // API absent, and shows manual-copy guidance instead.
+  const COPY_OK_MSG = "Snapshot copied.";
+  const COPY_FAIL_MSG =
+    "Copy failed — select and copy the text manually. Expand sync diagnostics to include that snapshot.";
+  const [copyStatus, setCopyStatus] = createSignal<{ ok: boolean } | null>(null);
+  // Attempt token: an attempt that settles after a NEWER attempt started
+  // (or after this dialog instance closed — App mounts us under <Show>, so
+  // reopen is a fresh instance with fresh state) must not repopulate stale
+  // feedback.
+  let copyAttempt = 0;
+
   async function copyAll() {
+    const attempt = ++copyAttempt;
+    // Clear any prior status when a new attempt starts.
+    setCopyStatus(null);
     try {
-      await navigator.clipboard.writeText(allText() || "(no entries)");
+      const clip = navigator.clipboard;
+      // Absent clipboard API (navigator.clipboard undefined) is a failure
+      // too — a missing writeText throws below and lands in the same catch.
+      if (!clip) throw new Error("clipboard API unavailable");
+      await clip.writeText(allText() || "(no entries)");
+      if (attempt === copyAttempt) setCopyStatus({ ok: true });
     } catch {
-      /* selection still works */
+      if (attempt === copyAttempt) setCopyStatus({ ok: false });
     }
   }
 
@@ -121,6 +146,14 @@ export default function DiagLogDialog(props: { onClose: () => void }) {
               </button>
             </Show>
           </div>
+
+          {/* Per-attempt copy status: text-only polite live region directly
+              under the copy controls (role="status" → aria-live=polite). */}
+          <Show when={copyStatus()}>
+            <p class={styles.copyStatus} classList={{ [styles.copyStatusErr]: !copyStatus()!.ok }} role="status">
+              {copyStatus()!.ok ? COPY_OK_MSG : COPY_FAIL_MSG}
+            </p>
+          </Show>
 
           <Show
             when={list().length > 0}

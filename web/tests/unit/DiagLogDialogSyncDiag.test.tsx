@@ -133,3 +133,135 @@ describe("DiagLogDialog __vhSyncDiag fold-in", () => {
     expect(screen.queryByRole("button", { name: /copy all/i })).toBeNull();
   });
 });
+
+// Copy-all status feedback (debate-settled shape: scoped inline text — the
+// dialog is the recurrence-capture instrument, a failed export must not
+// look identical to a successful one). Pins:
+//   - resolved write → the success line;
+//   - rejected write → the failure line with the exact manual-guidance
+//     wording;
+//   - absent clipboard API (navigator.clipboard undefined) → failure line;
+//   - retry recovery: a new attempt clears prior status and the LATEST
+//     attempt's result wins (an earlier attempt settling late cannot
+//     clobber — attempt-token guard);
+//   - reopen/reset: a fresh mount carries no stale status, and a prior
+//     instance's late-settling attempt cannot repopulate it.
+const FAIL_MSG =
+  "Copy failed — select and copy the text manually. Expand sync diagnostics to include that snapshot.";
+
+// The status line is a role="status" element below the list header row.
+const statusText = (): string | null => {
+  const el = screen.queryByRole("status");
+  return el ? (el.textContent ?? null) : null;
+};
+
+// Flush microtask turns so a late-settling attempt's continuation has run
+// before asserting it did NOT change anything (negative assertions have no
+// auto-wait).
+const flush = async (): Promise<void> => {
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+};
+
+describe("DiagLogDialog Copy-all status feedback", () => {
+  it("resolved write shows the success line", async () => {
+    (window as SyncDiagWindow).__vhSyncDiag = () => SNAPSHOT;
+    render(() => <DiagLogDialog onClose={() => {}} />);
+    expect(statusText()).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /copy all/i }));
+    await vi.waitFor(() => expect(statusText()).toBe("Snapshot copied."));
+  });
+
+  it("rejected write shows the failure line with the manual-guidance wording", async () => {
+    (window as SyncDiagWindow).__vhSyncDiag = () => SNAPSHOT;
+    Object.assign(navigator, {
+      clipboard: {
+        writeText: vi.fn(async () => {
+          throw new DOMException("write denied", "NotAllowedError");
+        }),
+      },
+    });
+    render(() => <DiagLogDialog onClose={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: /copy all/i }));
+    await vi.waitFor(() => expect(statusText()).toBe(FAIL_MSG));
+  });
+
+  it("absent clipboard API (navigator.clipboard undefined) shows the failure line", async () => {
+    // beforeEach cloned navigator and assigned a clipboard; remove it so
+    // the API itself is absent (early/test environments posture).
+    delete (navigator as { clipboard?: unknown }).clipboard;
+    (window as SyncDiagWindow).__vhSyncDiag = () => SNAPSHOT;
+    render(() => <DiagLogDialog onClose={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: /copy all/i }));
+    await vi.waitFor(() => expect(statusText()).toBe(FAIL_MSG));
+  });
+
+  it("retry recovery: a new attempt clears prior status and the latest attempt's result wins", async () => {
+    (window as SyncDiagWindow).__vhSyncDiag = () => SNAPSHOT;
+    // Attempt 1 rejects (settles immediately); attempt 2 resolves on a
+    // deferred we control, so the "cleared at attempt start" window is
+    // observable before it settles.
+    let resolveSecond!: (v: string) => void;
+    const writeText = vi
+      .fn()
+      .mockImplementationOnce(async () => {
+        throw new Error("denied");
+      })
+      .mockImplementationOnce(() => new Promise<string>((res) => (resolveSecond = res)));
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(() => <DiagLogDialog onClose={() => {}} />);
+    const btn = screen.getByRole("button", { name: /copy all/i });
+    fireEvent.click(btn); // attempt 1 → failure
+    await vi.waitFor(() => expect(statusText()).toBe(FAIL_MSG));
+    fireEvent.click(btn); // attempt 2 starts → prior status cleared synchronously
+    expect(statusText()).toBeNull();
+    resolveSecond(""); // attempt 2 settles → success
+    await vi.waitFor(() => expect(statusText()).toBe("Snapshot copied."));
+  });
+
+  it("attempt token: an earlier attempt settling AFTER a newer success cannot clobber it", async () => {
+    (window as SyncDiagWindow).__vhSyncDiag = () => SNAPSHOT;
+    // Attempt 1 hangs on a deferred rejection; attempt 2 resolves
+    // immediately. Attempt 1's rejection then lands LATE — the token guard
+    // must keep attempt 2's success on screen.
+    let rejectFirst!: (e: unknown) => void;
+    const writeText = vi
+      .fn()
+      .mockImplementationOnce(() => new Promise<string>((_res, rej) => (rejectFirst = rej)))
+      .mockImplementationOnce(async () => {});
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(() => <DiagLogDialog onClose={() => {}} />);
+    const btn = screen.getByRole("button", { name: /copy all/i });
+    fireEvent.click(btn); // attempt 1 (pending)
+    fireEvent.click(btn); // attempt 2 → success
+    await vi.waitFor(() => expect(statusText()).toBe("Snapshot copied."));
+    rejectFirst(new Error("late denial"));
+    await flush();
+    expect(statusText()).toBe("Snapshot copied.");
+  });
+
+  it("reopen resets: fresh mount shows no stale status and a prior late-resolving attempt does not repopulate", async () => {
+    (window as SyncDiagWindow).__vhSyncDiag = () => SNAPSHOT;
+    // Controllable deferred (NOT setTimeout): rejecting it runs the prior
+    // instance's catch in MICROTASKS, so the flush() below observably lands
+    // the late rejection inside the assertion window while the second
+    // instance is mounted (a microtask-only flush never reaches the timer
+    // phase, so a setTimeout rejection would settle only after the final
+    // assert — vacuously green).
+    let rejectFirst!: (e: unknown) => void;
+    const writeText = vi
+      .fn()
+      .mockImplementation(() => new Promise<string>((_res, rej) => (rejectFirst = rej)));
+    Object.assign(navigator, { clipboard: { writeText } });
+    const first = render(() => <DiagLogDialog onClose={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: /copy all/i })); // pending
+    first.unmount(); // close the dialog before the write settles
+    // reopen — a FRESH instance (App mounts the dialog under <Show>); no
+    // stale status may carry over.
+    const second = render(() => <DiagLogDialog onClose={() => {}} />);
+    expect(statusText()).toBeNull();
+    rejectFirst(new Error("late denial")); // prior attempt settles after close
+    await flush(); // rejection propagates through the prior instance's catch
+    expect(statusText()).toBeNull(); // must not repopulate the new instance
+    second.unmount();
+  });
+});

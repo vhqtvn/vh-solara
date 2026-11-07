@@ -8,9 +8,10 @@
 //   2. the <details> snapshot expansion — a NATIVE toggle, no JS (no lane-6
 //      precedent drives a details toggle at all; this is the first);
 //   3. the real clipboard write — "Copy all" → navigator.clipboard.writeText.
-//      CRITICAL: copyAll() swallows clipboard failure silently (empty catch),
-//      so NO in-app assertion can detect a denied/failed write — reading the
-//      clipboard back IS the assertion.
+//      The per-attempt status line now reports success/failure in-app, but
+//      the BYTE-EXACT payload claim still cannot be asserted from the UI
+//      alone — reading the clipboard back remains the assertion for WHAT
+//      landed; the failure arm below covers the UI-side failure report.
 // The __vhSyncDiag snapshot getter installs on every real boot (startSync →
 // installSyncDiagGlobal, recovery-reasons.ts), so no seeding is needed; with
 // capture off by default (diaglog.ts) and a fresh context, the combined
@@ -53,18 +54,55 @@ test.describe("diag log instrument (real gesture chain)", () => {
     await expect(snapshot).toContainText('"recovery"');
     await expect(snapshot).toContainText('"generatedAt"');
 
-    // 3. REAL CLIPBOARD WRITE + READ-BACK — copyAll() catches clipboard
-    //    errors silently, so a UI assertion cannot detect failure; the
-    //    read-back is the assertion. Capture is off by default and this
-    //    context is fresh (zero entries), so the combined payload is
-    //    exactly the snapshot section under its separator (allText's
-    //    0-entries branch). The pre's text IS the frozen snapshot the
-    //    dialog captured at open — the exact bytes copyAll writes.
+    // 3. REAL CLIPBOARD WRITE + READ-BACK — the status line reports the
+    //    attempt's outcome in-app; the read-back is still the assertion for
+    //    the exact BYTES. Capture is off by default and this context is
+    //    fresh (zero entries), so the combined payload is exactly the
+    //    snapshot section under its separator (allText's 0-entries branch).
+    //    The pre's text IS the frozen snapshot the dialog captured at open
+    //    — the exact bytes copyAll writes.
     const snapshotText = (await snapshot.textContent()) ?? "";
     expect(snapshotText, "snapshot section carries JSON").not.toBe("");
     await dlg.getByRole("button", { name: "Copy all" }).click();
+    // In-app success report (polite live region under the copy controls).
+    await expect(dlg.getByRole("status")).toHaveText("Snapshot copied.");
     await expect
       .poll(async () => page.evaluate(() => navigator.clipboard.readText()), { timeout: 5000 })
       .toBe(`--- __vhSyncDiag ---\n${snapshotText}`);
+  });
+
+  test("Copy all failure: injected writeText rejection shows the manual-copy guidance line", async ({ page }) => {
+    // This arm tests INJECTED failure (writeText stubbed to reject before
+    // any app code runs), NOT a real permission denial — the goal is the
+    // dialog's failure REPORT, and driving a genuine browser denial from
+    // Playwright is neither stable nor needed here.
+    await page.addInitScript(() => {
+      Object.defineProperty(Navigator.prototype, "clipboard", {
+        configurable: true,
+        get: () => ({
+          writeText: () => Promise.reject(new Error("injected writeText rejection")),
+        }),
+      });
+    });
+
+    await page.goto(projectUrl("/"));
+    await page.getByRole("button", { name: "Settings" }).click({ button: "right" });
+    const pop = page.getByRole("dialog", { name: "Server admin" });
+    await pop.getByRole("button", { name: "Diagnostic log" }).click();
+    const dlg = page.getByRole("dialog", { name: "Diagnostic log" });
+    await expect(dlg).toBeVisible();
+
+    await dlg.getByRole("button", { name: "Copy all" }).click();
+    const status = dlg.getByRole("status");
+    await expect(status).toHaveText(
+      "Copy failed — select and copy the text manually. Expand sync diagnostics to include that snapshot.",
+    );
+
+    // Wrap check (cheap, bounded): at a narrow viewport the status line
+    // must wrap instead of overflowing horizontally.
+    await page.setViewportSize({ width: 360, height: 640 });
+    await expect(status).toBeVisible();
+    const overflowPx = await status.evaluate((el) => el.scrollWidth - el.clientWidth);
+    expect(overflowPx).toBeLessThanOrEqual(0);
   });
 });

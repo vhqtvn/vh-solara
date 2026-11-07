@@ -85,6 +85,21 @@
 .copyAll:hover {
   border-color: var(--accent);
 }
+/* Copy-all status line (per-attempt feedback): plain wrapping text in a
+   polite live region — success/failure tinted but quiet, matching the
+   SettingsDialog theme-note precedent. overflow-wrap keeps the long
+   failure guidance line wrapping on narrow screens instead of
+   overflowing; no fixed widths, no GPU-expensive effects. */
+.copyStatus {
+  margin: 0 0 6px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--ok, var(--accent));
+  overflow-wrap: anywhere;
+}
+.copyStatusErr {
+  color: var(--danger);
+}
 /* The whole list is one selectable <pre> (newest first) so the operator can
    drag-select a range or hit Copy all. Plain monospaced, wrapped. */
 .list {
