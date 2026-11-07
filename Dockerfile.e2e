@@ -55,10 +55,13 @@ COPY --from=webbuild /app/web/dist-build ./pkg/web/dist
 # carry gitignored host assets from a prior `make build`, since
 # pkg/web/host-dist is NOT in .dockerignore -- unlike pkg/web/dist), preserving
 # the tracked placeholder.html, then copy the fresh build. serveHostIndex prefers
-# index.html, so the placeholder is inert when a real build is present. See the
-# production Dockerfile stage 3 for the full rationale.
-RUN rm -rf ./pkg/web/host-dist/assets ./pkg/web/host-dist/index.html \
-    ./pkg/web/host-dist/*.js ./pkg/web/host-dist/*.map 2>/dev/null || true
+# index.html, so the placeholder is inert when a real build is present. The
+# find is the docker-context MIRROR of the canonical clean in
+# web/scripts/materialize.sh (same find form + preserve set; the script needs
+# bash, which golang:<tag>-alpine does not ship -- do not apk-add it just for
+# this). See the production Dockerfile stage 3 for the full rationale.
+RUN find ./pkg/web/host-dist -mindepth 1 -maxdepth 1 \
+    ! -name 'placeholder.html' -exec rm -rf {} +
 COPY --from=hostbuild /app/host-web/dist ./pkg/web/host-dist
 # GOTOOLCHAIN=local is deliberate (hermetic, reproducible builds) and means there is
 # NO auto-download fallback inside this image. Invariant: the base image's Go (FROM

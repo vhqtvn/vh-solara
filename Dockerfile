@@ -61,11 +61,19 @@ COPY --from=webbuild /app/web/dist-build ./pkg/web/dist
 # artifacts FIRST, preserving the tracked placeholder.html, then copy the fresh
 # build. The cleanup matters because pkg/web/host-dist is NOT in .dockerignore
 # (unlike pkg/web/dist), so COPY . . above can carry gitignored host assets left
-# in a local working dir by a prior `make build` -- without this rm those stale
-# assets would ship in the image. serveHostIndex prefers index.html, so the
-# placeholder is inert when a real build is present.
-RUN rm -rf ./pkg/web/host-dist/assets ./pkg/web/host-dist/index.html \
-    ./pkg/web/host-dist/*.js ./pkg/web/host-dist/*.map 2>/dev/null || true
+# in a local working dir by a prior `make build` -- without this clean those
+# stale assets would ship in the image. serveHostIndex prefers index.html, so
+# the placeholder is inert when a real build is present.
+# The find below is the docker-context MIRROR of the canonical clean in
+# web/scripts/materialize.sh (same find form + preserve set): remove EVERY
+# top-level generated entry except the preserve set, so ghosts the old fixed
+# rm-list (assets/, index.html, *.js, *.map) could never remove (stale
+# subdirs, non-index *.html, *.css, ...) do not survive into the embed. The
+# script itself cannot run here: it needs bash, which golang:<tag>-alpine does
+# not ship, and adding an apk layer just for this clean would bloat the image.
+# Keep this form in sync with the script when either changes.
+RUN find ./pkg/web/host-dist -mindepth 1 -maxdepth 1 \
+    ! -name 'placeholder.html' -exec rm -rf {} +
 COPY --from=hostbuild /app/host-web/dist ./pkg/web/host-dist
 # GOTOOLCHAIN=local is deliberate (hermetic, reproducible builds) and means there is
 # NO auto-download fallback inside this image. Invariant: the base image's Go (FROM
