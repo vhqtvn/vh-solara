@@ -694,7 +694,10 @@ is **no pytest** anywhere in this repo.
 3. **Go e2e (in-process)** — `tests/e2e/`. Real controller daemon + real worker
    over an actual yamux tunnel + fake OpenCode (`pkg/fixtures`). No docker, no
    real opencode binary, no LLM. Entry helper `StartCluster()` at
-   `tests/e2e/harness.go:47`.
+   `tests/e2e/harness.go:47`. Includes `TestMultiProjectLatencyGuard`
+   (`multiproject_latency_guard_test.go`) — the PR-facing multi-project
+   stream-latency thresholds (direct+tunnel, p=7 warm; generous bounds, see
+   the file's derivation header).
    Runner: `go test ./tests/e2e/`.
 
 4. **Go e2e (docker gold)** — `tests/e2e-docker/run.sh`. Real opencode + fake
@@ -722,6 +725,12 @@ is **no pytest** anywhere in this repo.
    config runs `scripts/fixture-web.sh` which builds the SPA and starts
    `go run ./tools/fixtureserver`, so go must be on PATH.
    Runner: `npm --prefix web run test:e2e`.
+   *Multiproject spec note* (`web/tests/e2e/multiproject-latency.spec.ts`): the
+   PR-blocking form is SCALED (3 pages, short runs) — it retains every
+   structural obligation (isolation, byte-exact digests, negotiation,
+   contiguity, flush ledger, cursor replay, stale-ring repair); the PR-facing
+   latency watch is the Go guard `TestMultiProjectLatencyGuard`
+   (`tests/e2e/multiproject_latency_guard_test.go`, lane 3).
    *Dispatch-only queue-delivery variant* (`web/tests/e2e/queue-delivery-custody.spec.ts`):
    proves daemon-custody queue delivery (`VH_FIXTURE_DAEMON_DISPATCH=1`) with
    frozen nonterminal browser queue reads, live SSE chip clearance, and
@@ -731,6 +740,15 @@ is **no pytest** anywhere in this repo.
    blocked). Dispatch-only, NOT PR-blocking.
    Runner (headless): `cd web && npx playwright test --config=playwright.queue-delivery.config.ts --project=chromium --workers=1 --retries=0`.
    Runner (headed in Docker under Xvfb; real virtual display + real browser): `make test-queue-delivery-headed-docker`.
+   *Dispatch-only multiproject soak variant* (`web/tests/e2e/multiproject-soak.spec.ts`):
+   the FULL-SCALE seven-page sustained-demand form (~49s; perceived-UI latency
+   under multi-project load — the soak the test-speed plan slice 3 moved out of
+   the PR lane). Excluded from ordinary discovery (same `testIgnore`); runs
+   isolated via `web/playwright.multiproject-soak.config.ts` (pinned
+   127.0.0.1:8097, fresh probe-guarded dirs, serial, retries: 0; serviceWorkers
+   blocked). Dispatch-only (CI nightly cron + workflow_dispatch), NOT
+   PR-blocking.
+   Runner: `cd web && npx playwright test --config=playwright.multiproject-soak.config.ts --project=chromium --workers=1 --retries=0`.
 
 7. **host-web e2e** — `host-web/tests/e2e/*.spec.ts` (Playwright: iframe survival
    + shell ops) and `host-web/tests/preview-e2e/*.spec.ts` (production-build shell
@@ -817,6 +835,8 @@ vh-agent-harness exec npm --prefix web run test:unit
 vh-agent-harness exec npm --prefix web run typecheck
 # Web e2e (serial; go must be on PATH for the fixtureserver):
 vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && npm --prefix web run test:e2e'
+# Multiproject soak (dispatch lane; full-scale 7-page form; fresh fixture on :8097):
+vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && cd web && npx playwright test --config=playwright.multiproject-soak.config.ts --project=chromium --workers=1 --retries=0'
 # host-web e2e (iframe survival + shell; self-bootstrapped vite dev servers):
 vh-agent-harness exec npm --prefix host-web run test:e2e
 # host-web e2e via docker (no host Node/browsers needed; full three-engine lane 7):

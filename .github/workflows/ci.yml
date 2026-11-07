@@ -643,16 +643,115 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+  # Multiproject SOAK e2e — the FULL-SCALE seven-page sustained-demand form
+  # of the lane-6 multiproject spec (test-speed plan slice 3, "coverage-
+  # preserving soak split"). ~49s of lane-6 body time whose value is
+  # latency-diagnostic (perceived-UI latency under sustained multi-project
+  # load); its structural obligations stay per-PR in the scaled
+  # multiproject-latency.spec.ts plus the Go latency guard
+  # (TestMultiProjectLatencyGuard, in the `go` job's ./... run).
+  #
+  # SCHEDULED/DISPATCHABLE ONLY — NOT in the push/PR matrix (the
+  # host-web-real-embed pattern above). The dedicated config pins its own
+  # port (127.0.0.1:8097) and fresh repo-local dirs, so it cannot perturb any
+  # concurrently-running lane.
+  multiproject-soak:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: install deps
+        run: npm ci
+      - name: install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: multiproject soak e2e (dispatch lane; fresh fixture on :8097)
+        # The webServer command (playwright.multiproject-soak.config.ts) builds
+        # the SPA, materializes the embed, and boots the fixtureserver on the
+        # lane's pinned port — go must be on PATH for it (setup-go provides it;
+        # the export matches the repo convention for local runs).
+        shell: bash
+        run: |
+          export PATH="$PATH:/usr/local/go/bin"
+          # tmp/ is gitignored — a fresh checkout has none; every sibling tee
+          # in this workflow mkdirs its target dir first (commit-review F1).
+          mkdir -p ../tmp
+          t=$SECONDS
+          status=0
+          npx playwright test --config=playwright.multiproject-soak.config.ts --project=chromium --workers=1 --retries=0 2>&1 | tee ../tmp/mp-soak-e2e.log || status=$?
+          echo "MP_SOAK_SECS=$((SECONDS - t))" >> "$GITHUB_ENV"
+          exit "$status"
+      - name: timing summary
+        # Advisory visibility only — never a pass/fail gate on wall-clock.
+        if: ${{ !cancelled() }}
+        working-directory: .
+        run: |
+          mkdir -p tmp/timing-summaries
+          cat >>"$GITHUB_STEP_SUMMARY" <<EOF
+          ## Timing — multiproject-soak
+          - soak run: ${MP_SOAK_SECS:-unknown}s (chromium, workers:1, fresh fixture on :8097)
+          EOF
+          recorded=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > tmp/timing-summaries/mp-soak.json <<EOF
+          {
+            "job": "multiproject-soak",
+            "lane": "web multiproject soak (dispatch lane)",
+            "engine": "chromium",
+            "steps": { "soak_secs": "${MP_SOAK_SECS:-unknown}" },
+            "counts": {},
+            "runner_class": "github-hosted-ubuntu-latest",
+            "command": "npx playwright test --config=playwright.multiproject-soak.config.ts",
+            "build_mode": "fresh (SPA build + fixtureserver compile in webServer boot)",
+            "event": "${GITHUB_EVENT_NAME}",
+            "commit": "${GITHUB_SHA}",
+            "recorded_at": "${recorded}"
+          }
+          EOF
+      - name: upload timing summary
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: timing-summaries-mp-soak
+          path: tmp/timing-summaries/mp-soak.json
+          retention-days: 14
+          if-no-files-found: warn
+      - name: upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # Covers the outputDir set in playwright.multiproject-soak.config.ts
+          # (tmp/mp-soak-e2e/playwright-output); traces are on, screenshots
+          # only-on-failure. The parent path deliberately also sweeps the
+          # lane's fixture demo/state dirs (tmp/mp-soak-e2e/{demo,state}) —
+          # small seeded trees that ride along for diagnosability.
+          name: playwright-multiproject-soak
+          path: tmp/mp-soak-e2e
+          retention-days: 14
+          if-no-files-found: warn
+
   # Stable aggregate (push-safety Phase 4): runs for every event; red iff any
-  # lane that executed went red. Lane skips are legitimate — they only happen
-  # on push events (changes-gate) and on the real-embed event guard, neither
-  # of which carries merge-gate semantics. If branch protection wants a single
-  # required check instead of per-lane ones, require "CI / ci-summary".
+  # lane that executed went red. Lane skips are legitimate — they happen on
+  # push events (changes-gate) and on the schedule/dispatch-only event guards
+  # (host-web-real-embed and multiproject-soak, both skipped on push/PR),
+  # none of which carries merge-gate semantics. If branch protection wants a
+  # single required check instead of per-lane ones, require "CI / ci-summary".
   # !cancelled() (GitHub's recommended alternative to always()) both lets this
   # job run when a needed job was skipped or failed and avoids post-cancel
   # zombie runs.
   ci-summary:
-    needs: [changes, go, web, e2e, host-web-e2e, host-web-real-embed]
+    needs: [changes, go, web, e2e, host-web-e2e, host-web-real-embed, multiproject-soak]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
@@ -664,6 +763,7 @@ jobs:
           E2E: ${{ needs.e2e.result }}
           HOST_WEB_E2E: ${{ needs['host-web-e2e'].result }}
           REAL_EMBED: ${{ needs['host-web-real-embed'].result }}
+          MP_SOAK: ${{ needs.multiproject-soak.result }}
         run: |
           status=0
           check() {
@@ -678,4 +778,5 @@ jobs:
           check e2e "$E2E"
           check host-web-e2e "$HOST_WEB_E2E"
           check host-web-real-embed "$REAL_EMBED"
+          check multiproject-soak "$MP_SOAK"
           exit "$status"

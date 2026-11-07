@@ -27,11 +27,18 @@ const useExistingWebServer = process.env.PLAYWRIGHT_USE_EXISTING_WEB_SERVER === 
 export default defineConfig({
   globalSetup: path.resolve(webRoot, "global-setup.ts"),
   testDir: path.join(webRoot, "tests/e2e"),
-  // The queue-delivery-custody spec needs the DAEMON-DISPATCH fixture posture
-  // (custody drain owns dispatch) — a different server than this config's
-  // webServer boots. It is EXCLUDED from ordinary discovery and runs ONLY via
-  // its dedicated config (playwright.queue-delivery.config.ts, dispatch-only).
-  testIgnore: /queue-delivery-custody\.spec\.ts$/,
+  // Two specs are EXCLUDED from ordinary discovery and run ONLY via their
+  // dedicated dispatch-only configs:
+  //   - queue-delivery-custody.spec.ts needs the DAEMON-DISPATCH fixture
+  //     posture (custody drain owns dispatch) — a different server than this
+  //     config's webServer boots (playwright.queue-delivery.config.ts).
+  //   - multiproject-soak.spec.ts is the FULL-SCALE sustained-demand soak
+  //     (~49s body; test-speed plan slice 3). Its structural obligations
+  //     stay per-PR in multiproject-latency.spec.ts (scaled form) plus the
+  //     Go latency guard (tests/e2e/multiproject_latency_guard_test.go);
+  //     the soak itself runs via playwright.multiproject-soak.config.ts
+  //     (nightly/workflow_dispatch, NOT PR-blocking).
+  testIgnore: /(queue-delivery-custody|multiproject-soak)\.spec\.ts$/,
   fullyParallel: false,
   // One shared fixture backend with mutable session state -> run serially so
   // state-mutating specs don't perturb each other.
