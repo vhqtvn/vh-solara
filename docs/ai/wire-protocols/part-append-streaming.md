@@ -150,7 +150,10 @@ Mirror the existing `z=1` (gzip64 snapshot) pattern exactly:
   to a controlled subset even when the client opts in.
 
 The capability is per-CONNECTION and established once at `/vh/stream` open. It
-does not change mid-stream.
+does not change mid-stream. Both client streams now send `part_delta=1`;
+tree-stream adoption is delivery-neutral because the tree URL's empty
+`sessions=` filter drops all message-class events identically on replay and
+live tail — the opt-in changes only the §4.3 branch verdict.
 
 ---
 
@@ -202,6 +205,10 @@ that has already emitted suffixes into the ring) takes a **snapshot** rather
 than interpreting frames it cannot decode. The server detects "replay range
 contains a kind the client didn't negotiate" and falls back to snapshot for
 that connection. Legacy must NEVER be asked to interpret a `part.append` frame.
+
+*(Note on diagnostics: journal `replayed=` is the RAW pre-filter
+`store.Replay` count — for tree streams zero part frames cross the wire despite
+`replayed=N`.)*
 
 ### 4.4 Authoritative `part.upsert` still repairs
 

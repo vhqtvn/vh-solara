@@ -140,9 +140,11 @@ On 2026-10-29 at **05:22Z**, production diagnostics captured a real warm resume 
 1. **Toast/Cascade Grading Amplifiers (Card 2):**
    - `ConnectionToast` lacks an internal expiry and can be orphaned in "reconnecting" by the degraded state (A-F4 residue) or cascade `convergence-pending` (bounded at 15s).
    - Card 2 (orphaned warn clearing and grade transition timestamps) remains unstarted as follow-up polish.
+   - *(superseded — see Addendum 2026-10-29 item 5 and Addendum 2026-11-07: landed in commit `6dd6e8e` and `20342cf`).*
 2. **Tree Stream `part_delta` Client Opt-In:**
    - Tree stream URL currently lacks the `part_delta=1` query parameter, generating benign compatibility fallbacks whenever `part.append` exists in the ring.
    - Deferred as a post-release protocol optimization (measured cost is negligible: ≤134ms).
+   - *(superseded — see Addendum 2026-10-29 item 3: landed in commit `ad19da32`).*
 3. **Capture-2 on Naturally Slow Occasion:**
    - Recommended on an hours-alive, non-reloaded page to capture complete grade transition logs during an authentic slow resume, definitively benchmarking the render-storm model vs environmental thermal/radio drag.
 4. **Store Merge-Policy Gap (Draft Card `task-2026-10-28t18-40-00-store-merge-policy-gap-draft`):**
@@ -198,3 +200,24 @@ To maintain strict epistemic honesty, evidence is classified into verified measu
    - **Next theme:** Formal verification of the sync layer — entry point is the store merge-policy gap draft card (`task-2026-10-28t18-40-00-store-merge-policy-gap-draft`, `prependMessagesIfAbsent` keyed-non-completed-resident skip, `web/src/lib/reduce.ts:200–228` region), pinned by the round-5b bidirectional boundary test.
 5. **Ledger status at addendum time:**
    Six unpushed local commits: `b2d3d62` (diagnostics), `e2f0f36` (cursor fix), `f0b6ff1` (this memo), `6dd6e8e` (toast/stamps), `4d5cfd8` (ledger cleanup), `ad19da3` (part_delta).
+
+---
+
+## Addendum 2026-11-07: content-first UX landed
+
+This addendum records the closure of the UX polish and send-state contracts originating from the resume-surge findings, landed across Cards A and B:
+
+1. **Card A (commit `20342cf` — content-first connection display):**
+   - **Grace period:** Introduced a 1.5s foreground-visible grace REPLACING the 1200ms warn debounce. Transient reconnect blips no longer churn the screen.
+   - **Display tiers:** Added a quiet pill for transient reconnections and an honest 30s banner conditioned on the real readiness signal `messagesDelivered`.
+   - **Retired routine reconnect ack:** Formally retired the routine "Reconnected" ack toast. This records the deliberate product decision re-opening the "product decision only" cell at `ConnectionToast.tsx:79-81`. "Back online" is now displayed ONLY when the reconnect banner was visible for ≥5s, and NEVER at degraded.
+2. **Card B (commit `251ab36` — receipt-bound send vocabulary):**
+   - **Status vocabulary:** Replaced ambiguous states with receipt-bound labels: `Pending — on this device` / `Queued` / `Not sent — reconnecting`.
+   - **Delivery authority invariant:** The connection grade is NEVER delivery authority. A message is confirmed ONLY when sent + verified as a transcript entry.
+3. **Capture-3's answer to the banner-vs-content question (2026-10-30):**
+   - Instrumented captures demonstrated that streams and connection grading are both consistently fast on every instrumented occasion, including an occasion reported as slow by the operator.
+   - The residual 10–15s delay was isolated to phone radio wake (the interval between EventSource construction and `onopen`), an environmental latency that cannot be shaved client-side.
+4. **Ack-path honesty rule:**
+   - Never claim "Back online" is browser-proven without a real browser receipt — it remains unit-seam-only today.
+5. **Arc completion & push confirmation:**
+   - The entire coordination arc (`b2d3d62..8c050640`, 83 commits) is committed on `main` and verified pushed (`main == origin/main @ 8c050640`).
