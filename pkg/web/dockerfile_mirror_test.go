@@ -179,6 +179,41 @@ func dockerfileMirrorProblems(file, content string, canonicalPreserve []string) 
 		fail("preserve mismatch vs script default %v: extra in mirror %v", canonicalPreserve, extra)
 	}
 
+	// Allowlist pass: the required-token and preserve checks above pin what
+	// MUST be present, but an ADDED narrowing predicate (-type f,
+	// -name '*.js', -size, -newer, a bare -name, extra operators, …) weakens
+	// the clean while superficially matching every one of them. Walk the
+	// find argument stream and permit ONLY the pinned grammar — validated
+	// PER OCCURRENCE, because the existence-somewhere hasSeq checks above
+	// cannot see a decoy clause riding alongside the real one (e.g. a
+	// `-exec false x {} +` before the real rm: find's implicit AND makes
+	// the rm a silent no-op — exactly the D2 weakening this rejects).
+	seqAt := func(i int, seq ...string) bool {
+		if i+len(seq) > len(tokens) {
+			return false
+		}
+		for j, wantTok := range seq {
+			if tokens[i+j] != wantTok {
+				return false
+			}
+		}
+		return true
+	}
+	anchorLen := len(strings.Fields(mirrorFindLine)) // "RUN", "find", <dest>
+	for i := anchorLen; i < len(tokens); {
+		switch {
+		case seqAt(i, "-mindepth", "1"), seqAt(i, "-maxdepth", "1"):
+			i += 2 // flag + pinned value, validated at this occurrence
+		case i+2 < len(tokens) && tokens[i] == "!" && tokens[i+1] == "-name":
+			i += 3 // `! -name <preserve>` pair (membership pinned by set equality above)
+		case seqAt(i, "-exec", "rm", "-rf", "{}", "+"):
+			i += 5 // the exact pinned payload, validated at this occurrence
+		default:
+			fail("unexpected predicate in mirror clean: %q — only -mindepth 1, -maxdepth 1, ! -name <preserve> pairs, and -exec rm -rf {} + are permitted (exact per-occurrence form); an added or altered predicate silently weakens the clean (D2)", tokens[i])
+			i++
+		}
+	}
+
 	// D4: the clean must precede the hostbuild COPY that fills the cleaned
 	// dir — a clean placed after it deletes the freshly copied host shell.
 	var copyIdxs []int
@@ -263,6 +298,28 @@ RUN find ./pkg/web/host-dist -mindepth 1 \
 COPY --from=hostbuild /app/host-web/dist ./pkg/web/host-dist
 `,
 			wantProblem: `-maxdepth 1`,
+		},
+		{
+			name: "narrowing predicate added to the clean (-type f)",
+			content: `FROM golang:1.26.10-alpine AS gobuild
+WORKDIR /src
+COPY . .
+RUN find ./pkg/web/host-dist -mindepth 1 -maxdepth 1 -type f \
+    ! -name 'placeholder.html' -exec rm -rf {} +
+COPY --from=hostbuild /app/host-web/dist ./pkg/web/host-dist
+`,
+			wantProblem: "unexpected predicate in mirror clean",
+		},
+		{
+			name: "decoy -exec before the real rm silently weakens the clean",
+			content: `FROM golang:1.26.10-alpine AS gobuild
+WORKDIR /src
+COPY . .
+RUN find ./pkg/web/host-dist -mindepth 1 -maxdepth 1 \
+    ! -name 'placeholder.html' -exec false x {} + -exec rm -rf {} +
+COPY --from=hostbuild /app/host-web/dist ./pkg/web/host-dist
+`,
+			wantProblem: "unexpected predicate in mirror clean",
 		},
 		{
 			name: "duplicated clean block (D3)",
