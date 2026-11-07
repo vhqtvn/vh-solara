@@ -311,8 +311,50 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 		// NEW assistant message goes inflight (a new turn started), so a
 		// legitimate future busy is respected.
 		blockedByAuthority := a != ActivityIdle && s.completionAuthoritative[sid]
+		if blockedByAuthority && s.newTurnSupersedesArmedAuthorityLocked(sid) {
+			// Approach B (false-interrupted-marker fix, bug 2026-10-14): the
+			// authority was armed over a PRIOR turn, and the session's newest
+			// assistant is a keyed row whose created key strictly postdates
+			// the ENTIRE arm-time view and is still uncompleted — independent
+			// new-turn provenance (the uncompleted tightener refuses the
+			// disarm when the newest assistant already completed, and a
+			// #2696 post-terminal trap row — old/equal/unkeyed created — can
+			// never prove it postdates the arm, so a missed-idle turn and
+			// trap shapes stay protected). Disarm the authority pair and let
+			// this observation flow as truthful busy: the busy-class activity
+			// write below resets notBusyOnce through the normal chokepoint —
+			// the d-F1 "ANY busy-class signal resets" contract is reachable
+			// again under an armed authority, so the primed latch cannot
+			// false-mark the LIVE turn in this same call's clear path — and
+			// markTurnRunningLocked adopts the turn (its D4 guard still
+			// refuses the adoption mid-drain). Lane A's stale same-turn busy
+			// has newest==armed ⇒ completed ⇒ still blocked.
+			blockedByAuthority = false
+			s.disarmCompletionAuthorityLocked(sid)
+		}
 		if blockedByAuthority {
 			a = ActivityIdle
+			// Busy-report rider (false-interrupted-marker fix): this
+			// snapshot AFFIRMATIVELY reported the session busy-class — the
+			// authority only converted the ACTIVITY, not the fact of the
+			// report. Two consequences, both independent of the converted
+			// activity value:
+			// (1) d-F1 latch reset: an affirmative busy/retry report is a
+			//     busy-class signal and ENDS the consecutive not-busy run
+			//     (delete notBusyOnce) — without this, a stale primed latch
+			//     would survive the blocked report and the NEXT single
+			//     not-busy observation would sweep a LIVE turn.
+			// (2) sweep-skip: a busy report is not not-busy evidence, so the
+			//     session is excluded from the clear path below for THIS
+			//     snapshot — it can neither settle a draining stop nor feed
+			//     sweepInterruptedTurnsLocked. Without this, the Lane A
+			//     conversion launders a busy report into sweep authority and
+			//     the latch false-marks a LIVE turn in this same call (the
+			//     reported bug's core shape, including the unanchorable
+			//     empty-view corner the new-turn discriminator must refuse;
+			//     see newTurnSupersedesArmedAuthorityLocked).
+			delete(s.notBusyOnce, sid)
+			busy[sid] = true
 		}
 		// O1 fix: seed the activity timestamp from the session's OWN time.updated
 		// (reconstructed state), NOT wall-clock now. A status reconcile/hydrate
@@ -475,10 +517,12 @@ func (s *Store) Apply(ev opencode.Event) {
 		case NormSessionTerminalIdle:
 			// Authoritative turn-end: cancel any pending completion-grace
 			// (redundant now) and arm the completion-authority guard so a
-			// stale busy from /session/status does not re-strand.
+			// stale busy from /session/status does not re-strand. The arm
+			// records the newest assistant row it was armed OVER (approach B;
+			// see armCompletionAuthorityLocked).
 			s.cancelGraceLocked(ne.SessionID)
 			s.setActivityLocked(ne.SessionID, ActivityIdle)
-			s.completionAuthoritative[ne.SessionID] = true
+			s.armCompletionAuthorityLocked(ne.SessionID)
 			// #2696 discriminator: a LIVE session.idle was observed (the
 			// authoritative terminal). A subsequent mutable message.updated is
 			// the trap (OpenCode stamps its fs-snapshot diff AFTER idle), so
@@ -513,8 +557,9 @@ func (s *Store) Apply(ev opencode.Event) {
 			// Without this, the D4 TurnStopping check does not catch the re-adoption
 			// (turnState is already TurnIdle after the error settle), so
 			// completionAuthoritative is the load-bearing guard here — exactly as
-			// it is for session.idle.
-			s.completionAuthoritative[ne.SessionID] = true
+			// it is for session.idle. The arm records the newest assistant row it
+			// was armed OVER (approach B; see armCompletionAuthorityLocked).
+			s.armCompletionAuthorityLocked(ne.SessionID)
 			// P7 turn-state: session.error is a turn TERMINAL. Settle the same
 			// way session.idle does.
 			s.settleTerminalLocked(ne.SessionID)
@@ -781,6 +826,7 @@ func (s *Store) deleteSessionLocked(id string) {
 	// busy guard applies to this id (and a recreated id starts fresh).
 	s.cancelGraceLocked(id)
 	delete(s.completionAuthoritative, id)
+	delete(s.completionArmedOver, id)
 	// P7 turn-state teardown: cancel the settle timer (no callback fires into a
 	// torn-down entry) and drop the turn-state / abort-gate / pending-turn-id
 	// records. A recreated id starts fresh (TurnIdle, gate open).
@@ -1088,9 +1134,12 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 				// pending completion-grace (the turn is continuing, not ending)
 				// and clears the completion-authority guard (a new turn started,
 				// so a prior turn's authority no longer applies) — the genuine
-				// new-turn path (NOT post-idle, so NOT the #2696 trap).
+				// new-turn path (NOT post-idle, so NOT the #2696 trap). The
+				// armed-over record drops with the guard (approach B invariant:
+				// completionArmedOver is meaningful iff completionAuthoritative).
 				s.cancelGraceLocked(env.SessionID)
 				delete(s.completionAuthoritative, env.SessionID)
+				delete(s.completionArmedOver, env.SessionID)
 				s.setActivityLocked(env.SessionID, ActivityBusy)
 			}
 		case !wasCompleted && env.Time.Completed != nil:

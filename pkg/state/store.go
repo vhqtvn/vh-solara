@@ -866,8 +866,31 @@ type Store struct {
 	// over: the grace window fired OR session.idle was observed. While set, a
 	// stale busy from /session/status (the HTTP poll) must NOT re-escalate the
 	// session — message.updated{completed} wins over a stale status snapshot.
-	// Cleared when a NEW assistant message goes inflight (a new turn started).
+	// Cleared when a NEW assistant message goes inflight (a new turn started),
+	// or — the approach-B disarm (false-interrupted-marker fix, 2026-10-14) —
+	// by a busy/retry statuses observation backed by a NEWER still-uncompleted
+	// newest assistant (new-turn evidence); see completionArmedOver.
 	completionAuthoritative map[string]bool
+	// completionArmedOver records WHAT the completion authority was armed
+	// over: the identity of the session's newest assistant message at arm
+	// time, plus the created-key high-water of the WHOLE resident message
+	// view at that moment (see armedAuthorityRecord, grace.go). It is the
+	// approach-B discriminator for the false-interrupted-marker fix (bug
+	// 2026-10-14, "False interrupted marker after restart"): under an armed
+	// authority, a busy/retry statuses observation is converted to idle
+	// (Lane A) UNLESS the session's newest assistant is provably NEWER than
+	// the entire arm-time view — a keyed row whose time.created strictly
+	// exceeds the recorded high-water AND is still uncompleted — new-turn
+	// evidence that disarms the authority and treats the busy as truthful.
+	// Newness is proven by the row's own MESSAGE CHRONOLOGY (created key),
+	// never wall clock and never sm.order position alone: a #2696
+	// post-terminal trap row (an old record re-served, an equal-created
+	// stamped copy, or an unkeyed patched row) can never prove it postdates
+	// the arm, so it stays blocked. The uncompleted tightener refuses the
+	// disarm when the newest assistant already completed (a missed-idle turn
+	// stays protected). Meaningful iff completionAuthoritative is set: every
+	// arm site re-records, every clear site drops it. Guarded by s.mu.
+	completionArmedOver map[string]armedAuthorityRecord
 	// completionGrace is the grace-window duration (default 5s via
 	// defaultCompletionGrace; shrunk in tests). Set on the Store instance in New
 	// so a test can shrink s.completionGrace without a global-mutation race.
@@ -1088,11 +1111,15 @@ type Store struct {
 	// live, which clears this latch, so the stale not-busy snapshot cannot
 	// mark the just-started turn). The latch is cleared by EVERY busy-class
 	// signal — a busy/retry statuses observation (setActivityAtLocked's
-	// busy-class write) or a live busy escalation / session.status busy event
-	// (same chokepoint) — and set by each not-busy observation in
-	// SetActivityFromStatuses' clear path. Set for every known session on
-	// every successful fetch (cheap map write). Cleared on session delete so
-	// a recreated id re-stabilizes from scratch.
+	// busy-class write, or the explicit blocked-report rider in
+	// SetActivityFromStatuses when the approach-B discriminator keeps the
+	// authority converting it to idle), a live busy escalation, or a
+	// session.status busy event — and set by each not-busy observation in
+	// SetActivityFromStatuses' clear path (an affirmatively busy-reported
+	// session never reaches that path for the reporting snapshot). Set for
+	// every known session on every successful fetch (cheap map write).
+	// Cleared on session delete so a recreated id re-stabilizes from
+	// scratch.
 	notBusyOnce map[string]bool
 	// pendingEmptyNewest / confirmedEmptyNewest distinguish a newest COMPLETED
 	// assistant message with zero resident parts that is SOURCE TRUTH (the
@@ -1307,6 +1334,7 @@ func NewWithConfig(cfg Config) (*Store, error) {
 		graceTimers:             map[string]*time.Timer{},
 		graceGen:                map[string]uint64{},
 		completionAuthoritative: map[string]bool{},
+		completionArmedOver:     map[string]armedAuthorityRecord{},
 		// P7 turn-boundary state machine (turn_state.go): the per-session
 		// idle|running|stopping layer + the fail-closed abort gate + the settle
 		// timer / supersede counter.

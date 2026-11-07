@@ -229,6 +229,7 @@ func (s *Store) markTurnRunningLocked(sessionID string, source turnStartSource) 
 		return
 	}
 	delete(s.completionAuthoritative, sessionID)
+	delete(s.completionArmedOver, sessionID) // approach-B invariant: the armed-over record drops with the guard
 	delete(s.liveIdleObserved, sessionID)
 	s.cancelStopTimerLocked(sessionID)
 	s.setAbortSettlingLocked(sessionID, false) // opens the gate + wakes waiters

@@ -33,6 +33,20 @@
 // runs, so its latch is cleared and the stale not-busy cannot mark it; the
 // next truthful observation reports busy and keeps it cleared. Pins:
 // TestSweepTOCTOUTurnStartAfterFetchNotMarked, TestSweepLatchResetsOnBusy.
+//
+// Approach-B rider (false-interrupted-marker fix, bug 2026-10-14): a busy
+// statuses observation under an ARMED completion authority used to be
+// converted busy→idle BEFORE the reset chokepoint, so the "ANY busy-class
+// signal resets" contract was unreachable exactly when a primed latch was
+// most dangerous — a restart or missed live busy left the prior turn's
+// authority armed, and the new live turn was false-marked. The authority now
+// records what it was armed OVER; a busy observation backed by a provably
+// newer uncompleted newest assistant (created key strictly past the arm-time
+// high-water — see newTurnSupersedesArmedAuthorityLocked) disarms the
+// authority and flows as truthful busy (resetting the latch through the
+// normal chokepoint), so the reset contract holds on every path that
+// reports busy. Pins:
+// TestSweepArmedAuthorityNewerInflightTurnIsNotFalseMarked.
 // Accepted cost: orphan heal lands on the SECOND consecutive not-busy
 // observation after the kill (the next 60s reconcile tick, or the next
 // reconnect-hydrate/reload — whichever comes first).
