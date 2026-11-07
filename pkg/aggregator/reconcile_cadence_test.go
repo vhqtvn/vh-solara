@@ -644,14 +644,19 @@ func TestRehydrateArchivedRefreshOverlapIsBenign(t *testing.T) {
 	// race-free: the reconcile goroutine is parked on the hold channel,
 	// and this write happens-before close(holds[0]) happens-before its
 	// receive happens-before its next archivedSnapshotDue read.
+	//
+	// Wall-clock hazard (tPre/tRh witnesses): strict > on time.Now().UnixNano()
+	// means an NTP step-backward can only false-RED loudly, never false-green.
 	tRh := agg.lastArchivedRefresh.Load()
 	agg.archivedSnapshotInterval = time.Hour
 	closeHolds(0) // the tick's fetch (arrival #1) — its apply lands asynchronously
 	tickApplyEnd := time.Now().Add(5 * time.Second)
 	for agg.lastArchivedRefresh.Load() <= tRh {
 		if time.Now().After(tickApplyEnd) {
-			t.Errorf("the parked tick's archived apply never landed after release: lastArchivedRefresh %d never advanced past the rehydrate's %d — a tick-side apply discard would look exactly like this", agg.lastArchivedRefresh.Load(), tRh)
-			break
+			// Hard fail: the rehydrate's earlier apply can already satisfy
+			// the post-tick asserts below — falling through invites false-comfort.
+			cancel()
+			t.Fatalf("the parked tick's archived apply never landed after release: lastArchivedRefresh %d never advanced past the rehydrate's %d — a tick-side apply discard would look exactly like this", agg.lastArchivedRefresh.Load(), tRh)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
