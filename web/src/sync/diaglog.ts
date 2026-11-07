@@ -64,8 +64,19 @@ export interface ColdOpenEntry {
   *  - `tail-incomplete-on-idle` — activity=idle arrived but the resident tail's
   *                             last assistant message lacks time.completed
   *                             (Invariant 2).
+  *  - `transport-stale-watchdog` — the dual-clock watchdog forced a reconnect
+  *                             after the TRANSPORT clock aged out (pings
+  *                             stopped; health.ts). Also the label when BOTH
+  *                             clocks aged out — transport has precedence (a
+  *                             dead transport explains the content silence;
+  *                             the same predicate the legacyForce log line
+  *                             uses). B4.2a (2026-11-07): before this, both
+  *                             watchdog stall paths mislabeled themselves
+  *                             content-stale-watchdog.
   *  - `content-stale-watchdog` — the dual-clock watchdog forced a reconnect
-  *                             (health.ts transport/content stall paths).
+  *                             after the CONTENT clock ALONE aged out (pings
+  *                             kept flowing, zero content delivered; health.ts
+  *                             content-only stall path).
   *  - `sentinel-timeout`     — the liveness sentinel (slice 5 webperf/F7)
   *                             waited SENTINEL_TIMEOUT for the probe nonce and
   *                             recovered cursor-preserving (health.ts onTimeout
@@ -84,7 +95,7 @@ export interface StallEntry {
   /** Wall-clock capture time (ms epoch). */
   ts: number;
   /** What triggered the stall detection + self-heal. */
-  trigger: "seq-gap" | "tail-incomplete-on-idle" | "content-stale-watchdog" | "sentinel-timeout" | "reconnect" | "part-append-offset-mismatch" | "resume-silent-fallback";
+  trigger: "seq-gap" | "tail-incomplete-on-idle" | "content-stale-watchdog" | "transport-stale-watchdog" | "sentinel-timeout" | "reconnect" | "part-append-offset-mismatch" | "resume-silent-fallback";
   /** Which stream(s) the detection + recovery targets. */
   stream: "tree" | "session" | "both";
   /** The session the stall concerns (for session-scoped triggers). */
@@ -163,6 +174,10 @@ export type StreamOpenReason = (typeof STREAM_OPEN_REASONS)[number];
  * Stamp semantics (wall-clock ms epoch, joinable against the worker journal
  * ±100 ms):
  *  - openTs            — EventSource onopen (also emitted as an es-life entry).
+ *                        Rendered as `onopen@` since 2026-11-07 (B4.2b) — the
+ *                        stamp is taken inside es.onopen, NOT at construction;
+ *                        the former `open@` label invited exactly that
+ *                        misreading. The persisted key stays `openTs`.
  *  - firstFrameTs      — first CONTENT frame of any kind on this connection
  *                        (replayed delta, snapshot, tree.snapshot, message.*).
  *  - firstSnapshotTs   — first snapshot-family frame (`snapshot` detail /
@@ -355,7 +370,13 @@ export function entryLine(e: DiagEntry): string {
       parts.push(`gen=${e.generation}`, `cursor=${e.cursor}`, `had_cursor=${e.hadCursor}`);
       if (e.sessionId) parts.push(`sess=${e.sessionId}`);
       parts.push(`fb=${e.fallbackArmed ? 1 : 0}`, `pane=${e.pane}`, `proj=${e.project}`);
-      if (e.openTs !== undefined) parts.push(`open@=${e.openTs}`);
+      // B4.2b (2026-11-07): rendered as `onopen@` — the stamp is written
+      // inside EventSource ONOPEN (not at construction), and the old `open@`
+      // label was misread as a construction stamp during the 2026-10-30
+      // decomposition. The persisted/internal key stays `openTs` (renaming
+      // the record field would orphan the stamps on already-persisted
+      // captures); only the rendered label tells the truth.
+      if (e.openTs !== undefined) parts.push(`onopen@=${e.openTs}`);
       if (e.firstFrameTs !== undefined) parts.push(`frame@=${e.firstFrameTs}`);
       if (e.firstSnapshotTs !== undefined) parts.push(`snap@=${e.firstSnapshotTs}`);
       if (e.snapshotAppliedTs !== undefined) parts.push(`applied@=${e.snapshotAppliedTs}`);

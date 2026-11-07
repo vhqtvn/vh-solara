@@ -192,10 +192,15 @@ export function watchdogTick() {
         // StallEntry: capture the watchdog's pre-recovery state. Today this path
         // had NO diag — the operator could only observe the symptom (stuck
         // running node) with no record of the watchdog firing.
+        // B4.2a truthfulness: the trigger names the clock that ACTUALLY aged
+        // out — the same predicate the log line above uses. Transport has
+        // precedence when BOTH clocks aged (a dead transport explains the
+        // content silence). Pre-B4.2a records hardcoded
+        // trigger=content-stale-watchdog even on transport-only fires.
         captureDiagEntry({
           kind: "stall",
           ts: Date.now(),
-          trigger: "content-stale-watchdog",
+          trigger: contentStale && !transportStale ? "content-stale-watchdog" : "transport-stale-watchdog",
           stream: "tree",
           treeLastSeenAge: getTreeLastSeen() ? Date.now() - getTreeLastSeen() : undefined,
           treeContentSeenAge: getTreeContentSeen() ? Date.now() - getTreeContentSeen() : undefined,
@@ -349,10 +354,13 @@ export function watchdogTick() {
             reason: contentStale && !transportStale ? "content-stall" : "transport-stall",
           });
           // StallEntry: capture the watchdog's pre-recovery state.
+          // B4.2a truthfulness (mirror of the tree branch): the trigger names
+          // the clock that ACTUALLY aged out — the same predicate the log
+          // line above uses, transport precedence when both aged.
           captureDiagEntry({
             kind: "stall",
             ts: Date.now(),
-            trigger: "content-stale-watchdog",
+            trigger: contentStale && !transportStale ? "content-stale-watchdog" : "transport-stale-watchdog",
             stream: "session",
             sessionId: sesId,
             sessionLastSeenAge: getSessionLastSeen() ? Date.now() - getSessionLastSeen() : undefined,

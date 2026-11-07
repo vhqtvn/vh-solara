@@ -451,4 +451,103 @@ describe("stream-open diag — entryLine rendering for capture retrieval", () =>
     expect(lines).toContain("es-life stream=tree");
     expect(lines).toContain("onerror readyState=0");
   });
+
+  // B4.2b (card task-2026-11-07t14-20-00): the openTs stamp is written inside
+  // EventSource ONOPEN (tree-transport es.onopen → noteTreeStamp(gen,
+  // "openTs")), NOT at construction — the `open@` label was misread as a
+  // construction stamp during the 2026-10-30 decomposition (a real radio-wake
+  // misattribution). The rendered label must say onopen@. \b-anchored so the
+  // new label never satisfies an old-label assertion (open@ is a substring of
+  // onopen@; the boundary regex is the only honest form both ways).
+  it("renders the onopen stamp as onopen@ — never the open@ misnomer", () => {
+    diaglog.setDiagLogOn(true);
+    stream.connect(false, "watchdog", "watchdog-closed");
+    const es = treeESes()[0];
+    es.simulateOpen(); // onopen → stamps openTs on the open record
+    const lines = diaglog.diagEntries().map(diaglog.entryLine).join("\n");
+    expect(lines).toMatch(/\bonopen@=\d+/);
+    expect(lines).not.toMatch(/\bopen@/);
+  });
+});
+
+// ── diag-label truthfulness (card task-2026-11-07t14-20-00, debate B4.2a) ────
+// The stall record's trigger must name the clock that ACTUALLY aged out. The
+// pre-fix record hardcoded trigger=content-stale-watchdog on BOTH watchdog
+// stall paths, so a transport-stale-only fire (pings stopped <120s after the
+// last content) falsely claimed a content stall. Truth table pinned here:
+//   transport-only (lastSeen>STALE_MS=45s, contentSeen<CONTENT_STALE_MS=120s)
+//     → transport-stale-watchdog
+//   content-only (pings keep lastSeen fresh, contentSeen>120s, activity busy)
+//     → content-stale-watchdog (unchanged — the label was always accurate
+//       here; this pin guards the regression)
+// Transport precedence when BOTH age out follows the same predicate the
+// legacyForce log line has always used (contentStale && !transportStale).
+describe("stall diag — truthful trigger labels (B4.2a)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("a transport-stale-ONLY stall records trigger=transport-stale-watchdog (not content-stale)", () => {
+    diaglog.setDiagLogOn(true);
+    // Construction seeds BOTH clocks at T0 (connect() → markTreeSeen).
+    stream.connect(false, "first-open", "boot");
+    // Age past STALE_MS (45s) but stay under CONTENT_STALE_MS (120s): the
+    // transport clock is dead, the content clock is not → transport-only.
+    vi.setSystemTime(Date.now() + 60_000);
+    stream.watchdogTick();
+    const stall = diaglog.diagEntries().find((e) => e.kind === "stall");
+    expect(stall).toBeTruthy();
+    if (!stall || stall.kind !== "stall") return;
+    expect(stall.trigger).toBe("transport-stale-watchdog");
+    expect(stall.trigger).not.toBe("content-stale-watchdog");
+    expect(stall.stream).toBe("tree");
+    // Both age fields still ride the record (debate: preserve both ages).
+    expect(stall.treeLastSeenAge).toBeGreaterThanOrEqual(60_000);
+    expect(stall.treeContentSeenAge).toBeGreaterThanOrEqual(60_000);
+    expect(stall.treeContentSeenAge).toBeLessThan(120_000);
+  });
+
+  it("a content-only stall (pings flowing, session busy) keeps trigger=content-stale-watchdog", async () => {
+    diaglog.setDiagLogOn(true);
+    stream.connect(false, "first-open", "boot");
+    const es = treeESes()[0];
+    // Content at T0 marks BOTH clocks (markTreeSeen fires on content too).
+    es.fire("session.upsert", { id: "s1" }, "1.1");
+    // Keep the TRANSPORT clock fresh with pings while the content clock ages:
+    // ping at T0+90s (transport-only mark), tick at T0+130s → lastSeenAge=40s
+    // (<45s, alive), contentSeenAge=130s (>120s, stale) → content-only stall.
+    vi.setSystemTime(Date.now() + 90_000);
+    es.fire("ping", null);
+    vi.setSystemTime(Date.now() + 40_000);
+    // Activity busy → the legacy path must FORCE (not idle-skip) once the
+    // sentinel hands the decision back.
+    store.setState("activity", { s1: "busy" });
+    // The sentinel owns the content-only boundary first (capability is
+    // available until a 404 memos it away): stub the probe 404 → memo +
+    // onLegacy → anySessionActive() → legacyForce with the TRUE label.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((url: unknown) =>
+        Promise.resolve(
+          new Response("{}", {
+            status: typeof url === "string" && url.includes("/vh/stream/probe") ? 404 : 200,
+          }),
+        ),
+      ),
+    );
+    stream.watchdogTick();
+    await vi.advanceTimersByTimeAsync(0); // flush the probe fetch → onLegacy
+    const stall = diaglog.diagEntries().find((e) => e.kind === "stall");
+    expect(stall).toBeTruthy();
+    if (!stall || stall.kind !== "stall") return;
+    expect(stall.trigger).toBe("content-stale-watchdog");
+    expect(stall.stream).toBe("tree");
+    // Clock truth corroborates the label: transport fresh, content aged out.
+    expect(stall.treeLastSeenAge ?? 0).toBeLessThan(45_000);
+    expect(stall.treeContentSeenAge ?? 0).toBeGreaterThanOrEqual(120_000);
+  });
 });
