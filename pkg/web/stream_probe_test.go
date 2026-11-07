@@ -79,6 +79,7 @@ func postProbe(t *testing.T, webURL, nonce string, hdr map[string]string) *http.
 // --- 1. Emit + nonce echo + interest bypass + no-id -------------------------
 
 func TestStreamProbeEmitsLivenessEverySubscriberNoID(t *testing.T) {
+	t.Parallel() // per-test verb server + SSE readers; no env/disk/log-sink changes and no exact shared-metric assertions (diagnostics counters may increase)
 	web, agg := probeServer(t)
 	_ = agg
 
@@ -127,6 +128,7 @@ func TestStreamProbeEmitsLivenessEverySubscriberNoID(t *testing.T) {
 // --- 2. Ring/seq isolation ---------------------------------------------------
 
 func TestStreamProbeNotReplayedNotSeqAdvancing(t *testing.T) {
+	t.Parallel() // per-test verb server + SSE readers; no env/disk/log-sink changes and no exact shared-metric assertions (diagnostics counters may increase)
 	web, agg := probeServer(t)
 
 	// Apply one real event so the store has a nonzero head + ring content.

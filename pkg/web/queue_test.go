@@ -314,6 +314,7 @@ func TestQueueClaimSingleWinner(t *testing.T) {
 }
 
 func TestQueueConcurrentEnqueuesPreserved(t *testing.T) {
+	t.Parallel() // per-test tempdir store; no shared state
 	s, root := newTestStore(t, "s1")
 	const N = 50
 	var wg sync.WaitGroup
@@ -814,6 +815,7 @@ func TestQueueHTTPEndpointRoundTrip(t *testing.T) {
 // deleteStore has completed, NONE of the pre-archive seeded items may appear on
 // disk, and every on-disk item is a legitimately post-archive enqueue.
 func TestQueueRegistryConcurrentArchiveVsEnqueueNoResurrection(t *testing.T) {
+	t.Parallel()          // per-iteration t.TempDir + local registry; no env/ports/globals
 	const iterations = 50 // many shots at the window; pre-fix resurrects quickly
 	for iter := 0; iter < iterations; iter++ {
 		root := t.TempDir()
@@ -1146,6 +1148,7 @@ func TestQueueArchivedStoreRejectsRetainedPointer(t *testing.T) {
 // items on disk. The deterministic test above is the primary guard; this
 // variant exercises the race detector and the resurrection invariant in a loop.
 func TestQueueArchivedStoreConcurrentNoResurrection(t *testing.T) {
+	t.Parallel() // per-iteration t.TempDir + local registry; no env/ports/globals
 	const iterations = 40
 	for iter := 0; iter < iterations; iter++ {
 		root := t.TempDir()

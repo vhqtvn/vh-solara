@@ -71,6 +71,9 @@ func readUntilSnapshot(t *testing.T, r *bufio.Reader) string {
 // FAIL-without (RecordSnapshotPath(len(b))): delta == len(rawMarshal).
 // PASS-with (RecordSnapshotPath(len(wire))): delta == len(wire) < len(rawMarshal).
 func TestSnapshotDiag_BytesReflectWire(t *testing.T) {
+	// Serial: asserts an EXACT byte delta on the process-global
+	// diagnostics.Default snapshot counter; any concurrently running test
+	// that opens a selected-class stream would pollute the delta.
 	fake := newFake()
 	fake.sessions = []string{`{"id":"a","title":"A","time":{"updated":1}}`}
 	// A transcript large enough to exceed snapshotCompressThreshold.

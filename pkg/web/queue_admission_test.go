@@ -387,6 +387,7 @@ func TestQueueAdmissionRejectsOversizedAttemptID(t *testing.T) {
 // succeeds linearizably or is refused with errQueueArchived, and never
 // reports a ghost replay.
 func TestQueueAdmissionCleanupRaceConsistency(t *testing.T) {
+	t.Parallel() // per-iteration t.TempDir + local registry; no env/ports/globals
 	const iterations = 100
 	for iter := 0; iter < iterations; iter++ {
 		root := t.TempDir()
@@ -470,6 +471,7 @@ func TestQueueAdmissionCleanupRaceConsistency(t *testing.T) {
 // forward; identical re-resolve is a timestamp-preserving no-op; everything
 // else conflicts; pending is rejected outright.
 func TestQueueResolveMatrix(t *testing.T) {
+	t.Parallel() // each case builds its own tempdir store
 	const setupDetail = "original detail"
 	cases := []struct {
 		name     string

@@ -100,6 +100,7 @@ func doManaged(t *testing.T, webURL, method, path string, body string) *http.Res
 // the declared view is registered and proxyable through dispatchView, and the
 // process controls respond.
 func TestManagedHTTP_TrustGateThenProxy(t *testing.T) {
+	t.Parallel() // per-test upstream + managed server; independent child process
 	// A reachable upstream the declared view will proxy to.
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "hello from upstream")

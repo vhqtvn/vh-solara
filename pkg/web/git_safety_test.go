@@ -91,6 +91,8 @@ func TestGitPushBoundKills(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Cannot t.Parallel(): Go's testing framework forbids Parallel in any
+	// test that uses t.Setenv (regardless of ordering).
 	t.Setenv("VH_GIT_PUSH_TIMEOUT_SECS", "1")
 	s := &Server{}
 	req := httptest.NewRequest("POST", "/vh/git/push?dir="+dir, nil)
@@ -157,6 +159,12 @@ func TestGitPushUnderBoundSucceeds(t *testing.T) {
 // env override, unlike push), so the test shrinks the package-level var —
 // the sanctioned seam; the handler under test reads the same var runGit does.
 func TestGitCommitBoundKills(t *testing.T) {
+	// Parallel-safe: the gitCommandTimeout package-var swap below is visible
+	// to other parallel tests. Every reader is one of the git
+	// status/stage/commit/log handlers or the code-view handlers —
+	// status/stage/log/code-view go through runGit, commit applies the bound
+	// itself via runGitCtx — and no other parallel test invokes any of them.
+	t.Parallel()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}

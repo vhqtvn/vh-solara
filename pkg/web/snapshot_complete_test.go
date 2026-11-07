@@ -55,6 +55,7 @@ func decodeComplete(t *testing.T, ev sseEvent) struct {
 // connect emits snapshot.complete AFTER both tree.snapshot and snapshot
 // (detail), stamped with the SAME {epoch, seq} as both projections.
 func TestSnapshotComplete_FreshConnectTruthfulBoundary(t *testing.T) {
+	t.Parallel() // per-test treeReplayServer; no env/disk/log-sink changes and no exact shared-metric assertions (diagnostics counters may increase)
 	srv, agg := treeReplayServer(t)
 	store := agg.Store()
 	applyCreate(store, "R", "")
@@ -118,6 +119,7 @@ func TestSnapshotComplete_FreshConnectTruthfulBoundary(t *testing.T) {
 // path (valid cursor, treeEmitter != nil) ALSO emits snapshot.complete after
 // both projections — the second SnapshotWithTree call site in handleStream.
 func TestSnapshotComplete_ReconnectEmitsBoundary(t *testing.T) {
+	t.Parallel() // per-test treeReplayServer; no env/disk/log-sink changes and no exact shared-metric assertions (diagnostics counters may increase)
 	srv, agg := treeReplayServer(t)
 	store := agg.Store()
 	applyCreate(store, "R", "")

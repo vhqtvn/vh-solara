@@ -221,6 +221,7 @@ func TestTreeReplay_ReconnectReplaysDelta(t *testing.T) {
 // emission (D-F1, review ses_ed9164bb2): no RED was expected — they pin the
 // wire contract the Slice B client switch (noteServerRingGap) consumes.
 func TestTreeReplay_RingGapSendsReconnectSnapshot(t *testing.T) {
+	t.Parallel() // per-test server/store; no env/disk/log-sink changes and no exact shared-metric assertions (diagnostics counters may increase)
 	oc := httptest.NewServer(http.NotFoundHandler())
 	t.Cleanup(oc.Close)
 	agg := aggregator.New(oc.URL, 4) // small ring so 5 events evict Seq=1

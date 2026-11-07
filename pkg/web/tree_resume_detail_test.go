@@ -54,6 +54,7 @@ func lastEventIDOf(events []sseEvent, kind string) string {
 // resume path must bootstrap full detail (mirroring GAP 3's fresh-connect
 // block) so a client reconnecting with empty in-memory detail maps is seeded.
 func TestTreeResume_ReconnectBootstrapsDetail(t *testing.T) {
+	t.Parallel() // per-test treeReplayServer; no env/disk/log-sink changes and no exact shared-metric assertions (diagnostics counters may increase)
 	srv, agg := treeReplayServer(t)
 	store := agg.Store()
 	applyCreate(store, "R", "")
@@ -137,6 +138,7 @@ func TestTreeResume_ReconnectBootstrapsDetail(t *testing.T) {
 // STILL flow — a client that resumed at head with empty detail maps must be
 // seeded. This is the purest C-F1 signal (no ring deltas to mask the gap).
 func TestTreeResume_ReconnectAtHeadBootstrapsDetail(t *testing.T) {
+	t.Parallel() // per-test treeReplayServer; no env/disk/log-sink changes and no exact shared-metric assertions (diagnostics counters may increase)
 	srv, agg := treeReplayServer(t)
 	store := agg.Store()
 	applyCreate(store, "R", "")

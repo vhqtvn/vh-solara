@@ -158,6 +158,7 @@ func TestOrchestrator_ReapprovalEvictsRemovedView(t *testing.T) {
 // registered until its process reaches readiness (so it never proxies to a
 // not-yet-bound upstream), then registers automatically once ready.
 func TestOrchestrator_ViewDeferredUntilReady(t *testing.T) {
+	t.Parallel() // per-test tempdir config + orchestrator/manager; independent child process
 	root := writeManagedConfig(t, depConfig)
 	o, mgr := newTestOrchestrator(t)
 	defer mgr.StopAll()

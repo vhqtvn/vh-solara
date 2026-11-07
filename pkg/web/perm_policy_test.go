@@ -135,6 +135,7 @@ func TestSpawnPermissionPolicyReplayNoDoubleRegister(t *testing.T) {
 // session and asserts the watcher auto-rejects it (never "always"), the
 // permission_blocked gate fact appears, and the spawn outcome stays "created".
 func TestWatcherAutoRejectsFailFast(t *testing.T) {
+	t.Parallel() // per-test verb server; the permission watcher is per-server state
 	f := &fakeOC{}
 	web, agg, srv := newVerbServerSrv(t, f)
 	st, out, _ := post(t, web.URL+"/vh/spawn", `{"prompt":"hi","permission_policy":"fail_fast"}`, nil)

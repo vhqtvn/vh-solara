@@ -258,6 +258,7 @@ func TestNamedLayoutStoreUpsertMismatchedRevisionDoesNotTouchDisk(t *testing.T) 
 // untouched); an OVERWRITE of an existing name at a full catalog still
 // succeeds.
 func TestNamedLayoutStoreCatalogCap(t *testing.T) {
+	t.Parallel() // per-test tempdir store
 	st, path := newLayoutTestStore(t)
 
 	for i := 0; i < maxNamedLayouts; i++ {

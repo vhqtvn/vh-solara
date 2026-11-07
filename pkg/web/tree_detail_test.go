@@ -122,6 +122,7 @@ func eventDataFor(events []sseEvent, kind, needle string) (string, bool) {
 // emits tree.snapshot (structure) AND snapshot (legacy detail bootstrap) — the
 // latter populates state.sessions/permissions/questions/todos on the client.
 func TestTreeDetail_FreshConnectEmitsBothSnapshots(t *testing.T) {
+	t.Parallel() // per-test treeReplayServer; no env/disk/log-sink changes and no exact shared-metric assertions (diagnostics counters may increase)
 	srv, agg := treeReplayServer(t)
 	store := agg.Store()
 	applyCreate(store, "R", "")
@@ -165,6 +166,7 @@ func TestTreeDetail_FreshConnectEmitsBothSnapshots(t *testing.T) {
 // in tree=2 mode emits BOTH tree.op (structure delta) AND the legacy detail event
 // (e.g. session.upsert) so state.sessions stays current as sessions are created.
 func TestTreeDetail_LiveEventsEmitLegacyAlongsideTreeOp(t *testing.T) {
+	t.Parallel() // per-test treeReplayServer; no env/disk/log-sink changes and no exact shared-metric assertions (diagnostics counters may increase)
 	srv, agg := treeReplayServer(t)
 	store := agg.Store()
 	applyCreate(store, "R", "")
@@ -207,6 +209,7 @@ func TestTreeDetail_LiveEventsEmitLegacyAlongsideTreeOp(t *testing.T) {
 // snapshot ships RAW (not gzip64) so it does not race tree.snapshot's async
 // gzip64 decode on the client's shared treeSnapshotDecoding flag.
 func TestTreeDetail_LegacySnapshotNotCompressedGzip64(t *testing.T) {
+	t.Parallel() // per-test treeReplayServer; no env/disk/log-sink changes and no exact shared-metric assertions (diagnostics counters may increase)
 	srv, agg := treeReplayServer(t)
 	store := agg.Store()
 	applyCreate(store, "R", "")

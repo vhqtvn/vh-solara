@@ -31,6 +31,7 @@ const watchEventWait = 30 * time.Second
 // The watch SSE must emit "changed" when the project's project.jsonc appears or
 // is modified, so the UI reflects an external edit without a manual reload.
 func TestProjectSettingsWatchEmitsOnChange(t *testing.T) {
+	t.Parallel() // per-test server + watched tempdir
 	ws := newWebServer(t)
 	defer ws.Close()
 
@@ -78,6 +79,7 @@ func TestProjectSettingsWatchEmitsOnChange(t *testing.T) {
 // edit to either must nudge a reload. A missing overlay is the normal starting
 // state and must not fire on its own.
 func TestProjectSettingsWatchEmitsOnPreferencesChange(t *testing.T) {
+	t.Parallel() // per-test server + watched tempdir
 	ws := newWebServer(t)
 	defer ws.Close()
 

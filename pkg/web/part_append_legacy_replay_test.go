@@ -33,6 +33,9 @@ import (
 // the sendable() filter (plain /vh/stream is the tree-only Stream 1 with an
 // empty non-nil filter that drops ALL message-class events).
 func TestPartAppend_LegacyReplayFallbackToSnapshot(t *testing.T) {
+	// Serial: asserts an EXACT delta (==1) on the process-global
+	// Stream2ReplayFallback diagnostics counter; any concurrently running
+	// fallback-triggering test would pollute the delta.
 	srv, agg := treeReplayServer(t)
 	store := agg.Store()
 	store.Apply(ev("session.created", `{"info":{"id":"s1"}}`))

@@ -20,8 +20,12 @@ import (
 // when VH_STATE_DIR is unset or empty — an explicitly pinned env (CI, an
 // operator, a focused local run) keeps control. Per-test
 // t.Setenv("VH_STATE_DIR", ...) still wins: it mutates the process env for
-// that test's duration after this default is installed, and no test in this
-// package runs parallel (verified), so there is no cross-test env race.
+// that test's duration after this default is installed. A subset of this
+// package's tests opts into t.Parallel() (the test-speed slice-4 pilot);
+// those tests never call t.Setenv/t.Chdir and never pin VH_STATE_DIR, so
+// the process env stays at this default for the whole parallel phase and
+// there is no cross-test env race. Keep it that way: a test that needs a
+// private state root via t.Setenv must stay serial.
 func TestMain(m *testing.M) {
 	if cur := os.Getenv("VH_STATE_DIR"); cur != "" {
 		os.Exit(m.Run())
