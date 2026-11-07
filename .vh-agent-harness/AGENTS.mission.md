@@ -237,10 +237,16 @@ is **no pytest** anywhere in this repo.
     mid-test, drives the SW update, and asserts the four transition invariants:
     exactly-one pane reload, host never reloaded, old-stamp cache reaped with
     zero residual entries, and SW controller continuity. Dispatchable only,
-    NOT PR-blocking; serial (`workers: 1`); Chromium by default (~1.3m as
-    currently measured); Firefox opt-in via the commented project slot in
-    the lane-10 playwright config (re-enable conditions documented there;
-    evaluate-channel starvation pathology on some hosts).
+    NOT PR-blocking; serial (`workers: 1`); Chromium + Firefox (~1.2m /
+    ~1.3m per engine, ~2.6m for the two-engine suite as measured
+    2026-11-08 under playwright 1.65.0). Firefox was disabled 2026-11-07 by
+    a stochastic per-frame `frame.evaluate` hang around the SW controller
+    transition on 1.64.1/firefox-1555 and re-enabled 2026-11-08 after the
+    1.65.0 bump went green n=3 on fresh full-pipeline runs (defect record +
+    repeat receipts: the lane-10 playwright config comment and
+    `tmp/agent-runs/lane10-pw-bump/`; the Firefox project keeps a raised
+    1200s timeout so a recurrence fails bounded instead of hanging). WebKit
+    opt-in via the commented project slot in the lane-10 playwright config.
     Runner: `make test-host-web-deploy-transition` (full pipeline: builds web SPA
     twice with distinct stamps, host folded once, both binaries, runs Playwright),
     or `bash host-web/scripts/deploy-transition-run.sh` (`VH_DEPLOY_SKIP_BUILD=1`

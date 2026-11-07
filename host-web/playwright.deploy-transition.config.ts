@@ -25,10 +25,9 @@ import { defineConfig, devices } from "@playwright/test";
 // the stamps.json receipt the spec asserts against.
 //
 // Run: cd host-web && npx playwright test --config=playwright.deploy-transition.config.ts
-// Engines: chromium (default). firefox is dispatch-gated to OPT-IN since
-// 2026-11-07 — environment-driven evaluate-channel starvation on the lane
-// host (see the projects block below for the full justification + receipts);
-// webkit opt-in as before (lane-9 posture).
+// Engines: chromium + firefox (firefox RE-ENABLED 2026-11-08 — see the
+// projects block below for the defect record + evidence); webkit opt-in
+// (lane-9 posture).
 // =============================================================================
 const hostRoot = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(hostRoot, "..");
@@ -65,27 +64,25 @@ export default defineConfig({
   },
   projects: [
     { name: "chromium", use: { ...devices["Desktop Chrome"] } },
-    // Firefox OPT-IN (dispatch-gated 2026-11-07, environment-driven — the
-    // webkit-style slot below it). Diagnosis (receipts:
+    // Firefox RE-ENABLED 2026-11-08 (was dispatch-gated OPT-IN since
+    // 2026-11-07). DEFECT that gated it: on playwright 1.64.1/firefox-1555 a
+    // per-frame `frame.evaluate` around a service-worker controller
+    // transition (claim / controllerchange guard-reload — exactly this lane's
+    // deploy drive) could STOCHASTICALLY hang forever while the page stayed
+    // healthy — 5/5 lane reds over two days, one wedge in 6 minimal-repro
+    // runs; any evaluate could stall unboundedly (diagnosis receipts:
     // tmp/agent-runs/lane10-ff-diag/REPORT.md, G8:
-    // tmp/agent-runs/g8-lane10-verify/): firefox on the lane host starves
-    // the Playwright evaluate channel under the host's persistent baseline
-    // load (Android emulator w/ software GL since 2026-10-30) — per-Evaluate
-    // cost grows 10s → 100s → 1000s+ → hang while the page itself stays
-    // healthy (steady SPA polling, DOM/inspector reads fine).
-    // Deterministic 4/4 red (G8 ×2 @360s, no-self-load rerun @360s, post-fix
-    // @1200s despite the deploy transition itself LANDING at +36s per the
-    // network trace); chromium green on the same binaries/host/load;
-    // spec+config unchanged since the 2026-10-10 firefox pass. Budget raise
-    // (project timeout below) and ~3× round-trip batching (spec, 2026-11-07)
-    // are both already in — and both demonstrably insufficient: ANY evaluate
-    // can stall unboundedly (a standalone probe's FIRST trivial evaluate
-    // hung 14m). The project timeout derivation (measured p50 ≈ 12s,
-    // p90 ≈ 25s per round-trip; healthy path ≈ ~36 round-trips ≈ ~560s;
-    // worst legal ≈ ~950s → 1200s) is retained for a re-enable on hosts
-    // WITHOUT the starvation pathology; re-enable (uncomment) when the host
-    // baseline changes or a firefox run completes within it.
-    // { name: "firefox", use: { ...devices["Desktop Firefox"] }, timeout: 1_200_000 },
+    // tmp/agent-runs/g8-lane10-verify/, repro + fix evidence:
+    // tmp/agent-runs/lane10-ff-repro/REPORT.md). FIXED-IN-EVIDENCE:
+    // @playwright/test 1.65.0 (Firefox 159.0, firefox-1572) ran the REAL
+    // lane-10 firefox leg bit-identical against the SAME prebuilt binaries
+    // (mw6q*) that hung 20.2m on 1.64.1 — GREEN 1.3m, all four invariants;
+    // full repro suite green. The bump landed 2026-11-08 with fresh
+    // full-pipeline firefox greens n≥3 (repeat receipts under
+    // tmp/agent-runs/lane10-pw-bump/). The generous project timeout below
+    // (1200s vs ~1.3m healthy) is retained deliberately: if the wedge class
+    // ever recurs, the leg fails BOUNDED at 20m instead of hanging forever.
+    { name: "firefox", use: { ...devices["Desktop Firefox"] }, timeout: 1_200_000 },
     // Webkit opt-in (disclosed skip by default — lane-9 posture):
     // { name: "webkit", use: { ...devices["Desktop Safari"] } },
   ],

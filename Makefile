@@ -98,7 +98,7 @@ test-host-web-deploy-transition: ## Run host-web DEPLOY-TRANSITION e2e (BUILD_ID
 # Official Playwright image, pinned to the exact @playwright/test version in
 # host-web/package.json (browsers ship inside the image; PLAYWRIGHT_BROWSERS_PATH
 # is preset). Host prerequisites: docker + repo checkout. Nothing else.
-PLAYWRIGHT_IMAGE ?= mcr.microsoft.com/playwright:v1.64.1-noble
+PLAYWRIGHT_IMAGE ?= mcr.microsoft.com/playwright:v1.65.0-noble
 # Run as the invoking uid/gid with a writable HOME so artifacts under tmp/ and
 # host-web/node_modules/.vite stay user-owned (never root-owned).
 PW_DOCKER = docker run --rm --init --user "$$(id -u):$$(id -g)" -e HOME=/tmp/pw-home -v "$$(pwd)":/repo -w /repo $(PLAYWRIGHT_IMAGE)
@@ -137,15 +137,24 @@ test-host-web-docker: ## Run host-web Playwright e2e (LANE 7, all three engines)
 #   - PLAYWRIGHT_JSON_OUTPUT_NAME is inert for the config's list reporter;
 #     pass ARGS='--reporter=list,json' to also retain full results (incl. the
 #     spec's qd-* timing/correlation annotations) in report.json.
-# Version coupling: web/'s caret range (^1.64.1) currently lock-RESOLVES to
-# @playwright/test 1.64.1 — the same version as host-web's exact pin and the
-# PLAYWRIGHT_IMAGE tag. web/ is NOT exactly pinned: any web lock refresh must
-# re-assert resolved version == image tag (see docs/ai/docker-test-routes.md).
-PW_DOCKER_GO = docker run --rm --init --ipc=host --network=host --user "$$(id -u):$$(id -g)" -e HOME=/tmp/pw-home -e PLAYWRIGHT_JSON_OUTPUT_NAME=/repo/tmp/queue-delivery-e2e/report.json -v "$$(pwd)":/repo -v /usr/local/go:/usr/local/go:ro -w /repo $(PLAYWRIGHT_IMAGE)
+# Version coupling: host-web's exact pin (@playwright/test 1.65.0) matches the
+# PLAYWRIGHT_IMAGE tag (v1.65.0-noble) — keep them in lockstep. web/ is NOT
+# exactly pinned and its lockfile still RESOLVES to @playwright/test 1.64.1
+# (independent lane decision, 2026-11-08). The queue-delivery headed-docker
+# route below runs WEB/'s playwright, so it gets its own image default pinned
+# to web/'s RESOLVED version (PW_QUEUE_IMAGE, v1.64.1-noble ships the
+# chromium-1248 that 1.64.1 expects) — the documented bare command stays
+# executable. When web/'s lock is refreshed, bump PW_QUEUE_IMAGE to match the
+# newly resolved version (and collapse it back into PLAYWRIGHT_IMAGE once the
+# two pins agree). Any web lock refresh must re-assert resolved version ==
+# PW_QUEUE_IMAGE tag; any host-web pin bump must re-assert exact pin ==
+# PLAYWRIGHT_IMAGE tag (see docs/ai/docker-test-routes.md).
+PW_QUEUE_IMAGE ?= mcr.microsoft.com/playwright:v1.64.1-noble
+PW_DOCKER_GO = docker run --rm --init --ipc=host --network=host --user "$$(id -u):$$(id -g)" -e HOME=/tmp/pw-home -e PLAYWRIGHT_JSON_OUTPUT_NAME=/repo/tmp/queue-delivery-e2e/report.json -v "$$(pwd)":/repo -v /usr/local/go:/usr/local/go:ro -w /repo $(PW_QUEUE_IMAGE)
 
 test-queue-delivery-headed-docker: ## Run the queue-delivery-custody lane (O3, dispatch-only) HEADED under Xvfb inside the pinned Playwright image — real virtual display + real browser, no host X/browsers needed; mounts the host Go toolchain read-only for the webServer's fixtureserver. Installs web/node_modules in-container first if missing. ARGS appends to playwright test (e.g. ARGS='--reporter=list,json' retains timing evidence in tmp/queue-delivery-e2e/report.json).
 	@if [ ! -d web/node_modules ]; then \
-		echo ">> web/node_modules missing — running npm ci inside $(PLAYWRIGHT_IMAGE)"; \
+		echo ">> web/node_modules missing — running npm ci inside $(PW_QUEUE_IMAGE)"; \
 		$(PW_DOCKER_GO) bash -c 'mkdir -p "$$HOME" && cd web && npm ci'; \
 	fi
 	$(PW_DOCKER_GO) bash -c 'set -euo pipefail; mkdir -p "$$HOME" tmp/queue-delivery-e2e/go-cache tmp/queue-delivery-e2e/go-mod tmp/queue-delivery-e2e/go-path; command -v xvfb-run >/dev/null 2>&1 || { echo "[qdh] xvfb-run missing in image" >&2; exit 1; }; command -v curl >/dev/null 2>&1 || { echo "[qdh] curl missing in image (the lane wipe probe requires it)" >&2; exit 1; }; export PATH=/usr/local/go/bin:$$PATH; command -v go >/dev/null 2>&1 || { echo "[qdh] go missing — docker host /usr/local/go not mounted?" >&2; exit 1; }; export GOCACHE=/repo/tmp/queue-delivery-e2e/go-cache GOMODCACHE=/repo/tmp/queue-delivery-e2e/go-mod GOPATH=/repo/tmp/queue-delivery-e2e/go-path GOTOOLCHAIN=auto; echo "[qdh] prewarming go build (first run pays toolchain + module downloads + compile)"; go build -o /dev/null ./tools/fixtureserver; go version; cd web && xvfb-run --auto-servernum npx playwright test --config=playwright.queue-delivery.config.ts --project=chromium --headed --workers=1 --retries=0 $(ARGS)'
