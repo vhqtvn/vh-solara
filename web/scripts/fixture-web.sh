@@ -32,7 +32,10 @@
 # serving a broken SPA — cost: one sha256 pass over ~7 MB of build output per
 # warm start (measured tens of ms; see slice-5 report). Stamp/binary writes
 # are atomic (write temp + rename) because two lane-6 configs can start
-# concurrently.
+# concurrently. Local boots additionally serialize their whole boot critical
+# section (SPA staging rebuild → materialize → embed hash → go build → stamp
+# write) behind an flock inside the cache dir — see "Concurrent-boot
+# serialization" below.
 #
 # CI PR-blocking runs stay fresh-built FOREVER — hard invariant, not a
 # preference: when CI or GITHUB_ACTIONS is set, this script takes the legacy
@@ -126,6 +129,32 @@ fi
 no_blank_names "$spa_files" "SPA build input"
 spa_in="$(cd "$web_dir" && printf '%s\n' "$spa_files" | fingerprint "$web_dir")"
 
+# ── Concurrent-boot serialization ─────────────────────────────────────────
+# The local critical section below — SPA staging rebuild (vite empties the
+# SHARED web/dist-build) → spa.stamp read/write → materialize (rm/cp on the
+# SHARED pkg/web/dist) → embed hashing → go build → stamp publication — must
+# not interleave with another local lane-6-family boot (ordinary :8099 /
+# queue-delivery :8098 / soak :8097, incl. the docker-headed route sharing
+# this cache via the repo mount): an interleave can hand materialize a
+# transiently-empty staging dir or go:embed a torn dist, embedding a broken
+# SPA under a cache stamp (the input-keyed shape poisons the cache until an
+# input changes or the cache is wiped). The lock is therefore taken BEFORE
+# the first shared-cache read (spa.stamp) and the staging rebuild, not just
+# before materialize. fd-based flock, 600s wait budget; the lock file lives
+# in the cache dir so wiping the cache wipes the lock too. CI never reaches
+# here (early-return branch above). VH_FIXTURE_FRESH=1 deliberately stays
+# lock-free — the manual debug escape must never wait on cache state. If a
+# build step dies under set -e, process exit closes the fd and releases the
+# lock; the lock is also explicitly released before exec'ing the server (see
+# the release below — bash exec-fds carry no close-on-exec).
+if [[ "$fresh" != "1" ]]; then
+  exec 200>"$cache_dir/.boot.lock"
+  if ! flock -n 200; then
+    echo "[fixture-web] another local fixture boot holds the lock — waiting (≤600s)…"
+    flock -w 600 200 || { echo "[fixture-web] boot lock timeout ($cache_dir/.boot.lock)" >&2; exit 1; }
+  fi
+fi
+
 stamped_in=""
 stamped_out=""
 if [[ -f "$spa_stamp" ]]; then
@@ -206,6 +235,16 @@ else
   mv -f "$bin_tmp" "$srv_bin"  # atomic rename: a concurrent start execs either the old or the new complete binary
   printf '%s\n' "$srv_in" >"$srv_stamp.$$"
   mv -f "$srv_stamp.$$" "$srv_stamp"
+fi
+
+# Critical section complete (stamp written). Release the boot lock BEFORE
+# exec'ing the server: bash exec-fds carry no close-on-exec, so fd 200 would
+# otherwise be inherited by the fixtureserver — holding the lock for the
+# SERVER's lifetime and blocking every later local boot (verified: a plain
+# `exec 200>…; flock …; exec sleep …` child keeps the lock). Boots serialize;
+# servers stay concurrent.
+if [[ "$fresh" != "1" ]]; then
+  exec 200>&-
 fi
 
 echo "[fixture-web] starting fixture server on $ADDR"
