@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # Materialize the staged host shell (host-web/dist/) into the Go embed dir
-# (pkg/web/host-dist/). Mirror of web/scripts/materialize.sh.
-#
-# Clean generated outputs first to avoid stale-asset accumulation across repeated
-# local builds. The cleanup removes generated artifacts (stale index.html, assets/,
-# *.js, *.map, *.webmanifest, icons) but EXPLICITLY preserves the tracked
-# pkg/web/host-dist/placeholder.html (the cold-build fallback banner). Safe on a
-# cold clone with empty staging (cp is a no-op; placeholder.html untouched).
+# (pkg/web/host-dist/). Thin caller of the shared web/scripts/materialize.sh —
+# the clean-then-copy implementation lives in ONE place; this wrapper only
+# supplies the host paths and the same tracked fallback preserve set
+# (pkg/web/host-dist/placeholder.html is the cold-build fallback banner).
+# Caller-provided VH_MATERIALIZE_* overrides pass through (tests/special
+# callers); unset ones default to the host values here.
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
-staging="$repo_root/host-web/dist"
-dest="$repo_root/pkg/web/host-dist"
-# Remove generated host artifacts, preserving the tracked placeholder.html.
-rm -rf "$dest/assets" "$dest"/index.html "$dest"/*.js "$dest"/*.map "$dest"/*.webmanifest "$dest"/*.svg "$dest"/*.png 2>/dev/null || true
-cp -r "$staging/." "$dest/"
+export VH_MATERIALIZE_STAGING="${VH_MATERIALIZE_STAGING-$repo_root/host-web/dist}"
+export VH_MATERIALIZE_DEST="${VH_MATERIALIZE_DEST-$repo_root/pkg/web/host-dist}"
+export VH_MATERIALIZE_PRESERVE="${VH_MATERIALIZE_PRESERVE-placeholder.html}"
+exec bash "$repo_root/web/scripts/materialize.sh"

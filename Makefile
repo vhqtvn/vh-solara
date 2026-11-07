@@ -191,8 +191,8 @@ e2e-keep: ## Same as e2e but leave the container running for inspection
 docker: ## Build the production image
 	docker build -t vh-solara .
 
-clean-web-embed: ## Remove generated single-server SPA artifacts from pkg/web/dist (preserve tracked placeholder.html → cold-fallback embed)
-	rm -rf pkg/web/dist/assets pkg/web/dist/index.html pkg/web/dist/*.js pkg/web/dist/*.map pkg/web/dist/*.webmanifest pkg/web/dist/*.svg pkg/web/dist/*.png 2>/dev/null || true
+clean-web-embed: ## Remove generated single-server SPA artifacts from pkg/web/dist (preserve tracked placeholder.html → cold-fallback embed). Routes through the shared materialize clean mode — removes subdirs/unlisted extensions too (the old rm-list could not).
+	VH_MATERIALIZE_CLEAN=1 bash web/scripts/materialize.sh
 
-clean-host-web-embed: ## Remove generated host shell artifacts from pkg/web/host-dist (preserve tracked placeholder.html → cold-fallback embed)
-	rm -rf pkg/web/host-dist/assets pkg/web/host-dist/index.html pkg/web/host-dist/*.js pkg/web/host-dist/*.map pkg/web/host-dist/*.webmanifest pkg/web/host-dist/*.svg pkg/web/host-dist/*.png 2>/dev/null || true
+clean-host-web-embed: ## Remove generated host shell artifacts from pkg/web/host-dist (preserve tracked placeholder.html → cold-fallback embed). Same shared clean mode as clean-web-embed.
+	VH_MATERIALIZE_CLEAN=1 bash host-web/scripts/materialize.sh

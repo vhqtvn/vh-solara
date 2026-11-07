@@ -48,15 +48,15 @@ lane_tmp="tmp/deploy-lane"
 artifacts="tmp/agent-runs/page-load-perf-deploy-lane"
 mkdir -p "$lane_tmp" "$artifacts"
 
-# Materialize a web dist dir into pkg/web/dist (mirror of
-# web/scripts/materialize.sh, sourced from the lane cache instead of
-# web/dist-build). Preserves the tracked placeholder.html.
+# Materialize a web dist dir into pkg/web/dist via the SHARED materialize
+# script (web/scripts/materialize.sh owns the one clean-then-copy
+# implementation across all embed sites; this used to be a fifth inline copy
+# of the cleanup list, which could not remove subdirectories or
+# unlisted-extension ghosts). Dest/preserve stay at the shared defaults
+# (pkg/web/dist, tracked placeholder.html); staging is the lane cache dir,
+# not web/dist-build.
 materialize_web_dist() {
-  local src="$1"
-  local dest="pkg/web/dist"
-  rm -rf "$dest/assets" "$dest"/index.html "$dest"/*.js "$dest"/*.map \
-    "$dest"/*.webmanifest "$dest"/*.svg "$dest"/*.png 2>/dev/null || true
-  cp -r "$src/." "$dest/"
+  VH_MATERIALIZE_STAGING="$repo_root/$1" bash web/scripts/materialize.sh
 }
 
 extract_stamp() {
