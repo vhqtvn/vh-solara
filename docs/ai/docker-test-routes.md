@@ -159,8 +159,8 @@ non-root UID/GID containment (`-e HOME=/tmp/pw-home`, user ownership under
    external exposure.
 2. **Host Go bootstrap mount + `GOTOOLCHAIN=auto`:**
    The `PLAYWRIGHT_IMAGE` ships Node and browsers but no Go toolchain. The
-   lane's Playwright `webServer` executes `scripts/fixture-web.sh`, which runs
-   the Go fixtureserver (`go run ./tools/fixtureserver`). The wrapper mounts the
+   lane's Playwright `webServer` executes `scripts/fixture-web.sh`, which boots
+   the Go fixtureserver from a go-built cached binary (compiled on cache miss). The wrapper mounts the
    host's `/usr/local/go` read-only as a bootstrap. Because the host Go may be
    older than `go.mod` requires, `GOTOOLCHAIN=auto` downloads the exact pinned
    toolchain into a persistent cache at `tmp/queue-delivery-e2e/go-mod` and

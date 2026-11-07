@@ -61,3 +61,19 @@ Wall-time growth is watched, not gated:
   never a failure. No annotation parser enforces this today and no hard CI
   timing gate is permitted. Required new proof may legitimately increase
   duration when the rationale is explicit (§1, §2).
+
+## 4. Timing artifacts must not carry secrets
+
+Any future `secrets.*` (or secret-derived value) wired into the `web`, `e2e`
+(lane 6), `host-web-e2e`, or `multiproject-soak` CI jobs MUST first narrow that
+job's timing/artifact upload from the whole `tmp/timing-summaries/` directory
+to an explicit file list: GitHub masks secrets in **live** logs but **not** in
+uploaded artifact files, and the whole-dir uploads include the raw tee'd run
+logs — so any secret-derived value a failing test prints would be exfiltrated
+in exactly the artifact attached to the red run that reports it. Precedent: the
+`go` job's upload is deliberately `go.json` only (commit-review tier1_c-F1,
+commit 1cecac5) because the banned-token deny-list test prints the
+secret-derived `VH_SKILL_BANNED_TOKENS` token on failure; `multiproject-soak`
+(`mp-soak.json`) is likewise already file-scoped, while `web`, `e2e`, and
+`host-web-e2e` remain whole-dir and therefore must not gain secrets without
+this narrowing.

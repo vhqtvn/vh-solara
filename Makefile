@@ -113,8 +113,9 @@ test-host-web-docker: ## Run host-web Playwright e2e (LANE 7, all three engines)
 # Headed-in-docker route for the DISPATCH-ONLY queue-delivery-custody lane
 # (O3). Same PW_DOCKER pattern as test-host-web-docker, plus:
 #   - a Go BOOTSTRAP mounted read-only from the docker host's /usr/local/go
-#     (the lane's webServer runs scripts/fixture-web.sh, which `go run`s the
-#     fixtureserver — the image ships no go). The bootstrap may be OLDER than
+#     (the lane's webServer runs scripts/fixture-web.sh, which boots the
+#     fixtureserver via a go-built cached binary — compiled on cache miss;
+#     the image ships no go). The bootstrap may be OLDER than
 #     go.mod requires: GOTOOLCHAIN=auto fetches the go.mod-pinned toolchain
 #     into the persistent GOMODCACHE below — one-time, warm after. This
 #     two-phase scheme is required because the harness dev container's

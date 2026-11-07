@@ -628,8 +628,10 @@ It lets an operator:
 - SPA unit tests: `cd web && npm run test:unit` (preferred over bare `npx vitest run`, which from the repo root can resolve to a cached vitest that lacks the project jsdom config). Typecheck: `npm run typecheck`.
 - Playwright e2e: `cd web && export PATH=$PATH:/usr/local/go/bin && npx playwright
   test` (the `webServer` runs `scripts/fixture-web.sh`, which builds the SPA and
-  `go run ./tools/fixtureserver`, so go must be on PATH). The e2e suite is serial
-  and shares fixture state.
+  serves it via a prebuilt `tools/fixtureserver` binary cached under
+  `tmp/.fixture-cache/` — locally go is needed only when that cache misses;
+  CI always takes the fresh `go run` path, so go must be on PATH there). The e2e
+  suite is serial and shares fixture state.
 - Go e2e harness: `tests/e2e/` (`e2e.StartCluster()`).
 - **CSS architecture (AI-first):** component styles are co-located CSS Modules
   (`Component.module.css` beside `Component.tsx`); global tokens/theme/z-index
@@ -722,8 +724,10 @@ is **no pytest** anywhere in this repo.
    design (`web/playwright.config.ts`: `fullyParallel: false` at line 30,
    `workers: 1` at line 33, `retries: process.env.CI ? 2 : 0` at line 34) — one
    shared mutable fixture backend (`pkg/fixtures/opencode.go`). The `webServer`
-   config runs `scripts/fixture-web.sh` which builds the SPA and starts
-   `go run ./tools/fixtureserver`, so go must be on PATH.
+   config runs `scripts/fixture-web.sh`, which builds the SPA and boots the
+   fixtureserver — locally via a hash-guarded prebuilt binary under
+   `tmp/.fixture-cache/` (go needed only on cache miss), in CI always fresh
+   via `go run` (go on PATH required).
    Runner: `npm --prefix web run test:e2e`.
    *Multiproject spec note* (`web/tests/e2e/multiproject-latency.spec.ts`): the
    PR-blocking form is SCALED (3 pages, short runs) — it retains every
@@ -833,7 +837,7 @@ vh-agent-harness exec bash tests/e2e-docker/run.sh
 # Web unit + typecheck:
 vh-agent-harness exec npm --prefix web run test:unit
 vh-agent-harness exec npm --prefix web run typecheck
-# Web e2e (serial; go must be on PATH for the fixtureserver):
+# Web e2e (serial; go must be on PATH in CI and for local cache-miss rebuilds):
 vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && npm --prefix web run test:e2e'
 # Multiproject soak (dispatch lane; full-scale 7-page form; fresh fixture on :8097):
 vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && cd web && npx playwright test --config=playwright.multiproject-soak.config.ts --project=chromium --workers=1 --retries=0'

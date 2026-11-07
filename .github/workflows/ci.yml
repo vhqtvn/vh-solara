@@ -519,11 +519,18 @@ jobs:
             pv_pass=skipped
             pv_secs=skipped
           fi
+          # Append the seconds suffix only when the value is numeric — the
+          # webkit leg (no preview suite) would otherwise render "skippeds".
+          pv_disp="$pv_secs"
+          case "$pv_secs" in
+            *[!0-9]*|"") ;;
+            *) pv_disp="${pv_secs}s" ;;
+          esac
           cat >>"$GITHUB_STEP_SUMMARY" <<EOF
           ## Timing — host-web-e2e (${{ matrix.engine }})
           - browser install: ${HW_INSTALL_SECS:-unknown}s
           - DEV e2e: ${HW_E2E_SECS:-unknown}s (${{ matrix.engine }}, workers:1, self-bootstrapped servers)
-          - preview e2e: ${pv_secs}s (preview config covers chromium+firefox only)
+          - preview e2e: ${pv_disp} (preview config covers chromium+firefox only)
           - outcome: DEV ${hw_pass} passed / ${hw_fail} failed; preview ${pv_pass} (parsed from list reporter; raw logs in artifact)
           EOF
           recorded=$(date -u +%Y-%m-%dT%H:%M:%SZ)
