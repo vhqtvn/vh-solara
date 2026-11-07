@@ -1,0 +1,21 @@
+: bridge-fixture: K2-epoch-change-fresh.sse
+: request: GET /vh/stream?cursor=6&sessions=s1&z=1&part_delta=1&epoch=ep-0000000000000000000aaaaa (cursor+epoch = the client's DEAD-store pairing; served by a SECOND store life whose epoch differs → epoch_mismatch fresh snapshot@7 with B-exclusive ids n1..n3)
+: journal: time=<normalized> level=INFO msg="stream baseline" path=fresh class=selected fallback_reason=epoch_mismatch part_append_in_range=false had_cursor=true cursor=6 head=7
+: normalizations: retry: <jitter> -> retry: 2000 ; ep-<24hex> -> ep-0000000000000000000bbbbb ; time=<RFC3339> -> time=<normalized>
+
+: hello
+retry: 2000
+
+id: 7.1
+event: snapshot
+data: {"epoch":"ep-0000000000000000000bbbbb","seq":7,"sessions":[{"id":"s1"}],"messages":{"s1":[{"info":{"id":"m1","sessionID":"s1","role":"user"},"parts":[]},{"info":{"id":"n1","sessionID":"s1","role":"user"},"parts":[]},{"info":{"id":"n2","sessionID":"s1","role":"user"},"parts":[]},{"info":{"id":"n3","sessionID":"s1","role":"user"},"parts":[]}]},"messageWindows":{"s1":{"oldest_loaded_id":"m1","has_older":false,"message_count":4,"serialized_bytes":168,"count_limited":false,"bytes_limited":false}},"gate":{"s1":{"activity":"idle","hydrated":true,"hasMessages":true,"messagesLoaded":true,"last_assistant_completed":false,"last_assistant_empty":false,"subtree_busy":false,"pending_question":false,"pending_permission":false,"permission_blocked":false,"permissionWasBlocked":false,"fleet_selected":true,"subtree_error":0,"subtree_retry":0,"unread":false}},"fleet_selection":"root_unarchived_v1"}
+
+event: pins.snapshot
+data: {"revision":0,"initialized":false,"orderedSessionIds":[]}
+
+event: labels.snapshot
+data: {"revision":0,"groups":[],"tags":[],"tagIdsByRootSessionId":{}}
+
+event: archive-failures.snapshot
+data: {"failures":[]}
+

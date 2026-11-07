@@ -16,9 +16,11 @@ package web
 //         seq > cursor from the ring (or honestly falls back).
 //   OB2 — fallback_reason truthfulness: the branch the server actually took
 //         (replay vs fresh, and WHY) is named truthfully on the always-on
-//         "stream baseline" journal line (five-way fresh discriminator:
-//         epoch_mismatch | compatibility_fallback | stale_cursor_exceeds_head
-//         | ring_eviction | cursorless; "none" on the replay path).
+//         "stream baseline" journal line (six-way discriminator: the five
+//         fresh fallback_reasons epoch_mismatch | compatibility_fallback |
+//         stale_cursor_exceeds_head | ring_eviction | cursorless, plus
+//         "none" on the replay path; epoch_mismatch is exercised on real
+//         bytes by the OB5 K family below).
 //
 // SERVER TRUTHFULNESS IS ITSELF UNDER TEST: the assertions below pin the
 // journal discriminator per scenario (including ≥1 genuine ring_eviction and
@@ -40,8 +42,15 @@ package web
 //      (sseRetryBaseMs + rand.Intn(sseRetryJitterMs)) is normalized to the
 //      deterministic base `retry: 2000`.
 //   2. `ep-<24 hex>` — the per-store-lifetime epoch id (state.newEpoch,
-//      crypto/rand) is normalized to ep-0000000000000000000aaaaa wherever it
-//      appears on the wire (snapshot JSON, snapshot.complete).
+//      crypto/rand) is normalized to a deterministic PER-LIFE token:
+//      ep-0000000000000000000aaaaa for the FIRST store life of a scenario
+//      and ep-0000000000000000000bbbbb for the SECOND (OB5 chain K's
+//      epoch-change stores). The mapping is ROLE-based (the scenario's
+//      builder assigns the token when it constructs the store), never
+//      first-appearance-in-bytes, so distinct store lives NEVER collapse to
+//      one token and the double-build determinism receipt holds. An epoch
+//      the scenario did not register fails the capture loudly (it would
+//      leak crypto/rand bytes into committed fixtures).
 //   3. `time=<RFC3339>` — the captured "stream baseline" journal line's
 //      vhlog wall-clock timestamp is pinned to time=<normalized>; the line's
 //      semantic content (path=, fallback_reason=, and the other key=value
@@ -66,11 +75,14 @@ package web
 // eviction chain, 1000 elsewhere; the production premise of 4096 is a
 // user-supplied settled premise and the discriminator path is
 // capacity-independent); the generator's requests omit `dir=` (default
-// aggregator) and `epoch=` (an absent epoch param never mismatches,
-// stream_http.go:248) — both are store-routing/handshake parameters that do
-// not change the branch selection under test. The claim this file supports
-// is an obligation-preservation OBSERVATION at this revision, not production
-// correctness.
+// aggregator — a store-routing parameter that does not change the branch
+// selection under test) but DO exercise `epoch=` in the OB5 K family: K1
+// carries the store's REAL epoch (a matching handshake must stay replay)
+// and K2/K3B carry the DEAD store-A pairing (cursor from A's seq space
+// paired with A's epoch against a SECOND store life — the client's real
+// reconnect URL shape, forcing the epoch_mismatch branch). The claim this
+// file supports is an obligation-preservation OBSERVATION at this revision,
+// not production correctness.
 
 import (
 	"bytes"
@@ -96,19 +108,48 @@ import (
 // from web/tests/unit (see session-cursor-bridge.test.ts).
 const bridgeFixtureDir = "../../web/tests/unit/go-bridge-fixtures"
 
-// The three documented normalizations (see file header).
+// The three documented normalizations (see file header). The epoch tokens
+// are PER-STORE-LIFE and ROLE-based: bridgeEpochTokA is the FIRST store life
+// of every scenario (the seven original scenarios each have exactly one —
+// this is the token they have always carried), bridgeEpochTokB is the SECOND
+// store life of an epoch-change scenario (OB5 chain K).
 var (
-	bridgeRetryRe  = regexp.MustCompile(`(?m)^retry: \d+$`)
-	bridgeEpochRe  = regexp.MustCompile(`ep-[0-9a-f]{24}`)
-	bridgeTimeRe   = regexp.MustCompile(`^time=[^ ]+ `)
-	bridgeEpochTok = "ep-0000000000000000000aaaaa"
-	bridgeRetryTok = "retry: 2000"
-	bridgeTimeTok  = "time=<normalized>"
+	bridgeRetryRe   = regexp.MustCompile(`(?m)^retry: \d+$`)
+	bridgeEpochRe   = regexp.MustCompile(`ep-[0-9a-f]{24}`)
+	bridgeTimeRe    = regexp.MustCompile(`^time=[^ ]+ `)
+	bridgeEpochTok  = "ep-0000000000000000000aaaaa"
+	bridgeEpoch2Tok = "ep-0000000000000000000bbbbb"
+	bridgeRetryTok  = "retry: 2000"
+	bridgeTimeTok   = "time=<normalized>"
 )
 
-func bridgeNormalize(b []byte) []byte {
+// bridgeNormalizeLife maps each REAL per-store-lifetime epoch id to its
+// scenario-assigned deterministic token. `life` is builder-owned (the
+// builder holds agg.Store().Epoch() for every store it constructs); an
+// epoch missing from the map FAILS the capture — residual crypto/rand bytes
+// in committed fixtures would be nondeterminism the drift guard cannot
+// tell apart from handler drift.
+func bridgeNormalizeLife(t *testing.T, b []byte, life map[string]string) []byte {
+	t.Helper()
 	out := bridgeRetryRe.ReplaceAll(b, []byte(bridgeRetryTok))
-	return bridgeEpochRe.ReplaceAll(out, []byte(bridgeEpochTok))
+	var unmapped []string
+	norm := bridgeEpochRe.ReplaceAllFunc(out, func(m []byte) []byte {
+		if tok, ok := life[string(m)]; ok {
+			return []byte(tok)
+		}
+		unmapped = append(unmapped, string(m))
+		return m
+	})
+	if len(unmapped) > 0 {
+		t.Fatalf("bridge fixture: unmapped store epoch(s) %v — register every store life of the scenario before capture", unmapped)
+	}
+	return norm
+}
+
+// bridgeLifeA is the single-store-life mapping every original scenario uses.
+func bridgeLifeA(t *testing.T, agg *aggregator.Aggregator) map[string]string {
+	t.Helper()
+	return map[string]string{agg.Store().Epoch(): bridgeEpochTok}
 }
 
 // bridgeJournalLine normalizes a captured "stream baseline" journal line:
@@ -320,18 +361,25 @@ func bridgeWarmup(t *testing.T, agg *aggregator.Aggregator, web *httptest.Server
 	time.Sleep(50 * time.Millisecond)
 }
 
-// bridgeFixture is one scenario's captured artifact.
+// bridgeFixture is one scenario's captured artifact. epochTok is the
+// per-life token this file's store maps to (shown in the file's
+// normalizations header).
 type bridgeFixture struct {
-	name    string
-	request string
-	journal string
-	raw     []byte // normalized response bytes
+	name     string
+	request  string
+	journal  string
+	raw      []byte // normalized response bytes
+	epochTok string
 }
 
 func (f *bridgeFixture) fileBytes() []byte {
+	tok := f.epochTok
+	if tok == "" {
+		tok = bridgeEpochTok
+	}
 	head := fmt.Sprintf(
 		": bridge-fixture: %s\n: request: %s\n: journal: %s\n: normalizations: %s -> %s ; %s -> %s ; %s -> %s\n\n",
-		f.name, f.request, f.journal, `retry: <jitter>`, bridgeRetryTok, `ep-<24hex>`, bridgeEpochTok, `time=<RFC3339>`, bridgeTimeTok,
+		f.name, f.request, f.journal, `retry: <jitter>`, bridgeRetryTok, `ep-<24hex>`, tok, `time=<RFC3339>`, bridgeTimeTok,
 	)
 	return append([]byte(head), f.raw...)
 }
@@ -343,7 +391,8 @@ func (f *bridgeFixture) frames(t *testing.T) []bridgeSSEFrame {
 
 // bridgeCapture runs one connect inside the vhlog capture window and returns
 // the raw normalized bytes plus the (single) "stream baseline" journal line.
-func bridgeCapture(t *testing.T, web *httptest.Server, url string) ([]byte, string) {
+// life is the scenario's epoch→token mapping (see bridgeNormalizeLife).
+func bridgeCapture(t *testing.T, web *httptest.Server, url string, life map[string]string) ([]byte, string) {
 	t.Helper()
 	var raw []byte
 	lines := captureBaselines(t, func() {
@@ -351,7 +400,7 @@ func bridgeCapture(t *testing.T, web *httptest.Server, url string) ([]byte, stri
 		raw = bridgeCaptureRaw(t, resp.Body, 350*time.Millisecond)
 	})
 	line := lastBaselineLine(t, lines, 1)
-	return bridgeNormalize(raw), bridgeJournalLine(line)
+	return bridgeNormalizeLife(t, raw, life), bridgeJournalLine(line)
 }
 
 // ─── scenario scripts ────────────────────────────────────────────────────────
@@ -396,6 +445,7 @@ func bridgeLiveRC(t *testing.T, agg *aggregator.Aggregator) (m2, p1up, appendSeq
 func bridgeBuildRC(t *testing.T) []bridgeFixture {
 	t.Helper()
 	_, agg, web := bridgeServer(t, 1000)
+	life := bridgeLifeA(t, agg)
 	bridgeSeedRC(t, agg, web)
 
 	// R1: cursorless fresh connect; keep it OPEN, land the live tail, capture
@@ -420,15 +470,15 @@ func bridgeBuildRC(t *testing.T) []bridgeFixture {
 	r1raw = rd.closeAndCollect(t, resp.Body)
 
 	r2raw, r2journal := bridgeCapture(t, web,
-		fmt.Sprintf("/vh/stream?cursor=%d&sessions=s1&z=1&part_delta=1", p1up))
+		fmt.Sprintf("/vh/stream?cursor=%d&sessions=s1&z=1&part_delta=1", p1up), life)
 
 	c3raw, c3journal := bridgeCapture(t, web,
-		fmt.Sprintf("/vh/stream?cursor=%d&sessions=s1&z=1", m2))
+		fmt.Sprintf("/vh/stream?cursor=%d&sessions=s1&z=1", m2), life)
 
 	return []bridgeFixture{
 		{name: "R1-initial-cursorless.sse",
 			request: "GET /vh/stream?sessions=s1&z=1&part_delta=1 (cursorless; live tail scripted post-snapshot)",
-			journal: r1journal, raw: bridgeNormalize(r1raw)},
+			journal: r1journal, raw: bridgeNormalizeLife(t, r1raw, life)},
 		{name: "R2-replay-in-range.sse",
 			request: fmt.Sprintf("GET /vh/stream?cursor=%d&sessions=s1&z=1&part_delta=1 (cursor = the client's prefix-remembered claim = p1.upsert seq)", p1up),
 			journal: r2journal, raw: r2raw},
@@ -448,6 +498,7 @@ func bridgeBuildRC(t *testing.T) []bridgeFixture {
 func bridgeBuildE(t *testing.T) []bridgeFixture {
 	t.Helper()
 	_, agg, web := bridgeServer(t, 4)
+	life := bridgeLifeA(t, agg)
 	store := agg.Store()
 	store.Apply(ev("session.created", `{"info":{"id":"s1"}}`))
 	store.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"s1","role":"user"}}`))
@@ -481,12 +532,12 @@ func bridgeBuildE(t *testing.T) []bridgeFixture {
 	store.Apply(ev("message.updated", `{"info":{"id":"m5","sessionID":"s1","role":"user"}}`))
 
 	e2raw, e2journal := bridgeCapture(t, web,
-		fmt.Sprintf("/vh/stream?cursor=%d&sessions=s1&z=1&part_delta=1", snapSeq))
+		fmt.Sprintf("/vh/stream?cursor=%d&sessions=s1&z=1&part_delta=1", snapSeq), life)
 
 	return []bridgeFixture{
 		{name: "E1-initial-cursorless.sse",
 			request: "GET /vh/stream?sessions=s1&z=1&part_delta=1 (cursorless; live tail m2 post-snapshot)",
-			journal: e1journal, raw: bridgeNormalize(e1raw)},
+			journal: e1journal, raw: bridgeNormalizeLife(t, e1raw, life)},
 		{name: "E2-ring-eviction.sse",
 			request: fmt.Sprintf("GET /vh/stream?cursor=%d&sessions=s1&z=1&part_delta=1 (cursor = snapshot seq — the floor-only claim after the live tail was missed; 5 later events evicted the window, ring cap 4)", snapSeq),
 			journal: e2journal, raw: e2raw},
@@ -498,13 +549,14 @@ func bridgeBuildE(t *testing.T) []bridgeFixture {
 func bridgeBuildS(t *testing.T) []bridgeFixture {
 	t.Helper()
 	_, agg, web := bridgeServer(t, 1000)
+	life := bridgeLifeA(t, agg)
 	store := agg.Store()
 	store.Apply(ev("session.created", `{"info":{"id":"s1"}}`))
 	bridgeWarmup(t, agg, web, "s1")
 	head := store.Head()
 
 	sraw, sjournal := bridgeCapture(t, web,
-		fmt.Sprintf("/vh/stream?cursor=%d&sessions=s1&z=1&part_delta=1", head+50_000))
+		fmt.Sprintf("/vh/stream?cursor=%d&sessions=s1&z=1&part_delta=1", head+50_000), life)
 
 	return []bridgeFixture{
 		{name: "S1-stale-cursor-exceeds-head.sse",
@@ -521,6 +573,7 @@ func bridgeBuildS(t *testing.T) []bridgeFixture {
 func bridgeBuildT(t *testing.T) []bridgeFixture {
 	t.Helper()
 	_, agg, web := bridgeServer(t, 1000)
+	life := bridgeLifeA(t, agg)
 	store := agg.Store()
 	applyCreate(store, "R", "")
 	applyCreate(store, "C1", "R")
@@ -533,12 +586,122 @@ func bridgeBuildT(t *testing.T) []bridgeFixture {
 	applyCreate(store, "C2", "R")
 
 	traw, tjournal := bridgeCapture(t, web,
-		fmt.Sprintf("/vh/stream?cursor=%d&sessions=&tree=2&part_delta=1", head))
+		fmt.Sprintf("/vh/stream?cursor=%d&sessions=&tree=2&part_delta=1", head), life)
 
 	return []bridgeFixture{
 		{name: "T1-tree2-replay-reconnect-pair.sse",
 			request: fmt.Sprintf("GET /vh/stream?cursor=%d&sessions=&tree=2&part_delta=1 (replay reconnect over the C2 delta)", head),
 			journal: tjournal, raw: traw},
+	}
+}
+
+// bridgeBuildK — chain K (OB5 epoch handshake through the bridge): DISTINCT
+// lifetime epochs, real emission, both handshake outcomes. The TS half
+// (session-cursor-bridge.test.ts, chain K) pairs these with an epoch-scoped
+// obligation oracle. Three fixtures, three store lives:
+//
+//	K1 epoch-PRESERVED resume — K's own store A (the exact bridgeBuildRC
+//	  script), reconnect URL carrying &epoch=<A's REAL epoch> alongside
+//	  cursor=<p1up>. A matching handshake must NOT flip the replay branch:
+//	  journal stays path=replay fallback_reason=none (the bridge twin of
+//	  TestStreamEpoch_MatchValidCursorReplays, on real newEpoch bytes).
+//
+//	K2 epoch-CHANGE resume (the crux) — a SECOND store life seeded so its
+//	  fresh snapshot lands at seq 7 with B-EXCLUSIVE message ids (n1..n3 —
+//	  absent from every A-delivered set): the capture URL is the client's
+//	  real DEAD-STORE pairing cursor=<A p1up>&epoch=<A's REAL epoch>, which
+//	  the handler computes against store B's epoch → mismatch → fresh
+//	  snapshot → journal path=fresh fallback_reason=epoch_mismatch
+//	  had_cursor=true (the discriminator arm the pilot deferred, now on
+//	  real bytes). The high snapshot seq (7 ≥ A's withheld append@7) is the
+//	  geometry the pre-OB5 TS oracle false-greened on (cross-epoch floor
+//	  discharge); B-exclusive content makes the lie observable.
+//
+//	K3B epoch-CHANGE low resume — a THIRD store life (a second B role,
+//	  token bbbbb) MIRRORING A's seq layout (snapshot@4 + scripted live
+//	  tail n1@5, q1up@6), captured for the SAME dead pairing. The TS side
+//	  withholds the live tail's last frame so epoch B holds an OPEN
+//	  obligation at seq 6 — a seq the dead A-cursor (6) numerically
+//	  covers: the K3 perturbation leg's over-claim geometry. (K2 and K3B
+//	  need separate stores because the two shapes are geometrically
+//	  exclusive: a B snapshot ≥ A's open seq leaves no B obligation ≤ A's
+//	  cursor, and vice versa — OB1's cursor<open invariant forces it.)
+func bridgeBuildK(t *testing.T) []bridgeFixture {
+	t.Helper()
+
+	// Store A — same life shape as bridgeBuildRC (deterministic: same script
+	// ⇒ same seqs ⇒ the dead cursor equals the R chain's p1up).
+	_, aggA, webA := bridgeServer(t, 1000)
+	lifeA := bridgeLifeA(t, aggA)
+	bridgeSeedRC(t, aggA, webA)
+	_, p1up, _ := bridgeLiveRC(t, aggA)
+	if p1up != 6 || aggA.Store().Head() != 7 {
+		t.Fatalf("K store A layout drifted: p1up=%d head=%d, want p1up=6 head=7 (must mirror the R chain's seq space)", p1up, aggA.Store().Head())
+	}
+	realA := aggA.Store().Epoch()
+
+	// K1: the SAME-epoch resume — cursor+epoch PAIRED against store A.
+	k1raw, k1journal := bridgeCapture(t, webA,
+		fmt.Sprintf("/vh/stream?cursor=%d&sessions=s1&z=1&part_delta=1&epoch=%s", p1up, realA), lifeA)
+
+	// Store B (K2) — the HIGH second life: B-exclusive ids push the snapshot
+	// to seq 7 so it numerically covers A's withheld append@7.
+	_, aggB, webB := bridgeServer(t, 1000)
+	lifeB := map[string]string{aggB.Store().Epoch(): bridgeEpoch2Tok}
+	storeB := aggB.Store()
+	storeB.Apply(ev("session.created", `{"info":{"id":"s1"}}`))
+	storeB.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"s1","role":"user"}}`))
+	bridgeWarmup(t, aggB, webB, "s1")
+	storeB.Apply(ev("message.updated", `{"info":{"id":"n1","sessionID":"s1","role":"user"}}`))
+	storeB.Apply(ev("message.updated", `{"info":{"id":"n2","sessionID":"s1","role":"user"}}`))
+	storeB.Apply(ev("message.updated", `{"info":{"id":"n3","sessionID":"s1","role":"user"}}`))
+	if storeB.Head() != 7 {
+		t.Fatalf("K store B layout drifted: head=%d, want 7 (snapshot must cover A's withheld append@7)", storeB.Head())
+	}
+
+	// K2: the DEAD-STORE pairing — A's cursor + A's epoch against store B.
+	k2raw, k2journal := bridgeCapture(t, webB,
+		fmt.Sprintf("/vh/stream?cursor=%d&sessions=s1&z=1&part_delta=1&epoch=%s", p1up, realA), lifeB)
+
+	// Store C (K3B) — the LOW second life: A's mirrored layout (snapshot@4)
+	// plus a scripted live tail on the SAME connection (phased reader).
+	_, aggC, webC := bridgeServer(t, 1000)
+	lifeC := map[string]string{aggC.Store().Epoch(): bridgeEpoch2Tok}
+	storeC := aggC.Store()
+	storeC.Apply(ev("session.created", `{"info":{"id":"s1"}}`))
+	storeC.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"s1","role":"user"}}`))
+	bridgeWarmup(t, aggC, webC, "s1")
+	if storeC.Head() != 4 {
+		t.Fatalf("K store C layout drifted: head=%d, want 4 (mirrored A layout)", storeC.Head())
+	}
+
+	var resp *http.Response
+	var rd *bridgeReader
+	lines := captureBaselines(t, func() {
+		resp = bridgeGet(t, webC,
+			fmt.Sprintf("/vh/stream?cursor=%d&sessions=s1&z=1&part_delta=1&epoch=%s", p1up, realA))
+		rd = startBridgeReader(resp.Body)
+		rd.waitIdle(250 * time.Millisecond)
+	})
+	if len(lines) != 1 {
+		t.Fatalf("K3B: captured %d baseline lines, want 1: %v", len(lines), lines)
+	}
+	k3journal := bridgeJournalLine(lines[0])
+	storeC.Apply(ev("message.updated", `{"info":{"id":"n1","sessionID":"s1","role":"user"}}`))
+	storeC.Apply(ev("message.part.updated", `{"part":{"id":"q1","sessionID":"s1","messageID":"n1","type":"text","text":""}}`))
+	rd.waitIdle(350 * time.Millisecond)
+	k3raw := rd.closeAndCollect(t, resp.Body)
+
+	return []bridgeFixture{
+		{name: "K1-epoch-preserved-replay.sse", epochTok: bridgeEpochTok,
+			request: fmt.Sprintf("GET /vh/stream?cursor=%d&sessions=s1&z=1&part_delta=1&epoch=%s (cursor+epoch = the client's SAME-store pairing; a matching handshake must stay replay)", p1up, bridgeEpochTok),
+			journal: k1journal, raw: k1raw},
+		{name: "K2-epoch-change-fresh.sse", epochTok: bridgeEpoch2Tok,
+			request: fmt.Sprintf("GET /vh/stream?cursor=%d&sessions=s1&z=1&part_delta=1&epoch=%s (cursor+epoch = the client's DEAD-store pairing; served by a SECOND store life whose epoch differs → epoch_mismatch fresh snapshot@7 with B-exclusive ids n1..n3)", p1up, bridgeEpochTok),
+			journal: k2journal, raw: k2raw},
+		{name: "K3B-epoch-change-low-live.sse", epochTok: bridgeEpoch2Tok,
+			request: fmt.Sprintf("GET /vh/stream?cursor=%d&sessions=s1&z=1&part_delta=1&epoch=%s (the SAME dead pairing against a low second life: epoch_mismatch fresh snapshot@4 + scripted live tail n1@5/q1up@6 — the TS side withholds q1up@6)", p1up, bridgeEpochTok),
+			journal: k3journal, raw: bridgeNormalizeLife(t, k3raw, lifeC)},
 	}
 }
 
@@ -572,6 +735,7 @@ func bridgeBuildAll(t *testing.T) ([]bridgeFixture, []byte) {
 	fixtures = append(fixtures, bridgeBuildE(t)...)
 	fixtures = append(fixtures, bridgeBuildS(t)...)
 	fixtures = append(fixtures, bridgeBuildT(t)...)
+	fixtures = append(fixtures, bridgeBuildK(t)...)
 
 	dispositions := map[string]string{
 		"R1-initial-cursorless.sse":          "fresh-snapshot-applies (floor=snapshot seq); live tail delivered by the TS harness as a PREFIX (tail withheld = real disconnect shape)",
@@ -581,17 +745,21 @@ func bridgeBuildAll(t *testing.T) ([]bridgeFixture, []byte) {
 		"E2-ring-eviction.sse":               "fallback discharge: fresh snapshot applies (floor=snapshot seq) and DISCHARGES the withheld m2 obligation; the NEXT reconnect claims the snapshot seq",
 		"S1-stale-cursor-exceeds-head.sse":   bridgeClientDispositionPrefix + " (journal discriminator pin; not consumed by the TS harness)",
 		"T1-tree2-replay-reconnect-pair.sse": bridgeClientDispositionPrefix + " (tree stream / Stream 1; not consumed by the session-stream harness)",
+		"K1-epoch-preserved-replay.sse":      "epoch-preserved resume (OB5 K1): the reconnect URL's cursor+epoch PAIRING matches the store — journal stays replay/none; obligations repair within the same epoch",
+		"K2-epoch-change-fresh.sse":          "epoch-change crux (OB5 K2): the dead-store cursor+epoch pair forces epoch_mismatch → fresh snapshot with B-exclusive content; obligations re-seed under the NEW epoch; the NEXT reconnect claims B's snapshot seq paired with B's epoch",
+		"K3B-epoch-change-low-live.sse":      "epoch-change low resume (OB5 K3): B's live tail leaves an OPEN epoch-B obligation at a seq the dead A-cursor covers — the perturbation leg's over-claim geometry",
 	}
 	chains := map[string]string{
 		"R1-initial-cursorless.sse": "R", "R2-replay-in-range.sse": "R", "C3-compat-fallback.sse": "C",
 		"E1-initial-cursorless.sse": "E", "E2-ring-eviction.sse": "E",
 		"S1-stale-cursor-exceeds-head.sse": "S", "T1-tree2-replay-reconnect-pair.sse": "T",
+		"K1-epoch-preserved-replay.sse": "K", "K2-epoch-change-fresh.sse": "K", "K3B-epoch-change-low-live.sse": "K",
 	}
 	md := bridgeManifest{
 		GeneratedBy: "pkg/web/stream_bridge_fixture_test.go (VH_BRIDGE_FIXTURE_REGEN=1); regenerate after ANY handler behavior change",
 		Normalizations: []string{
 			"retry: <jitter> -> retry: 2000 (per-connection random SSE retry hint)",
-			"ep-<24hex> -> " + bridgeEpochTok + " (per-store-lifetime crypto/rand epoch id)",
+			"ep-<24hex> -> ep-0000000000000000000aaaaa (FIRST store life of a scenario) / ep-0000000000000000000bbbbb (SECOND store life — OB5 epoch-change scenarios); per-store-lifetime crypto/rand epoch ids, ROLE-mapped by the scenario's builder so distinct lives never collapse to one token",
 			"time=<RFC3339> -> " + bridgeTimeTok + " (journal-line vhlog wall-clock timestamp; discriminator fields verbatim)",
 		},
 	}
@@ -707,6 +875,110 @@ func TestStreamBridgeFixture(t *testing.T) {
 	}
 	if !bridgeHasFrame(t1, "tree.snapshot") || !bridgeHasFrame(t1, "snapshot") || !bridgeHasFrame(t1, "snapshot.complete") {
 		t.Errorf("T1: reconnect pair tree.snapshot+snapshot+snapshot.complete must follow the replay; events=%v", bridgeNames(t1))
+	}
+
+	// K1 (OB5): a MATCHING epoch handshake must not flip the replay branch —
+	// same wire shape as R2 (every replayed message-class frame's globalSeq >
+	// cursor, ascending; no snapshot re-ship).
+	k1f := byName["K1-epoch-preserved-replay.sse"]
+	k1cursor := bridgeCursorOf(t, k1f.journal)
+	if k1cursor != 6 {
+		t.Errorf("K1: journal cursor=%d, want 6 (the dead-pairing cursor K2/K3B are generated for)", k1cursor)
+	}
+	k1 := assertR("K1-epoch-preserved-replay.sse", "replay", "none")
+	if bridgeHasFrame(k1, "snapshot") {
+		t.Errorf("K1: same-epoch replay must not re-ship a snapshot; events=%v", bridgeNames(k1))
+	}
+	last = 0
+	for _, fr := range k1 {
+		if fr.event == "part.append" || fr.event == "part.upsert" || fr.event == "message.upsert" {
+			seq := bridgeGlobalSeq(t, fr.id)
+			if seq <= k1cursor {
+				t.Errorf("K1: OB1 violation — replayed %s id=%s covers cursor=%d", fr.event, fr.id, k1cursor)
+			}
+			if seq < last {
+				t.Errorf("K1: replay order not ascending: %s id=%s after %d", fr.event, fr.id, last)
+			}
+			last = seq
+		}
+	}
+	if !strings.Contains(k1f.request, "&epoch="+bridgeEpochTok) {
+		t.Errorf("K1: request line must pin the cursor+epoch PAIRING (epoch=%s): %s", bridgeEpochTok, k1f.request)
+	}
+
+	// K2 (OB5): the epoch_mismatch branch on real bytes — the discriminator
+	// arm the pilot deferred. Fresh snapshot at head with B-exclusive ids;
+	// had_cursor=true; cursor=6 (the dead pairing).
+	k2f := byName["K2-epoch-change-fresh.sse"]
+	if !strings.Contains(k2f.journal, "had_cursor=true") {
+		t.Errorf("K2: journal = %q, want had_cursor=true", k2f.journal)
+	}
+	if got := bridgeCursorOf(t, k2f.journal); got != 6 {
+		t.Errorf("K2: journal cursor=%d, want 6 (the dead A-store cursor)", got)
+	}
+	k2 := assertR("K2-epoch-change-fresh.sse", "fresh", "epoch_mismatch")
+	if !bridgeHasFrame(k2, "snapshot") {
+		t.Errorf("K2: epoch_mismatch must serve a fresh snapshot; events=%v", bridgeNames(k2))
+	}
+	k2head := bridgeHeadOf(t, k2f.journal)
+	if k2head < 7 {
+		t.Errorf("K2: head=%d, want >= 7 (B's snapshot must numerically cover A's withheld append@7 — the false-green geometry)", k2head)
+	}
+	for _, fr := range k2 {
+		if fr.event == "snapshot" {
+			if got := bridgeGlobalSeq(t, fr.id); got != k2head {
+				t.Errorf("K2: snapshot id seq=%d want head=%d", got, k2head)
+			}
+			for _, want := range []string{`"id":"n1"`, `"id":"n2"`, `"id":"n3"`} {
+				if !strings.Contains(fr.data, want) {
+					t.Errorf("K2: snapshot must carry B-exclusive %s (content witness for the TS oracle); data=%s", want, fr.data)
+				}
+			}
+		}
+	}
+	if !strings.Contains(k2f.request, "&epoch="+bridgeEpochTok) {
+		t.Errorf("K2: request line must pin the DEAD pairing (cursor=6 declared against epoch=%s): %s", bridgeEpochTok, k2f.request)
+	}
+
+	// K3B (OB5): same discriminator, LOW second life — snapshot@4 + a
+	// scripted live tail (message.upsert@5, part.upsert@6) whose seqs mirror
+	// A's, so epoch B's withheld q1up@6 sits at a seq the dead cursor covers.
+	k3f := byName["K3B-epoch-change-low-live.sse"]
+	k3 := assertR("K3B-epoch-change-low-live.sse", "fresh", "epoch_mismatch")
+	if !bridgeHasFrame(k3, "snapshot") || !bridgeHasFrame(k3, "message.upsert") || !bridgeHasFrame(k3, "part.upsert") {
+		t.Errorf("K3B: snapshot + live tail message.upsert + part.upsert must all be present; events=%v", bridgeNames(k3))
+	}
+	var k3snap, k3m, k3p uint64
+	for _, fr := range k3 {
+		switch fr.event {
+		case "snapshot":
+			k3snap = bridgeGlobalSeq(t, fr.id)
+		case "message.upsert":
+			k3m = bridgeGlobalSeq(t, fr.id)
+		case "part.upsert":
+			k3p = bridgeGlobalSeq(t, fr.id)
+		}
+	}
+	if k3snap != 4 || k3m != 5 || k3p != 6 {
+		t.Errorf("K3B: mirrored layout drifted — snapshot@%d message@%d part@%d, want 4/5/6 (the perturbation geometry needs the open obligation at 6)", k3snap, k3m, k3p)
+	}
+	if !strings.Contains(k3f.request, "&epoch="+bridgeEpochTok) {
+		t.Errorf("K3B: request line must pin the DEAD pairing (cursor=6 declared against epoch=%s): %s", bridgeEpochTok, k3f.request)
+	}
+
+	// The six-way discriminator is now covered on real bytes: the five fresh
+	// fallback_reasons (cursorless, compatibility_fallback,
+	// stale_cursor_exceeds_head, ring_eviction, epoch_mismatch) + none.
+	seen := map[string]bool{}
+	for _, f := range fixtures {
+		if m := regexp.MustCompile(`fallback_reason=(\w+)`).FindStringSubmatch(f.journal); m != nil {
+			seen[m[1]] = true
+		}
+	}
+	for _, want := range []string{"cursorless", "none", "compatibility_fallback", "ring_eviction", "stale_cursor_exceeds_head", "epoch_mismatch"} {
+		if !seen[want] {
+			t.Errorf("six-way discriminator: %s not covered across the fixture matrix", want)
+		}
 	}
 
 	// Determinism receipt: rebuild EVERYTHING from scratch and require

@@ -1,0 +1,21 @@
+: bridge-fixture: K1-epoch-preserved-replay.sse
+: request: GET /vh/stream?cursor=6&sessions=s1&z=1&part_delta=1&epoch=ep-0000000000000000000aaaaa (cursor+epoch = the client's SAME-store pairing; a matching handshake must stay replay)
+: journal: time=<normalized> level=INFO msg="stream baseline" path=replay class=selected fallback_reason=none part_append_in_range=true cursor=6 replayed=1 head=7
+: normalizations: retry: <jitter> -> retry: 2000 ; ep-<24hex> -> ep-0000000000000000000aaaaa ; time=<RFC3339> -> time=<normalized>
+
+: hello
+retry: 2000
+
+id: 7.1
+event: part.append
+data: {"field":"text","messageID":"m1","partID":"p1","sessionID":"s1","start":0,"text":"a"}
+
+event: pins.snapshot
+data: {"revision":0,"initialized":false,"orderedSessionIds":[]}
+
+event: labels.snapshot
+data: {"revision":0,"groups":[],"tags":[],"tagIdsByRootSessionId":{}}
+
+event: archive-failures.snapshot
+data: {"failures":[]}
+

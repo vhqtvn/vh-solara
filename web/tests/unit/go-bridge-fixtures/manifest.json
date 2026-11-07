@@ -2,7 +2,7 @@
   "generatedBy": "pkg/web/stream_bridge_fixture_test.go (VH_BRIDGE_FIXTURE_REGEN=1); regenerate after ANY handler behavior change",
   "normalizations": [
     "retry: \u003cjitter\u003e -\u003e retry: 2000 (per-connection random SSE retry hint)",
-    "ep-\u003c24hex\u003e -\u003e ep-0000000000000000000aaaaa (per-store-lifetime crypto/rand epoch id)",
+    "ep-\u003c24hex\u003e -\u003e ep-0000000000000000000aaaaa (FIRST store life of a scenario) / ep-0000000000000000000bbbbb (SECOND store life — OB5 epoch-change scenarios); per-store-lifetime crypto/rand epoch ids, ROLE-mapped by the scenario's builder so distinct lives never collapse to one token",
     "time=\u003cRFC3339\u003e -\u003e time=\u003cnormalized\u003e (journal-line vhlog wall-clock timestamp; discriminator fields verbatim)"
   ],
   "scenarios": [
@@ -210,6 +210,89 @@
         {
           "event": "archive-failures.snapshot",
           "id": ""
+        }
+      ]
+    },
+    {
+      "file": "K1-epoch-preserved-replay.sse",
+      "chain": "K",
+      "request": "GET /vh/stream?cursor=6\u0026sessions=s1\u0026z=1\u0026part_delta=1\u0026epoch=ep-0000000000000000000aaaaa (cursor+epoch = the client's SAME-store pairing; a matching handshake must stay replay)",
+      "journal": "time=\u003cnormalized\u003e level=INFO msg=\"stream baseline\" path=replay class=selected fallback_reason=none part_append_in_range=true cursor=6 replayed=1 head=7",
+      "clientDisposition": "epoch-preserved resume (OB5 K1): the reconnect URL's cursor+epoch PAIRING matches the store — journal stays replay/none; obligations repair within the same epoch",
+      "frames": [
+        {
+          "event": "part.append",
+          "id": "7.1"
+        },
+        {
+          "event": "pins.snapshot",
+          "id": ""
+        },
+        {
+          "event": "labels.snapshot",
+          "id": ""
+        },
+        {
+          "event": "archive-failures.snapshot",
+          "id": ""
+        }
+      ]
+    },
+    {
+      "file": "K2-epoch-change-fresh.sse",
+      "chain": "K",
+      "request": "GET /vh/stream?cursor=6\u0026sessions=s1\u0026z=1\u0026part_delta=1\u0026epoch=ep-0000000000000000000aaaaa (cursor+epoch = the client's DEAD-store pairing; served by a SECOND store life whose epoch differs → epoch_mismatch fresh snapshot@7 with B-exclusive ids n1..n3)",
+      "journal": "time=\u003cnormalized\u003e level=INFO msg=\"stream baseline\" path=fresh class=selected fallback_reason=epoch_mismatch part_append_in_range=false had_cursor=true cursor=6 head=7",
+      "clientDisposition": "epoch-change crux (OB5 K2): the dead-store cursor+epoch pair forces epoch_mismatch → fresh snapshot with B-exclusive content; obligations re-seed under the NEW epoch; the NEXT reconnect claims B's snapshot seq paired with B's epoch",
+      "frames": [
+        {
+          "event": "snapshot",
+          "id": "7.1"
+        },
+        {
+          "event": "pins.snapshot",
+          "id": ""
+        },
+        {
+          "event": "labels.snapshot",
+          "id": ""
+        },
+        {
+          "event": "archive-failures.snapshot",
+          "id": ""
+        }
+      ]
+    },
+    {
+      "file": "K3B-epoch-change-low-live.sse",
+      "chain": "K",
+      "request": "GET /vh/stream?cursor=6\u0026sessions=s1\u0026z=1\u0026part_delta=1\u0026epoch=ep-0000000000000000000aaaaa (the SAME dead pairing against a low second life: epoch_mismatch fresh snapshot@4 + scripted live tail n1@5/q1up@6 — the TS side withholds q1up@6)",
+      "journal": "time=\u003cnormalized\u003e level=INFO msg=\"stream baseline\" path=fresh class=selected fallback_reason=epoch_mismatch part_append_in_range=false had_cursor=true cursor=6 head=4",
+      "clientDisposition": "epoch-change low resume (OB5 K3): B's live tail leaves an OPEN epoch-B obligation at a seq the dead A-cursor covers — the perturbation leg's over-claim geometry",
+      "frames": [
+        {
+          "event": "snapshot",
+          "id": "4.1"
+        },
+        {
+          "event": "pins.snapshot",
+          "id": ""
+        },
+        {
+          "event": "labels.snapshot",
+          "id": ""
+        },
+        {
+          "event": "archive-failures.snapshot",
+          "id": ""
+        },
+        {
+          "event": "message.upsert",
+          "id": "5.2"
+        },
+        {
+          "event": "part.upsert",
+          "id": "6.3"
         }
       ]
     }

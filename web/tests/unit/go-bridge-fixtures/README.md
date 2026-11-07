@@ -31,7 +31,7 @@ hello / retry hint) to the post-live-tail idle.
 | Raw | Normalized | Why |
 |---|---|---|
 | `retry: <n>` | `retry: 2000` | per-connection random SSE retry hint (`sseRetryBaseMs + rand.Intn(sseRetryJitterMs)`) |
-| `ep-<24 hex>` | `ep-0000000000000000000aaaaa` | per-store-lifetime epoch id (`state.newEpoch`, crypto/rand) |
+| `ep-<24 hex>` | `ep-0000000000000000000aaaaa` (first store life) / `ep-0000000000000000000bbbbb` (second store life) | per-store-lifetime epoch id (`state.newEpoch`, crypto/rand), ROLE-mapped per scenario by the generator's builder so distinct store lives never collapse to one token (OB5 chain K) |
 | `time=<RFC3339>` (journal line only) | `time=<normalized>` | vhlog wall-clock timestamp on the captured journal line |
 
 `manifest.json` is the machine contract: per scenario, the request shape,
@@ -50,11 +50,14 @@ it.
 | `E2-ring-eviction.sse` | E | `path=fresh fallback_reason=ring_eviction had_cursor=true cursor=4 head=10` | fallback discharge: fresh snapshot@10 applies, DISCHARGES the withheld m2@5; the NEXT reconnect claims cursor=10 |
 | `S1-stale-cursor-exceeds-head.sse` | S | `path=fresh fallback_reason=stale_cursor_exceeds_head cursor=50003 head=3` | Go-side-only pin (journal discriminator); not consumed by the TS harness |
 | `T1-tree2-replay-reconnect-pair.sse` | T | `path=replay fallback_reason=none cursor=2 replayed=1` | Go-side-only pin (tree stream / Stream 1): the treeEmitter-gated reconnect pair `tree.op` → `tree.snapshot` + `snapshot` + `snapshot.complete` |
+| `K1-epoch-preserved-replay.sse` | K | `path=replay fallback_reason=none cursor=6 replayed=1` | epoch-preserved resume (OB5 K1): the reconnect URL's cursor+epoch PAIRING matches the store — the handshake does not flip same-epoch resume; withheld obligation repairs in the same epoch |
+| `K2-epoch-change-fresh.sse` | K | `path=fresh fallback_reason=epoch_mismatch had_cursor=true cursor=6 head=7` | epoch-change crux (OB5 K2): the DEAD-store cursor+epoch pair forces epoch_mismatch → fresh snapshot@7 with B-exclusive ids (n1..n3); obligations re-seed under the NEW epoch; dead-epoch obligations take the explicit `expired` disposition; the NEXT reconnect claims B's snapshot seq paired with B's epoch |
+| `K3B-epoch-change-low-live.sse` | K | `path=fresh fallback_reason=epoch_mismatch had_cursor=true cursor=6 head=4` | epoch-change low resume (OB5 K3): B's live tail (n1@5 delivered, q1up@6 withheld by the TS harness) leaves an OPEN epoch-B obligation at a seq the dead A-cursor covers — the perturbation leg's over-claim geometry |
 
-The five-way fresh discriminator (`epoch_mismatch` excluded — that is the OB5
-surface, deliberately deferred by the pilot) is covered: `cursorless`,
-`none` (replay), `compatibility_fallback`, `ring_eviction`,
-`stale_cursor_exceeds_head`.
+The six-way discriminator is covered on real bytes: the five fresh
+fallback_reasons (`cursorless`, `compatibility_fallback`,
+`ring_eviction`, `stale_cursor_exceeds_head`, `epoch_mismatch` — the OB5
+K family landed the last one) plus `none` (replay).
 
 ## Regeneration + drift guard
 
@@ -71,7 +74,10 @@ go test ./pkg/web/ -run TestStreamBridgeFixture
 The generator also captures every scenario TWICE from two freshly-built
 store/server instances and requires byte-identical output (a determinism
 receipt — residual nondeterminism fails loudly at generation, not as CI
-drift).
+drift). This holds for the epoch-change scenarios too: the per-life epoch
+tokens are assigned ROLE-based (first store life → `…aaaaa`, second →
+`…bbbbb`) by the scenario's builder, never by first appearance in the
+bytes, so the random epoch ids never reach the committed output.
 
 ## Honest scope
 
@@ -79,10 +85,13 @@ drift).
   chain, 1000 elsewhere). The production premise of a 4096-event ring is a
   user-supplied settled premise; the fallback discriminator path is
   capacity-independent.
-- The generator's requests omit `dir=` (selects the default aggregator) and
-  `epoch=` (an absent epoch param never mismatches — stream_http.go:248);
-  both are store-routing/handshake parameters that do not change the branch
-  selection under test. The TS harness sets its own project dir; the
+- The generator's requests omit `dir=` (selects the default aggregator — a
+  store-routing parameter that does not change the branch selection under
+  test). `epoch=` IS exercised by the K family: K1 carries the store's REAL
+  epoch (a matching handshake must stay `replay`), and K2/K3B carry the
+  DEAD store-A pairing (`cursor=` from A's seq space + A's epoch against a
+  SECOND store life — the client's real reconnect URL shape, forcing
+  `epoch_mismatch`). The TS harness sets its own project dir; the
   obligations are dir-invariant.
 - The claim these fixtures support is an **obligation-preservation
   OBSERVATION at this revision** — real Go emission consumed by the real TS
