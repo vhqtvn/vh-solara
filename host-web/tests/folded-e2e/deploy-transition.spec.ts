@@ -204,17 +204,32 @@ async function cacheKeys(page: Page): Promise<string[]> {
   return page.evaluate(async () => (await caches.keys()).slice().sort());
 }
 
-/** Per-cache entry URL list (sorted) — makes any residual old-stamp cache's
- * CONTENTS inspectable (which requests resurrected it). */
-async function cacheContents(page: Page): Promise<Record<string, string[]>> {
+/** Counters + cache keys + cache contents in ONE host-document round-trip
+ * (replaces the former separate readCounters+cacheKeys+cacheContents triple
+ * wherever those co-occur — drive-loop breakdown, diagnostics, invariants,
+ * stability, receipt; the returned shape matches the helpers it replaces).
+ * (2026-11-07) Firefox on the lane host pays ~10–15s PER Evaluate round-trip
+ * under baseline load (chromium: sub-second) — see the FIREFOX budget notes
+ * in playwright.deploy-transition.config.ts. */
+async function storageProbe(page: Page): Promise<{
+  counters: Record<string, string>;
+  keys: string[];
+  contents: Record<string, string[]>;
+}> {
   return page.evaluate(async () => {
-    const out: Record<string, string[]> = {};
-    for (const k of await caches.keys()) {
+    const counters: Record<string, string> = {};
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i);
+      if (k && k.startsWith("vh-deploy-")) counters[k] = sessionStorage.getItem(k) ?? "";
+    }
+    const keys = (await caches.keys()).slice().sort();
+    const contents: Record<string, string[]> = {};
+    for (const k of keys) {
       const c = await caches.open(k);
       const reqs = await c.keys();
-      out[k] = reqs.map((r) => new URL(r.url).pathname + new URL(r.url).search).sort();
+      contents[k] = reqs.map((r) => new URL(r.url).pathname + new URL(r.url).search).sort();
     }
-    return out;
+    return { counters, keys, contents };
   });
 }
 
@@ -235,28 +250,36 @@ function cacheStateOk(
   return { ok: newCachePopulated && residualEmpty, residual, newCachePopulated };
 }
 
-/** The live planted pane frames (`/app?pane=N` — the self-seed pane has no query). */
-function livePaneFrames(page: Page): Frame[] {
-  return page.frames().filter((f) => f.url().startsWith(`${ORIGIN}/app?pane=`));
-}
-
 /** Controller script url PATHNAME per pane ("loading" while mid-navigation —
- * poll). scriptURL is absolute; the pathname normalizes it to "/sw.js". */
+ * poll). scriptURL is absolute; the pathname normalizes it to "/sw.js".
+ * (2026-11-07) ONE host-document round-trip instead of one evaluate per pane
+ * frame: the panes are SAME-ORIGIN iframes, so their contentWindows are
+ * reachable from the host document, and on this host's firefox each Evaluate
+ * costs ~10–15s (chromium: sub-second) — see the FIREFOX budget notes in
+ * playwright.deploy-transition.config.ts. Slot identity is the iframe's src
+ * attribute (stable across the pane reloads this lane asserts); a
+ * mid-navigation window reads "loading" exactly like the per-frame evaluate
+ * it replaced. */
 async function paneControllers(page: Page): Promise<string[]> {
-  const out: string[] = [];
-  for (const f of livePaneFrames(page)) {
-    try {
-      out.push(
-        await f.evaluate(() => {
-          const u = navigator.serviceWorker.controller?.scriptURL;
-          return u ? new URL(u).pathname : "uncontrolled";
-        }),
-      );
-    } catch {
-      out.push("loading");
+  return page.evaluate((origin: string) => {
+    const out: string[] = [];
+    for (const f of document.querySelectorAll<HTMLIFrameElement>("iframe")) {
+      const src = f.getAttribute("src") ?? "";
+      if (!src.startsWith(`${origin}/app?pane=`)) continue;
+      try {
+        const w = f.contentWindow;
+        if (!w || !w.location.href.startsWith(`${origin}/app`)) {
+          out.push("loading");
+          continue;
+        }
+        const u = w.navigator.serviceWorker.controller?.scriptURL;
+        out.push(u ? new URL(u).pathname : "uncontrolled");
+      } catch {
+        out.push("loading");
+      }
     }
-  }
-  return out;
+    return out;
+  }, ORIGIN);
 }
 
 /** All vh-deploy-* counters accumulated by the init script (tab-wide —
@@ -356,7 +379,10 @@ async function plantThreePanes(page: Page): Promise<void> {
 
 test.describe.serial("folded deploy-transition (BUILD_ID bump on the real binary path)", () => {
   test("old SW/shell → deploy swap → exactly-one pane reload, host intact, cache reaped", async ({ page }, testInfo) => {
-    test.setTimeout(360_000); // two ~32s server boots (dead-opencode probe) + warm + swap + retries
+    // Per-test budget lives in playwright.deploy-transition.config.ts (base
+    // timeout 360s; the firefox project entry carries its own raised budget
+    // + derivation when re-enabled — do NOT reintroduce test.setTimeout
+    // here, it would override the project-level timeout).
     const engine = testInfo.project.name;
 
     // The build receipt (written by the runner) maps binary A/B → stamps.
@@ -511,10 +537,13 @@ test.describe.serial("folded deploy-transition (BUILD_ID bump on the real binary
         // Breakdown (not a bare boolean) so a red run NAMES the failing piece.
         let lastBreakdown: Record<string, unknown> = {};
         const breakdown = async () => {
-          const c = await readCounters(page);
+          // 2 round-trips (storageProbe + paneControllers), was 6 — see the
+          // FIREFOX budget derivation above for why round-trip count matters.
+          const probe = await storageProbe(page);
+          const c = probe.counters;
           const reloads = paneReloads(c);
-          const keys = await cacheKeys(page);
-          const contents = await cacheContents(page);
+          const keys = probe.keys;
+          const contents = probe.contents;
           const cs = cacheStateOk(keys, contents, `vh-${stamps.b}`);
           const ctrl = await paneControllers(page);
           lastBreakdown = {
@@ -555,20 +584,25 @@ test.describe.serial("folded deploy-transition (BUILD_ID bump on the real binary
               return reg ? new URL(reg.scope).pathname : null;
             })
             .catch((e: unknown) => `error: ${String(e)}`);
+          // 2 round-trips (registrations + storageProbe), was 3; the driveLog
+          // SHAPE is unchanged — same regs/caches/reloads keys as before.
+          const driveState = await storageProbe(page);
           driveLog.push({
             drive: updateDrives,
             paneScope,
             hostScope,
             regs: await registrations(page),
-            caches: await cacheKeys(page),
-            reloads: paneReloads(await readCounters(page)),
+            caches: driveState.keys,
+            reloads: paneReloads(driveState.counters),
           });
           await page.waitForTimeout(5000);
         }
 
         // Diagnostics receipt FIRST (also lands on failure — see honesty
         // limits): whatever the assert verdict, the state is inspectable.
-        const countersFinalPre = await readCounters(page);
+        // 4 round-trips (storageProbe + registrations + paneControllers +
+        // servedStamp), was 7; receipt SHAPE unchanged.
+        const preProbe = await storageProbe(page);
         const diagnostics = {
           engine,
           lane: "deploy-transition",
@@ -578,11 +612,11 @@ test.describe.serial("folded deploy-transition (BUILD_ID bump on the real binary
           regsBaseline,
           regsFinal: await registrations(page),
           countersBaseline,
-          countersFinalPre,
+          countersFinalPre: preProbe.counters,
           lastBreakdown,
           cacheKeysBefore,
-          cacheKeysFinalPre: await cacheKeys(page),
-          cacheContentsFinalPre: await cacheContents(page),
+          cacheKeysFinalPre: preProbe.keys,
+          cacheContentsFinalPre: preProbe.contents,
           controllersFinalPre: await paneControllers(page),
           servedStampFinalPre: await servedStamp(page),
           frameEventRecord: {
@@ -655,8 +689,9 @@ test.describe.serial("folded deploy-transition (BUILD_ID bump on the real binary
         // surviving entry is a defect), new cache populated with the shell.
         // An empty resurrected old-stamp NAME (see header) is receipted for
         // coordinator disposition, not silently ignored.
-        const cacheKeysAfter = await cacheKeys(page);
-        const cacheContentsAfter = await cacheContents(page);
+        const afterProbe = await storageProbe(page); // keys+contents: 1 round-trip
+        const cacheKeysAfter = afterProbe.keys;
+        const cacheContentsAfter = afterProbe.contents;
         const cs = cacheStateOk(cacheKeysAfter, cacheContentsAfter, `vh-${stamps.b}`);
         expect(cs.newCachePopulated, "new-stamp cache populated (shell precached)").toBe(true);
         for (const [name, entries] of Object.entries(cs.residual)) {
@@ -684,9 +719,11 @@ test.describe.serial("folded deploy-transition (BUILD_ID bump on the real binary
         ).toBeGreaterThanOrEqual(PANE_COUNT);
 
         // ---- 8. no-loop stability window (X6 discipline) -------------------
+        // (storageProbe keeps each side at ≤2 round-trips; shape unchanged.)
+        const stableSnapshot = await storageProbe(page);
         const stable = {
-          counters: await readCounters(page),
-          caches: await cacheKeys(page),
+          counters: stableSnapshot.counters,
+          caches: stableSnapshot.keys,
           residualNames: Object.keys(cs.residual),
           populated: cs.newCachePopulated,
         };
@@ -694,12 +731,9 @@ test.describe.serial("folded deploy-transition (BUILD_ID bump on the real binary
         expect(await readCounters(page), "stability: document counters unchanged").toEqual(
           stable.counters,
         );
-        const stableCaches = await cacheKeys(page);
-        const stableCs = cacheStateOk(
-          stableCaches,
-          await cacheContents(page),
-          `vh-${stamps.b}`,
-        );
+        const stableProbe = await storageProbe(page);
+        const stableCaches = stableProbe.keys;
+        const stableCs = cacheStateOk(stableCaches, stableProbe.contents, `vh-${stamps.b}`);
         expect(stableCaches, "stability: cache names unchanged").toEqual(stable.caches);
         expect(stableCs.ok, "stability: cache state still contract-clean").toBe(true);
         expect(Object.keys(stableCs.residual), "stability: same residual names").toEqual(
@@ -707,12 +741,15 @@ test.describe.serial("folded deploy-transition (BUILD_ID bump on the real binary
         );
 
         // ---- final receipt (overwrites the diagnostics-only one) -----------
+        // (3 round-trips: storageProbe + readCounters + paneControllers; the
+        // receipt SHAPE is unchanged.)
+        const finalProbe = await storageProbe(page);
         const receipt = {
           ...diagnostics,
           verdict: "green",
           countersFinal: await readCounters(page),
-          cacheKeysAfter: await cacheKeys(page),
-          cacheContentsAfter: await cacheContents(page),
+          cacheKeysAfter: finalProbe.keys,
+          cacheContentsAfter: finalProbe.contents,
           controllers: await paneControllers(page),
           paneResponses: paneResponses.map((r) => ({
             url: r.url.replace(ORIGIN, ""),
