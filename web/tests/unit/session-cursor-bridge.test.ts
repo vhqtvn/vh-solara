@@ -21,8 +21,11 @@
 //   are registered at the PRODUCER boundary (the fixture bytes — registered
 //   at parse time, BEFORE any frame is fired), never from the consumer's
 //   cursor or bookkeeping. Dispositions are observed independently via the
-//   store's content (never pendingBatchSeqs/mismatchLatchedSids/
-//   lastKnownSesCursor — module-private production bookkeeping).
+//   store's content (message frames and content-bearing snapshots — SOME
+//   newly-introduced id resident) or, for a snapshot whose every id is
+//   already resident (fully merge-skipped; no content witness exists), the
+//   NEXT reconnect's URL cursor — never pendingBatchSeqs/mismatchLatchedSids/
+//   lastKnownSesCursor (module-private production bookkeeping).
 //   Under-advance is ALWAYS legal; the oracle never demands cursor ==
 //   maxApplied (a hypothetical cursor COVERING an open obligation is flagged
 //   — the standalone negative control below).
@@ -98,6 +101,10 @@ class MockEventSource {
 }
 
 let instances: MockEventSource[] = [];
+// lastUrlCursor — the most recent reconnect's URL cursor: the WIRE-deferred
+// snapshot witness's observable (updated inside openAndObserve; harness-level
+// state read off the mocked EventSource's URL — never a production export).
+let lastUrlCursor = 0;
 const sessionESes = (): MockEventSource[] =>
   instances.filter((e) => /sessions=[^&]/.test(e.url));
 const urlCursor = (es: MockEventSource): number => {
@@ -248,6 +255,20 @@ class ObligationOracle {
       }
     }
   }
+  // settle — classify pending/open obligations against their witnesses, then
+  // apply the round-5b discharge axiom: every snapshot whose witness HAS
+  // FIRED raises the floor and discharges every obligation ≤ floor. Called
+  // at every observation point: post-feed settlement (settleAsync) AND
+  // reconnect (openAndObserve — the wire-deferred witness's observable, the
+  // URL cursor, moves exactly there).
+  settle(): void {
+    this.classifyPending();
+    for (const o of this.obls) {
+      if (o.kind === "snapshot" && o.disp === "applied") {
+        this.snapshotApplied(o.seq);
+      }
+    }
+  }
   openObligations(): Obligation[] {
     return this.obls.filter((o) => o.disp === "open" || o.disp === "pending");
   }
@@ -285,6 +306,7 @@ let ctx: Ctx | null = null;
 async function boot(): Promise<Ctx> {
   vi.resetModules();
   instances = [];
+  lastUrlCursor = 0;
   const store = await import("../../src/sync/store");
   const ses = await import("../../src/sync/session-stream");
   store.setProjectDirRaw(PROJ);
@@ -333,9 +355,55 @@ function registerProducer(oracle: ObligationOracle, frames: FixtureFrame[], upto
         const key = `${seq}:${f.event}`;
         if (oracle.obls.some((o) => `${o.seq}:${o.kind}` === key)) continue;
         switch (f.event) {
-          case "snapshot":
-            oracle.deliver(seq, "snapshot", () => true, "snapshot");
+          case "snapshot": {
+            // TWO-CLASS SNAPSHOT WITNESS (F3 oracle honesty). The pre-F3
+            // `() => true` observer marked every registered snapshot applied
+            // at settle — raising the discharge floor without observing
+            // anything. The honest witness is built from the frame's OWN
+            // bytes plus a registration-time store fingerprint (which ids
+            // are resident at the PRODUCER boundary, BEFORE any byte of
+            // this connection fired):
+            //
+            //   CONTENT class — the snapshot carries ≥1 message id NOT
+            //   resident at registration (the "newly" set). observe = SOME
+            //   newly id now resident. prependMessagesIfAbsent inserts
+            //   absent ids wholesale (reduce.ts:230-238), so delivery+apply
+            //   makes them resident. SOME, not ALL: the claim auto-scopes
+            //   to the round-5b adjudicated applied-through-merge boundary —
+            //   it never demands residency for content inside the keyed-
+            //   resident merge-skip zone (reduce.ts:202-228) and never
+            //   claims part-installation inside a protected resident.
+            //
+            //   WIRE-DEFERRED class — newly is empty (a snapshot whose every
+            //   id is already resident — C3 — or a messageless snapshot): NO
+            //   store-content witness exists (the apply's only observable
+            //   delta is the module's own cursor memory), so the obligation
+            //   defers to the WIRE: observe = the next reconnect's URL
+            //   cursor ≥ seq — the module claims the snapshot seq as its
+            //   resume point iff it actually applied. DOCUMENTED
+            //   APPROXIMATION: a cursor ≥ seq could in principle rise past
+            //   seq by a non-snapshot route; in this scenario set that is
+            //   impossible (the only advance routes are this snapshot's own
+            //   floor-raise and incremental claims — and the negative
+            //   control delivers nothing). NEVER a `() => true` fallback.
+            const snap = JSON.parse(f.data) as any;
+            const newly: string[] = [];
+            for (const it of (snap.messages?.[SID] ?? []) as any[]) {
+              const mid = it?.info?.id;
+              if (typeof mid === "string" && !ctx?.byId(mid)) newly.push(mid);
+            }
+            if (newly.length > 0) {
+              oracle.deliver(
+                seq,
+                "snapshot",
+                () => newly.some((mid) => Boolean(ctx?.byId(mid))),
+                `snap-content:${newly.join(",")}`,
+              );
+            } else {
+              oracle.deliver(seq, "snapshot", () => lastUrlCursor >= seq, "snap-wire");
+            }
             break;
+          }
           case "message.upsert": {
             const mid = (JSON.parse(f.data) as any).id as string;
             oracle.deliver(seq, "message.upsert", () => Boolean(ctx?.byId(mid)), `m:${mid}`);
@@ -364,17 +432,11 @@ function registerProducer(oracle: ObligationOracle, frames: FixtureFrame[], upto
   }
 }
 
-// settle — let the module's listeners run, then classify. Snapshots that
-// APPLIED (through the merge policy — the round-5b adjudicated boundary)
-// raise the floor and discharge every obligation ≤ floor.
+// settle — let the module's listeners run, then settle the oracle (classify
+// + the round-5b floor-raise/discharge axiom — see ObligationOracle.settle).
 async function settleAsync(oracle: ObligationOracle): Promise<void> {
   await flushMicro(12);
-  oracle.classifyPending();
-  for (const o of oracle.obls) {
-    if (o.kind === "snapshot" && o.disp === "applied") {
-      oracle.snapshotApplied(o.seq);
-    }
-  }
+  oracle.settle();
 }
 
 // openAndObserve — close, reopen, and return the NEW ES with its observed
@@ -391,6 +453,12 @@ function openAndObserve(
   const all = sessionESes();
   const es = all[all.length - 1];
   const cursor = urlCursor(es);
+  // The URL cursor is the wire-deferred snapshot witness's observable, and
+  // it just moved — re-settle BEFORE the invariant check, so a snapshot
+  // whose apply is qualified by THIS cursor (chain C's fully merge-skipped
+  // fallback) is no longer counted open against its own repair point.
+  lastUrlCursor = cursor;
+  oracle.settle();
   const violations = oracle.checkMemoryOpen(cursor, atOp);
   // The invariant check result is consumed by callers via expect on the
   // returned violations — keep it explicit:
@@ -585,26 +653,37 @@ describe("chain C — legacy (no part_delta) reconnect takes the §4.3 snapshot 
     await settleAsync(oracle);
 
     // The fallback snapshot applies THROUGH THE MERGE POLICY (the round-5b
-    // recorded boundary the oracle adopts as its discharge axiom): the ABSENT
-    // message m2 is prepended and lands; the floor discharges both open
-    // obligations. NOTE — the part-level repair inside m1 does NOT land: m1
-    // is a keyed non-completed RESIDENT, so prependMessagesIfAbsent protects
-    // its body and the snapshot's m1 (with parts [p1 "a"]) is merge-skipped
-    // — the known, deliberately out-of-scope store-policy gap (reduce.ts
-    // keyed-resident merge-skip). This test asserts the ADJUDICATED boundary
-    // (applied = ran through merge policy, not every byte resident), not
-    // byte-residency.
-    expect(c.byId("m2")).toBeTruthy(); // the absent message DID land via prepend
+    // recorded boundary the oracle adopts as its discharge axiom). In THIS
+    // chain both of C3's message ids (m1, m2) were already resident at
+    // registration — m2 landed via the leg-1 delta m2@5.2, NOT via the
+    // snapshot — so the snapshot's apply is fully merge-skipped and the
+    // honest witness is WIRE-DEFERRED (no store-content witness exists; see
+    // registerProducer): its observation point is the post-repair reconnect
+    // below, where the module's own URL cursor claims seq 7. The floor/open
+    // asserts therefore moved AFTER that observation — at settle-time they
+    // rested on the unconditional `() => true` predicate F3 removed (the
+    // sanctioned reorder; nothing else in the chain was weakened). NOTE —
+    // the part-level repair inside m1 does NOT land: m1 is a keyed
+    // non-completed RESIDENT, so prependMessagesIfAbsent protects its body
+    // and the snapshot's m1 (with parts [p1 "a"]) is merge-skipped — the
+    // known, deliberately out-of-scope store-policy gap (reduce.ts
+    // keyed-resident merge-skip). This test asserts the ADJUDICATED
+    // boundary (applied = ran through merge policy, not every byte
+    // resident), not byte-residency.
+    expect(c.byId("m2")).toBeTruthy(); // landed via the leg-1 delta, not the snapshot
     expect(c.byId("m1")).toBeTruthy(); // resident body protected (live-wins)
     expect(c.partP1()).toBeUndefined(); // merge-skipped — the documented gap
-    expect(oracle.openObligations()).toEqual([]);
-    expect(oracle.floor).toBe(7);
 
-    // The NEXT reconnect claims the repair point.
+    // The NEXT reconnect claims the repair point — and (F3) it is THE
+    // observation point for C3's wire-deferred witness: openAndObserve
+    // settles with lastUrlCursor=7, the witness fires, the floor rises to 7
+    // and discharges both open obligations.
     const { es: es3, cursor: cursor3, violations: violations3 } = openAndObserve(c, oracle, "C:post-repair");
     expect(cursor3).toBe(7);
     expect(violations3).toEqual([]);
     expect(es3.url).not.toContain("part_delta"); // kill-switch still in effect
+    expect(oracle.openObligations()).toEqual([]);
+    expect(oracle.floor).toBe(7);
   }, 20_000);
 });
 
@@ -665,6 +744,84 @@ describe("chain E — ring_eviction fallback discharge + resume from repair poin
     const { cursor: cursor3, violations: violations3 } = openAndObserve(c, oracle, "E:post-repair");
     expect(cursor3).toBe(10);
     expect(violations3).toEqual([]);
+  }, 20_000);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// NEGATIVE CONTROL (F3) — the snapshot obligation registered but WITHHELD.
+// The pre-F3 oracle registered snapshots with an unconditional `() => true`
+// observer: settlement marked every registered snapshot APPLIED and raised
+// the discharge floor without observing anything — exactly the lie this
+// control withholds. Same fixtures as chain E; the divergence is purely
+// delivery: the fallback snapshot's bytes are never fired on the connection
+// that requested them (the connection died before the first frame — the
+// `feedFrames(..., 0)` prefix-withholding idiom; the snapshot stanza is
+// frame 0 in every committed scenario, so "before the snapshot" is
+// unambiguous).
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("negative control — a WITHHELD fallback snapshot raises neither floor nor discharge", () => {
+  it("E2 registered-but-undelivered keeps floor 4 and m2@5 open; feeding the same bytes later applies genuinely", async () => {
+    const c = await boot();
+    const oracle = new ObligationOracle();
+    const e1 = loadFixture("E1-initial-cursorless.sse");
+    const e2 = loadFixture("E2-ring-eviction.sse");
+
+    // Leg 1 — chain E's prefix exactly: E1's snapshot@4 delivered (m2@5
+    // withheld). The content witness fires on m1's residency: floor 4.
+    c.ses.openSessionStream(SID, false, "selection-change", "bridge-test");
+    const es1 = sessionESes()[0];
+    registerProducer(oracle, e1.frames);
+    feedFrames(es1, e1.frames, e1.frames.length - 1);
+    await settleAsync(oracle);
+    expect(c.byId("m1")).toBeTruthy();
+    expect(c.byId("m2")).toBeUndefined(); // withheld — content absent
+    expect(oracle.floor).toBe(4);
+    expect(oracle.openObligations().map((o) => o.seq)).toEqual([5]);
+
+    // Leg 2 (the probe) — reconnect: the URL carries the floor-only
+    // cursor=4 (E2's manifest request line pins this exact shape), the
+    // producer ledger registers E2's obligations BEFORE any feeding — and
+    // then NOTHING is delivered on es2. An honest oracle must keep BOTH the
+    // withheld m2@5 AND the undelivered snapshot@10 open, and the floor at
+    // the last genuinely-applied snapshot.
+    const { es: es2, cursor } = openAndObserve(c, oracle, "NC:withheld-reconnect");
+    expect(cursor).toBe(4);
+    const manifest = loadManifest();
+    const e2md = manifest.scenarios.find((s) => s.file === "E2-ring-eviction.sse")!;
+    expect(e2md.request).toContain(`cursor=${cursor}`);
+    registerProducer(oracle, e2.frames); // snapshot@10 obligation registered BEFORE any feeding
+    feedFrames(es2, e2.frames, 0); // deliver NOTHING — the withheld snapshot
+    await settleAsync(oracle);
+    // These two asserts are the RED-FIRST receipt: under the pre-F3
+    // `() => true` snapshot observer this settle reported floor 10 and
+    // open [] — m2@5 FALSELY discharged by a snapshot whose bytes never
+    // arrived.
+    expect(oracle.floor).toBe(4);
+    expect(oracle.openObligations().map((o) => o.seq)).toEqual([5, 10]);
+    expect(c.byId("m3")).toBeUndefined(); // E2-exclusive content never landed
+
+    // Leg 3 — the NEXT reconnect still sends the PRE-snapshot cursor=4.
+    // HONESTY NOTE: this assert PASSES on the pre-change tree too — the
+    // module's own cursor memory was always honest (it never applied the
+    // undelivered snapshot); it was the ORACLE that lied. The red-first
+    // receipt rests on the leg-2 settle asserts above, not on this URL.
+    const { es: es3, cursor: cursor3, violations } = openAndObserve(c, oracle, "NC:post-withhold");
+    expect(cursor3).toBe(4);
+    expect(violations).toEqual([]); // 4 < 5,10 — the withheld pair stays uncovered
+
+    // Leg 4 (sensitivity the other way) — feed the UNCHANGED e2.frames on
+    // es3 through the real decoder: the content witness NOW genuinely
+    // fires (m2..m5 install wholesale), the floor rises to 10, and m2@5
+    // discharges on the real apply — the withheld/delivered contrast in
+    // one scenario. No re-registration: obligation identity is (seq,kind);
+    // this delivery resolves the ORIGINAL leg-2 registration.
+    feedFrames(es3, e2.frames);
+    await settleAsync(oracle);
+    expect(oracle.floor).toBe(10);
+    expect(oracle.openObligations()).toEqual([]);
+    expect(c.byId("m2")).toBeTruthy(); // genuinely discharged — content resident
+    expect(c.byId("m3")).toBeTruthy();
   }, 20_000);
 });
 
