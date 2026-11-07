@@ -11,13 +11,16 @@ package web
 //   - D1: the script's default VH_MATERIALIZE_PRESERVE set grows; the mirrors
 //     keep the old names and docker builds DELETE the new tracked fallback.
 //   - D2: the clean semantics change shape on one side only (e.g. a weakened
-//     find re-opens the ghost-assets defect 316697a fixed, silently, in images).
+//     find re-opens the ghost-assets defect 316697a fixed, silently, in images,
+//     or clause ORDER drifts — an exec hoisted before or mid preserve-set
+//     voids the preserve set, D-F1).
 //   - D3: a mirror is deleted or duplicated outright — no signal anywhere.
 //   - D4: a future edit reorders the clean after the consuming COPY, so the
 //     find deletes the freshly copied host shell.
 //
-// This guard pins each mirror's TEXTUAL find form against the script's
-// DECLARED default preserve set. It does not re-execute the script: the
+// This guard pins each mirror's TEXTUAL find form — clause set, clause
+// ORDER, and per-clause shape — against the script's DECLARED default
+// preserve set. It does not re-execute the script: the
 // script's own behavioral contract is already pinned by materialize_test.go
 // (ghost/subdir/preserve/clean-mode), which runs in the same `go test ./...`
 // PR job. Pure file parsing — deterministic, milliseconds, no exec, no sleeps.
@@ -122,28 +125,100 @@ func dockerfileMirrorProblems(file, content string, canonicalPreserve []string) 
 	}
 	findIdx := findIdxs[0]
 
-	// D2: pin the clean's find form — top-level-only scan + batched rm.
+	// D2/D-F1: pin the clean's find form. Two composed passes over the same
+	// token stream — the phase walk pins the canonical clause ORDER, the
+	// per-occurrence walk further down pins each clause's FORM.
 	tokens := strings.Fields(lines[findIdx])
-	hasSeq := func(seq ...string) bool {
-	outer:
-		for i := 0; i+len(seq) <= len(tokens); i++ {
-			for j, wantTok := range seq {
-				if tokens[i+j] != wantTok {
-					continue outer
-				}
-			}
-			return true
+	seqAt := func(i int, seq ...string) bool {
+		if i+len(seq) > len(tokens) {
+			return false
 		}
-		return false
+		for j, wantTok := range seq {
+			if tokens[i+j] != wantTok {
+				return false
+			}
+		}
+		return true
 	}
-	if !hasSeq("-mindepth", "1") {
-		fail(`find must carry %q`, "-mindepth 1")
+	at := func(i int, tok string) bool { return i < len(tokens) && tokens[i] == tok }
+	anchorLen := len(strings.Fields(mirrorFindLine)) // "RUN", "find", <dest>
+
+	// Phase walk (D-F1): find evaluates its expression left-to-right with
+	// implicit AND, so clause ORDER is semantic — yet the per-occurrence
+	// walk alone stays green through an order drift that voids the preserve
+	// set (exec hoisted before the ! -name filters, or splitting the set).
+	// The mirror's charter is "same find form as materialize.sh", so pin the
+	// EXACT canonical sequence that script emits:
+	//
+	//   1. `-mindepth 1 -maxdepth 1` — first, in that fixed internal order;
+	//   2. zero or more `! -name <preserve>` pairs — internal order free
+	//      (independent ANDed tests commute; membership is pinned by the
+	//      set-equality check below);
+	//   3. `-exec rm -rf {} +` — the final clauses, exactly once.
+	//
+	// Depth-flag placement and internal order are semantically inert (find
+	// applies the options globally regardless of position) — those pins are
+	// exact-form charter fidelity, not destructive-change catches, and the
+	// messages say so. Exec placement is NOT inert: hoisted, it fires for
+	// every depth-1 entry; mid-set, it strips protection from the names
+	// after it.
+	depthMustLead := func(detail string) {
+		fail("mirror clean clauses out of canonical order: %q must lead the mirror clean %s — depth-flag placement is semantically inert (find applies the options globally), pinned as exact-form charter fidelity, not a destructive-change catch",
+			"-mindepth 1 -maxdepth 1", detail)
 	}
-	if !hasSeq("-maxdepth", "1") {
-		fail(`find must carry %q`, "-maxdepth 1")
+	execBeforePreserves := func() {
+		fail("mirror clean clauses out of canonical order: %q before the ! -name preserve filters — destructive: with no ! -name test ahead of it the exec fires for every depth-1 entry (the preserved fallback included); trailing filters gate nothing",
+			"-exec rm -rf {} +")
 	}
-	if !hasSeq("-exec", "rm", "-rf", "{}", "+") {
-		fail(`find must carry %q`, "-exec rm -rf {} +")
+	i := anchorLen
+	if seqAt(i, "-mindepth", "1", "-maxdepth", "1") {
+		i += 4
+		preservesBefore := 0
+		for i+2 < len(tokens) && tokens[i] == "!" && tokens[i+1] == "-name" {
+			preservesBefore++
+			i += 3
+		}
+		switch {
+		case i == len(tokens):
+			fail("mirror clean clauses out of canonical order: %q must terminate the clean — no exec payload found (the clean deletes nothing)",
+				"-exec rm -rf {} +")
+		case seqAt(i, "-exec", "rm", "-rf", "{}", "+"):
+			i += 5
+			switch {
+			case i == len(tokens):
+				// Exact canonical sequence — nothing may follow, nothing does.
+			case i+2 < len(tokens) && tokens[i] == "!" && tokens[i+1] == "-name":
+				if preservesBefore == 0 {
+					execBeforePreserves()
+				} else {
+					fail("mirror clean clauses out of canonical order: %q splits the ! -name preserve set — destructive: names before it stay protected (find's implicit AND short-circuits), names after it lose protection and are deleted",
+						"-exec rm -rf {} +")
+				}
+			case at(i, "-mindepth"), at(i, "-maxdepth"):
+				depthMustLead("— depth flags found after the terminal exec")
+			case seqAt(i, "-exec", "rm", "-rf", "{}", "+"):
+				fail("mirror clean clauses out of canonical order: %q must appear exactly once, as the final clauses",
+					"-exec rm -rf {} +")
+			}
+		case at(i, "-mindepth"), at(i, "-maxdepth"):
+			depthMustLead("before any ! -name filter")
+		}
+		// Any other clause head here is alien or malformed — the
+		// per-occurrence walk below flags it.
+	} else {
+		switch {
+		case seqAt(i, "-maxdepth", "1", "-mindepth", "1"):
+			fail("mirror clean clauses out of canonical order: depth pair swapped — canonical is %q; the swap is semantically inert (find applies -mindepth/-maxdepth globally regardless of order), pinned as exact-form charter fidelity, not a destructive-change catch",
+				"-mindepth 1 -maxdepth 1")
+		case at(i, "-mindepth"), at(i, "-maxdepth"):
+			fail("mirror clean clauses out of canonical order: %q must lead the mirror clean in that exact form and order (canonical form of the shared script's find)",
+				"-mindepth 1 -maxdepth 1")
+		case i+2 < len(tokens) && tokens[i] == "!" && tokens[i+1] == "-name":
+			depthMustLead("before any ! -name filter")
+		case seqAt(i, "-exec", "rm", "-rf", "{}", "+"):
+			execBeforePreserves()
+		}
+		// Alien head — the per-occurrence walk below flags it.
 	}
 
 	// D1/D2: the mirror's `! -name` preserve set must equal the script's
@@ -179,27 +254,15 @@ func dockerfileMirrorProblems(file, content string, canonicalPreserve []string) 
 		fail("preserve mismatch vs script default %v: extra in mirror %v", canonicalPreserve, extra)
 	}
 
-	// Allowlist pass: the required-token and preserve checks above pin what
-	// MUST be present, but an ADDED narrowing predicate (-type f,
-	// -name '*.js', -size, -newer, a bare -name, extra operators, …) weakens
-	// the clean while superficially matching every one of them. Walk the
-	// find argument stream and permit ONLY the pinned grammar — validated
-	// PER OCCURRENCE, because the existence-somewhere hasSeq checks above
-	// cannot see a decoy clause riding alongside the real one (e.g. a
-	// `-exec false x {} +` before the real rm: find's implicit AND makes
+	// Per-occurrence form walk: the phase walk above pins the canonical
+	// ORDER and the preserve checks above pin the SET, but an ADDED
+	// narrowing predicate (-type f, -name '*.js', -size, -newer, a bare
+	// -name, extra operators, …) can still ride inside a phase slot in
+	// well-formed disguise. Walk the find argument stream and permit ONLY
+	// the pinned grammar — validated PER OCCURRENCE, because order/set
+	// checks cannot see a decoy clause riding alongside the real one (e.g.
+	// a `-exec false x {} +` before the real rm: find's implicit AND makes
 	// the rm a silent no-op — exactly the D2 weakening this rejects).
-	seqAt := func(i int, seq ...string) bool {
-		if i+len(seq) > len(tokens) {
-			return false
-		}
-		for j, wantTok := range seq {
-			if tokens[i+j] != wantTok {
-				return false
-			}
-		}
-		return true
-	}
-	anchorLen := len(strings.Fields(mirrorFindLine)) // "RUN", "find", <dest>
 	for i := anchorLen; i < len(tokens); {
 		switch {
 		case seqAt(i, "-mindepth", "1"), seqAt(i, "-maxdepth", "1"):
@@ -353,6 +416,49 @@ COPY . .
 COPY --from=hostbuild /app/host-web/dist ./pkg/web/host-dist
 `,
 			wantProblem: "mirror clean deleted",
+		},
+		{
+			// D-F1 R1: the exec hoisted before all preserve filters — the
+			// per-clause checks all pass (every clause is well-formed and the
+			// preserve set matches); only the ORDER pin catches it.
+			name: "exec hoisted before the preserve filters (D-F1: voids the preserve set)",
+			content: `FROM golang:1.26.10-alpine AS gobuild
+WORKDIR /src
+COPY . .
+RUN find ./pkg/web/host-dist -mindepth 1 -maxdepth 1 \
+    -exec rm -rf {} + ! -name 'placeholder.html'
+COPY --from=hostbuild /app/host-web/dist ./pkg/web/host-dist
+`,
+			wantProblem: "fires for every depth-1 entry",
+		},
+		{
+			// D-F1 R2: exec mid-preserve-set. canonicalOver makes the set
+			// check pass (both names present), so the ORDER assertion is the
+			// one that must fire — names after the exec lose protection.
+			name: "exec splits the preserve set (D-F1: names after it lose protection)",
+			content: `FROM golang:1.26.10-alpine AS gobuild
+WORKDIR /src
+COPY . .
+RUN find ./pkg/web/host-dist -mindepth 1 -maxdepth 1 \
+    ! -name 'placeholder.html' -exec rm -rf {} + ! -name 'host-placeholder.html'
+COPY --from=hostbuild /app/host-web/dist ./pkg/web/host-dist
+`,
+			canonicalOver: []string{"placeholder.html", "host-placeholder.html"},
+			wantProblem:   "names after it lose protection",
+		},
+		{
+			// D-F1 R3: depth flags after the preserve filters — semantically
+			// inert (find applies them globally), rejected as non-canonical
+			// form; the message must say canonical-order, not destructive.
+			name: "depth flags after the preserve filters (D-F1: non-canonical order)",
+			content: `FROM golang:1.26.10-alpine AS gobuild
+WORKDIR /src
+COPY . .
+RUN find ./pkg/web/host-dist \
+    ! -name 'placeholder.html' -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+COPY --from=hostbuild /app/host-web/dist ./pkg/web/host-dist
+`,
+			wantProblem: "must lead the mirror clean",
 		},
 	}
 
