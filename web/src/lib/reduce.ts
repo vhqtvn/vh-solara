@@ -192,6 +192,60 @@ function mergePartsOrdered(
   resident.partOrder = next;
 }
 
+// MERGE-SAFETY / ADMISSION-SAFETY CONTRACT (card
+// task-2026-11-07t15-07-21-store-merge-verify-first; binding basis:
+// tmp/agent-runs/store-merge/eligibility.md). Comment-only record — no logic
+// here. This merge is PATH-BLIND: "missing" alone cannot distinguish loss
+// from intentional deletion (no tombstones, no per-part provenance, no
+// comparable per-session seq client-side), so its safety rests on WHERE the
+// merged state source comes from, not on anything in the data:
+//
+// ELIGIBILITY RULE — merge admission is safe ONLY from sources that are
+// (a) FRESH-CAPTURED after every client-applied delete, or (b) followed by
+// ordered re-delivery of any post-capture delete. All THREE current callers
+// qualify by construction:
+//   - history.ts applyPageMerge (historical page): the Contract-B dirty gate
+//     (part.delete / message.delete / messages.batch during the flight mark
+//     it dirty; the response gate discards + bounded-retries).
+//   - reducers.ts messages.batch (cold batch): the server-side msgRev ABA
+//     guard on publishColdBatch (a delete racing the package bumps msgRev;
+//     the stale package is discarded and repackaged post-delete).
+//   - session-stream.ts applySessionSnapshot (Stream-2 snapshot): capture at
+//     connection open + live events serialized behind the gzip64 decode +
+//     ordered SSE delivery — a post-capture delete arrives as an event that
+//     re-deletes (client deletePart is idempotent).
+// Any NEW caller must carry one of these two orderings or it is ineligible.
+//
+// THE FOUR INVARIANT CLAUSES (pinned by web/tests/unit/store-merge-property.
+// test.ts — the acceptance net; transport no-resurrection pins:
+// web/tests/unit/history-merge-transport.test.ts + pkg/state/
+// message_window_msgrev_aba_test.go):
+//   (a) NO-DROP — incoming absence never deletes a resident part/message.
+//   (b) NO-CLOBBER — incoming content never overwrites resident content,
+//       EXCEPT the completed-upgrade path (below).
+//   (c) COMPLETED-AUTHORITY-MONOTONE — resident time.completed never
+//       regresses once set.
+//   (d) ADMISSION-BOUND — every part that becomes resident comes from the
+//       incoming snapshot's parts (new ⊆ incoming), and message order stays
+//       created-sorted.
+//
+// OBLIGATIONS OF ANY FUTURE ADMISSION CHANGE (widening the boundary to fill
+// MISSING parts of keyed non-completed residents — never bodies; completed
+// authority untouched; `added` semantics unchanged):
+//   1. Keep the property suite green — the four clauses hold under BOTH
+//      boundary shapes; only which-parts-are-resident changes.
+//   2. Flip the round-5b boundary pin DELIBERATELY
+//      (web/tests/unit/session-cursor-persistence.test.ts:1477-1561): all
+//      three conjuncts re-derived, not assumed — (a) merge-skips flips;
+//      (b) floor-raise + mismatch-latch-clear at applySnap re-adjudicated;
+//      (c) reopen-sends-snapshot-seq re-derived.
+//   3. Re-adjudicate the floor-raise and latch-clear premises against the
+//      new boundary, and rewrite the boundary comments that the eligibility
+//      pass flagged: the applySnap RECORDED BOUNDARY comment
+//      (session-stream.ts ~1348-1365), the isPageDirtyingKind FALSE-case
+//      rationale (history.ts — "the page merge skips the resident parent"
+//      becomes textually false), and the S0/S1 oracle discharge-axiom comment
+//      (session-cursor-property.test.ts:33-44).
 export function prependMessagesIfAbsent(sm: SessionMessages, items: any[]): number {
   let added = 0;
   let upgraded = false;
