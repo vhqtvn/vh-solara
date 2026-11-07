@@ -84,6 +84,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { gzipSync } from "node:zlib";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { CursorMutant } from "./session-cursor-mutants";
 
 const CONNECTING = 0;
@@ -849,41 +850,102 @@ describe("S0 oracle qualification — identity-based obligation tracking", () =>
 // S1 — drift guard: the disposable copy stays faithful to production
 // ═════════════════════════════════════════════════════════════════════════════
 
-describe("S1 drift guard — disposable-copy fidelity", () => {
-  const MARKERS = ["H1", "H6", "H3", "H5", "H2H4"] as const;
+describe("S1 drift guard — whole-file disposable-copy fidelity", () => {
+  // CWD-ROBUST paths: resolved from THIS test file (import.meta.url), never
+  // process.cwd() — the previous guard's readFileSync("src/sync/...") broke
+  // under any runner cwd other than web/. This hardening (card
+  // task-2026-11-07t02-47-57 O1.1, the carried S0+S1 M1 review trigger) also
+  // UPGRADES the check from "the 5 pinned MUT-SYNC-ORIGINAL snippets exist in
+  // production" to EXACT whole-file equality: the 2026-11-07 freshness audit
+  // found production +315/−10 (F1 epoch handshake) with every pinned snippet
+  // still verbatim-present — the old guard stayed green while the copy was
+  // massively stale. VH_MUTANTS_COPY (path relative to this file) is a scratch
+  // hook for the red-on-drift demonstration: it points this guard at a
+  // deliberately mutated copy without touching the committed one.
+  const resolveFromHere = (rel: string): string =>
+    fileURLToPath(new URL(rel, import.meta.url));
 
-  it("every MUT-SYNC-ORIGINAL snippet exists VERBATIM in production session-stream.ts", () => {
-    const prod = readFileSync("src/sync/session-stream.ts", "utf8");
-    const copy = readFileSync("tests/unit/session-cursor-mutants.ts", "utf8");
-    for (const id of MARKERS) {
-      const begin = `// MUT-SYNC-ORIGINAL ${id} BEGIN`;
-      const end = `// MUT-SYNC-ORIGINAL ${id} END`;
-      const bi = copy.indexOf(begin);
+  // reconstructProduction — the EXACT inverse of the copy's generation
+  // transform: delete the marked header (through MUT-HEADER-END), delete the
+  // arming hook (MUT-HOOK-BEGIN..MUT-HOOK-END + its trailing blank line),
+  // replace each mutant scaffold (MUT-SYNC-ORIGINAL <id> BEGIN ..
+  // MUT-SITE-END <id>) with its pinned original (a pin line is "// " + the
+  // verbatim production line), and invert the import-specifier rewrites
+  // ("../../src/sync/x" → "./x", "../../src/x" → "../x"). Byte-equality of
+  // the result with web/src/sync/session-stream.ts pins the WHOLE copy, so
+  // drift anywhere — the previously guarded mutant regions AND every other
+  // line — turns this red.
+  function reconstructProduction(copy: string): string {
+    let t = copy;
+    const hdr = "// MUT-HEADER-END\n";
+    const hi = t.indexOf(hdr);
+    expect(hi, "copy carries the MUT-HEADER-END header marker").toBeGreaterThanOrEqual(0);
+    t = t.slice(hi + hdr.length);
+
+    const hookB = "// MUT-HOOK-BEGIN\n";
+    const hookE = "// MUT-HOOK-END\n";
+    const hb = t.indexOf(hookB);
+    expect(hb, "copy carries the MUT-HOOK-BEGIN marker").toBeGreaterThanOrEqual(0);
+    const he = t.indexOf(hookE, hb);
+    expect(he, "copy carries the MUT-HOOK-END marker").toBeGreaterThan(hb);
+    // +1 newline: the blank line the hook insertion added after the block.
+    t = t.slice(0, hb) + t.slice(he + hookE.length + 1);
+
+    for (const id of ["H1", "H6", "H3", "H5", "H2H4"]) {
+      const begin = `// MUT-SYNC-ORIGINAL ${id} BEGIN\n`;
+      const end = `// MUT-SYNC-ORIGINAL ${id} END\n`;
+      const siteEnd = `// MUT-SITE-END ${id}\n`;
+      const bi = t.indexOf(begin);
       expect(bi, `marker ${id} BEGIN present in copy`).toBeGreaterThanOrEqual(0);
-      const ei = copy.indexOf(end, bi);
+      const ei = t.indexOf(end, bi);
       expect(ei, `marker ${id} END present in copy`).toBeGreaterThan(bi);
-      const block = copy.slice(bi + begin.length, ei);
-      const snippet = block
+      const si = t.indexOf(siteEnd, ei);
+      expect(si, `marker ${id} MUT-SITE-END present in copy`).toBeGreaterThan(ei);
+      const pinned = t
+        .slice(bi + begin.length, ei)
         .split("\n")
-        .map((l) => l.trim())
-        .filter((l) => l.startsWith("// "))
-        .map((l) => l.slice(3))
+        .map((l) => (l.startsWith("// ") ? l.slice(3) : l.startsWith("//") ? l.slice(2) : l))
         .join("\n");
-      expect(snippet.length, `marker ${id} snippet non-empty`).toBeGreaterThan(0);
-      expect(
-        prod.includes(snippet),
-        `marker ${id}: production no longer contains the pinned original snippet — the disposable copy is STALE; regenerate it from production per its header's mutation map (this card: tmp/agent-runs/formal-verify-scope/brief.md S1 mutation-authorization boundary)`,
-      ).toBe(true);
-      // The copy itself must still carry the production branch (armed=null ≡
-      // production outside the mutant branches) — line-level (the retained
-      // branch sits one indent deeper inside its mutant if/else).
-      const snippetLines = snippet.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
-      for (const line of snippetLines) {
-        expect(
-          copy.includes(line),
-          `marker ${id}: copy retains the production line "${line}"`,
-        ).toBe(true);
-      }
+      t = t.slice(0, bi) + pinned + t.slice(si + siteEnd.length);
+    }
+
+    // Import-specifier inversion — import lines only (the generation transform
+    // rewrote exactly those).
+    t = t
+      .split("\n")
+      .map((l) =>
+        /^import |^\} from "/.test(l)
+          ? l
+              .replace('from "../../src/sync/', 'from "./')
+              .replace('from "../../src/', 'from "../')
+          : l,
+      )
+      .join("\n");
+    return t;
+  }
+
+  it("reconstructing production from the copy (markers → pinned originals) is EXACT — any drift anywhere is red", () => {
+    const prodText = readFileSync(
+      resolveFromHere("../../src/sync/session-stream.ts"),
+      "utf8",
+    );
+    const copyPath = resolveFromHere(
+      process.env.VH_MUTANTS_COPY ?? "./session-cursor-mutants.ts",
+    );
+    const copy = readFileSync(copyPath, "utf8");
+    const recon = reconstructProduction(copy);
+    if (recon !== prodText) {
+      const a = recon.split("\n");
+      const b = prodText.split("\n");
+      let i = 0;
+      while (i < Math.min(a.length, b.length) && a[i] === b[i]) i++;
+      throw new Error(
+        `disposable copy DRIFTED from web/src/sync/session-stream.ts (whole-file reconstruction mismatch)\n` +
+          `first difference at reconstructed line ${i + 1}:\n` +
+          `  copy(reconstructed): ${JSON.stringify(a[i])}\n` +
+          `  production        : ${JSON.stringify(b[i])}\n` +
+          `Regenerate the copy from CURRENT production per its header (card task-2026-11-07t02-47-57 O1.1).`,
+      );
     }
   });
 });

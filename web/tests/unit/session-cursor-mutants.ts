@@ -1,6 +1,9 @@
 // ═════════════════════════════════════════════════════════════════════════════
 // DISPOSABLE TEST-LOCAL COPY — web/tests/unit/session-cursor-mutants.ts
-// (card task-2026-10-30t06-40-21-s0-s1-cursor-verification-calibration, S1)
+// (card task-2026-10-30t06-40-21-s0-s1-cursor-verification-calibration, S1;
+// regenerated 2026-11-07 by card task-2026-11-07t02-47-57-o11-harness-freshness
+// -gots-obligation-map after production session-stream.ts drifted +315/−10 —
+// the F1 epoch-handshake rounds 2–9 — between c05cb914 and HEAD b77750d.)
 //
 // This file is NOT production code. It is a mechanically generated copy of
 // web/src/sync/session-stream.ts (the generator ran a pure text transform:
@@ -8,10 +11,14 @@
 // revert-mutants that reconstruct the recorded ROOT CAUSES of the six
 // historical review-round defect classes H1–H6. With no mutant armed
 // (_armCursorMutantForTest(null) — the default) it is behaviorally identical
-// to production outside the marked sites; the drift guard in
-// session-cursor-property.test.ts asserts every MUT-SYNC-ORIGINAL snippet
-// still exists verbatim in the production file, so production drift on any
-// mutated region turns the guard red and this copy must be regenerated.
+// to production outside the marked sites. The HARDENED drift guard in
+// session-cursor-property.test.ts reconstructs production from this copy by
+// inverting the transform (strip MUT-HEADER-END header + MUT-HOOK block +
+// uncomment every MUT-SYNC-ORIGINAL pin in place of its MUT-SITE-END scaffold
+// + invert the import specifiers) and requires EXACT whole-file equality with
+// web/src/sync/session-stream.ts — so ANY production drift, sanctioned region
+// or not, turns the guard red and this copy must be regenerated (tmp/agent-
+// runs/formal-verify-fullflow/gen-mutants.mjs pattern; see the O1.1 report).
 //
 // Mutation map (each reverts ONLY the named fix dimension, so kills attribute
 // cleanly to the intended invariant violation):
@@ -22,6 +29,7 @@
 //   H5  mismatch latch never set              (pre-round-4  flush-local protection)
 //   H6  claim helper ignores the latch        (pre-round-4b ungated listener tail)
 // ═════════════════════════════════════════════════════════════════════════════
+// MUT-HEADER-END
 // The Stream 2 (active-session messages) lifecycle, extracted from ./stream per
 // the invariant audit §6c. Owns the session EventSource, its listeners, the
 // sesGen connection-generation token, sesCursor resume cursor, the per-session
@@ -70,7 +78,8 @@ import { createEffect, createRoot, on } from "solid-js";
 import type { Snapshot } from "../../src/types";
 import { prependMessagesIfAbsent, appendPartSuffix, utf8ByteLength, type PartAppendPayload } from "../../src/lib/reduce";
 import { log } from "../../src/lib/log";
-import { setState, projectDir, selectedId } from "../../src/sync/store";
+import { setState, state, projectDir, selectedId } from "../../src/sync/store";
+import { readBootEpoch } from "../../src/sync/bootEpoch";
 import { sessionWorking } from "../../src/sync/selectors";
 // CONTENT_STALE_MS (./health): the busy-edge re-arm's content-clock threshold.
 // This ADDS a session-stream → health reverse edge to the existing health →
@@ -108,12 +117,14 @@ import { recordStreamDrop } from "../../src/sync/weaklink";
 import { noteLivenessFrame } from "../../src/sync/liveness";
 import { requestRecovery, noteSessionConverged } from "../../src/sync/cascade";
 
+// MUT-HOOK-BEGIN
 // ── mutant arming (test-only; default null ≡ production) ────────────────────
 export type CursorMutant = "H1" | "H2" | "H3" | "H4" | "H5" | "H6";
 let armed: CursorMutant | null = null;
 export function _armCursorMutantForTest(m: CursorMutant | null): void {
   armed = m;
 }
+// MUT-HOOK-END
 
 // === Slice 3: part.append suffix streaming client opt-in ====================
 //
@@ -340,6 +351,36 @@ let sesSnapshotDecoding = false;
 // fresh snapshot. Self-retries on error.
 let ses: EventSource | null = null;
 let sesId = "";
+// F1 epoch handshake (round 2): the epoch the LIVE session ES URL declares
+// (frozen at openSessionES construction — native auto-reconnect re-requests
+// that exact URL). noteStoreEpochChanged compares it against a newly
+// established epoch and reconstructs the ES when it under-declares.
+let sesUrlEpoch = "";
+// F1 round 9 (gate F1, buffered-message laundering): whether THIS connection
+// was opened with a resume cursor (cursor>0). A cursor-resume connection is
+// SERVER-VALIDATED provenance: the server checked cursor+epoch pairing before
+// choosing the replay branch, so every frame it delivers is content of the
+// epoch the URL declared — message frames on such a connection may stamp that
+// epoch even before any snapshot applies locally. A CURSORLESS connection has
+// no such validation for its pre-snapshot frames (boot-race window), so those
+// stamp "" (unknown producer) and never pair at open. Reset at every
+// openSessionES alongside sesUrlEpoch.
+let sesResumedCursor = false;
+// F1 round 7 (gate t1b-F1, inverse ordering): the PRODUCER lifetime of the
+// most recent snapshot APPLIED on the current connection (snap.epoch at
+// applySnap; "" until one applies, reset at every openSessionES). Message-
+// class frames carry no epoch of their own — they follow the connection's
+// snapshot on the wire — so their cursor-memory claims stamp with this
+// producer inference instead of raw state.epoch: a delayed frame from a
+// PREVIOUS store lifetime (an epoch-less connection surviving a restart,
+// buffered frames delivered after the new store established) must not claim
+// under the NEW epoch's stamp. Sliver honestly left open: a message frame
+// arriving between a compressed snapshot's RECEIPT and its DECODE-APPLY
+// claims under state.epoch (the producer is invisible until decode); that
+// window is ms-scale and requires the buffered-foreign-frames shape inside
+// it — the reviewer's named orderings (snapshot applied, then messages) are
+// covered and regression-pinned.
+let sesProducerEpoch = "";
 let sesRetry: number | undefined;
 // sesBackoff: exponential backoff for Stream2's manual CLOSED-reopen, mirroring
 // Stream1's backoff (stream.ts ~1862). The native EventSource does NOT honor
@@ -365,6 +406,16 @@ const SES_CONNECTING_GIVEUP = 3;
 // state.cursor. Reset to 0 in closeSessionStream (session switch / close) so a
 // new session always starts fresh; preserved across retries (same session).
 let sesCursor = 0;
+// F1 epoch handshake (round 2, review C-F2): the store lifetime sesCursor was
+// accumulated under (stamped at the advance sites from state.epoch; reset
+// beside every sesCursor = 0). openSessionES sends the live cursor ONLY when
+// this pairs with the CURRENT state.epoch — after a daemon restart the tree
+// stream's re-seed advances state.epoch while this cursor still references
+// the DEAD store's history; sending it (paired with the new epoch → a
+// MATCHING handshake) would take the server's replay branch and apply
+// new-store deltas over the old store's transcript. Unpaired ⇒ cursorless
+// (the server fresh-snapshots the session — always safe).
+let sesCursorEpoch = "";
 // lastKnownSesCursor — per-session LAST-APPLIED cursor memory (card
 // task-2026-10-28t17-34-52-pwa-session-cursor-loss-fix, capture-1 §Q3: the
 // "second recovery" cursor-loss defect). closeSessionStream zeroes the LIVE
@@ -414,12 +465,57 @@ let sesCursor = 0;
 // changed dir — the change is never observed, and the stale cursor would be
 // sent on return against the wiped store, stranding the pre-cursor transcript.
 const lastKnownSesCursor = new Map<string, number>();
+// F1 epoch handshake (round 2, review C-F2): the store lifetime the
+// lastKnownSesCursor entries were accumulated under. Maintained at the single
+// advance point (noteSessionCursorApplied — a foreign-epoch advance first
+// CLEARS the map: entries from another/unknown lifetime are meaningless) and
+// reset wherever the map clears. openSessionES restores a remembered cursor
+// only when this pairs with the DECLARED epoch. noteStoreEpochChanged
+// (the tree transport's transition notification) clears both eagerly; the
+// open-time comparison is the belt-and-braces second layer.
+//
+// Round 6 (t1b-F1) — PRODUCER stamping: the stamp is the PRODUCING store's
+// own lifetime id (snap.epoch — every current daemon stamps it into every
+// Snapshot; the server's stream_http.go marshals detailSnap with Epoch
+// non-omitempty), falling back to state.epoch only when the snapshot carried
+// no epoch (ancient daemons / message-class claims, which have no snapshot
+// payload). state.epoch alone was WRONG for the boot race: session frames
+// apply while state.epoch is still "" (the tree snapshot has not landed), and
+// if the daemon restarts between that apply and the first tree snapshot, the
+// OLD store's frames would later be RELABELED into the new lifetime by the
+// establishment branch's former adoption — pairing a matching epoch with a
+// dead store's cursor (the exact P2 cross-lifetime window, laundered
+// client-side where the server's epoch check cannot see it). The producer's
+// own id cannot lie: an E1-produced claim stays E1-stamped no matter what
+// state.epoch later becomes.
+let lastKnownCursorEpoch = "";
 let lastKnownCursorDir: string | null = null;
 // noteSessionCursorApplied — the single advance point for the per-session
 // cursor memory. Monotonic per session id; ignores non-positive seqs (legacy
-// ids / parse fallbacks) and empty ids.
-function noteSessionCursorApplied(id: string, seq: number): void {
+// ids / parse fallbacks) and empty ids. producerEpoch is the snapshot's OWN
+// epoch field when called from applySnap (the authoritative source); omit it
+// for message-class claims, where the producer is inferred: the connection's
+// last APPLIED snapshot (sesProducerEpoch), else the URL-declared epoch of a
+// SERVER-VALIDATED cursor-resume connection (sesResumedCursor), else "" —
+// never state.epoch blindly (gate round 8 F1: a boot-race/cursorless
+// connection's buffered frames may be previous-lifetime content while the
+// tree stream has already established the new epoch; stamping state.epoch
+// there relabeled foreign cursors into the new lifetime).
+function noteSessionCursorApplied(id: string, seq: number, producerEpoch?: string): void {
   if (!id || !(seq > 0)) return;
+  // F1 epoch pairing (review C-F2, round 6 producer-stamped): a claim landing
+  // under a DIFFERENT store lifetime than the memory's current stamp means
+  // every existing entry pre-dates this lifetime — foreign content. Clear
+  // first; this claim starts the memory under the claim's lifetime. The
+  // ""→known direction deliberately DIES (not adopts): ""-stamped entries are
+  // unproven-provenance (boot-race message claims / cursorless-connection
+  // frames) and the first PROVEN claim is the earliest point their lifetime
+  // can be adjudicated — keeping them would re-open the relabeling hole.
+  const stampEpoch = producerEpoch || sesProducerEpoch || (sesResumedCursor ? sesUrlEpoch : "");
+  if (lastKnownCursorEpoch !== stampEpoch) {
+    lastKnownSesCursor.clear();
+    lastKnownCursorEpoch = stampEpoch;
+  }
   const prev = lastKnownSesCursor.get(id) ?? 0;
   if (seq > prev) lastKnownSesCursor.set(id, seq);
 }
@@ -435,6 +531,7 @@ function noteSessionCursorApplied(id: string, seq: number): void {
 export function resetLastKnownSesCursors(): void {
 // MUT-SYNC-ORIGINAL H1 BEGIN
 //   lastKnownSesCursor.clear();
+//   lastKnownCursorEpoch = "";
 // MUT-SYNC-ORIGINAL H1 END
   // MUTANT(H1) — pre-round-1 (F1/F2/F3) root cause: LAZY/open-only project
   // invalidation. Armed, the boundary reset is a no-op, so the only remaining
@@ -443,6 +540,100 @@ export function resetLastKnownSesCursors(): void {
   // observes, and the stale cursor is sent on return against the wiped store.
   if (armed === "H1") return;
   lastKnownSesCursor.clear();
+  lastKnownCursorEpoch = "";
+// MUT-SITE-END H1
+}
+// noteStoreEpochChanged — the F1 epoch-handshake transition hook (round 2,
+// review C-F1/C-F2). Called by the TREE transport (tree-transport.ts
+// noteEpochAdvanced — the only writer of state.epoch) whenever an applied
+// snapshot establishes (prevEpoch "") or CHANGES (prevEpoch non-empty) the
+// store epoch. The session stream's own snapshots never write state.epoch,
+// so it cannot observe transitions locally. Two shapes, two duties:
+//
+// ESTABLISHMENT (prevEpoch === "") — the client LEARNED the lifetime id (the
+// first tree snapshot of a page life). Round 6 (t1b-F1): the former ADOPTION
+// of ""-stamped cursors is GONE. Adoption rested on "same-store by
+// construction" — refuted: a daemon restart between a session-frame apply and
+// the first tree snapshot leaves PREVIOUS-lifetime content stamped only with
+// the unknown ("") epoch, and adopting relabeled it into the new lifetime —
+// a matching epoch paired with a dead store's cursor, sent as
+// cursor=<old>&epoch=<new> (the server-side check cannot catch a MATCHING
+// handshake). Instead:
+//   - The MAP needs no adoption on current daemons: claims are PRODUCER-
+//     stamped (snap.epoch at apply), so a same-store boot race is already
+//     stamped with the RIGHT epoch before establishment, and a previous-
+//     store claim keeps its WRONG (foreign) stamp — the open-time pairing
+//     drops it. A ""-stamped map at establishment is unproven provenance
+//     (boot-race message-class claims — no snapshot payload; old-daemon
+//     fallbacks never reach here at all, since a daemon that emits no epoch
+//     never establishes one): CLEAR it, cursorless is the safe resume.
+//   - The LIVE cursor is receipt-stamped with state.epoch ("" pre-
+//     establishment — its receipt cannot see inside a gzip64 payload), so a
+//     ""-stamped live cursor is equally unproven: ZERO it. Same-store boot
+//     races lose nothing — the producer-stamped map restores the cursor at
+//     the next open; the receipt-time content that never applied was never
+//     safe to resume (the round-3/4 discipline).
+//
+// TRANSITION (prevEpoch !== "") — a genuine restart while connected: the
+// cursor memory belongs to the OUTGOING lifetime. Clear it (the open-time
+// epoch comparison is the second layer; the live cursor is dropped by the
+// same comparison at the next open), and RECONSTRUCT the live ES whenever
+// its frozen URL is wrong about the new lifetime — a DECLARED-stale epoch
+// (every native auto-reconnect of it takes a correct but wasteful
+// fresh-fallback snapshot until the URL is rebuilt) OR an epoch-LESS URL
+// (review b-F1: the pairing guards run only at open time, so a native
+// auto-reconnect of an epoch-less URL sends its accumulated Last-Event-ID
+// with NO epoch param — bypassing the server handshake entirely; a
+// below-head old-lifetime cursor then replays over the dead store's
+// history). A transition is a dead store — rare, never boot churn — so the
+// live session ES is rebuilt cursorless under the new epoch whenever
+// sesUrlEpoch !== epoch, epoch-less included.
+export function noteStoreEpochChanged(epoch: string, prevEpoch: string): void {
+  if (!epoch) return;
+  if (prevEpoch === "") {
+    // Establishment: PRODUCER-stamped memory is already lifetime-correct —
+    // nothing to adopt. ""-stamped memory is unproven provenance: die.
+    if (sesCursorEpoch === "") sesCursor = 0;
+    if (lastKnownCursorEpoch === "") {
+      lastKnownSesCursor.clear();
+    }
+    // A DECLARED-stale session URL (the readBootEpoch fallback — a returning
+    // visit whose store restarted before this page loaded) is permanently
+    // wrong about the lifetime: every native retry of it takes a wasteful
+    // fresh fallback, and its retained cursor is receipt-suspect. Rebuild
+    // it — but NEVER by resuming the LIVE cursor: sesCursor advances at
+    // RECEIPT, so a snapshot still mid-gzip64-decode has already stamped
+    // it, and any gen bump (this rebuild's own, or a visibility suspend's —
+    // which preserves sesId+sesCursor while dropping the decode) discards
+    // that decode. Resuming its cursor would pair a matching epoch with
+    // UNAPPLIED content and the server would replay past a baseline the
+    // client never installed (review t1b-F1/t1c-F1 rounds 3-4: the zeroing
+    // must run whenever sesId exists — a HOST-HIDDEN session has ses=null
+    // and reopens at reveal through the same pairing guard). The lastKnown
+    // map is stamped only at APPLY (noteSessionCursorApplied), so what it
+    // restores is apply-proven content of the CURRENTLY-SERVING store.
+    // An epoch-LESS URL (first-ever visit, or a same-lifetime boot race —
+    // sesUrlEpoch === epoch) is NOT rebuilt: that is every ordinary boot,
+    // and the pairing guards + transition branch below carry it.
+    if (sesId && sesUrlEpoch !== "" && sesUrlEpoch !== epoch) {
+      sesCursor = 0;
+      sesCursorEpoch = "";
+      if (ses) openSessionES(sesId, "epoch-upgrade", "epoch-handshake");
+    }
+    return;
+  }
+  lastKnownSesCursor.clear();
+  lastKnownCursorEpoch = "";
+  // Zero the live cursor too (review t1a-F1 symmetry): it is receipt-suspect
+  // (an in-flight decode of the outgoing lifetime dies at the rebuild's gen
+  // bump), and a stale high-water mark from the old epoch would otherwise
+  // suppress `seq > sesCursor` advancement and can trip a false-positive
+  // silence-fallback until the new store's seqs exceed it.
+  sesCursor = 0;
+  sesCursorEpoch = "";
+  if (ses && sesId && sesUrlEpoch !== epoch) {
+    openSessionES(sesId, "epoch-upgrade", "epoch-handshake");
+  }
 }
 // pendingBatchSeqs — F9 round-2b (data_integrity): per-session frame seqs of
 // UNRESOLVED messages.batch decodes. pendingBatch keeps only the LATEST
@@ -508,6 +699,7 @@ function claimSessionCursorApplied(id: string, seq: number, ignorePendingSeq = 0
   // this is exactly the pre-4b helper — no uniform latch gate inside the claim
   // (the flush site keeps its own explicit latch clause, as it did then).
   if (armed !== "H6" && mismatchLatchedSids.has(id)) return;
+// MUT-SITE-END H6
 // MUT-SYNC-ORIGINAL H3 BEGIN
 //   const pend = pendingBatchSeqs.get(id);
 //   if (pend && pend.size > 0) {
@@ -529,6 +721,7 @@ function claimSessionCursorApplied(id: string, seq: number, ignorePendingSeq = 0
       if (min !== Infinity && seq >= min) seq = min - 1;
     }
   }
+// MUT-SITE-END H3
   noteSessionCursorApplied(id, seq);
 }
 // mismatchLatchedSids — round-4 F1 (data_integrity, enumeration E11): the
@@ -729,6 +922,7 @@ export function closeSessionStream() {
   // retries of the SAME session (the retry path calls open() directly, not
   // closeSessionStream, so sesCursor survives and enables replay-based resume).
   sesCursor = 0;
+  sesCursorEpoch = ""; // F1 pairing: no live cursor ⇒ no accumulation lifetime
   // Phase 4: clear ALL in-flight historical-page requests on connection
   // teardown. A page in flight belongs to the outgoing connection (its
   // flight.gen was captured against THIS sesGen); after the bump above those
@@ -921,6 +1115,11 @@ export function openSessionStream(id: string, force = false, reason: StreamOpenR
 // last-known cursor, never a live one (callers that reach here with
 // sesCursor>0 keep today's wire shape exactly).
 function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: string, fresh = false): void {
+    // A replacement connection supersedes any armed CLOSED-retry timer: if it
+    // fired, it would tear down THIS fresh connection for a redundant second
+    // reconnect (review t1b-F3/t1c-F3/t1d-F2 — matches the closeSessionStream
+    // and suspend cancellations; a no-op when open() IS the timer callback).
+    clearTimeout(sesRetry);
     if (sesId !== id) return;
     // Bump the connection generation so listeners captured by any prior open()
     // of THIS selection (a retry) or a superseded selection are ignored. The
@@ -981,19 +1180,87 @@ function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: 
     const dirNow = projectDir();
     if (dirNow !== lastKnownCursorDir) {
       lastKnownSesCursor.clear();
+      lastKnownCursorEpoch = "";
       lastKnownCursorDir = dirNow;
     }
-    const rememberedCursor = fresh ? 0 : lastKnownSesCursor.get(id) ?? 0;
-    const sendCursor = sesCursor > 0 ? sesCursor : rememberedCursor;
+    // F1 epoch pairing (review C-F2; round 6 producer-stamped): a remembered
+    // cursor is restored ONLY when its accumulation stamp — the PRODUCING
+    // store's lifetime (snap.epoch at apply; see noteSessionCursorApplied) —
+    // equals the epoch this open DECLARES (declaredEpoch below). The "" === ""
+    // case is the never-snapshotted page life — no epoch exists to pair with,
+    // so the pre-handshake behavior (restore, no epoch param) is preserved
+    // byte-identically. A previous-lifetime stamp never pairs: the round-6
+    // relabeling hole (adoption laundering an E1-produced cursor into an E2
+    // declaration — cursor=<old>&epoch=<new>, a MATCHING handshake the server
+    // cannot reject) is closed by stamping claims with the producer's own id.
+    // declaredEpoch: state.epoch (the tree-established lifetime) first; else
+    // the memory's PRODUCER stamp (a boot race that already APPLIED session
+    // snapshots knows the store's lifetime from the producer itself — declare
+    // it WITH the cursor so the server validates the pairing); else the
+    // PERSISTED previous lifetime (readBootEpoch). Every non-empty
+    // declaration is server-validated (mismatch ⇒ fresh fallback), so the
+    // chain is safe in any order of knowledge.
+    const declaredEpoch = state.epoch || lastKnownCursorEpoch || readBootEpoch();
+    const rememberedCursor =
+      fresh || lastKnownCursorEpoch !== declaredEpoch
+        ? 0
+        : lastKnownSesCursor.get(id) ?? 0;
+    // F1 round 7 (gate t1b-F1, inverse ordering): the LIVE arm is resumed
+    // when — and only when — its receipt stamp pairs with the declared
+    // epoch, and the stamp is now a PRODUCER truth (raw snapshots stamp
+    // snap.epoch at receipt — parsed synchronously before the advance;
+    // gzip64 receipts stamp "" — the producer is invisible until decoded;
+    // message receipts stamp the connection's last-applied producer), so a
+    // delayed frame from a PREVIOUS store lifetime can never be stamped
+    // under the NEW epoch and resumed with a MATCHING handshake the server
+    // cannot reject. The receipt-time resume itself (a reconnect may drop a
+    // pending decode whose content the resumed cursor then skips) is the
+    // PRE-EXISTING documented class — the round-4/5 reviewers' "documented
+    // parity" for every gen-bumping teardown, deliberately preserved here
+    // (the A/B full-suite evidence: removing the live arm regresses the
+    // boot-race reconnect convergence path pins-multiclient depends on);
+    // what rounds 6-7 close is the LIFETIME laundering — the stamp can
+    // never again name the wrong store.
+    const sendCursor =
+      sesCursor > 0 && sesCursorEpoch === declaredEpoch
+        ? sesCursor
+        : rememberedCursor;
     const cursorParam = sendCursor > 0 ? `cursor=${sendCursor}&` : "";
-    // Slice 3: part_delta=1 opts into the KindPartAppend suffix wire format
+    // part_delta=1 opts into the KindPartAppend suffix wire format
     // (spec §3), mirroring the z=1 (gzip64) capability flag. Gated behind
     // partDeltaEnabled (isPartDeltaEnabled) so flipping the single flag reverts
     // to legacy full part.upsert for this connection (one-reconnect rollback,
     // no server change).
     const partDeltaParam = isPartDeltaEnabled() ? `&part_delta=1` : "";
+    // F1 epoch handshake (P2 follow-up): declare the store lifetime this
+    // client's cursor belongs to — declaredEpoch (constructed above: the
+    // tree-established lifetime, else the memory's PRODUCER stamp, else the
+    // PERSISTED previous lifetime — symmetric with tree-transport connect(),
+    // review b-F1: a boot-race session open must carry the handshake too, or
+    // its native auto-reconnects send an old-lifetime Last-Event-ID with NO
+    // epoch and bypass the server check entirely; a declared epoch without a
+    // cursor is a server-side no-op when it matches). A declared epoch that
+    // mismatches the server's store epoch forces the fresh fallback (snapshot
+    // + message-load kick) instead of a plausible-but-wrong ring replay over
+    // a PREVIOUS daemon lifetime's history — the cursor-below-head window the
+    // numeric comparison cannot see. Omitted only when ALL sources are empty
+    // (first-ever visit, nothing applied — cursorless, fresh anyway).
+    // Strictly additive: a server without the check ignores the param.
+    // ROUND 2 (review C-F1): the URL is FROZEN at construction and native
+    // auto-reconnect re-requests it verbatim, so the sent cursor is only
+    // ever paired with the epoch stamped HERE — the accumulation-epoch
+    // guards above + noteStoreEpochChanged's URL reconstruction keep that
+    // pairing true across store-lifetime changes.
+    const epochParam = declaredEpoch ? `&epoch=${encodeURIComponent(declaredEpoch)}` : "";
+    sesUrlEpoch = declaredEpoch;
+    sesProducerEpoch = ""; // F1 round 7: per-connection producer inference starts unknown
+    // F1 round 9: this connection's frames may stamp sesUrlEpoch as their
+    // producer ONLY when the server actually validated a resume against it
+    // (cursor>0 sent) — set here per connection, read by the message receipt
+    // stamp + noteSessionCursorApplied's message-class chain.
+    sesResumedCursor = sendCursor > 0;
     sesConnectingFails = 0; // F3: a fresh ES starts a fresh streak count
-    ses = new EventSource(`/vh/stream?${cursorParam}sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}&z=1${partDeltaParam}`);
+    ses = new EventSource(`/vh/stream?${cursorParam}sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}&z=1${partDeltaParam}${epochParam}`);
     // Diagnostics (logging-only): one stream-open record per construction —
     // reason taxonomy + the cursor this open sent. Progress stamps complete
     // later on the SAME record (listeners below). Inert unless the diaglog
@@ -1040,7 +1307,6 @@ function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: 
       // connection is authoritative (MERGE via prependMessagesIfAbsent), so
       // drop this frame cleanly.
       if (gen !== sesGen) return;
-      if (seq > sesCursor) sesCursor = seq;
       if (ordinal > sesLastDeliveryOrdinal) sesLastDeliveryOrdinal = ordinal;
       let raw: any;
       try {
@@ -1054,6 +1320,26 @@ function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: 
         // state-machine surgery, out of scope for parse hardening.
         log.warn("sync", "malformed session snapshot frame", { err });
         return;
+      }
+      // F1 round 7 (gate t1b-F1, inverse ordering): the LIVE cursor's receipt
+      // stamp must be a PRODUCER truth, never state.epoch blindly — a delayed
+      // frame from a PREVIOUS store lifetime delivered after an establishment
+      // would otherwise stamp dead-store content under the NEW epoch, and the
+      // live arm at open would resume it with a MATCHING handshake the server
+      // cannot reject. Receipt can see the producer only for RAW snapshots
+      // (parsed above, synchronous): stamp snap.epoch when present. A gzip64
+      // payload's epoch is invisible until decoded: stamp "" (unknown) — it
+      // never pairs at open, dies at establishment, and applySnap's producer
+      // reconcile re-stamps/zeroes once decoded. Old daemons (no epoch field)
+      // keep the state.epoch fallback (they never establish one anyway).
+      if (seq > sesCursor) {
+        sesCursor = seq;
+        sesCursorEpoch =
+          raw.encoding === "gzip64"
+            ? ""
+            : typeof raw.epoch === "string" && raw.epoch !== ""
+              ? raw.epoch
+              : state.epoch;
       }
       // L1 t2: stamp `snap` on FRAME ARRIVAL, before any decode. The window
       // measures pure transport (server compute + serialize + tunnel) — the
@@ -1089,6 +1375,22 @@ function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: 
         // Diagnostics stamp (logging-only): first snapshot APPLIED on this
         // connection — the fresh-path catch-up boundary.
         noteSessionStamp(gen, "snapshotAppliedTs");
+        // F1 round 7 (gate t1b-F1): a snapshot that APPLIED carries its own
+        // producer lifetime — record it for the message-class claims that
+        // follow on this connection (they carry no epoch of their own). And
+        // when the producer is FOREIGN to the client's established epoch, the
+        // live cursor's receipt-time stamp (state.epoch at receipt — possibly
+        // the NEW epoch, per the delayed-frame inverse ordering) is wrong:
+        // zero the live cursor so its high-water cannot suppress same-store
+        // seq advancement or trip a false silence-fallback under foreign
+        // content (the t1a-F1 discipline, extended to the producer check).
+        if (snap.epoch) {
+          if (snap.epoch !== state.epoch) {
+            sesCursor = 0;
+            sesCursorEpoch = "";
+          }
+          sesProducerEpoch = snap.epoch;
+        }
         if (first) {
           // L1 hydrate: warm-vs-cold read from the snapshot's gate. A warm
           // session (gate.messagesLoaded!==false) already has the full history,
@@ -1142,7 +1444,9 @@ function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: 
         // claimSessionCursorApplied — the snapshot-apply site must stay
         // UNGATED by the mismatch latch, because the very next line is the
         // latch's CLEAR point (a snapshot that APPLIED is the repair itself).
-        noteSessionCursorApplied(id, seq);
+        // Round 6 (t1b-F1): pass the snapshot's OWN epoch — the producer
+        // lifetime is the one truth this claim can be stamped with.
+        noteSessionCursorApplied(id, seq, snap.epoch);
         // Round-4 F1: an authoritative session snapshot APPLIED — the
         // content-inclusion repair point for the mismatch latch (a snapshot
         // at a higher seq contains the mismatched range's content by
@@ -1462,6 +1766,7 @@ function armResumeSilenceFallback(): void {
     // wedge slice 5b exists to close. The fallback's snapshot re-advances the
     // cursor memory when it applies.
     sesCursor = 0;
+    sesCursorEpoch = ""; // F1 pairing: cursorless fallback ⇒ no lifetime either
     openSessionES(sesId, "recovery-fresh", "silence-fallback", true);
   }, SES_RESUME_SILENT_FALLBACK_MS);
 }
@@ -1675,7 +1980,21 @@ function registerSessionMessageListeners(es: EventSource, gen: number, id: strin
       // checkSesOrdinalGap MAY have triggered openSessionStream(id, true) →
       // sesGen++ → this connection is superseded. Drop cleanly.
       if (gen !== sesGen) return;
-      if (seq > sesCursor) sesCursor = seq;
+      if (seq > sesCursor) {
+        sesCursor = seq;
+        // F1 round 9 (gate round 8 F1): message frames carry no epoch — the
+        // producer is the connection's last APPLIED snapshot
+        // (sesProducerEpoch), else the URL-declared epoch when this
+        // connection was opened as a SERVER-VALIDATED cursor resume
+        // (sesResumedCursor — the server checked the pairing before choosing
+        // replay, so its frames are that epoch's content), else "" (unknown:
+        // boot-race / cursorless-connection frames; never pairs at open).
+        // state.epoch is deliberately NOT a fallback: the tree stream can
+        // establish the new epoch while THIS connection is still delivering
+        // previous-lifetime frames — stamping state.epoch there laundered a
+        // foreign cursor into the new lifetime (the round-8 block).
+        sesCursorEpoch = sesProducerEpoch || (sesResumedCursor ? sesUrlEpoch : "");
+      }
       if (ordinal > sesLastDeliveryOrdinal) sesLastDeliveryOrdinal = ordinal;
       if (isGateActive()) {
         // Deferred Stream-2 frame — neither mutate the store nor advance the
@@ -2024,6 +2343,7 @@ function flushAppends(): void {
   if (armed !== "H5") {
     for (const sid of mismatchSessions) mismatchLatchedSids.add(sid);
   }
+// MUT-SITE-END H5
   // F9 (round-2 review, data_integrity): the flush-time cursor advance must
   // NEVER pass an unresolved pendingBatch. Wire order guarantees an append
   // arriving after a messages.batch frame has a HIGHER seq, so advancing here
@@ -2140,6 +2460,7 @@ function flushAppends(): void {
   ) {
     claimSessionCursorApplied(flushAppliedSid, flushAppliedSeq);
   }
+// MUT-SITE-END H2H4
   // Trigger cursorless re-snapshot for each mismatched session (defense in depth
   // + the genuine reconnect/loss case). Only the SELECTED session has an open
   // Stream2 to repair; a non-selected session re-snapshots on next open.
