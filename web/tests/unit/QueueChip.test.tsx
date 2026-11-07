@@ -88,6 +88,71 @@ function item(opts: Partial<QueuedMessage>): QueuedMessage {
   };
 }
 
+// Minimal Composer mount props (card B queue-row surface; reused by the card C
+// send-button aria mounts below). All accessors are static — a test overrides
+// just what its branch needs via `over`.
+function composerProps(over: Partial<ComposerProps> = {}): ComposerProps {
+  return {
+    draft: () => false,
+    sessionId: () => "s1",
+    isChild: () => false,
+    parentId: () => undefined,
+    onOpenParent: () => {},
+    input: () => "",
+    setInput: () => {},
+    focusMode: () => false,
+    setFocusMode: () => {},
+    working: () => false,
+    sending: () => false,
+    send: async () => {},
+    abort: () => {},
+    sendInFlight: () => false,
+    readyToSend: () => true,
+    curModel: () => undefined,
+    curVariant: () => "",
+    modelDialog: () => false,
+    setModelDialog: () => {},
+    ac: {
+      acItems: () => [],
+      acIndex: () => 0,
+      acVisible: () => false,
+      setAcIndex: () => {},
+      applyAc: () => {},
+      onAcKeyDown: () => false,
+      syncCaret: () => {},
+      dismissAc: () => {},
+    },
+    att: {
+      attachments: () => [],
+      setAttachments: () => [],
+      uploading: () => false,
+      uploadProgress: () => null,
+      presentInlineIds: () => new Set<string>(),
+      removeAttachment: () => {},
+      reinsertInlineChip: () => {},
+      addFiles: () => {},
+      flushPendingAttachments: async (_id: string) => ({ failed: [] }),
+      uploadFile: async (_file: File, _id: string) => null,
+      inlineFiles: new Map<string, File>(),
+    },
+    paste: {
+      onPaste: () => {},
+      pasteFromClipboard: async () => {},
+      onPasteButtonDown: () => {},
+      onPasteButtonUp: () => {},
+      onPasteButtonClick: () => {},
+      onPasteButtonBlur: () => {},
+    },
+    hist: { onHistoryKey: () => false, resetHistory: () => {} },
+    recovery: { retract: async () => {}, markSent: async () => {} },
+    refTa: () => {},
+    refMirror: () => {},
+    refFileInput: () => {},
+    onPickFile: () => {},
+    ...over,
+  };
+}
+
 describe("QueueChip — recovered `unknown` detail surfacing", () => {
   it("renders the backend detail visibly for an `unknown` item with detail", () => {
     const onRemove = vi.fn();
@@ -761,68 +826,6 @@ describe("QueueChip — receipt-bound vocabulary (card B): 'Not sent — reconne
 // attempt and binds delivery to the transcript.
 // ---------------------------------------------------------------------------
 describe("Queue-row vocabulary (Composer surface) — 'Queued' never implies delivery", () => {
-  function composerProps(over: Partial<ComposerProps> = {}): ComposerProps {
-    return {
-      draft: () => false,
-      sessionId: () => "s1",
-      isChild: () => false,
-      parentId: () => undefined,
-      onOpenParent: () => {},
-      input: () => "",
-      setInput: () => {},
-      focusMode: () => false,
-      setFocusMode: () => {},
-      working: () => false,
-      sending: () => false,
-      send: async () => {},
-      abort: () => {},
-      sendInFlight: () => false,
-      readyToSend: () => true,
-      curModel: () => undefined,
-      curVariant: () => "",
-      modelDialog: () => false,
-      setModelDialog: () => {},
-      ac: {
-        acItems: () => [],
-        acIndex: () => 0,
-        acVisible: () => false,
-        setAcIndex: () => {},
-        applyAc: () => {},
-        onAcKeyDown: () => false,
-        syncCaret: () => {},
-        dismissAc: () => {},
-      },
-      att: {
-        attachments: () => [],
-        setAttachments: () => [],
-        uploading: () => false,
-        uploadProgress: () => null,
-        presentInlineIds: () => new Set<string>(),
-        removeAttachment: () => {},
-        reinsertInlineChip: () => {},
-        addFiles: () => {},
-        flushPendingAttachments: async (_id: string) => ({ failed: [] }),
-        uploadFile: async (_file: File, _id: string) => null,
-        inlineFiles: new Map<string, File>(),
-      },
-      paste: {
-        onPaste: () => {},
-        pasteFromClipboard: async () => {},
-        onPasteButtonDown: () => {},
-        onPasteButtonUp: () => {},
-        onPasteButtonClick: () => {},
-        onPasteButtonBlur: () => {},
-      },
-      hist: { onHistoryKey: () => false, resetHistory: () => {} },
-      recovery: { retract: async () => {}, markSent: async () => {} },
-      refTa: () => {},
-      refMirror: () => {},
-      refFileInput: () => {},
-      onPickFile: () => {},
-      ...over,
-    };
-  }
-
   it("the queue-row label reads 'Queued' (custody receipt) and its tip never promises sending — delivery is named transcript-bound", () => {
     Q.items = [item({ id: "q-row-1", state: "pending", resolvedAt: undefined, text: "queued hello" })];
     const r = render(() => <Composer {...composerProps()} />);
@@ -835,5 +838,85 @@ describe("Queue-row vocabulary (Composer surface) — 'Queued' never implies del
     // …delivery is bound to its only receipt: the transcript entry.
     expect(tip).toContain("transcript");
     r.unmount();
+  });
+
+  it("M3 (card C): the tip is timing-accurate for the row's MIXED contents — the turn-finish promise is gone; custody prefix + transcript-receipt clause stay verbatim", () => {
+    // The row holds more than turn-waiting items: dispatchPolicy:'now'
+    // pending items dispatch IMMEDIATELY (queue.ts: absent policy ≡ "queue" ≡
+    // the whole-tree idle gate) and terminal failed/unknown items never
+    // dispatch (their wording is the chip's own). The old tip promised
+    // "dispatches when the current turn finishes" for all of them.
+    Q.items = [item({ id: "q-row-2", state: "pending", resolvedAt: undefined, text: "scoped tip" })];
+    const r = render(() => <Composer {...composerProps()} />);
+    const tip = r.container.querySelector(".queue-label")!.getAttribute("data-tip")!;
+    // Custody prefix unchanged (card B)…
+    expect(tip.startsWith("Held in the server queue")).toBe(true);
+    // …the overgeneralized turn-finish promise is gone…
+    expect(tip).not.toContain("current turn finishes");
+    // …timing is scoped to PENDING items and states both policies honestly…
+    expect(tip).toContain("pending items");
+    expect(tip).toContain("whole tree");
+    // …and the transcript-receipt clause stays VERBATIM (card B).
+    expect(tip).toContain("delivered only once it appears in the transcript");
+    r.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Card C (2026-11-07, debate B4.1) — the Composer send buttons' IN-FLIGHT
+// accessible name. sendInFlight is the single-flight BUTTON LATCH ("work is
+// happening on this device"), not a receipt that a network send is in
+// progress — so the in-flight aria-label reads the neutral "Working…", never
+// the send-stage "Sending…" (send-stage vocabulary belongs to SendStatus's
+// receipt-bound headlines and QueueChip's dispatching "Sending…" dispatch
+// claim). Idle action names ("Send" / "Send now") are unchanged.
+// ---------------------------------------------------------------------------
+describe("Composer send-button aria (card C) — in-flight name is 'Working…', never a send-stage claim", () => {
+  it("idle composer: in-flight latch aria reads 'Working…' (Composer.tsx send-btn); idle keeps the action name 'Send'", () => {
+    const rIdle = render(() => <Composer {...composerProps({ sendInFlight: () => false })} />);
+    const idle = rIdle.container.querySelector<HTMLButtonElement>(".composer-bar .send-btn")!;
+    expect(idle).toBeTruthy();
+    expect(idle.getAttribute("aria-label")).toBe("Send");
+    rIdle.unmount();
+
+    const rFlight = render(() => <Composer {...composerProps({ sendInFlight: () => true })} />);
+    const inFlight = rFlight.container.querySelector<HTMLButtonElement>(".composer-bar .send-btn")!;
+    expect(inFlight.getAttribute("aria-label")).toBe("Working…");
+    rFlight.unmount();
+  });
+
+  it("busy policy table: Send-now in-flight aria reads 'Working…'; idle keeps 'Send now'; the Queue button's own 'Queueing…' latch name is untouched (out of card scope)", async () => {
+    // The policy table needs the capability probe (queueDispatchPolicyVersion
+    // advertised) + a wired sendPolicy entry; a nonempty draft renders the
+    // Queue + Send now pair (empty would render Stop only).
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ version: "t", daemonDispatchCapable: true, queueDispatchPolicyVersion: 1 }),
+      })),
+    );
+    await refreshDispatchMode();
+    const over: Partial<ComposerProps> = {
+      working: () => true,
+      input: () => "hello",
+      sendPolicy: async () => {},
+    };
+
+    const rIdle = render(() => <Composer {...composerProps({ ...over, sendInFlight: () => false })} />);
+    const idleNow = rIdle.container.querySelector<HTMLButtonElement>(".send-btn.send-now")!;
+    expect(idleNow).toBeTruthy();
+    expect(idleNow.getAttribute("aria-label")).toBe("Send now");
+    rIdle.unmount();
+
+    const rFlight = render(() => <Composer {...composerProps({ ...over, sendInFlight: () => true })} />);
+    const inFlightNow = rFlight.container.querySelector<HTMLButtonElement>(".send-btn.send-now")!;
+    expect(inFlightNow.getAttribute("aria-label")).toBe("Working…");
+    // Boundary pin: the Queue button keeps its own in-flight latch name —
+    // "Queueing…" is a local-operation claim on a DIFFERENT button, retained.
+    const queue = rFlight.container.querySelector<HTMLButtonElement>(".send-btn.queue")!;
+    expect(queue.getAttribute("aria-label")).toBe("Queueing…");
+    rFlight.unmount();
   });
 });

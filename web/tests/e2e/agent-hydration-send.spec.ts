@@ -91,12 +91,15 @@ test("send while agent evidence is pending dispatches exactly once with the evid
   await page.getByPlaceholder(/Message/).fill("agent hydration probe");
   await page.locator(".composer-bar .send-btn").click();
 
-  // 4. The tap was acknowledged (single-flight engaged → "Sending…", button
-  //    disabled) and admission is parked in the evidence gate. This state is
-  //    STABLE — evidence is withheld until the release below, so there is no
-  //    race between this assertion and a wrongful dispatch.
+  // 4. The tap was acknowledged (single-flight engaged → the neutral latch
+  //    name "Working…" (card C, debate B4.1 — the latch claims work-is-
+  //    happening, never a send stage; send-stage vocabulary is SendStatus's /
+  //    QueueChip's), button disabled) and admission is parked in the evidence
+  //    gate. This state is STABLE — evidence is withheld until the release
+  //    below, so there is no race between this assertion and a wrongful
+  //    dispatch.
   const sendBtn = page.locator(".composer-bar .send-btn");
-  await expect(sendBtn).toHaveAttribute("aria-label", "Sending…", { timeout: 10000 });
+  await expect(sendBtn).toHaveAttribute("aria-label", "Working…", { timeout: 10000 });
 
   // 4b. O2 slice 2 — STATIC tap acknowledgement: the former infinite
   //     icon-opacity pulse is gone (no animation loop even without

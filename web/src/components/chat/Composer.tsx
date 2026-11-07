@@ -270,12 +270,19 @@ export function Composer(props: ComposerProps) {
               Card B (2026-10-30, receipt-bound send vocabulary): the row
               label "Queued" states CUSTODY (server queue holds the message),
               never delivery — the tip below spells out the transcript as the
-              only delivery receipt, matching the QueueChip vocabulary. */}
+              only delivery receipt, matching the QueueChip vocabulary.
+              Card C / M3 (2026-11-07, debate B4.1 batch): the tip's timing
+              clause is scoped to PENDING items and their dispatch policy —
+              the row also holds dispatchPolicy:'now' items (immediate
+              dispatch, never turn-waiting) and terminal failed/unknown items
+              (never dispatched; the chip owns their wording), so the former
+              blanket "dispatches when the current turn finishes" promised a
+              timing much of the row does not follow. */}
           <Show when={!props.draft() && queueFor(props.sessionId()).length > 0}>
             <div class="queue-row">
               <span
                 class="queue-label"
-                data-tip="Held in the server queue — dispatches when the current turn finishes; delivered only once it appears in the transcript"
+                data-tip="Held in the server queue — pending items dispatch per their policy (default: when the whole tree goes idle; Send now: immediately); delivered only once it appears in the transcript"
               >
                 Queued
               </span>
@@ -525,6 +532,13 @@ export function Composer(props: ComposerProps) {
             >
               <Icon name="maximize" />
             </button>
+            {/* Card C (2026-11-07, debate B4.1): the send buttons' in-flight
+                accessible name is the neutral "Working…", NOT "Sending…" —
+                sendInFlight is the single-flight BUTTON LATCH
+                (work-is-happening on this device), not a receipt that a
+                network send is in progress; send-stage vocabulary belongs to
+                SendStatus (receipt-bound headlines) and QueueChip (the
+                dispatching "Sending…" dispatch claim). Idle action names stay. */}
             <Show
               when={props.working()}
               fallback={
@@ -532,7 +546,7 @@ export function Composer(props: ComposerProps) {
                   type="button"
                   class="send-btn"
                   classList={{ sending: props.sendInFlight() }}
-                  aria-label={props.sendInFlight() ? "Sending…" : "Send"}
+                  aria-label={props.sendInFlight() ? "Working…" : "Send"}
                   onClick={props.send}
                   disabled={props.sending() || props.sendInFlight() || !props.readyToSend()}
                 >
@@ -600,11 +614,14 @@ export function Composer(props: ComposerProps) {
                   >
                     <Icon name="plus" />
                   </button>
+                  {/* Card C: same B4.1 rule as the idle send button — the
+                      latch reads "Working…" in flight; "Send now" is the idle
+                      action name. */}
                   <button
                     type="button"
                     class="send-btn send-now"
                     classList={{ sending: props.sendInFlight() }}
-                    aria-label={props.sendInFlight() ? "Sending…" : "Send now"}
+                    aria-label={props.sendInFlight() ? "Working…" : "Send now"}
                     data-tip="Send now — dispatches immediately, folding into the running turn"
                     disabled={props.sendInFlight() || !props.readyToSend()}
                     onClick={() => void props.sendPolicy!("now")}
