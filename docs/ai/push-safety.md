@@ -226,16 +226,28 @@ ref-list stdin; a stdin-consuming check could swallow later refs of a
 multi-ref push (conditional, no current check reads stdin) — harden with
 `</dev/null` at the next touch of `.githooks/pre-push`.
 
-## Standing adoption-gate observables (not authoring blockers)
+## Adoption-gate observables
 
-1. **F-D3 — first real-network-remote push.** All wrapper transport
-   evidence to date is `file://` fixtures. Before general adoption, one
-   real-remote push through the wrapper must be observed and its receipt
-   recorded.
-2. **First docs-only push validates Phase 4 live.** Expected: filtered lane
+**F-D3 — first real-network-remote push: OBSERVED.** Wrapper transport
+evidence is no longer `file://`-fixture-only: three real-remote pushes
+through the wrapper (remote `origin`), every one clean on the first
+attempt.
+
+```text
+outcome: 3/3 ok:true first-attempt, remote advanced each time
+  2026-11-01  4d612ed..eb421bc   pushed_sha eb421bc42f5a (45 files, ~4.6s)
+  2026-11-01  eb421bc..919c4c2   pushed_sha 919c4c290c9b (~3.8s)
+  2026-11-02  919c4c2..f770c85b  pushed_sha f770c85b4402 (18 files, ~4.2s)
+receipts: schema push-checked/1, remote NAME only — never URLs
+tree binding: each receipt's pushed_sha = the head of its range above
+```
+
+Still standing (not authoring blockers):
+
+1. **First docs-only push validates Phase 4 live.** Expected: filtered lane
    skips + `ci-summary` green; audit the branch-protection required-check
    list after it.
-3. **`make prepush-selftest` is due at the next wrapper/checker touch**
+2. **`make prepush-selftest` is due at the next wrapper/checker touch**
    (durable self-test; run it whenever `scripts/push-checked.sh` or
    `scripts/prepush-check.sh` changes).
 
