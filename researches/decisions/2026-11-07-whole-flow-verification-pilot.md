@@ -70,6 +70,8 @@ The pilot established four durable verification components:
 4. **Epoch-scoped oracle (`web/tests/unit/session-cursor-bridge.test.ts`):**  
    Lifetime-aware obligation oracle enforcing epoch-qualified identities, edge-triggered lifetime establishment, terminal `expired` dispositions, and settle idempotence.
 
+- **Narrow-checkpoint disposition (CLOSED 2026-11-07):** Retain the S0/S1 suite as standing observation infrastructure (retain ≠ whole-sync correctness); ratified during the defer-retirement batch (task-2026-11-07t13-04-20-defer-retirement-bundle, commit 56e732eb provenance).
+
 ---
 
 ## 5. Reopen Triggers

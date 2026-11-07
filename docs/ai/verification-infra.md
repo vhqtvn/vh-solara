@@ -20,7 +20,7 @@ For the background research and pilot closure decisions, see:
 - **M6:** Premature pendingBatchSeqs clearance.
 
 ### 1.2 Whole-File Round-Trip Drift Guard
-The property test suite runs an automated drift guard (`web/tests/unit/session-cursor-property.test.ts:868-910`) that:
+The property test suite runs an automated drift guard (`web/tests/unit/session-cursor-property.test.ts:853-1035`) that:
 1. Strips the mutant header and arming hook.
 2. Inverts import path rewrites (`../../src/sync/x` → `./x`).
 3. Replaces each mutant scaffold (`MUT-SYNC-ORIGINAL <id> BEGIN .. MUT-SITE-END <id>`) with its pinned original production code.
@@ -99,7 +99,7 @@ Obligations are identified by the tuple `${epoch}:${seq}:${kind}`. Floors are tr
 ### 3.4 Expired-Sweep Launder Pin (8c050640/F1 — DISCHARGED)
 Line 360 of `session-cursor-bridge.test.ts` excludes `expired` obligations from the discharge sweep (`o.disp !== "expired"`). The launder shape is now pinned (OB5 launder pin, same file): a late epoch-A snapshot@8 (seq ≥ the expired A@7) applying after the epoch-B transition keeps A@7 `expired` — never `discharged` — while a same-settle, same-epoch pending control discharges NORMALLY under epoch B's floor (the exclusion is scoped, not a discharge freeze).
 - **Discharged by:** task `task-2026-11-07t13-04-20-defer-retirement-bundle` (item 1).
-- **Trigger:** `path_touched(web/tests/unit/session-cursor-bridge.test.ts)` (standing obligation on the next edit).
+- **Trigger:** `path_touched(web/tests/unit/session-cursor-bridge.test.ts)` (discharged by task-2026-11-07t13-04-20-defer-retirement-bundle, item 1 / the OB5 launder pin).
 
 ---
 
