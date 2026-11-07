@@ -1,0 +1,217 @@
+{
+  "generatedBy": "pkg/web/stream_bridge_fixture_test.go (VH_BRIDGE_FIXTURE_REGEN=1); regenerate after ANY handler behavior change",
+  "normalizations": [
+    "retry: \u003cjitter\u003e -\u003e retry: 2000 (per-connection random SSE retry hint)",
+    "ep-\u003c24hex\u003e -\u003e ep-0000000000000000000aaaaa (per-store-lifetime crypto/rand epoch id)",
+    "time=\u003cRFC3339\u003e -\u003e time=\u003cnormalized\u003e (journal-line vhlog wall-clock timestamp; discriminator fields verbatim)"
+  ],
+  "scenarios": [
+    {
+      "file": "R1-initial-cursorless.sse",
+      "chain": "R",
+      "request": "GET /vh/stream?sessions=s1\u0026z=1\u0026part_delta=1 (cursorless; live tail scripted post-snapshot)",
+      "journal": "time=\u003cnormalized\u003e level=INFO msg=\"stream baseline\" path=fresh class=selected fallback_reason=cursorless part_append_in_range=false had_cursor=false cursor=0 head=4",
+      "clientDisposition": "fresh-snapshot-applies (floor=snapshot seq); live tail delivered by the TS harness as a PREFIX (tail withheld = real disconnect shape)",
+      "frames": [
+        {
+          "event": "snapshot",
+          "id": "4.1"
+        },
+        {
+          "event": "pins.snapshot",
+          "id": ""
+        },
+        {
+          "event": "labels.snapshot",
+          "id": ""
+        },
+        {
+          "event": "archive-failures.snapshot",
+          "id": ""
+        },
+        {
+          "event": "message.upsert",
+          "id": "5.2"
+        },
+        {
+          "event": "part.upsert",
+          "id": "6.3"
+        },
+        {
+          "event": "part.append",
+          "id": "7.4"
+        }
+      ]
+    },
+    {
+      "file": "R2-replay-in-range.sse",
+      "chain": "R",
+      "request": "GET /vh/stream?cursor=6\u0026sessions=s1\u0026z=1\u0026part_delta=1 (cursor = the client's prefix-remembered claim = p1.upsert seq)",
+      "journal": "time=\u003cnormalized\u003e level=INFO msg=\"stream baseline\" path=replay class=selected fallback_reason=none part_append_in_range=true cursor=6 replayed=1 head=7",
+      "clientDisposition": "replay-repair: every replayed frame's globalSeq \u003e cursor; withheld obligation re-served and applied",
+      "frames": [
+        {
+          "event": "part.append",
+          "id": "7.1"
+        },
+        {
+          "event": "pins.snapshot",
+          "id": ""
+        },
+        {
+          "event": "labels.snapshot",
+          "id": ""
+        },
+        {
+          "event": "archive-failures.snapshot",
+          "id": ""
+        }
+      ]
+    },
+    {
+      "file": "C3-compat-fallback.sse",
+      "chain": "C",
+      "request": "GET /vh/stream?cursor=5\u0026sessions=s1\u0026z=1 (NO part_delta opt-in — legacy connection)",
+      "journal": "time=\u003cnormalized\u003e level=INFO msg=\"stream baseline\" path=fresh class=selected fallback_reason=compatibility_fallback part_append_in_range=true had_cursor=true cursor=5 head=7",
+      "clientDisposition": "legacy fresh-snapshot fallback applies; missed part content arrives via the snapshot (full-text reference)",
+      "frames": [
+        {
+          "event": "snapshot",
+          "id": "7.1"
+        },
+        {
+          "event": "pins.snapshot",
+          "id": ""
+        },
+        {
+          "event": "labels.snapshot",
+          "id": ""
+        },
+        {
+          "event": "archive-failures.snapshot",
+          "id": ""
+        }
+      ]
+    },
+    {
+      "file": "E1-initial-cursorless.sse",
+      "chain": "E",
+      "request": "GET /vh/stream?sessions=s1\u0026z=1\u0026part_delta=1 (cursorless; live tail m2 post-snapshot)",
+      "journal": "time=\u003cnormalized\u003e level=INFO msg=\"stream baseline\" path=fresh class=selected fallback_reason=cursorless part_append_in_range=false had_cursor=false cursor=0 head=4",
+      "clientDisposition": "fresh-snapshot-applies (floor=snapshot seq); live tail m2 present — the TS harness delivers it as a WITHHELD prefix (floor-only claim)",
+      "frames": [
+        {
+          "event": "snapshot",
+          "id": "4.1"
+        },
+        {
+          "event": "pins.snapshot",
+          "id": ""
+        },
+        {
+          "event": "labels.snapshot",
+          "id": ""
+        },
+        {
+          "event": "archive-failures.snapshot",
+          "id": ""
+        },
+        {
+          "event": "message.upsert",
+          "id": "5.2"
+        }
+      ]
+    },
+    {
+      "file": "E2-ring-eviction.sse",
+      "chain": "E",
+      "request": "GET /vh/stream?cursor=4\u0026sessions=s1\u0026z=1\u0026part_delta=1 (cursor = snapshot seq — the floor-only claim after the live tail was missed; 5 later events evicted the window, ring cap 4)",
+      "journal": "time=\u003cnormalized\u003e level=INFO msg=\"stream baseline\" path=fresh class=selected fallback_reason=ring_eviction part_append_in_range=false had_cursor=true cursor=4 head=10",
+      "clientDisposition": "fallback discharge: fresh snapshot applies (floor=snapshot seq) and DISCHARGES the withheld m2 obligation; the NEXT reconnect claims the snapshot seq",
+      "frames": [
+        {
+          "event": "snapshot",
+          "id": "10.1"
+        },
+        {
+          "event": "pins.snapshot",
+          "id": ""
+        },
+        {
+          "event": "labels.snapshot",
+          "id": ""
+        },
+        {
+          "event": "archive-failures.snapshot",
+          "id": ""
+        }
+      ]
+    },
+    {
+      "file": "S1-stale-cursor-exceeds-head.sse",
+      "chain": "S",
+      "request": "GET /vh/stream?cursor=50003\u0026sessions=s1\u0026z=1\u0026part_delta=1 (cursor \u003e head=3)",
+      "journal": "time=\u003cnormalized\u003e level=INFO msg=\"stream baseline\" path=fresh class=selected fallback_reason=stale_cursor_exceeds_head part_append_in_range=false had_cursor=true cursor=50003 head=3",
+      "clientDisposition": "go-side-only (journal discriminator pin; not consumed by the TS harness)",
+      "frames": [
+        {
+          "event": "snapshot",
+          "id": "3.1"
+        },
+        {
+          "event": "pins.snapshot",
+          "id": ""
+        },
+        {
+          "event": "labels.snapshot",
+          "id": ""
+        },
+        {
+          "event": "archive-failures.snapshot",
+          "id": ""
+        }
+      ]
+    },
+    {
+      "file": "T1-tree2-replay-reconnect-pair.sse",
+      "chain": "T",
+      "request": "GET /vh/stream?cursor=2\u0026sessions=\u0026tree=2\u0026part_delta=1 (replay reconnect over the C2 delta)",
+      "journal": "time=\u003cnormalized\u003e level=INFO msg=\"stream baseline\" path=replay class=tree fallback_reason=none part_append_in_range=false cursor=2 replayed=1 head=3",
+      "clientDisposition": "go-side-only (tree stream / Stream 1; not consumed by the session-stream harness)",
+      "frames": [
+        {
+          "event": "tree.op",
+          "id": "3.1"
+        },
+        {
+          "event": "session.upsert",
+          "id": "3.1"
+        },
+        {
+          "event": "tree.snapshot",
+          "id": "3.0"
+        },
+        {
+          "event": "snapshot",
+          "id": "3.0"
+        },
+        {
+          "event": "snapshot.complete",
+          "id": "3.0"
+        },
+        {
+          "event": "pins.snapshot",
+          "id": ""
+        },
+        {
+          "event": "labels.snapshot",
+          "id": ""
+        },
+        {
+          "event": "archive-failures.snapshot",
+          "id": ""
+        }
+      ]
+    }
+  ]
+}

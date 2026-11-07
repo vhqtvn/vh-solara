@@ -1,0 +1,37 @@
+: bridge-fixture: T1-tree2-replay-reconnect-pair.sse
+: request: GET /vh/stream?cursor=2&sessions=&tree=2&part_delta=1 (replay reconnect over the C2 delta)
+: journal: time=<normalized> level=INFO msg="stream baseline" path=replay class=tree fallback_reason=none part_append_in_range=false cursor=2 replayed=1 head=3
+: normalizations: retry: <jitter> -> retry: 2000 ; ep-<24hex> -> ep-0000000000000000000aaaaa ; time=<RFC3339> -> time=<normalized>
+
+: hello
+retry: 2000
+
+id: 3.1
+event: tree.op
+data: {"seq":1,"sessionId":"C2","op":"node.upsert","data":{"node":{"id":"C2","title":"C2","activity":"","childCount":0,"loaded":false,"flags":{"pendingInput":false,"subtreeNeedsInput":false,"subtreeBusy":false,"permission":false,"archived":false,"orphan":false},"updatedMs":1000,"parentId":"R"}}}
+
+id: 3.1
+event: session.upsert
+data: {"id":"C2","parentID":"R","title":"C2","time":{"updated":1000}}
+
+id: 3.0
+event: tree.snapshot
+data: {"tree":"2","epoch":"ep-0000000000000000000aaaaa","seq":3,"nodes":[{"id":"R","title":"R","activity":"","childCount":2,"descendantCount":3,"loaded":false,"flags":{"pendingInput":false,"subtreeNeedsInput":false,"subtreeBusy":false,"permission":false,"archived":false,"orphan":false},"updatedMs":1000,"parentId":null}],"cause":"reconnect"}
+
+id: 3.0
+event: snapshot
+data: {"epoch":"ep-0000000000000000000aaaaa","seq":3,"sessions":[{"id":"R","title":"R","time":{"updated":1000}}],"messages":{},"gate":{"R":{"activity":"idle","hydrated":false,"hasMessages":false,"messagesLoaded":false,"last_assistant_completed":false,"last_assistant_empty":false,"subtree_busy":false,"pending_question":false,"pending_permission":false,"permission_blocked":false,"permissionWasBlocked":false,"fleet_selected":true,"subtree_error":0,"subtree_retry":0,"unread":false}},"partial":{"mode":"tree-stream-1-frontier","scope":["R"],"authority":{"activity":"frontier","currentVerbs":"frontier","gate":"frontier","lastAgents":"frontier","messages":"omitted","permissions":"global","questions":"global","sessions":"frontier","statuses":"omitted","todos":"omitted","unread":"global"}},"fleet_selection":"root_unarchived_v1"}
+
+id: 3.0
+event: snapshot.complete
+data: {"epoch":"ep-0000000000000000000aaaaa","revision":3,"projections":["tree","detail"]}
+
+event: pins.snapshot
+data: {"revision":0,"initialized":false,"orderedSessionIds":[]}
+
+event: labels.snapshot
+data: {"revision":0,"groups":[],"tags":[],"tagIdsByRootSessionId":{}}
+
+event: archive-failures.snapshot
+data: {"failures":[]}
+

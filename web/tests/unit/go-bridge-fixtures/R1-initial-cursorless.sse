@@ -1,0 +1,33 @@
+: bridge-fixture: R1-initial-cursorless.sse
+: request: GET /vh/stream?sessions=s1&z=1&part_delta=1 (cursorless; live tail scripted post-snapshot)
+: journal: time=<normalized> level=INFO msg="stream baseline" path=fresh class=selected fallback_reason=cursorless part_append_in_range=false had_cursor=false cursor=0 head=4
+: normalizations: retry: <jitter> -> retry: 2000 ; ep-<24hex> -> ep-0000000000000000000aaaaa ; time=<RFC3339> -> time=<normalized>
+
+: hello
+retry: 2000
+
+id: 4.1
+event: snapshot
+data: {"epoch":"ep-0000000000000000000aaaaa","seq":4,"sessions":[{"id":"s1"}],"messages":{"s1":[{"info":{"id":"m1","sessionID":"s1","role":"user"},"parts":[]}]},"messageWindows":{"s1":{"oldest_loaded_id":"m1","has_older":false,"message_count":1,"serialized_bytes":42,"count_limited":false,"bytes_limited":false}},"gate":{"s1":{"activity":"idle","hydrated":true,"hasMessages":true,"messagesLoaded":true,"last_assistant_completed":false,"last_assistant_empty":false,"subtree_busy":false,"pending_question":false,"pending_permission":false,"permission_blocked":false,"permissionWasBlocked":false,"fleet_selected":true,"subtree_error":0,"subtree_retry":0,"unread":false}},"fleet_selection":"root_unarchived_v1"}
+
+event: pins.snapshot
+data: {"revision":0,"initialized":false,"orderedSessionIds":[]}
+
+event: labels.snapshot
+data: {"revision":0,"groups":[],"tags":[],"tagIdsByRootSessionId":{}}
+
+event: archive-failures.snapshot
+data: {"failures":[]}
+
+id: 5.2
+event: message.upsert
+data: {"id":"m2","sessionID":"s1","role":"user"}
+
+id: 6.3
+event: part.upsert
+data: {"id":"p1","sessionID":"s1","messageID":"m1","type":"text","text":""}
+
+id: 7.4
+event: part.append
+data: {"field":"text","messageID":"m1","partID":"p1","sessionID":"s1","start":0,"text":"a"}
+
