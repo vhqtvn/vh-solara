@@ -302,6 +302,19 @@ class ObligationOracle {
   obls: Obligation[] = [];
   floors = new Map<string, number>(); // per-epoch: highest APPLIED snapshot seq (the round-5b discharge axiom)
   activeEpoch = ""; // the newest store lifetime an applied snapshot established
+  // establishedEpochs — the EDGE memory of the LIFETIME RULE below: the
+  // epochs whose serving lifetime a FIRST-applied snapshot already
+  // established. settle() REPLAYS every historically-applied snapshot on
+  // every call (an "applied" disposition is terminal), so the lifetime
+  // transition must key on FIRST ESTABLISHMENT, not on activeEpoch
+  // inequality — a replayed OLD-epoch snapshot visit must never re-fire it.
+  // EPOCH-keyed rather than (epoch,seq)-keyed by design: the rule is a
+  // property of the LIFETIME ("a snapshot applying under E establishes E"),
+  // not of an individual snapshot seq — a second snapshot of an
+  // already-established epoch (chain E's snapshot@10 after snapshot@4)
+  // re-fires nothing. (settle-idempotence micro-slice, the OB5 review's
+  // b-F1/b-F2/c-F1 defer.)
+  establishedEpochs = new Set<string>();
 
   deliver(epoch: string, seq: number, kind: string, observe: () => boolean, note = ""): void {
     this.obls.push({ epoch, seq, kind, disp: "pending", observe, note });
@@ -311,15 +324,23 @@ class ObligationOracle {
   }
   snapshotApplied(epoch: string, seq: number): void {
     if (seq > this.floorOf(epoch)) this.floors.set(epoch, seq);
-    // OB5 LIFETIME RULE: a snapshot applying under epoch E establishes E as
-    // the serving lifetime. Every still-open/pending obligation of a
-    // DIFFERENT epoch belongs to a DEAD store — its content will never
-    // arrive through this lifetime's bytes, so it takes the explicit
-    // terminal disposition "expired": visible in obls, excluded from open,
-    // and never laundered as "discharged" (E's floor discharges SAME-epoch
-    // obligations only — the numeric sweep across lifetimes was the
-    // pre-OB5 false green; see the UnscopedObligationOracle receipt).
-    if (this.activeEpoch !== epoch) {
+    // OB5 LIFETIME RULE (EDGE-TRIGGERED): a snapshot applying under epoch E
+    // establishes E as the serving lifetime — ONCE, at the FIRST settle that
+    // observes one of E's snapshots applied (the establishedEpochs edge
+    // memory). Every still-open/pending obligation of a DIFFERENT epoch
+    // belongs to a DEAD store — its content will never arrive through this
+    // lifetime's bytes, so it takes the explicit terminal disposition
+    // "expired": visible in obls, excluded from open, and never laundered as
+    // "discharged" (E's floor discharges SAME-epoch obligations only — the
+    // numeric sweep across lifetimes was the pre-OB5 false green; see the
+    // UnscopedObligationOracle receipt). Edge-triggering is what makes the
+    // rule survive REPEATED observation: settle() replays every
+    // historically-applied snapshot, and under the old activeEpoch-inequality
+    // trigger the replayed visit of a DEAD epoch's snapshot re-fired this
+    // rule in reverse — expiring the CURRENT epoch's open obligations (the
+    // settle-idempotence regression above).
+    if (!this.establishedEpochs.has(epoch)) {
+      this.establishedEpochs.add(epoch);
       for (const o of this.obls) {
         if (o.epoch !== epoch && (o.disp === "pending" || o.disp === "open")) {
           o.disp = "expired";
@@ -327,8 +348,19 @@ class ObligationOracle {
       }
       this.activeEpoch = epoch;
     }
+    // The discharge sweep stays LEVEL-triggered (idempotent + monotone): a
+    // replayed visit re-derives the same floor and the same same-epoch ≤seq
+    // discharges — a no-op. "expired" is TERMINAL here too: a dead epoch's
+    // obligation is never resurrected as "discharged" by a later settle.
     for (const o of this.obls) {
-      if (o.epoch === epoch && o.seq <= seq && o.disp !== "applied") o.disp = "discharged";
+      if (
+        o.epoch === epoch &&
+        o.seq <= seq &&
+        o.disp !== "applied" &&
+        o.disp !== "expired"
+      ) {
+        o.disp = "discharged";
+      }
     }
   }
   // classify: pending obligations take their first disposition, and OPEN
@@ -354,6 +386,22 @@ class ObligationOracle {
   // observation point: post-feed settlement (settleAsync) AND reconnect
   // (openAndObserve — the wire-deferred witness's observables, the URL
   // cursor+epoch, move exactly there).
+  //
+  // INVARIANT (settle IDEMPOTENCE — single-epoch-per-settle; the OB5
+  // review's dropped advisory a-F2, folded): settle() REPLAYS every
+  // historically-applied snapshot on every call ("applied" is terminal, so
+  // each visit re-fires snapshotApplied forever), yet the oracle's verdicts
+  // must depend only on the OBSERVATION state, never on how many times it
+  // was settled. The load-bearing half is the EDGE-TRIGGERED lifetime rule:
+  // within a single settle() the loop may visit snapshots of several epochs
+  // (registration order), but establishment only ever ADVANCES the active
+  // lifetime (a first-applied epoch) — a replayed settle can never regress
+  // activeEpoch to a dead epoch, never expires an obligation of the current
+  // epoch, and never resurrects a terminally-disposed one. Floors are
+  // monotone, discharges/expiries are terminal: any number of settles over
+  // the same observation state yields identical obls/floors/activeEpoch
+  // (proven by the settle-idempotence regression below). The committed
+  // chains settle once per observation point; nothing breaks at two.
   settle(): void {
     this.classifyPending();
     for (const o of this.obls) {
@@ -1370,6 +1418,95 @@ describe("chain K3 — red-first receipt (b) + the dead-cursor perturbation the 
     expect(perturbedUrl).toContain(`&epoch=${epochB}`); // …paired with ep-B (the laundering shape)
     expect(cursorOfUrl(perturbedUrl)).not.toBe(cursor3); // the pairing assert `toBe(5)` rejects it — detected
   }, 20_000);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// settle() IDEMPOTENCE — the OB5 review's three-leaf deferred finding
+// (b-F1/b-F2/c-F1, fired by the OB5 commit's own path_touched trigger),
+// red-first. Oracle-only (no module, no fixtures — the defect is the ORACLE's
+// repeated-observation behavior, tool hardening not production): K3's exact
+// disposition timeline is reproduced with boolean-flag observers standing in
+// for the chain's witness classes (A's snapshot content witness fires at leg
+// 1; B's snapshot wire witness fires at leg 3; the two withheld obligations
+// never fire). Registration is PHASED exactly like the chain — epoch B's
+// obligations are registered only AFTER leg 1's settle (A's snapshot already
+// applied) — because the A-establishment at leg 1 would otherwise expire B's
+// not-yet-legitimate obligations for a reason no chain schedule exhibits.
+// The applied-but-inert middle obligations of the real chain (A's m2@5/
+// p1up@6, B's n1@5) are omitted: they are neither snapshots (no replay in
+// settle's loop) nor ever open (no expiry target) — the two mechanisms the
+// double-settle exercises. The RED mechanism: settle() REPLAYS every
+// historically-applied snapshot (an "applied" disposition is terminal), and
+// the pre-fix LIFETIME RULE fired on `activeEpoch !== epoch` — so the second
+// settle's REPLAYED A-snapshot@4 visit (first in registration order) flips
+// activeEpoch to A and expires B's open q1up@6; the later B-snapshot replay
+// flips activeEpoch back to B (the pointer self-heals) but the terminal
+// "expired" does not — the perturbation detector then goes blind exactly
+// where K3 planted it.
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("settle idempotence — a SECOND settle after the K3 epoch transition changes nothing", () => {
+  it("re-settling the K3 leg-3 state keeps activeEpoch=B, q1up@6 OPEN, and the perturbed dead-cursor still flagged", () => {
+    const epA = "ep-a";
+    const epB = "ep-b";
+    const oracle = new ObligationOracle();
+    let aSnapSeen = false; // A:snapshot@4 content witness (fires at leg 1)
+    let bSnapSeen = false; // B:snapshot@4 wire witness (fires at leg 3)
+
+    // Leg 1 — K3's R1-prefix settle: A's snapshot applies (content witness),
+    // the withheld append@7 stays open; epoch A established, floorA=4.
+    oracle.deliver(epA, 4, "snapshot", () => aSnapSeen, "A snap-content");
+    oracle.deliver(epA, 7, "part.append", () => false, "A a:p1 withheld");
+    aSnapSeen = true;
+    oracle.settle();
+    expect(oracle.activeEpoch).toBe(epA);
+    expect(oracle.floorOf(epA)).toBe(4);
+    expect(oracle.openObligations().map((o) => `${o.epoch}:${o.seq}`)).toEqual([`${epA}:7`]);
+
+    // Leg 2 — K3's reconnect + partial-feed settles (settle runs TWICE here,
+    // as in the chain: openAndObserve's and settleAsync's): B's snapshot
+    // registers WIRE-DEFERRED (witness not yet fired) and q1up@6 is
+    // withheld — both open under epoch B; A's append@7 still open (nothing
+    // has established B yet, so no expiry fires on either settle).
+    oracle.deliver(epB, 4, "snapshot", () => bSnapSeen, "B snap-wire");
+    oracle.deliver(epB, 6, "part.upsert", () => false, "B p:q1 withheld");
+    oracle.settle();
+    oracle.settle();
+    expect(oracle.openObligations().map((o) => `${o.epoch}:${o.seq}`)).toEqual([
+      `${epA}:7`,
+      `${epB}:4`,
+      `${epB}:6`,
+    ]);
+
+    // Leg 3 — the wire observation fires B's snapshot witness (K3's
+    // openAndObserve settle): B establishes, the LIFETIME RULE expires A's
+    // append@7, q1up@6 stays open — the chain's committed end state.
+    bSnapSeen = true;
+    oracle.settle();
+    expect(oracle.activeEpoch).toBe(epB);
+    expect(oracle.floorOf(epB)).toBe(4);
+    expect(oracle.obls.find((o) => o.epoch === epA && o.seq === 7)!.disp).toBe("expired");
+    expect(oracle.openObligations().map((o) => `${o.epoch}:${o.seq}`)).toEqual([`${epB}:6`]);
+
+    // THE REGRESSION — settle() AGAIN over the SAME observation state.
+    oracle.settle();
+    // (a) the active lifetime does not regress to the dead epoch A …
+    expect(oracle.activeEpoch).toBe(epB);
+    // (b) … so B's open q1up@6 was not expired by the replayed A-visit …
+    const q = oracle.obls.find((o) => o.epoch === epB && o.seq === 6)!;
+    expect(q.disp).toBe("open");
+    expect(oracle.openObligations().map((o) => `${o.epoch}:${o.seq}`)).toEqual([`${epB}:6`]);
+    // (c) … and the perturbed dead-cursor covering check STILL fires (K3's
+    // detector 1, re-executed on the post-re-settle state: cursor=6 paired
+    // with ep-B covers B's open q1up@6 — the exact shape the matrix exists
+    // to catch).
+    const flagged = oracle.checkMemoryOpen(6, "idem:perturbed-dead-cursor", epB);
+    expect(flagged).toHaveLength(1);
+    expect(flagged[0].cursor).toBe(6);
+    expect(flagged[0].offending.seq).toBe(6);
+    expect(flagged[0].offending.epoch).toBe(epB);
+    expect(flagged[0].offending.kind).toBe("part.upsert");
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
