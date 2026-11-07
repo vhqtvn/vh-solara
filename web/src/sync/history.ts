@@ -422,7 +422,11 @@ function applyPageMerge(
       if (!sm) return; // session closed mid-flight — drop
       const prevWin = s.messageWindows[sid];
       const prevEvictedHistory = !!prevWin?.evictedHistory;
-      const added = prependMessagesIfAbsent(sm, res.items);
+      // admitMissing=true — the page caller is admission-ELIGIBLE (the
+      // Contract-B dirty gate orders every client-applied delete out of the
+      // flight; admission-safety contract at prependMessagesIfAbsent,
+      // reduce.ts). The messages.batch caller is NOT eligible (d-F1).
+      const added = prependMessagesIfAbsent(sm, res.items, true);
       if (added === 0) {
         // Page was a pure overlap (all messages already resident) or empty.
         // Still update hasOlder from the server's authoritative page meta so

@@ -145,11 +145,17 @@ export function buildMessages(items: any[]): SessionMessages {
 // (the partial cached while streaming), so the stale partial stayed on screen
 // until a full reload. It also fills a resident message that the activity-idle
 // path stamped time.completed on but that is MISSING parts. A NON-completed
-// incoming copy still takes the insert-if-absent path for a keyed resident
-// (this is the live-streaming tail the guard protects) — so the fix does NOT
-// reopen "a stale snapshot clobbers a live mid-stream message" — with ONE
-// exception: a KEYLESS SHADOW resident (never in order, no info of its own)
-// adopts the incoming info (see prependMessagesIfAbsent).
+// incoming copy still never overwrites a KEYED resident's info or any
+// EXISTING part's body (the live-streaming tail the guard protects) — so the
+// fix does NOT reopen "a stale snapshot clobbers a live mid-stream message" —
+// with TWO additions: a KEYLESS SHADOW resident (never in order, no info of
+// its own) adopts the incoming info (see prependMessagesIfAbsent), and —
+// since the store-merge stage-2 admission (card
+// task-2026-11-07t15-45-23-store-merge-stage2-admission, operator-ratified
+// ADMIT-REPAIR) — parts the keyed non-completed resident is MISSING are
+// installed from the copy (MISSING-PARTS ONLY, never body corrections), and
+// only from callers that pass the admitMissing merge option (the
+// messages.batch caller is EXCLUDED — see the admission-safety contract).
 //
 // Returns the count of messages actually INSERTED (an in-place upgrade is NOT
 // counted — callers rely on the return meaning "newly inserted older messages"
@@ -202,19 +208,28 @@ function mergePartsOrdered(
 //
 // ELIGIBILITY RULE — merge admission is safe ONLY from sources that are
 // (a) FRESH-CAPTURED after every client-applied delete, or (b) followed by
-// ordered re-delivery of any post-capture delete. All THREE current callers
-// qualify by construction:
+// ordered re-delivery of any post-capture delete. Admission is therefore
+// CALLER-GATED via the admitMissing merge option (d-F1, below). Exactly TWO
+// callers carry one of these orderings and pass it:
 //   - history.ts applyPageMerge (historical page): the Contract-B dirty gate
 //     (part.delete / message.delete / messages.batch during the flight mark
 //     it dirty; the response gate discards + bounded-retries).
-//   - reducers.ts messages.batch (cold batch): the server-side msgRev ABA
-//     guard on publishColdBatch (a delete racing the package bumps msgRev;
-//     the stale package is discarded and repackaged post-delete).
 //   - session-stream.ts applySessionSnapshot (Stream-2 snapshot): capture at
 //     connection open + live events serialized behind the gzip64 decode +
 //     ordered SSE delivery — a post-capture delete arrives as an event that
 //     re-deletes (client deletePart is idempotent).
-// Any NEW caller must carry one of these two orderings or it is ineligible.
+// The THIRD caller — reducers.ts messages.batch (cold batch) — is EXCLUDED
+// (d-F1, round-1 review, data_integrity): the server-side msgRev ABA guard
+// on publishColdBatch is EMIT-TIME and cannot see CLIENT decode reordering.
+// pendingBatch retains only the LATEST registration per session, so a held
+// earlier same-session batch can apply AFTER a part.delete that raced
+// between the two decodes (the later batch's finally already cleared the
+// map entry, so the delete does not wait), and the admission leg would
+// reinstall the stale pre-delete part — the resurrection. Lifting the
+// exclusion requires serializing same-session batch application in WIRE
+// ORDER (a separate future slice — not this option's concern).
+// Any NEW caller must carry one of the two orderings above before it may
+// pass admitMissing=true.
 //
 // THE FOUR INVARIANT CLAUSES (pinned by web/tests/unit/store-merge-property.
 // test.ts — the acceptance net; transport no-resurrection pins:
@@ -235,18 +250,40 @@ function mergePartsOrdered(
 //   1. Keep the property suite green — the four clauses hold under BOTH
 //      boundary shapes; only which-parts-are-resident changes.
 //   2. Flip the round-5b boundary pin DELIBERATELY
-//      (web/tests/unit/session-cursor-persistence.test.ts:1477-1561): all
+//      (web/tests/unit/session-cursor-persistence.test.ts): all
 //      three conjuncts re-derived, not assumed — (a) merge-skips flips;
 //      (b) floor-raise + mismatch-latch-clear at applySnap re-adjudicated;
 //      (c) reopen-sends-snapshot-seq re-derived.
 //   3. Re-adjudicate the floor-raise and latch-clear premises against the
 //      new boundary, and rewrite the boundary comments that the eligibility
 //      pass flagged: the applySnap RECORDED BOUNDARY comment
-//      (session-stream.ts ~1348-1365), the isPageDirtyingKind FALSE-case
+//      (session-stream.ts applySnap), the isPageDirtyingKind FALSE-case
 //      rationale (history.ts — "the page merge skips the resident parent"
 //      becomes textually false), and the S0/S1 oracle discharge-axiom comment
-//      (session-cursor-property.test.ts:33-44).
-export function prependMessagesIfAbsent(sm: SessionMessages, items: any[]): number {
+//      (session-cursor-property.test.ts).
+//
+// STAGE 2 LANDED (task-2026-11-07t15-45-23-store-merge-stage2-admission, the
+// operator-ratified ADMIT-REPAIR): the keyed non-completed resident branch
+// below now installs the resident's MISSING parts via mergePartsOrdered(
+// …, assignPresent=false) — existing part bodies/info are never overwritten
+// (live-wins stays; clause (b) unchanged), `added` still counts only NEW
+// message ids, and message order/info are untouched (admission triggers no
+// re-sort) — but ONLY when the caller passes admitMissing=true (d-F1
+// caller gating; see the eligibility rule above). Obligations 1-2 discharged
+// by that card: the property suite ran
+// GREEN UNMODIFIED against the admitted reducer (kill criterion honored) and
+// the round-5b pin flipped deliberately with all three conjuncts re-derived.
+// Obligation 3 is discharged for the applySnap comment (session-stream.ts);
+// the history.ts FALSE-case and S0/S1 oracle comment rewrites remain with
+// the coordinator (out of that slice's ≤6-file scope — tracked at review).
+// d-F1 (round-1 review on that card, data_integrity): the original "all
+// THREE callers qualify" premise was FALSE for the batch path (client decode
+// reordering — see the eligibility rule above). The admission is now gated
+// behind the admitMissing option (default FALSE — conservative):
+// applySessionSnapshot (session-stream.ts) and applyPageMerge (history.ts)
+// pass true; the messages.batch merge (reducers.ts) does NOT. Pinned
+// red-first by the d-F1 regression in session-cursor-persistence.test.ts.
+export function prependMessagesIfAbsent(sm: SessionMessages, items: any[], admitMissing = false): number {
   let added = 0;
   let upgraded = false;
   for (const it of items) {
@@ -254,7 +291,7 @@ export function prependMessagesIfAbsent(sm: SessionMessages, items: any[]): numb
     if (!info) continue;
     const resident = sm.byId[info.id];
     if (resident) {
-      // Already resident. Two ways a resident entry may be touched:
+      // Already resident. Three ways a resident entry may be touched:
       //   1. The incoming copy is COMPLETED (terminal/immutable — safe
       //      against live): upgrade info + merge parts with the completed
       //      copy authoritative (assign-in-place). A shadow is also realized
@@ -264,9 +301,20 @@ export function prependMessagesIfAbsent(sm: SessionMessages, items: any[]): numb
       //      own to protect): adopting the incoming info — which carries
       //      time.created, an honest slot — is strictly a repair. Resident
       //      part BODIES still win (they arrived via the live stream); the
-      //      incoming copy only fills gaps. A KEYED resident (already in
-      //      order) is untouched by a non-completed copy — the live-wins
-      //      guard for the mid-stream tail is preserved exactly.
+      //      incoming copy only fills gaps.
+      //   3. ADMIT-REPAIR (stage 2): the resident is KEYED (already in order)
+      //      and NOT completed, and the incoming copy is not completed — the
+      //      copy's parts ABSENT from the resident are installed. Existing
+      //      part bodies/info are NEVER overwritten (assignPresent=false:
+      //      live-wins stays — this is missing-parts admission, NOT
+      //      "corrected streaming fields"); the resident's info and message
+      //      slot are untouched (no re-sort: admission cannot move order).
+      //      Safety rests on the ADMISSION-SAFETY CONTRACT above: this leg
+      //      fires ONLY when the caller passes admitMissing=true (the two
+      //      eligible callers — snapshot + page; the messages.batch caller
+      //      is EXCLUDED, d-F1). A COMPLETED keyed resident is excluded: it
+      //      is terminal — its repair route is the completed-upgrade path
+      //      (1), never a non-completed (possibly pre-completion) copy.
       const isShadow = !sm.order.includes(info.id);
       if (info.time?.completed) {
         resident.info = info;
@@ -278,6 +326,8 @@ export function prependMessagesIfAbsent(sm: SessionMessages, items: any[]): numb
         mergePartsOrdered(resident, it.parts, false);
         sm.order.push(info.id);
         upgraded = true;
+      } else if (admitMissing && !isShadow && !resident.info.time?.completed) {
+        mergePartsOrdered(resident, it.parts, false);
       }
       continue;
     }

@@ -1474,27 +1474,34 @@ describe("round-4b E2 subsume corner — drain-time mismatch subsumed by a pendi
   });
 });
 
-// Round-5b (coordinator adjudication on round-5 F1/F2): the PIN of the
-// adjudicated behavior at the applySnap boundary — deliberately NOT
+// Round-5b (coordinator adjudication on round-5 F1/F2; STAGE-2 FLIP): the
+// pin of the ADMITTED behavior at the applySnap boundary — deliberately NOT
 // tier1_b's failing regression. The residual gap tier1_b targeted (a
 // snapshot CONTAINS repair for a keyed non-completed resident — a missing
-// part — but prependMessagesIfAbsent skips merging it, reduce.ts:200-228)
-// is a PRE-EXISTING store merge-policy defect, routed to a separate
-// store-policy card; this slice does not change store semantics. This pin
-// freezes the CURRENT adjudicated boundary on three conjuncts:
-//   (a) the merge SKIPS (p2 stays absent — pins the store-policy boundary);
+// part — but prependMessagesIfAbsent skipped merging it) was routed to the
+// store-merge track and is CLOSED by stage 2 (card
+// task-2026-11-07t15-45-23-store-merge-stage2-admission, operator-ratified
+// ADMIT-REPAIR): the merge now installs such a resident's MISSING parts from
+// the incoming copy — MISSING-PARTS ONLY (an existing part's body/info is
+// NEVER overwritten; live-wins stays), per the admission-safety contract at
+// prependMessagesIfAbsent (reduce.ts, landed fd91545a stage 1). This pin was
+// flipped DELIBERATELY per that contract's obligation 2 — all three
+// conjuncts re-derived against the admitted reducer; the round-5 F7 defer
+// trigger fires with this landing:
+//   (a) the repair LANDS (p2 installs with its content) while the resident
+//       live part p1 stays '' (never overwritten by the stale copy);
 //   (b) the memory floor-raises to the snapshot seq AND the latch clears at
-//       applySnap receipt (pins the adjudicated repair predicate — accepted
-//       over freeze-until-merged, which would livelock the mismatch-recovery
-//       loop into re-snapshot storms);
+//       applySnap receipt (the adjudicated repair predicate — accepted over
+//       freeze-until-merged, which would livelock the mismatch-recovery
+//       loop into re-snapshot storms; under admission the predicate is
+//       strictly STRONGER: the missing part the latch was raised for is now
+//       repaired IN CONTENT by the snapshot's own merge);
 //   (c) close + unforced reopen sends the snapshot seq (the documented
 //       pre-slice-parity boundary: pre-slice, the LIVE cursor advanced at
 //       receipt — session-stream.ts:974 pre-slice — so the same reopen also
 //       sent 300).
-// If reduce.ts's merge semantics ever change (the separate store-policy
-// card landing), this pin AND the round-5 F7 defer trigger fire.
-describe("round-5b boundary pin — keyed incomplete resident's snapshot repair is merge-SKIPPED, yet the memory floor-raises and the latch clears", () => {
-  it("m1 missing p2 → append@200 mismatch latches → cursorless recovery snapshot@300 (m1-with-p2, incomplete) → merge skips p2; memory → 300 + latch cleared; close+unforced reopen sends 300", async () => {
+describe("round-5b admission behavior — keyed incomplete resident's snapshot repair LANDS (missing part admitted, live body preserved); the memory floor-raises and the latch clears", () => {
+  it("m1 missing p2 → append@200 mismatch latches → cursorless recovery snapshot@300 (m1-with-p2, incomplete) → merge ADMITS p2, p1 live body preserved; memory → 300 + latch cleared; close+unforced reopen sends 300", async () => {
     // Seed: m1 KEYED (inserted into order by the cold snapshot) and
     // INCOMPLETE (no time.completed), its only part p1 (empty text — a
     // known-length target for the post-repair claim below). Memory = 100.
@@ -1530,9 +1537,10 @@ describe("round-5b boundary pin — keyed incomplete resident's snapshot repair 
     expect(urlCursor(esRec)).toBe(0);
 
     // The cursorless recovery delivers its authoritative snapshot@300
-    // carrying m1-WITH-p2 — but m1's incoming copy is still INCOMPLETE, so
-    // the store's merge policy (prependMessagesIfAbsent) leaves the KEYED
-    // resident untouched: the repair does NOT land.
+    // carrying m1-WITH-p2 — m1's incoming copy is INCOMPLETE and m1 is a
+    // KEYED non-completed resident, so under the stage-2 admission the merge
+    // installs the MISSING p2 (missing-parts only; the resident p1 body and
+    // info are never touched): the repair LANDS.
     esRec.fire(
       "snapshot",
       {
@@ -1552,20 +1560,25 @@ describe("round-5b boundary pin — keyed incomplete resident's snapshot repair 
     );
     await flushMicro();
 
-    // (a) THE STORE-POLICY BOUNDARY (pinned, not fixed — separate card): the
-    // merge skipped m1's repair — p2 is STILL absent, and the resident p1
-    // body was not clobbered by the stale incoming copy (live-wins).
-    expect(store.state.messages[SID]?.byId?.m1?.parts?.p2).toBeUndefined();
-    expect(
-      (store.state.messages[SID]?.byId?.m1?.parts?.p1 as { text?: string }).text,
-    ).toBe("");
+    // (a) THE ADMISSION (the deliberate stage-2 flip of this conjunct): the
+    // merge installed m1's MISSING part p2 with its content — the repair
+    // LANDS — while the resident live part p1 was NOT overwritten by the
+    // stale incoming copy (missing-parts only, live-wins stays). partOrder
+    // integrity: both parts resident, server order, no dups.
+    const m1 = store.state.messages[SID]?.byId?.m1;
+    expect((m1?.parts?.p2 as { text?: string } | undefined)?.text).toBe("repaired");
+    expect((m1?.parts?.p1 as { text?: string } | undefined)?.text).toBe("");
+    expect(m1?.partOrder).toEqual(["p1", "p2"]);
 
     // (c) Close + UNFORCED reopen (the re-selection shape): the close zeroes
     // the LIVE cursor, so the 300 can come ONLY from the memory — applySnap's
-    // floor-raise fired at receipt THROUGH the merge policy even though the
-    // merge skipped p2 (the adjudicated predicate). Pre-slice parity: the
-    // LIVE cursor also sat at 300 after receipt, so the same reopen sent 300
-    // from it — the fix preserves that wire value by a different mechanism.
+    // floor-raise fired at receipt THROUGH the merge policy; under admission
+    // that floor now covers content that IS resident for the missing-part
+    // class (p2 installed by the merge itself), so the receipt-time advance
+    // no longer papers over any skipped repair of this class. Pre-slice
+    // parity: the LIVE cursor also sat at 300 after receipt, so the same
+    // reopen sent 300 from it — the fix preserves that wire value by a
+    // different mechanism.
     stream.closeSessionStream();
     stream.openSessionStream(SID, false, "selection-change", "reselect");
     const esReopen = sessionESes()[sessionESes().length - 1];
@@ -1576,7 +1589,9 @@ describe("round-5b boundary pin — keyed incomplete resident's snapshot repair 
     // suffix at 350 on the reopen connection CLAIMS again — a still-latched
     // sid would void the claim and leave the memory at 300 (the latch-clear
     // observation; a never-clearing latch is exactly the frozen-memory
-    // regression this half catches).
+    // regression this half catches). The premise is now in-content true:
+    // the recovery snapshot's merge INSTALLED the mismatched append's target
+    // part (p2), so the repaired range is genuinely resident.
     esReopen.fire(
       "part.append",
       { sessionID: SID, messageID: "m1", partID: "p1", field: "text", start: 0, text: "abc" },
@@ -1592,5 +1607,111 @@ describe("round-5b boundary pin — keyed incomplete resident's snapshot repair 
     sesMod.suspendSessionStreamForVisibility();
     sesMod.resumeSessionStreamForVisibility();
     expect(urlCursor(sessionESes()[sessionESes().length - 1])).toBe(350);
+  });
+});
+
+// d-F1 (round-1 review BLOCKER, data_integrity — card
+// task-2026-11-07t15-45-23-store-merge-stage2-admission): the stage-2
+// missing-parts admission applied via the messages.batch caller can
+// RESURRECT A DELETED PART when same-session batch decodes overlap.
+// pendingBatch retains only the LATEST registration per session, so a held
+// earlier batch's decode can still be unresolved when a later same-session
+// batch completes — the later batch's finally CLEARS the shared map entry,
+// and a part.delete arriving in that window finds pendingBatch.has(sid) ===
+// false, applies IMMEDIATELY (removing the part), and then the released
+// earlier batch applies LATE through the messages.batch merge: its stale
+// pre-delete copy still carries the part, the admission leg sees the part
+// as MISSING from the (now-deleted) resident, and REINSTALLS it. The
+// server-side msgRev ABA guard is emit-time and cannot see this CLIENT
+// decode reordering; pendingBatchSeqs caps cursor claims only. The snapshot
+// caller is safe (sesSnapshotDecode serialization) and the page caller is
+// safe (Contract-B dirty gate) — ONLY the batch path's ordering premise
+// fails. FIX (reviewer option b): the admission leg is gated behind an
+// explicit admitMissing merge option (default FALSE — conservative); the
+// messages.batch caller does NOT pass it.
+describe("d-F1 — batch-path admission exclusion: a held earlier same-session batch must not resurrect a part deleted while its decode was in flight", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("held batch 200 (m1-with-p2) → batch 300 completes + finalizes (clears pendingBatch) → part.delete@400 removes p2 → released batch 200 applies LATE → p2 STAYS ABSENT (red-first: the admission reinstalled it)", async () => {
+    // Seed: m1 KEYED (inserted into order by the cold snapshot) and
+    // INCOMPLETE, its only part p2 (the delete target).
+    stream.openSessionStream(SID, false, "first-open", "boot");
+    const es0 = sessionESes()[0];
+    es0.fire(
+      "snapshot",
+      {
+        seq: 100,
+        gate: { [SID]: { messagesLoaded: true } },
+        messages: {
+          [SID]: [{
+            info: { id: "m1", sessionID: SID, role: "assistant", time: { created: 1 } },
+            parts: [{ id: "p2", sessionID: SID, messageID: "m1", type: "text", text: "pre-delete" }],
+          }],
+        },
+      },
+      "100.1",
+    );
+    await settle();
+    expect(store.state.messages[SID]?.byId?.m1?.parts?.p2?.text).toBe("pre-delete");
+
+    // Hold construction instance #1 = batch 200's decode (fired first).
+    const release = stubHoldNthBatchDecode(1);
+
+    // Same task: batch 200 (carrying the STALE pre-delete m1-with-p2 copy)
+    // registers its pendingBatch entry and parks on the HELD decode; batch
+    // 300 (m3 — unrelated content) OVERWRITES the map entry and decodes
+    // natively.
+    es0.fire(
+      "messages.batch",
+      gzip64Batch([{
+        info: { id: "m1", sessionID: SID, role: "assistant", time: { created: 1 } },
+        parts: [{ id: "p2", sessionID: SID, messageID: "m1", type: "text", text: "STALE-PRE-DELETE" }],
+      }]),
+      "200.2",
+    );
+    es0.fire(
+      "messages.batch",
+      gzip64Batch([{ info: { id: "m3", sessionID: SID, role: "user", time: { created: 3 } }, parts: [] }]),
+      "300.3",
+    );
+    await settle();
+    // The later batch APPLIED and FINALIZED — its finally cleared the shared
+    // pendingBatch entry while batch 200's decode is still held.
+    expect(store.state.messages[SID]?.byId?.m3).toBeTruthy();
+    expect(store.state.messages[SID]?.byId?.m1?.parts?.p2).toBeDefined(); // 200 still held
+
+    // part.delete@400 through the REAL listener: pendingBatch.has(SID) is
+    // false (batch 300's finally owned the last entry), so the listener does
+    // NOT wait — the delete applies NOW, BEFORE the held batch 200.
+    es0.fire(
+      "part.delete",
+      { sessionID: SID, messageID: "m1", partID: "p2" },
+      "400.4",
+    );
+    await flushMicro();
+    // THE DELETE ITSELF APPLIED: p2 is gone before the release.
+    expect(store.state.messages[SID]?.byId?.m1?.parts?.p2).toBeUndefined();
+    expect(store.state.messages[SID]?.byId?.m1?.partOrder).toEqual([]);
+
+    // Release batch 200: its decode completes, the gen guard passes (no
+    // suspend ever happened), and it applies LATE through the
+    // messages.batch merge — the resurrection window.
+    release();
+    await settle();
+
+    // THE PIN: p2 STAYS ABSENT. Pre-fix the admission leg fired (m1 is a
+    // keyed non-completed resident; the stale batch copy carries p2; the
+    // resident is missing p2 → mergePartsOrdered reinstalled the stale
+    // pre-delete part). Post-fix the batch caller passes NO admitMissing →
+    // the admission leg is skipped for it.
+    expect(store.state.messages[SID]?.byId?.m1?.parts?.p2).toBeUndefined();
+    expect(store.state.messages[SID]?.byId?.m1?.partOrder).toEqual([]);
+    // The merge still never DROPS and never clobbers live info: m1 itself
+    // stays resident, keyed, with its own info untouched.
+    expect(store.state.messages[SID]?.byId?.m1).toBeTruthy();
+    expect(store.state.messages[SID]?.byId?.m1?.info.time?.created).toBe(1);
+    expect(store.state.messages[SID]?.order).toContain("m1");
   });
 });

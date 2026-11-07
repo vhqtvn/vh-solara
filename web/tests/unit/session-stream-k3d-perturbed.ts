@@ -953,7 +953,11 @@ export function applySessionSnapshot(id: string, snap: Snapshot) {
   setState(
     produce((s) => {
       if (!s.messages[id]) s.messages[id] = { order: [], byId: {} };
-      prependMessagesIfAbsent(s.messages[id], items);
+      // admitMissing=true — the snapshot caller is admission-ELIGIBLE
+      // (fresh capture + decode-window serialization; admission-safety
+      // contract at prependMessagesIfAbsent, reduce.ts). The messages.batch
+      // caller is NOT eligible (d-F1) and passes no such option.
+      prependMessagesIfAbsent(s.messages[id], items, true);
       // Hydrate the opened session's STRUCTURAL detail (parentID/title/...) from
       // the Stream-2 snapshot. Stream-2 is scope-selected to exactly this session
       // (pkg/state/snapshots.go captureSnapshotLocked: inScope(sid)=messagesFor),
@@ -1392,22 +1396,30 @@ function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: 
         // sites share strict post-apply ordering — the memory claims content
         // only once the reducer has actually run for it.
         // Round-5b RECORDED BOUNDARY (coordinator adjudication, round-5
-        // F1/F2): for the SNAPSHOT path, the remembered-cursor charter's
-        // "applied" means "applySnap ran the snapshot through the store's
-        // established merge policy" — prependMessagesIfAbsent, live-wins for
-        // keyed non-completed residents — NOT "every byte the snapshot
-        // carried is now resident". The floor-raise below therefore fires at
-        // receipt even when the merge SKIPS content: the known pre-existing
-        // gap (a keyed incomplete resident missing a part whose snapshot
-        // repair the merge skips — reduce.ts:200-228) stays un-repaired in
-        // the store while the memory floor-raises past it. That gap is
-        // OUT-OF-SLICE (routed to the separate store-policy card);
-        // freeze-until-merged was adjudicated AGAINST (it would livelock the
+        // F1/F2; RE-ADJUDICATED at store-merge stage 2 — card
+        // task-2026-11-07t15-45-23-store-merge-stage2-admission,
+        // operator-ratified ADMIT-REPAIR): for the SNAPSHOT path, the
+        // remembered-cursor charter's "applied" means "applySnap ran the
+        // snapshot through the store's established merge policy" —
+        // prependMessagesIfAbsent — NOT "every byte the snapshot carried is
+// now resident". Since stage 2 that policy INSTALLS a keyed
+         // non-completed resident's MISSING parts (admission-safety contract
+         // at reduce.ts; the snapshot and page callers are fresh-capture-or-
+         // delete-replaying by construction — the messages.batch caller is
+         // EXCLUDED from admission, d-F1), so the repair predicate got STRICTLY
+        // STRONGER: for the missing-part class the receipt-time floor-raise
+        // now covers content that IS resident — the merge itself landed the
+        // repair. The boundary that remains is BODY-level: a stale snapshot
+        // copy never overwrites an existing part's live body or the
+        // resident's info (live-wins, deliberately — a mid-stream tail must
+        // not be clobbered by a stale point-in-time read), so "applied"
+        // still does not mean "bodies match the snapshot". freeze-until-
+        // merged stays adjudicated AGAINST (it would livelock the
         // mismatch-recovery loop into re-snapshot storms; the pre-slice
-        // parity this preserves is the receipt-time LIVE-cursor advance).
+        // parity preserved is the receipt-time LIVE-cursor advance).
         // Incremental claims (every other advance site) remain STRICTLY
         // applied-only — no incremental claim covers un-applied content.
-        // Pinned by the round-5b boundary-pin test in
+        // Pinned by the round-5b admission-behavior test in
         // session-cursor-persistence.test.ts.
         // Round-4b ARCHITECTURAL INVARIANT: this is deliberately the RAW
         // noteSessionCursorApplied (authoritative floor-raise + repair), NOT
@@ -1420,7 +1432,11 @@ function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: 
         // Round-4 F1: an authoritative session snapshot APPLIED — the
         // content-inclusion repair point for the mismatch latch (a snapshot
         // at a higher seq contains the mismatched range's content by
-        // construction; see mismatchLatchedSids). Clear it so the session's
+        // construction; see mismatchLatchedSids). Since store-merge stage 2
+        // the premise is in-content true for the missing-part class: the
+        // snapshot's own merge INSTALLS the absent target part, so the
+        // repaired range is genuinely resident (the round-5b pin observes
+        // exactly this). Clear it so the session's
         // capped claims (all sites, round-4b uniform gating) may resume from
         // this repair point.
         mismatchLatchedSids.delete(id);

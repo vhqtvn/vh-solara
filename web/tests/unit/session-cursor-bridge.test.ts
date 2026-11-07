@@ -684,12 +684,16 @@ function registerProducer(
             //   CONTENT class — the snapshot carries ≥1 message id NOT
             //   resident at registration (the "newly" set). observe = SOME
             //   newly id now resident. prependMessagesIfAbsent inserts
-            //   absent ids wholesale (reduce.ts:230-238), so delivery+apply
-            //   makes them resident. SOME, not ALL: the claim auto-scopes
-            //   to the round-5b adjudicated applied-through-merge boundary —
-            //   it never demands residency for content inside the keyed-
-            //   resident merge-skip zone (reduce.ts:202-228) and never
-            //   claims part-installation inside a protected resident.
+            //   absent ids wholesale (the new-id insert path in reduce.ts),
+            //   so delivery+apply makes them resident. SOME, not ALL: the
+            //   claim auto-scopes to the applySnap recorded boundary. Under
+            //   the stage-2 admission (reduce.ts admission-safety contract,
+            //   card task-2026-11-07t15-45-23-store-merge-stage2-admission)
+            //   the merge also installs MISSING parts of keyed non-completed
+            //   residents, so the SOME form is now WEAKER than the boundary
+            //   allows (an ALL-of-newly form would also hold) but remains
+            //   SOUND: it never over-claims residency and never depends on
+            //   part-level installation inside already-resident messages.
             //
             //   WIRE-DEFERRED class — newly is empty (a snapshot whose every
             //   id is already resident — C3 — or a messageless snapshot): NO
@@ -1020,23 +1024,22 @@ describe("chain C — legacy (no part_delta) reconnect takes the §4.3 snapshot 
     // recorded boundary the oracle adopts as its discharge axiom). In THIS
     // chain both of C3's message ids (m1, m2) were already resident at
     // registration — m2 landed via the leg-1 delta m2@5.2, NOT via the
-    // snapshot — so the snapshot's apply is fully merge-skipped and the
-    // honest witness is WIRE-DEFERRED (no store-content witness exists; see
-    // registerProducer): its observation point is the post-repair reconnect
-    // below, where the module's own URL cursor claims seq 7. The floor/open
-    // asserts therefore moved AFTER that observation — at settle-time they
-    // rested on the unconditional `() => true` predicate F3 removed (the
-    // sanctioned reorder; nothing else in the chain was weakened). NOTE —
-    // the part-level repair inside m1 does NOT land: m1 is a keyed
-    // non-completed RESIDENT, so prependMessagesIfAbsent protects its body
-    // and the snapshot's m1 (with parts [p1 "a"]) is merge-skipped — the
-    // known, deliberately out-of-scope store-policy gap (reduce.ts
-    // keyed-resident merge-skip). This test asserts the ADJUDICATED
-    // boundary (applied = ran through merge policy, not every byte
-    // resident), not byte-residency.
+    // snapshot — so no MESSAGE-id-level store-content witness exists and the
+    // honest witness is WIRE-DEFERRED (see registerProducer): its observation
+    // point is the post-repair reconnect below, where the module's own URL
+    // cursor claims seq 7. The floor/open asserts therefore moved AFTER that
+    // observation — at settle-time they rested on the unconditional `() =>
+    // true` predicate F3 removed (the sanctioned reorder; nothing else in the
+    // chain was weakened). Under the stage-2 ADMISSION (card
+    // task-2026-11-07t15-45-23-store-merge-stage2-admission; the
+    // admission-safety contract at prependMessagesIfAbsent, reduce.ts) the
+    // PART-level repair inside m1 now LANDS: p1 is a MISSING part of a keyed
+    // non-completed resident (p1up@6 was withheld in leg 1), so the merge
+    // installs it from the snapshot copy — nothing live to protect at part
+    // level; the resident's info and message slot stay untouched.
     expect(c.byId("m2")).toBeTruthy(); // landed via the leg-1 delta, not the snapshot
-    expect(c.byId("m1")).toBeTruthy(); // resident body protected (live-wins)
-    expect(c.partP1()).toBeUndefined(); // merge-skipped — the documented gap
+    expect(c.byId("m1")).toBeTruthy(); // resident info/slot authority preserved (live-wins)
+    expect(c.partP1()?.text).toBe("a"); // ADMITTED — the missing part installs (stage-2)
 
     // The NEXT reconnect claims the repair point — and (F3) it is THE
     // observation point for C3's wire-deferred witness: openAndObserve
@@ -1088,18 +1091,20 @@ describe("chain E — ring_eviction fallback discharge + resume from repair poin
 
     // The fallback snapshot applies: the missed range's ABSENT messages
     // (m2..m5 — all withheld by the disconnect) land via prepend, and the
-    // floor discharges the stranded m2@5 — nothing left open. The part-level
-    // repair inside m1 is merge-skipped (keyed non-completed resident — the
-    // documented out-of-scope gap; see the chain-C note) so p1 stays absent;
-    // the assertion here is the adjudicated applied-through-merge boundary.
+    // floor discharges the stranded m2@5 — nothing left open. Under the
+    // stage-2 ADMISSION the part-level repair inside m1 also LANDS: p1 is a
+    // MISSING part of a keyed non-completed resident (E1 seeded m1 with NO
+    // parts), so the merge installs it from the snapshot copy — live-wins
+    // now protects resident BODIES, not part slots (the applied-through-
+    // merge boundary strengthened; see the chain-C note above).
     registerProducer(oracle, e2.frames);
     feedFrames(es2, e2.frames);
     await settleAsync(oracle);
     expect(c.byId("m2")).toBeTruthy();
     expect(c.byId("m3")).toBeTruthy();
     expect(c.byId("m5")).toBeTruthy();
-    expect(c.byId("m1")).toBeTruthy(); // resident body protected (live-wins)
-    expect(c.partP1()).toBeUndefined(); // merge-skipped — the documented gap
+    expect(c.byId("m1")).toBeTruthy(); // resident info/slot authority preserved (live-wins)
+    expect(c.partP1()?.text).toBe("a"); // ADMITTED — the missing part installs (stage-2)
     expect(oracle.openObligations()).toEqual([]);
     expect(oracle.floorOf(EPOCH_TOK)).toBe(10);
 

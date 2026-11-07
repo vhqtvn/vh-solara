@@ -390,6 +390,16 @@ export function projectMessageEvent(
         if (!s.messages[payload.sessionID]) {
           s.messages[payload.sessionID] = { order: [], byId: {} };
         }
+        // ADMISSION EXCLUDED (d-F1, round-1 review,
+        // task-2026-11-07t15-45-23-store-merge-stage2-admission,
+        // data_integrity): this caller deliberately does NOT pass
+        // admitMissing. pendingBatch retains only the LATEST same-session
+        // registration, so a held earlier batch decode can apply AFTER a
+        // part.delete that raced between the two decodes (the later batch's
+        // finally already cleared the map entry) — admission here would
+        // reinstall the stale pre-delete part. The snapshot (session-stream)
+        // and page (history) callers keep the repair; this path skips it
+        // until same-session batch application is serialized in wire order.
         prependMessagesIfAbsent(s.messages[payload.sessionID], items);
         s.messageWindows[payload.sessionID] = deriveMessageWindow(items, payload.window);
         // Cross-stream completion bridge, arrival-path #3 (cold-load orphan

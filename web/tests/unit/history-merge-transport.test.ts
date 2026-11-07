@@ -28,10 +28,15 @@
 //      during a page flight mark it dirty and the response gate discards +
 //      bounded-retries (history.ts:291-346) — pinned part-level in §3a here.
 //
-// TEST-ONLY slice: ZERO production files are modified. Real modules are driven
-// through the REAL listener machinery (MockEventSource → session-stream
-// listeners → applyMessageEvent/applySessionSnapshot), the persistence-harness
-// pattern (session-cursor-persistence.test.ts).
+// TEST-ONLY slice (stage 1): the stage-1 verify-first card modified ZERO
+// production files. Real modules are driven through the REAL listener
+// machinery (MockEventSource → session-stream listeners →
+// applyMessageEvent/applySessionSnapshot), the persistence-harness pattern
+// (session-cursor-persistence.test.ts). STAGE 2 (card
+// task-2026-11-07t15-45-23-store-merge-stage2-admission) folded the stage-1
+// review's F1 defer here (§3a now fires part.delete through the REAL
+// session-stream listener) and added the §case-4 paired case for the
+// admitted page-merge behavior.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { gzipSync } from "node:zlib";
 import { buildMessages, prependMessagesIfAbsent } from "../../src/lib/reduce";
@@ -146,7 +151,7 @@ const SID = "s1";
 // markPageDirty(sid)`).
 // ═════════════════════════════════════════════════════════════════════════════
 describe("§3a page dirty-gate (part-level): a part.delete during a page flight discards the stale page and re-fetches", () => {
-  it("part.delete mid-flight → stale page (still carrying the deleted part) is discarded; the re-fetch heals — no resurrection", async () => {
+  it("part.delete mid-flight (fired through the REAL session-stream listener) → stale page (still carrying the deleted part) is discarded; the re-fetch heals — no resurrection", async () => {
     // Resident tail: m5 with one part. Window says older history exists.
     const sm = buildMessages([
       {
@@ -198,16 +203,30 @@ describe("§3a page dirty-gate (part-level): a part.delete during a page flight 
         json: async () => body,
       }) as any;
 
+    // F1 FOLD (stage-1 review defer, folded at store-merge stage 2): drive
+    // the dirty mark through the REAL session-stream listener —
+    // MockEventSource → the session-stream message listener →
+    // applyMessageEvent(part.delete) + the Stream2 hook `if (sid &&
+    // isPageDirtyingKind(kind)) markPageDirty(sid)` — instead of calling
+    // markPageDirty directly inside the fetch mock. The server processed
+    // part.delete(m4, pb) mid-flight and the event reaches the client while
+    // the (pre-delete) page response is being read; m4/pb is not yet
+    // resident, so the applied delete no-ops on content — the dirty MARK is
+    // the load-bearing effect this leg proves reaches the gate from the real
+    // wire path.
+    stream.openSessionStream("s1", false, "first-open", "boot");
     let fetchCount = 0;
-    const fetchMock = vi.fn().mockImplementation(async () => {
+    const fetchMock = vi.fn().mockImplementation(async (url: unknown) => {
+      if (typeof url !== "string" || !url.includes("/vh/session/")) {
+        return new Response("{}", { status: 200 }); // non-page fetches: benign
+      }
       fetchCount++;
       if (fetchCount === 1) {
-        // The Stream2 listener hook's EXACT call-site pattern: the server
-        // processed part.delete(m4, pb) mid-flight and the event reaches the
-        // client while the (pre-delete) page response is being read.
-        const kind = "part.delete";
-        const sid = "s1";
-        if (sid && history.isPageDirtyingKind(kind)) history.markPageDirty(sid);
+        sessionESes()[sessionESes().length - 1].fire(
+          "part.delete",
+          { sessionID: "s1", messageID: "m4", partID: "pb" },
+          "150.1",
+        );
         return makeResponse(pageResponse(stalePageItem));
       }
       return makeResponse(pageResponse(healedPageItem));
@@ -382,5 +401,104 @@ describe("§3b snapshot-then-part.delete healing (real session-stream path)", ()
     expect(store.state.messages[SID]?.byId?.m1?.parts?.p1?.text).toBe("final-full");
     expect(store.state.messages[SID]?.byId?.m1?.info?.time?.completed).toBe(299);
     expect(store.state.messages[SID]?.byId?.m1?.parts?.p2).toBeUndefined();
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// §case-4 — the HISTORY-PAGE paired case under the stage-2 ADMISSION (card
+// task-2026-11-07t15-45-23-store-merge-stage2-admission; the fourth paired
+// case from the store-merge draft, eligibility Q3): a clean page merge
+// ADMITS a keyed non-completed resident's MISSING parts while PRESERVING its
+// live parts (bodies/info never overwritten — live-wins stays). Also pins
+// the case-4 bookkeeping invariants: `added` counts only NEW message ids, so
+// oldestResidentID/hasOlder move by the server page meta alone (eligibility
+// Q2 receipts — part admission into an existing resident leaves `added`
+// unchanged → history.ts eviction bookkeeping unaffected).
+// ═════════════════════════════════════════════════════════════════════════════
+describe("§case-4 page merge under admission — keyed resident gains missing parts, live body preserved, insert-only bookkeeping", () => {
+  it("page [m3 (new), m4 (resident keyed incomplete: stale pl4 body + missing p-miss4)] → m3 inserted, p-miss4 ADMITTED, pl4 live body kept; window meta from page only", async () => {
+    // Resident state: m5 (tail) + m4 (oldest), both KEYED + incomplete. m4
+    // holds one LIVE part pl4 ("live4" — streamed live; the body the
+    // live-wins guard protects) and is MISSING p-miss4 (e.g. its part.upsert
+    // was lost out-of-window — the repair class admission targets).
+    const sm = buildMessages([
+      {
+        info: { id: "m4", sessionID: "s1", role: "user", time: { created: 40 } },
+        parts: [{ id: "pl4", sessionID: "s1", messageID: "m4", type: "text", text: "live4" }],
+      },
+      {
+        info: { id: "m5", sessionID: "s1", role: "user", time: { created: 50 } },
+        parts: [{ id: "p-m5", sessionID: "s1", messageID: "m5", type: "text", text: "tail" }],
+      },
+    ]);
+    store.setState("epoch", "e1");
+    store.setState("messages", "s1", sm);
+    store.setState("messageWindows", "s1", { hasOlder: true, oldestResidentID: "m4" });
+
+    // The page (request_before=m4) carries m3 (genuinely new) AND m4's
+    // server copy: pl4 with a STALE body ("stale-page4" — must NOT overwrite
+    // "live4") plus the MISSING p-miss4 ("miss4-repaired" — must INSTALL).
+    const pageResponse = {
+      items: [
+        {
+          info: { id: "m3", sessionID: "s1", role: "user", time: { created: 30 } },
+          parts: [{ id: "p-m3", sessionID: "s1", messageID: "m3", type: "text", text: "older" }],
+        },
+        {
+          info: { id: "m4", sessionID: "s1", role: "user", time: { created: 40 } },
+          parts: [
+            { id: "pl4", sessionID: "s1", messageID: "m4", type: "text", text: "stale-page4" },
+            { id: "p-miss4", sessionID: "s1", messageID: "m4", type: "text", text: "miss4-repaired" },
+          ],
+        },
+      ],
+      oldest_id: "m3",
+      newest_id: "m4",
+      has_older: false,
+      session_id: "s1",
+      project_id: "",
+      daemon_epoch: "e1",
+      baseline_seq: 1,
+      request_before: "m4",
+      serialized_bytes: 0,
+      count_limited: false,
+      bytes_limited: false,
+    };
+    let fetchCount = 0;
+    const fetchMock = vi.fn().mockImplementation(async (url: unknown) => {
+      if (typeof url !== "string" || !url.includes("/vh/session/")) {
+        return new Response("{}", { status: 200 }); // non-page fetches: benign
+      }
+      fetchCount++;
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get: (name: string) =>
+            name === "X-VH-Seq" ? "1" : name === "X-VH-Epoch" ? "e1" : null,
+        },
+        json: async () => pageResponse,
+      } as any;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await history.loadOlder("s1");
+
+    // Clean page — exactly one fetch (no dirty, no retry).
+    expect(fetchCount).toBe(1);
+    // THE PAIRED CASE: p-miss4 ADMITTED (the repair lands), pl4's live body
+    // PRESERVED (the stale page body did NOT overwrite it), info untouched,
+    // partOrder = server order with no dups (integrity maintained).
+    const m4 = store.state.messages.s1?.byId?.m4;
+    expect(m4?.parts?.pl4?.text).toBe("live4");
+    expect(m4?.parts?.["p-miss4"]?.text).toBe("miss4-repaired");
+    expect(m4?.partOrder).toEqual(["pl4", "p-miss4"]);
+    expect(m4?.info?.time?.completed).toBeUndefined();
+    // Insert-only bookkeeping: m3 inserted (added counted it alone), order
+    // created-sorted, window meta moved by the server page alone.
+    expect(store.state.messages.s1?.order).toEqual(["m3", "m4", "m5"]);
+    expect(store.state.messages.s1?.byId?.m3?.parts?.["p-m3"]?.text).toBe("older");
+    expect(store.state.messageWindows.s1?.oldestResidentID).toBe("m3");
+    expect(store.state.messageWindows.s1?.hasOlder).toBe(false);
   });
 });

@@ -42,14 +42,18 @@
 //   - resident stores are created-sorted with byId-only keyless shadows
 //     (upsertPart's placeholder shape: minimal info, never in order).
 //
-// SURVIVES ADMISSION: the suite is the ACCEPTANCE NET for the later admission
-// slice (fill MISSING parts of keyed non-completed residents from the
-// incoming copy). The four clauses hold under BOTH boundary shapes — under
-// admission only WHICH parts are resident changes (absent → admitted-from-
-// incoming), which (a)/(b)/(d) are written to tolerate and (c) never touches.
-// The suite deliberately does NOT pin the CURRENT skip (the round-5b pin in
-// session-cursor-persistence.test.ts owns that boundary pin and flips
-// deliberately when admission lands).
+// SURVIVED ADMISSION (stage 2 landed — card
+// task-2026-11-07t15-45-23-store-merge-stage2-admission): this suite was the
+// ACCEPTANCE NET for the admission slice (fill MISSING parts of keyed
+// non-completed residents from the incoming copy) and ran GREEN UNMODIFIED —
+// clause semantics untouched — against the admitted reducer (the kill
+// criterion honored: any clause failure would have STOPPED the admission).
+// The four clauses hold under BOTH boundary shapes — under admission only
+// WHICH parts are resident changes (absent → admitted-from-incoming), which
+// (a)/(b)/(d) are written to tolerate and (c) never touches. The suite
+// deliberately does NOT pin either boundary (the round-5b pin in
+// session-cursor-persistence.test.ts owns that boundary pin and flipped
+// deliberately when admission landed).
 //
 // MUTANT DEMONSTRATION (the established test-local pattern — session-cursor-
 // mutants.ts precedent; NEVER production edits): each clause has a test-local
@@ -304,7 +308,10 @@ type MergeFn = (sm: SessionMessages, items: any[]) => number;
 // MUT-A ≙ a merge that treats the incoming copy's parts as the authoritative
 // SET for already-resident messages — incoming ABSENCE deletes resident parts
 // (the resurrection hazard inverted: what a delete-replaying source makes safe
-// is precisely that the merge itself never deletes).
+// is precisely that the merge itself never deletes). Under admission this
+// mutant ALSO guards the admission path: a just-ADMITTED part is a resident
+// part, and a later incoming copy's absence deleting it is exactly the
+// admitted-part drop clause (a) must catch.
 const mutAbsenceDeletes: MergeFn = (sm, items) => {
   const residentBefore = new Set(Object.keys(sm.byId));
   const added = prependMessagesIfAbsent(sm, items);
@@ -322,9 +329,14 @@ const mutAbsenceDeletes: MergeFn = (sm, items) => {
   return added;
 };
 
-// MUT-B ≙ removing the keyed-skip guard (reduce.ts:202-229) / forcing
-// assignPresent=true: a NON-completed incoming copy overwrites the resident
-// info + part bodies (stale page clobbers the live stream).
+// MUT-B ≙ removing the keyed-resident body/info guard (reduce.ts:296-313,
+// the resident branch — under stage-2 admission the missing-parts leg is
+// reduce.ts:310-311) / forcing assignPresent=true: a NON-completed incoming
+// copy overwrites the resident info + part bodies (stale page clobbers the
+// live stream). Under admission this mutant ALSO guards the admission path:
+// the admitted merge touches keyed residents now, and MUT-B is exactly the
+// "corrected streaming fields"/body-overwrite violation admission must
+// never commit.
 const mutStaleClobbersLive: MergeFn = (sm, items) => {
   const residentBefore = new Set(Object.keys(sm.byId));
   const added = prependMessagesIfAbsent(sm, items);
@@ -359,7 +371,10 @@ const mutUncomplete: MergeFn = (sm, items) => {
 };
 
 // MUT-D1 ≙ admission from a NON-incoming source: the merge fabricates a part
-// no incoming copy carried.
+// no incoming copy carried. Under stage-2 admission this is the DIRECT
+// admission-path mutant — the admitted reducer genuinely installs missing
+// parts now, and clause (d) is what confines every installation to the
+// incoming copies' part union.
 const mutFabricatedPart: MergeFn = (sm, items) => {
   const added = prependMessagesIfAbsent(sm, items);
   const id = sm.order[0] ?? Object.keys(sm.byId)[0];
@@ -377,7 +392,7 @@ const mutFabricatedPart: MergeFn = (sm, items) => {
   return added;
 };
 
-// MUT-D2 ≙ dropping the sortMessages call (reduce.ts:244) after an insert:
+// MUT-D2 ≙ dropping the sortMessages call (reduce.ts:329) after an insert:
 // the first ordered id is left at the END → order not created-sorted.
 const mutSkipResort: MergeFn = (sm, items) => {
   const added = prependMessagesIfAbsent(sm, items);
@@ -403,10 +418,11 @@ function sweepSquash(merge: MergeFn): { violations: string[]; dirtySeeds: number
   return { violations: [...all], dirtySeeds: dirty };
 }
 
-describe("store-merge property suite — the CURRENT (keep-boundary) reducer is merge-safe (card task-2026-11-07t15-07-21-store-merge-verify-first)", () => {
+describe("store-merge property suite — the ADMITTED reducer (stage-2 missing-parts admission, card task-2026-11-07t15-45-23) is merge-safe; stage-1 card task-2026-11-07t15-07-21-store-merge-verify-first", () => {
   it("(a)+(b)+(c)+(d): the real prependMessagesIfAbsent satisfies all four clauses on every seed", () => {
     // KILL CRITERION guard: if this fails, a clause discovered a defect in the
-    // CURRENT reducer — STOP and report (routes to a new card; do not fix here).
+    // ADMITTED reducer — STOP and report (routes to a new card; do not fix
+    // here, and never weaken a clause to land).
     const { violations, dirtySeeds } = sweepSquash(prependMessagesIfAbsent);
     expect(dirtySeeds).toBe(0);
     expect(violations).toEqual([]);
