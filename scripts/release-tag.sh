@@ -34,6 +34,9 @@
 # Invariants enforced before any mutation:
 #   - exactly one arg matching ^v[0-9]+\.[0-9]+\.[0-9]+$
 #   - working tree clean (git status --porcelain empty)
+#   - harness render-tree not drifted (vh-agent-harness diff: 0
+#     drifted-vs-render and 0 missing; 'unexpected' project extras tolerated;
+#     missing binary or unreadable diff refuses fail-closed)
 #   - tag does not already exist
 #   - tags HEAD only (no arbitrary commit arg)
 #   - current branch resolvable (refuses on detached HEAD)
@@ -110,6 +113,64 @@ fi
 STATUS_OUT=$(git status --porcelain 2>/dev/null || true)
 if [ -n "$STATUS_OUT" ]; then
     refuse "working tree is not clean (git status --porcelain is non-empty); commit or stash changes before releasing"
+fi
+
+# Harness render-tree must not have drifted from its overlay sources. Stale
+# rendered skills can ship overclaims the sources no longer carry (the
+# push-safety skill drifted stale until e601523 re-rendered it), and
+# `vh-agent-harness doctor` cannot see this drift class — only
+# `vh-agent-harness diff` reports it. Gate semantics (harness 0.29.x,
+# `vh-agent-harness help diff`; the summary-line format is pinned by the
+# harness's own tests):
+#   - exit 0: no non-ok files at all -> pass.
+#   - exit != 0 + trailing summary line
+#       "summary: <N> ok, <D> drifted-vs-render, <M> missing, <U> unexpected"
+#     -> refuse iff D > 0 or M > 0. U counts project/runtime extras the corpus
+#     does not produce (several exist in this repo by design); they must NOT
+#     block a release. There is no flag or config to scope diff's exit code to
+#     drifted/missing only (ownership overrides are raise-only for
+#     platform-declared paths and reject unknown paths), so the summary line is
+#     the parse surface — and the gate fails closed if it is absent or
+#     unparseable, so a format change can only block releases, never wave
+#     drift through.
+#   - exit != 0 with NO summary line: the diff command itself errored (e.g.
+#     broken harness config) -> refuse fail-closed. A gate that cannot verify
+#     must not wave a release through.
+if ! command -v vh-agent-harness >/dev/null 2>&1; then
+    refuse "vh-agent-harness not found on PATH: cannot verify harness render-tree drift; refusing (fail-closed)"
+fi
+DIFF_RC=0
+DIFF_OUT=$(vh-agent-harness diff 2>&1) || DIFF_RC=$?
+if [ "$DIFF_RC" -ne 0 ]; then
+    DIFF_SUMMARY=$(printf '%s\n' "$DIFF_OUT" \
+        | sed -n 's/^summary: \([0-9][0-9]*\) ok, \([0-9][0-9]*\) drifted-vs-render, \([0-9][0-9]*\) missing, \([0-9][0-9]*\) unexpected$/\1 \2 \3 \4/p')
+    if [ -z "$DIFF_SUMMARY" ]; then
+        if [ -n "$DIFF_OUT" ]; then
+            # `|| true`: grep exits 1 when no non-empty line survives (output
+            # was only newlines) and head can SIGPIPE upstream writers; under
+            # `set -o pipefail` either would abort outside refuse().
+            DIFF_ERR_BRIEF=$(printf '%s\n' "$DIFF_OUT" | grep -v '^$' | head -n 2 | tr '\n' ' ' | sed 's/  */ /g' || true)
+        else
+            DIFF_ERR_BRIEF="(no output)"
+        fi
+        refuse "vh-agent-harness diff errored (exit ${DIFF_RC}) without a summary line: ${DIFF_ERR_BRIEF} - refusing (fail-closed; drift gate cannot verify)"
+    fi
+    DRIFT_N=$(printf '%s' "$DIFF_SUMMARY" | cut -d' ' -f2)
+    MISSING_N=$(printf '%s' "$DIFF_SUMMARY" | cut -d' ' -f3)
+    if [ "$DRIFT_N" -gt 0 ] || [ "$MISSING_N" -gt 0 ]; then
+        # Trailing `|| true` mirrors the error-brief pipeline above: head -n 3
+        # closes its read end early, so a large drift report (>pipe-buffer)
+        # SIGPIPEs the upstream sed; under `set -o pipefail` that would fail
+        # this assignment and abort BEFORE refuse() (nonzero exit, no JSON
+        # receipt). The guard is load-bearing, not cosmetic.
+        DRIFT_PATHS=$(printf '%s\n' "$DIFF_OUT" \
+            | sed -n -e 's/^drifted-vs-render[[:space:]][[:space:]]*\(.*\)$/\1/p' \
+                     -e 's/^missing[[:space:]][[:space:]]*\(.*\)$/\1/p' \
+            | head -n 3 | tr '\n' ' ' | sed 's/  */ /g' || true)
+        refuse "harness render-tree drift: ${DRIFT_N} drifted-vs-render, ${MISSING_N} missing (vh-agent-harness diff; e.g. ${DRIFT_PATHS}) - run 'vh-agent-harness update', review, and commit the re-rendered tree before releasing"
+    fi
+    # Only 'unexpected' project extras remain: tolerated by design; do not
+    # block the release on them.
 fi
 
 # Tag must not already exist.

@@ -163,6 +163,14 @@ which shell-guard does not parse. The wrapper enforces, then mutates:
 
 - validates `<version>` matches `^v[0-9]+\.[0-9]+\.[0-9]+$`;
 - working tree clean (`git status --porcelain` empty);
+- harness render-tree not drifted (`vh-agent-harness diff`: refuses when any
+  file is `drifted-vs-render` or `missing`; `unexpected` project extras are
+  tolerated, and a missing `vh-agent-harness` binary or errored diff refuses
+  fail-closed). If the wrapper refuses on drift, STOP and relay the refusal
+  JSON to the operator/coordinator — do NOT run `vh-agent-harness update` and
+  do NOT commit anything yourself (Hard rule 2). The re-render and its commit
+  land via a separately authorized build/committer workflow; once that lands,
+  the wrapper can be re-run;
 - tag does not already exist (`git rev-parse refs/tags/<version>`);
 - tags HEAD only (no arbitrary commit);
 - `git tag -a <version> HEAD -F <message-file>`;
