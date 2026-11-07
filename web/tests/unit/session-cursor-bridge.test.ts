@@ -582,6 +582,39 @@ async function boot(): Promise<Ctx> {
   return c;
 }
 
+// bootPerturbed — boots the K3D DISPOSABLE PERTURBED COPY
+// (./session-stream-k3d-perturbed.ts) in place of the real module, against
+// the same shared store singleton. The copy is a mechanically generated
+// session-stream clone whose single ALWAYS-ON perturbation is the K3D
+// relabeling hole (a foreign-lifetime cursor-memory claim RELABELS the
+// memory's stamp without clearing the dead epoch's entries — see the copy's
+// header); everything else — URL grammar, reconciliation, snapshot apply —
+// is production. It exists so the K3D describe below can EXECUTE the
+// defect end-to-end through the real openSessionStream reconnect instead of
+// string-patching a URL (which is all the committed K3 detector-2 leg could
+// receipt pre-OB5/d-F2). The cast is honest: the copy's exports are
+// structurally identical (same file, one perturbed branch); only its import
+// specifiers differ.
+async function bootPerturbed(): Promise<Ctx> {
+  vi.resetModules();
+  instances = [];
+  lastUrlCursor = 0;
+  lastUrlEpoch = "";
+  const store = await import("../../src/sync/store");
+  const perturbed = await import("./session-stream-k3d-perturbed");
+  const ses = perturbed as unknown as SesModule;
+  store.setProjectDirRaw(PROJ);
+  store.setSelectedIdRaw(SID);
+  const c: Ctx = {
+    store,
+    ses,
+    byId: (mid) => (store.state.messages[SID] as any)?.byId?.[mid],
+    partP1: () => (store.state.messages[SID] as any)?.byId?.m1?.parts?.p1,
+  };
+  ctx = c;
+  return c;
+}
+
 async function flushMicro(n = 10): Promise<void> {
   for (let i = 0; i < n; i++) await Promise.resolve();
 }
@@ -1421,6 +1454,131 @@ describe("chain K3 — red-first receipt (b) + the dead-cursor perturbation the 
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// K3 DETECTOR-2, EXECUTED MUTANT (defer OB5/d-F2, discharged by card
+// task-2026-11-07t13-04-20-defer-retirement-bundle, item 4) — the committed
+// K3 leg above could only STRING-PATCH a URL to stand in for the defect;
+// this suite drives the REAL defect through the REAL code path. The
+// disposable copy ./session-stream-k3d-perturbed.ts is web/src/sync/
+// session-stream.ts with exactly ONE always-on perturbation (K3D: the
+// round-6 relabeling hole — noteSessionCursorApplied's stamp-change branch
+// relabels WITHOUT clearing, so the dead epoch's cursor high-water survives
+// an epoch transition and the send site later RESTORES THE DEAD-EPOCH
+// CURSOR UNDER THE NEW EPOCH). The reconstruction guard below ties the copy
+// to that single named perturbation; the executed-mutant leg then replays
+// K3's exact three-leg schedule against the copy and asserts the defect
+// shape end-to-end: leg 3's URL IS cursor=6&epoch=ep-B (the honest module
+// sends cursor=5 there — pinned by the committed K3 leg-3 assert above,
+// which stays untouched as the pairing check's honest control).
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("K3 detector-2 executed mutant — the perturbed copy restores the dead-epoch cursor under epoch B", () => {
+  it("the perturbed copy reconstructs production exactly outside its single named site (K3D)", () => {
+    const copy = readFileSync(resolveFromHere("./session-stream-k3d-perturbed.ts"), "utf8");
+    const prod = readFileSync(resolveFromHere("../../src/sync/session-stream.ts"), "utf8");
+    const hdr = "// PERT-HEADER-END\n";
+    const body = copy.slice(copy.indexOf(hdr) + hdr.length);
+    // Invert the import rewrites (parent specifier first, mirroring the
+    // generator: "../../src/sync/x" → "./x" then "../../src/x" → "../x" is
+    // safe in this direction because "../../src/sync/" has no "../../src/"
+    // prefix collision after the first rewrite).
+    const unrewritten = body
+      .split("\n")
+      .map((l) =>
+        /^import |^\} from "/.test(l)
+          ? l.replace('from "../../src/sync/', 'from "./').replace('from "../../src/', 'from "../')
+          : l,
+      )
+      .join("\n");
+    // Replace the perturbation scaffold with its pinned original.
+    const begin = "// PERT-SYNC-ORIGINAL K3D BEGIN\n";
+    const end = "// PERT-SYNC-ORIGINAL K3D END\n";
+    const siteEnd = "// PERT-SITE-END K3D\n";
+    const bi = unrewritten.indexOf(begin);
+    const ei = unrewritten.indexOf(end, bi);
+    const si = unrewritten.indexOf(siteEnd, ei);
+    expect(bi).toBeGreaterThanOrEqual(0);
+    expect(ei).toBeGreaterThan(bi);
+    expect(si).toBeGreaterThan(ei);
+    const pinned = unrewritten
+      .slice(bi + begin.length, ei)
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l) => (l.startsWith("// ") ? l.slice(3) : l))
+      .join("\n");
+    const recon = unrewritten.slice(0, bi) + pinned + "\n" + unrewritten.slice(si + siteEnd.length);
+    if (recon !== prod) {
+      let i = 0;
+      while (i < Math.min(recon.length, prod.length) && recon[i] === prod[i]) i++;
+      throw new Error(
+        `K3D perturbed copy drifted from production outside the named site — first diff at offset ${i}:\n` +
+          `copy: ${JSON.stringify(recon.slice(Math.max(0, i - 40), i + 60))}\n` +
+          `prod: ${JSON.stringify(prod.slice(Math.max(0, i - 40), i + 60))}`,
+      );
+    }
+  });
+
+  it("the K3D copy's leg-3 reconnect URL IS cursor=6&epoch=ep-B end-to-end; the pairing check flags it [executed mutant]", async () => {
+    const c = await bootPerturbed();
+    const oracle = new ObligationOracle();
+    const r1 = loadFixture("R1-initial-cursorless.sse");
+    const k3b = loadFixture("K3B-epoch-change-low-live.sse");
+    const epochA = fixtureEpoch(r1.frames);
+    const epochB = fixtureEpoch(k3b.frames);
+    expect(epochB).not.toBe(epochA);
+
+    // Leg 1 — R1's prefix under epoch A (append@7 withheld). The map ends
+    // {s1:6}@ep-A; the perturbation is DORMANT here (the stamp never
+    // changes: ""→ep-A clears an already-empty map either way).
+    c.ses.openSessionStream(SID, false, "selection-change", "bridge-test");
+    const es1 = sessionESes()[0];
+    registerProducer(oracle, r1.frames);
+    feedFrames(es1, r1.frames, r1.frames.length - 1);
+    await settleAsync(oracle);
+
+    // Leg 2 — the DEAD-STORE pairing on the wire (cursor=6&epoch=ep-A —
+    // identical to the committed K3: the honest pre-transition claim), then
+    // K3B's prefix: snapshot@4 (ep-B) APPLIES → the K3D perturbation fires
+    // (stamp ep-B ≠ ep-A: RELABEL WITHOUT CLEAR — {s1:6} survives); n1@5
+    // applies (message-class claim, sesProducerEpoch=ep-B: max(6,5)=6).
+    const { es: es2, cursor: deadCursor, epoch } = openAndObserve(c, oracle, "K3D:reconnect");
+    expect(deadCursor).toBe(6);
+    expect(epoch).toBe(epochA);
+    registerProducer(oracle, k3b.frames);
+    feedFrames(es2, k3b.frames, k3b.frames.length - 1); // deliver snapshot@4 + n1@5; WITHHOLD q1up@6
+    await settleAsync(oracle);
+    expect(c.byId("n1")).toBeTruthy(); // epoch B's snapshot + live tail really applied
+
+    // Leg 3 — THE DEFECT, EXECUTED: the copy's send site pairs the SURVIVED
+    // dead-epoch cursor (6) with the NEW epoch's declaration (ep-B) — a
+    // MATCHING handshake the server cannot reject, over-claiming B's seq
+    // space (6 covers B's open q1up@6; B's snapshot floor is only 4). The
+    // honest module sends cursor=5 here (the committed K3 leg-3 assert
+    // above pins that repair point and is deliberately untouched).
+    const { es: es3, cursor: cursor3, epoch: epoch3, violations } = openAndObserve(
+      c,
+      oracle,
+      "K3D:post-epoch-change",
+    );
+    expect(cursor3).toBe(6); // the dead A-cursor RESTORED under epoch B — not the honest 5
+    expect(cursor3).not.toBe(5); // explicit contrast with the committed honest-module pin
+    expect(epoch3).toBe(epochB); // …paired with the NEW lifetime's declaration
+    expect(es3.url).toContain(`cursor=${cursor3}&`);
+    expect(es3.url).toContain(`&epoch=${epochB}`);
+    expect(oracle.floorOf(epochB)).toBe(4); // B established by the wire witness (6 ≥ 4, ep-B)
+    const expired = oracle.obls.find((o) => o.epoch === epochA && o.seq === 7)!;
+    expect(expired.disp).toBe("expired"); // A's withheld append took the terminal dead-lifetime disposition
+
+    // …and the OB1 pairing check CATCHES the executed shape: cursor 6
+    // declared under ep-B sits ON B's open q1up@6.
+    expect(violations).toHaveLength(1);
+    expect(violations[0].cursor).toBe(6);
+    expect(violations[0].offending.seq).toBe(6);
+    expect(violations[0].offending.epoch).toBe(epochB);
+    expect(violations[0].offending.kind).toBe("part.upsert");
+  }, 20_000);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // settle() IDEMPOTENCE — the OB5 review's three-leaf deferred finding
 // (b-F1/b-F2/c-F1, fired by the OB5 commit's own path_touched trigger),
 // red-first. Oracle-only (no module, no fixtures — the defect is the ORACLE's
@@ -1506,6 +1664,71 @@ describe("settle idempotence — a SECOND settle after the K3 epoch transition c
     expect(flagged[0].offending.seq).toBe(6);
     expect(flagged[0].offending.epoch).toBe(epB);
     expect(flagged[0].offending.kind).toBe("part.upsert");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// OB5 LAUNDER PIN (defer OB5/d-F2's sibling row, discharged by card
+// task-2026-11-07t13-04-20-defer-retirement-bundle, item 1) — [pin] of
+// LANDED oracle behavior, green-on-landing: a DEAD-epoch snapshot applying
+// AFTER the epoch transition never re-discharges obligations the LIFETIME
+// RULE already expired. "expired" is TERMINAL in snapshotApplied's
+// discharge sweep (the `disp !== "expired"` exclusion): a late A-snapshot
+// whose seq ≥ N would otherwise flip A@N from "expired" to "discharged" —
+// LAUNDERING a dead-store obligation through its own lifetime's replayed
+// floor. Oracle-only (same shape as the settle-idempotence suite above);
+// the same-settle CONTROL proves the exclusion is scoped, not a discharge
+// freeze — B's own pending obligation discharges NORMALLY in the very same
+// sweep pass that skips A's expired one.
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("OB5 launder pin — a late dead-epoch snapshot never re-discharges expired obligations [pin]", () => {
+  it("A-snapshot@8 (seq ≥ 7) applying after the B-transition keeps A@7 'expired'; a same-epoch pending control still discharges in the same sweep", () => {
+    const epA = "ep-a";
+    const epB = "ep-b";
+    const oracle = new ObligationOracle();
+    let aSnap4Seen = false; // A:snapshot@4 content witness (fires at leg 1)
+    let aSnap8Seen = false; // A:snapshot@8 content witness (fires LATE, post-transition)
+
+    // Leg 1 — A establishes: snapshot@4 applies, append@7 withheld open.
+    oracle.deliver(epA, 4, "snapshot", () => aSnap4Seen, "A snap@4");
+    oracle.deliver(epA, 7, "part.append", () => false, "A append@7 withheld");
+    aSnap4Seen = true;
+    oracle.settle();
+    expect(oracle.activeEpoch).toBe(epA);
+    expect(oracle.floorOf(epA)).toBe(4);
+    expect(oracle.openObligations().map((o) => `${o.epoch}:${o.seq}`)).toEqual([`${epA}:7`]);
+
+    // Leg 2 — B establishes on its own snapshot@5: the LIFETIME RULE
+    // expires A@7 (terminal); B's msg@6 is withheld open.
+    oracle.deliver(epB, 5, "snapshot", () => true, "B snap@5");
+    oracle.deliver(epB, 6, "message", () => false, "B msg@6 withheld");
+    oracle.settle();
+    expect(oracle.activeEpoch).toBe(epB);
+    expect(oracle.floorOf(epB)).toBe(5);
+    expect(oracle.obls.find((o) => o.epoch === epA && o.seq === 7)!.disp).toBe("expired");
+    expect(oracle.openObligations().map((o) => `${o.epoch}:${o.seq}`)).toEqual([`${epB}:6`]);
+
+    // THE PIN — the late dead-epoch snapshot applies (A's witness fires at
+    // seq 8 ≥ 7, in the SAME settle as B's snapshot@9): A@7 stays "expired"
+    // — the sweep's `disp !== "expired"` exclusion holds — and activeEpoch
+    // does not regress to the dead lifetime (establishedEpochs edge memory).
+    oracle.deliver(epA, 8, "snapshot", () => aSnap8Seen, "A snap@8 LATE");
+    oracle.deliver(epB, 9, "snapshot", () => true, "B snap@9");
+    aSnap8Seen = true;
+    oracle.settle();
+    const laundered = oracle.obls.find((o) => o.epoch === epA && o.seq === 7)!;
+    expect(laundered.disp).toBe("expired"); // NOT "discharged" — terminal under the dead lifetime
+    expect(oracle.activeEpoch).toBe(epB);
+    expect(oracle.floorOf(epA)).toBe(8); // the late A snapshot still raises A's own floor…
+    expect(oracle.floorOf(epB)).toBe(9); // …and B's snapshot raises hers
+
+    // CONTROL (same settle, same sweep pass): B's pending msg@6 discharges
+    // NORMALLY under B's floor 9 — the expiry exclusion skips expired
+    // entries only; it never freezes same-epoch discharges.
+    const control = oracle.obls.find((o) => o.epoch === epB && o.seq === 6)!;
+    expect(control.disp).toBe("discharged");
+    expect(oracle.openObligations()).toEqual([]);
   });
 });
 

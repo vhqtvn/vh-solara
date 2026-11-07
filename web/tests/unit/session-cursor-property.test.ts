@@ -872,9 +872,14 @@ describe("S1 drift guard — whole-file disposable-copy fidelity", () => {
   // MUT-SITE-END <id>) with its pinned original (a pin line is "// " + the
   // verbatim production line), and invert the import-specifier rewrites
   // ("../../src/sync/x" → "./x", "../../src/x" → "../x"). Byte-equality of
-  // the result with web/src/sync/session-stream.ts pins the WHOLE copy, so
-  // drift anywhere — the previously guarded mutant regions AND every other
-  // line — turns this red.
+  // the result with web/src/sync/session-stream.ts pins the WHOLE copy
+  // EXCEPT the scaffold INTERIORS — the executable mutant branches between
+  // MUT-SYNC-ORIGINAL <id> END and MUT-SITE-END <id>, which reconstruction
+  // REPLACES with the pinned originals and therefore never inspects. Drift
+  // anywhere OUTSIDE those interiors turns this red; the interiors
+  // themselves (the copy's armed=null paths) are byte-pinned by the sibling
+  // scaffold-pin test below (card task-2026-11-07t13-04-20-defer-
+  // retirement-bundle, item 2 — the §1.4 blind-spot defer).
   function reconstructProduction(copy: string): string {
     let t = copy;
     const hdr = "// MUT-HEADER-END\n";
@@ -924,7 +929,7 @@ describe("S1 drift guard — whole-file disposable-copy fidelity", () => {
     return t;
   }
 
-  it("reconstructing production from the copy (markers → pinned originals) is EXACT — any drift anywhere is red", () => {
+  it("reconstructing production from the copy (markers → pinned originals) is EXACT — any drift outside the scaffold interiors is red (interiors: the sibling scaffold pin)", () => {
     const prodText = readFileSync(
       resolveFromHere("../../src/sync/session-stream.ts"),
       "utf8",
@@ -946,6 +951,85 @@ describe("S1 drift guard — whole-file disposable-copy fidelity", () => {
           `  production        : ${JSON.stringify(b[i])}\n` +
           `Regenerate the copy from CURRENT production per its header (card task-2026-11-07t02-47-57 O1.1).`,
       );
+    }
+  });
+
+  // SCAFFOLD-INTERIOR PIN (defer O1.1/C-F1 blind spot, discharged by card
+  // task-2026-11-07t13-04-20-defer-retirement-bundle, item 2) — [pin] of
+  // the committed copy's LANDED bytes, green-on-landing. The
+  // reconstruction guard above SUBSTITUTE pinned originals for the scaffold
+  // interiors, so the EXECUTABLE mutant branches (the code between
+  // MUT-SYNC-ORIGINAL <id> END and MUT-SITE-END <id>) are invisible to it:
+  // a corrupted armed=null branch would pass the whole-file guard while
+  // silently changing the control copy's baseline behavior. This pin
+  // byte-checks each scaffold's armed=null EXECUTABLE branch against its
+  // own pinned original after stripping the arming-guard WRAPPERS (which
+  // are the scaffolding, not the baseline). The armed MUTANT bodies are
+  // deliberately NOT equated to production — they exist to differ; their
+  // behavior is pinned by the canonical-kill suite below.
+  it("each scaffold's armed=null executable branch is byte-identical to its pinned original (guard wrappers stripped) [pin]", () => {
+    const copy = readFileSync(
+      resolveFromHere(process.env.VH_MUTANTS_COPY ?? "./session-cursor-mutants.ts"),
+      "utf8",
+    );
+    const uncomment = (l: string): string =>
+      l.startsWith("// ") ? l.slice(3) : l.startsWith("//") ? l.slice(2) : l;
+    const parts = (id: string): { pinned: string[]; executable: string[] } => {
+      const begin = `// MUT-SYNC-ORIGINAL ${id} BEGIN\n`;
+      const end = `// MUT-SYNC-ORIGINAL ${id} END\n`;
+      const siteEnd = `// MUT-SITE-END ${id}\n`;
+      const bi = copy.indexOf(begin);
+      expect(bi, `${id} BEGIN`).toBeGreaterThanOrEqual(0);
+      const ei = copy.indexOf(end, bi);
+      expect(ei, `${id} END`).toBeGreaterThan(bi);
+      const si = copy.indexOf(siteEnd, ei);
+      expect(si, `${id} SITE-END`).toBeGreaterThan(ei);
+      const pinned = copy
+        .slice(bi + begin.length, ei)
+        .split("\n")
+        .filter((l) => l !== "")
+        .map(uncomment);
+      const executable = copy
+        .slice(ei + end.length, si)
+        .split("\n")
+        .filter((l) => l.trim() !== "" && !l.trimStart().startsWith("//"));
+      return { pinned, executable };
+    };
+
+    // H1 — arming guard is an early-return ABOVE the pinned body: drop it
+    // and the remainder must equal the pinned original line-for-line.
+    {
+      const { pinned, executable } = parts("H1");
+      expect(executable.shift()).toBe('  if (armed === "H1") return;');
+      expect(executable).toEqual(pinned);
+    }
+    // H6 — single-line condition EXTENSION: strip the `armed !== "H6" && `
+    // prefix and the line is the pinned original.
+    {
+      const { pinned, executable } = parts("H6");
+      expect(executable).toHaveLength(1);
+      expect(executable[0].replace('armed !== "H6" && ', "")).toBe(pinned[0]);
+    }
+    // H3 / H5 — brace-wrapped block `if (armed !== "<ID>") { … }`: the
+    // wrapper adds ONE indent level, so the inner lines DEDENTED by 2
+    // spaces must equal the pinned original line-for-line.
+    for (const id of ["H3", "H5"]) {
+      const { pinned, executable } = parts(id);
+      expect(executable[0]).toBe(`  if (armed !== "${id}") {`);
+      expect(executable[executable.length - 1]).toBe("  }");
+      const dedented = executable.slice(1, -1).map((l) => l.slice(2));
+      expect(dedented).toEqual(pinned);
+    }
+    // H2H4 — armed=null is the FINAL else-if branch of the chain (no added
+    // indent): rewrite the leading `} else if (` to `  if (` and the branch
+    // (condition + body + closing brace) is the pinned original.
+    {
+      const { pinned, executable } = parts("H2H4");
+      const text = executable.join("\n") + "\n";
+      const branchAt = text.lastIndexOf("} else if (");
+      expect(branchAt, "H2H4 final else-if branch").toBeGreaterThan(0);
+      const nullPath = text.slice(branchAt).replace("} else if (", "  if (");
+      expect(nullPath).toBe(pinned.join("\n") + "\n");
     }
   });
 });

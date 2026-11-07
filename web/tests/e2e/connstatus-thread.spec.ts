@@ -238,6 +238,17 @@ test("tunnel-drop degrades the visible status, converges via the precise ring-ga
   const toast = page.getByRole("status");
   await expect(toast.filter({ hasText: "Reconnecting…" })).toBeVisible({ timeout: 15_000 });
 
+  // (a′) A SECOND, ALWAYS-RENDERED user-visible surface degrades with it:
+  // the sidebar's StatusMark (role="img") carries the grade on its
+  // aria-label (statusMarkTip). Pill-clear distinguishability (d′) needs
+  // this mark: the toast pill clears at BOTH a live and a degraded landing
+  // (A-F5 — clear is not a grade), so the mark's label is the durable
+  // live-vs-degraded discriminator.
+  const mark = page.locator(".status-mark");
+  await expect(mark).toHaveAttribute("aria-label", /^Status: (reconnecting…|connecting…)$/, {
+    timeout: 15_000,
+  });
+
   // (b) The PRECISE ring-gap signal fired the cascade (frame consumed).
   await page.waitForFunction(
     () =>
@@ -270,6 +281,15 @@ test("tunnel-drop degrades the visible status, converges via the precise ring-ga
   // toast history pins the thread's text sequence: the degradation pill
   // rendered, and no "Back online" ever did.
   await expect(toast.filter({ hasText: "Reconnecting…" })).toHaveCount(0, { timeout: 30_000 });
+  // (d′) The pill clear landed at a LIVE grade, not a degraded one: the
+  // fixture topology (no tunnel header → unknown; no fetch failures; tree
+  // not stale) recovers to grade "live", which the mark's aria-label
+  // distinguishes from a degraded landing's "Status: stale —…" /
+  // "Status: degraded —…" wording ("syncing…" is the live grade's transient
+  // substate — still live).
+  await expect(mark).toHaveAttribute("aria-label", /^Status: (connected|syncing…)$/, {
+    timeout: 15_000,
+  });
   const toastHistory = await page.evaluate(
     () => (window as unknown as { __vhToastHistory: string[] }).__vhToastHistory,
   );

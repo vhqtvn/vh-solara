@@ -38,9 +38,9 @@ To regenerate `session-cursor-mutants.ts` after production changes:
    VH_MUTANTS_COPY=./session-cursor-mutants.scratch.ts npx vitest run tests/unit/session-cursor-property.test.ts
    ```
 
-### 1.4 Scaffold Interior Blind-Spot (C-F1 Defer)
-The drift guard reconstructs production by substituting pinned originals, which validates fidelity **outside** scaffolds and verifies that the pinned originals match production. However, it does not inspect the active mutant branches *inside* scaffold interiors.
-- **Carried Defer O1.1/C-F1:** Add byte-fidelity pins for the mutant branch implementations.
+### 1.4 Scaffold Interior Fidelity Pins (O1.1/C-F1 — DISCHARGED)
+The drift guard reconstructs production by substituting pinned originals, which validates fidelity **outside** scaffolds and verifies that the pinned originals match production. It does not inspect the active mutant branches *inside* scaffold interiors — that blind spot is closed by a sibling byte-pin in the same suite (`session-cursor-property.test.ts`, scaffold-interior pin): for each scaffold (H1, H6, H3, H5, H2H4) the armed=null EXECUTABLE branch is byte-compared against its own pinned original after stripping the arming-guard wrappers (early-return drop / condition-prefix strip / brace-wrap dedent / else-if rewrite). The guard's claim wording is scoped accordingly ("any drift outside the scaffold interiors is red").
+- **Discharged by:** task `task-2026-11-07t13-04-20-defer-retirement-bundle` (item 2).
 - **Trigger:** `path_touched(web/tests/unit/session-cursor-mutants.ts)` or `path_touched(web/tests/unit/session-cursor-property.test.ts)`.
 
 ---
@@ -68,9 +68,9 @@ VH_BRIDGE_FIXTURE_REGEN=1 go test ./pkg/web/ -run TestStreamBridgeFixture
 ```
 *(Use `VH_BRIDGE_FIXTURE_REGEN_FORCE=1` only when bootstrapping a completely missing fixture set).*
 
-### 2.4 Retry-Hint Raw Bounds Defer (O1.2/F2)
-The retry-hint normalizer replaces `retry: \d+` with `retry: 2000` but currently does not assert that the pre-normalized value falls within the legal bounds `[sseRetryBaseMs, sseRetryBaseMs + sseRetryJitterMs)`.
-- **Carried Defer O1.2/F2:** Add an explicit range check asserting raw retry-hint values before normalization.
+### 2.4 Retry-Hint Raw Bounds Check (O1.2/F2 — DISCHARGED)
+The retry-hint normalizer replaces `retry: \d+` with `retry: 2000`. To keep that rewrite from silently absorbing a semantic retry-cadence change, `bridgeNormalizeLife` now asserts every captured RAW `retry: N` value is a plausible `sseRetryHintMs()` draw (`sseRetryBaseMs ≤ N < sseRetryBaseMs + sseRetryJitterMs`) BEFORE normalizing — at every capture, including regeneration and both determinism builds. A cadence change now reds instead of normalizing green.
+- **Discharged by:** task `task-2026-11-07t13-04-20-defer-retirement-bundle` (item 3).
 - **Trigger:** `path_touched(pkg/web/stream_http.go)` (region around lines 98–99).
 
 ---
@@ -96,9 +96,9 @@ Obligations are identified by the tuple `${epoch}:${seq}:${kind}`. Floors are tr
 - Floor advances remain **level-triggered**, monotone, and epoch-scoped.
 - Open obligations are re-tested at each settle, flipping to `applied` if content arrived via repair replay.
 
-### 3.4 Expired-Sweep Launder Pin Defer (8c050640/F1)
-Line 360 of `session-cursor-bridge.test.ts` excludes `expired` obligations from the discharge sweep (`o.disp !== "expired"`). Because no committed test schedule currently drives an expired obligation under a later same-epoch snapshot floor with `seq >= obligation.seq`, this clause is unpinned.
-- **Carried Defer 8c050640/F1:** Add a launder-shape test verifying that an expired obligation (epoch A @ seq N) is not converted to `discharged` if an identical-seq snapshot from epoch A is encountered later.
+### 3.4 Expired-Sweep Launder Pin (8c050640/F1 — DISCHARGED)
+Line 360 of `session-cursor-bridge.test.ts` excludes `expired` obligations from the discharge sweep (`o.disp !== "expired"`). The launder shape is now pinned (OB5 launder pin, same file): a late epoch-A snapshot@8 (seq ≥ the expired A@7) applying after the epoch-B transition keeps A@7 `expired` — never `discharged` — while a same-settle, same-epoch pending control discharges NORMALLY under epoch B's floor (the exclusion is scoped, not a discharge freeze).
+- **Discharged by:** task `task-2026-11-07t13-04-20-defer-retirement-bundle` (item 1).
 - **Trigger:** `path_touched(web/tests/unit/session-cursor-bridge.test.ts)` (standing obligation on the next edit).
 
 ---
@@ -120,9 +120,11 @@ When interpreting or reporting verification results, maintain these four mandato
 
 ## 5. Summary of Carried Defers
 
-| Defer ID | Target Path | Trigger Condition (`path_touched`) |
-|---|---|---|
-| **O1.1/C-F1** | `web/tests/unit/session-cursor-mutants.ts`<br>`web/tests/unit/session-cursor-property.test.ts` | `path_touched(web/tests/unit/session-cursor-mutants.ts)` or `path_touched(web/tests/unit/session-cursor-property.test.ts)` |
-| **O1.2/F2** | `pkg/web/stream_http.go` (lines 98–99) | `path_touched(pkg/web/stream_http.go)` |
-| **OB5/d-F2** | `web/src/sync/session-stream.ts` | `path_touched(web/src/sync/session-stream.ts)` |
-| **8c050640/F1** | `web/tests/unit/session-cursor-bridge.test.ts` | `path_touched(web/tests/unit/session-cursor-bridge.test.ts)` |
+All four rows below were **discharged** by task `task-2026-11-07t13-04-20-defer-retirement-bundle` (items 1–4; §1.4, §2.4, §3.4 describe the landed pins/tests). The trigger conditions remain recorded for audit; they no longer carry open obligations.
+
+| Defer ID | Target Path | Trigger Condition (`path_touched`) | Disposition |
+|---|---|---|---|
+| **O1.1/C-F1** | `web/tests/unit/session-cursor-mutants.ts`<br>`web/tests/unit/session-cursor-property.test.ts` | `path_touched(web/tests/unit/session-cursor-mutants.ts)` or `path_touched(web/tests/unit/session-cursor-property.test.ts)` | **Discharged** — scaffold-interior armed=null byte-pins (§1.4) |
+| **O1.2/F2** | `pkg/web/stream_http.go` (lines 98–99) | `path_touched(pkg/web/stream_http.go)` | **Discharged** — raw retry-hint bounds check before normalization (§2.4) |
+| **OB5/d-F2** | `web/src/sync/session-stream.ts` | `path_touched(web/src/sync/session-stream.ts)` | **Discharged** — K3D executed mutant + reconstruction guard; OB5 launder pin (§3.4; item 4's disposable perturbed copy `web/tests/unit/session-stream-k3d-perturbed.ts`) |
+| **8c050640/F1** | `web/tests/unit/session-cursor-bridge.test.ts` | `path_touched(web/tests/unit/session-cursor-bridge.test.ts)` | **Discharged** — OB5 launder pin (§3.4) |

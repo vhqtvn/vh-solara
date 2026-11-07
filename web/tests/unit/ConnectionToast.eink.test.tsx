@@ -859,3 +859,99 @@ describe("ConnectionToast — visibility accounting (foreground-visible time onl
     expect(toastEl(container)?.textContent).toContain("Reconnecting…");
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DISMISS-INTERLEAVING PINS (card task-2026-11-07t13-04-20-defer-retirement-
+// bundle, item 5) — [pin]s of the LANDED dismiss × landing interleavings,
+// green-on-landing. The dismissed banner demotes to the quiet tier but the
+// EPISODE stays open with its visibility accumulator PRESERVED (dismiss
+// absorbs bannerVisibleStart into bannerVisibleMs): what that accumulator
+// is then WORTH depends on where the episode ends —
+//   (5a) a DEGRADED landing closes the episode and DISCARDS the
+//        accumulator (closeEpisode's return is dropped at degraded): the
+//        pill clears (A-F5), nothing is armed, and the later live acks
+//        NOTHING (the episode already ended);
+//   (5b) a straight LIVE landing CONSUMES the preserved accumulator
+//        (≥ACK_MIN_VISIBLE_MS): the static "Back online" ack fires.
+// NOTE: an earlier review phrased 5a as "no-op clear, warned preserved,
+// live acks" — that is the RETIRED pre-rework semantics (see the file
+// header: "`warned`-survives-so-live-acks tails → no ack from a
+// degraded-closed episode"); these pins follow the LANDED semantics.
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("ConnectionToast — dismissed-banner × landing interleavings [pin]", () => {
+  afterEach(() => {
+    _resetWeakLinkForTest();
+    delete (globalThis as { __vhTunnelSampled?: boolean }).__vhTunnelSampled;
+  });
+
+  it("5a: dismiss → degraded landing clears the pill with NO ack ever (accumulator discarded); the later live re-surfaces nothing", async () => {
+    const { container } = await mount();
+
+    // Drop → banner (30s) → 6000ms banner-visible → DISMISS.
+    setState("status", "reconnecting");
+    await vi.advanceTimersByTimeAsync(DISCONNECT_BANNER_MS);
+    const banner = toastEl(container)!;
+    expect(banner.textContent).toContain("longer than expected");
+    await vi.advanceTimersByTimeAsync(6_000); // ≥ ACK_MIN_VISIBLE_MS visible
+    fireEvent.click(banner.querySelector('button[aria-label="Dismiss notice"]')!);
+    await vi.advanceTimersByTimeAsync(0);
+    // Demoted to the quiet tier: one surface, episode still open.
+    const pill = toastEl(container);
+    expect(pill).not.toBeNull();
+    expect(pill!.textContent).toContain("Reconnecting…");
+    expect(container.querySelectorAll('[role="status"]').length).toBe(1);
+
+    // Degraded landing (socket live + converged, ≥2 racked failures): the
+    // pill clears (A-F5), nothing is armed, the accumulator is DISCARDED.
+    recordFetchFailure("network");
+    recordFetchFailure("network");
+    setState("status", "live");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("degraded"); // the landing is real, not vacuous
+    expect(toastEl(container)).toBeNull(); // cleared at the landing, NO ack
+    expect(vi.getTimerCount()).toBe(0); // nothing armed: it cannot come back
+
+    // …and the later live (weak evidence decayed) re-surfaces NOTHING: the
+    // preserved 6000ms accumulator died with the episode at the landing.
+    const carrier = tunnelCarrier();
+    _resetWeakLinkForTest();
+    await carrier.probe();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("live");
+    expect(toastEl(container)).toBeNull();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(toastEl(container)).toBeNull(); // nothing auto-expiry-shaped later either
+  });
+
+  it("5b: dismiss → straight-to-live landing acks 'Back online' from the PRESERVED visibility accumulator (static, dismissible)", async () => {
+    const { container } = await mount();
+
+    // Same head: drop → banner → 6000ms visible → DISMISS (quiet pill).
+    setState("status", "reconnecting");
+    await vi.advanceTimersByTimeAsync(DISCONNECT_BANNER_MS);
+    const banner = toastEl(container)!;
+    await vi.advanceTimersByTimeAsync(6_000);
+    fireEvent.click(banner.querySelector('button[aria-label="Dismiss notice"]')!);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(toastEl(container)?.textContent).toContain("Reconnecting…"); // demoted, episode open
+
+    // Straight to LIVE (no weak evidence racked): the episode ends at the
+    // live landing and the PRESERVED accumulator (6000 ≥ 5000) earns the
+    // static ack — dismissal did not forfeit it.
+    setState("status", "live");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connGrade()).toBe("live");
+    const ack = toastEl(container);
+    expect(ack).not.toBeNull();
+    expect(ack!.textContent).toContain("Back online");
+    expect(vi.getTimerCount()).toBe(0); // static: nothing armed to remove it
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(toastEl(container)?.textContent).toContain("Back online"); // persists
+    // Dismissible via its button.
+    expect(ack!.querySelector('button[aria-label="Dismiss notice"]')).not.toBeNull();
+    fireEvent.click(ack!.querySelector('button[aria-label="Dismiss notice"]')!);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(toastEl(container)).toBeNull();
+  });
+});

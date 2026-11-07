@@ -877,6 +877,30 @@ describe("SendStatus — create-certainty Slice 2 modern states", () => {
     r.unmount();
   });
 
+  // SPAN-SCOPED PIN (card task-2026-11-07t13-04-20-defer-retirement-bundle,
+  // item 7) — [pin] of LANDED markup, green-on-landing: the container-level
+  // assert above cannot see WHERE the copy renders. "Checking session
+  // creation." is the uncertain row's SECONDARY payload span (Card B: the
+  // Pending headline answers "where is my message"; the payload span names
+  // WHAT is unknown) — never the primary text span, and the only payload
+  // span in the row.
+  it("'Checking session creation.' is span-scoped to the secondary .sendStatusPayload; the primary span stays 'Pending — on this device.' [pin]", () => {
+    seedModernUnknown({ recoveryActive: true });
+    const r = render(() => <SendStatus {...baseProps({ draft: () => true, sessionId: () => "" })} />);
+    const row = r.container.querySelector('.sendStatusLine[data-kind="uncertain"]')!;
+    expect(row).toBeTruthy();
+    // Exactly ONE secondary payload span in the row…
+    const payloads = row.querySelectorAll(".sendStatusPayload");
+    expect(payloads).toHaveLength(1);
+    // …and it carries the create-check copy verbatim.
+    expect(payloads[0].textContent).toBe("Checking session creation.");
+    // The PRIMARY text span is the Pending headline — never the check copy.
+    const primary = row.querySelector(".sendStatusText")!;
+    expect(primary.textContent).toBe("Pending — on this device.");
+    expect(primary.textContent).not.toContain("Checking");
+    r.unmount();
+  });
+
   it("budget exhausted: the unconfirmed copy returns with Check again + Start a new session anyway", () => {
     seedModernUnknown({});
     const r = render(() => <SendStatus {...baseProps({ draft: () => true, sessionId: () => "" })} />);
