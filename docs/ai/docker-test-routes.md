@@ -39,17 +39,19 @@ The image pin lives in exactly one place — the `PLAYWRIGHT_IMAGE` Make
 variable — and can be overridden for experiments:
 
 ```bash
-make test-host-web-docker PLAYWRIGHT_IMAGE=mcr.microsoft.com/playwright:v1.64.1-noble
+make test-host-web-docker PLAYWRIGHT_IMAGE=mcr.microsoft.com/playwright:v1.65.0-noble
 ```
 
 **Pin coupling:** the image tag MUST track the exact `@playwright/test` version
-pinned in `host-web/package.json` (currently `1.64.1`). The official image
-ships the matching browser builds (chromium 1248 / firefox 1555 / webkit 2370
-for 1.64.1) with `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright` preset — no browser
+pinned in `host-web/package.json` (currently `1.65.0`). The official image
+ships the matching browser builds (chromium 1254 / firefox 1572 / webkit 2388
+for 1.65.0) with `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright` preset — no browser
 download ever runs. When bumping the package version, bump the tag in the same
-change. Note: the `web/` package has its own Playwright version range — this
-image is proven for host-web (lanes 7) only; do not assume lane 6 reuse without
-reconciling versions.
+change. Note: the `web/` package has its own Playwright caret range
+(`^1.65.0`, lock-resolved `1.65.0`) — the lane-6 queue-delivery docker route
+rides the SAME single `PLAYWRIGHT_IMAGE` pin, and the tag must equal BOTH
+trees' resolved versions (see the image-coupling item in the queue-delivery
+section below).
 
 ## How the wrapper behaves
 
@@ -78,7 +80,7 @@ once with a root container (symmetric with how they were created; no host sudo
 needed):
 
 ```bash
-docker run --rm -v "$PWD":/repo -w /repo mcr.microsoft.com/playwright:v1.64.1-noble \
+docker run --rm -v "$PWD":/repo -w /repo mcr.microsoft.com/playwright:v1.65.0-noble \
   bash -c 'rm -rf tmp/agent-runs/host-web-playwright/output tmp/agent-runs/host-web-playwright/report host-web/node_modules/.vite'
 ```
 
@@ -177,10 +179,15 @@ non-root UID/GID containment (`-e HOME=/tmp/pw-home`, user ownership under
    preset in the container environment. Passing `ARGS='--reporter=list,json'`
    records the full test report, including the custom `qd-*` correlation and
    timing annotations emitted by `queue-delivery-custody.spec.ts`.
-5. **Image tag coupling and riding DEFER:**
-   The wrapper uses the single `PLAYWRIGHT_IMAGE` pin (`mcr.microsoft.com/playwright:v1.64.1-noble`).
-   While `host-web/package.json` pins `@playwright/test` to exact `1.64.1`,
-   `web/package.json` specifies a caret range (`^1.64.1`) that currently
-   lock-resolves to `1.64.1`. Any future lockfile refresh in `web/` must re-assert
-   that the resolved `@playwright/test` version matches `PLAYWRIGHT_IMAGE`.
+5. **Image tag coupling (single pin, both routes):**
+   The queue-delivery wrapper rides the same single `PLAYWRIGHT_IMAGE` pin
+   (`mcr.microsoft.com/playwright:v1.65.0-noble`) as lane 7 above — ONE pin
+   covers BOTH docker routes (host-web lane 7 and the web/ queue-delivery
+   lane). `host-web/package.json` pins `@playwright/test` exact `1.65.0`;
+   `web/package.json` caret `^1.65.0` lock-resolves `1.65.0`. Coupling rule:
+   the image tag must equal BOTH package pins' resolved versions — re-assert
+   it on any host-web pin bump OR any web/ lockfile refresh. (History: the
+   routes were briefly split — a `PW_QUEUE_IMAGE` v1.64.1-noble default for
+   web/ from commit 203b746 — and collapsed back into the single pin on
+   2026-11-08, commit 87370d4, when web/ joined 1.65.0.)
 
