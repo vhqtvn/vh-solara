@@ -71,7 +71,8 @@ const CONVERGE_MS = 20_000;
 // sweep checkpoint + 80b569d) whose captured artifacts were lost to later green
 // runs wiping the output dir. These helpers append an OBSERVABLE-STATE payload
 // (rendered tree rows, pinned-group ids, expected-id presence, the legacy pins
-// localStorage shadow, and the .status-mark conn-state class) to the timeout
+// localStorage shadow, and the status-mark conn-state class — selected by its
+// stable data-testid, not the raw class) to the timeout
 // message of every cross-client wait — enough to adjudicate the NEXT recurrence
 // (SSE-recovery tail vs render defect vs shadow miss vs boot starvation) with
 // no assertion-semantics or budget change: the enriched error is the SAME error
@@ -89,7 +90,7 @@ async function pinsDiag(page: Page, expectId: string): Promise<Record<string, un
       ).length,
       lsPinned: localStorage.getItem("vh.pinned.v1"),
       lsOrder: localStorage.getItem("vh.pinned-order.v1"),
-      conn: document.querySelector(".status-mark")?.className ?? null,
+      conn: document.querySelector('[data-testid="status-mark"]')?.className ?? null,
       pinErr: document.querySelector('[role="status"]')?.textContent ?? null,
       events: ((window as unknown as { __pinsJournal?: string[] }).__pinsJournal ?? []).slice(-12),
     };

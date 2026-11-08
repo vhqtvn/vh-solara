@@ -29,7 +29,7 @@ test("desktop: wordmark shows at full width, all controls on one line", async ({
   // status mark and the two desktop buttons all sit inside the box.
   within(await head.locator(".brand-mark").boundingBox(), r);
   within(await head.locator(".help-inspect").boundingBox(), r);
-  within(await head.locator(".status-mark").boundingBox(), r);
+  within(await head.getByTestId("status-mark").boundingBox(), r);
   for (const label of ["Search sessions", "Create session"]) {
     within(await head.getByRole("button", { name: label }).boundingBox(), r);
   }

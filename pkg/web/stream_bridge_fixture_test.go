@@ -40,7 +40,10 @@ package web
 // identically at capture and at drift-check):
 //   1. `retry: <n>` — the handler's per-connection jittered SSE retry hint
 //      (sseRetryBaseMs + rand.Intn(sseRetryJitterMs)) is normalized to the
-//      deterministic base `retry: 2000`.
+//      deterministic base `retry: <sseRetryBaseMs>` (currently 2000). The
+//      token derives from the SAME-PACKAGE constant (bridgeRetryTok below),
+//      so a cadence change retargets the normalization without editing this
+//      file; the raw-bounds check keeps catching non-retry corruption.
 //   2. `ep-<24 hex>` — the per-store-lifetime epoch id (state.newEpoch,
 //      crypto/rand) is normalized to a deterministic PER-LIFE token:
 //      ep-0000000000000000000aaaaa for the FIRST store life of a scenario
@@ -117,19 +120,24 @@ var (
 	bridgeRetryRe = regexp.MustCompile(`(?m)^retry: \d+$`)
 	// bridgeRetryValueRe — the RAW retry hint BEFORE normalization (defer
 	// O1.2/F2, discharged by card task-2026-11-07t13-04-20-defer-
-	// retirement-bundle, item 3): the →"retry: 2000" rewrite below silently
-	// absorbs ANY numeric drift in the emitted cadence, so a semantic
-	// retry-hint change (e.g. sseRetryHintMs regressing to a constant, or a
-	// runaway bound) would normalize away without a red. bridgeNormalizeLife
-	// asserts the captured value is a plausible sseRetryHintMs() draw
-	// (base ≤ v < base+jitter) before rewriting it.
+	// retirement-bundle, item 3): the →"retry: <base>" rewrite below (the
+	// token self-tracks sseRetryBaseMs) silently absorbs ANY numeric drift
+	// in the emitted cadence, so a semantic retry-hint change (e.g.
+	// sseRetryHintMs regressing to a constant, or a runaway bound) would
+	// normalize away without a red. bridgeNormalizeLife asserts the captured
+	// value is a plausible sseRetryHintMs() draw (base ≤ v < base+jitter)
+	// before rewriting it.
 	bridgeRetryValueRe = regexp.MustCompile(`(?m)^retry: (\d+)$`)
 	bridgeEpochRe      = regexp.MustCompile(`ep-[0-9a-f]{24}`)
 	bridgeTimeRe       = regexp.MustCompile(`^time=[^ ]+ `)
 	bridgeEpochTok     = "ep-0000000000000000000aaaaa"
 	bridgeEpoch2Tok    = "ep-0000000000000000000bbbbb"
-	bridgeRetryTok     = "retry: 2000"
-	bridgeTimeTok      = "time=<normalized>"
+	// bridgeRetryTok — the deterministic normalization target, DERIVED from
+	// the same-package constant so the committed fixtures' token and this
+	// file never disagree about the base (A7 coupling,
+	// task-2026-11-08t04-02-22-armed-ledger-discharge).
+	bridgeRetryTok = "retry: " + strconv.Itoa(sseRetryBaseMs)
+	bridgeTimeTok  = "time=<normalized>"
 )
 
 // bridgeNormalizeLife maps each REAL per-store-lifetime epoch id to its
@@ -144,6 +152,13 @@ func bridgeNormalizeLife(t *testing.T, b []byte, life map[string]string) []byte 
 	// every captured `retry: N` line must be a plausible sseRetryHintMs()
 	// draw. This runs at EVERY capture (regen and both determinism builds),
 	// so a semantic cadence change reds here instead of normalizing green.
+	// The bounds are expressed in the SAME-PACKAGE constants
+	// (sseRetryBaseMs/sseRetryJitterMs — A7,
+	// task-2026-11-08t04-02-22-armed-ledger-discharge): the check catches
+	// NON-RETRY corruption (a captured value that is not a plausible draw),
+	// while the cadence VALUES are self-tracking — a deliberate base/jitter
+	// change moves the window, the token, and the manifest string together
+	// without editing this file (the committed fixtures then regenerate).
 	for _, m := range bridgeRetryValueRe.FindAllSubmatch(b, -1) {
 		v, err := strconv.ParseUint(string(m[1]), 10, 64)
 		if err != nil {
@@ -780,7 +795,9 @@ func bridgeBuildAll(t *testing.T) ([]bridgeFixture, []byte) {
 	md := bridgeManifest{
 		GeneratedBy: "pkg/web/stream_bridge_fixture_test.go (VH_BRIDGE_FIXTURE_REGEN=1); regenerate after ANY handler behavior change",
 		Normalizations: []string{
-			"retry: <jitter> -> retry: 2000 (per-connection random SSE retry hint)",
+			// Self-tracks sseRetryBaseMs (must stay byte-identical while the
+			// constant is 2000 — the committed manifest.json is drift-guarded).
+			fmt.Sprintf("retry: <jitter> -> retry: %d (per-connection random SSE retry hint)", sseRetryBaseMs),
 			"ep-<24hex> -> ep-0000000000000000000aaaaa (FIRST store life of a scenario) / ep-0000000000000000000bbbbb (SECOND store life — OB5 epoch-change scenarios); per-store-lifetime crypto/rand epoch ids, ROLE-mapped by the scenario's builder so distinct lives never collapse to one token",
 			"time=<RFC3339> -> " + bridgeTimeTok + " (journal-line vhlog wall-clock timestamp; discriminator fields verbatim)",
 		},

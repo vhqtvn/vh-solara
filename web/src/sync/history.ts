@@ -376,14 +376,22 @@ export function markPageDirty(sid: string) {
 //     messageWindows[id]; a stale page merged after the batch could clobber
 //     the batch's fresher window meta, so it remains in the dirty set.
 //
-// The kinds FALSE here are safe to skip because the merge is INSERT-IF-NOT-
-// PRESENT (live always wins, never overwrites):
+// The kinds FALSE here are safe to skip because the page merge never
+// OVERWRITES live content (live always wins) and every FALSE kind is a
+// NON-DELETION. Under stage-2 admission the page caller passes
+// admitMissing=true (a keyed non-completed resident's MISSING parts are
+// installed from the page capture) — admission is strictly ADDITIVE and
+// sourced from the page itself, and only a delete (both delete kinds stay
+// TRUE above) can make those additions resurrection-unsafe:
 //
 //   - message.upsert (NEW tail): newer than the `before` cursor → NOT in the
 //     page range. The page cannot contain it. Live delta already applied.
-//   - message.upsert (EXISTING): prependMessagesIfAbsent skips resident ids.
+//   - message.upsert (EXISTING): the merge leaves the resident's info and
+//     EXISTING part bodies untouched (it may only ADMIT parts the resident
+//     still lacks — an additive repair that cannot lose the live copy).
 //   - part.upsert (EXISTING — token streaming): upsertPart Object.assigns into
-//     the live part; the page merge skips the resident parent message.
+//     the live part — the live body wins over any stale page copy; the
+//     merge's admission leg never overwrites a PRESENT part.
 //   - part.upsert (NEW tail placeholder): newer than `before` → NOT in page
 //     range.
 //   - messages.loaded / messages.error: reveal-gate flips + cold-batch error
@@ -405,9 +413,13 @@ export function isPageDirtyingKind(kind: string): boolean {
 }
 
 // applyPageMerge — the clean-response merge. Inserts page messages that are NOT
-// already resident (live always wins — existing byId entries are left untouched
-// EXCEPT the upgrade-on-completed path, reduce.ts:123-136, which replaces a
-// resident entry's info when the incoming copy is completed),
+// already resident, and (admitMissing=true — this is the ADMISSION-ELIGIBLE
+// caller; the Contract-B dirty gate above orders deletes out of the flight)
+// installs a keyed non-completed resident's MISSING parts from the page. Live
+// content always wins: existing part bodies and keyed residents' info are
+// never overwritten EXCEPT the upgrade-on-completed path (reduce.ts — the
+// completed branch of prependMessagesIfAbsent), which replaces a resident
+// entry's info when the incoming copy is completed),
 // updates oldestResidentID + hasOlder from the server's page meta, and evicts
 // from the oldest end if resident caps are exceeded. Mutates the store via
 // produce() so Solid's reactivity propagates the prepend + the window-state

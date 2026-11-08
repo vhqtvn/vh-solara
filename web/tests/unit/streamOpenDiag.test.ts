@@ -551,3 +551,96 @@ describe("stall diag — truthful trigger labels (B4.2a)", () => {
     expect(stall.treeContentSeenAge ?? 0).toBeGreaterThanOrEqual(120_000);
   });
 });
+
+// ── SESSION-site twin (A8, card task-2026-11-08t04-02-22-armed-ledger- ────────
+// ── discharge): the Stream-2 watchdog branch (health.ts legacyForce) emits ────
+// ── the SAME truthful trigger labels on its StallEntry (health.ts:
+// ── trigger: contentStale && !transportStale ? "content-stale-watchdog"
+// ── : "transport-stale-watchdog"). The pins were owed since the 480ae71
+// ── diag-label-truthfulness card landed the tree-side pair above. The tree
+// ── is deliberately NEVER connected here: watchdogTick's tree branch sees a
+// ── closed tree and reconnects it (seeding ITS clocks "now"), so only
+// ── session stall records fire — the finds below filter stream="session".
+describe("stall diag — SESSION-site truthful trigger labels (A8)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("a session transport-stale-ONLY stall emits trigger=transport-stale-watchdog (the truthful label, not the pre-B4.2a hardcode)", () => {
+    diaglog.setDiagLogOn(true);
+    // open() seeds BOTH session clocks at T0 (markSessionSeen).
+    stream.openSessionStream("s1", false, "first-open", "boot");
+    // Age past STALE_MS (45s) but stay under CONTENT_STALE_MS (120s):
+    // session transport dead, session content not → transport-only.
+    vi.setSystemTime(Date.now() + 60_000);
+    stream.watchdogTick();
+    const stall = diaglog.diagEntries().find((e) => e.kind === "stall" && e.stream === "session");
+    expect(stall).toBeTruthy();
+    if (!stall || stall.kind !== "stall") return;
+    expect(stall.trigger).toBe("transport-stale-watchdog");
+    expect(stall.trigger).not.toBe("content-stale-watchdog"); // the pre-fix hardcode shape
+    expect(stall.sessionId).toBe("s1");
+    // Clock truth corroborates the label.
+    expect(stall.sessionLastSeenAge).toBeGreaterThanOrEqual(60_000);
+    expect(stall.sessionContentSeenAge ?? 0).toBeLessThan(120_000);
+  });
+
+  it("BOTH session clocks aged → transport WINS the label (precedence pin)", () => {
+    diaglog.setDiagLogOn(true);
+    stream.openSessionStream("s1", false, "first-open", "boot");
+    // Age past BOTH windows (45s transport, 120s content): both stale.
+    vi.setSystemTime(Date.now() + 130_000);
+    stream.watchdogTick();
+    const stall = diaglog.diagEntries().find((e) => e.kind === "stall" && e.stream === "session");
+    expect(stall).toBeTruthy();
+    if (!stall || stall.kind !== "stall") return;
+    // Precedence: a dead transport explains the content silence, so the
+    // trigger names the transport clock even though content ALSO aged out.
+    expect(stall.trigger).toBe("transport-stale-watchdog");
+    expect(stall.trigger).not.toBe("content-stale-watchdog");
+    expect(stall.sessionId).toBe("s1");
+    expect(stall.sessionLastSeenAge).toBeGreaterThanOrEqual(45_000);
+    expect(stall.sessionContentSeenAge).toBeGreaterThanOrEqual(120_000); // content WAS aged too
+  });
+
+  it("a session content-only stall (pings flowing, session busy) keeps trigger=content-stale-watchdog", async () => {
+    diaglog.setDiagLogOn(true);
+    stream.openSessionStream("s1", false, "first-open", "boot");
+    const ses = sessionESes()[0];
+    // Keep the TRANSPORT clock fresh with pings while the content clock
+    // ages: ping at T0+90s (transport-only mark), tick at T0+130s →
+    // lastSeenAge=40s (<45s, alive), contentSeenAge=130s (>120s, stale).
+    vi.setSystemTime(Date.now() + 90_000);
+    ses.fire("ping", null);
+    vi.setSystemTime(Date.now() + 40_000);
+    // Session busy → the legacy path must FORCE (not idle-skip) once the
+    // sentinel hands the decision back.
+    store.setState("activity", { s1: "busy" });
+    // The sentinel owns the content-only boundary first: stub the probe 404
+    // → memo + onLegacy → sessionWorking → legacyForce with the TRUE label.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((url: unknown) =>
+        Promise.resolve(
+          new Response("{}", {
+            status: typeof url === "string" && url.includes("/vh/stream/probe") ? 404 : 200,
+          }),
+        ),
+      ),
+    );
+    stream.watchdogTick();
+    await vi.advanceTimersByTimeAsync(0); // flush the probe fetch → onLegacy
+    const stall = diaglog.diagEntries().find((e) => e.kind === "stall" && e.stream === "session");
+    expect(stall).toBeTruthy();
+    if (!stall || stall.kind !== "stall") return;
+    expect(stall.trigger).toBe("content-stale-watchdog");
+    expect(stall.sessionId).toBe("s1");
+    // Clock truth corroborates the label: transport fresh, content aged out.
+    expect(stall.sessionLastSeenAge ?? 0).toBeLessThan(45_000);
+    expect(stall.sessionContentSeenAge ?? 0).toBeGreaterThanOrEqual(120_000);
+  });
+});

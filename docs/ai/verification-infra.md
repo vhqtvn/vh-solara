@@ -52,7 +52,7 @@ The drift guard reconstructs production by substituting pinned originals, which 
 
 ### 2.2 Three Shape-Preserving Normalizations
 To ensure byte-for-byte determinism across repeated generation runs, three specific transformations are applied identically at capture and comparison:
-1. **Retry hint jitter:** The randomized `retry: <n>` header (from `sseRetryBaseMs + rand.Intn(sseRetryJitterMs)`) is normalized to the deterministic base `retry: 2000`.
+1. **Retry hint jitter:** The randomized `retry: <n>` header (from `sseRetryBaseMs + rand.Intn(sseRetryJitterMs)`) is normalized to the deterministic base `retry: <sseRetryBaseMs>` (currently 2000). The token is DERIVED from the same-package constant (A7, task `task-2026-11-08t04-02-22-armed-ledger-discharge`), so the normalization target and the manifest string self-track any cadence change.
 2. **Deterministic per-life epoch tokens:** The `crypto/rand` store epoch token is normalized to role-based constants:
    - First store life: `ep-0000000000000000000aaaaa`
    - Second store life (epoch change in chain K): `ep-0000000000000000000bbbbb`  
@@ -69,7 +69,7 @@ VH_BRIDGE_FIXTURE_REGEN=1 go test ./pkg/web/ -run TestStreamBridgeFixture
 *(Use `VH_BRIDGE_FIXTURE_REGEN_FORCE=1` only when bootstrapping a completely missing fixture set).*
 
 ### 2.4 Retry-Hint Raw Bounds Check (O1.2/F2 — DISCHARGED)
-The retry-hint normalizer replaces `retry: \d+` with `retry: 2000`. To keep that rewrite from silently absorbing a semantic retry-cadence change, `bridgeNormalizeLife` now asserts every captured RAW `retry: N` value is a plausible `sseRetryHintMs()` draw (`sseRetryBaseMs ≤ N < sseRetryBaseMs + sseRetryJitterMs`) BEFORE normalizing — at every capture, including regeneration and both determinism builds. A cadence change now reds instead of normalizing green.
+The retry-hint normalizer replaces `retry: \d+` with the deterministic base token (derived from `sseRetryBaseMs` — currently `retry: 2000`). To keep that rewrite from silently absorbing a semantic retry-cadence change, `bridgeNormalizeLife` asserts every captured RAW `retry: N` value is a plausible `sseRetryHintMs()` draw (`sseRetryBaseMs ≤ N < sseRetryBaseMs + sseRetryJitterMs` — bounds expressed in the SAME-PACKAGE constants, so the check catches non-retry corruption while the cadence values self-track) BEFORE normalizing — at every capture, including regeneration and both determinism builds. A cadence change now reds instead of normalizing green.
 - **Discharged by:** task `task-2026-11-07t13-04-20-defer-retirement-bundle` (item 3).
 - **Trigger:** `path_touched(pkg/web/stream_http.go)` (region around lines 98–99).
 

@@ -8,25 +8,36 @@
 // never shipped" — NO item-level eligibility signal exists — so resurrection
 // safety lives ONLY in the transport orderings pinned here).
 //
-// THE ORDERING PREMISE (cited in-test below): all THREE production callers of
-// prependMessagesIfAbsent are fresh-capture-or-delete-replaying BY
-// CONSTRUCTION (eligibility Q1 receipts):
+// THE ORDERING PREMISE (cited in-test below; corrected to the two-caller
+// truth by card task-2026-11-08t04-02-22-armed-ledger-discharge — the
+// pre-correction "all THREE callers" claim was FALSE for the batch path):
+// admission into the merge is CALLER-GATED (the reduce.ts ADMISSION-SAFETY
+// CONTRACT, web/src/lib/reduce.ts:201-232). Exactly TWO production callers
+// of prependMessagesIfAbsent pass admitMissing=true, because each carries a
+// no-resurrection ordering by construction (eligibility Q1 receipts):
 //   1. Stream-2 session snapshot (web/src/sync/session-stream.ts:887-938):
-//      snapshot frames are captures at connection open; live events in the
-//      gzip64 decode window serialize BEHIND the decode (session-stream.ts:
+//      snapshot frames are FRESH captures at connection open; live events in
+//      the gzip64 decode window serialize BEHIND the decode (session-stream.ts:
 //      1386-1395); SSE delivery on one connection is ordered. A delete the
 //      client applied was processed server-side BEFORE any later capture, and
 //      a delete processed after capture arrives as an event applied AFTER the
 //      snapshot and re-deletes (client deletePart is idempotent).
-//   2. messages.batch (web/src/sync/reducers.ts:369-394): server-side cold
-//      batches are packaged under the msgRev ABA guard — a delete racing the
-//      package bumps msgRev and the stale package is discarded and repackaged
-//      (pkg/state/message_window.go publishColdBatch; pinned Go-side by
-//      pkg/state/message_window_msgrev_aba_test.go).
-//   3. Historical page (web/src/sync/history.ts:407-464): guarded by the
+//   2. Historical page (web/src/sync/history.ts:407-464): guarded by the
 //      Contract-B dirty gate — part.delete / message.delete / messages.batch
 //      during a page flight mark it dirty and the response gate discards +
 //      bounded-retries (history.ts:291-346) — pinned part-level in §3a here.
+// The THIRD caller — messages.batch (web/src/sync/reducers.ts:369-394) — is
+// EXCLUDED from admission (it passes no admitMissing option; default false).
+// The server-side msgRev ABA guard on publishColdBatch is EMIT-TIME and
+// cannot see CLIENT decode reordering: pendingBatch retains only the LATEST
+// same-session registration, so a held earlier same-session batch can apply
+// AFTER a part.delete that raced between the two decodes, and the admission
+// leg would reinstall the stale pre-delete part — the resurrection (d-F1,
+// round-1 review, reduce.ts:221-230/279-285). Lifting the exclusion requires
+// serializing same-session batch application in WIRE ORDER (a named future
+// slice; until then this file pins only the two admitted callers'
+// orderings — the no-resurrection property for the batch caller rests on its
+// merge being insert-if-absent WITHOUT admission, not on an ordering).
 //
 // TEST-ONLY slice (stage 1): the stage-1 verify-first card modified ZERO
 // production files. Real modules are driven through the REAL listener

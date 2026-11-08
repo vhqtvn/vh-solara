@@ -26,7 +26,7 @@
    same-specificity selector would LOSE the tie to the later-emitted legacy
    '.send-btn:disabled'. The :disabled in this selector raises specificity to
    (0,3,0) > (0,2,0) so it wins regardless of emission order. The truthful
-   accessible name ("Sending…") carries the state for AT users; the
+   accessible name ("Working…") carries the state for AT users; the
    aria-label AND the computed opacity are e2e-asserted (the
    production-bundle CSS guard, review C-F4). */
 .send-btn.sending:disabled {

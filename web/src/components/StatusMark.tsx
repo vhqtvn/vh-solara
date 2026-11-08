@@ -36,6 +36,7 @@ export default function StatusMark(props: { state: string; tip: string }) {
       role="img"
       aria-label={props.tip}
       data-tip={props.tip}
+      data-testid="status-mark"
     >
       <BrandMark class="brand-mark" />
       <span class="halo" />

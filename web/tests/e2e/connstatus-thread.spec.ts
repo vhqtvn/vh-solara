@@ -244,7 +244,7 @@ test("tunnel-drop degrades the visible status, converges via the precise ring-ga
   // this mark: the toast pill clears at BOTH a live and a degraded landing
   // (A-F5 — clear is not a grade), so the mark's label is the durable
   // live-vs-degraded discriminator.
-  const mark = page.locator(".status-mark");
+  const mark = page.getByTestId("status-mark");
   await expect(mark).toHaveAttribute("aria-label", /^Status: (reconnecting…|connecting…)$/, {
     timeout: 15_000,
   });

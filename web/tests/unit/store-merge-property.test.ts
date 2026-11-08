@@ -48,7 +48,15 @@
 // non-completed residents from the incoming copy) and ran GREEN UNMODIFIED —
 // clause semantics untouched — against the admitted reducer (the kill
 // criterion honored: any clause failure would have STOPPED the admission).
-// The four clauses hold under BOTH boundary shapes — under admission only
+// SCOPE HONESTY (A2 claim-gate discharge, card
+// task-2026-11-08t04-02-22-armed-ledger-discharge): that stage-2 acceptance
+// run swept the DEFAULT merge mode ONLY (admitMissing=false — the sweep
+// wrapper passed no option, so the admission leg never fired in it). The
+// seeded ADMITTED-path sweep (admitMissing=true, the mode the page and
+// snapshot callers pass) is pinned in this file: the ADMITTED-MODE SWEEP
+// below runs the SAME generator, the SAME clause checkers, and the SAME 250
+// seeds with the third argument true. The four clauses hold under BOTH
+// boundary shapes — under admission only
 // WHICH parts are resident changes (absent → admitted-from-incoming), which
 // (a)/(b)/(d) are written to tolerate and (c) never touches. The suite
 // deliberately does NOT pin either boundary (the round-5b pin in
@@ -59,7 +67,12 @@
 // mutants.ts precedent; NEVER production edits): each clause has a test-local
 // mutant merge (the real merge + one perturbation emulating the corresponding
 // production-logic change) that MUST trip its clause — proving the property
-// actually detects the violation class it names.
+// actually detects the violation class it names. Each mutant is swept in
+// BOTH modes (admitMissing=false and =true): the internal reducer call
+// forwards the mode, so the perturbation runs against the SAME boundary the
+// sweep under test exercises — MUT-A (a just-ADMITTED part dropped by a
+// later absence) and MUT-D1 (a fabricated admission source) thereby exercise
+// the admission leg directly in the admitted sweep.
 //
 // Determinism: seeded mulberry32 PRNG (the in-repo hand-rolled pattern from
 // session-cursor-property.test.ts — no new dependencies, no fast-check).
@@ -303,7 +316,10 @@ function checkMergeSafety(before: SessionMessages, items: any[], after: SessionM
 }
 
 // ── mutants (test-local substitutions — NEVER production edits) ──────────────
-type MergeFn = (sm: SessionMessages, items: any[]) => number;
+// `admit` is forwarded to the internal real-reducer call so every mutant's
+// perturbation runs against the SAME boundary the sweep under test exercises
+// (default vs the admitted path).
+type MergeFn = (sm: SessionMessages, items: any[], admit: boolean) => number;
 
 // MUT-A ≙ a merge that treats the incoming copy's parts as the authoritative
 // SET for already-resident messages — incoming ABSENCE deletes resident parts
@@ -312,9 +328,9 @@ type MergeFn = (sm: SessionMessages, items: any[]) => number;
 // mutant ALSO guards the admission path: a just-ADMITTED part is a resident
 // part, and a later incoming copy's absence deleting it is exactly the
 // admitted-part drop clause (a) must catch.
-const mutAbsenceDeletes: MergeFn = (sm, items) => {
+const mutAbsenceDeletes: MergeFn = (sm, items, admit) => {
   const residentBefore = new Set(Object.keys(sm.byId));
-  const added = prependMessagesIfAbsent(sm, items);
+  const added = prependMessagesIfAbsent(sm, items, admit);
   for (const it of items) {
     const info = it?.info;
     if (!info) continue;
@@ -337,9 +353,9 @@ const mutAbsenceDeletes: MergeFn = (sm, items) => {
 // the admitted merge touches keyed residents now, and MUT-B is exactly the
 // "corrected streaming fields"/body-overwrite violation admission must
 // never commit.
-const mutStaleClobbersLive: MergeFn = (sm, items) => {
+const mutStaleClobbersLive: MergeFn = (sm, items, admit) => {
   const residentBefore = new Set(Object.keys(sm.byId));
-  const added = prependMessagesIfAbsent(sm, items);
+  const added = prependMessagesIfAbsent(sm, items, admit);
   for (const it of items) {
     const info = it?.info;
     if (!info || info.time?.completed) continue;
@@ -357,8 +373,8 @@ const mutStaleClobbersLive: MergeFn = (sm, items) => {
 // MUT-C ≙ letting a NON-completed incoming copy overwrite a completed KEYED
 // resident's info (dropping the completed-authority guard) — time.completed
 // regresses to unset.
-const mutUncomplete: MergeFn = (sm, items) => {
-  const added = prependMessagesIfAbsent(sm, items);
+const mutUncomplete: MergeFn = (sm, items, admit) => {
+  const added = prependMessagesIfAbsent(sm, items, admit);
   for (const it of items) {
     const info = it?.info;
     if (!info || info.time?.completed) continue;
@@ -375,8 +391,8 @@ const mutUncomplete: MergeFn = (sm, items) => {
 // admission-path mutant — the admitted reducer genuinely installs missing
 // parts now, and clause (d) is what confines every installation to the
 // incoming copies' part union.
-const mutFabricatedPart: MergeFn = (sm, items) => {
-  const added = prependMessagesIfAbsent(sm, items);
+const mutFabricatedPart: MergeFn = (sm, items, admit) => {
+  const added = prependMessagesIfAbsent(sm, items, admit);
   const id = sm.order[0] ?? Object.keys(sm.byId)[0];
   if (id) {
     const mv = sm.byId[id];
@@ -394,8 +410,8 @@ const mutFabricatedPart: MergeFn = (sm, items) => {
 
 // MUT-D2 ≙ dropping the sortMessages call (reduce.ts:329) after an insert:
 // the first ordered id is left at the END → order not created-sorted.
-const mutSkipResort: MergeFn = (sm, items) => {
-  const added = prependMessagesIfAbsent(sm, items);
+const mutSkipResort: MergeFn = (sm, items, admit) => {
+  const added = prependMessagesIfAbsent(sm, items, admit);
   if (sm.order.length >= 2) {
     sm.order.push(sm.order.shift() as string);
   }
@@ -404,13 +420,17 @@ const mutSkipResort: MergeFn = (sm, items) => {
 
 // ── the sweep ────────────────────────────────────────────────────────────────
 const SEEDS = 250;
-function sweepSquash(merge: MergeFn): { violations: string[]; dirtySeeds: number } {
+// sweepSquash runs the SAME 250 generated cases through `merge` in ONE mode.
+// admit=false is the DEFAULT boundary (the messages.batch caller's shape);
+// admit=true is the ADMITTED boundary (the page/snapshot callers' shape —
+// missing parts of keyed non-completed residents install).
+function sweepSquash(merge: MergeFn, admit: boolean): { violations: string[]; dirtySeeds: number } {
   const all = new Set<string>();
   let dirty = 0;
   for (let seed = 1; seed <= SEEDS; seed++) {
     const c = genCase(mulberry32(seed));
     const draft = structuredClone(c.before);
-    merge(draft, c.items);
+    merge(draft, c.items, admit);
     const v = checkMergeSafety(c.before, c.items, draft);
     if (v.length) dirty++;
     for (const x of v) all.add(x.replace(/m\d+|p\d+|→ -?\d+|\d+/g, "#").split(" ").slice(0, 4).join(" "));
@@ -419,19 +439,29 @@ function sweepSquash(merge: MergeFn): { violations: string[]; dirtySeeds: number
 }
 
 describe("store-merge property suite — the ADMITTED reducer (stage-2 missing-parts admission, card task-2026-11-07t15-45-23) is merge-safe; stage-1 card task-2026-11-07t15-07-21-store-merge-verify-first", () => {
-  it("(a)+(b)+(c)+(d): the real prependMessagesIfAbsent satisfies all four clauses on every seed", () => {
+  it("(a)+(b)+(c)+(d): the real prependMessagesIfAbsent satisfies all four clauses on every seed — DEFAULT mode (admitMissing=false)", () => {
     // KILL CRITERION guard: if this fails, a clause discovered a defect in the
-    // ADMITTED reducer — STOP and report (routes to a new card; do not fix
-    // here, and never weaken a clause to land).
-    const { violations, dirtySeeds } = sweepSquash(prependMessagesIfAbsent);
+    // reducer — STOP and report (routes to a new card; do not fix here, and
+    // never weaken a clause to land).
+    const { violations, dirtySeeds } = sweepSquash(prependMessagesIfAbsent, false);
     expect(dirtySeeds).toBe(0);
     expect(violations).toEqual([]);
   });
 
-  describe("mutant demonstrations — each clause's mutant trips it (attribution)", () => {
+  it("(a)+(b)+(c)+(d): the real prependMessagesIfAbsent satisfies all four clauses on every seed — ADMITTED mode (admitMissing=true; the A2 claim-gate sweep)", () => {
+    // Same kill criterion as the default-mode sweep: the admitted path (the
+    // mode the page and snapshot callers pass) must hold every clause too.
+    const { violations, dirtySeeds } = sweepSquash(prependMessagesIfAbsent, true);
+    expect(dirtySeeds).toBe(0);
+    expect(violations).toEqual([]);
+  });
+
+  describe("mutant demonstrations — each clause's mutant trips it in BOTH modes (attribution)", () => {
     // clause → mutant shape → the property that trips (the closeout table's
     // source of truth; each mutant must be DETECTED (≥1 dirty seed) and must
-    // trip its INTENDED clause id).
+    // trip its INTENDED clause id — under admitMissing=false AND =true: the
+    // admitted-mode leg proves the clauses police the admission boundary
+    // itself, not just the default one).
     const table: Array<{ clause: string; mutant: MergeFn; name: string }> = [
       { clause: "(a)", mutant: mutAbsenceDeletes, name: "MUT-A absence-deletes (incoming parts treated as authoritative set)" },
       { clause: "(b)", mutant: mutStaleClobbersLive, name: "MUT-B stale-clobbers-live (keyed-skip guard removed)" },
@@ -440,11 +470,13 @@ describe("store-merge property suite — the ADMITTED reducer (stage-2 missing-p
       { clause: "(d)", mutant: mutSkipResort, name: "MUT-D2 skip re-sort (order left unsorted after insert)" },
     ];
     for (const row of table) {
-      it(`${row.name} trips ${row.clause}`, () => {
-        const { violations, dirtySeeds } = sweepSquash(row.mutant);
-        expect(dirtySeeds).toBeGreaterThan(0);
-        expect(violations.some((x) => x.startsWith(row.clause))).toBe(true);
-      });
+      for (const admit of [false, true] as const) {
+        it(`${row.name} trips ${row.clause} (admitMissing=${admit})`, () => {
+          const { violations, dirtySeeds } = sweepSquash(row.mutant, admit);
+          expect(dirtySeeds).toBeGreaterThan(0);
+          expect(violations.some((x) => x.startsWith(row.clause))).toBe(true);
+        });
+      }
     }
   });
 });

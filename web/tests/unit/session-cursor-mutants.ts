@@ -962,18 +962,21 @@ export function closeSessionStream() {
 // reconciliation.
 export function applySessionSnapshot(id: string, snap: Snapshot) {
   const items = (snap.messages?.[id] as any[]) || [];
-  // MERGE-IF-ABSENT (live always wins): a Stream-2 snapshot is a point-in-time
+  // MERGE + ADMIT (live always wins): a Stream-2 snapshot is a point-in-time
   // read; a live tail that landed via message.upsert/part.upsert (or a fresher
   // prior snapshot) must NOT be clobbered when a STALE reconnect/reconcile
   // snapshot arrives afterward. The decode-window serialization at the listener
   // (sesSnapshotDecoding, stream.ts:~2186) protects live events landing DURING
   // the gzip64 decode; THIS guard closes the residual gap — live data ALREADY in
   // the store when a stale snapshot lands. Reuses prependMessagesIfAbsent (the
-  // Phase-4 historical-page idiom): insert snapshot items that are ABSENT; an
-  // existing byId entry is left untouched (live always wins) EXCEPT the
-  // upgrade-on-completed path (reduce.ts:123-136), which replaces the resident
-  // info when the incoming copy is completed (terminal/immutable — safe against
-  // live). Cold/warm first hydrate is unaffected —
+  // Phase-4 historical-page idiom): insert snapshot items that are ABSENT and
+  // (admitMissing=true, below) ADMIT a keyed non-completed resident's MISSING
+  // parts — while an existing part's body and a keyed resident's info are
+  // never overwritten (live always wins) EXCEPT the upgrade-on-completed path
+  // (reduce.ts — the completed branch of prependMessagesIfAbsent), which
+  // replaces the resident info when the incoming copy is completed
+  // (terminal/immutable — safe against live). Cold/warm first hydrate is
+  // unaffected —
   // messages[id] is empty so every item is absent (equivalent to the old
   // buildMessages wholesale-replace). A seq/revision guard was considered but
   // rejected: the store tracks no per-session last-applied seq (only the shared
@@ -1432,11 +1435,11 @@ function openSessionES(id: string, reason: StreamOpenReason = "other", detail?: 
         // remembered-cursor charter's "applied" means "applySnap ran the
         // snapshot through the store's established merge policy" —
         // prependMessagesIfAbsent — NOT "every byte the snapshot carried is
-// now resident". Since stage 2 that policy INSTALLS a keyed
-         // non-completed resident's MISSING parts (admission-safety contract
-         // at reduce.ts; the snapshot and page callers are fresh-capture-or-
-         // delete-replaying by construction — the messages.batch caller is
-         // EXCLUDED from admission, d-F1), so the repair predicate got STRICTLY
+        // now resident". Since stage 2 that policy INSTALLS a keyed
+        // non-completed resident's MISSING parts (admission-safety contract
+        // at reduce.ts; the snapshot caller is fresh-capture + serialized
+        // decode and the page caller is dirty-gated — the messages.batch
+        // caller is EXCLUDED from admission, d-F1), so the repair predicate got STRICTLY
         // STRONGER: for the missing-part class the receipt-time floor-raise
         // now covers content that IS resident — the merge itself landed the
         // repair. The boundary that remains is BODY-level: a stale snapshot
@@ -2106,12 +2109,18 @@ function registerSessionMessageListeners(es: EventSource, gen: number, id: strin
       // mutation is stale.
       //
       // NARROW FILTER: the filter deliberately EXCLUDES message.upsert and
-      // part.upsert. The merge is insert-if-not-present (live always wins),
-      // so a live upsert CANNOT make a stale page resurrect anything:
+      // part.upsert. The page merge never overwrites live content, and its
+      // admission leg (admitMissing=true since stage 2) only installs parts
+      // the page itself carried — an upsert is not a delete, so it cannot
+      // invalidate the page's captured parts — so a live upsert CANNOT make a
+      // stale page resurrect anything:
       //   - upsert for a NEW tail message: newer than the `before` cursor →
       //     NOT in the page range.
-      //   - upsert for an EXISTING message / part: prependMessagesIfAbsent
-      //     and upsertPart both leave the live entry untouched.
+      //   - upsert for an EXISTING message / part: upsertPart assigns into
+      //     the live part (live body wins), and prependMessagesIfAbsent
+      //     never overwrites a PRESENT part or a keyed resident's info —
+      //     admission fills only parts still MISSING, all sourced from the
+      //     page capture.
       // Excluding upserts is what keeps Load-older usable on actively-
       // streaming sessions (a part.upsert flood per streamed token would
       // otherwise exhaust MAX_PAGE_RETRIES and abandon with no merge).

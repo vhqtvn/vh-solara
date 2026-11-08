@@ -856,6 +856,11 @@ describe("Queue-row vocabulary (Composer surface) — 'Queued' never implies del
     // …timing is scoped to PENDING items and states both policies honestly…
     expect(tip).toContain("pending items");
     expect(tip).toContain("whole tree");
+    // …the per-policy timing clause is pinned VERBATIM (A10,
+    // task-2026-11-08t04-02-22-armed-ledger-discharge): the queue-row tip
+    // states the Send-now policy dispatches IMMEDIATELY (the clause at
+    // Composer.tsx's queue-row data-tip — previously unpinned).
+    expect(tip).toContain("Send now: immediately");
     // …and the transcript-receipt clause stays VERBATIM (card B).
     expect(tip).toContain("delivered only once it appears in the transcript");
     r.unmount();

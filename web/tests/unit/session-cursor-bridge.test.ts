@@ -696,10 +696,15 @@ function registerProducer(
             //   part-level installation inside already-resident messages.
             //
             //   WIRE-DEFERRED class — newly is empty (a snapshot whose every
-            //   id is already resident — C3 — or a messageless snapshot): NO
-            //   store-content witness exists (the apply's only observable
-            //   delta is the module's own cursor memory), so the obligation
-            //   defers to the WIRE: observe = the next reconnect's URL
+            //   id is already resident — C3 — or a messageless snapshot): no
+            //   MESSAGE-id witness exists (every id resident at
+            //   registration). Since stage-2 admission a PART-level witness
+            //   could in principle exist (the apply may install missing
+            //   parts of keyed non-completed residents), but this oracle
+            //   deliberately does not depend on part-level installation (the
+            //   content-class note above — the SOME form stays sound
+            //   precisely because it ignores it), so the obligation defers
+            //   to the WIRE: observe = the next reconnect's URL
             //   claims seq as its resume point WITH THE OBLIGATION'S OWN
             //   EPOCH DECLARED (OB5 scoping — a foreign-epoch URL never
             //   satisfies it). DOCUMENTED APPROXIMATION: a matching-epoch
@@ -1315,8 +1320,11 @@ describe("chain K2 — epoch-CHANGE crux: dead pairing → epoch_mismatch fresh 
     // B-exclusive ids; the floor map holds BOTH lifetimes; epoch A's
     // withheld append@7 takes the EXPLICIT terminal disposition "expired"
     // (recorded, not open, and NOT discharged — B's bytes provably omit its
-    // content: p1.text is still "" — the m1 body is a protected resident
-    // and the snapshot's repair is merge-skipped).
+    // content: p1.text is still "". Mechanism, post-stage-2 wording: the
+    // merge does NOT skip m1 — its admission leg RUNS, but p1 is PRESENT
+    // in the resident (an empty body is still a body) and live-wins keeps
+    // the present body: admission fills only MISSING parts, never
+    // overwrites a present one).
     expect(c.byId("n1")).toBeTruthy();
     expect(c.byId("n2")).toBeTruthy();
     expect(c.byId("n3")).toBeTruthy();
