@@ -58,13 +58,14 @@ import { projectUrl, settledTopLineNumber } from "./util";
 // PathSelectionAction, code-view folder ctxm) was closed by surfaces 5-10.
 //
 // Engines: spec-compliant CSS zoom needs Chromium ≥ 128 (lane bundles
-// playwright-core 1.64.1 → Chrome for Testing 156.0.8078.4, see
+// playwright-core 1.65.0 → Chrome for Testing 158.0.8127.18, see
 // node_modules/playwright-core/browsers.json) or Firefox ≥ 126. The lane runs
-// this file on the `chromium` project only — the `firefox` project is
-// testMatch-scoped to codeview.spec.ts (playwright.config.ts) — so no engine
-// restriction is silently added here. WebKit is skipped defensively in case
-// the project matrix is ever widened: it does not implement the standardized
-// zoom model.
+// this file in full on the `chromium` project only; the firefox projects are
+// testMatch-scoped (playwright.config.ts) — `firefox` to codeview.spec.ts,
+// `firefox-zoom` to exactly ONE test of this file (the wheel-parity proof) —
+// so no engine restriction is silently added here. WebKit is skipped
+// defensively in case the project matrix is ever widened: it does not
+// implement the standardized zoom model.
 const UI_KEY = "vh.prefs.uiScale.v1";
 const TOL = 2; // px — honest bound for gBCR subpixel rounding under zoom
 
