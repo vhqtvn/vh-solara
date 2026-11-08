@@ -85,14 +85,15 @@ receipts, not raw stderr, anywhere a URL could be parsed.
 
 ## Standing adoption-gate observables
 
+F-D3 (first real-network-remote push): OBSERVED and retired — three
+real-remote pushes through the wrapper, all clean on the first attempt.
+Receipts: `docs/ai/push-safety.md` → "Adoption-gate observables".
+
 Encode these as observables, not blockers:
 
-1. First REAL-network-remote push through the wrapper not yet observed
-   (F-D3 — fixture evidence is `file://` only). Before general adoption,
-   one real-remote push must be observed and its receipt recorded.
-2. The first docs-only push validates the Phase-4 CI path filters live
+1. The first docs-only push validates the Phase-4 CI path filters live
    (expect filtered lane skips + `ci-summary` green).
-3. `make prepush-selftest` is due at the next wrapper/checker touch
+2. `make prepush-selftest` is due at the next wrapper/checker touch
    (durable self-test; run it whenever `scripts/push-checked.sh` or
    `scripts/prepush-check.sh` changes).
 
