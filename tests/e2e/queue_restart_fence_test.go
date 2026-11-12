@@ -200,18 +200,25 @@ func TestQueueRestartFence_IdleRestartUnfenced(t *testing.T) {
 	itemID, _ := enqueueAndClaim(t, sid, dir, "no restart here")
 	time.Sleep(fastThreshold + 300*time.Millisecond)
 
-	items, ok := pollQueue(t, sid, dir, 5*time.Second, func(items []queueItemView) (bool, string) {
-		return len(items) == 1 && items[0].State == "unknown", "recovered"
-	})
-	if !ok {
-		t.Fatalf("ordinary abandoned dispatch did not recover: %+v", items)
+	// Converge on the recovered-but-NOT-terminal snapshot with the RAW list
+	// (it also decodes RestartFenceAt) and assert on that ONE consistent
+	// snapshot: a non-terminal unknown item's detail is exactly the recovery
+	// text set at recovery time, so asserting the snapshot that satisfied
+	// the predicate cannot race a later reconcile bump.
+	var raw []fencedItemView
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		raw = listFencedRaw(t, sid, dir)
+		if len(raw) == 1 && raw[0].ID == itemID && raw[0].State == "unknown" && !raw[0].ReconcileTerminal {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ordinary abandoned dispatch did not recover: %+v", raw)
+		}
+		time.Sleep(40 * time.Millisecond)
 	}
 	// The item must NOT carry a fence marker (restart happened while idle),
 	// and the recovery detail is the GENERIC text.
-	raw := listFencedRaw(t, sid, dir)
-	if len(raw) != 1 || raw[0].ID != itemID {
-		t.Fatalf("raw list drift: %+v want [%s]", raw, itemID)
-	}
 	if raw[0].RestartFenceAt != 0 {
 		t.Fatalf("idle-restart test item was fenced (restartFenceAt=%d) — fence must only touch in-flight dispatches", raw[0].RestartFenceAt)
 	}
@@ -221,4 +228,34 @@ func TestQueueRestartFence_IdleRestartUnfenced(t *testing.T) {
 
 	t.Logf("no-regression control verified: idle restart fenced nothing; later abandoned dispatch %s "+
 		"kept the generic recovery text: %q", itemID, raw[0].Detail)
+
+	// JOIN the reconcile budget before returning. The polls above leave the
+	// item a live reconcile candidate (unknown + correlation id + not
+	// terminal), and every queue List — including this test's own final
+	// reads — spawns a background reconcile pass whose bump→save() writes
+	// <dir>/.vh-solara/sessions/<sid>/queue.json (plus the best-effort
+	// .vh-solara/.gitignore). The shared cluster's web server is only shut
+	// down at package end, so a pass still in flight at body-exit races
+	// t.TempDir's RemoveAll — observed 2× in CI (2026-11-04 run 41937231960,
+	// 2026-11-05 run 41950859698) and reproduced locally under CPU load as
+	// "TempDir RemoveAll cleanup: unlinkat .../sessions/proj_qfence-idle
+	// (or .vh-solara): directory not empty", with the leftover file being
+	// queue.json at reconcileAttempts=1. Observing ReconcileTerminal via a
+	// List happens-after the terminalizing save (both run under the store
+	// mutex), and a terminal item is no longer a candidate so no further
+	// passes spawn — the store is quiescent for this dir when this wait
+	// succeeds. The terminal texts must ALSO be the generic variant (the
+	// file-header promise: "keeps the GENERIC recovery/terminal texts").
+	terminal, ok := pollQueue(t, sid, dir, 5*time.Second, func(items []queueItemView) (bool, string) {
+		return len(items) == 1 && items[0].ReconcileTerminal, "terminal"
+	})
+	if !ok {
+		t.Fatalf("unfenced abandoned dispatch never reached ReconcileTerminal; last=%+v", terminal)
+	}
+	if terminal[0].State != "unknown" || terminal[0].ReconcileAttempts != 3 {
+		t.Fatalf("terminal shape = state %q attempts %d, want unknown/3 (the idle-restart control must not weaken the fail-closed 3×404 budget)", terminal[0].State, terminal[0].ReconcileAttempts)
+	}
+	if strings.Contains(terminal[0].Detail, "restart") {
+		t.Fatalf("terminal detail = %q — the idle-restart control must keep the GENERIC terminal text (no restart mention)", terminal[0].Detail)
+	}
 }
