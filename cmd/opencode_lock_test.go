@@ -369,7 +369,7 @@ func (sc *ocLockScenario) alivePids(suffix string) []int {
 // leave a recorded pid that is no longer the recorded process, both
 // state-only "running":
 //
-//   - MID-EXIT window (the 2026-11-02 CI racehammer flake, "cleanup left 1
+//   - MID-EXIT window (the 2026-09-27 CI racehammer flake, "cleanup left 1
 //     children" + the sweep's revalidation failure for the same pid): a
 //     SIGKILLed fake releases its flock the moment exit_files() runs — so
 //     waitOwnerFree returns — but the task's /proc state only becomes 'Z'
@@ -753,68 +753,8 @@ func TestOCSpawnGrandchildRetainsOwner(t *testing.T) {
 func TestOCSpawnRacehammer(t *testing.T) {
 	sc := newOCLockScenario(t)
 	const reps = 10
-	// Rep-boundary retries (2026-11-05 gate-run red on tree 1037e38): a
-	// fresh starter transiently observed the owner lock HELD — verdict
-	// orphaned-owner, its /proc fd scan finding NO holders — after the
-	// previous rep's teardown had passed EVERY test-side probe
-	// (waitOwnerFree + identity-matched zero count). The holder is
-	// invisible to the test process (kernel-deferred file release of the
-	// dying fake's fd 3, or an equally transient flocker), so no
-	// test-side wait can close the window — the 2026-09-27/2026-11-02
-	// fixes closed the state/cmdline shapes, not this flock-visibility
-	// shape. The starter's refusal is CORRECT conservative product
-	// behavior (never spawn beside maybe-live work) and must be
-	// accommodated by the test, not the product: retry the rep, bounded,
-	// when a fresh starter reports orphaned-owner with no fake spawned.
-	// Any other verdict (or persistence past the bound) still fails with
-	// the report retained — the evidence path survives. contended from a
-	// deferred SPAWN-lock release is the mechanically analogous sibling
-	// shape; it is unobserved to date and stays a hard fail.
-	const repAttempts = 3
 	for i := 0; i < reps; i++ {
-		var (
-			a     *exec.Cmd
-			fakes []int
-		)
-		for try := 1; ; try++ {
-			name := fmt.Sprintf("A%d.%d", i, try)
-			a = sc.startStarter(name, map[string]string{"VH_FAKE_OC_NOLISTEN": "1"}, false)
-			// A green attempt NEVER produces the starter's report (the
-			// starter blocks in readiness until we crash it); its
-			// existence — or the starter dying — while no fake is up is
-			// failure evidence worth surfacing immediately instead of
-			// burning the 10s budget blind. Accounting is
-			// identity-matched (aliveMatchingPids): a stale pid from a
-			// previous rep — mid-exit (cmdline gone, state not yet Z) or
-			// recycled into a foreign process — must never satisfy this
-			// wait, count as a child, or survive the cleanup check.
-			deadline := time.Now().Add(10 * time.Second)
-			for {
-				fakes = sc.aliveMatchingPids(".fake")
-				if len(fakes) == 1 {
-					break
-				}
-				if b, err := os.ReadFile(sc.resultPath(name)); err == nil {
-					var rep ocStarterReport
-					if json.Unmarshal(b, &rep) == nil && rep.Verdict == "orphaned-owner" && try < repAttempts {
-						t.Logf("rep %d try %d: transient orphaned-owner at the rep boundary (previous rep's dying fake still holds lock visibility); retrying — report: %s", i, try, b)
-						time.Sleep(100 * time.Millisecond)
-						break // next try
-					}
-					t.Fatalf("rep %d try %d: starter ended without a live fake; report: %s", i, try, b)
-				}
-				if !ocProcessRunning(a.Process.Pid) {
-					t.Fatalf("rep %d try %d: starter died before spawning a fake (no report)", i, try)
-				}
-				if time.Now().After(deadline) {
-					t.Fatalf("rep %d try %d: wanted 1 alive %q processes, got %d (%v)", i, try, ".fake", len(fakes), fakes)
-				}
-				time.Sleep(20 * time.Millisecond)
-			}
-			if len(fakes) == 1 {
-				break // attempt succeeded: fake is up
-			}
-		}
+		a, fakes := sc.starterUntilFake(i, nil)
 		_ = a.Process.Kill() // crash mid-window
 		_ = a.Wait()
 		b := EnsureDetachedOpenCode(sc.bin, sc.dir)
@@ -830,6 +770,154 @@ func TestOCSpawnRacehammer(t *testing.T) {
 			t.Fatalf("rep %d: cleanup left %d children", i, got)
 		}
 	}
+}
+
+// starterUntilFake runs ONE racehammer rep's bounded starter attempts: each
+// attempt starts a fresh starter (named "A<rep>.<try>") and waits for exactly
+// one live, identity-matching fake. A green attempt returns with the starter
+// still running — blocked in its readiness window, exactly where the hammer
+// crashes it. beforeEachAttempt (nil for the hammer itself) runs immediately
+// before each starter launch so a regression test can inject per-attempt
+// environmental variation (e.g. a transiently un-executable fake bin).
+//
+// Rep-boundary retries (2026-11-05 gate-run red on tree 1037e38): a
+// fresh starter transiently observed the owner lock HELD — verdict
+// orphaned-owner, its /proc fd scan finding NO holders — after the
+// previous rep's teardown had passed EVERY test-side probe
+// (waitOwnerFree + identity-matched zero count). The holder is
+// invisible to the test process (kernel-deferred file release of the
+// dying fake's fd 3, or an equally transient flocker), so no
+// test-side wait can close the window — the 2026-09-27/2026-11-02
+// fixes closed the state/cmdline shapes, not this flock-visibility
+// shape. The starter's refusal is CORRECT conservative product
+// behavior (never spawn beside maybe-live work) and must be
+// accommodated by the test, not the product: retry the rep, bounded,
+// when a fresh starter reports orphaned-owner with no fake spawned.
+// contended from a deferred SPAWN-lock release is the mechanically
+// analogous sibling shape; it is unobserved to date and stays a hard
+// fail. Any other verdict (or persistence past the bound) still fails
+// with the report retained — the evidence path survives.
+//
+// Attempt-boundary env-failure retries (2026-11-02 CI red on tree f770c85,
+// run 41394753860: `wanted 1 alive ".fake" processes, got 0`): the failing
+// rep was rep 0 — the 10.34s test duration is the 10s wait plus setup, which
+// leaves no room for even ONE completed rep (a completed rep pays two
+// test-binary re-execs plus B's full /proc holder scan), so the rep-boundary
+// shape above cannot explain that receipt. What remains at rep 0 is a
+// starter that ended WITHOUT spawning a fake — and that very run's log shows
+// the runner live-failing execs for a sibling cmd test (`fork/exec
+// …/bin/opencode: no such file or directory`). Every early transaction
+// failure (lock open, fork/exec) makes the REAL product code report verdict
+// failed and exit conservatively with NO child spawned. That is correct
+// product behavior with nothing left running, so the hammer retries it
+// bounded — the same budget as the orphaned-owner shape. A failed verdict is
+// retry-eligible ONLY on a clean slate (no identity-matching fake alive AND
+// the owner lock observably free): a readiness-timeout failure can leave an
+// un-recorded child holding the owner lock, and spawning beside maybe-live
+// work must stay a hard fail.
+func (sc *ocLockScenario) starterUntilFake(rep int, beforeEachAttempt func(try int)) (*exec.Cmd, []int) {
+	sc.t.Helper()
+	const repAttempts = 3
+	for try := 1; ; try++ {
+		if beforeEachAttempt != nil {
+			beforeEachAttempt(try)
+		}
+		name := fmt.Sprintf("A%d.%d", rep, try)
+		a := sc.startStarter(name, map[string]string{"VH_FAKE_OC_NOLISTEN": "1"}, false)
+		// A green attempt NEVER produces the starter's report (the
+		// starter blocks in readiness until we crash it); its
+		// existence — or the starter dying — while no fake is up is
+		// failure evidence worth surfacing immediately instead of
+		// burning the 10s budget blind. Accounting is
+		// identity-matched (aliveMatchingPids): a stale pid from a
+		// previous rep — mid-exit (cmdline gone, state not yet Z) or
+		// recycled into a foreign process — must never satisfy this
+		// wait, count as a child, or survive the cleanup check.
+		deadline := time.Now().Add(10 * time.Second)
+		var fakes []int
+		for {
+			fakes = sc.aliveMatchingPids(".fake")
+			if len(fakes) == 1 {
+				break
+			}
+			if b, err := os.ReadFile(sc.resultPath(name)); err == nil {
+				var sr ocStarterReport
+				if json.Unmarshal(b, &sr) == nil {
+					if try < repAttempts && len(fakes) == 0 {
+						why := ""
+						switch sr.Verdict {
+						case "orphaned-owner":
+							why = "previous attempt's dying holder still holds lock visibility"
+						case "failed":
+							// Clean slate only: no fake alive, owner lock free —
+							// the transaction provably left nothing running. A
+							// live holder (a readiness-timeout child) keeps this
+							// a hard fail below.
+							if ocOwnerLockHeldByOthers() {
+								break
+							}
+							why = "environmental spawn failure; nothing left running"
+						}
+						if why != "" {
+							sc.t.Logf("rep %d try %d: transient %s at the attempt boundary (%s); retrying — report: %s", rep, try, sr.Verdict, why, b)
+							time.Sleep(100 * time.Millisecond)
+							break // next try
+						}
+					}
+					sc.t.Fatalf("rep %d try %d: starter ended without a live fake; report: %s", rep, try, b)
+				}
+				// Unparseable body: the starter's os.WriteFile is not
+				// atomic — this poll caught the truncate→write window
+				// (observed live as an empty body under -count=30). Keep
+				// polling; the deadline and starter-death fatals below
+				// still bound the wait loudly. waitReport has always
+				// tolerated this window ("bad json"); this poll now has
+				// parity.
+			}
+			if !ocProcessRunning(a.Process.Pid) {
+				sc.t.Fatalf("rep %d try %d: starter died before spawning a fake (no report)", rep, try)
+			}
+			if time.Now().After(deadline) {
+				sc.t.Fatalf("rep %d try %d: wanted 1 alive %q processes, got %d (%v)", rep, try, ".fake", len(fakes), fakes)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if len(fakes) == 1 {
+			return a, fakes // attempt succeeded: fake is up
+		}
+	}
+}
+
+// TestOCSpawnRetriesEnvFailedSpawn — deterministic regression for the
+// 2026-11-02 CI failure of TestOCSpawnRacehammer (run 41394753860,
+// `wanted 1 alive ".fake" processes, got 0`; duration arithmetic pins the
+// failing rep to rep 0, where the rep-boundary orphaned-owner window cannot
+// exist). The injected shape is the receipt's leading hypothesis made
+// deterministic: attempt 1's fake `opencode` wrapper is un-executable, so the
+// REAL transaction's startChildWithOwner fails (fork/exec EACCES — the same
+// cmd.Start error class the 11-02 runner exhibited live for a sibling test)
+// and the starter honestly reports verdict failed with NO child spawned and
+// the owner lock free. The hammer must retry that bounded (attempt 2 spawns
+// against the repaired bin) instead of blind-failing the suite; a persistent
+// failure still exhausts the bound and fails with the report retained.
+func TestOCSpawnRetriesEnvFailedSpawn(t *testing.T) {
+	sc := newOCLockScenario(t)
+	if err := os.Chmod(sc.bin, 0o644); err != nil { // attempt 1: un-executable
+		t.Fatal(err)
+	}
+	repair := func(try int) {
+		if try >= 2 {
+			if err := os.Chmod(sc.bin, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	a, fakes := sc.starterUntilFake(0, repair)
+	if len(fakes) != 1 {
+		t.Fatalf("wanted 1 alive .fake after the bounded retry, got %v", fakes)
+	}
+	_ = a.Process.Kill()
+	_ = a.Wait()
 }
 
 // TestOCLeftoverCountsIgnoreUnreapedZombies — regression for the 2026-09-27
