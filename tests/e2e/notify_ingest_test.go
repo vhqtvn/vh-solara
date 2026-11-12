@@ -160,6 +160,16 @@ func TestNotifyIngestEndToEndOverRealTunnel(t *testing.T) {
 	waitLedger(t, c, "worker ACK 5", func() bool {
 		return c.AlertsEngine.Source().AckedSeq() == 5
 	})
+	// The ledger records the acceptance strictly AFTER the worker's ack
+	// POST returns (pullOnce: PostNotifyAck → RecordAck) and retries the
+	// recording on later ticks while HighSeq > AckedSeq. Waiting on the
+	// WORKER-side watermark alone races that continuation (CI flakes
+	// 2026-11-03 + 2026-11-12: cursor=5 acked=0/4 read in the window) —
+	// converge on the LEDGER-side watermark before asserting it.
+	waitLedger(t, c, "ledger ACK 5", func() bool {
+		_, _, acked, ok := c.Daemon.NotifySourceCursor(c.WorkerID)
+		return ok && acked == 5
+	})
 	if _, cursor, acked, ok := c.Daemon.NotifySourceCursor(c.WorkerID); !ok || cursor != 5 || acked != 5 {
 		t.Fatalf("ledger cursor/ack: cursor=%d acked=%d ok=%v", cursor, acked, ok)
 	}
@@ -329,6 +339,13 @@ func TestNotifyIngestControllerRestartResumesFromCommittedCursor(t *testing.T) {
 	waitLedger(t, c, "resume to 7 events", func() bool { return c.Daemon.NotifyLedgerHead() == 7 })
 	assertMergedStream(t, c, en.Epoch, 7)
 	waitLedger(t, c, "worker ACK 7", func() bool { return c.AlertsEngine.Source().AckedSeq() == 7 })
+	// Same ledger-side convergence as test 1: the ledger's acked watermark
+	// trails the worker's acceptance by one ack POST → RecordAck
+	// continuation (retried per tick) — wait it out before asserting.
+	waitLedger(t, c, "ledger ACK 7", func() bool {
+		_, _, acked, ok := c.Daemon.NotifySourceCursor(c.WorkerID)
+		return ok && acked == 7
+	})
 	if _, cursor, acked, ok := c.Daemon.NotifySourceCursor(c.WorkerID); !ok || cursor != 7 || acked != 7 {
 		t.Fatalf("post-restart cursor/ack: cursor=%d acked=%d ok=%v", cursor, acked, ok)
 	}
