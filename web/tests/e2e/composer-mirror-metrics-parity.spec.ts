@@ -62,8 +62,13 @@ test("composer textarea and mirror share font metrics at desktop AND mobile (emp
 
   // --- Mobile (≤720px trips the media query; composer stays mounted) ---
   await page.setViewportSize({ width: 390, height: 844 });
-  // Brief settle for any resize-driven effect (autosize, viewport var).
-  await page.waitForTimeout(80);
+  // Deterministic settle for the resize-driven media-query re-evaluation:
+  // poll until the textarea observably reports the iOS-safe 16px mobile
+  // font-size (the visible effect of the ≤720px rules having applied) —
+  // no fixed sleep that can flake on slow CI resize dispatch.
+  await expect
+    .poll(async () => (await metrics(page)).taFs, { timeout: 5_000 })
+    .toBe("16px");
   const m = await metrics(page);
   expect(m.taFs, `mobile font-size must match (ta=${m.taFs} mi=${m.miFs})`).toBe(m.miFs);
   expect(m.taLh, `mobile line-height must match (ta=${m.taLh} mi=${m.miLh})`).toBe(m.miLh);
