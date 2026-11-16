@@ -659,6 +659,187 @@ func TestMPWorkloadSlowSubscriberBackpressure(t *testing.T) {
 	}
 }
 
+// TestMPWorkloadCancelDuringGraceRetry (deep-study card #2 cell a, debt W3a)
+// pins the OBSERVED cancel-during-grace-retry outcome of emitBackpressure
+// (pkg/fixtures/opencode.go — the authoritative owner of backpressure
+// semantics; this cell deliberately asserts outcomes only, never timing
+// internals, so backpressure PARAMETER increases — a longer grace, a deeper
+// subscriber buffer — pass green by design: the wedge detection below
+// freezes wherever the buffer pegs, not at a hardcoded count). A
+// never-draining subscriber fills its bounded buffer, so the NEXT delta
+// enters the grace retry loop — and a stop posted MID-GRACE must take the
+// cancel arm (the `case <-cancel: return false` at opencode.go:2865-2867,
+// unreachable in every pre-W3a test: the stop tests ran subscriber-less and
+// TestMPWorkloadOverflowAccounting exercises only grace EXHAUSTION).
+//
+// Capacity-agnostic wedge detection: at 1ms cadence an unblocked pump adds
+// ~50 events per 50ms, so `emitted` frozen across two consecutive 50ms
+// gaps while state stays running means the pump is parked in a grace retry
+// behind the wedge. The run's total event budget (2 bookends + 200 deltas)
+// must simply exceed the buffer capacity for the wedge to onset at all —
+// with today's 64 slots it pegs at delta #62; a deeper buffer just pegs
+// later.
+//
+// Outcome assertions: state=cancelled; dropped_run=0 (cancel NEVER counts a
+// drop — only grace exhaustion does); emitted frozen at the observed
+// plateau; the drained sibling's tally is emitted+bookends+1 — the canceled
+// in-flight delta WAS delivered to it in round 0 before the wedge entered
+// grace, but is never counted emitted (the +1 boundary the adversarial
+// review called out; blanket equality here would be wrong by construction).
+func TestMPWorkloadCancelDuringGraceRetry(t *testing.T) {
+	f := New()
+	f.SeedMultiProject(MultiProjectSpec{Projects: 1, SessionsPerProj: 1, BulkSessions: 0, TurnsPerSession: 1, SmallPartBytes: 64, BulkPartBytes: 64})
+	srv := startFixtureHTTP(t, f)
+
+	// The wedge: subscribed, never drained. The sibling: fully drained by a
+	// plain range goroutine (never full → every round-0 send succeeds).
+	wedge, unwedge := f.subscribe()
+	defer unwedge()
+	_ = wedge
+	sibling, unsib := f.subscribe()
+	defer unsib()
+	received := make(chan int, 1)
+	go func() {
+		n := 0
+		for range sibling {
+			n++
+		}
+		received <- n
+	}()
+
+	// Events:200 at 1ms cadence leaves a long delta tail queued behind the
+	// wedge, so the run can never finish inside the grace window we stop
+	// within.
+	start := mpWLStart(t, srv, MPWorkloadSpec{Projects: 1, Events: 200, ChunkBytes: 64, BulkProject: -1, CadenceMs: 1})
+	mpWLPost(t, srv, "release", start.RunID, http.StatusOK)
+
+	// Freeze detection: emitted identical across TWO consecutive 50ms gaps
+	// while the run stays running (mpWLStatus fatals loudly if the run ever
+	// completes instead — e.g. a buffer deeper than the 202-event budget,
+	// which would need this cell co-updated WITH its owner).
+	var plateau int64
+	prev := int64(-1)
+	gaps := 0
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		st := mpWLStatus(t, srv, start.RunID, "running", time.Second)
+		if st.Emitted > 0 && st.Emitted == prev {
+			gaps++
+		} else {
+			gaps = 0
+		}
+		prev = st.Emitted
+		if gaps >= 2 {
+			plateau = st.Emitted
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("run never wedged behind the stuck subscriber (emitted=%d) — premise drifted; co-update this cell WITH its owner (emitBackpressure, pkg/fixtures/opencode.go) in the same slice", prev)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Stop MID-GRACE: the cancel arm must unblock the emitter (retry rounds
+	// poll cancel every 2ms), so the stop's done-wait returns promptly and
+	// the run settles cancelled WITHOUT counting a drop.
+	stopped := mpWLPost(t, srv, "stop", start.RunID, http.StatusOK)
+	if stopped.State != "cancelled" {
+		t.Fatalf("stop-during-grace state=%s, want cancelled", stopped.State)
+	}
+	if stopped.DroppedRun != 0 {
+		t.Fatalf("stop-during-grace dropped_run=%d, want 0 (cancel must never count a drop; only grace exhaustion does)", stopped.DroppedRun)
+	}
+	if stopped.Emitted != plateau {
+		t.Fatalf("stop-during-grace emitted=%d, want frozen plateau %d", stopped.Emitted, plateau)
+	}
+	if stopped.Bookends != 2 {
+		t.Fatalf("stop-during-grace bookends=%d, want 2 (initial bookends only; the canceled run never reaches final bookends)", stopped.Bookends)
+	}
+
+	// Sibling tally: every counted event (62 deltas + 2 bookends) PLUS the
+	// canceled in-flight delta #63, delivered round-0 before the wedge
+	// entered grace but never counted emitted.
+	unsib()
+	select {
+	case n := <-received:
+		if want := int(stopped.Emitted + stopped.Bookends + 1); n != want {
+			t.Fatalf("sibling received %d events, want emitted+bookends+1=%d (round-0 delivery of the canceled in-flight delta)", n, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("sibling channel never closed")
+	}
+}
+
+// TestMPWorkloadDualSlowSubscriberBackpressure (deep-study card #2 cell b,
+// debt W3a) extends TestMPWorkloadSlowSubscriberBackpressure to TWO
+// concurrent rate-capped consumers: emitBackpressure
+// (pkg/fixtures/opencode.go — the authoritative owner of backpressure
+// semantics; outcome-only assertions here) must keep the sustained pump
+// lossless for EVERY subscriber that keeps making progress — the retry loop
+// serves slow consumers round-by-round without dropping or duplicating
+// (already-served ids never re-receive), and no grace window ever opens
+// because both consumers always progress. For a COMPLETED run the exact
+// per-subscriber equality tallies == emitted+bookends is sound (both
+// subscribers are drained to channel-close before counting).
+func TestMPWorkloadDualSlowSubscriberBackpressure(t *testing.T) {
+	f := New()
+	f.SeedMultiProject(MultiProjectSpec{Projects: 2, SessionsPerProj: 1, BulkSessions: 0, TurnsPerSession: 1, SmallPartBytes: 64, BulkPartBytes: 64})
+	srv := startFixtureHTTP(t, f)
+
+	// Two independent rate-capped consumers (the base test's goroutine,
+	// duplicated): ~500 ev/s each, alive and always progressing, well under
+	// the pump's 2000 ev/s.
+	type sub struct {
+		ch       <-chan string
+		un       func()
+		received chan int
+	}
+	subs := make([]sub, 2)
+	for i := range subs {
+		ch, un := f.subscribe()
+		subs[i] = sub{ch: ch, un: un, received: make(chan int, 1)}
+		go func(s *sub) {
+			n := 0
+			for {
+				select {
+				case _, ok := <-s.ch:
+					if !ok {
+						s.received <- n
+						return
+					}
+					n++
+					time.Sleep(2 * time.Millisecond)
+				default:
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
+		}(&subs[i])
+	}
+
+	start := mpWLStart(t, srv, MPWorkloadSpec{Projects: 2, Events: 150, ChunkBytes: 64, BulkProject: -1, CadenceMs: 1})
+	mpWLPost(t, srv, "release", start.RunID, http.StatusOK)
+	done := mpWLStatus(t, srv, start.RunID, "done", 15*time.Second)
+
+	if done.DroppedRun != 0 {
+		t.Fatalf("dual slow subscribers lost events: dropped_run=%d, want 0", done.DroppedRun)
+	}
+	if done.Emitted != 300 {
+		t.Fatalf("emitted=%d, want 300", done.Emitted)
+	}
+	want := int(done.Emitted + done.Bookends)
+	for i := range subs {
+		subs[i].un()
+		select {
+		case n := <-subs[i].received:
+			if n != want {
+				t.Fatalf("slow subscriber %d received %d events, want emitted+bookends=%d (lossless for every progressing consumer)", i, n, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("slow subscriber %d channel never closed", i)
+		}
+	}
+}
+
 func TestMPWorkloadStartValidationAndSeedIdempotence(t *testing.T) {
 	f := New()
 	srv := startFixtureHTTP(t, f)
