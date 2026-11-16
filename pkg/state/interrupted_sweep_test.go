@@ -2,7 +2,10 @@ package state
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+
+	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
 // seedOrphan seeds session sid with a user message + an UNCOMPLETED newest
@@ -749,5 +752,74 @@ func TestSweepZeroPartOrphanMessagesLoadedAfterTwoReconciles(t *testing.T) {
 	// Marker still sticky after both reconciles.
 	if c, te, _ := orphanState(t, s, sid, "zl1"); !c || te != InterruptedTurnErrorName {
 		t.Fatalf("reconcile 2 dropped the marker: completed=%v err=%q", c, te)
+	}
+}
+
+// TestSweepMarkTimeJournal (deep-study card #6, debt W3a): the mark is
+// OBSERVABLE in the journal — exactly ONE vhlog.Info line per marked row
+// carrying the session, mid, the row's per-part shape (type, status,
+// time.start), and the mark-time turn state. This is the one-grep recurrence
+// capture: before W3a the mark was silent and capturing a recurrence meant
+// manual state-diff archaeology. Log-only pin — the row's terminal shape and
+// the emit are already pinned by TestSweepMarksIdleOrphanOnClear; the
+// settle arm (settleRealErrorTerminalLocked) is deliberately NOT
+// instrumented (the study scopes the journal line to the synthesized
+// marker only).
+func TestSweepMarkTimeJournal(t *testing.T) {
+	// vhlog.SetOutput is process-wide — this test must stay free of
+	// t.Parallel (mirrors the journalBuf precedent in translate_test.go).
+	var jb journalBuf
+	prev := vhlog.SetOutput(&jb)
+	defer vhlog.SetOutput(prev)
+
+	s := New(100)
+	sid := "sess_sweep_journal"
+	// Seed the orphan covering the real part shapes the journal line must
+	// render (partOrder: tool, text, reasoning): a TOOL part in the
+	// production nested-state shape (state.status/state.time.start — the
+	// shape recomputeCurrentVerbLocked consumes, cf. the running-tool
+	// fixtures in store_test.go), a TEXT part in the top-level shape, and a
+	// REASONING part carrying NEITHER status NOR time (absent-field render).
+	s.Apply(ev("session.created", `{"info":{"id":"`+sid+`","title":"J"}}`))
+	s.Apply(ev("message.updated", `{"info":{"id":"ju1","sessionID":"`+sid+`","role":"user","time":{"created":10,"completed":11}}}`))
+	s.Apply(ev("message.updated", `{"info":{"id":"ja1","sessionID":"`+sid+`","role":"assistant","time":{"created":20}}}`))
+	s.Apply(ev("message.part.updated", `{"part":{"id":"jap1","sessionID":"`+sid+`","messageID":"ja1","type":"tool","tool":"read","state":{"status":"running","input":{"filePath":"src/parser.go"},"time":{"start":4000}}}}`))
+	s.Apply(ev("message.part.updated", `{"part":{"id":"jap2","sessionID":"`+sid+`","messageID":"ja1","type":"text","status":"streaming","time":{"start":40}}}`))
+	s.Apply(ev("message.part.updated", `{"part":{"id":"jap3","sessionID":"`+sid+`","messageID":"ja1","type":"reasoning","text":"half"}}`))
+
+	// Arm a deterministic mark-time turn state (running), then drive the
+	// sweep body directly under s.mu (the TestSweepDoesNotMarkBusyOrUnsettled
+	// direct-call precedent): running + uncompleted newest assistant IS the
+	// orphan shape, so the mark fires with turn_state=running.
+	s.Apply(ev("session.status", evStatus(sid, "busy")))
+	s.mu.RLock()
+	ts := s.turnState[sid]
+	s.mu.RUnlock()
+	if ts != TurnRunning {
+		t.Fatalf("seed: expected TurnRunning, got %v", ts)
+	}
+	jb.Reset()
+	s.mu.Lock()
+	s.sweepInterruptedTurnsLocked(sid)
+	s.mu.Unlock()
+
+	line := jb.String()
+	for _, want := range []string{
+		`msg="interrupted turn marked"`,
+		"session=" + sid,
+		"mid=ja1",
+		"turn_state=running",
+		// tool renders from the NESTED state block, text from top level,
+		// reasoning's absent status AND absent time.start render "?".
+		`parts="tool=running@4000 text=streaming@40 reasoning=?@?"`,
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("mark-time journal line missing %q, got: %q", want, line)
+		}
+	}
+	// Volume pin: exactly one line per mark (a duplicate emission must
+	// fail, not pass silently through substring containment).
+	if n := strings.Count(line, `msg="interrupted turn marked"`); n != 1 {
+		t.Errorf("exactly one mark journal line expected, got %d: %q", n, line)
 	}
 }

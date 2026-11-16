@@ -54,7 +54,11 @@ package state
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
+
+	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
 // InterruptedTurnErrorName is the terminal-error name the sweep synthesizes on
@@ -152,6 +156,18 @@ func (s *Store) sweepInterruptedTurnsLocked(sessionID string) {
 // publishColdBatch's revision validation rather than transiently clobbering
 // the marked row client-side. Pin: TestColdBatchHookSweepMarkDiscardsStaleBatch.
 func (s *Store) markInterruptedLocked(sessionID string, me *messageEntry, now time.Time) {
+	// Mark-time journal (deep-study card #6, debt W3a): the mark used to be
+	// silent, so capturing an interrupted-sweep recurrence required manual
+	// state-diff archaeology. ONE line carrying the marked row's per-part
+	// shape (type, status, time.start) plus the mark-time turn state makes
+	// the recurrence a one-grep. Log-only: no state, emit, or ordering
+	// change (logged pre-mutation; the merge never touches parts).
+	vhlog.Info("interrupted turn marked",
+		"session", sessionID,
+		"mid", me.id,
+		"turn_state", s.turnState[sessionID],
+		"parts", interruptedMarkerPartsSummary(me),
+	)
 	ms := float64(now.UnixMilli())
 	me.completed = true
 	me.terminalError = InterruptedTurnErrorName
@@ -168,6 +184,64 @@ func (s *Store) markInterruptedLocked(sessionID string, me *messageEntry, now ti
 	// (mirrors the assistant-completion arm of upsertMessageLocked).
 	s.recomputeCurrentVerbLocked(sessionID)
 	s.emit(KindMessageUpsert, me.info)
+}
+
+// interruptedMarkerPartsSummary renders the marked row's parts — per part,
+// type=status@time.start in partOrder sequence — for the mark-time journal
+// line (markInterruptedLocked). Tool parts carry status/time nested under
+// `state` (the production shape recomputeCurrentVerbLocked consumes, see
+// reducers.go); text/reasoning parts carry them top-level — both are read,
+// preferring whichever field is present. Render-only best effort: an absent
+// field renders "?", an unparseable part renders "unparseable", a part-less
+// row renders "<no-parts>"; it never fails and never mutates me.
+func interruptedMarkerPartsSummary(me *messageEntry) string {
+	if len(me.partOrder) == 0 {
+		return "<no-parts>"
+	}
+	var b strings.Builder
+	for i, pid := range me.partOrder {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		raw := me.parts[pid]
+		var p struct {
+			Type   string `json:"type"`
+			Status string `json:"status"`
+			Time   struct {
+				Start *float64 `json:"start"`
+			} `json:"time"`
+			State struct {
+				Status string `json:"status"`
+				Time   struct {
+					Start *float64 `json:"start"`
+				} `json:"time"`
+			} `json:"state"`
+		}
+		if len(raw) == 0 || json.Unmarshal(raw, &p) != nil {
+			b.WriteString("unparseable")
+			continue
+		}
+		status := p.Status
+		if status == "" {
+			status = p.State.Status
+		}
+		start := p.Time.Start
+		if start == nil {
+			start = p.State.Time.Start
+		}
+		if p.Type == "" {
+			p.Type = "?"
+		}
+		if status == "" {
+			status = "?"
+		}
+		if start == nil {
+			fmt.Fprintf(&b, "%s=%s@?", p.Type, status)
+			continue
+		}
+		fmt.Fprintf(&b, "%s=%s@%.0f", p.Type, status, *start)
+	}
+	return b.String()
 }
 
 // settleRealErrorTerminalLocked is the d-F2 settle arm: the selected uncompleted
