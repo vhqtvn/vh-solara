@@ -590,13 +590,13 @@ jobs:
   # Q1-C "document alive" indicator, real SPA render, real SSE connect, and
   # iframe survival across a Dockview split. Heavier than the mock survival gate.
   #
-  # SCHEDULED/DISPATCHABLE ONLY — NOT in the push/PR matrix. The `if:` guard
-  # restricts this job to schedule/workflow_dispatch; it is additive to the
-  # PR-blocking mock survival gate (host-web-e2e above), which stays untouched.
-  # Adding schedule/workflow_dispatch to the workflow `on:` also gives the
-  # existing jobs a nightly run (additive — their push/PR behavior is unchanged).
+  # In the push/PR matrix (promoted 2026-11-16 from schedule/workflow_dispatch-
+  # only: 10 consecutive green scheduled runs Nov 4–13 2026 plus the Nov 15
+  # run, ≥ the N=7 evidence bar — operator GO). Additive to the PR-blocking
+  # mock survival gate (host-web-e2e above), which stays untouched; the
+  # workflow `on:` schedule/workflow_dispatch entries keep giving it a nightly
+  # run on top of every push/PR.
   host-web-real-embed:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
