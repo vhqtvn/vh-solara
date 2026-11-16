@@ -1,6 +1,6 @@
 module github.com/vhqtvn/vh-solara
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/alecthomas/chroma/v2 v2.14.0
