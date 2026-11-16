@@ -4,6 +4,7 @@
  * inside the :root block in tokens.css (originally lines 21-33 of styles.css):
  *
  *     --z-jump:        46    "↓ Latest" / "Live" pill
+ *     --z-eink-paging: 47    e-ink paging toolbar row (ChatPagingControls .bar)
  *     --z-composer:    40    composer bar (textarea + actions)
  *     --z-tasks:       45    tasks popover anchored to the composer
  *     --z-drawer:      48    mobile off-canvas sidebar + scrim

@@ -21,6 +21,22 @@
 
 .bar {
   flex: 0 0 auto;
+  /* Clickability floor (2026-11-16 CI ambiguouschip-geometry red): under a
+     degenerate composer column (e.g. font-metric variance growing the queue
+     chip at e-ink viewports), .chat-main (flex:1, min-height:0) collapses
+     BELOW this 44px row — the row then overflows .chat-main's box and the
+     DOM-later .chat-status / .composer-wrap (z:40) painted OVER it and
+     intercepted its buttons ("tasks-count … intercepts pointer events" ×
+     every click retry → 60s test timeout; deterministic on CI font metrics,
+     green on local fonts — a knife-edge). The toolbar is the e-ink reading
+     lifeline ("stays usable" is its mounting contract), so it wins the
+     overlap: positioned + one rung above the jump pill (46) and the composer
+     band (40/45), still below the off-canvas drawer (48). position:relative
+     alone (z:auto) would NOT be enough — later-positioned siblings (the
+     composer's z:40) would still win. GPU-cheap: no geometry change, no new
+     compositing hints. */
+  position: relative;
+  z-index: var(--z-eink-paging);
   display: flex;
   align-items: center;
   justify-content: flex-end;

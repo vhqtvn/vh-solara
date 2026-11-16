@@ -165,6 +165,27 @@ async function chipGeometry(page: Page) {
   });
 }
 
+/** Hit-test ownership guard for the real prev-page clicks: the element the
+ * browser would hand a pointer event to at the button's center must be the
+ * button (or inside it). Without this, an occlusion regression (e.g. a
+ * DOM-later sibling painting over the toolbar — the 2026-11-16 CI red, where
+ * .chat-status's Tasks pill intercepted every click retry) surfaces as a
+ * line-less 60s TEST timeout, because locator.click has no own timeout here;
+ * with it, the same regression is an instant, located assertion failure. */
+async function expectPrevPageOwnsItsPoint(page: Page) {
+  const hit = await page.evaluate(() => {
+    const prev = document.querySelector('[data-eink="prev-page"]') as HTMLElement | null;
+    if (!prev) return { owned: false, hit: "(prev-page not found)" };
+    const r = prev.getBoundingClientRect();
+    const el = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return {
+      owned: !!el && (el === prev || prev.contains(el)),
+      hit: el ? `${el.tagName.toLowerCase()}.${(el as HTMLElement).className}` : "(null)",
+    };
+  });
+  expect(hit.owned, `prev-page must own its click point (hit: ${hit.hit})`).toBe(true);
+}
+
 test.beforeEach(async ({ request }, testInfo) => {
   // The 45s cleanQueue retry (a crashed prior run's `dispatching` item needs
   // ~30s to go stale) can exceed Playwright's DEFAULT 30s test timeout, and
@@ -218,7 +239,11 @@ test("e-ink 400×600: armed chip warning spans the row, clamp idle; forced font-
   // (4a) REAL click receipt: prev-page is an enabled no-op at the extent BY
   //      CONTRACT — a real click with the armed chip present proves the
   //      toolbar is not buried (Playwright actionability would time out if
-  //      the chip or its scroll covered it).
+  //      the chip or its scroll covered it). The ownership guard below makes
+  //      an occlusion regression fail FAST and located (clicks carry no own
+  //      timeout in this config, so a raw retry loop dies as a line-less
+  //      whole-test timeout — the 2026-11-16 CI failure shape).
+  await expectPrevPageOwnsItsPoint(page);
   await page.locator('[data-eink="prev-page"]').click();
 
   // --- Phase 2: forced font-metric variance → clamp ENGAGES ---------------------
@@ -269,7 +294,9 @@ test("e-ink 400×600: armed chip warning spans the row, clamp idle; forced font-
   await expect(page.getByTestId("ambiguous-wait")).toBeVisible();
   await expect(page.getByTestId("ambiguous-replace")).toBeVisible();
 
-  // (4b) The paging toolbar remains REALLY clickable after engagement too.
+  // (4b) The paging toolbar remains REALLY clickable after engagement too
+  //      (same ownership guard — this is the exact click the CI red hung on).
+  await expectPrevPageOwnsItsPoint(page);
   await page.locator('[data-eink="prev-page"]').click();
 
   // The chip is still the ACTIVE ambiguous chip throughout (no state drift
