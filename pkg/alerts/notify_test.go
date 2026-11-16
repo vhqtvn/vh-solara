@@ -1064,6 +1064,23 @@ func captureLogger(f *notifyFixture) *syncBuf {
 	return sb
 }
 
+// waitLog blocks until the captured buffer contains marker, then returns one
+// snapshot for the full assertion set. The per-failure log line is emitted
+// AFTER the probe state these tests poll first: FCMTransport.Deliver
+// publishes last_attempt/last_error under statMu (and runs the UNREGISTERED
+// prune inside send) and only THEN calls logFailure — so a one-shot
+// sb.String() read following an eventually(Health)/eventually(Count) poll
+// races the log write (observed as a load-dependent flake in
+// TestNotifierFailureLogging under full-tree parallel test load). Waiting on
+// the log itself is safe: slog emits each record with a single Write, and
+// syncBuf serializes Write/String under one mutex, so once the marker is
+// visible the WHOLE line — every attr — is in the snapshot.
+func waitLog(t *testing.T, sb *syncBuf, marker, msg string) string {
+	t.Helper()
+	eventually(t, func() bool { return strings.Contains(sb.String(), marker) }, msg)
+	return sb.String()
+}
+
 // TestNotifierAlwaysPolicyDeliversWhileAttended is the LOAD-BEARING crux for
 // v3 change 1: with a device actively attending, an always-policy token
 // RECEIVES its push while a when_unattended token in the SAME registry is
@@ -1141,7 +1158,7 @@ func TestNotifierFailureLogging(t *testing.T) {
 			_, lastErr := f.nt.Health()
 			return lastErr == "oauth exchange failed"
 		}, "oauth failure must set last_error")
-		line := sb.String()
+		line := waitLog(t, sb, `msg="notify: fcm send failed"`, "oauth failure log line must land")
 		for _, want := range []string{
 			`msg="notify: fcm send failed"`,
 			"channel=notify",
@@ -1170,7 +1187,7 @@ func TestNotifierFailureLogging(t *testing.T) {
 			_, lastErr := f.nt.Health()
 			return lastErr == "401 UNAUTHENTICATED"
 		}, "persistent 401 must set last_error")
-		line := sb.String()
+		line := waitLog(t, sb, `msg="notify: fcm send failed"`, "401 log line must land")
 		for _, want := range []string{
 			`msg="notify: fcm send failed"`,
 			"reason=\"unauthenticated after refresh\"",
@@ -1195,7 +1212,7 @@ func TestNotifierFailureLogging(t *testing.T) {
 			_, lastErr := f.nt.Health()
 			return lastErr == "500 fcm 5xx retry exhausted"
 		}, "5xx exhaustion must set last_error")
-		line := sb.String()
+		line := waitLog(t, sb, `msg="notify: fcm send failed"`, "5xx log line must land")
 		for _, want := range []string{
 			"reason=\"fcm 5xx retry exhausted\"",
 			"status=500",
@@ -1220,7 +1237,7 @@ func TestNotifierFailureLogging(t *testing.T) {
 			_, lastErr := f.nt.Health()
 			return lastErr == "429 RESOURCE_EXHAUSTED"
 		}, "429 must set last_error")
-		line := sb.String()
+		line := waitLog(t, sb, `msg="notify: fcm send failed"`, "429 log line must land")
 		for _, want := range []string{"reason=\"rate limited (quota)\"", "status=429"} {
 			if !strings.Contains(line, want) {
 				t.Fatalf("429 log line missing %q:\n%s", want, line)
@@ -1239,7 +1256,7 @@ func TestNotifierFailureLogging(t *testing.T) {
 			_, lastErr := f.nt.Health()
 			return lastErr == "404 NOT_FOUND"
 		}, "404 must set last_error (status + canonical name)")
-		line := sb.String()
+		line := waitLog(t, sb, `msg="notify: fcm send failed"`, "404 log line must land")
 		for _, want := range []string{"reason=\"fcm rejected message\"", "status=404", "code=NOT_FOUND"} {
 			if !strings.Contains(line, want) {
 				t.Fatalf("404 log line missing %q:\n%s", want, line)
@@ -1265,7 +1282,7 @@ func TestNotifierFailureLogging(t *testing.T) {
 			_, lastErr := f.nt.Health()
 			return lastErr == "404 UNREGISTERED"
 		}, "prune must still set last_error (delivery failed)")
-		line := sb.String()
+		line := waitLog(t, sb, `msg="notify: token unregistered, pruned"`, "prune log line must land")
 		for _, want := range []string{
 			`msg="notify: token unregistered, pruned"`,
 			"reason=\"token unregistered (pruned)\"",
@@ -1288,7 +1305,7 @@ func TestNotifierFailureLogging(t *testing.T) {
 			_, lastErr := f.nt.Health()
 			return lastErr == "transport error"
 		}, "transport failure must set last_error")
-		line := sb.String()
+		line := waitLog(t, sb, `msg="notify: fcm send failed"`, "transport log line must land")
 		for _, want := range []string{"reason=\"transport error\"", "token=phone-xport", "err="} {
 			if !strings.Contains(line, want) {
 				t.Fatalf("transport log line missing %q:\n%s", want, line)
@@ -1315,8 +1332,7 @@ func TestNotifierLogSecretHygiene(t *testing.T) {
 		_, lastErr := f.nt.Health()
 		return lastErr == "404 NOT_FOUND"
 	}, "failed send must settle")
-
-	line := sb.String()
+	line := waitLog(t, sb, `msg="notify: fcm send failed"`, "failure log line must land")
 	if strings.Contains(line, secret) {
 		t.Fatalf("token VALUE leaked into a log line:\n%s", line)
 	}
