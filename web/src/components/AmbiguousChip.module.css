@@ -1,7 +1,9 @@
 /* AmbiguousChip — scoped styles (send-net-resilience slice 3). Consumes
-   global tokens only; no new global CSS. A non-scrolling, small, flat
-   composer surface — no mask-image / backdrop-filter / contain /
-   content-visibility (Firefox/WebRender GPU rules, AGENTS.md). */
+   global tokens only; no new global CSS. A small, flat composer surface —
+   non-scrolling in the normal case (the bounded .warning/.stale clamps
+   below scroll only when a narrow viewport / font-metric variance engages
+   them). No mask-image / backdrop-filter / contain / content-visibility
+   (Firefox/WebRender GPU rules, AGENTS.md). */
 
 .ambiguousChip {
   display: inline-flex;
@@ -54,6 +56,17 @@
   max-width: 480px;
   white-space: normal;
   overflow-wrap: anywhere;
+  /* Height defense (defer-scroll-follow-1943): bound the note to four
+     wrapped lines at ANY viewport — the ~170-char verbatim warning wraps
+     to ≈3.2 lines at the 400px e-ink width, so the clamp never engages in
+     the normal case; only narrow-viewport / font-metric variance (or a
+     longer note if the verbatim text ever changes) can grow past it, and
+     then it scrolls (still readable, never tooltip-only — debate-4 B1
+     holds). Plain overflow only: no mask/contain (Firefox/WebRender GPU
+     rules). As a flex item this span is blockified, so max-height and
+     overflow apply despite display:inline. */
+  max-height: 6em; /* 4 lines × 1.5 line-height at the chip's 11px font */
+  overflow-y: auto;
 }
 
 .act {
@@ -95,4 +108,9 @@ Cancel while active). Own full-width line — same 1ch-min-content hazard as
   flex-basis: 100%;
   width: 100%;
   max-width: 360px;
+  /* Height defense (defer-scroll-follow-1943): same bounded-note clamp as
+     .warning, sized for this ~52-char note (1 line at 360px; 2 lines at the
+     narrowest widths) — scrollable past the clamp, GPU-cheap. */
+  max-height: 3em; /* 2 lines × 1.5 line-height */
+  overflow-y: auto;
 }

@@ -937,7 +937,11 @@ test("reopen of a busy session at a stored anchor is not yanked to the tail", as
 // aggregator store (repeat iterations, or any prior test that opened the
 // session) hydrates instantly and the restore runs at t≈53ms while the
 // container does not even overflow (sh == ch: the write clamps 0→0, no
-// scroll event, no contact). /fixture/reset does not re-cold the store.
+// scroll event, no contact). /fixture/reset DOES re-cold the store (d41f0bf:
+// it emits session.deleted, dropping each listening aggregator's cached
+// session entry incl. the messages-loaded latch, before re-creating the id;
+// messages re-hydrate from the restored baseline on the next open) — but
+// reset ordering across serial iterations is still not a per-test lever.
 // So the staging uses the fixture-event fallback: /fixture/slow-tail
 // appends/removes a staged tail of 8 user rows THROUGH THE REAL /event
 // stream. With the tail present, the restore lands mid-content
