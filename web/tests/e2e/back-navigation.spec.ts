@@ -5,15 +5,16 @@ import { projectUrl } from "./util";
 // browser back dismisses the TOPMOST open surface and NEVER walks session
 // selection; forward never reopens; explicit closes leave no ghost entries.
 //
-// The ONE documented carve-out (the compat tail, pinned by the last test
-// below): a popstate onto a LEGACY session entry — pushed by an older build
-// (modern selection is replaceState-only) — still re-selects the session and
-// switches project (sync.ts's legacy-walk handler).
+// The ONE documented carve-out (the compat tail, pinned by the legacy-walk
+// test below): a popstate onto a LEGACY session entry — pushed by an older
+// build (modern selection is replaceState-only) — still re-selects the
+// session and switches project (sync.ts's legacy-walk handler).
 //
 // Every test keeps at least one surface open (or asserts history.length
-// directly) before pressing back, so back never falls out of the app to the
-// initial about:blank entry — the empty-stack case intentionally falls through
-// to native behavior (no exit trapping, by design).
+// directly) before pressing back — EXCEPT the final test, which pins the
+// empty-stack case itself: back intentionally falls through to native
+// behavior (no exit trapping, no base sentinel — lib/backStack.ts:20-21), a
+// REAL navigation out of the app to the initial about:blank entry.
 
 const settingsDialog = (page: import("@playwright/test").Page) =>
   page.locator('div[role="dialog"][aria-label="Settings"]');
@@ -194,4 +195,26 @@ test("back onto a LEGACY history entry (old-build pushState) switches project th
   await page.getByRole("button", { name: "Create session" }).click();
   await expect(page.locator(".composer")).toBeVisible();
   await expect(page.locator(".sendStatusLine")).toHaveCount(0);
+});
+
+// The empty-stack carve-out, pinned (review-defer-backnav-e2e-empty-stack):
+// with NO surfaces open, back must fall through to NATIVE browser behavior —
+// a real cross-document navigation out of the app — proving the SPA neither
+// traps the exit nor pushes a base-sentinel entry (lib/backStack.ts:20-21:
+// "When the stack is empty, back falls through to native browser behavior").
+// This test would FAIL if a base-sentinel pushState were ever added: back
+// would then land in-app instead of leaving the fixture origin.
+test("empty stack: back falls through to native navigation (no exit trapping)", async ({ page }) => {
+  // The fresh page's initial about:blank entry sits behind the app goto.
+  await page.goto(projectUrl("/"));
+  await selectDemoSession(page);
+
+  // No surfaces opened: the back stack is empty. Gesture-honest back (a real
+  // operator Back press through the browser, not a synthetic popstate).
+  await page.goBack();
+
+  // OUTCOME: the navigation really left the app — cross-document back to the
+  // initial about:blank entry. If the app trapped the exit (base sentinel,
+  // preventDefault'd popstate consumption), the URL would stay in-app.
+  await expect(page).toHaveURL("about:blank", { timeout: 5_000 });
 });

@@ -2,9 +2,10 @@
 //
 // Unit coverage for the centralized back-dismissal history manager
 // (src/lib/backStack.ts): token push/consume, LIFO back-dismissal,
-// forward-never-reopens, orphan auto-unwind, foreign-state tolerance, and the
+// forward-never-reopens, orphan auto-unwind, foreign-state tolerance, the
 // bindBackDismiss lifecycle (push on open, release on close/unmount,
-// reentrancy-safe manager closes).
+// reentrancy-safe manager closes), and the canonical-URL repair hook
+// (registered repair invoked on MANAGED traversals only, best-effort).
 //
 // jsdom's history is replaced with a fake state stack (same approach as
 // MermaidViewer.test.tsx): pushState/replaceState mutate the stack,
@@ -17,6 +18,7 @@ import {
   bindBackDismiss,
   isBackEntry,
   pushBackSurface,
+  registerCanonicalRepair,
   releaseBackSurface,
   wasManagedPopState,
   __resetBackStackForTest,
@@ -248,6 +250,60 @@ describe("backStack", () => {
       expect(backSpy).toHaveBeenCalledTimes(1); // consumed, not stranded
       expect(backStackDepth()).toBe(0);
       expect(open()).toBe(true); // the signal itself is untouched
+    });
+  });
+
+  // The canonical-URL repair hook (wired in production by sync/url.ts: after
+  // a MANAGER-OWNED traversal the address bar must be repaired back to the
+  // canonical URL). Coverage: invoked on managed backs and consume
+  // traversals, NOT on unmanaged (empty-stack/native) backs, and a throwing
+  // repair never escapes or blocks the dismissal.
+  describe("canonical-URL repair (registerCanonicalRepair)", () => {
+    afterEach(() => {
+      // repairUrl is module-level and __resetBackStackForTest does NOT clear
+      // it; neutralize so nothing downstream observes this block's spies.
+      registerCanonicalRepair(() => {});
+    });
+
+    it("a MANAGED back (surface dismissed) invokes the registered repair", () => {
+      const repair = vi.fn();
+      registerCanonicalRepair(repair);
+      const close = vi.fn();
+      pushBackSurface(close, "dlg");
+      hardwareBack(); // dismisses the surface → manager-owned popstate
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(repair).toHaveBeenCalledTimes(1);
+    });
+
+    it("the consume traversal after an explicit release also invokes the repair", async () => {
+      const repair = vi.fn();
+      registerCanonicalRepair(repair);
+      const close = vi.fn();
+      const s = pushBackSurface(close, "dlg");
+      releaseBackSurface(s);
+      await flush(); // consume traversal fires a pendingTraversal popstate
+      expect(repair).toHaveBeenCalledTimes(1);
+      expect(close).not.toHaveBeenCalled(); // explicit release never closes
+    });
+
+    it("an UNMANAGED back (empty stack, nothing open) does NOT invoke the repair", () => {
+      const repair = vi.fn();
+      registerCanonicalRepair(repair);
+      // No surfaces: back from the base entry falls through to native/session
+      // handling — the manager must not claim it NOR repair the URL.
+      hardwareBack();
+      expect(repair).not.toHaveBeenCalled();
+      expect(backStackDepth()).toBe(0);
+    });
+
+    it("a throwing repair is best-effort: surfaces still close and nothing escapes", () => {
+      registerCanonicalRepair(() => {
+        throw new Error("repair exploded");
+      });
+      const close = vi.fn();
+      pushBackSurface(close, "dlg");
+      expect(() => hardwareBack()).not.toThrow();
+      expect(close).toHaveBeenCalledTimes(1); // the dismissal completed
     });
   });
 });
