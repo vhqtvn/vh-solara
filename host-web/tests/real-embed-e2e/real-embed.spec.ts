@@ -29,8 +29,11 @@ import * as H from "../e2e/util";
 // satisfied trivially under no-auth (no /auth/login gate to redirect to); it
 // remains a valid smoke that a regression starting to gate would be caught.
 //
-// Runs on Chromium + Firefox (see playwright.real-embed.config.ts). Scheduled/
-// dispatchable ONLY — NOT PR-blocking.
+// Runs on Chromium + Firefox (see playwright.real-embed.config.ts). In the
+// push/PR matrix (promoted 2026-11-16; previously scheduled/dispatchable-only
+// pending stability measurement; promoted after 10 consecutive green scheduled
+// runs Nov 4–13 2026 + guard removal commit 036b5c2). Additive to the mock
+// survival gate.
 // =============================================================================
 
 // Derive the real origin from the SAME env var the Playwright config uses to

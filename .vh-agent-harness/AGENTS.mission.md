@@ -201,9 +201,11 @@ is **no pytest** anywhere in this repo.
    cruxes this lane closes (heartbeat + survival) are cookie-INDEPENDENT; the
    SameSite=Lax cookie crux was proven by the Phase-0′ spike in passphrase mode
    and is not re-exercised here. Runs **serially** (`workers: 1`). Chromium +
-   Firefox (WebKit opt-in). **Scheduled/dispatchable ONLY** (nightly cron +
-   `workflow_dispatch`); NOT in the push/PR matrix — additive to the PR-blocking
-   mock survival gate, not PR-blocking until measured stable.
+   Firefox (WebKit opt-in). **In the push/PR matrix** (promoted 2026-11-16;
+   previously scheduled/dispatchable-only pending stability measurement;
+   promoted after 10 consecutive green scheduled runs Nov 4–13 2026 + guard removal
+   commit `036b5c2`). Additive to the PR-blocking mock survival gate, which stays
+   untouched; the nightly schedule and workflow_dispatch continue to run.
     Runner: `make test-host-web-real-embed` (full pipeline), or
     `cd host-web && npx playwright test --config=playwright.real-embed.config.ts`
     (after the binary is built; or `bash host-web/scripts/real-embed-run.sh`).
@@ -276,7 +278,7 @@ vh-agent-harness exec npm --prefix host-web run test:e2e
 vh-agent-harness exec make test-host-web-docker
 # host-web production-build shell proof (vite preview):
 vh-agent-harness exec npm --prefix host-web run test:e2e:preview
-# host-web real-embedding e2e (LANE 8: real web/ SPA + real local-server; NOT PR-blocking; full pipeline builds web→materializes→builds go→runs Playwright):
+# host-web real-embedding e2e (LANE 8: real web/ SPA + real local-server; in push/PR matrix; full pipeline builds web→materializes→builds go→runs Playwright):
 vh-agent-harness exec bash host-web/scripts/real-embed-run.sh
 # host-web folded-posture restore e2e (LANE 9: real binary serving the FOLDED host at / — the production fold topology; dispatch on PWA-relaunch layout regressions):
 vh-agent-harness exec bash host-web/scripts/folded-restore-run.sh

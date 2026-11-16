@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # host-web/scripts/real-embed-run.sh — full local pipeline for the host-web
-# real-embedding e2e lane (LANE 8). NOT PR-blocking; nightly-grade.
+# real-embedding e2e lane (LANE 8). In the push/PR matrix (promoted 2026-11-16;
+# previously scheduled/dispatchable-only pending stability measurement;
+# promoted after 10 consecutive green scheduled runs Nov 4–13 2026 + guard removal
+# commit 036b5c2). Additive to the mock survival gate; keeps nightly runs.
 #
 # Builds the production `web/` SPA, materializes it into pkg/web/dist/ (the
 # //go:embed path), builds the real vh-solara binary, then runs the Playwright

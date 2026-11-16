@@ -30,10 +30,11 @@ import { defineConfig, devices } from "@playwright/test";
 // survival). The two open cruxes are cookie-INDEPENDENT (heartbeat is
 // postMessage; survival is renderer:'always'), so no-auth fully exercises them.
 //
-// Scheduled/dispatchable ONLY (nightly + workflow_dispatch); NOT in the
-// push/PR matrix. Additive to the PR-blocking mock survival gate, which stays
-// untouched. Heavier than the mock lane (real Go binary + built SPA), so it is
-// not PR-blocking until measured stable.
+// In the push/PR matrix (promoted 2026-11-16; previously scheduled/
+// dispatchable-only pending stability measurement; promoted after 10
+// consecutive green scheduled runs Nov 4–13 2026 + guard removal commit
+// 036b5c2). Additive to the PR-blocking mock survival gate, which stays
+// untouched; nightly cron + workflow_dispatch continues to run.
 //
 // The real Go binary MUST be pre-built at repo-root/vh-solara before this suite
 // runs (the webServer below starts it). CI / `make test-host-web-real-embed`
