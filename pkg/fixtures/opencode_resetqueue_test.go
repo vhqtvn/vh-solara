@@ -422,6 +422,93 @@ func TestFixtureResetSweepsScopedPromptHoldLatch(t *testing.T) {
 	}
 }
 
+// TestFixtureResetGC2NextConsumerBoundaryIsolation pins the GC-2
+// next-consumer boundary (defer-reset-gc2-boundary-isolation): the daemon's
+// queue-GC reaction to a reset's session.deleted (FIX-QUEUE-GC-2 — the
+// EVENTUAL half: it runs on the subscriber goroutine, AFTER the reset's
+// synchronous file sweep and potentially after intervening HTTP traffic) must
+// tombstone exactly the OLD store and never reach the NEXT consumer's queue
+// at the same session id. Sequence: seed a loaded store with residue →
+// reset → converge on the GC having run (List drains to zero — the retained
+// pre-GC store still serves its in-memory residue until CleanupSession
+// tombstones it, so "empty" proves the GC processed the delete) → THEN, as
+// the next consumer of the recreated session, drive a full
+// enqueue→claim→resolve lifecycle at the SAME id and assert every step works
+// (BLK-1's fresh-store-after-deleteStore contract, end-to-end through the
+// real HTTP + event paths) and that a second reset's delayed GC collects the
+// recreated queue just as cleanly.
+//
+// ABA RE-EVALUATION (per the card): deleteStore is keyed (root, sessionID)
+// with no epoch, so an enqueue landing BETWEEN the reset's session.deleted
+// emission and the GC subscriber's CleanupSession would be tombstoned and
+// its queue.json removed — item loss. That ordering is scheduler-dependent
+// and deliberately NOT forced here (it would be flaky by construction); it
+// is unreachable in the supported sequential contract the serial e2e lane
+// actually uses (reset runs between tests; the next consumer's first queue
+// op happens after the GC converges — the crux test's waitFor models that
+// discipline). If a future spec needs reset→immediate-enqueue within one
+// test, deleteStore needs an epoch/generation guard comparing store creation
+// against the delete event; re-raise on the card at that point.
+func TestFixtureResetGC2NextConsumerBoundaryIsolation(t *testing.T) {
+	h := bootResetQHarness(t)
+	h.openProject()
+
+	// A loaded daemon-side store carrying hung-prompt residue (the
+	// contamination posture every other test in this file seeds).
+	residue := h.seedHungPromptResidue("demo", "gc2-residue")
+	if residue.OpencodeMsgID == "" {
+		t.Fatalf("residue must carry the minted correlation id")
+	}
+	if items := h.listQueue("demo"); len(items) != 1 || items[0].State != "unknown" {
+		t.Fatalf("pre-reset residue not visible: %+v", items)
+	}
+
+	h.reset("demo")
+
+	// Converge on the DELAYED GC having processed the reset's delete: the
+	// retained in-memory store serves its residue until CleanupSession
+	// tombstones it, so an empty List proves the GC ran (not merely the
+	// synchronous file sweep, which cannot touch the loaded store's items).
+	if !waitFor(t, "GC-2 processes reset delete (old store drained)", 5*time.Second, func() bool {
+		return len(h.listQueue("demo")) == 0
+	}) {
+		items := h.listQueue("demo")
+		t.Fatalf("GC-2 never collected the reset scope (got %d items: %+v)", len(items), items)
+	}
+
+	// NEXT CONSUMER at the same session id (the session.created recreate):
+	// a fresh store must materialize — the completed GC must not reach back
+	// and archive it — and the full queue lifecycle must work on it.
+	fresh := h.enqueue("demo", "post-reset next-consumer item", "intent-gc2-next")
+	if fresh.State != "pending" {
+		t.Fatalf("next-consumer enqueue must land on a fresh store: %+v", fresh)
+	}
+	if _, err := os.Stat(h.queueFile("demo")); err != nil {
+		t.Fatalf("recreated queue.json must persist: %v", err)
+	}
+	claimed := h.claim("demo")
+	if claimed.State != "dispatching" || claimed.OpencodeMsgID == "" {
+		t.Fatalf("next-consumer claim must mint a correlation id: %+v", claimed)
+	}
+	final := h.resolve("demo", claimed.ID, "unknown", "gc2 next-consumer resolve")
+	if final.State != "unknown" {
+		t.Fatalf("next-consumer resolve: %+v", final)
+	}
+
+	// The recreated queue is itself cleanly collectable by the NEXT reset's
+	// delayed GC — the cycle is idempotent, no wedge, no stale tombstone.
+	h.reset("demo")
+	if !waitFor(t, "second GC-2 collects the recreated queue", 5*time.Second, func() bool {
+		return len(h.listQueue("demo")) == 0
+	}) {
+		items := h.listQueue("demo")
+		t.Fatalf("second reset must collect the recreated queue (got %d items: %+v)", len(items), items)
+	}
+	if _, err := os.Stat(h.queueFile("demo")); !os.IsNotExist(err) {
+		t.Fatalf("second reset must remove the recreated queue.json (stat err=%v)", err)
+	}
+}
+
 // TestFixtureResetQueueFileSweepNoDaemon pins the deterministic FILE-level
 // half of the semantics plus today's request shape: session is required (400),
 // and a reset removes the scope's queue.json even when the daemon-side store
