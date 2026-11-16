@@ -543,6 +543,129 @@ func TestReconcile_RestartFencedTransientExhaustionUsesRestartDetail(t *testing.
 	}
 }
 
+// backdateDispatchStartedAtForTest rewrites one item's DispatchStartedAt in
+// the persisted store (test seam modeled on stripCorrelationIDForTest). It
+// lets a STILL-DISPATCHING item cross the stale-dispatch threshold for BOTH
+// clocks that gate it: the injected `now` of snapshotReconcileCandidates and
+// the real time.Now() that bumpReconcileAttempt's eligibility re-check uses
+// (queue_msg_reconcile.go:319-330 — a value comfortably in the past of both
+// satisfies each). The production fence stamps only dispatching items
+// (restart_fence.go), so the discriminating mid-pass test cannot reuse
+// newStuckUnknownStoreRestartFenced (which resolves to unknown first).
+func backdateDispatchStartedAtForTest(t *testing.T, s *sessionQueueStore, id string, unixMilli int64) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.load(); err != nil {
+		t.Fatalf("backdate load: %v", err)
+	}
+	for i := range s.items {
+		if s.items[i].ID == id {
+			s.items[i].DispatchStartedAt = unixMilli
+			if err := s.save(); err != nil {
+				t.Fatalf("backdate save: %v", err)
+			}
+			return
+		}
+	}
+	t.Fatalf("backdate: item %q not found", id)
+	return
+}
+
+// TestReconcile_FenceLandingMidTerminalPassUsesRestartDetail is the
+// DISCRIMINATING mid-pass-3 pin (defer-t1d-f1-reconcile-test). Every existing
+// restart-fenced detail test stamps the fence BEFORE all passes
+// (newStuckUnknownStoreRestartFenced), which pins NOTHING against a
+// snapshot-time selection regression: a pre-pass fence is visible to pass 3's
+// snapshot, so both the current design AND the regression would emit the
+// restart fmt. This test fences INSIDE the terminalizing (3rd) pass's GET —
+// after that pass's snapshot, before bumpReconcileAttempt — so the design
+// under test is exactly bumpReconcileAttempt's mutex-time fmt choice
+// (queue_msg_reconcile.go:363-398: the restart format is selected UNDER s.mu
+// from the item's CURRENT RestartFenceAt marker, not from the reconcile
+// snapshot). A regression that re-reads selection state at snapshot time
+// emits the generic fmt here and FAILS this test.
+//
+// Setup constraints (per card): the item stays STALE-DISPATCHING throughout
+// (the production fence stamps only dispatching items), with DispatchStartedAt
+// backdated past the threshold against both clocks; the GET-window fence lands
+// via the resolver hook. Assertion is a RAW s.mu read (restart_fence_test.go
+// precedent), NOT List()/mustListItem — List() runs recoverStaleDispatchingLocked
+// (queue.go:765) which would recover the still-dispatching terminal item and
+// OVERWRITE Detail with stale-recovery text, destroying the assertion.
+func TestReconcile_FenceLandingMidTerminalPassUsesRestartDetail(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	mustEnqueue(t, s, "hello")
+	claimed, _, err := s.Claim()
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if claimed.OpencodeMsgID == "" {
+		t.Fatalf("Claim must mint the correlation id")
+	}
+
+	// Backdate past the stale threshold for both the injected pass clock and
+	// the real clock (see backdateDispatchStartedAtForTest doc).
+	t0 := time.Unix(1000000, 0)
+	backdateDispatchStartedAtForTest(t, s, claimed.ID, t0.Add(-2*reconcileThreshold).UnixMilli())
+
+	// The resolver is the injection window: the 3rd lookup happens AFTER
+	// pass 3's snapshot selected the candidate and BEFORE
+	// bumpReconcileAttempt mutates under s.mu — the exact production window
+	// a restart fence lands in (restart kills the process between the GET
+	// and the mutation persist).
+	lookups := 0
+	resolve := func(_ context.Context, _, _ string) ([]byte, error) {
+		lookups++
+		if lookups == 3 {
+			if _, err := s.fenceDispatchingForRestart(time.Now()); err != nil {
+				t.Fatalf("mid-pass fence: %v", err)
+			}
+		}
+		return nil, opencode.ErrMessageNotFound
+	}
+
+	for i := 0; i < 3; i++ {
+		s.reconcileMessageIDs("s1", resolve, t0.Add(time.Duration(i)*(reconcileThreshold+time.Second)))
+	}
+	if lookups != 3 {
+		t.Fatalf("lookups = %d, want exactly 3 (throttle + budget)", lookups)
+	}
+
+	// RAW read under s.mu — List() would recover the stale-dispatching
+	// terminal item and overwrite Detail (see doc).
+	s.mu.Lock()
+	items := make([]QueueItem, len(s.items))
+	copy(items, s.items)
+	s.mu.Unlock()
+	var got QueueItem
+	found := false
+	for _, it := range items {
+		if it.ID == claimed.ID {
+			got, found = it, true
+		}
+	}
+	if !found {
+		t.Fatalf("item %q not found", claimed.ID)
+	}
+	if !got.ReconcileTerminal {
+		t.Fatalf("mid-pass-fenced item must terminalize on the 3rd pass")
+	}
+	if got.ReconcileAttempts != reconcileMaxAttempts {
+		t.Fatalf("attempts = %d, want %d", got.ReconcileAttempts, reconcileMaxAttempts)
+	}
+	if got.State != QueueDispatching {
+		t.Fatalf("state = %q, want dispatching (the fence stamps, recovery owns the state machine)", got.State)
+	}
+	if got.RestartFenceAt == 0 {
+		t.Fatalf("RestartFenceAt = 0, want the mid-pass fence stamp")
+	}
+	want := fmt.Sprintf(restartFenceTerminal404DetailFmt, reconcileMaxAttempts)
+	if got.Detail != want {
+		t.Fatalf("terminal detail = %q,\nwant MUTEX-TIME restart fmt (fence landed mid-pass-3): %q", got.Detail, want)
+	}
+}
+
 // TestReconcile_RestartFencedExactMatchStillResolvesSent: the fence NEVER
 // blocks the heal — if OpenCode actually persisted under the minted id (the
 // 204 landed before the kill), the exact-match authority resolves the fenced
