@@ -78,11 +78,15 @@ import { DIAG_VERSION, recordLayoutDiag } from "./layoutDiag";
 // whose fractions are degenerate) restores to EQUAL fractions (documented in
 // fractionMath.ts sizesToFractions) — never NaN, never a crash.
 //
-// PRECEDENCE (defensible default — NOT settled canon): on cold start, for each
-// workspace, SAVED-LAYOUT-WINS-WITH-VALIDATION; the fleet/mock seed is the
-// fallback ONLY for the default workspace when there was no blob at all. A
-// workspace created at runtime (addWorkspace) has no saved layout and is empty
-// by design (the empty-workspace affordance prompts Add Server).
+// PRECEDENCE (SETTLED — saved-wins-with-validation, decided 2026-11-16 by
+// operator sign-off): on cold start, for each workspace,
+// SAVED-LAYOUT-WINS-WITH-VALIDATION; the fleet/mock seed is the fallback ONLY
+// for the default workspace when there was no blob at all. A workspace created
+// at runtime (addWorkspace) has no saved layout and is empty by design (the
+// empty-workspace affordance prompts Add Server). Decision basis: operator
+// sign-off over the 2026-11-16 hostweb-precedence restudy brief + a
+// current-HEAD lane-9 folded-posture e2e receipt (23/23 specs green at HEAD
+// 3619211, including the second-window no-clobber spec).
 // =============================================================================
 
 /** Versioned + namespaced storage key. Bumped v2→v3 for FRACTIONAL split
