@@ -1387,9 +1387,16 @@ func (f *FakeOpenCode) SilentClearBusyForTest(sessionID string) {
 // GET /session/:sid/message/:mid finds it. Empty → the fake mints its own u%n
 // (the pre-Slice-5 path).
 func (f *FakeOpenCode) commitUserMessage(sessionID, text, messageID string) int {
-	now := float64(time.Now().UnixMilli())
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.commitUserMessageLocked(sessionID, text, messageID)
+}
+
+// commitUserMessageLocked is the lock-free core of commitUserMessage; caller
+// MUST hold f.mu. Split out so the DelayedPersist fence can validate the
+// arrival generations and append in ONE continuous critical section.
+func (f *FakeOpenCode) commitUserMessageLocked(sessionID, text, messageID string) int {
+	now := float64(time.Now().UnixMilli())
 	f.counter++
 	n := f.counter
 	userID := messageID
@@ -1406,6 +1413,26 @@ func (f *FakeOpenCode) commitUserMessage(sessionID, text, messageID string) int 
 	// caller-id-wins contract — record them identically to appendMessage.
 	f.recordPersistedUserLocked(sessionID, userID)
 	return n
+}
+
+// commitUserMessageIfGensMatch is the DelayedPersist goroutine's
+// generation-fenced commit: the arrival-captured restart AND reset
+// generations are re-read UNDER THE SAME f.mu hold as the append, so no
+// reset/restart can interleave between the check and the commit. (Review F1
+// on defer-delayedpersist-resetgen-fence: checking under one hold and
+// appending under a second leaves a window where handleFixtureReset — which
+// restores the baseline, bumps resetGen, and collects its message.removed set
+// under f.mu — completes between the two, and the stale append then lands in
+// the restored transcript with NO removal event covering it.) Returns whether
+// the commit landed.
+func (f *FakeOpenCode) commitUserMessageIfGensMatch(sessionID, text, messageID string, arrivalRestartGen, arrivalResetGen uint64) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.restartGen != arrivalRestartGen || f.resetGen[sessionID] != arrivalResetGen {
+		return false // restarted and/or reset while the delay elapsed: discard
+	}
+	f.commitUserMessageLocked(sessionID, text, messageID)
+	return true
 }
 
 // dropResponse simulates a lost HTTP response by hijacking and immediately
@@ -2280,9 +2307,15 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 		mode := f.promptAsyncMode
 		// Slice-2a DelayedPersist capture: the delay and restart generation are
 		// read in the SAME critical section as the mode so the deferred commit's
-		// behavior is fixed atomically at arrival time.
+		// behavior is fixed atomically at arrival time. The reset generation is
+		// captured alongside it (defer-delayedpersist-resetgen-fence): a
+		// /fixture/reset between arrival and the deferred commit bumps resetGen,
+		// and the restored baseline must not absorb the stale write — the same
+		// invalidation shape the resetGen counter already gives leaked stall
+		// defers (see the resetGen field doc).
 		delay := f.promptPersistDelay
 		arrivalRestartGen := f.restartGen
+		arrivalResetGen := f.resetGen[id]
 		f.mu.Unlock()
 		switch mode {
 		case PromptAsyncCommitThenDropResponse:
@@ -2303,18 +2336,21 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 			// Faithful-to-real-async-persist path: answer 204 NOW, commit the
 			// user message LATER (after the captured delay). A SimulateRestart
 			// before the delay elapses discards the pending commit (the
-			// generation check below) — the post-restart-404 topology. The
-			// commit itself goes through commitUserMessage so the caller-id-wins
+			// restart generation check) — the post-restart-404 topology. A
+			// /fixture/reset before the delay elapses discards it too (the
+			// resetGen check): the reset restored the baseline and emitted
+			// message.removed for what it cleared, so a late landing commit
+			// would re-pollute the restored transcript with NO accompanying
+			// removal event — exactly the cross-test accumulation the reset
+			// exists to prevent. Both generations are re-checked and the
+			// commit performed in ONE continuous f.mu hold
+			// (commitUserMessageIfGensMatch) so no reset can interleave
+			// between the check and the append. The commit itself goes through
+			// the same core as commitUserMessage, so the caller-id-wins
 			// correlation id contract is identical to every other mode.
 			go func() {
 				time.Sleep(delay)
-				f.mu.Lock()
-				cur := f.restartGen
-				f.mu.Unlock()
-				if cur != arrivalRestartGen {
-					return // restarted before commit: the write-ahead entry vanishes
-				}
-				f.commitUserMessage(id, text, messageID)
+				f.commitUserMessageIfGensMatch(id, text, messageID, arrivalRestartGen, arrivalResetGen)
 			}()
 			w.WriteHeader(http.StatusNoContent)
 			return

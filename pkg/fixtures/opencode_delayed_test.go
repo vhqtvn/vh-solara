@@ -14,6 +14,8 @@ package fixtures
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -103,6 +105,74 @@ func TestPromptAsyncDelayedPersistRestartVanishesBeforeCommit(t *testing.T) {
 	gr, gb := get(t, srv, "/session/"+sid+"/message/"+mid)
 	if gr.StatusCode != http.StatusNotFound {
 		t.Fatalf("exact-GET after restart = %d, want PERMANENT 404 (body=%s)", gr.StatusCode, gb)
+	}
+}
+
+func TestPromptAsyncDelayedPersistResetDiscardsPendingCommit(t *testing.T) {
+	f := New()
+	f.SetPromptAsyncMode(PromptAsyncDelayedPersist)
+	f.SetPromptAsyncPersistDelay(200 * time.Millisecond)
+	srv := startFixtureHTTP(t, f)
+
+	const sid = "dly-4"
+	const mid = "msg_resetdiscard04"
+	body := `{"parts":[{"type":"text","text":"stale"}],"messageID":` + jsonQuote(mid) + `}`
+
+	resp, _ := postJSON(t, srv, "/session/"+sid+"/prompt_async", body)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("prompt_async: got %d want 204", resp.StatusCode)
+	}
+
+	// /fixture/reset BEFORE the delay elapses: the baseline is restored (here:
+	// no baseline, so an empty transcript) and resetGen bumps. The pending
+	// delayed commit belongs to the PRE-reset world and must be discarded —
+	// landing it would re-pollute the restored transcript with no
+	// message.removed to clear it (defer-delayedpersist-resetgen-fence).
+	resetViaHTTP(t, srv, sid)
+
+	// Wait WELL past the original delay: the commit must never land.
+	time.Sleep(400 * time.Millisecond)
+	if n := f.UserMessageCount(sid); n != 0 {
+		t.Fatalf("UserMessageCount after reset+delay = %d, want 0 (pending commit must be discarded on reset)", n)
+	}
+	gr, gb := get(t, srv, "/session/"+sid+"/message/"+mid)
+	if gr.StatusCode != http.StatusNotFound {
+		t.Fatalf("exact-GET after reset = %d, want PERMANENT 404 (body=%s)", gr.StatusCode, gb)
+	}
+}
+
+// TestPromptAsyncDelayedPersistCommitWithoutResetStillLands is the control for
+// the resetGen fence: with NO reset in flight the captured generation still
+// matches after the delay, so the commit lands normally (the fence must not
+// over-discard).
+func TestPromptAsyncDelayedPersistCommitWithoutResetStillLands(t *testing.T) {
+	f := New()
+	f.SetPromptAsyncMode(PromptAsyncDelayedPersist)
+	f.SetPromptAsyncPersistDelay(60 * time.Millisecond)
+	srv := startFixtureHTTP(t, f)
+
+	const sid = "dly-5"
+	const mid = "msg_noreset05"
+	body := `{"parts":[{"type":"text","text":"fresh"}],"messageID":` + jsonQuote(mid) + `}`
+
+	resp, _ := postJSON(t, srv, "/session/"+sid+"/prompt_async", body)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("prompt_async: got %d want 204", resp.StatusCode)
+	}
+
+	waitFor(t, "commit without reset", 2*time.Second, func() bool { return f.UserMessageCount(sid) == 1 })
+	gr, gb := get(t, srv, "/session/"+sid+"/message/"+mid)
+	if gr.StatusCode != http.StatusOK {
+		t.Fatalf("exact-GET without reset = %d, want 200 (body=%s)", gr.StatusCode, gb)
+	}
+}
+
+// resetViaHTTP drives the real POST /fixture/reset?session=<sid> handler.
+func resetViaHTTP(t *testing.T, srv *httptest.Server, sid string) {
+	t.Helper()
+	resp, _ := postJSON(t, srv, "/fixture/reset?session="+url.QueryEscape(sid), "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("fixture reset: got %d want 200", resp.StatusCode)
 	}
 }
 
