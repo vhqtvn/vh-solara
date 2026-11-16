@@ -118,7 +118,7 @@ passed under the snapshot-time regression, exactly as the ledger predicted.)
     { "id": "measured_outcome[fnv1a:2ac3bc2937144968]",
       "disposition": "curated",
       "carrier": { "kind": "artifact", "path": "docs/checkpoints/2026-11-16-debt-paydown-w2-go-closeout.md" },
-      "handle": "W2 discharged: fence 5334634, t1d-f1 test 7a5ed8a, GC-2 test 80262fd, rider skipped (balloons), matrix sweep 396/5/0 at 80262fd == W1 baseline",
+      "handle": "decision-item: task-2026-11-16t10-13-26-debt-paydown-w2-go-resetgen-fence-t1d-f1-mid-pass-fence-test-gc-2-boundary-test-fixtures-matrix-sweep-final-tree#measured_outcome[fnv1a:2ac3bc2937144968] (curated)",
       "provenance": "this checkpoint's Per-item dispositions + Behavioral closure sections carry the curated summary; commits 5334634/7a5ed8a/80262fd carry the per-item detail" }
   ]
 }
