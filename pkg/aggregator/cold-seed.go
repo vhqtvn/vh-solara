@@ -166,6 +166,10 @@ func (a *Aggregator) seedColdLastAgents(ctx context.Context, sessions []json.Raw
 	}
 	wg.Wait()
 	if len(lastAgents) > 0 {
+		// The store-side loaded fence in SetLastAgents covers this batch path
+		// against the late-overwrite shape: a session whose history was loaded
+		// authoritatively while these tail GETs were in flight is skipped
+		// there, so its recompute-derived lastAgent survives the late seed.
 		a.store.SetLastAgents(lastAgents)
 	}
 }
@@ -226,7 +230,10 @@ func (a *Aggregator) reseedCreatedSessionAgent(ctx context.Context, id string) {
 	if agent := lastAssistantAgent(items); agent != "" {
 		// No-op if the session was deleted again in the fetch race window —
 		// the memo stays correct across remove/recreate, same as
-		// seedColdLastAgents.
+		// seedColdLastAgents. A session whose history was LOADED while this
+		// tail GET was in flight is likewise protected: SetLastAgents' store-
+		// side loaded fence drops the stale seed so the recompute path's
+		// authoritative value survives (the W5 late-overwrite repair).
 		a.store.MarkColdSeeded(id)
 		a.store.SetLastAgents(map[string]string{id: agent})
 	}

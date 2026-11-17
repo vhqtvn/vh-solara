@@ -761,11 +761,25 @@ func (s *Store) setSessionMessages(sid string, list []MessageWithParts, exhauste
 // each cold session is tail-fetched at most once per aggregator lifetime, so
 // reconnects skip already-seeded sessions. Once a session is opened (messages
 // loaded), recomputeLastAssistantLocked overrides the seed authoritatively from
-// the full history.
+// the full history — and a seed arriving AFTER that load is dropped entirely
+// (the loaded fence below): the tail GET is captured before the load completes,
+// so letting it write would clobber the authoritative value with stale data
+// (the W5 late-overwrite defect). The fence holds for empty seeds too — a
+// LOADED session's lastAgent is writable only by the recompute path — and is
+// deliberately conservative in both time directions: a genuinely NEWER tail
+// value landing just after a load is also dropped, staying stale until the next
+// recompute trigger, which is strictly less severe than the clobber it prevents.
 func (s *Store) SetLastAgents(agents map[string]string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for sid, agent := range agents {
+		if s.msgLoaded[sid] {
+			// Loaded-fence: this seed's tail GET raced a full history load
+			// (checked and written under the same s.mu the load path holds,
+			// so the interleaving is decided atomically). recompute owns a
+			// loaded session's lastAgent — skip the stale seed, emit nothing.
+			continue
+		}
 		// Route every cold seed through the universal lastAgent chokepoint so a
 		// real change (incl. a seed to "", exercised when a recompute or an
 		// explicit empty seed clears a previously-set chip) advances the seq and
