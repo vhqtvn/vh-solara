@@ -781,6 +781,14 @@ func (s *Store) deleteSessionLocked(id string) {
 	// scratch (a prior incarnation's not-busy run must not pre-arm the
 	// interrupted-turn sweep for a fresh session).
 	delete(s.notBusyOnce, id)
+	// Advance the cold-seed incarnation fence (W8): every removal of this id
+	// makes any still-in-flight cold-seed tail fetch — which captured the
+	// PRIOR incarnation — stale, so its fenced writes decline. DELIBERATELY
+	// NOT deleted here (unlike every other per-id map below): resetting the
+	// entry would let a recreated incarnation collide with a value captured
+	// before the removal and silently reopen the W7 cell-3 defect. See the
+	// sessionIncarnation field comment in store.go.
+	s.sessionIncarnation[id]++
 	// Drop the cold-seed memo so a session recreated under the same id (live
 	// session.deleted then session.created, an archive/un-archive, or a hydrate
 	// prune-then-reappear) gets its lastAgent re-seeded from a fresh tail fetch.

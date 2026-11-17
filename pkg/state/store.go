@@ -1163,6 +1163,26 @@ type Store struct {
 	// lastAgent authoritatively from the full history; seeded only suppresses
 	// the lightweight tail re-fetch for un-opened sessions.
 	seeded map[string]bool
+	// sessionIncarnation is the per-session incarnation (generation) counter
+	// behind the cold-seed write fence (W8): a cold-seed tail fetch captures
+	// the incarnation of the session that started it (SessionIncarnation),
+	// and the fenced store writes (MarkColdSeededAtIncarnation /
+	// SetLastAgentAtIncarnation) land only when the incarnation still
+	// matches — so a response returning after a delete/recreate of the same
+	// id can neither write the dead incarnation's agent into the fresh one
+	// nor consume its cold-seed memo (the W7 cell-3 defect). Bumped ONLY in
+	// deleteSessionLocked — the single session-removal chokepoint every
+	// removal shape funnels through — and DELIBERATELY NEVER RESET OR
+	// DELETED: this is the one per-id map in deleteSessionLocked that
+	// survives on purpose. Deleting an entry there would reset the next
+	// incarnation to 0 and collide it with a pre-delete captured 0, silently
+	// reopening the W7 cell-3 defect (the cold-seed regression cells in
+	// pkg/aggregator/cold-seed_test.go pin this invariant — a reset turns
+	// them red). The first incarnation of an id is the zero value; the map
+	// deliberately retains one counter per distinct session id ever removed
+	// for the store's lifetime — an intentional retention bounded by the
+	// machine's session-id universe. Guarded by s.mu.
+	sessionIncarnation map[string]uint64
 	// recentlyArchived is the short-TTL tombstone set by RemoveSessions (the
 	// archive path). It prevents a stale session.updated / session.compacted
 	// arriving with archived=null (because OpenCode rewrote the record from a
@@ -1377,6 +1397,7 @@ func NewWithConfig(cfg Config) (*Store, error) {
 		pendingEmptyNewest:     map[string]string{},
 		confirmedEmptyNewest:   map[string]string{},
 		seeded:                 map[string]bool{},
+		sessionIncarnation:     map[string]uint64{},
 		recentlyArchived:       map[string]time.Time{},
 		archivedSnapshot:       map[string]bool{},
 		ring:                   newRingBuffer(cfg.RingCapacity),

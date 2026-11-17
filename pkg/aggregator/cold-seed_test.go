@@ -382,21 +382,238 @@ func TestColdSeedReseedCancelMidFetchCompletesClientSideAndRetries(t *testing.T)
 	}
 }
 
-// W7 cell 3 (delete/recreate same ID UNLOADED before the old response
-// returns) was executed on the AFFIRMATIVE pre-flight adjudication and
-// DEMONSTRATED RED: the late old-incarnation tail response seeded the
-// UNLOADED recreated session (stale agent A) AND consumed its cold-seed
-// memo, starving the fresh incarnation's own re-seed. Per the card's stop
-// rules the red was NOT fixed in-slice: the durable tracking anchor is the
-// source card (defer-reseed-adversarial-coverage, cell
-// "delete/recreate before response returns"); the verbatim cell body, the
-// both-halves diagnostic, and the tree-bound receipt are preserved for the
-// separately-scoped repair slice under tmp/agent-runs/debt-w7-adversarial-
-// cells/ (gitignored run dir — the repair slice lands this cell as its
-// regression pin, the W5→W6 precedent). No incarnation fence exists on the
-// write path today: MarkColdSeeded marks any existing id, SetLastAgents
-// fences only msgLoaded, and setLastAgentLocked checks only
-// existence+unchanged.
+// TestColdSeedReseedDeleteRecreateUnloadedBeforeOldResponse is W7 cell 3,
+// landed on the AFFIRMATIVE pre-flight adjudication (F3 H1 source_records:
+// the plain session.deleted -> session.created dance re-tracks the id
+// UNLOADED+UNSEEDED while an old reseed GET is still pending; nothing
+// auto-opens a mid-stream recreation; no incarnation fence exists on the
+// write path). The recreation is staged via Store().Apply events ONLY —
+// SetSessionMessages is deliberately NOT used (it would load the session and
+// repeat the already-paid W6 loaded-fence cell). Agents A != B so a clobber
+// cannot hide at the unchanged guard.
+//
+// The cell asserts the DESIRED outcome: the late old-A response must write
+// nothing into the fresh unloaded incarnation and consume none of its memo;
+// the incarnation's own tail (B) must then seed and memoize. Static
+// prediction is RED (MarkColdSeeded marks any existing id; SetLastAgents
+// fences only msgLoaded; setLastAgentLocked checks only existence+unchanged)
+// — a genuine red here is a FINDING for the source card, preserved with a
+// tree-bound receipt and repaired in a separate slice, never in-slice.
+func TestColdSeedReseedDeleteRecreateUnloadedBeforeOldResponse(t *testing.T) {
+	agg, h, oc := newReseedAgg(t)
+	const sid = "s_rec"
+	trackCreatedSession(t, agg, sid)
+
+	// The old incarnation's slow tail (agent A), captured and held.
+	entered, release := h.holdTail(sid, `[{"info":{"id":"r0","sessionID":"s_rec","role":"assistant","agent":"A"}}]`)
+	done := startReseed(context.Background(), agg, sid)
+	defer oc.Close()
+	defer func() { waitReseed(t, done, "old-incarnation reseed completion (cleanup)") }()
+	defer release()
+
+	waitReseed(t, entered, "held tail GET capture")
+
+	// The production mid-stream remove/recreate dance while the old GET is
+	// pending: plain deleted -> created (NOT archive-shaped, which the
+	// store's resurrection tombstone suppresses), leaving the recreation
+	// UNLOADED — nobody has opened it.
+	agg.Store().Apply(opencode.Event{Type: "session.deleted", Properties: json.RawMessage(`{"info":{"id":"s_rec"}}`)})
+	trackCreatedSession(t, agg, sid)
+	for _, loaded := range agg.Store().LoadedSessions() {
+		if loaded == sid {
+			t.Fatalf("precondition: the recreated session must be UNLOADED for this cell")
+		}
+	}
+
+	release()
+	waitReseed(t, done, "old-incarnation reseed completion")
+
+	// THE CELL: no stale A into the fresh incarnation, no consumed memo.
+	if got := agg.Store().Snapshot(nil).LastAgents[sid]; got != "" {
+		t.Fatalf("HAZARD MANIFESTED: late old-incarnation tail response (agent %q) seeded the UNLOADED recreated session", got)
+	}
+	if got := agg.Store().ColdSeedNeeded([]string{sid}); len(got) != 1 {
+		t.Fatalf("late old response must not consume the recreated session's memo, ColdSeedNeeded=%v", got)
+	}
+
+	// The fresh incarnation's own tail (B) must still seed and memoize.
+	h.armTail(sid, `[{"info":{"id":"r1","sessionID":"s_rec","role":"assistant","agent":"B"}}]`)
+	agg.reseedCreatedSessionAgent(context.Background(), sid)
+	if got := agg.Store().Snapshot(nil).LastAgents[sid]; got != "B" {
+		t.Fatalf("recreated session must seed its OWN tail agent B, got %q", got)
+	}
+	if got, want := h.tailGETs(sid), 2; got != want {
+		t.Fatalf("fresh incarnation must be fetched exactly once: GETs=%d want %d", got, want)
+	}
+	agg.reseedCreatedSessionAgent(context.Background(), sid)
+	if got, want := h.tailGETs(sid), 2; got != want {
+		t.Fatalf("successful seed must memoize (no third GET): GETs=%d want %d", got, want)
+	}
+}
+
+// TestColdSeedBatchDeleteRecreateMidFanOutKeepsFreshIncarnationClean is the
+// W8 batch-sibling cell (obligation adopted from the W8 F3 adversarial
+// review: no existing pin covered a delete/recreate shape on the BATCH
+// hydrate path, so a batch fence regression would have landed green). It
+// drives seedColdLastAgents directly — the fan-out the hydrate path runs —
+// with one id's tail GET held: a delete/recreate dance landing while that
+// GET is pending must leave the fresh incarnation clean (no stale agent from
+// the old response, memo unconsumed), and the fresh incarnation's own tail
+// (B) must then seed and memoize via the single-id reseed path.
+func TestColdSeedBatchDeleteRecreateMidFanOutKeepsFreshIncarnationClean(t *testing.T) {
+	agg, h, oc := newReseedAgg(t)
+	const sid = "s_bat"
+	trackCreatedSession(t, agg, sid)
+
+	// The batch fan-out's slow tail (agent A) for the one candidate session,
+	// captured and held.
+	entered, release := h.holdTail(sid, `[{"info":{"id":"b0","sessionID":"s_bat","role":"assistant","agent":"A"}}]`)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		agg.seedColdLastAgents(context.Background(), []json.RawMessage{json.RawMessage(`{"id":"` + sid + `"}`)})
+	}()
+	// LIFO failure-safe cleanup: release the held GET, bounded-join the
+	// fan-out, then Close (which waits for outstanding requests).
+	defer oc.Close()
+	defer func() { waitReseed(t, done, "batch fan-out completion (cleanup)") }()
+	defer release()
+
+	waitReseed(t, entered, "held batch tail GET capture")
+
+	// The mid-stream remove/recreate dance while the batch GET is pending
+	// (same staging as cell 3: plain Store().Apply events, recreation left
+	// UNLOADED).
+	agg.Store().Apply(opencode.Event{Type: "session.deleted", Properties: json.RawMessage(`{"info":{"id":"s_bat"}}`)})
+	trackCreatedSession(t, agg, sid)
+	for _, loaded := range agg.Store().LoadedSessions() {
+		if loaded == sid {
+			t.Fatalf("precondition: the recreated session must be UNLOADED for this cell")
+		}
+	}
+
+	release()
+	waitReseed(t, done, "batch fan-out completion")
+
+	// THE CELL: the held old-incarnation response must have landed nothing —
+	// no stale agent A, no consumed memo (the batch fence declined both).
+	if got := agg.Store().Snapshot(nil).LastAgents[sid]; got != "" {
+		t.Fatalf("HAZARD MANIFESTED: late batch tail response (agent %q) seeded the UNLOADED recreated session", got)
+	}
+	if got := agg.Store().ColdSeedNeeded([]string{sid}); len(got) != 1 {
+		t.Fatalf("late batch response must not consume the recreated session's memo, ColdSeedNeeded=%v", got)
+	}
+
+	// The fresh incarnation's own tail (B) must seed and memoize.
+	h.armTail(sid, `[{"info":{"id":"b1","sessionID":"s_bat","role":"assistant","agent":"B"}}]`)
+	agg.reseedCreatedSessionAgent(context.Background(), sid)
+	if got := agg.Store().Snapshot(nil).LastAgents[sid]; got != "B" {
+		t.Fatalf("recreated session must seed its OWN tail agent B, got %q", got)
+	}
+	if got, want := h.tailGETs(sid), 2; got != want {
+		t.Fatalf("fresh incarnation must be fetched exactly once: GETs=%d want %d", got, want)
+	}
+	agg.reseedCreatedSessionAgent(context.Background(), sid)
+	if got, want := h.tailGETs(sid), 2; got != want {
+		t.Fatalf("successful seed must memoize (no third GET): GETs=%d want %d", got, want)
+	}
+}
+
+// TestColdSeedBatchMarkedThenRecreatedBeforeFinalWriteDeclinesStaleWrite is
+// the W8 write-side-fence cell (commit-review F1 obligation): unlike the
+// other W8 cells — where the delete/recreate lands while the GET is still
+// HELD, so the incarnation-fenced MARK declines first and the final write is
+// never reached — this cell drives the schedule where the mark SUCCEEDS at
+// the captured incarnation and the remove/recreate dance lands BETWEEN that
+// mark and the fan-out's post-wg.Wait final write. The blocked-on-B fan-out
+// provides the window deterministically: session s_wsa's tail GET completes
+// and marks while s_wsb's held GET keeps wg.Wait pending; the dance then
+// bumps s_wsa's incarnation; on release, the accumulated {agent A,
+// incarnation 0} write must be DECLINED by SetLastAgentAtIncarnation — no
+// stale agent, memo unconsumed, fresh incarnation re-seeds from its own tail.
+func TestColdSeedBatchMarkedThenRecreatedBeforeFinalWriteDeclinesStaleWrite(t *testing.T) {
+	agg, h, oc := newReseedAgg(t)
+	const (
+		sa = "s_wsa" // the session whose final write must be fenced out
+		sb = "s_wsb" // the fan-out blocker keeping wg.Wait pending
+	)
+	trackCreatedSession(t, agg, sa)
+	trackCreatedSession(t, agg, sb)
+
+	// sa's tail (agent A) answers immediately — its fetch completes and its
+	// incarnation-fenced MARK succeeds while the fan-out below is still
+	// blocked on sb's held GET.
+	h.armTail(sa, `[{"info":{"id":"wa0","sessionID":"s_wsa","role":"assistant","agent":"A"}}]`)
+	entered, release := h.holdTail(sb, `[{"info":{"id":"wb0","sessionID":"s_wsb","role":"assistant","agent":"X"}}]`)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		agg.seedColdLastAgents(context.Background(), []json.RawMessage{
+			json.RawMessage(`{"id":"` + sa + `"}`),
+			json.RawMessage(`{"id":"` + sb + `"}`),
+		})
+	}()
+	defer oc.Close()
+	defer func() { waitReseed(t, done, "fan-out completion (cleanup)") }()
+	defer release()
+
+	// The blocker's GET is captured and held — the fan-out is running and
+	// wg.Wait cannot complete until release() below.
+	waitReseed(t, entered, "held blocker GET capture")
+
+	// Bounded poll for sa's memo being consumed (the successful mark at
+	// incarnation 0) — a monotone observable condition, so the bounded wait
+	// stays deterministic in outcome.
+	deadline := time.After(reseedWaitBound)
+	for {
+		if got := agg.Store().ColdSeedNeeded([]string{sa}); len(got) == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s's batch mark — deterministic red: diagnose the ordering, do not bump the bound", sa)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	// The dance lands BETWEEN sa's mark and the fan-out's final write (which
+	// cannot run: wg.Wait is still blocked on sb's held GET). sa's
+	// incarnation advances; the recreation is UNLOADED.
+	agg.Store().Apply(opencode.Event{Type: "session.deleted", Properties: json.RawMessage(`{"info":{"id":"` + sa + `"}}`)})
+	trackCreatedSession(t, agg, sa)
+	for _, loaded := range agg.Store().LoadedSessions() {
+		if loaded == sa {
+			t.Fatalf("precondition: the recreated session must be UNLOADED for this cell")
+		}
+	}
+
+	release()
+	waitReseed(t, done, "fan-out completion")
+
+	// THE CELL (write-side fence): the already-MARKED stale seed must be
+	// DECLINED at the final write — no stale A, and the delete's memo clear
+	// leaves the fresh incarnation retry-eligible.
+	if got := agg.Store().Snapshot(nil).LastAgents[sa]; got != "" {
+		t.Fatalf("HAZARD MANIFESTED: batch final write landed stale agent %q after the session was recreated mid-fan-out", got)
+	}
+	if got := agg.Store().ColdSeedNeeded([]string{sa}); len(got) != 1 {
+		t.Fatalf("recreated session must be retry-eligible after the dance, ColdSeedNeeded=%v", got)
+	}
+	// The blocker session seeded normally through the same fan-out.
+	if got := agg.Store().Snapshot(nil).LastAgents[sb]; got != "X" {
+		t.Fatalf("blocker session must seed its own agent X, got %q", got)
+	}
+
+	// The fresh incarnation's own tail (B) must seed and memoize.
+	h.armTail(sa, `[{"info":{"id":"wa1","sessionID":"s_wsa","role":"assistant","agent":"B"}}]`)
+	agg.reseedCreatedSessionAgent(context.Background(), sa)
+	if got := agg.Store().Snapshot(nil).LastAgents[sa]; got != "B" {
+		t.Fatalf("recreated session must seed its OWN tail agent B, got %q", got)
+	}
+	if got, want := h.tailGETs(sa), 2; got != want {
+		t.Fatalf("fresh incarnation must be fetched exactly once: GETs=%d want %d", got, want)
+	}
+}
 
 // reseedTailHandler wraps the fixture backend and answers cold-seed TAIL GETs
 // (GET /session/:id/message?limit=coldTailLimit) for sids armed in tails with a

@@ -23,10 +23,13 @@ import (
 // that finds one running skips. The goroutine clears seedDone and closes done
 // in its defer, BOTH under the constraint that close(done) happens OUTSIDE
 // seedMu (no blocking work under the lock). seedColdLastAgents fans out the
-// per-session MessagesTail GETs 8-wide under a semaphore and a WaitGroup, then
-// SetLastAgents the accumulated map. Each cold session is seeded at most once
-// for the aggregator's lifetime (memoized in the store via MarkColdSeeded); a
-// failed fetch is NOT marked seeded so it retries next reconnect. The
+// per-session MessagesTail GETs 8-wide under a semaphore and a WaitGroup; each
+// goroutine marks its session seeded through the incarnation-fenced memo and
+// accumulates the agent together with the incarnation its GET started under,
+// then the post-Wait writes go through the incarnation + loaded fenced
+// SetLastAgentAtIncarnation (W8). Each cold session is seeded at most once
+// for the aggregator's lifetime (memoized in the store via the fenced mark);
+// a failed fetch is NOT marked seeded so it retries next reconnect. The
 // single-id reseed path (below) additionally skips memoization on a
 // SUCCESSFUL-but-empty tail; this batch path marks on any successful fetch.
 // See the aggregator concurrency map §4 (seedDone) + §5 (seedCtx ctx tree).
@@ -101,7 +104,9 @@ func (a *Aggregator) waitColdSeed() {
 // per session are logged and skipped (graceful — no worse than an empty chip);
 // a failed fetch is NOT marked seeded, so it retries on the next reconnect,
 // matching pre-memo behavior. A successful fetch marks the session seeded
-// (store.MarkColdSeeded) so later reconnects skip the re-fetch entirely.
+// through the incarnation-fenced memo (store.MarkColdSeededAtIncarnation —
+// only when the session still exists at the incarnation the fetch captured),
+// so later reconnects skip the re-fetch entirely.
 func (a *Aggregator) seedColdLastAgents(ctx context.Context, sessions []json.RawMessage) {
 	loaded := make(map[string]bool)
 	for _, id := range a.store.LoadedSessions() {
@@ -133,11 +138,21 @@ func (a *Aggregator) seedColdLastAgents(ctx context.Context, sessions []json.Raw
 		return
 	}
 
+	// coldSeedResult carries one batch fan-out result together with the
+	// session incarnation its tail GET started under, so the post-Wait write
+	// can be fenced per id (W8): a session deleted (or deleted+recreated)
+	// while the fan-out was in flight is skipped rather than seeded with the
+	// dead incarnation's agent.
+	type coldSeedResult struct {
+		agent       string
+		incarnation uint64
+	}
+
 	var (
-		mu         sync.Mutex
-		wg         sync.WaitGroup
-		lastAgents = map[string]string{}
-		sem        = make(chan struct{}, 8) // bound concurrency; limit=10 keeps each fetch cheap
+		mu     sync.Mutex
+		wg     sync.WaitGroup
+		agents = map[string]coldSeedResult{}
+		sem    = make(chan struct{}, 8) // bound concurrency; limit=10 keeps each fetch cheap
 	)
 	for _, id := range need {
 		wg.Add(1)
@@ -145,6 +160,11 @@ func (a *Aggregator) seedColdLastAgents(ctx context.Context, sessions []json.Raw
 		go func(id string) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			// Bind this fetch to the session incarnation that started it
+			// (W8): the fenced mark + accumulated write below are dropped if
+			// the session is deleted (or deleted+recreated under a new
+			// incarnation) while the GET is in flight.
+			incarnation := a.store.SessionIncarnation(id)
 			// The tail GET's X-Next-Cursor is irrelevant here (cold-seed only
 			// scans the newest assistant's agent) — discarded deliberately.
 			items, _, err := a.client.MessagesTail(ctx, id, coldTailLimit)
@@ -153,24 +173,30 @@ func (a *Aggregator) seedColdLastAgents(ctx context.Context, sessions []json.Raw
 				return
 			}
 			// Mark seeded only on a successful fetch so a transient failure
-			// retries next reconnect (pre-memo behavior). MarkColdSeeded is a
-			// no-op if the session was deleted in the race window between the
-			// fetch and here, keeping the memo correct across remove/recreate.
-			a.store.MarkColdSeeded(id)
+			// retries next reconnect (pre-memo behavior), and only when the
+			// incarnation still matches — a delete/recreate racing the fetch
+			// must not consume the fresh incarnation's memo (W8; the W7
+			// cell-3 hazard, batch variant). Empty tails still mark here
+			// (batch semantics; the single-id reseed deliberately does not).
+			if !a.store.MarkColdSeededAtIncarnation(id, incarnation) {
+				return
+			}
 			if agent := lastAssistantAgent(items); agent != "" {
 				mu.Lock()
-				lastAgents[id] = agent
+				agents[id] = coldSeedResult{agent: agent, incarnation: incarnation}
 				mu.Unlock()
 			}
 		}(id)
 	}
 	wg.Wait()
-	if len(lastAgents) > 0 {
-		// The store-side loaded fence in SetLastAgents covers this batch path
-		// against the late-overwrite shape: a session whose history was loaded
-		// authoritatively while these tail GETs were in flight is skipped
-		// there, so its recompute-derived lastAgent survives the late seed.
-		a.store.SetLastAgents(lastAgents)
+	// Incarnation + loaded fenced writes (W8, with the W6 loaded fence
+	// preserved inside): each accumulated seed lands only if its session is
+	// still on the incarnation that fetched it and was not loaded meanwhile
+	// — a session whose history was loaded authoritatively mid-fan-out keeps
+	// its recompute-derived lastAgent. Per-id event granularity is unchanged
+	// (SetLastAgents already emitted one event per changed id).
+	for id, res := range agents {
+		a.store.SetLastAgentAtIncarnation(id, res.agent, res.incarnation)
 	}
 }
 
@@ -191,6 +217,10 @@ func (a *Aggregator) seedColdLastAgents(ctx context.Context, sessions []json.Raw
 //     reconnect hydrate) can re-fetch once a turn exists;
 //   - LOADED sessions are skipped — the message-recompute path owns their
 //     lastAgent authoritatively;
+//   - the fetch is bound to the session incarnation that started it (W8): a
+//     delete/recreate of the same id while the GET is in flight fences BOTH
+//     the memo and the write, so the late stale response lands nothing and
+//     the fresh incarnation re-seeds from its own tail;
 //   - a failed fetch is NOT marked seeded, so the next hydrate retries
 //     (same grace as seedColdLastAgents). An empty tail is also left
 //     unmarked — reseed-specific: the batch hydrate path still marks empty
@@ -222,20 +252,33 @@ func (a *Aggregator) reseedCreatedSessionAgent(ctx context.Context, id string) {
 	if len(a.store.ColdSeedNeeded([]string{id})) == 0 {
 		return // unknown session, or memo already seeded
 	}
+	// Bind this fetch to the session incarnation that started it (W8): the
+	// fenced mark/write below land only if the incarnation is unchanged, so a
+	// delete/recreate of the same id while the GET is in flight can neither
+	// write the dead incarnation's agent into the fresh one nor consume its
+	// cold-seed memo (the W7 cell-3 defect: stale seed + starved re-seed).
+	incarnation := a.store.SessionIncarnation(id)
 	items, _, err := a.client.MessagesTail(ctx, id, coldTailLimit)
 	if err != nil {
 		log.Printf("[aggregator] lastAgent re-seed tail fetch failed for %s: %v", id, err)
 		return // unmarked: the next hydrate retries, mirroring cold-seed grace
 	}
 	if agent := lastAssistantAgent(items); agent != "" {
-		// No-op if the session was deleted again in the fetch race window —
-		// the memo stays correct across remove/recreate, same as
-		// seedColdLastAgents. A session whose history was LOADED while this
-		// tail GET was in flight is likewise protected: SetLastAgents' store-
-		// side loaded fence drops the stale seed so the recompute path's
-		// authoritative value survives (the W5 late-overwrite repair).
-		a.store.MarkColdSeeded(id)
-		a.store.SetLastAgents(map[string]string{id: agent})
+		// Incarnation-fenced memo (W8): a declined mark means the session was
+		// deleted (no-op either way) or deleted+recreated under a NEW
+		// incarnation in the fetch race window — the response is stale, so
+		// write nothing and leave the fresh incarnation eligible to re-seed
+		// from its own tail. A session whose history was LOADED while this
+		// GET was in flight is still marked here (the W6 loaded fence governs
+		// the write, not the memo — pre-W8 semantics preserved).
+		if !a.store.MarkColdSeededAtIncarnation(id, incarnation) {
+			return
+		}
+		// Incarnation + loaded fenced write: dropped when the incarnation
+		// moved (delete/recreate) or the session got LOADED mid-fetch, so the
+		// recompute path's authoritative value survives (the W5/W6
+		// late-overwrite repair, preserved).
+		a.store.SetLastAgentAtIncarnation(id, agent, incarnation)
 	}
 	// An empty tail (no assistant turn yet) is deliberately NOT marked seeded:
 	// memoizing it would pin lastAgent empty for the aggregator's lifetime even

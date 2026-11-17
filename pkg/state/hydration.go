@@ -12,7 +12,10 @@
 //     markers that let the reconcile preserve newer live bodies;
 //   - SetLastAgents / ColdSeedNeeded / MarkColdSeeded — the cold-seed surface
 //     that lets the tree render per-agent chips before any session's full
-//     message history is hydrated.
+//     message history is hydrated; plus their incarnation-fenced variants
+//     (SessionIncarnation / MarkColdSeededAtIncarnation /
+//     SetLastAgentAtIncarnation, W8) that bind a cold-seed write to the
+//     session incarnation whose fetch produced it.
 //
 // The Store struct and its single s.mu RWMutex stay in store.go and are shared
 // across this whole package (same-package file split; no protocol change). The
@@ -821,4 +824,71 @@ func (s *Store) MarkColdSeeded(id string) {
 	if s.sessions[id] != nil {
 		s.seeded[id] = true
 	}
+}
+
+// SessionIncarnation returns the current incarnation (generation) number of
+// the session id — the value a cold-seed fetch captures at fetch start and
+// re-presents to the fenced write paths below. The first incarnation of an
+// id is 0; every removal (deleteSessionLocked — the single session-removal
+// chokepoint) advances the counter, and entries are never reset, so a
+// recreated incarnation can never collide with a value captured before the
+// removal. The aggregator's cold-seed paths use this to bind a tail fetch to
+// the incarnation that started it (the W8 incarnation fence).
+func (s *Store) SessionIncarnation(id string) uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sessionIncarnation[id]
+}
+
+// MarkColdSeededAtIncarnation is the incarnation-fenced variant of
+// MarkColdSeeded (W8): it records the cold-seed memo ONLY when the session
+// still exists AND its incarnation still equals the one the fetch captured,
+// returning whether the memo was recorded. A tail response returning after
+// the session was deleted and recreated under the same id therefore cannot
+// consume the fresh incarnation's memo — the fresh incarnation stays
+// retry-eligible and re-seeds from its own tail (the W7 cell-3 repair). Like
+// MarkColdSeeded it does NOT consult msgLoaded: a session whose history was
+// loaded while the fetch was in flight is still marked seeded (the W6 loaded
+// fence governs the WRITE, in SetLastAgentAtIncarnation, not the memo —
+// preserving the pre-W8 mark-on-success semantics exactly). The existence +
+// incarnation checks and the mark run under ONE s.mu hold, so the decision is
+// atomic against deleteSessionLocked's incarnation bump.
+func (s *Store) MarkColdSeededAtIncarnation(id string, incarnation uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessions[id] == nil || s.sessionIncarnation[id] != incarnation {
+		return false
+	}
+	s.seeded[id] = true
+	return true
+}
+
+// SetLastAgentAtIncarnation is the incarnation-fenced variant of the
+// SetLastAgents cold-seed write (W8) for one session: it routes the seed
+// through the universal setLastAgentLocked chokepoint ONLY when the session
+// still exists, its incarnation still equals the one the fetch captured, and
+// the session is NOT loaded. The loaded check is the W6 loaded-fence
+// preserved exactly: a seed whose tail GET raced a full history load is
+// dropped so the recompute path's authoritative value survives (the memo may
+// already be marked, which matches pre-W8 behavior where MarkColdSeeded ran
+// unconditionally on fetch success). Returns whether the fence admitted the
+// seed to the chokepoint (the chokepoint itself may still no-op on an
+// unchanged value — an unchanged seed advances neither the seq nor an event,
+// same as SetLastAgents). All checks run under ONE s.mu hold, atomic against
+// deleteSessionLocked's incarnation bump and the load path's msgLoaded set.
+func (s *Store) SetLastAgentAtIncarnation(id, agent string, incarnation uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessions[id] == nil || s.sessionIncarnation[id] != incarnation {
+		return false // session gone, or a later incarnation now owns the id
+	}
+	if s.msgLoaded[id] {
+		// Loaded-fence (W6, preserved verbatim from SetLastAgents): recompute
+		// owns a loaded session's lastAgent — skip the stale seed, emit
+		// nothing. Deliberately conservative in both time directions, same
+		// rationale as SetLastAgents' fence.
+		return false
+	}
+	s.setLastAgentLocked(id, agent)
+	return true
 }
