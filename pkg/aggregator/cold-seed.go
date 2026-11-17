@@ -26,8 +26,10 @@ import (
 // per-session MessagesTail GETs 8-wide under a semaphore and a WaitGroup, then
 // SetLastAgents the accumulated map. Each cold session is seeded at most once
 // for the aggregator's lifetime (memoized in the store via MarkColdSeeded); a
-// failed fetch is NOT marked seeded so it retries next reconnect. See the
-// aggregator concurrency map §4 (seedDone) + §5 (seedCtx ctx tree).
+// failed fetch is NOT marked seeded so it retries next reconnect. The
+// single-id reseed path (below) additionally skips memoization on a
+// SUCCESSFUL-but-empty tail; this batch path marks on any successful fetch.
+// See the aggregator concurrency map §4 (seedDone) + §5 (seedCtx ctx tree).
 
 // coldTailLimit is the number of newest messages fetched per un-opened session
 // to derive its lastAgent for the tree chips. It only needs to be large enough
@@ -180,12 +182,15 @@ func (a *Aggregator) seedColdLastAgents(ctx context.Context, sessions []json.Raw
 //
 // Guards (mirroring seedColdLastAgents' semantics for one id):
 //   - unknown or already-seeded sessions do nothing (ColdSeedNeeded), so this
-//     is idempotent and safe for genuinely-new sessions (their tail is empty
-//     → no agent → no SetLastAgents — identical to today's post-hydrate state);
+//     is safe for genuinely-new sessions: an empty tail writes no lastAgent
+//     and no memo, so a LATER trigger (a session.created for this id, or a
+//     reconnect hydrate) can re-fetch once a turn exists;
 //   - LOADED sessions are skipped — the message-recompute path owns their
 //     lastAgent authoritatively;
 //   - a failed fetch is NOT marked seeded, so the next hydrate retries
-//     (same grace as seedColdLastAgents).
+//     (same grace as seedColdLastAgents). An empty tail is also left
+//     unmarked — reseed-specific: the batch hydrate path still marks empty
+//     tails, which would consume that retry eligibility.
 //
 // Lifetime binding mirrors startColdSeed: runCtx read under seedMu; the
 // fallback context.Background() only fires when Run has not run yet, which
@@ -218,12 +223,20 @@ func (a *Aggregator) reseedCreatedSessionAgent(ctx context.Context, id string) {
 		log.Printf("[aggregator] lastAgent re-seed tail fetch failed for %s: %v", id, err)
 		return // unmarked: the next hydrate retries, mirroring cold-seed grace
 	}
-	// No-op if the session was deleted again in the fetch race window — the
-	// memo stays correct across remove/recreate, same as seedColdLastAgents.
-	a.store.MarkColdSeeded(id)
 	if agent := lastAssistantAgent(items); agent != "" {
+		// No-op if the session was deleted again in the fetch race window —
+		// the memo stays correct across remove/recreate, same as
+		// seedColdLastAgents.
+		a.store.MarkColdSeeded(id)
 		a.store.SetLastAgents(map[string]string{id: agent})
 	}
+	// An empty tail (no assistant turn yet) is deliberately NOT marked seeded:
+	// memoizing it would pin lastAgent empty for the aggregator's lifetime even
+	// after a later turn produces one, and a connected daemon never rehydrates.
+	// This does NOT schedule a retry by itself — it only leaves the session
+	// eligible: a later session.created trigger (remove/recreate) or hydrate
+	// re-fetches. (The batch hydrate path still marks empty tails, which would
+	// consume that eligibility.)
 }
 
 // lastAssistantAgent scans a list of raw {info,parts} messages from the END
