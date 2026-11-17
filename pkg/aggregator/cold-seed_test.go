@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/fixtures"
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
@@ -188,6 +189,214 @@ func TestColdSeedReseedLateHeldResponseKeepsLoadedAgent(t *testing.T) {
 		t.Fatalf("exactly one tail GET expected for the held reseed: GETs=%d want %d", got, want)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// W7 adversarial cells (delete-mid-fetch, cancel-mid-fetch, and the
+// conditional unloaded delete/recreate). Shared helpers first: every
+// rendezvous is bounded (a violated ordering is a deterministic red, never a
+// 10-minute suite hang), the reseed goroutine never calls t.Fatalf (its
+// Goexit would strand the test's join — failures surface via test-side
+// assertions), and each cell registers its release/join/Close defers LIFO
+// immediately after arming its hold.
+// ---------------------------------------------------------------------------
+
+// reseedWaitBound bounds every W7 rendezvous/join wait. It is a failure
+// signal, not a synchronization knob: exceeding it means an expected
+// rendezvous did not happen, which is the finding — diagnose the ordering,
+// never bump the bound.
+const reseedWaitBound = 5 * time.Second
+
+// waitReseed waits for ch up to reseedWaitBound, failing the test with `what`
+// on timeout instead of hanging the suite.
+func waitReseed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(reseedWaitBound):
+		t.Fatalf("timed out after %v waiting for %s — deterministic red: diagnose the ordering, do not bump the bound", reseedWaitBound, what)
+	}
+}
+
+// startReseed runs reseedCreatedSessionAgent on ctx in a goroutine and
+// returns its completion channel. The goroutine itself never fails the test.
+func startReseed(ctx context.Context, agg *Aggregator, sid string) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		agg.reseedCreatedSessionAgent(ctx, sid)
+	}()
+	return done
+}
+
+// newReseedAgg builds the W7 cell harness: a fixture-backed hold/count
+// server plus a rehydrated aggregator whose initial batch cold-seed has
+// settled, so the single-id reseed path is exercised in isolation.
+func newReseedAgg(t *testing.T) (*Aggregator, *reseedTailHandler, *httptest.Server) {
+	t.Helper()
+	h := &reseedTailHandler{
+		inner: fixtures.New().Handler(),
+		count: map[string]int{},
+		tails: map[string]string{},
+	}
+	oc := httptest.NewServer(h)
+	agg := New(oc.URL, 100)
+	if err := agg.Rehydrate(context.Background()); err != nil {
+		oc.Close()
+		t.Fatalf("rehydrate: %v", err)
+	}
+	agg.waitColdSeed()
+	return agg, h, oc
+}
+
+// trackCreatedSession applies the production session.created shape — the
+// same store-level event application lifecycle.go's event callback performs
+// (Apply, then the session.created handling that routes to
+// startCreatedSessionReseed) — and asserts the tracked+unseeded precondition
+// the reseed's ColdSeedNeeded guard requires.
+func trackCreatedSession(t *testing.T, agg *Aggregator, sid string) {
+	t.Helper()
+	agg.Store().Apply(opencode.Event{Type: "session.created", Properties: json.RawMessage(`{"info":{"id":"` + sid + `"}}`)})
+	if got := agg.Store().ColdSeedNeeded([]string{sid}); len(got) != 1 {
+		t.Fatalf("precondition: %s must be tracked and un-seeded, got %v", sid, got)
+	}
+}
+
+// TestColdSeedReseedDeleteMidFetchKeepsDeletedSessionClean is W7 cell 1: the
+// session is deleted while the reseed tail GET is held, and the late response
+// (old agent A) must land NOTHING — no stale lastAgent on the deleted id, no
+// memo residue — so a recreated same-id session can still be re-seeded fresh.
+// Grounding for the expected-green outcome: MarkColdSeeded no-ops on an
+// absent session (hydration.go) and setLastAgentLocked no-ops on an unknown
+// session (reducers.go); deleteSessionLocked wiped both maps. The recreation
+// leg then pins the documented intent (cold-seed.go: a recreated id gets its
+// lastAgent re-seeded from a fresh tail fetch, memoized on success).
+func TestColdSeedReseedDeleteMidFetchKeepsDeletedSessionClean(t *testing.T) {
+	agg, h, oc := newReseedAgg(t)
+	const sid = "s_del"
+	trackCreatedSession(t, agg, sid)
+
+	entered, release := h.holdTail(sid, `[{"info":{"id":"d0","sessionID":"s_del","role":"assistant","agent":"A"}}]`)
+	done := startReseed(context.Background(), agg, sid)
+	// LIFO failure-safe cleanup: release the held GET, join the reseed
+	// goroutine (bounded), then Close (which waits for outstanding requests).
+	defer oc.Close()
+	defer func() { waitReseed(t, done, "reseed completion (cleanup)") }()
+	defer release()
+
+	waitReseed(t, entered, "held tail GET capture")
+
+	// The delete lands while the tail GET is held (a live session.deleted
+	// racing a slow tail; the same store path lifecycle.go applies).
+	agg.Store().Apply(opencode.Event{Type: "session.deleted", Properties: json.RawMessage(`{"info":{"id":"s_del"}}`)})
+	if got := agg.Store().ColdSeedNeeded([]string{sid}); len(got) != 0 {
+		t.Fatalf("precondition: a deleted session must not be cold-seed-needed, got %v", got)
+	}
+
+	release()
+	waitReseed(t, done, "reseed completion after delete")
+
+	// THE CELL: the late agent-A response must not resurrect anything.
+	if got := agg.Store().Snapshot(nil).LastAgents[sid]; got != "" {
+		t.Fatalf("HAZARD MANIFESTED: late tail response wrote stale agent %q into a deleted session", got)
+	}
+	if got := agg.Store().ColdSeedNeeded([]string{sid}); len(got) != 0 {
+		t.Fatalf("late response must not leave memo eligibility for a deleted session, got %v", got)
+	}
+	if got, want := h.tailGETs(sid), 1; got != want {
+		t.Fatalf("exactly one tail GET for the held reseed: GETs=%d want %d", got, want)
+	}
+
+	// The RECREATED session (delete/recreate after completion) must re-seed
+	// fresh: agent B lands, exactly one new GET, and the memo suppresses a
+	// third fetch.
+	trackCreatedSession(t, agg, sid)
+	h.armTail(sid, `[{"info":{"id":"d1","sessionID":"s_del","role":"assistant","agent":"B"}}]`)
+	agg.reseedCreatedSessionAgent(context.Background(), sid)
+	if got := agg.Store().Snapshot(nil).LastAgents[sid]; got != "B" {
+		t.Fatalf("recreated session must re-seed agent B, got %q", got)
+	}
+	if got, want := h.tailGETs(sid), 2; got != want {
+		t.Fatalf("recreated session must be re-fetched exactly once: GETs=%d want %d", got, want)
+	}
+	agg.reseedCreatedSessionAgent(context.Background(), sid)
+	if got, want := h.tailGETs(sid), 2; got != want {
+		t.Fatalf("successful re-seed must memoize (no third GET): GETs=%d want %d", got, want)
+	}
+}
+
+// TestColdSeedReseedCancelMidFetchCompletesClientSideAndRetries is W7 cell 2:
+// the CLIENT context is cancelled while the server still holds the response.
+// The client-side reseed helper must COMPLETE while the hold is still closed
+// (Go's http.Client returns on request-ctx cancellation without waiting for
+// the server — pkg/opencode/client.go binds the ctx), consume no memo, write
+// nothing, and a retry under a fresh context must still fetch and memoize.
+// The ordering claim is asserted structurally: waitReseed(done) runs BEFORE
+// release() in program order — a client that blocked until the server
+// responded would fail the bounded wait deterministically.
+func TestColdSeedReseedCancelMidFetchCompletesClientSideAndRetries(t *testing.T) {
+	agg, h, oc := newReseedAgg(t)
+	const sid = "s_can"
+	trackCreatedSession(t, agg, sid)
+
+	entered, release := h.holdTail(sid, `[{"info":{"id":"c0","sessionID":"s_can","role":"assistant","agent":"A"}}]`)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startReseed(ctx, agg, sid)
+	// LIFO failure-safe cleanup: cancel (a live ctx also unblocks the client),
+	// release the abandoned handler, bounded-join, then Close.
+	defer oc.Close()
+	defer func() { waitReseed(t, done, "cancelled reseed completion (cleanup)") }()
+	defer release()
+	defer cancel()
+
+	waitReseed(t, entered, "held tail GET capture")
+
+	// Cancel while the response is still held server-side.
+	cancel()
+	waitReseed(t, done, "client-side completion while the hold is still closed")
+
+	// No mutation, memo unconsumed (the error path returns before
+	// MarkColdSeeded/SetLastAgents), exactly one GET so far.
+	if got := agg.Store().Snapshot(nil).LastAgents[sid]; got != "" {
+		t.Fatalf("cancelled fetch must not write lastAgent, got %q", got)
+	}
+	if got := agg.Store().ColdSeedNeeded([]string{sid}); len(got) != 1 {
+		t.Fatalf("cancelled fetch must leave the session retry-eligible (memo unconsumed), ColdSeedNeeded=%v", got)
+	}
+	if got, want := h.tailGETs(sid), 1; got != want {
+		t.Fatalf("exactly one tail GET before the retry: GETs=%d want %d", got, want)
+	}
+
+	// Free the abandoned server handler, then retry under a FRESH context.
+	release()
+	h.armTail(sid, `[{"info":{"id":"c1","sessionID":"s_can","role":"assistant","agent":"B"}}]`)
+	agg.reseedCreatedSessionAgent(context.Background(), sid)
+	if got := agg.Store().Snapshot(nil).LastAgents[sid]; got != "B" {
+		t.Fatalf("retry after cancel must recover agent B, got %q", got)
+	}
+	if got, want := h.tailGETs(sid), 2; got != want {
+		t.Fatalf("retry must perform exactly one new GET: GETs=%d want %d", got, want)
+	}
+	agg.reseedCreatedSessionAgent(context.Background(), sid)
+	if got, want := h.tailGETs(sid), 2; got != want {
+		t.Fatalf("successful retry must memoize (no third GET): GETs=%d want %d", got, want)
+	}
+}
+
+// W7 cell 3 (delete/recreate same ID UNLOADED before the old response
+// returns) was executed on the AFFIRMATIVE pre-flight adjudication and
+// DEMONSTRATED RED: the late old-incarnation tail response seeded the
+// UNLOADED recreated session (stale agent A) AND consumed its cold-seed
+// memo, starving the fresh incarnation's own re-seed. Per the card's stop
+// rules the red was NOT fixed in-slice: the durable tracking anchor is the
+// source card (defer-reseed-adversarial-coverage, cell
+// "delete/recreate before response returns"); the verbatim cell body, the
+// both-halves diagnostic, and the tree-bound receipt are preserved for the
+// separately-scoped repair slice under tmp/agent-runs/debt-w7-adversarial-
+// cells/ (gitignored run dir — the repair slice lands this cell as its
+// regression pin, the W5→W6 precedent). No incarnation fence exists on the
+// write path today: MarkColdSeeded marks any existing id, SetLastAgents
+// fences only msgLoaded, and setLastAgentLocked checks only
+// existence+unchanged.
 
 // reseedTailHandler wraps the fixture backend and answers cold-seed TAIL GETs
 // (GET /session/:id/message?limit=coldTailLimit) for sids armed in tails with a
