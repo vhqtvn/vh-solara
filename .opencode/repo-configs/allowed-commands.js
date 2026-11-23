@@ -23,6 +23,7 @@ export const GIT_MUTATION_VERBS = [
     "am",
     "apply",
     "switch",
+    "worktree",
     "checkout-index",
     "checkout--worker",
     "commit-graph",

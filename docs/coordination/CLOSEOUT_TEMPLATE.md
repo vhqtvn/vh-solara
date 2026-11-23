@@ -197,7 +197,15 @@ Rules:
   `{kind:"artifact",path,revision?}` (a durable file — `docs/checkpoints/`,
   `researches/decisions/`, `researches/sources/`, `docs/planning/` — whose
   COMMITTED blob carries the anchor + handle). There is deliberately NO
-  inline carrier; working-tree content never counts.
+  inline carrier; working-tree content never counts. For `curated`/
+  `sanitized` slots prefer an artifact carrier pointing at (or a commit
+  carrier backed by) a **retirement-carrier document** — a committed file
+  under those homes whose basename contains `retirement-carrier`: commit
+  messages authored by the committer protocol do not carry decision-item
+  label lines, and at retirement the verifier accepts such documents as a
+  fallback carrier for commit-carrier slots (anchor + handle together in
+  one committed blob — see RECORD_LIFECYCLE.md → "Carrier-document
+  fallback").
 - `handle` — the per-item representation the verifier checks in the carrier
   TOGETHER with the card-id anchor:
   - `verbatim`: a single line copied from that item's own content (≥ 24

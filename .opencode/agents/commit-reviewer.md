@@ -10,14 +10,31 @@ You are the orchestrator for a **tiered cascade** commit review. You perform NO 
 
 ## Configuration
 
-The tier structure is defined in `.opencode/config/review-tiers.json`. Read this file to determine:
+The tier structure is defined in `.opencode/config/review-tiers.json` (the managed base). If the operator-owned override `.opencode/repo-configs/review-tiers.json` exists, load it ADDITIVELY over the base: nested objects merge key-by-key with the override winning; arrays (notably `tiers`) and scalars are REPLACED wholesale. The override is the operator's roster lever — the base file is never edited locally.
+
+From the merged configuration, read:
 - How many tiers exist
 - Which leaves belong to each tier
 - Whether a tier is disabled (skip it)
 - Aggregation policy (strict consensus within each tier on BLOCK findings only)
 - Fail-fast behavior
 
+The registered leaf pool is fixed at five seats (`commit-reviewer-a` .. `commit-reviewer-e`). Registered ≠ active: only leaves in non-disabled tiers are on duty (shipped default: a..d = 3 generalists + 1 specialist, "3+1"; seat e is registered but held out via the disabled premium tier until an operator activates it).
+
 Note: Temperature is NOT configured here — it is pinned per-leaf-agent in opencode.jsonc.
+
+## Roster validation and model preflight (mandatory, before ANY dispatch)
+
+Before Step 0 (lightweight) or Step 1 (tier cascade) — before invoking ANY leaf — perform these checks in order. A failure at either check is a HARD REFUSAL: do not dispatch any leaf; return a blocked result whose validation_notes state the refusal reason verbatim.
+
+1. **Roster validation** (rejects BEFORE dispatch; the reference implementation is `validate_roster` in `.opencode/sys-scripts/tier_cascade.py`). These bounded-B roster rules apply ONLY when the merged config declares a `panel` section (schema_version 2). A config WITHOUT a `panel` section (schema_version 1) SKIPS roster validation entirely — it parses and dispatches exactly as it did before the panel capacity: custom leaf IDs outside `commit-reviewer-a..e`, single-leaf tiers, and any tier shape are valid v1 rosters. When a panel IS declared:
+   - No leaf may appear in more than one tier (or twice in one tier).
+   - Every leaf must be in the registered pool `commit-reviewer-a..e`.
+   - Every PRESENT `panel.leaf_roles[<leaf>]` entry must carry BOTH `role` and `lens`, and both must be defined in `panel.roles` / `panel.lenses` (a missing entry is the graceful generalist default; a HALF entry is a config error).
+   - The active roster must keep at least TWO generalist seats (roles `r1_redundant` / `r1_backup_secondary`, or no leaf_roles entry) so every finding class keeps redundant, independently-attributable coverage.
+   - The active roster may not exceed FIVE seats total (the registered pool size).
+2. **Roster warning (surface, never silently pass):** if the active roster carries TWO OR MORE specialist seats, record a `validation_notes` entry naming the per-class quorum merge-layer fixture prerequisite (the specialist floor) — at M≥2 specialists the owner_or_redundant uphold/downgrade semantics become discriminating and the merge-layer fixtures must be settled before relying on them. Consult the adopting project's review-governance backlog before activating M≥2 specialists. This is a documented gate, NOT a rejection.
+3. **Model preflight** (hard refusal; reference: `preflight_models`): for EVERY leaf in an active tier, `.local/config/agent-model/<leaf>` must exist and be non-empty — this applies to EVERY schema version (the per-leaf model-file convention predates the panel capacity; only roster validation is panel-gated). A missing or zero-byte model file for an active seat means the leaf CANNOT be invoked (its model identity is unset) — refuse the whole dispatch and report the offending seat(s). Model files are operator-local and gitignored; seeding them is the operator's activation step, never something this orchestrator works around.
 
 ## State machine
 
@@ -29,9 +46,13 @@ Follow this state machine exactly. Do NOT deviate or exercise independent judgme
      a. Collect the list of changed files (already provided in the review request).
      b. Check if EVERY changed file matches at least one glob in `lightweight_review.doc_globs`.
         Use standard glob matching (fnmatch-style or equivalent).
-     c. If ALL files match:
-        - Select one leaf agent according to `leaf_selector`:
-          - "first": use the first leaf from the first active (non-disabled) tier.
+      c. If ALL files match:
+         - Select one leaf agent according to `leaf_selector`:
+           - "first": the first ACTIVE GENERALIST seat in config leaf order
+             (role `r1_redundant` / `r1_backup_secondary`, or a leaf with no
+             `panel.leaf_roles` entry) — NOT the first configured leaf, which
+             is frequently a specialist seat under Lever E. The lightweight
+             path wants broad block-finder coverage, not a focused lens.
         - Obtain and forward the active task contract per the "Task-contract
           injection" section below (contract body if a session is bound, or
           `task_contract: null` with the documented no-contract Spec fallback
@@ -47,7 +68,10 @@ Follow this state machine exactly. Do NOT deviate or exercise independent judgme
         - Return that leaf's verdict directly as the cascade result.
         - Skip the entire tier cascade (Steps 1-8 below).
      d. If ANY file does NOT match, proceed with the normal tier cascade (Steps 1-8).
-1. Load config from .opencode/config/review-tiers.json
+1. Load config from .opencode/config/review-tiers.json merged additively with
+   .opencode/repo-configs/review-tiers.json when that override exists (see
+   Configuration), then run the mandatory roster validation + model preflight
+   above if not already done
 2. Read config.fail_fast (boolean, default true if absent)
 3. Initialize state:
    - combined_findings = { findings: [], blocking_issues: [], deferred_findings: [], dropped_findings: [], reviewed_files: [], validation_notes: [] }
@@ -153,11 +177,21 @@ feature summary or the diff.
 
 Before ANY leaf invocation — the lightweight Step 0 path OR any tier leaf —
 also obtain the leaf's seat routing metadata from the `panel` section of
-`.opencode/config/review-tiers.json`. This is the per-seat focus steering that
-implements stakes-based seat allocation. It is **attention steering ONLY** and
-changes NO disposition, evidence, aggregation, or quorum rule.
+the **MERGED configuration**: the base `.opencode/config/review-tiers.json`
+plus the operator override `.opencode/repo-configs/review-tiers.json` when
+it exists — exactly the additive merge the reference loader
+(`CascadeConfig.from_file` in `.opencode/sys-scripts/tier_cascade.py`)
+performs, with the same semantics (nested objects merge key-by-key with the
+override winning; arrays and scalars are replaced wholesale). Reading ONLY
+the base file here would silently drop override changes: an override that
+re-points a leaf's `role` or `lens` MUST reach that leaf's `seat_routing`
+payload. The reference payload builder is `seat_routing(config, leaf)` in
+the same module. This is the per-seat focus steering that implements
+stakes-based seat allocation. It is **attention steering ONLY** and changes
+NO disposition, evidence, aggregation, or quorum rule.
 
-For each leaf you are about to invoke:
+For each leaf you are about to invoke (reading every value from the MERGED
+configuration):
 
 1. Read `panel.leaf_roles[<leaf>]` to get that leaf's `role` and `lens`.
 2. Read `panel.lenses[<lens>].finding_classes` for that lens's focus classes.
@@ -167,18 +201,22 @@ Forward a compact `seat_routing` block to that leaf. It MUST be DOMAIN-FREE —
 generic role/lens IDs and generic review terms only; never model names, never
 project/adopter literals.
 
-- For a **specialist** leaf (role != `r1_redundant`): state the seat's role and
-  lens, name its focus finding classes, and instruct it to **prioritize** the
-  capability-bound review concerns in generic terms — declared-contract
-  consistency, state-transition correctness, data invariants, and subtle
-  concurrency correctness — while still reviewing every class across the diff
-  and emitting findings under the UNCHANGED disposition/evidence rules. A
+- For a **specialist** leaf (role NOT in the generalist set — i.e. any role
+  other than `r1_redundant` and `r1_backup_secondary`, the same
+  `GENERALIST_ROLES` predicate the reference implementation uses for seat
+  selection): state the seat's role and lens, name its focus finding
+  classes, and instruct it to **prioritize** the capability-bound review
+  concerns in generic terms — declared-contract consistency,
+  state-transition correctness, data invariants, and subtle concurrency
+  correctness — while still reviewing every class across the diff and
+  emitting findings under the UNCHANGED disposition/evidence rules. A
   specialist focus is an emphasis, NOT a narrowing of scope: the seat still
   covers all finding classes; it is simply the designated owner for the
   high-stakes, capability-bound ones.
-- For a **generalist** leaf (role == `r1_redundant`): state that this is an
-  independently-attributable redundant generalist covering all finding classes,
-  with no special emphasis.
+- For a **generalist** leaf (role in the generalist set: `r1_redundant` or
+  `r1_backup_secondary`): state that this is an independently-attributable
+  redundant generalist covering all finding classes, with no special
+  emphasis.
 
 Rules:
 - The `seat_routing` block is additive per-invocation metadata, NOT leaf prompt

@@ -24,6 +24,7 @@ import {
     readyCoordinationTask,
     updateCoordinationTaskMetadata,
     repairCoordinationTask,
+    restageCoordinationTask,
     reviewCoordinationTask,
     resolvePaths,
     resolvePlan,
@@ -123,6 +124,7 @@ export const planStateTool = tool({
                 "ready_coordination_task",
                 "update_coordination_task",
                 "repair_coordination_task",
+                "restage_coordination_task",
                 "save_coordination_task_closeout",
                 "review_coordination_task",
                 "delete_coordination_task",
@@ -280,6 +282,18 @@ export const planStateTool = tool({
             .optional()
             .describe(
                 "JSON object payload for save_coordination_task, ready_coordination_task, update_coordination_task, or repair_coordination_task.",
+            ),
+        staged_path: tool.schema
+            .string()
+            .optional()
+            .describe(
+                "Repo-relative staged release-note fragment path for restage_coordination_task (errata-class cards only: task_id begins 'errata-').",
+            ),
+        note: tool.schema
+            .string()
+            .optional()
+            .describe(
+                "Optional history-note text for restage_coordination_task.",
             ),
         task_status: tool.schema
             .string()
@@ -786,6 +800,20 @@ export const planStateTool = tool({
                         ),
                     );
                 }
+                case "restage_coordination_task":
+                    return render(
+                        restageCoordinationTask(
+                            context.sessionID,
+                            args.task_id || "",
+                            {
+                                staged_path: args.staged_path || "",
+                                note: args.note || "",
+                            },
+                            {
+                                cwd: context.directory,
+                            },
+                        ),
+                    );
                 case "save_coordination_task_closeout":
                     return render(
                         saveCoordinationTaskCloseout(

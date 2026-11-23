@@ -35,7 +35,9 @@ Covered new-work seams (refused when engaged):
 - bgshell launch + resume (NEW spawn only; the stop path is untouched)
 - OpenCode TaskTool dispatch (`@subagent` / new child task)
 - the dispatch commands `/implement` `/implement-goal` `/research`
-  `/solution-brief` (the "begin new delegated work" class)
+  `/solution-brief` `/deep-research` (the "begin new delegated work" class;
+  `/deep-research` ships via the native-deep-research-pilot overlay pack —
+  in repos without that pack the blocklist entry is inert)
 
 Deliberately NOT blocked (so status/closeout/recovery/drafting/continuation
 stay reachable): ordinary chat, diagnostic tools, ordinary non-dispatch tool

@@ -15,7 +15,6 @@ import { readPauseState, formatRefusal } from "./pause-new-work.js";
 const SCHEMA_VERSION = 1;
 const LOCK_TIMEOUT_MS = 5000;
 const LOCK_RETRY_MS = 50;
-const STALE_LOCK_MS = 30000;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -135,6 +134,16 @@ const COORDINATION_TASK_STATUSES = Object.freeze([
     "blocked",
     "completed",
     "cancelled",
+    // Errata-transport HOLDING status (defer-taskcard-repair-op-deadlock):
+    // a "staged" card waits for the release ceremony's inject-errata step,
+    // which consumes only errata-class staged cards, injects the staged
+    // corrective body into the next release note, and flips the card to
+    // completed. It is a holding state, not open work: excluded from the
+    // OPEN/REVIEWABLE/CLOSEOUT/RESUMABLE sets; metadata updates on it take
+    // the narrow follow-up allowlist; entry is the dedicated restage op
+    // (and the repair op's transition-validated staged restoration) only —
+    // never a review/closeout verdict.
+    "staged",
 ]);
 const OPEN_COORDINATION_TASK_STATUSES = new Set([
     "draft",
@@ -152,6 +161,21 @@ const COORDINATION_REVIEWABLE_STATUSES = new Set([
     "reported",
     "blocked",
     "completed",
+]);
+// The review op's accepted RESULT statuses: an EXPLICIT frozen allowlist,
+// never derived from the (widenable) lifecycle enum — the five documented
+// coordinator-review resolutions. `staged` is deliberately absent: it is a
+// release-mechanic holding state whose only entries are the dedicated
+// restage op and the repair op's transition-validated staged restoration
+// (both carrying the staged_path contract); deriving review's result set
+// from the lifecycle enum would let a review verdict resolve a card into
+// staged and bypass that contract (the status-widening leak this closes).
+const COORDINATION_REVIEW_RESULT_STATUSES = Object.freeze([
+    "ready",
+    "reported",
+    "blocked",
+    "completed",
+    "cancelled",
 ]);
 const COORDINATION_RESUMABLE_STATUSES = new Set([
     "ready",
@@ -439,25 +463,154 @@ function readJson(targetPath, defaultValue) {
     }
 }
 
+// --- Non-reclaiming shared lock protocol (operator-ratified 2026-11-06) ---
+//
+// withLock is the shared per-resource lock behind every PARTICIPATING state
+// write (session and workstream indexes, session memory stores, coordination
+// task cards — creation, updates, review/closeout report publication, and
+// retirement — and skill-proposal transport: creation, status transitions,
+// retirement). As of the v0.29.0 deleteCoordinationTask TOCTOU repair it
+// is NON-RECLAIMING and OWNERSHIP-SAFE:
+//
+//   * NEVER remove another acquisition — not on age (the former 30s
+//     mtime-based stale reclamation is REMOVED: an aged lock may belong to a
+//     live holder mid-callback, and reaping it silently destroys exclusion),
+//     not on PID liveness (PID reuse and cross-namespace liveness make any
+//     such inference unsound), and not on malformed/empty metadata (a crashed
+//     or killed holder can leave an empty lock; content is DIAGNOSTIC ONLY
+//     and never gates acquisition or release).
+//   * Ownership-safe release: the owner unlinks the lock pathname only while
+//     that pathname still resolves to the file THIS acquisition created
+//     (fstat/stat inode identity). A predecessor whose lock was removed
+//     externally — the only sanctioned actor is an operator, after verified
+//     quiescence — must never unlink a successor's acquisition.
+//   * Initialization-error cleanup removes ONLY the acquisition just created
+//     (inode-proven); when ownership is uncertain it fails closed and leaves
+//     the file for manual recovery.
+//   * Bounded acquisition waiting is PRESERVED: a contender that cannot
+//     acquire within LOCK_TIMEOUT_MS fails closed with an actionable
+//     diagnostic. Recovery of an abandoned lock is MANUAL: verify the holder
+//     process is really gone / all participants are quiescent (note:
+//     already-loaded old-version modules remain unsafe participants until
+//     restarted), then remove the lock file by hand. This availability cost —
+//     bounded refusal after a crash, contender timeouts during long holders —
+//     was accepted (2026-11-06 debate) as preferable to silent
+//     reclamation-based decision-content destruction.
+function lockFileIdentity(stats) {
+    return stats ? `${stats.dev}:${stats.ino}` : "";
+}
+
+function readLockHolderDiagnostic(lockPath) {
+    // Holder metadata (pid + acquisition time) is DIAGNOSTIC ONLY: it
+    // identifies an acquisition in error messages and never authorizes
+    // reclamation or release.
+    try {
+        return fs.readFileSync(lockPath, "utf8").trim();
+    } catch {
+        return "<unreadable>";
+    }
+}
+
+function describeLockWaitTimeout(lockPath, startedAt) {
+    const waitedMs = Date.now() - startedAt;
+    const holder = readLockHolderDiagnostic(lockPath);
+    return (
+        `Timed out waiting for session state lock: ${lockPath} ` +
+        `(waited ${waitedMs}ms; lock content: "${holder}"). Locks are never ` +
+        `reclaimed automatically — an aged, empty, or malformed lock may ` +
+        `still belong to a live holder, so this process refuses to guess. ` +
+        `If the holder is verifiably gone (all participants stopped or ` +
+        `restarted; already-loaded old-version modules remain unsafe ` +
+        `participants), recover manually by removing the lock file after ` +
+        `confirming quiescence.`
+    );
+}
+
+function releaseOwnedLockFile(fd, lockPath) {
+    // Ownership-safe release. fstat(fd) MUST precede closeSync(fd): after the
+    // descriptor is closed, ownership can no longer be proven from this side.
+    //
+    // KNOWN RESIDUAL WINDOW (deliberate, ratified): the identity check
+    // (stat → inode compare) and the unlink are two separate operations, so a
+    // narrow stat→unlink interleaving exists in which an EXTERNAL actor
+    // removes our lock and a successor acquires the pathname between our
+    // matching stat and our unlink, and this release would then remove the
+    // successor's acquisition. POSIX path-based fs APIs offer no atomic
+    // owner-conditional unlink (and conditional-unlink primitives were
+    // explicitly rejected in the 2026-11-06 design debate as unsound for the
+    // same reason), so this window cannot be closed in code — it is closed by
+    // the PROTOCOL: no cooperating actor ever removes another acquisition,
+    // and the only sanctioned external removal is an operator acting after
+    // verified QUIESCENCE (no live participants), at which point no successor
+    // can exist. The inode comparison below is therefore defense-in-depth
+    // diagnostics for out-of-protocol interference (it catches the common
+    // predecessor/successor overlap), not the protocol's primary guarantee —
+    // the absence of any reaping actor is.
+    let owned = false;
+    let observed = "missing";
+    try {
+        let fdStats = null;
+        try {
+            fdStats = fs.fstatSync(fd);
+        } catch (fstatError) {
+            if (fstatError.code !== "EBADF") {
+                throw fstatError;
+            }
+        }
+        if (fdStats) {
+            try {
+                const pathStats = fs.statSync(lockPath);
+                observed = lockFileIdentity(pathStats);
+                owned = lockFileIdentity(fdStats) === observed;
+            } catch (statError) {
+                if (statError.code !== "ENOENT") {
+                    throw statError;
+                }
+                observed = "missing";
+            }
+            if (owned) {
+                try {
+                    fs.unlinkSync(lockPath);
+                } catch (error) {
+                    if (error.code !== "ENOENT") {
+                        throw error;
+                    }
+                }
+            }
+        }
+    } finally {
+        // The descriptor is closed on EVERY path (including release-side
+        // errors above) so a failed release can never leak it.
+        try {
+            fs.closeSync(fd);
+        } catch (error) {
+            if (error.code !== "EBADF") {
+                throw error;
+            }
+        }
+    }
+    return { owned, observed };
+}
+
 function withLock(lockPath, fn) {
     ensureDir(path.dirname(lockPath));
     const startedAt = Date.now();
     let fd = null;
 
     while (fd === null) {
+        let created = null;
         try {
-            fd = fs.openSync(lockPath, "wx");
-            fs.writeFileSync(fd, `${process.pid} ${isoZ()}\n`, "utf8");
+            created = fs.openSync(lockPath, "wx");
         } catch (error) {
             if (error.code !== "EEXIST") {
                 throw error;
             }
+            // The lock exists (or vanished between the failed create and this
+            // stat). NEVER unlink it: a lock that disappeared on its own (the
+            // holder released it) is immediately retryable; a lock that still
+            // exists is respected regardless of its age or content.
             try {
-                const stats = fs.statSync(lockPath);
-                if (Date.now() - stats.mtimeMs > STALE_LOCK_MS) {
-                    fs.unlinkSync(lockPath);
-                    continue;
-                }
+                fs.statSync(lockPath);
             } catch (statError) {
                 if (statError.code === "ENOENT") {
                     continue;
@@ -466,30 +619,38 @@ function withLock(lockPath, fn) {
             }
             if (Date.now() - startedAt > LOCK_TIMEOUT_MS) {
                 throw new StateError(
-                    `Timed out waiting for session state lock: ${lockPath}`,
+                    describeLockWaitTimeout(lockPath, startedAt),
                 );
             }
             sleep(LOCK_RETRY_MS);
+            continue;
         }
+        try {
+            // Publish owner metadata immediately after the exclusive create.
+            // The content is diagnostics-only (see protocol comment above).
+            fs.writeFileSync(created, `${process.pid} ${isoZ()}\n`, "utf8");
+        } catch (writeError) {
+            // Initialization-error cleanup: remove ONLY the acquisition just
+            // created, proven by inode identity; when ownership is uncertain,
+            // fail closed (leave the file for manual recovery) and rethrow.
+            try {
+                releaseOwnedLockFile(created, lockPath);
+            } catch (_cleanupError) {
+                try {
+                    fs.closeSync(created);
+                } catch {
+                    // best-effort cleanup; the original error is rethrown below
+                }
+            }
+            throw writeError;
+        }
+        fd = created;
     }
 
     try {
         return fn();
     } finally {
-        try {
-            fs.closeSync(fd);
-        } catch (error) {
-            if (error.code !== "EBADF") {
-                throw error;
-            }
-        }
-        try {
-            fs.unlinkSync(lockPath);
-        } catch (error) {
-            if (error.code !== "ENOENT") {
-                throw error;
-            }
-        }
+        releaseOwnedLockFile(fd, lockPath);
     }
 }
 
@@ -2096,6 +2257,16 @@ const DEGRADED_CORE_REPAIRABLE_FIELD_NAMES = [
     "primary_lane",
 ];
 
+// Round-5 narrowing (2026-11-16, operator c-prime): the degraded-FILL
+// supplement that once let a degraded-card repair ALSO carry
+// files_in_scope/success_criteria/validation_plan was REMOVED — four
+// review rounds sourced their findings in that widening, and it is
+// deferred as its own card. A repair payload carrying those fields now
+// refuses with the standard "Unsupported fields…" diagnostic, so no
+// sanctioned op replaces execution-contract fields at all and the
+// task-update freeze (no files_in_scope/success_criteria/
+// validation_plan changes after execution starts) holds trivially.
+
 const TASK_METADATA_UPDATE_PRE_EXECUTION_FIELD_NAMES = [
     "title",
     "coordination_mode",
@@ -2190,6 +2361,12 @@ function allowedTaskMetadataUpdateFieldNamesForStatus(status) {
         case "reported":
         case "blocked":
             return TASK_METADATA_UPDATE_FOLLOW_UP_FIELD_NAMES;
+        // Staged errata transport: holding state — narrow follow-up-class
+        // updates only (owner_notes/next_action/measured_outcome). The
+        // staged_path itself moves through the dedicated restage op, never
+        // the generic metadata update.
+        case "staged":
+            return TASK_METADATA_UPDATE_FOLLOW_UP_FIELD_NAMES;
         default:
             return [];
     }
@@ -2208,6 +2385,8 @@ function defaultCoordinationTaskNextAction(taskIDRaw, status) {
             return `Review the latest closeout and run /task-review ${taskID}.`;
         case "blocked":
             return `Review the blocker report and run /task-review ${taskID}.`;
+        case "staged":
+            return "Awaiting release inject-errata: the release ceremony reads staged_path, injects the corrective body into the next release note, and flips this card to completed.";
         case "completed":
         case "cancelled":
             return "Open the task card if follow-up is needed; create a new task for additional work.";
@@ -3746,6 +3925,34 @@ function cleanupArtifacts(sessionID, options = {}) {
     return summary;
 }
 
+// The RAW on-disk status of a stored card, canonicalized ONLY by
+// trim+lowercase (the same casing fold normalizeCoordinationEnumCollected
+// applies) and accepted only when it is a VALID task-status enum —
+// deliberately WITHOUT the fault-tolerant rewrites
+// normalizeCoordinationTaskRecord performs on the projection (a stored
+// `working` card whose ownership/claim metadata cannot be recovered is
+// rewritten to `ready`; an invalid stored enum coerces to the draft
+// default). Lifecycle guards that must refuse based on what the card
+// ACTUALLY says on disk — the degraded-repair execution-source refusal,
+// staging-source allowlist, and F3 crossing detection — authorize on this
+// value so a valid stored execution status cannot be laundered into a
+// pre-execution projection by the fault-tolerant read (round-3 b-F1/b-F2:
+// the rewrite is a READ resilience behavior and must never become a WRITE
+// authority). Returns "" when the stored bytes carry no valid enum status
+// (absent, non-string, or invalid); callers fall back to the normalized
+// projection for that case, where the fault-tolerant read has already
+// flagged `status` as an offending field and restore-only semantics
+// demand an explicit status payload anyway.
+function coordinationTaskStoredStatus(storedPayload) {
+    if (!storedPayload || typeof storedPayload !== "object") {
+        return "";
+    }
+    const raw = String(storedPayload.status || "")
+        .trim()
+        .toLowerCase();
+    return COORDINATION_TASK_STATUSES.includes(raw) ? raw : "";
+}
+
 function loadCoordinationTask(taskIDRaw, options = {}) {
     ensureLocalCoordinatorNamespace();
     const taskID = normalizeCoordinationTaskId(taskIDRaw);
@@ -3757,6 +3964,7 @@ function loadCoordinationTask(taskIDRaw, options = {}) {
                 path: targetPath,
                 payload: defaultCoordinationTaskPayload(taskID),
                 exists: false,
+                stored_status: "",
                 diagnostics: {
                     problems: [],
                     offendingFields: [],
@@ -3779,16 +3987,21 @@ function loadCoordinationTask(taskIDRaw, options = {}) {
     // ensureCoordinationTaskCoreFields call, so only the read path tolerates
     // already-stored data. This closes the read/write asymmetry: writes
     // reject bad INPUT, reads tolerate bad STORED data — and now REPORT it.
+    const storedPayload = readJson(
+        targetPath,
+        defaultCoordinationTaskPayload(taskID),
+    );
     const { task: payload, diagnostics } =
-        normalizeCoordinationTaskRecordWithDiagnostics(
-            readJson(targetPath, defaultCoordinationTaskPayload(taskID)),
-            taskID,
-        );
+        normalizeCoordinationTaskRecordWithDiagnostics(storedPayload, taskID);
     return {
         task_id: taskID,
         path: targetPath,
         payload,
         exists: true,
+        // Stored-status preservation (round-3 b-F1/b-F2): the RAW on-disk
+        // status, captured BEFORE normalization so the diagnostic boundary
+        // cannot launder it. See coordinationTaskStoredStatus.
+        stored_status: coordinationTaskStoredStatus(storedPayload),
         diagnostics,
     };
 }
@@ -3929,64 +4142,84 @@ function listCoordinationTaskCards() {
         .map((entry) => entry.task);
 }
 
+// Apply a coordination-task card update INSIDE an already-held per-task
+// lock. This is the private core of updateCoordinationTask and the ONLY
+// sanctioned way for a compound transaction (delete / review / closeout —
+// each of which holds coordinationTaskLockPath across its whole sequence)
+// to mutate the card: re-entering the PUBLIC updater inside such a
+// transaction would deadlock on the non-reentrant withLock.
+//
+// Absent-card semantics (deliberate split): the PUBLIC wrapper loads with
+// required:false (absent → defaults → the create-flow path), but a
+// compound transaction loads REQUIRED by default — a card that vanished
+// while the transaction held its lock must REFUSE (no resurrection from
+// defaults, no zombie publication), never invent a card to update.
+function applyCoordinationTaskUpdateLocked(taskID, updateFn, options = {}) {
+    const current = loadCoordinationTask(taskID, {
+        required: options.allowAbsent === true ? false : true,
+    }).payload;
+    const targetPath = coordinationTaskPath(taskID);
+    const updated = normalizeCoordinationTaskRecord(
+        updateFn({
+            ...current,
+            latest_report: current.latest_report
+                ? { ...current.latest_report }
+                : null,
+            last_review: current.last_review
+                ? { ...current.last_review }
+                : null,
+            history: Array.isArray(current.history)
+                ? current.history.map((entry) => ({ ...entry }))
+                : [],
+        }) || current,
+        taskID,
+    );
+    updated.schema_version = SCHEMA_VERSION;
+    updated.task_id = taskID;
+    updated.created_at = updated.created_at || current.created_at || isoZ();
+    updated.updated_at = isoZ();
+    ensureCoordinationTaskCoreFields(updated);
+    atomicWriteJson(targetPath, updated);
+    // defer-003: any successful canonical coordinator-task WRITE (create,
+    // update, ready, closeout, review, repair, activate — every public op
+    // routes through this single chokepoint) seeds the committed
+    // coordinator-adoption marker (unmanaged — runtime-created,
+    // template-less, never renderer-seeded; idempotent
+    // create-if-absent — NEVER overwrite an existing marker). A WRITE is
+    // the act of adoption (matrix row-2 semantics); mere file presence is
+    // not. Its presence flips the release gate's defer-liveness check from
+    // SKIP (greenfield) to authoritative: a later whole-directory loss of
+    // .local/coordinator/tasks/ then FAILs (fail-closed) instead of
+    // silently SKIPping. Wrapped in try/catch so a marker write failure can
+    // never break a task save that has already succeeded — the marker is a
+    // gate signal, not a correctness precondition for the save itself.
+    try {
+        const markerPath = path.join(repoRoot(), ".vh-agent-harness", "coordinator-adoption.json");
+        if (!fs.existsSync(markerPath)) {
+            ensureDir(path.dirname(markerPath));
+            fs.writeFileSync(
+                markerPath,
+                JSON.stringify({ version: 1, adopted: true }, null, 2) + "\n",
+                "utf8",
+            );
+        }
+    } catch (_markerErr) {
+        // Non-fatal: see comment above.
+    }
+    return updated;
+}
+
 function updateCoordinationTask(taskIDRaw, updateFn) {
     ensureLocalCoordinatorNamespace();
     const taskID = normalizeCoordinationTaskId(taskIDRaw);
-    const targetPath = coordinationTaskPath(taskID);
     const lockPath = coordinationTaskLockPath(taskID);
-    return withLock(lockPath, () => {
-        const current = loadCoordinationTask(taskID, {
-            required: false,
-        }).payload;
-        const updated = normalizeCoordinationTaskRecord(
-            updateFn({
-                ...current,
-                latest_report: current.latest_report
-                    ? { ...current.latest_report }
-                    : null,
-                last_review: current.last_review
-                    ? { ...current.last_review }
-                    : null,
-                history: Array.isArray(current.history)
-                    ? current.history.map((entry) => ({ ...entry }))
-                    : [],
-            }) || current,
-            taskID,
-        );
-        updated.schema_version = SCHEMA_VERSION;
-        updated.task_id = taskID;
-        updated.created_at = updated.created_at || current.created_at || isoZ();
-        updated.updated_at = isoZ();
-        ensureCoordinationTaskCoreFields(updated);
-        atomicWriteJson(targetPath, updated);
-        // defer-003: any successful canonical coordinator-task WRITE (create,
-        // update, ready, closeout, review, repair, activate — every public op
-        // routes through this single chokepoint) seeds the committed
-        // coordinator-adoption marker (unmanaged — runtime-created,
-        // template-less, never renderer-seeded; idempotent
-        // create-if-absent — NEVER overwrite an existing marker). A WRITE is
-        // the act of adoption (matrix row-2 semantics); mere file presence is
-        // not. Its presence flips the release gate's defer-liveness check from
-        // SKIP (greenfield) to authoritative: a later whole-directory loss of
-        // .local/coordinator/tasks/ then FAILs (fail-closed) instead of
-        // silently SKIPping. Wrapped in try/catch so a marker write failure can
-        // never break a task save that has already succeeded — the marker is a
-        // gate signal, not a correctness precondition for the save itself.
-        try {
-            const markerPath = path.join(repoRoot(), ".vh-agent-harness", "coordinator-adoption.json");
-            if (!fs.existsSync(markerPath)) {
-                ensureDir(path.dirname(markerPath));
-                fs.writeFileSync(
-                    markerPath,
-                    JSON.stringify({ version: 1, adopted: true }, null, 2) + "\n",
-                    "utf8",
-                );
-            }
-        } catch (_markerErr) {
-            // Non-fatal: see comment above.
-        }
-        return updated;
-    });
+    return withLock(lockPath, () =>
+        // Public path keeps the historical absent-card semantics (create
+        // flow, metadata updates): absent → defaults via required:false.
+        applyCoordinationTaskUpdateLocked(taskID, updateFn, {
+            allowAbsent: true,
+        }),
+    );
 }
 
 /**
@@ -5257,6 +5490,17 @@ function verifyLandingProof(taskID, repoOverride) {
 // AND that item's handle. A commit whose body contains only the card id
 // satisfies NOTHING (owner condition 1).
 //
+// Carrier-document fallback (2026-11-14 Class A fix): when a COMMIT carrier
+// (pinned or search mode) DETERMINISTICALLY misses the anchor and/or the
+// handle, a committed, branch-reachable retirement-carrier document (naming
+// convention per DECISION_CARRIER_DOC_* — durable home + "retirement-carrier"
+// basename token) carrying BOTH together in one blob ALSO satisfies the
+// slot. The fallback proves the durable preservation the gate exists for;
+// a stale pin pointing at label-less slice commits is a pointer problem,
+// not a preservation failure. Unresolvable/unreachable/unreadable pins and
+// artifact-carrier path misses keep their own honest diagnoses (no
+// fallback).
+//
 // INVENTORY BASELINE (owner condition 2): the stored record IS the baseline
 // item inventory. At closeout, every decision item currently on the card
 // must be declared (no missing slots, no surplus slots) and verbatim
@@ -5358,6 +5602,42 @@ const DECISION_RECORD_PROCESS_REVIEW_STATUSES = Object.freeze(["completed"]);
 // without weakening the declared-revision path (which checks exactly one
 // revision).
 const DECISION_RECORD_SEARCH_CAP = 200;
+// Carrier-DOCUMENT fallback (the 2026-11-14 Class A mismatch fix, 7
+// reproductions): decision-bearing closeouts declared commit carriers PINNED
+// to the slice commits, but those commits carry the card-id anchor (the
+// Task-Card trailer) and NEVER the decision-item labels/verbatim handles —
+// commit messages are authored by the committer protocol — so the carrier
+// verification predictably returned handle_not_in_carrier even though the
+// decision content was durably preserved in committed carrier documents (the
+// 476bfc8 checkpoint shape). When a COMMIT carrier (pinned or search mode)
+// deterministically misses the anchor and/or the handle, the verifier ALSO
+// searches committed, branch-reachable retirement-carrier DOCUMENTS for the
+// card-id anchor AND the item's handle together in one committed blob.
+//
+// The naming convention IS the trust boundary — "any committed doc" must
+// never become a carrier (accidental satisfaction from unrelated content, an
+// unbounded and unexplainable search). A carrier document is a file whose:
+//   - path sits under one of the durable homes below (the same homes
+//     artifact-carrier validation names), and
+//   - basename contains DECISION_CARRIER_DOC_NAME_TOKEN.
+// The fallback fires ONLY on deterministic misses of the DECLARED commit
+// carrier (anchor_missing / handle_not_in_carrier). A pin that does not
+// resolve, is not branch-reachable, or whose git read failed keeps its own
+// honest diagnosis — a broken declaration is a re-closeout matter, not a
+// preservation question. Artifact carriers (declared path) keep their own
+// path-scoped search: a wrong path declaration is not masked by the
+// fallback.
+const DECISION_CARRIER_DOC_NAME_TOKEN = "retirement-carrier";
+const DECISION_CARRIER_DOC_ROOTS = Object.freeze([
+    "docs/checkpoints/",
+    "researches/decisions/",
+    "researches/sources/",
+    "docs/planning/",
+]);
+// Distinct carrier-document paths the fallback will walk (each then bounded
+// by DECISION_RECORD_SEARCH_CAP revisions). Realistically one or two docs
+// exist per repo; the cap bounds pathological histories.
+const DECISION_CARRIER_DOC_PATH_CAP = 32;
 
 function decisionItemLabel(taskID, itemId, disposition) {
     return `${DECISION_ITEM_LABEL_PREFIX}${taskID}#${itemId} (${disposition})`;
@@ -5395,7 +5675,7 @@ const DECISION_ITEM_HASH_TAG = "fnv1a:";
 function fnv1a32Hex(text, offsetBasis) {
     let h = offsetBasis >>> 0;
     const s = String(text === undefined || text === null ? "" : text);
-    for (let i = 0; i < s.length; i++) {
+    for (let i = 0; i < s.length; i += 1) {
         h ^= s.charCodeAt(i);
         h = Math.imul(h, 0x01000193) >>> 0;
     }
@@ -6073,6 +6353,11 @@ function treeAtRevisionContains(repo, sha, marker) {
 }
 
 // Reachable commits whose tree touched the path, newest first (capped).
+// Returns { revs, truncated } — truncated is true when the reachable
+// history exceeded DECISION_RECORD_SEARCH_CAP and the walk stopped early
+// (a capped walk can never ground a universal-absence claim; the caller
+// qualifies its deterministic-miss diagnosis accordingly) — or null when
+// the history read itself failed (tri-state, unchanged).
 function reachableCommitsTouchingPath(repo, targetPath) {
     const res = gitSpawn(repo, [
         "log",
@@ -6084,11 +6369,83 @@ function reachableCommitsTouchingPath(repo, targetPath) {
     if (res.status !== 0) {
         return null;
     }
-    return res.stdout
+    const all = res.stdout
         .split(/\r?\n/)
         .map((line) => line.trim())
-        .filter((line) => line !== "")
-        .slice(0, DECISION_RECORD_SEARCH_CAP);
+        .filter((line) => line !== "");
+    return {
+        revs: all.slice(0, DECISION_RECORD_SEARCH_CAP),
+        truncated: all.length > DECISION_RECORD_SEARCH_CAP,
+    };
+}
+
+// --- carrier-document fallback helpers (2026-11-14 Class A fix) ---------------
+//
+// A retirement-carrier document is NAMED as one: path under a durable home,
+// basename carrying the convention token. The check is re-run JS-side on
+// every candidate (belt-and-braces on top of the git pathspec wildcard) so
+// a surprising git match can never slip a non-carrier path into the walk.
+function isCarrierDocPath(candidate) {
+    if (typeof candidate !== "string" || candidate.trim() === "") {
+        return false;
+    }
+    const normalized = candidate.trim().replace(/^(?:\.\/)+/, "");
+    if (normalized.includes("..") || normalized.startsWith("/")) {
+        return false;
+    }
+    const root = DECISION_CARRIER_DOC_ROOTS.find((home) =>
+        normalized.startsWith(home),
+    );
+    if (!root) {
+        return false;
+    }
+    const basename = normalized.slice(normalized.lastIndexOf("/") + 1);
+    return basename.includes(DECISION_CARRIER_DOC_NAME_TOKEN);
+}
+
+// Distinct committed carrier-document paths across reachable history,
+// newest-discovery first, capped at DECISION_CARRIER_DOC_PATH_CAP distinct
+// paths. Returns { paths, truncated } — truncated is true when discovery
+// stopped at the cap while further distinct carrier-doc paths remained in
+// history (a capped candidate list can never ground a universal-absence
+// claim) — or null when the history read itself failed (tri-state: an
+// unavailable search is never "searched and empty").
+function discoverCarrierDocPaths(repo) {
+    const res = gitSpawn(repo, [
+        "log",
+        "--branches",
+        "--format=",
+        "--name-only",
+        "--",
+        ...DECISION_CARRIER_DOC_ROOTS.map(
+            (home) => `${home}*${DECISION_CARRIER_DOC_NAME_TOKEN}*`,
+        ),
+    ]);
+    if (res.status !== 0) {
+        return null;
+    }
+    const paths = [];
+    const seen = new Set();
+    let truncated = false;
+    for (const rawLine of res.stdout.split(/\r?\n/)) {
+        const candidate = rawLine.trim();
+        if (candidate === "" || seen.has(candidate)) {
+            continue;
+        }
+        if (!isCarrierDocPath(candidate)) {
+            continue;
+        }
+        seen.add(candidate);
+        if (paths.length >= DECISION_CARRIER_DOC_PATH_CAP) {
+            // A distinct carrier-doc path beyond the cap: never enumerated
+            // as a candidate, so its examination never happens — flag the
+            // incompleteness instead of silently dropping it.
+            truncated = true;
+            continue;
+        }
+        paths.push(candidate);
+    }
+    return { paths, truncated };
 }
 
 // Tri-state committed-blob read: { available, tracked, blob, stderr,
@@ -6183,6 +6540,364 @@ function committedBlobAt(repo, sha, targetPath) {
         };
     }
     return { available: true, tracked: true, blob: blob.stdout, stderr: "" };
+}
+
+// Shared path-scoped search: walk reachable commits that touched
+// `targetPath`, newest first, for the card-id anchor AND the item's handle
+// together in ONE committed blob. Extracted from the artifact-carrier search
+// mode so the carrier-document fallback (below) verifies candidate carrier
+// documents with byte-identical semantics — unavailable reads keep b-F2
+// honesty (an incomplete negative search is never a confident miss),
+// directory paths keep b-F1 naming, and anchor-in-one-revision +
+// handle-in-another stays the TERMINAL scatter diagnosis (review F1,
+// 2026-10-27). Returns { status: "verified", locator, how } on success or
+// { status: "failed", problems: [...] } with fully-formed problems; a
+// failed walk that stopped at DECISION_RECORD_SEARCH_CAP revisions also
+// carries truncated: true (its miss details are qualified — absence
+// beyond the cap is NOT established). The directory-diagnosis return
+// honors the same contract: qualified detail + truncated: walkTruncated
+// (2026-11-16 dir-truncation fix).
+function searchCommittedPathForAnchorAndHandle(
+    repo,
+    taskID,
+    handle,
+    targetPath,
+    id,
+    index,
+    handleKind,
+) {
+    const problems = [];
+    const walk = reachableCommitsTouchingPath(repo, targetPath);
+    if (walk === null) {
+        return {
+            status: "failed",
+            problems: [
+                {
+                    index,
+                    kind: "item",
+                    id,
+                    locator: targetPath,
+                    code: "verifier_unavailable",
+                    detail: `item "${id}": git could not read history for the path`,
+                },
+            ],
+        };
+    }
+    const revs = walk.revs;
+    const walkTruncated = walk.truncated === true;
+    if (revs.length === 0) {
+        return {
+            status: "failed",
+            problems: [
+                {
+                    index,
+                    kind: "item",
+                    id,
+                    locator: targetPath,
+                    code: "path_never_committed",
+                    detail: `item "${id}": no reachable commit carries "${targetPath}" — the durable file was never committed (local-only files never count)`,
+                },
+            ],
+        };
+    }
+    let unavailableDetail = null;
+    let directoryDetail = null;
+    let anchorEver = false;
+    let handleEver = false;
+    // First (newest) revision bearing each half, so the scatter diagnosis
+    // can NAME where each side actually lives.
+    let anchorRev = null;
+    let handleRev = null;
+    for (const sha of revs) {
+        const read = committedBlobAt(repo, sha, targetPath);
+        if (!read.available) {
+            if (unavailableDetail === null) {
+                unavailableDetail = `item "${id}": git could not read "${targetPath}" at commit ${sha}: ${read.stderr}`;
+            }
+            continue;
+        }
+        if (read.blob === null) {
+            if (read.missReason && directoryDetail === null) {
+                directoryDetail = `item "${id}": ${read.missReason}`;
+            }
+            continue;
+        }
+        const anchorOk = read.blob.includes(taskID);
+        const handleOk = normalizedTextContains(read.blob, handle);
+        if (anchorOk && handleOk) {
+            return {
+                status: "verified",
+                locator: `${sha}:${targetPath}`,
+                how: `card-id anchor + ${handleKind} for "${id}" present in the committed blob at reachable revision ${sha}`,
+            };
+        }
+        if (anchorOk) {
+            anchorEver = true;
+            if (anchorRev === null) {
+                anchorRev = sha;
+            }
+        }
+        if (handleOk) {
+            handleEver = true;
+            if (handleRev === null) {
+                handleRev = sha;
+            }
+        }
+    }
+    if (unavailableDetail !== null) {
+        return {
+            status: "failed",
+            problems: [
+                {
+                    index,
+                    kind: "item",
+                    id,
+                    locator: targetPath,
+                    code: "verifier_unavailable",
+                    detail: `no reachable revision verified "${targetPath}" for item "${id}" and at least one committed-blob read was unavailable — content absence is NOT established: ${unavailableDetail}`,
+                },
+            ],
+        };
+    }
+    // A walk that stopped at DECISION_RECORD_SEARCH_CAP revisions can
+    // never ground a universal-absence claim, in ANY outcome class:
+    // revisions beyond the cap were never read, so the miss details below
+    // (deterministic miss AND directory diagnosis) carry the SAME
+    // diagnostic-certainty qualification as verifier_unavailable (absence
+    // beyond the cap is NOT established) while the fail-closed refusal
+    // itself is unchanged.
+    const truncationSuffix = walkTruncated
+        ? ` — the revision walk was capped at ${DECISION_RECORD_SEARCH_CAP} reachable commits touching this path, so absence beyond the cap is NOT established`
+        : "";
+    if (directoryDetail !== null) {
+        // A directory diagnosis is per-revision DETERMINATE, but when the
+        // walk was capped only the capped slice was examined — the same
+        // incompleteness class as the truncation-aware returns below, so
+        // the detail carries the truncation suffix and the return keeps
+        // truncated: walkTruncated (carrierDocFallbackVerify then routes
+        // the candidate into unexaminedCandidates with zero caller
+        // changes; the 2026-11-16 dir-truncation fix — the early return
+        // used to drop walkTruncated, letting the universal-absence miss
+        // note fire over a capped walk).
+        return {
+            status: "failed",
+            problems: [
+                {
+                    index,
+                    kind: "item",
+                    id,
+                    locator: targetPath,
+                    code: "path_is_directory_not_file_blob",
+                    detail: `${directoryDetail}${truncationSuffix}`,
+                },
+            ],
+            truncated: walkTruncated,
+        };
+    }
+    // An unsuccessful walk is ALWAYS terminal. anchorEver and handleEver
+    // are per-revision accumulators, so "each half seen somewhere" is NOT
+    // "both seen together": anchor-alone in revision X + handle-alone in
+    // revision Y used to fall through with zero problems and read as
+    // ok:true (review F1 — the fail-open the deleted v2 scatter pin was
+    // guarding). Fail closed with a diagnosis naming both revisions.
+    //
+    // The deterministic-miss details below carry truncationSuffix (hoisted
+    // above with the directory diagnosis for the same cap-qualification
+    // contract); the walk-truncated return shape closes the function.
+    if (!anchorEver) {
+        problems.push({
+            index,
+            kind: "item",
+            id,
+            locator: targetPath,
+            code: "anchor_missing",
+            detail: `item "${id}": no reachable revision of "${targetPath}" carries the card-id anchor "${taskID}" in its committed blob — every carrier must be discoverable from the card id after retirement (the documented back-reference convention)${truncationSuffix}`,
+        });
+    }
+    if (!handleEver) {
+        problems.push({
+            index,
+            kind: "item",
+            id,
+            locator: targetPath,
+            code: "handle_not_in_carrier",
+            detail: `item "${id}": no reachable revision of "${targetPath}" carries the ${handleKind} ("${String(handle).slice(0, 60)}…") in its committed blob — the declared carrier does not contain THIS item's representation${truncationSuffix}`,
+        });
+    }
+    if (anchorEver && handleEver) {
+        problems.push({
+            index,
+            kind: "item",
+            id,
+            locator: targetPath,
+            code: "anchor_handle_scattered",
+            detail: `item "${id}": no single reachable revision of "${targetPath}" carries the card-id anchor "${taskID}" AND the ${handleKind} together — the anchor was found at commit ${anchorRev} and the ${handleKind} at commit ${handleRev}, but never in the same committed blob. Split evidence across revisions is not a same-carrier representation: a fresh session recovering from the anchor-bearing revision finds no item representation there. Reunite both in one committed, branch-reachable carrier (or pin the revision that carries both).${truncationSuffix}`,
+        });
+    }
+    if (walkTruncated) {
+        return { status: "failed", problems, truncated: true };
+    }
+    return { status: "failed", problems };
+}
+
+// Carrier-document fallback (the 2026-11-14 Class A mismatch fix): search
+// every committed, branch-reachable retirement-carrier document (naming
+// convention per DECISION_CARRIER_DOC_* above) for the card-id anchor AND
+// the item's handle together in one committed blob, newest-discovery first.
+// Returns:
+//   { status: "verified", locator, how }
+//   { status: "failed" }          — every candidate was actually searched
+//                                   and none verified: a DETERMINISTIC miss
+//                                   (the miss note may assert absence)
+//   { status: "unavailable" }     — the discovery read itself failed; the
+//                                   caller makes NO claim about carrier docs
+//   { status: "unavailable", unexaminedCandidates: [path, ...] }
+//                                  — no candidate verified AND at least one
+//                                  candidate search could not complete
+//                                  (unreadable blob / history read error /
+//                                  walk capped before every revision was
+//                                  examined). Mirroring the discovery-level
+//                                  tri-state honesty convention, a walk with
+//                                  unexamined candidates is NEVER collapsed
+//                                  into a confident miss: the caller
+//                                  qualifies its note so universal absence
+//                                  is never asserted over documents that
+//                                  were never read (b-F1/c-F1/d-F2, commit
+//                                  review 2026-11-15 of 5db2741).
+//   { status: "unavailable", truncatedDiscovery: true }
+//                                  — no candidate verified AND candidate
+//                                  discovery itself stopped at
+//                                  DECISION_CARRIER_DOC_PATH_CAP distinct
+//                                  paths: carrier documents beyond the cap
+//                                  were never even enumerated, the same
+//                                  incompleteness class one level up.
+function carrierDocFallbackVerify(repo, taskID, handle, id, index, handleKind) {
+    const discovery = discoverCarrierDocPaths(repo);
+    if (discovery === null) {
+        return { status: "unavailable" };
+    }
+    const unexaminedCandidates = [];
+    for (const docPath of discovery.paths) {
+        const searched = searchCommittedPathForAnchorAndHandle(
+            repo,
+            taskID,
+            handle,
+            docPath,
+            id,
+            index,
+            handleKind,
+        );
+        if (searched.status === "verified") {
+            return searched;
+        }
+        // A candidate whose search could not COMPLETE (unreadable blob,
+        // history-read error) is unavailability, not a miss — record it
+        // and keep walking the remaining candidates (the same shape as
+        // the per-revision loop inside searchCommittedPathForAnchorAndHandle).
+        if (
+            Array.isArray(searched.problems) &&
+            searched.problems.some(
+                (p) => p && p.code === "verifier_unavailable",
+            )
+        ) {
+            unexaminedCandidates.push(docPath);
+        }
+        // A candidate whose walk was CAPPED before every revision was
+        // examined is the same incompleteness class: the candidate was
+        // not fully examined, so it can never ground a confident miss.
+        else if (searched.truncated === true) {
+            unexaminedCandidates.push(docPath);
+        }
+        // A non-verified candidate keeps the search going; its per-path
+        // problems are deliberately not surfaced (the DECLARED carrier's
+        // diagnosis stays the refusal of record — the fallback only adds
+        // evidence FOR preservation, never new refusal reasons).
+    }
+    if (unexaminedCandidates.length > 0) {
+        return { status: "unavailable", unexaminedCandidates };
+    }
+    // Discovery itself capped: distinct carrier-document paths beyond
+    // DECISION_CARRIER_DOC_PATH_CAP were never enumerated as candidates
+    // at all — universal absence over them is unassertable.
+    if (discovery.truncated) {
+        return { status: "unavailable", truncatedDiscovery: true };
+    }
+    return { status: "failed" };
+}
+
+// The appended note when the fallback ran and found nothing — names the
+// convention so a refusal teaches the sanctioned preservation route. ONLY
+// ever appended for a DETERMINISTIC miss: carrierDocFallbackVerify returns
+// status "failed" only when every discovered candidate was actually
+// searched AND neither discovery nor any candidate walk was capped, so
+// the universal-absence claim below is never made over unexamined
+// candidates or beyond-cap revisions/documents.
+function carrierDocFallbackMissNote(handleKind) {
+    return (
+        ` The retirement-carrier document fallback also found nothing: no committed, branch-reachable file matching *${DECISION_CARRIER_DOC_NAME_TOKEN}* ` +
+        `under ${DECISION_CARRIER_DOC_ROOTS.join(", ")} carries the card-id anchor and this ${handleKind} together in one blob — landing such a document (the checkpoint carrier shape) is the sanctioned preservation route for commit carriers whose messages cannot carry item labels.`
+    );
+}
+
+// The appended note when the fallback's candidate walk could NOT complete
+// (≥1 candidate carrier-document search was unavailable — unreadable
+// blob, history-read error, or a walk capped before every revision was
+// examined — and none verified): still names the sanctioned preservation
+// route, but claims NEITHER presence NOR absence — content absence is NOT
+// established over documents that were never read (b-F1/c-F1/d-F2, commit
+// review 2026-11-15 of 5db2741).
+function carrierDocFallbackUnavailableNote(handleKind, unexaminedCandidates) {
+    const listed = (unexaminedCandidates || [])
+        .map((docPath) => `"${docPath}"`)
+        .join(", ");
+    return (
+        ` The retirement-carrier document fallback could not complete its search: candidate carrier document${(unexaminedCandidates || []).length === 1 ? "" : "s"} ${listed} could not be fully examined (a committed-blob or history read did not complete, or the revision walk was capped before every revision was examined), so carrier-document absence is NOT established for this ${handleKind} — and neither is presence. ` +
+        `Landing an examinable file matching *${DECISION_CARRIER_DOC_NAME_TOKEN}* under ${DECISION_CARRIER_DOC_ROOTS.join(", ")} (the checkpoint carrier shape) remains the sanctioned preservation route for commit carriers whose messages cannot carry item labels.`
+    );
+}
+
+// The appended note when candidate DISCOVERY itself was capped: distinct
+// carrier-document paths beyond DECISION_CARRIER_DOC_PATH_CAP were never
+// enumerated, so neither presence nor absence over them is assertable —
+// the same qualified diagnostic-certainty class as an unexamined
+// candidate, one level up.
+function carrierDocFallbackTruncationNote(handleKind) {
+    return (
+        ` The retirement-carrier document fallback stopped at ${DECISION_CARRIER_DOC_PATH_CAP} distinct candidate carrier documents, so any documents beyond that cap were never examined and carrier-document absence is NOT established for this ${handleKind} — and neither is presence. ` +
+        `Landing an examinable file matching *${DECISION_CARRIER_DOC_NAME_TOKEN}* under ${DECISION_CARRIER_DOC_ROOTS.join(", ")} (the checkpoint carrier shape) remains the sanctioned preservation route for commit carriers whose messages cannot carry item labels.`
+    );
+}
+
+// Note selection for the commit-carrier call sites — three distinct
+// outcomes: a DETERMINISTIC miss (every candidate discovered, every
+// candidate fully searched, none verified) appends the miss note; a walk
+// with unexamined candidates appends the unavailable note (honest about
+// incompleteness, still teaching the route); a capped DISCOVERY appends
+// the truncation note (same class — candidates beyond the cap were never
+// enumerated); a discovery-level unavailable appends NOTHING (the
+// pre-existing convention: an unavailable search never claims "searched
+// and empty").
+function carrierDocFallbackNote(fallback, handleKind) {
+    if (fallback.status === "failed") {
+        return carrierDocFallbackMissNote(handleKind);
+    }
+    if (
+        fallback.status === "unavailable" &&
+        Array.isArray(fallback.unexaminedCandidates) &&
+        fallback.unexaminedCandidates.length > 0
+    ) {
+        return carrierDocFallbackUnavailableNote(
+            handleKind,
+            fallback.unexaminedCandidates,
+        );
+    }
+    if (
+        fallback.status === "unavailable" &&
+        fallback.truncatedDiscovery === true
+    ) {
+        return carrierDocFallbackTruncationNote(handleKind);
+    }
+    return "";
 }
 
 // Verify every declared slot of a v3 decision_record against committed,
@@ -6356,6 +7071,43 @@ function verifyDecisionRecordForRetirement(taskID, record, repoOverride) {
                     });
                     return;
                 }
+                // Carrier-document fallback (2026-11-14 Class A fix): the
+                // declared commit carrier DETERMINISTICALLY misses the
+                // anchor and/or the handle — the pinned slice commit shape
+                // (trailer anchor, no labels) that produced seven
+                // force-deletions. Before refusing, search committed
+                // retirement-carrier documents for the anchor + handle
+                // together; the fallback proves preservation independently
+                // of the stale pin. Note selection is THREE-way: a
+                // deterministic miss (all candidates discovered and fully
+                // searched, none verified) appends the miss note (naming
+                // the convention); ≥1 unexamined candidate (unreadable
+                // blob / capped walk) appends the QUALIFIED note claiming
+                // neither presence nor absence; a discovery-level
+                // unavailable search appends NOTHING (an unavailable
+                // search never asserts "searched and empty").
+                const fallback = carrierDocFallbackVerify(
+                    repo,
+                    taskID,
+                    handle,
+                    id,
+                    index,
+                    handleKind,
+                );
+                if (fallback.status === "verified") {
+                    verified.push({
+                        index,
+                        kind: "item",
+                        id,
+                        locator: fallback.locator,
+                        how: `${fallback.how} — verified via the retirement-carrier document fallback for the declared commit carrier ${sha}`,
+                    });
+                    return;
+                }
+                const fallbackNote = carrierDocFallbackNote(
+                    fallback,
+                    handleKind,
+                );
                 if (!anchorOk) {
                     problems.push({
                         index,
@@ -6363,7 +7115,7 @@ function verifyDecisionRecordForRetirement(taskID, record, repoOverride) {
                         id,
                         locator: declaredRev,
                         code: "anchor_missing",
-                        detail: `item "${id}": carrier commit ${sha} carries the card-id anchor "${taskID}" neither in its message nor in any blob at that committed revision — every carrier must be discoverable from the card id after retirement`,
+                        detail: `item "${id}": carrier commit ${sha} carries the card-id anchor "${taskID}" neither in its message nor in any blob at that committed revision — every carrier must be discoverable from the card id after retirement${fallbackNote}`,
                     });
                 }
                 if (!handleOk) {
@@ -6373,7 +7125,7 @@ function verifyDecisionRecordForRetirement(taskID, record, repoOverride) {
                         id,
                         locator: declaredRev,
                         code: "handle_not_in_carrier",
-                        detail: `item "${id}": carrier commit ${sha} does not contain the ${handleKind} ("${String(handle).slice(0, 60)}…") in its message or any blob at that committed revision — the declared carrier does not contain THIS item's representation`,
+                        detail: `item "${id}": carrier commit ${sha} does not contain the ${handleKind} ("${String(handle).slice(0, 60)}…") in its message or any blob at that committed revision — the declared carrier does not contain THIS item's representation${fallbackNote}`,
                     });
                 }
                 return;
@@ -6431,6 +7183,40 @@ function verifyDecisionRecordForRetirement(taskID, record, repoOverride) {
                 });
                 return;
             }
+            // Carrier-document fallback (2026-11-14 Class A fix) — same
+            // shape as the pinned branch: no reachable commit MESSAGE
+            // carries the anchor + handle together (search-mode commit
+            // carriers declared at closeout, before the landing commit
+            // exists, hit exactly this when decision-item labels cannot
+            // ride in committer-authored messages). Search committed
+            // retirement-carrier documents before refusing. Note selection
+            // mirrors the pinned branch's three-way split: a deterministic
+            // miss appends the miss note; ≥1 unexamined candidate (or a
+            // capped discovery) appends the QUALIFIED note claiming
+            // neither presence nor absence; a discovery-level unavailable
+            // search appends NOTHING.
+            const fallback = carrierDocFallbackVerify(
+                repo,
+                taskID,
+                handle,
+                id,
+                index,
+                handleKind,
+            );
+            if (fallback.status === "verified") {
+                verified.push({
+                    index,
+                    kind: "item",
+                    id,
+                    locator: fallback.locator,
+                    how: `${fallback.how} — verified via the retirement-carrier document fallback for the declared search-mode commit carrier`,
+                });
+                return;
+            }
+            const fallbackNote = carrierDocFallbackNote(
+                fallback,
+                handleKind,
+            );
             if (!anchorSeen) {
                 problems.push({
                     index,
@@ -6438,7 +7224,7 @@ function verifyDecisionRecordForRetirement(taskID, record, repoOverride) {
                     id,
                     locator: "<reachable history>",
                     code: "anchor_missing",
-                    detail: `item "${id}": no reachable commit message carries the card-id anchor "${taskID}" — every carrier must be discoverable from the card id after retirement (the landing trailer makes the landing commit body the natural carrier)`,
+                    detail: `item "${id}": no reachable commit message carries the card-id anchor "${taskID}" — every carrier must be discoverable from the card id after retirement (the landing trailer makes the landing commit body the natural carrier)${fallbackNote}`,
                 });
                 return;
             }
@@ -6448,7 +7234,7 @@ function verifyDecisionRecordForRetirement(taskID, record, repoOverride) {
                 id,
                 locator: "<reachable history>",
                 code: "handle_not_in_carrier",
-                detail: `item "${id}": no card-id-anchored reachable commit message carries the ${handleKind} ("${String(handle).slice(0, 60)}…") — the declared carrier does not contain THIS item's representation`,
+                detail: `item "${id}": no card-id-anchored reachable commit message carries the ${handleKind} ("${String(handle).slice(0, 60)}…") — the declared carrier does not contain THIS item's representation${fallbackNote}`,
             });
             return;
         }
@@ -6577,134 +7363,25 @@ function verifyDecisionRecordForRetirement(taskID, record, repoOverride) {
             // diagnosis (review F1, 2026-10-27) — split evidence is never
             // a silent pass, because no single committed blob would carry
             // the item's representation next to its discoverability anchor.
-            const revs = reachableCommitsTouchingPath(repo, targetPath);
-            if (revs === null) {
-                problems.push({
+            const searched = searchCommittedPathForAnchorAndHandle(
+                repo,
+                taskID,
+                handle,
+                targetPath,
+                id,
+                index,
+                handleKind,
+            );
+            if (searched.status === "verified") {
+                verified.push({
                     index,
                     kind: "item",
                     id,
-                    locator: targetPath,
-                    code: "verifier_unavailable",
-                    detail: `item "${id}": git could not read history for the path`,
+                    locator: searched.locator,
+                    how: searched.how,
                 });
-                return;
-            }
-            if (revs.length === 0) {
-                problems.push({
-                    index,
-                    kind: "item",
-                    id,
-                    locator: targetPath,
-                    code: "path_never_committed",
-                    detail: `item "${id}": no reachable commit carries "${targetPath}" — the durable file was never committed (local-only files never count)`,
-                });
-                return;
-            }
-            let unavailableDetail = null;
-            let directoryDetail = null;
-            let anchorEver = false;
-            let handleEver = false;
-            // First (newest) revision bearing each half, so the scatter
-            // diagnosis can NAME where each side actually lives.
-            let anchorRev = null;
-            let handleRev = null;
-            for (const sha of revs) {
-                const read = committedBlobAt(repo, sha, targetPath);
-                if (!read.available) {
-                    if (unavailableDetail === null) {
-                        unavailableDetail = `item "${id}": git could not read "${targetPath}" at commit ${sha}: ${read.stderr}`;
-                    }
-                    continue;
-                }
-                if (read.blob === null) {
-                    if (read.missReason && directoryDetail === null) {
-                        directoryDetail = `item "${id}": ${read.missReason}`;
-                    }
-                    continue;
-                }
-                const anchorOk = read.blob.includes(taskID);
-                const handleOk = normalizedTextContains(read.blob, handle);
-                if (anchorOk && handleOk) {
-                    verified.push({
-                        index,
-                        kind: "item",
-                        id,
-                        locator: `${sha}:${targetPath}`,
-                        how: `card-id anchor + ${handleKind} for "${id}" present in the committed blob at reachable revision ${sha}`,
-                    });
-                    return;
-                }
-                if (anchorOk) {
-                    anchorEver = true;
-                    if (anchorRev === null) {
-                        anchorRev = sha;
-                    }
-                }
-                if (handleOk) {
-                    handleEver = true;
-                    if (handleRev === null) {
-                        handleRev = sha;
-                    }
-                }
-            }
-            if (unavailableDetail !== null) {
-                problems.push({
-                    index,
-                    kind: "item",
-                    id,
-                    locator: targetPath,
-                    code: "verifier_unavailable",
-                    detail: `no reachable revision verified "${targetPath}" for item "${id}" and at least one committed-blob read was unavailable — content absence is NOT established: ${unavailableDetail}`,
-                });
-                return;
-            }
-            if (directoryDetail !== null) {
-                problems.push({
-                    index,
-                    kind: "item",
-                    id,
-                    locator: targetPath,
-                    code: "path_is_directory_not_file_blob",
-                    detail: directoryDetail,
-                });
-                return;
-            }
-            // An unsuccessful walk is ALWAYS terminal. anchorEver and
-            // handleEver are per-revision accumulators, so "each half seen
-            // somewhere" is NOT "both seen together": anchor-alone in
-            // revision X + handle-alone in revision Y used to fall through
-            // with zero problems and read as ok:true (review F1 — the
-            // fail-open the deleted v2 scatter pin was guarding). Fail
-            // closed with a diagnosis naming both revisions.
-            if (!anchorEver) {
-                problems.push({
-                    index,
-                    kind: "item",
-                    id,
-                    locator: targetPath,
-                    code: "anchor_missing",
-                    detail: `item "${id}": no reachable revision of "${targetPath}" carries the card-id anchor "${taskID}" in its committed blob — every carrier must be discoverable from the card id after retirement (the documented back-reference convention)`,
-                });
-            }
-            if (!handleEver) {
-                problems.push({
-                    index,
-                    kind: "item",
-                    id,
-                    locator: targetPath,
-                    code: "handle_not_in_carrier",
-                    detail: `item "${id}": no reachable revision of "${targetPath}" carries the ${handleKind} ("${String(handle).slice(0, 60)}…") in its committed blob — the declared carrier does not contain THIS item's representation`,
-                });
-            }
-            if (anchorEver && handleEver) {
-                problems.push({
-                    index,
-                    kind: "item",
-                    id,
-                    locator: targetPath,
-                    code: "anchor_handle_scattered",
-                    detail: `item "${id}": no single reachable revision of "${targetPath}" carries the card-id anchor "${taskID}" AND the ${handleKind} together — the anchor was found at commit ${anchorRev} and the ${handleKind} at commit ${handleRev}, but never in the same committed blob. Split evidence across revisions is not a same-carrier representation: a fresh session recovering from the anchor-bearing revision finds no item representation there. Reunite both in one committed, branch-reachable carrier (or pin the revision that carries both).`,
-                });
+            } else {
+                problems.push(...searched.problems);
             }
             return;
         }
@@ -6893,12 +7570,66 @@ function deleteCoordinationTask(sessionID, taskIDRaw, options = {}) {
     fenceCandidate(cardPath, tasksRootReal, "card");
     fenceCandidate(reportDir, reportsRootReal, "report directory");
 
+    // 2b. Fast-path missing-card refusal BEFORE acquiring the lock: no
+    //     coordinator transport mutation (no card, report, or LOCK file is
+    //     created, rewritten, or removed on this path — not even lock
+    //     creation). (Actor-context resolution earlier in this call may
+    //     still touch session-binding state; that is outside the task
+    //     transport.) The authoritative check runs again INSIDE the locked
+    //     transaction (step 3) — a card removed between the two checks
+    //     refuses there. Missing-card retries refuse deterministically on
+    //     both paths; nothing is ever resurrected.
+    if (!fs.existsSync(cardPath)) {
+        throw new StateError(
+            `delete_coordination_task: card not found for task_id "${taskID}" (expected at ${relativeToRepo(cardPath)}).`,
+        );
+    }
+
+    // 2c. The removal TRANSACTION runs under the shared per-task lock
+    //     (coordinationTaskLockPath) — the v0.29.0 TOCTOU repair. The whole
+    //     sequence — authoritative reread, active-owner / in-flight /
+    //     landing-gated guards, decision-record retention verification, the
+    //     beforeRemove hook, and the removal itself — executes inside ONE
+    //     locked boundary, so a concurrent card writer (review/closeout
+    //     publication, metadata update) CANNOT interleave: previously the
+    //     unlocked read-guard-remove window let a writer publish a report
+    //     and recreate the card AFTER delete returned, or let delete
+    //     destroy a writer's mid-flight state. Contenders serialize on the
+    //     lock; a contender that cannot acquire within the bounded wait
+    //     fails closed (throws). Removal order inside the transaction:
+    //     report directory FIRST, card LAST (a surviving card anchors a
+    //     retry; see step 6).
+    return withLock(
+        coordinationTaskLockPath(taskID),
+        () =>
+            deleteCoordinationTaskLocked(actor, taskID, options, {
+                cardPath,
+                reportDir,
+                forced,
+            }),
+    );
+}
+
+// Steps 3–6 of deleteCoordinationTask, extracted so the ENTIRE removal
+// transaction — authoritative reread → guards → landing/decision-record
+// verification → beforeRemove hook → report-dir-then-card removal — executes
+// inside ONE withLock(coordinationTaskLockPath(taskID)) boundary (see 2c
+// above). Runs ONLY from deleteCoordinationTask under that lock; never call
+// it directly. The refusal `return` objects propagate as the withLock
+// callback's value unchanged.
+function deleteCoordinationTaskLocked(actor, taskID, options, paths) {
+    const { cardPath, reportDir } = paths;
+    const forced = options.force === true;
+
     // 3. Lenient-load. Read the exact card path directly; if it parses,
     //    extract best-effort summary fields. Do NOT require core-field
     //    validation — degraded and malformed cards are precisely the cards an
     //    operator may need to retire, so strict validation here would brick
     //    the retire path. A missing file is a not-found refusal; a parse
     //    failure is classified as malformed and removal proceeds.
+    //    This read is AUTHORITATIVE: it runs under the transaction lock, so
+    //    the guards below decide on exactly the card state that removal will
+    //    act on.
     if (!fs.existsSync(cardPath)) {
         throw new StateError(
             `delete_coordination_task: card not found for task_id "${taskID}" (expected at ${relativeToRepo(cardPath)}).`,
@@ -7327,18 +8058,22 @@ function deleteCoordinationTask(sessionID, taskIDRaw, options = {}) {
         options.beforeRemove(summary);
     }
 
-    // 6. Removal sequence (removeIfExists idiom). Exact card JSON first, then
-    //    the exact report dir recursively. Verify each is gone. Do NOT read
-    //    fields again after deletion.
-    let cardRemoved = false;
-    if (fs.existsSync(cardPath)) {
-        fs.rmSync(cardPath, { recursive: true, force: true });
-        cardRemoved = !fs.existsSync(cardPath);
-    }
+    // 6. Removal sequence (removeIfExists idiom), INSIDE the transaction
+    //    lock. Report directory FIRST, card LAST — the deliberate v0.29.0
+    //    TOCTOU-repair ordering: a card that survives a mid-sequence
+    //    crash/refusal still anchors a retry (its guards re-run on the next
+    //    attempt and re-derive what to remove), whereas card-first would
+    //    leave orphaned report directories nothing points at. Verify each is
+    //    gone. Do NOT read fields again after deletion.
     let reportDirRemoved = false;
     if (fs.existsSync(reportDir)) {
         fs.rmSync(reportDir, { recursive: true, force: true });
         reportDirRemoved = !fs.existsSync(reportDir);
+    }
+    let cardRemoved = false;
+    if (fs.existsSync(cardPath)) {
+        fs.rmSync(cardPath, { recursive: true, force: true });
+        cardRemoved = !fs.existsSync(cardPath);
     }
 
     return {
@@ -7944,25 +8679,33 @@ function deleteSkillProposal(sessionID, proposalIDRaw, options = {}) {
             "delete_skill_proposal target escapes the transport root; refusing.",
         );
     }
-    const existed = fs.existsSync(targetPath);
-    if (existed) {
-        fs.rmSync(targetPath, { force: true });
-    }
+    // Serialized retirement under the shared NON-RECLAIMING lock (the same
+    // protocol as every other proposal mutation — saveSkillProposal /
+    // setSkillProposalStatus already take this lock). The existence check and
+    // the card removal run INSIDE the locked boundary so they cannot
+    // interleave with a writer mid-transition: previously this function
+    // removed the card UNLOCKED and then unlinked the lock file
+    // UNCONDITIONALLY — destroying another actor's acquisition in the middle
+    // of its critical section (the same TOCTOU family as the
+    // deleteCoordinationTask v0.29.0 defect). The lock here is always
+    // released by its owner (withLock's finally); this function never
+    // touches a lock file it does not own. A contender that cannot acquire
+    // within the bounded wait fails closed (throws) — it never reaps.
     const lockPath = skillProposalLockPath(proposalID);
-    if (fs.existsSync(lockPath)) {
-        try {
-            fs.rmSync(lockPath, { force: true });
-        } catch (_lockErr) {
-            // Non-fatal: a stale lock for a deleted card is harmless.
+    const cardRemoved = withLock(lockPath, () => {
+        const existed = fs.existsSync(targetPath);
+        if (existed) {
+            fs.rmSync(targetPath, { force: true });
         }
-    }
+        return existed && !fs.existsSync(targetPath);
+    });
     return {
         ...actor,
         ok: true,
         operation: "delete_skill_proposal",
         removed: {
             proposal_id: proposalID,
-            card_removed: existed && !fs.existsSync(targetPath),
+            card_removed: cardRemoved,
         },
     };
 }
@@ -8461,6 +9204,186 @@ function readyCoordinationTask(sessionID, taskIDRaw, input = {}, options = {}) {
     };
 }
 
+// Shared staged_path guard (round-4 C-F2): BOTH entry paths into `staged`
+// — the dedicated restage op below and a staged-target degraded repair —
+// validate the fragment path through this one predicate. Pre-fix it was
+// POSIX-only ('/'-prefix + '..' traversal), so Windows drive-absolute
+// ("C:/x.md", "C:\x.md") and UNC ("\\server\share\x.md") forms passed.
+// The release injector honors an ABSOLUTE staged_path at inject time (only
+// a non-absolute path is joined to the repo root), so a card carrying such
+// a path would read its erratum body from OUTSIDE the repository during
+// the release ceremony — the JS write side is this gate, because the
+// ceremony consumes the stored path as-is.
+function isNonRepoRelativeStagedPath(stagedPath) {
+    return (
+        stagedPath.startsWith("/") ||
+        // Windows drive-absolute (C:/x.md, C:\x.md)
+        /^[A-Za-z]:[\\/]/.test(stagedPath) ||
+        // UNC (\\server\share\x.md)
+        stagedPath.startsWith("\\\\") ||
+        // parent traversal on either separator
+        stagedPath.split(/[\\/]+/).includes("..")
+    );
+}
+
+// Restage a coordination task for release inject-errata
+// (defer-taskcard-repair-op-deadlock): move a healthy `ready` card to the
+// canonical `staged` holding status, or refresh the staged_path of a card
+// that is already `staged` (idempotent re-stage). This is the sanctioned
+// ready -> staged transition: /task-update never allows `status` in any
+// allowlist (by design — lifecycle transitions are op-owned), and the
+// review/closeout result-status allowlists never include staged. Dedicated
+// op, NOT a whitelist extension: staging is a release-mechanic handoff,
+// not a coordinator verdict, so it must not widen the review/closeout
+// verdict surfaces. Errata-class only (task_id begins "errata-"): the
+// release injector consumes only errata-class staged cards, so staging a
+// non-errata card would strand it in a holding state no ceremony ever
+// drains — such cards are refused with a pointer at the ordinary
+// lifecycle ops. Mirrors the readyCoordinationTask shape: degraded
+// boundary guard (action boundary closes on degraded cards regardless of
+// coerced status), errata-class guard, pre-lock source-status guard, then
+// a locked save through the PUBLIC updateCoordinationTask with an in-lock
+// source re-check (TOCTOU: a concurrent caller may have transitioned the
+// card between the pre-lock read and lock acquisition). Round-4 B-F1/B-F2:
+// BOTH source-status guards authorize on the STORED status first (the
+// same authority the round-3 repair guard uses), never the normalized
+// projection alone — see the guard sites below. staged_path is
+// repo-relative by contract (cross-platform: POSIX, Windows drive-letter,
+// and UNC absolute forms all refused by isNonRepoRelativeStagedPath) and
+// is NOT filesystem-validated here — the
+// release ceremony reads it at inject time, and staging may legitimately
+// precede the file's appearance on disk (transport ordering freedom).
+function restageCoordinationTask(sessionID, taskIDRaw, input = {}, options = {}) {
+    const actor = coordinationActorContext(sessionID, options);
+    const loaded = loadCoordinationTask(taskIDRaw);
+    if (loaded.diagnostics && loaded.diagnostics.degraded) {
+        const fields = loaded.diagnostics.offendingFields.length
+            ? loaded.diagnostics.offendingFields.join(", ")
+            : "(unspecified)";
+        throw new StateError(
+            `Task ${loaded.payload.task_id} is degraded ` +
+                `(offending fields: ${fields}) and cannot be staged for ` +
+                `release inject-errata. Inspect or repair the stored card ` +
+                `first; a degraded card is refused at the action boundary ` +
+                `regardless of its normalized status.`,
+        );
+    }
+    if (!loaded.payload.task_id.startsWith("errata-")) {
+        throw new StateError(
+            `Task ${loaded.payload.task_id} is not an errata-class card (task_id must begin "errata-"); restage is the release inject-errata transport for errata cards only. Use the ordinary lifecycle ops (/task-ready, /resume-task, /task-closeout, /task-review) for this card.`,
+        );
+    }
+    // Round-4 B-F1/B-F2 (restage laundering; mirrors the round-3 repair
+    // guard): the SOURCE authority is the STORED status, not the
+    // normalized projection. normalizeCoordinationTaskRecord rewrites a
+    // stored `working` card whose ownership/claim metadata cannot be
+    // recovered to a PROJECTED `ready` — a fault-tolerant READ behavior
+    // that must not become a staging WRITE authority. Pre-fix this
+    // allowlist read loaded.payload.status, so such a NON-degraded card
+    // (a valid `working` enum is not a diagnostic; only the claim
+    // metadata is missing) restaged into `staged`, laundering the
+    // execution status through the read path. The projection remains the
+    // fallback only when the stored bytes carry no valid enum status — a
+    // card the degraded boundary above has already refused.
+    const storedStatus =
+        typeof loaded.stored_status === "string" ? loaded.stored_status : "";
+    const sourceStatus = storedStatus || loaded.payload.status;
+    if (!["ready", "staged"].includes(sourceStatus)) {
+        throw new StateError(
+            `Task ${loaded.payload.task_id} is ${sourceStatus} and cannot be staged for release inject-errata; only ready tasks (or already-staged tasks refreshing staged_path) can be staged.`,
+        );
+    }
+    const payload = input && typeof input === "object" ? input : {};
+    const stagedPath = String(payload.staged_path || "").trim();
+    if (!stagedPath) {
+        throw new StateError(
+            `Restaging task ${loaded.payload.task_id} requires a staged_path (repo-relative path of the staged release-note fragment the release ceremony will inject).`,
+        );
+    }
+    if (isNonRepoRelativeStagedPath(stagedPath)) {
+        throw new StateError(
+            `staged_path must be a repo-relative path without parent traversal (POSIX, Windows drive-letter, and UNC absolute forms are all out-of-repo reads at inject time); got ${stagedPath}.`,
+        );
+    }
+    const note = String(payload.note || "").trim();
+    const explicitNextAction =
+        payload.next_action !== undefined
+            ? String(payload.next_action || "").trim()
+            : null;
+
+    const saved = updateCoordinationTask(loaded.payload.task_id, (current) => {
+        // Locked source re-checks (same TOCTOU defense as
+        // readyCoordinationTask): the pre-lock guards above read
+        // loaded.payload; re-check under the lock before writing.
+        if (!current.task_id.startsWith("errata-")) {
+            throw new StateError(
+                `Task ${current.task_id} is not an errata-class card (task_id must begin "errata-"); restage is the release inject-errata transport for errata cards only.`,
+            );
+        }
+        // Round-4 B-F1/B-F2 in-lock: `current` here is the NORMALIZED
+        // projection (applyCoordinationTaskUpdateLocked passes only
+        // loadCoordinationTask(...).payload), so a locked re-load is
+        // required to re-derive the STORED status under the lock — the
+        // same stored-status authority the pre-lock guard uses. The
+        // projection stays the fallback only for bytes carrying no valid
+        // enum status (the card the pre-lock degraded boundary refused).
+        // A card that vanished inside the load->save window surfaces the
+        // canonical does-not-exist refusal here (absence beats
+        // invalidity, the defer-018 ordering pin).
+        const lockedStored = loadCoordinationTask(current.task_id);
+        const lockedStoredStatus =
+            typeof lockedStored.stored_status === "string"
+                ? lockedStored.stored_status
+                : "";
+        const lockedSourceStatus = lockedStoredStatus || current.status;
+        if (!["ready", "staged"].includes(lockedSourceStatus)) {
+            throw new StateError(
+                `Task ${current.task_id} is ${lockedSourceStatus} and cannot be staged for release inject-errata; only ready tasks (or already-staged tasks refreshing staged_path) can be staged.`,
+            );
+        }
+        const wasStaged = current.status === "staged";
+        return {
+            ...current,
+            status: "staged",
+            staged_path: stagedPath,
+            next_action:
+                explicitNextAction !== null
+                    ? explicitNextAction
+                    : wasStaged
+                      ? current.next_action ||
+                        defaultCoordinationTaskNextAction(
+                            current.task_id,
+                            "staged",
+                        )
+                      : defaultCoordinationTaskNextAction(
+                            current.task_id,
+                            "staged",
+                        ),
+            history: [
+                ...(current.history || []),
+                {
+                    at: isoZ(),
+                    event: "task_restaged",
+                    session_name: actor.session_name,
+                    status: "staged",
+                    note: note
+                        ? note
+                        : wasStaged
+                          ? "Refreshed the staged release-inject path."
+                          : "Staged the task for release inject-errata.",
+                },
+            ],
+        };
+    });
+    return {
+        ...actor,
+        path: relativeToRepo(coordinationTaskPath(saved.task_id)),
+        task: saved,
+        summary: summarizeCoordinationTask(saved),
+        ...recommendedCoordinationTaskFields(saved, actor.session_name || null),
+    };
+}
+
 function updateCoordinationTaskMetadata(
     sessionID,
     taskIDRaw,
@@ -8667,54 +9590,183 @@ function updateCoordinationTaskMetadata(
 
 // Degraded-core repair branch of repairCoordinationTask. Restores the CURRENT
 // core-offender subset (offendingFields ∩ DEGRADED_CORE_REPAIRABLE_FIELD_NAMES)
-// on a degraded card in one atomic request — restore-only, never an edit of
-// non-offending fields. Dispatched STRICTLY on diagnostics.degraded === true
-// (a healthy card never reaches here), so the task_type/status carve-out does
-// not weaken healthy-card immutability — which the ordinary update allowlist
+// on a degraded card in one atomic request — restore-only for the core fields,
+// never an edit of non-offending fields. The degraded-FILL supplement that
+// once ALSO accepted files_in_scope/success_criteria/validation_plan here
+// was removed by the round-5 narrowing (2026-11-16): four review rounds
+// sourced their findings in that widening, it is deferred as its own card,
+// and with no execution-contract field replacement existing at all the
+// task-update freeze (no files_in_scope/success_criteria/validation_plan
+// changes after execution starts) holds trivially. The deliberate
+// pre-execution status widening (draft|ready|staged) is TRANSITION-VALIDATED
+// in-branch: the ready-target
+// runs the same F3 design-readiness gate as readyCoordinationTask, the
+// staged-target carries the restage op's staged_path contract, and a
+// verdict/execution current status is never widened back. Dispatched
+// STRICTLY on diagnostics.degraded === true (a healthy card never reaches
+// here), so the task_type/status carve-out does not weaken healthy-card
+// immutability — which the ordinary update allowlist
 // (TASK_METADATA_UPDATE_*_FIELD_NAMES, never including task_type/status)
-// enforces elsewhere. Repair routes through updateCoordinationTask (the
-// canonical writer), which re-runs collectCoordinationTaskCoreFieldErrors +
-// throws BEFORE atomicWriteJson, so a partial/invalid repair never lands.
+// enforces elsewhere. The merged result is pre-validated
+// against collectCoordinationTaskCoreFieldErrors BEFORE the in-transaction
+// save, so a partial/invalid repair never lands.
+//
+// Runs ONLY under repairCoordinationTask's per-task lock (its sole caller);
+// the save is a required-load in-transaction update — never the public
+// absent-tolerant updateCoordinationTask.
+//
+// Round-2 guard-completeness classes (all refusal-before-write):
+//  - prohibited target status: EVERY explicitly-supplied repair target
+//    status outside {draft, ready, staged} is refused outright, INDEPENDENT
+//    of offender classification. A card whose STORED status is invalid
+//    (coerces to draft on read) has `status` among its offending fields,
+//    so without this guard a payload status of completed/cancelled/
+//    reported/... would pass the offender carve-out, normalize to a VALID
+//    enum value, and clear the verdict-source check (coerced current status
+//    is draft) — landing a terminal/verdict status through the repair save,
+//    which (like updateCoordinationTask) never re-runs the lifecycle
+//    transition-legality guard. The guard closes exactly that bypass.
+//  - staged -> ready is a BUILD-READY crossing: F3 design-readiness
+//    validation fires for EVERY repair entering ready from ANY non-ready
+//    current status (draft -> ready AND staged -> ready); the
+//    envelope-free exemption survives only for genuine ready -> ready
+//    refreshes.
+//  - staged-target restage guards: a repair targeting staged enforces the
+//    SAME lifecycle guards as the dedicated restage op — errata-class
+//    card-id requirement and a ready|staged source-status allowlist
+//    (draft cannot jump to staged; verdict/execution sources are already
+//    refused below).
+//  - blocked source: `blocked` joins the never-repair-restore verdict/
+//    execution source set (a review verdict parked the card; repair has no
+//    authority to silently unblock it).
+//  - stored-status authority (round-3 b-F1/b-F2): EVERY lifecycle check
+//    below — the execution-source refusal, the staged-target source
+//    allowlist, and the F3 BUILD-READY crossing detection — authorizes on
+//    the STORED status threaded through loadCoordinationTask
+//    (loaded.stored_status), never on the normalized projection. The
+//    fault-tolerant read rewrites a stored `working` card with
+//    unrecoverable ownership/claim metadata to a projected `ready`;
+//    authorizing guards on that projection laundered execution state
+//    through the diagnostic boundary (a stored-`working` card repaired
+//    into staged/draft/ready, or persisted as the laundered `ready` by a
+//    no-explicit-status repair).
 function repairDegradedCoordinationTaskCoreFields(actor, loaded, payload) {
     const offendingFields = loaded.diagnostics
         ? [...loaded.diagnostics.offendingFields]
         : [];
     const errors = [];
     const enumInvalidFields = new Set();
-    // RESTORE-ONLY: a degraded-card repair may touch ONLY fields that are
-    // currently offending. The allowed payload set is the intersection of the
-    // core-offender field set and THIS card's offendingFields — NOT the full
-    // repairable set. This closes a transition-guard bypass: if status were
-    // accepted on a card degraded by a NON-status corruption (e.g. title), the
-    // repair could move a healthy status to a terminal value (completed) via
+    // RESTORE-ONLY (core fields): a degraded-card repair may touch ONLY
+    // core fields that are currently offending. The allowed payload set is
+    // the intersection of the core-offender field set and THIS card's
+    // offendingFields — NOT the full repairable set (the partial-repair
+    // check below still demands every repairable offender be covered).
+    // This closes a
+    // transition-guard bypass: if status were accepted on a card degraded
+    // by a NON-status corruption (e.g. title), the repair could move a
+    // healthy status to a terminal value (completed) via
     // updateCoordinationTask, which re-runs only enum-validity
-    // (collectCoordinationTaskCoreFieldErrors), never the lifecycle transition
-    // legality guard (coordinationTaskStatusTransitionErrors, enforced only on
-    // the save path). Restricting to offenders keeps the carve-out a pure
-    // "restore corrupted fields" exit; legitimate status recovery (where status
-    // itself is the corrupted offender) remains allowed.
+    // (collectCoordinationTaskCoreFieldErrors), never the lifecycle
+    // transition legality guard (coordinationTaskStatusTransitionErrors,
+    // enforced only on the save path). Restricting to offenders keeps the
+    // carve-out a pure "restore corrupted fields" exit; legitimate status
+    // recovery (where status itself is the corrupted offender) remains
+    // allowed. The ONE deliberate widening: a `status` payload whose value
+    // is draft | ready | staged (pre-execution/holding class only) is
+    // accepted even when status is not an offender — see the
+    // payloadStatusIsPreExecution note below for why that cannot bypass
+    // the transition guard.
     const repairableOffenders = offendingFields.filter((field) =>
         DEGRADED_CORE_REPAIRABLE_FIELD_NAMES.includes(field),
     );
+    // Status acceptance is wider than restore-only, deliberately: a repair
+    // may carry `status` whenever the supplied value is one of draft |
+    // ready | staged — the pre-execution/holding class. A degraded transport
+    // card can hold a VALID "staged" status (not an offender) while its
+    // enums are the corrupted fields, and the operator contract for this
+    // repair is exactly "enums + status among staged/ready/draft". Those
+    // three values carry no lifecycle verdict (no
+    // working/reported/blocked/completed/cancelled), so admitting them
+    // cannot bypass the transition guard in a dangerous direction. The
+    // widening is TRANSITION-VALIDATED below: a ready-target runs the
+    // same F3 design-readiness gate readyCoordinationTask enforces
+    // (envelope in the payload or already on the card, validated by the
+    // same validator), a staged-target must carry a repo-relative
+    // staged_path (the restage contract), and a card whose CURRENT
+    // status is a verdict/execution status is never widened back to a
+    // pre-execution status. Every other core field stays strictly
+    // restore-only.
+    const payloadStatusNormalized =
+        typeof payload.status === "string"
+            ? payload.status.trim().toLowerCase()
+            : "";
+    const payloadStatusIsPreExecution = [
+        "draft",
+        "ready",
+        "staged",
+    ].includes(payloadStatusNormalized);
+    // Prohibited-target refusal (guard completeness, round-2): EVERY
+    // explicitly-supplied target status outside {draft, ready, staged} is
+    // refused here — BEFORE the accepted-field set is even computed, so
+    // the refusal is INDEPENDENT of offender classification. Pre-fix, a
+    // card whose stored status was invalid (so status WAS an offender and
+    // the payload field was accepted) could be "repaired" to
+    // completed/cancelled/reported: the payload value normalized to a
+    // VALID enum, and the verdict-source check below could not fire (the
+    // card's coerced current status is draft). The locked repair save
+    // never re-runs coordinationTaskStatusTransitionErrors, so nothing
+    // else stood between that payload and a landed terminal status.
+    if (payload.status !== undefined && !payloadStatusIsPreExecution) {
+        throw new StateError(
+            `Task ${loaded.payload.task_id} repair never accepts a target status outside the pre-execution/holding class (draft | ready | staged); got ${JSON.stringify(
+                payload.status === undefined ? null : payload.status,
+            )}. ` +
+                `Verdict, execution, terminal, and invalid status values can never be installed by a repair — use the lifecycle ops (closeout, review) for terminal dispositions and the operator hand-edit path for genuinely corrupted verdict state.`,
+        );
+    }
+    // Stored-first authority applies to the INTENDED TARGET too (round-5
+    // A-F1 ride-along): intendedTargetStatus derives from currentStatus —
+    // the stored-first value, moved up from the execution-source check
+    // below — not the raw normalized projection. The transition-contract
+    // supplement slots below are keyed on this value, so a stored
+    // execution status that merely PROJECTS as a pre-execution shape (the
+    // round-3 laundering vector) cannot widen its own accepted-payload
+    // set; the execution-source refusal still fires, and the supplements
+    // stay keyed on the status the card actually carries on disk.
+    const storedStatus =
+        typeof loaded.stored_status === "string" ? loaded.stored_status : "";
+    const currentStatus = storedStatus || loaded.payload.status;
+    const intendedTargetStatus = payloadStatusNormalized || currentStatus;
+    const acceptedPayloadFields = [
+        ...repairableOffenders,
+        ...(payloadStatusIsPreExecution ? ["status"] : []),
+        // Transition-contract supplements, accepted only when the
+        // intended target status demands them (fail-closed otherwise):
+        ...(intendedTargetStatus === "staged" ? ["staged_path"] : []),
+        ...(intendedTargetStatus === "ready" ? ["f3_design_readiness"] : []),
+    ];
     errors.push(
         ...unexpectedCoordinationTaskPayloadFieldsErrors(
             payload,
-            repairableOffenders,
+            acceptedPayloadFields,
             "degraded task repair",
         ),
     );
     const providedRepairFields = Object.keys(payload).filter((key) =>
-        repairableOffenders.includes(key),
+        acceptedPayloadFields.includes(key),
     );
     // Residual risk #1: the repair must cover EVERY offending field this
     // branch can repair (the core enum/identity offenders). Status-conditional
     // offenders (rough_scope/open_questions/ready_criteria when status coerces
     // to "draft"; active_session_alias/claimed_at for "working") VANISH once
-    // status is corrected; list-field offenders (files_in_scope etc.) are
-    // outside this branch (caught by the canonical save-path throw as
-    // backstop). So the partial-repair check considers only repairable
-    // offenders uncovered by the payload — keeping the save-path throw a
-    // backstop, not the primary diagnostic.
+    // status is corrected; DoR list-field demands re-attach to the merged
+    // preview below, where they are answered by the card's STORED values
+    // only — the round-5 narrowing removed the fill supplement, so a
+    // corrupted card whose stored DoR fields cannot satisfy the restored
+    // status's demands is refused there (the fill widening is deferred as
+    // its own card). So the partial-repair check considers only repairable
+    // offenders uncovered by the payload — keeping the merged-preview
+    // validation the primary diagnostic for everything else.
     const uncoveredFields = repairableOffenders.filter(
         (field) => !providedRepairFields.includes(field),
     );
@@ -8775,14 +9827,249 @@ function repairDegradedCoordinationTaskCoreFields(actor, loaded, payload) {
             : null;
     throwCollectedErrors(errors);
 
-    // Fields actually written by this repair. With restore-only,
-    // providedRepairFields == repairableOffenders (the partial-repair check
-    // above guarantees every repairable offender is covered, and the
-    // unexpected-field check forbids any non-offender). Scope the history note
-    // and return value to these, not the full offending set (which may also
-    // carry status-conditional / list-field offenders this branch never wrote).
+    // Transition validation (B-F1b): a degraded card whose CURRENT status
+    // is a verdict/execution status
+    // (working/blocked/reported/completed/cancelled) is NEVER widened back
+    // to a pre-execution/holding status. Such a card carries lifecycle
+    // state the repair op has no authority to rewind — an execution claim,
+    // a review verdict (including `blocked`: the verdict PARKED the card,
+    // and unblocking is a coordinator decision, not a side effect of
+    // field repair), or a terminal disposition. The sanctioned paths from
+    // those statuses are the lifecycle ops (closeout, review) or, for
+    // genuinely corrupted verdict state, the operator hand-edit. Without
+    // this guard the status-widening above could move a degraded
+    // `reported` card to `staged`/`ready`/`draft` in one payload.
+    //
+    // Round-3 b-F1/b-F2 (normalization-laundered execution status): the
+    // SOURCE authority here is the STORED status, not the normalized
+    // projection. normalizeCoordinationTaskRecord rewrites a stored
+    // `working` card whose ownership/claim metadata (active_session_alias
+    // / claimed_at, including the single-alias and updated_at fallbacks)
+    // cannot be recovered to a PROJECTED `ready` — a fault-tolerant READ
+    // behavior that must never become a fault-tolerant WRITE authority.
+    // Pre-fix, authorizing on the projection let a stored-`working` card
+    // with an independently degraded core field (e.g. an empty title)
+    // repair into staged/draft/ready — laundering the execution state
+    // through the diagnostic boundary. The stored value governs the
+    // no-explicit-status case too: such a repair persists the NORMALIZED
+    // projection (the locked save re-derives it), which for a
+    // stored-`working` card is the laundered `ready` — itself a
+    // pre-execution restoration from a stored execution status. The
+    // projection remains the fallback ONLY when the stored bytes carry no
+    // valid enum status (absent/invalid — `status` is then an offending
+    // field and the partial-repair check demands an explicit status
+    // payload, so no laundering path exists through that fallback).
+    // (currentStatus — stored-first — is computed above, before the
+    // accepted-field set; see the round-5 A-F1 note there.)
+    // What this repair would PERSIST: an explicit payload status, else the
+    // normalized projection the locked save re-derives. Comparing the
+    // stored source against THIS value is what closes the title-only
+    // laundering vector (no explicit status, projection = laundered
+    // ready).
+    const targetStatus =
+        repairedStatus !== null ? repairedStatus : loaded.payload.status;
+    if (
+        ["working", "blocked", "reported", "completed", "cancelled"].includes(
+            currentStatus,
+        ) &&
+        ["draft", "ready", "staged"].includes(targetStatus)
+    ) {
+        throw new StateError(
+            `Task ${loaded.payload.task_id} is currently ${currentStatus} (a verdict/execution status); degraded-card repair never restores a pre-execution status (${targetStatus}) from it. ` +
+                `Close the card out through its lifecycle ops, or use the operator hand-edit path for genuinely corrupted verdict state.`,
+        );
+    }
+
+    // Transition validation (staged-source directional refusal, round-6 /
+    // defer-repair-staged-source-refusal): `staged` is deliberately NOT
+    // in the execution-source refusal set above — it is a release-HOLDING
+    // status, not a verdict/execution status, and the sanctioned moves out
+    // of staged stay open (the staged -> staged refresh with a
+    // staged_path below, and the F3-gated staged -> ready restore). The
+    // one refused direction is the DEMOTION to draft: a staged card
+    // carries release-ceremony state (staged_path, the inject-errata
+    // transport), and a degraded-card field repair has no authority to
+    // strand it back in pre-execution holding. Authority form (round-5
+    // A-F1): the source is the stored-first currentStatus; the target is
+    // the EFFECTIVE PERSISTED target — an explicit payload status, else
+    // the normalized projection the locked save re-derives — so an
+    // omitted status cannot bypass this guard where the effective
+    // persisted target is draft. (For a staged-source card that shape is
+    // not constructible with an omitted status: the read path rewrites
+    // only an unrecoverable `working` to ready and coerces an invalid
+    // status to draft, so a valid stored `staged` projects as `staged`
+    // itself — a draft target here implies an explicit draft payload.)
+    if (currentStatus === "staged" && targetStatus === "draft") {
+        throw new StateError(
+            `Task ${loaded.payload.task_id} is staged for release; ` +
+                `degraded-card repair cannot demote it to draft. ` +
+                `Refresh staged with staged_path, or restore ready through ` +
+                `the F3 design-readiness gate.`,
+        );
+    }
+
+    // Transition validation (staged-target restage guards, guard
+    // completeness round-2): a repair targeting `staged` enforces the SAME
+    // lifecycle guards as the dedicated restageCoordinationTask op — the
+    // errata-class card-id requirement and the ready|staged source-status
+    // allowlist. Pre-fix the staged-target branch checked only the
+    // staged_path contract, so a repair could stage a NON-errata card (or
+    // jump a degraded draft card straight to staged), bypassing the class
+    // and source guards every other path into staged honors. These run
+    // BEFORE the merged-preview validation so the lifecycle refusal is
+    // never masked by field diagnostics. (Round-3: the allowlist below
+    // reads currentStatus — the STORED status first — so a stored
+    // execution status cannot pass as its projected pre-execution shape.)
+    if (targetStatus === "staged") {
+        if (!loaded.payload.task_id.startsWith("errata-")) {
+            throw new StateError(
+                `Task ${loaded.payload.task_id} is not an errata-class card (task_id must begin "errata-"); a staged-target repair is the release inject-errata transport for errata cards only (the same class contract the dedicated restage op enforces). Use the ordinary lifecycle ops (/task-ready, /resume-task, /task-closeout, /task-review) for this card.`,
+            );
+        }
+        if (!["ready", "staged"].includes(currentStatus)) {
+            throw new StateError(
+                `Task ${loaded.payload.task_id} is ${currentStatus} and cannot be repaired to staged; only ready tasks (or already-staged tasks refreshing staged_path) can be staged — the same source-status contract the dedicated restage op enforces. Restore the card to ready first (a ready-target repair runs the F3 gate), then restage.`,
+            );
+        }
+    }
+
+    // Absence beats invalidity (defer-018 ordering pin): a card that
+    // vanished mid-diagnosis (a concurrent delete landing inside the
+    // load->save window; the TOCTOU regression arms reproduce exactly this)
+    // must surface the canonical no-resurrection refusal, NOT a
+    // merged-preview diagnostic for a card that no longer exists. Required
+    // re-load: throws the canonical does-not-exist error that the public
+    // repairCoordinationTask catch translates. The locked save below
+    // re-checks absence authoritatively; this keeps the diagnostic ORDER
+    // stable now that merged-preview validation runs before the save.
+    loadCoordinationTask(loaded.payload.task_id);
+
+    // Pre-validate the MERGED card against the canonical validator BEFORE
+    // the in-transaction save: with the enums restored, status-conditional
+    // demands (files_in_scope/success_criteria/validation_plan for every
+    // non-draft status) re-attach to the card and are answered by the
+    // card's STORED values only — the round-5 narrowing removed the fill
+    // supplement, so the original op-split deadlock deliberately remains
+    // for a card whose stored DoR fields cannot satisfy the restored
+    // status's demands (the fill widening is deferred as its own card;
+    // until it lands, such a card completes through the operator
+    // hand-edit path). Refuse (with the validator's own diagnostics)
+    // rather than write a card the next load would flag degraded again.
+    const mergedPreview = {
+        ...loaded.payload,
+        task_type:
+            repairedTaskType !== null ? repairedTaskType : loaded.payload.task_type,
+        status: repairedStatus !== null ? repairedStatus : loaded.payload.status,
+        coordination_mode:
+            repairedCoordinationMode !== null
+                ? repairedCoordinationMode
+                : loaded.payload.coordination_mode,
+        report_envelope:
+            repairedReportEnvelope !== null
+                ? repairedReportEnvelope
+                : loaded.payload.report_envelope,
+        title: repairedTitle !== null ? repairedTitle : loaded.payload.title,
+        primary_lane:
+            repairedPrimaryLane !== null
+                ? repairedPrimaryLane
+                : loaded.payload.primary_lane,
+    };
+    const mergedErrors = collectCoordinationTaskCoreFieldErrors(mergedPreview, {
+        enumInvalidFields,
+    });
+    if (mergedErrors.length) {
+        throwCollectedErrors(
+            mergedErrors.map(
+                (line) =>
+                    `Degraded task repair would leave task ${loaded.payload.task_id} invalid: ${line}`,
+            ),
+        );
+    }
+
+    // Transition validation (B-F1c): a staged-target repair must carry a
+    // repo-relative staged_path — the SAME contract the dedicated restage
+    // op enforces, through the SAME shared validator (round-4 C-F2: the
+    // predicate is cross-platform — POSIX '/', Windows drive-letter, and
+    // UNC absolute forms are all refused, because the release injector
+    // honors an absolute staged_path at inject time and would read the
+    // erratum body from outside the repository). Without it the repair
+    // would land a staged card with no injectable fragment path for the
+    // release ceremony to consume.
+    const stagedPath =
+        payload.staged_path !== undefined
+            ? String(payload.staged_path || "").trim()
+            : "";
+    if (targetStatus === "staged") {
+        if (!stagedPath) {
+            throw new StateError(
+                `Repairing task ${loaded.payload.task_id} to staged requires a staged_path (repo-relative path of the staged release-note fragment the release ceremony will inject) — the same contract the dedicated restage op enforces.`,
+            );
+        }
+        if (isNonRepoRelativeStagedPath(stagedPath)) {
+            throw new StateError(
+                `staged_path must be a repo-relative path without parent traversal (POSIX, Windows drive-letter, and UNC absolute forms are all out-of-repo reads at inject time); got ${stagedPath}.`,
+            );
+        }
+    }
+
+    // Transition validation (B-F1a): a ready-target repair runs the SAME
+    // F3 design-readiness gate readyCoordinationTask enforces at the
+    // BUILD-READY crossing. The envelope comes from the repair payload or
+    // is already persisted on the card, and is validated by the same
+    // validator against the design digest of the MERGED (post-repair)
+    // card — so a repair can never promote a degraded card to ready
+    // without a complete, current-digest-bound envelope any more than
+    // /task-ready could. Guard completeness (round-2): EVERY repair
+    // entering ready from ANY non-ready current status is a BUILD-READY
+    // crossing (draft -> ready AND staged -> ready — staged is a holding
+    // status, not a review verdict, and a staged card re-entering ready
+    // must re-earn BUILD-READY). The envelope-free exemption survives
+    // ONLY for a genuine ready -> ready refresh (validate-when-supplied,
+    // the split readyCoordinationTask uses for envelope refreshes).
+    // (Round-3: `currentStatus` here is the STORED status first — the
+    // exemption for a "genuine ready -> ready refresh" cannot be earned
+    // by a stored execution status merely PROJECTING as ready.)
+    if (targetStatus === "ready") {
+        const isBuildReadyCrossing = currentStatus !== "ready";
+        const envelopeSupplied = payload.f3_design_readiness !== undefined;
+        if (isBuildReadyCrossing || envelopeSupplied) {
+            const f3Envelope = envelopeSupplied
+                ? payload.f3_design_readiness
+                : loaded.payload.f3_design_readiness !== undefined
+                  ? loaded.payload.f3_design_readiness
+                  : null;
+            const f3Result = validateF3DesignReadiness({
+                envelope: f3Envelope,
+                currentDesignDigest: computeTaskDesignDigest(mergedPreview, {}),
+                transitionKind: isBuildReadyCrossing
+                    ? "task_ready"
+                    : "task_ready_refresh",
+            });
+            if (!f3Result.passed) {
+                throw new StateError(
+                    `F3 design-readiness gate refused the degraded repair to ready for task ${loaded.payload.task_id} ` +
+                        `(reason: ${f3Result.reasonCode}). ${f3Result.detail} ` +
+                        `The repair is refused; supply a complete f3_design_readiness ` +
+                        `envelope bound to the current design digest in the repair ` +
+                        `payload (or persist one on the card), or declare ` +
+                        `ownership_hazards: [] if no hazard was named.`,
+                );
+            }
+        }
+    }
+
+    // Fields actually written by this repair. With restore-only for the
+    // core fields, every repairable offender is covered (the partial-repair
+    // check above), and the unexpected-field check admits no core
+    // non-offender beyond the transition-contract supplements (staged_path,
+    // f3_design_readiness). Scope the history note and return value to
+    // these, not the full offending set.
     const repairedFields = uniqueStrings(providedRepairFields);
-    const saved = updateCoordinationTask(loaded.payload.task_id, (current) => ({
+    // In-transaction save — the PRIVATE already-locked core (the public
+    // updateCoordinationTask would re-enter this transaction's non-reentrant
+    // per-task lock, and its absent-tolerant semantics are the resurrection
+    // vector this locked boundary exists to close).
+    const saved = applyCoordinationTaskUpdateLocked(loaded.payload.task_id, (current) => ({
         ...current,
         task_type:
             repairedTaskType !== null ? repairedTaskType : current.task_type,
@@ -8800,6 +10087,18 @@ function repairDegradedCoordinationTaskCoreFields(actor, loaded, payload) {
             repairedPrimaryLane !== null
                 ? repairedPrimaryLane
                 : current.primary_lane,
+        // Transition-contract supplements (validated above): the staged
+        // fragment path on a staged-target repair, and the F3 envelope on
+        // a ready-target repair (persisted when supplied, mirroring
+        // readyCoordinationTask's envelope refresh).
+        staged_path:
+            targetStatus === "staged" && stagedPath
+                ? stagedPath
+                : current.staged_path,
+        f3_design_readiness:
+            payload.f3_design_readiness !== undefined
+                ? payload.f3_design_readiness
+                : current.f3_design_readiness,
         history: [
             ...(current.history || []),
             {
@@ -8823,7 +10122,45 @@ function repairDegradedCoordinationTaskCoreFields(actor, loaded, payload) {
 
 function repairCoordinationTask(sessionID, taskIDRaw, input = {}, options = {}) {
     const actor = coordinationActorContext(sessionID, options);
-    const loaded = loadCoordinationTask(taskIDRaw);
+    const taskID = normalizeCoordinationTaskId(taskIDRaw);
+    // TOCTOU repair (defer-018): diagnosis and save now run inside ONE
+    // per-task locked boundary — the same boundary deleteCoordinationTask's
+    // removal transaction uses. Previously the unlocked
+    // load -> diagnose -> save window let a concurrent delete interleave:
+    // the save then re-loaded the card through updateCoordinationTask's
+    // absent-tolerant semantics (required:false -> defaultCoordinationTask
+    // Payload) and silently attempted to write a DEFAULT-bodied card for an
+    // id whose card had just been retired — resurrection from defaults (the
+    // written form was only held back by core-field validation, producing a
+    // misleading validation error instead of a refusal). A card missing at
+    // the REQUIRED load under the lock now refuses with a named refusal
+    // diagnostic; repair never recreates a card from defaults.
+    try {
+        return withLock(coordinationTaskLockPath(taskID), () =>
+            repairCoordinationTaskLocked(actor, taskID, input),
+        );
+    } catch (err) {
+        if (
+            err instanceof StateError &&
+            String(err.message).startsWith("Coordination task does not exist:")
+        ) {
+            throw new StateError(
+                `Task ${taskID} card no longer exists; repair refused (a concurrent delete may have retired it; repair never resurrects a card from defaults).`,
+            );
+        }
+        throw err;
+    }
+}
+
+// The body of repairCoordinationTask; runs ONLY under that function's
+// per-task lock (never call directly). Every load inside is REQUIRED — a
+// card that vanished under the lock refuses instead of resurrecting — and
+// both repair branches save through applyCoordinationTaskUpdateLocked (the
+// public updateCoordinationTask would deadlock on the non-reentrant lock
+// already held here, and its absent-tolerant semantics are exactly the
+// resurrection vector this boundary closes).
+function repairCoordinationTaskLocked(actor, taskID, input) {
+    const loaded = loadCoordinationTask(taskID);
     const payload = input && typeof input === "object" ? input : {};
 
     // DISPATCH: a DEGRADED card (diagnostics.degraded === true — authoritative,
@@ -8878,7 +10215,11 @@ function repairCoordinationTask(sessionID, taskIDRaw, input = {}, options = {}) 
         ...missingResearchFields,
         ...providedRepairFields,
     ]);
-    const saved = updateCoordinationTask(loaded.payload.task_id, (current) => ({
+    // In-transaction save — the PRIVATE already-locked core (the public
+    // updateCoordinationTask would re-enter this transaction's non-reentrant
+    // per-task lock, and its absent-tolerant semantics are the resurrection
+    // vector this locked boundary exists to close).
+    const saved = applyCoordinationTaskUpdateLocked(loaded.payload.task_id, (current) => ({
         ...current,
         research_question:
             payload.research_question !== undefined
@@ -8931,7 +10272,30 @@ function repairCoordinationTask(sessionID, taskIDRaw, input = {}, options = {}) 
 
 function saveCoordinationTaskCloseout(sessionID, taskIDRaw, options = {}) {
     const actor = coordinationActorContext(sessionID, options);
-    const loaded = loadCoordinationTask(taskIDRaw);
+    const taskID = normalizeCoordinationTaskId(taskIDRaw);
+    // Publication transaction (v0.29.0 TOCTOU repair): the working/owner
+    // checks, the decision-record gate, the closeout-report publication, and
+    // the card update all run inside ONE per-task locked boundary — the
+    // same boundary deleteCoordinationTask's removal transaction uses. A
+    // concurrent delete cannot interleave: previously the unlocked
+    // load-check-publish-update window could publish an orphan closeout
+    // report into a report directory a concurrent delete was already
+    // removing, or recreate a card the delete had already removed. A
+    // contender that finds the card missing after a completed delete
+    // REFUSES at the required load inside the lock — it never publishes
+    // and never resurrects.
+    return withLock(
+        coordinationTaskLockPath(taskID),
+        () =>
+            saveCoordinationTaskCloseoutLocked(actor, taskID, sessionID, options),
+    );
+}
+
+// The body of saveCoordinationTaskCloseout; runs ONLY under that function's
+// per-task lock (never call directly). The load is REQUIRED — a card that
+// vanished under the lock refuses instead of resurrecting.
+function saveCoordinationTaskCloseoutLocked(actor, taskID, sessionID, options) {
+    const loaded = loadCoordinationTask(taskID);
     const errors = [];
     if (loaded.payload.status !== "working") {
         errors.push(
@@ -9125,7 +10489,10 @@ function saveCoordinationTaskCloseout(sessionID, taskIDRaw, options = {}) {
         options.measuredOutcome !== undefined
             ? normalizeOptionalText(options.measuredOutcome)
             : null;
-    const saved = updateCoordinationTask(loaded.payload.task_id, (current) => ({
+    // In-transaction card update — the PRIVATE already-locked core (the
+    // public updateCoordinationTask would re-enter the same non-reentrant
+    // per-task lock this transaction already holds).
+    const saved = applyCoordinationTaskUpdateLocked(loaded.payload.task_id, (current) => ({
         ...current,
         status: taskStatus,
         report_envelope: reportEnvelope,
@@ -9195,7 +10562,28 @@ function saveCoordinationTaskCloseout(sessionID, taskIDRaw, options = {}) {
 
 function reviewCoordinationTask(sessionID, taskIDRaw, options = {}) {
     const actor = coordinationActorContext(sessionID, options);
-    const loaded = loadCoordinationTask(taskIDRaw);
+    const taskID = normalizeCoordinationTaskId(taskIDRaw);
+    // Publication transaction (v0.29.0 TOCTOU repair): the reviewable-status
+    // checks, the review-report publication, and the card update all run
+    // inside ONE per-task locked boundary. A concurrent deleteCoordinationTask
+    // (or any other card writer) cannot interleave: previously the unlocked
+    // load-check-publish-update window could publish an orphan review report
+    // into a report directory a concurrent delete was already removing, or
+    // update a card the delete had already removed (resurrecting it from
+    // under a refused refusal). A contender that finds the card missing
+    // after a completed delete REFUSES at the required load inside the lock
+    // — it never publishes and never resurrects.
+    return withLock(
+        coordinationTaskLockPath(taskID),
+        () => reviewCoordinationTaskLocked(actor, taskID, sessionID, options),
+    );
+}
+
+// The body of reviewCoordinationTask; runs ONLY under that function's
+// per-task lock (never call directly). The load is REQUIRED — a card that
+// vanished under the lock refuses instead of resurrecting.
+function reviewCoordinationTaskLocked(actor, taskID, sessionID, options) {
+    const loaded = loadCoordinationTask(taskID);
     const errors = [];
     if (!COORDINATION_REVIEWABLE_STATUSES.has(loaded.payload.status)) {
         errors.push(
@@ -9218,9 +10606,18 @@ function reviewCoordinationTask(sessionID, taskIDRaw, options = {}) {
             "task_status",
             errors,
         ) || loaded.payload.status;
-    if (["draft", "working"].includes(taskStatus)) {
+    // Result-status allowlist (explicit + frozen — see
+    // COORDINATION_REVIEW_RESULT_STATUSES): review resolves a closeout into
+    // one of the five documented /task-review resolutions and NOTHING else.
+    // This is deliberately NOT derived from COORDINATION_TASK_STATUSES: the
+    // lifecycle enum carries holding/mechanic states (staged) that must
+    // never be reachable as a review verdict — a review resolving a card
+    // into staged would bypass the dedicated restage op's staged_path
+    // contract (status-widening leak, closed here).
+    if (!COORDINATION_REVIEW_RESULT_STATUSES.includes(taskStatus)) {
         errors.push(
-            "task_review should resolve to ready, reported, blocked, completed, or cancelled.",
+            "task_review should resolve to ready, reported, blocked, completed, or cancelled. " +
+                "(Explicit verdict allowlist — staged is a release-mechanic holding state owned by the dedicated restage op, never a review result.)",
         );
     }
     throwCollectedErrors(errors);
@@ -9257,7 +10654,10 @@ function reviewCoordinationTask(sessionID, taskIDRaw, options = {}) {
         }),
     );
     const storedReviewPath = relativeToRepo(reviewPath);
-    const saved = updateCoordinationTask(loaded.payload.task_id, (current) => ({
+    // In-transaction card update — the PRIVATE already-locked core (the
+    // public updateCoordinationTask would re-enter the same non-reentrant
+    // per-task lock this transaction already holds).
+    const saved = applyCoordinationTaskUpdateLocked(loaded.payload.task_id, (current) => ({
         ...current,
         status: taskStatus,
         next_action:
@@ -10026,6 +11426,7 @@ export {
     readyCoordinationTask,
     updateCoordinationTaskMetadata,
     repairCoordinationTask,
+    restageCoordinationTask,
     saveCoordinationTaskCloseout,
     reviewCoordinationTask,
     deleteCoordinationTask,
@@ -10117,6 +11518,7 @@ export default {
     readyCoordinationTask,
     updateCoordinationTaskMetadata,
     repairCoordinationTask,
+    restageCoordinationTask,
     saveCoordinationTaskCloseout,
     reviewCoordinationTask,
     deleteCoordinationTask,

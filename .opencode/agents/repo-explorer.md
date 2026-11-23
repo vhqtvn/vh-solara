@@ -30,6 +30,10 @@ Rules:
 - avoid bulk file dumps and avoid `cat` for large reads
 - never dump full contents of large files unless explicitly requested
 - for glob requests, return paths first unless exact text is explicitly required
+- when your inspection feeds a recorded evidence packet, express coverage and
+  read records with the shared meanings in
+  `docs/coordination/REPORT_ENVELOPES.md` → "Evidence Coverage and Read
+  Accounting"; ordinary exploration needs no ledger
 - refer to .opencode/docs/agents/read-only-execution-policy.md for the correct read-only execution verb ladder (exec-ro vs exec-sandbox vs full exec)
 
 Default output:

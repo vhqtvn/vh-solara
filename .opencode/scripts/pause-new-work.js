@@ -191,11 +191,23 @@ export function status() {
 // blanket command block would forbid continuation under a pause, violating the
 // "in-flight work is never touched" contract; the JS ready->working gate is
 // the precise seam instead.
+//
+// Re-audit record (card defer-017-pause-new-work-coverage-reaudit, 2026-11-15):
+// `deep-research` was triaged BLOCK — it is the deep variant of blocked
+// /research (begins new delegated research work with run packets). It ships
+// via the native-deep-research-pilot OVERLAY pack, so in repos that have not
+// selected that pack the entry is INERT (the command never dispatches there;
+// blocking a nonexistent command is a no-op). The blocklist stays one fixed
+// enumerated set in this shared contract module rather than per-repo forks.
+// New dispatch commands must be re-triaged against this class when they land
+// (fiction guard: tests/scripts/pause-new-work.test.js asserts every entry
+// exists in the dev repo's rendered command surface).
 export const PAUSE_BLOCKED_DISPATCH_COMMANDS = Object.freeze([
     "implement",
     "implement-goal",
     "research",
     "solution-brief",
+    "deep-research",
 ]);
 
 // isBlockedDispatchCommand returns true when a command name is in the

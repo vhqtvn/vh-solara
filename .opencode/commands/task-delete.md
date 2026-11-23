@@ -49,7 +49,11 @@ every declared slot's carrier is committed, branch-reachable, and contains
 the card-id anchor AND that item's handle together (verbatim line, or the
 canonical `decision-item: <task-id>#<item-id> (<disposition>)` label). A
 carrier containing only the card id satisfies NOTHING. Working-tree content
-and local-report prose never count. The remedy for a mismatch is the
+and local-report prose never count. For commit-carrier slots the verifier
+also accepts a committed retirement-carrier document (durable-home file with
+`retirement-carrier` in the basename carrying anchor + handle together —
+see RECORD_LIFECYCLE.md → "Carrier-document fallback"). The remedy for a
+mismatch is the
 sanctioned ADD-ONLY re-closeout amendment (stored slots verbatim + fresh
 slots for new items). Legacy completed cards without a `decision_record`
 — and stored legacy version-1 (v1/v2) records — follow the compatibility

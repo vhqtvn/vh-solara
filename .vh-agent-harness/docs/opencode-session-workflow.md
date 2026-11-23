@@ -219,6 +219,11 @@ When a prompt uses explicit phases, checkpoint at the phase boundaries that chan
 
 When a checkpoint records a material decision in the decision log, that entry should cross-reference the Verification-table row that grounded it and name the downstream artifact or checkpoint it authorizes — this carries the dependency link as prose, since the `episodic` record type already covers such remembered decisions and no new record type is introduced.
 
+Checkpoints that record evidence-gathering state may carry coverage receipts
+and read-ledger entries using the shared meanings in
+`docs/coordination/REPORT_ENVELOPES.md` → "Evidence Coverage and Read
+Accounting" (optional — ordinary checkpoints need none of it).
+
 ## Premise-recheck protocol (load-bearing premises across boundaries)
 
 A **load-bearing premise** is a mutable fact a downstream step will act on as if
@@ -259,6 +264,11 @@ summary.
 This applies at every handoff/dispatch/resume boundary: encode load-bearing
 premises as the 4-tuple when you send them (see `/handoff-save`), and re-derive
 the cheap ones when you receive them (see `/resume-task`).
+
+Evidence reuse across sessions uses these same tuples as the transport for
+freshness-aware reuse bindings — see `docs/coordination/REPORT_ENVELOPES.md`
+→ "Evidence Coverage and Read Accounting" for the binding fields and the
+conditions under which stale evidence earns no reuse credit.
 
 ### Authority on refuted premises
 

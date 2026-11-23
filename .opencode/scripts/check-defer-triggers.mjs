@@ -334,6 +334,7 @@ function parseArgs(argv) {
         mode: null, // null|'promoter' = human-readable (default); 'release' = JSON + strict
         releaseVersion: null, // release version being tagged (manifest authority: override binding)
         overrideConfirmedVersion: null, // operator-confirmed version (wrapper ceremony); honors override_required
+        commit: null, // explicit commit to evaluate (release mode only; full 40-hex SHA; default HEAD)
     };
     for (let i = 2; i < argv.length; i++) {
         const raw = argv[i];
@@ -359,6 +360,9 @@ function parseArgs(argv) {
         } else if (a === "--override-confirmed-version") {
             const v = takeValue(true);
             if (v !== null) options.overrideConfirmedVersion = v;
+        } else if (a === "--commit") {
+            const v = takeValue(true);
+            if (v !== null) options.commit = v;
         } else if (a === "--help" || a === "-h") {
             process.stdout.write(
                 "usage: check-defer-triggers.mjs [--mode promoter|release|release-prep] [--tasks <dir>]\n" +
@@ -373,6 +377,11 @@ function parseArgs(argv) {
                 "    --override-confirmed-version is the operator-side wrapper confirmation\n" +
                 "    signal: an override_required record is honored only when\n" +
                 "    override.release_version == --release-version == --override-confirmed-version.\n" +
+                "    --commit <full-SHA> evaluates the ceremony anchored at that commit\n" +
+                "    instead of HEAD (manifest blob, blob SHA, handshake parent/tree,\n" +
+                "    single-path diff, and release-base tag reachability all resolve\n" +
+                "    from <commit>). Used by the wrapper's historical-M verification\n" +
+                "    when HEAD has advanced past the manifest commit M.\n" +
                 "    Release mode NEVER reads --since (evaluation is manifest-authority at\n" +
                 "    the tagged commit, not diff-based; a --since flag is ignored here).\n" +
                 "  --mode=release-prep: F4-C mechanical enumerator. Reads\n" +
@@ -795,17 +804,17 @@ function isFullSha(s) {
     return typeof s === "string" && /^[0-9a-f]{40}$/.test(s);
 }
 
-// Read the bytes of a path AS COMMITTED AT HEAD via `git show HEAD:<path>`.
-// This is the manifest-authority contract: the bytes evaluated equal the bytes
-// a fresh checkout (and CI) will see — NOT the worktree, which may carry
-// uncommitted edits that would otherwise let a dirty edit flip a `block`
-// record to `disclose+valid` while leaving the handshake SHAs intact. Returns
-// the file content as a UTF-8 string, or null if git fails (typically because
-// the path is not tracked at HEAD).
-function gitShowHeadBlob(relPath) {
+// Read the bytes of a path AS COMMITTED AT a commit (default HEAD) via
+// `git show <at>:<path>`. This is the manifest-authority contract: the bytes
+// evaluated equal the bytes a fresh checkout (and CI) will see — NOT the
+// worktree, which may carry uncommitted edits that would otherwise let a dirty
+// edit flip a `block` record to `disclose+valid` while leaving the handshake
+// SHAs intact. Returns the file content as a UTF-8 string, or null if git
+// fails (typically because the path is not tracked at that commit).
+function gitShowHeadBlob(relPath, at = "HEAD") {
     try {
         return gitCapture(
-            ["show", `HEAD:${relPath}`],
+            ["show", `${at}:${relPath}`],
             repoRoot(),
         );
     } catch (_) {
@@ -813,15 +822,15 @@ function gitShowHeadBlob(relPath) {
     }
 }
 
-// Compute the git blob SHA of `HEAD:<relPath>` via `git rev-parse`. Returns the
+// Compute the git blob SHA of `<at>:<relPath>` via `git rev-parse`. Returns the
 // 40-char lowercase hex blob SHA the committed tree carries, or null on
 // failure. The SHA is the override-binding token: it MUST be derived from the
 // committed blob (what CI sees), NEVER from a `git hash-object` of the worktree
 // path (which a dirty edit could swap out from under the ceremony).
-function gitHeadBlobSha(relPath) {
+function gitHeadBlobSha(relPath, at = "HEAD") {
     try {
         const sha = gitCapture(
-            ["rev-parse", `HEAD:${relPath}`],
+            ["rev-parse", `${at}:${relPath}`],
             repoRoot(),
         ).trim();
         return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
@@ -830,12 +839,12 @@ function gitHeadBlobSha(relPath) {
     }
 }
 
-// Resolve HEAD^ to a full commit SHA. Returns null if HEAD^ does not exist
-// (single-commit repo) or git is unusable.
-function gitHeadParent() {
+// Resolve `<at>^` to a full commit SHA (default: HEAD^). Returns null if the
+// parent does not exist (single-commit repo) or git is unusable.
+function gitHeadParent(at = "HEAD") {
     try {
         const sha = gitCapture(
-            ["rev-parse", "--verify", "--quiet", "HEAD^"],
+            ["rev-parse", "--verify", "--quiet", `${at}^`],
             repoRoot(),
         ).trim();
         return isFullSha(sha) ? sha : null;
@@ -844,14 +853,15 @@ function gitHeadParent() {
     }
 }
 
-// Resolve HEAD^^{tree} to the tree SHA of HEAD^ (the evaluated commit P).
-// NB: `HEAD^{tree}` would be the tree of HEAD itself (the manifest commit M);
-// we need the tree of HEAD^ (P), so the ref is `HEAD^^{tree}` (parent of HEAD,
-// peeled to its tree). Forward brace — argv form, no shell, so `^{}` is safe.
-function gitHeadParentTree() {
+// Resolve `<at>^^{tree}` to the tree SHA of `<at>^` (the evaluated commit P;
+// default: HEAD^). NB: `<at>^{tree}` would be the tree of `<at>` itself (the
+// manifest commit M); we need the tree of `<at>^` (P), so the ref is
+// `<at>^^{tree}` (parent of `<at>`, peeled to its tree). Forward brace — argv
+// form, no shell, so `^{}` is safe.
+function gitHeadParentTree(at = "HEAD") {
     try {
         const sha = gitCapture(
-            ["rev-parse", "--verify", "--quiet", "HEAD^^{tree}"],
+            ["rev-parse", "--verify", "--quiet", `${at}^^{tree}`],
             repoRoot(),
         ).trim();
         return isFullSha(sha) ? sha : null;
@@ -860,12 +870,13 @@ function gitHeadParentTree() {
     }
 }
 
-// Sorted array of files changed in HEAD^..HEAD, or null on failure. Forward
-// slashes (git's output convention) for cross-platform comparability.
-function gitDiffHeadRange() {
+// Sorted array of files changed in `<at>^..<at>` (default HEAD^..HEAD), or null
+// on failure. Forward slashes (git's output convention) for cross-platform
+// comparability.
+function gitDiffHeadRange(at = "HEAD") {
     try {
         const out = gitCapture(
-            ["diff", "--name-only", "HEAD^..HEAD"],
+            ["diff", "--name-only", `${at}^..${at}`],
             repoRoot(),
         );
         return out.split("\n").map((l) => l.trim()).filter(Boolean).sort(lexCompare);
@@ -884,13 +895,13 @@ function gitDiffHeadRange() {
 // invocation also forwards --release-version, but the new tag does not exist
 // yet at that point, so the exclusion is a no-op there and the bare describe
 // path remains equivalent.
-function gitLatestTag(excludeVersion) {
+function gitLatestTag(excludeVersion, at = "HEAD") {
     try {
         if (excludeVersion) {
-            // List tags REACHABLE from HEAD in descending version order and
+            // List tags REACHABLE from <at> in descending version order and
             // return the first that is not the excluded version. The
-            // `--merged HEAD` filter is the reachability guarantee: only tags
-            // whose commits are ancestors of (or equal to) HEAD are listed.
+            // `--merged <at>` filter is the reachability guarantee: only tags
+            // whose commits are ancestors of (or equal to) <at> are listed.
             // Without it, a maintenance-branch release (e.g. v1.0.2 declaring
             // release_base v1.0.0) would incorrectly select an unrelated
             // higher mainline tag (v1.1.0 on main, unreachable from the
@@ -901,7 +912,7 @@ function gitLatestTag(excludeVersion) {
             // release_base must resolve to the prior reachable release) and the
             // branched maintenance-release case.
             const out = gitCapture(
-                ["tag", "--merged", "HEAD", "--sort=-v:refname"],
+                ["tag", "--merged", at, "--sort=-v:refname"],
                 repoRoot(),
             );
             for (const line of out.split("\n")) {
@@ -913,7 +924,7 @@ function gitLatestTag(excludeVersion) {
             return null;
         }
         const tag = gitCapture(
-            ["describe", "--tags", "--abbrev=0"],
+            ["describe", "--tags", "--abbrev=0", at],
             repoRoot(),
         ).trim();
         return tag || null;
@@ -1171,6 +1182,49 @@ function mainRelease(options) {
     const releaseVersion = options.releaseVersion || null;
     const overrideConfirmedVersion = options.overrideConfirmedVersion || null;
 
+    // Evaluation anchor: HEAD by default, or an explicit --commit <full-SHA>
+    // (the wrapper's historical-M verification). Every git read below resolves
+    // from `at`, so a caller cannot mix anchors mid-evaluation.
+    const at = options.commit || "HEAD";
+    if (options.commit && !isFullSha(options.commit)) {
+        const envelope = {
+            mode: "release",
+            manifest_authority: true,
+            manifest_path: manifestPath,
+            manifest_sha: null,
+            release_version: releaseVersion,
+            override_confirmed_version: overrideConfirmedVersion,
+            // Additive field (release-tag historical-M slice): carries the
+            // explicit --commit SHA. The classic HEAD path gains the same
+            // field (reading "HEAD"), so classic behavior — anchor and error
+            // text — is identical, but the ENVELOPE is not byte-identical to
+            // the pre-historical shape.
+            evaluated_ref: options.commit,
+            release_base: null,
+            evaluated_commit: null,
+            evaluated_tree: null,
+            manifest_parent_commit: null,
+            head_parent: null,
+            head_parent_tree: null,
+            reconciliation: null,
+            records: [],
+            disclosures: [],
+            accepted_overrides: [],
+            refusals: [],
+            blocking_ids: [],
+            disclose_ids: [],
+            evaluator_error_ids: [],
+            advisories: [],
+            classification: "evaluator-error",
+            error: `--commit must be a 40-char lowercase hex SHA (got ${JSON.stringify(options.commit)})`,
+        };
+        emitReleaseResult(envelope);
+        return;
+    }
+    // Human-facing label for handshake errors: literal HEAD when evaluating
+    // HEAD (byte-compatible with the historical messages), else the SHA.
+    const atLabel = at;
+
     const envelope = {
         mode: "release",
         manifest_authority: true,
@@ -1178,6 +1232,12 @@ function mainRelease(options) {
         manifest_sha: null,
         release_version: releaseVersion,
         override_confirmed_version: overrideConfirmedVersion,
+        // Additive field (release-tag historical-M slice): reads "HEAD" in
+        // the classic path (no --commit) or the explicit SHA in the
+        // historical flow. Classic anchor/error behavior is unchanged, but
+        // the envelope carries this extra field — not byte-identical to the
+        // pre-historical shape.
+        evaluated_ref: at,
         release_base: null,
         evaluated_commit: null,
         evaluated_tree: null,
@@ -1197,22 +1257,23 @@ function mainRelease(options) {
         error: null,
     };
 
-    // 1. Read manifest bytes FROM THE COMMITTED HEAD BLOB (never the worktree).
+    // 1. Read manifest bytes FROM THE COMMITTED BLOB AT THE EVALUATION ANCHOR
+    // (never the worktree).
     //
     // This is the manifest-authority contract: the bytes evaluated MUST equal
     // the bytes a fresh checkout (and CI) will see. Reading the worktree file
     // would let a dirty edit flip a committed `block` record to
     // `disclose+valid` while leaving the handshake SHAs intact — the wrapper's
-    // subsequent HEAD^..HEAD path-list check would still pass (the manifest
+    // subsequent single-path check would still pass (the manifest
     // path is unchanged), but the bytes evaluated would not be the bytes
-    // committed at HEAD. Reading from `HEAD:<path>` makes that bypass
+    // committed at the anchor. Reading from `<at>:<path>` makes that bypass
     // impossible: the evaluator and CI see the same bytes by construction.
     //
     // `manifestPath` is still computed (above) for the envelope's
     // `manifest_path` field, but the bytes themselves come from git, not fs.
-    const raw = gitShowHeadBlob(RELEASE_MANIFEST_REL);
+    const raw = gitShowHeadBlob(RELEASE_MANIFEST_REL, at);
     if (raw === null) {
-        envelope.error = `release manifest missing from HEAD: ${RELEASE_MANIFEST_REL} (must be committed, not just on worktree)`;
+        envelope.error = `release manifest missing from ${at}: ${RELEASE_MANIFEST_REL} (must be committed, not just on worktree)`;
         emitReleaseResult(envelope);
         return;
     }
@@ -1228,12 +1289,12 @@ function mainRelease(options) {
     }
 
     // 3. Manifest blob SHA FROM THE SAME COMMITTED BLOB (override binding +
-    // echo). Computed via `git rev-parse HEAD:<path>` so it equals what CI
+    // echo). Computed via `git rev-parse <at>:<path>` so it equals what CI
     // will also see — a dirty worktree cannot swap this SHA under the
     // override ceremony.
-    envelope.manifest_sha = gitHeadBlobSha(RELEASE_MANIFEST_REL);
+    envelope.manifest_sha = gitHeadBlobSha(RELEASE_MANIFEST_REL, at);
     if (!envelope.manifest_sha) {
-        envelope.error = `release manifest unreadable from HEAD: ${RELEASE_MANIFEST_REL} (git rev-parse HEAD:<path> failed)`;
+        envelope.error = `release manifest unreadable from ${at}: ${RELEASE_MANIFEST_REL} (git rev-parse ${at}:<path> failed)`;
         emitReleaseResult(envelope);
         return;
     }
@@ -1252,39 +1313,44 @@ function mainRelease(options) {
     envelope.reconciliation = obj.reconciliation;
     envelope.records = obj.records;
 
-    // 5. Freshness handshake (sacred — do not weaken).
-    const headParent = gitHeadParent();
-    const headParentTree = gitHeadParentTree();
+    // 5. Freshness handshake (sacred — do not weaken). All checks resolve from
+    // the evaluation anchor `at`: evaluated_commit / manifest_parent_commit
+    // must equal <at>^, evaluated_tree must equal tree(<at>^), and
+    // <at>^..<at> must change ONLY the manifest. With --commit <M> this is
+    // exactly the historical-M verification: the manifest commits only itself
+    // on top of the commit it evaluated, at the commit that will be tagged.
+    const headParent = gitHeadParent(at);
+    const headParentTree = gitHeadParentTree(at);
     envelope.head_parent = headParent;
     envelope.head_parent_tree = headParentTree;
     if (!headParent || !headParentTree) {
-        envelope.error = "handshake failed: HEAD^ does not exist (need at least 2 commits)";
+        envelope.error = `handshake failed: ${atLabel}^ does not exist (need at least 2 commits)`;
         emitReleaseResult(envelope);
         return;
     }
     if (obj.evaluated_commit !== headParent) {
-        envelope.error = `handshake failed: evaluated_commit=${obj.evaluated_commit} != HEAD^=${headParent}`;
+        envelope.error = `handshake failed: evaluated_commit=${obj.evaluated_commit} != ${atLabel}^=${headParent}`;
         emitReleaseResult(envelope);
         return;
     }
     if (obj.manifest_parent_commit !== headParent) {
-        envelope.error = `handshake failed: manifest_parent_commit=${obj.manifest_parent_commit} != HEAD^=${headParent}`;
+        envelope.error = `handshake failed: manifest_parent_commit=${obj.manifest_parent_commit} != ${atLabel}^=${headParent}`;
         emitReleaseResult(envelope);
         return;
     }
     if (obj.evaluated_tree !== headParentTree) {
-        envelope.error = `handshake failed: evaluated_tree=${obj.evaluated_tree} != tree(HEAD^)=${headParentTree}`;
+        envelope.error = `handshake failed: evaluated_tree=${obj.evaluated_tree} != tree(${atLabel}^)=${headParentTree}`;
         emitReleaseResult(envelope);
         return;
     }
-    const diff = gitDiffHeadRange();
+    const diff = gitDiffHeadRange(at);
     if (diff === null) {
-        envelope.error = "handshake failed: cannot compute HEAD^..HEAD diff";
+        envelope.error = `handshake failed: cannot compute ${atLabel}^..${atLabel} diff`;
         emitReleaseResult(envelope);
         return;
     }
     if (diff.length !== 1 || diff[0] !== RELEASE_MANIFEST_REL) {
-        envelope.error = `handshake failed: HEAD^..HEAD must change only the manifest (${RELEASE_MANIFEST_REL}); got [${diff.join(", ")}]`;
+        envelope.error = `handshake failed: ${atLabel}^..${atLabel} must change only the manifest (${RELEASE_MANIFEST_REL}); got [${diff.join(", ")}]`;
         emitReleaseResult(envelope);
         return;
     }
@@ -1310,13 +1376,13 @@ function mainRelease(options) {
         // the PRIOR tag. Pre-tag wrapper invocations also forward
         // --release-version, but the new tag does not exist yet so the
         // exclusion is a no-op there.
-        const derived = gitLatestTag(releaseVersion);
+        const derived = gitLatestTag(releaseVersion, at);
         if (derived === null) {
             // kind=tag declares a prior-tag release, but no tag is reachable
-            // from HEAD (after excluding the release version). That is a
-            // genuine malformed-manifest state (a tag release with no prior
-            // tag), NOT a stale value — fail closed.
-            envelope.error = `release_base kind=tag but no prior tag reachable from HEAD (release_version=${releaseVersion || "<none>"}); a tag release requires a discoverable prior tag`;
+            // from the evaluation anchor (after excluding the release
+            // version). That is a genuine malformed-manifest state (a tag
+            // release with no prior tag), NOT a stale value — fail closed.
+            envelope.error = `release_base kind=tag but no prior tag reachable from ${atLabel} (release_version=${releaseVersion || "<none>"}); a tag release requires a discoverable prior tag`;
             emitReleaseResult(envelope);
             return;
         }

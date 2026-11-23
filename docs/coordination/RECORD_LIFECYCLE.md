@@ -202,6 +202,22 @@ A commit whose body contains only the card id (the landing trailer)
 satisfies **nothing**. A handle floating in an un-anchored carrier satisfies
 nothing. Each slot names its own carrier; several slots may share one.
 
+**Carrier-document fallback (2026-11-14):** when a `commit` carrier (pinned
+or search mode) deterministically misses the anchor and/or the handle, the
+retirement verifier ALSO accepts a committed, branch-reachable
+**retirement-carrier document**: a file under one of the durable homes
+(`docs/checkpoints/`, `researches/decisions/`, `researches/sources/`,
+`docs/planning/`) whose **basename contains `retirement-carrier`**, carrying
+the card-id anchor and the item's handle together in one committed blob
+(same-blob rule, cap-bounded history walk). The naming convention IS the
+trust boundary — "any committed doc" is deliberately not a carrier. This
+closes the flow/gate mismatch where closeouts pinned commit carriers to the
+slice commits (trailer anchor, no labels — commit messages authored by the
+committer protocol never carry per-item labels) while the decision content
+was durably preserved in a carrier document. Unresolvable / unreachable /
+unreadable pins and artifact-carrier path misses keep their own honest
+diagnoses (no fallback — a broken declaration is a re-closeout matter).
+
 **Mechanical vs semantic — what the gate proves:**
 
 | Disposition | Mechanical guarantee (gate) | Semantic ceiling (author + reviewer) |
@@ -288,7 +304,11 @@ landing proof) refuses — naming each item — with:
   and the item's handle each exist somewhere in the carrier path's reachable
   history, but never together in ONE committed revision — a fresh session
   recovering from the anchor-bearing revision would find no representation
-  there, so split evidence never verifies.
+  there, so split evidence never verifies. For commit carriers, the
+  carrier-document fallback (above) runs BEFORE `anchor_missing` /
+  `handle_not_in_carrier` refuse — land a `*retirement-carrier*` document
+  under a durable home carrying the anchor + handle together, and the same
+  retirement re-run verifies.
 
 ### Compatibility (legacy + in-flight cards)
 

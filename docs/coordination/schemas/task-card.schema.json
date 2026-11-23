@@ -143,8 +143,14 @@
         "reported",
         "blocked",
         "completed",
-        "cancelled"
+        "cancelled",
+        "staged"
       ]
+    },
+    "staged_path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Repo-relative path of the staged release-note fragment the release ceremony's inject-errata step consumes. Present on staged errata-transport cards; written by the restage op (or a transition-validated staged repair), never by the generic metadata update."
     },
     "session_aliases": {
       "type": "array",

@@ -24,7 +24,7 @@ Only these agents should fan out via `permission.task`:
 - `coordination`
 - `project-coordinator`
 - `commit-message` (to `commit-reviewer` only)
-- `commit-reviewer` (to `commit-reviewer-a`, `commit-reviewer-b`, and `commit-reviewer-c` only; `commit-reviewer-d` deferred until premium tier is enabled)
+- `commit-reviewer` (to the registered leaf pool `commit-reviewer-a` .. `commit-reviewer-e` only; which seats are ACTIVE is a review-tiers.json roster decision — the shipped default activates a..d, with e registered but held out via the disabled premium tier)
 
 All other specialists should keep `task: { "*": "deny" }` to prevent lateral drift.
 
@@ -101,12 +101,14 @@ For private helper families (implemented for debate):
 
 #### Commit-reviewer cluster
 
-`commit-reviewer` is an internal cluster: one visible orchestrator (`commit-reviewer`) dispatches to hidden leaves across multiple tiers. Tier structure is defined in `.opencode/config/review-tiers.json` — currently Tier 1 (free, B+C), Tier 2 (cheap, A), and Tier 3 (premium, D, disabled). The leaves are identical except for description frontmatter; running independent reviews across tiers reduces single-model blind spots. The orchestrator performs mechanical JSON aggregation with strict consensus within each tier and fail-fast escalation across tiers — all tiers must approve for an overall approve. The delegation ownership rule (§2) applies: only the orchestrator may call the leaves via `task`.
+`commit-reviewer` is an internal cluster: one visible orchestrator (`commit-reviewer`) dispatches to hidden leaves across tiers. Tier structure is defined in `.opencode/config/review-tiers.json` (additively overridable via the operator-owned `.opencode/repo-configs/review-tiers.json`) — currently one active tier (free: a, b, c, d) and one disabled tier (premium: e). The leaves are identical except for description frontmatter; running independent reviews across seats reduces single-model blind spots. The orchestrator performs mechanical JSON aggregation with strict consensus within each tier and fail-fast escalation across tiers — all tiers must approve for an overall approve. The delegation ownership rule (§2) applies: only the orchestrator may call the leaves via `task`.
+
+The cluster is a bounded-B 5-seat registered pool: seats a..e are all registered; the active roster must keep at least 2 generalist seats and at most 5 total (validated before dispatch). The shipped default is 3+1 — a is the contract/data-integrity specialist (Lever E), b/c/d are redundant generalists, and e stays registered-but-inactive until an operator activates it via the override.
 
 Cluster pattern:
 - visible: `commit-reviewer` (orchestrator, in read-only specialists list)
-- hidden: `commit-reviewer-a`, `commit-reviewer-b`, `commit-reviewer-c` (leaves, not in callable graph; `commit-reviewer-d` deferred until premium tier enabled)
-- task allowlist on orchestrator: `{ "*": "deny", "commit-reviewer-a": "allow", "commit-reviewer-b": "allow", "commit-reviewer-c": "allow" }`
+- hidden: `commit-reviewer-a` .. `commit-reviewer-e` (leaves, not in callable graph; all five registered — active roster per review-tiers.json)
+- task allowlist on orchestrator: `{ "*": "deny", "commit-reviewer-a": "allow", ..., "commit-reviewer-e": "allow" }`
 - leaves have `task: { "*": "deny" }` — cannot call anyone
 - review modes are documented in `commit-reviewer-modes.md`
 

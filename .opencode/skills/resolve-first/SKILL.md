@@ -49,7 +49,8 @@ detections, and the scoreboard. Concretely:
   until the commit exists; a classifier that claims `defer-with-trigger` is not
   believed until the draft card exists with a whitelist tag and a real trigger.
   This is the same read-state-directly discipline the back end already enforces
-  (see `researches/decisions/2026-07-30-defer-liveness-release-gate.md`).
+  (documented in the upstream harness repo's recorded decision memo on defer
+  liveness — upstream provenance, see References).
 - The scoreboard is read off deterministic observers that already exist
   (`check-defer-triggers.mjs`, git history), NEVER off the skill's own emitted
   outputs. The skill predeclares what those observers mean; it does not produce
@@ -71,17 +72,18 @@ decision frame is loaded. Parking does not delete cost; it compounds it with a
 re-derivation tax. So the **default is RESOLVE NOW**: the pile shrinks by
 resolution, not grows by parking.
 
-This is empirically grounded, not aesthetic.
-`researches/decisions/2026-07-30-defer-liveness-release-gate.md` §F1-D1 records
-the population-scale instance: **16 `draft` DEFER cards had fired `path_touched`
-targets in `v0.18.0..HEAD` and would have shipped without a forced verdict**, and
-**one erratum card's trigger fired on three consecutive releases and stayed
-`draft` through all of them.** Those cards were not parked because their triggers
-hadn't fired — they were parked *while their triggers were firing*. The trigger
-machinery itself fails mechanically (it is not only severity verdicts that
-decay). **Parking decays.** That decay is the failure mode this front gate
-exists to reduce — by refusing to create the card when the work could instead
-be landed, decided, or legitimately declined this session.
+This is empirically grounded, not aesthetic. The upstream harness repo's
+recorded decision memo on defer liveness (§F1-D1 — upstream provenance, see
+References) documents the population-scale instance: **16 `draft` DEFER cards
+had fired `path_touched` targets in `v0.18.0..HEAD` and would have shipped
+without a forced verdict**, and **one erratum card's trigger fired on three
+consecutive releases and stayed `draft` through all of them.** Those cards were
+not parked because their triggers hadn't fired — they were parked *while their
+triggers were firing*. The trigger machinery itself fails mechanically (it is
+not only severity verdicts that decay). **Parking decays.** That decay is the
+failure mode this front gate exists to reduce — by refusing to create the card
+when the work could instead be landed, decided, or legitimately declined this
+session.
 
 ## The mechanism — front gate composes with (does NOT replace) the back end
 
@@ -363,7 +365,16 @@ does NOT score S2.
 ## References
 
 - `references/runbook.md` — worked examples of each of the four legal outputs,
-  each of the four whitelist tags, and each falsifier.
+  each of the four whitelist tags, and each falsifier. (Shipped with this pack,
+  pack-relative.)
+
+**Upstream provenance — dev-repo decision memos.** The memos below live in the
+vh-agent-harness dev repo
+(github.com/vhqtvn/vh-agent-harness — its `researches/decisions/` tree). They
+are NOT shipped with this pack and are NOT required reading in adopter repos;
+absence of a local `researches/` tree is normal. They are cited as accurate
+history of this skill's design.
+
 - `researches/decisions/2026-11-02-post-review-decision-quality-disposition.md`
   — the successor decision memo: corrects the disposition contract to four
   legal outputs (adds decline-and-close) and records the accepted canon drift.
@@ -375,5 +386,8 @@ does NOT score S2.
   empirical decay evidence the philosophy cites.
 - `researches/decisions/2026-07-24-behavioral-closure-pilot.md` — the
   decision-memo shape precedent.
-- `.opencode/skills/contract-invariant-audit/SKILL.md` — the instruction-only /
-  INFORMS-only skill-shape precedent.
+
+**Cross-pack reference.** `.opencode/skills/contract-invariant-audit/SKILL.md`
+— the instruction-only / INFORMS-only skill-shape precedent. Resolves only in
+repos that also selected the `contract-invariant-audit-pilot` overlay pack;
+absence of that skill is normal elsewhere.

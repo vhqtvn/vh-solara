@@ -45,6 +45,11 @@ Rules:
 - route durable reference material to `researches/sources/`
 - route synthesized option comparisons or recommendations to
   `researches/decisions/`
+- when a source packet records examination coverage, read attempts, or reuse
+  of earlier evidence, use the shared field meanings in
+  `docs/coordination/REPORT_ENVELOPES.md` → "Evidence Coverage and Read
+  Accounting" (slot states, ledger entries, reuse bindings — the schema lives
+  there, not here)
 - when the task is exploratory and a downstream `debate` or `planner` handoff is
   likely, prefer a compact solution-scout packet over a long essay
 - keep exploratory option sets to 3-5 materially distinct candidates unless the
