@@ -119,8 +119,10 @@ describe("highlightInput: a fence behind a container prefix", () => {
     const out = expectLines(["- ```bash", "  npm install", "  ```", "# after"], [1, 2]);
     expect(out[0]).toBe(prefixSpan("hl-marker", "- ") + codeSpan("```bash"));
     expect(out[3]).toBe(headLine("# after"));
-    // An ordered list marker works the same way.
-    const ord = expectLines(["10. ```", "x := 1", "```", "# after"], [1, 2]);
+    // An ordered list marker works the same way. Content and closer are indented
+    // by the marker's width (4 for "10. ") so that they belong to the list item
+    // under CommonMark — the highlighter would accept them unindented as well.
+    const ord = expectLines(["10. ```", "    x := 1", "    ```", "# after"], [1, 2]);
     expect(ord[0]).toBe(prefixSpan("hl-marker", "10. ") + codeSpan("```"));
     expect(ord[3]).toBe(headLine("# after"));
   });
