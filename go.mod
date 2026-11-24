@@ -1,6 +1,7 @@
 module github.com/vhqtvn/vh-solara
 
 go 1.26.11
+ignore ./tmp
 
 require (
 	github.com/alecthomas/chroma/v2 v2.14.0
