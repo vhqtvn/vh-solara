@@ -306,10 +306,10 @@ For any substantial boundary change, also update the relevant docs.
   `/job-cleanup` and verify that it is gone. Do not delete another session's
   artifacts. Never commit scratch. The root `go.mod` declares `ignore ./tmp`, so
   wildcard patterns such as `./...` never discover packages under `tmp/`, and a
-  wildcard run from inside `tmp/` matches nothing: build or run scratch by its
-  literal path or as its own module. That fence covers wildcard build discovery
-  only. This convention is about placement and cleanup, and it depends on
-  compliance.
+  wildcard run against the root module from inside `tmp/` matches nothing:
+  build or run scratch by its literal path or as its own module. That fence
+  covers wildcard build discovery only. This convention is about placement and
+  cleanup, and it depends on compliance.
 
 ## Coordinator and build-session lifecycle discipline (harness)
 
