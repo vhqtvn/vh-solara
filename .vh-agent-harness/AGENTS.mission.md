@@ -297,6 +297,19 @@ For any substantial boundary change, also update the relevant docs.
   `.vh-solara/project.jsonc` to declare managed processes — see
   [`docs/guides/managed-projects.md`](../docs/guides/managed-projects.md). Building the embedded
   view app itself: [`docs/guides/custom-views.md`](../docs/guides/custom-views.md).
+- **Go scratch:** Create all scratch Go source (standalone files, packages, or
+  modules) under an underscore-prefixed directory within
+  `tmp/agent-runs/<alias>/`, normally `_go/`. Do not create loose `.go` files
+  elsewhere under `tmp/`, and do not use a shared global stash. Create the
+  intended path up front. Before moving existing scratch, audit and update
+  references. At task end, remove the scratch you created as part of
+  `/job-cleanup` and verify that it is gone. Do not delete another session's
+  artifacts. Never commit scratch. The root `go.mod` declares `ignore ./tmp`, so
+  wildcard patterns such as `./...` never discover packages under `tmp/`, and a
+  wildcard run from inside `tmp/` matches nothing: build or run scratch by its
+  literal path or as its own module. That fence covers wildcard build discovery
+  only. This convention is about placement and cleanup, and it depends on
+  compliance.
 
 ## Coordinator and build-session lifecycle discipline (harness)
 
