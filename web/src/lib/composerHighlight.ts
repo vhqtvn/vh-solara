@@ -48,9 +48,14 @@ function inlineHl(s: string): string {
 // by nothing but whitespace closes the block. So three backticks are plain
 // content inside a four-backtick block.
 //
-// An opener may also sit behind a container prefix — a blockquote marker or a
-// list marker — and is tested on the rest of that line. One behind a blockquote
-// marker closes only behind a blockquote marker again.
+// An opener may also sit behind container prefixes — blockquote markers and
+// list markers, combined or nested ("> - ```", ">>", a quote inside a list
+// item). The block belongs to those containers: it ends when one of them ends,
+// even without a closer line, and a closer must sit behind the same prefixes.
+//
+// Each of them — a fence run, a list marker, a ">" — may be indented at most
+// 3 columns, counted from the start of the content of the container it sits
+// in. More makes it indented code: never a fence.
 //
 // A fence line: optional leading whitespace (list-nested fences rely on it),
 // then a maximal run of ONE fence character, then the rest of the line.
@@ -61,10 +66,16 @@ const QUOTE = /^(\s*>\s?)([\s\S]*)$/;
 // A list-item line: optional spaces, a bullet or "digits.", one space.
 const LIST = /^(\s*(?:[-*+]|\d+\.)\s)([\s\S]*)$/;
 // Both capture the prefix in [1] and the rest of the line in [2].
+// The list marker alone, sticky: matched at a scanning position (below).
+const MARKER = /[-*+]|\d+\./y;
 
-// The open fence: the opener's character and run length, and whether the opener
-// sat on a blockquote line.
-type Fence = { ch: string; len: number; quoted: boolean };
+// A container a line can sit in: a blockquote level, or a list item whose
+// content starts at column `n`.
+type Container = { quote: true } | { quote: false; n: number };
+
+// The open fence: the opener's character and run length, and the containers
+// the opener line sat in, outermost first.
+type Fence = { ch: string; len: number; ctx: Container[] };
 
 // Opening fence (outside a block): at least 3 of one fence character. A
 // backtick fence's info string must not contain another backtick — such a line
@@ -77,28 +88,82 @@ function openFence(line: string): { ch: string; len: number } | null {
 }
 
 // Closing fence for `fence`: a run of at least `len` of its character, then
-// only whitespace to end of line. A block opened on a blockquote line closes
-// only on a blockquote line — the same prefix is stripped first, and a bare
-// fence line is content. Any other block closes on the bare run alone, so a
-// ">" line inside it is content.
+// only whitespace to end of line. Tested on the text behind the block's
+// container prefixes, so a line outside those containers never closes it.
 function isCloseFence(line: string, fence: Fence): boolean {
-  let rest = line;
-  if (fence.quoted) {
-    const q = QUOTE.exec(line);
-    if (!q) return false;
-    rest = q[2];
-  }
-  const m = FENCE_RUN.exec(rest);
+  const m = FENCE_RUN.exec(line);
   return !!m && m[1][0] === fence.ch && m[1].length >= fence.len && /^\s*$/.test(m[2]);
 }
 
-// The rest of a container line (behind a blockquote or list marker): a code
-// span that opens a fence, or inline highlighting. Also returns the fence it
-// opened, if any.
-function afterPrefix(rest: string, quoted: boolean): { html: string; fence: Fence | null } {
-  const open = openFence(rest);
-  if (!open) return { html: inlineHl(rest), fence: null };
-  return { html: `<span class="hl-code">${escHtml(rest)}</span>`, fence: { ...open, quoted } };
+// One line's scan through its container prefixes. `pos` is the index of the
+// next unconsumed character — always the next non-whitespace character, or the
+// end of the line — and `col` its column: one per character, except that a
+// tab advances to the next multiple of 4. `base` is the content start column
+// of the innermost container matched so far (0 with none): whatever comes
+// next on the line is indented `col - base` columns.
+type Scan = { line: string; pos: number; col: number; base: number };
+
+const isWs = (c: string | undefined) => c !== undefined && /\s/.test(c);
+
+// Consumes one character.
+function step(s: Scan): void {
+  s.col = s.line[s.pos] === "\t" ? (Math.floor(s.col / 4) + 1) * 4 : s.col + 1;
+  s.pos++;
+}
+
+// Consumes the whitespace at the scanning position.
+function skipWs(s: Scan): void {
+  while (isWs(s.line[s.pos])) step(s);
+}
+
+// A blockquote level written at the scanning position: ">", indented at most
+// 3 columns, then at most one whitespace character. Consumes both; the rest
+// of the line is its content, measured from after them.
+function matchQuote(s: Scan): boolean {
+  if (s.line[s.pos] !== ">" || s.col - s.base > 3) return false;
+  step(s);
+  if (isWs(s.line[s.pos])) step(s);
+  s.base = s.col;
+  skipWs(s);
+  return true;
+}
+
+// A list item written at the scanning position: the marker, indented at most
+// 3 columns, then at least one whitespace character. Consumes both and
+// returns the column its content starts at — after the marker and the
+// whitespace following it, 5 or more columns of which count as 1.
+function matchItem(s: Scan): number | null {
+  if (s.col - s.base > 3) return null;
+  MARKER.lastIndex = s.pos;
+  const marker = MARKER.exec(s.line)?.[0];
+  if (!marker || !isWs(s.line[s.pos + marker.length])) return null;
+  const after = s.col + marker.length; // a marker holds no tabs
+  for (let i = marker.length; i > 0; i--) step(s);
+  skipWs(s);
+  const ws = s.col - after;
+  const n = after + (ws >= 5 ? 1 : ws);
+  s.base = n;
+  return n;
+}
+
+// Whether the line continues the container `c` from the scanning position. A
+// blockquote level consumes its marker. A list item holds a blank line, or a
+// line whose first non-whitespace character past what was consumed sits at or
+// past the item's content column; it consumes nothing. Either way the
+// container's content start becomes the base.
+function inContainer(s: Scan, c: Container, blank: boolean): boolean {
+  if (c.quote) return matchQuote(s);
+  if (!blank && s.col < c.n) return false;
+  s.base = c.n;
+  return true;
+}
+
+// A container written at the scanning position: a blockquote level, or a list
+// item. Null when the line writes neither.
+function written(s: Scan): Container | null {
+  if (matchQuote(s)) return { quote: true };
+  const n = matchItem(s);
+  return n === null ? null : { quote: false, n };
 }
 
 // Line-level markdown (headings, blockquotes, list markers, fenced code), then
@@ -108,33 +173,50 @@ export function highlightInput(text: string): string {
   const lines = text.split("\n");
   // The open fence, or null outside a block.
   let fence: Fence | null = null;
+  // The containers a line outside a block sits in, outermost first. They carry
+  // over from line to line; a line ends those it is not in.
+  let stack: Container[] = [];
   const out: string[] = [];
+  const codeSpan = (l: string) => `<span class="hl-code">${escHtml(l)}</span>`;
   for (const line of lines) {
-    if (fence) {
-      // Inside a block: everything is content except a valid closer.
-      if (isCloseFence(line, fence)) fence = null;
-      out.push(`<span class="hl-code">${escHtml(line)}</span>`);
+    // Scan the line through its containers: the block's context inside a
+    // block, stopping at the first one the line is not in.
+    const s: Scan = { line, pos: 0, col: 0, base: 0 };
+    skipWs(s);
+    const blank = s.pos === line.length;
+    const ctx = fence ? fence.ctx : stack;
+    let depth = 0;
+    while (depth < ctx.length && inContainer(s, ctx[depth], blank)) depth++;
+    if (fence && depth === ctx.length) {
+      // Inside the block: everything is content except a valid closer, which
+      // ends the block after this line.
+      if (s.col - s.base <= 3 && isCloseFence(line.slice(s.pos), fence)) {
+        fence = null;
+        stack = ctx;
+      }
+      out.push(codeSpan(line));
       continue;
     }
-    const open = openFence(line);
-    if (open) {
-      fence = { ...open, quoted: false };
-      out.push(`<span class="hl-code">${escHtml(line)}</span>`);
-      continue;
-    }
+    // Outside a block (a block whose container ended ends before this line):
+    // the stack is what matched, plus the containers written on this line.
+    fence = null;
+    stack = ctx.slice(0, depth);
+    for (let c = written(s); c; c = written(s)) stack = [...stack, c];
+    // The rest of the line opens a block unless it is blank or indented code:
+    // a fence run indented more than 3 columns past the container content is
+    // never a fence. An opener's rest — behind the line's prefix, if it has
+    // one — is one code span; otherwise the rendering is as ever.
+    const open = blank || s.col - s.base > 3 ? null : openFence(line.slice(s.pos));
+    if (open) fence = { ...open, ctx: stack };
     let mm: RegExpExecArray | null;
-    if (/^#{1,6}\s/.test(line)) {
+    if (!open && /^#{1,6}\s/.test(line)) {
       out.push(`<span class="hl-head">${escHtml(line)}</span>`);
     } else if ((mm = QUOTE.exec(line))) {
-      const tail = afterPrefix(mm[2], true);
-      fence = tail.fence;
-      out.push(`<span class="hl-quote">${escHtml(mm[1])}</span>` + tail.html);
+      out.push(`<span class="hl-quote">${escHtml(mm[1])}</span>` + (open ? codeSpan(mm[2]) : inlineHl(mm[2])));
     } else if ((mm = LIST.exec(line))) {
-      const tail = afterPrefix(mm[2], false);
-      fence = tail.fence;
-      out.push(`<span class="hl-marker">${escHtml(mm[1])}</span>` + tail.html);
+      out.push(`<span class="hl-marker">${escHtml(mm[1])}</span>` + (open ? codeSpan(mm[2]) : inlineHl(mm[2])));
     } else {
-      out.push(inlineHl(line));
+      out.push(open ? codeSpan(line) : inlineHl(line));
     }
   }
   return out.join("\n") + "\n"; // trailing line so the mirror height matches the textarea
