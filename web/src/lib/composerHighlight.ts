@@ -57,17 +57,39 @@ function inlineHl(s: string): string {
 // 3 columns, counted from the start of the content of the container it sits
 // in. More makes it indented code: never a fence.
 //
+// A thematic break — three or more of one character, "-", "_" or "*", with
+// nothing but spaces and tabs between and around them, and nothing else on
+// the line — is no container. From where one starts on a line, the line
+// writes no marker: "- - -" is not two nested list items.
+//
+// A paragraph is what a lazy line continues: a non-blank line that carries
+// neither the prefix of the container it sits in nor the start of a block
+// keeps that container open. An empty list item — a marker with nothing
+// after it but spaces and tabs — starts no container above a paragraph: there
+// the marker is paragraph text. An ordered item interrupts a paragraph only
+// when it starts at 1; otherwise it is paragraph text in the same way.
+//
 // A fence line: optional leading whitespace (list-nested fences rely on it),
 // then a maximal run of ONE fence character, then the rest of the line.
 // [1] = the run, [2] = the rest.
 const FENCE_RUN = /^\s*(`+|~+)([\s\S]*)$/;
 // A blockquote line: optional spaces, ">", at most one space.
 const QUOTE = /^(\s*>\s?)([\s\S]*)$/;
-// A list-item line: optional spaces, a bullet or "digits.", one space.
-const LIST = /^(\s*(?:[-*+]|\d+\.)\s)([\s\S]*)$/;
+// A list-item line: optional spaces, a bullet or an ordered marker (one to
+// nine digits, then "." or ")"), then a whitespace character or the end of
+// the line — a marker alone on the line is a list item too.
+const LIST = /^(\s*(?:[-*+]|\d{1,9}[.)])(?:\s|$))([\s\S]*)$/;
 // Both capture the prefix in [1] and the rest of the line in [2].
 // The list marker alone, sticky: matched at a scanning position (below).
-const MARKER = /[-*+]|\d+\./y;
+const MARKER = /[-*+]|\d{1,9}[.)]/y;
+// A thematic break on the rest of the line from a scanning position: three or
+// more of ONE character — "-", "_" or "*" — with nothing but spaces and tabs
+// between them and after them. Mixed characters are not a break: "- * -" is
+// a list.
+const THEMATIC_BREAK = /^([-_*])(?:[ \t]*\1){2,}[ \t]*$/;
+// A setext heading underline on the rest of the line from a scanning
+// position: a run of "=" or a run of "-", then nothing but spaces and tabs.
+const SETEXT = /^(?:=+|-+)[ \t]*$/;
 
 // A container a line can sit in: a blockquote level, or a list item whose
 // content starts at column `n`.
@@ -129,21 +151,57 @@ function matchQuote(s: Scan): boolean {
 }
 
 // A list item written at the scanning position: the marker, indented at most
-// 3 columns, then at least one whitespace character. Consumes both and
-// returns the column its content starts at — after the marker and the
-// whitespace following it, 5 or more columns of which count as 1.
+// 3 columns, then at least one whitespace character — or the end of the line:
+// a marker alone on the line is an item too, an empty one that starts with a
+// blank line. Consumes both and returns the column its content starts at —
+// after the marker and the whitespace following it, 5 or more columns of
+// which count as 1; one column past a lone marker.
 function matchItem(s: Scan): number | null {
   if (s.col - s.base > 3) return null;
   MARKER.lastIndex = s.pos;
   const marker = MARKER.exec(s.line)?.[0];
-  if (!marker || !isWs(s.line[s.pos + marker.length])) return null;
+  if (!marker) return null;
+  const bare = s.pos + marker.length === s.line.length;
+  if (!bare && !isWs(s.line[s.pos + marker.length])) return null;
   const after = s.col + marker.length; // a marker holds no tabs
   for (let i = marker.length; i > 0; i--) step(s);
+  if (bare) {
+    s.base = after + 1;
+    return after + 1;
+  }
   skipWs(s);
   const ws = s.col - after;
   const n = after + (ws >= 5 ? 1 : ws);
   s.base = n;
   return n;
+}
+
+// A marker at the scanning position, indented at most 3 columns, followed by
+// nothing but spaces and tabs up to the end of the line: an empty list item.
+// Consumes nothing.
+function bareMarker(s: Scan): boolean {
+  if (s.col - s.base > 3) return false;
+  MARKER.lastIndex = s.pos;
+  const marker = MARKER.exec(s.line)?.[0];
+  return !!marker && /^[ \t]*$/.test(s.line.slice(s.pos + marker.length));
+}
+
+// An ATX heading at the scanning position: one to six "#", then a space, a
+// tab or the end of the line, the "#" indented at most 3 columns. Consumes
+// nothing.
+function isHeading(s: Scan): boolean {
+  if (s.col - s.base > 3) return false;
+  return /^#{1,6}(?:[ \t]|$)/.test(s.line.slice(s.pos));
+}
+
+// An ordered marker at the scanning position, indented at most 3 columns,
+// whose start number is not 1: it cannot interrupt a paragraph. Consumes
+// nothing.
+function orderedNotFromOne(s: Scan): boolean {
+  if (s.col - s.base > 3) return false;
+  MARKER.lastIndex = s.pos;
+  const marker = MARKER.exec(s.line)?.[0];
+  return !!marker && /\d/.test(marker) && !/^0*1[.)]$/.test(marker);
 }
 
 // Whether the line continues the container `c` from the scanning position. A
@@ -158,10 +216,43 @@ function inContainer(s: Scan, c: Container, blank: boolean): boolean {
   return true;
 }
 
+// Whether a block can start at the scanning position, so that the line is no
+// lazy continuation of a paragraph. False when the rest of the line is
+// indented more than 3 columns (indented code never interrupts a paragraph);
+// true when it is a heading, a fence, a thematic break or a blockquote, or a
+// list item that has content. An empty item — a marker with nothing after it
+// but spaces and tabs — starts no block where a paragraph is open, nor does
+// an ordered item that does not start at 1. Consumes nothing.
+//
+// A setext underline is not a block start here: this runs only for a lazy
+// line, which does not match the paragraph's own container, and a line that
+// does not match that container cannot underline it.
+function startsBlock(s: Scan, inPara: boolean): boolean {
+  if (s.col - s.base > 3) return false;
+  const rest = s.line.slice(s.pos);
+  if (isHeading(s) || openFence(rest) || THEMATIC_BREAK.test(rest)) return true;
+  if (rest[0] === ">") return true;
+  if (bareMarker(s)) return !inPara;
+  if (inPara && orderedNotFromOne(s)) return false;
+  MARKER.lastIndex = s.pos;
+  const marker = MARKER.exec(s.line)?.[0];
+  if (!marker) return false;
+  const after = s.line.slice(s.pos + marker.length);
+  return isWs(after[0]) && /\S/.test(after);
+}
+
 // A container written at the scanning position: a blockquote level, or a list
-// item. Null when the line writes neither.
-function written(s: Scan): Container | null {
+// item. Null when the line writes neither — or when a thematic break starts
+// there: no marker is recognised behind a break, and no fence either, the rest
+// of the line being the break itself. A marker with nothing after it but
+// spaces and tabs is an empty item, which cannot interrupt a paragraph, nor
+// can an ordered item that does not start at 1: where one is open (`inPara`)
+// it is paragraph text, and "text" is returned. Consumes nothing in that
+// case.
+function written(s: Scan, inPara: boolean): Container | "text" | null {
+  if (THEMATIC_BREAK.test(s.line.slice(s.pos))) return null;
   if (matchQuote(s)) return { quote: true };
+  if (inPara && (bareMarker(s) || orderedNotFromOne(s))) return "text";
   const n = matchItem(s);
   return n === null ? null : { quote: false, n };
 }
@@ -176,6 +267,10 @@ export function highlightInput(text: string): string {
   // The containers a line outside a block sits in, outermost first. They carry
   // over from line to line; a line ends those it is not in.
   let stack: Container[] = [];
+  // Whether a paragraph is the innermost open block inside a container: one
+  // flag per container, and one more for outside every container — `para[k]`
+  // is the paragraph inside container k - 1, `para[0]` the one at top level.
+  let para: boolean[] = [false];
   const out: string[] = [];
   const codeSpan = (l: string) => `<span class="hl-code">${escHtml(l)}</span>`;
   for (const line of lines) {
@@ -198,22 +293,67 @@ export function highlightInput(text: string): string {
       continue;
     }
     // Outside a block (a block whose container ended ends before this line):
-    // the stack is what matched, plus the containers written on this line.
+    // the stack is what matched, plus the containers written on this line up
+    // to a thematic break.
     fence = null;
+    // A lazy line continues the paragraph open inside the innermost container,
+    // so the line stays in all of them and writes no block of its own. It is
+    // rendered like any line without a block: the prefix it carries — a quote
+    // prefix, or a list marker — stays a prefix span, and the rest is inline.
+    if (depth < ctx.length && !blank && para[ctx.length] && !startsBlock(s, para[depth])) {
+      let lm: RegExpExecArray | null;
+      if ((lm = QUOTE.exec(line))) {
+        out.push(`<span class="hl-quote">${escHtml(lm[1])}</span>` + inlineHl(lm[2]));
+      } else if ((lm = LIST.exec(line))) {
+        out.push(`<span class="hl-marker">${escHtml(lm[1])}</span>` + inlineHl(lm[2]));
+      } else {
+        out.push(inlineHl(line));
+      }
+      continue;
+    }
     stack = ctx.slice(0, depth);
-    for (let c = written(s); c; c = written(s)) stack = [...stack, c];
+    // A paragraph can be open only in the innermost container the line is
+    // still in; none is open inside one the line writes itself. A marker
+    // alone where one is open is paragraph text, not an item: `bareText`.
+    let bareText = false;
+    for (;;) {
+      const c = written(s, stack.length === depth ? para[depth] : false);
+      if (c === "text") {
+        bareText = true;
+        break;
+      }
+      if (!c) break;
+      stack = [...stack, c];
+    }
+    const wasPara = stack.length === depth && para[depth];
     // The rest of the line opens a block unless it is blank or indented code:
     // a fence run indented more than 3 columns past the container content is
     // never a fence. An opener's rest — behind the line's prefix, if it has
     // one — is one code span; otherwise the rendering is as ever.
     const open = blank || s.col - s.base > 3 ? null : openFence(line.slice(s.pos));
     if (open) fence = { ...open, ctx: stack };
+    // The line's own content keeps a paragraph open at this level unless it
+    // is nothing, a heading, a thematic break, a setext underline closing the
+    // paragraph that was open, or indented code — which cannot start a block
+    // under an open paragraph, and is a paragraph line there. A break or an
+    // underline counts only when the line is not indented: indented four
+    // columns or more, it cannot interrupt a paragraph.
+    const rest = line.slice(s.pos);
+    const indented = s.col - s.base > 3;
+    const isText =
+      !open &&
+      s.pos < line.length &&
+      !isHeading(s) &&
+      !(!indented && THEMATIC_BREAK.test(rest)) &&
+      !(!indented && wasPara && SETEXT.test(rest)) &&
+      !(indented && !wasPara);
+    para = [...para.slice(0, depth), ...stack.slice(depth).map(() => false), isText];
     let mm: RegExpExecArray | null;
     if (!open && /^#{1,6}\s/.test(line)) {
       out.push(`<span class="hl-head">${escHtml(line)}</span>`);
     } else if ((mm = QUOTE.exec(line))) {
       out.push(`<span class="hl-quote">${escHtml(mm[1])}</span>` + (open ? codeSpan(mm[2]) : inlineHl(mm[2])));
-    } else if ((mm = LIST.exec(line))) {
+    } else if (!bareText && (mm = LIST.exec(line))) {
       out.push(`<span class="hl-marker">${escHtml(mm[1])}</span>` + (open ? codeSpan(mm[2]) : inlineHl(mm[2])));
     } else {
       out.push(open ? codeSpan(line) : inlineHl(line));

@@ -37,19 +37,8 @@ const fixture: OracleEntry[] = JSON.parse(
   readFileSync(new URL("./fixtures/composerHighlight.goldmark.json", import.meta.url), "utf8"),
 );
 
-// The six classes of known deviation between the mirror and goldmark.
-// "lazy continuation" is an item's (or a quote's) continuity across a lazy
-// line — a non-blank line that does not carry the container's prefix. The
-// mirror ends the container at such a line; while a paragraph inside the
-// container is open, CommonMark keeps it open.
-const CAUSES = [
-  "indented code",
-  "`)` marker",
-  "list start rule",
-  "thematic break",
-  "HTML block",
-  "lazy continuation",
-] as const;
+// The two classes of known deviation between the mirror and goldmark.
+const CAUSES = ["indented code", "HTML block"] as const;
 type Cause = (typeof CAUSES)[number];
 
 // Every line on which the mirror is known to disagree with goldmark, by
@@ -80,11 +69,7 @@ const knownGaps: Record<string, Array<{ line: number; cause: Cause }>> = {
   "list-quote-fence": [],
   "list-next-item-ends-block-without-closer": [],
   "list-empty-fence": [],
-  // "lazy" (line 1) lazily continues the paragraph in the item, so the item
-  // stays open and the fence at line 2 belongs to it; "after" ends it. The
-  // mirror ends the item at "lazy" and opens a top-level fence at line 2,
-  // which swallows "after": goldmark plain, mirror code.
-  "lazy-paragraph-then-fence-in-item": [{ line: 4, cause: "lazy continuation" }],
+  "lazy-paragraph-then-fence-in-item": [],
   "lazy-paragraph-then-fence-in-quote": [],
   // Indented code: on every line here goldmark says code and the mirror
   // plain. A block indented four or more columns is never coloured.
@@ -97,30 +82,58 @@ const knownGaps: Record<string, Array<{ line: number; cause: Cause }>> = {
   "indent-fence-in-item-is-code": [{ line: 2, cause: "indented code" }],
   "indent-marker-in-item-is-code": [{ line: 2, cause: "indented code" }],
   "indent-quote-in-item-is-code": [{ line: 2, cause: "indented code" }],
-  // "1) " is no list marker to the mirror, so lines 0 and 1 are plain to it.
-  // The fence at line 2 then opens a top-level block, which swallows
-  // "after": line 3 is goldmark plain, mirror code.
-  "paren-list-marker-fence": [
-    { line: 0, cause: "`)` marker" },
-    { line: 1, cause: "`)` marker" },
-    { line: 3, cause: "`)` marker" },
-  ],
+  "paren-list-marker-fence": [],
+  "list-ten-digits-are-no-marker": [],
+  "list-nine-digits-are-a-marker": [],
   "list-starts-at-two": [],
-  // "1." alone is an empty list item in CommonMark. The mirror opens no
-  // item, so the fence at line 1 is top-level and swallows "text": goldmark
-  // plain, mirror code.
-  "list-bare-marker-then-fence": [{ line: 3, cause: "list start rule" }],
-  // A bare "-" is an empty list item in CommonMark too, and the mirror opens
-  // no item here either: the fence at line 1 is top-level and swallows "text".
-  // goldmark plain, mirror code.
-  "list-bare-bullet-then-fence": [{ line: 3, cause: "list start rule" }],
+  "list-bare-marker-then-fence": [],
+  "list-bare-bullet-then-fence": [],
+  "list-bare-marker-then-deeper-fence": [],
+  "paragraph-then-bare-marker-then-fence": [],
+  "paragraph-then-lone-dash-is-setext-then-fence": [],
+  "paragraph-then-bare-star-then-fence": [],
+  "paragraph-then-bare-plus-then-fence": [],
+  "paragraph-then-ordered-item-starting-at-two": [],
+  "item-paragraph-then-ordered-item-starting-at-two": [],
+  "quote-paragraph-then-ordered-item-starting-at-two": [],
+  "quote-paragraph-then-lazy-ordered-item-starting-at-two-then-fence": [],
+  "paragraph-then-ordered-item-with-leading-zero": [],
+  "paragraph-then-bullet-with-trailing-space-then-fence": [],
+  "paragraph-then-ordered-marker-with-trailing-tab-then-fence": [],
+  "paragraph-then-star-with-trailing-space-then-fence": [],
+  "blank-line-then-bullet-with-trailing-space-then-fence": [],
+  "paragraph-then-indented-dashes-then-marker-then-fence": [],
+  "paragraph-then-indented-equals-then-marker-then-fence": [],
+  "paragraph-then-indented-spaced-dashes-then-marker-then-fence": [],
+  "paragraph-then-empty-heading-then-marker-then-fence": [],
+  "paragraph-then-indented-heading-then-marker-then-fence": [],
+  "quote-paragraph-then-heading-then-lazy-marker-then-fence": [],
+  "item-paragraph-then-heading-then-lazy-marker-then-fence": [],
+  "paragraph-then-seven-hashes-then-marker-then-fence": [],
+  "paragraph-then-hash-without-space-then-marker-then-fence": [],
+  "paragraph-then-item-then-fence": [],
+  "paragraph-in-item-then-nested-bare-marker-then-fence": [],
+  "heading-closes-paragraph-then-marker-is-an-item": [],
+  "blank-line-closes-paragraph-then-marker-is-an-item": [],
+  "dash-after-paragraph-is-setext-then-marker-is-an-item": [],
+  "lazy-line-then-bare-marker-then-fence": [],
+  "lazy-line-then-bare-ordered-marker-then-fence": [],
+  "lazy-line-then-ordered-item-starting-at-two-then-fence": [],
+  "lazy-line-then-equals-line-then-fence": [],
+  "lazy-line-then-two-dashes-line-then-fence": [],
+  "lazy-line-then-three-dashes-line-then-fence": [],
+  "nested-bare-marker-then-deep-fence": [],
+  "list-second-item-bare-bullet-then-fence": [],
+  "list-second-item-bare-marker-then-fence": [],
   "list-continues-at-two": [],
-  // "- - -" is a thematic break, not nested list items. To the mirror the
-  // fence at line 1 sits inside a list item, which the bare fence at line 3
-  // ends; that line then opens a top-level block, which swallows "b":
-  // goldmark plain, mirror code.
-  "thematic-break-dashes": [{ line: 4, cause: "thematic break" }],
+  "thematic-break-dashes": [],
   "thematic-break-stars": [],
+  "thematic-break-spaced-stars": [],
+  "thematic-break-tabbed-dashes": [],
+  "thematic-break-underscores": [],
+  "thematic-break-ends-list-then-fence": [],
+  "quote-thematic-break": [],
+  "mixed-break-characters-are-a-list": [],
   "setext-heading-then-fence": [],
   "two-dashes-are-a-list": [],
   // "<div>" opens an HTML block that runs to the blank line, so lines 1 to 4

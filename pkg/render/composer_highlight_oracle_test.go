@@ -306,12 +306,27 @@ var composerOracleInputs = []oracleInput{
 		want:  flags("FFTF"),
 	},
 
-	// 6. ")" is an ordered-list marker too.
+	// 6. Ordered-list markers: ")" is one too, and nine digits are the most.
 	{
 		name:  "paren-list-marker-fence",
 		lines: []string{"1) ```", "   a", "   ```", "after"},
 		// "1) " opens an ordered list item, three columns wide like "1. ".
 		want: flags("TTTF"),
+	},
+	{
+		name:  "list-ten-digits-are-no-marker",
+		lines: []string{"1234567890. ```", "after"},
+		// Ten digits are no list marker: the line is a paragraph, and the
+		// fence it holds is inline text; "after" continues the paragraph.
+		want: flags("FF"),
+	},
+	{
+		name:  "list-nine-digits-are-a-marker",
+		lines: []string{"123456789. ```", "after"},
+		// Nine digits are a list marker, the most there can be. The fence
+		// opens inside the item; the unindented line ends both, with no
+		// closing fence.
+		want: flags("TF"),
 	},
 
 	// 7. List start rules.
@@ -339,6 +354,235 @@ var composerOracleInputs = []oracleInput{
 		want: flags("FTTF"),
 	},
 	{
+		name:  "list-bare-marker-then-deeper-fence",
+		lines: []string{"1.", "    ```", "    a", "text"},
+		// The fence sits one column past the bare marker's content column
+		// (3), still inside the item; the unindented line ends it.
+		want: flags("FTTF"),
+	},
+	{
+		name:  "paragraph-then-bare-marker-then-fence",
+		lines: []string{"text", "1.", "   ```", "after"},
+		// An empty list item cannot interrupt a paragraph: "1." continues
+		// it. The fence is therefore at the top level, and with no closing
+		// fence it runs to the end of the input.
+		want: flags("FFTT"),
+	},
+	{
+		name:  "paragraph-then-lone-dash-is-setext-then-fence",
+		lines: []string{"text", "-", "  ```", "after"},
+		// A lone "-" under a paragraph reads as a setext heading underline,
+		// which also ends the paragraph. The next line is therefore a
+		// top-level fence, and with no closing fence it runs to the end of
+		// the input.
+		want: flags("FFTT"),
+	},
+	{
+		name:  "paragraph-then-bare-star-then-fence",
+		lines: []string{"text", "*", "  ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "paragraph-then-bare-plus-then-fence",
+		lines: []string{"text", "+", "  ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "paragraph-then-ordered-item-starting-at-two",
+		lines: []string{"text", "2. item", "   ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "item-paragraph-then-ordered-item-starting-at-two",
+		lines: []string{"- text", "  2. item", "     ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "quote-paragraph-then-ordered-item-starting-at-two",
+		lines: []string{"> text", "2. item", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "quote-paragraph-then-lazy-ordered-item-starting-at-two-then-fence",
+		lines: []string{"> text", "2. item", "   ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "paragraph-then-ordered-item-with-leading-zero",
+		lines: []string{"text", "01. item", "    ```", "after"},
+		// "01." counts as starting at 1, so it opens an item and interrupts
+		// the paragraph. The four-space fence sits inside that item, and
+		// "after", at column 0, ends it.
+		want: flags("FFTF"),
+	},
+	{
+		name:  "paragraph-then-bullet-with-trailing-space-then-fence",
+		lines: []string{"text", "- ", "  ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "paragraph-then-ordered-marker-with-trailing-tab-then-fence",
+		lines: []string{"text", "1.\t", "   ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "paragraph-then-star-with-trailing-space-then-fence",
+		lines: []string{"text", "* ", "  ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "blank-line-then-bullet-with-trailing-space-then-fence",
+		lines: []string{"text", "", "- ", "  ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "paragraph-then-indented-dashes-then-marker-then-fence",
+		lines: []string{"text", "    ---", "1.", "   ```", "after"},
+		// A line indented four columns cannot interrupt a paragraph: the
+		// dashes are paragraph text there. The bare marker continues the
+		// paragraph too, so the fence is at the top level and, with no
+		// closing fence, runs to the end of the input.
+		want: flags("FFFTT"),
+	},
+	{
+		name:  "paragraph-then-indented-equals-then-marker-then-fence",
+		lines: []string{"text", "    ===", "1.", "   ```", "after"},
+		// The same with a setext underline of equals signs.
+		want: flags("FFFTT"),
+	},
+	{
+		name:  "paragraph-then-indented-spaced-dashes-then-marker-then-fence",
+		lines: []string{"text", "    - - -", "1.", "   ```", "after"},
+		// The same with dashes separated by spaces.
+		want: flags("FFFTT"),
+	},
+	{
+		name:  "paragraph-then-empty-heading-then-marker-then-fence",
+		lines: []string{"text", "#", "1.", "   ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "paragraph-then-indented-heading-then-marker-then-fence",
+		lines: []string{"text", "  # head", "1.", "   ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "quote-paragraph-then-heading-then-lazy-marker-then-fence",
+		lines: []string{"> text", "> # head", "lazy", "1.", "   ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "item-paragraph-then-heading-then-lazy-marker-then-fence",
+		lines: []string{"- text", "  # head", "lazy", "1.", "   ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "paragraph-then-seven-hashes-then-marker-then-fence",
+		lines: []string{"text", "#######", "1.", "   ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "paragraph-then-hash-without-space-then-marker-then-fence",
+		lines: []string{"text", "#head", "1.", "   ```", "after"},
+		// No hand-derived expectation: measured only.
+	},
+	{
+		name:  "paragraph-then-item-then-fence",
+		lines: []string{"text", "- a", "  ```", "  a", "after"},
+		// A list item with content can interrupt a paragraph. The fence
+		// belongs to the item, and "after" is outside it.
+		want: flags("FFTTF"),
+	},
+	{
+		name:  "paragraph-in-item-then-nested-bare-marker-then-fence",
+		lines: []string{"- text", "  -", "  ```", "  a", "after"},
+		// While the item's paragraph is open, the bare marker is paragraph
+		// text and opens no nested item. A lone "-" is also a setext
+		// underline, which ends the paragraph. The fence belongs to the item,
+		// and "after", outside it, ends it.
+		want: flags("FFTTF"),
+	},
+	{
+		name:  "heading-closes-paragraph-then-marker-is-an-item",
+		lines: []string{"text", "# head", "1.", "   ```", "after"},
+		// The heading closes the paragraph, so the bare marker on the next
+		// line interrupts nothing: it is an empty item holding the fence.
+		// The fence holds only its opening line: "after", at column 0, ends
+		// the item — and with it the block, which has no closing fence.
+		want: flags("FFFTF"),
+	},
+	{
+		name:  "blank-line-closes-paragraph-then-marker-is-an-item",
+		lines: []string{"text", "", "1.", "   ```", "after"},
+		// A blank line closes the paragraph in the same way.
+		want: flags("FFFTF"),
+	},
+	{
+		name:  "dash-after-paragraph-is-setext-then-marker-is-an-item",
+		lines: []string{"text", "-", "1.", "   ```", "after"},
+		// "-" under a paragraph is a setext heading underline, which closes
+		// the paragraph in the same way.
+		want: flags("FFFTF"),
+	},
+	{
+		name:  "lazy-line-then-bare-marker-then-fence",
+		lines: []string{"- text", "-", "  ```", "after"},
+		// The bare "-" is a lazy line that opens a second, empty item rather
+		// than continuing the first item's paragraph. The fence belongs to
+		// that item as an empty block, holding only its opening fence;
+		// "after", outside it, ends it.
+		want: flags("FFTF"),
+	},
+	// The bare "1." opens a new, empty ordered item and so ends the bullet list; the fence at column 2 sits left of that item's content (column 3), so it ends the list too and opens a top-level block, which holds "a" and "after".
+	{
+		name:  "lazy-line-then-bare-ordered-marker-then-fence",
+		lines: []string{"- text", "1.", "  ```", "  a", "after"},
+	},
+	// "2. item" opens a new ordered item, ending the bullet list, rather than continuing its paragraph; the fence belongs to that item as an empty block, and "after" ends it.
+	{
+		name:  "lazy-line-then-ordered-item-starting-at-two-then-fence",
+		lines: []string{"- text", "2. item", "   ```", "after"},
+	},
+	// "===" stays paragraph text of the item's open paragraph: no heading is made, the item stays open, the fence is its empty block, and "after" ends it.
+	{
+		name:  "lazy-line-then-equals-line-then-fence",
+		lines: []string{"- text", "===", "  ```", "after"},
+	},
+	// "--" leaves the item open: the fence is the item's empty block, and "after" ends it.
+	{
+		name:  "lazy-line-then-two-dashes-line-then-fence",
+		lines: []string{"- text", "--", "  ```", "after"},
+	},
+	// "---" is a thematic break, which ends the list: the fence is a top-level block with no closer, so "after" is inside it.
+	{
+		name:  "lazy-line-then-three-dashes-line-then-fence",
+		lines: []string{"- text", "---", "  ```", "after"},
+	},
+	{
+		name:  "nested-bare-marker-then-deep-fence",
+		lines: []string{"- -", "    ```", "  - a"},
+		// The second "-" is a bare marker inside the first item: a nested,
+		// empty item whose content starts at column 4. The fence belongs to
+		// it; "  - a" is indented less than 4, so it ends that item and the
+		// unclosed fence with it.
+		want: flags("FTF"),
+	},
+	{
+		name:  "list-second-item-bare-bullet-then-fence",
+		lines: []string{"- a", "-", "  ```", "after"},
+		// A bare bullet after an item opens a second, empty item. The fence
+		// belongs to that item, and "after" ends the item — and with it the
+		// fence, which has no closer.
+		want: flags("FFTF"),
+	},
+	{
+		name:  "list-second-item-bare-marker-then-fence",
+		lines: []string{"1. a", "2.", "   ```", "after"},
+		// The same with an ordered marker: the second item's content starts
+		// at column 3.
+		want: flags("FFTF"),
+	},
+	{
 		name:  "list-continues-at-two",
 		lines: []string{"1. item", "2. item", "   ```", "   a", "text"},
 		// "2. item" continues the list: same delimiter, still ordered. The
@@ -359,6 +603,47 @@ var composerOracleInputs = []oracleInput{
 		name:  "thematic-break-stars",
 		lines: []string{"***", "  ```", "  a", "```", "b"},
 		want:  flags("FTTTF"),
+	},
+	{
+		name:  "thematic-break-spaced-stars",
+		lines: []string{"* * *", "  ```", "  a", "```", "b"},
+		// Stars with spaces between them are a break in the same way as
+		// dashes: the fence is a top-level one, and the bare fence closes it.
+		want: flags("FTTTF"),
+	},
+	{
+		name:  "thematic-break-tabbed-dashes",
+		lines: []string{"-\t-\t-", "  ```", "  a", "```", "b"},
+		// Tabs separate the characters as well as spaces do.
+		want: flags("FTTTF"),
+	},
+	{
+		name:  "thematic-break-underscores",
+		lines: []string{"___", "  ```", "  a", "```", "b"},
+		// "_" is the third character a break may be made of.
+		want: flags("FTTTF"),
+	},
+	{
+		name:  "thematic-break-ends-list-then-fence",
+		lines: []string{"- a", "- - -", "  ```", "  a", "after"},
+		// The break ends the list, so the fence at line 2 is a top-level
+		// one. Nothing closes it: "after" is inside the block.
+		want: flags("FFTTT"),
+	},
+	{
+		name:  "quote-thematic-break",
+		lines: []string{"> - - -", "> ```", "> a", "after"},
+		// A break may sit inside a blockquote, which it does not end. The
+		// fence on the next quote line belongs to the quote and ends with it.
+		want: flags("FTTF"),
+	},
+	{
+		name:  "mixed-break-characters-are-a-list",
+		lines: []string{"- * -", "  ```", "  a", "```", "b"},
+		// A break is three or more of ONE character: "- * -" is a list item
+		// with a nested empty item, like "- - ". The bare fence ends that
+		// item and opens a top-level block, which holds "b".
+		want: flags("FTTTT"),
 	},
 	{
 		name:  "setext-heading-then-fence",
