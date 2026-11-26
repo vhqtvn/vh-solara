@@ -11,16 +11,17 @@ package cmd
 // trio: squatter on the initial candidate is never credited, ONE fresh-port
 // retry on a pre-readiness child exit, exhaustion fails closed while the
 // server keeps serving (the P2-API-005 keep-serving crux, through the REAL
-// localServerCmd.Run), and a post-readiness boot-child crash flips ocLife
-// ready → failed (P1-API-005 DEFER 3, through the REAL Run).
+// runLocalServer under the context the boot helper owns), and a
+// post-readiness boot-child crash flips ocLife ready → failed (P1-API-005
+// DEFER 3, through the same real run).
 //
 // Slice 1 landed the shared child-aware core (restartOwnedOpenCode) and
 // client-daemon's behavioral crux trio; its review flagged the local-server
 // arm as "retarget verified structurally, not behaviorally". These tests
-// close that gap: they run the ACTUAL localServerCmd.Run in-process — real
-// cobra command, real boot arm (owned spawn + readiness), real web server,
-// real aggregator, real restart hook — and drive the accepted restart path
-// end-to-end:
+// close that gap: they run the ACTUAL runLocalServer in-process (the body
+// localServerCmd.Run calls, under the context the boot helper owns) — real
+// boot arm (owned spawn + readiness), real web server, real aggregator,
+// real restart hook — and drive the accepted restart path end-to-end:
 //
 //	POST /vh/restart-opencode  →  handleRestartOpenCode  →  restartOC
 //	  →  restartOpencodeLocked (under opencodeMu)  →  restartOwnedOpenCode
@@ -33,6 +34,7 @@ package cmd
 // opencode_owned_restart_test.go.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -62,21 +64,24 @@ var lsClient = &http.Client{Timeout: 60 * time.Second}
 //
 // These scenarios mutate process-global state: the cobra-bound package flag
 // vars (complete snapshot/restore in withLocalServerFlags), the process cwd
-// (t.Chdir via newOCLockScenario), ambient env (t.Setenv, restored per
-// test), and the process-lifetime HTTP listeners each `go
-// localServerCmd.Run` leaves behind (the keep-serving posture under test —
-// the unique per-test ports from bootLocalServerForTest keep them from
-// colliding). lsSerial mechanically serializes every local-server fixture
+// (t.Chdir via newOCLockScenario), and ambient env (t.Setenv, restored per
+// test). Each boot helper runs runLocalServer (the body localServerCmd.Run
+// calls — entered directly so the test can pass a cancellable context) under
+// a per-test context whose cleanup cancels it and waits for the server to
+// return, so no HTTP listener or death watcher outlives its test; the
+// keep-serving posture under test is scoped to the test body (the unique
+// per-test ports from bootLocalServerForTest keep listeners from colliding).
+// lsSerial mechanically serializes every local-server fixture
 // test against the others, so a future t.Parallel anywhere in this fixture
 // family cannot interleave two scenarios mid-mutation. No local-server test
 // calls t.Parallel.
 //
 // Subprocess isolation is deliberately NOT used: no leakage that in-process
-// containment cannot absorb has been demonstrated. The residual
-// process-lifetime state is the spawned servers themselves — which is the
-// behavior under test — plus their captured per-scenario state dirs, which
-// die with the per-test t.TempDir (writeDaemonState lands inside the
-// scenario-scoped VH_STATE_DIR).
+// containment cannot absorb has been demonstrated. The residual state is
+// the scenario's fake opencode children (reaped by the scenario sweep) plus
+// their captured per-scenario state dirs, which die with the per-test
+// t.TempDir (writeDaemonState lands inside the scenario-scoped
+// VH_STATE_DIR).
 var lsFixtureMu sync.Mutex
 
 // lsSerial acquires the package-level local-server fixture guard for the
@@ -145,6 +150,12 @@ func useVersionFakeBin(t *testing.T, sc *ocLockScenario) {
 // localServerHandle addresses a real in-process local-server.
 type localServerHandle struct {
 	base string // http://127.0.0.1:<port>
+	port int    // the server's own listener port
+
+	// cancel stops the server by cancelling the context it runs under; done
+	// closes once it has returned — its listener is closed by then.
+	cancel context.CancelFunc
+	done   <-chan struct{}
 }
 
 func (h *localServerHandle) statusURL() string  { return h.base + "/vh/opencode/status" }
@@ -283,17 +294,30 @@ func waitPortClosed(t *testing.T, port int, d time.Duration) {
 	}
 }
 
-// bootLocalServerForTest runs the REAL localServerCmd.Run in a goroutine
-// (it blocks in ListenAndServe for the rest of the test process — the
-// keep-serving posture under test) and returns immediately; the caller waits
-// for the boot outcome it expects (waitLSBootReady / waitLSBootState). The
-// server's own port is picked up front per test (bind :0, read, release —
-// the repo's standard freePort pattern; Run re-binds it moments later), so
-// every scenario's process-lifetime listener is unique. The scenario sweep +
-// flag restore handle cleanup.
+// bootLocalServerForTest runs the REAL local-server body (runLocalServer —
+// what localServerCmd.Run calls) in a goroutine under a per-test context and
+// returns immediately; it serves until that context is cancelled — the
+// keep-serving posture under test — and the caller waits for the boot
+// outcome it expects (waitLSBootReady / waitLSBootState). The server's own
+// port is picked up front per test (bind :0, read, release — the repo's
+// standard freePort pattern; the server re-binds it moments later), so every
+// scenario's listener is unique. The stop cleanup is registered right after
+// the scenario helper so it runs BEFORE the scenario sweep (t.Cleanup is
+// LIFO): the server is stopped while its fake children are still alive.
+// withLocalServerFlags owns the flag restore.
 func bootLocalServerForTest(t *testing.T) (*localServerHandle, *ocLockScenario) {
 	t.Helper()
 	sc := newOCLockScenario(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("local-server did not stop within 10s of its context being cancelled")
+		}
+	})
 	useVersionFakeBin(t, sc)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -304,9 +328,14 @@ func bootLocalServerForTest(t *testing.T) (*localServerHandle, *ocLockScenario) 
 	ln.Close()
 	withLocalServerFlags(t, sc, fmt.Sprintf("127.0.0.1:%d", port))
 
-	go localServerCmd.Run(nil, nil)
+	go func() { defer close(done); runLocalServer(ctx) }()
 
-	return &localServerHandle{base: fmt.Sprintf("http://127.0.0.1:%d", port)}, sc
+	return &localServerHandle{
+		base:   fmt.Sprintf("http://127.0.0.1:%d", port),
+		port:   port,
+		cancel: cancel,
+		done:   done,
+	}, sc
 }
 
 // startLocalServerForTest runs bootLocalServerForTest and waits out the real
@@ -455,12 +484,12 @@ func TestLocalServerOwnedRestartExhaustedKeepsServing(t *testing.T) {
 // calls) must never false-ready on a foreign port: the old arm spawned on an
 // internally selected port and credited whatever answered the dial
 // (waitForPort) — a squatter on that port yielded a false SetReady with the
-// server's /oc/* proxy serving foreign content. Two cruxes run through the
-// REAL localServerCmd.Run surface (exhaustion keep-serving, post-ready
-// crash); the squatter and bind-race cruxes need a pre-set candidate port,
-// which the real Run selects internally — so they run the boot seam directly
-// (mirroring A1's client-daemon boot tests) with the post-boot consumer
-// surface built exactly as Run builds it.
+// server's /oc/* proxy serving foreign content. Two cruxes (exhaustion
+// keep-serving, post-ready crash) run through the REAL runLocalServer, under
+// the context the boot helper owns; the squatter and bind-race cruxes need a
+// pre-set candidate port, which the real Run selects internally — so they run
+// the boot seam directly (mirroring A1's client-daemon boot tests) with the
+// post-boot consumer surface built exactly as Run builds it.
 
 // localBootSeam is one run of local-server's owned boot seam with the
 // deterministic pre-set candidate port the cruxes need.
@@ -599,12 +628,13 @@ func TestLocalServerOwnedBootRetriesFreshPortWhenChildLosesBindRace(t *testing.T
 }
 
 // TestLocalServerOwnedBootExhaustedKeepsServing — the boot fail-closed crux
-// through the REAL localServerCmd.Run surface (the P2-API-005 keep-serving
-// crux): BOTH the initial-candidate child and the one fresh retry die before
-// readiness. The server still comes up and keeps serving, /vh/opencode/status
-// truthfully reports failed with a summary, the finalized URL stays a
-// parseable dead loopback whose /oc proxy answers 502 — never foreign
-// content — and exactly two spawns bound the recovery.
+// through the REAL runLocalServer, under the context the boot helper owns
+// (the P2-API-005 keep-serving crux): BOTH the initial-candidate child and
+// the one fresh retry die before readiness. The server still comes up and
+// keeps serving, /vh/opencode/status truthfully reports failed with a
+// summary, the finalized URL stays a parseable dead loopback whose /oc proxy
+// answers 502 — never foreign content — and exactly two spawns bound the
+// recovery.
 func TestLocalServerOwnedBootExhaustedKeepsServing(t *testing.T) {
 	// Every boot child dies pre-readiness. Env is ambient for the boot
 	// spawn (startOpenCodeServe reads os.Environ() at exec time), so this
@@ -638,9 +668,10 @@ func TestLocalServerOwnedBootExhaustedKeepsServing(t *testing.T) {
 }
 
 // TestLocalServerOwnedBootPostReadyCrashFlipsFailed — the boot observer
-// crux (P1-API-005 DEFER 3) through the REAL localServerCmd.Run surface:
-// after a GENUINE child-attributed boot readiness, the boot child's death
-// must flip ocLife ready → failed — never leave it stuck at ready.
+// crux (P1-API-005 DEFER 3) through the REAL runLocalServer, under the
+// context the boot helper owns: after a GENUINE child-attributed boot
+// readiness, the boot child's death must flip ocLife ready → failed — never
+// leave it stuck at ready.
 func TestLocalServerOwnedBootPostReadyCrashFlipsFailed(t *testing.T) {
 	h, sc, _ := startLocalServerForTest(t) // real boot, real readiness
 
@@ -786,13 +817,24 @@ func TestLocalServerOwnedRestartRecoversAfterExhaustedBoot(t *testing.T) {
 
 // --- F3: detached-restart ring fan-in parity ---
 
-// bootLocalServerDetachedForTest boots the REAL localServerCmd.Run in the
+// bootLocalServerDetachedForTest boots the REAL local-server body in the
 // DETACHED topology — the same choreography as bootLocalServerForTest with
-// localOpenCodeDetached flipped on BEFORE Run reads it (the flag restore
-// stays owned by withLocalServerFlags' cleanup snapshot).
+// localOpenCodeDetached flipped on BEFORE the server reads it (the flag
+// restore stays owned by withLocalServerFlags' cleanup snapshot). The
+// per-test stop context + cleanup are identical.
 func bootLocalServerDetachedForTest(t *testing.T) (*localServerHandle, *ocLockScenario) {
 	t.Helper()
 	sc := newOCLockScenario(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("local-server did not stop within 10s of its context being cancelled")
+		}
+	})
 	useVersionFakeBin(t, sc)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -804,9 +846,14 @@ func bootLocalServerDetachedForTest(t *testing.T) (*localServerHandle, *ocLockSc
 	withLocalServerFlags(t, sc, fmt.Sprintf("127.0.0.1:%d", port))
 	localOpenCodeDetached = true
 
-	go localServerCmd.Run(nil, nil)
+	go func() { defer close(done); runLocalServer(ctx) }()
 
-	return &localServerHandle{base: fmt.Sprintf("http://127.0.0.1:%d", port)}, sc
+	return &localServerHandle{
+		base:   fmt.Sprintf("http://127.0.0.1:%d", port),
+		port:   port,
+		cancel: cancel,
+		done:   done,
+	}, sc
 }
 
 // TestLocalServerDetachedRestartFansChildOutputIntoLogs — F3 parity: the
@@ -870,4 +917,25 @@ func TestLocalServerDetachedRestartFansChildOutputIntoLogs(t *testing.T) {
 		t.Fatalf("boot child pid %d still alive after the detached restart", bootPid)
 	}
 	sc.waitAliveCount(".fake", 1, 5*time.Second)
+}
+
+// TestLocalServerStopsWhenItsContextIsCancelled — the teardown contract the
+// boot helpers rely on: cancelling the context a local-server was started
+// under STOPS it. Before this the helpers ran `go localServerCmd.Run(nil,
+// nil)` with nothing ever stopping it, so each test left a server behind
+// for the rest of the process — its death watcher outliving its test and
+// its listener staying bound. Boot detached (the topology with the watcher),
+// cancel, and observe both outcomes: the run returns and the port refuses.
+func TestLocalServerStopsWhenItsContextIsCancelled(t *testing.T) {
+	h, _ := bootLocalServerDetachedForTest(t)
+	waitLSBootReady(t, h)
+
+	h.cancel()
+
+	select {
+	case <-h.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("local-server did not return within 5s of its context being cancelled")
+	}
+	waitPortClosed(t, h.port, 5*time.Second)
 }
