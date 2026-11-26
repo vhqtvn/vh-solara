@@ -67,15 +67,28 @@ function inlineHl(s: string): string {
 // keeps that container open. An empty list item — a marker with nothing
 // after it but spaces and tabs — starts no container above a paragraph: there
 // the marker is paragraph text. An ordered item interrupts a paragraph only
-// when it starts at 1; otherwise it is paragraph text in the same way.
+// when it starts at 1; otherwise it is paragraph text in the same way. That
+// holds for a line inside the paragraph's own container. A list marker on a
+// line that leaves that container is judged where it lands, where no paragraph
+// is open, so it starts an item at any number; a line that starts no block
+// there — an indented line, which cannot interrupt a paragraph — still
+// continues the paragraph.
 //
 // Indented code: a non-blank line whose content starts four or more columns
 // past the content start of the container it sits in, when no paragraph is
 // open there, opens an indented code block. Blank lines and indented lines
-// continue it; any other line ends it before itself.
+// continue it; any other line ends it before itself. Blank lines that trail the
+// block are not part of it.
 //
 // A line that holds only a quote marker — nothing but whitespace behind the
 // ">" — is a blank line for what the quote contains.
+//
+// An HTML block — a line starting with "<pre", "<script", "<style" or
+// "<textarea", a comment, a processing instruction, a declaration, a CDATA
+// section, a block-level tag, or any complete tag alone on the line — holds
+// everything up to the line that closes it: the one holding its end marker,
+// or the first blank line for a block started by a tag. Nothing inside it is
+// code. Every kind but a tag alone can interrupt a paragraph.
 //
 // A fence line: optional leading whitespace (list-nested fences rely on it),
 // then a maximal run of ONE fence character, then the rest of the line.
@@ -98,6 +111,63 @@ const THEMATIC_BREAK = /^([-_*])(?:[ \t]*\1){2,}[ \t]*$/;
 // A setext heading underline on the rest of the line from a scanning
 // position: a run of "=" or a run of "-", then nothing but spaces and tabs.
 const SETEXT = /^(?:=+|-+)[ \t]*$/;
+
+// An HTML block, by CommonMark's start conditions. Kinds 1 to 6 can
+// interrupt a paragraph; kind 7 — any complete tag alone on the line —
+// cannot.
+//
+// The names a block-level tag may have.
+const HTML_BLOCK_TAGS = new Set(
+  (
+    "address article aside base basefont blockquote body caption center col colgroup dd details dialog dir " +
+    "div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html " +
+    "iframe legend li link main menu menuitem nav noframes ol optgroup option p param search section summary " +
+    "table tbody td tfoot th thead title tr track ul"
+  ).split(" "),
+);
+// A complete open tag, attributes included, or a complete closing tag, alone
+// on the line.
+const HTML_OPEN_TAG =
+  /^<[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[a-zA-Z_:][a-zA-Z0-9:._-]*(?:[ \t]*=[ \t]*(?:[^ "'=<>`]+|'[^']*'|"[^"]*"))?)*[ \t]*\/?>[ \t]*$/;
+const HTML_CLOSING_TAG = /^<\/[A-Za-z][A-Za-z0-9-]*[ \t]*>[ \t]*$/;
+// The end marker of an HTML block of kind 1 to 5: the line that holds it
+// closes the block after itself. Kinds 6 and 7 have no marker; a blank line
+// ends them.
+const HTML_END: RegExp[] = [
+  /<\/(?:script|pre|style|textarea)>/i,
+  /-->/,
+  /\?>/,
+  />/,
+  /\]\]>/,
+];
+
+// The kind of HTML block the content of a line starts with; 0 when none.
+function htmlKind(rest: string): number {
+  if (rest[0] !== "<") return 0;
+  if (/^<(?:script|pre|style|textarea)(?:[ \t]|>|$)/i.test(rest)) return 1;
+  if (rest.startsWith("<!--")) return 2;
+  if (rest.startsWith("<?")) return 3;
+  if (/^<![A-Za-z]/.test(rest)) return 4;
+  if (rest.startsWith("<![CDATA[")) return 5;
+  const t = /^<(\/?)([A-Za-z][A-Za-z0-9-]*)/.exec(rest);
+  if (!t) return 0;
+  const after = rest.slice(t[0].length);
+  // A block-level tag, open or closing, followed by whitespace, the end of
+  // the line, ">", or — open only — "/>" or an attribute quote.
+  if (
+    HTML_BLOCK_TAGS.has(t[2].toLowerCase()) &&
+    (after === "" || /[\t >]/.test(after[0]) || (!t[1] && (after.startsWith("/>") || after[0] === '"' || after[0] === "'")))
+  )
+    return 6;
+  // A kind-1 tag that failed its start condition starts nothing.
+  if (/^(?:script|style|pre|textarea)$/i.test(t[2])) return 0;
+  return HTML_OPEN_TAG.test(rest) || HTML_CLOSING_TAG.test(rest) ? 7 : 0;
+}
+
+// Whether the content of a line holds the end marker of HTML block `kind`.
+function htmlEnds(kind: number, rest: string): boolean {
+  return HTML_END[kind - 1].test(rest);
+}
 
 // A container a line can sit in: a blockquote level, or a list item whose
 // content starts at column `n`.
@@ -227,8 +297,8 @@ function inContainer(s: Scan, c: Container, blank: boolean): boolean {
 // Whether a block can start at the scanning position, so that the line is no
 // lazy continuation of a paragraph. False when the rest of the line is
 // indented more than 3 columns (indented code never interrupts a paragraph);
-// true when it is a heading, a fence, a thematic break or a blockquote, or a
-// list item. Consumes nothing.
+// true when it is a heading, a fence, a thematic break, a blockquote, an HTML
+// block of kind 1 to 6, or a list item. Consumes nothing.
 //
 // It runs only for a lazy line, which leaves the innermost container, the one
 // holding the paragraph it continues: at the level where it is tested, no
@@ -244,6 +314,8 @@ function startsBlock(s: Scan): boolean {
   const rest = s.line.slice(s.pos);
   if (isHeading(s) || openFence(rest) || THEMATIC_BREAK.test(rest)) return true;
   if (rest[0] === ">") return true;
+  const k = htmlKind(rest);
+  if (k !== 0 && k <= 6) return true;
   if (bareMarker(s)) return true;
   MARKER.lastIndex = s.pos;
   const marker = MARKER.exec(s.line)?.[0];
@@ -275,6 +347,9 @@ export function highlightInput(text: string): string {
   const lines = text.split("\n");
   // The open fence, or null outside a block.
   let fence: Fence | null = null;
+  // The open HTML block: its kind and the containers its opener line sat
+  // in. Never open together with a fence.
+  let html: { kind: number; ctx: Container[] } | null = null;
   // The containers a line outside a block sits in, outermost first. They carry
   // over from line to line; a line ends those it is not in.
   let stack: Container[] = [];
@@ -311,7 +386,7 @@ export function highlightInput(text: string): string {
     const s: Scan = { line, pos: 0, col: 0, base: 0 };
     skipWs(s);
     let blank = s.pos === line.length;
-    const ctx = fence ? fence.ctx : stack;
+    const ctx = fence ? fence.ctx : html ? html.ctx : stack;
     let depth = 0;
     while (depth < ctx.length && inContainer(s, ctx[depth], blank)) {
       depth++;
@@ -328,10 +403,19 @@ export function highlightInput(text: string): string {
       out.push(codeSpan(line));
       continue;
     }
+    if (html && depth === ctx.length) {
+      // Inside the block the line is plain, blank lines included, up to the
+      // line that holds its end marker. A block started by a tag alone ends
+      // at its first blank line.
+      if (html.kind >= 6 ? blank : htmlEnds(html.kind, line.slice(s.pos))) html = null;
+      out.push(withPrefix(line, inlineHl));
+      continue;
+    }
     // Outside a block (a block whose container ended ends before this line):
     // the stack is what matched, plus the containers written on this line up
     // to a thematic break.
     fence = null;
+    html = null;
     // An indented code block open in the innermost container the line is
     // still in holds the line when the line is blank or indented like the
     // block: an indented line is code, and the blank lines before it inside
@@ -384,26 +468,33 @@ export function highlightInput(text: string): string {
       stack = [...stack, c];
     }
     const wasPara = stack.length === depth && para[depth];
+    const rest = line.slice(s.pos);
+    const indented = s.col - s.base > 3;
     // The rest of the line opens a block unless it is blank or indented code:
     // a fence run indented more than 3 columns past the container content is
     // never a fence. An opener's rest — behind the line's prefix, if it has
     // one — is one code span; otherwise the rendering is as ever.
-    const open = blank || s.col - s.base > 3 ? null : openFence(line.slice(s.pos));
+    const open = blank || indented ? null : openFence(rest);
     if (open) fence = { ...open, ctx: stack };
+    // An HTML block starts on a line that is neither blank nor indented and
+    // whose content meets a start condition. Kind 7 cannot interrupt a
+    // paragraph. The opener line may hold the end marker too.
+    let hk = blank || indented ? 0 : htmlKind(rest);
+    if (hk === 7 && wasPara) hk = 0;
+    if (hk) html = hk >= 6 || !htmlEnds(hk, rest) ? { kind: hk, ctx: stack } : null;
     // The line's own content keeps a paragraph open at this level unless it
     // is nothing, a heading, a thematic break, a setext underline closing the
-    // paragraph that was open, or indented code — which cannot start a block
-    // under an open paragraph, and is a paragraph line there. A break or an
-    // underline counts only when the line is not indented: indented four
-    // columns or more, it cannot interrupt a paragraph.
-    const rest = line.slice(s.pos);
-    const indented = s.col - s.base > 3;
+    // paragraph that was open, an HTML block, or indented code — which cannot
+    // start a block under an open paragraph, and is a paragraph line there.
+    // A break or an underline counts only when the line is not indented:
+    // indented four columns or more, it cannot interrupt a paragraph.
     // The line starts an indented code block when its content is indented
     // and no paragraph is open at its level: indented code cannot interrupt
     // a paragraph, and there the line is a paragraph line.
     const ic = !open && !blank && s.pos < line.length && indented && !wasPara;
     const isText =
       !open &&
+      !hk &&
       s.pos < line.length &&
       !isHeading(s) &&
       !(!indented && THEMATIC_BREAK.test(rest)) &&
@@ -412,11 +503,12 @@ export function highlightInput(text: string): string {
     para = [...para.slice(0, depth), ...stack.slice(depth).map(() => false), isText];
     icode = [...icode.slice(0, depth), ...stack.slice(depth).map(() => false), ic];
     // A block line — a fence opener or an indented-code line — is code,
-    // behind its prefix if it has one.
+    // behind its prefix if it has one. A heading is coloured on the text
+    // behind its prefix.
     const block = !!open || ic;
     let mm: RegExpExecArray | null;
-    if (!block && /^#{1,6}\s/.test(line)) {
-      out.push(`<span class="hl-head">${escHtml(line)}</span>`);
+    if (!block && isHeading(s)) {
+      out.push(withPrefix(line, (r) => `<span class="hl-head">${escHtml(r)}</span>`));
     } else if ((mm = QUOTE.exec(line))) {
       out.push(`<span class="hl-quote">${escHtml(mm[1])}</span>` + (block ? codeSpan(mm[2]) : inlineHl(mm[2])));
     } else if (!bareText && (mm = LIST.exec(line))) {

@@ -15,13 +15,15 @@
 // compares, line by line.
 //
 // The ledger: every line on which the mirror is known to differ is listed in
-// `knownGaps` below with its cause. The test fails when
+// `knownGaps` below with its cause. It lists none, and `CAUSES` names no
+// cause: there are no known deviations — the mirror agrees with goldmark on
+// every line of every input. The test fails when
 //   - a line differs and is not listed: a new or unknown deviation;
 //   - a listed line no longer differs: a stale entry, to be removed.
 // So the number of entries goes down only on purpose. To close a class of
 // deviation, fix the scanner, run this test, and delete the entries it
-// reports as stale. A differing line that fits none of the causes below is
-// not a known gap: find out what it is before adding anything.
+// reports as stale. A differing line is not a known gap until its cause is
+// found: find out what it is before adding a cause or an entry.
 //
 // Pure logic, default node environment (no jsdom docblock).
 
@@ -37,14 +39,16 @@ const fixture: OracleEntry[] = JSON.parse(
   readFileSync(new URL("./fixtures/composerHighlight.goldmark.json", import.meta.url), "utf8"),
 );
 
-// The one class of known deviation between the mirror and goldmark.
-const CAUSES = ["HTML block"] as const;
+// The classes of known deviation between the mirror and goldmark. None: the
+// mirror agrees with goldmark on every line of every input.
+const CAUSES = [] as const;
 type Cause = (typeof CAUSES)[number];
 
 // Every line on which the mirror is known to disagree with goldmark, by
-// input name, in line order. `line` is a 0-based index into the input's
-// lines. An input with no deviation has an empty array. A deviating input
-// carries a comment on how the two come to differ.
+// input name, in line order. There are no known deviations, so every input
+// here has an empty array. Should one appear, `line` is a 0-based index into
+// the input's lines and the entry carries a cause from `CAUSES`, with a
+// comment on the input saying how the two come to differ.
 const knownGaps: Record<string, Array<{ line: number; cause: Cause }>> = {
   "fence-plain": [],
   "fence-info-string": [],
@@ -131,14 +135,7 @@ const knownGaps: Record<string, Array<{ line: number; cause: Cause }>> = {
   "mixed-break-characters-are-a-list": [],
   "setext-heading-then-fence": [],
   "two-dashes-are-a-list": [],
-  // "<div>" opens an HTML block that runs to the blank line, so lines 1 to 4
-  // are plain to goldmark. The mirror opens a fence at line 1: mirror code.
-  "html-block-hides-fence-lines": [
-    { line: 1, cause: "HTML block" },
-    { line: 2, cause: "HTML block" },
-    { line: 3, cause: "HTML block" },
-    { line: 4, cause: "HTML block" },
-  ],
+  "html-block-hides-fence-lines": [],
   "marked-unindented-line-ends-item-block": [],
   "marked-blank-lines-inside-item-block": [],
   "tab-opener-is-indented-code": [],
@@ -168,6 +165,29 @@ const knownGaps: Record<string, Array<{ line: number; cause: Cause }>> = {
   "indent-code-item-first-line-then-continuation": [],
   "indent-code-tab-continuation": [],
   "indent-code-more-indented-continuation": [],
+  "html-pre-holds-blank-and-indented-lines": [],
+  "html-pre-close-then-fence": [],
+  "html-script-holds-blank-and-fence": [],
+  "html-comment-holds-fence": [],
+  "html-comment-holds-blank-line": [],
+  "html-processing-instruction-holds-fence": [],
+  "html-declaration-holds-fence": [],
+  "html-cdata-holds-fence": [],
+  "html-unterminated-div-holds-fence": [],
+  "html-div-after-paragraph-is-text": [],
+  "html-custom-tag-alone-is-a-block": [],
+  "html-custom-tag-with-text-is-paragraph": [],
+  "html-custom-tag-after-paragraph-is-text": [],
+  "html-closing-tag-alone-is-a-block": [],
+  "html-indented-tag-is-indented-code": [],
+  "html-block-in-quote": [],
+  "html-block-in-list": [],
+  "html-tag-inside-paragraph-line": [],
+  "html-script-inside-indented-code": [],
+  "html-pre-closes-on-the-same-line": [],
+  "bare-hash-then-fence": [],
+  "quote-heading-then-fence": [],
+  "list-heading-then-fence": [],
 };
 
 // The mirror's escHtml() encodes & < >; inverted for the text comparison.

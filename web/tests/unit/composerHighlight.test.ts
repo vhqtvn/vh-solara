@@ -294,7 +294,8 @@ describe("highlightInput: indentation bounds", () => {
     const out = expectLines(["- item", "", "      ```", "  # after"], [2]);
     expect(out[0]).toBe(prefixSpan("hl-marker", "- ") + "item");
     expect(out[1]).toBe("");
-    expect(out[3]).toBe("  # after");
+    // A heading at the item's content column: coloured whole, indentation included.
+    expect(out[3]).toBe(headLine("  # after"));
   });
 
   it("a \">\" indented four columns is not a blockquote", () => {
@@ -693,5 +694,118 @@ describe("highlightInput: an open paragraph", () => {
   it("a lazy line that carries a list prefix keeps it as a prefix span", () => {
     const out = expectLines(["> text", "    - x"], []);
     expect(out[1]).toBe(prefixSpan("hl-marker", "    - ") + "x");
+  });
+});
+
+// An HTML block — a line starting with "<pre", "<script", "<style" or
+// "<textarea", a comment, a processing instruction, a declaration, a CDATA
+// section, a block-level tag, or any complete tag alone on the line — holds
+// everything up to the line that closes it: the one holding its end marker,
+// or the first blank line for a block started by a tag. Nothing inside it is
+// code, so a fence-looking or indented line there stays plain. Every kind but
+// a tag alone can interrupt a paragraph.
+//
+// Each case asserts the whole rendering, the mirror's trailing line included:
+// a line without a prefix is exactly its plain rendering — the escaped line
+// and nothing more — and a code line is one whole-line code span.
+describe("highlightInput: HTML blocks", () => {
+  it("a <pre> block holds a blank line and an indented line, both plain, and its end tag closes it", () => {
+    const out = expectLines(["<pre>", "", "    x", "</pre>", "after"], []);
+    expect(out).toEqual([esc("<pre>"), "", esc("    x"), esc("</pre>"), esc("after"), ""]);
+  });
+
+  // A guard: the block is closed on the line before the fence.
+  it("a fence on the line after a <pre> block's end tag opens a code block", () => {
+    const out = expectLines(["<pre>", "</pre>", "```", "a", "```"], [2, 3, 4]);
+    expect(out).toEqual([esc("<pre>"), esc("</pre>"), codeLine("```"), codeLine("a"), codeLine("```"), ""]);
+  });
+
+  it("a <script> block holds a blank line and a fence line, both plain: a blank line does not close it", () => {
+    const out = expectLines(["<script>", "", "```", "x", "</script>", "after"], []);
+    expect(out).toEqual([esc("<script>"), "", "```", "x", esc("</script>"), esc("after"), ""]);
+  });
+
+  it("a comment holds a fence line, up to the line holding its end", () => {
+    const out = expectLines(["<!--", "```", "x", "-->", "after"], []);
+    expect(out).toEqual([esc("<!--"), "```", "x", esc("-->"), esc("after"), ""]);
+  });
+
+  it("a block-level tag interrupts a paragraph and holds the fence line after it", () => {
+    const out = expectLines(["text", "<div>", "```", "after"], []);
+    expect(out).toEqual([esc("text"), esc("<div>"), "```", esc("after"), ""]);
+  });
+
+  // A guard: a complete tag alone cannot interrupt a paragraph.
+  it("a complete tag alone does not interrupt a paragraph, so the fence after it opens a code block", () => {
+    const out = expectLines(["text", "<my-tag>", "```", "after"], [2, 3]);
+    expect(out).toEqual([esc("text"), esc("<my-tag>"), codeLine("```"), codeLine("after"), ""]);
+  });
+
+  it("a complete tag alone on the first line opens a block that holds the fence line after it", () => {
+    const out = expectLines(["<my-tag>", "```", "after"], []);
+    expect(out).toEqual([esc("<my-tag>"), "```", esc("after"), ""]);
+  });
+
+  it("a block inside a blockquote holds the quote's fence lines, and a bare quote marker ends it", () => {
+    const quoted = (rest: string) => prefixSpan("hl-quote", "> ") + rest;
+    const out = expectLines(["> <div>", "> ```", "> a", ">", "> after"], []);
+    expect(out).toEqual([quoted(esc("<div>")), quoted("```"), quoted("a"), prefixSpan("hl-quote", ">"), quoted("after"), ""]);
+  });
+
+  it("a block inside a list item holds the item's fence lines, and a blank line ends it", () => {
+    const out = expectLines(["- <div>", "  ```", "  a", "", "after"], []);
+    expect(out).toEqual([prefixSpan("hl-marker", "- ") + esc("<div>"), "  ```", "  a", "", esc("after"), ""]);
+  });
+
+  // A guard: the opener holds its end tag on the same line, so it starts nothing.
+  it("a <pre> block closed on its own first line holds nothing, so the fence after it opens a code block", () => {
+    const out = expectLines(["<pre>x</pre>", "```", "after"], [1, 2]);
+    expect(out).toEqual([esc("<pre>x</pre>"), codeLine("```"), codeLine("after"), ""]);
+  });
+
+  it("a processing instruction holds a fence line, up to the line holding its end", () => {
+    const out = expectLines(["<?", "```", "?>", "after"], []);
+    expect(out).toEqual([esc("<?"), "```", esc("?>"), esc("after"), ""]);
+  });
+});
+
+// A heading is coloured by the test that also closes a paragraph — `isHeading`:
+// one to six "#", then a space, a tab or the end of the line, the "#" at most
+// three columns past the content start. So a bare "#", an indented heading and
+// a heading behind a quote or list prefix get the heading colour too: the
+// prefix is its own span and the heading span holds the text behind it.
+//
+// Each case asserts the whole rendering, the mirror's trailing line included.
+describe("highlightInput: headings", () => {
+  it("a bare # is a heading, and the line after it is plain", () => {
+    const out = expectLines(["#", "after"], []);
+    expect(out).toEqual([headLine("#"), "after", ""]);
+  });
+
+  it("a heading indented up to three columns is one whole heading line", () => {
+    const out = expectLines(["  ## two", "after"], []);
+    expect(out).toEqual([headLine("  ## two"), "after", ""]);
+  });
+
+  it("a heading behind a quote marker: the marker is a prefix span, the heading span holds the text behind it", () => {
+    const out = expectLines(["> # title", "after"], []);
+    expect(out).toEqual([prefixSpan("hl-quote", "> ") + headLine("# title"), "after", ""]);
+  });
+
+  it("a heading behind a list marker: the marker is a prefix span, the heading span holds the text behind it", () => {
+    const out = expectLines(["- # title", "after"], []);
+    expect(out).toEqual([prefixSpan("hl-marker", "- ") + headLine("# title"), "after", ""]);
+  });
+
+  // A guard: the browser spec composer.spec.ts asserts this shape.
+  it("a heading at the top of the line is one whole heading line", () => {
+    const out = expectLines(["# Heading one", "after"], []);
+    expect(out).toEqual([headLine("# Heading one"), "after", ""]);
+  });
+
+  // A guard: four columns of indentation make indented code, whatever follows.
+  it("a # indented four columns is indented code, not a heading", () => {
+    const out = expectLines(["    # four", "after"], [0]);
+    expect(out).toEqual([codeLine("    # four"), "after", ""]);
   });
 });

@@ -380,32 +380,50 @@ var composerOracleInputs = []oracleInput{
 	{
 		name:  "paragraph-then-bare-star-then-fence",
 		lines: []string{"text", "*", "  ```", "after"},
-		// No hand-derived expectation: measured only.
+		// An empty list item cannot interrupt a paragraph, and "*" is not
+		// a thematic break: the star continues the paragraph. The fence is
+		// therefore at the top level, and with no closing fence it runs to
+		// the end of the input.
+		want: flags("FFTT"),
 	},
 	{
 		name:  "paragraph-then-bare-plus-then-fence",
 		lines: []string{"text", "+", "  ```", "after"},
-		// No hand-derived expectation: measured only.
+		// The same with "+".
+		want: flags("FFTT"),
 	},
 	{
 		name:  "paragraph-then-ordered-item-starting-at-two",
 		lines: []string{"text", "2. item", "   ```", "after"},
-		// No hand-derived expectation: measured only.
+		// An ordered list must start at 1 to interrupt a paragraph, so
+		// "2. item" continues it. The fence is therefore at the top level,
+		// and with no closing fence it runs to the end of the input.
+		want: flags("FFTT"),
 	},
 	{
 		name:  "item-paragraph-then-ordered-item-starting-at-two",
 		lines: []string{"- text", "  2. item", "     ```", "after"},
-		// No hand-derived expectation: measured only.
+		// An ordered list must start at 1 to interrupt a paragraph, so
+		// inside the item "2. item" continues the item's paragraph. The
+		// fence is indented three columns past the item's content and
+		// belongs to the item; "after", at column 0, ends it.
+		want: flags("FFTF"),
 	},
 	{
 		name:  "quote-paragraph-then-ordered-item-starting-at-two",
 		lines: []string{"> text", "2. item", "after"},
-		// No hand-derived expectation: measured only.
+		// An ordered list must start at 1 to interrupt a paragraph, so
+		// "2. item" is paragraph text: a lazy continuation of the quoted
+		// paragraph, which "after" continues the same way.
+		want: flags("FFF"),
 	},
 	{
 		name:  "quote-paragraph-then-lazy-ordered-item-starting-at-two-then-fence",
 		lines: []string{"> text", "2. item", "   ```", "after"},
-		// No hand-derived expectation: measured only.
+		// A line that leaves the quote is judged outside it, where no paragraph is open:
+		// "2. item" starts an ordered item, the fence sits inside it, and "after",
+		// at column 0, ends it.
+		want: flags("FFTF"),
 	},
 	{
 		name:  "paragraph-then-ordered-item-with-leading-zero",
@@ -418,22 +436,32 @@ var composerOracleInputs = []oracleInput{
 	{
 		name:  "paragraph-then-bullet-with-trailing-space-then-fence",
 		lines: []string{"text", "- ", "  ```", "after"},
-		// No hand-derived expectation: measured only.
+		// A marker followed only by whitespace is an empty list item, which
+		// cannot interrupt a paragraph: "- " continues it. The fence is
+		// therefore at the top level, and with no closing fence it runs to
+		// the end of the input.
+		want: flags("FFTT"),
 	},
 	{
 		name:  "paragraph-then-ordered-marker-with-trailing-tab-then-fence",
 		lines: []string{"text", "1.\t", "   ```", "after"},
-		// No hand-derived expectation: measured only.
+		// The same with "1." and a tab: the marker is still an empty list
+		// item.
+		want: flags("FFTT"),
 	},
 	{
 		name:  "paragraph-then-star-with-trailing-space-then-fence",
 		lines: []string{"text", "* ", "  ```", "after"},
-		// No hand-derived expectation: measured only.
+		// The same with "* ".
+		want: flags("FFTT"),
 	},
 	{
 		name:  "blank-line-then-bullet-with-trailing-space-then-fence",
 		lines: []string{"text", "", "- ", "  ```", "after"},
-		// No hand-derived expectation: measured only.
+		// The blank line ends the paragraph, so "- " opens an empty list
+		// item whose content starts two columns in. The fence sits there and
+		// belongs to the item; "after", at column 0, ends it.
+		want: flags("FFFTF"),
 	},
 	{
 		name:  "paragraph-then-indented-dashes-then-marker-then-fence",
@@ -459,32 +487,53 @@ var composerOracleInputs = []oracleInput{
 	{
 		name:  "paragraph-then-empty-heading-then-marker-then-fence",
 		lines: []string{"text", "#", "1.", "   ```", "after"},
-		// No hand-derived expectation: measured only.
+		// A bare "#" is a heading, which ends the paragraph, so "1." opens
+		// an empty list item whose content starts three columns in. The
+		// fence sits there and belongs to the item; "after", at column 0,
+		// ends it.
+		want: flags("FFFTF"),
 	},
 	{
 		name:  "paragraph-then-indented-heading-then-marker-then-fence",
 		lines: []string{"text", "  # head", "1.", "   ```", "after"},
-		// No hand-derived expectation: measured only.
+		// The same with a heading indented two columns, which is still a
+		// heading.
+		want: flags("FFFTF"),
 	},
 	{
 		name:  "quote-paragraph-then-heading-then-lazy-marker-then-fence",
 		lines: []string{"> text", "> # head", "lazy", "1.", "   ```", "after"},
-		// No hand-derived expectation: measured only.
+		// The heading ends the quoted paragraph, and only a paragraph
+		// continues lazily: "lazy" leaves the quote and starts a paragraph.
+		// The empty item "1." cannot interrupt it, so the fence is at the
+		// top level and, with no closing fence, runs to the end of the input.
+		want: flags("FFFFTT"),
 	},
 	{
 		name:  "item-paragraph-then-heading-then-lazy-marker-then-fence",
 		lines: []string{"- text", "  # head", "lazy", "1.", "   ```", "after"},
-		// No hand-derived expectation: measured only.
+		// The same inside a list item: the heading ends the item's
+		// paragraph, "lazy" leaves the item, and the fence is at the top
+		// level.
+		want: flags("FFFFTT"),
 	},
 	{
 		name:  "paragraph-then-seven-hashes-then-marker-then-fence",
 		lines: []string{"text", "#######", "1.", "   ```", "after"},
-		// No hand-derived expectation: measured only.
+		// Seven hashes are too many for a heading: the line is paragraph
+		// text, which the empty item "1." continues too. The fence is
+		// therefore at the top level and, with no closing fence, runs to the
+		// end of the input.
+		want: flags("FFFTT"),
 	},
 	{
 		name:  "paragraph-then-hash-without-space-then-marker-then-fence",
 		lines: []string{"text", "#head", "1.", "   ```", "after"},
-		// No hand-derived expectation: measured only.
+		// A "#" not followed by a space is no heading: the line is paragraph
+		// text, which the empty item "1." continues too. The fence is
+		// therefore at the top level and, with no closing fence, runs to the
+		// end of the input.
+		want: flags("FFFTT"),
 	},
 	{
 		name:  "paragraph-then-item-then-fence",
@@ -533,30 +582,49 @@ var composerOracleInputs = []oracleInput{
 		// "after", outside it, ends it.
 		want: flags("FFTF"),
 	},
-	// The bare "1." opens a new, empty ordered item and so ends the bullet list; the fence at column 2 sits left of that item's content (column 3), so it ends the list too and opens a top-level block, which holds "a" and "after".
+	// The line leaves the item, so it is judged outside it, where no paragraph
+	// is open: the bare "1." starts a new, empty ordered item and so ends the
+	// bullet list. The fence at column 2 sits left of that item's content
+	// (column 3), so it ends the list too and opens a top-level block, which
+	// holds "a" and "after".
 	{
 		name:  "lazy-line-then-bare-ordered-marker-then-fence",
 		lines: []string{"- text", "1.", "  ```", "  a", "after"},
+		want:  flags("FFTTT"),
 	},
-	// "2. item" opens a new ordered item, ending the bullet list, rather than continuing its paragraph; the fence belongs to that item as an empty block, and "after" ends it.
+	// The line leaves the item, so it is judged outside it, where no paragraph
+	// is open: "2. item" opens a new ordered item, ending the bullet list,
+	// rather than continuing its paragraph. The fence belongs to that item as
+	// an empty block, and "after" ends it.
 	{
 		name:  "lazy-line-then-ordered-item-starting-at-two-then-fence",
 		lines: []string{"- text", "2. item", "   ```", "after"},
+		want:  flags("FFTF"),
 	},
-	// "===" stays paragraph text of the item's open paragraph: no heading is made, the item stays open, the fence is its empty block, and "after" ends it.
+	// "===" is no marker and no block start: a line that does not match the
+	// paragraph's own container cannot underline it. It stays paragraph text
+	// of the item's open paragraph, so no heading is made; the item stays
+	// open, the fence is its empty block, and "after" ends it.
 	{
 		name:  "lazy-line-then-equals-line-then-fence",
 		lines: []string{"- text", "===", "  ```", "after"},
+		want:  flags("FFTF"),
 	},
-	// "--" leaves the item open: the fence is the item's empty block, and "after" ends it.
+	// "--" is no marker (a bullet marker is one character) and no block start,
+	// so it is paragraph text of the item's open paragraph: the item stays
+	// open, the fence is its empty block, and "after" ends it.
 	{
 		name:  "lazy-line-then-two-dashes-line-then-fence",
 		lines: []string{"- text", "--", "  ```", "after"},
+		want:  flags("FFTF"),
 	},
-	// "---" is a thematic break, which ends the list: the fence is a top-level block with no closer, so "after" is inside it.
+	// "---" is a thematic break, a block start wherever it lands, which ends
+	// the list: the fence is a top-level block with no closer, so "after" is
+	// inside it.
 	{
 		name:  "lazy-line-then-three-dashes-line-then-fence",
 		lines: []string{"- text", "---", "  ```", "after"},
+		want:  flags("FFTT"),
 	},
 	{
 		name:  "nested-bare-marker-then-deep-fence",
@@ -705,131 +773,369 @@ var composerOracleInputs = []oracleInput{
 		want: flags("FTTF"),
 	},
 
-	// 12. Indented code blocks, and the lines around them: measured only.
-	// The indented line is code; "after" is not.
+	// 12. Indented code blocks, and the lines around them.
+	// The indented line opens an indented code block; "after" is not blank
+	// and not indented, so it ends the block before itself.
 	{
 		name:  "indent-code-plain",
 		lines: []string{"    code", "after"},
+		want:  flags("TF"),
 	},
-	// Both indented lines and the blank line between them are code; "after" is not.
+	// The first indented line opens an indented code block. The blank line
+	// and the indented line after it continue it, so the blank line is inside
+	// the block; "after" ends it before itself.
 	{
 		name:  "indent-code-blank-line-inside",
 		lines: []string{"    a", "", "    b", "after"},
+		want:  flags("TTTF"),
 	},
-	// Only the first line is code: the blank line after it and "after" are not.
+	// The indented line opens an indented code block. The blank line after it
+	// would continue it, but "after" ends the block, and a blank line that
+	// trails an indented code block is not part of it.
 	{
 		name:  "indent-code-trailing-blank-line",
 		lines: []string{"    a", "", "after"},
+		want:  flags("TFF"),
 	},
-	// The first and the last line are code; the blank lines and "text" between them are not.
+	// The first indented line opens a block that "text" ends before itself;
+	// the blank line between them trails the block and is not part of it.
+	// "text" is a paragraph, which the next blank line ends, and with no
+	// paragraph open the last indented line opens a second block.
 	{
 		name:  "indent-code-two-blocks",
 		lines: []string{"    a", "", "text", "", "    b"},
+		want:  flags("TFFFT"),
 	},
-	// No line is code: the indented line after "text" is not.
+	// Indented code cannot interrupt a paragraph: with "text" still open, the
+	// indented line is paragraph text, and so is "after".
 	{
 		name:  "indent-code-cannot-interrupt-paragraph",
 		lines: []string{"text", "    code", "after"},
+		want:  flags("FFF"),
 	},
-	// Only the indented line is code; "text", the blank line and "after" are not.
+	// The blank line ends the paragraph "text" opened, so with no paragraph
+	// open the indented line opens an indented code block; "after" ends it
+	// before itself.
 	{
 		name:  "indent-code-after-blank-line",
 		lines: []string{"text", "", "    code", "after"},
+		want:  flags("FFTF"),
 	},
-	// Only the four-space line is code; "  b" and "after" are not.
+	// The first line opens an indented code block. "  b" is indented only two
+	// columns, so it is not an indented line: it ends the block before itself
+	// and opens a paragraph, which "after" continues.
 	{
 		name:  "indent-code-less-indent-ends",
 		lines: []string{"    a", "  b", "after"},
+		want:  flags("TFF"),
 	},
-	// Every line is code.
+	// The first line opens an indented code block. The fence line is neither
+	// blank nor indented, so it ends that block before itself, and it opens a
+	// fenced code block, which holds "b" up to its closing fence.
 	{
 		name:  "indent-code-then-fence",
 		lines: []string{"    a", "```", "b", "```"},
+		want:  flags("TTTT"),
 	},
-	// Only the six-space line is code; "  after" is not.
+	// The blank line ends the item's paragraph. The six-space line sits four
+	// columns past the item's content (column 2), so with no paragraph open it
+	// opens an indented code block in the item; "  after" is a paragraph line
+	// of the item and ends the block before itself.
 	{
 		name:  "indent-code-in-item",
 		lines: []string{"- item", "", "      code", "  after"},
+		want:  flags("FFTF"),
 	},
-	// The quote line is code; "after" is not.
+	// Behind ">", four columns of indentation open an indented code block
+	// inside the quote. "after" carries no quote marker, and a code block,
+	// not a paragraph, was last inside the quote, so it ends before "after".
 	{
 		name:  "indent-code-in-quote",
 		lines: []string{">     code", "after"},
+		want:  flags("TF"),
 	},
-	// No line is code.
+	// An indented line cannot interrupt the quote's paragraph: it continues
+	// it, and nothing is code.
 	{
 		name:  "indent-code-lazy-line-in-quote",
 		lines: []string{"> text", "    code"},
+		want:  flags("FF"),
 	},
-	// No line is code.
+	// Inside the item the line is indented two columns past its content
+	// start, not four: a paragraph, not code. "after" is a lazy line of it.
 	{
 		name:  "indent-two-spaces-in-item-is-paragraph",
 		lines: []string{"- item", "", "    code", "after"},
+		want:  flags("FFFF"),
 	},
-	// Only the first six-space line is code; "after" and the second six-space line are not.
+	// In the item, "      a" starts four columns past its content start:
+	// code. "after" leaves the item, and a code block, not a paragraph, was
+	// last, so it is a plain paragraph; the indented "      b" cannot
+	// interrupt a paragraph.
 	{
 		name:  "indent-code-in-item-then-plain-then-indent",
 		lines: []string{"- item", "", "      a", "after", "      b"},
+		want:  flags("FFTFF"),
 	},
-	// Only the ">       code" line is code.
+	// The bare ">" is a blank line for the quote: it ends the paragraph.
+	// ">       code" starts four columns past the item's content start, so
+	// it is code. "after" leaves the quote, and a code block was last.
 	{
 		name:  "indent-code-in-item-inside-quote",
 		lines: []string{"> - text", ">", ">       code", "after"},
+		want:  flags("FFTF"),
 	},
-	// Only the fence line is code; "after" is not.
+	// "***" is a thematic break, which ends the paragraph; the bare "1."
+	// then opens an empty item, with no paragraph above it to continue. The
+	// fence sits at the item's content start: code. "after" ends the item
+	// and its unclosed block.
 	{
 		name:  "thematic-break-closes-paragraph-then-bare-marker",
 		lines: []string{"text", "***", "1.", "   ```", "after"},
+		want:  flags("FFFTF"),
 	},
-	// No line is code.
+	// Indented four columns, the marker starts no item and cannot interrupt
+	// the quote's paragraph: the line continues it.
 	{
 		name:  "lazy-line-indented-list-marker-in-quote",
 		lines: []string{"> text", "    - x"},
+		want:  flags("FF"),
 	},
-	// The ">" line and both indented lines are code; "after" is not.
+	// The bare ">" is a blank line inside the quote's indented code block,
+	// which it continues: code, like ">     more". "after" leaves the quote,
+	// where a code block was last.
 	{
 		name:  "quote-marked-blank-line-inside-indented-code",
 		lines: []string{">     code", ">", ">     more", "after"},
+		want:  flags("TTTF"),
 	},
-	// Every line up to the closing fence is code; "after" is not.
+	// The fence belongs to the quote and the item; the bare ">", a blank
+	// line, continues it. Opener, content, blank line and closer are code.
+	// "after" leaves the quote, where a code block was last.
 	{
 		name:  "quote-marked-blank-line-keeps-fence-in-quoted-list",
 		lines: []string{"> - ```", ">   a", ">", ">   b", ">   ```", "after"},
+		want:  flags("TTTTTF"),
 	},
-	// No line is code.
+	// The bare ">" is a blank line for the quote: it ends the item's
+	// paragraph, and ">   more" starts a new one. "after" is a lazy line of
+	// that paragraph.
 	{
 		name:  "quote-marked-blank-line-closes-item-paragraph",
 		lines: []string{"> - text", ">", ">   more", "after"},
+		want:  flags("FFFF"),
 	},
-	// No line is code.
+	// The bare ">" is a blank line for the quote: it ends the paragraph, and
+	// "> more" starts a new one. "after" is a lazy line of that paragraph.
 	{
 		name:  "quote-marked-blank-line-closes-paragraph",
 		lines: []string{"> text", ">", "> more", "after"},
+		want:  flags("FFFF"),
 	},
-	// The fence lines and the indented line are code; "after" is not.
+	// The fence is closed by its closer, so no block is open: "    code" is
+	// indented code, which "after" ends before itself.
 	{
 		name:  "indent-code-after-fence",
 		lines: []string{"```", "a", "```", "    code", "after"},
+		want:  flags("TTTTF"),
 	},
-	// The indented heading line is code; "after" is not.
+	// A heading may be indented three columns at most: "    # head" is not
+	// one but indented code, which "after" ends before itself.
 	{
 		name:  "indent-code-indented-heading",
 		lines: []string{"    # head", "after"},
+		want:  flags("TF"),
 	},
-	// Only the first line is code; "continued" and "after" are not.
+	// The item's content starts one column past the marker (the five spaces
+	// do not all count), so "code" is indented four columns there: the
+	// first line of an indented code block. "  continued" sits at the item's
+	// content start: it ends the block and is a paragraph, of which "after"
+	// is a lazy line.
 	{
 		name:  "indent-code-item-first-line-then-continuation",
 		lines: []string{"-     code", "  continued", "after"},
+		want:  flags("TFF"),
 	},
-	// Both lines are code; "after" is not.
+	// A tab advances to the next tab stop, four columns: "\tb" is indented
+	// like "    a" and continues the block. "after" ends it before itself.
 	{
 		name:  "indent-code-tab-continuation",
 		lines: []string{"    a", "\tb", "after"},
+		want:  flags("TTF"),
 	},
-	// Both lines are code; "after" is not.
+	// "        b" is indented, so it continues the block that "    a"
+	// opened. "after" ends it before itself.
 	{
 		name:  "indent-code-more-indented-continuation",
 		lines: []string{"    a", "        b", "after"},
+		want:  flags("TTF"),
+	},
+
+	// 13. HTML blocks.
+	// "<pre>" opens an HTML block that holds everything up to "</pre>": the
+	// blank line, which does not end it, and the indented line, which is not
+	// code inside it. "after" follows the block.
+	{
+		name:  "html-pre-holds-blank-and-indented-lines",
+		lines: []string{"<pre>", "", "    x", "</pre>", "after"},
+		want:  flags("FFFFF"),
+	},
+	// "</pre>" holds the end marker, so the block ends on that line; the fence
+	// after it opens a code block, closed on the last line.
+	{
+		name:  "html-pre-close-then-fence",
+		lines: []string{"<pre>", "</pre>", "```", "a", "```"},
+		want:  flags("FFTTT"),
+	},
+	// "<script>" opens an HTML block that holds everything up to "</script>":
+	// the blank line and the fence line, which is no fence inside it. "after"
+	// follows the block.
+	{
+		name:  "html-script-holds-blank-and-fence",
+		lines: []string{"<script>", "", "```", "x", "</script>", "after"},
+		want:  flags("FFFFFF"),
+	},
+	// "<!--" opens an HTML block that holds the fence line up to "-->", the
+	// line holding its end marker. "after" follows the block.
+	{
+		name:  "html-comment-holds-fence",
+		lines: []string{"<!--", "```", "x", "-->", "after"},
+		want:  flags("FFFFF"),
+	},
+	// "<!--" opens an HTML block that holds the blank line, which does not end
+	// it, up to "-->". "after" follows the block.
+	{
+		name:  "html-comment-holds-blank-line",
+		lines: []string{"<!--", "", "-->", "after"},
+		want:  flags("FFFF"),
+	},
+	// "<?" opens an HTML block that holds the fence line up to "?>", the line
+	// holding its end marker. "after" follows the block.
+	{
+		name:  "html-processing-instruction-holds-fence",
+		lines: []string{"<?", "```", "?>", "after"},
+		want:  flags("FFFF"),
+	},
+	// "<!X" is a declaration: it opens an HTML block that holds the fence line
+	// up to ">", the line holding its end marker. "after" follows the block.
+	{
+		name:  "html-declaration-holds-fence",
+		lines: []string{"<!X", "```", ">", "after"},
+		want:  flags("FFFF"),
+	},
+	// "<![CDATA[" opens an HTML block that holds the fence line up to "]]>",
+	// the line holding its end marker. "after" follows the block.
+	{
+		name:  "html-cdata-holds-fence",
+		lines: []string{"<![CDATA[", "```", "]]>", "after"},
+		want:  flags("FFFF"),
+	},
+	// "<div>", a block-level tag, opens an HTML block that ends at a blank
+	// line: there is none, so it holds the fence line and "a".
+	{
+		name:  "html-unterminated-div-holds-fence",
+		lines: []string{"<div>", "```", "a"},
+		want:  flags("FFF"),
+	},
+	// A block-level tag interrupts a paragraph: "<div>" opens an HTML block,
+	// which holds the fence line and "after", there being no blank line.
+	{
+		name:  "html-div-after-paragraph-is-text",
+		lines: []string{"text", "<div>", "```", "after"},
+		want:  flags("FFFF"),
+	},
+	// A complete tag alone on the line opens an HTML block when no paragraph
+	// is open: it holds the fence line and "after", there being no blank line.
+	{
+		name:  "html-custom-tag-alone-is-a-block",
+		lines: []string{"<my-tag>", "```", "after"},
+		want:  flags("FFF"),
+	},
+	// The tag is not alone on the line, so it starts no block: the line is a
+	// paragraph, which the fence interrupts; the code block holds "after".
+	{
+		name:  "html-custom-tag-with-text-is-paragraph",
+		lines: []string{"<my-tag>text", "```", "after"},
+		want:  flags("FTT"),
+	},
+	// A complete tag alone cannot interrupt a paragraph: "<my-tag>" continues
+	// it, and the fence after it opens a code block, which holds "after".
+	{
+		name:  "html-custom-tag-after-paragraph-is-text",
+		lines: []string{"text", "<my-tag>", "```", "after"},
+		want:  flags("FFTT"),
+	},
+	// A block-level closing tag alone on the line opens an HTML block, which
+	// holds the fence line and "after", there being no blank line.
+	{
+		name:  "html-closing-tag-alone-is-a-block",
+		lines: []string{"</div>", "```", "after"},
+		want:  flags("FFF"),
+	},
+	// An HTML block starts on an unindented line: indented four columns, the
+	// tag line is indented code. "after" ends the block before itself.
+	{
+		name:  "html-indented-tag-is-indented-code",
+		lines: []string{"    <div>", "after"},
+		want:  flags("TF"),
+	},
+	// "<div>" opens an HTML block in the quote: it holds the quote's fence
+	// line and "a", up to the quote's blank line. "> after" is a paragraph.
+	{
+		name:  "html-block-in-quote",
+		lines: []string{"> <div>", "> ```", "> a", ">", "> after"},
+		want:  flags("FFFFF"),
+	},
+	// "<div>" opens an HTML block in the item: it holds the item's fence line
+	// and "a", up to the blank line. "after" is outside the item.
+	{
+		name:  "html-block-in-list",
+		lines: []string{"- <div>", "  ```", "  a", "", "after"},
+		want:  flags("FFFFF"),
+	},
+	// The line does not start with the tag, so it is a paragraph, which the
+	// fence interrupts; the code block holds "after".
+	{
+		name:  "html-tag-inside-paragraph-line",
+		lines: []string{"text <div> more", "```", "after"},
+		want:  flags("FTT"),
+	},
+	// The indented line opens indented code, which "<script>" ends before
+	// itself; it opens an HTML block that, having no end marker, holds "after".
+	{
+		name:  "html-script-inside-indented-code",
+		lines: []string{"    a", "<script>", "after"},
+		want:  flags("TFF"),
+	},
+	// The line holds both "<pre" and its end marker, so the block is that one
+	// line; the fence after it opens a code block, which holds "after".
+	{
+		name:  "html-pre-closes-on-the-same-line",
+		lines: []string{"<pre>x</pre>", "```", "after"},
+		want:  flags("FTT"),
+	},
+
+	// 14. Headings behind a prefix do not change what is code.
+	{
+		name:  "bare-hash-then-fence",
+		lines: []string{"#", "```", "a", "```"},
+		// A bare "#" is a heading, which closes a paragraph; the fence on the
+		// next line opens a top-level block, which the last fence closes.
+		want: flags("FTTT"), plain: true,
+	},
+	{
+		name:  "quote-heading-then-fence",
+		lines: []string{"> # h", "> ```", "> a", "> ```", "after"},
+		// The heading sits in the blockquote; the fence belongs to the quote
+		// and ends with it.
+		want: flags("FTTTF"),
+	},
+	{
+		name:  "list-heading-then-fence",
+		lines: []string{"- # h", "  ```", "  a", "  ```", "after"},
+		// The heading is the item's first block; the fence belongs to the
+		// item and ends with it.
+		want: flags("FTTTF"),
 	},
 }
 
