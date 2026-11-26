@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-27  
 **Status:** RESOLVED FOR 502 (workspace guard and lifecycle fix landed; boot-time 404 unresolved)  
-**Source:** Read-only study; every rate and receipt is the study's and the fix slice's reported test output, not re-run for the memo.  
+**Source:** Read-only synthesis of a diagnostic study that ran tests (`tmp/agent-runs/cmd-restart-flake-study/report.md`, gitignored, on study revision `1f6225d`); rates and receipts are reported test output, not re-run for the memo.  
 **Target artifact:** explicit state identity; boot-time 404 diagnostic instrumentation (unscheduled follow-ups)  
 
 ---
@@ -36,7 +36,7 @@ Diagnostic measurements on tree `1f6225d`:
 
 An intermittent `404` at `cmd/local-server_test.go:823` (`waitLSBootReady`) on `/vh/opencode/status` remains unresolved:
 - The route `/vh/opencode/status` is registered unconditionally (`pkg/web/server_routes.go:199`) and on GET returns only 200 or 503 (`pkg/web/opencode.go:159-170`; non-GET returns 405 Method Not Allowed at lines 160-163). A vh-solara server cannot return 404.
-- The only code-consistent explanation is a foreign listener taking the port between the port reservation probe (`Listen("127.0.0.1:0")` then close at `cmd/local-server_test.go:798-803`) and the server bind at the end of `Run` (`cmd/local-server.go:450-457`).
+- The leading unconfirmed explanation is a foreign listener taking the port between the port reservation probe (`Listen("127.0.0.1:0")` then close at `cmd/local-server_test.go:798-803`) and the server bind at the end of `Run` (`cmd/local-server.go:450-457`).
 - Not reproduced: 0 occurrences in 68 detached boots. The study's estimated collision rate (about 0.03% per boot under lane load, a model-derived figure) is too low to explain the one observation, and an undiscovered cause remains possible.
 
 ## 5. Landed Fix: Foreign Workspace Guard
@@ -79,7 +79,7 @@ Remaining follow-ups (not scheduled):
 - **(retarget test isolation)**: `TestRestartRetargetsRunningServerToFreshPort` did not fail in 60 isolated iterations; its failure was entirely collateral damage from the unmanaged Fans test watcher. source=`cmd/opencode_retarget_test.go:141` and study receipts on tree `1f6225d`, confidence=high, type=fact
 - **(workspace guard efficacy)**: Guarding restart on `os.Getwd()` prevents foreign workspace restarts and eliminates 502 flakes across test boundaries. source=commit `1ac87aca` and `cmd/opencode_restart_guard_test.go`, confidence=high, type=fact
 - **(boot-time 404 ambiguity)**: `/vh/opencode/status` on GET returns only 200 or 503 (non-GET returns 405 Method Not Allowed at lines 160-163); the estimated port collision rate (~0.03% per boot) is too low to explain the single observation at `:823`, leaving an undiscovered cause possible. source=`pkg/web/opencode.go:159-170`, `pkg/web/server_routes.go:199`, and study receipts, confidence=medium, type=inference
-- **(lifecycle fix efficacy)**: Context-cancellation teardown stops the local-server cleanly in 0.31s, ensuring server and watcher exit before test fake cleanup without residual watcher activity. source=commit `823dbc43` build agent receipts (`TestLocalServerStopsWhenItsContextIsCancelled`, Fans test ×30, `-race -count=3`), confidence=high, type=fact
+- **(lifecycle fix efficacy)**: The focused test shows that the run returns and the port closes within 5 s of cancellation; the Fans test, run 5 times verbose and 30 times plain, showed no watcher line after any test end; the run joins only the HTTP and web teardown, so a restart callback already running can still outlive it. source=commit `823dbc43` build agent receipts (`TestLocalServerStopsWhenItsContextIsCancelled`, Fans test ×30, `-race -count=3`), confidence=high, type=fact
 
 ## 9. Contradictions
 
