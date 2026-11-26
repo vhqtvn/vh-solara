@@ -37,8 +37,8 @@ const fixture: OracleEntry[] = JSON.parse(
   readFileSync(new URL("./fixtures/composerHighlight.goldmark.json", import.meta.url), "utf8"),
 );
 
-// The two classes of known deviation between the mirror and goldmark.
-const CAUSES = ["indented code", "HTML block"] as const;
+// The one class of known deviation between the mirror and goldmark.
+const CAUSES = ["HTML block"] as const;
 type Cause = (typeof CAUSES)[number];
 
 // Every line on which the mirror is known to disagree with goldmark, by
@@ -71,17 +71,12 @@ const knownGaps: Record<string, Array<{ line: number; cause: Cause }>> = {
   "list-empty-fence": [],
   "lazy-paragraph-then-fence-in-item": [],
   "lazy-paragraph-then-fence-in-quote": [],
-  // Indented code: on every line here goldmark says code and the mirror
-  // plain. A block indented four or more columns is never coloured.
-  "indent-top-level-fence-line-is-code": [
-    { line: 0, cause: "indented code" },
-    { line: 1, cause: "indented code" },
-  ],
-  "indent-quote-line-is-code": [{ line: 0, cause: "indented code" }],
-  "indent-marker-line-is-code": [{ line: 0, cause: "indented code" }],
-  "indent-fence-in-item-is-code": [{ line: 2, cause: "indented code" }],
-  "indent-marker-in-item-is-code": [{ line: 2, cause: "indented code" }],
-  "indent-quote-in-item-is-code": [{ line: 2, cause: "indented code" }],
+  "indent-top-level-fence-line-is-code": [],
+  "indent-quote-line-is-code": [],
+  "indent-marker-line-is-code": [],
+  "indent-fence-in-item-is-code": [],
+  "indent-marker-in-item-is-code": [],
+  "indent-quote-in-item-is-code": [],
   "paren-list-marker-fence": [],
   "list-ten-digits-are-no-marker": [],
   "list-nine-digits-are-a-marker": [],
@@ -146,9 +141,33 @@ const knownGaps: Record<string, Array<{ line: number; cause: Cause }>> = {
   ],
   "marked-unindented-line-ends-item-block": [],
   "marked-blank-lines-inside-item-block": [],
-  // A leading tab is four columns: indented code, goldmark code, mirror plain.
-  "tab-opener-is-indented-code": [{ line: 0, cause: "indented code" }],
+  "tab-opener-is-indented-code": [],
   "tab-before-fence-in-item": [],
+  "indent-code-plain": [],
+  "indent-code-blank-line-inside": [],
+  "indent-code-trailing-blank-line": [],
+  "indent-code-two-blocks": [],
+  "indent-code-cannot-interrupt-paragraph": [],
+  "indent-code-after-blank-line": [],
+  "indent-code-less-indent-ends": [],
+  "indent-code-then-fence": [],
+  "indent-code-in-item": [],
+  "indent-code-in-quote": [],
+  "indent-code-lazy-line-in-quote": [],
+  "indent-two-spaces-in-item-is-paragraph": [],
+  "indent-code-in-item-then-plain-then-indent": [],
+  "indent-code-in-item-inside-quote": [],
+  "thematic-break-closes-paragraph-then-bare-marker": [],
+  "lazy-line-indented-list-marker-in-quote": [],
+  "quote-marked-blank-line-inside-indented-code": [],
+  "quote-marked-blank-line-keeps-fence-in-quoted-list": [],
+  "quote-marked-blank-line-closes-item-paragraph": [],
+  "quote-marked-blank-line-closes-paragraph": [],
+  "indent-code-after-fence": [],
+  "indent-code-indented-heading": [],
+  "indent-code-item-first-line-then-continuation": [],
+  "indent-code-tab-continuation": [],
+  "indent-code-more-indented-continuation": [],
 };
 
 // The mirror's escHtml() encodes & < >; inverted for the text comparison.

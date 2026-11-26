@@ -69,6 +69,14 @@ function inlineHl(s: string): string {
 // the marker is paragraph text. An ordered item interrupts a paragraph only
 // when it starts at 1; otherwise it is paragraph text in the same way.
 //
+// Indented code: a non-blank line whose content starts four or more columns
+// past the content start of the container it sits in, when no paragraph is
+// open there, opens an indented code block. Blank lines and indented lines
+// continue it; any other line ends it before itself.
+//
+// A line that holds only a quote marker — nothing but whitespace behind the
+// ">" — is a blank line for what the quote contains.
+//
 // A fence line: optional leading whitespace (list-nested fences rely on it),
 // then a maximal run of ONE fence character, then the rest of the line.
 // [1] = the run, [2] = the rest.
@@ -220,20 +228,23 @@ function inContainer(s: Scan, c: Container, blank: boolean): boolean {
 // lazy continuation of a paragraph. False when the rest of the line is
 // indented more than 3 columns (indented code never interrupts a paragraph);
 // true when it is a heading, a fence, a thematic break or a blockquote, or a
-// list item that has content. An empty item — a marker with nothing after it
-// but spaces and tabs — starts no block where a paragraph is open, nor does
-// an ordered item that does not start at 1. Consumes nothing.
+// list item. Consumes nothing.
 //
-// A setext underline is not a block start here: this runs only for a lazy
-// line, which does not match the paragraph's own container, and a line that
-// does not match that container cannot underline it.
-function startsBlock(s: Scan, inPara: boolean): boolean {
+// It runs only for a lazy line, which leaves the innermost container, the one
+// holding the paragraph it continues: at the level where it is tested, no
+// paragraph is open, so nothing keeps a block from starting. An empty item —
+// a marker with nothing after it but spaces and tabs — is a block start
+// there, and so is an ordered item whatever number it starts at.
+//
+// A setext underline is not a block start: a lazy line does not match the
+// paragraph's own container, and a line that does not match that container
+// cannot underline it.
+function startsBlock(s: Scan): boolean {
   if (s.col - s.base > 3) return false;
   const rest = s.line.slice(s.pos);
   if (isHeading(s) || openFence(rest) || THEMATIC_BREAK.test(rest)) return true;
   if (rest[0] === ">") return true;
-  if (bareMarker(s)) return !inPara;
-  if (inPara && orderedNotFromOne(s)) return false;
+  if (bareMarker(s)) return true;
   MARKER.lastIndex = s.pos;
   const marker = MARKER.exec(s.line)?.[0];
   if (!marker) return false;
@@ -271,17 +282,42 @@ export function highlightInput(text: string): string {
   // flag per container, and one more for outside every container — `para[k]`
   // is the paragraph inside container k - 1, `para[0]` the one at top level.
   let para: boolean[] = [false];
+  // Whether an indented code block is the innermost open block inside a
+  // container, on the same scheme: `icode[k]` is the block inside container
+  // k - 1.
+  let icode: boolean[] = [false];
+  // Blank lines met while an indented code block is open. They are code
+  // only if an indented line follows: each is pushed as a plain line and
+  // rewritten to a code span when the block continues.
+  let pending: { i: number; line: string }[] = [];
   const out: string[] = [];
   const codeSpan = (l: string) => `<span class="hl-code">${escHtml(l)}</span>`;
+  // A line rendered with the prefix it carries as a prefix span (a quote
+  // prefix or a list marker) and `rest` applied to what follows; a line
+  // without a prefix gets `rest` on the whole line.
+  const withPrefix = (l: string, rest: (r: string) => string): string => {
+    let m: RegExpExecArray | null;
+    if ((m = QUOTE.exec(l))) {
+      return `<span class="hl-quote">${escHtml(m[1])}</span>` + rest(m[2]);
+    }
+    if ((m = LIST.exec(l))) {
+      return `<span class="hl-marker">${escHtml(m[1])}</span>` + rest(m[2]);
+    }
+    return rest(l);
+  };
   for (const line of lines) {
     // Scan the line through its containers: the block's context inside a
     // block, stopping at the first one the line is not in.
     const s: Scan = { line, pos: 0, col: 0, base: 0 };
     skipWs(s);
-    const blank = s.pos === line.length;
+    let blank = s.pos === line.length;
     const ctx = fence ? fence.ctx : stack;
     let depth = 0;
-    while (depth < ctx.length && inContainer(s, ctx[depth], blank)) depth++;
+    while (depth < ctx.length && inContainer(s, ctx[depth], blank)) {
+      depth++;
+      // A ">" with nothing behind it is a blank line for what it contains.
+      blank = s.pos === line.length;
+    }
     if (fence && depth === ctx.length) {
       // Inside the block: everything is content except a valid closer, which
       // ends the block after this line.
@@ -296,11 +332,30 @@ export function highlightInput(text: string): string {
     // the stack is what matched, plus the containers written on this line up
     // to a thematic break.
     fence = null;
+    // An indented code block open in the innermost container the line is
+    // still in holds the line when the line is blank or indented like the
+    // block: an indented line is code, and the blank lines before it inside
+    // the block are code too. Any other line ends the block before it.
+    if (depth === ctx.length && icode[depth]) {
+      if (blank) {
+        pending.push({ i: out.length, line });
+        out.push(withPrefix(line, inlineHl));
+        continue;
+      }
+      if (s.col - s.base > 3) {
+        for (const p of pending) out[p.i] = withPrefix(p.line, codeSpan);
+        pending = [];
+        out.push(withPrefix(line, codeSpan));
+        continue;
+      }
+      icode[depth] = false;
+      pending = [];
+    }
     // A lazy line continues the paragraph open inside the innermost container,
     // so the line stays in all of them and writes no block of its own. It is
     // rendered like any line without a block: the prefix it carries — a quote
     // prefix, or a list marker — stays a prefix span, and the rest is inline.
-    if (depth < ctx.length && !blank && para[ctx.length] && !startsBlock(s, para[depth])) {
+    if (depth < ctx.length && !blank && para[ctx.length] && !startsBlock(s)) {
       let lm: RegExpExecArray | null;
       if ((lm = QUOTE.exec(line))) {
         out.push(`<span class="hl-quote">${escHtml(lm[1])}</span>` + inlineHl(lm[2]));
@@ -312,6 +367,9 @@ export function highlightInput(text: string): string {
       continue;
     }
     stack = ctx.slice(0, depth);
+    // A line that gets this far continues no indented code block: the blank
+    // lines it left open stay plain.
+    pending = [];
     // A paragraph can be open only in the innermost container the line is
     // still in; none is open inside one the line writes itself. A marker
     // alone where one is open is paragraph text, not an item: `bareText`.
@@ -340,6 +398,10 @@ export function highlightInput(text: string): string {
     // columns or more, it cannot interrupt a paragraph.
     const rest = line.slice(s.pos);
     const indented = s.col - s.base > 3;
+    // The line starts an indented code block when its content is indented
+    // and no paragraph is open at its level: indented code cannot interrupt
+    // a paragraph, and there the line is a paragraph line.
+    const ic = !open && !blank && s.pos < line.length && indented && !wasPara;
     const isText =
       !open &&
       s.pos < line.length &&
@@ -348,15 +410,19 @@ export function highlightInput(text: string): string {
       !(!indented && wasPara && SETEXT.test(rest)) &&
       !(indented && !wasPara);
     para = [...para.slice(0, depth), ...stack.slice(depth).map(() => false), isText];
+    icode = [...icode.slice(0, depth), ...stack.slice(depth).map(() => false), ic];
+    // A block line — a fence opener or an indented-code line — is code,
+    // behind its prefix if it has one.
+    const block = !!open || ic;
     let mm: RegExpExecArray | null;
-    if (!open && /^#{1,6}\s/.test(line)) {
+    if (!block && /^#{1,6}\s/.test(line)) {
       out.push(`<span class="hl-head">${escHtml(line)}</span>`);
     } else if ((mm = QUOTE.exec(line))) {
-      out.push(`<span class="hl-quote">${escHtml(mm[1])}</span>` + (open ? codeSpan(mm[2]) : inlineHl(mm[2])));
+      out.push(`<span class="hl-quote">${escHtml(mm[1])}</span>` + (block ? codeSpan(mm[2]) : inlineHl(mm[2])));
     } else if (!bareText && (mm = LIST.exec(line))) {
-      out.push(`<span class="hl-marker">${escHtml(mm[1])}</span>` + (open ? codeSpan(mm[2]) : inlineHl(mm[2])));
+      out.push(`<span class="hl-marker">${escHtml(mm[1])}</span>` + (block ? codeSpan(mm[2]) : inlineHl(mm[2])));
     } else {
-      out.push(open ? codeSpan(line) : inlineHl(line));
+      out.push(block ? codeSpan(line) : inlineHl(line));
     }
   }
   return out.join("\n") + "\n"; // trailing line so the mirror height matches the textarea

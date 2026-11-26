@@ -704,6 +704,133 @@ var composerOracleInputs = []oracleInput{
 		// column: a fence inside the item.
 		want: flags("FTTF"),
 	},
+
+	// 12. Indented code blocks, and the lines around them: measured only.
+	// The indented line is code; "after" is not.
+	{
+		name:  "indent-code-plain",
+		lines: []string{"    code", "after"},
+	},
+	// Both indented lines and the blank line between them are code; "after" is not.
+	{
+		name:  "indent-code-blank-line-inside",
+		lines: []string{"    a", "", "    b", "after"},
+	},
+	// Only the first line is code: the blank line after it and "after" are not.
+	{
+		name:  "indent-code-trailing-blank-line",
+		lines: []string{"    a", "", "after"},
+	},
+	// The first and the last line are code; the blank lines and "text" between them are not.
+	{
+		name:  "indent-code-two-blocks",
+		lines: []string{"    a", "", "text", "", "    b"},
+	},
+	// No line is code: the indented line after "text" is not.
+	{
+		name:  "indent-code-cannot-interrupt-paragraph",
+		lines: []string{"text", "    code", "after"},
+	},
+	// Only the indented line is code; "text", the blank line and "after" are not.
+	{
+		name:  "indent-code-after-blank-line",
+		lines: []string{"text", "", "    code", "after"},
+	},
+	// Only the four-space line is code; "  b" and "after" are not.
+	{
+		name:  "indent-code-less-indent-ends",
+		lines: []string{"    a", "  b", "after"},
+	},
+	// Every line is code.
+	{
+		name:  "indent-code-then-fence",
+		lines: []string{"    a", "```", "b", "```"},
+	},
+	// Only the six-space line is code; "  after" is not.
+	{
+		name:  "indent-code-in-item",
+		lines: []string{"- item", "", "      code", "  after"},
+	},
+	// The quote line is code; "after" is not.
+	{
+		name:  "indent-code-in-quote",
+		lines: []string{">     code", "after"},
+	},
+	// No line is code.
+	{
+		name:  "indent-code-lazy-line-in-quote",
+		lines: []string{"> text", "    code"},
+	},
+	// No line is code.
+	{
+		name:  "indent-two-spaces-in-item-is-paragraph",
+		lines: []string{"- item", "", "    code", "after"},
+	},
+	// Only the first six-space line is code; "after" and the second six-space line are not.
+	{
+		name:  "indent-code-in-item-then-plain-then-indent",
+		lines: []string{"- item", "", "      a", "after", "      b"},
+	},
+	// Only the ">       code" line is code.
+	{
+		name:  "indent-code-in-item-inside-quote",
+		lines: []string{"> - text", ">", ">       code", "after"},
+	},
+	// Only the fence line is code; "after" is not.
+	{
+		name:  "thematic-break-closes-paragraph-then-bare-marker",
+		lines: []string{"text", "***", "1.", "   ```", "after"},
+	},
+	// No line is code.
+	{
+		name:  "lazy-line-indented-list-marker-in-quote",
+		lines: []string{"> text", "    - x"},
+	},
+	// The ">" line and both indented lines are code; "after" is not.
+	{
+		name:  "quote-marked-blank-line-inside-indented-code",
+		lines: []string{">     code", ">", ">     more", "after"},
+	},
+	// Every line up to the closing fence is code; "after" is not.
+	{
+		name:  "quote-marked-blank-line-keeps-fence-in-quoted-list",
+		lines: []string{"> - ```", ">   a", ">", ">   b", ">   ```", "after"},
+	},
+	// No line is code.
+	{
+		name:  "quote-marked-blank-line-closes-item-paragraph",
+		lines: []string{"> - text", ">", ">   more", "after"},
+	},
+	// No line is code.
+	{
+		name:  "quote-marked-blank-line-closes-paragraph",
+		lines: []string{"> text", ">", "> more", "after"},
+	},
+	// The fence lines and the indented line are code; "after" is not.
+	{
+		name:  "indent-code-after-fence",
+		lines: []string{"```", "a", "```", "    code", "after"},
+	},
+	// The indented heading line is code; "after" is not.
+	{
+		name:  "indent-code-indented-heading",
+		lines: []string{"    # head", "after"},
+	},
+	// Only the first line is code; "continued" and "after" are not.
+	{
+		name:  "indent-code-item-first-line-then-continuation",
+		lines: []string{"-     code", "  continued", "after"},
+	},
+	// Both lines are code; "after" is not.
+	{
+		name:  "indent-code-tab-continuation",
+		lines: []string{"    a", "\tb", "after"},
+	},
+	// Both lines are code; "after" is not.
+	{
+		name:  "indent-code-more-indented-continuation",
+		lines: []string{"    a", "        b", "after"},
+	},
 }
 
 // oracleBlock is one code block of a parse.

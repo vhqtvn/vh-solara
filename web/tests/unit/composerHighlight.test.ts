@@ -255,19 +255,16 @@ describe("highlightInput: an opener behind combined or nested prefixes", () => {
 
 // A fence, a list marker and a blockquote marker may each be indented at most
 // three columns, counted from the start of the content of the container they
-// sit in. More is indented code: never a fence. Lines that are not a fence
-// keep today's rendering, indentation included.
+// sit in. More is indented code: never a fence, a marker or a quote, and the
+// line is code.
 describe("highlightInput: indentation bounds", () => {
   it("four columns of indentation is indented code at top level, not a fence", () => {
-    const out = expectLines(["    ```", "    a", "# after"], []);
-    expect(out[0]).toBe("    ```");
-    expect(out[1]).toBe("    a");
+    const out = expectLines(["    ```", "    a", "# after"], [0, 1]);
     expect(out[2]).toBe(headLine("# after"));
   });
 
   it("a tab is four columns", () => {
-    const out = expectLines(["\t```", "a", "# after"], []);
-    expect(out[0]).toBe("\t```");
+    const out = expectLines(["\t```", "a", "# after"], [0]);
     expect(out[1]).toBe("a");
     expect(out[2]).toBe(headLine("# after"));
   });
@@ -294,36 +291,37 @@ describe("highlightInput: indentation bounds", () => {
   });
 
   it("a fence indented four columns inside an item is indented code", () => {
-    const out = expectLines(["- item", "", "      ```", "  # after"], []);
+    const out = expectLines(["- item", "", "      ```", "  # after"], [2]);
     expect(out[0]).toBe(prefixSpan("hl-marker", "- ") + "item");
     expect(out[1]).toBe("");
-    expect(out[2]).toBe("      ```");
     expect(out[3]).toBe("  # after");
   });
 
   it("a \">\" indented four columns is not a blockquote", () => {
+    // The first line opens the block, behind its quote prefix; the second
+    // continues it, behind its quote prefix too.
     const out = expectLines(["    > ```", "    > a", "# after"], []);
-    expect(out[0]).toBe(prefixSpan("hl-quote", "    > ") + "```");
-    expect(out[1]).toBe(prefixSpan("hl-quote", "    > ") + "a");
+    expect(out[0]).toBe(prefixSpan("hl-quote", "    > ") + codeSpan("```"));
+    expect(out[1]).toBe(prefixSpan("hl-quote", "    > ") + codeSpan("a"));
     expect(out[2]).toBe(headLine("# after"));
   });
 
   it("a marker indented four columns is not a list", () => {
     const out = expectLines(["    - ```", "# after"], []);
-    expect(out[0]).toBe(prefixSpan("hl-marker", "    - ") + "```");
+    expect(out[0]).toBe(prefixSpan("hl-marker", "    - ") + codeSpan("```"));
     expect(out[1]).toBe(headLine("# after"));
   });
 
   it("a marker indented four columns inside an item does not open a nested item", () => {
     // The fence sits in the outer item, and the indented closer closes it.
     const out = expectLines(["- a", "", "      - b", "  ```", "  x", "  ```", "# after"], [3, 4, 5]);
-    expect(out[2]).toBe(prefixSpan("hl-marker", "      - ") + "b");
+    expect(out[2]).toBe(prefixSpan("hl-marker", "      - ") + codeSpan("b"));
     expect(out[6]).toBe(headLine("# after"));
   });
 
   it("a \">\" indented four columns inside an item does not open a quote", () => {
     const out = expectLines(["- a", "", "      > b", "  ```", "  x", "  ```", "# after"], [3, 4, 5]);
-    expect(out[2]).toBe(prefixSpan("hl-quote", "      > ") + "b");
+    expect(out[2]).toBe(prefixSpan("hl-quote", "      > ") + codeSpan("b"));
     expect(out[6]).toBe(headLine("# after"));
   });
 
@@ -331,6 +329,83 @@ describe("highlightInput: indentation bounds", () => {
     const out = expectLines(["> ```", "> a", ">     ```", "> b", "> ```", "# after"], [1, 2, 3, 4]);
     expect(out[0]).toBe(prefixSpan("hl-quote", "> ") + codeSpan("```"));
     expect(out[5]).toBe(headLine("# after"));
+  });
+});
+
+// Indented code: a line whose content starts four or more columns past the
+// content start of its container opens an indented code block when no
+// paragraph is open there. Blank lines and indented lines continue the block;
+// any other line ends it before itself. A blank line is code only when an
+// indented line follows it.
+describe("highlightInput: indented code", () => {
+  it("a line indented four columns is code, and a less indented line ends the block", () => {
+    const out = expectLines(["    code", "after"], [0]);
+    expect(out[1]).toBe("after");
+  });
+
+  it("a blank line inside the block is code when an indented line follows it", () => {
+    const out = expectLines(["    a", "", "    b", "after"], [0, 1, 2]);
+    expect(out[3]).toBe("after");
+  });
+
+  it("a blank line that ends the block is not code", () => {
+    const out = expectLines(["    a", "", "after"], [0]);
+    expect(out[1]).toBe("");
+    expect(out[2]).toBe("after");
+  });
+
+  it("an indented line cannot interrupt a paragraph", () => {
+    const out = expectLines(["text", "    code", "after"], []);
+    expect(out[1]).toBe("    code");
+  });
+
+  it("a blank line closes the paragraph, so the indented line after it is code", () => {
+    const out = expectLines(["text", "", "    code", "after"], [2]);
+    expect(out[3]).toBe("after");
+  });
+
+  it("inside an item the columns are counted from the item's content", () => {
+    const out = expectLines(["- item", "", "      code", "  after"], [2]);
+    expect(out[0]).toBe(prefixSpan("hl-marker", "- ") + "item");
+    expect(out[3]).toBe("  after");
+  });
+
+  it("a line holding only a quote marker is blank for the code block inside the quote", () => {
+    const out = expectLines([">     code", ">", ">     more", "after"], []);
+    expect(out[0]).toBe(prefixSpan("hl-quote", "> ") + codeSpan("    code"));
+    expect(out[1]).toBe(prefixSpan("hl-quote", ">") + codeSpan(""));
+    expect(out[2]).toBe(prefixSpan("hl-quote", "> ") + codeSpan("    more"));
+    expect(out[3]).toBe("after");
+  });
+
+  it("a line holding only a quote marker keeps a fence open inside a quoted list", () => {
+    const out = expectLines(["> - ```", ">   a", ">", ">   b", ">   ```", "after"], [1, 2, 3, 4]);
+    expect(out[0]).toBe(prefixSpan("hl-quote", "> ") + codeSpan("- ```"));
+    expect(out[5]).toBe("after");
+  });
+
+  it("a continuation line that carries a quote prefix keeps it as a prefix span", () => {
+    const out = expectLines(["    > code", "    > more", "after"], []);
+    expect(out[0]).toBe(prefixSpan("hl-quote", "    > ") + codeSpan("code"));
+    expect(out[1]).toBe(prefixSpan("hl-quote", "    > ") + codeSpan("more"));
+    expect(out[2]).toBe("after");
+  });
+
+  it("a continuation line that carries a list marker keeps it as a prefix span", () => {
+    const out = expectLines(["    - a", "    - b", "after"], []);
+    expect(out[0]).toBe(prefixSpan("hl-marker", "    - ") + codeSpan("a"));
+    expect(out[1]).toBe(prefixSpan("hl-marker", "    - ") + codeSpan("b"));
+    expect(out[2]).toBe("after");
+  });
+
+  it("a heading indented four columns is code", () => {
+    const out = expectLines(["    # head", "after"], [0]);
+    expect(out[1]).toBe("after");
+  });
+
+  it("indented code right after a closed fence is code", () => {
+    const out = expectLines(["```", "a", "```", "    code", "after"], [0, 1, 2, 3]);
+    expect(out[4]).toBe("after");
   });
 });
 
@@ -606,5 +681,17 @@ describe("highlightInput: an open paragraph", () => {
 
   it("a three-dashes line that leaves its item is a thematic break, so the fence is top-level", () => {
     expectLines(["- text", "---", "  ```", "after"], [2, 3]);
+  });
+
+  // Pinned in the same way to "thematic-break-closes-paragraph-then-bare-marker"
+  // and "lazy-line-indented-list-marker-in-quote".
+  it("a thematic break closes the paragraph, so a bare marker after it is an item holding the fence", () => {
+    const out = expectLines(["text", "***", "1.", "   ```", "after"], [3]);
+    expect(out[2]).toBe(prefixSpan("hl-marker", "1."));
+  });
+
+  it("a lazy line that carries a list prefix keeps it as a prefix span", () => {
+    const out = expectLines(["> text", "    - x"], []);
+    expect(out[1]).toBe(prefixSpan("hl-marker", "    - ") + "x");
   });
 });
