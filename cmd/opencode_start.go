@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -322,7 +324,23 @@ var ocOwnerReleaseWait = 15 * time.Second
 // boot-parity wiring; nothing is proven listening), and 0 on a spawn error
 // (no child exists). P1-API-003: the detached-restart arms consume it to
 // retarget the RUNNING daemon at the new port (applyFreshPortRetarget).
+//
+// Workspace guard: the recorded state, log and both lock files are resolved
+// at call time from the ambient VH_STATE_DIR and process cwd, never from
+// `workspace`, so the FIRST thing this function does is refuse a workspace
+// that is not the current project (ocWorkspaceMismatch) — (nil, 0, err),
+// before the starter lock, before any state read, before any signal.
 func restartDetachedOpenCode(bin string, port int, workspace string, curPID int, extraW ...io.Writer) (cmd *exec.Cmd, effectivePort int, err error) {
+	// FIRST, before the starter lock, any state read or any signal: the
+	// state, log and lock paths below all resolve from the AMBIENT cwd and
+	// VH_STATE_DIR at call time, not from `workspace`, so a caller acting for
+	// another project (a death watcher that outlives its own) would read and
+	// SIGTERM THAT project's recorded `opencode serve`. Refusing here, ahead
+	// of acquireOCSpawnGuard, also leaves no lock file behind in whatever
+	// directory is ambient.
+	if why := ocWorkspaceMismatch(workspace); why != "" {
+		return nil, 0, fmt.Errorf("detached restart refused: %s — the recorded state, lock and log files are resolved from the current working directory and VH_STATE_DIR at call time, so acting here would stop another project's `opencode serve`", why)
+	}
 	guard, verdict, reason := acquireOCSpawnGuard()
 	if verdict != ocLockAcquired {
 		return nil, 0, fmt.Errorf("detached restart serialized out (%s): %s", verdict, reason)
@@ -459,6 +477,60 @@ func applyFreshPortRetarget(effectivePort, currentPort int, life *oclife.Lifecyc
 		srv.RetargetOpenCode(u)
 	}
 	return effectivePort, u, true
+}
+
+// ocWorkspaceMismatch reports why workspace does not identify the project
+// whose detached-OpenCode files are ambient, or "" when it does.
+//
+// Every detached-OpenCode artifact — recorded state, log, starter lock,
+// owner lock — is resolved at CALL TIME from the ambient VH_STATE_DIR and
+// the process cwd (ocStateDir / ocProjectKey), never from a parameter. So
+// the only project a restart can legitimately act on is the one the cwd
+// names right now, and `workspace` is the caller's claim about which project
+// that is. The claim is checked with the identity convention the artifacts
+// themselves use, OCProjectKey (sha1 of the directory string): the cwd
+// string matches directly. A workspace spelled differently but naming the
+// same directory (a relative path, the "." fallback for an unreadable cwd,
+// a symlink to it) is compared canonically — absolute, symlinks resolved —
+// on BOTH sides, so such a caller is served rather than refused. Anything
+// else is another project's workspace.
+func ocWorkspaceMismatch(workspace string) string {
+	// Same fallback as ocProjectKey, so the two never disagree about which
+	// project is ambient.
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "."
+	}
+	if OCProjectKey(workspace) == OCProjectKey(cwd) {
+		return ""
+	}
+	if ocSameDir(workspace, cwd) {
+		return ""
+	}
+	return fmt.Sprintf("workspace %q is not the current project directory %q", workspace, cwd)
+}
+
+// ocSameDir reports whether a and b name the same directory, both compared
+// canonically (absolute, symlinks resolved). False when either cannot be
+// resolved: an unverifiable path is not a match.
+func ocSameDir(a, b string) bool {
+	ca, err := ocCanonicalDir(a)
+	if err != nil {
+		return false
+	}
+	cb, err := ocCanonicalDir(b)
+	if err != nil {
+		return false
+	}
+	return ca == cb
+}
+
+func ocCanonicalDir(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(abs)
 }
 
 // reattachedResult / occupiedResult keep the operator-facing reasons of the

@@ -138,7 +138,19 @@ func TestRestartRetargetsRunningServerToFreshPort(t *testing.T) {
 	// proves the request traversed the running server's proxy to the NEW
 	// upstream, not a field flip.
 	if code, body := ocGet(t, ts, "/oc/session"); code != 200 || body != "ok" {
-		t.Fatalf("post-restart /oc/session through the RUNNING server = %d/%q, want 200/ok from the fresh upstream — the daemon kept serving through the old port", code, body)
+		// What the pair means. The retarget above completed BEFORE SetReady
+		// (the lifecycle URL and the published state already name the fresh
+		// port — asserted above), so this request DID traverse the running
+		// proxy to the FRESH upstream. A 502 "upstream error: EOF" is that
+		// upstream accepting the connection and closing it without a reply:
+		// the replacement child was lost mid-request (its 200ms drain window
+		// is where a restart attempt from another project's stale death
+		// watcher lands and SIGTERMs it). Only a 200 carrying the foreign
+		// squatter's marker would mean the OLD port was still served.
+		now := rt.ocLife.Snapshot()
+		freshPID := rtChildPID(rt)
+		t.Fatalf("post-restart /oc/session through the RUNNING server = %d/%q, want 200/ok from the fresh upstream (port %d). A 502/\"upstream error: EOF\" here means the FRESH upstream was lost mid-request (the replacement child was signalled), NOT that the old port was still served; 200 with the foreign marker would mean the old port was still served. Lifecycle before the request: state=%s url=%s; now: state=%s url=%s down_since=%v summary=%q. Published state=%+v. Fresh child pid=%d running=%v cmdline=%q",
+			code, body, fresh, snap.State, snap.OpenCodeURL, now.State, now.OpenCodeURL, now.DownSince, now.FailureSummary, st, freshPID, ocProcessRunning(freshPID), ocProcCmdlineArgs(freshPID))
 	}
 	if !ocProcessAlive(sacrifice.Process.Pid) {
 		t.Fatal("the foreign recorded pid must stay untouched")
