@@ -142,15 +142,27 @@ func TestRestartRetargetsRunningServerToFreshPort(t *testing.T) {
 		// (the lifecycle URL and the published state already name the fresh
 		// port — asserted above), so this request DID traverse the running
 		// proxy to the FRESH upstream. A 502 "upstream error: EOF" is that
-		// upstream accepting the connection and closing it without a reply:
-		// the replacement child was lost mid-request (its 200ms drain window
-		// is where a restart attempt from another project's stale death
-		// watcher lands and SIGTERMs it). Only a 200 carrying the foreign
-		// squatter's marker would mean the OLD port was still served.
+		// upstream accepting the connection and closing it without a reply.
+		// When the replacement child is no longer running afterwards,
+		// something signalled it; historically that was a stale death watcher
+		// of an earlier test, which the workspace guard (commit 1ac87ac) now
+		// refuses — this test does not observe the signal. Only a 200
+		// carrying the foreign squatter's marker would mean the OLD port was
+		// still served.
 		now := rt.ocLife.Snapshot()
 		freshPID := rtChildPID(rt)
-		t.Fatalf("post-restart /oc/session through the RUNNING server = %d/%q, want 200/ok from the fresh upstream (port %d). A 502/\"upstream error: EOF\" here means the FRESH upstream was lost mid-request (the replacement child was signalled), NOT that the old port was still served; 200 with the foreign marker would mean the old port was still served. Lifecycle before the request: state=%s url=%s; now: state=%s url=%s down_since=%v summary=%q. Published state=%+v. Fresh child pid=%d running=%v cmdline=%q",
-			code, body, fresh, snap.State, snap.OpenCodeURL, now.State, now.OpenCodeURL, now.DownSince, now.FailureSummary, st, freshPID, ocProcessRunning(freshPID), ocProcCmdlineArgs(freshPID))
+		running := ocProcessRunning(freshPID)
+		observed := "unexpected status"
+		if code == http.StatusBadGateway && strings.Contains(body, "upstream error: EOF") {
+			observed = "the proxy's upstream closed the connection without a reply"
+			if running {
+				observed += "; the fresh child is still running, so the cause lies elsewhere"
+			} else {
+				observed += "; the fresh child is no longer running, so something signalled it. Historically that was a stale death watcher of an earlier test, which the workspace guard (commit 1ac87ac) now refuses; this test does not observe the signal"
+			}
+		}
+		t.Fatalf("post-restart /oc/session through the RUNNING server = %d/%q, want 200/ok from the fresh upstream (port %d). Observed: %s. Lifecycle before the request: state=%s url=%s; now: state=%s url=%s down_since=%v summary=%q. Published state=%+v. Fresh child pid=%d running=%v cmdline=%q",
+			code, body, fresh, observed, snap.State, snap.OpenCodeURL, now.State, now.OpenCodeURL, now.DownSince, now.FailureSummary, st, freshPID, running, ocProcCmdlineArgs(freshPID))
 	}
 	if !ocProcessAlive(sacrifice.Process.Pid) {
 		t.Fatal("the foreign recorded pid must stay untouched")

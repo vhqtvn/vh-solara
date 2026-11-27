@@ -26,6 +26,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -174,6 +175,125 @@ func TestRestartDetachedRefusesForeignWorkspace(t *testing.T) {
 	}
 	if live := sc.aliveMatchingPids(".fake"); len(live) != 1 || live[0] != bPID {
 		t.Fatalf("live fakes after the refused restart = %v, want exactly B's pid %d", live, bPID)
+	}
+}
+
+// TestRestartDetachedRefusesForeignWorkspaceBeforeTakingTheStarterLock — the
+// workspace refusal runs BEFORE the starter lock is taken. The same
+// two-scenario setup as TestRestartDetachedRefusesForeignWorkspace, but
+// B's starter lock is held throughout: a restart issued for A's workspace
+// while B's namespace is ambient must still come back as the workspace
+// refusal — never "serialized out (contended)", which is what a guard
+// placed after acquireOCSpawnGuard would return here — and must return
+// without waiting for the lock. B's fake stays alive with its cmdline
+// unchanged.
+func TestRestartDetachedRefusesForeignWorkspaceBeforeTakingTheStarterLock(t *testing.T) {
+	// Scenario A: its own workspace + VH_STATE_DIR (the scenario helper), a
+	// detached fake `opencode serve` booted and recorded the normal way.
+	sc := newOCLockScenario(t)
+	resA := EnsureDetachedOpenCode(sc.bin, sc.dir)
+	if resA.Verdict != DetachedStartSpawned {
+		t.Fatalf("A boot: %v (%s)", resA.Verdict, resA.Reason)
+	}
+	t.Cleanup(func() { _ = resA.Cmd.Process.Kill(); _, _ = resA.Cmd.Process.Wait() })
+
+	// Scenario B: a second workspace and state dir, its namespace made
+	// current, with a live fake.
+	bBase := t.TempDir()
+	bDir := filepath.Join(bBase, "ws")
+	bState := filepath.Join(bBase, "state")
+	if err := os.MkdirAll(bDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	switchOCNamespace(t, bDir, bState)
+	resB := EnsureDetachedOpenCode(sc.bin, bDir)
+	if resB.Verdict != DetachedStartSpawned {
+		t.Fatalf("B boot: %v (%s)", resB.Verdict, resB.Reason)
+	}
+	t.Cleanup(func() { _ = resB.Cmd.Process.Kill(); _, _ = resB.Cmd.Process.Wait() })
+	bPID, bPort := resB.PID, resB.Port
+
+	// Preconditions: B is the ambient project and its instance is live.
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if OCProjectKey(sc.dir) == OCProjectKey(cwd) {
+		t.Fatalf("precondition: scenario A (%s) and the ambient cwd (%s) must be different projects", sc.dir, cwd)
+	}
+	bCmdline := ocProcCmdlineArgs(bPID)
+	if !ocProcessRunning(bPID) || bCmdline == "" {
+		t.Fatalf("precondition: B's fake pid %d must be live with a readable cmdline (running=%v cmdline=%q)", bPID, ocProcessRunning(bPID), bCmdline)
+	}
+
+	// B's starter lock, held for the rest of the test (the precedent is
+	// TestRestartDetachedContended). It resolves from B's namespace.
+	g, verdict, reason := acquireOCSpawnGuard()
+	if verdict != ocLockAcquired {
+		t.Fatalf("acquire B's starter lock: %v (%s)", verdict, reason)
+	}
+	defer g.Release()
+
+	// A's scenario ends: the sweep SIGKILLs its fake. What outlives it is A's
+	// daemon and its death watcher — modeled by the direct call below with
+	// exactly what the watcher's arm holds: A's workspace, A's port, and A's
+	// retained child pid.
+	killPid9(resA.PID)
+	if !waitPidDead(resA.PID, 5*time.Second) {
+		t.Fatalf("A's fake pid %d did not die", resA.PID)
+	}
+
+	// ACT: A's stale death watcher restarts ITS workspace while B's
+	// namespace is ambient and B's starter lock is held. Bounded: a restart
+	// that waited for the lock would hang the test.
+	var (
+		cmd     *exec.Cmd
+		effPort int
+		rerr    error
+	)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cmd, effPort, rerr = restartDetachedOpenCode(sc.bin, resA.Port, sc.dir, resA.PID)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the restart for a foreign workspace did not return within 10s while B's starter lock is held — the workspace refusal must run BEFORE the starter lock is taken")
+	}
+	if cmd != nil && cmd.Process != nil {
+		// Reachable only on a regressed tree: reap what must never have been
+		// spawned, so the red run leaks nothing either.
+		t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+	}
+
+	// THE CRUX — the refusal comes from the workspace guard, not the lock.
+	// A guard placed after acquireOCSpawnGuard returns "serialized out
+	// (contended)" on this fixture; asserted first, so a regression fails on
+	// the ordering itself.
+	if rerr == nil {
+		t.Fatalf("restart for workspace %q must refuse while %q is the current project and B's starter lock is held; got err=nil (cmd=%v effectivePort=%d)", sc.dir, cwd, cmd, effPort)
+	}
+	if strings.Contains(rerr.Error(), "serialized out") || strings.Contains(rerr.Error(), "contended") {
+		t.Fatalf("the workspace guard ran AFTER the starter lock — the restart answered from the lock instead of refusing the workspace: %v", rerr)
+	}
+	if !strings.Contains(rerr.Error(), "detached restart refused") {
+		t.Fatalf("restart for workspace %q while %q is the current project: want the workspace refusal (\"detached restart refused\"), got: %v", sc.dir, cwd, rerr)
+	}
+	// The refusal names both projects: the one given and the one that is current.
+	for _, want := range []string{sc.dir, cwd} {
+		if !strings.Contains(rerr.Error(), want) {
+			t.Fatalf("refusal must name the given workspace %q and the current one %q: %v", sc.dir, cwd, rerr)
+		}
+	}
+	if cmd != nil || effPort != 0 {
+		t.Fatalf("a refused restart must return (nil, 0, err); got cmd=%v effectivePort=%d err=%v", cmd, effPort, rerr)
+	}
+
+	// B's instance survived with its cmdline unchanged.
+	if !ocProcessRunning(bPID) || ocProcCmdlineArgs(bPID) != bCmdline {
+		t.Fatalf("CROSS-PROJECT KILL: B's `opencode serve` (pid %d, port %d) did not survive a restart issued for ANOTHER workspace %q while %q was the current project — running=%v cmdline=%q, want running with cmdline %q",
+			bPID, bPort, sc.dir, cwd, ocProcessRunning(bPID), ocProcCmdlineArgs(bPID), bCmdline)
 	}
 }
 

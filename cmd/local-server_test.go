@@ -68,9 +68,12 @@ var lsClient = &http.Client{Timeout: 60 * time.Second}
 // test). Each boot helper runs runLocalServer (the body localServerCmd.Run
 // calls — entered directly so the test can pass a cancellable context) under
 // a per-test context whose cleanup cancels it and waits for the server to
-// return, so no HTTP listener or death watcher outlives its test; the
-// keep-serving posture under test is scoped to the test body (the unique
-// per-test ports from bootLocalServerForTest keep listeners from colliding).
+// return: the listener closes and the run returns before the scenario sweep
+// (asserted by TestLocalServerStopsWhenItsContextIsCancelled), and the death
+// watcher's loop stops with the context — though a restart callback that is
+// already running is not waited for. The keep-serving posture under test is
+// scoped to the test body (the unique per-test ports from
+// bootLocalServerForTest keep listeners from colliding).
 // lsSerial mechanically serializes every local-server fixture
 // test against the others, so a future t.Parallel anywhere in this fixture
 // family cannot interleave two scenarios mid-mutation. No local-server test
@@ -242,8 +245,14 @@ func waitLSBootState(t *testing.T, h *localServerHandle, want oclife.State) ocli
 		res, err := lsClient.Get(h.statusURL())
 		if err == nil {
 			if res.StatusCode != 200 {
+				// What identifies the responder: every vh-solara /vh/* response
+				// carries X-VH-Epoch — present means a vh-solara server answered,
+				// absent means a foreign listener holds the port.
+				body, _ := io.ReadAll(io.LimitReader(res.Body, 120))
 				res.Body.Close()
-				t.Fatalf("/vh/opencode/status = %d, want 200 (local-server keeps serving)", res.StatusCode)
+				epoch := res.Header.Values("X-VH-Epoch")
+				t.Fatalf("/vh/opencode/status = %d, want 200 (local-server keeps serving). Responder: X-VH-Epoch present=%v value=%q (present means a vh-solara server answered, absent means a foreign listener holds the port); Server=%q; body first 120 bytes=[%s]",
+					res.StatusCode, len(epoch) > 0, epoch, res.Header.Get("Server"), strings.ReplaceAll(string(body), "\n", `\n`))
 			}
 			var snap oclife.Snapshot
 			_ = json.NewDecoder(res.Body).Decode(&snap)
