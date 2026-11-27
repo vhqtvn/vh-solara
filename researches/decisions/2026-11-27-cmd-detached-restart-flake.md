@@ -43,9 +43,10 @@ An intermittent `404` at `cmd/local-server_test.go:823` (`waitLSBootReady`) on `
 
 Landed in commit `1ac87aca189103f204f4af32b4ded74fe6c3f94a` (`fix(cmd): refuse a detached restart for a foreign workspace`):
 - Added an upfront guard in `restartDetachedOpenCode` (`cmd/opencode_start.go`) before taking the starter lock, reading any recorded state, or sending any signal. The guard canonicalizes paths and refuses to restart if the target workspace does not match the ambient workspace derived from `os.Getwd()`.
-- Added regression test `TestRestartDetachedRefusesForeignWorkspace` in `cmd/opencode_restart_guard_test.go` (red before the guard was added, green after).
-- Corrected the misleading assertion message in `cmd/opencode_retarget_test.go:141` so it no longer blames the old port.
-- **Verification receipts:** Fans test alone `-count=30` dropped from 14/30 failures to none (0/30); the four-test sequence dropped from 1/1 retarget failure to pass; `-race` on both tests clean; `go test ./cmd/` green.
+- Added regression tests in `cmd/opencode_restart_guard_test.go`: `TestRestartDetachedRefusesForeignWorkspace` (red before the guard was added, green after) and `TestRestartDetachedRefusesForeignWorkspaceBeforeStarterLock` (holds the starter lock and checks that restart for a foreign workspace is refused for the workspace rather than blocked or answered by the lock; fails if the guard is moved below the lock).
+- Corrected the assertion message in `cmd/opencode_retarget_test.go` so it states what it observes and names the stale-watcher kill as the historical cause rather than blaming the old port.
+- Updated local-server fixture comments (`cmd/local-server_test.go`) to remove the inaccurate claim that the death watcher is awaited at teardown.
+- **Verification receipts:** Both guard tests pass; Fans test alone `-count=30` dropped from 14/30 failures to none (0/30); the four-test sequence dropped from 1/1 retarget failure to pass; the flaky Fans test run 10 times ok; whole `cmd` package ok; `-race` clean.
 
 ## 6. Landed Fix: Local-Server Lifecycle Cancellation
 
@@ -54,11 +55,14 @@ Landed in commit `823dbc43e8c4ca0679996a59a0fcf68461461a95` (`fix(cmd): stop a l
 - **Verification receipts (build agent, isolated `XDG_CONFIG_HOME`):** New test `TestLocalServerStopsWhenItsContextIsCancelled` was red with the extraction only (`local-server did not return within 5s of its context being cancelled`) and is green with the stop (`--- PASS … (0.31s)`); the Fans test run 5 times verbose shows no `opencode watch:` line after any `--- PASS`, and 30 times plain is ok; `-race -count=3` on the Fans and retarget tests ok; whole `cmd` package once ok; gofmt and vet clean.
 - **Review:** Approved by all four seats; the first review was blocked on the shutdown order (server before listener) and was resolved as above.
 
-### 6.1 Remaining Follow-ups and Rejected Alternatives
+### 6.1 Deferred Follow-ups and Dispositions
 
-Remaining follow-ups (not scheduled):
-1. **Explicit state identity for detached OpenCode files:** Capture the state-directory base and project key once; use them for state, locks and logs (pass them explicitly through `EnsureDetachedOpenCode` and `restartDetachedOpenCode` rather than resolving ambient env/cwd at call time).
-2. **Diagnose the 404 before fixing it:** Instrument `waitLSBootState` to capture the responder's identity (headers, body prefix, and server access log verification) on any non-200.
+From the follow-up study (2026-11-27) and commit `4500a802`:
+1. **Boot responder diagnostics landed (`4500a802`):** `waitLSBootReady` (`cmd/local-server_test.go`) now captures whether a non-200 responder carries `X-VH-Epoch`, its `Server` header, and body start. Presence of `X-VH-Epoch` proves a vh-solara server answered; absence is inconclusive (responses written before auth middleware lack it). This replaces server access log verification, which never logs GET `/vh/opencode/status`.
+2. **Explicit state identity: DEFERRED (with triggers).** In production nothing changes cwd or state dir, so the landed guard covers it. Refactor would touch ~30 call sites, 200–350 lines, and the lock protocol. Triggers: a second production caller acting on another project's state; cross-test interference the watcher join would not cover; or parallelising `cmd` tests.
+3. **Waiting for death watcher at teardown: DEFERRED.** Trigger: any `opencode watch:` line after a test ends, or a detached local-server test with an unexpected fake death (unreachable today).
+4. **Pinning shutdown order and wait: DEFERRED.** Trigger: a change to the teardown path or merging its four copies (`cmd/local-server.go` has two, `cmd/client-daemon-vh.go` and `cmd/client-daemon-teardown.go` one each).
+5. **Drain timeout and force-close: SKIPPED.** No `cmd` test leaves a stream open across local-server teardown.
 
 **Rejected alternatives:**
 - *Renaming Fans test to run last:* Only patches package-level test ordering; leaves `-count` repetitions and concurrent executions vulnerable.
@@ -71,6 +75,7 @@ Remaining follow-ups (not scheduled):
 
 - **Workaround retired:** The `-skip` / isolated single-run legacy workaround is retired following the landed lifecycle fix.
 - **Known limits after the lifecycle fix:** The death watcher is not joined by the stop (a restart callback already running can outlive cancellation and the helper's `done`); no test pins the shutdown order or the join; the 2 s HTTP drain timeout is ignored; there is no force-close after the grace period (same posture as the restart hook).
+- **Nuance on workspace guard limits:** Saying production is unaffected is slightly too strong: an on-disk rename of the working directory changes what `os.Getwd` returns, causing both restart paths to be refused until the daemon restarts.
 
 ## 8. Findings
 
@@ -79,15 +84,16 @@ Remaining follow-ups (not scheduled):
 - **(retarget test isolation)**: `TestRestartRetargetsRunningServerToFreshPort` did not fail in 60 isolated iterations; its failure was entirely collateral damage from the unmanaged Fans test watcher. source=`cmd/opencode_retarget_test.go:141` and study receipts on tree `1f6225d`, confidence=high, type=fact
 - **(workspace guard efficacy)**: Guarding restart on `os.Getwd()` prevents foreign workspace restarts and eliminates 502 flakes across test boundaries. source=commit `1ac87aca` and `cmd/opencode_restart_guard_test.go`, confidence=high, type=fact
 - **(boot-time 404 ambiguity)**: `/vh/opencode/status` on GET returns only 200 or 503 (non-GET returns 405 Method Not Allowed at lines 160-163); the estimated port collision rate (~0.03% per boot) is too low to explain the single observation at `:823`, leaving an undiscovered cause possible. source=`pkg/web/opencode.go:159-170`, `pkg/web/server_routes.go:199`, and study receipts, confidence=medium, type=inference
-- **(lifecycle fix efficacy)**: The focused test shows that the run returns and the port closes within 5 s of cancellation; the Fans test, run 5 times verbose and 30 times plain, showed no watcher line after any test end; the run joins only the HTTP and web teardown, so a restart callback already running can still outlive it. source=commit `823dbc43` build agent receipts (`TestLocalServerStopsWhenItsContextIsCancelled`, Fans test ×30, `-race -count=3`), confidence=high, type=fact
+- **(lifecycle fix efficacy)**: The focused test shows that the run returns within 5 s of cancellation and the port closes within up to 5 s more; the Fans test, run 5 times verbose and 30 times plain, showed no watcher line after any test end; the run joins only the HTTP and web teardown, so a restart callback already running can still outlive it. source=commit `823dbc43` build agent receipts (`TestLocalServerStopsWhenItsContextIsCancelled`, Fans test ×30, `-race -count=3`), confidence=high, type=fact
+- **(guard ordering & boot responder diagnostics)**: Holding the starter lock proves restart refusal occurs upfront without starter lock acquisition; boot responder inspection (`X-VH-Epoch`, `Server`, body prefix) distinguishes vh-solara from foreign listeners on non-200. source=commit `4500a802` (`cmd/opencode_restart_guard_test.go`, `cmd/local-server_test.go`), confidence=high, type=fact
 
 ## 9. Contradictions
 
-- **Failure points in Fans test**: The read-only study saw the Fans test fail only at `local-server_test.go:859`. The fix slice's baseline also saw `:836` and a boot-never-ready face at `:823`, all gone with the guard.
+- **Failure points in Fans test**: The diagnostic study saw the Fans test fail only at `local-server_test.go:859`. The fix slice's baseline also saw `:836` and a boot-never-ready face at `:823`, all gone with the guard.
 - **Shutdown order during cancellation**: The initial review blocked on stopping the background server before draining the listener (which could reject in-flight requests or hang teardown); resolved by draining and closing the HTTP listener first (`pkg/web/server_aggregators.go:108-138`) before background work drain.
 
 ## 10. Disclaimer and Next Specialist
 
 This memo represents a durable research and decision-shaping evidence record, not active repo operational policy.
 
-- **Recommended next specialist:** None scheduled. If follow-ups are activated, `build` would execute both (after a `planner` brief for explicit state identity; directly for boot-time 404 diagnostic instrumentation).
+- **Recommended next specialist:** None scheduled; the deferred follow-up items name their activating triggers. If activated, `build` would execute the work (preceded by a `planner` brief for explicit state identity).

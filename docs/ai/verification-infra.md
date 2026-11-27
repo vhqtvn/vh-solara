@@ -78,7 +78,7 @@ The composer highlighter's per-line "is this line code" decision (`web/src/lib/c
 ```bash
 go test ./pkg/render/ -run TestComposerHighlightOracleFixture -update
 ```
-Without `-update` the same test fails when the fixture is out of date, and nothing is written when the run failed. The consumer, `web/tests/unit/composerHighlight.goldmark.test.ts`, compares the highlighter with the fixture and keeps a ledger (`knownGaps`) of every input: a deviation that is not listed fails the test, and so does a listed line that no longer deviates. Every table row carries flags (`want`) derived by hand from CommonMark; where the renderer departs from the spec, the row carries the renderer's flags and says so.
+Without `-update` the same test fails when the fixture is out of date, and nothing is written when the run failed. The consumer, `web/tests/unit/composerHighlight.goldmark.test.ts`, compares the highlighter with the fixture and keeps a ledger (`knownGaps`) of every input: a deviation that is not listed fails the test, and so does a listed line that no longer deviates. Every table row carries flags (`want`) checked against CommonMark; where the renderer departs from the spec, the row carries the renderer's flags and says so.
 
 ---
 
