@@ -738,8 +738,10 @@ var composerOracleInputs = []oracleInput{
 		want: flags("FFFFF"),
 	},
 
-	// 10. Shapes where the `marked` library is known to be wrong: the
-	// highlighter is expected to agree with goldmark here.
+	// 10. Shapes where the `marked` library is known to be wrong (the client
+	// declares marked ^18.1.1, its in-flight renderer; that version was not
+	// re-checked for these rows): the highlighter is expected to agree with
+	// goldmark here.
 	{
 		name:  "marked-unindented-line-ends-item-block",
 		lines: []string{"- ```", "  a", "b", "  ```", "after"},
@@ -1113,6 +1115,94 @@ var composerOracleInputs = []oracleInput{
 		name:  "html-pre-closes-on-the-same-line",
 		lines: []string{"<pre>x</pre>", "```", "after"},
 		want:  flags("FTT"),
+	},
+	// Start condition 4: the spec gives FFTF — "<!" then any letter starts a
+	// block that interrupts the paragraph, so the indented line is code. The
+	// renderer gives FFFF: its declaration starts with an uppercase letter
+	// only, so the line is paragraph text and "    code" continues it. The
+	// mirror follows the renderer.
+	{
+		name:  "html-lowercase-declaration-after-paragraph",
+		lines: []string{"text", "<!doctype html>", "    code", "after"},
+		want:  flags("FFFF"),
+	},
+	// The spec gives FFTT: "meta" is not in the condition-6 name list, so the
+	// line is paragraph text and the fence is code. The renderer gives FFFF:
+	// it counts "meta" as a block-level tag, so the line starts a block that
+	// holds the fence. The mirror follows the renderer.
+	{
+		name:  "html-meta-after-paragraph",
+		lines: []string{"text", "<meta charset=\"x\">", "```", "after"},
+		want:  flags("FFFF"),
+	},
+	// The spec gives FTT: condition 1 needs a space, tab, ">" or the end of
+	// the line after the name, and condition 7 excludes the kind-1 names, so
+	// the line is a paragraph and the fence is code. The renderer gives FFF:
+	// it lets "/>" follow the name, so the line starts a block that holds the
+	// fence. The mirror follows the renderer.
+	{
+		name:  "html-self-closing-kind-one-name",
+		lines: []string{"<pre/>", "```", "after"},
+		want:  flags("FFF"),
+	},
+	// Condition 6 allows a tab after the name; the block runs until a blank
+	// line.
+	{
+		name:  "html-tab-after-block-tag-name",
+		lines: []string{"<div\tclass=\"x\">", "```", "after"},
+		want:  flags("FFF"),
+	},
+	// Condition 1 allows a tab after the name; the block runs until "</pre>".
+	{
+		name:  "html-tab-after-kind-one-name",
+		lines: []string{"<pre\tclass=\"x\">", "```", "</pre>", "after"},
+		want:  flags("FFFF"),
+	},
+	// Condition 6 allows a space, tab, the end of the line, ">" and "/>" after
+	// the name, but no quote: a paragraph; the fence is code.
+	{
+		name:  "html-quote-after-block-tag-name",
+		lines: []string{"<div\"class\">", "```", "after"},
+		want:  flags("FTT"),
+	},
+	// Condition 7 cannot interrupt a paragraph, so the tag is lazy text of the
+	// quote's paragraph; the fence is a block start outside the quote, never
+	// closed.
+	{
+		name:  "lazy-line-then-tag-alone-then-fence",
+		lines: []string{"> text", "<my-tag>", "```", "after"},
+		want:  flags("FFTT"),
+	},
+	// Condition 2 interrupts the paragraph, so the quote ends; the block runs
+	// until "-->", which never comes.
+	{
+		name:  "lazy-line-then-comment-start-then-fence",
+		lines: []string{"> text", "<!--", "```", "after"},
+		want:  flags("FFFF"),
+	},
+	// Condition 1: the block holds the fence and ends on "</style>".
+	{
+		name:  "html-style-holds-fence",
+		lines: []string{"<style>", "```", "x", "</style>", "after"},
+		want:  flags("FFFFF"),
+	},
+	// Condition 1: the block holds the fence and ends on "</textarea>".
+	{
+		name:  "html-textarea-holds-fence",
+		lines: []string{"<textarea>", "```", "x", "</textarea>", "after"},
+		want:  flags("FFFFF"),
+	},
+	// Condition 2 interrupts the paragraph; the block ends on "-->".
+	{
+		name:  "html-comment-interrupts-paragraph",
+		lines: []string{"text", "<!--", "```", "-->", "after"},
+		want:  flags("FFFFF"),
+	},
+	// Condition 1 interrupts the paragraph; the block ends on "</pre>".
+	{
+		name:  "html-pre-interrupts-paragraph",
+		lines: []string{"text", "<pre>", "```", "</pre>", "after"},
+		want:  flags("FFFFF"),
 	},
 
 	// 14. Headings behind a prefix do not change what is code.
@@ -1535,7 +1625,9 @@ func TestComposerHighlightOracleGenerator(t *testing.T) {
 }
 
 // TestComposerHighlightOracleFixture holds the committed fixture against the
-// oracle, or rewrites it with -update.
+// oracle, or rewrites it with -update. A failed run writes nothing: the
+// fixture is what later checks are measured against, so it is rewritten only
+// from a table the whole of which the oracle agreed with.
 func TestComposerHighlightOracleFixture(t *testing.T) {
 	const regenerate = "go test ./pkg/render/ -run TestComposerHighlightOracleFixture -update"
 	entries := buildComposerOracle(t)
@@ -1544,6 +1636,10 @@ func TestComposerHighlightOracleFixture(t *testing.T) {
 		t.Fatalf("encoding the oracle: %v", err)
 	}
 	if *updateComposerOracleFixture {
+		if t.Failed() {
+			t.Logf("the run failed, so %s was not written; fix the table, then regenerate it with: %s", composerOracleFixturePath, regenerate)
+			return
+		}
 		if err := os.MkdirAll(filepath.Dir(composerOracleFixturePath), 0o755); err != nil {
 			t.Fatalf("creating the fixture directory: %v", err)
 		}

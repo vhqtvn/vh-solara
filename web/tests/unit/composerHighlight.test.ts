@@ -767,6 +767,58 @@ describe("highlightInput: HTML blocks", () => {
     const out = expectLines(["<?", "```", "?>", "after"], []);
     expect(out).toEqual([esc("<?"), "```", esc("?>"), esc("after"), ""]);
   });
+
+  // The renderer writes every line of an HTML block out escaped and unparsed,
+  // so the mirror colours no inline Markdown inside one. A block started by a
+  // tag ends only at a blank line, so the third line is inside it too.
+  it("inside a block no inline Markdown is coloured: the lines are the escaped text", () => {
+    const out = expectLines(["<div> **x**", "`y`", "after *z*"], []);
+    expect(out).toEqual([esc("<div> **x**"), esc("`y`"), esc("after *z*"), ""]);
+  });
+
+  it("inside a quoted block the quote prefix is a span and the rest is the escaped text", () => {
+    const quoted = (rest: string) => prefixSpan("hl-quote", "> ") + rest;
+    const out = expectLines(["> <div>", "> **x**", "after"], []);
+    expect(out).toEqual([quoted(esc("<div>")), quoted("**x**"), esc("after"), ""]);
+  });
+
+  // Guards: the item's paragraph decides whether the block start counts.
+  it("a complete tag alone does not interrupt an item's paragraph, so the fence after it opens a code block", () => {
+    const out = expectLines(["- text", "<my-tag>", "```", "after"], [2, 3]);
+    expect(out).toEqual([prefixSpan("hl-marker", "- ") + "text", esc("<my-tag>"), codeLine("```"), codeLine("after"), ""]);
+  });
+
+  it("a comment start does interrupt an item's paragraph, so no line is code", () => {
+    const out = expectLines(["- text", "<!--", "```", "after"], []);
+    expect(out).toEqual([prefixSpan("hl-marker", "- ") + "text", esc("<!--"), "```", esc("after"), ""]);
+  });
+});
+
+// The renderer departs from CommonMark 0.31.2 on three HTML start conditions,
+// and the mirror follows it: its job is to preview what the reader gets. Each
+// departure is pinned by its own row of the Go oracle table.
+//
+// Each case asserts the whole rendering, the mirror's trailing line included.
+describe("highlightInput: HTML blocks follow the renderer", () => {
+  it("a lowercase declaration is paragraph text, so it closes no paragraph and the indented line is plain", () => {
+    const out = expectLines(["text", "<!doctype html>", "    code", "after"], []);
+    expect(out).toEqual(["text", esc("<!doctype html>"), esc("    code"), "after", ""]);
+  });
+
+  it("a meta tag counts as a block-level tag: it interrupts the paragraph and holds the fence", () => {
+    const out = expectLines(["text", '<meta charset="x">', "```", "after"], []);
+    expect(out).toEqual(["text", esc('<meta charset="x">'), "```", "after", ""]);
+  });
+
+  it("a kind-1 name closed by \"/>\" starts a block, which holds the fence", () => {
+    const out = expectLines(["<pre/>", "```", "after"], []);
+    expect(out).toEqual([esc("<pre/>"), "```", "after", ""]);
+  });
+
+  it("a quote right after a block-level name starts no block, so the fence opens a code block", () => {
+    const out = expectLines(['<div"class">', "```", "after"], [1, 2]);
+    expect(out).toEqual([esc('<div"class">'), codeLine("```"), codeLine("after"), ""]);
+  });
 });
 
 // A heading is coloured by the test that also closes a paragraph — `isHeading`:

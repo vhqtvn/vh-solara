@@ -90,6 +90,12 @@ function inlineHl(s: string): string {
 // or the first blank line for a block started by a tag. Nothing inside it is
 // code. Every kind but a tag alone can interrupt a paragraph.
 //
+// The renderer departs from CommonMark 0.31.2 on three of these start
+// conditions — a declaration starts with an uppercase letter only, "meta"
+// counts as a block-level tag, and "/>" may follow the first four names — and
+// the mirror follows the renderer there: its job is to preview what the reader
+// gets. Each departure is pinned by a row of the Go oracle table.
+//
 // A fence line: optional leading whitespace (list-nested fences rely on it),
 // then a maximal run of ONE fence character, then the rest of the line.
 // [1] = the run, [2] = the rest.
@@ -121,7 +127,7 @@ const HTML_BLOCK_TAGS = new Set(
   (
     "address article aside base basefont blockquote body caption center col colgroup dd details dialog dir " +
     "div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html " +
-    "iframe legend li link main menu menuitem nav noframes ol optgroup option p param search section summary " +
+    "iframe legend li link main menu menuitem meta nav noframes ol optgroup option p param search section summary " +
     "table tbody td tfoot th thead title tr track ul"
   ).split(" "),
 );
@@ -144,20 +150,22 @@ const HTML_END: RegExp[] = [
 // The kind of HTML block the content of a line starts with; 0 when none.
 function htmlKind(rest: string): number {
   if (rest[0] !== "<") return 0;
-  if (/^<(?:script|pre|style|textarea)(?:[ \t]|>|$)/i.test(rest)) return 1;
+  // The renderer departs from CommonMark 0.31.2 in three places, and the
+  // mirror follows it: a declaration starts with an uppercase letter only,
+  // "meta" counts as a block-level tag, and "/>" may follow the first four
+  // names.
+  if (/^<(?:script|pre|style|textarea)(?:[ \t]|\/?>|$)/i.test(rest)) return 1;
   if (rest.startsWith("<!--")) return 2;
   if (rest.startsWith("<?")) return 3;
-  if (/^<![A-Za-z]/.test(rest)) return 4;
+  if (/^<![A-Z]/.test(rest)) return 4;
   if (rest.startsWith("<![CDATA[")) return 5;
   const t = /^<(\/?)([A-Za-z][A-Za-z0-9-]*)/.exec(rest);
   if (!t) return 0;
   const after = rest.slice(t[0].length);
   // A block-level tag, open or closing, followed by whitespace, the end of
-  // the line, ">", or — open only — "/>" or an attribute quote.
-  if (
-    HTML_BLOCK_TAGS.has(t[2].toLowerCase()) &&
-    (after === "" || /[\t >]/.test(after[0]) || (!t[1] && (after.startsWith("/>") || after[0] === '"' || after[0] === "'")))
-  )
+  // the line, ">", or — open only — "/>". No quote: the CommonMark of an
+  // earlier release allowed one, 0.31.2 does not, and nor does the renderer.
+  if (HTML_BLOCK_TAGS.has(t[2].toLowerCase()) && (after === "" || /[\t >]/.test(after[0]) || (!t[1] && after.startsWith("/>"))))
     return 6;
   // A kind-1 tag that failed its start condition starts nothing.
   if (/^(?:script|style|pre|textarea)$/i.test(t[2])) return 0;
@@ -304,7 +312,9 @@ function inContainer(s: Scan, c: Container, blank: boolean): boolean {
 // holding the paragraph it continues: at the level where it is tested, no
 // paragraph is open, so nothing keeps a block from starting. An empty item —
 // a marker with nothing after it but spaces and tabs — is a block start
-// there, and so is an ordered item whatever number it starts at.
+// there, and so is an ordered item whatever number it starts at. An HTML
+// block of kind 1 to 6 is a block start there too; kind 7 — a complete tag
+// alone — is not, as everywhere: it cannot interrupt a paragraph.
 //
 // A setext underline is not a block start: a lazy line does not match the
 // paragraph's own container, and a line that does not match that container
@@ -404,11 +414,11 @@ export function highlightInput(text: string): string {
       continue;
     }
     if (html && depth === ctx.length) {
-      // Inside the block the line is plain, blank lines included, up to the
-      // line that holds its end marker. A block started by a tag alone ends
-      // at its first blank line.
+      // Inside the block the line is plain escaped text, blank lines
+      // included, up to the line that holds its end marker. A block started
+      // by a tag alone ends at its first blank line.
       if (html.kind >= 6 ? blank : htmlEnds(html.kind, line.slice(s.pos))) html = null;
-      out.push(withPrefix(line, inlineHl));
+      out.push(withPrefix(line, escHtml));
       continue;
     }
     // Outside a block (a block whose container ended ends before this line):
@@ -506,6 +516,12 @@ export function highlightInput(text: string): string {
     // behind its prefix if it has one. A heading is coloured on the text
     // behind its prefix.
     const block = !!open || ic;
+    // The line that opens an HTML block is escaped text like the ones inside
+    // it, whether it closes the block again or not.
+    if (hk) {
+      out.push(withPrefix(line, escHtml));
+      continue;
+    }
     let mm: RegExpExecArray | null;
     if (!block && isHeading(s)) {
       out.push(withPrefix(line, (r) => `<span class="hl-head">${escHtml(r)}</span>`));

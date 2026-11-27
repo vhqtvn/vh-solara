@@ -73,6 +73,13 @@ The retry-hint normalizer replaces `retry: \d+` with the deterministic base toke
 - **Discharged by:** task `task-2026-11-07t13-04-20-defer-retirement-bundle` (item 3).
 - **Trigger:** `path_touched(pkg/web/stream_http.go)` (region around lines 98–99).
 
+### 2.5 Composer Highlighter Oracle (goldmark per-line "is this line code")
+The composer highlighter's per-line "is this line code" decision (`web/src/lib/composerHighlight.ts`) is held against goldmark, the parser of the daemon's renderer (`pkg/render/renderer.go`). The Go table `composerOracleInputs` (`pkg/render/composer_highlight_oracle_test.go`) feeds a generator that rewrites `web/tests/unit/fixtures/composerHighlight.goldmark.json`:
+```bash
+go test ./pkg/render/ -run TestComposerHighlightOracleFixture -update
+```
+Without `-update` the same test fails when the fixture is out of date, and nothing is written when the run failed. The consumer, `web/tests/unit/composerHighlight.goldmark.test.ts`, compares the highlighter with the fixture and keeps a ledger (`knownGaps`) of every input: a deviation that is not listed fails the test, and so does a listed line that no longer deviates. Every table row carries flags (`want`) derived by hand from CommonMark; where the renderer departs from the spec, the row carries the renderer's flags and says so.
+
 ---
 
 ## 3. Bridge Oracle Honesty Rules

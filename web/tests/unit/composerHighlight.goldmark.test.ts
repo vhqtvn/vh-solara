@@ -185,6 +185,18 @@ const knownGaps: Record<string, Array<{ line: number; cause: Cause }>> = {
   "html-tag-inside-paragraph-line": [],
   "html-script-inside-indented-code": [],
   "html-pre-closes-on-the-same-line": [],
+  "html-lowercase-declaration-after-paragraph": [],
+  "html-meta-after-paragraph": [],
+  "html-self-closing-kind-one-name": [],
+  "html-tab-after-block-tag-name": [],
+  "html-tab-after-kind-one-name": [],
+  "html-quote-after-block-tag-name": [],
+  "lazy-line-then-tag-alone-then-fence": [],
+  "lazy-line-then-comment-start-then-fence": [],
+  "html-style-holds-fence": [],
+  "html-textarea-holds-fence": [],
+  "html-comment-interrupts-paragraph": [],
+  "html-pre-interrupts-paragraph": [],
   "bare-hash-then-fence": [],
   "quote-heading-then-fence": [],
   "list-heading-then-fence": [],
@@ -223,7 +235,9 @@ function audit(): string[] {
   const failures: string[] = [];
   for (const { name, lines, code } of fixture) {
     const mirror = mirrorCodeLines(lines);
-    const listed = new Map(knownGaps[name].map((gap) => [gap.line, gap.cause]));
+    // An input the ledger does not name reads as no listed deviation, so the
+    // audit reports the line itself instead of throwing.
+    const listed = new Map((knownGaps[name] ?? []).map((gap) => [gap.line, gap.cause]));
     lines.forEach((line, i) => {
       const differs = mirror[i] !== code[i];
       const at = `${name} line ${i} ${JSON.stringify(line)}: goldmark=${said(code[i])} highlighter=${said(mirror[i])}`;
