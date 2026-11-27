@@ -19,11 +19,9 @@ package render
 // The generator's output is the oracle, so the generator is validated on
 // every run, for every input:
 //
-//   - Hand-derived: every row carries a `want`, one flag per line. Every
-//     row's flags are checked against the CommonMark spec; most were derived
-//     from the spec first, some were measured from the renderer first, and
-//     three rows carry the renderer's flags where it departs from the spec
-//     (see composerOracleInputs). The oracle must agree with each.
+//   - Every row carries flags (`want`) that hold the renderer's output for
+//     that row; three rows carry the renderer's flags where it departs from
+//     CommonMark 0.31.2 and say so.
 //   - Rendered HTML: the content lines the oracle attributes to code blocks
 //     must be the lines the renderer puts inside <pre>, in order — and, for
 //     `plain` inputs, with the same text. This check does not read the AST.
@@ -70,8 +68,7 @@ type oracleInput struct {
 	name  string
 	lines []string
 	// want holds, one flag per line, whether that line is code. Every row
-	// carries one. See composerOracleInputs for how closely each checks the
-	// spec.
+	// carries one. See composerOracleInputs for what a green run proves.
 	want []bool
 	// plain marks inputs whose code blocks sit at top level behind spaces
 	// only, so the HTML the renderer produces shows their content verbatim
@@ -97,33 +94,20 @@ func flags(s string) []bool {
 
 // composerOracleInputs is the table: the shapes a composer block can take.
 // Every input is parsed with the renderer's own parser and compared with its
-// `want`. A green run proves two things: the highlighter and the renderer
-// agree on every row, and the renderer has not changed on any row since the
-// row's flags were written. How much the flags check the renderer against
-// CommonMark depends on the row:
+// `want`, which holds the renderer's output for that row. Each row's comment
+// names the rule its flags follow. For some rows that rule was written before
+// the renderer was run on them; for others it was written after the renderer
+// had answered. Which rows are which is not recorded.
 //
-//   - Every row's flags were checked against the spec.
-//   - Most rows had their flags derived from the spec before the renderer
-//     was run on them.
-//   - The flags of section 13 (HTML blocks), of the last five rows of
-//     section 7 (the lazy-line rows that start with a bare or ordered
-//     marker), and of three rows named below were measured from the
-//     renderer first and then checked against the spec. They pin the
-//     renderer's current behaviour more than they check it.
-//   - Three rows carry the renderer's flags where it departs from the spec,
-//     each with its own comment saying so:
-//     html-lowercase-declaration-after-paragraph, html-meta-after-paragraph
-//     and html-self-closing-kind-one-name.
+// Three rows carry the renderer's flags where it departs from CommonMark
+// 0.31.2, each with its own comment saying so:
+// html-lowercase-declaration-after-paragraph, html-meta-after-paragraph and
+// html-self-closing-kind-one-name.
 //
-// The three rows outside the groups above are
-// quote-paragraph-then-lazy-ordered-item-starting-at-two-then-fence,
-// indent-code-lazy-line-in-quote and lazy-line-indented-list-marker-in-quote.
-// Each was derived from the spec first; the renderer disagreed, the spec
-// reading was revised, and the flags were then written from the renderer's
-// answer.
-//
-// The flags of the rows that had `want` before this table was extended were
-// not re-derived; how they were derived is not recorded here.
+// A green run of this test together with a green run of the web conformance
+// test (composerHighlight.goldmark.test.ts) shows two things: the highlighter
+// and the renderer agree on every row's code flags, and the renderer's code
+// flags have not changed on any row since they were written.
 var composerOracleInputs = []oracleInput{
 	// 1. Top-level fences.
 	{
