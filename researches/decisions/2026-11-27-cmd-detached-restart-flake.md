@@ -51,7 +51,7 @@ Follow-up pins landed in commit `4500a802b54153d6db4a8ffb5df701fecbacaf66` (`tes
 - Added ordering regression test `TestRestartDetachedRefusesForeignWorkspaceBeforeTakingTheStarterLock` in `cmd/opencode_restart_guard_test.go` (holds the starter lock and checks that restart for a foreign workspace is refused for the workspace rather than blocked or answered by the lock; fails if the guard is moved below the lock).
 - Updated the retarget test's assertion message (`cmd/opencode_retarget_test.go`) so it states what it observes and names the stale-watcher kill as the historical cause.
 - Updated local-server fixture comments (`cmd/local-server_test.go`) to remove the inaccurate claim that the death watcher is awaited at teardown.
-- **Verification receipts:** Both guard tests pass; the flaky Fans test run 10 times ok; whole `cmd` package ok; `-race` clean.
+- **Verification receipts:** Both guard tests pass; the flaky Fans test run 10 times ok; whole `cmd` package ok.
 
 ## 6. Landed Fix: Local-Server Lifecycle Cancellation
 
@@ -96,6 +96,7 @@ From the follow-up study (2026-11-27) and commit `4500a802`:
 
 - **Failure points in Fans test**: The diagnostic study saw the Fans test fail only at `local-server_test.go:859`. The fix slice's baseline also saw `:836` and a boot-never-ready face at `:823`, all gone with the guard.
 - **Shutdown order during cancellation**: The initial review blocked on stopping the background server before draining the listener (which could reject in-flight requests or hang teardown); resolved by draining and closing the HTTP listener first (`pkg/web/server_aggregators.go:108-138`) before background work drain.
+- **Commit messages overstating in history**: `89848af` says the oracle "cites the `marked` version it was checked against", while the comment it adds says the client declares `marked ^18.1.1` and that it was not re-checked for those rows. `f2e8399` and `994954a` describe the provenance of the conformance table's flags more completely than the table can show. The accurate statement is the table's comment as of `5ead48e` and `docs/ai/verification-infra.md` section 2.5.
 
 ## 10. Disclaimer and Next Specialist
 
