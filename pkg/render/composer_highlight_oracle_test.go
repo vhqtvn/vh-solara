@@ -94,9 +94,13 @@ func flags(s string) []bool {
 
 // composerOracleInputs is the table: the shapes a composer block can take.
 // Every input is parsed with the renderer's own parser and compared with its
-// `want`, which holds the renderer's output for that row. Each row's comment
-// names the rule its flags follow. For some rows that rule was written before
-// the renderer was run on them; for others it was written after the renderer
+// `want`, which holds the renderer's output for that row. Every row's comment
+// but eight names the rule its flags follow; the eight are: fence-tilde,
+// fence-blank-line-inside-tildes, double-quote-fence,
+// lazy-paragraph-then-fence-in-quote, indent-marker-line-is-code,
+// indent-marker-in-item-is-code, indent-quote-in-item-is-code and
+// thematic-break-stars. For some rows that rule was written before the
+// renderer was run on them; for others it was written after the renderer
 // had answered. Which rows are which is not recorded.
 //
 // Three rows carry the renderer's flags where it departs from CommonMark

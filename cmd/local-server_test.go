@@ -245,13 +245,16 @@ func waitLSBootState(t *testing.T, h *localServerHandle, want oclife.State) ocli
 		res, err := lsClient.Get(h.statusURL())
 		if err == nil {
 			if res.StatusCode != 200 {
-				// What identifies the responder: every vh-solara /vh/* response
-				// carries X-VH-Epoch — present means a vh-solara server answered,
-				// absent means a foreign listener holds the port.
+				// What answered, reported and not concluded. X-VH-Epoch is stamped
+				// by stampMeta, inside the auth/CORS/CSRF middleware chain: a
+				// response that carries it came from a vh-solara server. One that
+				// lacks it is inconclusive — either a foreign listener, or a
+				// vh-solara response written before stampMeta runs (a middleware
+				// short-circuit).
 				body, _ := io.ReadAll(io.LimitReader(res.Body, 120))
 				res.Body.Close()
 				epoch := res.Header.Values("X-VH-Epoch")
-				t.Fatalf("/vh/opencode/status = %d, want 200 (local-server keeps serving). Responder: X-VH-Epoch present=%v value=%q (present means a vh-solara server answered, absent means a foreign listener holds the port); Server=%q; body first 120 bytes=[%s]",
+				t.Fatalf("/vh/opencode/status = %d, want 200 (local-server keeps serving). Responder: X-VH-Epoch present=%v value=%q — when present, a vh-solara server answered (X-VH-Epoch is stamped by stampMeta); when absent, inconclusive: either a foreign listener, or a vh-solara response written before stampMeta runs (a middleware short-circuit); Server=%q; body first 120 bytes=[%s]",
 					res.StatusCode, len(epoch) > 0, epoch, res.Header.Get("Server"), strings.ReplaceAll(string(body), "\n", `\n`))
 			}
 			var snap oclife.Snapshot
